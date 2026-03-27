@@ -1,0 +1,11 @@
+{
+  "name": "@gam/marketing",
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "node server.js",
+    "build": "echo 'Static site — no build step'"
+  },
+  "dependencies": {
+    "serve": "^14.2.1"
+  }
+}

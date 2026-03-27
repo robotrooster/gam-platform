@@ -1,0 +1,17 @@
+{
+  "name": "gold-asset-management",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "dev": "concurrently -n api,landlord,tenant,admin,marketing -c blue,green,yellow,magenta,cyan \"npm run dev --workspace=apps/api\" \"npm run dev --workspace=apps/landlord\" \"npm run dev --workspace=apps/tenant\" \"npm run dev --workspace=apps/admin\" \"npm run dev --workspace=apps/marketing\"",
+    "build": "npm run build --workspaces",
+    "db:migrate": "npm run migrate --workspace=apps/api",
+    "db:seed": "npm run seed --workspace=apps/api"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}
