@@ -24,6 +24,57 @@ landlordsRouter.get('/', requireAdmin, async (_req, res, next) => {
 })
 
 
+
+// ── FLEXCHARGE LANDLORD ROUTES ────────────────────────────────────────────
+
+landlordsRouter.get('/flexcharge', requireAuth, requireLandlord, async (req, res, next) => {
+  try {
+    const accounts = await query<any>(`
+      SELECT fca.*, u.first_name, u.last_name, u.email, un.unit_number
+      FROM flex_charge_accounts fca
+      JOIN tenants t ON t.id = fca.tenant_id
+      JOIN users u ON u.id = t.user_id
+      LEFT JOIN units un ON un.tenant_id = t.id
+      WHERE fca.landlord_id = $1
+      ORDER BY u.last_name`, [req.user!.profileId])
+    res.json({ success: true, data: accounts })
+  } catch (e) { next(e) }
+})
+
+landlordsRouter.post('/flexcharge', requireAuth, requireLandlord, async (req, res, next) => {
+  try {
+    const { tenantId, creditLimit } = req.body
+    if (!tenantId) return res.status(400).json({ success: false, error: 'tenantId required' })
+    const tenant = await queryOne<any>(`
+      SELECT t.id FROM tenants t JOIN units u ON u.tenant_id = t.id
+      WHERE t.id=$1 AND u.landlord_id=$2`, [tenantId, req.user!.profileId])
+    if (!tenant) return res.status(403).json({ success: false, error: 'Tenant not found or not yours' })
+    await query(`
+      INSERT INTO flex_charge_accounts (tenant_id, landlord_id, credit_limit, status)
+      VALUES ($1, $2, $3, 'active')
+      ON CONFLICT (tenant_id) DO UPDATE SET credit_limit=$3, status='active', updated_at=NOW()`,
+      [tenantId, req.user!.profileId, creditLimit || null])
+    res.json({ success: true })
+  } catch (e) { next(e) }
+})
+
+landlordsRouter.delete('/flexcharge/:tenantId', requireAuth, requireLandlord, async (req, res, next) => {
+  try {
+    await query(`UPDATE flex_charge_accounts SET status='suspended', updated_at=NOW()
+      WHERE tenant_id=$1 AND landlord_id=$2`, [req.params.tenantId, req.user!.profileId])
+    res.json({ success: true })
+  } catch (e) { next(e) }
+})
+
+landlordsRouter.patch('/flexcharge/:tenantId', requireAuth, requireLandlord, async (req, res, next) => {
+  try {
+    const { creditLimit } = req.body
+    await query(`UPDATE flex_charge_accounts SET credit_limit=$1, updated_at=NOW()
+      WHERE tenant_id=$2 AND landlord_id=$3`, [creditLimit, req.params.tenantId, req.user!.profileId])
+    res.json({ success: true })
+  } catch (e) { next(e) }
+})
+
 // ── GET /api/landlords/theme ───────────────────────────────────────────────
 landlordsRouter.get('/theme', requireAuth, async (req, res, next) => {
   try {

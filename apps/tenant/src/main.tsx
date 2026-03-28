@@ -375,11 +375,129 @@ function AchVerifyForm({ onSuccess }: { onSuccess: () => void }) {
   )
 }
 
+
+// ── FLEXPAY ENROLL MODAL ──────────────────────────────────────────────────
+const FLEXPAY_TIERS = [
+  { tier:'early',    days:'1st – 5th',   fee:3,  label:'Early',    desc:'Best rate — income arrives early in month' },
+  { tier:'standard', days:'6th – 15th',  fee:7,  label:'Standard', desc:'Most common — mid-month income' },
+  { tier:'extended', days:'16th – 25th', fee:12, label:'Extended', desc:'Late month — highest float period' },
+  { tier:'variable', days:'Variable',    fee:10, label:'SSI/SSDI', desc:'3rd Wednesday etc — fixed pattern income' },
+]
+
+const WEEK_PATTERNS = [
+  { value:'1st-monday',    label:'1st Monday' },
+  { value:'1st-wednesday', label:'1st Wednesday' },
+  { value:'2nd-wednesday', label:'2nd Wednesday' },
+  { value:'3rd-wednesday', label:'3rd Wednesday (SSI)' },
+  { value:'4th-wednesday', label:'4th Wednesday' },
+  { value:'1st-friday',    label:'1st Friday' },
+  { value:'2nd-friday',    label:'2nd Friday' },
+  { value:'3rd-friday',    label:'3rd Friday' },
+  { value:'4th-friday',    label:'4th Friday' },
+]
+
+function FlexPayModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: () => void }) {
+  const [pullType, setPullType] = useState<'specific'|'variable'>('specific')
+  const [pullDay, setPullDay] = useState(15)
+  const [pullPattern, setPullPattern] = useState('3rd-wednesday')
+  const [error, setError] = useState('')
+
+  const selectedTier = pullType === 'variable'
+    ? FLEXPAY_TIERS.find(t => t.tier === 'variable')!
+    : pullDay <= 5 ? FLEXPAY_TIERS[0]
+    : pullDay <= 15 ? FLEXPAY_TIERS[1]
+    : FLEXPAY_TIERS[2]
+
+  const mut = useMutation(
+    () => fetch((import.meta as any).env?.VITE_API_URL + '/api/tenants/flexpay/enroll', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + localStorage.getItem('gam_tenant_token') },
+      body: JSON.stringify(pullType === 'variable' ? { pullPattern } : { pullDay })
+    }).then(r => r.json()),
+    {
+      onSuccess: (data) => {
+        if (!data.success) { setError(data.error || 'Enrollment failed'); return }
+        onSuccess()
+      },
+      onError: () => setError('Enrollment failed. Please try again.')
+    }
+  )
+
+  return (
+    <div className="modal-ov" onClick={onClose}>
+      <div className="modal" onClick={e=>e.stopPropagation()} style={{maxWidth:520}}>
+        <div className="modal-t">⚡ Enroll in FlexPay</div>
+        <p style={{fontSize:'.82rem',color:'var(--t2)',marginBottom:20}}>Choose when your rent is pulled each month. Your landlord always receives payment on the 1st.</p>
+
+        <div style={{display:'flex',gap:8,marginBottom:20}}>
+          <button onClick={()=>setPullType('specific')}
+            style={{flex:1,padding:'10px',borderRadius:8,border:pullType==='specific'?'2px solid var(--gold)':'1px solid var(--b1)',background:pullType==='specific'?'rgba(201,162,39,.08)':'var(--bg3)',cursor:'pointer',color:pullType==='specific'?'var(--gold)':'var(--t2)',fontWeight:600,fontSize:'.82rem'}}>
+            📅 Specific Date
+          </button>
+          <button onClick={()=>setPullType('variable')}
+            style={{flex:1,padding:'10px',borderRadius:8,border:pullType==='variable'?'2px solid var(--gold)':'1px solid var(--b1)',background:pullType==='variable'?'rgba(201,162,39,.08)':'var(--bg3)',cursor:'pointer',color:pullType==='variable'?'var(--gold)':'var(--t2)',fontWeight:600,fontSize:'.82rem'}}>
+            🔄 Variable Date (SSI/SSDI)
+          </button>
+        </div>
+
+        {pullType === 'specific' ? (
+          <div className="fg">
+            <label className="fl">Pull day of month</label>
+            <div style={{display:'flex',alignItems:'center',gap:12}}>
+              <input type="range" min={1} max={25} value={pullDay} onChange={e=>setPullDay(parseInt(e.target.value))}
+                style={{flex:1,accentColor:'var(--gold)'}} />
+              <span style={{fontFamily:'var(--font-m)',fontSize:'1.2rem',fontWeight:800,color:'var(--t0)',minWidth:32,textAlign:'center'}}>{pullDay}</span>
+            </div>
+            <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:4}}>Day {pullDay} of each month</div>
+          </div>
+        ) : (
+          <div className="fg">
+            <label className="fl">Income pattern</label>
+            <select className="fs" value={pullPattern} onChange={e=>setPullPattern(e.target.value)}>
+              {WEEK_PATTERNS.map(p => <option key={p.value} value={p.value}>{p.label}</option>)}
+            </select>
+          </div>
+        )}
+
+        <div style={{background:'var(--bg3)',borderRadius:10,padding:16,marginBottom:16}}>
+          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:8}}>
+            <span style={{fontWeight:700,color:'var(--t0)',fontSize:'.875rem'}}>{selectedTier?.label} Tier</span>
+            <span style={{fontFamily:'var(--font-m)',fontSize:'1.2rem',fontWeight:800,color:'var(--gold)'}}>${selectedTier?.fee}/mo</span>
+          </div>
+          <div style={{fontSize:'.75rem',color:'var(--t3)'}}>{selectedTier?.desc}</div>
+          <div style={{marginTop:10,display:'flex',gap:6}}>
+            {FLEXPAY_TIERS.filter(t=>t.tier!=='variable').map(t=>(
+              <div key={t.tier} style={{flex:1,padding:'6px 4px',borderRadius:6,background:selectedTier?.tier===t.tier?'rgba(201,162,39,.12)':'var(--bg4)',border:selectedTier?.tier===t.tier?'1px solid rgba(201,162,39,.3)':'1px solid var(--b1)',textAlign:'center'}}>
+                <div style={{fontSize:'.65rem',color:selectedTier?.tier===t.tier?'var(--gold)':'var(--t3)',fontWeight:600}}>{t.label}</div>
+                <div style={{fontSize:'.72rem',color:'var(--t0)',fontWeight:700}}>${t.fee}/mo</div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {error && <div className="alert a-warn" style={{marginBottom:12}}>{error}</div>}
+
+        <div style={{fontSize:'.72rem',color:'var(--t3)',marginBottom:16}}>
+          ⓘ FlexPay is a payment scheduling service. Your ACH will be pulled on your chosen date. If the pull fails, one retry occurs 2 business days later. Second failure suspends FlexPay for 60 days.
+        </div>
+
+        <div className="modal-f">
+          <button className="btn btn-g" onClick={onClose}>Cancel</button>
+          <button className="btn btn-p" disabled={mut.isLoading} onClick={()=>mut.mutate()}>
+            {mut.isLoading ? <span className="spinner"/> : `Enroll — ${selectedTier?.fee}/month`}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // ── SERVICES PAGE ─────────────────────────────────────────────
 function ServicesPage() {
   const qc2 = useQuery('tenant-me', () => get<any>('/tenants/me'))
   const me = qc2.data
   const [otpModal, setOtpModal] = useState(false)
+  const [flexPayModal, setFlexPayModal] = useState(false)
   const [incomeDay, setIncomeDay] = useState(15)
   const [enrolling, setEnrolling] = useState<string|null>(null)
 
@@ -391,7 +509,7 @@ function ServicesPage() {
   const services = [
     {
       id: 'credit',
-      name: 'Credit Reporting',
+      name: 'FlexCredit',
       desc: 'Report your on-time rent payments to all 3 bureaus — Experian, TransUnion & Equifax. Build credit just by paying rent.',
       price: '$5/month',
       enrolled: me?.credit_reporting_enrolled,
@@ -401,7 +519,7 @@ function ServicesPage() {
     },
     {
       id: 'otp',
-      name: 'On-Time Pay Float Service',
+      name: 'FlexPay Float',
       desc: 'Your landlord gets paid on the 1st regardless of when your income arrives. No late fees, ever.',
       price: 'Covered by landlord',
       enrolled: me?.on_time_pay_enrolled,
@@ -411,6 +529,21 @@ function ServicesPage() {
         : !me?.deposit_fully_funded ? '⚠ Deposit must be fully funded to qualify'
         : !me?.ach_verified ? '⚠ Bank account must be verified to qualify'
         : 'You qualify for On-Time Pay!',
+      locked: !me?.deposit_fully_funded || !me?.ach_verified,
+    },
+    {
+      id: 'flexpay',
+      name: 'FlexPay',
+      desc: 'Choose your own rent payment date. Your landlord gets paid on the 1st — you pay when your income arrives.',
+      price: '$3–$12/month',
+      enrolled: me?.flexpay_enrolled,
+      action: () => setFlexPayModal(true),
+      loading: false,
+      highlight: me?.flexpay_enrolled
+        ? `${me.flexpay_pull_pattern || 'Day '+me.flexpay_pull_day} · ${me.flexpay_fee}/mo`
+        : !me?.deposit_fully_funded ? '⚠ Deposit must be funded first'
+        : !me?.ach_verified ? '⚠ Bank account must be verified first'
+        : 'Choose your pull date — tiered pricing',
       locked: !me?.deposit_fully_funded || !me?.ach_verified,
     },
     {
@@ -517,6 +650,12 @@ function ServicesPage() {
             </div>
           </div>
         </div>
+      )}
+    {flexPayModal && (
+        <FlexPayModal
+          onClose={() => setFlexPayModal(false)}
+          onSuccess={() => { qc2.refetch(); setFlexPayModal(false) }}
+        />
       )}
     </div>
   )

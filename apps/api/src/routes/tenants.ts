@@ -85,6 +85,140 @@ tenantsRouter.post('/verify-ach', async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
+
+
+// ── FLEXCHARGE ROUTES ─────────────────────────────────────────────────────
+
+// GET /api/tenants/flexcharge — get my charge account
+tenantsRouter.get('/flexcharge', async (req, res, next) => {
+  try {
+    const account = await queryOne<any>(`
+      SELECT fca.*,
+        COALESCE(json_agg(fct ORDER BY fct.created_at DESC) FILTER (WHERE fct.id IS NOT NULL), '[]') AS transactions
+      FROM flex_charge_accounts fca
+      LEFT JOIN flex_charge_transactions fct ON fct.account_id = fca.id
+      WHERE fca.tenant_id = $1
+      GROUP BY fca.id`, [req.user!.profileId])
+    res.json({ success: true, data: account || null })
+  } catch (e) { next(e) }
+})
+
+// POST /api/tenants/flexcharge/dispute/:txId — dispute a charge
+tenantsRouter.post('/flexcharge/dispute/:txId', async (req, res, next) => {
+  try {
+    const tx = await queryOne<any>(
+      'SELECT fct.*, fca.tenant_id FROM flex_charge_transactions fct JOIN flex_charge_accounts fca ON fca.id = fct.account_id WHERE fct.id=$1',
+      [req.params.txId]
+    )
+    if (!tx) return res.status(404).json({ success: false, error: 'Transaction not found' })
+    if (tx.tenant_id !== req.user!.profileId) return res.status(403).json({ success: false, error: 'Forbidden' })
+    if (tx.status === 'pulled') return res.status(400).json({ success: false, error: 'Cannot dispute already-pulled charge' })
+
+    await query('UPDATE flex_charge_transactions SET status=$1, disputed_at=NOW() WHERE id=$2', ['disputed', tx.id])
+    await query(`
+      UPDATE flex_charge_accounts SET status='disqualified', disqualified_at=NOW(), disqualified_reason='Tenant dispute'
+      WHERE tenant_id=$1`, [req.user!.profileId])
+
+    res.json({ success: true, message: 'Dispute recorded. Account closes after next scheduled pull.' })
+  } catch (e) { next(e) }
+})
+
+// ── FLEXPAY TIER CALCULATOR ────────────────────────────────────────────────
+function getFlexPayTier(pullDay: number | null, pattern: string | null): { tier: string; fee: number; label: string } {
+  if (pattern) return { tier: 'variable', fee: 10, label: 'Variable (SSI/SSDI)' }
+  if (!pullDay) return { tier: 'none', fee: 0, label: 'Not enrolled' }
+  if (pullDay <= 5)  return { tier: 'early',    fee: 3,  label: 'Early (1st–5th)' }
+  if (pullDay <= 15) return { tier: 'standard', fee: 7,  label: 'Standard (6th–15th)' }
+  return             { tier: 'extended',  fee: 12, label: 'Extended (16th–25th)' }
+}
+
+// ── GET /api/tenants/flexpay ───────────────────────────────────────────────
+tenantsRouter.get('/flexpay', async (req, res, next) => {
+  try {
+    const tenant = await queryOne<any>(`
+      SELECT t.flexpay_enrolled, t.flexpay_tier, t.flexpay_pull_day,
+             t.flexpay_pull_pattern, t.flexpay_fee, t.flexpay_enrolled_at,
+             t.ach_verified, t.otp_qualified_at,
+             CASE
+               WHEN sd.id IS NULL THEN false
+               WHEN sd.flex_deposit_enabled = true AND sd.installments_remaining > 0 THEN false
+               WHEN sd.collected_amount >= sd.total_amount THEN true
+               ELSE false
+             END AS deposit_fully_funded
+      FROM tenants t
+      LEFT JOIN security_deposits sd ON sd.tenant_id = t.id
+      WHERE t.id = $1`, [req.user!.profileId])
+
+    const tierInfo = getFlexPayTier(tenant?.flexpay_pull_day, tenant?.flexpay_pull_pattern)
+
+    res.json({ success: true, data: { ...tenant, tierInfo } })
+  } catch (e) { next(e) }
+})
+
+// ── POST /api/tenants/flexpay/enroll ──────────────────────────────────────
+tenantsRouter.post('/flexpay/enroll', async (req, res, next) => {
+  try {
+    const { pullDay, pullPattern } = req.body
+
+    // Gate: must have deposit funded + ACH verified
+    const tenant = await queryOne<any>(`
+      SELECT t.ach_verified,
+        CASE
+          WHEN sd.id IS NULL THEN false
+          WHEN sd.flex_deposit_enabled = true AND sd.installments_remaining > 0 THEN false
+          WHEN sd.collected_amount >= sd.total_amount THEN true
+          ELSE false
+        END AS deposit_fully_funded
+      FROM tenants t
+      LEFT JOIN security_deposits sd ON sd.tenant_id = t.id
+      WHERE t.id = $1`, [req.user!.profileId])
+
+    if (!tenant?.deposit_fully_funded)
+      return res.status(400).json({ success: false, error: 'Deposit must be fully funded to enroll in FlexPay' })
+    if (!tenant?.ach_verified)
+      return res.status(400).json({ success: false, error: 'Bank account must be verified to enroll in FlexPay' })
+
+    if (!pullDay && !pullPattern)
+      return res.status(400).json({ success: false, error: 'Pull day or pattern required' })
+    if (pullDay && (pullDay < 1 || pullDay > 25))
+      return res.status(400).json({ success: false, error: 'Pull day must be between 1 and 25' })
+
+    const tierInfo = getFlexPayTier(pullDay || null, pullPattern || null)
+
+    await query(`
+      UPDATE tenants SET
+        flexpay_enrolled = TRUE,
+        flexpay_tier = $1,
+        flexpay_pull_day = $2,
+        flexpay_pull_pattern = $3,
+        flexpay_fee = $4,
+        flexpay_enrolled_at = NOW()
+      WHERE id = $5`,
+      [tierInfo.tier, pullDay || null, pullPattern || null, tierInfo.fee, req.user!.profileId])
+
+    // Stamp otp_qualified_at if not already set (ACH + deposit both satisfied)
+    await query(`
+      UPDATE tenants SET otp_qualified_at = NOW()
+      WHERE id = $1 AND otp_qualified_at IS NULL AND ach_verified = TRUE`,
+      [req.user!.profileId])
+
+    res.json({ success: true, data: { tier: tierInfo.tier, fee: tierInfo.fee, label: tierInfo.label, pullDay, pullPattern } })
+  } catch (e) { next(e) }
+})
+
+// ── DELETE /api/tenants/flexpay ───────────────────────────────────────────
+tenantsRouter.delete('/flexpay', async (req, res, next) => {
+  try {
+    await query(`
+      UPDATE tenants SET
+        flexpay_enrolled = FALSE, flexpay_tier = NULL,
+        flexpay_pull_day = NULL, flexpay_pull_pattern = NULL,
+        flexpay_fee = NULL, flexpay_enrolled_at = NULL
+      WHERE id = $1`, [req.user!.profileId])
+    res.json({ success: true })
+  } catch (e) { next(e) }
+})
+
 // POST /api/tenants/enroll-on-time-pay — opt-in to float service
 tenantsRouter.post('/enroll-on-time-pay', async (req, res, next) => {
   try {
