@@ -1,4 +1,5 @@
 import { NotificationBell } from '../NotificationBell'
+import { apiGet } from '../../lib/api'
 import { Outlet, NavLink, useNavigate } from 'react-router-dom'
 import { useQuery } from 'react-query'
 import { useAuth } from '../../context/AuthContext'
@@ -37,6 +38,15 @@ const NAV_ITEMS = [
   { to: '/work-trade',   icon: Wrench,         label: 'Work Trade',    section: null,          roles: ['landlord','property_manager'] },
 ]
 
+
+const LL_FONTS: Record<string, { imp: string; family: string; display: string }> = {
+  default:     { imp: '', family: "'DM Sans',sans-serif", display: "'Syne',sans-serif" },
+  terminator:  { imp: "@font-face{font-family:'Terminator';src:url('/fonts/terminator.ttf') format('truetype');}", family: "'Terminator',sans-serif", display: "'Terminator',sans-serif" },
+  matrix:      { imp: "@font-face{font-family:'Matrix';src:url('/fonts/matrix.ttf') format('truetype');}", family: "'Matrix',monospace", display: "'Matrix',monospace" },
+  bladerunner: { imp: "@font-face{font-family:'BladeRunner';src:url('/fonts/bladerunner.ttf') format('truetype');}", family: "'BladeRunner',sans-serif", display: "'BladeRunner',sans-serif" },
+  teamfury:    { imp: "@font-face{font-family:'TeamFury';src:url('/fonts/teamfury.ttf') format('truetype');}", family: "'TeamFury',sans-serif", display: "'TeamFury',sans-serif" },
+}
+
 const ROLE_BADGE: Record<string, string> = {
   landlord:         '',
   property_manager: 'PM',
@@ -70,6 +80,23 @@ export function Layout() {
   const navigate = useNavigate()
   const role = user?.role || 'landlord'
 
+  const { data: themeData } = useQuery(
+    'landlord-theme',
+    () => apiGet('/landlords/theme'),
+    { staleTime: 60000 }
+  )
+  const accent   = (themeData as any)?.theme_accent || '#c9a227'
+  const fontKey  = (themeData as any)?.font_style   || 'default'
+  const font     = LL_FONTS[fontKey] || LL_FONTS.default
+  const themeCss = `${font.imp}
+:root{--gold:${accent};--gold-dim:${accent}99;--gold-glow:${accent}26;--gold-bg:${accent}14;--font-display:${font.display};--font-body:${font.family};}
+.nav-item.active{background:${accent}14;color:${accent};border:1px solid ${accent}33;}
+.btn-primary{background:${accent};}.btn-primary:hover{background:${accent}cc;box-shadow:0 0 24px ${accent}33;}
+.tab-btn.active{color:${accent};border-bottom-color:${accent};}
+.form-input:focus,.form-select:focus,.form-textarea:focus{border-color:${accent};box-shadow:0 0 0 2px ${accent}26;}
+.sidebar-logo-mark{color:${accent};}a{color:${accent};}.kpi-card::before{background:${accent};}
+`
+
   const handleLogout = () => { logout(); navigate('/login') }
 
   // Filter nav items by role
@@ -80,6 +107,7 @@ export function Layout() {
 
   return (
     <div className="app-shell">
+      <style dangerouslySetInnerHTML={{__html: themeCss}} />
       <aside className="sidebar">
         <div className="sidebar-logo">
           <div className="sidebar-logo-mark">⚡ GAM</div>

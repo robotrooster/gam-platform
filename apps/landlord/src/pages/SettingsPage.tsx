@@ -2,10 +2,10 @@ import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPatch } from '../lib/api'
 import { useAuth } from '../context/AuthContext'
-import { Save, User, Building2, DollarSign, Bell, Wrench } from 'lucide-react'
+import { Save, User, Building2, DollarSign, Bell, Wrench, Palette } from 'lucide-react'
 import { formatCurrency } from '@gam/shared'
 
-type Tab = 'profile'|'business'|'fees'|'maintenance'|'notifications'
+type Tab = 'profile'|'business'|'fees'|'maintenance'|'notifications'|'customize'
 
 export function SettingsPage() {
   const qc = useQueryClient()
@@ -18,6 +18,10 @@ export function SettingsPage() {
   const [fees, setFees] = useState({ bgCheckFee:'45', bgCheckFeeMin:'25' })
   const [maint, setMaint] = useState({ maintApprovalThreshold:'500' })
   const [notifs, setNotifs] = useState({ emailMaintenance:true, emailPayments:true, emailApplications:true, smsMaintenance:false, smsPayments:false })
+  const [accent, setAccent] = useState('#c9a227')
+  const [fontStyle, setFontStyle] = useState('default')
+  const { data: themeData } = useQuery('landlord-theme-settings', () => apiGet<any>('/landlords/theme'), { staleTime: 0 })
+  useEffect(() => { if (themeData) { setAccent((themeData as any).theme_accent || '#c9a227'); setFontStyle((themeData as any).font_style || 'default') } }, [themeData])
 
   useEffect(() => { if (me) setProfile({ firstName:(me as any).firstName||'', lastName:(me as any).lastName||'', email:(me as any).email||'', phone:(me as any).phone||'' }) }, [me])
   useEffect(() => { if (landlord) { setBusiness({ businessName:(landlord as any).business_name||'', ein:(landlord as any).ein||'' }); setFees({ bgCheckFee:String((landlord as any).bg_check_fee||45), bgCheckFeeMin:String((landlord as any).bg_check_fee_min||25) }); setMaint({ maintApprovalThreshold:String((landlord as any).maint_approval_threshold||500) }) } }, [landlord])
@@ -27,6 +31,10 @@ export function SettingsPage() {
   const saveBusiness = useMutation(() => apiPatch('/landlords/me', business), { onSuccess: () => { qc.invalidateQueries('landlord-me'); flash() } })
   const saveFees = useMutation(() => apiPatch('/landlords/me', { bgCheckFee: parseFloat(fees.bgCheckFee), bgCheckFeeMin: parseFloat(fees.bgCheckFeeMin) }), { onSuccess: () => { qc.invalidateQueries('landlord-me'); flash() } })
   const saveMaint = useMutation(() => apiPatch('/landlords/me', { maintApprovalThreshold: parseFloat(maint.maintApprovalThreshold) }), { onSuccess: () => { qc.invalidateQueries('landlord-me'); flash() } })
+  const saveTheme = useMutation(
+    () => fetch((import.meta as any).env?.VITE_API_URL + '/api/landlords/theme', { method: 'PATCH', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + localStorage.getItem('gam_token') }, body: JSON.stringify({ themeAccent: accent, fontStyle }) }).then(r => r.json()),
+    { onSuccess: () => { qc.invalidateQueries('landlord-theme'); qc.invalidateQueries('landlord-theme-settings'); flash(); setTimeout(() => window.location.reload(), 500) } }
+  )
 
   const TABS: {id:Tab,label:string,icon:any}[] = [
     {id:'profile',label:'Profile',icon:User},
@@ -34,6 +42,7 @@ export function SettingsPage() {
     {id:'fees',label:'Fees',icon:DollarSign},
     {id:'maintenance',label:'Maintenance',icon:Wrench},
     {id:'notifications',label:'Notifications',icon:Bell},
+    {id:'customize',label:'Customize',icon:Palette},
   ]
 
   const lbl = { fontSize:'.68rem', fontWeight:600, color:'var(--text-3)', textTransform:'uppercase' as const, letterSpacing:'.06em', display:'block', marginBottom:5 }
@@ -123,6 +132,61 @@ export function SettingsPage() {
             </label>
           ))}
           <button className="btn btn-primary" style={{ marginTop:16 }} onClick={flash}><Save size={14}/> Save Notifications</button>
+        </div>
+      )}
+
+      {tab==='customize' && (
+        <div className="card" style={{padding:24}}>
+          <div style={{fontSize:'.85rem',fontWeight:700,color:'var(--text-0)',marginBottom:4}}>Portal Theme</div>
+          <div style={{fontSize:'.78rem',color:'var(--text-3)',marginBottom:20}}>Customize the look of your landlord portal. Changes apply live across all pages.</div>
+
+          <div style={{marginBottom:24}}>
+            <label style={lbl}>Accent Color</label>
+            <div style={{display:'flex',alignItems:'center',gap:12,marginTop:6,flexWrap:'wrap'}}>
+              <input type="color" value={accent} onChange={e=>setAccent(e.target.value)}
+                style={{width:44,height:44,padding:2,border:'1px solid var(--border-1)',borderRadius:8,background:'var(--bg-3)',cursor:'pointer'}}/>
+              <input className="form-input" value={accent} onChange={e=>setAccent(e.target.value)}
+                style={{fontFamily:'var(--font-mono)',fontSize:'.82rem',maxWidth:120}} placeholder="#c9a227"/>
+              <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>
+                {['#c9a227','#3b82f6','#22c55e','#ef4444','#8b5cf6','#06b6d4','#f59e0b','#ec4899'].map(c=>(
+                  <button key={c} onClick={()=>setAccent(c)} title={c}
+                    style={{width:26,height:26,borderRadius:6,background:c,border:accent===c?'2px solid var(--text-0)':'2px solid transparent',cursor:'pointer'}}/>
+                ))}
+              </div>
+            </div>
+            <div style={{marginTop:10,padding:'8px 12px',background:'var(--bg-3)',borderRadius:8,display:'flex',alignItems:'center',gap:10,fontSize:'.78rem',color:'var(--text-2)'}}>
+              Preview:&nbsp;
+              <span style={{padding:'3px 10px',borderRadius:20,background:accent+'14',color:accent,border:'1px solid '+accent+'33',fontWeight:600,fontSize:'.68rem',textTransform:'uppercase'}}>Active</span>
+              <span style={{padding:'5px 12px',borderRadius:8,background:accent,color:'#0a0b0e',fontWeight:700,fontSize:'.78rem'}}>Button</span>
+              <span style={{color:accent,fontWeight:600,fontSize:'.82rem'}}>Link text</span>
+            </div>
+          </div>
+
+          <div style={{marginBottom:24}}>
+            <label style={lbl}>Portal Font</label>
+            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginTop:6}}>
+              {([
+                {key:'default',       label:'Default',       preview:'Modern & clean (Syne + DM Sans)'},
+                {key:'terminator',    label:'Terminator',    preview:'Bold sci-fi action'},
+                {key:'matrix',        label:'Matrix',        preview:'Digital monospace'},
+                {key:'bladerunner',   label:'Blade Runner',  preview:'Neo-noir future'},
+                {key:'teamfury',      label:'Mad Max',       preview:'Raw & aggressive'},
+              ] as {key:string,label:string,preview:string}[]).map(f=>(
+                <button key={f.key} onClick={()=>setFontStyle(f.key)}
+                  style={{padding:'12px 14px',border:fontStyle===f.key?'2px solid '+accent:'1px solid var(--border-1)',borderRadius:8,background:fontStyle===f.key?accent+'0d':'var(--bg-3)',cursor:'pointer',textAlign:'left'}}>
+                  <div style={{fontWeight:700,fontSize:'.82rem',color:fontStyle===f.key?accent:'var(--text-0)',marginBottom:2}}>{f.label}</div>
+                  <div style={{fontSize:'.72rem',color:'var(--text-3)'}}>{f.preview}</div>
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div style={{padding:'10px 14px',background:'var(--gold-bg)',border:'1px solid var(--gold-glow)',borderRadius:8,fontSize:'.78rem',color:'var(--gold)',marginBottom:20}}>
+            ⚡ Page will reload after saving to apply the new theme.
+          </div>
+          <button className="btn btn-primary" disabled={saveTheme.isLoading} onClick={()=>saveTheme.mutate()}>
+            <Save size={14}/> Save Theme
+          </button>
         </div>
       )}
     </div>

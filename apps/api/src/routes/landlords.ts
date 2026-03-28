@@ -23,6 +23,30 @@ landlordsRouter.get('/', requireAdmin, async (_req, res, next) => {
   } catch (e) { next(e) }
 })
 
+
+// ── GET /api/landlords/theme ───────────────────────────────────────────────
+landlordsRouter.get('/theme', requireAuth, async (req, res, next) => {
+  try {
+    const row = await queryOne(
+      'SELECT theme_accent, font_style FROM landlords WHERE id=$1',
+      [req.user.profileId]
+    )
+    res.json({ success: true, data: row })
+  } catch (e) { next(e) }
+})
+
+// ── PATCH /api/landlords/theme ─────────────────────────────────────────────
+landlordsRouter.patch('/theme', requireAuth, async (req, res, next) => {
+  try {
+    const { themeAccent, fontStyle } = req.body
+    await query(
+      'UPDATE landlords SET theme_accent=$1, font_style=$2 WHERE id=$3',
+      [themeAccent || null, fontStyle || null, req.user.profileId]
+    )
+    res.json({ success: true })
+  } catch (e) { next(e) }
+})
+
 landlordsRouter.get('/:id', async (req, res, next) => {
   try {
     const id = req.params.id === 'me' ? req.user!.profileId : req.params.id
@@ -131,3 +155,6 @@ landlordsRouter.patch('/me', requireAuth, requireLandlord, async (req, res, next
     res.json({ success: true, data: updated })
   } catch(e) { next(e) }
 })
+
+
+
