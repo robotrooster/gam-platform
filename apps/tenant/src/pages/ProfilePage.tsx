@@ -1,6 +1,6 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
-import { User, Bell, Lock, Check, AlertCircle } from 'lucide-react'
+import { User, Bell, Lock, Check, AlertCircle, Palette } from 'lucide-react'
 
 import axios from 'axios'
 const API_URL = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
@@ -21,8 +21,14 @@ const NOTIF_TYPES = [
 
 export function ProfilePage() {
   const qc = useQueryClient()
-  const [tab, setTab]     = useState<'profile'|'notifications'|'security'>('profile')
+  const [tab, setTab]     = useState<'profile'|'notifications'|'security'|'customize'>('profile')
   const [saved, setSaved] = useState('')
+  const [bio, setBio]           = useState('')
+  const [accent, setAccent]     = useState('#c9a227')
+  const [fontStyle, setFontStyle] = useState('default')
+  const [avatarUrl, setAvatarUrl] = useState<string|null>(null)
+  const [avatarUploading, setAvatarUploading] = useState(false)
+  const avatarRef = useRef<HTMLInputElement>(null)
   const [firstName, setFirstName] = useState('')
   const [lastName,  setLastName]  = useState('')
   const [phone,     setPhone]     = useState('')
@@ -41,13 +47,19 @@ export function ProfilePage() {
       setLastName(me.last_name || '')
       setPhone(me.phone || '')
       setEmail(me.email || '')
+      setBio(me.bio || '')
+      setAccent(me.theme_accent || '#c9a227')
+      setFontStyle(me.font_style || 'default')
+      setAvatarUrl(me.avatar_url || null)
     }
   }, [me])
 
   const saveMut = useMutation(
-    () => patchReq('/tenants/profile', { phone, email }),
+    () => patchReq('/tenants/profile', { phone, email, bio, themeAccent: accent, fontStyle }),
     { onSuccess: () => {
       qc.invalidateQueries('tenant-me-profile')
+      qc.invalidateQueries('tenant-me-theme')
+      if (tab === 'customize') { setSaved('profile'); setTimeout(() => window.location.reload(), 500) }
       setSaved('profile')
       setTimeout(() => setSaved(''), 2500)
       // If email changed, force re-login with new credentials
@@ -99,6 +111,7 @@ export function ProfilePage() {
           { id:'profile',       icon:'👤', label:'Profile' },
           { id:'notifications', icon:'🔔', label:'Notifications' },
           { id:'security',      icon:'🔒', label:'Security' },
+          { id:'customize',     icon:'🎨', label:'Customize' },
         ].map(t => (
           <button key={t.id} onClick={() => setTab(t.id as any)}
             style={{ padding:'7px 14px', borderRadius:8, border:'none', cursor:'pointer', fontSize:'.78rem', fontWeight:600, background: tab===t.id ? 'var(--gold)' : 'var(--bg-2)', color: tab===t.id ? 'var(--bg-0)' : 'var(--text-3)' }}>
@@ -167,6 +180,84 @@ export function ProfilePage() {
             </div>
           </div>
           {saved==='pref' && <div style={{ marginTop:10, fontSize:'.78rem', color:'var(--green)', display:'flex', alignItems:'center', gap:4 }}><Check size={12} /> Preferences saved</div>}
+        </div>
+      )}
+
+      {tab === 'customize' && (
+        <div style={{ maxWidth:480 }}>
+          {/* Avatar */}
+          <div style={{ marginBottom:28 }}>
+            <div style={{ fontSize:'.72rem', fontWeight:700, color:'var(--t3)', textTransform:'uppercase', letterSpacing:'.07em', marginBottom:12 }}>Profile Photo</div>
+            <div style={{ display:'flex', alignItems:'center', gap:16 }}>
+              <div style={{ width:72, height:72, borderRadius:'50%', background:'var(--bg3)', border:'2px solid var(--b1)', overflow:'hidden', flexShrink:0, display:'flex', alignItems:'center', justifyContent:'center' }}>
+                {avatarUrl
+                  ? <img src={API_URL + avatarUrl} alt="avatar" style={{ width:'100%', height:'100%', objectFit:'cover' }} />
+                  : <User size={28} style={{ color:'var(--t3)' }} />
+                }
+              </div>
+              <div>
+                <button className="btn btn-g" onClick={() => avatarRef.current?.click()} disabled={avatarUploading} style={{ marginBottom:6 }}>
+                  {avatarUploading ? 'Uploading...' : 'Upload Photo'}
+                </button>
+                <div style={{ fontSize:'.7rem', color:'var(--t3)' }}>JPEG, PNG, WEBP · Max 5MB</div>
+                <input ref={avatarRef} type="file" accept="image/jpeg,image/png,image/webp" style={{ display:'none' }} onChange={async e => {
+                  const f = e.target.files?.[0]; if (!f) return
+                  setAvatarUploading(true)
+                  const fd = new FormData(); fd.append('file', f)
+                  const r = await fetch(API_URL + '/api/tenants/avatar', { method:'POST', headers:{ Authorization:'Bearer '+localStorage.getItem('gam_tenant_token') }, body:fd }).then(r=>r.json())
+                  if (r.success) { setAvatarUrl(r.data.url); qc.invalidateQueries('tenant-me-profile') }
+                  setAvatarUploading(false)
+                }} />
+              </div>
+            </div>
+          </div>
+
+          {/* Bio */}
+          <div style={{ marginBottom:24 }}>
+            <div style={{ fontSize:'.72rem', fontWeight:700, color:'var(--t3)', textTransform:'uppercase', letterSpacing:'.07em', marginBottom:8 }}>Bio <span style={{ color:'var(--t3)', fontWeight:400, textTransform:'none' }}>(visible to landlords)</span></div>
+            <textarea value={bio} onChange={e => setBio(e.target.value)} rows={3} maxLength={300} placeholder="Tell landlords a little about yourself..." style={{ width:'100%', padding:'10px 12px', background:'var(--bg3)', border:'1px solid var(--b1)', borderRadius:8, color:'var(--t0)', fontSize:'.85rem', resize:'none', fontFamily:'inherit', boxSizing:'border-box' }} />
+            <div style={{ fontSize:'.68rem', color:'var(--t3)', marginTop:4, textAlign:'right' }}>{bio.length}/300</div>
+          </div>
+
+          {/* Accent Color */}
+          <div style={{ marginBottom:24 }}>
+            <div style={{ fontSize:'.72rem', fontWeight:700, color:'var(--t3)', textTransform:'uppercase', letterSpacing:'.07em', marginBottom:12 }}>Accent Color</div>
+            <div style={{ display:'flex', gap:10, flexWrap:'wrap' }}>
+              {['#c9a227','#3b82f6','#22c55e','#ef4444','#a855f7','#f59e0b','#06b6d4','#ec4899','#ffffff'].map(c => (
+                <button key={c} onClick={() => setAccent(c)} style={{ width:32, height:32, borderRadius:'50%', background:c, border: accent===c ? '3px solid var(--t0)' : '3px solid transparent', outline: accent===c ? '2px solid '+c : 'none', cursor:'pointer', transition:'all .15s' }} />
+              ))}
+              <input type="color" value={accent} onChange={e => setAccent(e.target.value)} style={{ width:32, height:32, borderRadius:'50%', border:'3px solid var(--b1)', cursor:'pointer', padding:2, background:'var(--bg3)' }} title="Custom color" />
+            </div>
+            <div style={{ marginTop:10, padding:'8px 12px', background:accent+'14', border:'1px solid '+accent+'44', borderRadius:8, fontSize:'.78rem', color:accent, fontWeight:600 }}>
+              Preview: your accent color
+            </div>
+          </div>
+
+          {/* Font Style */}
+          <div style={{ marginBottom:28 }}>
+            <div style={{ fontSize:'.72rem', fontWeight:700, color:'var(--t3)', textTransform:'uppercase', letterSpacing:'.07em', marginBottom:12 }}>Font Style</div>
+            <div style={{ display:'flex', flexDirection:'column', gap:8 }}>
+              {[
+                { key:'default',     label:'Modern Sans',  preview:'Clean and contemporary' },
+                { key:'terminator',  label:'Terminator',   preview:'Bold sci-fi impact' },
+                { key:'matrix',      label:'Matrix',       preview:'Digital monospace code' },
+                { key:'bladerunner', label:'Blade Runner', preview:'Futuristic neo-noir' },
+                { key:'teamfury',    label:'Mad Max',      preview:'Post-apocalyptic edge' },
+              ].map(f => (
+                <button key={f.key} onClick={() => setFontStyle(f.key)} style={{ padding:'10px 14px', borderRadius:8, border:'1px solid '+(fontStyle===f.key?accent:'var(--b1)'), background:fontStyle===f.key?accent+'14':'var(--bg3)', cursor:'pointer', textAlign:'left', transition:'all .15s' }}>
+                  <div style={{ fontWeight:600, color:fontStyle===f.key?accent:'var(--t0)', fontSize:'.85rem' }}>{f.label}</div>
+                  <div style={{ fontSize:'.72rem', color:'var(--t3)', marginTop:2 }}>{f.preview}</div>
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div style={{ display:'flex', alignItems:'center', gap:10 }}>
+            <button className="btn btn-primary" disabled={saveMut.isLoading} onClick={() => saveMut.mutate()}>
+              {saveMut.isLoading ? <span className="spinner" /> : 'Save Preferences'}
+            </button>
+            {saved === 'profile' && <span style={{ fontSize:'.78rem', color:'var(--green)', display:'flex', alignItems:'center', gap:4 }}><Check size={12} /> Saved</span>}
+          </div>
         </div>
       )}
 

@@ -157,17 +157,56 @@ function LeaseNavLink() {
     : <NavLink to="/lease" className={({isActive})=>`ni${isActive?' active':''}`}>📋 Lease</NavLink>
 }
 
+const FONTS: Record<string, string> = {
+  default: "'DM Sans',sans-serif",
+  terminator: "'Terminator',sans-serif",
+  matrix: "'Matrix',monospace",
+  bladerunner: "'BladeRunner',sans-serif",
+  teamfury: "'TeamFury',sans-serif",
+}
+
+const FONT_IMPORTS: Record<string, string> = {
+  terminator: "@font-face{font-family:'Terminator';src:url('/fonts/terminator.ttf') format('truetype');}",
+  matrix: "@font-face{font-family:'Matrix';src:url('/fonts/matrix.ttf') format('truetype');}",
+  bladerunner: "@font-face{font-family:'BladeRunner';src:url('/fonts/bladerunner.ttf') format('truetype');}",
+  teamfury: "@font-face{font-family:'TeamFury';src:url('/fonts/teamfury.ttf') format('truetype');}",
+}
+
 function Layout() {
   const { data: bgStatus } = useQuery('bg-status-nav', () =>
     fetch((import.meta as any).env?.VITE_API_URL + '/api/background/status', {
       headers: { Authorization: 'Bearer ' + localStorage.getItem('gam_tenant_token') }
     }).then(r=>r.json()).then(r=>r.data)
   )
+  const { data: tenantMe } = useQuery('tenant-me-theme', () =>
+    fetch((import.meta as any).env?.VITE_API_URL + '/api/tenants/me', {
+      headers: { Authorization: 'Bearer ' + localStorage.getItem('gam_tenant_token') }
+    }).then(r=>r.json()).then(r=>r.data),
+    { staleTime: 60000 }
+  )
+  const accent = tenantMe?.theme_accent || '#c9a227'
+  const fontKey = tenantMe?.font_style || 'default'
+  const fontFamily = FONTS[fontKey] || FONTS.default
+  const fontImport = FONT_IMPORTS[fontKey] || ''
+  const themeCss = fontImport + `:root {
+    --gold: ${accent};
+    --font-b: ${fontFamily};
+    --font-d: ${fontFamily};
+  }
+  body, button, input, select, textarea { font-family: ${fontFamily} !important; }
+  h1, h2, h3, .pt, .kpi-v, .logo-name, .modal-t, .price-tag, .loading { font-family: ${fontFamily} !important; }
+  .ni.active { background: ${accent}14; color: ${accent}; border-color: ${accent}33; }
+  .btn-p { background: ${accent}; }
+  .btn-p:hover { background: ${accent}cc; }
+  a { color: ${accent}; }
+  .logo-name { color: ${accent}; }
+  `
   const bgApproved = bgStatus?.status === 'approved'
   const { user, logout } = useAuth()
   const navigate = useNavigate()
   return (
     <div className="shell">
+      <style dangerouslySetInnerHTML={{__html: themeCss}} />
       <aside className="sidebar">
         <div className="logo">
           <div className="logo-name">⚡ GAM Tenant</div>

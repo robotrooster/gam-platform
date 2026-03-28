@@ -1,4 +1,8 @@
 import { Router } from 'express'
+import multer from 'multer'
+import path from 'path'
+import fs from 'fs'
+import crypto from 'crypto'
 import { z } from 'zod'
 import { query, queryOne } from '../db'
 import { requireAuth, requireLandlord } from '../middleware/auth'
@@ -402,11 +406,45 @@ tenantsRouter.get('/:id/available-units', requireAuth, requireLandlord, async (r
 // ── TENANT PROFILE UPDATE ─────────────────────────────────────
 tenantsRouter.patch('/profile', requireAuth, async (req, res, next) => {
   try {
-    const { phone, email } = req.body
+    const { phone, email, bio, themeAccent, fontStyle } = req.body
     await query('UPDATE users SET phone=$1, email=$2 WHERE id=$3',
       [phone||null, email, req.user!.userId])
+    if (req.user!.profileId) {
+      await query('UPDATE tenants SET bio=$1, theme_accent=$2, font_style=$3 WHERE id=$4',
+        [bio||null, themeAccent||null, fontStyle||null, req.user!.profileId])
+    }
     res.json({ success: true })
   } catch (e) { next(e) }
+})
+
+
+// Avatar upload
+const avatarDir = path.join(process.cwd(), 'uploads', 'avatars')
+if (!fs.existsSync(avatarDir)) fs.mkdirSync(avatarDir, { recursive: true })
+const avatarStorage = multer.diskStorage({
+  destination: avatarDir,
+  filename: (req: any, file: any, cb: any) => cb(null, Date.now() + '-' + crypto.randomBytes(8).toString('hex') + path.extname(file.originalname))
+})
+const avatarUpload = multer({ storage: avatarStorage, limits: { fileSize: 5 * 1024 * 1024 }, fileFilter: (req: any, file: any, cb: any) => {
+  if (['image/jpeg','image/png','image/webp'].includes(file.mimetype)) cb(null, true)
+  else cb(new Error('JPEG PNG WEBP only'))
+}})
+
+tenantsRouter.post('/avatar', requireAuth, avatarUpload.single('file'), async (req: any, res: any, next: any) => {
+  try {
+    if (!req.file) throw new AppError(400, 'No file')
+    const url = '/api/tenants/avatar-files/' + req.file.filename
+    if (req.user!.profileId) await query('UPDATE tenants SET avatar_url=$1 WHERE id=$2', [url, req.user!.profileId])
+    res.json({ success: true, data: { url } })
+  } catch(e) { next(e) }
+})
+
+tenantsRouter.get('/avatar-files/:filename', async (req: any, res: any, next: any) => {
+  try {
+    const fp = path.join(avatarDir, req.params.filename)
+    if (!fs.existsSync(fp)) throw new AppError(404, 'Not found')
+    res.sendFile(fp)
+  } catch(e) { next(e) }
 })
 
 tenantsRouter.patch('/password', requireAuth, async (req, res, next) => {
