@@ -232,6 +232,125 @@ export function schedulerInit() {
     } catch (e) { console.error('[Scheduler] NACHA monitoring error:', e) }
   })
 
+
+  // ── FLEXPAY PULL ─────────────────────────────────────────────
+  // Run daily at 6am — pull rent for tenants whose chosen date is today
+  // Also handles variable patterns (3rd Wednesday etc)
+  cron.schedule('0 6 * * *', async () => {
+    try {
+      const today = new Date()
+      const dayOfMonth = today.getDate()
+      const dayOfWeek = today.getDay() // 0=Sun, 1=Mon ... 3=Wed ... 5=Fri
+      const weekOfMonth = Math.ceil(dayOfMonth / 7)
+
+      // Resolve variable pattern to today
+      const matchesPattern = (pattern: string) => {
+        const [week, day] = pattern.split('-')
+        const weekNum = { '1st':1,'2nd':2,'3rd':3,'4th':4 }[week] || 0
+        const dayNum  = { 'monday':1,'wednesday':3,'friday':5 }[day] || -1
+        return weekOfMonth === weekNum && dayOfWeek === dayNum
+      }
+
+      // Find all tenants with FlexPay pull due today
+      const dueTenants = await query<any>(`
+        SELECT t.id AS tenant_id, t.flexpay_pull_day, t.flexpay_pull_pattern,
+               t.flexpay_fee, t.flexpay_tier,
+               u.unit_number, u.rent_amount, u.id AS unit_id,
+               l.id AS landlord_id,
+               tu.email AS tenant_email, tu.first_name, tu.last_name
+        FROM tenants t
+        JOIN units u ON u.tenant_id = t.id
+        JOIN landlords l ON l.id = u.landlord_id
+        JOIN users tu ON tu.id = t.user_id
+        WHERE t.flexpay_enrolled = TRUE
+          AND t.ach_verified = TRUE
+          AND (
+            (t.flexpay_pull_day = $1 AND t.flexpay_pull_pattern IS NULL)
+            OR t.flexpay_pull_pattern IS NOT NULL
+          )
+      `, [dayOfMonth])
+
+      for (const tenant of dueTenants as any[]) {
+        // For variable patterns, check if today matches
+        if (tenant.flexpay_pull_pattern && !matchesPattern(tenant.flexpay_pull_pattern)) continue
+
+        console.log(`[FlexPay] Initiating pull for ${tenant.first_name} ${tenant.last_name} — ${tenant.rent_amount}`)
+        // TODO: initiate Stripe ACH pull for tenant.rent_amount
+        // Record payment intent
+        await query(`
+          INSERT INTO payments (tenant_id, unit_id, landlord_id, amount, type, status, due_date, entry_description)
+          VALUES ($1, $2, $3, $4, 'rent', 'processing', NOW(), 'FlexPay ACH pull')
+          ON CONFLICT DO NOTHING
+        `, [tenant.tenant_id, tenant.unit_id, tenant.landlord_id, tenant.rent_amount])
+      }
+
+      if ((dueTenants as any[]).length > 0) {
+        console.log(`[FlexPay] ${(dueTenants as any[]).length} pulls initiated for day ${dayOfMonth}`)
+      }
+    } catch (e) { console.error('[Scheduler] FlexPay pull error:', e) }
+  })
+
+  // ── FLEXCHARGE PULL ──────────────────────────────────────────
+  // Run daily at 7am — consolidate and pull FlexCharge balances
+  // for accounts whose pull date is today (synced with FlexPay or 15th)
+  cron.schedule('0 7 * * *', async () => {
+    try {
+      const today = new Date()
+      const dayOfMonth = today.getDate()
+
+      // Get accounts where pull date matches today
+      // Pull date = FlexPay pull day, or 15 if no FlexPay
+      const dueAccounts = await query<any>(`
+        SELECT fca.id AS account_id, fca.current_balance, fca.tenant_id,
+               fca.landlord_id, fca.status,
+               t.flexpay_pull_day, t.flexpay_pull_pattern,
+               tu.email AS tenant_email, tu.first_name, tu.last_name
+        FROM flex_charge_accounts fca
+        JOIN tenants t ON t.id = fca.tenant_id
+        JOIN users tu ON tu.id = t.user_id
+        WHERE fca.status IN ('active','disqualified')
+          AND fca.current_balance > 0
+          AND (
+            (t.flexpay_pull_day = $1)
+            OR (t.flexpay_pull_day IS NULL AND $1 = 15)
+          )
+      `, [dayOfMonth])
+
+      for (const account of dueAccounts as any[]) {
+        console.log(`[FlexCharge] Pulling ${account.current_balance} for ${account.first_name} ${account.last_name}`)
+        // TODO: initiate Stripe ACH pull for account.current_balance
+
+        // Mark all pending transactions as pulled
+        await query(`
+          UPDATE flex_charge_transactions
+          SET status = 'pulled', pulled_at = NOW()
+          WHERE account_id = $1 AND status = 'pending'
+        `, [account.account_id])
+
+        // Reset balance
+        await query(`
+          UPDATE flex_charge_accounts SET current_balance = 0, updated_at = NOW()
+          WHERE id = $1
+        `, [account.account_id])
+
+        // If disqualified, close the account after pull
+        if (account.status === 'disqualified') {
+          await query(`
+            UPDATE flex_charge_accounts SET status = 'closed', updated_at = NOW()
+            WHERE id = $1
+          `, [account.account_id])
+          console.log(`[FlexCharge] Account closed after final pull for ${account.first_name} ${account.last_name}`)
+        }
+      }
+
+      if ((dueAccounts as any[]).length > 0) {
+        console.log(`[FlexCharge] ${(dueAccounts as any[]).length} accounts pulled for day ${dayOfMonth}`)
+      }
+    } catch (e) { console.error('[Scheduler] FlexCharge pull error:', e) }
+  })
+
+  console.log('   ✓ FlexPay pulls:      Daily 6am (per tenant date)')
+  console.log('   ✓ FlexCharge pulls:   Daily 7am (synced with FlexPay)')
   console.log('   ✓ Rent collection:    28th of month, 6am')
   console.log('   ✓ Disbursement SLA:   Last business day, 8am')
   console.log('   ✓ Reserve build:      2nd of month, 10am')
