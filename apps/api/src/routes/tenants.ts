@@ -16,14 +16,72 @@ tenantsRouter.get('/me', async (req, res, next) => {
     const tenant = await queryOne<any>(`
       SELECT t.*, u.first_name, u.last_name, u.email, u.phone,
         un.id AS unit_id, un.unit_number, un.rent_amount, un.status AS unit_status,
-        pr.name AS property_name, pr.street1, pr.city, pr.state
+        pr.name AS property_name, pr.street1, pr.city, pr.state,
+        sd.total_amount AS deposit_total, sd.collected_amount AS deposit_collected,
+        sd.flex_deposit_enabled, sd.installments_remaining,
+        CASE
+          WHEN sd.id IS NULL THEN false
+          WHEN sd.flex_deposit_enabled = true AND sd.installments_remaining > 0 THEN false
+          WHEN sd.collected_amount >= sd.total_amount THEN true
+          ELSE false
+        END AS deposit_fully_funded
       FROM tenants t
       JOIN users u ON u.id = t.user_id
       LEFT JOIN units un ON un.tenant_id = t.id
       LEFT JOIN properties pr ON pr.id = un.property_id
+      LEFT JOIN security_deposits sd ON sd.tenant_id = t.id
       WHERE t.id = $1`, [req.user!.profileId])
     if (!tenant) throw new AppError(404, 'Tenant not found')
     res.json({ success: true, data: tenant })
+  } catch (e) { next(e) }
+})
+
+
+// ── POST /api/tenants/verify-ach ──────────────────────────────────────────
+// Simulates ACH verification (real impl would use Plaid/Stripe).
+// Sets ach_verified=true and stamps otp_qualified_at if deposit is also funded.
+tenantsRouter.post('/verify-ach', async (req, res, next) => {
+  try {
+    const { bankName, last4 } = req.body
+    if (!last4 || last4.length !== 4) {
+      return res.status(400).json({ success: false, error: 'Valid bank last 4 digits required' })
+    }
+
+    // Check deposit status
+    const row = await queryOne<any>(`
+      SELECT
+        CASE
+          WHEN sd.id IS NULL THEN false
+          WHEN sd.flex_deposit_enabled = true AND sd.installments_remaining > 0 THEN false
+          WHEN sd.collected_amount >= sd.total_amount THEN true
+          ELSE false
+        END AS deposit_fully_funded
+      FROM tenants t
+      LEFT JOIN security_deposits sd ON sd.tenant_id = t.id
+      WHERE t.id = $1`, [req.user!.profileId])
+
+    const now = new Date()
+    const qualifies = row?.deposit_fully_funded === true
+
+    await query(`
+      UPDATE tenants
+      SET ach_verified = TRUE,
+          bank_last4 = $1,
+          otp_qualified_at = CASE WHEN $2 THEN $3 ELSE otp_qualified_at END
+      WHERE id = $4`,
+      [last4, qualifies, now, req.user!.profileId])
+
+    res.json({
+      success: true,
+      data: {
+        ach_verified: true,
+        otp_qualified_at: qualifies ? now : null,
+        deposit_fully_funded: qualifies,
+        message: qualifies
+          ? 'Bank verified and OTP qualified!'
+          : 'Bank verified. OTP will activate once your deposit is fully funded.'
+      }
+    })
   } catch (e) { next(e) }
 })
 
@@ -33,11 +91,32 @@ tenantsRouter.post('/enroll-on-time-pay', async (req, res, next) => {
     const { incomeArrivalDay } = z.object({
       incomeArrivalDay: z.number().int().min(1).max(28)
     }).parse(req.body)
+
+    // Gate: must have deposit fully funded AND ach verified
+    const tenant = await queryOne<any>(`
+      SELECT t.ach_verified, t.otp_qualified_at,
+        CASE
+          WHEN sd.id IS NULL THEN false
+          WHEN sd.flex_deposit_enabled = true AND sd.installments_remaining > 0 THEN false
+          WHEN sd.collected_amount >= sd.total_amount THEN true
+          ELSE false
+        END AS deposit_fully_funded
+      FROM tenants t
+      LEFT JOIN security_deposits sd ON sd.tenant_id = t.id
+      WHERE t.id = $1`, [req.user!.profileId])
+
+    if (!tenant?.deposit_fully_funded) {
+      return res.status(400).json({ success: false, error: 'Security deposit must be fully funded before enrolling in On-Time Pay' })
+    }
+    if (!tenant?.ach_verified) {
+      return res.status(400).json({ success: false, error: 'Bank account must be verified before enrolling in On-Time Pay' })
+    }
+
     await query(`
       UPDATE tenants SET on_time_pay_enrolled=TRUE, float_fee_active=TRUE,
         income_arrival_day=$1 WHERE id=$2`,
       [incomeArrivalDay, req.user!.profileId])
-    res.json({ success: true, message: 'On-Time Pay float service activated — $20/month service fee' })
+    res.json({ success: true, message: 'On-Time Pay float service activated' })
   } catch (e) { next(e) }
 })
 

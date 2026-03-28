@@ -1,4 +1,5 @@
 import express from 'express'
+import { scheduleOtpCron } from './services/otpScheduler'
 import cors from 'cors'
 import helmet from 'helmet'
 import morgan from 'morgan'
@@ -103,6 +104,7 @@ app.use('/webhooks',          webhooksRouter)
 app.use(errorHandler)
 
 // ── START ────────────────────────────────────────────────────
+scheduleOtpCron()
 app.listen(PORT, () => {
   console.log(`\n🏢 GAM API running on http://localhost:${PORT}`)
   console.log(`   Landlord app:  ${process.env.LANDLORD_APP_URL || 'http://localhost:3001'}`)

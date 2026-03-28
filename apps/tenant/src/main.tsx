@@ -334,6 +334,47 @@ function PaymentsPage() {
   )
 }
 
+
+// ── ACH VERIFY FORM ───────────────────────────────────────────────────────
+function AchVerifyForm({ onSuccess }: { onSuccess: () => void }) {
+  const [bankName, setBankName] = useState('')
+  const [last4, setLast4] = useState('')
+  const [error, setError] = useState('')
+
+  const mut = useMutation(
+    () => fetch((import.meta as any).env?.VITE_API_URL + '/api/tenants/verify-ach', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + localStorage.getItem('gam_tenant_token') },
+      body: JSON.stringify({ bankName, last4 })
+    }).then(r => r.json()),
+    {
+      onSuccess: (data) => {
+        if (!data.success) { setError(data.error || 'Verification failed'); return }
+        onSuccess()
+      },
+      onError: () => setError('Verification failed. Please try again.')
+    }
+  )
+
+  return (
+    <div style={{display:'flex',flexDirection:'column',gap:12,maxWidth:400}}>
+      {error && <div className="alert a-warn">{error}</div>}
+      <div className="fg">
+        <label className="fl">Bank Name</label>
+        <input className="fi" value={bankName} onChange={e=>setBankName(e.target.value)} placeholder="e.g. Chase, Bank of America" />
+      </div>
+      <div className="fg">
+        <label className="fl">Last 4 digits of account number</label>
+        <input className="fi" value={last4} onChange={e=>setLast4(e.target.value.replace(/D/g,'').slice(0,4))} placeholder="1234" maxLength={4} style={{maxWidth:120,fontFamily:'var(--font-m)'}} />
+      </div>
+      <button className="btn btn-p" disabled={mut.isLoading || last4.length !== 4} onClick={()=>mut.mutate()}>
+        {mut.isLoading ? <span className="spinner"/> : '✓ Verify Bank Account'}
+      </button>
+      <p style={{fontSize:'.72rem',color:'var(--t3)'}}>This connects your bank account for automated rent collection via ACH.</p>
+    </div>
+  )
+}
+
 // ── SERVICES PAGE ─────────────────────────────────────────────
 function ServicesPage() {
   const qc2 = useQuery('tenant-me', () => get<any>('/tenants/me'))
@@ -361,13 +402,16 @@ function ServicesPage() {
     {
       id: 'otp',
       name: 'On-Time Pay Float Service',
-      desc: 'If your income arrives mid-month (SSI, SSDI, pension), your landlord still gets paid on the 1st. No more late fees.',
-      price: '$20/month',
+      desc: 'Your landlord gets paid on the 1st regardless of when your income arrives. No late fees, ever.',
+      price: 'Covered by landlord',
       enrolled: me?.on_time_pay_enrolled,
-      action: () => setOtpModal(true),
+      action: () => me?.deposit_fully_funded && me?.ach_verified ? setOtpModal(true) : null,
       loading: otpMut.isLoading,
-      highlight: 'Save $30–55/month vs late fees. Invitation-only after 2 late payments.',
-      inviteOnly: !me?.on_time_pay_invite_sent_at && !me?.on_time_pay_enrolled,
+      highlight: me?.on_time_pay_enrolled ? undefined
+        : !me?.deposit_fully_funded ? '⚠ Deposit must be fully funded to qualify'
+        : !me?.ach_verified ? '⚠ Bank account must be verified to qualify'
+        : 'You qualify for On-Time Pay!',
+      locked: !me?.deposit_fully_funded || !me?.ach_verified,
     },
     {
       id: 'flexdeposit',
@@ -401,13 +445,57 @@ function ServicesPage() {
               <span className="price-tag">{s.price}</span>
               {s.enrolled
                 ? <span className="badge b-green">✓ Active</span>
-                : s.inviteOnly
-                ? <span className="badge b-muted">Invite only</span>
+                : (s as any).locked
+                ? <span className="badge b-muted">🔒 Locked</span>
                 : <button className="btn btn-p btn-sm" onClick={s.action} disabled={s.loading}>{s.loading?<span className="spinner"/>:'Enroll'}</button>}
             </div>
           </div>
         ))}
       </div>
+
+
+      {/* ── ACH Verification ─────────────────────────────────────── */}
+      {!me?.ach_verified && (
+        <div className="card" style={{marginTop:24}}>
+          <h3 style={{marginBottom:4}}>🏦 Bank Account Verification</h3>
+          <p style={{fontSize:'.82rem',color:'var(--t3)',marginBottom:16}}>
+            {me?.deposit_fully_funded
+              ? 'Verify your bank account to unlock On-Time Pay.'
+              : 'Your security deposit must be fully funded before you can verify your bank account.'}
+          </p>
+          {!me?.deposit_fully_funded ? (
+            <div className="alert a-warn">⚠ Complete your security deposit payment first.</div>
+          ) : (
+            <AchVerifyForm onSuccess={()=>qc2.refetch()} />
+          )}
+        </div>
+      )}
+
+      {/* ── OTP Qualification Status ──────────────────────────────── */}
+      {me?.ach_verified && (
+        <div className="card" style={{marginTop:24}}>
+          <h3 style={{marginBottom:12}}>⚡ On-Time Pay Status</h3>
+          <div style={{display:'flex',flexDirection:'column',gap:10}}>
+            <div style={{display:'flex',alignItems:'center',gap:10,fontSize:'.82rem'}}>
+              <span style={{width:20,height:20,borderRadius:'50%',background:me?.deposit_fully_funded?'var(--green)':'var(--bg4)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'.65rem',flexShrink:0}}>{me?.deposit_fully_funded?'✓':'1'}</span>
+              <span style={{color:me?.deposit_fully_funded?'var(--t0)':'var(--t3)'}}>Security deposit fully funded</span>
+            </div>
+            <div style={{display:'flex',alignItems:'center',gap:10,fontSize:'.82rem'}}>
+              <span style={{width:20,height:20,borderRadius:'50%',background:me?.ach_verified?'var(--green)':'var(--bg4)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'.65rem',flexShrink:0}}>{me?.ach_verified?'✓':'2'}</span>
+              <span style={{color:me?.ach_verified?'var(--t0)':'var(--t3)'}}>Bank account verified {me?.bank_last4?'(••••'+me.bank_last4+')':''}</span>
+            </div>
+            <div style={{display:'flex',alignItems:'center',gap:10,fontSize:'.82rem'}}>
+              <span style={{width:20,height:20,borderRadius:'50%',background:me?.on_time_pay_enrolled?'var(--gold)':'var(--bg4)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'.65rem',flexShrink:0}}>{me?.on_time_pay_enrolled?'✓':'3'}</span>
+              <span style={{color:me?.on_time_pay_enrolled?'var(--gold)':'var(--t3)'}}>On-Time Pay enrolled</span>
+            </div>
+          </div>
+          {me?.otp_qualified_at && (
+            <div className="alert a-green" style={{marginTop:16}}>
+              ✓ OTP qualified since {new Date(me.otp_qualified_at).toLocaleDateString()}. You'll be included in the next disbursement cycle.
+            </div>
+          )}
+        </div>
+      )}
 
       {otpModal && (
         <div className="modal-ov" onClick={() => setOtpModal(false)}>
