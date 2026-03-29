@@ -70,10 +70,6 @@ export default function App() {
               <Route path="units/:id"      element={<UnitDetailPage />} />
               <Route path="tenants"        element={<TenantsPage />} />
               <Route path="tenants/:id"      element={<TenantDetailPage />} />
-              <Route path="tenants/:id"      element={<TenantDetailPage />} />
-              <Route path="payments"       element={<PaymentsPage />} />
-              <Route path="disbursements"  element={<DisbursementsPage />} />
-              <Route path="maintenance"    element={<MaintenancePage />} />
               <Route path="documents"      element={<DocumentsPage />} />
               <Route path="leases"         element={<LeasesPage />} />
               <Route path="esign"          element={<ESignPage />} />

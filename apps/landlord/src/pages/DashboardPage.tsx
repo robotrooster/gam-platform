@@ -2,7 +2,7 @@ import { useQuery } from 'react-query'
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
 import { apiGet } from '../lib/api'
 import { useAuth } from '../context/AuthContext'
-import { formatCurrency, PLATFORM_FEES, getReservePhase } from '@gam/shared'
+import { formatCurrency, PLATFORM_FEES } from '@gam/shared'
 import { AlertTriangle, CheckCircle, TrendingUp, ArrowDownToLine, Clock } from 'lucide-react'
 
 interface DashStats {
@@ -49,7 +49,6 @@ export function DashboardPage() {
   )
 
   const totalUnits = (stats?.active_units || 0) + (stats?.direct_pay_units || 0) + (stats?.vacant_units || 0)
-  const { phase, rate } = getReservePhase(stats?.active_units || 0)
 
   // Real monthly trend data from API
   const trendData = (stats as any)?.trend?.length > 0
@@ -71,11 +70,6 @@ export function DashboardPage() {
         <div>
           <h1 className="page-title">Dashboard</h1>
           <p className="page-subtitle">Welcome back, {user?.firstName}. {totalUnits} units across {stats?.property_count} properties.</p>
-        </div>
-        <div className="flex gap-8">
-          <span className={`badge badge-${phase === 1 ? 'amber' : phase === 2 ? 'blue' : 'green'}`}>
-            Reserve Phase {phase} — {(rate * 100).toFixed(0)}%
-          </span>
         </div>
       </div>
 
