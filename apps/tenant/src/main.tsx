@@ -247,18 +247,31 @@ function HomePage() {
   const { user } = useAuth()
   const { data: me } = useQuery('tenant-me', () => get<any>('/tenants/me'))
   const [bulletinScope, setBulletinScope] = useState<'property'|'city'|'state'>('property')
+  const [bulletinSort, setBulletinSort] = useState<'new'|'old'>('new')
+  const [bulletinSearch, setBulletinSearch] = useState('')
   const [bulletinDraft, setBulletinDraft] = useState('')
   const [bulletinPosting, setBulletinPosting] = useState(false)
   const [bulletinPosts, setBulletinPosts] = useState<any[]>([])
   const [bulletinLoading, setBulletinLoading] = useState(false)
+  const [bulletinRefreshing, setBulletinRefreshing] = useState(false)
 
+  const bulletinFirstLoad = React.useRef(true)
   useEffect(() => {
-    setBulletinLoading(true)
-    get<any[]>('/bulletin?scope='+bulletinScope)
-      .then(d => setBulletinPosts(d || []))
-      .catch(()=>setBulletinPosts([]))
-      .finally(()=>setBulletinLoading(false))
-  }, [bulletinScope])
+    const isFirst = bulletinFirstLoad.current
+    bulletinFirstLoad.current = false
+    const delay = bulletinSearch ? 400 : 0
+    const timer = setTimeout(() => {
+      if (isFirst) setBulletinLoading(true)
+      else setBulletinRefreshing(true)
+      const params = new URLSearchParams({ scope: bulletinScope, sort: bulletinSort })
+      if (bulletinSearch) params.set('search', bulletinSearch)
+      get<any[]>('/bulletin?'+params.toString())
+        .then(d => setBulletinPosts(d || []))
+        .catch(()=>{})
+        .finally(()=>{ setBulletinLoading(false); setBulletinRefreshing(false) })
+    }, delay)
+    return () => clearTimeout(timer)
+  }, [bulletinScope, bulletinSort, bulletinSearch])
 
   return (
     <div>
@@ -361,23 +374,44 @@ function HomePage() {
 
       {/* ── Community Bulletin Board ─────────────────────────── */}
       <div style={{marginTop:24,background:'var(--bg2)',border:'1px solid var(--b1)',borderRadius:12,overflow:'hidden'}}>
+
+        {/* Header */}
         <div style={{padding:'16px 20px',borderBottom:'1px solid var(--b0)',display:'flex',alignItems:'center',justifyContent:'space-between',flexWrap:'wrap',gap:12}}>
           <div>
             <div style={{fontFamily:'var(--font-d)',fontSize:'1rem',fontWeight:800,color:'var(--t0)'}}>📢 Community Bulletin</div>
-            <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:2}}>Anonymous · posts cannot be traced back to you</div>
+            <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:2}}>Anonymous · your identity is never revealed</div>
           </div>
-          <div style={{display:'flex',gap:6}}>
+          <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>
             {(['property','city','state'] as const).map(s => (
               <button key={s} onClick={()=>setBulletinScope(s)}
-                style={{padding:'5px 12px',borderRadius:20,border:`1px solid ${bulletinScope===s?'var(--gold)':'var(--b1)'}`,background:bulletinScope===s?'rgba(201,162,39,.1)':'var(--bg3)',color:bulletinScope===s?'var(--gold)':'var(--t3)',cursor:'pointer',fontSize:'.72rem',fontWeight:600,textTransform:'capitalize'}}>
-                {s === 'property' ? '🏘 Property' : s === 'city' ? '🏙 City' : '🗺 State'}
+                style={{padding:'5px 12px',borderRadius:20,border:`1px solid ${bulletinScope===s?'var(--gold)':'var(--b1)'}`,background:bulletinScope===s?'rgba(201,162,39,.1)':'var(--bg3)',color:bulletinScope===s?'var(--gold)':'var(--t3)',cursor:'pointer',fontSize:'.72rem',fontWeight:600}}>
+                {s==='property'?'🏘 Property':s==='city'?'🏙 City':'🗺 State'}
               </button>
             ))}
           </div>
         </div>
 
-        {/* Post composer */}
-        <div style={{padding:'12px 20px',borderBottom:'1px solid var(--b0)',background:'var(--bg3)'}}>
+        {/* Controls: search + sort */}
+        <div style={{padding:'10px 20px',borderBottom:'1px solid var(--b0)',background:'var(--bg3)',display:'flex',gap:10,alignItems:'center',flexWrap:'wrap'}}>
+          <input
+            value={bulletinSearch}
+            onChange={e=>setBulletinSearch(e.target.value)}
+            placeholder="Search posts…"
+            style={{flex:1,minWidth:160,background:'var(--bg4)',border:'1px solid var(--b1)',borderRadius:8,color:'var(--t0)',padding:'6px 10px',fontSize:'.78rem',fontFamily:'inherit'}}
+          />
+          <div style={{display:'flex',gap:6,alignItems:'center'}}>
+            {bulletinRefreshing && <span className="spinner" style={{width:12,height:12,borderWidth:1.5,flexShrink:0}}/>}
+            {(['new','old'] as const).map(s => (
+              <button key={s} onClick={()=>setBulletinSort(s)}
+                style={{padding:'5px 10px',borderRadius:6,border:`1px solid ${bulletinSort===s?'var(--gold)':'var(--b1)'}`,background:bulletinSort===s?'rgba(201,162,39,.1)':'var(--bg4)',color:bulletinSort===s?'var(--gold)':'var(--t3)',cursor:'pointer',fontSize:'.72rem',fontWeight:600}}>
+                {s==='new'?'Newest':'Oldest'}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Composer */}
+        <div style={{padding:'12px 20px',borderBottom:'1px solid var(--b0)'}}>
           <div style={{display:'flex',gap:10,alignItems:'flex-end'}}>
             <div style={{flex:1}}>
               <textarea
@@ -385,66 +419,115 @@ function HomePage() {
                 onChange={e=>setBulletinDraft(e.target.value.slice(0,500))}
                 placeholder="Share anonymously with your community…"
                 rows={2}
-                style={{width:'100%',background:'var(--bg4)',border:'1px solid var(--b1)',borderRadius:8,color:'var(--t0)',padding:'8px 12px',fontSize:'.82rem',resize:'none',fontFamily:'inherit',boxSizing:'border-box'}}
+                style={{width:'100%',background:'var(--bg3)',border:'1px solid var(--b1)',borderRadius:8,color:'var(--t0)',padding:'8px 12px',fontSize:'.82rem',resize:'none',fontFamily:'inherit',boxSizing:'border-box'}}
               />
               <div style={{fontSize:'.65rem',color:'var(--t3)',textAlign:'right',marginTop:2}}>{bulletinDraft.length}/500</div>
             </div>
-            <button
-              className="btn btn-p btn-sm"
+            <button className="btn btn-p btn-sm"
               disabled={bulletinDraft.trim().length < 3 || bulletinPosting}
               onClick={async()=>{
                 setBulletinPosting(true)
                 try {
-                  const r = await post('/bulletin', { scope: bulletinScope, content: bulletinDraft.trim() })
-                  if ((r as any).success) {
+                  const r = await post('/bulletin',{scope:bulletinScope,content:bulletinDraft.trim()})
+                  if((r as any).success){
                     setBulletinDraft('')
-                    setBulletinPosts((p:any[]) => [{ ...(r as any).data, isNew: true }, ...p])
+                    setBulletinPosts((prev:any[])=>[{...(r as any).data,isNew:true},...prev])
                   }
-                } catch(e) {} finally { setBulletinPosting(false) }
+                } catch(e){} finally{setBulletinPosting(false)}
               }}
               style={{marginBottom:20,whiteSpace:'nowrap'}}
             >
-              {bulletinPosting ? <span className="spinner"/> : 'Post'}
+              {bulletinPosting?<span className="spinner"/>:'Post'}
             </button>
           </div>
-          <div style={{fontSize:'.65rem',color:'var(--t3)',marginTop:4}}>
-            ⓘ Your identity is never revealed. Each post gets a random name. You appear as a different person each time.
-          </div>
+          <div style={{fontSize:'.65rem',color:'var(--t3)'}}>⓪ Each post gets a random name. You look different every time you post.</div>
         </div>
 
-        {/* Posts feed */}
-        <div style={{maxHeight:420,overflowY:'auto'}}>
+        {/* Feed */}
+        <div style={{maxHeight:520,overflowY:'auto'}}>
           {bulletinLoading ? (
             <div style={{padding:32,textAlign:'center',color:'var(--t3)',fontSize:'.82rem'}}>Loading…</div>
-          ) : bulletinPosts.length === 0 ? (
+          ) : bulletinPosts.length===0 ? (
             <div style={{padding:32,textAlign:'center',color:'var(--t3)',fontSize:'.82rem'}}>No posts yet. Be the first to share something.</div>
-          ) : bulletinPosts.map((p:any) => (
-            <div key={p.id} style={{padding:'12px 20px',borderBottom:'1px solid var(--b0)',display:'flex',gap:12,alignItems:'flex-start',background:p.isNew?'rgba(201,162,39,.04)':''}}>
-              <div style={{width:32,height:32,borderRadius:'50%',background:'var(--bg4)',border:'1px solid var(--b1)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'.65rem',fontWeight:800,color:'var(--t3)',flexShrink:0,fontFamily:'var(--font-m)'}}>
-                {p.alias?.slice(0,2).toUpperCase()}
-              </div>
-              <div style={{flex:1,minWidth:0}}>
-                <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:4}}>
-                  <span style={{fontSize:'.75rem',fontWeight:700,color:'var(--t2)'}}>{p.alias}</span>
-                  <span style={{fontSize:'.65rem',color:'var(--t3)'}}>{new Date(p.created_at).toLocaleDateString('en-US',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})}</span>
+          ) : (() => {
+            const grouped: Record<string,any[]> = {}
+            const pinned = bulletinPosts.filter((p:any)=>p.pinned)
+            const regular = bulletinPosts.filter((p:any)=>!p.pinned)
+
+            // Group by day — API already sorted correctly
+            regular.forEach((p:any)=>{
+              const day = new Date(p.created_at).toLocaleDateString('en-US',{weekday:'long',month:'long',day:'numeric',year:'numeric'})
+              if(!grouped[day]) grouped[day]=[]
+              grouped[day].push(p)
+            })
+
+            const renderPost = (p:any) => (
+              <div key={p.id} style={{padding:'12px 20px',borderBottom:'1px solid var(--b0)',display:'flex',gap:12,alignItems:'flex-start',background:p.isNew?'rgba(201,162,39,.04)':p.pinned?'rgba(201,162,39,.02)':''}}>
+                {/* Avatar */}
+                <div style={{width:34,height:34,borderRadius:'50%',background:'var(--bg4)',border:'1px solid var(--b1)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'.65rem',fontWeight:800,color:'var(--t3)',flexShrink:0}}>
+                  {p.alias?.slice(0,2).toUpperCase()}
                 </div>
-                <div style={{fontSize:'.82rem',color:'var(--t1)',lineHeight:1.6,wordBreak:'break-word'}}>{p.content}</div>
+                {/* Content */}
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:4,flexWrap:'wrap'}}>
+                    <span style={{fontSize:'.75rem',fontWeight:700,color:'var(--t2)'}}>{p.alias}</span>
+                    {p.pinned&&<span style={{fontSize:'.6rem',background:'rgba(201,162,39,.12)',color:'var(--gold)',border:'1px solid rgba(201,162,39,.3)',borderRadius:4,padding:'1px 6px',fontWeight:700}}>📌 PINNED</span>}
+                    <span style={{fontSize:'.65rem',color:'var(--t3)'}}>{new Date(p.created_at).toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'})}</span>
+                    {p.is_past&&<span style={{fontSize:'.6rem',color:'var(--t3)',background:'var(--bg4)',borderRadius:4,padding:'1px 6px'}}>archived</span>}
+                  </div>
+                  <div style={{fontSize:'.82rem',color:'var(--t1)',lineHeight:1.6,wordBreak:'break-word'}}>{p.content}</div>
+                </div>
+                {/* Vote buttons */}
+                <div style={{display:'flex',flexDirection:'column',alignItems:'center',gap:6,flexShrink:0}}>
+                  <button
+                    disabled={!p.can_vote||p.my_vote==='up'}
+                    onClick={async()=>{
+                      if(!p.can_vote||p.my_vote) return
+                      try {
+                        const r = await post(`/bulletin/${p.id}/vote`,{vote_type:'up'})
+                        if((r as any).success) setBulletinPosts((prev:any[])=>prev.map((x:any)=>x.id===p.id?{...x,...(r as any).data,my_vote:'up',can_vote:false,can_flag:false}:x))
+                      } catch(e){}
+                    }}
+                    title="Upvote — boost this post"
+                    style={{background:'none',border:'none',cursor:p.can_vote&&p.my_vote!=='up'?'pointer':'default',color:p.my_vote==='up'?'var(--green)':'var(--t3)',fontSize:'.85rem',padding:'2px 4px',lineHeight:1,opacity:p.is_past?0.4:1}}
+                  >▲</button>
+                  <span style={{fontSize:'.65rem',color:'var(--t3)',fontFamily:'var(--font-m)',minWidth:16,textAlign:'center'}}>{p.upvote_count||0}</span>
+                  <button
+                    disabled={!p.can_flag||p.my_vote==='flag'}
+                    onClick={async()=>{
+                      if(!p.can_flag||p.my_vote) return
+                      try {
+                        const r = await post(`/bulletin/${p.id}/vote`,{vote_type:'flag'})
+                        if((r as any).success) setBulletinPosts((prev:any[])=>prev.map((x:any)=>x.id===p.id?{...x,...(r as any).data,my_vote:'flag',can_vote:false,can_flag:false}:x))
+                      } catch(e){}
+                    }}
+                    title="Flag — report inappropriate content"
+                    style={{background:'none',border:'none',cursor:p.can_flag&&p.my_vote!=='flag'?'pointer':'default',color:p.my_vote==='flag'?'var(--amber)':'var(--t3)',fontSize:'.78rem',padding:'2px 4px',lineHeight:1,opacity:p.is_past?0.4:1}}
+                  >🚩</button>
+                  <span style={{fontSize:'.65rem',color:'var(--t3)',fontFamily:'var(--font-m)',minWidth:16,textAlign:'center'}}>{p.flag_count||0}</span>
+                </div>
               </div>
-              <button
-                onClick={async()=>{
-                  if (p.flagged_by_me) return
-                  try {
-                    await post(`/bulletin/${p.id}/flag`, {})
-                    setBulletinPosts((posts:any[]) => posts.map((x:any) => x.id===p.id ? {...x, flagged_by_me:true, flag_count:(x.flag_count||0)+1} : x))
-                  } catch(e) {}
-                }}
-                title="Flag this post"
-                style={{background:'none',border:'none',cursor:p.flagged_by_me?'default':'pointer',color:p.flagged_by_me?'var(--amber)':'var(--t3)',fontSize:'.75rem',flexShrink:0,padding:'2px 4px',lineHeight:1}}
-              >
-                {p.flagged_by_me ? '🚩' : '⚑'}{p.flag_count > 0 ? ' '+p.flag_count : ''}
-              </button>
-            </div>
-          ))}
+            )
+
+            return (
+              <>
+                {/* Pinned posts */}
+                {pinned.length>0&&(
+                  <>
+                    <div style={{padding:'6px 20px',background:'rgba(201,162,39,.06)',borderBottom:'1px solid rgba(201,162,39,.15)',fontSize:'.65rem',fontWeight:700,color:'var(--gold)',textTransform:'uppercase',letterSpacing:'.08em'}}>📌 Pinned</div>
+                    {[...pinned].sort((a:any,b:any)=>b.total_votes-a.total_votes).map(renderPost)}
+                  </>
+                )}
+                {/* Day-grouped posts */}
+                {Object.entries(grouped).map(([day,dayPosts])=>(
+                  <React.Fragment key={day}>
+                    <div style={{padding:'6px 20px',background:'var(--bg3)',borderBottom:'1px solid var(--b0)',borderTop:'1px solid var(--b0)',fontSize:'.65rem',fontWeight:700,color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.08em',position:'sticky',top:0,zIndex:1}}>{day}</div>
+                    {(dayPosts as any[]).map(renderPost)}
+                  </React.Fragment>
+                ))}
+              </>
+            )
+          })()}
         </div>
       </div>
     </div>
