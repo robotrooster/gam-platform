@@ -19,7 +19,7 @@ import { ProfilePage } from './pages/ProfilePage'
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react'
 import ReactDOM from 'react-dom/client'
 import { BrowserRouter, Routes, Route, Navigate, NavLink, Outlet, useNavigate } from 'react-router-dom'
-import { QueryClient, QueryClientProvider, useQuery, useMutation } from 'react-query'
+import { QueryClient, QueryClientProvider, useQuery, useMutation, useQueryClient } from 'react-query'
 import { useForm } from 'react-hook-form'
 import axios from 'axios'
 import { formatCurrency, PLATFORM_FEES, getFlexDepositTier } from '@gam/shared'
@@ -213,16 +213,18 @@ function Layout() {
           <div className="logo-sub">Gold Asset Management</div>
         </div>
         <nav className="nav">
-          <NavLink to="/background-check" className={({isActive})=>`ni${isActive?' active':''}`}>🛡 Application</NavLink>
-          <NavLink to="/notifications" className={({isActive})=>`ni${isActive?' active':''}`}>🔔 Notifications</NavLink>
+          {!bgApproved && (
+            <NavLink to="/background-check" className={({isActive})=>`ni${isActive?' active':''}`}>🛡 Application</NavLink>
+          )}
           {bgApproved && <>
             <NavLink to="/home" className={({isActive})=>`ni${isActive?' active':''}`}>🏠 Home</NavLink>
+            <NavLink to="/services" className={({isActive})=>`ni${isActive?' active':''}`}>⭐ Flex Advantage</NavLink>
             <NavLink to="/payments" className={({isActive})=>`ni${isActive?' active':''}`}>💳 Payments</NavLink>
             <NavLink to="/maintenance" className={({isActive})=>`ni${isActive?' active':''}`}>🔧 Maintenance</NavLink>
             <LeaseNavLink/>
-            <NavLink to="/services" className={({isActive})=>`ni${isActive?' active':''}`}>⭐ Services</NavLink>
-            <NavLink to="/profile" className={({isActive})=>`ni${isActive?' active':''}`}>👤 Profile</NavLink>
           </>}
+          <NavLink to="/notifications" className={({isActive})=>`ni${isActive?' active':''}`}>🔔 Notifications</NavLink>
+          {bgApproved && <NavLink to="/profile" className={({isActive})=>`ni${isActive?' active':''}`}>👤 Profile</NavLink>}
         </nav>
         <div className="footer">
           <div style={{padding:'8px 10px',marginBottom:4}}>
@@ -244,6 +246,19 @@ function Layout() {
 function HomePage() {
   const { user } = useAuth()
   const { data: me } = useQuery('tenant-me', () => get<any>('/tenants/me'))
+  const [bulletinScope, setBulletinScope] = useState<'property'|'city'|'state'>('property')
+  const [bulletinDraft, setBulletinDraft] = useState('')
+  const [bulletinPosting, setBulletinPosting] = useState(false)
+  const [bulletinPosts, setBulletinPosts] = useState<any[]>([])
+  const [bulletinLoading, setBulletinLoading] = useState(false)
+
+  useEffect(() => {
+    setBulletinLoading(true)
+    get<any[]>('/bulletin?scope='+bulletinScope)
+      .then(d => setBulletinPosts(d || []))
+      .catch(()=>setBulletinPosts([]))
+      .finally(()=>setBulletinLoading(false))
+  }, [bulletinScope])
 
   return (
     <div>
@@ -255,18 +270,49 @@ function HomePage() {
         {me?.on_time_pay_enrolled && <span className="badge b-gold">⚡ On-Time Pay Active</span>}
       </div>
 
-      {me?.on_time_pay_enrolled && (
+      {/* Deposit → ACH → OTP progression strip */}
+      {!me?.on_time_pay_enrolled && (
+        <div style={{background:'var(--bg3)',border:'1px solid var(--b1)',borderRadius:12,padding:20,marginBottom:24}}>
+          <div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.1em',fontWeight:600,marginBottom:16}}>⚡ On-Time Pay Qualification</div>
+          <div style={{display:'flex',alignItems:'center'}}>
+            {[
+              {label:'Security Deposit',sub:'Fully funded',done:!!me?.deposit_fully_funded},
+              {label:'Bank Account',sub:'ACH verified',done:!!me?.ach_verified},
+              {label:'On-Time Pay',sub:'Enrolled',done:!!me?.on_time_pay_enrolled},
+            ].map((step,i,arr)=>(
+              <React.Fragment key={step.label}>
+                <div style={{flex:1,textAlign:'center'}}>
+                  <div style={{width:34,height:34,borderRadius:'50%',background:step.done?'var(--green)':'var(--bg4)',border:`2px solid ${step.done?'var(--green)':'var(--b2)'}`,display:'flex',alignItems:'center',justifyContent:'center',margin:'0 auto 8px',fontSize:step.done?'.85rem':'.72rem',color:step.done?'#0a0b0e':'var(--t3)',fontWeight:700}}>
+                    {step.done?'✓':i+1}
+                  </div>
+                  <div style={{fontSize:'.75rem',fontWeight:600,color:step.done?'var(--t0)':'var(--t3)',lineHeight:1.3}}>{step.label}</div>
+                  <div style={{fontSize:'.65rem',color:step.done?'var(--green)':'var(--t3)',marginTop:2}}>{step.done?'✓ '+step.sub:step.sub}</div>
+                </div>
+                {i<arr.length-1&&<div style={{height:2,width:40,flexShrink:0,background:(i===0&&me?.deposit_fully_funded)||(i===1&&me?.ach_verified)?'var(--green)':'var(--b2)',marginBottom:28}}/>}
+              </React.Fragment>
+            ))}
+          </div>
+          <div style={{marginTop:14,textAlign:'center',fontSize:'.75rem'}}>
+            {!me?.deposit_fully_funded&&<span style={{color:'var(--t3)'}}>Complete your security deposit to begin</span>}
+            {me?.deposit_fully_funded&&!me?.ach_verified&&<a href="/services" style={{color:'var(--amber)'}}>→ Verify your bank account to unlock On-Time Pay</a>}
+            {me?.deposit_fully_funded&&me?.ach_verified&&<a href="/services" style={{color:'var(--gold)',fontWeight:600}}>→ You qualify! Enroll in On-Time Pay</a>}
+          </div>
+        </div>
+      )}
+            {me?.on_time_pay_enrolled && (
         <div className="alert a-gold" style={{marginBottom:24}}>
           ⚡ <div><strong>On-Time Pay is active.</strong> Your rent of {formatCurrency(me.rent_amount)} is guaranteed to your landlord on the 1st. Your payment is scheduled for the {me.income_arrival_day}th. $20/month service fee applies.</div>
         </div>
       )}
 
       <div className="grid3" style={{marginBottom:24}}>
-        <div className="kpi">
+        <a href="/payments" style={{textDecoration:'none'}} className="kpi"
+          onMouseEnter={e=>(e.currentTarget as any).style.borderColor='var(--gold)'}
+          onMouseLeave={e=>(e.currentTarget as any).style.borderColor=''}>
           <div className="kpi-l">Monthly Rent</div>
           <div className="kpi-v" style={{color:'var(--gold)'}}>{me?.rent_amount ? formatCurrency(me.rent_amount) : '—'}</div>
-          <div className="kpi-s">Due 1st of month</div>
-        </div>
+          <div className="kpi-s">Due 1st · tap to view history →</div>
+        </a>
         <div className="kpi">
           <div className="kpi-l">Unit Status</div>
           <div className="kpi-v" style={{fontSize:'1.1rem',marginTop:4}}>
@@ -274,30 +320,131 @@ function HomePage() {
           </div>
           <div className="kpi-s">{me?.property_name}</div>
         </div>
-        <div className="kpi">
+        <a href="/services" style={{textDecoration:'none'}} className="kpi"
+          onMouseEnter={e=>(e.currentTarget as any).style.borderColor='var(--gold)'}
+          onMouseLeave={e=>(e.currentTarget as any).style.borderColor=''}>
           <div className="kpi-l">Security Deposit</div>
           <div className="kpi-v">{me?.security_deposit ? formatCurrency(me.security_deposit) : '—'}</div>
-          <div className="kpi-s">{me?.flex_deposit_enrolled ? 'FlexDeposit installments' : 'Paid in full'}</div>
-        </div>
+          <div className="kpi-s">{me?.flex_deposit_enrolled ? 'FlexDeposit installments' : 'Paid in full'} →</div>
+        </a>
       </div>
 
       <div className="grid2">
-        <div className="card">
-          <h3 style={{marginBottom:16}}>Lease Details</h3>
+        <a href="/lease" style={{textDecoration:'none'}} className="card"
+          onMouseEnter={e=>(e.currentTarget as any).style.borderColor='var(--gold)'}
+          onMouseLeave={e=>(e.currentTarget as any).style.borderColor=''}>
+          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:16}}>
+            <h3>Lease Details</h3>
+            <span style={{fontSize:'.72rem',color:'var(--t3)'}}>View lease →</span>
+          </div>
           <div className="dr"><span className="dk">Address</span><span className="dv">{me?.street1}</span></div>
           <div className="dr"><span className="dk">City</span><span className="dv">{me?.city}, {me?.state}</span></div>
           <div className="dr"><span className="dk">Unit</span><span className="dv mono">{me?.unit_number}</span></div>
           <div className="dr"><span className="dk">Rent</span><span className="dv mono">{me?.rent_amount ? formatCurrency(me.rent_amount) : '—'}/mo</span></div>
           <div className="dr"><span className="dk">ACH</span><span className={`badge ${me?.ach_verified?'b-green':'b-amber'}`}>{me?.ach_verified?'Verified':'Pending'}</span></div>
-        </div>
-        <div className="card">
-          <h3 style={{marginBottom:16}}>Your Subscriptions</h3>
+        </a>
+        <a href="/services" style={{textDecoration:'none'}} className="card"
+          onMouseEnter={e=>(e.currentTarget as any).style.borderColor='var(--gold)'}
+          onMouseLeave={e=>(e.currentTarget as any).style.borderColor=''}>
+          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:16}}>
+            <h3>Your Subscriptions</h3>
+            <span style={{fontSize:'.72rem',color:'var(--t3)'}}>Manage →</span>
+          </div>
           <div className="dr"><span className="dk">Credit Reporting</span><span className={`badge ${me?.credit_reporting_enrolled?'b-green':'b-muted'}`}>{me?.credit_reporting_enrolled?'Active — $5/mo':'Not enrolled'}</span></div>
           <div className="dr"><span className="dk">FlexDeposit</span><span className={`badge ${me?.flex_deposit_enrolled?'b-green':'b-muted'}`}>{me?.flex_deposit_enrolled?'Active — $3/mo':'Not enrolled'}</span></div>
           <div className="dr"><span className="dk">On-Time Pay</span><span className={`badge ${me?.on_time_pay_enrolled?'b-gold':'b-muted'}`}>{me?.on_time_pay_enrolled?'Active — $20/mo':'Not enrolled'}</span></div>
           <div style={{marginTop:16}}>
-            <a href="/services" className="btn btn-g btn-sm" style={{textDecoration:'none'}}>Manage services →</a>
+            <span className="btn btn-g btn-sm">Manage services →</span>
           </div>
+        </a>
+      </div>
+
+      {/* ── Community Bulletin Board ─────────────────────────── */}
+      <div style={{marginTop:24,background:'var(--bg2)',border:'1px solid var(--b1)',borderRadius:12,overflow:'hidden'}}>
+        <div style={{padding:'16px 20px',borderBottom:'1px solid var(--b0)',display:'flex',alignItems:'center',justifyContent:'space-between',flexWrap:'wrap',gap:12}}>
+          <div>
+            <div style={{fontFamily:'var(--font-d)',fontSize:'1rem',fontWeight:800,color:'var(--t0)'}}>📢 Community Bulletin</div>
+            <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:2}}>Anonymous · posts cannot be traced back to you</div>
+          </div>
+          <div style={{display:'flex',gap:6}}>
+            {(['property','city','state'] as const).map(s => (
+              <button key={s} onClick={()=>setBulletinScope(s)}
+                style={{padding:'5px 12px',borderRadius:20,border:`1px solid ${bulletinScope===s?'var(--gold)':'var(--b1)'}`,background:bulletinScope===s?'rgba(201,162,39,.1)':'var(--bg3)',color:bulletinScope===s?'var(--gold)':'var(--t3)',cursor:'pointer',fontSize:'.72rem',fontWeight:600,textTransform:'capitalize'}}>
+                {s === 'property' ? '🏘 Property' : s === 'city' ? '🏙 City' : '🗺 State'}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Post composer */}
+        <div style={{padding:'12px 20px',borderBottom:'1px solid var(--b0)',background:'var(--bg3)'}}>
+          <div style={{display:'flex',gap:10,alignItems:'flex-end'}}>
+            <div style={{flex:1}}>
+              <textarea
+                value={bulletinDraft}
+                onChange={e=>setBulletinDraft(e.target.value.slice(0,500))}
+                placeholder="Share anonymously with your community…"
+                rows={2}
+                style={{width:'100%',background:'var(--bg4)',border:'1px solid var(--b1)',borderRadius:8,color:'var(--t0)',padding:'8px 12px',fontSize:'.82rem',resize:'none',fontFamily:'inherit',boxSizing:'border-box'}}
+              />
+              <div style={{fontSize:'.65rem',color:'var(--t3)',textAlign:'right',marginTop:2}}>{bulletinDraft.length}/500</div>
+            </div>
+            <button
+              className="btn btn-p btn-sm"
+              disabled={bulletinDraft.trim().length < 3 || bulletinPosting}
+              onClick={async()=>{
+                setBulletinPosting(true)
+                try {
+                  const r = await post('/bulletin', { scope: bulletinScope, content: bulletinDraft.trim() })
+                  if ((r as any).success) {
+                    setBulletinDraft('')
+                    setBulletinPosts((p:any[]) => [{ ...(r as any).data, isNew: true }, ...p])
+                  }
+                } catch(e) {} finally { setBulletinPosting(false) }
+              }}
+              style={{marginBottom:20,whiteSpace:'nowrap'}}
+            >
+              {bulletinPosting ? <span className="spinner"/> : 'Post'}
+            </button>
+          </div>
+          <div style={{fontSize:'.65rem',color:'var(--t3)',marginTop:4}}>
+            ⓘ Your identity is never revealed. Each post gets a random name. You appear as a different person each time.
+          </div>
+        </div>
+
+        {/* Posts feed */}
+        <div style={{maxHeight:420,overflowY:'auto'}}>
+          {bulletinLoading ? (
+            <div style={{padding:32,textAlign:'center',color:'var(--t3)',fontSize:'.82rem'}}>Loading…</div>
+          ) : bulletinPosts.length === 0 ? (
+            <div style={{padding:32,textAlign:'center',color:'var(--t3)',fontSize:'.82rem'}}>No posts yet. Be the first to share something.</div>
+          ) : bulletinPosts.map((p:any) => (
+            <div key={p.id} style={{padding:'12px 20px',borderBottom:'1px solid var(--b0)',display:'flex',gap:12,alignItems:'flex-start',background:p.isNew?'rgba(201,162,39,.04)':''}}>
+              <div style={{width:32,height:32,borderRadius:'50%',background:'var(--bg4)',border:'1px solid var(--b1)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'.65rem',fontWeight:800,color:'var(--t3)',flexShrink:0,fontFamily:'var(--font-m)'}}>
+                {p.alias?.slice(0,2).toUpperCase()}
+              </div>
+              <div style={{flex:1,minWidth:0}}>
+                <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:4}}>
+                  <span style={{fontSize:'.75rem',fontWeight:700,color:'var(--t2)'}}>{p.alias}</span>
+                  <span style={{fontSize:'.65rem',color:'var(--t3)'}}>{new Date(p.created_at).toLocaleDateString('en-US',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})}</span>
+                </div>
+                <div style={{fontSize:'.82rem',color:'var(--t1)',lineHeight:1.6,wordBreak:'break-word'}}>{p.content}</div>
+              </div>
+              <button
+                onClick={async()=>{
+                  if (p.flagged_by_me) return
+                  try {
+                    await post(`/bulletin/${p.id}/flag`, {})
+                    setBulletinPosts((posts:any[]) => posts.map((x:any) => x.id===p.id ? {...x, flagged_by_me:true, flag_count:(x.flag_count||0)+1} : x))
+                  } catch(e) {}
+                }}
+                title="Flag this post"
+                style={{background:'none',border:'none',cursor:p.flagged_by_me?'default':'pointer',color:p.flagged_by_me?'var(--amber)':'var(--t3)',fontSize:'.75rem',flexShrink:0,padding:'2px 4px',lineHeight:1}}
+              >
+                {p.flagged_by_me ? '🚩' : '⚑'}{p.flag_count > 0 ? ' '+p.flag_count : ''}
+              </button>
+            </div>
+          ))}
         </div>
       </div>
     </div>
@@ -517,20 +664,7 @@ function ServicesPage() {
       loading: creditMut.isLoading,
       highlight: '30% of tenants build 40+ credit score points in year 1',
     },
-    {
-      id: 'otp',
-      name: 'FlexPay Float',
-      desc: 'Your landlord gets paid on the 1st regardless of when your income arrives. No late fees, ever.',
-      price: 'Covered by landlord',
-      enrolled: me?.on_time_pay_enrolled,
-      action: () => me?.deposit_fully_funded && me?.ach_verified ? setOtpModal(true) : null,
-      loading: otpMut.isLoading,
-      highlight: me?.on_time_pay_enrolled ? undefined
-        : !me?.deposit_fully_funded ? '⚠ Deposit must be fully funded to qualify'
-        : !me?.ach_verified ? '⚠ Bank account must be verified to qualify'
-        : 'You qualify for On-Time Pay!',
-      locked: !me?.deposit_fully_funded || !me?.ach_verified,
-    },
+
     {
       id: 'flexpay',
       name: 'FlexPay',
@@ -561,7 +695,7 @@ function ServicesPage() {
   return (
     <div>
       <div className="ph">
-        <div><h1 className="pt">Services</h1><p className="ps">All services are voluntary. No mandatory fees.</p></div>
+        <div><h1 className="pt">Flex Advantage</h1><p className="ps">All services are voluntary. No mandatory fees.</p></div>
       </div>
       <div className="alert a-blue" style={{marginBottom:24}}>
         ℹ️ None of these services are required as a condition of your tenancy. Subscribe only if they benefit you.
@@ -657,6 +791,20 @@ function ServicesPage() {
           onSuccess={() => { qc2.refetch(); setFlexPayModal(false) }}
         />
       )}
+
+      {/* ── Feature Request ───────────────────────────────────── */}
+      <div className="card" style={{marginTop:24,background:'rgba(59,130,246,.04)',border:'1px solid rgba(59,130,246,.2)'}}>
+        <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',flexWrap:'wrap',gap:12}}>
+          <div>
+            <div style={{fontWeight:700,color:'var(--t0)',marginBottom:4}}>💡 Have a feature idea?</div>
+            <div style={{fontSize:'.78rem',color:'var(--t3)',lineHeight:1.5}}>Suggest a new service or improvement. Requests go directly to the GAM team.</div>
+          </div>
+          <a href="http://localhost:3003/feature-requests" target="_blank" rel="noreferrer"
+            style={{display:'inline-flex',alignItems:'center',gap:7,padding:'8px 16px',borderRadius:8,background:'rgba(59,130,246,.12)',border:'1px solid rgba(59,130,246,.3)',color:'#93c5fd',fontWeight:600,fontSize:'.78rem',textDecoration:'none',whiteSpace:'nowrap'}}>
+            Submit Request →
+          </a>
+        </div>
+      </div>
     </div>
   )
 }
@@ -666,13 +814,16 @@ function MaintenancePage() {
   const { data: me } = useQuery('tenant-me', () => get<any>('/tenants/me'))
   const { data: reqs = [], isLoading } = useQuery<any[]>('maint', () => get('/maintenance'))
   const [showAdd, setShowAdd] = useState(false)
+  const [selected, setSelected] = useState<any>(null)
   const { register, handleSubmit, reset } = useForm<any>()
+  const qc2 = useQueryClient()
   const addMut = useMutation(
     (d:any) => post('/maintenance', { ...d, unitId: me?.unit_id }),
-    { onSuccess: () => { useQuery('maint'); setShowAdd(false); reset() } }
+    { onSuccess: () => { qc2.invalidateQueries('maint'); setShowAdd(false); reset() } }
   )
   const PRI: Record<string,string> = { emergency:'b-red',high:'b-amber',normal:'b-gold',low:'b-muted' }
   const ST: Record<string,string> = { open:'b-amber',assigned:'b-gold',in_progress:'b-gold',completed:'b-green',cancelled:'b-muted' }
+  const ST_LABEL: Record<string,string> = { open:'Open',assigned:'Assigned',in_progress:'In Progress',completed:'Completed',cancelled:'Cancelled' }
 
   return (
     <div>
@@ -683,21 +834,81 @@ function MaintenancePage() {
       <div className="card" style={{padding:0}}>
         {isLoading ? <div style={{padding:32,color:'var(--t3)',textAlign:'center'}}>Loading…</div> : (
           <table className="tbl">
-            <thead><tr><th>Date</th><th>Title</th><th>Priority</th><th>Status</th><th>Contractor</th></tr></thead>
+            <thead><tr><th>Date</th><th>Title</th><th>Priority</th><th>Status</th><th>Assigned To</th><th></th></tr></thead>
             <tbody>
               {reqs.length ? reqs.map((r:any)=>(
-                <tr key={r.id}>
+                <tr key={r.id} onClick={()=>setSelected(r)} style={{cursor:'pointer'}}
+                  onMouseEnter={e=>(e.currentTarget as any).style.background='var(--bg3)'}
+                  onMouseLeave={e=>(e.currentTarget as any).style.background=''}>
                   <td className="mono" style={{fontSize:'.75rem'}}>{new Date(r.created_at).toLocaleDateString()}</td>
-                  <td style={{color:'var(--t0)'}}>{r.title}</td>
+                  <td style={{color:'var(--t0)',fontWeight:500}}>{r.title}</td>
                   <td><span className={`badge ${PRI[r.priority]}`}>{r.priority}</span></td>
-                  <td><span className={`badge ${ST[r.status]}`}>{r.status.replace('_',' ')}</span></td>
-                  <td style={{fontSize:'.82rem',color:'var(--t3)'}}>{r.contractor_name||'Unassigned'}</td>
+                  <td><span className={`badge ${ST[r.status]}`}>{ST_LABEL[r.status]||r.status}</span></td>
+                  <td style={{fontSize:'.82rem',color:r.contractor_name?'var(--t1)':'var(--t3)'}}>{r.contractor_name||'Unassigned'}</td>
+                  <td style={{color:'var(--t3)',fontSize:'.75rem'}}>View →</td>
                 </tr>
-              )) : <tr><td colSpan={5} style={{textAlign:'center',color:'var(--t3)',padding:32}}>No maintenance requests yet.</td></tr>}
+              )) : <tr><td colSpan={6} style={{textAlign:'center',color:'var(--t3)',padding:32}}>No maintenance requests yet.</td></tr>}
             </tbody>
           </table>
         )}
       </div>
+
+      {selected && (
+        <div className="modal-ov" onClick={()=>setSelected(null)}>
+          <div className="modal" onClick={e=>e.stopPropagation()} style={{maxWidth:560}}>
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:16}}>
+              <div>
+                <div className="modal-t" style={{marginBottom:4}}>{selected.title}</div>
+                <div style={{display:'flex',gap:8}}>
+                  <span className={`badge ${PRI[selected.priority]}`}>{selected.priority}</span>
+                  <span className={`badge ${ST[selected.status]}`}>{ST_LABEL[selected.status]||selected.status}</span>
+                </div>
+              </div>
+              <button onClick={()=>setSelected(null)} style={{background:'none',border:'none',cursor:'pointer',color:'var(--t3)',fontSize:'1.2rem',lineHeight:1}}>×</button>
+            </div>
+            {selected.description && (
+              <div style={{marginBottom:16}}>
+                <div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.08em',fontWeight:600,marginBottom:6}}>Description</div>
+                <div style={{fontSize:'.82rem',color:'var(--t1)',lineHeight:1.6,background:'var(--bg3)',padding:'10px 12px',borderRadius:8}}>{selected.description}</div>
+              </div>
+            )}
+            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:12,marginBottom:16}}>
+              <div style={{background:'var(--bg3)',borderRadius:8,padding:'10px 12px'}}>
+                <div style={{fontSize:'.62rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.08em',marginBottom:4}}>Assigned To</div>
+                <div style={{fontSize:'.85rem',fontWeight:600,color:selected.contractor_name?'var(--t0)':'var(--t3)'}}>{selected.contractor_name||'Unassigned'}</div>
+                {selected.contractor_phone && <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:2}}>📞 {selected.contractor_phone}</div>}
+              </div>
+              <div style={{background:'var(--bg3)',borderRadius:8,padding:'10px 12px'}}>
+                <div style={{fontSize:'.62rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.08em',marginBottom:4}}>Submitted</div>
+                <div style={{fontSize:'.82rem',color:'var(--t0)'}}>{new Date(selected.created_at).toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'})}</div>
+                {selected.completed_at && <div style={{fontSize:'.72rem',color:'var(--green)',marginTop:2}}>✓ Completed {new Date(selected.completed_at).toLocaleDateString()}</div>}
+              </div>
+            </div>
+            {selected.notes && (
+              <div style={{marginBottom:16}}>
+                <div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.08em',fontWeight:600,marginBottom:6}}>Contractor Notes</div>
+                <div style={{fontSize:'.82rem',color:'var(--t1)',lineHeight:1.6,background:'var(--bg3)',padding:'10px 12px',borderRadius:8,borderLeft:'3px solid var(--gold)'}}>{selected.notes}</div>
+              </div>
+            )}
+            {selected.proof_urls?.length > 0 && (
+              <div style={{marginBottom:16}}>
+                <div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.08em',fontWeight:600,marginBottom:8}}>Completion Photos</div>
+                <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(120px,1fr))',gap:8}}>
+                  {selected.proof_urls.map((url:string,i:number)=>(
+                    <a key={i} href={url} target="_blank" rel="noreferrer">
+                      <img src={url} alt={'proof-'+i} style={{width:'100%',height:90,objectFit:'cover',borderRadius:8,border:'1px solid var(--b1)'}} />
+                    </a>
+                  ))}
+                </div>
+              </div>
+            )}
+            <div className="modal-f">
+              <button className="btn btn-g" onClick={()=>setSelected(null)}>Close</button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {showAdd && (
         <div className="modal-ov" onClick={()=>setShowAdd(false)}>
           <div className="modal" onClick={e=>e.stopPropagation()}>
@@ -824,17 +1035,17 @@ function App() {
       <Routes>
         <Route path="/login" element={<LoginPage />} />
         <Route path="/accept-invite" element={<AcceptInvitePage />} />
-        <Route path="/background-check" element={<BackgroundCheckPage />} />
-        <Route path="/notifications" element={<TenantNotificationsPage />} />
         <Route path="/" element={token ? <Layout /> : <Navigate to="/login" replace />}>
           <Route index element={<DefaultPage />} />
-          <Route path="home"        element={<HomePage />} />
-          <Route path="payments"    element={<PaymentsPage />} />
-          <Route path="maintenance" element={<MaintenancePage />} />
-          <Route path="lease"       element={<LeasePage />} />
-          <Route path="sign/:token"  element={<SignPage />} />
-          <Route path="services"    element={<ServicesPage />} />
-          <Route path="profile"     element={<ProfilePage />} />
+          <Route path="background-check" element={<BackgroundCheckPage />} />
+          <Route path="notifications"    element={<TenantNotificationsPage />} />
+          <Route path="home"             element={<HomePage />} />
+          <Route path="payments"         element={<PaymentsPage />} />
+          <Route path="maintenance"      element={<MaintenancePage />} />
+          <Route path="lease"            element={<LeasePage />} />
+          <Route path="sign/:token"      element={<SignPage />} />
+          <Route path="services"         element={<ServicesPage />} />
+          <Route path="profile"          element={<ProfilePage />} />
         </Route>
       </Routes>
     </BrowserRouter>

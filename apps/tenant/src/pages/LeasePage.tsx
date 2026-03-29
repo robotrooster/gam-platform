@@ -5,6 +5,29 @@ import { FileText, Download, PenTool, CheckCircle, AlertCircle, RotateCcw } from
 
 const API_URL = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
 
+function useCountdown(targetDate: string | null) {
+  const [time, setTime] = useState({ days:0, hours:0, minutes:0, seconds:0, ms:0, expired:false })
+  useEffect(() => {
+    if (!targetDate) return
+    const tick = () => {
+      const diff = new Date(targetDate).getTime() - Date.now()
+      if (diff <= 0) { setTime(t => ({...t, expired:true})); return }
+      setTime({
+        days:    Math.floor(diff / 86400000),
+        hours:   Math.floor((diff % 86400000) / 3600000),
+        minutes: Math.floor((diff % 3600000) / 60000),
+        seconds: Math.floor((diff % 60000) / 1000),
+        ms:      Math.floor((diff % 1000) / 10),
+        expired: false,
+      })
+    }
+    tick()
+    const id = setInterval(tick, 50)
+    return () => clearInterval(id)
+  }, [targetDate])
+  return time
+}
+
 function get<T>(path: string): Promise<T> {
   const token = localStorage.getItem('gam_tenant_token')
   return fetch(`${API_URL}/api${path}`, { headers: { Authorization: `Bearer ${token}` } })
@@ -192,6 +215,8 @@ export function LeasePage() {
   const signature = signMode === 'type' ? typedSig : drawnSig
   const canSign   = agreed && scrolled && signature.length > 2
 
+  const countdown = useCountdown((lease as any)?.end_date || null)
+
   if (isLoading) return <div style={{ padding:32, color:'var(--text-3)', textAlign:'center' }}>Loading lease…</div>
 
   // Show pending signing banner
@@ -221,11 +246,7 @@ export function LeasePage() {
             {lease.start_date && ` · ${new Date(lease.start_date).toLocaleDateString()} – ${new Date(lease.end_date).toLocaleDateString()}`}
           </p>
         </div>
-        {fullyExecuted && lease.document_url && (
-          <a href={lease.document_url?.startsWith('http') ? lease.document_url : API_URL + lease.document_url} download className="btn btn-ghost" style={{ textDecoration:'none', display:'flex', alignItems:'center', gap:6 }}>
-            <Download size={14} /> Download PDF
-          </a>
-        )}
+
       </div>
       {(pendingDocs as any[]).length > 0 && (
         <div style={{ background:'rgba(201,162,39,.08)', border:'1px solid rgba(201,162,39,.3)', borderRadius:12, padding:'16px 20px', marginBottom:20, display:'flex', alignItems:'center', justifyContent:'space-between', gap:16 }}>
@@ -246,7 +267,7 @@ export function LeasePage() {
           <CheckCircle size={18} style={{ color:'var(--green)', flexShrink:0 }} />
           <div>
             <div style={{ fontSize:'.82rem', fontWeight:700, color:'var(--green)' }}>Lease Fully Executed</div>
-            <div style={{ fontSize:'.72rem', color:'var(--text-3)' }}>Signed by all parties · {new Date(lease.signed_by_tenant).toLocaleString()}</div>
+            <div style={{ fontSize:'.72rem', color:'var(--text-3)' }}>Signed by all parties{lease.tenant_signed_at ? ' · ' + new Date(lease.tenant_signed_at).toLocaleString() : ''}</div>
           </div>
         </div>
       ) : needsTenantSig ? (
@@ -263,10 +284,34 @@ export function LeasePage() {
         </div>
       )}
 
-      {/* Expiry warning */}
-      {daysToExpiry !== null && daysToExpiry <= 60 && daysToExpiry > 0 && (
-        <div style={{ padding:'10px 14px', background: daysToExpiry <= 30 ? 'rgba(255,71,87,.08)' : 'rgba(255,184,32,.06)', border:`1px solid ${daysToExpiry<=30?'rgba(255,71,87,.3)':'rgba(255,184,32,.3)'}`, borderRadius:10, marginBottom:20, fontSize:'.78rem', color: daysToExpiry<=30?'var(--red)':'var(--amber)' }}>
-          {daysToExpiry <= 30 ? '🚨' : '⚠️'} Your lease expires in <strong>{daysToExpiry} days</strong> on {new Date(lease.end_date).toLocaleDateString()}.
+      {/* Expiry countdown */}
+      {lease.end_date && daysToExpiry !== null && daysToExpiry > 0 && (
+        <div style={{ padding:'16px 20px', background: daysToExpiry <= 30 ? 'rgba(239,68,68,.06)' : daysToExpiry <= 60 ? 'rgba(245,158,11,.06)' : 'rgba(201,162,39,.04)', border:`1px solid ${daysToExpiry<=30?'rgba(239,68,68,.25)':daysToExpiry<=60?'rgba(245,158,11,.25)':'rgba(201,162,39,.2)'}`, borderRadius:12, marginBottom:20 }}>
+          <div style={{ fontSize:'.65rem', color:'var(--t3)', textTransform:'uppercase', letterSpacing:'.1em', fontWeight:600, marginBottom:10 }}>
+            {daysToExpiry <= 30 ? '🚨 Lease Expires Soon' : daysToExpiry <= 60 ? '⚠️ Lease Expiring' : '📅 Lease Term Remaining'}
+          </div>
+          <div style={{ display:'flex', gap:12, alignItems:'flex-end' }}>
+            {[
+              { val: countdown.days,    label: 'Days' },
+              { val: countdown.hours,   label: 'Hrs' },
+              { val: countdown.minutes, label: 'Min' },
+              { val: countdown.seconds, label: 'Sec' },
+            ].map(u => (
+              <div key={u.label} style={{ textAlign:'center' }}>
+                <div style={{ fontFamily:'var(--font-m,monospace)', fontSize:'1.6rem', fontWeight:800, color: daysToExpiry<=30?'var(--red)':daysToExpiry<=60?'var(--amber)':'var(--gold)', lineHeight:1, minWidth:40 }}>
+                  {String(u.val).padStart(2,'0')}
+                </div>
+                <div style={{ fontSize:'.58rem', color:'var(--t3)', textTransform:'uppercase', letterSpacing:'.08em', marginTop:3 }}>{u.label}</div>
+              </div>
+            ))}
+            <div style={{ textAlign:'center', marginBottom:2 }}>
+              <div style={{ fontFamily:'var(--font-m,monospace)', fontSize:'.9rem', fontWeight:700, color: daysToExpiry<=30?'var(--red)':daysToExpiry<=60?'var(--amber)':'var(--gold)', lineHeight:1, minWidth:28 }}>.{String(countdown.ms).padStart(2,'0')}</div>
+              <div style={{ fontSize:'.58rem', color:'var(--t3)', textTransform:'uppercase', letterSpacing:'.08em', marginTop:3 }}>ms</div>
+            </div>
+          </div>
+          <div style={{ fontSize:'.7rem', color:'var(--t3)', marginTop:10 }}>
+            Expires {new Date(lease.end_date).toLocaleDateString('en-US',{weekday:'long',year:'numeric',month:'long',day:'numeric'})}
+          </div>
         </div>
       )}
 
@@ -389,8 +434,8 @@ export function LeasePage() {
         <div style={{ background:'var(--bg-2)', border:'1px solid var(--border-0)', borderRadius:10, padding:16, marginTop:16 }}>
           <div style={{ fontSize:'.72rem', fontWeight:700, color:'var(--text-3)', textTransform:'uppercase' as const, letterSpacing:'.07em', marginBottom:10 }}>Signature Audit Trail</div>
           {[
-            lease.signed_by_landlord && { role:'Landlord', sig: "Landlord", at: lease.signed_by_landlord },
-            lease.signed_by_tenant   && { role:'Tenant',   sig: signature,   at: lease.signed_by_tenant },
+            lease.landlord_signed_at && { role:'Landlord', sig: "Landlord", at: lease.landlord_signed_at },
+            lease.tenant_signed_at   && { role:'Tenant',   sig: signature,   at: lease.tenant_signed_at },
           ].filter(Boolean).map((s: any) => (
             <div key={s.role} style={{ display:'flex', alignItems:'center', gap:10, padding:'8px 0', borderBottom:'1px solid var(--border-0)' }}>
               <CheckCircle size={14} style={{ color:'var(--green)', flexShrink:0 }} />

@@ -43,10 +43,14 @@ export function POSPage() {
   const [drawerBalance, setDrawerBalance] = useState(250)
   const [stats, setStats] = useState({ cash:0, card:0, charge:0, txCount:0 })
   const [flash, setFlash] = useState('')
+  useEffect(() => {
+    if (payMethod === 'charge' && tenant && !activeChargeSet.has(tenant.id)) setTenant(null)
+  }, [payMethod])
 
   const { data: units = [] } = useQuery<any[]>('units', () => apiGet('/units'))
   const { data: posItems = [] } = useQuery<any[]>('pos-items', () => apiGet('/pos/items'))
   const { data: posCats = [] } = useQuery<any[]>('pos-cats', () => apiGet('/pos/categories'))
+  const { data: chargeAccounts = [] } = useQuery<any[]>('flex-charge-accounts', () => apiGet('/landlords/flexcharge'))
   const tenants = (units as any[]).filter(u => u.tenant_first).map(u => ({
     id: u.tenant_id, name: `${u.tenant_first} ${u.tenant_last}`,
     unit: u.unit_number, property: u.property_name,
@@ -54,8 +58,11 @@ export function POSPage() {
     balance: 0, limit: 100,
   }))
 
+  const activeChargeSet = new Set((chargeAccounts as any[]).filter((a:any) => a.status === 'active').map((a:any) => a.tenant_id))
+  const searchableTenants = payMethod === 'charge' ? tenants.filter(t => activeChargeSet.has(t.id)) : tenants
+
   const filteredTenants = search && !isWalkin
-    ? tenants.filter(t => t.name.toLowerCase().includes(search.toLowerCase()) || t.unit.includes(search))
+    ? searchableTenants.filter(t => t.name.toLowerCase().includes(search.toLowerCase()) || t.unit.includes(search))
     : []
 
   const items = ITEMS.filter(i => (cat === 'all' || i.cat === cat))
@@ -110,7 +117,7 @@ export function POSPage() {
 
   const tendered = parseFloat(cashEntry || '0') / 100
   const change = tendered - getTotal()
-  const canCharge = cart.length > 0 && tenant && cart.every(i => i.charge) && payMethod === 'charge'
+  const canCharge = cart.length > 0 && tenant && cart.every(i => i.charge) && payMethod === 'charge' && activeChargeSet.has(tenant?.id)
 
   return (
     <div style={{ display:'flex', flexDirection:'column', height:'calc(100vh - 112px)', overflow:'hidden' }}>
@@ -181,7 +188,7 @@ export function POSPage() {
                 <div style={{ width:30, height:30, borderRadius:6, background:'linear-gradient(135deg,var(--gold-dark),var(--gold))', display:'flex', alignItems:'center', justifyContent:'center', fontSize:'.65rem', fontWeight:800, color:'var(--bg-0)' }}>{tenant.initials}</div>
                 <div style={{ flex:1 }}>
                   <div style={{ fontSize:'.8rem', fontWeight:600, color:'var(--text-0)' }}>{tenant.name}</div>
-                  <div style={{ fontSize:'.65rem', color:'var(--text-3)' }}>Unit {tenant.unit}</div>
+                  <div style={{ fontSize:'.65rem', color:'var(--text-3)' }}>Unit {tenant.unit}{payMethod==='charge'&&activeChargeSet.has(tenant.id)?' · ⚡ Charge active':''}</div>
                 </div>
                 <button onClick={() => setTenant(null)} style={{ background:'none', border:'none', cursor:'pointer', color:'var(--text-3)', padding:4 }}><X size={13} /></button>
               </div>

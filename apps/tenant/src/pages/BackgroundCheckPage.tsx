@@ -227,10 +227,11 @@ export function BackgroundCheckPage() {
       const h = Math.floor((diff%(24*60*60*1000))/(60*60*1000))
       const m = Math.floor((diff%(60*60*1000))/(60*1000))
       const s = Math.floor((diff%60000)/1000)
-      setCountdown(d+'d '+String(h).padStart(2,'0')+'h '+String(m).padStart(2,'0')+'m '+String(s).padStart(2,'0')+'s')
+      const ms = Math.floor((diff%1000)/10)
+      setCountdown(d+'d '+String(h).padStart(2,'0')+'h '+String(m).padStart(2,'0')+'m '+String(s).padStart(2,'0')+'s.'+String(ms).padStart(2,'0'))
     }
     tick()
-    const interval = setInterval(tick, 1000)
+    const interval = setInterval(tick, 50)
     return () => clearInterval(interval)
   }, [(status as any)?.status, (status as any)?.check?.decided_at])
 
@@ -273,7 +274,19 @@ export function BackgroundCheckPage() {
         {daysLeft !== null && daysLeft > 0 && countdown && (
           <div style={{padding:'16px 24px',background:'#0a0d10',border:'1px solid #1e2530',borderRadius:12}}>
             <div style={{fontSize:'.72rem',color:'#4a5568',marginBottom:8,textTransform:'uppercase',letterSpacing:'.08em'}}>Time until reapplication</div>
-            <div style={{fontFamily:'monospace',fontSize:'5rem',fontWeight:900,color:'#eef1f8',letterSpacing:'.12em',lineHeight:1}}>{countdown}</div>
+            <div style={{display:'flex',alignItems:'flex-end',gap:4,flexWrap:'wrap',justifyContent:'center'}}>
+              {countdown.replace('.', '|.').split(' ').map((part, i) => {
+                const isMs = part.startsWith('.')
+                return (
+                  <div key={i} style={{textAlign:'center'}}>
+                    <div style={{fontFamily:'monospace',fontSize:isMs?'2.5rem':'5rem',fontWeight:900,color:isMs?'#4a5568':'#eef1f8',letterSpacing:'.08em',lineHeight:1,marginBottom:isMs?'0.6rem':0}}>{part}</div>
+                    <div style={{fontSize:'.55rem',color:'#4a5568',textTransform:'uppercase',letterSpacing:'.1em',marginTop:3}}>
+                      {part.includes('d')&&!part.includes('h')?'days':part.includes('h')&&!part.includes('d')?'hrs':part.includes('m')&&!part.includes('s')?'min':part.includes('s')&&!part.startsWith('.')?'sec':isMs?'ms':''}
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
             {reapplyDate && <div style={{fontSize:'.68rem',color:'#4a5568',marginTop:6}}>Eligible: {reapplyDate.toLocaleDateString('en-US',{weekday:'long',year:'numeric',month:'long',day:'numeric'})}</div>}
           </div>
         )}
@@ -394,7 +407,6 @@ export function BackgroundCheckPage() {
           <div style={{borderTop:'1px solid #1e2530',paddingTop:14}}><div style={{fontSize:'.72rem',fontWeight:700,color:'#4a5568',textTransform:'uppercase',letterSpacing:'.07em',marginBottom:10}}>Previous Landlord *</div><div style={{marginBottom:8}}><label style={lbl}>Full Name *</label><input style={{...inp,borderColor:form.prevName&&!validPrev?'#ef4444':undefined}} value={form.prevName} onChange={e=>set('prevName',e.target.value)} placeholder="John Smith"/>{form.prevName&&!validPrev&&<div style={{color:'#ef4444',fontSize:'.68rem',marginTop:3}}>Enter first and last name</div>}</div><div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}><div>
                 <label style={lbl}>Phone *</label>
                 <input style={{...inp, borderColor:form.prevName&&!phoneValid&&form.prevPhone?'#ef4444':form.prevName&&phoneValid?'#22c55e':undefined}} type="tel" value={form.prevPhone}
-                  onChange={e=>{set('prevPhone',e.target.value);setPhoneValid(false);setPhoneError('')}}
                   onChange={e=>{set('prevPhone',fmtPhone(e.target.value));setPhoneValid(false);setPhoneError('')}} onBlur={e=>form.prevName&&validatePhone(e.target.value)}
                   placeholder="(555) 000-0000"/>
                 {phoneChecking && <div style={{fontSize:'.68rem',color:'#4a5568',marginTop:3}}>Checking...</div>}

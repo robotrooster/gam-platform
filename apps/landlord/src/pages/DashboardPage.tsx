@@ -15,6 +15,8 @@ interface DashStats {
   monthly_rent_volume: number
   property_count: number
   upcoming_disbursement: { count: number; amount: number }
+  otp_units?: number
+  projected_otp_disbursement?: number
 }
 
 const unitStatusBadge = (s: string) => {
@@ -136,7 +138,33 @@ export function DashboardPage() {
         </div>
       </div>
 
-      <div className="grid-2" style={{gap:20}}>
+      {/* OTP Pipeline */}
+      <div className="card" style={{marginBottom:20,background:'rgba(201,162,39,.04)',border:'1px solid rgba(201,162,39,.2)'}}>
+        <div className="card-header">
+          <span className="card-title">⚡ On-Time Pay Pipeline</span>
+          <span style={{fontSize:'.72rem',color:'var(--text-3)'}}>28th disbursement cycle</span>
+        </div>
+        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:20}}>
+          <div>
+            <div className="kpi-label">OTP-Qualified Units</div>
+            <div className="kpi-value" style={{color:'var(--gold)',fontSize:'1.8rem'}}>{stats?.otp_units || 0}</div>
+            <div className="kpi-sub">of {stats?.active_units || 0} active units</div>
+          </div>
+          <div>
+            <div className="kpi-label">Projected Disbursement</div>
+            <div className="kpi-value" style={{color:'var(--green)',fontSize:'1.8rem'}}>{formatCurrency(stats?.projected_otp_disbursement || 0)}</div>
+            <div className="kpi-sub">rent volume eligible for OTP</div>
+          </div>
+          <div>
+            <div className="kpi-label">Next OTP Run</div>
+            <div className="kpi-value" style={{fontSize:'1.2rem',marginTop:4}}>
+              {(() => { const d = new Date(); d.setMonth(d.getMonth() + (d.getDate() >= 28 ? 1 : 0)); d.setDate(28); return d.toLocaleDateString('en-US',{month:'short',day:'numeric'}); })()}
+            </div>
+            <div className="kpi-sub">28th of month · ACH batch</div>
+          </div>
+        </div>
+      </div>
+            <div className="grid-2" style={{gap:20}}>
         {/* Revenue trend */}
         <div className="card">
           <div className="card-header">

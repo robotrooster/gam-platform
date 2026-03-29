@@ -161,7 +161,17 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
       FROM background_checks
       WHERE landlord_id = $1 AND status = 'submitted'`, [id])
 
-    res.json({ success: true, data: { ...stats, upcoming_disbursement: upcoming, trend, maintenance, bg_pending: bgPending?.count||0 } })
+    const [otpStats] = await query<any>(`
+      SELECT
+        COUNT(*)::int AS otp_units,
+        COALESCE(SUM(u.rent_amount),0)::float AS projected_otp_disbursement
+      FROM tenants t
+      JOIN units u ON u.id = t.unit_id
+      WHERE u.landlord_id = $1
+        AND t.otp_qualified_at IS NOT NULL
+        AND u.status = 'active'`, [id])
+
+    res.json({ success: true, data: { ...stats, upcoming_disbursement: upcoming, trend, maintenance, bg_pending: bgPending?.count||0, otp_units: otpStats?.otp_units||0, projected_otp_disbursement: otpStats?.projected_otp_disbursement||0 } })
   } catch (e) { next(e) }
 })
 

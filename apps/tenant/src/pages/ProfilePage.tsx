@@ -37,6 +37,7 @@ export function ProfilePage() {
   const [pwNew,     setPwNew]     = useState('')
   const [pwConfirm, setPwConfirm] = useState('')
   const [pwError,   setPwError]   = useState('')
+  const [showEmailWarn, setShowEmailWarn] = useState(false)
 
   const { data: me } = useQuery('tenant-me-profile', () => get<any>('/tenants/me'))
   const { data: notifPrefs = [] } = useQuery<any[]>('notif-prefs-tenant', () => get('/notifications/preferences'))
@@ -62,11 +63,9 @@ export function ProfilePage() {
       if (tab === 'customize') { setSaved('profile'); setTimeout(() => window.location.reload(), 500) }
       setSaved('profile')
       setTimeout(() => setSaved(''), 2500)
-      // If email changed, force re-login with new credentials
       if (email !== me?.email) {
         setTimeout(() => {
           localStorage.removeItem('gam_tenant_token')
-          alert('Email updated. Please log in again with your new email address.')
           window.location.href = '/login'
         }, 1500)
       }
@@ -144,7 +143,7 @@ export function ProfilePage() {
             <input className="input" type="tel" value={phone} onChange={e => setPhone(e.target.value)} placeholder="(555) 000-0000" style={{ width:'100%' }} />
           </div>
           <div style={{ display:'flex', alignItems:'center', gap:10 }}>
-            <button className="btn btn-primary" onClick={() => saveMut.mutate()} disabled={saveMut.isLoading}>
+            <button className="btn btn-primary" onClick={() => email !== me?.email ? setShowEmailWarn(true) : saveMut.mutate()} disabled={saveMut.isLoading}>
               {saveMut.isLoading ? <span className="spinner" /> : 'Save Changes'}
             </button>
             {saved==='profile' && <span style={{ fontSize:'.78rem', color:'var(--green)', display:'flex', alignItems:'center', gap:4 }}><Check size={12} /> Saved</span>}
@@ -280,6 +279,31 @@ export function ProfilePage() {
               {pwMut.isLoading ? <span className="spinner" /> : 'Update Password'}
             </button>
             {saved==='pw' && <span style={{ fontSize:'.78rem', color:'var(--green)', display:'flex', alignItems:'center', gap:4 }}><Check size={12} /> Updated</span>}
+          </div>
+        </div>
+      )}
+      {/* Email change warning modal */}
+      {showEmailWarn && (
+        <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,.75)', display:'flex', alignItems:'center', justifyContent:'center', zIndex:200, padding:20, backdropFilter:'blur(4px)' }}>
+          <div style={{ background:'var(--bg-2)', border:'1px solid var(--border-0)', borderRadius:16, padding:28, width:'100%', maxWidth:420, boxShadow:'0 8px 32px rgba(0,0,0,.5)' }}>
+            <div style={{ width:44, height:44, borderRadius:'50%', background:'rgba(245,158,11,.1)', border:'2px solid var(--amber)', display:'flex', alignItems:'center', justifyContent:'center', margin:'0 auto 16px' }}>
+              <AlertCircle size={22} style={{ color:'var(--amber)' }} />
+            </div>
+            <div style={{ fontFamily:'var(--font-display)', fontSize:'1.05rem', fontWeight:800, color:'var(--text-0)', textAlign:'center', marginBottom:10 }}>Changing your email address</div>
+            <div style={{ fontSize:'.82rem', color:'var(--text-2)', lineHeight:1.7, marginBottom:8, textAlign:'center' }}>
+              Your email is your login. Changing it to <strong style={{ color:'var(--text-0)' }}>{email}</strong> will immediately lock you out of this session.
+            </div>
+            <div style={{ padding:'10px 14px', background:'rgba(245,158,11,.06)', border:'1px solid rgba(245,158,11,.2)', borderRadius:8, fontSize:'.78rem', color:'var(--amber)', marginBottom:20, lineHeight:1.6 }}>
+              ⚠ You must have access to <strong>{email}</strong> before continuing. Without access to that inbox you will be locked out permanently.
+            </div>
+            <div style={{ display:'flex', gap:10 }}>
+              <button onClick={() => setShowEmailWarn(false)} style={{ flex:1, padding:'10px', borderRadius:8, border:'1px solid var(--border-0)', background:'var(--bg-3)', color:'var(--text-1)', cursor:'pointer', fontWeight:600, fontSize:'.82rem' }}>
+                Cancel
+              </button>
+              <button onClick={() => { setShowEmailWarn(false); saveMut.mutate() }} style={{ flex:1, padding:'10px', borderRadius:8, border:'none', background:'var(--amber)', color:'var(--bg-0)', cursor:'pointer', fontWeight:700, fontSize:'.82rem' }}>
+                Yes, update email
+              </button>
+            </div>
           </div>
         </div>
       )}

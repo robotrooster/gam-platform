@@ -11,34 +11,74 @@ async function checkLeaseExpiry() {
   try {
     const expiring = await query(`
       SELECT l.id, l.end_date, l.landlord_id,
-        u.id as landlord_user_id, u.email as landlord_email, u.phone as landlord_phone,
+        l.tenant_renewal_intent, l.tenant_renewal_intent_at,
+        l.renewal_status, l.renewal_notified_37d_at, l.renewal_notified_31d_at, l.renewal_policy_sent_at,
+        lu.id as landlord_user_id, lu.email as landlord_email, lu.phone as landlord_phone,
         un.unit_number, p.name as property_name,
+        tu.id as tenant_user_id, tu.email as tenant_email, tu.phone as tenant_phone,
         tu.first_name as tenant_first, tu.last_name as tenant_last,
         EXTRACT(DAY FROM l.end_date - NOW())::int as days_remaining
       FROM leases l
       JOIN units un ON un.id = l.unit_id
       JOIN properties p ON p.id = un.property_id
       JOIN landlords la ON la.id = l.landlord_id
-      JOIN users u ON u.id = la.user_id
+      JOIN users lu ON lu.id = la.user_id
       LEFT JOIN tenants t ON t.id = un.tenant_id
       LEFT JOIN users tu ON tu.id = t.user_id
       WHERE l.status = 'active'
-        AND l.end_date BETWEEN NOW() AND NOW() + INTERVAL '61 days'
+        AND l.end_date BETWEEN NOW() AND NOW() + INTERVAL '76 days'
         AND l.renewal_status IS NULL
     `)
     for (const lease of expiring as any[]) {
-      // 60 days — survey tenant
-      if (lease.days_remaining === 60) {
-        if (lease.tenant_user_id) {
+      const d = lease.days_remaining
+      const tName = (lease.tenant_first || '') + ' ' + (lease.tenant_last || '')
+
+      // 75 days (AZ 30 + 15 extra buffer) — survey tenant first notice
+      if (d <= 75 && d >= 70 && lease.tenant_user_id && !lease.tenant_renewal_intent_at) {
+        await notifyLeaseRenewalSurvey({ tenantUserId: lease.tenant_user_id, tenantEmail: lease.tenant_email, tenantPhone: lease.tenant_phone, unitNumber: lease.unit_number, propertyName: lease.property_name, endDate: lease.end_date, leaseId: lease.id })
+      }
+
+      // 60 days — landlord expiry warning + tenant survey reminder if no response
+      if (d === 60) {
+        await notifyLeaseExpiring({ landlordUserId: lease.landlord_user_id, landlordId: lease.landlord_id, landlordEmail: lease.landlord_email, landlordPhone: lease.landlord_phone, tenantName: tName, unitNumber: lease.unit_number, propertyName: lease.property_name, endDate: lease.end_date, daysRemaining: d, leaseId: lease.id })
+        if (lease.tenant_user_id && !lease.tenant_renewal_intent_at) {
           await notifyLeaseRenewalSurvey({ tenantUserId: lease.tenant_user_id, tenantEmail: lease.tenant_email, tenantPhone: lease.tenant_phone, unitNumber: lease.unit_number, propertyName: lease.property_name, endDate: lease.end_date, leaseId: lease.id })
         }
       }
-      // 45 days — prompt landlord with tenant response
-      if (lease.days_remaining === 45 && lease.tenant_renewal_intent) {
-        await notifyLandlordRenewalDecision({ landlordUserId: lease.landlord_user_id, landlordId: lease.landlord_id, landlordEmail: lease.landlord_email, landlordPhone: lease.landlord_phone, tenantName: lease.tenant_first + ' ' + lease.tenant_last, unitNumber: lease.unit_number, propertyName: lease.property_name, endDate: lease.end_date, leaseId: lease.id, tenantIntent: lease.tenant_renewal_intent })
+
+      // 45 days — notify landlord of tenant response if received
+      if (d === 45 && lease.tenant_renewal_intent) {
+        await notifyLandlordRenewalDecision({ landlordUserId: lease.landlord_user_id, landlordId: lease.landlord_id, landlordEmail: lease.landlord_email, landlordPhone: lease.landlord_phone, tenantName: tName, unitNumber: lease.unit_number, propertyName: lease.property_name, endDate: lease.end_date, leaseId: lease.id, tenantIntent: lease.tenant_renewal_intent })
       }
-      if (lease.days_remaining === 60 || lease.days_remaining === 30) {
-        await notifyLeaseExpiring({ landlordUserId: lease.landlord_user_id, landlordId: lease.landlord_id, landlordEmail: lease.landlord_email, landlordPhone: lease.landlord_phone, tenantName: lease.tenant_first + ' ' + lease.tenant_last, unitNumber: lease.unit_number, propertyName: lease.property_name, endDate: lease.end_date, daysRemaining: lease.days_remaining, leaseId: lease.id })
+
+      // 37 days (AZ min 30 + 7) — escalation if unresolved
+      if (d <= 37 && d >= 36 && !lease.renewal_notified_37d_at) {
+        await notifyLandlordRenewalDecision({ landlordUserId: lease.landlord_user_id, landlordId: lease.landlord_id, landlordEmail: lease.landlord_email, landlordPhone: lease.landlord_phone, tenantName: tName, unitNumber: lease.unit_number, propertyName: lease.property_name, endDate: lease.end_date, leaseId: lease.id, tenantIntent: lease.tenant_renewal_intent || 'no_response' })
+        await query('UPDATE leases SET renewal_notified_37d_at=NOW() WHERE id=$1', [lease.id])
+      }
+
+      // 31 days (AZ min 30 + 1) — final notice
+      if (d <= 31 && d >= 30 && !lease.renewal_notified_31d_at) {
+        await notifyLeaseExpiring({ landlordUserId: lease.landlord_user_id, landlordId: lease.landlord_id, landlordEmail: lease.landlord_email, landlordPhone: lease.landlord_phone, tenantName: tName, unitNumber: lease.unit_number, propertyName: lease.property_name, endDate: lease.end_date, daysRemaining: d, leaseId: lease.id })
+        await query('UPDATE leases SET renewal_notified_31d_at=NOW() WHERE id=$1', [lease.id])
+      }
+
+      // 28 days — policy notice to landlord if still unresolved (not legal advice)
+      if (d <= 28 && d >= 27 && !lease.renewal_policy_sent_at) {
+        const { createNotification } = await import('../services/notifications')
+        await createNotification({
+          userId: lease.landlord_user_id, landlordId: lease.landlord_id,
+          type: 'lease_renewal_action_required',
+          title: `⚠ Unresolved Lease — Unit ${lease.unit_number} (${d} days)`,
+          body: `This lease expires in ${d} days with no renewal or non-renewal notice on file. Under A.R.S. § 33-1375, a landlord must provide at least 30 days written notice. This is a statutory reference only — not legal advice.`,
+          data: { leaseId: lease.id, daysRemaining: d },
+          sendEmail: true, emailTo: lease.landlord_email,
+          emailSubject: `Urgent: Unresolved Lease Expiry — Unit ${lease.unit_number}`,
+          emailHtml: `<b>Unit ${lease.unit_number}</b> lease expires in <b>${d} days</b> with no renewal decision on file.<br><br>Under <b>A.R.S. § 33-1375</b>, Arizona landlords must provide at least <b>30 days written notice</b> of non-renewal or termination.<br><br>GAM is informing you of this statute as a courtesy. <b>This is not legal advice.</b> Please consult an attorney if you have questions about your obligations.<br><br>Log in to your landlord portal to take action.`,
+          sendSMS: true, smsTo: lease.landlord_phone,
+          smsBody: `GAM URGENT: Unit ${lease.unit_number} lease expires in ${d} days. No renewal notice on file. ARS 33-1375 requires 30 days notice. Login now.`
+        })
+        await query('UPDATE leases SET renewal_policy_sent_at=NOW() WHERE id=$1', [lease.id])
       }
     }
   } catch(e) { console.error('[SCHEDULER] lease expiry:', e) }
