@@ -579,3 +579,66 @@ posRouter.get('/transactions', requireLandlord, async (req, res, next) => {
     res.json({ success: true, data: txns })
   } catch (e) { next(e) }
 })
+
+// POST /api/pos/purchase-orders — create new PO
+posRouter.post('/purchase-orders', requireLandlord, async (req, res, next) => {
+  try {
+    const { vendorId, notes, expectedDate, items } = req.body
+    const vendor = await queryOne<any>('SELECT * FROM pos_vendors WHERE id=$1 AND landlord_id=$2', [vendorId, req.user!.profileId])
+    if (!vendor) throw new AppError(404, 'Vendor not found')
+
+    const poNumber = 'PO-' + Date.now().toString(36).toUpperCase()
+    const po = await queryOne<any>(`INSERT INTO pos_purchase_orders
+      (landlord_id,vendor_id,status,po_number,notes,expected_date)
+      VALUES ($1,$2,'draft',$3,$4,$5) RETURNING *`,
+      [req.user!.profileId, vendorId, poNumber, notes||null, expectedDate||null])
+
+    let subtotal = 0
+    if (items && items.length > 0) {
+      for (const item of items) {
+        const lineTotal = (item.unitCost||0) * (item.qtyOrdered||1)
+        subtotal += lineTotal
+        await query(`INSERT INTO pos_purchase_order_items
+          (po_id,item_id,item_name,qty_ordered,unit_cost,subtotal)
+          VALUES ($1,$2,$3,$4,$5,$6)`,
+          [po!.id, item.itemId||null, item.itemName, item.qtyOrdered||1, item.unitCost||0, lineTotal])
+      }
+      await query('UPDATE pos_purchase_orders SET subtotal=$1 WHERE id=$2', [subtotal, po!.id])
+    }
+
+    res.status(201).json({ success: true, data: { ...po, subtotal } })
+  } catch (e) { next(e) }
+})
+
+// POST /api/pos/purchase-orders/:id/items — add line item to existing PO
+posRouter.post('/purchase-orders/:id/items', requireLandlord, async (req, res, next) => {
+  try {
+    const { itemId, itemName, qtyOrdered, unitCost } = req.body
+    const po = await queryOne<any>('SELECT * FROM pos_purchase_orders WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
+    if (!po) throw new AppError(404, 'PO not found')
+    if (po.status !== 'draft') throw new AppError(400, 'Can only add items to draft POs')
+
+    const lineTotal = (unitCost||0) * (qtyOrdered||1)
+    const item = await queryOne<any>(`INSERT INTO pos_purchase_order_items
+      (po_id,item_id,item_name,qty_ordered,unit_cost,subtotal)
+      VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [po.id, itemId||null, itemName, qtyOrdered||1, unitCost||0, lineTotal])
+
+    await query('UPDATE pos_purchase_orders SET subtotal=subtotal+$1, updated_at=NOW() WHERE id=$2', [lineTotal, po.id])
+
+    res.status(201).json({ success: true, data: item })
+  } catch (e) { next(e) }
+})
+
+// GET /api/pos/inventory-log — recent stock movement
+posRouter.get('/inventory-log', requireLandlord, async (req, res, next) => {
+  try {
+    const log = await query<any>(`
+      SELECT l.*, i.name as item_name, i.icon as item_icon, i.category
+      FROM pos_inventory_log l
+      JOIN pos_items i ON i.id = l.item_id
+      WHERE l.landlord_id=$1
+      ORDER BY l.created_at DESC LIMIT 200`, [req.user!.profileId])
+    res.json({ success: true, data: log })
+  } catch (e) { next(e) }
+})

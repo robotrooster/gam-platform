@@ -46,6 +46,8 @@ app.use(cors({
     process.env.TENANT_APP_URL   || 'http://localhost:3002',
     process.env.ADMIN_APP_URL    || 'http://localhost:3003',
     process.env.MARKETING_URL    || 'http://localhost:3004',
+    process.env.POS_APP_URL      || 'http://localhost:3005',
+    'http://localhost:3006',
   ],
   credentials: true,
 }))

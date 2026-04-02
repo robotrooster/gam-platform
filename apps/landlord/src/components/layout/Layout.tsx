@@ -17,6 +17,7 @@ const NAV_ITEMS = [
   // Portfolio
   { to: '/properties',    icon: Building2,        label: 'Properties',       section: 'Portfolio',   roles: ['landlord','property_manager'] },
   { to: '/units',         icon: DoorOpen,         label: 'Unit Overview',    section: null,          roles: ['landlord','property_manager','onsite_manager'] },
+  { to: '/schedule',      icon: DoorOpen,         label: 'Master Schedule',  section: null,          roles: ['landlord','property_manager','onsite_manager'] },
   { to: '/tenants',       icon: Users,            label: 'Tenants',          section: null,          roles: ['landlord','property_manager'] },
   { to: '/leases',        icon: ScrollText,       label: 'Leases',           section: null,          roles: ['landlord','property_manager'] },
   // Financials

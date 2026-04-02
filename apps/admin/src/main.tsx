@@ -37,7 +37,7 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
     try {
       const res = await api.get('/auth/me')
       const u = res.data.data
-      if (!u || u.role !== 'admin') { logout(); return }
+      if (!u || (u.role !== 'admin' && u.role !== 'super_admin')) { logout(); return }
       setUser({ id: u.id, email: u.email, role: u.role, firstName: u.first_name || u.firstName || '', lastName: u.last_name || u.lastName || '' })
     } catch { logout() }
     finally { setLoading(false) }
@@ -48,7 +48,7 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
   const login = async (email: string, password: string) => {
     const res = await axios.post(API + '/api/auth/login', { email, password })
     const { token: tk, user: u } = res.data.data
-    if (!u || u.role !== 'admin') throw new Error('Admin access required')
+    if (!u || (u.role !== 'admin' && u.role !== 'super_admin')) throw new Error('Admin access required')
     localStorage.setItem('gam_admin_token', tk)
     api.defaults.headers.common['Authorization'] = 'Bearer ' + tk
     setUser({ id: u.id, email: u.email, role: u.role, firstName: u.firstName || u.first_name || '', lastName: u.lastName || u.last_name || '' })
@@ -166,6 +166,8 @@ function Layout(){
           <div className="nl" style={{marginTop:8}}>Compliance</div>
           <NavLink to="/nacha" className={({isActive})=>`ni${isActive?' active':''}`}>⚡ NACHA Monitor</NavLink>
           <NavLink to="/maintenance" className={({isActive})=>`ni${isActive?' active':''}`}>🔧 Maintenance</NavLink>
+          <div className="nl" style={{marginTop:8}}>Community</div>
+          <NavLink to="/bulletin" className={({isActive})=>`ni${isActive?' active':''}`}>📋 Bulletin Board</NavLink>
         </nav>
         <div className="sfooter">
           <div style={{padding:'6px 10px',marginBottom:4}}>
@@ -533,6 +535,120 @@ function Maintenance(){
   )
 }
 
+
+// ── BULLETIN BOARD (super_admin) ──────────────────────────────
+function BulletinBoard(){
+  const{user}=useAuth()
+  const isSuperAdmin=user?.role==='super_admin'
+  const[revealedIds,setRevealedIds]=React.useState<Record<string,any>>({})
+  const[revealLoading,setRevealLoading]=React.useState<string|null>(null)
+  const[filterTab,setFilterTab]=React.useState<'all'|'flagged'|'pinned'>('all')
+
+  const{data:posts=[],isLoading,refetch}=useQuery<any[]>('bulletin-admin',()=>get('/admin/bulletin'),{enabled:!!user})
+
+  const filtered = filterTab==='flagged'
+    ? (posts as any[]).filter((p:any)=>p.flag_count>0)
+    : filterTab==='pinned'
+      ? (posts as any[]).filter((p:any)=>p.pinned)
+      : posts as any[]
+
+  const revealIdentity=async(postId:string)=>{
+    if(!isSuperAdmin)return
+    setRevealLoading(postId)
+    try{
+      const res=await get<any>('/admin/bulletin/'+postId+'/reveal')
+      setRevealedIds(r=>({...r,[postId]:res}))
+    }catch(e:any){alert('Could not reveal: '+e.message)}
+    finally{setRevealLoading(null)}
+  }
+
+  const pinPost=async(postId:string,pin:boolean)=>{
+    await post('/admin/bulletin/'+postId+'/pin',{pin})
+    refetch()
+  }
+
+  const removePost=async(postId:string)=>{
+    if(!confirm('Remove this post from the bulletin board?'))return
+    await post('/admin/bulletin/'+postId+'/remove',{})
+    refetch()
+  }
+
+  return(
+    <div>
+      <div className="ph">
+        <div><h1 className="pt">Community Bulletin Board</h1><p className="ps">Anonymous posts across all properties{isSuperAdmin?' · Identity reveal enabled':''}</p></div>
+        {!isSuperAdmin&&<span className="badge ba">Read-only — super_admin required for reveals</span>}
+        {isSuperAdmin&&<span className="badge bgold">super_admin · Identity reveal active</span>}
+      </div>
+
+      {isSuperAdmin&&<div className="alert agold" style={{marginBottom:16}}>⚠ Identity reveals are logged and auditable. Only reveal for legitimate moderation purposes.</div>}
+
+      <div className="tabs" style={{marginBottom:20}}>
+        <button className={"tab "+(filterTab==='all'?'on':'')} onClick={()=>setFilterTab('all')}>All Posts ({(posts as any[]).length})</button>
+        <button className={"tab "+(filterTab==='flagged'?'on':'')} onClick={()=>setFilterTab('flagged')} style={{color:(posts as any[]).filter((p:any)=>p.flag_count>0).length>0?'var(--red)':undefined}}>
+          Flagged ({(posts as any[]).filter((p:any)=>p.flag_count>0).length})
+        </button>
+        <button className={"tab "+(filterTab==='pinned'?'on':'')} onClick={()=>setFilterTab('pinned')}>Pinned ({(posts as any[]).filter((p:any)=>p.pinned).length})</button>
+      </div>
+
+      {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}>Loading...</div>:(
+        <div style={{display:'grid',gap:12}}>
+          {filtered.length?(filtered as any[]).map((post:any)=>(
+            <div key={post.id} className="card" style={{borderColor:post.flag_count>=3?'rgba(239,68,68,.4)':post.pinned?'rgba(201,162,39,.3)':'var(--b1)'}}>
+              <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',gap:16}}>
+                <div style={{flex:1}}>
+                  <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:8,flexWrap:'wrap'}}>
+                    <span style={{fontFamily:'var(--font-m)',fontSize:'.72rem',color:'var(--gold)',fontWeight:600}}>{post.alias}</span>
+                    {post.pinned&&<span className="badge bgold">📌 Pinned</span>}
+                    {post.flag_count>=3&&<span className="badge br">🚩 {post.flag_count} flags</span>}
+                    {post.flag_count>0&&post.flag_count<3&&<span className="badge ba">🚩 {post.flag_count} flag{post.flag_count>1?'s':''}</span>}
+                    <span className="badge bmu">{post.scope}</span>
+                    <span style={{fontSize:'.68rem',color:'var(--t3)',marginLeft:'auto'}}>{new Date(post.created_at).toLocaleDateString()}</span>
+                  </div>
+                  <div style={{fontSize:'.85rem',color:'var(--t1)',lineHeight:1.6,marginBottom:10}}>{post.content}</div>
+                  <div style={{display:'flex',gap:12,fontSize:'.72rem',color:'var(--t3)'}}>
+                    <span>👍 {post.vote_count||0} votes</span>
+                    <span>💬 {post.reply_count||0} replies</span>
+                    <span>🏠 {post.property_name||'Platform-wide'}</span>
+                  </div>
+
+                  {revealedIds[post.id]&&(
+                    <div style={{marginTop:12,background:'rgba(239,68,68,.06)',border:'1px solid rgba(239,68,68,.2)',borderRadius:8,padding:'10px 14px'}}>
+                      <div style={{fontSize:'.68rem',color:'var(--red)',fontWeight:700,textTransform:'uppercase',letterSpacing:'.06em',marginBottom:6}}>Identity Revealed — Confidential</div>
+                      <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:6,fontSize:'.78rem'}}>
+                        <div><span style={{color:'var(--t3)'}}>Name: </span><strong style={{color:'var(--t0)'}}>{revealedIds[post.id].first_name} {revealedIds[post.id].last_name}</strong></div>
+                        <div><span style={{color:'var(--t3)'}}>Email: </span><span style={{color:'var(--t0)'}}>{revealedIds[post.id].email}</span></div>
+                        <div><span style={{color:'var(--t3)'}}>Unit: </span><span style={{color:'var(--t0)'}}>{revealedIds[post.id].unit_number||'—'}</span></div>
+                        <div><span style={{color:'var(--t3)'}}>Alias was: </span><span style={{fontFamily:'var(--font-m)',color:'var(--gold)'}}>{post.alias}</span></div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                <div style={{display:'flex',flexDirection:'column',gap:6,flexShrink:0}}>
+                  {isSuperAdmin&&!revealedIds[post.id]&&(
+                    <button className="btn bd bsm" onClick={()=>revealIdentity(post.id)} disabled={revealLoading===post.id} style={{whiteSpace:'nowrap'}}>
+                      {revealLoading===post.id?'Revealing...':'🔍 Reveal'}
+                    </button>
+                  )}
+                  {isSuperAdmin&&(
+                    <button className="btn bg bsm" onClick={()=>pinPost(post.id,!post.pinned)}>
+                      {post.pinned?'Unpin':'📌 Pin'}
+                    </button>
+                  )}
+                  {isSuperAdmin&&(
+                    <button className="btn bd bsm" style={{color:'var(--red)'}} onClick={()=>removePost(post.id)}>Remove</button>
+                  )}
+                </div>
+              </div>
+            </div>
+          )):<div className="empty">No posts{filterTab!=='all'?' matching this filter':''}.</div>}
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ── LOGIN ─────────────────────────────────────────────────────
 function LoginPage(){
   React.useEffect(()=>{
@@ -577,7 +693,7 @@ function App(){
     <BrowserRouter>
       <Routes>
         <Route path="/login" element={user?<Navigate to="/overview" replace/>:<LoginPage/>}/>
-        <Route path="/" element={user&&user.role==='admin'?<Layout/>:<Navigate to="/login" replace/>}>
+        <Route path="/" element={(user&&(user.role==='admin'||user.role==='super_admin'))?<Layout/>:<Navigate to="/login" replace/>}>
           <Route index element={<Navigate to="/overview" replace/>}/>
           <Route path="overview"      element={<Overview/>}/>
           <Route path="landlords"     element={<Landlords/>}/>
@@ -588,6 +704,7 @@ function App(){
           <Route path="reserve"       element={<Reserve/>}/>
           <Route path="nacha"         element={<NachaMonitor/>}/>
           <Route path="maintenance"   element={<Maintenance/>}/>
+          <Route path="bulletin"      element={<BulletinBoard/>}/>
         </Route>
       </Routes>
     </BrowserRouter>

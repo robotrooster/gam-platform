@@ -12,6 +12,7 @@ sleep 3
 nohup npm run dev --workspace=apps/landlord > /tmp/gam-landlord.log 2>&1 &
 nohup npm run dev --workspace=apps/tenant > /tmp/gam-tenant.log 2>&1 &
 nohup npm run dev --workspace=apps/admin > /tmp/gam-admin.log 2>&1 &
+nohup npm run dev --workspace=apps/pos > /tmp/gam-pos.log 2>&1 &
 nohup npm run dev --workspace=apps/marketing > /tmp/gam-marketing.log 2>&1 &
 sleep 4
 echo ""

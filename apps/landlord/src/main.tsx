@@ -31,6 +31,7 @@ import { TeamPage } from './pages/TeamPage'
 import { WorkTradePage } from './pages/WorkTradePage'
 import { POSPage } from './pages/POSPage'
 import { InventoryPage } from './pages/InventoryPage'
+import { SchedulePage } from './pages/SchedulePage'
 import { ShelfLabelPage } from './pages/ShelfLabelPage'
 import './styles/globals.css'
 
@@ -101,6 +102,7 @@ export default function App() {
               <Route path="work-trade"     element={<WorkTradePage />} />
               <Route path="pos"            element={<POSPage />} />
               <Route path="inventory"       element={<InventoryPage />} />
+              <Route path="schedule"       element={<SchedulePage />} />
             </Route>
           </Routes>
         </BrowserRouter>
@@ -110,5 +112,5 @@ export default function App() {
 }
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
-  <React.StrictMode><App /></React.StrictMode>
+  <App />
 )

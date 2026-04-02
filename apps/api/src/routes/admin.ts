@@ -1,10 +1,16 @@
 import { Router } from 'express'
-import { query } from '../db'
+import { query, queryOne } from '../db'
 import { requireAuth, requireAdmin } from '../middleware/auth'
 
 export const adminRouter = Router()
 adminRouter.use(requireAuth)
-adminRouter.use(requireAdmin)
+adminRouter.use((req: any, res: any, next: any) => {
+  if (!req.user) return res.status(401).json({ success: false, error: 'Unauthenticated' })
+  if (req.user.role !== 'admin' && req.user.role !== 'super_admin') {
+    return res.status(403).json({ success: false, error: 'Insufficient permissions' })
+  }
+  next()
+})
 
 adminRouter.get('/overview', async (_req, res, next) => {
   try {
@@ -42,5 +48,69 @@ adminRouter.get('/nacha/monitoring', async (_req, res, next) => {
         COUNT(*) FILTER (WHERE event_type='velocity_flag') AS velocity_flags_30d
       FROM ach_monitoring_log WHERE created_at > NOW() - INTERVAL '30 days'`)
     res.json({ success: true, data: { logs, stats } })
+  } catch (e) { next(e) }
+})
+
+// ── BULLETIN BOARD (super_admin) ──────────────────────────────
+
+const requireSuperAdmin = (req: any, res: any, next: any) => {
+  if (req.user?.role !== 'super_admin') return res.status(403).json({ success: false, error: 'super_admin required' })
+  next()
+}
+
+adminRouter.get('/bulletin', requireSuperAdmin, async (req, res, next) => {
+  try {
+    const posts = await query<any>(`
+      SELECT b.*,
+        p.name as property_name,
+        b.upvote_count as vote_count
+      FROM bulletin_posts b
+      LEFT JOIN properties p ON p.id = b.property_id
+      WHERE (b.is_removed IS NULL OR b.is_removed = FALSE)
+      ORDER BY b.pinned DESC, b.created_at DESC
+      LIMIT 200`, [])
+    res.json({ success: true, data: posts })
+  } catch (e) { next(e) }
+})
+
+adminRouter.get('/bulletin/:id/reveal', requireSuperAdmin, async (req, res, next) => {
+  try {
+    const isSuperAdmin = req.user!.role === 'super_admin'
+    if (!isSuperAdmin) throw new AppError(403, 'super_admin required')
+
+    const post = await queryOne<any>('SELECT * FROM bulletin_posts WHERE id=$1', [req.params.id])
+    if (!post) throw new AppError(404, 'Post not found')
+
+    const tenant = await queryOne<any>(`
+      SELECT u.first_name, u.last_name, u.email, un.unit_number
+      FROM tenants t
+      JOIN users u ON u.id = t.user_id
+      LEFT JOIN leases l ON l.tenant_id = t.id AND l.status = 'active'
+      LEFT JOIN units un ON un.id = l.unit_id
+      WHERE t.id = $1`, [post.tenant_id])
+
+    if (!tenant) throw new AppError(404, 'Tenant not found')
+
+    // Log the reveal
+    await query(`INSERT INTO bulletin_reveal_log (post_id, revealed_by, admin_id)
+      VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+      [post.id, post.tenant_id, req.user!.userId])
+
+    res.json({ success: true, data: { ...tenant, alias: post.alias } })
+  } catch (e) { next(e) }
+})
+
+adminRouter.post('/bulletin/:id/pin', requireSuperAdmin, async (req, res, next) => {
+  try {
+    const { pin } = req.body
+    await query('UPDATE bulletin_posts SET pinned=$1 WHERE id=$2', [pin, req.params.id])
+    res.json({ success: true })
+  } catch (e) { next(e) }
+})
+
+adminRouter.post('/bulletin/:id/remove', requireSuperAdmin, async (req, res, next) => {
+  try {
+    await query('UPDATE bulletin_posts SET is_removed=TRUE, removed_at=NOW(), removed_by=$1 WHERE id=$2', [req.user!.userId, req.params.id])
+    res.json({ success: true })
   } catch (e) { next(e) }
 })

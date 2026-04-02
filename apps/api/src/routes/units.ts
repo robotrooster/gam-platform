@@ -158,3 +158,168 @@ unitsRouter.get('/:id/economics', async (req, res, next) => {
     res.json({ success: true, data: { ...econ, platformFee: fee, reserveRate: rate, occupiedPortfolio: count, netRentMonthly: unit.rent_amount - feeNum, netRentYearly: (unit.rent_amount - feeNum) * 12, netThisMonth: parseFloat(ps && ps.this_month || 0) - feeNum - parseFloat(ms && ms.this_month_cost || 0), netThisYear: parseFloat(ps && ps.this_year || 0) - (feeNum*12) - lm, tenantMonths: months, lifetimeCollected: lc, lifetimeMaintCost: lm, lifetimeNet: lc - (feeNum*months) - lm, lifetimePlatformFees: feeNum*months, settledCount: parseInt(ps && ps.settled_count || 0), failedCount: parseInt(ps && ps.failed_count || 0), totalRequests: parseInt(ms && ms.total_requests || 0) } })
   } catch (e) { next(e) }
 })
+
+// ── UNIT TYPE + SHORT-TERM CONFIG ─────────────────────────────
+
+const LEASE_TYPE_MATRIX: Record<string, string[]> = {
+  residential:     ['month_to_month', 'long_term'],
+  rv_spot:         ['nightly', 'weekly', 'month_to_month', 'long_term'],
+  storage:         ['month_to_month', 'long_term'],
+  parking:         ['nightly', 'weekly', 'month_to_month', 'long_term'],
+  short_term_cabin:['nightly', 'weekly', 'month_to_month'],
+}
+
+// PATCH /api/units/:id/type — set unit type and rates
+unitsRouter.patch('/:id/type', requireLandlord, async (req, res, next) => {
+  try {
+    const { unitType, nightlyRate, weeklyRate, monthlyRate, minStayNights, maxStayNights,
+            checkInTime, checkOutTime, amenities, unitDescription, isBookable } = req.body
+
+    const unit = await queryOne<any>('SELECT * FROM units WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
+    if (!unit) throw new AppError(404, 'Unit not found')
+
+    const leaseTypesAllowed = LEASE_TYPE_MATRIX[unitType] || LEASE_TYPE_MATRIX['residential']
+
+    const updated = await queryOne<any>(`UPDATE units SET
+      unit_type=$1, lease_types_allowed=$2, nightly_rate=$3, weekly_rate=$4, monthly_rate=$5,
+      min_stay_nights=$6, max_stay_nights=$7, check_in_time=$8, check_out_time=$9,
+      amenities=$10, unit_description=$11, is_bookable=$12, updated_at=NOW()
+      WHERE id=$13 RETURNING *`,
+      [unitType||'residential', leaseTypesAllowed, nightlyRate||null, weeklyRate||null,
+       monthlyRate||null, minStayNights||1, maxStayNights||null,
+       checkInTime||'15:00', checkOutTime||'11:00',
+       amenities||[], unitDescription||null, isBookable??false, unit.id])
+
+    res.json({ success: true, data: updated })
+  } catch (e) { next(e) }
+})
+
+// GET /api/units/:id/availability — get booked dates
+unitsRouter.get('/:id/availability', async (req, res, next) => {
+  try {
+    const { from, to } = req.query
+    const fromDate = from || new Date().toISOString().split('T')[0]
+    const toDate = to || new Date(Date.now() + 90*24*60*60*1000).toISOString().split('T')[0]
+
+    const bookings = await query<any>(`
+      SELECT id, check_in, check_out, status, lease_type, guest_name
+      FROM unit_bookings
+      WHERE unit_id=$1 AND status NOT IN ('cancelled') AND check_out >= $2 AND check_in <= $3
+      ORDER BY check_in`, [req.params.id, fromDate, toDate])
+
+    res.json({ success: true, data: bookings })
+  } catch (e) { next(e) }
+})
+
+// POST /api/units/:id/bookings — create booking
+unitsRouter.post('/:id/bookings', requireLandlord, async (req, res, next) => {
+  try {
+    const { guestName, guestEmail, guestPhone, leaseType, checkIn, checkOut,
+            tenantId, nightlyRate, weeklyRate, totalAmount, notes, source } = req.body
+
+    const unit = await queryOne<any>('SELECT * FROM units WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
+    if (!unit) throw new AppError(404, 'Unit not found')
+
+    // Check allowed lease types
+    if (unit.lease_types_allowed && !unit.lease_types_allowed.includes(leaseType)) {
+      throw new AppError(400, `Lease type '${leaseType}' not allowed for ${unit.unit_type} units`)
+    }
+
+    // Check for conflicts
+    const conflict = await queryOne<any>(`
+      SELECT id FROM unit_bookings
+      WHERE unit_id=$1 AND status NOT IN ('cancelled')
+      AND check_in < $2 AND check_out > $3`,
+      [unit.id, checkOut, checkIn])
+    if (conflict) throw new AppError(409, 'Unit is already booked for those dates')
+
+    const nights = Math.ceil((new Date(checkOut).getTime() - new Date(checkIn).getTime()) / (1000*60*60*24))
+    const platformFee = (totalAmount || 0) * 0.05 // 5% platform fee on short-term
+
+    const booking = await queryOne<any>(`INSERT INTO unit_bookings
+      (unit_id, landlord_id, tenant_id, guest_name, guest_email, guest_phone,
+       lease_type, check_in, check_out, nights, nightly_rate, weekly_rate,
+       total_amount, platform_fee, notes, source)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`,
+      [unit.id, req.user!.profileId, tenantId||null, guestName||null, guestEmail||null,
+       guestPhone||null, leaseType, checkIn, checkOut, nights,
+       nightlyRate||unit.nightly_rate||null, weeklyRate||unit.weekly_rate||null,
+       totalAmount||0, platformFee, notes||null, source||'direct'])
+
+    res.status(201).json({ success: true, data: booking })
+  } catch (e) { next(e) }
+})
+
+// GET /api/units/:id/bookings — list bookings for a unit
+unitsRouter.get('/:id/bookings', requireLandlord, async (req, res, next) => {
+  try {
+    const bookings = await query<any>(`
+      SELECT b.*, u.unit_number, u.unit_type
+      FROM unit_bookings b
+      JOIN units u ON u.id = b.unit_id
+      WHERE b.unit_id=$1 AND b.landlord_id=$2
+      ORDER BY b.check_in DESC`, [req.params.id, req.user!.profileId])
+    res.json({ success: true, data: bookings })
+  } catch (e) { next(e) }
+})
+
+// PATCH /api/units/:id/bookings/:bookingId — update booking status
+unitsRouter.patch('/:id/bookings/:bookingId', requireLandlord, async (req, res, next) => {
+  try {
+    const { status, notes } = req.body
+    const booking = await queryOne<any>('SELECT * FROM unit_bookings WHERE id=$1 AND landlord_id=$2', [req.params.bookingId, req.user!.profileId])
+    if (!booking) throw new AppError(404, 'Booking not found')
+    const updated = await queryOne<any>(`UPDATE unit_bookings SET status=$1, notes=COALESCE($2,notes), updated_at=NOW() WHERE id=$3 RETURNING *`,
+      [status||booking.status, notes, booking.id])
+    res.json({ success: true, data: updated })
+  } catch (e) { next(e) }
+})
+
+// GET /api/units/schedule — master schedule across all units for a landlord
+unitsRouter.get('/schedule/master', requireLandlord, async (req, res, next) => {
+  try {
+    const { from, to, unitType } = req.query
+    const fromDate = from || new Date().toISOString().split('T')[0]
+    const toDate = to || new Date(Date.now() + 30*24*60*60*1000).toISOString().split('T')[0]
+
+    const units = await query<any>(`
+      SELECT u.id, u.unit_number, u.unit_type, u.status, u.rent_amount,
+        u.nightly_rate, u.weekly_rate, u.is_bookable, u.lease_types_allowed,
+        u.check_in_time, u.check_out_time, u.amenities, u.unit_description,
+        p.name as property_name,
+        usr.first_name as tenant_first, usr.last_name as tenant_last
+      FROM units u
+      JOIN properties p ON p.id = u.property_id
+      LEFT JOIN leases l ON l.unit_id = u.id AND l.status = 'active'
+      LEFT JOIN tenants t ON t.id = l.tenant_id
+      LEFT JOIN users usr ON usr.id = t.user_id
+      WHERE u.landlord_id=$1 ${unitType ? "AND u.unit_type=$2" : ""}
+      ORDER BY u.unit_type, p.name, u.unit_number`,
+      unitType ? [req.user!.profileId, unitType] : [req.user!.profileId])
+
+    // Get all bookings in range
+    const bookings = await query<any>(`
+      SELECT b.*, u.unit_number, u.unit_type, p.name as property_name
+      FROM unit_bookings b
+      JOIN units u ON u.id = b.unit_id
+      JOIN properties p ON p.id = u.property_id
+      WHERE b.landlord_id=$1 AND b.status NOT IN ('cancelled')
+        AND b.check_out >= $2 AND b.check_in <= $3
+      ORDER BY b.check_in`, [req.user!.profileId, fromDate, toDate])
+
+    // Get active leases in range
+    const leases = await query<any>(`
+      SELECT l.*, u.unit_number, u.unit_type, p.name as property_name,
+        usr.first_name, usr.last_name
+      FROM leases l
+      JOIN units u ON u.id = l.unit_id
+      JOIN properties p ON p.id = u.property_id
+      JOIN tenants t ON t.id = l.tenant_id
+      JOIN users usr ON usr.id = t.user_id
+      WHERE u.landlord_id=$1 AND l.status='active'
+        AND l.end_date >= $2 AND l.start_date <= $3
+      ORDER BY l.start_date`, [req.user!.profileId, fromDate, toDate])
+
+    res.json({ success: true, data: { units, bookings, leases, range: { from: fromDate, to: toDate } } })
+  } catch (e) { next(e) }
+})
