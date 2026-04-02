@@ -4,7 +4,7 @@ import { useNavigate } from 'react-router-dom'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
 import { Building2, Plus, MapPin, Home, ChevronRight, DoorOpen, Users, DollarSign, X, Check, Edit2 } from 'lucide-react'
 import { AddUnitModal } from './AddUnitModal'
-import { formatCurrency } from '@gam/shared'
+const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
 const PROPERTY_TYPES = [
   { value: 'residential',  label: '🏠 Residential',     desc: 'Apartments, houses, condos' },
@@ -200,8 +200,8 @@ export function PropertiesPage() {
             { label: 'Properties',       val: (props as any[]).length,                       color: 'var(--gold)' },
             { label: 'Total Units',      val: totalUnits,                                     color: 'var(--text-0)' },
             { label: 'Occupied',         val: `${totalOccupied} / ${totalUnits}`,             color: 'var(--green)' },
-            { label: 'Monthly Revenue',  val: formatCurrency(totalRevenue),                   color: 'var(--gold)' },
-            { label: 'Max Potential',      val: formatCurrency(superMaxRevenue),              color: 'var(--text-3)' },
+            { label: 'Monthly Revenue',  val: fmt(totalRevenue),                   color: 'var(--gold)' },
+            { label: 'Max Potential',      val: fmt(superMaxRevenue),              color: 'var(--text-3)' },
           ].map(s => (
             <div key={s.label} className="card" style={{ padding: '14px 16px' }}>
               <div style={{ fontSize: '.65rem', fontWeight: 700, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.08em', marginBottom: 6 }}>{s.label}</div>
@@ -268,7 +268,7 @@ export function PropertiesPage() {
                     {[
                       { icon: <DoorOpen size={13} />, val: p.totalUnits,  label: 'Units' },
                       { icon: <Users size={13} />,    val: p.occupied,    label: 'Occupied' },
-                      { icon: <DollarSign size={13} />, val: formatCurrency(p.monthlyRevenue), label: 'Revenue' },
+                      { icon: <DollarSign size={13} />, val: fmt(p.monthlyRevenue), label: 'Revenue' },
                     ].map(s => (
                       <div key={s.label} style={{ background: 'var(--bg-2)', borderRadius: 8, padding: '8px 10px', textAlign: 'center' }}>
                         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4, color: 'var(--text-3)', marginBottom: 3 }}>{s.icon}</div>

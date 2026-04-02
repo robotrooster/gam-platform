@@ -3,7 +3,8 @@
   "private": true,
   "workspaces": [
     "packages/*",
-    "apps/*"
+    "apps/*",
+    "apps/pos"
   ],
   "scripts": {
     "dev": "concurrently -n api,landlord,tenant,admin,marketing -c blue,green,yellow,magenta,cyan \"npm run dev --workspace=apps/api\" \"npm run dev --workspace=apps/landlord\" \"npm run dev --workspace=apps/tenant\" \"npm run dev --workspace=apps/admin\" \"npm run dev --workspace=apps/marketing\"",

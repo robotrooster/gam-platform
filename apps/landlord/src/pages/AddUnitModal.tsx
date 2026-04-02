@@ -2,8 +2,8 @@ import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from 'react-query'
 import { useNavigate } from 'react-router-dom'
 import { apiGet, apiPost } from '../lib/api'
-import { formatCurrency } from '@gam/shared'
 import { X, Building2, DoorOpen, DollarSign, ChevronRight, ChevronLeft, Check } from 'lucide-react'
+const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
 interface Props { onClose: () => void; preselectedPropertyId?: string }
 
@@ -302,8 +302,8 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
                 { label: 'Bedrooms', val: form.bedrooms === 0 ? 'Studio' : `${form.bedrooms} bed` },
                 { label: 'Bathrooms', val: `${form.bathrooms} bath` },
                 form.sqft ? { label: 'Square feet', val: `${Number(form.sqft).toLocaleString()} sq ft` } : null,
-                { label: 'Monthly rent', val: formatCurrency(Number(form.rent_amount)) },
-                { label: 'Security deposit', val: form.security_deposit ? formatCurrency(Number(form.security_deposit)) : '$0.00' },
+                { label: 'Monthly rent', val: fmt(Number(form.rent_amount)) },
+                { label: 'Security deposit', val: form.security_deposit ? fmt(Number(form.security_deposit)) : '$0.00' },
                 { label: 'Platform fee', val: '$15.00/month' },
               ].filter(Boolean).map((row: any) => (
                 <div key={row.label} style={{ display: 'flex', justifyContent: 'space-between', padding: '8px 16px', borderBottom: '1px solid var(--border-0)', fontSize: '.78rem' }}>

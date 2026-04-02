@@ -28,6 +28,7 @@ import { reportsRouter }      from './routes/reports'
 import { maintenancePortalRouter } from './routes/maintenance-portal'
 import { esignRouter }        from './routes/esign'
 import { backgroundRouter }   from './routes/background'
+import { announcementsRouter }  from './routes/announcements'
 import { bulletinRouter }      from './routes/bulletin'
 import { notificationsRouter } from './routes/notifications'
 import { schedulerInit }      from './jobs/scheduler'
@@ -98,6 +99,7 @@ app.use('/api/background/id-files', (req, res, next) => {
 })
 app.use('/api/maint-portal', maintenancePortalRouter)
 app.use('/api/esign',         esignRouter)
+app.use('/api/announcements',  announcementsRouter)
 app.use('/api/bulletin',       bulletinRouter)
   app.use('/api/background',    backgroundRouter)
 app.use('/api/notifications',  notificationsRouter)

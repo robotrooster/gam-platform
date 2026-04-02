@@ -39,8 +39,7 @@ export function TenantsPage() {
           </table>
         </div>
       )}
+      {showInvite && <InviteTenantModal onClose={() => setShowInvite(false)} />}
     </div>
   )
-
-  {showInvite && <InviteTenantModal onClose={() => setShowInvite(false)} />}
 }

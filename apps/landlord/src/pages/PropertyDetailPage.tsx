@@ -2,9 +2,9 @@ import { useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
-import { formatCurrency } from '@gam/shared'
 import { ArrowLeft, Plus, DoorOpen, Users, DollarSign, Edit2, Building2, MapPin, AlertTriangle, Shield } from 'lucide-react'
 import { AddUnitModal } from './AddUnitModal'
+const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
 const STATUS_COLORS: Record<string,string> = {
   active:'badge-green', direct_pay:'badge-blue',
@@ -62,8 +62,8 @@ export function PropertyDetailPage() {
           { label:'Total Units',      val: units.length,              color:'var(--text-0)' },
           { label:'Occupied',         val: `${occupied} / ${units.length}`, color:'var(--green)' },
           { label:'Occupancy',        val: `${occupancy}%`,           color: occupancy >= 80 ? 'var(--green)' : 'var(--amber)' },
-          { label:'Monthly Revenue',  val: formatCurrency(revenue),   color:'var(--gold)' },
-          { label:'Max Potential',      val: formatCurrency(maxRevenue), color:'var(--text-3)' },
+          { label:'Monthly Revenue',  val: fmt(revenue),   color:'var(--gold)' },
+          { label:'Max Potential',      val: fmt(maxRevenue), color:'var(--text-3)' },
         ].map(s => (
           <div key={s.label} className="card" style={{ padding:'14px 16px' }}>
             <div style={{ fontSize:'.62rem', fontWeight:700, color:'var(--text-3)', textTransform:'uppercase', letterSpacing:'.08em', marginBottom:6 }}>{s.label}</div>
@@ -127,7 +127,7 @@ export function PropertyDetailPage() {
                       <span style={{ color:'var(--text-3)', fontSize:'.78rem' }}>Vacant</span>
                     )}
                   </td>
-                  <td className="mono">{formatCurrency(u.rent_amount)}/mo</td>
+                  <td className="mono">{fmt(u.rent_amount)}/mo</td>
                   <td><span className={`badge ${STATUS_COLORS[u.status] || 'badge-muted'}`}>{u.status?.replace('_',' ')}</span></td>
                   <td style={{ fontSize:'.78rem' }}>{u.bedrooms}bd / {u.bathrooms}ba</td>
                   <td className="mono" style={{ fontSize:'.75rem' }}>{u.sqft ? u.sqft.toLocaleString() : '—'}</td>

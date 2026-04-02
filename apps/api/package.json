@@ -27,7 +27,7 @@
     "pdf-parse": "^2.4.5",
     "pg": "^8.11.3",
     "resend": "^6.9.4",
-    "stripe": "^14.10.0",
+    "stripe": "^14.25.0",
     "zod": "^3.22.4"
   },
   "devDependencies": {

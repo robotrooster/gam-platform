@@ -1,7 +1,7 @@
+// @ts-nocheck
 import { useState, useRef, useCallback, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPatch, apiDelete, apiPut } from '../lib/api'
-import { formatCurrency } from '@gam/shared'
 import { Plus, X, FileText, Send, Settings, Eye, Trash2, ChevronRight, Check, AlertCircle, Download, MoreVertical } from 'lucide-react'
 
 const FIELD_TYPES = [

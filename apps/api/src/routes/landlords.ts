@@ -139,9 +139,8 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
         TO_CHAR(DATE_TRUNC('month', p.created_at), 'Mon') as month,
         COALESCE(SUM(p.amount),0)::float as revenue
       FROM payments p
-      JOIN units u ON u.id = p.unit_id
-      WHERE u.landlord_id = $1
-        AND p.status = 'completed'
+      WHERE p.landlord_id = $1
+        AND p.status IN ('completed','settled')
         AND p.created_at >= NOW() - INTERVAL '6 months'
       GROUP BY DATE_TRUNC('month', p.created_at)
       ORDER BY DATE_TRUNC('month', p.created_at) ASC`, [id])
@@ -166,7 +165,8 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
         COUNT(*)::int AS otp_units,
         COALESCE(SUM(u.rent_amount),0)::float AS projected_otp_disbursement
       FROM tenants t
-      JOIN units u ON u.id = t.unit_id
+      JOIN leases l ON l.tenant_id = t.id AND l.status = 'active'
+      JOIN units u ON u.id = l.unit_id
       WHERE u.landlord_id = $1
         AND t.otp_qualified_at IS NOT NULL
         AND u.status = 'active'`, [id])

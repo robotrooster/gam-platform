@@ -2,8 +2,11 @@ import { useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost } from '../lib/api'
-import { formatCurrency, getReservePhase } from '@gam/shared'
 import { ArrowLeft, Shield, CheckCircle, AlertTriangle } from 'lucide-react'
+
+const getReservePhase = (pct: number) => ({ phase: pct >= 90 ? 'full' : pct >= 70 ? 'growth' : 'early' })
+
+const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
 export function UnitDetailPage() {
   const { id } = useParams()
@@ -53,8 +56,8 @@ export function UnitDetailPage() {
         <div className="card">
           <div className="card-title" style={{ marginBottom: 16 }}>Unit Details</div>
           <div className="data-row"><span className="data-key">Status</span><span className={'badge badge-' + (unit.status === 'active' ? 'green' : unit.status === 'vacant' ? 'muted' : 'amber')}>{unit.status}</span></div>
-          <div className="data-row"><span className="data-key">Rent</span><span className="data-val mono">{formatCurrency(unit.rent_amount)}/mo</span></div>
-          <div className="data-row"><span className="data-key">Deposit</span><span className="data-val mono">{formatCurrency(unit.security_deposit)}</span></div>
+          <div className="data-row"><span className="data-key">Rent</span><span className="data-val mono">{fmt(unit.rent_amount)}/mo</span></div>
+          <div className="data-row"><span className="data-key">Deposit</span><span className="data-val mono">{fmt(unit.security_deposit)}</span></div>
           <div className="data-row"><span className="data-key">Bedrooms</span><span className="data-val">{unit.bedrooms}</span></div>
           <div className="data-row"><span className="data-key">Bathrooms</span><span className="data-val">{unit.bathrooms}</span></div>
         </div>
@@ -79,15 +82,15 @@ export function UnitDetailPage() {
           <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:10, marginBottom:20 }}>
             <div style={{ background:"var(--bg-2)", border:"1px solid var(--border-0)", borderRadius:10, padding:"12px 14px" }}>
               <div style={{ fontSize:".65rem", fontWeight:700, color:"var(--text-3)", textTransform:"uppercase", marginBottom:6 }}>Net Monthly</div>
-              <div style={{ fontFamily:"var(--font-mono)", fontSize:".95rem", fontWeight:700, color:"var(--green)" }}>{formatCurrency(unit.rent_amount-(unit.status==="vacant"?0:unit.status==="direct_pay"?5:15))}</div>
+              <div style={{ fontFamily:"var(--font-mono)", fontSize:".95rem", fontWeight:700, color:"var(--green)" }}>{fmt(unit.rent_amount-(unit.status==="vacant"?0:unit.status==="direct_pay"?5:15))}</div>
             </div>
             <div style={{ background:"var(--bg-2)", border:"1px solid var(--border-0)", borderRadius:10, padding:"12px 14px" }}>
               <div style={{ fontSize:".65rem", fontWeight:700, color:"var(--text-3)", textTransform:"uppercase", marginBottom:6 }}>Projected Yearly</div>
-              <div style={{ fontFamily:"var(--font-mono)", fontSize:".95rem", fontWeight:700, color:"var(--gold)" }}>{formatCurrency((unit.rent_amount-(unit.status==="vacant"?0:unit.status==="direct_pay"?5:15))*12)}</div>
+              <div style={{ fontFamily:"var(--font-mono)", fontSize:".95rem", fontWeight:700, color:"var(--gold)" }}>{fmt((unit.rent_amount-(unit.status==="vacant"?0:unit.status==="direct_pay"?5:15))*12)}</div>
             </div>
             <div style={{ background:"var(--bg-2)", border:"1px solid var(--border-0)", borderRadius:10, padding:"12px 14px" }}>
               <div style={{ fontSize:".65rem", fontWeight:700, color:"var(--text-3)", textTransform:"uppercase", marginBottom:6 }}>Lifetime Net</div>
-              <div style={{ fontFamily:"var(--font-mono)", fontSize:".95rem", fontWeight:700, color:"var(--gold)" }}>{econ ? formatCurrency(econ.lifetimeNet) : "—"}</div>
+              <div style={{ fontFamily:"var(--font-mono)", fontSize:".95rem", fontWeight:700, color:"var(--gold)" }}>{econ ? fmt(econ.lifetimeNet) : "—"}</div>
             </div>
             <div style={{ background:"var(--bg-2)", border:"1px solid var(--border-0)", borderRadius:10, padding:"12px 14px" }}>
               <div style={{ fontSize:".65rem", fontWeight:700, color:"var(--text-3)", textTransform:"uppercase", marginBottom:6 }}>Tenant Months</div>
@@ -97,30 +100,30 @@ export function UnitDetailPage() {
           <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:16 }}>
             <div>
               <div style={{ fontSize:".68rem", fontWeight:700, color:"var(--text-3)", textTransform:"uppercase", letterSpacing:".08em", marginBottom:8 }}>Monthly Breakdown</div>
-              <div className="data-row"><span className="data-key">Rent</span><span className="data-val mono">{formatCurrency(unit.rent_amount)}/mo</span></div>
+              <div className="data-row"><span className="data-key">Rent</span><span className="data-val mono">{fmt(unit.rent_amount)}/mo</span></div>
               <div className="data-row"><span className="data-key">Platform fee</span><span className="data-val mono" style={{ color:unit.status==="vacant"?"var(--text-3)":"var(--red)" }}>{unit.status==="vacant"?"Free (vacant)":unit.status==="direct_pay"?"-5.00/mo (direct pay)":"-15.00/mo (on-time pay)"}</span></div>
-              <div className="data-row" style={{ borderTop:"1px solid var(--border-1)", paddingTop:8, marginTop:4 }}><span className="data-key" style={{ fontWeight:700 }}>Net monthly</span><span className="data-val mono" style={{ color:"var(--green)", fontWeight:700 }}>{formatCurrency(unit.rent_amount-(unit.status==="vacant"?0:unit.status==="direct_pay"?5:15))}/mo</span></div>
-              <div className="data-row"><span className="data-key">Projected yearly</span><span className="data-val mono" style={{ color:"var(--gold)" }}>{formatCurrency((unit.rent_amount-(unit.status==="vacant"?0:unit.status==="direct_pay"?5:15))*12)}</span></div>
+              <div className="data-row" style={{ borderTop:"1px solid var(--border-1)", paddingTop:8, marginTop:4 }}><span className="data-key" style={{ fontWeight:700 }}>Net monthly</span><span className="data-val mono" style={{ color:"var(--green)", fontWeight:700 }}>{fmt(unit.rent_amount-(unit.status==="vacant"?0:unit.status==="direct_pay"?5:15))}/mo</span></div>
+              <div className="data-row"><span className="data-key">Projected yearly</span><span className="data-val mono" style={{ color:"var(--gold)" }}>{fmt((unit.rent_amount-(unit.status==="vacant"?0:unit.status==="direct_pay"?5:15))*12)}</span></div>
             </div>
             <div>
               <div style={{ fontSize:".68rem", fontWeight:700, color:"var(--text-3)", textTransform:"uppercase", letterSpacing:".08em", marginBottom:8 }}>Maintenance Costs</div>
               {(maintenance as any[]).filter((m:any)=>m.actual_cost).length===0
                 ? <div style={{ fontSize:".78rem", color:"var(--text-3)" }}>No costs recorded.</div>
                 : (maintenance as any[]).filter((m:any)=>m.actual_cost).slice(0,5).map((m:any)=>(
-                    <div key={m.id} className="data-row"><span className="data-key" style={{ fontSize:".73rem" }}>{m.title}</span><span className="data-val mono" style={{ color:"var(--red)", fontSize:".73rem" }}>−{formatCurrency(m.actual_cost)}</span></div>
+                    <div key={m.id} className="data-row"><span className="data-key" style={{ fontSize:".73rem" }}>{m.title}</span><span className="data-val mono" style={{ color:"var(--red)", fontSize:".73rem" }}>−{fmt(m.actual_cost)}</span></div>
                   ))
               }
-              {econ && econ.lifetimeMaintCost > 0 && (<div className="data-row" style={{ borderTop:"1px solid var(--border-1)", paddingTop:8, marginTop:4 }}><span className="data-key" style={{ fontWeight:700 }}>Lifetime total</span><span className="data-val mono" style={{ color:"var(--red)", fontWeight:700 }}>−{formatCurrency(econ.lifetimeMaintCost)}</span></div>)}
+              {econ && econ.lifetimeMaintCost > 0 && (<div className="data-row" style={{ borderTop:"1px solid var(--border-1)", paddingTop:8, marginTop:4 }}><span className="data-key" style={{ fontWeight:700 }}>Lifetime total</span><span className="data-val mono" style={{ color:"var(--red)", fontWeight:700 }}>−{fmt(econ.lifetimeMaintCost)}</span></div>)}
             </div>
           </div>
           {econ && econ.tenantMonths > 0 && (
             <div style={{ marginTop:16, padding:"12px 14px", background:"var(--bg-2)", border:"1px solid var(--border-0)", borderRadius:10 }}>
               <div style={{ fontSize:".68rem", fontWeight:700, color:"var(--text-3)", textTransform:"uppercase", letterSpacing:".08em", marginBottom:10 }}>Tenant Lifetime ({econ.tenantMonths} months)</div>
               <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:10 }}>
-                <div style={{ textAlign:"center" }}><div style={{ fontSize:".62rem", color:"var(--text-3)", marginBottom:3 }}>Collected</div><div style={{ fontFamily:"var(--font-mono)", fontSize:".82rem", fontWeight:700, color:"var(--text-0)" }}>{formatCurrency(econ.lifetimeCollected)}</div></div>
-                <div style={{ textAlign:"center" }}><div style={{ fontSize:".62rem", color:"var(--text-3)", marginBottom:3 }}>Platform Fees</div><div style={{ fontFamily:"var(--font-mono)", fontSize:".82rem", fontWeight:700, color:"var(--red)" }}>{formatCurrency(econ.lifetimePlatformFees)}</div></div>
-                <div style={{ textAlign:"center" }}><div style={{ fontSize:".62rem", color:"var(--text-3)", marginBottom:3 }}>Maint. Costs</div><div style={{ fontFamily:"var(--font-mono)", fontSize:".82rem", fontWeight:700, color:"var(--red)" }}>{formatCurrency(econ.lifetimeMaintCost)}</div></div>
-                <div style={{ textAlign:"center" }}><div style={{ fontSize:".62rem", color:"var(--text-3)", marginBottom:3 }}>Net to You</div><div style={{ fontFamily:"var(--font-mono)", fontSize:".82rem", fontWeight:700, color:"var(--gold)" }}>{formatCurrency(econ.lifetimeNet)}</div></div>
+                <div style={{ textAlign:"center" }}><div style={{ fontSize:".62rem", color:"var(--text-3)", marginBottom:3 }}>Collected</div><div style={{ fontFamily:"var(--font-mono)", fontSize:".82rem", fontWeight:700, color:"var(--text-0)" }}>{fmt(econ.lifetimeCollected)}</div></div>
+                <div style={{ textAlign:"center" }}><div style={{ fontSize:".62rem", color:"var(--text-3)", marginBottom:3 }}>Platform Fees</div><div style={{ fontFamily:"var(--font-mono)", fontSize:".82rem", fontWeight:700, color:"var(--red)" }}>{fmt(econ.lifetimePlatformFees)}</div></div>
+                <div style={{ textAlign:"center" }}><div style={{ fontSize:".62rem", color:"var(--text-3)", marginBottom:3 }}>Maint. Costs</div><div style={{ fontFamily:"var(--font-mono)", fontSize:".82rem", fontWeight:700, color:"var(--red)" }}>{fmt(econ.lifetimeMaintCost)}</div></div>
+                <div style={{ textAlign:"center" }}><div style={{ fontSize:".62rem", color:"var(--text-3)", marginBottom:3 }}>Net to You</div><div style={{ fontFamily:"var(--font-mono)", fontSize:".82rem", fontWeight:700, color:"var(--gold)" }}>{fmt(econ.lifetimeNet)}</div></div>
               </div>
             </div>
           )}

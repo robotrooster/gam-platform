@@ -34,6 +34,21 @@ import { InventoryPage } from './pages/InventoryPage'
 import { ShelfLabelPage } from './pages/ShelfLabelPage'
 import './styles/globals.css'
 
+class ErrorBoundary extends React.Component<{children: React.ReactNode}, {error: Error | null}> {
+  constructor(props: any) { super(props); this.state = { error: null } }
+  static getDerivedStateFromError(error: Error) { return { error } }
+  render() {
+    if (this.state.error) return (
+      <div style={{padding:40,textAlign:'center'}}>
+        <div style={{fontSize:'1.1rem',fontWeight:600,color:'var(--red)',marginBottom:8}}>Something went wrong</div>
+        <div style={{fontSize:'.82rem',color:'var(--text-3)',marginBottom:16,fontFamily:'monospace'}}>{this.state.error.message}</div>
+        <button className="btn btn-primary" onClick={()=>this.setState({error:null})}>Try again</button>
+      </div>
+    )
+    return this.props.children
+  }
+}
+
 function RoleRedirect() {
   const { user } = useAuth()
   if (!user) return <Navigate to="/login" replace />
@@ -42,7 +57,7 @@ function RoleRedirect() {
   return <Navigate to="/dashboard" replace />
 }
 
-const qc = new QueryClient({ defaultOptions: { queries: { retry: 1, staleTime: 30000 } } })
+const qc = new QueryClient({ defaultOptions: { queries: { retry: 1, staleTime: 300000, refetchOnWindowFocus: false, refetchOnMount: false } } })
 
 function PrivateRoute({ children }: { children: React.ReactNode }) {
   const { token, loading } = useAuth()
@@ -59,7 +74,7 @@ export default function App() {
             <Route path="/login"    element={<LoginPage />} />
             <Route path="/register" element={<RegisterPage />} />
             <Route path="/shelf/:id" element={<ShelfLabelPage />} />
-            <Route path="/" element={<PrivateRoute><Layout /></PrivateRoute>}>
+            <Route path="/" element={<PrivateRoute><ErrorBoundary><Layout /></ErrorBoundary></PrivateRoute>}>
               <Route index element={<RoleRedirect />} />
               <Route path="dashboard"      element={<DashboardPage />} />
               <Route path="onboarding"     element={<OnboardingPage />} />
@@ -78,6 +93,9 @@ export default function App() {
               <Route path="settings"         element={<SettingsPage />} />
               <Route path="maint-portal"    element={<MaintenancePortalPage />} />
               <Route path="sign/:token"    element={<SignPage />} />
+              <Route path="payments"       element={<PaymentsPage />} />
+              <Route path="disbursements"  element={<DisbursementsPage />} />
+              <Route path="maintenance"    element={<MaintenancePage />} />
               <Route path="reports"        element={<ReportsPage />} />
               <Route path="team"           element={<TeamPage />} />
               <Route path="work-trade"     element={<WorkTradePage />} />

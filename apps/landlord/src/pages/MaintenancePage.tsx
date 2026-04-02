@@ -1,11 +1,11 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
-import { formatCurrency } from '@gam/shared'
 import {
   Wrench, Plus, X, Check, Clock, AlertTriangle, MessageSquare,
   User, Calendar, DollarSign, ChevronDown, ChevronUp, Send, Lock
 } from 'lucide-react'
+const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
 const PRI_COLORS: Record<string,string> = { emergency:'badge-red', high:'badge-amber', normal:'badge-blue', low:'badge-muted' }
 const ST_COLORS: Record<string,string>  = { open:'badge-amber', assigned:'badge-blue', in_progress:'badge-blue', completed:'badge-green', cancelled:'badge-muted' }
@@ -126,7 +126,7 @@ function RequestDetailModal({ request: r, onClose }: { request: any; onClose: ()
             {/* Cost */}
             <div style={{ marginBottom: 10 }}>
               <label style={{ fontSize: '.68rem', color: 'var(--text-3)', display: 'block', marginBottom: 3 }}>
-                Actual Cost {req.actual_cost && <span style={{ color: 'var(--gold)' }}>→ Platform fee: {formatCurrency(req.actual_cost * 0.08)}</span>}
+                Actual Cost {req.actual_cost && <span style={{ color: 'var(--gold)' }}>→ Platform fee: {fmt(req.actual_cost * 0.08)}</span>}
               </label>
               <div style={{ display: 'flex', gap: 6 }}>
                 <div style={{ position: 'relative', flex: 1 }}>
@@ -270,7 +270,7 @@ export function MaintenancePage() {
             { label: 'Assigned',    val: (stats as any).assigned_count,    color: 'var(--blue)' },
             { label: 'In Progress', val: (stats as any).in_progress_count, color: 'var(--blue)' },
             { label: 'Completed',   val: (stats as any).completed_count,   color: 'var(--green)' },
-            { label: 'Total Cost',  val: formatCurrency((stats as any).total_cost), color: 'var(--text-0)' },
+            { label: 'Total Cost',  val: fmt((stats as any).total_cost), color: 'var(--text-0)' },
           ].map(s => (
             <div key={s.label} className="card" style={{ padding: '12px 14px' }}>
               <div style={{ fontSize: '.62rem', fontWeight: 700, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.08em', marginBottom: 5 }}>{s.label}</div>
@@ -333,7 +333,7 @@ export function MaintenancePage() {
                   <td><span className={`badge ${ST_COLORS[r.status]}`}>{r.status?.replace('_',' ')}</span></td>
                   <td style={{ fontSize: '.75rem' }}>{r.assigned_first ? `${r.assigned_first} ${r.assigned_last}` : <span style={{ color: 'var(--text-3)' }}>—</span>}</td>
                   <td className="mono" style={{ fontSize: '.72rem' }}>{r.scheduled_at ? new Date(r.scheduled_at).toLocaleDateString() : <span style={{ color: 'var(--text-3)' }}>—</span>}</td>
-                  <td className="mono">{r.actual_cost ? formatCurrency(r.actual_cost) : <span style={{ color: 'var(--text-3)' }}>—</span>}</td>
+                  <td className="mono">{r.actual_cost ? fmt(r.actual_cost) : <span style={{ color: 'var(--text-3)' }}>—</span>}</td>
                   <td onClick={e => e.stopPropagation()}>
                     <button className="btn btn-ghost btn-sm" onClick={() => setSelectedRequest(r)}>View</button>
                   </td>

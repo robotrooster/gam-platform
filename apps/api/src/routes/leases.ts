@@ -36,6 +36,7 @@ leasesRouter.post('/', requireLandlord, async (req, res, next) => {
       INSERT INTO leases (unit_id,tenant_id,landlord_id,start_date,end_date,rent_amount,security_deposit)
       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
       [body.unitId,body.tenantId,req.user!.profileId,body.startDate,body.endDate,body.rentAmount,body.securityDeposit])
+    await query('UPDATE units SET status=$1, tenant_id=$2 WHERE id=$3', ['active', body.tenantId, body.unitId])
     res.status(201).json({ success: true, data: lease })
   } catch (e) { next(e) }
 })
@@ -75,4 +76,26 @@ leasesRouter.post('/:id/renewal-intent', requireAuth, async (req, res, next) => 
 
     res.json({ success: true })
   } catch(e) { next(e) }
+})
+
+// PATCH /api/leases/:id — update lease status
+leasesRouter.patch('/:id', requireLandlord, async (req, res, next) => {
+  try {
+    const { status } = req.body
+    if (!['active','expired','terminated','month_to_month'].includes(status))
+      throw new AppError(400, 'Invalid status')
+
+    const lease = await queryOne<any>('SELECT * FROM leases WHERE id=$1', [req.params.id])
+    if (!lease) throw new AppError(404, 'Lease not found')
+
+    await query('UPDATE leases SET status=$1 WHERE id=$2', [status, lease.id])
+
+    // If lease ends, vacate the unit
+    if (status === 'expired' || status === 'terminated') {
+      await query('UPDATE units SET status=$1, tenant_id=NULL WHERE id=$2',
+        ['vacant', lease.unit_id])
+    }
+
+    res.json({ success: true })
+  } catch (e) { next(e) }
 })

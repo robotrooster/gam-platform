@@ -1,9 +1,12 @@
+import { useState } from 'react'
 import { useQuery } from 'react-query'
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
 import { apiGet } from '../lib/api'
+import { useNavigate } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
-import { formatCurrency, PLATFORM_FEES } from '@gam/shared'
 import { AlertTriangle, CheckCircle, TrendingUp, ArrowDownToLine, Clock } from 'lucide-react'
+const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
+const PLATFORM_FEES = { ACTIVE_UNIT: 15 }
 
 interface DashStats {
   active_units: number
@@ -29,11 +32,13 @@ const unitStatusBadge = (s: string) => {
 
 export function DashboardPage() {
   const { user } = useAuth()
+  const navigate = useNavigate()
+  const [showFeeModal, setShowFeeModal] = useState(false)
 
   const { data: stats, isLoading } = useQuery<DashStats>(
     'dashboard',
     () => apiGet('/landlords/me/dashboard'),
-    { refetchInterval: 60000 }
+    { staleTime: Infinity }
   )
 
   const { data: units } = useQuery(
@@ -50,10 +55,17 @@ export function DashboardPage() {
 
   const totalUnits = (stats?.active_units || 0) + (stats?.direct_pay_units || 0) + (stats?.vacant_units || 0)
 
-  // Real monthly trend data from API
-  const trendData = (stats as any)?.trend?.length > 0
-    ? (stats as any).trend
-    : [{ month: 'Now', revenue: stats?.monthly_rent_volume || 0 }]
+  // Pad trend to always show 6 months
+  const trendData = (() => {
+    const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
+    const now = new Date()
+    const slots = Array.from({length:6}, (_,i) => {
+      const d = new Date(now.getFullYear(), now.getMonth() - 5 + i, 1)
+      return months[d.getMonth()]
+    })
+    const apiTrend: any[] = (stats as any)?.trend || []
+    return slots.map(m => ({ month: m, revenue: apiTrend.find((r:any) => r.month === m)?.revenue || 0 }))
+  })()
 
   if (isLoading) return (
     <div>
@@ -66,69 +78,59 @@ export function DashboardPage() {
 
   return (
     <div>
-      <div className="page-header">
-        <div>
-          <h1 className="page-title">Dashboard</h1>
-          <p className="page-subtitle">Welcome back, {user?.firstName}. {totalUnits} units across {stats?.property_count} properties.</p>
-        </div>
-      </div>
-
       {/* Alerts */}
       {(stats?.eviction_mode_units || 0) > 0 && (
-        <div className="alert alert-danger">
+        <div className="alert alert-danger" style={{cursor:'pointer'}} onClick={()=>navigate('/units?status=eviction')}>
           <AlertTriangle size={16} />
           <div>
             <strong>{stats!.eviction_mode_units} unit(s) in Eviction Mode</strong> — All tenant ACH hard blocked per A.R.S. § 33-1371. No rent will be collected. Disbursement held.
           </div>
+          <span style={{marginLeft:'auto',fontSize:'.78rem',fontWeight:600}}>View →</span>
         </div>
       )}
       {(stats?.delinquent_units || 0) > 0 && (
-        <div className="alert alert-warn">
+        <div className="alert alert-warn" style={{cursor:'pointer'}} onClick={()=>navigate('/units?status=delinquent')}>
           <Clock size={16} />
           <strong>{stats!.delinquent_units} delinquent unit(s)</strong> — In cure window. Late fees accruing.
-        </div>
-      )}
-      {(stats?.eviction_mode_units || 0) === 0 && (stats?.delinquent_units || 0) === 0 && (
-        <div className="alert alert-success">
-          <CheckCircle size={16} />
-          <strong>All clear.</strong> No delinquencies. On-Time Pay SLA active.
+          <span style={{marginLeft:'auto',fontSize:'.78rem',fontWeight:600}}>View →</span>
         </div>
       )}
 
+
       {/* KPI Grid */}
-      <div className="kpi-grid">
-        <div className="kpi-card">
+      <div className="kpi-grid" style={{gridTemplateColumns:"repeat(3, 1fr)"}}>
+        <div className="kpi-card" style={{cursor:'pointer'}} onClick={()=>navigate('/units')}>
           <div className="kpi-label">Active Units</div>
           <div className="kpi-value green">{stats?.active_units || 0}</div>
           <div className="kpi-sub">{stats?.direct_pay_units || 0} direct pay · {stats?.vacant_units || 0} vacant</div>
         </div>
         <div className="kpi-card">
           <div className="kpi-label">Monthly Rent Volume</div>
-          <div className="kpi-value gold">{formatCurrency(stats?.monthly_rent_volume || 0)}</div>
+          <div className="kpi-value gold">{fmt(stats?.monthly_rent_volume || 0)}</div>
           <div className="kpi-sub">across {stats?.active_units || 0} occupied units</div>
         </div>
-        <div className="kpi-card">
+        <div className="kpi-card" style={{cursor:'pointer'}} onClick={()=>navigate('/maintenance')}>
           <div className="kpi-label">Maintenance</div>
           <div className="kpi-value" style={{fontSize:'1.4rem'}}>{(stats as any)?.maintenance?.open_requests||0} open</div>
           <div className="kpi-sub">{(stats as any)?.maintenance?.in_progress||0} in progress · {(stats as any)?.maintenance?.completed_30d||0} done this month</div>
         </div>
-        <div className="kpi-card">
+        <div className="kpi-card" style={{cursor:'pointer'}} onClick={()=>navigate('/background')}>
           <div className="kpi-label">Applications</div>
           <div className="kpi-value" style={{fontSize:'1.4rem',color:(stats as any)?.bg_pending>0?'var(--amber)':'var(--green)'}}>{(stats as any)?.bg_pending||0}</div>
           <div className="kpi-sub">{(stats as any)?.bg_pending>0?'pending review':'no pending applications'}</div>
         </div>
         <div className="kpi-card">
           <div className="kpi-label">Next Disbursement</div>
-          <div className="kpi-value" style={{fontSize:'1.4rem'}}>{formatCurrency(stats?.upcoming_disbursement?.amount || 0)}</div>
+          <div className="kpi-value" style={{fontSize:'1.4rem'}}>{fmt(stats?.upcoming_disbursement?.amount || 0)}</div>
           <div className="kpi-sub flex items-center gap-8">
             <span className="status-dot dot-green" />
             On-Time Pay SLA — 1st of month
           </div>
         </div>
-        <div className="kpi-card">
+        <div className="kpi-card" style={{cursor:'pointer'}} onClick={()=>setShowFeeModal(true)}>
           <div className="kpi-label">Platform Fee / Mo</div>
-          <div className="kpi-value">{formatCurrency((stats?.active_units || 0) * PLATFORM_FEES.ACTIVE_UNIT)}</div>
-          <div className="kpi-sub">${PLATFORM_FEES.ACTIVE_UNIT}/unit · {(stats?.direct_pay_units || 0)} × $5 direct pay</div>
+          <div className="kpi-value">{fmt(((stats?.otp_units||0) * 15) + (Math.max(0,(stats?.active_units||0)-(stats?.otp_units||0)) * 5))}</div>
+          <div className="kpi-sub">{stats?.otp_units||0} OTP × $15 · {Math.max(0,(stats?.active_units||0)-(stats?.otp_units||0))} direct × $5</div>
         </div>
       </div>
 
@@ -136,25 +138,31 @@ export function DashboardPage() {
       <div className="card" style={{marginBottom:20,background:'rgba(201,162,39,.04)',border:'1px solid rgba(201,162,39,.2)'}}>
         <div className="card-header">
           <span className="card-title">⚡ On-Time Pay Pipeline</span>
-          <span style={{fontSize:'.72rem',color:'var(--text-3)'}}>28th disbursement cycle</span>
         </div>
-        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:20}}>
+        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr 1fr',gap:20}}>
           <div>
-            <div className="kpi-label">OTP-Qualified Units</div>
+            <div className="kpi-label">Qualified Units</div>
             <div className="kpi-value" style={{color:'var(--gold)',fontSize:'1.8rem'}}>{stats?.otp_units || 0}</div>
             <div className="kpi-sub">of {stats?.active_units || 0} active units</div>
           </div>
           <div>
-            <div className="kpi-label">Projected Disbursement</div>
-            <div className="kpi-value" style={{color:'var(--green)',fontSize:'1.8rem'}}>{formatCurrency(stats?.projected_otp_disbursement || 0)}</div>
-            <div className="kpi-sub">rent volume eligible for OTP</div>
+            <div className="kpi-label">Unit Qualification Rate</div>
+            <div className="kpi-value" style={{color:'var(--gold)',fontSize:'1.8rem'}}>
+              {stats?.active_units ? Math.round(((stats?.otp_units || 0) / stats.active_units) * 100) : 0}%
+            </div>
+            <div className="kpi-sub">of occupied portfolio</div>
           </div>
           <div>
-            <div className="kpi-label">Next OTP Run</div>
-            <div className="kpi-value" style={{fontSize:'1.2rem',marginTop:4}}>
-              {(() => { const d = new Date(); d.setMonth(d.getMonth() + (d.getDate() >= 28 ? 1 : 0)); d.setDate(28); return d.toLocaleDateString('en-US',{month:'short',day:'numeric'}); })()}
+            <div className="kpi-label">Projected Disbursement</div>
+            <div className="kpi-value" style={{color:'var(--green)',fontSize:'1.8rem'}}>{fmt(stats?.projected_otp_disbursement || 0)}</div>
+            <div className="kpi-sub">guaranteed to landlord</div>
+          </div>
+          <div>
+            <div className="kpi-label">% of Rent Volume</div>
+            <div className="kpi-value" style={{color:'var(--green)',fontSize:'1.8rem'}}>
+              {stats?.monthly_rent_volume ? Math.round(((stats?.projected_otp_disbursement || 0) / stats.monthly_rent_volume) * 100) : 0}%
             </div>
-            <div className="kpi-sub">28th of month · ACH batch</div>
+            <div className="kpi-sub">of total monthly income</div>
           </div>
         </div>
       </div>
@@ -178,7 +186,7 @@ export function DashboardPage() {
                 tickFormatter={v => `$${(v/1000).toFixed(0)}k`} />
               <Tooltip
                 contentStyle={{background:'var(--bg-3)',border:'1px solid var(--border-2)',borderRadius:8,color:'var(--text-0)'}}
-                formatter={(v: any) => [formatCurrency(v), 'Rent Volume']}
+                formatter={(v: any) => [fmt(v), 'Rent Volume']}
               />
               <Area type="monotone" dataKey="revenue" stroke="#c9a227" strokeWidth={2}
                 fill="url(#gold-grad)" />
@@ -201,7 +209,7 @@ export function DashboardPage() {
                 {disbursements.map((d: any) => (
                   <tr key={d.id}>
                     <td className="mono">{new Date(d.target_date).toLocaleDateString()}</td>
-                    <td className="mono" style={{color:'var(--green)'}}>{formatCurrency(d.amount)}</td>
+                    <td className="mono" style={{color:'var(--green)'}}>{fmt(d.amount)}</td>
                     <td className="mono">{d.unit_count}</td>
                     <td><span className={`badge ${d.status === 'settled' ? 'badge-green' : d.status === 'pending' ? 'badge-amber' : 'badge-red'}`}>{d.status}</span></td>
                     <td><span className={`badge ${d.from_reserve ? 'badge-gold' : 'badge-muted'}`}>{d.from_reserve ? 'Reserve' : 'Collected'}</span></td>
@@ -234,7 +242,7 @@ export function DashboardPage() {
                   <td style={{color: u.tenant_first ? 'var(--text-1)' : 'var(--text-3)'}}>
                     {u.tenant_first ? `${u.tenant_first} ${u.tenant_last}` : '—'}
                   </td>
-                  <td className="mono">{formatCurrency(u.rent_amount)}</td>
+                  <td className="mono">{fmt(u.rent_amount)}</td>
                   <td><span className={`badge ${unitStatusBadge(u.status)}`}>{u.status.replace('_',' ')}</span></td>
                   <td>
                     {u.on_time_pay_active
@@ -249,6 +257,53 @@ export function DashboardPage() {
           </table>
         </div>
       </div>
+
+      {showFeeModal && (
+        <div className="modal-overlay" onClick={()=>setShowFeeModal(false)}>
+          <div className="modal" style={{maxWidth:480}} onClick={e=>e.stopPropagation()}>
+            <div className="modal-header">
+              <span className="modal-title">Platform Fee Breakdown</span>
+              <button className="btn btn-ghost btn-sm" onClick={()=>setShowFeeModal(false)}>✕</button>
+            </div>
+            <div style={{padding:'0 24px 24px'}}>
+              <table className="data-table" style={{marginTop:8}}>
+                <thead>
+                  <tr><th>Tier</th><th>Units</th><th>Rate</th><th>Subtotal</th></tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>OTP Enrolled</td>
+                    <td className="mono">{stats?.otp_units || 0}</td>
+                    <td className="mono">$15/unit</td>
+                    <td className="mono" style={{color:'var(--green)'}}>{fmt((stats?.otp_units || 0) * 15)}</td>
+                  </tr>
+                  <tr>
+                    <td>Direct Pay</td>
+                    <td className="mono">{Math.max(0,(stats?.active_units||0)-(stats?.otp_units||0))}</td>
+                    <td className="mono">$5/unit</td>
+                    <td className="mono" style={{color:'var(--green)'}}>{fmt(Math.max(0,(stats?.active_units||0)-(stats?.otp_units||0)) * 5)}</td>
+                  </tr>
+                  <tr>
+                    <td>Vacant</td>
+                    <td className="mono">{stats?.vacant_units || 0}</td>
+                    <td className="mono">$0/unit</td>
+                    <td className="mono" style={{color:'var(--text-3)'}}>—</td>
+                  </tr>
+                </tbody>
+                <tfoot>
+                  <tr style={{borderTop:'1px solid var(--border-2)'}}>
+                    <td colSpan={3} style={{fontWeight:600}}>Total Monthly Fee</td>
+                    <td className="mono" style={{fontWeight:600,color:'var(--gold)'}}>{fmt(((stats?.otp_units||0) * 15) + (Math.max(0,(stats?.active_units||0)-(stats?.otp_units||0)) * 5))}</td>
+                  </tr>
+                </tfoot>
+              </table>
+              <div style={{marginTop:16,fontSize:'.78rem',color:'var(--text-3)'}}>
+                Billed on the 1st · OTP tier unlocks guaranteed 28th disbursement
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

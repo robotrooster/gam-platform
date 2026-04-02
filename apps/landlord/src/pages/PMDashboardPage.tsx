@@ -1,8 +1,8 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost } from '../lib/api'
-import { formatCurrency } from '@gam/shared'
 import { Building2, Users, DollarSign, TrendingUp, Plus, X, Check, Copy, ExternalLink } from 'lucide-react'
+const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
 function SetupModal({ onClose }: { onClose: () => void }) {
   const qc = useQueryClient()
@@ -287,7 +287,7 @@ export function PMDashboardPage() {
           { label:'Total Units',    val: summary.totalUnits,                           color:'var(--text-0)' },
           { label:'Occupied',       val: `${summary.totalOccupied} / ${summary.totalUnits}`, color:'var(--green)' },
           { label:'Occupancy',      val: `${summary.occupancyRate}%`,                  color: summary.occupancyRate >= 80 ? 'var(--green)' : 'var(--amber)' },
-          { label:'PM Revenue/mo',  val: formatCurrency(summary.totalPMRevenue),       color:'var(--gold)' },
+          { label:'PM Revenue/mo',  val: fmt(summary.totalPMRevenue),       color:'var(--gold)' },
         ].map(s => (
           <div key={s.label} className="card" style={{ padding:'14px 16px' }}>
             <div style={{ fontSize:'.62rem', fontWeight:700, color:'var(--text-3)', textTransform:'uppercase' as const, letterSpacing:'.08em', marginBottom:6 }}>{s.label}</div>
@@ -327,8 +327,8 @@ export function PMDashboardPage() {
                       <span style={{ fontSize:'.72rem', color: occ >= 80 ? 'var(--green)' : 'var(--amber)', minWidth:30 }}>{occ}%</span>
                     </div>
                   </td>
-                  <td className="mono">{formatCurrency(l.collected_rent)}</td>
-                  <td className="mono" style={{ color:'var(--text-3)' }}>{formatCurrency(l.max_rent)}</td>
+                  <td className="mono">{fmt(l.collected_rent)}</td>
+                  <td className="mono" style={{ color:'var(--text-3)' }}>{fmt(l.max_rent)}</td>
                   <td style={{ fontSize:'.75rem' }}>
                     {l.plan_name ? (
                       <div>
@@ -341,7 +341,7 @@ export function PMDashboardPage() {
                       </div>
                     ) : '—'}
                   </td>
-                  <td className="mono" style={{ color:'var(--gold)', fontWeight:700 }}>{formatCurrency(l.pmFee)}</td>
+                  <td className="mono" style={{ color:'var(--gold)', fontWeight:700 }}>{fmt(l.pmFee)}</td>
                 </tr>
               )
             })}

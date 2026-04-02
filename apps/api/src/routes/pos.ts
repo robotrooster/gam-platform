@@ -458,3 +458,124 @@ posRouter.patch('/items/:id/variants/:variantId', requireLandlord, async (req, r
     res.json({ success: true, data: updated })
   } catch (e) { next(e) }
 })
+
+// ── TAX RATES ─────────────────────────────────────────────────
+
+posRouter.get('/tax-rates', requireLandlord, async (req, res, next) => {
+  try {
+    const rates = await query<any>('SELECT * FROM pos_tax_rates WHERE landlord_id=$1 ORDER BY tax_type, name', [req.user!.profileId])
+    res.json({ success: true, data: rates })
+  } catch (e) { next(e) }
+})
+
+posRouter.post('/tax-rates', requireLandlord, async (req, res, next) => {
+  try {
+    const { name, rate, taxType, appliesTo } = req.body
+    const r = await queryOne<any>(`INSERT INTO pos_tax_rates (landlord_id,name,rate,tax_type,applies_to)
+      VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+      [req.user!.profileId, name, rate, taxType, appliesTo||['all']])
+    res.status(201).json({ success: true, data: r })
+  } catch (e) { next(e) }
+})
+
+posRouter.patch('/tax-rates/:id', requireLandlord, async (req, res, next) => {
+  try {
+    const { name, rate, taxType, appliesTo, isActive } = req.body
+    const r = await queryOne<any>(`UPDATE pos_tax_rates SET
+      name=COALESCE($1,name), rate=COALESCE($2,rate), tax_type=COALESCE($3,tax_type),
+      applies_to=COALESCE($4,applies_to), is_active=COALESCE($5,is_active)
+      WHERE id=$6 AND landlord_id=$7 RETURNING *`,
+      [name, rate, taxType, appliesTo, isActive, req.params.id, req.user!.profileId])
+    res.json({ success: true, data: r })
+  } catch (e) { next(e) }
+})
+
+posRouter.delete('/tax-rates/:id', requireLandlord, async (req, res, next) => {
+  try {
+    await query('UPDATE pos_tax_rates SET is_active=FALSE WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
+    res.json({ success: true })
+  } catch (e) { next(e) }
+})
+
+// ── DISCOUNTS ─────────────────────────────────────────────────
+
+posRouter.get('/discounts', requireLandlord, async (req, res, next) => {
+  try {
+    const discounts = await query<any>('SELECT * FROM pos_discounts WHERE landlord_id=$1 AND is_active=TRUE ORDER BY name', [req.user!.profileId])
+    res.json({ success: true, data: discounts })
+  } catch (e) { next(e) }
+})
+
+posRouter.post('/discounts', requireLandlord, async (req, res, next) => {
+  try {
+    const { name, type, value, code } = req.body
+    const d = await queryOne<any>(`INSERT INTO pos_discounts (landlord_id,name,type,value,code)
+      VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+      [req.user!.profileId, name, type, value, code||null])
+    res.status(201).json({ success: true, data: d })
+  } catch (e) { next(e) }
+})
+
+posRouter.patch('/discounts/:id', requireLandlord, async (req, res, next) => {
+  try {
+    const { name, type, value, code, isActive } = req.body
+    const d = await queryOne<any>(`UPDATE pos_discounts SET
+      name=COALESCE($1,name), type=COALESCE($2,type), value=COALESCE($3,value),
+      code=COALESCE($4,code), is_active=COALESCE($5,is_active)
+      WHERE id=$6 AND landlord_id=$7 RETURNING *`,
+      [name, type, value, code, isActive, req.params.id, req.user!.profileId])
+    res.json({ success: true, data: d })
+  } catch (e) { next(e) }
+})
+
+// ── REFUNDS ───────────────────────────────────────────────────
+
+posRouter.post('/transactions/:id/refund', requireLandlord, async (req, res, next) => {
+  try {
+    const { amount, reason, items, refundMethod } = req.body
+    const tx = await queryOne<any>('SELECT * FROM pos_transactions WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
+    if (!tx) throw new AppError(404, 'Transaction not found')
+    if (tx.status === 'voided') throw new AppError(400, 'Cannot refund a voided transaction')
+
+    const refundAmt = amount ?? tx.total
+    const isFullRefund = refundAmt >= tx.total
+
+    await query(`INSERT INTO pos_refunds (transaction_id,landlord_id,amount,reason,items,refund_method)
+      VALUES ($1,$2,$3,$4,$5,$6)`,
+      [tx.id, req.user!.profileId, refundAmt, reason||null, items ? JSON.stringify(items) : null, refundMethod||tx.payment_method])
+
+    await query(`UPDATE pos_transactions SET
+      status=$1, refund_amount=$2, refunded_at=NOW() WHERE id=$3`,
+      [isFullRefund ? 'refunded' : 'partial_refund', refundAmt, tx.id])
+
+    res.json({ success: true, data: { refundAmount: refundAmt } })
+  } catch (e) { next(e) }
+})
+
+posRouter.post('/transactions/:id/void', requireLandlord, async (req, res, next) => {
+  try {
+    const { reason } = req.body
+    const tx = await queryOne<any>('SELECT * FROM pos_transactions WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
+    if (!tx) throw new AppError(404, 'Transaction not found')
+    if (tx.status !== 'completed') throw new AppError(400, 'Only completed transactions can be voided')
+    await query('UPDATE pos_transactions SET status=$1, void_reason=$2 WHERE id=$3',
+      ['voided', reason||null, tx.id])
+    res.json({ success: true })
+  } catch (e) { next(e) }
+})
+
+// GET /api/pos/transactions — full list with status
+posRouter.get('/transactions', requireLandlord, async (req, res, next) => {
+  try {
+    const txns = await query<any>(`
+      SELECT t.*,
+        u.first_name || ' ' || u.last_name AS tenant_name,
+        (SELECT COUNT(*) FROM pos_transaction_items WHERE transaction_id=t.id) as item_count
+      FROM pos_transactions t
+      LEFT JOIN tenants tn ON tn.id = t.tenant_id
+      LEFT JOIN users u ON u.id = tn.user_id
+      WHERE t.landlord_id=$1
+      ORDER BY t.created_at DESC LIMIT 100`, [req.user!.profileId])
+    res.json({ success: true, data: txns })
+  } catch (e) { next(e) }
+})

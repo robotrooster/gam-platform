@@ -1,8 +1,8 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from 'react-query'
 import { apiGet, apiPost } from '../lib/api'
-import { formatCurrency } from '@gam/shared'
 import { X, ArrowRight, DoorOpen, DollarSign, Calendar, Check, AlertTriangle } from 'lucide-react'
+const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
 interface Props {
   tenantId: string
@@ -69,18 +69,18 @@ export function TransferTenantModal({ tenantId, tenantName, currentUnit, onClose
               <div style={{ textAlign: 'center' }}>
                 <div style={{ fontSize: '.65rem', color: 'var(--text-3)', marginBottom: 3 }}>From</div>
                 <div style={{ fontFamily: 'var(--font-mono)', fontWeight: 700, color: 'var(--text-1)' }}>Unit {result.fromUnit}</div>
-                <div style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>{formatCurrency(result.oldRent)}/mo</div>
+                <div style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>{fmt(result.oldRent)}/mo</div>
               </div>
               <ArrowRight size={20} style={{ color: 'var(--gold)' }} />
               <div style={{ textAlign: 'center' }}>
                 <div style={{ fontSize: '.65rem', color: 'var(--text-3)', marginBottom: 3 }}>To</div>
                 <div style={{ fontFamily: 'var(--font-mono)', fontWeight: 700, color: 'var(--gold)' }}>Unit {result.toUnit}</div>
-                <div style={{ fontSize: '.72rem', color: 'var(--gold)' }}>{formatCurrency(result.newRent)}/mo</div>
+                <div style={{ fontSize: '.72rem', color: 'var(--gold)' }}>{fmt(result.newRent)}/mo</div>
               </div>
             </div>
             {result.proratedAmount && (
               <div style={{ marginTop: 10, padding: '8px 10px', background: 'rgba(201,162,39,.06)', border: '1px solid rgba(201,162,39,.2)', borderRadius: 8, fontSize: '.72rem', color: 'var(--gold)', textAlign: 'center' }}>
-                Prorated rent for remainder of month: {formatCurrency(result.proratedAmount)}
+                Prorated rent for remainder of month: {fmt(result.proratedAmount)}
               </div>
             )}
           </div>
@@ -104,7 +104,7 @@ export function TransferTenantModal({ tenantId, tenantName, currentUnit, onClose
           <DoorOpen size={14} style={{ color: 'var(--text-3)' }} />
           <div style={{ flex: 1 }}>
             <div style={{ fontSize: '.78rem', fontWeight: 600, color: 'var(--text-0)' }}>{tenantName}</div>
-            <div style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>Currently in Unit {currentUnit.unit_number} · {currentUnit.property_name} · {formatCurrency(currentUnit.rent_amount)}/mo</div>
+            <div style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>Currently in Unit {currentUnit.unit_number} · {currentUnit.property_name} · {fmt(currentUnit.rent_amount)}/mo</div>
           </div>
           <ArrowRight size={16} style={{ color: 'var(--gold)' }} />
         </div>
@@ -127,7 +127,7 @@ export function TransferTenantModal({ tenantId, tenantName, currentUnit, onClose
                     <div style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>{u.property_name} · {u.bedrooms}bd/{u.bathrooms}ba{u.sqft ? ` · ${u.sqft} sqft` : ''}</div>
                   </div>
                   <div style={{ textAlign: 'right' }}>
-                    <div style={{ fontFamily: 'var(--font-mono)', fontSize: '.82rem', color: 'var(--gold)', fontWeight: 600 }}>{formatCurrency(u.rent_amount)}/mo</div>
+                    <div style={{ fontFamily: 'var(--font-mono)', fontSize: '.82rem', color: 'var(--gold)', fontWeight: 600 }}>{fmt(u.rent_amount)}/mo</div>
                   </div>
                   {selectedUnit?.id === u.id && <Check size={14} style={{ color: 'var(--gold)', flexShrink: 0 }} />}
                 </div>
@@ -147,8 +147,8 @@ export function TransferTenantModal({ tenantId, tenantName, currentUnit, onClose
           </div>
           {rentChanged && (
             <div style={{ fontSize: '.7rem', color: 'var(--amber)', marginTop: 4 }}>
-              Rent changing from {formatCurrency(oldRent)} → {formatCurrency(newRentNum)}
-              {proratedAmount && ` · Prorated remainder: ${formatCurrency(proratedAmount)}`}
+              Rent changing from {fmt(oldRent)} → {fmt(newRentNum)}
+              {proratedAmount && ` · Prorated remainder: ${fmt(proratedAmount)}`}
             </div>
           )}
         </div>

@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
 import { Clock, CheckCircle, Package, ShoppingCart, Calendar, Wrench, Plus, User, AlertTriangle } from 'lucide-react'
-import { formatCurrency } from '@gam/shared'
+const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
 type Tab = 'shift'|'workorders'|'tasks'|'parts'|'purchases'|'scheduled'
 
@@ -211,7 +211,7 @@ export function MaintenancePortalPage() {
                       <td style={{ fontSize:'.78rem' }}>{p.location||'—'}</td>
                       <td><span style={{ fontWeight:700, color:p.quantity<=p.min_quantity?'var(--red)':'var(--green)' }}>{p.quantity} {p.unit}</span></td>
                       <td style={{ fontSize:'.78rem', color:'var(--text-3)' }}>{p.min_quantity}</td>
-                      <td className="mono" style={{ fontSize:'.78rem' }}>{p.cost ? formatCurrency(p.cost) : '—'}</td>
+                      <td className="mono" style={{ fontSize:'.78rem' }}>{p.cost ? fmt(p.cost) : '—'}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -260,7 +260,7 @@ export function MaintenancePortalPage() {
                       <tr key={p.id}>
                         <td><div style={{ fontWeight:600 }}>{p.requested_by_name}</div><div style={{ fontSize:'.7rem', color:'var(--text-3)' }}>{new Date(p.created_at).toLocaleDateString()}</div></td>
                         <td style={{ fontSize:'.78rem' }}>{items.map((i:any)=>i.name).join(', ')}</td>
-                        <td className="mono" style={{ fontSize:'.78rem' }}>{p.total_estimate ? formatCurrency(p.total_estimate) : '—'}</td>
+                        <td className="mono" style={{ fontSize:'.78rem' }}>{p.total_estimate ? fmt(p.total_estimate) : '—'}</td>
                         <td><span className={`badge ${p.status==='approved'?'badge-green':p.status==='denied'?'badge-red':p.status==='purchased'?'badge-blue':'badge-amber'}`}>{p.status}</span></td>
                         <td>
                           {p.status==='pending' && (
@@ -296,7 +296,7 @@ export function MaintenancePortalPage() {
                   <textarea className="input" rows={2} style={{ resize:'none', width:'100%' }} value={purchaseNotes} onChange={e=>setPurchaseNotes(e.target.value)}/>
                 </div>
                 <div style={{ padding:'10px 14px', background:'var(--bg-3)', borderRadius:8, marginBottom:12, fontSize:'.82rem' }}>
-                  Total estimate: <strong>{formatCurrency(purchaseItems.reduce((a,i)=>a+parseFloat(i.est||'0')*i.qty,0))}</strong>
+                  Total estimate: <strong>{fmt(purchaseItems.reduce((a,i)=>a+parseFloat(i.est||'0')*i.qty,0))}</strong>
                 </div>
                 <div className="modal-footer">
                   <button className="btn btn-ghost" onClick={()=>setShowPurchaseRequest(false)}>Cancel</button>

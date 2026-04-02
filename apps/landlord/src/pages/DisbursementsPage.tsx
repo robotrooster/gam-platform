@@ -1,8 +1,8 @@
 import { useState } from 'react'
 import { useQuery } from 'react-query'
 import { apiGet } from '../lib/api'
-import { formatCurrency } from '@gam/shared'
 import { ArrowDownToLine, X, CheckCircle, Clock, Shield } from 'lucide-react'
+const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
 export function DisbursementsPage() {
   const { data: disbs = [], isLoading } = useQuery<any[]>('disbursements', () => apiGet('/disbursements'))
@@ -28,12 +28,12 @@ export function DisbursementsPage() {
       <div className="kpi-grid" style={{ marginBottom: 24 }}>
         <div className="kpi-card">
           <div className="kpi-label">Total Disbursed</div>
-          <div className="kpi-value green">{formatCurrency(totalSettled)}</div>
+          <div className="kpi-value green">{fmt(totalSettled)}</div>
           <div className="kpi-sub">{(disbs as any[]).filter((d: any) => d.status === 'settled').length} settled payments</div>
         </div>
         <div className="kpi-card">
           <div className="kpi-label">Pending</div>
-          <div className="kpi-value amber">{formatCurrency(totalPending)}</div>
+          <div className="kpi-value amber">{fmt(totalPending)}</div>
           <div className="kpi-sub">{(disbs as any[]).filter((d: any) => d.status === 'pending').length} pending</div>
         </div>
         <div className="kpi-card">
@@ -56,7 +56,7 @@ export function DisbursementsPage() {
                 {(disbs as any[]).length ? (disbs as any[]).map((d: any) => (
                   <tr key={d.id} onClick={() => setSelected(d)} style={{ cursor: 'pointer' }}>
                     <td className="mono">{new Date(d.target_date).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}</td>
-                    <td className="mono" style={{ color: 'var(--green)', fontWeight: 700 }}>{formatCurrency(d.amount)}</td>
+                    <td className="mono" style={{ color: 'var(--green)', fontWeight: 700 }}>{fmt(d.amount)}</td>
                     <td className="mono">{d.unit_count}</td>
                     <td>
                       <span className={'badge ' + (d.status === 'settled' ? 'badge-green' : d.status === 'pending' ? 'badge-amber' : 'badge-red')}>
@@ -95,7 +95,7 @@ export function DisbursementsPage() {
             </div>
             <div style={{ background: 'var(--bg-3)', borderRadius: 10, padding: 16, marginBottom: 16, textAlign: 'center' }}>
               <div style={{ fontSize: '.75rem', color: 'var(--text-3)', marginBottom: 6, textTransform: 'uppercase', letterSpacing: '.06em' }}>Amount Disbursed</div>
-              <div style={{ fontFamily: 'var(--font-display)', fontSize: '2rem', fontWeight: 800, color: 'var(--green)' }}>{formatCurrency(selected.amount)}</div>
+              <div style={{ fontFamily: 'var(--font-display)', fontSize: '2rem', fontWeight: 800, color: 'var(--green)' }}>{fmt(selected.amount)}</div>
               <div style={{ fontSize: '.8rem', color: 'var(--text-3)', marginTop: 4 }}>
                 {new Date(selected.target_date).toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' })}
               </div>
@@ -110,7 +110,7 @@ export function DisbursementsPage() {
               </span>
             </div>
             {selected.from_reserve && (
-              <div className="data-row"><span className="data-key">Reserve amount</span><span className="data-val mono" style={{ color: 'var(--gold)' }}>{formatCurrency(selected.reserve_amount)}</span></div>
+              <div className="data-row"><span className="data-key">Reserve amount</span><span className="data-val mono" style={{ color: 'var(--gold)' }}>{fmt(selected.reserve_amount)}</span></div>
             )}
             <div className="data-row"><span className="data-key">Initiated</span><span className="data-val mono" style={{ fontSize: '.8rem' }}>{selected.initiated_at ? new Date(selected.initiated_at).toLocaleString() : '-'}</span></div>
             <div className="data-row"><span className="data-key">Settled</span><span className="data-val mono" style={{ fontSize: '.8rem' }}>{selected.settled_at ? new Date(selected.settled_at).toLocaleString() : 'Pending'}</span></div>

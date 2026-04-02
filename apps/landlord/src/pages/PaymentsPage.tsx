@@ -1,6 +1,6 @@
 import { useQuery } from 'react-query'
 import { apiGet } from '../lib/api'
-import { formatCurrency } from '@gam/shared'
+const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
 const STATUS_MAP: Record<string,string> = { settled:'badge-green', pending:'badge-amber', failed:'badge-red', returned:'badge-red', processing:'badge-blue' }
 
@@ -22,7 +22,7 @@ export function PaymentsPage() {
                   <td className="mono">{new Date(p.due_date).toLocaleDateString()}</td>
                   <td className="mono">{p.unit_number || '—'}</td>
                   <td><span className="badge badge-muted">{p.type}</span></td>
-                  <td className="mono" style={{color:'var(--text-0)'}}>{formatCurrency(p.amount)}</td>
+                  <td className="mono" style={{color:'var(--text-0)'}}>{fmt(p.amount)}</td>
                   <td><span className={`badge ${STATUS_MAP[p.status]||'badge-muted'}`}>{p.status}</span></td>
                   <td className="mono" style={{fontSize:'.72rem',color:'var(--text-3)'}}>{p.entry_description}</td>
                   <td>{p.return_code ? <span className={`badge ${p.zero_tolerance_flag?'badge-red':'badge-amber'}`}>{p.return_code}</span> : <span style={{color:'var(--text-3)'}}>—</span>}</td>

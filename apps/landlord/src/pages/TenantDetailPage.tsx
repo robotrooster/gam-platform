@@ -2,9 +2,9 @@ import { useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPatch, apiDelete } from '../lib/api'
-import { formatCurrency } from '@gam/shared'
 import { ArrowLeft, DoorOpen, Building2, CreditCard, Wrench, TrendingUp, Clock, CheckCircle, XCircle } from 'lucide-react'
 import { TransferTenantModal } from './TransferTenantModal'
+const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
 function FlexChargePanel({ tenantId, tenantName, chargeAccount, refetch, creditLimit, setCreditLimit, limitSaved, setLimitSaved, qc }: any) {
   const enableMut = useMutation(
@@ -162,7 +162,7 @@ export function TenantDetailPage() {
             {[
               { label: 'Tenant Since', val: stats.firstPayment ? new Date(stats.firstPayment).toLocaleDateString('en-US', { month: 'short', year: 'numeric' }) : '--', color: 'var(--text-0)' },
               { label: 'Months as Tenant', val: stats.tenantMonths + ' mo', color: 'var(--text-0)' },
-              { label: 'Total Paid', val: formatCurrency(stats.totalPaid), color: 'var(--gold)' },
+              { label: 'Total Paid', val: fmt(stats.totalPaid), color: 'var(--gold)' },
               { label: 'On-Time Rate', val: stats.onTimeRate + '%', color: onTimeColor, sub: onTimeLabel },
               { label: 'Units Occupied', val: stats.unitsOccupied, color: 'var(--text-0)' },
             ].map(s => (
@@ -205,7 +205,7 @@ export function TenantDetailPage() {
                 { label: 'Settled', val: stats.settledCount },
                 { label: 'Late', val: stats.lateCount },
                 { label: 'Failed', val: stats.failedCount },
-                { label: 'Avg Payment', val: formatCurrency(stats.avgPayment) },
+                { label: 'Avg Payment', val: fmt(stats.avgPayment) },
               ].map(row => (
                 <div key={row.label} className="data-row">
                   <span className="data-key">{row.label}</span>
@@ -229,7 +229,7 @@ export function TenantDetailPage() {
                     <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 1 }}>{u.property_name} - {u.street1}, {u.city}</div>
                   </div>
                   <div style={{ textAlign: 'right' }}>
-                    <div style={{ fontFamily: 'var(--font-mono)', fontSize: '.82rem', color: 'var(--gold)', fontWeight: 600 }}>{formatCurrency(u.rent_amount)}/mo</div>
+                    <div style={{ fontFamily: 'var(--font-mono)', fontSize: '.82rem', color: 'var(--gold)', fontWeight: 600 }}>{fmt(u.rent_amount)}/mo</div>
                     {u.start_date && <div style={{ fontSize: '.65rem', color: 'var(--text-3)', marginTop: 1 }}>{new Date(u.start_date).toLocaleDateString()} - {u.end_date ? new Date(u.end_date).toLocaleDateString() : 'Present'}</div>}
                   </div>
                   <button className="btn btn-ghost btn-sm" onClick={() => navigate('/units/' + u.id)}>View</button>
@@ -251,7 +251,7 @@ export function TenantDetailPage() {
                       <td className="mono" style={{ fontSize: '.72rem' }}>{new Date(p.due_date).toLocaleDateString()}</td>
                       <td style={{ fontSize: '.78rem' }}>{p.property_name}</td>
                       <td className="mono">{p.unit_number}</td>
-                      <td className="mono">{formatCurrency(p.amount)}</td>
+                      <td className="mono">{fmt(p.amount)}</td>
                       <td><span className={`badge ${p.status === 'settled' ? 'badge-green' : p.status === 'failed' ? 'badge-red' : 'badge-amber'}`}>{p.status}</span></td>
                     </tr>
                   ))}
@@ -275,7 +275,7 @@ export function TenantDetailPage() {
                       <td style={{ fontSize: '.78rem' }}>{m.title}</td>
                       <td><span className={`badge ${m.priority === 'emergency' ? 'badge-red' : m.priority === 'high' ? 'badge-amber' : 'badge-blue'}`}>{m.priority}</span></td>
                       <td><span className={`badge ${m.status === 'completed' ? 'badge-green' : 'badge-amber'}`}>{m.status?.replace('_', ' ')}</span></td>
-                      <td className="mono">{m.actual_cost ? formatCurrency(m.actual_cost) : '--'}</td>
+                      <td className="mono">{m.actual_cost ? fmt(m.actual_cost) : '--'}</td>
                     </tr>
                   ))}
                 </tbody>

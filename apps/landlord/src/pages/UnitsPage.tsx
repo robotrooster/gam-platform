@@ -3,8 +3,8 @@ import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useNavigate, Link } from 'react-router-dom'
 import { apiGet, apiPatch } from '../lib/api'
-import { formatCurrency, UnitStatus } from '@gam/shared'
 import { Plus, Search, AlertTriangle, Shield, DoorOpen } from 'lucide-react'
+const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
 const STATUS_COLORS: Record<string, string> = {
   active: 'badge-green', direct_pay: 'badge-blue',
@@ -84,11 +84,11 @@ export function UnitsPage() {
                         ? <><span style={{ color: 'var(--text-0)' }}>{u.tenant_first} {u.tenant_last}</span><br /><span style={{ color: 'var(--text-3)', fontSize: '.72rem' }}>{u.tenant_email}</span></>
                         : <span style={{ color: 'var(--text-3)' }}>Vacant</span>}
                     </td>
-                    <td className="mono">{formatCurrency(u.rent_amount)}</td>
+                    <td className="mono">{fmt(u.rent_amount)}</td>
                     <td onClick={e => e.stopPropagation()}>
                       <select value={u.status} onChange={e => setStatusMut.mutate({ id: u.id, status: e.target.value })}
                         style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '.75rem', color: 'inherit', padding: 0 }}>
-                        {Object.values(UnitStatus).map(s => <option key={s} value={s}>{s.replace('_', ' ')}</option>)}
+                        {['occupied','vacant','maintenance','eviction'].map(s => <option key={s} value={s}>{s.replace('_', ' ')}</option>)}
                       </select>
                       <span className={'badge ' + (STATUS_COLORS[u.status] || 'badge-muted')} style={{ marginLeft: 4 }}>{u.status.replace('_', ' ')}</span>
                     </td>

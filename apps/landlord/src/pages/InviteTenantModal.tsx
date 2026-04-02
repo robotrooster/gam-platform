@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from 'react-query'
 import { apiGet, apiPost } from '../lib/api'
 import { X, Mail, User, DoorOpen, Copy, Check, ChevronRight, ChevronLeft } from 'lucide-react'
-import { formatCurrency } from '@gam/shared'
+const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
 interface Props { onClose: () => void }
 
@@ -217,7 +217,7 @@ export function InviteTenantModal({ onClose }: Props) {
                       </div>
                     </div>
                     <div style={{ textAlign: 'right', flexShrink: 0 }}>
-                      <div style={{ fontFamily: 'var(--font-mono)', fontSize: '.85rem', color: 'var(--gold)', fontWeight: 600 }}>{formatCurrency(u.rent_amount)}</div>
+                      <div style={{ fontFamily: 'var(--font-mono)', fontSize: '.85rem', color: 'var(--gold)', fontWeight: 600 }}>{fmt(u.rent_amount)}</div>
                       <div style={{ fontSize: '.65rem', color: 'var(--text-3)' }}>/month</div>
                     </div>
                     {form.unitId === u.id && <Check size={16} style={{ color: 'var(--gold)', flexShrink: 0 }} />}
@@ -259,7 +259,7 @@ export function InviteTenantModal({ onClose }: Props) {
                       <div style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>{selectedUnit.property_name}</div>
                     </div>
                   </div>
-                  <div style={{ fontFamily: 'var(--font-mono)', fontSize: '.85rem', color: 'var(--gold)', fontWeight: 600 }}>{formatCurrency(selectedUnit.rent_amount)}/mo</div>
+                  <div style={{ fontFamily: 'var(--font-mono)', fontSize: '.85rem', color: 'var(--gold)', fontWeight: 600 }}>{fmt(selectedUnit.rent_amount)}/mo</div>
                 </div>
               )}
 

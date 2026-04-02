@@ -1,0 +1,32 @@
+{
+  "name": "@gam/pos",
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "vite --port 3005",
+    "build": "tsc && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@gam/shared": "*",
+    "@hookform/resolvers": "^3.3.4",
+    "@stripe/terminal-js": "^0.26.0",
+    "axios": "^1.6.5",
+    "clsx": "^2.1.0",
+    "date-fns": "^3.2.0",
+    "lucide-react": "^0.309.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-hook-form": "^7.49.2",
+    "react-query": "^3.39.3",
+    "react-router-dom": "^6.21.0",
+    "recharts": "^2.10.3",
+    "zod": "^3.22.4"
+  },
+  "devDependencies": {
+    "@types/react": "^18.2.47",
+    "@types/react-dom": "^18.2.18",
+    "@vitejs/plugin-react": "^4.2.1",
+    "typescript": "^5.3.3",
+    "vite": "^5.0.11"
+  }
+}
