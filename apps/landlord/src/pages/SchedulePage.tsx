@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
 
@@ -23,8 +23,8 @@ const STATUS_COLORS: Record<string,string> = {
 
 function getDaysInRange(from: string, to: string) {
   const days = []
-  const cur = new Date(from)
-  const end = new Date(to)
+  const cur = new Date(from + 'T12:00:00')
+  const end = new Date(to + 'T12:00:00')
   while (cur <= end) {
     days.push(cur.toISOString().split('T')[0])
     cur.setDate(cur.getDate() + 1)
@@ -33,7 +33,7 @@ function getDaysInRange(from: string, to: string) {
 }
 
 function addDays(dateStr: string, days: number) {
-  const d = new Date(dateStr)
+  const d = new Date(dateStr + 'T12:00:00')
   d.setDate(d.getDate() + days)
   return d.toISOString().split('T')[0]
 }
@@ -43,12 +43,61 @@ export function SchedulePage() {
   const today = new Date().toISOString().split('T')[0]
   const [view, setView] = useState<'timeline'|'list'|'units'>('timeline')
   const [fromDate, setFromDate] = useState(today)
-  const [toDate, setToDate] = useState(addDays(today, 30))
+  const [toDate, setToDate] = useState(addDays(today, 90))
   const [filterType, setFilterType] = useState('all')
-  const [bookingModal, setBookingModal] = useState<{show:boolean; unit:any}>({show:false, unit:null})
+  const [bookingModal, setBookingModal] = useState<{show:boolean; unit:any; prefillDate?:string}>({show:false, unit:null})
   const [typeModal, setTypeModal] = useState<{show:boolean; unit:any}>({show:false, unit:null})
   const [newBooking, setNewBooking] = useState({ guestName:'', guestEmail:'', guestPhone:'', leaseType:'nightly', checkIn:'', checkOut:'', totalAmount:'', notes:'' })
   const [typeForm, setTypeForm] = useState<any>({})
+  const [unitPickerOpen, setUnitPickerOpen] = useState(false)
+  const [selectedCell, setSelectedCell] = useState<{unitId:string; date:string}|null>(null)
+  const scrollContainerRef = useRef<HTMLDivElement>(null)
+  const theadRef = useRef<HTMLTableSectionElement>(null)
+  const legendRef = useRef<HTMLDivElement>(null)
+
+
+  useEffect(() => {
+    if (!selectedCell || !scrollContainerRef.current) return
+    const container = scrollContainerRef.current
+    const cell = container.querySelector(
+      `[data-unit="${selectedCell.unitId}"][data-date="${selectedCell.date}"]`
+    ) as HTMLElement
+    if (!cell) return
+    const row = cell.closest('tr') as HTMLElement
+    if (!row) return
+
+    const headerHeight = container.querySelector('thead')?.offsetHeight || 36
+    const rowTop = row.offsetTop
+    const rowBottom = rowTop + row.offsetHeight
+    const visibleTop = container.scrollTop + headerHeight
+    const visibleBottom = container.scrollTop + container.clientHeight
+
+    // Snap vertically — full row always visible
+    if (rowTop < visibleTop) {
+      container.scrollTop = rowTop - headerHeight
+    } else if (rowBottom > visibleBottom) {
+      container.scrollTop = rowBottom - container.clientHeight
+    }
+
+    // Pan horizontally — account for sticky unit column
+    const stickyWidth = 184
+    const cellLeft = cell.offsetLeft
+    const cellRight = cellLeft + cell.offsetWidth
+    const visLeft = container.scrollLeft + stickyWidth
+    const visRight = container.scrollLeft + container.clientWidth
+
+    if (cellLeft < visLeft) {
+      container.scrollLeft = cellLeft - stickyWidth - 4
+    } else if (cellRight > visRight) {
+      container.scrollLeft = cellRight - container.clientWidth + 4
+    }
+  }, [selectedCell])
+
+  // Drag state
+  const dragBooking = useRef<any>(null)
+  const dragOverRef = useRef<{unitId:string; date:string}|null>(null)
+  const [dragOver, setDragOver] = useState<{unitId:string; date:string}|null>(null)
+  const [dragging, setDragging] = useState<string|null>(null)
 
   const { data: schedule, isLoading } = useQuery(
     ['schedule', fromDate, toDate, filterType],
@@ -57,9 +106,11 @@ export function SchedulePage() {
   )
 
   const units: any[] = schedule?.units || []
+
+
   const bookings: any[] = schedule?.bookings || []
   const leases: any[] = schedule?.leases || []
-  const days = getDaysInRange(fromDate, addDays(fromDate, Math.min(30, Math.ceil((new Date(toDate).getTime()-new Date(fromDate).getTime())/(1000*60*60*24)))))
+  const days = getDaysInRange(fromDate, toDate)
 
   const createBookingMut = useMutation(
     () => apiPost(`/units/${bookingModal.unit?.id}/bookings`, { ...newBooking, totalAmount: Number(newBooking.totalAmount) }),
@@ -71,23 +122,19 @@ export function SchedulePage() {
     { onSuccess: () => { qc.invalidateQueries('schedule'); setTypeModal({show:false,unit:null}) } }
   )
 
-  const cancelBookingMut = useMutation(
-    (id:string) => apiPatch(`/units/${bookingModal.unit?.id||'x'}/bookings/${id}`, { status:'cancelled' }),
-    { onSuccess: () => qc.invalidateQueries('schedule') }
+  const moveBookingMut = useMutation(
+    (payload: {bookingId:string; unitId:string; checkIn:string; checkOut:string}) =>
+      apiPatch(`/units/${payload.unitId}/bookings/${payload.bookingId}`, {
+        unitId: payload.unitId, checkIn: payload.checkIn, checkOut: payload.checkOut
+      }),
+    {
+      onSuccess: () => { qc.invalidateQueries('schedule') },
+      onError: () => { alert('Cannot move booking — date conflict on that unit.') }
+    }
   )
 
-  const getBookingsForUnit = (unitId: string) =>
-    bookings.filter(b => b.unit_id === unitId)
-
-  const getLeasesForUnit = (unitId: string) =>
-    leases.filter(l => l.unit_id === unitId)
-
-  const isDateBooked = (unitId: string, date: string) => {
-    const unitBookings = getBookingsForUnit(unitId)
-    const unitLeases = getLeasesForUnit(unitId)
-    return unitBookings.some(b => date >= b.check_in && date < b.check_out) ||
-           unitLeases.some(l => date >= l.start_date && date <= l.end_date)
-  }
+  const getBookingsForUnit = (unitId: string) => bookings.filter(b => b.unit_id === unitId)
+  const getLeasesForUnit = (unitId: string) => leases.filter(l => l.unit_id === unitId)
 
   const getBookingForDate = (unitId: string, date: string) => {
     return bookings.find(b => b.unit_id === unitId && date >= b.check_in && date < b.check_out) ||
@@ -112,31 +159,136 @@ export function SchedulePage() {
     setTypeModal({show:true, unit})
   }
 
-  return (
-    <div>
-      <div className="page-header">
-        <div>
-          <h1 className="page-title">Master Schedule</h1>
-          <p className="page-subtitle">Bookings · Leases · Availability across all units</p>
-        </div>
-        <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap'}}>
-          <input type="date" className="form-input" value={fromDate} onChange={e=>setFromDate(e.target.value)} style={{fontSize:'.78rem'}} />
-          <span style={{color:'var(--text-3)',fontSize:'.8rem'}}>to</span>
-          <input type="date" className="form-input" value={toDate} onChange={e=>setToDate(e.target.value)} style={{fontSize:'.78rem'}} />
-          {['all',...UNIT_TYPES].map(t => (
-            <button key={t} className={`tab-btn ${filterType===t?'active':''}`} style={{fontSize:'.72rem',padding:'4px 10px',textTransform:'capitalize'}}
-              onClick={()=>setFilterType(t)}>{t==='all'?'All Types':UNIT_TYPE_LABELS[t]||t}</button>
-          ))}
-        </div>
-      </div>
+  const openBookingModal = (unit: any, prefillDate?: string) => {
+    setNewBooking(b => ({
+      ...b,
+      leaseType: unit.lease_types_allowed?.[0] || 'nightly',
+      checkIn: prefillDate || '',
+      checkOut: prefillDate ? addDays(prefillDate, 1) : '',
+    }))
+    setBookingModal({show:true, unit, prefillDate})
+  }
 
-      {/* View toggle */}
-      <div style={{display:'flex',gap:6,marginBottom:16}}>
+  // ── DRAG HANDLERS ──
+  const onDragStart = (e: React.DragEvent, booking: any) => {
+    dragBooking.current = booking
+    setDragging(booking.id)
+    e.dataTransfer.effectAllowed = 'move'
+  }
+
+  const onDragOver = (e: React.DragEvent, unitId: string, date: string) => {
+    e.preventDefault()
+    e.dataTransfer.dropEffect = 'move'
+    dragOverRef.current = {unitId, date}
+    setDragOver({unitId, date})
+  }
+
+  const onDrop = (e: React.DragEvent, targetUnitId: string, targetDate: string) => {
+    e.preventDefault()
+    setDragOver(null)
+    setDragging(null)
+    const b = dragBooking.current
+    if (!b || b.start_date) return
+
+    const nights = b.nights || 1
+    const newCheckIn = addDays(targetDate, -1)
+    const newCheckOut = addDays(newCheckIn, nights)
+    if (b.check_in === newCheckIn && b.unit_id === targetUnitId) return
+
+    // Validate target unit
+    const targetUnit = units.find(u => u.id === targetUnitId)
+    if (!targetUnit) return
+
+    // Check bookable
+    if (!targetUnit.is_bookable) {
+      alert('That unit does not allow bookings.')
+      dragBooking.current = null
+      dragOverRef.current = null
+      return
+    }
+
+    // Check lease type compatibility
+    if (targetUnit.lease_types_allowed && !targetUnit.lease_types_allowed.includes(b.lease_type)) {
+      alert(`That unit does not allow ${b.lease_type} bookings.`)
+      dragBooking.current = null
+      dragOverRef.current = null
+      return
+    }
+
+    // Check for overlaps with existing bookings (excluding self)
+    const rangeDays = getDaysInRange(newCheckIn, addDays(newCheckOut, -1))
+    const hasBookingConflict = bookings.some(existing =>
+      existing.id !== b.id &&
+      existing.unit_id === targetUnitId &&
+      rangeDays.some(d => d >= existing.check_in && d < existing.check_out)
+    )
+    const hasLeaseConflict = leases.some(l =>
+      l.unit_id === targetUnitId &&
+      rangeDays.some(d => d >= l.start_date && d <= l.end_date)
+    )
+    if (hasBookingConflict || hasLeaseConflict) {
+      alert('That unit is already occupied for those dates.')
+      dragBooking.current = null
+      dragOverRef.current = null
+      return
+    }
+
+    moveBookingMut.mutate({ bookingId: b.id, unitId: targetUnitId, checkIn: newCheckIn, checkOut: newCheckOut })
+    dragBooking.current = null
+    dragOverRef.current = null
+  }
+
+  const onDragEnd = () => {
+    setDragging(null)
+    setDragOver(null)
+    dragBooking.current = null
+    dragOverRef.current = null
+  }
+
+  const shiftDays = (n: number) => {
+    setFromDate(addDays(fromDate, n))
+    setToDate(addDays(toDate, n))
+  }
+
+  const jumpToToday = () => {
+    setFromDate(today)
+    setToDate(addDays(today, 90))
+  }
+
+  return (
+    <div style={{minWidth:0,overflow:'hidden'}}>
+      {/* ── COMPACT TOOLBAR ── */}
+      <div style={{display:'flex',gap:8,alignItems:'center',marginBottom:12,flexWrap:'wrap'}}>
+        {/* View toggle */}
         {(['timeline','list','units'] as const).map(v => (
-          <button key={v} className={`tab-btn ${view===v?'active':''}`} onClick={()=>setView(v)} style={{textTransform:'capitalize'}}>{v}</button>
+          <button key={v} className={`tab-btn ${view===v?'active':''}`} onClick={()=>setView(v)} style={{textTransform:'capitalize',fontSize:'.78rem'}}>{v}</button>
         ))}
-        <div style={{marginLeft:'auto',fontSize:'.78rem',color:'var(--text-3)',alignSelf:'center'}}>
-          {filteredUnits.length} units · {bookings.length} bookings · {leases.length} active leases
+
+        <div style={{width:1,height:20,background:'var(--border-1)',margin:'0 4px'}} />
+
+        {/* Calendar nav */}
+        <button className="btn btn-ghost btn-sm" onClick={()=>shiftDays(-14)} title="Back 2 weeks">‹‹</button>
+        <button className="btn btn-ghost btn-sm" onClick={()=>shiftDays(-7)} title="Back 1 week">‹</button>
+        <button className="btn btn-ghost btn-sm" onClick={jumpToToday} style={{fontWeight:600,color:'var(--gold)'}}>Today</button>
+        <button className="btn btn-ghost btn-sm" onClick={()=>shiftDays(7)} title="Forward 1 week">›</button>
+        <button className="btn btn-ghost btn-sm" onClick={()=>shiftDays(14)} title="Forward 2 weeks">››</button>
+
+        <span style={{fontSize:'.75rem',color:'var(--text-3)'}}>
+          {new Date(fromDate+'T12:00:00').toLocaleDateString('en-US',{month:'short',day:'numeric'})} — {new Date(toDate+'T12:00:00').toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'})}
+        </span>
+
+        <div style={{width:1,height:20,background:'var(--border-1)',margin:'0 4px'}} />
+
+        {/* Unit type filters */}
+        {['all',...UNIT_TYPES].map(t => (
+          <button key={t} className={`tab-btn ${filterType===t?'active':''}`} style={{fontSize:'.70rem',padding:'3px 8px'}}
+            onClick={()=>setFilterType(t)}>{t==='all'?'All':UNIT_TYPE_LABELS[t]||t}</button>
+        ))}
+
+        {/* Stats + New Reservation */}
+        <div style={{marginLeft:'auto',display:'flex',gap:8,alignItems:'center'}}>
+          <span style={{fontSize:'.72rem',color:'var(--text-3)'}}>{filteredUnits.length} units · {bookings.length} bookings</span>
+          <button className="btn btn-primary btn-sm" onClick={()=>setUnitPickerOpen(true)}>+ New Reservation</button>
         </div>
       </div>
 
@@ -144,11 +296,47 @@ export function SchedulePage() {
 
       {/* ── TIMELINE VIEW ── */}
       {!isLoading && view==='timeline' && (
-        <div className="card" style={{padding:0,overflowX:'auto'}}>
-          <table style={{width:'100%',borderCollapse:'collapse',minWidth:800}}>
-            <thead>
+        <div style={{display:'flex',flexDirection:'column',minWidth:0}}>
+        <div
+          ref={scrollContainerRef}
+          className="card"
+          style={{padding:0,overflowX:'auto',overflowY:'scroll',height:'calc(100vh - 200px)',marginBottom:0,borderRadius:'12px 12px 0 0'}}
+          onScroll={e => {
+            const container = e.currentTarget
+            clearTimeout((container as any)._snapTimer)
+            ;(container as any)._snapTimer = setTimeout(() => {
+              const firstRow = container.querySelector('tbody tr') as HTMLElement
+              const ROW_H = firstRow ? firstRow.offsetHeight : 72
+              const snapped = Math.round(container.scrollTop / ROW_H) * ROW_H
+              if (Math.abs(container.scrollTop - snapped) > 1) {
+                container.scrollTop = snapped
+              }
+            }, 80)
+          }}
+        >
+          <table
+            style={{borderCollapse:'collapse',minWidth:800}}
+            tabIndex={0}
+            onKeyDown={e => {
+              if (!selectedCell) return
+              const unitIdx = filteredUnits.findIndex(u => u.id === selectedCell.unitId)
+              const dayIdx = days.findIndex(d => d === selectedCell.date)
+              if (e.key === 'ArrowRight') { e.preventDefault(); if (dayIdx < days.length-1) setSelectedCell({unitId: selectedCell.unitId, date: days[dayIdx+1]}) }
+              if (e.key === 'ArrowLeft')  { e.preventDefault(); if (dayIdx > 0) setSelectedCell({unitId: selectedCell.unitId, date: days[dayIdx-1]}) }
+              if (e.key === 'ArrowDown')  { e.preventDefault(); if (unitIdx < filteredUnits.length-1) setSelectedCell({unitId: filteredUnits[unitIdx+1].id, date: selectedCell.date}) }
+              if (e.key === 'ArrowUp')    { e.preventDefault(); if (unitIdx > 0) setSelectedCell({unitId: filteredUnits[unitIdx-1].id, date: selectedCell.date}) }
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault()
+                const unit = filteredUnits.find(u => u.id === selectedCell.unitId)
+                const booked = getBookingForDate(selectedCell.unitId, selectedCell.date)
+                if (unit && unit.is_bookable && !booked) openBookingModal(unit, selectedCell.date)
+              }
+              if (e.key === 'Escape') setSelectedCell(null)
+            }}
+          >
+            <thead ref={theadRef} style={{position:'sticky',top:0,zIndex:3}}>
               <tr>
-                <th style={{background:'var(--bg-3)',padding:'8px 12px',textAlign:'left',fontSize:'.72rem',color:'var(--text-3)',fontWeight:600,position:'sticky',left:0,zIndex:2,minWidth:180,borderBottom:'1px solid var(--border-1)'}}>Unit</th>
+                <th style={{background:'var(--bg-3)',padding:'8px 12px',textAlign:'left',fontSize:'.72rem',color:'var(--text-3)',fontWeight:600,position:'sticky',left:0,zIndex:4,minWidth:180,borderBottom:'1px solid var(--border-1)'}}>Unit</th>
                 {days.map(d => (
                   <th key={d} style={{background:'var(--bg-3)',padding:'6px 4px',fontSize:'.65rem',color:d===today?'var(--gold)':'var(--text-3)',fontWeight:d===today?700:400,textAlign:'center',minWidth:32,borderBottom:'1px solid var(--border-1)',borderLeft:'1px solid var(--border-1)'}}>
                     <div>{new Date(d+'T12:00:00').toLocaleDateString('en-US',{month:'numeric',day:'numeric'})}</div>
@@ -158,8 +346,8 @@ export function SchedulePage() {
             </thead>
             <tbody>
               {filteredUnits.map(unit => (
-                <tr key={unit.id}>
-                  <td style={{padding:'8px 12px',borderBottom:'1px solid var(--border-1)',position:'sticky',left:0,background:'var(--bg-2)',zIndex:1}}>
+                <tr key={unit.id} style={{height:72,maxHeight:72}}>
+                  <td style={{padding:'6px 12px',borderBottom:'1px solid var(--border-1)',position:'sticky',left:0,background:'var(--bg-2)',zIndex:1,height:72,boxSizing:'border-box',overflow:'hidden'}}>
                     <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:8}}>
                       <div>
                         <div style={{fontWeight:600,fontSize:'.82rem'}}>{unit.unit_number}</div>
@@ -167,7 +355,7 @@ export function SchedulePage() {
                         <div style={{fontSize:'.65rem',color:'var(--text-3)'}}>{unit.property_name}</div>
                       </div>
                       <div style={{display:'flex',gap:4}}>
-                        {unit.is_bookable && <button className="btn btn-ghost btn-sm" style={{fontSize:'.65rem',padding:'2px 6px'}} onClick={()=>{setBookingModal({show:true,unit});setNewBooking(b=>({...b,leaseType:unit.lease_types_allowed?.[0]||'nightly'}))}}>+ Book</button>}
+                        {unit.is_bookable && <button className="btn btn-ghost btn-sm" style={{fontSize:'.65rem',padding:'2px 6px'}} onClick={()=>openBookingModal(unit)}>+ Book</button>}
                         <button className="btn btn-ghost btn-sm" style={{fontSize:'.65rem',padding:'2px 6px'}} onClick={()=>openTypeModal(unit)}>⚙</button>
                       </div>
                     </div>
@@ -175,15 +363,63 @@ export function SchedulePage() {
                   {days.map(d => {
                     const booking = getBookingForDate(unit.id, d)
                     const isBooked = !!booking
+                    const isLease = !!(booking && booking.start_date)
                     const isStart = booking && (booking.check_in === d || booking.start_date === d)
+                    const previewNights = (dragging && dragBooking.current) ? (dragBooking.current.nights || 1) : 0
+                    const previewEnd = dragOver && dragOver.unitId === unit.id
+                      ? addDays(dragOver.date, previewNights)
+                      : null
+                    const isDragTarget = !!(previewEnd && dragOver && dragOver.unitId === unit.id && d >= dragOver.date && d < previewEnd)
+                    const isGhostCell = !!(dragging && dragBooking.current && booking?.id === dragging)
+                    const isBeingDragged = dragging === booking?.id
+
                     return (
-                      <td key={d} style={{borderBottom:'1px solid var(--border-1)',borderLeft:'1px solid var(--border-1)',padding:2,textAlign:'center',background:d===today?'rgba(201,162,39,.04)':''}}>
-                        {isBooked ? (
-                          <div style={{background:booking.guest_name?'var(--green)':'var(--blue)',borderRadius:3,height:24,display:'flex',alignItems:'center',justifyContent:'center',fontSize:'.6rem',color:'#fff',overflow:'hidden',whiteSpace:'nowrap',padding:'0 2px',opacity:.85}} title={booking.guest_name||booking.first_name||'Tenant'}>
-                            {isStart ? (booking.guest_name||booking.first_name||'●').slice(0,8) : ''}
+                      <td
+                        key={d}
+                        data-unit={unit.id}
+                        data-date={d}
+                        style={{borderBottom:'1px solid var(--border-1)',borderLeft:'1px solid var(--border-1)',padding:2,textAlign:'center',
+                          background: isDragTarget ? 'rgba(201,162,39,.18)' : d===today ? 'rgba(201,162,39,.04)' : '',
+                          outline: selectedCell?.unitId===unit.id && selectedCell?.date===d ? '2px solid var(--gold)' : isDragTarget ? '2px solid var(--gold)' : 'none',
+                          outlineOffset: '-2px',
+                          cursor: isBooked && !isLease ? 'grab' : unit.is_bookable && !isBooked ? 'pointer' : 'default'
+                        }}
+                        onDragOver={e => onDragOver(e, unit.id, d)}
+                        onDrop={e => onDrop(e, unit.id, d)}
+                        onClick={e => {
+                          setSelectedCell({unitId: unit.id, date: d})
+                          ;(e.currentTarget.closest('table') as HTMLElement)?.focus()
+                        }}
+                        onDoubleClick={() => {
+                          if (!isBooked && unit.is_bookable) openBookingModal(unit, d)
+                        }}
+                      >
+                        {isDragTarget ? (
+                          <div style={{background:'var(--gold)',borderRadius:3,height:24,opacity:.7,display:'flex',alignItems:'center',justifyContent:'center',fontSize:'.6rem',color:'#000',fontWeight:700}}>
+                            {d === dragOver?.date ? (dragBooking.current?.guest_name||'↔').slice(0,8) : ''}
+                          </div>
+                        ) : isBooked ? (
+                          <div
+                            draggable={!isLease}
+                            onDragStart={e => !isLease && onDragStart(e, booking)}
+                            onDragEnd={onDragEnd}
+                            style={{
+                              background: isLease ? 'var(--blue)' : 'var(--green)',
+                              borderRadius:3, height:24,
+                              display:'flex', alignItems:'center', justifyContent:'center',
+                              fontSize:'.6rem', color:'#fff', overflow:'hidden',
+                              whiteSpace:'nowrap', padding:'0 2px',
+                              opacity: isGhostCell ? 0.2 : 0.85,
+                              cursor: isLease ? 'default' : 'grab',
+                            }}
+                            title={booking.guest_name || booking.first_name || 'Tenant'}
+                          >
+                            {isStart && !isGhostCell ? (booking.guest_name||booking.first_name||'●').slice(0,8) : ''}
                           </div>
                         ) : (
-                          <div style={{height:24,background:unit.is_bookable?'transparent':'var(--bg-3)',borderRadius:3,opacity:.3}} />
+                          <div
+                            style={{height:24, background: unit.is_bookable ? 'transparent' : 'var(--bg-3)', borderRadius:3, opacity:.3}}
+                          />
                         )}
                       </td>
                     )
@@ -195,11 +431,13 @@ export function SchedulePage() {
               )}
             </tbody>
           </table>
-          <div style={{padding:'8px 12px',fontSize:'.72rem',color:'var(--text-3)',display:'flex',gap:16,borderTop:'1px solid var(--border-1)'}}>
-            <span><span style={{display:'inline-block',width:12,height:12,background:'var(--green)',borderRadius:2,marginRight:4}}/>Booking</span>
-            <span><span style={{display:'inline-block',width:12,height:12,background:'var(--blue)',borderRadius:2,marginRight:4}}/>Lease</span>
-            <span><span style={{display:'inline-block',width:12,height:12,background:'var(--gold)',borderRadius:2,opacity:.3,marginRight:4}}/>Today</span>
-          </div>
+        </div>
+        <div ref={legendRef} style={{padding:'8px 12px',fontSize:'.72rem',color:'var(--text-3)',display:'flex',gap:16,borderTop:'1px solid var(--border-1)',background:'var(--bg-2)',borderRadius:'0 0 12px 12px',flexShrink:0}}>
+          <span><span style={{display:'inline-block',width:12,height:12,background:'var(--green)',borderRadius:2,marginRight:4}}/>Booking (draggable)</span>
+          <span><span style={{display:'inline-block',width:12,height:12,background:'var(--blue)',borderRadius:2,marginRight:4}}/>Lease</span>
+          <span><span style={{display:'inline-block',width:12,height:12,background:'var(--gold)',borderRadius:2,opacity:.3,marginRight:4}}/>Today</span>
+          <span>· Double-click empty cell to book · Drag block to move</span>
+        </div>
         </div>
       )}
 
@@ -281,11 +519,40 @@ export function SchedulePage() {
               {unit.unit_description && <div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:10,lineHeight:1.5}}>{unit.unit_description}</div>}
               <div style={{display:'flex',gap:6}}>
                 <button className="btn btn-ghost btn-sm" style={{flex:1}} onClick={()=>openTypeModal(unit)}>⚙ Configure</button>
-                {unit.is_bookable && <button className="btn btn-primary btn-sm" style={{flex:1}} onClick={()=>{setBookingModal({show:true,unit});setNewBooking(b=>({...b,leaseType:unit.lease_types_allowed?.[0]||'nightly'}))}}>+ Book</button>}
+                {unit.is_bookable && <button className="btn btn-primary btn-sm" style={{flex:1}} onClick={()=>openBookingModal(unit)}>+ Book</button>}
               </div>
             </div>
           ))}
           {filteredUnits.length===0 && <div style={{gridColumn:'1/-1',textAlign:'center',padding:48,color:'var(--text-3)'}}>No units found.</div>}
+        </div>
+      )}
+
+      {/* ── UNIT PICKER MODAL ── */}
+      {unitPickerOpen && (
+        <div className="modal-overlay" onClick={()=>setUnitPickerOpen(false)}>
+          <div className="modal" style={{maxWidth:420}} onClick={e=>e.stopPropagation()}>
+            <div className="modal-header">
+              <span className="modal-title">Select a Unit to Book</span>
+              <button className="btn btn-ghost btn-sm" onClick={()=>setUnitPickerOpen(false)}>✕</button>
+            </div>
+            <div style={{padding:'0 24px 24px',display:'grid',gap:8}}>
+              {units.filter(u=>u.is_bookable).length === 0 && (
+                <div style={{color:'var(--text-3)',fontSize:'.82rem',textAlign:'center',padding:24}}>No bookable units configured.<br/>Use ⚙ Configure on a unit to enable bookings.</div>
+              )}
+              {units.filter(u=>u.is_bookable).map(u=>(
+                <button key={u.id} className="btn btn-ghost" style={{textAlign:'left',display:'flex',alignItems:'center',justifyContent:'space-between',gap:12}}
+                  onClick={()=>{setUnitPickerOpen(false);openBookingModal(u)}}>
+                  <div>
+                    <div style={{fontWeight:600,fontSize:'.85rem'}}>{u.unit_number}</div>
+                    <div style={{fontSize:'.72rem',color:TYPE_COLORS[u.unit_type]||'var(--text-3)'}}>{UNIT_TYPE_LABELS[u.unit_type]||u.unit_type} · {u.property_name}</div>
+                  </div>
+                  <div style={{textAlign:'right',fontSize:'.75rem',color:'var(--gold)',fontWeight:600}}>
+                    {u.nightly_rate ? fmt(u.nightly_rate)+'/night' : u.weekly_rate ? fmt(u.weekly_rate)+'/wk' : ''}
+                  </div>
+                </button>
+              ))}
+            </div>
+          </div>
         </div>
       )}
 

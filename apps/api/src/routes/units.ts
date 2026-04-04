@@ -263,14 +263,38 @@ unitsRouter.get('/:id/bookings', requireLandlord, async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
-// PATCH /api/units/:id/bookings/:bookingId — update booking status
+// PATCH /api/units/:id/bookings/:bookingId — update booking (status, move dates, swap unit)
 unitsRouter.patch('/:id/bookings/:bookingId', requireLandlord, async (req, res, next) => {
   try {
-    const { status, notes } = req.body
+    const { status, notes, checkIn, checkOut, unitId } = req.body
     const booking = await queryOne<any>('SELECT * FROM unit_bookings WHERE id=$1 AND landlord_id=$2', [req.params.bookingId, req.user!.profileId])
     if (!booking) throw new AppError(404, 'Booking not found')
-    const updated = await queryOne<any>(`UPDATE unit_bookings SET status=$1, notes=COALESCE($2,notes), updated_at=NOW() WHERE id=$3 RETURNING *`,
-      [status||booking.status, notes, booking.id])
+
+    const newUnitId = unitId || booking.unit_id
+    const newCheckIn = checkIn || booking.check_in
+    const newCheckOut = checkOut || booking.check_out
+
+    // If dates or unit changed, verify target unit exists and check for conflicts
+    if (checkIn || checkOut || unitId) {
+      const targetUnit = await queryOne<any>('SELECT * FROM units WHERE id=$1 AND landlord_id=$2', [newUnitId, req.user!.profileId])
+      if (!targetUnit) throw new AppError(404, 'Target unit not found')
+
+      const conflict = await queryOne<any>(`
+        SELECT id FROM unit_bookings
+        WHERE unit_id=$1 AND id != $2 AND status NOT IN ('cancelled')
+        AND check_in < $3 AND check_out > $4`,
+        [newUnitId, booking.id, newCheckOut, newCheckIn])
+      if (conflict) throw new AppError(409, 'Unit already booked for those dates')
+    }
+
+    const nights = Math.ceil((new Date(newCheckOut).getTime() - new Date(newCheckIn).getTime()) / (1000*60*60*24))
+
+    const updated = await queryOne<any>(`
+      UPDATE unit_bookings
+      SET status=COALESCE($1,status), notes=COALESCE($2,notes),
+          unit_id=$3, check_in=$4, check_out=$5, nights=$6, updated_at=NOW()
+      WHERE id=$7 RETURNING *`,
+      [status||null, notes||null, newUnitId, newCheckIn, newCheckOut, nights, booking.id])
     res.json({ success: true, data: updated })
   } catch (e) { next(e) }
 })
