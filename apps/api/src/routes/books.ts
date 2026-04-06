@@ -6,11 +6,21 @@ import { AppError } from '../middleware/errorHandler'
 export const booksRouter = Router()
 booksRouter.use(requireAuth)
 
-// ── Scope helper — admin sees all, landlord sees own ──────────
+// ── Scope helper — admin sees all, landlord sees own, bookkeeper uses active client ──
 function landlordScope(user: any) {
   if (user.role === 'admin' || user.role === 'super_admin') return null
+  if (user.role === 'bookkeeper') return user.activeClientId || null // set via X-Client-Id header
   return user.landlordId || user.profileId
 }
+
+// Middleware to inject activeClientId for bookkeepers from X-Client-Id header
+import { Request, Response, NextFunction } from 'express'
+booksRouter.use((req: Request, _res: Response, next: NextFunction) => {
+  if (req.user?.role === 'bookkeeper') {
+    (req.user as any).activeClientId = req.headers['x-client-id'] || null
+  }
+  next()
+})
 
 // ════════════════════════════════════════
 // CHART OF ACCOUNTS
@@ -553,5 +563,251 @@ booksRouter.post('/payroll/runs/:id/void', async (req, res, next) => {
       res.json({ success: true, data: { message: 'Run voided' } })
     } catch (e) { await client.query('ROLLBACK'); throw e }
     finally { client.release() }
+  } catch (e) { next(e) }
+})
+
+
+// ════════════════════════════════════════
+// BOOKKEEPER MANAGEMENT
+// ════════════════════════════════════════
+
+// GET /api/books/bookkeeper/clients — list all clients for logged-in bookkeeper
+booksRouter.get('/bookkeeper/clients', async (req, res, next) => {
+  try {
+    if (req.user?.role !== 'bookkeeper' && req.user?.role !== 'admin' && req.user?.role !== 'super_admin')
+      throw new AppError(403, 'Bookkeeper access required')
+
+    const userId = req.user.role === 'bookkeeper' ? req.user.userId : null
+
+    const { rows } = await db.query(
+      `SELECT
+          ba.id AS access_id, ba.permissions, ba.status, ba.created_at AS access_since,
+          l.id AS landlord_id, l.business_name, l.volume_tier,
+          u.first_name, u.last_name, u.email,
+          (SELECT COUNT(*) FROM books_employees WHERE landlord_id = l.id AND status='active') AS employee_count,
+          (SELECT COUNT(*) FROM books_contractors WHERE landlord_id = l.id AND status='active') AS contractor_count,
+          (SELECT COUNT(*) FROM payroll_runs WHERE landlord_id = l.id AND status='approved') AS payroll_run_count
+        FROM books_access ba
+        JOIN landlords l ON l.id = ba.landlord_id
+        JOIN users u ON u.id = l.user_id
+        WHERE ($1::uuid IS NULL OR ba.bookkeeper_user_id = $1)
+        AND ba.status = 'active'
+        ORDER BY l.business_name ASC`,
+      [userId]
+    )
+    res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
+// GET /api/books/bookkeeper/all — admin: list all bookkeepers
+booksRouter.get('/bookkeeper/all', async (req, res, next) => {
+  try {
+    if (req.user?.role !== 'admin' && req.user?.role !== 'super_admin')
+      throw new AppError(403, 'Admin required')
+    const { rows } = await db.query(
+      `SELECT u.id, u.email, u.first_name, u.last_name, u.created_at,
+          COUNT(ba.id) AS client_count
+        FROM users u
+        LEFT JOIN books_access ba ON ba.bookkeeper_user_id = u.id AND ba.status = 'active'
+        WHERE u.role = 'bookkeeper'
+        GROUP BY u.id ORDER BY u.last_name`
+    )
+    res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
+// POST /api/books/bookkeeper/invite — admin: create bookkeeper user + assign clients
+booksRouter.post('/bookkeeper/invite', async (req, res, next) => {
+  try {
+    if (req.user?.role !== 'admin' && req.user?.role !== 'super_admin' && req.user?.role !== 'landlord')
+      throw new AppError(403, 'Admin or Landlord required')
+
+    const { email, firstName, lastName, password, landlordIds } = req.body
+    if (!email || !firstName || !lastName || !password)
+      throw new AppError(400, 'email, firstName, lastName, password required')
+
+    const bcrypt = require('bcryptjs')
+    const hash = await bcrypt.hash(password, 12)
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      // Create or update user with bookkeeper role
+      const { rows: [user] } = await client.query(
+        `INSERT INTO users (email, password_hash, role, first_name, last_name)
+         VALUES ($1,$2,'bookkeeper',$3,$4)
+         ON CONFLICT (email) DO UPDATE SET role='bookkeeper', first_name=$3, last_name=$4
+         RETURNING id, email, first_name, last_name, role`,
+        [email, hash, firstName, lastName]
+      )
+      // Assign clients
+      const assigned = []
+      for (const lid of (landlordIds || [])) {
+        await client.query(
+          `INSERT INTO books_access (bookkeeper_user_id, landlord_id, invited_by)
+           VALUES ($1,$2,$3) ON CONFLICT (bookkeeper_user_id, landlord_id) DO UPDATE SET status='active'`,
+          [user.id, lid, req.user.userId]
+        )
+        assigned.push(lid)
+      }
+      await client.query('COMMIT')
+      res.status(201).json({ success: true, data: { user, clientsAssigned: assigned.length } })
+    } catch (e) { await client.query('ROLLBACK'); throw e }
+    finally { client.release() }
+  } catch (e) { next(e) }
+})
+
+// POST /api/books/bookkeeper/assign — assign existing bookkeeper to a landlord
+booksRouter.post('/bookkeeper/assign', async (req, res, next) => {
+  try {
+    if (req.user?.role !== 'admin' && req.user?.role !== 'super_admin' && req.user?.role !== 'landlord')
+      throw new AppError(403, 'Admin or Landlord required')
+    const { bookkeeperUserId, landlordId, permissions } = req.body
+    if (!bookkeeperUserId || !landlordId) throw new AppError(400, 'bookkeeperUserId and landlordId required')
+    const { rows: [access] } = await db.query(
+      `INSERT INTO books_access (bookkeeper_user_id, landlord_id, permissions, invited_by)
+       VALUES ($1,$2,$3,$4)
+       ON CONFLICT (bookkeeper_user_id, landlord_id) DO UPDATE SET status='active', permissions=COALESCE($3,books_access.permissions)
+       RETURNING *`,
+      [bookkeeperUserId, landlordId, permissions ? JSON.stringify(permissions) : null, req.user.userId]
+    )
+    res.json({ success: true, data: access })
+  } catch (e) { next(e) }
+})
+
+// DELETE /api/books/bookkeeper/revoke — remove bookkeeper from a client
+booksRouter.delete('/bookkeeper/revoke', async (req, res, next) => {
+  try {
+    if (req.user?.role !== 'admin' && req.user?.role !== 'super_admin' && req.user?.role !== 'landlord')
+      throw new AppError(403, 'Admin or Landlord required')
+    const { bookkeeperUserId, landlordId } = req.body
+    await db.query(
+      `UPDATE books_access SET status='revoked', updated_at=NOW()
+       WHERE bookkeeper_user_id=$1 AND landlord_id=$2`,
+      [bookkeeperUserId, landlordId]
+    )
+    res.json({ success: true })
+  } catch (e) { next(e) }
+})
+
+
+// ════════════════════════════════════════
+// BOOKKEEPER MANAGEMENT
+// ════════════════════════════════════════
+
+// GET /api/books/bookkeeper/clients — list all clients for logged-in bookkeeper
+booksRouter.get('/bookkeeper/clients', async (req, res, next) => {
+  try {
+    if (req.user?.role !== 'bookkeeper' && req.user?.role !== 'admin' && req.user?.role !== 'super_admin')
+      throw new AppError(403, 'Bookkeeper access required')
+
+    const userId = req.user.role === 'bookkeeper' ? req.user.userId : null
+
+    const { rows } = await db.query(
+      `SELECT
+          ba.id AS access_id, ba.permissions, ba.status, ba.created_at AS access_since,
+          l.id AS landlord_id, l.business_name, l.volume_tier,
+          u.first_name, u.last_name, u.email,
+          (SELECT COUNT(*) FROM books_employees WHERE landlord_id = l.id AND status='active') AS employee_count,
+          (SELECT COUNT(*) FROM books_contractors WHERE landlord_id = l.id AND status='active') AS contractor_count,
+          (SELECT COUNT(*) FROM payroll_runs WHERE landlord_id = l.id AND status='approved') AS payroll_run_count
+        FROM books_access ba
+        JOIN landlords l ON l.id = ba.landlord_id
+        JOIN users u ON u.id = l.user_id
+        WHERE ($1::uuid IS NULL OR ba.bookkeeper_user_id = $1)
+        AND ba.status = 'active'
+        ORDER BY l.business_name ASC`,
+      [userId]
+    )
+    res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
+// GET /api/books/bookkeeper/all — admin: list all bookkeepers
+booksRouter.get('/bookkeeper/all', async (req, res, next) => {
+  try {
+    if (req.user?.role !== 'admin' && req.user?.role !== 'super_admin')
+      throw new AppError(403, 'Admin required')
+    const { rows } = await db.query(
+      `SELECT u.id, u.email, u.first_name, u.last_name, u.created_at,
+          COUNT(ba.id) AS client_count
+        FROM users u
+        LEFT JOIN books_access ba ON ba.bookkeeper_user_id = u.id AND ba.status = 'active'
+        WHERE u.role = 'bookkeeper'
+        GROUP BY u.id ORDER BY u.last_name`
+    )
+    res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
+// POST /api/books/bookkeeper/invite — admin: create bookkeeper user + assign clients
+booksRouter.post('/bookkeeper/invite', async (req, res, next) => {
+  try {
+    if (req.user?.role !== 'admin' && req.user?.role !== 'super_admin' && req.user?.role !== 'landlord')
+      throw new AppError(403, 'Admin or Landlord required')
+
+    const { email, firstName, lastName, password, landlordIds } = req.body
+    if (!email || !firstName || !lastName || !password)
+      throw new AppError(400, 'email, firstName, lastName, password required')
+
+    const bcrypt = require('bcryptjs')
+    const hash = await bcrypt.hash(password, 12)
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      // Create or update user with bookkeeper role
+      const { rows: [user] } = await client.query(
+        `INSERT INTO users (email, password_hash, role, first_name, last_name)
+         VALUES ($1,$2,'bookkeeper',$3,$4)
+         ON CONFLICT (email) DO UPDATE SET role='bookkeeper', first_name=$3, last_name=$4
+         RETURNING id, email, first_name, last_name, role`,
+        [email, hash, firstName, lastName]
+      )
+      // Assign clients
+      const assigned = []
+      for (const lid of (landlordIds || [])) {
+        await client.query(
+          `INSERT INTO books_access (bookkeeper_user_id, landlord_id, invited_by)
+           VALUES ($1,$2,$3) ON CONFLICT (bookkeeper_user_id, landlord_id) DO UPDATE SET status='active'`,
+          [user.id, lid, req.user.userId]
+        )
+        assigned.push(lid)
+      }
+      await client.query('COMMIT')
+      res.status(201).json({ success: true, data: { user, clientsAssigned: assigned.length } })
+    } catch (e) { await client.query('ROLLBACK'); throw e }
+    finally { client.release() }
+  } catch (e) { next(e) }
+})
+
+// POST /api/books/bookkeeper/assign — assign existing bookkeeper to a landlord
+booksRouter.post('/bookkeeper/assign', async (req, res, next) => {
+  try {
+    if (req.user?.role !== 'admin' && req.user?.role !== 'super_admin' && req.user?.role !== 'landlord')
+      throw new AppError(403, 'Admin or Landlord required')
+    const { bookkeeperUserId, landlordId, permissions } = req.body
+    if (!bookkeeperUserId || !landlordId) throw new AppError(400, 'bookkeeperUserId and landlordId required')
+    const { rows: [access] } = await db.query(
+      `INSERT INTO books_access (bookkeeper_user_id, landlord_id, permissions, invited_by)
+       VALUES ($1,$2,$3,$4)
+       ON CONFLICT (bookkeeper_user_id, landlord_id) DO UPDATE SET status='active', permissions=COALESCE($3,books_access.permissions)
+       RETURNING *`,
+      [bookkeeperUserId, landlordId, permissions ? JSON.stringify(permissions) : null, req.user.userId]
+    )
+    res.json({ success: true, data: access })
+  } catch (e) { next(e) }
+})
+
+// DELETE /api/books/bookkeeper/revoke — remove bookkeeper from a client
+booksRouter.delete('/bookkeeper/revoke', async (req, res, next) => {
+  try {
+    if (req.user?.role !== 'admin' && req.user?.role !== 'super_admin' && req.user?.role !== 'landlord')
+      throw new AppError(403, 'Admin or Landlord required')
+    const { bookkeeperUserId, landlordId } = req.body
+    await db.query(
+      `UPDATE books_access SET status='revoked', updated_at=NOW()
+       WHERE bookkeeper_user_id=$1 AND landlord_id=$2`,
+      [bookkeeperUserId, landlordId]
+    )
+    res.json({ success: true })
   } catch (e) { next(e) }
 })

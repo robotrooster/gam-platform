@@ -12,6 +12,7 @@ export enum UserRole {
   ONSITE_MANAGER   = 'onsite_manager',
   MAINTENANCE      = 'maintenance',
   TENANT           = 'tenant',
+  BOOKKEEPER        = 'bookkeeper',
 }
 
 export const ROLE_LABELS: Record<string, string> = {
@@ -21,6 +22,7 @@ export const ROLE_LABELS: Record<string, string> = {
   onsite_manager:   'On-Site Manager',
   maintenance:      'Maintenance',
   tenant:           'Tenant',
+  bookkeeper:       'Bookkeeper',
 }
 
 export const ROLE_PERMISSIONS: Record<string, string[]> = {
@@ -30,6 +32,7 @@ export const ROLE_PERMISSIONS: Record<string, string[]> = {
   onsite_manager:   ['pos','units','maintenance'],
   maintenance:      ['maintenance'],
   tenant:           ['home','payments','maintenance','documents','services'],
+  bookkeeper:       ['books'],
 }
 
 export enum UnitStatus {

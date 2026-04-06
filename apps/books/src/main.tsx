@@ -11,20 +11,23 @@ const TOKEN_KEYS = ['gam_admin_token', 'gam_books_token']
 const getToken = () => TOKEN_KEYS.map(k => localStorage.getItem(k)).find(Boolean) || null
 api.interceptors.request.use(c => { const t=getToken(); if(t) c.headers.Authorization=`Bearer ${t}`; return c })
 api.interceptors.response.use(r=>r, e=>{ if(e.response?.status===401&&!e.config.url.includes('/auth/')){ TOKEN_KEYS.forEach(k=>localStorage.removeItem(k)); window.location.href='/login' } return Promise.reject(e) })
+// Inject active client header for bookkeepers
+api.interceptors.request.use(c=>{ const cid=localStorage.getItem('gam_books_client'); if(cid) c.headers['X-Client-Id']=cid; return c })
 const get=<T,>(url:string)=>api.get<{success:boolean;data:T}>(url).then(r=>r.data.data)
 const post=<T,>(url:string,body?:any)=>api.post<{success:boolean;data:T;message?:string}>(url,body).then(r=>r.data)
 const patch=<T,>(url:string,body?:any)=>api.patch<{success:boolean;data:T}>(url,body).then(r=>r.data)
 const del=(url:string)=>api.delete(url).then(r=>r.data)
 
-const ALLOWED_ROLES=['admin','super_admin','landlord']
-interface AuthUser{id:string;email:string;role:string;firstName:string;lastName:string;landlordId?:string}
-interface AuthCtx{user:AuthUser|null;loading:boolean;login:(e:string,p:string)=>Promise<void>;logout:()=>void}
+const ALLOWED_ROLES=['admin','super_admin','landlord','bookkeeper']
+interface AuthUser{id:string;email:string;role:string;firstName:string;lastName:string;landlordId?:string;activeClientId?:string;activeClientName?:string}
+interface AuthCtx{user:AuthUser|null;loading:boolean;activeClientId:string|null;activeClientName:string|null;setActiveClient:(id:string,name:string)=>void;login:(e:string,p:string)=>Promise<void>;logout:()=>void}
 const Ctx=createContext<AuthCtx>(null!)
 const useAuth=()=>useContext(Ctx)
 
 function AuthProvider({children}:{children:React.ReactNode}){
   const[user,setUser]=useState<AuthUser|null>(null)
   const[loading,setLoading]=useState(true)
+  const[activeClientId,setActiveClientId]=useState<string|null>(()=>localStorage.getItem('gam_books_client'))
   const logout=React.useCallback(()=>{ TOKEN_KEYS.forEach(k=>localStorage.removeItem(k)); delete api.defaults.headers.common['Authorization']; setUser(null) },[])
   React.useEffect(()=>{
     const params=new URLSearchParams(window.location.search)
@@ -47,7 +50,14 @@ function AuthProvider({children}:{children:React.ReactNode}){
     api.defaults.headers.common['Authorization']='Bearer '+tk
     setUser({id:u.id,email:u.email,role:u.role,firstName:u.firstName||u.first_name||'',lastName:u.lastName||u.last_name||'',landlordId:u.landlord_id||u.landlordId})
   }
-  return<Ctx.Provider value={{user,loading,login,logout}}>{children}</Ctx.Provider>
+  const setActiveClient=(id:string,name:string)=>{
+    localStorage.setItem('gam_books_client',id)
+    localStorage.setItem('gam_books_client_name',name)
+    setActiveClientId(id)
+    setUser(u=>u?{...u,activeClientId:id,activeClientName:name}:u)
+  }
+  const activeClientName=localStorage.getItem('gam_books_client_name')
+  return<Ctx.Provider value={{user,loading,activeClientId,activeClientName,setActiveClient,login,logout}}>{children}</Ctx.Provider>
 }
 
 const qc=new QueryClient({defaultOptions:{queries:{retry:1,staleTime:15000}}})
@@ -175,6 +185,7 @@ function Layout(){
         <nav className="nav">
           <div className="nl">Overview</div>
           <NavLink to="/dashboard" className={({isActive})=>`ni${isActive?' active':''}`}>📊 Dashboard</NavLink>
+          {(user?.role==='bookkeeper'||isAdmin)&&<NavLink to="/clients" className={({isActive})=>`ni${isActive?' active':''}`}>🏢 My Clients</NavLink>}
           <div className="nl" style={{marginTop:8}}>Payroll</div>
           <NavLink to="/payroll/employees"   className={({isActive})=>`ni${isActive?' active':''}`}>👥 Employees (W-2)</NavLink>
           <NavLink to="/payroll/contractors" className={({isActive})=>`ni${isActive?' active':''}`}>🔧 Contractors (1099)</NavLink>
@@ -214,7 +225,8 @@ function Layout(){
       <div className="main">
         <header className="topbar">
           <span style={{fontSize:'.72rem',color:'var(--t3)',fontFamily:'var(--font-m)'}}>GAM Books · Professional Accounting</span>
-          <div style={{marginLeft:'auto',display:'flex',gap:8}}>
+          <div style={{marginLeft:'auto',display:'flex',gap:8,alignItems:'center'}}>
+            <ClientSwitcher/>
             <span className="badge bgold">Beta</span>
           </div>
         </header>
@@ -1051,6 +1063,169 @@ function PayHistory(){
   )
 }
 
+
+// ── CLIENT SWITCHER ───────────────────────────────────────────────────
+function ClientSwitcher(){
+  const{user,activeClientId,activeClientName,setActiveClient}=useAuth()
+  const[open,setOpen]=useState(false)
+  const{data:clients=[]}=useQuery('bk-clients',()=>get<any[]>('/books/bookkeeper/clients'),{enabled:user?.role==='bookkeeper'||user?.role==='admin'||user?.role==='super_admin'})
+  if(user?.role==='landlord')return null
+  if((clients as any[]).length===0)return null
+  return(
+    <div style={{position:'relative'}}>
+      <button className="btn bg-btn bsm" onClick={()=>setOpen(o=>!o)} style={{display:'flex',alignItems:'center',gap:6,maxWidth:200}}>
+        <span style={{fontSize:'.7rem',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>
+          {activeClientName||'Select Client'}
+        </span>
+        <span style={{color:'var(--t3)'}}>▾</span>
+      </button>
+      {open&&(
+        <div style={{position:'absolute',right:0,top:'calc(100% + 6px)',background:'var(--bg2)',border:'1px solid var(--b1)',borderRadius:10,minWidth:220,zIndex:100,boxShadow:'0 8px 32px rgba(0,0,0,.4)',overflow:'hidden'}}>
+          <div style={{padding:'8px 12px',borderBottom:'1px solid var(--b0)',fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.08em'}}>Switch Client</div>
+          {(clients as any[]).map((cl:any)=>(
+            <button key={cl.landlord_id} onClick={()=>{setActiveClient(cl.landlord_id,cl.business_name||cl.first_name+' '+cl.last_name);setOpen(false)}}
+              style={{width:'100%',padding:'10px 14px',background:activeClientId===cl.landlord_id?'rgba(201,162,39,.08)':'none',border:'none',textAlign:'left',cursor:'pointer',display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+              <div>
+                <div style={{fontWeight:600,color:'var(--t0)',fontSize:'.82rem'}}>{cl.business_name||cl.first_name+' '+cl.last_name}</div>
+                <div style={{fontSize:'.65rem',color:'var(--t3)'}}>{cl.employee_count} emp · {cl.contractor_count} contractors</div>
+              </div>
+              {activeClientId===cl.landlord_id&&<span style={{color:'var(--gold)'}}>✓</span>}
+            </button>
+          ))}
+          <div style={{padding:'8px 12px',borderTop:'1px solid var(--b0)'}}>
+            <a href="/clients" style={{fontSize:'.72rem',color:'var(--t3)'}} onClick={()=>setOpen(false)}>Manage clients →</a>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── MY CLIENTS ────────────────────────────────────────────────────────
+function MyClients(){
+  const{user,activeClientId,setActiveClient}=useAuth()
+  const isAdmin=user?.role==='admin'||user?.role==='super_admin'
+  const{data:clients=[],isLoading,refetch}=useQuery('bk-clients',()=>get<any[]>('/books/bookkeeper/clients'))
+  const{data:allBookkeepers=[]}=useQuery('all-bk',()=>get<any[]>('/books/bookkeeper/all'),{enabled:isAdmin})
+  const[showInvite,setShowInvite]=useState(false)
+  const[inviteForm,setInviteForm]=useState({email:'',firstName:'',lastName:'',password:'',landlordIds:[] as string[]})
+  const[saving,setSaving]=useState(false)
+  const[err,setErr]=useState('')
+  const qc=useQueryClient()
+
+  const invite=async(e:React.FormEvent)=>{
+    e.preventDefault();setSaving(true);setErr('')
+    try{
+      await post('/books/bookkeeper/invite',inviteForm)
+      qc.invalidateQueries('bk-clients')
+      qc.invalidateQueries('all-bk')
+      setShowInvite(false)
+      setInviteForm({email:'',firstName:'',lastName:'',password:'',landlordIds:[]})
+    }catch(ex:any){setErr(ex.response?.data?.error||'Failed')}
+    finally{setSaving(false)}
+  }
+
+  const revoke=async(bookkeeperUserId:string,landlordId:string)=>{
+    if(!confirm('Revoke this bookkeeper access?'))return
+    await del('/books/bookkeeper/revoke')
+    // Note: delete with body — use post pattern
+    await api.delete('/books/bookkeeper/revoke',{data:{bookkeeperUserId,landlordId}})
+    qc.invalidateQueries('bk-clients')
+    refetch()
+  }
+
+  return(
+    <div>
+      <div className="ph">
+        <div>
+          <h1 className="pt">🏢 {isAdmin?'All Bookkeeper Clients':'My Clients'}</h1>
+          <p className="ps">{(clients as any[]).length} client{(clients as any[]).length!==1?'s':''} assigned</p>
+        </div>
+        {isAdmin&&<button className="btn bp" onClick={()=>setShowInvite(true)}>+ Invite Bookkeeper</button>}
+      </div>
+
+      {(clients as any[]).length===0&&!isLoading&&(
+        <div className="card" style={{textAlign:'center',padding:'60px 20px'}}>
+          <div style={{fontSize:'3rem',marginBottom:16}}>🏢</div>
+          <h2 style={{color:'var(--t0)',marginBottom:8}}>No clients assigned yet</h2>
+          <p style={{color:'var(--t3)',fontSize:'.85rem',maxWidth:380,margin:'0 auto'}}>
+            {isAdmin?'Invite a bookkeeper and assign them to landlord accounts.':'Your account hasn't been assigned to any clients yet. Contact your administrator.'}
+          </p>
+        </div>
+      )}
+
+      <div style={{display:'grid',gap:12}}>
+        {(clients as any[]).map((cl:any)=>(
+          <div key={cl.landlord_id} className="card" style={{borderColor:activeClientId===cl.landlord_id?'rgba(201,162,39,.4)':'var(--b1)'}}>
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',gap:16}}>
+              <div style={{flex:1}}>
+                <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:8}}>
+                  <h3 style={{color:'var(--t0)',fontSize:'1rem'}}>{cl.business_name||cl.first_name+' '+cl.last_name}</h3>
+                  {activeClientId===cl.landlord_id&&<span className="badge bgold">Active</span>}
+                  <span className={cl.status==='active'?'badge bg2':'badge br'}>{cl.status}</span>
+                </div>
+                <div style={{display:'flex',gap:20,fontSize:'.75rem',color:'var(--t3)',flexWrap:'wrap'}}>
+                  <span>👤 {cl.first_name} {cl.last_name} ({cl.email})</span>
+                  <span>👥 {cl.employee_count} employees</span>
+                  <span>🔧 {cl.contractor_count} contractors</span>
+                  <span>▶ {cl.payroll_run_count} payroll runs</span>
+                  <span>📅 Since {new Date(cl.access_since).toLocaleDateString()}</span>
+                </div>
+              </div>
+              <div style={{display:'flex',gap:8,flexShrink:0}}>
+                <button className="btn bp bsm" onClick={()=>setActiveClient(cl.landlord_id,cl.business_name||cl.first_name+' '+cl.last_name)}>
+                  {activeClientId===cl.landlord_id?'✓ Active':'Switch To'}
+                </button>
+                {isAdmin&&<button className="btn bd bsm" onClick={()=>revoke('',cl.landlord_id)}>Revoke</button>}
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {isAdmin&&(allBookkeepers as any[]).length>0&&(
+        <div style={{marginTop:24}}>
+          <div className="ct">All Bookkeepers on Platform</div>
+          <div className="card" style={{padding:0}}>
+            <table className="tbl">
+              <thead><tr><th>Bookkeeper</th><th>Email</th><th>Clients</th><th>Joined</th></tr></thead>
+              <tbody>
+                {(allBookkeepers as any[]).map((bk:any)=>(
+                  <tr key={bk.id}>
+                    <td style={{fontWeight:600,color:'var(--t0)'}}>{bk.first_name} {bk.last_name}</td>
+                    <td style={{fontSize:'.75rem'}}>{bk.email}</td>
+                    <td className="mono">{bk.client_count}</td>
+                    <td style={{fontSize:'.72rem',color:'var(--t3)'}}>{new Date(bk.created_at).toLocaleDateString()}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {showInvite&&(
+        <Modal title="Invite Bookkeeper" onClose={()=>setShowInvite(false)}>
+          {err&&<div className="alert ae">{err}</div>}
+          <form onSubmit={invite}>
+            <div className="frow2">
+              <div><label>First Name</label><input type="text" value={inviteForm.firstName} onChange={e=>setInviteForm(f=>({...f,firstName:e.target.value}))} required/></div>
+              <div><label>Last Name</label><input type="text" value={inviteForm.lastName} onChange={e=>setInviteForm(f=>({...f,lastName:e.target.value}))} required/></div>
+            </div>
+            <div className="frow"><label>Email</label><input type="email" value={inviteForm.email} onChange={e=>setInviteForm(f=>({...f,email:e.target.value}))} required/></div>
+            <div className="frow"><label>Temporary Password</label><input type="text" value={inviteForm.password} onChange={e=>setInviteForm(f=>({...f,password:e.target.value}))} required placeholder="They should change this on first login"/></div>
+            <div className="alert agold" style={{fontSize:'.75rem'}}>After creating the account, use the Assign button on each client to link them.</div>
+            <div className="factions">
+              <button type="button" className="btn bg-btn" onClick={()=>setShowInvite(false)}>Cancel</button>
+              <button type="submit" className="btn bp" disabled={saving}>{saving?<><span className="spinner"/>Creating…</>:'Create Bookkeeper Account'}</button>
+            </div>
+          </form>
+        </Modal>
+      )}
+    </div>
+  )
+}
+
 // ── STUB ──────────────────────────────────────────────────────────────
 function ComingSoon({title,icon,description}:{title:string;icon:string;description:string}){
   return(
@@ -1112,6 +1287,7 @@ function App(){
       <Route path="/" element={authed?<Layout/>:<Navigate to="/login" replace/>}>
         <Route index element={<Navigate to="/dashboard" replace/>}/>
         <Route path="dashboard"          element={<Dashboard/>}/>
+        <Route path="clients"            element={<MyClients/>}/>
         <Route path="payroll/employees"  element={<Employees/>}/>
         <Route path="payroll/contractors" element={<Contractors/>}/>
         <Route path="payroll/vendors"    element={<Vendors/>}/>
