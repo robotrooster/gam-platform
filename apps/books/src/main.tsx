@@ -1305,7 +1305,7 @@ function Transactions(){
                   <td style={{fontSize:'.72rem',color:'var(--t2)'}}>{t.category||'—'}</td>
                   <td style={{fontSize:'.72rem',color:'var(--t3)'}}>{t.account_name?t.code+' · '+t.account_name:'—'}</td>
                   <td className="mono" style={{color:t.type==='income'?'var(--green)':'var(--red)',fontWeight:600}}>{t.type==='income'?'+':'-'}{formatCurrency(t.amount)}</td>
-                  <td><span className={`badge ${t.type==='income'?'bg2':'br'}`}>{t.type}</span></td>
+                  <td><span className={t.type==='income'?'badge bg2':'badge br'}>{t.type}</span></td>
                   <td>{t.reconciled?<span className="badge bg2">✓</span>:<button className="btn bg-btn bsm" onClick={()=>reconcile(t.id)}>Mark</button>}</td>
                 </tr>
               )):<tr><td colSpan={7}><div className="empty">No transactions yet.</div></td></tr>}
@@ -1388,7 +1388,7 @@ function BankReconcile(){
           <div className="dr"><span className="dk">Book balance (unreconciled)</span><span className="dv mono">{formatCurrency(bookBal)}</span></div>
           <div className="dr" style={{borderTop:'1px solid var(--b1)',marginTop:4,paddingTop:8}}>
             <span className="dk" style={{fontWeight:700}}>Difference</span>
-            <span className={`dv mono ${Math.abs(diff)<0.01?'':''`} style={{color:Math.abs(diff)<0.01?'var(--green)':'var(--red)',fontWeight:700}}>{formatCurrency(diff)}</span>
+            <span style={{color:Math.abs(diff)<0.01?'var(--green)':'var(--red)',fontWeight:700,fontFamily:'var(--font-m)'}}>{formatCurrency(diff)}</span>
           </div>
           {Math.abs(diff)<0.01&&statementBal&&<div style={{marginTop:10}}><span className="badge bg2">✓ Reconciled</span></div>}
         </div>

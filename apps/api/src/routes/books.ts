@@ -1107,8 +1107,8 @@ booksRouter.get('/rent-roll', async (req, res, next) => {
         JOIN landlords l ON l.id = u.landlord_id
         LEFT JOIN tenants ten ON ten.id = u.tenant_id
         LEFT JOIN users t_user ON t_user.id = ten.user_id
-        WHERE ($1 IS NULL OR l.id = $1)
-          AND ($2 OR l.user_id = $3)
+        WHERE ($1::uuid IS NULL OR l.id = $1::uuid)
+          AND ($2::boolean OR l.user_id = $3::uuid)
         ORDER BY p.name, u.unit_number`,
       [lid, role === 'admin' || role === 'super_admin', userId]
     )
