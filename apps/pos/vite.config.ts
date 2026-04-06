@@ -6,5 +6,5 @@ export default defineConfig({
   resolve: {
     alias: { '@gam/shared': '/Users/gold/Downloads/gam/packages/shared/src/index.ts' }
   },
-  server: { port: 3005 }
+  server: { strictPort: true, port: 3005 }
 })

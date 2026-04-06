@@ -168,6 +168,8 @@ function Layout(){
           <NavLink to="/maintenance" className={({isActive})=>`ni${isActive?' active':''}`}>🔧 Maintenance</NavLink>
           <div className="nl" style={{marginTop:8}}>Community</div>
           <NavLink to="/bulletin" className={({isActive})=>`ni${isActive?' active':''}`}>📋 Bulletin Board</NavLink>
+          <div className="nl" style={{marginTop:8}}>Tools</div>
+          <button className="ni" onClick={()=>{const t=localStorage.getItem('gam_admin_token');window.open('http://localhost:3006'+(t?'?token='+t:''),'_blank')}}>📒 GAM Books</button>
           <div className="nl" style={{marginTop:8}}>External</div>
           <button className="ni" onClick={()=>{const t=localStorage.getItem('gam_admin_token');window.open('http://localhost:3006'+(t?`?token=${t}`:''),'_blank')}}>📒 GAM Books</button>
         </nav>

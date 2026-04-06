@@ -430,3 +430,17 @@ CREATE TRIGGER trg_units_updated_at       BEFORE UPDATE ON units        FOR EACH
 CREATE TRIGGER trg_leases_updated_at      BEFORE UPDATE ON leases       FOR EACH ROW EXECUTE FUNCTION update_updated_at();
 CREATE TRIGGER trg_maintenance_updated_at BEFORE UPDATE ON maintenance_requests FOR EACH ROW EXECUTE FUNCTION update_updated_at();
 CREATE TRIGGER trg_deposits_updated_at    BEFORE UPDATE ON security_deposits    FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+
+-- Team members (property managers, on-site managers, maintenance staff)
+CREATE TABLE IF NOT EXISTS team_members (
+  id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  landlord_id  UUID NOT NULL REFERENCES landlords(id) ON DELETE CASCADE,
+  user_id      UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  role         TEXT NOT NULL DEFAULT 'property_manager',
+  permissions  JSONB,
+  status       TEXT NOT NULL DEFAULT 'active',
+  invited_at   TIMESTAMPTZ DEFAULT NOW(),
+  created_at   TIMESTAMPTZ DEFAULT NOW(),
+  updated_at   TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(landlord_id, user_id)
+);
