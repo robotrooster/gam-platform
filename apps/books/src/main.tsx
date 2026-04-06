@@ -1149,7 +1149,7 @@ function MyClients(){
           <div style={{fontSize:'3rem',marginBottom:16}}>🏢</div>
           <h2 style={{color:'var(--t0)',marginBottom:8}}>No clients assigned yet</h2>
           <p style={{color:'var(--t3)',fontSize:'.85rem',maxWidth:380,margin:'0 auto'}}>
-            {isAdmin?'Invite a bookkeeper and assign them to landlord accounts.':'Your account hasn't been assigned to any clients yet. Contact your administrator.'}
+            {isAdmin?'Invite a bookkeeper and assign them to landlord accounts.':"Your account hasn't been assigned to any clients yet. Contact your administrator."}
           </p>
         </div>
       )}
