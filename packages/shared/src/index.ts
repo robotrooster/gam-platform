@@ -13,6 +13,7 @@ export enum UserRole {
   MAINTENANCE      = 'maintenance',
   TENANT           = 'tenant',
   BOOKKEEPER        = 'bookkeeper',
+  SUPER_ADMIN       = 'super_admin',
 }
 
 export const ROLE_LABELS: Record<string, string> = {
@@ -23,6 +24,7 @@ export const ROLE_LABELS: Record<string, string> = {
   maintenance:      'Maintenance',
   tenant:           'Tenant',
   bookkeeper:       'Bookkeeper',
+  super_admin:      'Super Admin',
 }
 
 export const ROLE_PERMISSIONS: Record<string, string[]> = {
@@ -33,6 +35,7 @@ export const ROLE_PERMISSIONS: Record<string, string[]> = {
   maintenance:      ['maintenance'],
   tenant:           ['home','payments','maintenance','documents','services'],
   bookkeeper:       ['books'],
+  super_admin:      ['*'],
 }
 
 export enum UnitStatus {

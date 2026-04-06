@@ -444,3 +444,220 @@ CREATE TABLE IF NOT EXISTS team_members (
   updated_at   TIMESTAMPTZ DEFAULT NOW(),
   UNIQUE(landlord_id, user_id)
 );
+
+-- ── BOOKS MODULE ──────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS books_accounts (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  landlord_id UUID REFERENCES landlords(id) ON DELETE CASCADE,
+  code VARCHAR(20) NOT NULL,
+  name VARCHAR(200) NOT NULL,
+  type VARCHAR(50) NOT NULL,
+  subtype VARCHAR(50),
+  description TEXT,
+  is_system BOOLEAN DEFAULT FALSE,
+  balance DECIMAL(12,2) DEFAULT 0,
+  active BOOLEAN DEFAULT TRUE,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS books_employees (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  landlord_id UUID REFERENCES landlords(id) ON DELETE CASCADE,
+  first_name VARCHAR(100) NOT NULL,
+  last_name VARCHAR(100) NOT NULL,
+  email VARCHAR(200),
+  phone VARCHAR(20),
+  address TEXT,
+  ssn_last4 VARCHAR(4),
+  pay_type VARCHAR(20) NOT NULL DEFAULT 'salary',
+  pay_rate DECIMAL(10,2) NOT NULL DEFAULT 0,
+  pay_frequency VARCHAR(20) DEFAULT 'biweekly',
+  filing_status VARCHAR(20) DEFAULT 'single',
+  federal_allowances INT DEFAULT 0,
+  az_withholding_pct DECIMAL(5,2) DEFAULT 2.5,
+  title VARCHAR(100),
+  department VARCHAR(100),
+  start_date DATE,
+  end_date DATE,
+  status VARCHAR(20) DEFAULT 'active',
+  ytd_gross DECIMAL(12,2) DEFAULT 0,
+  ytd_federal_tax DECIMAL(12,2) DEFAULT 0,
+  ytd_state_tax DECIMAL(12,2) DEFAULT 0,
+  ytd_ss DECIMAL(12,2) DEFAULT 0,
+  ytd_medicare DECIMAL(12,2) DEFAULT 0,
+  ytd_net DECIMAL(12,2) DEFAULT 0,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS books_contractors (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  landlord_id UUID REFERENCES landlords(id) ON DELETE CASCADE,
+  first_name VARCHAR(100),
+  last_name VARCHAR(100),
+  business_name VARCHAR(200),
+  email VARCHAR(200),
+  phone VARCHAR(20),
+  address TEXT,
+  ein VARCHAR(10),
+  ssn_last4 VARCHAR(4),
+  entity_type VARCHAR(30) DEFAULT 'individual',
+  trade VARCHAR(100),
+  pay_rate DECIMAL(10,2),
+  pay_unit VARCHAR(20) DEFAULT 'project',
+  status VARCHAR(20) DEFAULT 'active',
+  ytd_paid DECIMAL(12,2) DEFAULT 0,
+  w9_on_file BOOLEAN DEFAULT FALSE,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS books_vendors (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  landlord_id UUID REFERENCES landlords(id) ON DELETE CASCADE,
+  name VARCHAR(200) NOT NULL,
+  contact_name VARCHAR(200),
+  email VARCHAR(200),
+  phone VARCHAR(20),
+  address TEXT,
+  category VARCHAR(100),
+  payment_terms VARCHAR(50) DEFAULT 'net30',
+  account_number VARCHAR(100),
+  tax_id VARCHAR(20),
+  ap_balance DECIMAL(12,2) DEFAULT 0,
+  ytd_paid DECIMAL(12,2) DEFAULT 0,
+  status VARCHAR(20) DEFAULT 'active',
+  notes TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS books_bills (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  landlord_id UUID REFERENCES landlords(id) ON DELETE CASCADE,
+  vendor_id UUID REFERENCES books_vendors(id),
+  bill_number VARCHAR(100),
+  date DATE NOT NULL,
+  due_date DATE,
+  description TEXT NOT NULL,
+  amount DECIMAL(12,2) NOT NULL,
+  amount_paid DECIMAL(12,2) DEFAULT 0,
+  status VARCHAR(20) DEFAULT 'open',
+  category VARCHAR(100),
+  account_id UUID REFERENCES books_accounts(id),
+  notes TEXT,
+  paid_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS payroll_runs (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  landlord_id UUID REFERENCES landlords(id) ON DELETE CASCADE,
+  period_start DATE NOT NULL,
+  period_end DATE NOT NULL,
+  pay_date DATE NOT NULL,
+  pay_frequency VARCHAR(20) NOT NULL,
+  status VARCHAR(20) NOT NULL DEFAULT 'draft',
+  total_gross DECIMAL(12,2) DEFAULT 0,
+  total_federal_tax DECIMAL(12,2) DEFAULT 0,
+  total_state_tax DECIMAL(12,2) DEFAULT 0,
+  total_ss DECIMAL(12,2) DEFAULT 0,
+  total_medicare DECIMAL(12,2) DEFAULT 0,
+  total_net DECIMAL(12,2) DEFAULT 0,
+  employee_count INT DEFAULT 0,
+  notes TEXT,
+  approved_at TIMESTAMPTZ,
+  approved_by UUID REFERENCES users(id),
+  voided_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS payroll_run_lines (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  run_id UUID NOT NULL REFERENCES payroll_runs(id) ON DELETE CASCADE,
+  employee_id UUID NOT NULL REFERENCES books_employees(id),
+  pay_type VARCHAR(20) NOT NULL,
+  hours_worked DECIMAL(8,2),
+  gross_pay DECIMAL(10,2) NOT NULL,
+  federal_tax DECIMAL(10,2) NOT NULL DEFAULT 0,
+  state_tax DECIMAL(10,2) NOT NULL DEFAULT 0,
+  ss_tax DECIMAL(10,2) NOT NULL DEFAULT 0,
+  medicare_tax DECIMAL(10,2) NOT NULL DEFAULT 0,
+  other_deductions DECIMAL(10,2) DEFAULT 0,
+  net_pay DECIMAL(10,2) NOT NULL,
+  memo TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS journal_entries (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  landlord_id UUID REFERENCES landlords(id) ON DELETE CASCADE,
+  entry_number SERIAL,
+  date DATE NOT NULL,
+  description TEXT NOT NULL,
+  reference TEXT,
+  type VARCHAR(30) DEFAULT 'manual',
+  status VARCHAR(20) DEFAULT 'posted',
+  total_debits DECIMAL(12,2) DEFAULT 0,
+  total_credits DECIMAL(12,2) DEFAULT 0,
+  created_by UUID REFERENCES users(id),
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS journal_entry_lines (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  entry_id UUID NOT NULL REFERENCES journal_entries(id) ON DELETE CASCADE,
+  account_id UUID NOT NULL REFERENCES books_accounts(id),
+  description TEXT,
+  debit DECIMAL(12,2) NOT NULL DEFAULT 0,
+  credit DECIMAL(12,2) NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS books_transactions (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  landlord_id UUID REFERENCES landlords(id) ON DELETE CASCADE,
+  date DATE NOT NULL,
+  description TEXT NOT NULL,
+  amount DECIMAL(12,2) NOT NULL,
+  type VARCHAR(20) NOT NULL,
+  category VARCHAR(100),
+  account_id UUID REFERENCES books_accounts(id),
+  reference TEXT,
+  reconciled BOOLEAN DEFAULT FALSE,
+  reconciled_at TIMESTAMPTZ,
+  source VARCHAR(30) DEFAULT 'manual',
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS bank_reconciliations (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  landlord_id UUID REFERENCES landlords(id) ON DELETE CASCADE,
+  account_id UUID REFERENCES books_accounts(id),
+  period_start DATE NOT NULL,
+  period_end DATE NOT NULL,
+  statement_balance DECIMAL(12,2) NOT NULL,
+  book_balance DECIMAL(12,2) NOT NULL,
+  difference DECIMAL(12,2) GENERATED ALWAYS AS (statement_balance - book_balance) STORED,
+  status VARCHAR(20) DEFAULT 'open',
+  completed_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS books_access (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  bookkeeper_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  landlord_id UUID NOT NULL REFERENCES landlords(id) ON DELETE CASCADE,
+  permissions JSONB DEFAULT '{"read":true,"write":true,"payroll":true,"reports":true}'::jsonb,
+  status VARCHAR(20) DEFAULT 'active',
+  invited_by UUID REFERENCES users(id),
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(bookkeeper_user_id, landlord_id)
+);
