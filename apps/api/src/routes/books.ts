@@ -811,3 +811,320 @@ booksRouter.delete('/bookkeeper/revoke', async (req, res, next) => {
     res.json({ success: true })
   } catch (e) { next(e) }
 })
+
+// ════════════════════════════════════════
+// JOURNAL ENTRIES
+// ════════════════════════════════════════
+
+booksRouter.get('/journal', async (req, res, next) => {
+  try {
+    const lid = landlordScope(req.user)
+    const { limit = 50, offset = 0 } = req.query
+    const { rows } = await db.query(
+      `SELECT je.*, COUNT(jel.id) as line_count
+       FROM journal_entries je
+       LEFT JOIN journal_entry_lines jel ON jel.entry_id = je.id
+       WHERE (je.landlord_id = $1 OR $1 IS NULL)
+       GROUP BY je.id
+       ORDER BY je.date DESC, je.created_at DESC
+       LIMIT $2 OFFSET $3`,
+      [lid, limit, offset]
+    )
+    res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
+booksRouter.get('/journal/:id', async (req, res, next) => {
+  try {
+    const lid = landlordScope(req.user)
+    const entry = await queryOne<any>(
+      'SELECT * FROM journal_entries WHERE id=$1 AND (landlord_id=$2 OR $2 IS NULL)',
+      [req.params.id, lid]
+    )
+    if (!entry) throw new AppError(404, 'Entry not found')
+    const { rows: lines } = await db.query(
+      `SELECT jel.*, ba.code, ba.name AS account_name, ba.type AS account_type
+       FROM journal_entry_lines jel
+       JOIN books_accounts ba ON ba.id = jel.account_id
+       WHERE jel.entry_id = $1 ORDER BY jel.debit DESC`,
+      [req.params.id]
+    )
+    res.json({ success: true, data: { ...entry, lines } })
+  } catch (e) { next(e) }
+})
+
+booksRouter.post('/journal', async (req, res, next) => {
+  try {
+    const lid = landlordScope(req.user)
+    const { date, description, reference, type = 'manual', lines } = req.body
+    if (!date || !description || !lines?.length)
+      throw new AppError(400, 'date, description, and lines required')
+
+    // Validate double-entry balance
+    const totalDebits = lines.reduce((s: number, l: any) => s + (+l.debit || 0), 0)
+    const totalCredits = lines.reduce((s: number, l: any) => s + (+l.credit || 0), 0)
+    if (Math.abs(totalDebits - totalCredits) > 0.01)
+      throw new AppError(400, `Entry out of balance — debits ${totalDebits.toFixed(2)} ≠ credits ${totalCredits.toFixed(2)}`)
+    if (totalDebits === 0)
+      throw new AppError(400, 'Entry must have at least one debit and one credit')
+
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      const { rows: [entry] } = await client.query(
+        `INSERT INTO journal_entries (landlord_id, date, description, reference, type, total_debits, total_credits, created_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+        [lid, date, description, reference || null, type, totalDebits.toFixed(2), totalCredits.toFixed(2), req.user!.userId]
+      )
+      for (const line of lines) {
+        if (!line.accountId) throw new AppError(400, 'Each line requires accountId')
+        await client.query(
+          `INSERT INTO journal_entry_lines (entry_id, account_id, description, debit, credit)
+           VALUES ($1,$2,$3,$4,$5)`,
+          [entry.id, line.accountId, line.description || null, +line.debit || 0, +line.credit || 0]
+        )
+        // Update account balance (debit increases asset/expense, credit increases liability/equity/income)
+        await client.query(
+          `UPDATE books_accounts SET
+             balance = balance + $1,
+             updated_at = NOW()
+           WHERE id = $2`,
+          [(+line.debit || 0) - (+line.credit || 0), line.accountId]
+        )
+      }
+      await client.query('COMMIT')
+      const { rows: finalLines } = await db.query(
+        `SELECT jel.*, ba.code, ba.name AS account_name FROM journal_entry_lines jel
+         JOIN books_accounts ba ON ba.id = jel.account_id WHERE jel.entry_id=$1`,
+        [entry.id]
+      )
+      res.status(201).json({ success: true, data: { ...entry, lines: finalLines } })
+    } catch (e) { await client.query('ROLLBACK'); throw e }
+    finally { client.release() }
+  } catch (e) { next(e) }
+})
+
+booksRouter.post('/journal/:id/void', async (req, res, next) => {
+  try {
+    const lid = landlordScope(req.user)
+    const entry = await queryOne<any>(
+      'SELECT * FROM journal_entries WHERE id=$1 AND (landlord_id=$2 OR $2 IS NULL)',
+      [req.params.id, lid]
+    )
+    if (!entry) throw new AppError(404, 'Entry not found')
+    if (entry.status === 'voided') throw new AppError(400, 'Already voided')
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      // Reverse account balances
+      const { rows: lines } = await client.query('SELECT * FROM journal_entry_lines WHERE entry_id=$1', [entry.id])
+      for (const line of lines) {
+        await client.query(
+          `UPDATE books_accounts SET balance = balance - $1, updated_at=NOW() WHERE id=$2`,
+          [(+line.debit || 0) - (+line.credit || 0), line.account_id]
+        )
+      }
+      await client.query(`UPDATE journal_entries SET status='voided', updated_at=NOW() WHERE id=$1`, [entry.id])
+      await client.query('COMMIT')
+      res.json({ success: true, data: { message: 'Entry voided' } })
+    } catch (e) { await client.query('ROLLBACK'); throw e }
+    finally { client.release() }
+  } catch (e) { next(e) }
+})
+
+// ════════════════════════════════════════
+// TRANSACTIONS
+// ════════════════════════════════════════
+
+booksRouter.get('/transactions', async (req, res, next) => {
+  try {
+    const lid = landlordScope(req.user)
+    const { type, reconciled, limit = 100, offset = 0 } = req.query
+    const conditions = ['(bt.landlord_id = $1 OR $1 IS NULL)']
+    const params: any[] = [lid]
+    if (type) { params.push(type); conditions.push(`bt.type = $${params.length}`) }
+    if (reconciled !== undefined) { params.push(reconciled === 'true'); conditions.push(`bt.reconciled = $${params.length}`) }
+    params.push(limit, offset)
+    const { rows } = await db.query(
+      `SELECT bt.*, ba.code, ba.name AS account_name
+       FROM books_transactions bt
+       LEFT JOIN books_accounts ba ON ba.id = bt.account_id
+       WHERE ${conditions.join(' AND ')}
+       ORDER BY bt.date DESC, bt.created_at DESC
+       LIMIT $${params.length - 1} OFFSET $${params.length}`,
+      params
+    )
+    res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
+booksRouter.post('/transactions', async (req, res, next) => {
+  try {
+    const lid = landlordScope(req.user)
+    const { date, description, amount, type, category, accountId, reference } = req.body
+    if (!date || !description || amount === undefined || !type)
+      throw new AppError(400, 'date, description, amount, type required')
+    const { rows: [tx] } = await db.query(
+      `INSERT INTO books_transactions (landlord_id, date, description, amount, type, category, account_id, reference)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+      [lid, date, description, amount, type, category || null, accountId || null, reference || null]
+    )
+    res.status(201).json({ success: true, data: tx })
+  } catch (e) { next(e) }
+})
+
+booksRouter.patch('/transactions/:id/reconcile', async (req, res, next) => {
+  try {
+    const lid = landlordScope(req.user)
+    const { rows: [tx] } = await db.query(
+      `UPDATE books_transactions SET reconciled=TRUE, reconciled_at=NOW(), updated_at=NOW()
+       WHERE id=$1 AND (landlord_id=$2 OR $2 IS NULL) RETURNING *`,
+      [req.params.id, lid]
+    )
+    if (!tx) throw new AppError(404, 'Transaction not found')
+    res.json({ success: true, data: tx })
+  } catch (e) { next(e) }
+})
+
+// ════════════════════════════════════════
+// REPORTS
+// ════════════════════════════════════════
+
+booksRouter.get('/reports/pl', async (req, res, next) => {
+  try {
+    const lid = landlordScope(req.user)
+    const { startDate, endDate } = req.query
+    const start = startDate || new Date(new Date().getFullYear(), 0, 1).toISOString().split('T')[0]
+    const end = endDate || new Date().toISOString().split('T')[0]
+
+    // Income accounts
+    const { rows: income } = await db.query(
+      `SELECT ba.code, ba.name, ba.balance,
+          COALESCE(SUM(jel.credit - jel.debit), 0) AS period_amount
+        FROM books_accounts ba
+        LEFT JOIN journal_entry_lines jel ON jel.account_id = ba.id
+        LEFT JOIN journal_entries je ON je.id = jel.entry_id
+          AND je.date BETWEEN $2 AND $3
+          AND je.status = 'posted'
+          AND (je.landlord_id = $1 OR $1 IS NULL)
+        WHERE ba.type = 'income' AND ba.active = TRUE
+          AND (ba.landlord_id = $1 OR $1 IS NULL)
+        GROUP BY ba.id ORDER BY ba.code`,
+      [lid, start, end]
+    )
+
+    const { rows: expenses } = await db.query(
+      `SELECT ba.code, ba.name, ba.balance,
+          COALESCE(SUM(jel.debit - jel.credit), 0) AS period_amount
+        FROM books_accounts ba
+        LEFT JOIN journal_entry_lines jel ON jel.account_id = ba.id
+        LEFT JOIN journal_entries je ON je.id = jel.entry_id
+          AND je.date BETWEEN $2 AND $3
+          AND je.status = 'posted'
+          AND (je.landlord_id = $1 OR $1 IS NULL)
+        WHERE ba.type = 'expense' AND ba.active = TRUE
+          AND (ba.landlord_id = $1 OR $1 IS NULL)
+        GROUP BY ba.id ORDER BY ba.code`,
+      [lid, start, end]
+    )
+
+    // Pull rent income from GAM payments if synced
+    const { rows: rentIncome } = await db.query(
+      `SELECT COALESCE(SUM(amount), 0) AS total
+       FROM payments
+       WHERE landlord_id IN (SELECT id FROM landlords WHERE (user_id=$1 OR $1 IS NULL))
+         AND status = 'settled'
+         AND due_date BETWEEN $2 AND $3`,
+      [req.user!.userId, start, end]
+    ).catch(() => ({ rows: [{ total: 0 }] }))
+
+    const totalIncome = income.reduce((s: number, a: any) => s + (+a.period_amount || 0), 0)
+    const totalExpenses = expenses.reduce((s: number, a: any) => s + (+a.period_amount || 0), 0)
+
+    res.json({
+      success: true,
+      data: {
+        period: { start, end },
+        income,
+        expenses,
+        totalIncome,
+        totalExpenses,
+        netIncome: totalIncome - totalExpenses,
+        gamRentIncome: +rentIncome[0]?.total || 0,
+      }
+    })
+  } catch (e) { next(e) }
+})
+
+booksRouter.get('/reports/balance-sheet', async (req, res, next) => {
+  try {
+    const lid = landlordScope(req.user)
+    const getAccounts = (type: string) => db.query(
+      `SELECT code, name, balance FROM books_accounts
+       WHERE type=$1 AND active=TRUE AND (landlord_id=$2 OR $2 IS NULL) ORDER BY code`,
+      [type, lid]
+    )
+    const [assets, liabilities, equity] = await Promise.all([
+      getAccounts('asset'), getAccounts('liability'), getAccounts('equity')
+    ])
+    const totalAssets = assets.rows.reduce((s: number, a: any) => s + (+a.balance || 0), 0)
+    const totalLiabilities = liabilities.rows.reduce((s: number, a: any) => s + (+a.balance || 0), 0)
+    const totalEquity = equity.rows.reduce((s: number, a: any) => s + (+a.balance || 0), 0)
+    res.json({
+      success: true,
+      data: {
+        asOf: new Date().toISOString().split('T')[0],
+        assets: assets.rows, totalAssets,
+        liabilities: liabilities.rows, totalLiabilities,
+        equity: equity.rows, totalEquity,
+        balances: Math.abs(totalAssets - (totalLiabilities + totalEquity)) < 0.01,
+      }
+    })
+  } catch (e) { next(e) }
+})
+
+// Rent roll — sync from GAM
+booksRouter.get('/rent-roll', async (req, res, next) => {
+  try {
+    const userId = req.user!.userId
+    const role = req.user!.role
+    const lid = landlordScope(req.user)
+
+    const { rows } = await db.query(
+      `SELECT
+          u.unit_number, u.rent_amount, u.status, u.on_time_pay_active,
+          p.name AS property_name,
+          t_user.first_name AS tenant_first, t_user.last_name AS tenant_last,
+          t_user.email AS tenant_email,
+          ten.ach_verified, ten.on_time_pay_enrolled,
+          (SELECT SUM(amount) FROM payments
+           WHERE unit_id=u.id AND status='settled'
+           AND due_date >= date_trunc('month', CURRENT_DATE)) AS collected_mtd,
+          (SELECT COUNT(*) FROM payments
+           WHERE unit_id=u.id AND status='pending') AS pending_count
+        FROM units u
+        JOIN properties p ON p.id = u.property_id
+        JOIN landlords l ON l.id = u.landlord_id
+        LEFT JOIN tenants ten ON ten.id = u.tenant_id
+        LEFT JOIN users t_user ON t_user.id = ten.user_id
+        WHERE ($1 IS NULL OR l.id = $1)
+          AND ($2 OR l.user_id = $3)
+        ORDER BY p.name, u.unit_number`,
+      [lid, role === 'admin' || role === 'super_admin', userId]
+    )
+
+    const totalExpected = rows.reduce((s: number, r: any) => s + (r.status !== 'vacant' ? +r.rent_amount : 0), 0)
+    const totalCollected = rows.reduce((s: number, r: any) => s + (+r.collected_mtd || 0), 0)
+
+    res.json({
+      success: true,
+      data: {
+        units: rows,
+        totalExpected,
+        totalCollected,
+        variance: totalCollected - totalExpected,
+        occupancyRate: rows.length > 0 ? rows.filter((r: any) => r.status !== 'vacant').length / rows.length : 0,
+      }
+    })
+  } catch (e) { next(e) }
+})

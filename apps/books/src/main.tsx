@@ -1064,6 +1064,557 @@ function PayHistory(){
 }
 
 
+
+// ── JOURNAL ENTRIES ───────────────────────────────────────────────────
+function JournalEntries(){
+  const qc=useQueryClient()
+  const{data:entries=[],isLoading}=useQuery('journal',()=>get<any[]>('/books/journal'))
+  const{data:accounts=[]}=useQuery('acct',()=>get<any[]>('/books/accounts'))
+  const[showAdd,setShowAdd]=useState(false)
+  const[selectedEntry,setSelectedEntry]=useState<any>(null)
+  const{data:entryDetail}=useQuery(['je',selectedEntry?.id],()=>get<any>('/books/journal/'+selectedEntry.id),{enabled:!!selectedEntry?.id})
+  const[err,setErr]=useState('')
+  const[saving,setSaving]=useState(false)
+  const initForm={date:new Date().toISOString().split('T')[0],description:'',reference:'',lines:[{accountId:'',description:'',debit:'',credit:''},{accountId:'',description:'',debit:'',credit:''}]}
+  const[form,setForm]=useState(initForm)
+
+  const totalDebits=form.lines.reduce((s,l)=>s+(+l.debit||0),0)
+  const totalCredits=form.lines.reduce((s,l)=>s+(+l.credit||0),0)
+  const balanced=Math.abs(totalDebits-totalCredits)<0.01&&totalDebits>0
+
+  const addLine=()=>setForm(f=>({...f,lines:[...f.lines,{accountId:'',description:'',debit:'',credit:''}]}))
+  const removeLine=(i:number)=>setForm(f=>({...f,lines:f.lines.filter((_,idx)=>idx!==i)}))
+  const updateLine=(i:number,k:string,v:string)=>setForm(f=>({...f,lines:f.lines.map((l,idx)=>idx===i?{...l,[k]:v}:l)}))
+
+  const submit=async(e:React.FormEvent)=>{
+    e.preventDefault();setSaving(true);setErr('')
+    try{
+      await post('/books/journal',{...form,lines:form.lines.filter(l=>l.accountId).map(l=>({...l,debit:+l.debit||0,credit:+l.credit||0}))})
+      qc.invalidateQueries('journal');qc.invalidateQueries('acct')
+      setShowAdd(false);setForm(initForm)
+    }catch(ex:any){setErr(ex.response?.data?.error||'Failed')}
+    finally{setSaving(false)}
+  }
+
+  const voidEntry=async(id:string)=>{
+    if(!confirm('Void this journal entry? Account balances will be reversed.'))return
+    await post('/books/journal/'+id+'/void')
+    qc.invalidateQueries('journal');qc.invalidateQueries('acct')
+    setSelectedEntry(null)
+  }
+
+  const STATUS:Record<string,string>={posted:'bg2',voided:'bmu',draft:'ba'}
+  const incomeAccts=(accounts as any[]).filter((a:any)=>a.type==='income')
+  const expenseAccts=(accounts as any[]).filter((a:any)=>a.type==='expense')
+  const assetAccts=(accounts as any[]).filter((a:any)=>a.type==='asset')
+  const liabAccts=(accounts as any[]).filter((a:any)=>a.type==='liability')
+  const equityAccts=(accounts as any[]).filter((a:any)=>a.type==='equity')
+
+  return(
+    <div>
+      <div className="ph">
+        <div><h1 className="pt">📓 Journal Entries</h1><p className="ps">{(entries as any[]).length} entries · double-entry bookkeeping</p></div>
+        <button className="btn bp" onClick={()=>setShowAdd(true)}>+ New Entry</button>
+      </div>
+
+      {(accounts as any[]).length===0&&<div className="alert aw">⚠ No chart of accounts found. <a href="/books/accounts">Set up your accounts</a> before creating journal entries.</div>}
+
+      <div className="grid2" style={{gap:16}}>
+        <div className="card" style={{padding:0}}>
+          {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}><span className="spinner" style={{display:'inline-block'}}/></div>:(
+            <table className="tbl">
+              <thead><tr><th>#</th><th>Date</th><th>Description</th><th>Debits</th><th>Status</th></tr></thead>
+              <tbody>
+                {(entries as any[]).length?(entries as any[]).map((e:any)=>(
+                  <tr key={e.id} style={{cursor:'pointer',background:selectedEntry?.id===e.id?'rgba(201,162,39,.05)':''}} onClick={()=>setSelectedEntry(e)}>
+                    <td className="mono" style={{color:'var(--t3)',fontSize:'.7rem'}}>{e.entry_number}</td>
+                    <td className="mono" style={{fontSize:'.75rem'}}>{new Date(e.date+'T12:00:00').toLocaleDateString()}</td>
+                    <td style={{color:'var(--t0)',fontSize:'.78rem'}}>{e.description}</td>
+                    <td className="mono">{formatCurrency(e.total_debits)}</td>
+                    <td><span className={`badge ${STATUS[e.status]||'bmu'}`}>{e.status}</span></td>
+                  </tr>
+                )):<tr><td colSpan={5}><div className="empty">No journal entries yet.</div></td></tr>}
+              </tbody>
+            </table>
+          )}
+        </div>
+
+        <div>
+          {!selectedEntry&&<div className="card" style={{textAlign:'center',padding:'48px 20px',color:'var(--t3)'}}>Select an entry to view detail</div>}
+          {selectedEntry&&entryDetail&&(
+            <div className="card">
+              <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:16}}>
+                <div>
+                  <div style={{fontFamily:'var(--font-d)',fontWeight:700,color:'var(--t0)',marginBottom:4}}>Entry #{entryDetail.entry_number}</div>
+                  <div style={{fontSize:'.72rem',color:'var(--t3)'}}>{new Date(entryDetail.date+'T12:00:00').toLocaleDateString()} · {entryDetail.type}</div>
+                  <div style={{fontSize:'.82rem',color:'var(--t1)',marginTop:4}}>{entryDetail.description}</div>
+                  {entryDetail.reference&&<div style={{fontSize:'.7rem',color:'var(--t3)',marginTop:2}}>Ref: {entryDetail.reference}</div>}
+                </div>
+                <span className={`badge ${STATUS[entryDetail.status]||'bmu'}`}>{entryDetail.status}</span>
+              </div>
+              <table className="tbl" style={{marginBottom:12}}>
+                <thead><tr><th>Account</th><th>Description</th><th style={{textAlign:'right'}}>Debit</th><th style={{textAlign:'right'}}>Credit</th></tr></thead>
+                <tbody>
+                  {entryDetail.lines?.map((l:any)=>(
+                    <tr key={l.id}>
+                      <td><div style={{fontWeight:600,color:'var(--t0)',fontSize:'.75rem'}}>{l.code} · {l.account_name}</div></td>
+                      <td style={{fontSize:'.72rem',color:'var(--t3)'}}>{l.description||'—'}</td>
+                      <td className="mono" style={{textAlign:'right',color:+l.debit>0?'var(--t0)':'var(--t3)'}}>{+l.debit>0?formatCurrency(l.debit):'—'}</td>
+                      <td className="mono" style={{textAlign:'right',color:+l.credit>0?'var(--t0)':'var(--t3)'}}>{+l.credit>0?formatCurrency(l.credit):'—'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+                <tfoot>
+                  <tr style={{background:'var(--bg3)'}}>
+                    <td colSpan={2} style={{padding:'8px 12px',fontWeight:700,color:'var(--t0)',fontSize:'.72rem'}}>TOTALS</td>
+                    <td className="mono" style={{textAlign:'right',fontWeight:700,padding:'8px 12px'}}>{formatCurrency(entryDetail.total_debits)}</td>
+                    <td className="mono" style={{textAlign:'right',fontWeight:700,padding:'8px 12px'}}>{formatCurrency(entryDetail.total_credits)}</td>
+                  </tr>
+                </tfoot>
+              </table>
+              {entryDetail.status==='posted'&&<button className="btn bd bsm" onClick={()=>voidEntry(entryDetail.id)}>Void Entry</button>}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {showAdd&&(
+        <Modal title="New Journal Entry" onClose={()=>setShowAdd(false)}>
+          {err&&<div className="alert ae">{err}</div>}
+          <form onSubmit={submit}>
+            <div className="frow2">
+              <div><label>Date</label><input type="date" value={form.date} onChange={e=>setForm(f=>({...f,date:e.target.value}))} required/></div>
+              <div><label>Reference (optional)</label><input type="text" value={form.reference} onChange={e=>setForm(f=>({...f,reference:e.target.value}))} placeholder="Invoice #, check #…"/></div>
+            </div>
+            <div className="frow"><label>Description</label><input type="text" value={form.description} onChange={e=>setForm(f=>({...f,description:e.target.value}))} required placeholder="e.g. Record rent income for April"/></div>
+
+            <div style={{marginBottom:10}}>
+              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:8}}>
+                <label style={{marginBottom:0}}>Lines</label>
+                <button type="button" className="btn bg-btn bsm" onClick={addLine}>+ Add Line</button>
+              </div>
+              <table style={{width:'100%',borderCollapse:'collapse',fontSize:'.75rem'}}>
+                <thead><tr>
+                  <th style={{textAlign:'left',padding:'4px 6px',color:'var(--t3)',fontWeight:600,fontSize:'.65rem',textTransform:'uppercase'}}>Account</th>
+                  <th style={{textAlign:'left',padding:'4px 6px',color:'var(--t3)',fontWeight:600,fontSize:'.65rem',textTransform:'uppercase'}}>Note</th>
+                  <th style={{textAlign:'right',padding:'4px 6px',color:'var(--t3)',fontWeight:600,fontSize:'.65rem',textTransform:'uppercase'}}>Debit</th>
+                  <th style={{textAlign:'right',padding:'4px 6px',color:'var(--t3)',fontWeight:600,fontSize:'.65rem',textTransform:'uppercase'}}>Credit</th>
+                  <th></th>
+                </tr></thead>
+                <tbody>
+                  {form.lines.map((line,i)=>(
+                    <tr key={i}>
+                      <td style={{padding:'3px 4px'}}>
+                        <select value={line.accountId} onChange={e=>updateLine(i,'accountId',e.target.value)} style={{width:'100%',fontSize:'.72rem',padding:'5px 6px'}}>
+                          <option value="">Select…</option>
+                          {[['Assets',assetAccts],['Liabilities',liabAccts],['Equity',equityAccts],['Income',incomeAccts],['Expenses',expenseAccts]].map(([label,grp]:any)=>
+                            (grp as any[]).length>0&&<optgroup key={label} label={label}>{(grp as any[]).map((a:any)=><option key={a.id} value={a.id}>{a.code} · {a.name}</option>)}</optgroup>
+                          )}
+                        </select>
+                      </td>
+                      <td style={{padding:'3px 4px'}}><input type="text" value={line.description} onChange={e=>updateLine(i,'description',e.target.value)} placeholder="optional" style={{fontSize:'.72rem',padding:'5px 6px'}}/></td>
+                      <td style={{padding:'3px 4px'}}><input type="number" min="0" step="0.01" value={line.debit} onChange={e=>updateLine(i,'debit',e.target.value)} style={{textAlign:'right',fontSize:'.72rem',padding:'5px 6px',width:90}}/></td>
+                      <td style={{padding:'3px 4px'}}><input type="number" min="0" step="0.01" value={line.credit} onChange={e=>updateLine(i,'credit',e.target.value)} style={{textAlign:'right',fontSize:'.72rem',padding:'5px 6px',width:90}}/></td>
+                      <td style={{padding:'3px 4px'}}>{form.lines.length>2&&<button type="button" onClick={()=>removeLine(i)} style={{background:'none',border:'none',color:'var(--red)',cursor:'pointer',fontSize:'.9rem'}}>✕</button>}</td>
+                    </tr>
+                  ))}
+                  <tr style={{background:'var(--bg3)'}}>
+                    <td colSpan={2} style={{padding:'6px 8px',fontSize:'.72rem',color:'var(--t3)',fontWeight:600}}>TOTALS</td>
+                    <td style={{padding:'6px 8px',textAlign:'right',fontFamily:'var(--font-m)',fontSize:'.78rem',color:balanced?'var(--green)':'var(--amber)'}}>{formatCurrency(totalDebits)}</td>
+                    <td style={{padding:'6px 8px',textAlign:'right',fontFamily:'var(--font-m)',fontSize:'.78rem',color:balanced?'var(--green)':'var(--amber)'}}>{formatCurrency(totalCredits)}</td>
+                    <td/>
+                  </tr>
+                </tbody>
+              </table>
+              {!balanced&&totalDebits>0&&<div style={{fontSize:'.72rem',color:'var(--amber)',marginTop:6}}>⚠ Entry out of balance by {formatCurrency(Math.abs(totalDebits-totalCredits))}</div>}
+              {balanced&&<div style={{fontSize:'.72rem',color:'var(--green)',marginTop:6}}>✓ Entry is balanced</div>}
+            </div>
+
+            <div className="factions">
+              <button type="button" className="btn bg-btn" onClick={()=>setShowAdd(false)}>Cancel</button>
+              <button type="submit" className="btn bp" disabled={saving||!balanced}>{saving?<><span className="spinner"/>Posting…</>:'Post Entry'}</button>
+            </div>
+          </form>
+        </Modal>
+      )}
+    </div>
+  )
+}
+
+// ── TRANSACTIONS ──────────────────────────────────────────────────────
+function Transactions(){
+  const qc=useQueryClient()
+  const{data:txs=[],isLoading}=useQuery('txs',()=>get<any[]>('/books/transactions'))
+  const{data:accounts=[]}=useQuery('acct',()=>get<any[]>('/books/accounts'))
+  const[tab,setTab]=useState<'all'|'income'|'expense'>('all')
+  const[showAdd,setShowAdd]=useState(false)
+  const[err,setErr]=useState('')
+  const[saving,setSaving]=useState(false)
+  const init={date:new Date().toISOString().split('T')[0],description:'',amount:'',type:'expense',category:'',accountId:'',reference:''}
+  const[form,setForm]=useState(init)
+  const f=(k:string)=>(e:React.ChangeEvent<HTMLInputElement|HTMLSelectElement>)=>setForm(p=>({...p,[k]:e.target.value}))
+
+  const filtered=tab==='all'?(txs as any[]):(txs as any[]).filter((t:any)=>t.type===tab)
+  const totalIncome=(txs as any[]).filter((t:any)=>t.type==='income').reduce((s:number,t:any)=>s+(+t.amount),0)
+  const totalExpense=(txs as any[]).filter((t:any)=>t.type==='expense').reduce((s:number,t:any)=>s+(+t.amount),0)
+  const unreconciled=(txs as any[]).filter((t:any)=>!t.reconciled).length
+
+  const add=async(e:React.FormEvent)=>{
+    e.preventDefault();setSaving(true);setErr('')
+    try{
+      await post('/books/transactions',{...form,amount:+form.amount})
+      qc.invalidateQueries('txs');setShowAdd(false);setForm(init)
+    }catch(ex:any){setErr(ex.response?.data?.error||'Failed')}
+    finally{setSaving(false)}
+  }
+
+  const reconcile=async(id:string)=>{
+    await patch('/books/transactions/'+id+'/reconcile')
+    qc.invalidateQueries('txs')
+  }
+
+  return(
+    <div>
+      <div className="ph">
+        <div><h1 className="pt">💳 Transactions</h1><p className="ps">{(txs as any[]).length} transactions · {unreconciled} unreconciled</p></div>
+        <button className="btn bp" onClick={()=>setShowAdd(true)}>+ Add Transaction</button>
+      </div>
+
+      <div className="grid4" style={{marginBottom:16}}>
+        <div className="kpi"><div className="kl">Total Income</div><div className="kv g">{formatCurrency(totalIncome)}</div><div className="ks">{(txs as any[]).filter((t:any)=>t.type==='income').length} transactions</div></div>
+        <div className="kpi"><div className="kl">Total Expenses</div><div className="kv r">{formatCurrency(totalExpense)}</div><div className="ks">{(txs as any[]).filter((t:any)=>t.type==='expense').length} transactions</div></div>
+        <div className="kpi"><div className="kl">Net</div><div className={`kv ${totalIncome-totalExpense>=0?'g':'r'}`}>{formatCurrency(totalIncome-totalExpense)}</div><div className="ks">Income minus expenses</div></div>
+        <div className="kpi"><div className="kl">Unreconciled</div><div className={`kv ${unreconciled>0?'a':'g'}`}>{unreconciled}</div><div className="ks">Pending reconciliation</div></div>
+      </div>
+
+      <div className="tabs">
+        <button className={`tab ${tab==='all'?'on':''}`} onClick={()=>setTab('all')}>All ({(txs as any[]).length})</button>
+        <button className={`tab ${tab==='income'?'on':''}`} onClick={()=>setTab('income')}>Income ({(txs as any[]).filter((t:any)=>t.type==='income').length})</button>
+        <button className={`tab ${tab==='expense'?'on':''}`} onClick={()=>setTab('expense')}>Expenses ({(txs as any[]).filter((t:any)=>t.type==='expense').length})</button>
+      </div>
+
+      <div className="card" style={{padding:0}}>
+        {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}><span className="spinner" style={{display:'inline-block'}}/></div>:(
+          <table className="tbl">
+            <thead><tr><th>Date</th><th>Description</th><th>Category</th><th>Account</th><th>Amount</th><th>Type</th><th>Reconciled</th></tr></thead>
+            <tbody>
+              {(filtered as any[]).length?(filtered as any[]).map((t:any)=>(
+                <tr key={t.id}>
+                  <td className="mono" style={{fontSize:'.72rem'}}>{new Date(t.date+'T12:00:00').toLocaleDateString()}</td>
+                  <td style={{color:'var(--t0)',fontSize:'.78rem'}}>{t.description}</td>
+                  <td style={{fontSize:'.72rem',color:'var(--t2)'}}>{t.category||'—'}</td>
+                  <td style={{fontSize:'.72rem',color:'var(--t3)'}}>{t.account_name?t.code+' · '+t.account_name:'—'}</td>
+                  <td className="mono" style={{color:t.type==='income'?'var(--green)':'var(--red)',fontWeight:600}}>{t.type==='income'?'+':'-'}{formatCurrency(t.amount)}</td>
+                  <td><span className={`badge ${t.type==='income'?'bg2':'br'}`}>{t.type}</span></td>
+                  <td>{t.reconciled?<span className="badge bg2">✓</span>:<button className="btn bg-btn bsm" onClick={()=>reconcile(t.id)}>Mark</button>}</td>
+                </tr>
+              )):<tr><td colSpan={7}><div className="empty">No transactions yet.</div></td></tr>}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      {showAdd&&(
+        <Modal title="Add Transaction" onClose={()=>setShowAdd(false)}>
+          {err&&<div className="alert ae">{err}</div>}
+          <form onSubmit={add}>
+            <div className="frow2">
+              <div><label>Date</label><input type="date" value={form.date} onChange={f('date')} required/></div>
+              <div><label>Type</label>
+                <select value={form.type} onChange={f('type')}>
+                  <option value="income">Income</option>
+                  <option value="expense">Expense</option>
+                </select>
+              </div>
+            </div>
+            <div className="frow"><label>Description</label><input type="text" value={form.description} onChange={f('description')} required/></div>
+            <div className="frow2">
+              <div><label>Amount</label><input type="number" min="0" step="0.01" value={form.amount} onChange={f('amount')} required/></div>
+              <div><label>Category</label><input type="text" value={form.category} onChange={f('category')} placeholder="e.g. Repairs, Rent"/></div>
+            </div>
+            <div className="frow"><label>Account</label>
+              <select value={form.accountId} onChange={f('accountId')}>
+                <option value="">— Uncategorized —</option>
+                {(accounts as any[]).map((a:any)=><option key={a.id} value={a.id}>{a.code} · {a.name}</option>)}
+              </select>
+            </div>
+            <div className="frow"><label>Reference (optional)</label><input type="text" value={form.reference} onChange={f('reference')} placeholder="Check #, invoice #…"/></div>
+            <div className="factions">
+              <button type="button" className="btn bg-btn" onClick={()=>setShowAdd(false)}>Cancel</button>
+              <button type="submit" className="btn bp" disabled={saving}>{saving?<><span className="spinner"/>Saving…</>:'Add Transaction'}</button>
+            </div>
+          </form>
+        </Modal>
+      )}
+    </div>
+  )
+}
+
+// ── BANK RECONCILE ────────────────────────────────────────────────────
+function BankReconcile(){
+  const{data:txs=[],isLoading}=useQuery('txs-unrec',()=>get<any[]>('/books/transactions?reconciled=false'))
+  const{data:accounts=[]}=useQuery('acct',()=>get<any[]>('/books/accounts'))
+  const[statementBal,setStatementBal]=useState('')
+  const[selectedAcct,setSelectedAcct]=useState('')
+  const qc=useQueryClient()
+  const bankAccts=(accounts as any[]).filter((a:any)=>a.subtype==='bank')
+  const unrecTxs=txs as any[]
+  const bookBal=unrecTxs.reduce((s:number,t:any)=>s+(t.type==='income'?+t.amount:-+t.amount),0)
+  const diff=(+statementBal||0)-bookBal
+
+  const reconcile=async(id:string)=>{
+    await patch('/books/transactions/'+id+'/reconcile')
+    qc.invalidateQueries('txs-unrec')
+  }
+
+  return(
+    <div>
+      <div className="ph"><div><h1 className="pt">🏦 Bank Reconciliation</h1><p className="ps">{unrecTxs.length} unreconciled transactions</p></div></div>
+
+      <div className="grid2" style={{marginBottom:16}}>
+        <div className="card">
+          <div className="ct">Reconciliation Setup</div>
+          <div className="frow"><label>Bank Account</label>
+            <select value={selectedAcct} onChange={e=>setSelectedAcct(e.target.value)}>
+              <option value="">Select bank account…</option>
+              {bankAccts.map((a:any)=><option key={a.id} value={a.id}>{a.code} · {a.name}</option>)}
+            </select>
+          </div>
+          <div className="frow"><label>Statement Ending Balance</label><input type="number" step="0.01" value={statementBal} onChange={e=>setStatementBal(e.target.value)} placeholder="0.00"/></div>
+        </div>
+        <div className="card">
+          <div className="ct">Balance Summary</div>
+          <div className="dr"><span className="dk">Statement balance</span><span className="dv mono">{formatCurrency(+statementBal||0)}</span></div>
+          <div className="dr"><span className="dk">Book balance (unreconciled)</span><span className="dv mono">{formatCurrency(bookBal)}</span></div>
+          <div className="dr" style={{borderTop:'1px solid var(--b1)',marginTop:4,paddingTop:8}}>
+            <span className="dk" style={{fontWeight:700}}>Difference</span>
+            <span className={`dv mono ${Math.abs(diff)<0.01?'':''`} style={{color:Math.abs(diff)<0.01?'var(--green)':'var(--red)',fontWeight:700}}>{formatCurrency(diff)}</span>
+          </div>
+          {Math.abs(diff)<0.01&&statementBal&&<div style={{marginTop:10}}><span className="badge bg2">✓ Reconciled</span></div>}
+        </div>
+      </div>
+
+      <div className="card" style={{padding:0}}>
+        <div style={{padding:'12px 16px',borderBottom:'1px solid var(--b1)',display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+          <div className="ct" style={{marginBottom:0}}>Unreconciled Transactions</div>
+          <span style={{fontSize:'.72rem',color:'var(--t3)'}}>Click to mark reconciled</span>
+        </div>
+        {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}><span className="spinner" style={{display:'inline-block'}}/></div>:(
+          <table className="tbl">
+            <thead><tr><th>Date</th><th>Description</th><th>Type</th><th>Amount</th><th></th></tr></thead>
+            <tbody>
+              {unrecTxs.length?unrecTxs.map((t:any)=>(
+                <tr key={t.id}>
+                  <td className="mono" style={{fontSize:'.72rem'}}>{new Date(t.date+'T12:00:00').toLocaleDateString()}</td>
+                  <td style={{fontSize:'.78rem',color:'var(--t0)'}}>{t.description}</td>
+                  <td><span className={`badge ${t.type==='income'?'bg2':'br'}`}>{t.type}</span></td>
+                  <td className="mono" style={{color:t.type==='income'?'var(--green)':'var(--red)'}}>{t.type==='income'?'+':'-'}{formatCurrency(t.amount)}</td>
+                  <td><button className="btn bg-btn bsm" onClick={()=>reconcile(t.id)}>✓ Reconcile</button></td>
+                </tr>
+              )):<tr><td colSpan={5}><div className="empty">All transactions reconciled! 🎉</div></td></tr>}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ── RENT ROLL ─────────────────────────────────────────────────────────
+function RentRoll(){
+  const{data,isLoading}=useQuery('rent-roll',()=>get<any>('/books/rent-roll'))
+  const units=(data as any)?.units||[]
+  const occupied=units.filter((u:any)=>u.status!=='vacant')
+
+  return(
+    <div>
+      <div className="ph">
+        <div><h1 className="pt">🏘 Rent Roll</h1><p className="ps">Live sync from GAM · {units.length} units</p></div>
+        <span className="badge bteal">Live Data</span>
+      </div>
+
+      <div className="grid4" style={{marginBottom:16}}>
+        <div className="kpi"><div className="kl">Expected Rent (MTD)</div><div className="kv gold">{formatCurrency((data as any)?.totalExpected||0)}</div><div className="ks">{occupied.length} occupied units</div></div>
+        <div className="kpi"><div className="kl">Collected (MTD)</div><div className="kv g">{formatCurrency((data as any)?.totalCollected||0)}</div><div className="ks">Settled payments</div></div>
+        <div className="kpi"><div className="kl">Variance</div><div className={`kv ${((data as any)?.variance||0)>=0?'g':'r'}`}>{formatCurrency((data as any)?.variance||0)}</div><div className="ks">Collected minus expected</div></div>
+        <div className="kpi"><div className="kl">Occupancy Rate</div><div className="kv b">{(((data as any)?.occupancyRate||0)*100).toFixed(0)}%</div><div className="ks">{occupied.length}/{units.length} units</div></div>
+      </div>
+
+      <div className="card" style={{padding:0}}>
+        {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}><span className="spinner" style={{display:'inline-block'}}/></div>:(
+          <table className="tbl">
+            <thead><tr><th>Unit</th><th>Property</th><th>Tenant</th><th>Rent</th><th>Collected MTD</th><th>Variance</th><th>Status</th><th>ACH</th><th>OTP</th></tr></thead>
+            <tbody>
+              {units.length?units.map((u:any)=>{
+                const variance=(+u.collected_mtd||0)-(u.status!=='vacant'?+u.rent_amount:0)
+                return(
+                  <tr key={u.unit_number+u.property_name}>
+                    <td className="mono" style={{fontWeight:600,color:'var(--t0)'}}>{u.unit_number}</td>
+                    <td style={{fontSize:'.75rem'}}>{u.property_name}</td>
+                    <td style={{fontSize:'.75rem'}}>{u.tenant_first?u.tenant_first+' '+u.tenant_last:<span style={{color:'var(--t3)'}}>Vacant</span>}</td>
+                    <td className="mono">{formatCurrency(u.rent_amount)}</td>
+                    <td className="mono" style={{color:'var(--green)'}}>{+u.collected_mtd>0?formatCurrency(u.collected_mtd):'—'}</td>
+                    <td className="mono" style={{color:variance>=0?'var(--green)':'var(--red)'}}>{u.status!=='vacant'?formatCurrency(variance):'—'}</td>
+                    <td><span className={`badge ${u.status==='active'?'bg2':u.status==='delinquent'?'ba':u.status==='vacant'?'bmu':'br'}`}>{u.status}</span></td>
+                    <td>{u.ach_verified?<span className="badge bg2">✓</span>:<span style={{color:'var(--t3)'}}>—</span>}</td>
+                    <td>{u.on_time_pay_enrolled?<span className="badge bgold">OTP</span>:<span style={{color:'var(--t3)'}}>—</span>}</td>
+                  </tr>
+                )
+              }):<tr><td colSpan={9}><div className="empty">No units found.</div></td></tr>}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ── P&L REPORT ────────────────────────────────────────────────────────
+function ProfitLoss(){
+  const now=new Date()
+  const[startDate,setStartDate]=useState(`${now.getFullYear()}-01-01`)
+  const[endDate,setEndDate]=useState(now.toISOString().split('T')[0])
+  const{data,isLoading,refetch}=useQuery(['pl',startDate,endDate],()=>get<any>(`/books/reports/pl?startDate=${startDate}&endDate=${endDate}`))
+
+  const income=(data as any)?.income||[]
+  const expenses=(data as any)?.expenses||[]
+  const totalIncome=(data as any)?.totalIncome||0
+  const totalExpenses=(data as any)?.totalExpenses||0
+  const netIncome=(data as any)?.netIncome||0
+  const gamRent=(data as any)?.gamRentIncome||0
+
+  return(
+    <div>
+      <div className="ph">
+        <div><h1 className="pt">📈 Profit & Loss</h1><p className="ps">Income statement · {new Date(startDate+'T12:00:00').toLocaleDateString()} – {new Date(endDate+'T12:00:00').toLocaleDateString()}</p></div>
+        <div style={{display:'flex',gap:8,alignItems:'center'}}>
+          <input type="date" value={startDate} onChange={e=>setStartDate(e.target.value)} style={{width:'auto',padding:'5px 8px',fontSize:'.75rem'}}/>
+          <span style={{color:'var(--t3)'}}>to</span>
+          <input type="date" value={endDate} onChange={e=>setEndDate(e.target.value)} style={{width:'auto',padding:'5px 8px',fontSize:'.75rem'}}/>
+        </div>
+      </div>
+
+      <div className="grid4" style={{marginBottom:16}}>
+        <div className="kpi"><div className="kl">Total Income</div><div className="kv g">{formatCurrency(totalIncome)}</div><div className="ks">{income.length} income accounts</div></div>
+        <div className="kpi"><div className="kl">GAM Rent (synced)</div><div className="kv gold">{formatCurrency(gamRent)}</div><div className="ks">Settled payments from GAM</div></div>
+        <div className="kpi"><div className="kl">Total Expenses</div><div className="kv r">{formatCurrency(totalExpenses)}</div><div className="ks">{expenses.length} expense accounts</div></div>
+        <div className="kpi"><div className="kl">Net Income</div><div className={`kv ${netIncome>=0?'g':'r'}`}>{formatCurrency(netIncome)}</div><div className="ks">{netIncome>=0?'Profitable':'Loss'}</div></div>
+      </div>
+
+      {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}><span className="spinner" style={{display:'inline-block'}}/></div>:(
+        <div className="grid2">
+          <div>
+            <div className="card" style={{marginBottom:12}}>
+              <div className="ct">Income</div>
+              {gamRent>0&&<div className="dr"><span className="dk" style={{color:'var(--teal)'}}>🏘 GAM Rent Income (synced)</span><span className="dv mono" style={{color:'var(--teal)'}}>{formatCurrency(gamRent)}</span></div>}
+              {income.map((a:any)=>(
+                <div key={a.code} className="dr">
+                  <span className="dk">{a.code} · {a.name}</span>
+                  <span className="dv mono" style={{color:'var(--green)'}}>{formatCurrency(a.period_amount)}</span>
+                </div>
+              ))}
+              {income.length===0&&!gamRent&&<div style={{color:'var(--t3)',fontSize:'.78rem',padding:'8px 0'}}>No income recorded. Post journal entries or transactions.</div>}
+              <div className="dr" style={{borderTop:'2px solid var(--b1)',marginTop:8,paddingTop:8}}>
+                <span style={{fontWeight:700,color:'var(--t0)',fontFamily:'var(--font-d)'}}>Total Income</span>
+                <span style={{fontFamily:'var(--font-m)',fontWeight:700,color:'var(--green)',fontSize:'1rem'}}>{formatCurrency(totalIncome)}</span>
+              </div>
+            </div>
+
+            <div className="card">
+              <div className="ct">Expenses</div>
+              {expenses.map((a:any)=>(
+                <div key={a.code} className="dr">
+                  <span className="dk">{a.code} · {a.name}</span>
+                  <span className="dv mono" style={{color:'var(--red)'}}>{formatCurrency(a.period_amount)}</span>
+                </div>
+              ))}
+              {expenses.length===0&&<div style={{color:'var(--t3)',fontSize:'.78rem',padding:'8px 0'}}>No expenses recorded.</div>}
+              <div className="dr" style={{borderTop:'2px solid var(--b1)',marginTop:8,paddingTop:8}}>
+                <span style={{fontWeight:700,color:'var(--t0)',fontFamily:'var(--font-d)'}}>Total Expenses</span>
+                <span style={{fontFamily:'var(--font-m)',fontWeight:700,color:'var(--red)',fontSize:'1rem'}}>{formatCurrency(totalExpenses)}</span>
+              </div>
+            </div>
+          </div>
+
+          <div className="card" style={{alignSelf:'start'}}>
+            <div className="ct">Net Income Summary</div>
+            <div className="dr"><span className="dk">Total Income</span><span className="dv mono" style={{color:'var(--green)'}}>{formatCurrency(totalIncome)}</span></div>
+            <div className="dr"><span className="dk">Total Expenses</span><span className="dv mono" style={{color:'var(--red)'}}>({formatCurrency(totalExpenses)})</span></div>
+            <div style={{borderTop:'2px solid var(--b1)',marginTop:12,paddingTop:12,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+              <span style={{fontFamily:'var(--font-d)',fontWeight:800,fontSize:'1rem',color:'var(--t0)'}}>NET INCOME</span>
+              <span style={{fontFamily:'var(--font-d)',fontWeight:800,fontSize:'1.4rem',color:netIncome>=0?'var(--green)':'var(--red)'}}>{formatCurrency(netIncome)}</span>
+            </div>
+            <div style={{marginTop:16,padding:'12px',background:'var(--bg3)',borderRadius:8,fontSize:'.72rem',color:'var(--t3)',lineHeight:1.6}}>
+              <strong style={{color:'var(--t2)'}}>Note:</strong> This P&L reflects journal entries posted to income/expense accounts plus GAM rent payments. Add transactions and journal entries to build a complete picture.
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── BALANCE SHEET ─────────────────────────────────────────────────────
+function BalanceSheet(){
+  const{data,isLoading}=useQuery('balance-sheet',()=>get<any>('/books/reports/balance-sheet'))
+  const assets=(data as any)?.assets||[]
+  const liabilities=(data as any)?.liabilities||[]
+  const equity=(data as any)?.equity||[]
+  const totalAssets=(data as any)?.totalAssets||0
+  const totalLiabilities=(data as any)?.totalLiabilities||0
+  const totalEquity=(data as any)?.totalEquity||0
+  const balanced=(data as any)?.balances
+
+  return(
+    <div>
+      <div className="ph">
+        <div><h1 className="pt">⚖ Balance Sheet</h1><p className="ps">As of {new Date().toLocaleDateString()}</p></div>
+        {balanced!==undefined&&<span className={`badge ${balanced?'bg2':'br'}`}>{balanced?'✓ Balanced':'⚠ Out of Balance'}</span>}
+      </div>
+
+      {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}><span className="spinner" style={{display:'inline-block'}}/></div>:(
+        <div className="grid2">
+          <div>
+            <div className="card" style={{marginBottom:12}}>
+              <div className="ct">Assets</div>
+              {assets.map((a:any)=><div key={a.code} className="dr"><span className="dk">{a.code} · {a.name}</span><span className="dv mono">{formatCurrency(a.balance)}</span></div>)}
+              {assets.length===0&&<div style={{color:'var(--t3)',fontSize:'.78rem'}}>No asset accounts with balances.</div>}
+              <div className="dr" style={{borderTop:'2px solid var(--b1)',marginTop:8,paddingTop:8}}>
+                <span style={{fontWeight:700,color:'var(--t0)',fontFamily:'var(--font-d)'}}>Total Assets</span>
+                <span style={{fontFamily:'var(--font-m)',fontWeight:700,color:'var(--blue)',fontSize:'1rem'}}>{formatCurrency(totalAssets)}</span>
+              </div>
+            </div>
+          </div>
+          <div>
+            <div className="card" style={{marginBottom:12}}>
+              <div className="ct">Liabilities</div>
+              {liabilities.map((a:any)=><div key={a.code} className="dr"><span className="dk">{a.code} · {a.name}</span><span className="dv mono">{formatCurrency(a.balance)}</span></div>)}
+              {liabilities.length===0&&<div style={{color:'var(--t3)',fontSize:'.78rem'}}>No liability accounts with balances.</div>}
+              <div className="dr" style={{borderTop:'2px solid var(--b1)',marginTop:8,paddingTop:8}}>
+                <span style={{fontWeight:700,color:'var(--t0)',fontFamily:'var(--font-d)'}}>Total Liabilities</span>
+                <span style={{fontFamily:'var(--font-m)',fontWeight:700,color:'var(--red)',fontSize:'1rem'}}>{formatCurrency(totalLiabilities)}</span>
+              </div>
+            </div>
+            <div className="card">
+              <div className="ct">Equity</div>
+              {equity.map((a:any)=><div key={a.code} className="dr"><span className="dk">{a.code} · {a.name}</span><span className="dv mono">{formatCurrency(a.balance)}</span></div>)}
+              {equity.length===0&&<div style={{color:'var(--t3)',fontSize:'.78rem'}}>No equity accounts with balances.</div>}
+              <div className="dr" style={{borderTop:'2px solid var(--b1)',marginTop:8,paddingTop:8}}>
+                <span style={{fontWeight:700,color:'var(--t0)',fontFamily:'var(--font-d)'}}>Total Equity</span>
+                <span style={{fontFamily:'var(--font-m)',fontWeight:700,color:'var(--gold)',fontSize:'1rem'}}>{formatCurrency(totalEquity)}</span>
+              </div>
+              <div className="dr" style={{borderTop:'2px solid var(--b1)',marginTop:8,paddingTop:8}}>
+                <span style={{fontWeight:700,color:'var(--t0)',fontFamily:'var(--font-d)'}}>Total Liabilities + Equity</span>
+                <span style={{fontFamily:'var(--font-m)',fontWeight:700,color:balanced?'var(--green)':'var(--red)',fontSize:'1rem'}}>{formatCurrency(totalLiabilities+totalEquity)}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ── CLIENT SWITCHER ───────────────────────────────────────────────────
 function ClientSwitcher(){
   const{user,activeClientId,activeClientName,setActiveClient}=useAuth()
@@ -1295,14 +1846,14 @@ function App(){
         <Route path="payroll/history"    element={<PayHistory/>}/>
         <Route path="payroll/tax-forms"  element={<ComingSoon title="Tax Forms" icon="📋" description="W-2s, 1099-NECs, 940, 941, AZ state forms"/>}/>
         <Route path="books/accounts"     element={<ChartOfAccounts/>}/>
-        <Route path="books/journal"      element={<ComingSoon title="Journal Entries" icon="📓" description="Manual double-entry journal entries"/>}/>
-        <Route path="books/transactions" element={<ComingSoon title="Transactions" icon="💳" description="Income and expense transaction feed"/>}/>
-        <Route path="books/reconcile"    element={<ComingSoon title="Bank Reconciliation" icon="🏦" description="Reconcile bank statements to book balance"/>}/>
-        <Route path="rent-roll"          element={<ComingSoon title="Rent Roll" icon="🏘" description="Live rent roll synced from GAM"/>}/>
+        <Route path="books/journal"      element={<JournalEntries/>}/>
+        <Route path="books/transactions" element={<Transactions/>}/>
+        <Route path="books/reconcile"    element={<BankReconcile/>}/>
+        <Route path="rent-roll"          element={<RentRoll/>}/>
         <Route path="disbursements"      element={<ComingSoon title="Owner Disbursements" icon="💸" description="Disbursement history synced from GAM"/>}/>
         <Route path="bills"              element={<ComingSoon title="Bills & AP" icon="📄" description="Vendor bills and accounts payable"/>}/>
-        <Route path="reports/pl"              element={<ComingSoon title="Profit & Loss" icon="📈" description="Income statement by period"/>}/>
-        <Route path="reports/balance-sheet"   element={<ComingSoon title="Balance Sheet" icon="⚖" description="Assets, liabilities, and equity"/>}/>
+        <Route path="reports/pl"              element={<ProfitLoss/>}/>
+        <Route path="reports/balance-sheet"   element={<BalanceSheet/>}/>
         <Route path="reports/cash-flow"       element={<ComingSoon title="Cash Flow" icon="💧" description="Operating, investing, financing activities"/>}/>
         <Route path="reports/owner-statements" element={<ComingSoon title="Owner Statements" icon="🏠" description="Per-property income and expense statements"/>}/>
         <Route path="tax"                element={<ComingSoon title="Tax Center" icon="🏛" description="Payroll tax tracking — Federal, AZ, SS, Medicare"/>}/>
