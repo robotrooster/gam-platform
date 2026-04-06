@@ -29,6 +29,7 @@ import { maintenancePortalRouter } from './routes/maintenance-portal'
 import { esignRouter }        from './routes/esign'
 import { backgroundRouter }   from './routes/background'
 import { announcementsRouter }  from './routes/announcements'
+import { booksRouter } from './routes/books'
 import { bulletinRouter }      from './routes/bulletin'
 import { notificationsRouter } from './routes/notifications'
 import { schedulerInit }      from './jobs/scheduler'
@@ -105,6 +106,7 @@ app.use('/api/announcements',  announcementsRouter)
 app.use('/api/bulletin',       bulletinRouter)
   app.use('/api/background',    backgroundRouter)
 app.use('/api/notifications',  notificationsRouter)
+app.use('/api/books',          booksRouter)
 app.use('/webhooks',          webhooksRouter)
 
 app.use(errorHandler)
