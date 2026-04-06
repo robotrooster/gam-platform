@@ -1420,6 +1420,389 @@ function BankReconcile(){
   )
 }
 
+
+// ── BILLS & AP ────────────────────────────────────────────────────────
+function BillsAP(){
+  const qc=useQueryClient()
+  const{data:bills=[],isLoading}=useQuery('bills',()=>get<any[]>('/books/bills'))
+  const{data:vendors=[]}=useQuery('ven',()=>get<any[]>('/books/vendors'))
+  const{data:accounts=[]}=useQuery('acct',()=>get<any[]>('/books/accounts'))
+  const[tab,setTab]=useState<'open'|'paid'|'all'>('open')
+  const[showAdd,setShowAdd]=useState(false)
+  const[err,setErr]=useState('')
+  const[saving,setSaving]=useState(false)
+  const init={vendorId:'',billNumber:'',date:new Date().toISOString().split('T')[0],dueDate:'',description:'',amount:'',category:'',accountId:'',notes:''}
+  const[form,setForm]=useState(init)
+  const f=(k:string)=>(e:React.ChangeEvent<HTMLInputElement|HTMLSelectElement|HTMLTextAreaElement>)=>setForm(p=>({...p,[k]:e.target.value}))
+
+  const filtered=tab==='all'?(bills as any[]):(bills as any[]).filter((b:any)=>tab==='open'?b.status==='open'||b.status==='partial':b.status==='paid')
+  const totalOpen=(bills as any[]).filter((b:any)=>b.status==='open'||b.status==='partial').reduce((s:number,b:any)=>s+(+b.amount-+b.amount_paid),0)
+  const overdue=(bills as any[]).filter((b:any)=>b.due_date&&new Date(b.due_date)<new Date()&&b.status!=='paid')
+
+  const add=async(e:React.FormEvent)=>{
+    e.preventDefault();setSaving(true);setErr('')
+    try{
+      await post('/books/bills',{...form,amount:+form.amount})
+      qc.invalidateQueries('bills');qc.invalidateQueries('ven')
+      setShowAdd(false);setForm(init)
+    }catch(ex:any){setErr(ex.response?.data?.error||'Failed')}
+    finally{setSaving(false)}
+  }
+
+  const payBill=async(id:string,amount:number)=>{
+    await post('/books/bills/'+id+'/pay',{amount})
+    qc.invalidateQueries('bills');qc.invalidateQueries('ven')
+  }
+
+  const STATUS:Record<string,string>={open:'ba',partial:'bb',paid:'bg2',void:'bmu'}
+  const expenseAccts=(accounts as any[]).filter((a:any)=>a.type==='expense')
+
+  return(
+    <div>
+      <div className="ph">
+        <div><h1 className="pt">📄 Bills & AP</h1><p className="ps">{(bills as any[]).length} bills · {formatCurrency(totalOpen)} outstanding</p></div>
+        <button className="btn bp" onClick={()=>setShowAdd(true)}>+ Add Bill</button>
+      </div>
+
+      {overdue.length>0&&<div className="alert ae">⚠ {overdue.length} bill{overdue.length!==1?'s':''} overdue. Review and pay to avoid late fees.</div>}
+
+      <div className="grid4" style={{marginBottom:16}}>
+        <div className="kpi"><div className="kl">Open Bills</div><div className="kv a">{(bills as any[]).filter((b:any)=>b.status==='open').length}</div><div className="ks">Awaiting payment</div></div>
+        <div className="kpi"><div className="kl">Total Outstanding</div><div className="kv r">{formatCurrency(totalOpen)}</div><div className="ks">AP balance</div></div>
+        <div className="kpi"><div className="kl">Overdue</div><div className={`kv ${overdue.length>0?'r':'g'}`}>{overdue.length}</div><div className="ks">Past due date</div></div>
+        <div className="kpi"><div className="kl">Paid This Month</div><div className="kv g">{formatCurrency((bills as any[]).filter((b:any)=>b.status==='paid'&&b.paid_at&&new Date(b.paid_at)>=new Date(new Date().getFullYear(),new Date().getMonth(),1)).reduce((s:number,b:any)=>s+(+b.amount_paid),0))}</div><div className="ks">Cleared bills</div></div>
+      </div>
+
+      <div className="tabs">
+        <button className={`tab ${tab==='open'?'on':''}`} onClick={()=>setTab('open')}>Open ({(bills as any[]).filter((b:any)=>b.status==='open'||b.status==='partial').length})</button>
+        <button className={`tab ${tab==='paid'?'on':''}`} onClick={()=>setTab('paid')}>Paid ({(bills as any[]).filter((b:any)=>b.status==='paid').length})</button>
+        <button className={`tab ${tab==='all'?'on':''}`} onClick={()=>setTab('all')}>All ({(bills as any[]).length})</button>
+      </div>
+
+      <div className="card" style={{padding:0}}>
+        {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}><span className="spinner" style={{display:'inline-block'}}/></div>:(
+          <table className="tbl">
+            <thead><tr><th>Date</th><th>Vendor</th><th>Description</th><th>Due</th><th>Amount</th><th>Paid</th><th>Balance</th><th>Status</th><th></th></tr></thead>
+            <tbody>
+              {(filtered as any[]).length?(filtered as any[]).map((b:any)=>{
+                const isOverdue=b.due_date&&new Date(b.due_date)<new Date()&&b.status!=='paid'
+                return(
+                  <tr key={b.id} style={{background:isOverdue?'rgba(239,68,68,.03)':''}}>
+                    <td className="mono" style={{fontSize:'.72rem'}}>{new Date(b.date+'T12:00:00').toLocaleDateString()}</td>
+                    <td style={{fontSize:'.75rem',color:'var(--t0)'}}>{b.vendor_name||'—'}</td>
+                    <td style={{fontSize:'.78rem'}}>{b.description}</td>
+                    <td className="mono" style={{fontSize:'.72rem',color:isOverdue?'var(--red)':'var(--t3)'}}>{b.due_date?new Date(b.due_date+'T12:00:00').toLocaleDateString():'—'}{isOverdue&&' ⚠'}</td>
+                    <td className="mono">{formatCurrency(b.amount)}</td>
+                    <td className="mono" style={{color:'var(--green)'}}>{+b.amount_paid>0?formatCurrency(b.amount_paid):'—'}</td>
+                    <td className="mono" style={{color:'var(--red)',fontWeight:600}}>{formatCurrency(+b.amount-+b.amount_paid)}</td>
+                    <td><span className={`badge ${STATUS[b.status]||'bmu'}`}>{b.status}</span></td>
+                    <td>{b.status!=='paid'&&<button className="btn bp bsm" onClick={()=>payBill(b.id,+b.amount-+b.amount_paid)}>Pay Full</button>}</td>
+                  </tr>
+                )
+              }):<tr><td colSpan={9}><div className="empty">No {tab==='open'?'open ':''}bills.</div></td></tr>}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      {showAdd&&(
+        <Modal title="Add Bill" onClose={()=>setShowAdd(false)}>
+          {err&&<div className="alert ae">{err}</div>}
+          <form onSubmit={add}>
+            <div className="frow"><label>Vendor</label>
+              <select value={form.vendorId} onChange={f('vendorId')}>
+                <option value="">— No vendor —</option>
+                {(vendors as any[]).map((v:any)=><option key={v.id} value={v.id}>{v.name}</option>)}
+              </select>
+            </div>
+            <div className="frow2">
+              <div><label>Bill Date</label><input type="date" value={form.date} onChange={f('date')} required/></div>
+              <div><label>Due Date</label><input type="date" value={form.dueDate} onChange={f('dueDate')}/></div>
+            </div>
+            <div className="frow"><label>Description</label><input type="text" value={form.description} onChange={f('description')} required placeholder="e.g. APS Electric — March"/></div>
+            <div className="frow2">
+              <div><label>Amount</label><input type="number" min="0" step="0.01" value={form.amount} onChange={f('amount')} required/></div>
+              <div><label>Bill # (optional)</label><input type="text" value={form.billNumber} onChange={f('billNumber')}/></div>
+            </div>
+            <div className="frow"><label>Expense Account</label>
+              <select value={form.accountId} onChange={f('accountId')}>
+                <option value="">— Uncategorized —</option>
+                {expenseAccts.map((a:any)=><option key={a.id} value={a.id}>{a.code} · {a.name}</option>)}
+              </select>
+            </div>
+            <div className="frow"><label>Notes</label><textarea rows={2} value={form.notes} onChange={f('notes')}/></div>
+            <div className="factions">
+              <button type="button" className="btn bg-btn" onClick={()=>setShowAdd(false)}>Cancel</button>
+              <button type="submit" className="btn bp" disabled={saving}>{saving?<><span className="spinner"/>Saving…</>:'Add Bill'}</button>
+            </div>
+          </form>
+        </Modal>
+      )}
+    </div>
+  )
+}
+
+// ── CASH FLOW ────────────────────────────────────────────────────────
+function CashFlow(){
+  const now=new Date()
+  const[startDate,setStartDate]=useState(`${now.getFullYear()}-01-01`)
+  const[endDate,setEndDate]=useState(now.toISOString().split('T')[0])
+  const{data,isLoading}=useQuery(['cf',startDate,endDate],()=>get<any>(`/books/reports/cash-flow?startDate=${startDate}&endDate=${endDate}`))
+
+  const op=(data as any)?.operating
+  const fin=(data as any)?.financing
+  const net=(data as any)?.netCashFlow||0
+
+  return(
+    <div>
+      <div className="ph">
+        <div><h1 className="pt">💧 Cash Flow Statement</h1><p className="ps">{new Date(startDate+'T12:00:00').toLocaleDateString()} – {new Date(endDate+'T12:00:00').toLocaleDateString()}</p></div>
+        <div style={{display:'flex',gap:8,alignItems:'center'}}>
+          <input type="date" value={startDate} onChange={e=>setStartDate(e.target.value)} style={{width:'auto',padding:'5px 8px',fontSize:'.75rem'}}/>
+          <span style={{color:'var(--t3)'}}>to</span>
+          <input type="date" value={endDate} onChange={e=>setEndDate(e.target.value)} style={{width:'auto',padding:'5px 8px',fontSize:'.75rem'}}/>
+        </div>
+      </div>
+
+      <div className="grid4" style={{marginBottom:16}}>
+        <div className="kpi"><div className="kl">Operating Inflows</div><div className="kv g">{formatCurrency(op?.inflows?.total||0)}</div><div className="ks">Rent + other income</div></div>
+        <div className="kpi"><div className="kl">Operating Outflows</div><div className="kv r">{formatCurrency(op?.outflows?.total||0)}</div><div className="ks">Expenses + payroll + bills</div></div>
+        <div className="kpi"><div className="kl">Financing Outflows</div><div className="kv a">{formatCurrency(fin?.total||0)}</div><div className="ks">Owner disbursements</div></div>
+        <div className="kpi"><div className="kl">Net Cash Flow</div><div className={`kv ${net>=0?'g':'r'}`}>{formatCurrency(net)}</div><div className="ks">{net>=0?'Positive cash flow':'Negative cash flow'}</div></div>
+      </div>
+
+      {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}><span className="spinner" style={{display:'inline-block'}}/></div>:(
+        <div className="grid2">
+          <div>
+            <div className="card" style={{marginBottom:12}}>
+              <div className="ct">Operating Activities</div>
+              <div style={{marginBottom:10}}>
+                <div style={{fontSize:'.72rem',fontWeight:700,color:'var(--t2)',marginBottom:6,textTransform:'uppercase',letterSpacing:'.06em'}}>Inflows</div>
+                <div className="dr"><span className="dk">🏘 GAM Rent Collected</span><span className="dv mono" style={{color:'var(--green)'}}>{formatCurrency(op?.inflows?.rentCollected||0)}</span></div>
+                <div className="dr"><span className="dk">Other Income</span><span className="dv mono" style={{color:'var(--green)'}}>{formatCurrency(op?.inflows?.otherIncome||0)}</span></div>
+                <div className="dr" style={{borderTop:'1px solid var(--b1)',paddingTop:6,marginTop:4}}><span className="dk" style={{fontWeight:700}}>Total Inflows</span><span className="dv mono" style={{color:'var(--green)',fontWeight:700}}>{formatCurrency(op?.inflows?.total||0)}</span></div>
+              </div>
+              <div>
+                <div style={{fontSize:'.72rem',fontWeight:700,color:'var(--t2)',marginBottom:6,textTransform:'uppercase',letterSpacing:'.06em'}}>Outflows</div>
+                <div className="dr"><span className="dk">Expenses</span><span className="dv mono" style={{color:'var(--red)'}}>({formatCurrency(op?.outflows?.expenses||0)})</span></div>
+                <div className="dr"><span className="dk">Payroll (net)</span><span className="dv mono" style={{color:'var(--red)'}}>({formatCurrency(op?.outflows?.payroll||0)})</span></div>
+                <div className="dr"><span className="dk">Bills Paid</span><span className="dv mono" style={{color:'var(--red)'}}>({formatCurrency(op?.outflows?.bills||0)})</span></div>
+                <div className="dr" style={{borderTop:'1px solid var(--b1)',paddingTop:6,marginTop:4}}><span className="dk" style={{fontWeight:700}}>Total Outflows</span><span className="dv mono" style={{color:'var(--red)',fontWeight:700}}>({formatCurrency(op?.outflows?.total||0)})</span></div>
+              </div>
+              <div className="dr" style={{borderTop:'2px solid var(--b1)',paddingTop:8,marginTop:8}}>
+                <span style={{fontWeight:700,color:'var(--t0)',fontFamily:'var(--font-d)'}}>Net Operating Cash Flow</span>
+                <span style={{fontFamily:'var(--font-m)',fontWeight:700,color:(op?.net||0)>=0?'var(--green)':'var(--red)',fontSize:'1rem'}}>{formatCurrency(op?.net||0)}</span>
+              </div>
+            </div>
+
+            <div className="card">
+              <div className="ct">Financing Activities</div>
+              <div className="dr"><span className="dk">Owner Disbursements</span><span className="dv mono" style={{color:'var(--amber)'}}>({formatCurrency(fin?.disbursements||0)})</span></div>
+              <div className="dr" style={{borderTop:'2px solid var(--b1)',paddingTop:8,marginTop:8}}>
+                <span style={{fontWeight:700,color:'var(--t0)',fontFamily:'var(--font-d)'}}>Net Financing</span>
+                <span style={{fontFamily:'var(--font-m)',fontWeight:700,color:'var(--amber)',fontSize:'1rem'}}>({formatCurrency(fin?.total||0)})</span>
+              </div>
+            </div>
+          </div>
+
+          <div className="card" style={{alignSelf:'start'}}>
+            <div className="ct">Cash Flow Summary</div>
+            <div className="dr"><span className="dk">Net Operating</span><span className="dv mono" style={{color:(op?.net||0)>=0?'var(--green)':'var(--red)'}}>{formatCurrency(op?.net||0)}</span></div>
+            <div className="dr"><span className="dk">Net Financing</span><span className="dv mono" style={{color:'var(--amber)'}}>({formatCurrency(fin?.total||0)})</span></div>
+            <div style={{borderTop:'2px solid var(--b1)',marginTop:12,paddingTop:12,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+              <span style={{fontFamily:'var(--font-d)',fontWeight:800,fontSize:'1rem',color:'var(--t0)'}}>NET CASH FLOW</span>
+              <span style={{fontFamily:'var(--font-d)',fontWeight:800,fontSize:'1.4rem',color:net>=0?'var(--green)':'var(--red)'}}>{formatCurrency(net)}</span>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── OWNER STATEMENTS ─────────────────────────────────────────────────
+function OwnerStatements(){
+  const now=new Date()
+  const[startDate,setStartDate]=useState(`${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-01`)
+  const[endDate,setEndDate]=useState(now.toISOString().split('T')[0])
+  const[selected,setSelected]=useState<any>(null)
+  const{data:statements=[],isLoading}=useQuery(['owner-statements',startDate,endDate],()=>get<any[]>(`/books/reports/owner-statements?startDate=${startDate}&endDate=${endDate}`))
+
+  return(
+    <div>
+      <div className="ph">
+        <div><h1 className="pt">🏠 Owner Statements</h1><p className="ps">Per-property income statements</p></div>
+        <div style={{display:'flex',gap:8,alignItems:'center'}}>
+          <input type="date" value={startDate} onChange={e=>setStartDate(e.target.value)} style={{width:'auto',padding:'5px 8px',fontSize:'.75rem'}}/>
+          <span style={{color:'var(--t3)'}}>to</span>
+          <input type="date" value={endDate} onChange={e=>setEndDate(e.target.value)} style={{width:'auto',padding:'5px 8px',fontSize:'.75rem'}}/>
+        </div>
+      </div>
+
+      {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}><span className="spinner" style={{display:'inline-block'}}/></div>:(
+        <div className="grid2" style={{gap:16}}>
+          <div style={{display:'flex',flexDirection:'column',gap:12}}>
+            {(statements as any[]).length?(statements as any[]).map((s:any)=>(
+              <div key={s.landlord.id} className="card" style={{cursor:'pointer',borderColor:selected?.landlord?.id===s.landlord.id?'rgba(201,162,39,.4)':'var(--b1)'}} onClick={()=>setSelected(s)}>
+                <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start'}}>
+                  <div>
+                    <div style={{fontWeight:700,color:'var(--t0)',fontFamily:'var(--font-d)'}}>{s.landlord.business_name||s.landlord.first_name+' '+s.landlord.last_name}</div>
+                    <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:2}}>{s.landlord.email}</div>
+                  </div>
+                  <span className={s.variance>=0?'badge bg2':'badge br'}>{s.variance>=0?'✓ Collected':'⚠ Short'}</span>
+                </div>
+                <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:12,marginTop:12}}>
+                  <div><div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.06em'}}>Expected</div><div style={{fontFamily:'var(--font-m)',color:'var(--t0)',fontWeight:600}}>{formatCurrency(s.totalExpected)}</div></div>
+                  <div><div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.06em'}}>Collected</div><div style={{fontFamily:'var(--font-m)',color:'var(--green)',fontWeight:600}}>{formatCurrency(s.totalCollected)}</div></div>
+                  <div><div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.06em'}}>Disbursed</div><div style={{fontFamily:'var(--font-m)',color:'var(--gold)',fontWeight:600}}>{formatCurrency(s.totalDisbursed)}</div></div>
+                </div>
+              </div>
+            )):<div className="card" style={{textAlign:'center',padding:'48px 20px',color:'var(--t3)'}}>No owner data for this period.</div>}
+          </div>
+
+          <div>
+            {!selected&&<div className="card" style={{textAlign:'center',padding:'48px 20px',color:'var(--t3)'}}>Select an owner to view statement</div>}
+            {selected&&(
+              <div className="card">
+                <div style={{marginBottom:16,paddingBottom:14,borderBottom:'1px solid var(--b0)'}}>
+                  <div style={{fontFamily:'var(--font-d)',fontWeight:800,fontSize:'1.1rem',color:'var(--t0)'}}>{selected.landlord.business_name||selected.landlord.first_name+' '+selected.landlord.last_name}</div>
+                  <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:2}}>{new Date(startDate+'T12:00:00').toLocaleDateString()} – {new Date(endDate+'T12:00:00').toLocaleDateString()}</div>
+                </div>
+
+                {selected.properties.map((p:any)=>(
+                  <div key={p.id} style={{marginBottom:16,paddingBottom:14,borderBottom:'1px solid var(--b0)'}}>
+                    <div style={{fontWeight:600,color:'var(--t0)',marginBottom:8}}>{p.name}</div>
+                    <div className="dr"><span className="dk">Units</span><span className="dv mono">{p.occupied}/{p.unit_count} occupied</span></div>
+                    <div className="dr"><span className="dk">Expected Rent</span><span className="dv mono">{formatCurrency(p.expected_rent)}</span></div>
+                    <div className="dr"><span className="dk">Collected</span><span className="dv mono" style={{color:'var(--green)'}}>{formatCurrency(p.collected)}</span></div>
+                    <div className="dr"><span className="dk">Variance</span><span className="dv mono" style={{color:(+p.collected-+p.expected_rent)>=0?'var(--green)':'var(--red)'}}>{formatCurrency(+p.collected-+p.expected_rent)}</span></div>
+                  </div>
+                ))}
+
+                <div className="dr"><span className="dk" style={{fontWeight:700}}>Total Expected</span><span className="dv mono">{formatCurrency(selected.totalExpected)}</span></div>
+                <div className="dr"><span className="dk" style={{fontWeight:700}}>Total Collected</span><span className="dv mono" style={{color:'var(--green)',fontWeight:700}}>{formatCurrency(selected.totalCollected)}</span></div>
+                <div className="dr"><span className="dk" style={{fontWeight:700}}>Total Disbursed</span><span className="dv mono" style={{color:'var(--gold)',fontWeight:700}}>{formatCurrency(selected.totalDisbursed)}</span></div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── TAX CENTER ────────────────────────────────────────────────────────
+function TaxCenter(){
+  const now=new Date()
+  const[year,setYear]=useState(now.getFullYear())
+  const{data,isLoading}=useQuery(['tax',year],()=>get<any>(`/books/tax/summary?year=${year}`))
+
+  const payroll=(data as any)?.payroll||{}
+  const contractors=(data as any)?.contractors1099||[]
+  const employees=(data as any)?.employees||[]
+  const deadlines=(data as any)?.filingDeadlines||[]
+
+  return(
+    <div>
+      <div className="ph">
+        <div><h1 className="pt">🏛 Tax Center</h1><p className="ps">Payroll tax liabilities and filing deadlines</p></div>
+        <div style={{display:'flex',gap:8,alignItems:'center'}}>
+          <label style={{marginBottom:0,textTransform:'none',letterSpacing:0,fontSize:'.82rem',color:'var(--t2)'}}>Tax Year</label>
+          <select value={year} onChange={e=>setYear(+e.target.value)} style={{width:'auto',padding:'5px 10px',fontSize:'.82rem'}}>
+            {[now.getFullYear(),now.getFullYear()-1,now.getFullYear()-2].map(y=><option key={y} value={y}>{y}</option>)}
+          </select>
+        </div>
+      </div>
+
+      <div className="grid4" style={{marginBottom:16}}>
+        <div className="kpi"><div className="kl">YTD Gross Payroll</div><div className="kv gold">{formatCurrency(payroll.ytd_gross||0)}</div><div className="ks">{payroll.run_count||0} approved runs</div></div>
+        <div className="kpi"><div className="kl">Employee Tax W/H</div><div className="kv r">{formatCurrency((+payroll.ytd_federal||0)+(+payroll.ytd_state||0)+(+payroll.ytd_ss||0)+(+payroll.ytd_medicare||0))}</div><div className="ks">Fed + AZ + SS + Medicare</div></div>
+        <div className="kpi"><div className="kl">Employer Tax Match</div><div className="kv a">{formatCurrency((+payroll.employer_ss||0)+(+payroll.employer_medicare||0))}</div><div className="ks">SS + Medicare match</div></div>
+        <div className="kpi"><div className="kl">Total Tax Liability</div><div className="kv r">{formatCurrency(payroll.total_tax_liability||0)}</div><div className="ks">Employee + employer</div></div>
+      </div>
+
+      {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}><span className="spinner" style={{display:'inline-block'}}/></div>:(
+        <div className="grid2" style={{gap:16,marginBottom:16}}>
+          <div className="card">
+            <div className="ct">Payroll Tax Breakdown ({year})</div>
+            <div className="dr"><span className="dk">Federal Income W/H (employee)</span><span className="dv mono" style={{color:'var(--red)'}}>{formatCurrency(payroll.ytd_federal||0)}</span></div>
+            <div className="dr"><span className="dk">Social Security (employee 6.2%)</span><span className="dv mono" style={{color:'var(--amber)'}}>{formatCurrency(payroll.ytd_ss||0)}</span></div>
+            <div className="dr"><span className="dk">Medicare (employee 1.45%)</span><span className="dv mono" style={{color:'var(--amber)'}}>{formatCurrency(payroll.ytd_medicare||0)}</span></div>
+            <div className="dr"><span className="dk">AZ State W/H (employee 2.5%)</span><span className="dv mono" style={{color:'var(--amber)'}}>{formatCurrency(payroll.ytd_state||0)}</span></div>
+            <div className="dr" style={{borderTop:'1px solid var(--b1)',paddingTop:6,marginTop:4}}><span className="dk">Employer SS match (6.2%)</span><span className="dv mono" style={{color:'var(--red)'}}>{formatCurrency(payroll.employer_ss||0)}</span></div>
+            <div className="dr"><span className="dk">Employer Medicare match (1.45%)</span><span className="dv mono" style={{color:'var(--red)'}}>{formatCurrency(payroll.employer_medicare||0)}</span></div>
+            <div className="dr" style={{borderTop:'2px solid var(--b1)',paddingTop:8,marginTop:8}}>
+              <span style={{fontWeight:700,color:'var(--t0)',fontFamily:'var(--font-d)'}}>Total Liability</span>
+              <span style={{fontFamily:'var(--font-m)',fontWeight:700,color:'var(--red)',fontSize:'1rem'}}>{formatCurrency(payroll.total_tax_liability||0)}</span>
+            </div>
+          </div>
+
+          <div className="card">
+            <div className="ct">Filing Deadlines</div>
+            {deadlines.map((d:any)=>(
+              <div key={d.form} style={{padding:'10px 0',borderBottom:'1px solid var(--b0)'}}>
+                <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:4}}>
+                  <span style={{fontFamily:'var(--font-m)',fontWeight:600,color:'var(--gold)',fontSize:'.82rem'}}>{d.form}</span>
+                  {d.due&&<span className="badge ba">{d.due}</span>}
+                </div>
+                <div style={{fontSize:'.75rem',color:'var(--t2)',marginBottom:d.q1?6:0}}>{d.description}</div>
+                {d.q1&&<div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
+                  {['Q1','Q2','Q3','Q4'].map((q,i)=><span key={q} className="badge bmu" style={{fontSize:'.62rem'}}>{q}: {[d.q1,d.q2,d.q3,d.q4][i]}</span>)}
+                </div>}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {(contractors as any[]).length>0&&(
+        <div className="card" style={{marginBottom:16}}>
+          <div className="ct">1099-NEC Required ({year}) — Contractors Paid $600+</div>
+          {(contractors as any[]).filter((c:any)=>!c.w9_on_file).length>0&&(
+            <div className="alert aw" style={{marginBottom:12}}>⚠ {(contractors as any[]).filter((c:any)=>!c.w9_on_file).length} contractor(s) missing W-9. Collect before Jan 31.</div>
+          )}
+          <table className="tbl">
+            <thead><tr><th>Contractor</th><th>Entity</th><th>YTD Paid</th><th>W-9</th><th>1099 Status</th></tr></thead>
+            <tbody>
+              {(contractors as any[]).map((c:any)=>(
+                <tr key={c.id}>
+                  <td style={{fontWeight:600,color:'var(--t0)'}}>{c.business_name||[c.first_name,c.last_name].filter(Boolean).join(' ')}</td>
+                  <td><span className="badge bmu">{c.entity_type}</span></td>
+                  <td className="mono" style={{color:'var(--amber)',fontWeight:600}}>{formatCurrency(c.ytd_paid)}</td>
+                  <td>{c.w9_on_file?<span className="badge bg2">✓ On File</span>:<span className="badge br">Missing</span>}</td>
+                  <td><span className={c.w9_on_file?'badge bg2':'badge ba'}>{c.w9_on_file?'Ready to File':'Needs W-9'}</span></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {employees.length>0&&(
+        <div className="card">
+          <div className="ct">W-2 Employee YTD Summary ({year})</div>
+          <table className="tbl">
+            <thead><tr><th>Employee</th><th>YTD Gross</th><th>Federal W/H</th><th>AZ State</th><th>SS</th><th>Medicare</th><th>Net Pay</th></tr></thead>
+            <tbody>
+              {employees.map((e:any,i:number)=>(
+                <tr key={i}>
+                  <td style={{fontWeight:600,color:'var(--t0)'}}>{e.first_name} {e.last_name}</td>
+                  <td className="mono" style={{color:'var(--gold)'}}>{formatCurrency(e.ytd_gross)}</td>
+                  <td className="mono" style={{color:'var(--red)'}}>{formatCurrency(e.ytd_federal_tax)}</td>
+                  <td className="mono" style={{color:'var(--amber)'}}>{formatCurrency(e.ytd_state_tax)}</td>
+                  <td className="mono" style={{color:'var(--amber)'}}>{formatCurrency(e.ytd_ss)}</td>
+                  <td className="mono" style={{color:'var(--amber)'}}>{formatCurrency(e.ytd_medicare)}</td>
+                  <td className="mono" style={{color:'var(--green)',fontWeight:700}}>{formatCurrency(e.ytd_net)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ── RENT ROLL ─────────────────────────────────────────────────────────
 function RentRoll(){
   const{data,isLoading}=useQuery('rent-roll',()=>get<any>('/books/rent-roll'))
@@ -1851,12 +2234,12 @@ function App(){
         <Route path="books/reconcile"    element={<BankReconcile/>}/>
         <Route path="rent-roll"          element={<RentRoll/>}/>
         <Route path="disbursements"      element={<ComingSoon title="Owner Disbursements" icon="💸" description="Disbursement history synced from GAM"/>}/>
-        <Route path="bills"              element={<ComingSoon title="Bills & AP" icon="📄" description="Vendor bills and accounts payable"/>}/>
+        <Route path="bills"              element={<BillsAP/>}/>
         <Route path="reports/pl"              element={<ProfitLoss/>}/>
         <Route path="reports/balance-sheet"   element={<BalanceSheet/>}/>
-        <Route path="reports/cash-flow"       element={<ComingSoon title="Cash Flow" icon="💧" description="Operating, investing, financing activities"/>}/>
-        <Route path="reports/owner-statements" element={<ComingSoon title="Owner Statements" icon="🏠" description="Per-property income and expense statements"/>}/>
-        <Route path="tax"                element={<ComingSoon title="Tax Center" icon="🏛" description="Payroll tax tracking — Federal, AZ, SS, Medicare"/>}/>
+        <Route path="reports/cash-flow"       element={<CashFlow/>}/>
+        <Route path="reports/owner-statements" element={<OwnerStatements/>}/>
+        <Route path="tax"                element={<TaxCenter/>}/>
         <Route path="admin/companies"    element={<ComingSoon title="All Companies" icon="🏢" description="Platform-wide books view"/>}/>
         <Route path="admin/audit"        element={<ComingSoon title="Audit Log" icon="🔍" description="Full audit trail for all entries"/>}/>
       </Route>
