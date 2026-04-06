@@ -314,3 +314,244 @@ booksRouter.patch('/vendors/:id', async (req, res, next) => {
     res.json({ success: true, data: v })
   } catch (e) { next(e) }
 })
+
+// ════════════════════════════════════════
+// PAYROLL RUNS
+// ════════════════════════════════════════
+
+// Tax calculation helper
+function calcTaxes(grossPay: number, filingStatus: string, azPct: number, ytdGross: number) {
+  // Federal withholding — simplified % by filing status (production would use IRS tables)
+  const fedRates: Record<string, number> = {
+    single: 0.12, married: 0.10, married_higher: 0.12, head_of_household: 0.10
+  }
+  const fedRate = fedRates[filingStatus] || 0.12
+  const federalTax = Math.max(0, grossPay * fedRate)
+
+  // Social Security: 6.2% up to $168,600 annual wage base
+  const SS_WAGE_BASE = 168600
+  const ssEligible = Math.max(0, Math.min(grossPay, SS_WAGE_BASE - ytdGross))
+  const ssTax = ssEligible * 0.062
+
+  // Medicare: 1.45% (+ 0.9% over $200k)
+  const medicareTax = grossPay * 0.0145 + (ytdGross + grossPay > 200000 ? grossPay * 0.009 : 0)
+
+  // AZ state flat rate
+  const stateTax = grossPay * (azPct / 100)
+
+  const netPay = grossPay - federalTax - ssTax - medicareTax - stateTax
+
+  return {
+    federalTax: +federalTax.toFixed(2),
+    ssTax: +ssTax.toFixed(2),
+    medicareTax: +medicareTax.toFixed(2),
+    stateTax: +stateTax.toFixed(2),
+    netPay: +netPay.toFixed(2),
+  }
+}
+
+// GET /api/books/payroll/runs
+booksRouter.get('/payroll/runs', async (req, res, next) => {
+  try {
+    const lid = landlordScope(req.user)
+    const { rows } = await db.query(
+      `SELECT pr.*, COUNT(prl.id) as line_count
+       FROM payroll_runs pr
+       LEFT JOIN payroll_run_lines prl ON prl.run_id = pr.id
+       WHERE (pr.landlord_id = $1 OR $1 IS NULL)
+       GROUP BY pr.id
+       ORDER BY pr.pay_date DESC`,
+      [lid]
+    )
+    res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
+// GET /api/books/payroll/runs/:id
+booksRouter.get('/payroll/runs/:id', async (req, res, next) => {
+  try {
+    const lid = landlordScope(req.user)
+    const run = await queryOne<any>(
+      'SELECT * FROM payroll_runs WHERE id=$1 AND (landlord_id=$2 OR $2 IS NULL)',
+      [req.params.id, lid]
+    )
+    if (!run) throw new AppError(404, 'Run not found')
+    const { rows: lines } = await db.query(
+      `SELECT prl.*, e.first_name, e.last_name, e.title, e.pay_type as emp_pay_type,
+              e.pay_rate, e.ytd_gross
+       FROM payroll_run_lines prl
+       JOIN books_employees e ON e.id = prl.employee_id
+       WHERE prl.run_id = $1`,
+      [req.params.id]
+    )
+    res.json({ success: true, data: { ...run, lines } })
+  } catch (e) { next(e) }
+})
+
+// POST /api/books/payroll/runs — calculate draft run
+booksRouter.post('/payroll/runs', async (req, res, next) => {
+  try {
+    const lid = landlordScope(req.user)
+    const { periodStart, periodEnd, payDate, payFrequency, employeeIds, hoursMap = {} } = req.body
+    if (!periodStart || !periodEnd || !payDate || !payFrequency || !employeeIds?.length)
+      throw new AppError(400, 'periodStart, periodEnd, payDate, payFrequency, employeeIds required')
+
+    // Fetch selected employees
+    const placeholders = employeeIds.map((_: any, i: number) => `$${i + 2}`).join(',')
+    const { rows: employees } = await db.query(
+      `SELECT * FROM books_employees WHERE id IN (${placeholders}) AND (landlord_id=$1 OR $1 IS NULL) AND status='active'`,
+      [lid, ...employeeIds]
+    )
+    if (!employees.length) throw new AppError(400, 'No active employees found')
+
+    // Calculate gross per period
+    const periods: Record<string, number> = { weekly: 52, biweekly: 26, semimonthly: 24, monthly: 12 }
+    const periodsPerYear = periods[payFrequency] || 26
+
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      const { rows: [run] } = await client.query(
+        `INSERT INTO payroll_runs (landlord_id, period_start, period_end, pay_date, pay_frequency, status)
+         VALUES ($1,$2,$3,$4,$5,'draft') RETURNING *`,
+        [lid, periodStart, periodEnd, payDate, payFrequency]
+      )
+
+      let totalGross = 0, totalFed = 0, totalState = 0, totalSS = 0, totalMedicare = 0, totalNet = 0
+
+      for (const emp of employees) {
+        const hours = hoursMap[emp.id] || null
+        let grossPay = 0
+        if (emp.pay_type === 'salary') {
+          grossPay = +emp.pay_rate / periodsPerYear
+        } else {
+          // Hourly — require hours
+          const h = hours || (40 * (payFrequency === 'weekly' ? 1 : 2))
+          grossPay = +emp.pay_rate * h
+        }
+        grossPay = +grossPay.toFixed(2)
+
+        const taxes = calcTaxes(grossPay, emp.filing_status || 'single', +emp.az_withholding_pct || 2.5, +emp.ytd_gross || 0)
+
+        await client.query(
+          `INSERT INTO payroll_run_lines
+             (run_id, employee_id, pay_type, hours_worked, gross_pay,
+              federal_tax, state_tax, ss_tax, medicare_tax, net_pay)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+          [run.id, emp.id, emp.pay_type, hours, grossPay,
+           taxes.federalTax, taxes.stateTax, taxes.ssTax, taxes.medicareTax, taxes.netPay]
+        )
+
+        totalGross += grossPay; totalFed += taxes.federalTax; totalState += taxes.stateTax
+        totalSS += taxes.ssTax; totalMedicare += taxes.medicareTax; totalNet += taxes.netPay
+      }
+
+      await client.query(
+        `UPDATE payroll_runs SET
+           total_gross=$1, total_federal_tax=$2, total_state_tax=$3,
+           total_ss=$4, total_medicare=$5, total_net=$6, employee_count=$7
+         WHERE id=$8`,
+        [+totalGross.toFixed(2), +totalFed.toFixed(2), +totalState.toFixed(2),
+         +totalSS.toFixed(2), +totalMedicare.toFixed(2), +totalNet.toFixed(2),
+         employees.length, run.id]
+      )
+
+      await client.query('COMMIT')
+      const { rows: [finalRun] } = await db.query('SELECT * FROM payroll_runs WHERE id=$1', [run.id])
+      const { rows: lines } = await db.query(
+        `SELECT prl.*, e.first_name, e.last_name, e.title FROM payroll_run_lines prl
+         JOIN books_employees e ON e.id = prl.employee_id WHERE prl.run_id=$1`, [run.id]
+      )
+      res.status(201).json({ success: true, data: { ...finalRun, lines } })
+    } catch (e) { await client.query('ROLLBACK'); throw e }
+    finally { client.release() }
+  } catch (e) { next(e) }
+})
+
+// POST /api/books/payroll/runs/:id/approve
+booksRouter.post('/payroll/runs/:id/approve', async (req, res, next) => {
+  try {
+    const lid = landlordScope(req.user)
+    const run = await queryOne<any>(
+      'SELECT * FROM payroll_runs WHERE id=$1 AND (landlord_id=$2 OR $2 IS NULL)',
+      [req.params.id, lid]
+    )
+    if (!run) throw new AppError(404, 'Run not found')
+    if (run.status !== 'draft') throw new AppError(400, `Run is already ${run.status}`)
+
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      // Update run status
+      await client.query(
+        `UPDATE payroll_runs SET status='approved', approved_at=NOW(), approved_by=$1, updated_at=NOW() WHERE id=$2`,
+        [req.user!.userId, req.params.id]
+      )
+      // Update YTD on each employee
+      const { rows: lines } = await client.query(
+        'SELECT * FROM payroll_run_lines WHERE run_id=$1', [req.params.id]
+      )
+      for (const line of lines) {
+        await client.query(
+          `UPDATE books_employees SET
+             ytd_gross = ytd_gross + $1,
+             ytd_federal_tax = ytd_federal_tax + $2,
+             ytd_state_tax = ytd_state_tax + $3,
+             ytd_ss = ytd_ss + $4,
+             ytd_medicare = ytd_medicare + $5,
+             ytd_net = ytd_net + $6,
+             updated_at = NOW()
+           WHERE id = $7`,
+          [line.gross_pay, line.federal_tax, line.state_tax, line.ss_tax, line.medicare_tax, line.net_pay, line.employee_id]
+        )
+      }
+      await client.query('COMMIT')
+      const { rows: [updated] } = await db.query('SELECT * FROM payroll_runs WHERE id=$1', [req.params.id])
+      res.json({ success: true, data: updated })
+    } catch (e) { await client.query('ROLLBACK'); throw e }
+    finally { client.release() }
+  } catch (e) { next(e) }
+})
+
+// POST /api/books/payroll/runs/:id/void
+booksRouter.post('/payroll/runs/:id/void', async (req, res, next) => {
+  try {
+    const lid = landlordScope(req.user)
+    const run = await queryOne<any>(
+      'SELECT * FROM payroll_runs WHERE id=$1 AND (landlord_id=$2 OR $2 IS NULL)',
+      [req.params.id, lid]
+    )
+    if (!run) throw new AppError(404, 'Run not found')
+    if (run.status === 'voided') throw new AppError(400, 'Already voided')
+
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      // If approved, reverse YTD
+      if (run.status === 'approved') {
+        const { rows: lines } = await client.query('SELECT * FROM payroll_run_lines WHERE run_id=$1', [req.params.id])
+        for (const line of lines) {
+          await client.query(
+            `UPDATE books_employees SET
+               ytd_gross = GREATEST(0, ytd_gross - $1),
+               ytd_federal_tax = GREATEST(0, ytd_federal_tax - $2),
+               ytd_state_tax = GREATEST(0, ytd_state_tax - $3),
+               ytd_ss = GREATEST(0, ytd_ss - $4),
+               ytd_medicare = GREATEST(0, ytd_medicare - $5),
+               ytd_net = GREATEST(0, ytd_net - $6),
+               updated_at = NOW()
+             WHERE id=$7`,
+            [line.gross_pay, line.federal_tax, line.state_tax, line.ss_tax, line.medicare_tax, line.net_pay, line.employee_id]
+          )
+        }
+      }
+      await client.query(
+        `UPDATE payroll_runs SET status='voided', voided_at=NOW(), updated_at=NOW() WHERE id=$1`,
+        [req.params.id]
+      )
+      await client.query('COMMIT')
+      res.json({ success: true, data: { message: 'Run voided' } })
+    } catch (e) { await client.query('ROLLBACK'); throw e }
+    finally { client.release() }
+  } catch (e) { next(e) }
+})

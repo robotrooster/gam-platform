@@ -745,6 +745,312 @@ function Vendors(){
   )
 }
 
+
+// ── RUN PAYROLL ───────────────────────────────────────────────────────
+const FREQ_OPTIONS=[
+  {value:'weekly',    label:'Weekly'},
+  {value:'biweekly',  label:'Bi-Weekly'},
+  {value:'semimonthly',label:'Semi-Monthly'},
+  {value:'monthly',   label:'Monthly'},
+]
+
+function RunPayroll(){
+  const qc=useQueryClient()
+  const{data:employees=[]}=useQuery('emp',()=>get<any[]>('/books/employees'))
+  const active=(employees as any[]).filter((e:any)=>e.status==='active')
+  const[step,setStep]=useState<'setup'|'review'|'done'>('setup')
+  const[selectedIds,setSelectedIds]=useState<string[]>([])
+  const[hoursMap,setHoursMap]=useState<Record<string,string>>({})
+  const[freq,setFreq]=useState('biweekly')
+  const[periodStart,setPeriodStart]=useState('')
+  const[periodEnd,setPeriodEnd]=useState('')
+  const[payDate,setPayDate]=useState('')
+  const[draftRun,setDraftRun]=useState<any>(null)
+  const[calculating,setCalculating]=useState(false)
+  const[approving,setApproving]=useState(false)
+  const[err,setErr]=useState('')
+
+  const toggleEmp=(id:string)=>setSelectedIds(s=>s.includes(id)?s.filter(x=>x!==id):[...s,id])
+  const toggleAll=()=>setSelectedIds(s=>s.length===active.length?[]:active.map((e:any)=>e.id))
+
+  const calcRun=async(e:React.FormEvent)=>{
+    e.preventDefault();setCalculating(true);setErr('')
+    try{
+      const r=await post<any>('/books/payroll/runs',{
+        periodStart,periodEnd,payDate,payFrequency:freq,
+        employeeIds:selectedIds,
+        hoursMap:Object.fromEntries(Object.entries(hoursMap).map(([k,v])=>[k,+v]))
+      })
+      setDraftRun(r.data)
+      setStep('review')
+    }catch(ex:any){setErr(ex.response?.data?.error||'Calculation failed')}
+    finally{setCalculating(false)}
+  }
+
+  const approve=async()=>{
+    if(!confirm('Approve this payroll run? YTD totals will be updated for all employees.'))return
+    setApproving(true);setErr('')
+    try{
+      await post(`/books/payroll/runs/${draftRun.id}/approve`)
+      qc.invalidateQueries('emp')
+      qc.invalidateQueries('payroll-runs')
+      setStep('done')
+    }catch(ex:any){setErr(ex.response?.data?.error||'Approval failed')}
+    finally{setApproving(false)}
+  }
+
+  const voidRun=async()=>{
+    if(!confirm('Void this draft run?'))return
+    await post(`/books/payroll/runs/${draftRun.id}/void`)
+    setDraftRun(null);setStep('setup')
+    qc.invalidateQueries('payroll-runs')
+  }
+
+  const fmtFreq=(f:string)=>FREQ_OPTIONS.find(o=>o.value===f)?.label||f
+
+  return(
+    <div>
+      <div className="ph">
+        <div><h1 className="pt">▶ Run Payroll</h1><p className="ps">Calculate, review, and approve payroll for your employees</p></div>
+        {step!=='setup'&&<button className="btn bg-btn" onClick={()=>{setStep('setup');setDraftRun(null)}}>← Start Over</button>}
+      </div>
+
+      {err&&<div className="alert ae">{err}</div>}
+
+      {/* STEP 1 — SETUP */}
+      {step==='setup'&&(
+        <form onSubmit={calcRun}>
+          <div className="grid2" style={{marginBottom:16}}>
+            <div className="card">
+              <div className="ct">Pay Period</div>
+              <div className="frow"><label>Pay Frequency</label>
+                <select value={freq} onChange={e=>setFreq(e.target.value)}>
+                  {FREQ_OPTIONS.map(o=><option key={o.value} value={o.value}>{o.label}</option>)}
+                </select>
+              </div>
+              <div className="frow2">
+                <div><label>Period Start</label><input type="date" value={periodStart} onChange={e=>setPeriodStart(e.target.value)} required/></div>
+                <div><label>Period End</label><input type="date" value={periodEnd} onChange={e=>setPeriodEnd(e.target.value)} required/></div>
+              </div>
+              <div className="frow"><label>Pay Date</label><input type="date" value={payDate} onChange={e=>setPayDate(e.target.value)} required/></div>
+            </div>
+
+            <div className="card">
+              <div className="ct">Deduction Summary (per paycheck)</div>
+              <div className="dr"><span className="dk">Social Security</span><span className="dv mono">6.2% (up to $168,600/yr)</span></div>
+              <div className="dr"><span className="dk">Medicare</span><span className="dv mono">1.45% (+0.9% over $200k)</span></div>
+              <div className="dr"><span className="dk">AZ State (flat)</span><span className="dv mono">2.5% per employee setting</span></div>
+              <div className="dr"><span className="dk">Federal W/H</span><span className="dv mono">Per filing status</span></div>
+              <div style={{marginTop:10,fontSize:'.72rem',color:'var(--t3)'}}>Federal withholding uses simplified rate tables. Production should use IRS Publication 15-T bracket tables.</div>
+            </div>
+          </div>
+
+          <div className="card" style={{marginBottom:16}}>
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:14}}>
+              <div className="ct" style={{marginBottom:0}}>Select Employees ({selectedIds.length}/{active.length})</div>
+              <button type="button" className="btn bg-btn bsm" onClick={toggleAll}>{selectedIds.length===active.length?'Deselect All':'Select All'}</button>
+            </div>
+            {active.length===0?<div className="empty">No active employees. Add employees first.</div>:(
+              <table className="tbl">
+                <thead><tr><th style={{width:40}}></th><th>Employee</th><th>Type</th><th>Rate</th><th>Hours (if hourly)</th><th>Est. Gross</th></tr></thead>
+                <tbody>
+                  {active.map((emp:any)=>{
+                    const periods:Record<string,number>={weekly:52,biweekly:26,semimonthly:24,monthly:12}
+                    const ppy=periods[freq]||26
+                    const h=+(hoursMap[emp.id]||'80')
+                    const gross=emp.pay_type==='salary'?(+emp.pay_rate/ppy):(+emp.pay_rate*h)
+                    return(
+                      <tr key={emp.id} style={{background:selectedIds.includes(emp.id)?'rgba(201,162,39,.04)':''}}>
+                        <td><input type="checkbox" checked={selectedIds.includes(emp.id)} onChange={()=>toggleEmp(emp.id)} style={{width:'auto',cursor:'pointer'}}/></td>
+                        <td><div style={{fontWeight:600,color:'var(--t0)'}}>{emp.first_name} {emp.last_name}</div><div style={{fontSize:'.68rem',color:'var(--t3)'}}>{emp.title||''}</div></td>
+                        <td><span className={`badge ${emp.pay_type==='salary'?'bb':'ba'}`}>{emp.pay_type}</span></td>
+                        <td className="mono">{emp.pay_type==='salary'?formatCurrency(emp.pay_rate)+'/yr':formatCurrency(emp.pay_rate)+'/hr'}</td>
+                        <td>{emp.pay_type==='hourly'?(
+                          <input type="number" min="0" step="0.5" style={{width:80}} value={hoursMap[emp.id]||'80'} onChange={e=>setHoursMap(m=>({...m,[emp.id]:e.target.value}))} disabled={!selectedIds.includes(emp.id)}/>
+                        ):<span style={{color:'var(--t3)'}}>—</span>}</td>
+                        <td className="mono" style={{color:'var(--green)'}}>{formatCurrency(gross)}</td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            )}
+          </div>
+
+          <div style={{display:'flex',justifyContent:'flex-end'}}>
+            <button type="submit" className="btn bp" disabled={calculating||selectedIds.length===0} style={{padding:'10px 24px',fontSize:'.9rem'}}>
+              {calculating?<><span className="spinner"/>Calculating…</>:`Calculate Payroll for ${selectedIds.length} Employee${selectedIds.length!==1?'s':''} →`}
+            </button>
+          </div>
+        </form>
+      )}
+
+      {/* STEP 2 — REVIEW */}
+      {step==='review'&&draftRun&&(
+        <div>
+          <div className="grid4" style={{marginBottom:16}}>
+            <div className="kpi"><div className="kl">Total Gross Pay</div><div className="kv gold">{formatCurrency(draftRun.total_gross)}</div><div className="ks">{draftRun.employee_count} employees · {fmtFreq(draftRun.pay_frequency)}</div></div>
+            <div className="kpi"><div className="kl">Total Taxes</div><div className="kv r">{formatCurrency((+draftRun.total_federal_tax)+(+draftRun.total_state_tax)+(+draftRun.total_ss)+(+draftRun.total_medicare))}</div><div className="ks">Fed + AZ + SS + Medicare</div></div>
+            <div className="kpi"><div className="kl">Total Net Pay</div><div className="kv g">{formatCurrency(draftRun.total_net)}</div><div className="ks">Employee take-home</div></div>
+            <div className="kpi"><div className="kl">Pay Date</div><div className="kv b" style={{fontSize:'1.1rem'}}>{new Date(draftRun.pay_date+'T12:00:00').toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'})}</div><div className="ks">Period: {new Date(draftRun.period_start+'T12:00:00').toLocaleDateString()} – {new Date(draftRun.period_end+'T12:00:00').toLocaleDateString()}</div></div>
+          </div>
+
+          <div className="card" style={{marginBottom:16,padding:0}}>
+            <div style={{padding:'12px 16px',borderBottom:'1px solid var(--b1)'}}><div className="ct" style={{marginBottom:0}}>Pay Run Breakdown</div></div>
+            <table className="tbl">
+              <thead><tr><th>Employee</th><th>Pay Type</th><th>Gross</th><th>Federal W/H</th><th>SS (6.2%)</th><th>Medicare</th><th>AZ State</th><th>Net Pay</th></tr></thead>
+              <tbody>
+                {draftRun.lines?.map((line:any)=>(
+                  <tr key={line.id}>
+                    <td><div style={{fontWeight:600,color:'var(--t0)'}}>{line.first_name} {line.last_name}</div><div style={{fontSize:'.68rem',color:'var(--t3)'}}>{line.title||''}{line.hours_worked?' · '+line.hours_worked+' hrs':''}</div></td>
+                    <td><span className={`badge ${line.pay_type==='salary'?'bb':'ba'}`}>{line.pay_type}</span></td>
+                    <td className="mono" style={{color:'var(--t0)',fontWeight:600}}>{formatCurrency(line.gross_pay)}</td>
+                    <td className="mono" style={{color:'var(--red)'}}>{formatCurrency(line.federal_tax)}</td>
+                    <td className="mono" style={{color:'var(--amber)'}}>{formatCurrency(line.ss_tax)}</td>
+                    <td className="mono" style={{color:'var(--amber)'}}>{formatCurrency(line.medicare_tax)}</td>
+                    <td className="mono" style={{color:'var(--amber)'}}>{formatCurrency(line.state_tax)}</td>
+                    <td className="mono" style={{color:'var(--green)',fontWeight:700}}>{formatCurrency(line.net_pay)}</td>
+                  </tr>
+                ))}
+              </tbody>
+              <tfoot>
+                <tr style={{background:'var(--bg3)'}}>
+                  <td colSpan={2} style={{padding:'10px 12px',fontWeight:700,color:'var(--t0)',fontFamily:'var(--font-d)'}}>TOTALS</td>
+                  <td className="mono" style={{fontWeight:700,color:'var(--gold)',padding:'10px 12px'}}>{formatCurrency(draftRun.total_gross)}</td>
+                  <td className="mono" style={{color:'var(--red)',padding:'10px 12px'}}>{formatCurrency(draftRun.total_federal_tax)}</td>
+                  <td className="mono" style={{color:'var(--amber)',padding:'10px 12px'}}>{formatCurrency(draftRun.total_ss)}</td>
+                  <td className="mono" style={{color:'var(--amber)',padding:'10px 12px'}}>{formatCurrency(draftRun.total_medicare)}</td>
+                  <td className="mono" style={{color:'var(--amber)',padding:'10px 12px'}}>{formatCurrency(draftRun.total_state_tax)}</td>
+                  <td className="mono" style={{fontWeight:700,color:'var(--green)',padding:'10px 12px'}}>{formatCurrency(draftRun.total_net)}</td>
+                </tr>
+              </tfoot>
+            </table>
+          </div>
+
+          <div className="card" style={{marginBottom:16}}>
+            <div className="ct">Employer Tax Liability (this run)</div>
+            <div className="dr"><span className="dk">Employer SS match (6.2%)</span><span className="dv mono" style={{color:'var(--amber)'}}>{formatCurrency(draftRun.total_ss)}</span></div>
+            <div className="dr"><span className="dk">Employer Medicare match (1.45%)</span><span className="dv mono" style={{color:'var(--amber)'}}>{formatCurrency(draftRun.total_medicare)}</span></div>
+            <div className="dr"><span className="dk">Total employer tax cost</span><span className="dv mono" style={{color:'var(--red)',fontWeight:700}}>{formatCurrency((+draftRun.total_ss)+(+draftRun.total_medicare))}</span></div>
+            <div className="dr"><span className="dk">Total cost to employer (gross + employer taxes)</span><span className="dv mono" style={{color:'var(--gold)',fontWeight:700}}>{formatCurrency((+draftRun.total_gross)+(+draftRun.total_ss)+(+draftRun.total_medicare))}</span></div>
+          </div>
+
+          <div style={{display:'flex',gap:12,justifyContent:'flex-end'}}>
+            <button className="btn bd" onClick={voidRun}>Void Draft</button>
+            <button className="btn bp" onClick={approve} disabled={approving} style={{padding:'10px 28px',fontSize:'.9rem'}}>
+              {approving?<><span className="spinner"/>Approving…</>:'✓ Approve & Post Payroll'}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* STEP 3 — DONE */}
+      {step==='done'&&(
+        <div className="card" style={{textAlign:'center',padding:'60px 20px'}}>
+          <div style={{fontSize:'3rem',marginBottom:16}}>✅</div>
+          <h2 style={{color:'var(--green)',marginBottom:8}}>Payroll Approved!</h2>
+          <p style={{color:'var(--t2)',marginBottom:4}}>Total gross: <strong style={{color:'var(--t0)'}}>{formatCurrency(draftRun?.total_gross)}</strong></p>
+          <p style={{color:'var(--t2)',marginBottom:24}}>Net pay: <strong style={{color:'var(--green)'}}>{formatCurrency(draftRun?.total_net)}</strong> for {draftRun?.employee_count} employee{draftRun?.employee_count!==1?'s':''}</p>
+          <p style={{color:'var(--t3)',fontSize:'.8rem',marginBottom:24}}>YTD totals have been updated. View the run in Pay History.</p>
+          <div style={{display:'flex',gap:12,justifyContent:'center'}}>
+            <button className="btn bg-btn" onClick={()=>{setStep('setup');setDraftRun(null);setSelectedIds([]);setHoursMap({})}}>Run Another Payroll</button>
+            <a href="/payroll/history" className="btn bp">View Pay History →</a>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── PAY HISTORY ───────────────────────────────────────────────────────
+function PayHistory(){
+  const{data:runs=[],isLoading}=useQuery('payroll-runs',()=>get<any[]>('/books/payroll/runs'))
+  const[selected,setSelected]=useState<any>(null)
+  const{data:runDetail}=useQuery(['payroll-run',selected?.id],()=>get<any>(`/books/payroll/runs/${selected.id}`),{enabled:!!selected?.id})
+  const qc=useQueryClient()
+
+  const voidRun=async(id:string)=>{
+    if(!confirm('Void this approved run? YTD totals will be reversed.'))return
+    await post(`/books/payroll/runs/${id}/void`)
+    qc.invalidateQueries('payroll-runs')
+    qc.invalidateQueries('emp')
+    setSelected(null)
+  }
+
+  const STATUS:Record<string,string>={draft:'ba',approved:'bg2',voided:'bmu'}
+
+  return(
+    <div>
+      <div className="ph">
+        <div><h1 className="pt">🕐 Pay History</h1><p className="ps">{(runs as any[]).length} payroll runs</p></div>
+        <a href="/payroll/runs" className="btn bp">▶ New Run</a>
+      </div>
+
+      <div className="grid2" style={{gap:16}}>
+        <div className="card" style={{padding:0}}>
+          {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}><span className="spinner" style={{display:'inline-block'}}/></div>:(
+            <table className="tbl">
+              <thead><tr><th>Pay Date</th><th>Period</th><th>Freq</th><th>Employees</th><th>Gross</th><th>Net</th><th>Status</th></tr></thead>
+              <tbody>
+                {(runs as any[]).length?(runs as any[]).map((r:any)=>(
+                  <tr key={r.id} style={{cursor:'pointer',background:selected?.id===r.id?'rgba(201,162,39,.05)':''}} onClick={()=>setSelected(r)}>
+                    <td className="mono" style={{color:'var(--t0)',fontWeight:600}}>{new Date(r.pay_date+'T12:00:00').toLocaleDateString()}</td>
+                    <td style={{fontSize:'.68rem',color:'var(--t3)'}}>{new Date(r.period_start+'T12:00:00').toLocaleDateString()} – {new Date(r.period_end+'T12:00:00').toLocaleDateString()}</td>
+                    <td><span className="badge bmu" style={{fontSize:'.6rem'}}>{r.pay_frequency}</span></td>
+                    <td className="mono">{r.employee_count}</td>
+                    <td className="mono" style={{color:'var(--gold)'}}>{formatCurrency(r.total_gross)}</td>
+                    <td className="mono" style={{color:'var(--green)'}}>{formatCurrency(r.total_net)}</td>
+                    <td><span className={`badge ${STATUS[r.status]||'bmu'}`}>{r.status}</span></td>
+                  </tr>
+                )):<tr><td colSpan={7}><div className="empty">No payroll runs yet.</div></td></tr>}
+              </tbody>
+            </table>
+          )}
+        </div>
+
+        <div>
+          {!selected&&<div className="card" style={{textAlign:'center',padding:'48px 20px',color:'var(--t3)'}}>Select a run to view details</div>}
+          {selected&&runDetail&&(
+            <div className="card">
+              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:16}}>
+                <div>
+                  <div style={{fontFamily:'var(--font-d)',fontWeight:700,color:'var(--t0)'}}>Pay Date: {new Date(runDetail.pay_date+'T12:00:00').toLocaleDateString()}</div>
+                  <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:2}}>{new Date(runDetail.period_start+'T12:00:00').toLocaleDateString()} – {new Date(runDetail.period_end+'T12:00:00').toLocaleDateString()} · {runDetail.pay_frequency}</div>
+                </div>
+                <span className={`badge ${STATUS[runDetail.status]||'bmu'}`}>{runDetail.status}</span>
+              </div>
+              <div className="dr"><span className="dk">Gross Pay</span><span className="dv mono" style={{color:'var(--gold)'}}>{formatCurrency(runDetail.total_gross)}</span></div>
+              <div className="dr"><span className="dk">Federal W/H</span><span className="dv mono" style={{color:'var(--red)'}}>{formatCurrency(runDetail.total_federal_tax)}</span></div>
+              <div className="dr"><span className="dk">SS + Medicare</span><span className="dv mono" style={{color:'var(--amber)'}}>{formatCurrency((+runDetail.total_ss)+(+runDetail.total_medicare))}</span></div>
+              <div className="dr"><span className="dk">AZ State Tax</span><span className="dv mono" style={{color:'var(--amber)'}}>{formatCurrency(runDetail.total_state_tax)}</span></div>
+              <div className="dr" style={{borderTop:'1px solid var(--b1)',paddingTop:8,marginTop:4}}><span className="dk" style={{fontWeight:700}}>Net Pay</span><span className="dv mono" style={{color:'var(--green)',fontWeight:700}}>{formatCurrency(runDetail.total_net)}</span></div>
+
+              <div style={{marginTop:16}}>
+                <div className="ct">Employee Lines</div>
+                {runDetail.lines?.map((l:any)=>(
+                  <div key={l.id} style={{padding:'8px 0',borderBottom:'1px solid var(--b0)',display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+                    <div>
+                      <div style={{fontSize:'.82rem',fontWeight:600,color:'var(--t0)'}}>{l.first_name} {l.last_name}</div>
+                      <div style={{fontSize:'.68rem',color:'var(--t3)'}}>Gross {formatCurrency(l.gross_pay)} · Net {formatCurrency(l.net_pay)}</div>
+                    </div>
+                    <span className="mono" style={{color:'var(--green)',fontWeight:600}}>{formatCurrency(l.net_pay)}</span>
+                  </div>
+                ))}
+              </div>
+
+              {runDetail.status==='approved'&&(
+                <div style={{marginTop:16}}>
+                  <button className="btn bd bsm" onClick={()=>voidRun(runDetail.id)}>Void This Run</button>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // ── STUB ──────────────────────────────────────────────────────────────
 function ComingSoon({title,icon,description}:{title:string;icon:string;description:string}){
   return(
@@ -809,8 +1115,8 @@ function App(){
         <Route path="payroll/employees"  element={<Employees/>}/>
         <Route path="payroll/contractors" element={<Contractors/>}/>
         <Route path="payroll/vendors"    element={<Vendors/>}/>
-        <Route path="payroll/runs"       element={<ComingSoon title="Run Payroll" icon="▶" description="Process payroll runs for W-2 and 1099"/>}/>
-        <Route path="payroll/history"    element={<ComingSoon title="Pay History" icon="🕐" description="Full payroll run history and pay stubs"/>}/>
+        <Route path="payroll/runs"       element={<RunPayroll/>}/>
+        <Route path="payroll/history"    element={<PayHistory/>}/>
         <Route path="payroll/tax-forms"  element={<ComingSoon title="Tax Forms" icon="📋" description="W-2s, 1099-NECs, 940, 941, AZ state forms"/>}/>
         <Route path="books/accounts"     element={<ChartOfAccounts/>}/>
         <Route path="books/journal"      element={<ComingSoon title="Journal Entries" icon="📓" description="Manual double-entry journal entries"/>}/>
