@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useState, useCallback } from 'react'
 import ReactDOM from 'react-dom/client'
-import { BrowserRouter, Routes, Route, Navigate, NavLink, Outlet, useNavigate } from 'react-router-dom'
+import { BrowserRouter, Routes, Route, Navigate, NavLink, Link, Outlet, useNavigate, useSearchParams } from 'react-router-dom'
 import { QueryClient, QueryClientProvider, useQuery } from 'react-query'
 import axios from 'axios'
 
@@ -228,13 +228,13 @@ function ParcelDrawer({ apn, onClose }: { apn: string; onClose: () => void }) {
               <div className="dr"><span className="dk">Owner</span><span className="dv" style={{textAlign:'right',maxWidth:260}}>{parcel.owner_name_parsed||parcel.owner_name_raw||'—'}</span></div>
               <div className="dr"><span className="dk">Type</span><span className="dv"><span className={`badge ${parcel.owner_type==='corporate'?'bb':'bg2'}`}>{parcel.owner_type||'—'}</span></span></div>
               <div className="dr"><span className="dk">Mailing</span><span className="dv" style={{textAlign:'right',fontSize:'.72rem',maxWidth:260}}>{parcel.owner_mailing_address?`${parcel.owner_mailing_address}, ${parcel.owner_mailing_city} ${parcel.owner_mailing_state}`:'—'}</span></div>
-              <div className="dr"><span className="dk">Portfolio Size</span><span className="dv mono">{parcel.parcel_count?fmt(parcel.parcel_count)+' parcels':'—'}</span></div>
+              <div className="dr"><span className="dk">Portfolio Size</span>{parcel.parcel_count > 1 ? <Link to={`/owners?q=${encodeURIComponent(parcel.owner_name_parsed||parcel.owner_name_raw||'')}`} className="dv mono" style={{color:'var(--gold)',textDecoration:'underline',cursor:'pointer'}} onClick={()=>onClose()}>{fmt(parcel.parcel_count)} parcels →</Link> : <span className="dv mono">{parcel.parcel_count ? fmt(parcel.parcel_count)+' parcels' : '—'}</span>}</div>
             </div>
             {parcel.lat && parcel.lon && (
               <div className="card">
                 <div className="ct">Location</div>
                 <div className="dr"><span className="dk">Coordinates</span><span className="dv mono">{Number(parcel.lat).toFixed(6)}, {Number(parcel.lon).toFixed(6)}</span></div>
-                <a href={`https://maps.google.com/?q=${parcel.lat},${parcel.lon}`} target="_blank" rel="noreferrer" className="btn bg-btn bsm" style={{marginTop:8}}>Open in Google Maps →</a>
+                <a href={`https://mcassessor.maricopa.gov/mcs.php?q=${parcel.apn}`} target="_blank" rel="noreferrer" className="btn bg-btn bsm" style={{marginTop:8}}>View Parcel on County GIS →</a>
               </div>
             )}
             {(bizData?.count > 0) && (
@@ -523,8 +523,10 @@ function Multifamily() {
 }
 
 function OwnerLookup() {
-  const [q, setQ] = useState('')
-  const [query, setQuery] = useState('')
+  const [searchParams] = useSearchParams()
+  const initQ = searchParams.get('q') || ''
+  const [q, setQ] = useState(initQ)
+  const [query, setQuery] = useState(initQ)
   const [selectedApn, setSelectedApn] = useState<string|null>(null)
 
   const { data, isLoading } = useQuery(

@@ -167,7 +167,7 @@ router.get('/mobile-homes/search', async (req: Request, res: Response) => {
     let i = 1;
 
     if (q) {
-      conditions.push(`(b.business_name ILIKE ${i} OR b.situs_address ILIKE ${i})`);
+      conditions.push(`(b.business_name ILIKE $${i} OR b.situs_address ILIKE $${i})`);
       params.push(`%${q}%`); i++;
     }
 
