@@ -177,16 +177,32 @@ function Layout() {
       </aside>
       <div className="main">
         <header className="topbar">
-          <span style={{fontSize:'.72rem',color:'var(--t3)',fontFamily:'var(--font-m)'}}>GAM Property Intelligence · Maricopa County · 1.75M parcels</span>
+          <span style={{fontSize:'.72rem',color:'var(--t3)',fontFamily:'var(--font-m)'}}>GAM Property Intelligence · Arizona Statewide · 3.48M parcels</span>
           <div style={{marginLeft:'auto',display:'flex',gap:8}}>
-            <span className="badge bteal">Maricopa ✓</span>
-            <span className="badge bmu">Pima Soon</span>
+            <span className="badge bteal">15 Counties ✓</span>
+            <span className="badge bg2">3.48M Parcels</span>
           </div>
         </header>
         <div className="page"><Outlet/></div>
       </div>
     </div>
   )
+}
+
+function countyGisUrl(parcel: any): string {
+  const apn = (parcel.apn || '').replace(/[A-Za-z]+$/, '');
+  const county = (parcel.county || '').toLowerCase();
+  const map: Record<string, string> = {
+    maricopa: `https://maps.mcassessor.maricopa.gov/?esearch=${apn}&slayer=0&exprnum=0`,
+    navajo: `https://apps.navajocountyaz.gov/navajowebpayments/propertyinformation?p=1&apn=${parcel.apn}`,
+    mohave: `https://mcgis.mohave.gov/`,
+    cochise: `https://gis-cochise.opendata.arcgis.com/app/37d793d478664634b4de3ad8042f248a`,
+    pima: `https://www.asr.pima.gov/advanced-search`,
+    yuma: `https://arcgis.yumacountyaz.gov/webgis/rest/services/YC_Parcels/MapServer`,
+    yavapai: `https://gis.yavapaiaz.gov/v4/`,
+    coconino: `https://datahub-coconinocounty.opendata.arcgis.com`,
+  };
+  return map[county] || `https://maps.mcassessor.maricopa.gov/?esearch=${apn}&slayer=0&exprnum=0`;
 }
 
 function ParcelDrawer({ apn, onClose }: { apn: string; onClose: () => void }) {
@@ -234,7 +250,7 @@ function ParcelDrawer({ apn, onClose }: { apn: string; onClose: () => void }) {
               <div className="card">
                 <div className="ct">Location</div>
                 <div className="dr"><span className="dk">Coordinates</span><span className="dv mono">{Number(parcel.lat).toFixed(6)}, {Number(parcel.lon).toFixed(6)}</span></div>
-                <a href={`https://maps.mcassessor.maricopa.gov/?esearch=${(parcel.apn||"").replace(/[A-Za-z]+$/, "")}&slayer=0&exprnum=0`} target="_blank" rel="noreferrer" className="btn bg-btn bsm" style={{marginTop:8}}>View Parcel on County GIS →</a>
+                <a href={countyGisUrl(parcel)} target="_blank" rel="noreferrer" className="btn bg-btn bsm" style={{marginTop:8}}>View Parcel on County GIS →</a>
               </div>
             )}
             {(bizData?.count > 0) && (
@@ -300,7 +316,7 @@ function ParcelSearch() {
   return (
     <div>
       <div className="ph">
-        <div><h1 className="pt">🔍 Parcel Search</h1><p className="ps">{query && total > 0 ? `${fmt(total)} results for "${query}"` : 'Search 1.75M Maricopa County parcels'}</p></div>
+        <div><h1 className="pt">🔍 Parcel Search</h1><p className="ps">{query && total > 0 ? `${fmt(total)} results for "${query}"` : 'Search 3.48M Arizona parcels across 15 counties'}</p></div>
       </div>
       <form onSubmit={search} className="search-bar">
         <input className="search-input" value={q} onChange={e=>setQ(e.target.value)} placeholder="Address, owner name, APN, or city…" autoFocus/>
@@ -321,7 +337,7 @@ function ParcelSearch() {
         <button className={`chip ${isRental?'on':''}`} onClick={()=>{setIsRental(r=>!r);setOffset(0)}}>🏠 Rentals Only</button>
       </div>
       {!query
-        ? <EmptyPrompt icon="🔍" title="Search Parcels" body="Enter an address, owner name, APN, or city above to search 1.75 million Maricopa County parcels."/>
+        ? <EmptyPrompt icon="🔍" title="Search Parcels" body="Enter an address, owner name, APN, or city above to search 3.48 million Arizona parcels across all 15 counties."/>
         : <div className="card" style={{padding:0}}>
             {isLoading
               ? <div style={{padding:32,textAlign:'center',color:'var(--t3)'}}><span className="spinner" style={{display:'inline-block'}}/></div>
@@ -371,7 +387,7 @@ function RVParks() {
   return (
     <div>
       <div className="ph">
-        <div><h1 className="pt">🚐 RV & Mobile Home Parks</h1><p className="ps">{query && total > 0 ? `${fmt(total)} parks found` : 'Search Maricopa County RV and mobile home parks'}</p></div>
+        <div><h1 className="pt">🚐 RV & Mobile Home Parks</h1><p className="ps">{query && total > 0 ? `${fmt(total)} parks found` : 'Search Arizona RV and mobile home parks'}</p></div>
         <div style={{display:'flex',gap:8}}><span className="badge bteal">Business Registry</span><span className="badge bgold">Your Market</span></div>
       </div>
       <form onSubmit={search} className="search-bar">
@@ -379,7 +395,7 @@ function RVParks() {
         <button type="submit" className="btn bp">{isFetching?<span className="spinner"/>:'🔍 Search'}</button>
       </form>
       {!query
-        ? <EmptyPrompt icon="🚐" title="Find RV & Mobile Home Parks" body="Search Maricopa County business registry for RV parks, mobile home parks, and manufactured housing communities. Try searching 'rv park', 'mobile home', or 'trailer'."/>
+        ? <EmptyPrompt icon="🚐" title="Find RV & Mobile Home Parks" body="Search Arizona business registry for RV parks, mobile home parks, and manufactured housing communities. Try searching 'rv park', 'mobile home', or 'trailer'."/>
         : <div className="card" style={{padding:0}}>
             {isLoading
               ? <div style={{padding:32,textAlign:'center',color:'var(--t3)'}}><span className="spinner" style={{display:'inline-block'}}/></div>
@@ -436,7 +452,7 @@ function PortfolioSales() {
         {!loaded && <button className="btn bp" onClick={()=>setLoaded(true)} style={{flexShrink:0}}>Load Data</button>}
       </div>
       {!loaded
-        ? <EmptyPrompt icon="📦" title="Portfolio Sale Detection" body="Click Load Data to search for multi-parcel institutional transactions across Maricopa County."/>
+        ? <EmptyPrompt icon="📦" title="Portfolio Sale Detection" body="Click Load Data to search for multi-parcel institutional transactions across Arizona."/>
         : <div className="card" style={{padding:0}}>
             {isLoading
               ? <div style={{padding:32,textAlign:'center',color:'var(--t3)'}}><span className="spinner" style={{display:'inline-block'}}/></div>
@@ -493,7 +509,7 @@ function Multifamily() {
         </div>
       </div>
       {!loaded
-        ? <EmptyPrompt icon="🏢" title="Multifamily Property Search" body="Select a minimum unit count above or click a filter to search for multifamily properties across Maricopa County."/>
+        ? <EmptyPrompt icon="🏢" title="Multifamily Property Search" body="Select a minimum unit count above or click a filter to search for multifamily properties across Arizona."/>
         : <div className="card" style={{padding:0}}>
             {isLoading
               ? <div style={{padding:32,textAlign:'center',color:'var(--t3)'}}><span className="spinner" style={{display:'inline-block'}}/></div>
@@ -549,7 +565,7 @@ function OwnerLookup() {
         <button type="submit" className="btn bp">{isLoading?<span className="spinner"/>:'🔍 Search'}</button>
       </form>
       {!query
-        ? <EmptyPrompt icon="👤" title="Owner Portfolio Search" body="Search any owner or company name to see all parcels they own in Maricopa County. Useful for identifying large landlords, corporate owners, and acquisition targets."/>
+        ? <EmptyPrompt icon="👤" title="Owner Portfolio Search" body="Search any owner or company name to see all parcels they own across Arizona. Useful for identifying large landlords, corporate owners, and acquisition targets."/>
         : <>
             {results.length > 0 && (
               <div className="grid4" style={{marginBottom:16}}>
@@ -613,10 +629,10 @@ function CountyCoverage() {
       </div>
       <div className="grid4" style={{marginBottom:16}}>
         <div className="kpi"><div className="kl">Live</div><div className="kv g">1</div><div className="ks">Maricopa</div></div>
-        <div className="kpi"><div className="kl">Parcels Loaded</div><div className="kv t">1.75M+</div><div className="ks">Maricopa only</div></div>
-        <div className="kpi"><div className="kl">Next Up</div><div className="kv a">Pima</div><div className="ks">~450K parcels</div></div>
-        <div className="kpi"><div className="kl">AZ Total Est.</div><div className="kv">~3M</div><div className="ks">All 15 counties</div></div>
-      </div>
+        <div className="kpi"><div className="kl">Live Counties</div><div className="kv g">15</div><div className="ks">All AZ counties</div></div>
+        <div className="kpi"><div className="kl">Parcels Loaded</div><div className="kv t">3.48M</div><div className="ks">Statewide</div></div>
+        <div className="kpi"><div className="kl">Next State</div><div className="kv a">NV</div><div className="ks">Coming soon</div></div>
+        <div className="kpi"><div className="kl">Coverage</div><div className="kv">100%</div><div className="ks">Arizona complete</div></div>
       <div className="card" style={{padding:0}}>
         <table className="tbl">
           <thead><tr><th>County</th><th>Status</th><th>Est. Parcels</th><th>Date Loaded</th></tr></thead>
@@ -657,7 +673,7 @@ function LoginPage() {
       <div style={{width:'100%',maxWidth:400}}>
         <div style={{textAlign:'center',marginBottom:40}}>
           <div style={{fontFamily:'var(--font-d)',fontSize:'2rem',fontWeight:800,color:'var(--teal)',marginBottom:8}}>🏘 GAM Intel</div>
-          <div style={{color:'var(--t3)',fontSize:'.82rem'}}>Property Intelligence · Maricopa County · 1.75M Parcels</div>
+          <div style={{color:'var(--t3)',fontSize:'.82rem'}}>Property Intelligence · Arizona Statewide · 3.48M Parcels</div>
         </div>
         <div className="card" style={{padding:24}}>
           {err&&<div style={{background:'rgba(239,68,68,.08)',border:'1px solid rgba(239,68,68,.18)',color:'#fca5a5',padding:'10px 14px',borderRadius:8,fontSize:'.78rem',marginBottom:14}}>{err}</div>}
