@@ -234,7 +234,7 @@ function ParcelDrawer({ apn, onClose }: { apn: string; onClose: () => void }) {
               <div className="card">
                 <div className="ct">Location</div>
                 <div className="dr"><span className="dk">Coordinates</span><span className="dv mono">{Number(parcel.lat).toFixed(6)}, {Number(parcel.lon).toFixed(6)}</span></div>
-                <a href={`https://mcassessor.maricopa.gov/mcs.php?q=${parcel.apn}`} target="_blank" rel="noreferrer" className="btn bg-btn bsm" style={{marginTop:8}}>View Parcel on County GIS →</a>
+                <a href={`https://maps.mcassessor.maricopa.gov/?esearch=${(parcel.apn||"").replace(/[A-Za-z]+$/, "")}&slayer=0&exprnum=0`} target="_blank" rel="noreferrer" className="btn bg-btn bsm" style={{marginTop:8}}>View Parcel on County GIS →</a>
               </div>
             )}
             {(bizData?.count > 0) && (
@@ -589,7 +589,7 @@ function OwnerLookup() {
 function CountyCoverage() {
   const counties = [
     {name:'Maricopa',status:'live',parcels:'1,750,000+',loaded:'Apr 2026'},
-    {name:'Pima',status:'next',parcels:'~450,000',loaded:'—'},
+    {name:'Pima',status:'live',parcels:'446,703',loaded:'Apr 2026'},
     {name:'Pinal',status:'planned',parcels:'~180,000',loaded:'—'},
     {name:'Yavapai',status:'planned',parcels:'~100,000',loaded:'—'},
     {name:'Coconino',status:'planned',parcels:'~60,000',loaded:'—'},
