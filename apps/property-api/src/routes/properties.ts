@@ -78,7 +78,10 @@ router.get('/search', async (req: Request, res: Response) => {
     };
     const orderBy = orderMap[sort as string] || orderMap.val_desc;
 
-    const countResult = await pool.query(`SELECT COUNT(*) FROM parcels p ${where}`, params);
+    // Use fast estimate for unfiltered queries, exact count only when filtered
+    const countResult = conditions.length === 0
+      ? await pool.query(`SELECT reltuples::bigint AS count FROM pg_class WHERE relname = 'parcels'`)
+      : await pool.query(`SELECT COUNT(*) FROM parcels p ${where}`, params);
 
     const dataResult = await pool.query(
       `SELECT

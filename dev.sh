@@ -1,6 +1,6 @@
 #!/bin/bash
 echo "Killing existing processes on all GAM ports..."
-for port in 3001 3002 3003 3004 3005 3006 4000; do
+for port in 3001 3002 3003 3004 3005 3006 3007 4000 4001; do
   pid=$(lsof -ti tcp:$port 2>/dev/null)
   [ -n "$pid" ] && kill -9 $pid 2>/dev/null && echo "  Killed :$port (pid $pid)"
 done
@@ -29,6 +29,8 @@ echo "  Admin     http://localhost:3003"
 echo "  Marketing http://localhost:3004"
 echo "  POS       http://localhost:3005"
 echo "  Books     http://localhost:3006"
+echo "  PropIntel http://localhost:3007"
+echo "  PropAPI   http://localhost:4001"
 echo "═══════════════════════════════════"
 
 # Verify all ports are actually listening

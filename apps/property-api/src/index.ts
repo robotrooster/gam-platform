@@ -5,6 +5,7 @@ import morgan from 'morgan';
 import dotenv from 'dotenv';
 import { Pool } from 'pg';
 import propertyRoutes from './routes/properties';
+import { requireAuth } from './middleware/auth';
 
 dotenv.config();
 
@@ -20,7 +21,10 @@ export const pool = new Pool({
 });
 
 app.use(helmet());
-app.use(cors());
+app.use(cors({
+  origin: ['http://localhost:3001','http://localhost:3002','http://localhost:3003','http://localhost:3004','http://localhost:3005','http://localhost:3006','http://localhost:3007'],
+  credentials: true,
+}));
 app.use(morgan('dev'));
 app.use(express.json());
 
@@ -28,7 +32,7 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', service: 'gam-property-api', port: PORT });
 });
 
-app.use('/api/properties', propertyRoutes);
+app.use('/api/properties', requireAuth, propertyRoutes);
 
 app.listen(PORT, () => {
   console.log(`Property API running on port ${PORT}`);
