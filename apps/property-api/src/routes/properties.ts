@@ -33,8 +33,10 @@ router.get('/search', async (req: Request, res: Response) => {
     let i = 1;
 
     if (q) {
-      conditions.push(`(p.owner_name_parsed ILIKE $${i} OR p.owner_name_raw ILIKE $${i} OR p.situs_address ILIKE $${i} OR p.apn ILIKE $${i} OR p.situs_city ILIKE $${i})`);
-      params.push(`%${q}%`); i++;
+      // Use tsvector full-text search — scales to 100M+ rows
+      const tsquery = (q as string).trim().split(/\s+/).filter(Boolean).map((w: string) => w.replace(/[^a-zA-Z0-9]/g,'')).filter(Boolean).join(' & ')
+      conditions.push(`p.search_vector @@ to_tsquery('simple', $${i})`)
+      params.push(tsquery); i++;
     }
     if (min_price) { conditions.push(`p.last_sale_price >= $${i++}`); params.push(Number(min_price)); }
     if (max_price) { conditions.push(`p.last_sale_price <= $${i++}`); params.push(Number(max_price)); }
@@ -165,7 +167,7 @@ router.get('/mobile-homes/search', async (req: Request, res: Response) => {
     let i = 1;
 
     if (q) {
-      conditions.push(`(b.business_name ILIKE $${i} OR b.situs_address ILIKE $${i})`);
+      conditions.push(`(b.business_name ILIKE ${i} OR b.situs_address ILIKE ${i})`);
       params.push(`%${q}%`); i++;
     }
 

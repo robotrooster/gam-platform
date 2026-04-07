@@ -55,9 +55,7 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
 
 const qc = new QueryClient({ defaultOptions: { queries: { retry: 1, staleTime: 30000 } } })
 
-// ── STYLES ─────────────────────────────────────────────────────────────
 const css = `
-
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
   --bg0:#06080a;--bg1:#0a0d10;--bg2:#0f1318;--bg3:#141920;--bg4:#1a2030;
@@ -69,7 +67,7 @@ const css = `
 html{-webkit-font-smoothing:antialiased}
 body{font-family:var(--font-b);background:var(--bg0);color:var(--t1);line-height:1.6;min-height:100vh}
 h1,h2,h3{font-family:var(--font-d);color:var(--t0);line-height:1.2}
-button{cursor:pointer;font-family:var(--font-b)}input,select,textarea{font-family:var(--font-b)}
+button{cursor:pointer;font-family:var(--font-b)}input,select{font-family:var(--font-b)}
 .shell{display:flex;min-height:100vh}
 .sidebar{width:220px;flex-shrink:0;background:var(--bg1);border-right:1px solid var(--b0);position:fixed;top:0;left:0;bottom:0;z-index:50;display:flex;flex-direction:column;overflow-y:auto}
 .main{flex:1;margin-left:220px;min-height:100vh;display:flex;flex-direction:column}
@@ -86,11 +84,9 @@ button{cursor:pointer;font-family:var(--font-b)}input,select,textarea{font-famil
 .sfooter{padding:10px;border-top:1px solid var(--b0)}
 .card{background:var(--bg2);border:1px solid var(--b1);border-radius:10px;padding:18px}
 .ct{font-size:.72rem;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.07em;margin-bottom:14px}
-.grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px}
 .grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
 @media(max-width:1100px){.grid4{grid-template-columns:repeat(2,1fr)}}
-@media(max-width:800px){.grid2,.grid3,.grid4{grid-template-columns:1fr}}
 .ph{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;padding-bottom:14px;border-bottom:1px solid var(--b0);flex-wrap:wrap;gap:10px}
 .pt{font-family:var(--font-d);font-size:1.4rem;font-weight:800;color:var(--t0)}
 .ps{font-size:.78rem;color:var(--t3);margin-top:2px}
@@ -118,7 +114,7 @@ button{cursor:pointer;font-family:var(--font-b)}input,select,textarea{font-famil
 .tbl td{padding:9px 12px;border-bottom:1px solid var(--b0);color:var(--t1)}
 .tbl tr:last-child td{border-bottom:none}
 .tbl tr:hover td{background:rgba(255,255,255,.012)}
-.tbl tr.clickable{cursor:pointer}
+.tbl tr.click{cursor:pointer}
 .mono{font-family:var(--font-m);font-size:.8rem}
 .empty{text-align:center;padding:48px 20px;color:var(--t3)}
 .loading-pg{display:flex;align-items:center;justify-content:center;height:100vh;font-family:var(--font-d);font-size:1.1rem;color:var(--t3)}
@@ -126,33 +122,26 @@ button{cursor:pointer;font-family:var(--font-b)}input,select,textarea{font-famil
 .dr{display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--b0);font-size:.78rem}
 .dr:last-child{border-bottom:none}
 .dk{color:var(--t3)}.dv{color:var(--t0);font-weight:500}
-.tabs{display:flex;gap:2px;border-bottom:1px solid var(--b0);margin-bottom:20px}
-.tab{padding:9px 14px;background:none;border:none;color:var(--t3);font-size:.78rem;font-weight:600;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;transition:all .12s;font-family:var(--font-b)}
-.tab:hover{color:var(--t1)}.tab.on{color:var(--teal);border-bottom-color:var(--teal)}
-/* Search bar */
 .search-bar{display:flex;gap:10px;margin-bottom:16px;align-items:center}
 .search-input{flex:1;background:var(--bg2);border:1px solid var(--b1);border-radius:8px;color:var(--t0);padding:10px 14px;font-size:.875rem;outline:none;transition:border .12s}
 .search-input:focus{border-color:var(--teal)}
-/* Drawer */
+.filters{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}
+.chip{padding:5px 12px;border-radius:20px;border:1px solid var(--b1);background:var(--bg3);color:var(--t2);font-size:.72rem;font-weight:600;cursor:pointer;transition:all .12s}
+.chip.on{background:rgba(20,184,166,.1);border-color:rgba(20,184,166,.3);color:var(--teal)}
 .drawer-overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:100;display:flex;justify-content:flex-end}
 .drawer{width:520px;background:var(--bg1);border-left:1px solid var(--b1);height:100%;overflow-y:auto;padding:24px;display:flex;flex-direction:column;gap:16px}
 .drawer-h{display:flex;justify-content:space-between;align-items:flex-start;padding-bottom:14px;border-bottom:1px solid var(--b0)}
-/* Filters */
-.filters{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}
-.filter-chip{padding:5px 12px;border-radius:20px;border:1px solid var(--b1);background:var(--bg3);color:var(--t2);font-size:.72rem;font-weight:600;cursor:pointer;transition:all .12s}
-.filter-chip.on{background:rgba(20,184,166,.1);border-color:rgba(20,184,166,.3);color:var(--teal)}
-input[type=text],input[type=email],input[type=number],input[type=password],select{background:var(--bg3);border:1px solid var(--b1);border-radius:7px;color:var(--t0);padding:8px 11px;font-size:.875rem;outline:none;transition:border .12s}
+input[type=text],input[type=email],input[type=password],select{background:var(--bg3);border:1px solid var(--b1);border-radius:7px;color:var(--t0);padding:8px 11px;font-size:.875rem;outline:none}
 input:focus,select:focus{border-color:var(--teal)}
+.pagination{display:flex;gap:8px;justify-content:center;margin-top:16px;align-items:center}
 @keyframes spin{to{transform:rotate(360deg)}}
 `
 
-// ── UTILS ──────────────────────────────────────────────────────────────
 const fmt = (n: any) => n == null ? '—' : Number(n).toLocaleString()
 const fmtCurrency = (n: any) => n == null ? '—' : '$' + Number(n).toLocaleString()
 const fmtDate = (d: any) => d ? new Date(d).toLocaleDateString() : '—'
 const fmtSqft = (n: any) => n == null ? '—' : Number(n).toLocaleString() + ' sqft'
 
-// ── LAYOUT ─────────────────────────────────────────────────────────────
 function Layout() {
   const { user, logout } = useAuth()
   const navigate = useNavigate()
@@ -166,15 +155,15 @@ function Layout() {
         </div>
         <nav className="nav">
           <div className="nl">Search</div>
-          <NavLink to="/search"     className={({isActive})=>`ni${isActive?' active':''}`}>🔍 Parcel Search</NavLink>
-          <NavLink to="/rv-parks"   className={({isActive})=>`ni${isActive?' active':''}`}>🚐 RV & Mobile Parks</NavLink>
-          <NavLink to="/portfolios" className={({isActive})=>`ni${isActive?' active':''}`}>📦 Portfolio Sales</NavLink>
+          <NavLink to="/search"      className={({isActive})=>`ni${isActive?' active':''}`}>🔍 Parcel Search</NavLink>
+          <NavLink to="/rv-parks"    className={({isActive})=>`ni${isActive?' active':''}`}>🚐 RV & Mobile Parks</NavLink>
+          <NavLink to="/portfolios"  className={({isActive})=>`ni${isActive?' active':''}`}>📦 Portfolio Sales</NavLink>
           <div className="nl" style={{marginTop:8}}>Analysis</div>
-          <NavLink to="/owners"     className={({isActive})=>`ni${isActive?' active':''}`}>👤 Owner Lookup</NavLink>
+          <NavLink to="/owners"      className={({isActive})=>`ni${isActive?' active':''}`}>👤 Owner Lookup</NavLink>
           <NavLink to="/multifamily" className={({isActive})=>`ni${isActive?' active':''}`}>🏢 Multifamily</NavLink>
           {isAdmin && <>
             <div className="nl" style={{marginTop:8}}>Admin</div>
-            <NavLink to="/coverage"  className={({isActive})=>`ni${isActive?' active':''}`}>🗺 County Coverage</NavLink>
+            <NavLink to="/coverage" className={({isActive})=>`ni${isActive?' active':''}`}>🗺 County Coverage</NavLink>
           </>}
         </nav>
         <div className="sfooter">
@@ -200,13 +189,11 @@ function Layout() {
   )
 }
 
-// ── PARCEL DRAWER ──────────────────────────────────────────────────────
 function ParcelDrawer({ apn, onClose }: { apn: string; onClose: () => void }) {
   const { data: parcel, isLoading } = useQuery(['parcel', apn], () => get<any>(`/api/properties/${apn}`))
-  const { data: bizData } = useQuery(['parcel-biz', apn], () => get<any>(`/api/properties/${apn}/businesses`))
-
+  const { data: bizData } = useQuery(['biz', apn], () => get<any>(`/api/properties/${apn}/businesses`))
   return (
-    <div className="drawer-overlay" onClick={e => { if (e.target === e.currentTarget) onClose() }}>
+    <div className="drawer-overlay" onClick={e=>{ if(e.target===e.currentTarget) onClose() }}>
       <div className="drawer">
         <div className="drawer-h">
           <div>
@@ -217,73 +204,83 @@ function ParcelDrawer({ apn, onClose }: { apn: string; onClose: () => void }) {
           </div>
           <button onClick={onClose} style={{background:'none',border:'none',color:'var(--t3)',fontSize:'1.3rem',cursor:'pointer'}}>✕</button>
         </div>
-
-        {isLoading ? <div style={{textAlign:'center',padding:32,color:'var(--t3)'}}><span className="spinner" style={{display:'inline-block'}}/></div> : parcel && <>
-          <div className="card">
-            <div className="ct">Property Details</div>
-            <div className="dr"><span className="dk">Address</span><span className="dv" style={{textAlign:'right',maxWidth:260}}>{parcel.situs_address}, {parcel.situs_city} {parcel.situs_zip}</span></div>
-            <div className="dr"><span className="dk">Property Type</span><span className="dv">{parcel.property_type_std || parcel.property_type_raw || '—'}</span></div>
-            <div className="dr"><span className="dk">Use Type</span><span className="dv mono">{parcel.use_type || '—'}</span></div>
-            <div className="dr"><span className="dk">Year Built</span><span className="dv mono">{parcel.year_built || '—'}</span></div>
-            <div className="dr"><span className="dk">Lot Size</span><span className="dv mono">{fmtSqft(parcel.lot_size_sqft)}</span></div>
-            <div className="dr"><span className="dk">Units</span><span className="dv mono">{parcel.unit_count || '—'}</span></div>
-            <div className="dr"><span className="dk">Legal Class</span><span className="dv mono">{parcel.legal_class || '—'}</span></div>
-          </div>
-
-          <div className="card">
-            <div className="ct">Valuation & Sale</div>
-            <div className="dr"><span className="dk">Assessed Value</span><span className="dv mono" style={{color:'var(--teal)'}}>{fmtCurrency(parcel.assessed_value)}</span></div>
-            <div className="dr"><span className="dk">Full Cash Value</span><span className="dv mono">{fmtCurrency(parcel.full_cash_value)}</span></div>
-            <div className="dr"><span className="dk">Last Sale Price</span><span className="dv mono" style={{color:'var(--gold)'}}>{fmtCurrency(parcel.last_sale_price)}</span></div>
-            <div className="dr"><span className="dk">Last Sale Date</span><span className="dv mono">{fmtDate(parcel.last_sale_date)}</span></div>
-            {parcel.portfolio_sale_flag && <div className="dr"><span className="dk">Portfolio Sale</span><span className="badge bpurple">Portfolio</span></div>}
-          </div>
-
-          <div className="card">
-            <div className="ct">Owner</div>
-            <div className="dr"><span className="dk">Owner Name</span><span className="dv" style={{textAlign:'right',maxWidth:260}}>{parcel.owner_name_parsed || parcel.owner_name_raw || '—'}</span></div>
-            <div className="dr"><span className="dk">Owner Type</span><span className="dv"><span className={`badge ${parcel.owner_type==='corporate'?'bb':parcel.owner_type==='individual'?'bg2':'bmu'}`}>{parcel.owner_type||'—'}</span></span></div>
-            <div className="dr"><span className="dk">Mailing Address</span><span className="dv" style={{textAlign:'right',fontSize:'.72rem',maxWidth:260}}>{parcel.owner_mailing_address ? `${parcel.owner_mailing_address}, ${parcel.owner_mailing_city} ${parcel.owner_mailing_state} ${parcel.owner_mailing_zip}` : '—'}</span></div>
-            <div className="dr"><span className="dk">Portfolio Size</span><span className="dv mono">{parcel.parcel_count ? fmt(parcel.parcel_count) + ' parcels' : '—'}</span></div>
-            <div className="dr"><span className="dk">States</span><span className="dv mono">{parcel.states_present || '—'}</span></div>
-          </div>
-
-          {parcel.lat && parcel.lon && (
+        {isLoading
+          ? <div style={{textAlign:'center',padding:32,color:'var(--t3)'}}><span className="spinner" style={{display:'inline-block'}}/></div>
+          : parcel && <>
             <div className="card">
-              <div className="ct">Location</div>
-              <div className="dr"><span className="dk">Coordinates</span><span className="dv mono">{Number(parcel.lat).toFixed(6)}, {Number(parcel.lon).toFixed(6)}</span></div>
-              <a href={`https://maps.google.com/?q=${parcel.lat},${parcel.lon}`} target="_blank" rel="noreferrer" className="btn bg-btn bsm" style={{marginTop:8}}>Open in Google Maps →</a>
+              <div className="ct">Property Details</div>
+              <div className="dr"><span className="dk">Address</span><span className="dv" style={{textAlign:'right',maxWidth:260}}>{parcel.situs_address}, {parcel.situs_city} {parcel.situs_zip}</span></div>
+              <div className="dr"><span className="dk">Property Type</span><span className="dv">{parcel.property_type_std||parcel.property_type_raw||'—'}</span></div>
+              <div className="dr"><span className="dk">Year Built</span><span className="dv mono">{parcel.year_built||'—'}</span></div>
+              <div className="dr"><span className="dk">Lot Size</span><span className="dv mono">{fmtSqft(parcel.lot_size_sqft)}</span></div>
+              <div className="dr"><span className="dk">Units</span><span className="dv mono">{parcel.unit_count||'—'}</span></div>
             </div>
-          )}
-
-          {(bizData?.count > 0) && (
             <div className="card">
-              <div className="ct">Businesses at Parcel ({bizData.count})</div>
-              {bizData.results.slice(0,5).map((b: any) => (
-                <div key={b.account_number} style={{padding:'8px 0',borderBottom:'1px solid var(--b0)'}}>
-                  <div style={{fontWeight:600,color:'var(--t0)',fontSize:'.82rem'}}>{b.business_name}</div>
-                  {b.dba_name && <div style={{fontSize:'.7rem',color:'var(--t3)'}}>DBA: {b.dba_name}</div>}
-                  <div style={{fontSize:'.72rem',color:'var(--t2)',marginTop:2,display:'flex',gap:12}}>
-                    <span>Value: {fmtCurrency(b.full_cash_value)}</span>
-                    <span>{b.use_type || b.class_code || ''}</span>
+              <div className="ct">Valuation & Sale</div>
+              <div className="dr"><span className="dk">Assessed Value</span><span className="dv mono" style={{color:'var(--teal)'}}>{fmtCurrency(parcel.assessed_value)}</span></div>
+              <div className="dr"><span className="dk">Full Cash Value</span><span className="dv mono">{fmtCurrency(parcel.full_cash_value)}</span></div>
+              <div className="dr"><span className="dk">Last Sale Price</span><span className="dv mono" style={{color:'var(--gold)'}}>{fmtCurrency(parcel.last_sale_price)}</span></div>
+              <div className="dr"><span className="dk">Last Sale Date</span><span className="dv mono">{fmtDate(parcel.last_sale_date)}</span></div>
+              {parcel.portfolio_sale_flag && <div className="dr"><span className="dk">Portfolio Sale</span><span className="badge bpurple">Portfolio</span></div>}
+            </div>
+            <div className="card">
+              <div className="ct">Owner</div>
+              <div className="dr"><span className="dk">Owner</span><span className="dv" style={{textAlign:'right',maxWidth:260}}>{parcel.owner_name_parsed||parcel.owner_name_raw||'—'}</span></div>
+              <div className="dr"><span className="dk">Type</span><span className="dv"><span className={`badge ${parcel.owner_type==='corporate'?'bb':'bg2'}`}>{parcel.owner_type||'—'}</span></span></div>
+              <div className="dr"><span className="dk">Mailing</span><span className="dv" style={{textAlign:'right',fontSize:'.72rem',maxWidth:260}}>{parcel.owner_mailing_address?`${parcel.owner_mailing_address}, ${parcel.owner_mailing_city} ${parcel.owner_mailing_state}`:'—'}</span></div>
+              <div className="dr"><span className="dk">Portfolio Size</span><span className="dv mono">{parcel.parcel_count?fmt(parcel.parcel_count)+' parcels':'—'}</span></div>
+            </div>
+            {parcel.lat && parcel.lon && (
+              <div className="card">
+                <div className="ct">Location</div>
+                <div className="dr"><span className="dk">Coordinates</span><span className="dv mono">{Number(parcel.lat).toFixed(6)}, {Number(parcel.lon).toFixed(6)}</span></div>
+                <a href={`https://maps.google.com/?q=${parcel.lat},${parcel.lon}`} target="_blank" rel="noreferrer" className="btn bg-btn bsm" style={{marginTop:8}}>Open in Google Maps →</a>
+              </div>
+            )}
+            {(bizData?.count > 0) && (
+              <div className="card">
+                <div className="ct">Businesses ({bizData.count})</div>
+                {bizData.results.slice(0,5).map((b: any) => (
+                  <div key={b.account_number} style={{padding:'8px 0',borderBottom:'1px solid var(--b0)'}}>
+                    <div style={{fontWeight:600,color:'var(--t0)',fontSize:'.82rem'}}>{b.business_name}</div>
+                    <div style={{fontSize:'.72rem',color:'var(--t2)',marginTop:2}}>Value: {fmtCurrency(b.full_cash_value)}</div>
                   </div>
-                </div>
-              ))}
-            </div>
-          )}
-        </>}
+                ))}
+              </div>
+            )}
+          </>
+        }
       </div>
     </div>
   )
 }
 
-// ── PARCEL SEARCH ──────────────────────────────────────────────────────
+function Pagination({ offset, total, limit, onPage }: { offset:number; total:number; limit:number; onPage:(o:number)=>void }) {
+  if (total <= limit) return null
+  return (
+    <div className="pagination">
+      <button className="btn bg-btn" disabled={offset===0} onClick={()=>onPage(Math.max(0,offset-limit))}>← Prev</button>
+      <span style={{color:'var(--t3)',fontSize:'.78rem'}}>{offset+1}–{Math.min(offset+limit,total)} of {fmt(total)}</span>
+      <button className="btn bg-btn" disabled={offset+limit>=total} onClick={()=>onPage(offset+limit)}>Next →</button>
+    </div>
+  )
+}
+
+function EmptyPrompt({ icon, title, body }: { icon:string; title:string; body:string }) {
+  return (
+    <div className="card" style={{textAlign:'center',padding:'60px 20px'}}>
+      <div style={{fontSize:'3rem',marginBottom:16}}>{icon}</div>
+      <h2 style={{color:'var(--t0)',marginBottom:8}}>{title}</h2>
+      <p style={{color:'var(--t3)',fontSize:'.85rem',maxWidth:420,margin:'0 auto'}}>{body}</p>
+    </div>
+  )
+}
+
 function ParcelSearch() {
   const [q, setQ] = useState('')
   const [query, setQuery] = useState('')
   const [sort, setSort] = useState('val_desc')
   const [ownerType, setOwnerType] = useState('')
-  const [propType, setPropType] = useState('')
   const [portfolio, setPortfolio] = useState(false)
   const [isRental, setIsRental] = useState(false)
   const [offset, setOffset] = useState(0)
@@ -291,34 +288,22 @@ function ParcelSearch() {
   const LIMIT = 50
 
   const { data, isLoading, isFetching } = useQuery(
-    ['search', query, sort, ownerType, propType, portfolio, isRental, offset],
-    () => get<any>('/api/properties/search', {
-      q: query || undefined,
-      sort,
-      owner_type: ownerType || undefined,
-      property_type: propType || undefined,
-      portfolio: portfolio ? 'true' : undefined,
-      is_rental: isRental ? 'true' : undefined,
-      limit: LIMIT,
-      offset,
-    }),
+    ['search', query, sort, ownerType, portfolio, isRental, offset],
+    () => get<any>('/api/properties/search', { q:query||undefined, sort, owner_type:ownerType||undefined, portfolio:portfolio?'true':undefined, is_rental:isRental?'true':undefined, limit:LIMIT, offset }),
     { enabled: query.length > 0, keepPreviousData: true }
   )
 
   const results = data?.results || []
   const total = data?.total || 0
-
   const search = (e: React.FormEvent) => { e.preventDefault(); setOffset(0); setQuery(q) }
 
   return (
     <div>
       <div className="ph">
-        <div><h1 className="pt">🔍 Parcel Search</h1><p className="ps">{total > 0 ? `${fmt(total)} results` : 'Search 1.75M Maricopa County parcels'}</p></div>
+        <div><h1 className="pt">🔍 Parcel Search</h1><p className="ps">{query && total > 0 ? `${fmt(total)} results for "${query}"` : 'Search 1.75M Maricopa County parcels'}</p></div>
       </div>
-
       <form onSubmit={search} className="search-bar">
-        <input className="search-input" value={q} onChange={e => setQ(e.target.value)}
-          placeholder="Search by address, owner name, APN, or city…"/>
+        <input className="search-input" value={q} onChange={e=>setQ(e.target.value)} placeholder="Address, owner name, APN, or city…" autoFocus/>
         <select value={sort} onChange={e=>setSort(e.target.value)} style={{width:'auto'}}>
           <option value="val_desc">Highest Value</option>
           <option value="val_asc">Lowest Value</option>
@@ -326,61 +311,46 @@ function ParcelSearch() {
           <option value="sale_desc">Recent Sales</option>
           <option value="addr">Address A-Z</option>
         </select>
-        <button type="submit" className="btn bp">{isFetching ? <span className="spinner"/> : '🔍 Search'}</button>
+        <button type="submit" className="btn bp">{isFetching?<span className="spinner"/>:'🔍 Search'}</button>
       </form>
-
       <div className="filters">
-        {[['All Owners',''],['Corporate','corporate'],['Individual','individual'],['Trust','trust'],['Government','government']].map(([label,val])=>(
-          <button key={val} className={`filter-chip ${ownerType===val?'on':''}`} onClick={()=>{setOwnerType(val);setOffset(0)}}>{label}</button>
+        {[['All',''],['Corporate','corporate'],['Individual','individual'],['Trust','trust'],['Government','government']].map(([label,val])=>(
+          <button key={val} className={`chip ${ownerType===val?'on':''}`} onClick={()=>{setOwnerType(val as string);setOffset(0)}}>{label}</button>
         ))}
-        <button className={`filter-chip ${portfolio?'on':''}`} onClick={()=>{setPortfolio(p=>!p);setOffset(0)}}>📦 Portfolio Sales Only</button>
-        <button className={`filter-chip ${isRental?'on':''}`} onClick={()=>{setIsRental(r=>!r);setOffset(0)}}>🏠 Rentals Only</button>
+        <button className={`chip ${portfolio?'on':''}`} onClick={()=>{setPortfolio(p=>!p);setOffset(0)}}>📦 Portfolio Only</button>
+        <button className={`chip ${isRental?'on':''}`} onClick={()=>{setIsRental(r=>!r);setOffset(0)}}>🏠 Rentals Only</button>
       </div>
-
-      <div className="card" style={{padding:0}}>
-        {isLoading ? <div style={{padding:32,textAlign:'center',color:'var(--t3)'}}><span className="spinner" style={{display:'inline-block'}}/></div> : (
-          <table className="tbl">
-            <thead><tr><th>Address</th><th>Owner</th><th>Type</th><th>Units</th><th>Assessed</th><th>Last Sale</th><th>Sale Date</th><th>Flags</th></tr></thead>
-            <tbody>
-              {results.length ? results.map((r: any) => (
-                <tr key={r.apn} className="clickable" onClick={() => setSelectedApn(r.apn)}>
-                  <td>
-                    <div style={{fontWeight:600,color:'var(--t0)',fontSize:'.78rem'}}>{r.situs_address}</div>
-                    <div style={{fontSize:'.65rem',color:'var(--t3)'}}>{r.situs_city} · {r.apn}</div>
-                  </td>
-                  <td>
-                    <div style={{fontSize:'.75rem',color:'var(--t1)',maxWidth:160,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{r.owner_name_parsed||r.owner_name_raw||'—'}</div>
-                    <span className={`badge ${r.owner_type==='corporate'?'bb':r.owner_type==='individual'?'bg2':'bmu'}`} style={{fontSize:'.58rem'}}>{r.owner_type||'—'}</span>
-                  </td>
-                  <td style={{fontSize:'.72rem',color:'var(--t2)'}}>{r.property_type_std||r.property_type_raw||'—'}</td>
-                  <td className="mono">{r.unit_count||'—'}</td>
-                  <td className="mono" style={{color:'var(--teal)'}}>{fmtCurrency(r.assessed_value)}</td>
-                  <td className="mono" style={{color:'var(--gold)'}}>{fmtCurrency(r.last_sale_price)}</td>
-                  <td className="mono" style={{fontSize:'.7rem',color:'var(--t3)'}}>{fmtDate(r.last_sale_date)}</td>
-                  <td style={{whiteSpace:'nowrap'}}>
-                    {r.portfolio_sale_flag && <span className="badge bpurple" style={{fontSize:'.58rem',marginRight:3}}>Portfolio</span>}
-                  </td>
-                </tr>
-              )) : <tr><td colSpan={8}><div className="empty">No results. Try a different search.</div></td></tr>}
-            </tbody>
-          </table>
-        )}
-      </div>
-
-      {total > LIMIT && (
-        <div style={{display:'flex',gap:8,justifyContent:'center',marginTop:16,alignItems:'center'}}>
-          <button className="btn bg-btn" disabled={offset===0} onClick={()=>setOffset(o=>Math.max(0,o-LIMIT))}>← Prev</button>
-          <span style={{color:'var(--t3)',fontSize:'.78rem'}}>{offset+1}–{Math.min(offset+LIMIT,total)} of {fmt(total)}</span>
-          <button className="btn bg-btn" disabled={offset+LIMIT>=total} onClick={()=>setOffset(o=>o+LIMIT)}>Next →</button>
-        </div>
-      )}
-
-      {selectedApn && <ParcelDrawer apn={selectedApn} onClose={() => setSelectedApn(null)} />}
+      {!query
+        ? <EmptyPrompt icon="🔍" title="Search Parcels" body="Enter an address, owner name, APN, or city above to search 1.75 million Maricopa County parcels."/>
+        : <div className="card" style={{padding:0}}>
+            {isLoading
+              ? <div style={{padding:32,textAlign:'center',color:'var(--t3)'}}><span className="spinner" style={{display:'inline-block'}}/></div>
+              : <table className="tbl">
+                  <thead><tr><th>Address</th><th>Owner</th><th>Type</th><th>Units</th><th>Assessed</th><th>Last Sale</th><th>Sale Date</th><th>Flags</th></tr></thead>
+                  <tbody>
+                    {results.length ? results.map((r: any) => (
+                      <tr key={r.apn} className="click" onClick={()=>setSelectedApn(r.apn)}>
+                        <td><div style={{fontWeight:600,color:'var(--t0)',fontSize:'.78rem'}}>{r.situs_address}</div><div style={{fontSize:'.65rem',color:'var(--t3)'}}>{r.situs_city} · {r.apn}</div></td>
+                        <td><div style={{fontSize:'.75rem',maxWidth:160,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{r.owner_name_parsed||r.owner_name_raw||'—'}</div><span className={`badge ${r.owner_type==='corporate'?'bb':'bg2'}`} style={{fontSize:'.58rem'}}>{r.owner_type||'—'}</span></td>
+                        <td style={{fontSize:'.72rem',color:'var(--t2)'}}>{r.property_type_std||'—'}</td>
+                        <td className="mono">{r.unit_count||'—'}</td>
+                        <td className="mono" style={{color:'var(--teal)'}}>{fmtCurrency(r.assessed_value)}</td>
+                        <td className="mono" style={{color:'var(--gold)'}}>{fmtCurrency(r.last_sale_price)}</td>
+                        <td className="mono" style={{fontSize:'.7rem',color:'var(--t3)'}}>{fmtDate(r.last_sale_date)}</td>
+                        <td>{r.portfolio_sale_flag&&<span className="badge bpurple" style={{fontSize:'.58rem'}}>Portfolio</span>}</td>
+                      </tr>
+                    )) : <tr><td colSpan={8}><div className="empty">No results found.</div></td></tr>}
+                  </tbody>
+                </table>
+            }
+          </div>
+      }
+      {query && <Pagination offset={offset} total={total} limit={LIMIT} onPage={setOffset}/>}
+      {selectedApn && <ParcelDrawer apn={selectedApn} onClose={()=>setSelectedApn(null)}/>}
     </div>
   )
 }
 
-// ── RV & MOBILE PARKS ─────────────────────────────────────────────────
 function RVParks() {
   const [q, setQ] = useState('')
   const [query, setQuery] = useState('')
@@ -389,79 +359,55 @@ function RVParks() {
   const LIMIT = 50
 
   const { data, isLoading, isFetching } = useQuery(
-    ['rv-parks', query, offset],
-    () => get<any>('/api/properties/mobile-homes/search', { q: query || undefined, limit: LIMIT, offset }),
+    ['rv', query, offset],
+    () => get<any>('/api/properties/mobile-homes/search', { q:query||undefined, limit:LIMIT, offset }),
     { enabled: query.length > 0, keepPreviousData: true }
   )
 
   const results = data?.results || []
   const total = data?.total || 0
-
   const search = (e: React.FormEvent) => { e.preventDefault(); setOffset(0); setQuery(q) }
 
   return (
     <div>
       <div className="ph">
-        <div><h1 className="pt">🚐 RV & Mobile Home Parks</h1><p className="ps">{total > 0 ? `${fmt(total)} parks found` : 'Search Maricopa County RV and mobile home parks'}</p></div>
-        <div style={{display:'flex',gap:8}}>
-          <span className="badge bteal">Business Registry Data</span>
-          <span className="badge bgold">Your Target Market</span>
-        </div>
+        <div><h1 className="pt">🚐 RV & Mobile Home Parks</h1><p className="ps">{query && total > 0 ? `${fmt(total)} parks found` : 'Search Maricopa County RV and mobile home parks'}</p></div>
+        <div style={{display:'flex',gap:8}}><span className="badge bteal">Business Registry</span><span className="badge bgold">Your Market</span></div>
       </div>
-
       <form onSubmit={search} className="search-bar">
-        <input className="search-input" value={q} onChange={e=>setQ(e.target.value)} placeholder="Search park name or address…"/>
+        <input className="search-input" value={q} onChange={e=>setQ(e.target.value)} placeholder="Park name or address… (try 'rv park' or 'mobile home')"/>
         <button type="submit" className="btn bp">{isFetching?<span className="spinner"/>:'🔍 Search'}</button>
       </form>
-
-      {!query && <div className="card" style={{textAlign:'center',padding:'48px 20px',marginBottom:16}}>
-        <div style={{fontSize:'2rem',marginBottom:12}}>🚐</div>
-        <p style={{color:'var(--t3)',fontSize:'.85rem'}}>Search for RV parks, mobile home parks, and manufactured housing communities in Maricopa County.</p>
-      </div>}
-      {query && <div className="card" style={{padding:0,marginBottom:0}}>
-        {isLoading ? <div style={{padding:32,textAlign:'center',color:'var(--t3)'}}><span className="spinner" style={{display:'inline-block'}}/></div> : (
-          <table className="tbl">
-            <thead><tr><th>Park Name</th><th>Address</th><th>Owner</th><th>Assessed Value</th><th>Lot Size</th><th>Last Sale</th><th>Owner Mail</th></tr></thead>
-            <tbody>
-              {results.length ? results.map((r: any, i: number) => (
-                <tr key={i} className="clickable" onClick={() => r.apn && setSelectedApn(r.apn)}>
-                  <td>
-                    <div style={{fontWeight:600,color:'var(--teal)',fontSize:'.82rem'}}>{r.business_name}</div>
-                    {r.dba_name && <div style={{fontSize:'.65rem',color:'var(--t3)'}}>DBA: {r.dba_name}</div>}
-                  </td>
-                  <td style={{fontSize:'.75rem'}}>{r.situs_address}<div style={{fontSize:'.65rem',color:'var(--t3)'}}>{r.situs_zip}</div></td>
-                  <td style={{fontSize:'.75rem',maxWidth:160}}>
-                    <div style={{overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{r.owner_name_parsed||'—'}</div>
-                    {r.owner_type && <span className={`badge ${r.owner_type==='corporate'?'bb':'bg2'}`} style={{fontSize:'.58rem'}}>{r.owner_type}</span>}
-                  </td>
-                  <td className="mono" style={{color:'var(--teal)'}}>{fmtCurrency(r.full_cash_value||r.parcel_fcv)}</td>
-                  <td className="mono">{fmtSqft(r.lot_size_sqft)}</td>
-                  <td>
-                    <div className="mono" style={{fontSize:'.72rem',color:'var(--gold)'}}>{fmtCurrency(r.last_sale_price)}</div>
-                    <div style={{fontSize:'.65rem',color:'var(--t3)'}}>{fmtDate(r.last_sale_date)}</div>
-                  </td>
-                  <td style={{fontSize:'.7rem',color:'var(--t3)'}}>{r.owner_mailing_address?`${r.owner_mailing_address}, ${r.owner_mailing_city} ${r.owner_mailing_state}`:'—'}</td>
-                </tr>
-              )) : <tr><td colSpan={7}><div className="empty">No parks found.</div></td></tr>}
-            </tbody>
-          </table>
-        )}
-      </div>
-
-      </div>}
-      {total > LIMIT && (
-        <div style={{display:'flex',gap:8,justifyContent:'center',marginTop:16,alignItems:'center'}}>
-          <button className="btn bg-btn" disabled={offset===0} onClick={()=>setOffset(o=>Math.max(0,o-LIMIT))}>← Prev</button>
-          <span style={{color:'var(--t3)',fontSize:'.78rem'}}>{offset+1}–{Math.min(offset+LIMIT,total)} of {fmt(total)}</span>
-          <button className="btn bg-btn" disabled={offset+LIMIT>=total} onClick={()=>setOffset(o=>o+LIMIT)}>Next →</button>
-        </div>
-      )}
-      {selectedApn && <ParcelDrawer apn={selectedApn} onClose={() => setSelectedApn(null)} />}
+      {!query
+        ? <EmptyPrompt icon="🚐" title="Find RV & Mobile Home Parks" body="Search Maricopa County business registry for RV parks, mobile home parks, and manufactured housing communities. Try searching 'rv park', 'mobile home', or 'trailer'."/>
+        : <div className="card" style={{padding:0}}>
+            {isLoading
+              ? <div style={{padding:32,textAlign:'center',color:'var(--t3)'}}><span className="spinner" style={{display:'inline-block'}}/></div>
+              : <table className="tbl">
+                  <thead><tr><th>Park Name</th><th>Address</th><th>Owner</th><th>Assessed</th><th>Lot Size</th><th>Last Sale</th><th>Owner Mail</th></tr></thead>
+                  <tbody>
+                    {results.length ? results.map((r: any, i: number) => (
+                      <tr key={i} className="click" onClick={()=>r.apn&&setSelectedApn(r.apn)}>
+                        <td><div style={{fontWeight:600,color:'var(--teal)',fontSize:'.82rem'}}>{r.business_name}</div>{r.dba_name&&<div style={{fontSize:'.65rem',color:'var(--t3)'}}>DBA: {r.dba_name}</div>}</td>
+                        <td style={{fontSize:'.75rem'}}>{r.situs_address}<div style={{fontSize:'.65rem',color:'var(--t3)'}}>{r.situs_zip}</div></td>
+                        <td style={{fontSize:'.75rem',maxWidth:140}}><div style={{overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{r.owner_name_parsed||'—'}</div>{r.owner_type&&<span className={`badge ${r.owner_type==='corporate'?'bb':'bg2'}`} style={{fontSize:'.58rem'}}>{r.owner_type}</span>}</td>
+                        <td className="mono" style={{color:'var(--teal)'}}>{fmtCurrency(r.full_cash_value||r.parcel_fcv)}</td>
+                        <td className="mono">{fmtSqft(r.lot_size_sqft)}</td>
+                        <td><div className="mono" style={{fontSize:'.72rem',color:'var(--gold)'}}>{fmtCurrency(r.last_sale_price)}</div><div style={{fontSize:'.65rem',color:'var(--t3)'}}>{fmtDate(r.last_sale_date)}</div></td>
+                        <td style={{fontSize:'.7rem',color:'var(--t3)'}}>{r.owner_mailing_address?`${r.owner_mailing_address}, ${r.owner_mailing_city} ${r.owner_mailing_state}`:'—'}</td>
+                      </tr>
+                    )) : <tr><td colSpan={7}><div className="empty">No parks found.</div></td></tr>}
+                  </tbody>
+                </table>
+            }
+          </div>
+      }
+      {query && <Pagination offset={offset} total={total} limit={LIMIT} onPage={setOffset}/>}
+      {selectedApn && <ParcelDrawer apn={selectedApn} onClose={()=>setSelectedApn(null)}/>}
     </div>
   )
 }
 
-// ── PORTFOLIO SALES ────────────────────────────────────────────────────
 function PortfolioSales() {
   const [loaded, setLoaded] = useState(false)
   const [offset, setOffset] = useState(0)
@@ -469,8 +415,8 @@ function PortfolioSales() {
   const LIMIT = 50
 
   const { data, isLoading } = useQuery(
-    ['portfolio-sales', offset],
-    () => get<any>('/api/properties/search', { portfolio: 'true', sort: 'sale_desc', limit: LIMIT, offset }),
+    ['portfolio', offset],
+    () => get<any>('/api/properties/search', { portfolio:'true', sort:'sale_desc', limit:LIMIT, offset }),
     { enabled: loaded, keepPreviousData: true }
   )
 
@@ -480,60 +426,55 @@ function PortfolioSales() {
   return (
     <div>
       <div className="ph">
-        <div><h1 className="pt">📦 Portfolio Sales</h1><p className="ps">{fmt(total)} multi-parcel transactions detected</p></div>
+        <div><h1 className="pt">📦 Portfolio Sales</h1><p className="ps">{loaded && total > 0 ? `${fmt(total)} multi-parcel transactions detected` : 'Institutional acquisitions and large portfolio transfers'}</p></div>
         <span className="badge bpurple">Multi-signal Detection</span>
       </div>
-
-      <div className="card" style={{marginBottom:16,padding:'12px 16px',display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+      <div className="card" style={{marginBottom:16,padding:'14px 16px',display:'flex',justifyContent:'space-between',alignItems:'center',gap:16}}>
         <div style={{fontSize:'.78rem',color:'var(--t2)',lineHeight:1.7,flex:1}}>
-          Portfolio sales are flagged using multi-signal detection: same-day sales, same grantor/grantee, same deed book, or matching sale prices across multiple parcels. These represent institutional acquisitions and large landlord portfolio transfers.
+          Portfolio sales are flagged using multi-signal detection: same-day sales, same grantor/grantee, same deed book, or matching sale prices across multiple parcels.
         </div>
+        {!loaded && <button className="btn bp" onClick={()=>setLoaded(true)} style={{flexShrink:0}}>Load Data</button>}
       </div>
-
-      <div className="card" style={{padding:0}}>
-        {isLoading ? <div style={{padding:32,textAlign:'center',color:'var(--t3)'}}><span className="spinner" style={{display:'inline-block'}}/></div> : (
-          <table className="tbl">
-            <thead><tr><th>Address</th><th>Owner</th><th>Type</th><th>Sale Price</th><th>Sale Date</th><th>Assessed</th><th>Portfolio ID</th></tr></thead>
-            <tbody>
-              {results.length ? results.map((r: any) => (
-                <tr key={r.apn} className="clickable" onClick={()=>setSelectedApn(r.apn)}>
-                  <td><div style={{fontWeight:600,color:'var(--t0)',fontSize:'.78rem'}}>{r.situs_address}</div><div style={{fontSize:'.65rem',color:'var(--t3)'}}>{r.situs_city} · {r.apn}</div></td>
-                  <td style={{fontSize:'.75rem',maxWidth:160,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{r.owner_name_parsed||r.owner_name_raw||'—'}</td>
-                  <td style={{fontSize:'.72rem',color:'var(--t2)'}}>{r.property_type_std||'—'}</td>
-                  <td className="mono" style={{color:'var(--gold)',fontWeight:600}}>{fmtCurrency(r.last_sale_price)}</td>
-                  <td className="mono" style={{fontSize:'.72rem'}}>{fmtDate(r.last_sale_date)}</td>
-                  <td className="mono" style={{color:'var(--teal)'}}>{fmtCurrency(r.assessed_value)}</td>
-                  <td><span className="badge bpurple" style={{fontSize:'.6rem',fontFamily:'var(--font-m)'}}>{r.portfolio_sale_id?.slice(0,8)||'—'}</span></td>
-                </tr>
-              )) : <tr><td colSpan={7}><div className="empty">No portfolio sales found.</div></td></tr>}
-            </tbody>
-          </table>
-        )}
-      </div>
-
-      {total > LIMIT && (
-        <div style={{display:'flex',gap:8,justifyContent:'center',marginTop:16,alignItems:'center'}}>
-          <button className="btn bg-btn" disabled={offset===0} onClick={()=>setOffset(o=>Math.max(0,o-LIMIT))}>← Prev</button>
-          <span style={{color:'var(--t3)',fontSize:'.78rem'}}>{offset+1}–{Math.min(offset+LIMIT,total)} of {fmt(total)}</span>
-          <button className="btn bg-btn" disabled={offset+LIMIT>=total} onClick={()=>setOffset(o=>o+LIMIT)}>Next →</button>
-        </div>
-      )}
+      {!loaded
+        ? <EmptyPrompt icon="📦" title="Portfolio Sale Detection" body="Click Load Data to search for multi-parcel institutional transactions across Maricopa County."/>
+        : <div className="card" style={{padding:0}}>
+            {isLoading
+              ? <div style={{padding:32,textAlign:'center',color:'var(--t3)'}}><span className="spinner" style={{display:'inline-block'}}/></div>
+              : <table className="tbl">
+                  <thead><tr><th>Address</th><th>Owner</th><th>Type</th><th>Sale Price</th><th>Sale Date</th><th>Assessed</th><th>Portfolio ID</th></tr></thead>
+                  <tbody>
+                    {results.length ? results.map((r: any) => (
+                      <tr key={r.apn} className="click" onClick={()=>setSelectedApn(r.apn)}>
+                        <td><div style={{fontWeight:600,color:'var(--t0)',fontSize:'.78rem'}}>{r.situs_address}</div><div style={{fontSize:'.65rem',color:'var(--t3)'}}>{r.situs_city} · {r.apn}</div></td>
+                        <td style={{fontSize:'.75rem',maxWidth:160,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{r.owner_name_parsed||r.owner_name_raw||'—'}</td>
+                        <td style={{fontSize:'.72rem',color:'var(--t2)'}}>{r.property_type_std||'—'}</td>
+                        <td className="mono" style={{color:'var(--gold)',fontWeight:600}}>{fmtCurrency(r.last_sale_price)}</td>
+                        <td className="mono" style={{fontSize:'.72rem'}}>{fmtDate(r.last_sale_date)}</td>
+                        <td className="mono" style={{color:'var(--teal)'}}>{fmtCurrency(r.assessed_value)}</td>
+                        <td><span className="badge bpurple" style={{fontSize:'.6rem',fontFamily:'var(--font-m)'}}>{r.portfolio_sale_id?.slice(0,8)||'—'}</span></td>
+                      </tr>
+                    )) : <tr><td colSpan={7}><div className="empty">No portfolio sales found.</div></td></tr>}
+                  </tbody>
+                </table>
+            }
+          </div>
+      }
+      {loaded && <Pagination offset={offset} total={total} limit={LIMIT} onPage={setOffset}/>}
       {selectedApn && <ParcelDrawer apn={selectedApn} onClose={()=>setSelectedApn(null)}/>}
     </div>
   )
 }
 
-// ── MULTIFAMILY ────────────────────────────────────────────────────────
 function Multifamily() {
   const [loaded, setLoaded] = useState(false)
+  const [minUnits, setMinUnits] = useState('4')
   const [offset, setOffset] = useState(0)
-  const [minUnits, setMinUnits] = useState('2')
   const [selectedApn, setSelectedApn] = useState<string|null>(null)
   const LIMIT = 50
 
   const { data, isLoading } = useQuery(
-    ['multifamily', minUnits, offset],
-    () => get<any>('/api/properties/search', { min_units: minUnits, sort: 'units_desc', limit: LIMIT, offset }),
+    ['mfr', minUnits, offset],
+    () => get<any>('/api/properties/search', { min_units:minUnits, sort:'units_desc', limit:LIMIT, offset }),
     { enabled: loaded, keepPreviousData: true }
   )
 
@@ -543,68 +484,57 @@ function Multifamily() {
   return (
     <div>
       <div className="ph">
-        <div><h1 className="pt">🏢 Multifamily Properties</h1><p className="ps">{fmt(total)} properties with {minUnits}+ units</p></div>
-        <div style={{display:'flex',gap:8,alignItems:'center'}}>
+        <div><h1 className="pt">🏢 Multifamily</h1><p className="ps">{loaded && total > 0 ? `${fmt(total)} properties with ${minUnits}+ units` : 'Find apartment buildings and multi-unit properties'}</p></div>
+        <div style={{display:'flex',gap:6,alignItems:'center'}}>
           <span style={{color:'var(--t3)',fontSize:'.78rem'}}>Min units:</span>
           {['2','4','10','20','50','100'].map(n=>(
-            <button key={n} className={`filter-chip ${minUnits===n?'on':''}`} onClick={()=>{setMinUnits(n);setOffset(0)}}>{n}+</button>
+            <button key={n} className={`chip ${minUnits===n?'on':''}`} onClick={()=>{setMinUnits(n);setOffset(0);setLoaded(true)}}>{n}+</button>
           ))}
         </div>
       </div>
-
-      {!loaded && <div className="card" style={{textAlign:'center',padding:'48px 20px'}}>
-        <div style={{fontSize:'2rem',marginBottom:12}}>🏢</div>
-        <p style={{color:'var(--t3)',marginBottom:16,fontSize:'.85rem'}}>Click to search {minUnits}+ unit properties across 1.75M parcels</p>
-        <button className="btn bp" onClick={()=>setLoaded(true)}>Load Multifamily Data</button>
-      </div>}
-      {loaded && <div className="card" style={{padding:0}}>
-        {isLoading ? <div style={{padding:32,textAlign:'center',color:'var(--t3)'}}><span className="spinner" style={{display:'inline-block'}}/></div> : (
-          <table className="tbl">
-            <thead><tr><th>Address</th><th>Owner</th><th>Units</th><th>Type</th><th>Assessed</th><th>Last Sale</th><th>Year Built</th></tr></thead>
-            <tbody>
-              {results.length ? results.map((r: any) => (
-                <tr key={r.apn} className="clickable" onClick={()=>setSelectedApn(r.apn)}>
-                  <td><div style={{fontWeight:600,color:'var(--t0)',fontSize:'.78rem'}}>{r.situs_address}</div><div style={{fontSize:'.65rem',color:'var(--t3)'}}>{r.situs_city} · {r.apn}</div></td>
-                  <td style={{fontSize:'.75rem',maxWidth:140,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{r.owner_name_parsed||r.owner_name_raw||'—'}</td>
-                  <td><span className="badge bteal" style={{fontSize:'.72rem',fontFamily:'var(--font-m)'}}>{fmt(r.unit_count)}</span></td>
-                  <td style={{fontSize:'.72rem',color:'var(--t2)'}}>{r.property_type_std||'—'}</td>
-                  <td className="mono" style={{color:'var(--teal)'}}>{fmtCurrency(r.assessed_value)}</td>
-                  <td className="mono" style={{color:'var(--gold)'}}>{fmtCurrency(r.last_sale_price)}</td>
-                  <td className="mono" style={{color:'var(--t3)'}}>{r.year_built||'—'}</td>
-                </tr>
-              )) : <tr><td colSpan={7}><div className="empty">No results.</div></td></tr>}
-            </tbody>
-          </table>
-        )}
-      </div>
-
-      {total > LIMIT && (
-        <div style={{display:'flex',gap:8,justifyContent:'center',marginTop:16,alignItems:'center'}}>
-          <button className="btn bg-btn" disabled={offset===0} onClick={()=>setOffset(o=>Math.max(0,o-LIMIT))}>← Prev</button>
-          <span style={{color:'var(--t3)',fontSize:'.78rem'}}>{offset+1}–{Math.min(offset+LIMIT,total)} of {fmt(total)}</span>
-          <button className="btn bg-btn" disabled={offset+LIMIT>=total} onClick={()=>setOffset(o=>o+LIMIT)}>Next →</button>
-        </div>
-      )}
+      {!loaded
+        ? <EmptyPrompt icon="🏢" title="Multifamily Property Search" body="Select a minimum unit count above or click a filter to search for multifamily properties across Maricopa County."/>
+        : <div className="card" style={{padding:0}}>
+            {isLoading
+              ? <div style={{padding:32,textAlign:'center',color:'var(--t3)'}}><span className="spinner" style={{display:'inline-block'}}/></div>
+              : <table className="tbl">
+                  <thead><tr><th>Address</th><th>Owner</th><th>Units</th><th>Type</th><th>Assessed</th><th>Last Sale</th><th>Year Built</th></tr></thead>
+                  <tbody>
+                    {results.length ? results.map((r: any) => (
+                      <tr key={r.apn} className="click" onClick={()=>setSelectedApn(r.apn)}>
+                        <td><div style={{fontWeight:600,color:'var(--t0)',fontSize:'.78rem'}}>{r.situs_address}</div><div style={{fontSize:'.65rem',color:'var(--t3)'}}>{r.situs_city} · {r.apn}</div></td>
+                        <td style={{fontSize:'.75rem',maxWidth:140,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{r.owner_name_parsed||r.owner_name_raw||'—'}</td>
+                        <td><span className="badge bteal" style={{fontFamily:'var(--font-m)'}}>{fmt(r.unit_count)}</span></td>
+                        <td style={{fontSize:'.72rem',color:'var(--t2)'}}>{r.property_type_std||'—'}</td>
+                        <td className="mono" style={{color:'var(--teal)'}}>{fmtCurrency(r.assessed_value)}</td>
+                        <td className="mono" style={{color:'var(--gold)'}}>{fmtCurrency(r.last_sale_price)}</td>
+                        <td className="mono" style={{color:'var(--t3)'}}>{r.year_built||'—'}</td>
+                      </tr>
+                    )) : <tr><td colSpan={7}><div className="empty">No results.</div></td></tr>}
+                  </tbody>
+                </table>
+            }
+          </div>
+      }
+      {loaded && <Pagination offset={offset} total={total} limit={LIMIT} onPage={setOffset}/>}
       {selectedApn && <ParcelDrawer apn={selectedApn} onClose={()=>setSelectedApn(null)}/>}
     </div>
   )
 }
 
-// ── OWNER LOOKUP ───────────────────────────────────────────────────────
 function OwnerLookup() {
   const [q, setQ] = useState('')
   const [query, setQuery] = useState('')
   const [selectedApn, setSelectedApn] = useState<string|null>(null)
 
   const { data, isLoading } = useQuery(
-    ['owner-search', query],
-    () => get<any>('/api/properties/search', { q: query, owner_type: 'corporate', sort: 'val_desc', limit: 100 }),
+    ['owner', query],
+    () => get<any>('/api/properties/search', { q:query, sort:'val_desc', limit:100 }),
     { enabled: !!query }
   )
 
   const results = data?.results || []
   const total = data?.total || 0
-
   const search = (e: React.FormEvent) => { e.preventDefault(); setQuery(q) }
 
   return (
@@ -612,104 +542,87 @@ function OwnerLookup() {
       <div className="ph">
         <div><h1 className="pt">👤 Owner Lookup</h1><p className="ps">Search by owner name to see full portfolio</p></div>
       </div>
-
       <form onSubmit={search} className="search-bar">
-        <input className="search-input" value={q} onChange={e=>setQ(e.target.value)} placeholder="Search owner or company name…" autoFocus/>
+        <input className="search-input" value={q} onChange={e=>setQ(e.target.value)} placeholder="Owner or company name…" autoFocus/>
         <button type="submit" className="btn bp">{isLoading?<span className="spinner"/>:'🔍 Search'}</button>
       </form>
-
-      {query && (
-        <div style={{marginBottom:12}}>
-          <span style={{color:'var(--t3)',fontSize:'.78rem'}}>{fmt(total)} parcels matching "{query}"</span>
-        </div>
-      )}
-
-      {results.length > 0 && (
-        <>
-          <div className="grid4" style={{marginBottom:16}}>
-            <div className="kpi"><div className="kl">Parcels Found</div><div className="kv t">{fmt(total)}</div></div>
-            <div className="kpi"><div className="kl">Total Assessed</div><div className="kv gold">{fmtCurrency(results.reduce((s:number,r:any)=>s+(+r.assessed_value||0),0))}</div></div>
-            <div className="kpi"><div className="kl">Total Sale Value</div><div className="kv g">{fmtCurrency(results.reduce((s:number,r:any)=>s+(+r.last_sale_price||0),0))}</div></div>
-            <div className="kpi"><div className="kl">Total Units</div><div className="kv b">{fmt(results.reduce((s:number,r:any)=>s+(+r.unit_count||0),0))}</div></div>
-          </div>
-
-          <div className="card" style={{padding:0}}>
-            <table className="tbl">
-              <thead><tr><th>Address</th><th>Owner</th><th>Type</th><th>Units</th><th>Assessed</th><th>Last Sale</th><th>Portfolio</th></tr></thead>
-              <tbody>
-                {results.map((r:any)=>(
-                  <tr key={r.apn} className="clickable" onClick={()=>setSelectedApn(r.apn)}>
-                    <td><div style={{fontWeight:600,color:'var(--t0)',fontSize:'.78rem'}}>{r.situs_address}</div><div style={{fontSize:'.65rem',color:'var(--t3)'}}>{r.situs_city} · {r.apn}</div></td>
-                    <td style={{fontSize:'.72rem',maxWidth:160,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{r.owner_name_parsed||r.owner_name_raw||'—'}</td>
-                    <td style={{fontSize:'.72rem',color:'var(--t2)'}}>{r.property_type_std||'—'}</td>
-                    <td className="mono">{r.unit_count||'—'}</td>
-                    <td className="mono" style={{color:'var(--teal)'}}>{fmtCurrency(r.assessed_value)}</td>
-                    <td className="mono" style={{color:'var(--gold)'}}>{fmtCurrency(r.last_sale_price)}</td>
-                    <td>{r.portfolio_sale_flag?<span className="badge bpurple">Portfolio</span>:<span style={{color:'var(--t3)'}}>—</span>}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </>
-      )}
-
-      {!query && (
-        <div className="card" style={{textAlign:'center',padding:'60px 20px'}}>
-          <div style={{fontSize:'3rem',marginBottom:16}}>👤</div>
-          <h2 style={{color:'var(--t0)',marginBottom:8}}>Owner Portfolio Search</h2>
-          <p style={{color:'var(--t3)',fontSize:'.85rem',maxWidth:420,margin:'0 auto'}}>Search any owner or company name to see all parcels they own in Maricopa County. Useful for identifying large landlords, corporate owners, and acquisition targets.</p>
-        </div>
-      )}
-
+      {!query
+        ? <EmptyPrompt icon="👤" title="Owner Portfolio Search" body="Search any owner or company name to see all parcels they own in Maricopa County. Useful for identifying large landlords, corporate owners, and acquisition targets."/>
+        : <>
+            {results.length > 0 && (
+              <div className="grid4" style={{marginBottom:16}}>
+                <div className="kpi"><div className="kl">Parcels Found</div><div className="kv t">{fmt(total)}</div></div>
+                <div className="kpi"><div className="kl">Total Assessed</div><div className="kv gold">{fmtCurrency(results.reduce((s:number,r:any)=>s+(+r.assessed_value||0),0))}</div></div>
+                <div className="kpi"><div className="kl">Total Sale Value</div><div className="kv g">{fmtCurrency(results.reduce((s:number,r:any)=>s+(+r.last_sale_price||0),0))}</div></div>
+                <div className="kpi"><div className="kl">Total Units</div><div className="kv b">{fmt(results.reduce((s:number,r:any)=>s+(+r.unit_count||0),0))}</div></div>
+              </div>
+            )}
+            <div className="card" style={{padding:0}}>
+              {isLoading
+                ? <div style={{padding:32,textAlign:'center',color:'var(--t3)'}}><span className="spinner" style={{display:'inline-block'}}/></div>
+                : <table className="tbl">
+                    <thead><tr><th>Address</th><th>Owner</th><th>Type</th><th>Units</th><th>Assessed</th><th>Last Sale</th></tr></thead>
+                    <tbody>
+                      {results.length ? results.map((r:any)=>(
+                        <tr key={r.apn} className="click" onClick={()=>setSelectedApn(r.apn)}>
+                          <td><div style={{fontWeight:600,color:'var(--t0)',fontSize:'.78rem'}}>{r.situs_address}</div><div style={{fontSize:'.65rem',color:'var(--t3)'}}>{r.situs_city} · {r.apn}</div></td>
+                          <td style={{fontSize:'.72rem',maxWidth:160,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{r.owner_name_parsed||r.owner_name_raw||'—'}</td>
+                          <td style={{fontSize:'.72rem',color:'var(--t2)'}}>{r.property_type_std||'—'}</td>
+                          <td className="mono">{r.unit_count||'—'}</td>
+                          <td className="mono" style={{color:'var(--teal)'}}>{fmtCurrency(r.assessed_value)}</td>
+                          <td className="mono" style={{color:'var(--gold)'}}>{fmtCurrency(r.last_sale_price)}</td>
+                        </tr>
+                      )) : <tr><td colSpan={6}><div className="empty">No results for "{query}"</div></td></tr>}
+                    </tbody>
+                  </table>
+              }
+            </div>
+          </>
+      }
       {selectedApn && <ParcelDrawer apn={selectedApn} onClose={()=>setSelectedApn(null)}/>}
     </div>
   )
 }
 
-// ── COUNTY COVERAGE ────────────────────────────────────────────────────
 function CountyCoverage() {
   const counties = [
-    { name:'Maricopa', status:'live', parcels:'1,750,000+', loaded:'Apr 2026', next:false },
-    { name:'Pima', status:'next', parcels:'~450,000', loaded:'—', next:true },
-    { name:'Pinal', status:'planned', parcels:'~180,000', loaded:'—', next:false },
-    { name:'Yavapai', status:'planned', parcels:'~100,000', loaded:'—', next:false },
-    { name:'Coconino', status:'planned', parcels:'~60,000', loaded:'—', next:false },
-    { name:'Mohave', status:'planned', parcels:'~80,000', loaded:'—', next:false },
-    { name:'Navajo', status:'planned', parcels:'~50,000', loaded:'—', next:false },
-    { name:'Apache', status:'planned', parcels:'~30,000', loaded:'—', next:false },
-    { name:'Graham', status:'planned', parcels:'~15,000', loaded:'—', next:false },
-    { name:'Greenlee', status:'planned', parcels:'~5,000', loaded:'—', next:false },
-    { name:'La Paz', status:'planned', parcels:'~15,000', loaded:'—', next:false },
-    { name:'Santa Cruz', status:'planned', parcels:'~20,000', loaded:'—', next:false },
-    { name:'Gila', status:'planned', parcels:'~25,000', loaded:'—', next:false },
-    { name:'Cochise', status:'planned', parcels:'~60,000', loaded:'—', next:false },
-    { name:'Yuma', status:'planned', parcels:'~70,000', loaded:'—', next:false },
+    {name:'Maricopa',status:'live',parcels:'1,750,000+',loaded:'Apr 2026'},
+    {name:'Pima',status:'next',parcels:'~450,000',loaded:'—'},
+    {name:'Pinal',status:'planned',parcels:'~180,000',loaded:'—'},
+    {name:'Yavapai',status:'planned',parcels:'~100,000',loaded:'—'},
+    {name:'Coconino',status:'planned',parcels:'~60,000',loaded:'—'},
+    {name:'Mohave',status:'planned',parcels:'~80,000',loaded:'—'},
+    {name:'Navajo',status:'planned',parcels:'~50,000',loaded:'—'},
+    {name:'Apache',status:'planned',parcels:'~30,000',loaded:'—'},
+    {name:'Graham',status:'planned',parcels:'~15,000',loaded:'—'},
+    {name:'Greenlee',status:'planned',parcels:'~5,000',loaded:'—'},
+    {name:'La Paz',status:'planned',parcels:'~15,000',loaded:'—'},
+    {name:'Santa Cruz',status:'planned',parcels:'~20,000',loaded:'—'},
+    {name:'Gila',status:'planned',parcels:'~25,000',loaded:'—'},
+    {name:'Cochise',status:'planned',parcels:'~60,000',loaded:'—'},
+    {name:'Yuma',status:'planned',parcels:'~70,000',loaded:'—'},
   ]
-  const STATUS: Record<string,string> = { live:'bg2', next:'ba', planned:'bmu' }
-
+  const STATUS: Record<string,string> = {live:'bg2',next:'ba',planned:'bmu'}
   return (
     <div>
       <div className="ph">
         <div><h1 className="pt">🗺 County Coverage</h1><p className="ps">Arizona statewide rollout — 15 counties</p></div>
         <span className="badge bteal">1 of 15 Live</span>
       </div>
-
       <div className="grid4" style={{marginBottom:16}}>
-        <div className="kpi"><div className="kl">Live Counties</div><div className="kv g">1</div><div className="ks">Maricopa</div></div>
+        <div className="kpi"><div className="kl">Live</div><div className="kv g">1</div><div className="ks">Maricopa</div></div>
         <div className="kpi"><div className="kl">Parcels Loaded</div><div className="kv t">1.75M+</div><div className="ks">Maricopa only</div></div>
         <div className="kpi"><div className="kl">Next Up</div><div className="kv a">Pima</div><div className="ks">~450K parcels</div></div>
         <div className="kpi"><div className="kl">AZ Total Est.</div><div className="kv">~3M</div><div className="ks">All 15 counties</div></div>
       </div>
-
       <div className="card" style={{padding:0}}>
         <table className="tbl">
           <thead><tr><th>County</th><th>Status</th><th>Est. Parcels</th><th>Date Loaded</th></tr></thead>
           <tbody>
             {counties.map(c=>(
-              <tr key={c.name} style={{background:c.status==='live'?'rgba(34,197,94,.02)':c.next?'rgba(245,158,11,.02)':''}}>
-                <td style={{fontWeight:600,color:c.status==='live'?'var(--green)':c.next?'var(--amber)':'var(--t2)'}}>{c.name} County</td>
-                <td><span className={`badge ${STATUS[c.status]}`}>{c.status==='live'?'✓ Live':c.next?'Next Up':'Planned'}</span></td>
+              <tr key={c.name} style={{background:c.status==='live'?'rgba(34,197,94,.02)':c.status==='next'?'rgba(245,158,11,.02)':''}}>
+                <td style={{fontWeight:600,color:c.status==='live'?'var(--green)':c.status==='next'?'var(--amber)':'var(--t2)'}}>{c.name} County</td>
+                <td><span className={`badge ${STATUS[c.status]}`}>{c.status==='live'?'✓ Live':c.status==='next'?'Next Up':'Planned'}</span></td>
                 <td className="mono" style={{color:'var(--t2)'}}>{c.parcels}</td>
                 <td style={{fontSize:'.75rem',color:'var(--t3)'}}>{c.loaded}</td>
               </tr>
@@ -721,9 +634,8 @@ function CountyCoverage() {
   )
 }
 
-// ── LOGIN ──────────────────────────────────────────────────────────────
 function LoginPage() {
-  React.useEffect(() => { TOKEN_KEYS.forEach(k=>localStorage.removeItem(k)); delete api.defaults.headers.common['Authorization'] }, [])
+  React.useEffect(()=>{ TOKEN_KEYS.forEach(k=>localStorage.removeItem(k)); delete api.defaults.headers.common['Authorization'] },[])
   const { login } = useAuth()
   const navigate = useNavigate()
   const [email, setEmail] = useState('')
@@ -734,7 +646,7 @@ function LoginPage() {
   const onSubmit = async (e: React.FormEvent) => {
     e.preventDefault(); setLoading(true); setErr('')
     try { await login(email, pw); navigate('/search') }
-    catch (ex: any) { setErr(ex.response?.data?.error || ex.message || 'Login failed') }
+    catch (ex: any) { setErr(ex.response?.data?.error||ex.message||'Login failed') }
     finally { setLoading(false) }
   }
 
@@ -746,7 +658,7 @@ function LoginPage() {
           <div style={{color:'var(--t3)',fontSize:'.82rem'}}>Property Intelligence · Maricopa County · 1.75M Parcels</div>
         </div>
         <div className="card" style={{padding:24}}>
-          {err && <div style={{background:'rgba(239,68,68,.08)',border:'1px solid rgba(239,68,68,.18)',color:'#fca5a5',padding:'10px 14px',borderRadius:8,fontSize:'.78rem',marginBottom:14}}>{err}</div>}
+          {err&&<div style={{background:'rgba(239,68,68,.08)',border:'1px solid rgba(239,68,68,.18)',color:'#fca5a5',padding:'10px 14px',borderRadius:8,fontSize:'.78rem',marginBottom:14}}>{err}</div>}
           <div style={{background:'rgba(20,184,166,.08)',border:'1px solid rgba(20,184,166,.18)',color:'var(--teal)',padding:'10px 14px',borderRadius:8,fontSize:'.75rem',marginBottom:20}}>
             Sign in with your GAM Admin or Landlord credentials.
           </div>
@@ -760,7 +672,7 @@ function LoginPage() {
               <input type="password" value={pw} onChange={e=>setPw(e.target.value)} required style={{width:'100%'}}/>
             </div>
             <button className="btn bp" type="submit" disabled={loading} style={{width:'100%',justifyContent:'center',padding:'10px 14px'}}>
-              {loading ? <span className="spinner"/> : 'Sign in to GAM Intel'}
+              {loading?<span className="spinner"/>:'Sign in to GAM Intel'}
             </button>
           </form>
         </div>
@@ -772,22 +684,21 @@ function LoginPage() {
   )
 }
 
-// ── APP ────────────────────────────────────────────────────────────────
 function App() {
   const { user, loading } = useAuth()
   if (loading) return <div className="loading-pg"><span className="spinner" style={{marginRight:10}}/>Loading GAM Intel…</div>
   const authed = !!user && ALLOWED.includes(user.role)
   return (
     <Routes>
-      <Route path="/login" element={authed ? <Navigate to="/search" replace/> : <LoginPage/>}/>
-      <Route path="/" element={authed ? <Layout/> : <Navigate to="/login" replace/>}>
+      <Route path="/login" element={authed?<Navigate to="/search" replace/>:<LoginPage/>}/>
+      <Route path="/" element={authed?<Layout/>:<Navigate to="/login" replace/>}>
         <Route index element={<Navigate to="/search" replace/>}/>
-        <Route path="search"    element={<ParcelSearch/>}/>
-        <Route path="rv-parks"  element={<RVParks/>}/>
-        <Route path="portfolios" element={<PortfolioSales/>}/>
-        <Route path="owners"    element={<OwnerLookup/>}/>
+        <Route path="search"      element={<ParcelSearch/>}/>
+        <Route path="rv-parks"    element={<RVParks/>}/>
+        <Route path="portfolios"  element={<PortfolioSales/>}/>
+        <Route path="owners"      element={<OwnerLookup/>}/>
         <Route path="multifamily" element={<Multifamily/>}/>
-        <Route path="coverage"  element={<CountyCoverage/>}/>
+        <Route path="coverage"    element={<CountyCoverage/>}/>
       </Route>
       <Route path="*" element={<Navigate to={authed?'/search':'/login'} replace/>}/>
     </Routes>
@@ -798,7 +709,7 @@ function Root() {
   return (
     <QueryClientProvider client={qc}>
       <AuthProvider>
-        <style dangerouslySetInnerHTML={{ __html: css }}/>
+        <style dangerouslySetInnerHTML={{__html:css}}/>
         <BrowserRouter><App/></BrowserRouter>
       </AuthProvider>
     </QueryClientProvider>
