@@ -32,6 +32,7 @@ import { announcementsRouter }  from './routes/announcements'
 import { booksRouter } from './routes/books'
 import { bulletinRouter }      from './routes/bulletin'
 import { notificationsRouter } from './routes/notifications'
+import { fitnessRouter }      from './routes/fitness'
 import { schedulerInit }      from './jobs/scheduler'
 
 dotenv.config()
@@ -50,6 +51,7 @@ app.use(cors({
     process.env.POS_APP_URL      || 'http://localhost:3005',
     'http://localhost:3006',
     'http://localhost:3007',
+    'http://localhost:3008',
   ],
   credentials: true,
 }))
@@ -106,6 +108,7 @@ app.use('/api/esign',         esignRouter)
 app.use('/api/announcements',  announcementsRouter)
 app.use('/api/bulletin',       bulletinRouter)
   app.use('/api/background',    backgroundRouter)
+app.use('/api/fitness',        fitnessRouter)
 app.use('/api/notifications',  notificationsRouter)
 app.use('/api/books',          booksRouter)
 app.use('/webhooks',          webhooksRouter)

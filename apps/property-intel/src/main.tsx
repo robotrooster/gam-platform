@@ -190,19 +190,20 @@ function Layout() {
 }
 
 function countyGisUrl(parcel: any): string {
-  const apn = (parcel.apn || '').replace(/[A-Za-z]+$/, '');
+  const raw = parcel.apn || '';
+  const apn = raw.replace(/[A-Za-z]+$/, '');
   const county = (parcel.county || '').toLowerCase();
   const map: Record<string, string> = {
-    maricopa: `https://maps.mcassessor.maricopa.gov/?esearch=${apn}&slayer=0&exprnum=0`,
-    navajo: `https://apps.navajocountyaz.gov/navajowebpayments/propertyinformation?p=1&apn=${parcel.apn}`,
-    mohave: `https://mcgis.mohave.gov/`,
-    cochise: `https://gis-cochise.opendata.arcgis.com/app/37d793d478664634b4de3ad8042f248a`,
-    pima: `https://www.asr.pima.gov/advanced-search`,
-    yuma: `https://arcgis.yumacountyaz.gov/webgis/rest/services/YC_Parcels/MapServer`,
-    yavapai: `https://gis.yavapaiaz.gov/v4/`,
-    coconino: `https://datahub-coconinocounty.opendata.arcgis.com`,
+    maricopa: 'https://maps.mcassessor.maricopa.gov/?esearch=' + apn + '&slayer=0&exprnum=0',
+    navajo: 'https://apps.navajocountyaz.gov/navajowebpayments/propertyinformation?p=1&apn=' + raw,
+    mohave: 'https://mcgis.mohave.gov/',
+    cochise: 'https://gis-cochise.opendata.arcgis.com/app/37d793d478664634b4de3ad8042f248a',
+    pima: 'https://www.asr.pima.gov/advanced-search',
+    yuma: 'https://arcgis.yumacountyaz.gov/webgis/',
+    yavapai: 'https://gis.yavapaiaz.gov/v4/',
+    coconino: 'https://datahub-coconinocounty.opendata.arcgis.com',
   };
-  return map[county] || `https://maps.mcassessor.maricopa.gov/?esearch=${apn}&slayer=0&exprnum=0`;
+  return map[county] || ('https://maps.mcassessor.maricopa.gov/?esearch=' + apn + '&slayer=0&exprnum=0');
 }
 
 function ParcelDrawer({ apn, onClose }: { apn: string; onClose: () => void }) {
@@ -625,14 +626,14 @@ function CountyCoverage() {
     <div>
       <div className="ph">
         <div><h1 className="pt">🗺 County Coverage</h1><p className="ps">Arizona statewide rollout — 15 counties</p></div>
-        <span className="badge bteal">1 of 15 Live</span>
+        <span className="badge bteal">15 of 15 Live ✓</span>
       </div>
       <div className="grid4" style={{marginBottom:16}}>
-        <div className="kpi"><div className="kl">Live</div><div className="kv g">1</div><div className="ks">Maricopa</div></div>
         <div className="kpi"><div className="kl">Live Counties</div><div className="kv g">15</div><div className="ks">All AZ counties</div></div>
         <div className="kpi"><div className="kl">Parcels Loaded</div><div className="kv t">3.48M</div><div className="ks">Statewide</div></div>
         <div className="kpi"><div className="kl">Next State</div><div className="kv a">NV</div><div className="ks">Coming soon</div></div>
         <div className="kpi"><div className="kl">Coverage</div><div className="kv">100%</div><div className="ks">Arizona complete</div></div>
+      </div>
       <div className="card" style={{padding:0}}>
         <table className="tbl">
           <thead><tr><th>County</th><th>Status</th><th>Est. Parcels</th><th>Date Loaded</th></tr></thead>
