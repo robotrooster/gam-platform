@@ -33,10 +33,12 @@ router.get('/search', async (req: Request, res: Response) => {
     let i = 1;
 
     if (q) {
-      // Use tsvector full-text search — scales to 100M+ rows
-      const tsquery = (q as string).trim().split(/\s+/).filter(Boolean).map((w: string) => w.replace(/[^a-zA-Z0-9]/g,'')).filter(Boolean).join(' & ')
-      conditions.push(`p.search_vector @@ to_tsquery('simple', $${i})`)
-      params.push(tsquery); i++;
+      const words = (q as string).trim().split(/\s+/).filter(Boolean)
+      for (const word of words) {
+        const term = `%${word}%`
+        conditions.push(`(p.situs_address ILIKE $${i} OR p.owner_name_raw ILIKE $${i} OR p.owner_name_parsed ILIKE $${i} OR p.apn ILIKE $${i} OR p.situs_city ILIKE $${i})`)
+        params.push(term); i++;
+      }
     }
     if (min_price) { conditions.push(`p.last_sale_price >= $${i++}`); params.push(Number(min_price)); }
     if (max_price) { conditions.push(`p.last_sale_price <= $${i++}`); params.push(Number(max_price)); }
@@ -109,7 +111,7 @@ router.get('/search', async (req: Request, res: Response) => {
     });
   } catch (err: any) {
     console.error(err);
-    res.status(500).json({ error: err.message });
+    console.error("BULK UPDATE ERROR:", err.message, err.detail || ""); res.status(500).json({ error: err.message });
   }
 });
 
@@ -129,7 +131,7 @@ router.get('/:apn', async (req: Request, res: Response) => {
     res.json(result.rows[0]);
   } catch (err: any) {
     console.error(err);
-    res.status(500).json({ error: err.message });
+    console.error("BULK UPDATE ERROR:", err.message, err.detail || ""); res.status(500).json({ error: err.message });
   }
 });
 
@@ -152,7 +154,7 @@ router.get('/:apn/businesses', async (req: Request, res: Response) => {
     res.json({ count: result.rows.length, results: result.rows });
   } catch (err: any) {
     console.error(err);
-    res.status(500).json({ error: err.message });
+    console.error("BULK UPDATE ERROR:", err.message, err.detail || ""); res.status(500).json({ error: err.message });
   }
 });
 
@@ -210,8 +212,47 @@ router.get('/mobile-homes/search', async (req: Request, res: Response) => {
     });
   } catch (err: any) {
     console.error(err);
-    res.status(500).json({ error: err.message });
+    console.error("BULK UPDATE ERROR:", err.message, err.detail || ""); res.status(500).json({ error: err.message });
   }
 });
 
+export default router;
+
+router.post('/bulk-update', async (req: Request, res: Response) => {
+  try {
+    const { rows } = req.body;
+    if (!rows?.length) return res.json({ updated: 0 });
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      for (const r of rows) {
+        await client.query(
+          `UPDATE parcels SET
+            situs_address         = COALESCE(situs_address, $1),
+            situs_city            = COALESCE(situs_city, $2),
+            situs_zip             = COALESCE(situs_zip, $3),
+            owner_name_raw        = COALESCE(owner_name_raw, $4),
+            owner_name_parsed     = COALESCE(owner_name_parsed, $4),
+            owner_mailing_address = COALESCE(owner_mailing_address, $5),
+            owner_mailing_city    = COALESCE(owner_mailing_city, $6),
+            owner_mailing_state   = COALESCE(owner_mailing_state, $7),
+            owner_mailing_zip     = COALESCE(owner_mailing_zip, $8)
+          WHERE apn = $9 AND county = $10`,
+          [r.situs||null, r.situs_city||null, r.situs_zip||null, r.owner||null,
+           r.mail_addr||null, r.mail_city||null, (r.mail_state||null)?.substring(0,2)||null, r.mail_zip||null,
+           r.apn, r.county]
+        );
+      }
+      await client.query('COMMIT');
+    } catch(e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
+    res.json({ updated: rows.length });
+  } catch (err: any) {
+    console.error("BULK UPDATE ERROR:", err.message, err.detail || ""); res.status(500).json({ error: err.message });
+  }
+});
 export default router;

@@ -22,11 +22,11 @@ export const pool = new Pool({
 
 app.use(helmet());
 app.use(cors({
-  origin: ['http://localhost:3001','http://localhost:3002','http://localhost:3003','http://localhost:3004','http://localhost:3005','http://localhost:3006','http://localhost:3007'],
+  origin: ['http://localhost:3001','http://localhost:3002','http://localhost:3003','http://localhost:3004','http://localhost:3005','http://localhost:3006','http://localhost:3007','https://experience.arcgis.com'],
   credentials: true,
 }));
 app.use(morgan('dev'));
-app.use(express.json());
+app.use(express.json({ limit: "50mb" }));
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', service: 'gam-property-api', port: PORT });
