@@ -691,128 +691,6 @@ booksRouter.delete('/bookkeeper/revoke', async (req, res, next) => {
 
 
 // ════════════════════════════════════════
-// BOOKKEEPER MANAGEMENT
-// ════════════════════════════════════════
-
-// GET /api/books/bookkeeper/clients — list all clients for logged-in bookkeeper
-booksRouter.get('/bookkeeper/clients', async (req, res, next) => {
-  try {
-    if (req.user?.role !== 'bookkeeper' && req.user?.role !== 'admin' && req.user?.role !== 'super_admin')
-      throw new AppError(403, 'Bookkeeper access required')
-
-    const userId = req.user.role === 'bookkeeper' ? req.user.userId : null
-
-    const { rows } = await db.query(
-      `SELECT
-          ba.id AS access_id, ba.permissions, ba.status, ba.created_at AS access_since,
-          l.id AS landlord_id, l.business_name, l.volume_tier,
-          u.first_name, u.last_name, u.email,
-          (SELECT COUNT(*) FROM books_employees WHERE landlord_id = l.id AND status='active') AS employee_count,
-          (SELECT COUNT(*) FROM books_contractors WHERE landlord_id = l.id AND status='active') AS contractor_count,
-          (SELECT COUNT(*) FROM payroll_runs WHERE landlord_id = l.id AND status='approved') AS payroll_run_count
-        FROM books_access ba
-        JOIN landlords l ON l.id = ba.landlord_id
-        JOIN users u ON u.id = l.user_id
-        WHERE ($1::uuid IS NULL OR ba.bookkeeper_user_id = $1)
-        AND ba.status = 'active'
-        ORDER BY l.business_name ASC`,
-      [userId]
-    )
-    res.json({ success: true, data: rows })
-  } catch (e) { next(e) }
-})
-
-// GET /api/books/bookkeeper/all — admin: list all bookkeepers
-booksRouter.get('/bookkeeper/all', async (req, res, next) => {
-  try {
-    if (req.user?.role !== 'admin' && req.user?.role !== 'super_admin')
-      throw new AppError(403, 'Admin required')
-    const { rows } = await db.query(
-      `SELECT u.id, u.email, u.first_name, u.last_name, u.created_at,
-          COUNT(ba.id) AS client_count
-        FROM users u
-        LEFT JOIN books_access ba ON ba.bookkeeper_user_id = u.id AND ba.status = 'active'
-        WHERE u.role = 'bookkeeper'
-        GROUP BY u.id ORDER BY u.last_name`
-    )
-    res.json({ success: true, data: rows })
-  } catch (e) { next(e) }
-})
-
-// POST /api/books/bookkeeper/invite — admin: create bookkeeper user + assign clients
-booksRouter.post('/bookkeeper/invite', async (req, res, next) => {
-  try {
-    if (req.user?.role !== 'admin' && req.user?.role !== 'super_admin' && req.user?.role !== 'landlord')
-      throw new AppError(403, 'Admin or Landlord required')
-
-    const { email, firstName, lastName, password, landlordIds } = req.body
-    if (!email || !firstName || !lastName || !password)
-      throw new AppError(400, 'email, firstName, lastName, password required')
-
-    const bcrypt = require('bcryptjs')
-    const hash = await bcrypt.hash(password, 12)
-    const client = await db.connect()
-    try {
-      await client.query('BEGIN')
-      // Create or update user with bookkeeper role
-      const { rows: [user] } = await client.query(
-        `INSERT INTO users (email, password_hash, role, first_name, last_name)
-         VALUES ($1,$2,'bookkeeper',$3,$4)
-         ON CONFLICT (email) DO UPDATE SET role='bookkeeper', first_name=$3, last_name=$4
-         RETURNING id, email, first_name, last_name, role`,
-        [email, hash, firstName, lastName]
-      )
-      // Assign clients
-      const assigned = []
-      for (const lid of (landlordIds || [])) {
-        await client.query(
-          `INSERT INTO books_access (bookkeeper_user_id, landlord_id, invited_by)
-           VALUES ($1,$2,$3) ON CONFLICT (bookkeeper_user_id, landlord_id) DO UPDATE SET status='active'`,
-          [user.id, lid, req.user.userId]
-        )
-        assigned.push(lid)
-      }
-      await client.query('COMMIT')
-      res.status(201).json({ success: true, data: { user, clientsAssigned: assigned.length } })
-    } catch (e) { await client.query('ROLLBACK'); throw e }
-    finally { client.release() }
-  } catch (e) { next(e) }
-})
-
-// POST /api/books/bookkeeper/assign — assign existing bookkeeper to a landlord
-booksRouter.post('/bookkeeper/assign', async (req, res, next) => {
-  try {
-    if (req.user?.role !== 'admin' && req.user?.role !== 'super_admin' && req.user?.role !== 'landlord')
-      throw new AppError(403, 'Admin or Landlord required')
-    const { bookkeeperUserId, landlordId, permissions } = req.body
-    if (!bookkeeperUserId || !landlordId) throw new AppError(400, 'bookkeeperUserId and landlordId required')
-    const { rows: [access] } = await db.query(
-      `INSERT INTO books_access (bookkeeper_user_id, landlord_id, permissions, invited_by)
-       VALUES ($1,$2,$3,$4)
-       ON CONFLICT (bookkeeper_user_id, landlord_id) DO UPDATE SET status='active', permissions=COALESCE($3,books_access.permissions)
-       RETURNING *`,
-      [bookkeeperUserId, landlordId, permissions ? JSON.stringify(permissions) : null, req.user.userId]
-    )
-    res.json({ success: true, data: access })
-  } catch (e) { next(e) }
-})
-
-// DELETE /api/books/bookkeeper/revoke — remove bookkeeper from a client
-booksRouter.delete('/bookkeeper/revoke', async (req, res, next) => {
-  try {
-    if (req.user?.role !== 'admin' && req.user?.role !== 'super_admin' && req.user?.role !== 'landlord')
-      throw new AppError(403, 'Admin or Landlord required')
-    const { bookkeeperUserId, landlordId } = req.body
-    await db.query(
-      `UPDATE books_access SET status='revoked', updated_at=NOW()
-       WHERE bookkeeper_user_id=$1 AND landlord_id=$2`,
-      [bookkeeperUserId, landlordId]
-    )
-    res.json({ success: true })
-  } catch (e) { next(e) }
-})
-
-// ════════════════════════════════════════
 // JOURNAL ENTRIES
 // ════════════════════════════════════════
 
@@ -1083,6 +961,280 @@ booksRouter.get('/reports/balance-sheet', async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
+
+// ════════════════════════════════════════
+// BILLS & AP
+// ════════════════════════════════════════
+
+booksRouter.get('/bills', async (req, res, next) => {
+  try {
+    const lid = landlordScope(req.user)
+    const { rows } = await db.query(
+      `SELECT bb.*, bv.name AS vendor_name
+       FROM books_bills bb
+       LEFT JOIN books_vendors bv ON bv.id = bb.vendor_id
+       WHERE (bb.landlord_id = $1 OR $1 IS NULL)
+       ORDER BY bb.date DESC`,
+      [lid]
+    )
+    res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
+booksRouter.post('/bills', async (req, res, next) => {
+  try {
+    const lid = landlordScope(req.user)
+    const { vendorId, billNumber, date, dueDate, description, amount, category, accountId, notes } = req.body
+    if (!date || !description || amount === undefined)
+      throw new AppError(400, 'date, description, amount required')
+    const { rows: [bill] } = await db.query(
+      `INSERT INTO books_bills
+         (landlord_id, vendor_id, bill_number, date, due_date, description, amount, category, account_id, notes)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+      [lid, vendorId||null, billNumber||null, date, dueDate||null,
+       description, amount, category||null, accountId||null, notes||null]
+    )
+    if (vendorId) {
+      await db.query(
+        `UPDATE books_vendors SET ap_balance = COALESCE(ap_balance,0) + $1, updated_at=NOW() WHERE id=$2`,
+        [amount, vendorId]
+      )
+    }
+    res.status(201).json({ success: true, data: bill })
+  } catch (e) { next(e) }
+})
+
+booksRouter.post('/bills/:id/pay', async (req, res, next) => {
+  try {
+    const lid = landlordScope(req.user)
+    const bill = await queryOne<any>(
+      'SELECT * FROM books_bills WHERE id=$1 AND (landlord_id=$2 OR $2 IS NULL)',
+      [req.params.id, lid]
+    )
+    if (!bill) throw new AppError(404, 'Bill not found')
+    if (bill.status === 'paid') throw new AppError(400, 'Bill already paid')
+    const payAmount = req.body.amount || (+bill.amount - +bill.amount_paid)
+    const newPaid = +bill.amount_paid + +payAmount
+    const newStatus = newPaid >= +bill.amount ? 'paid' : 'partial'
+    const { rows: [updated] } = await db.query(
+      `UPDATE books_bills SET
+         amount_paid=$1, status=$2,
+         paid_at=CASE WHEN $2='paid' THEN NOW() ELSE paid_at END,
+         updated_at=NOW()
+       WHERE id=$3 RETURNING *`,
+      [newPaid.toFixed(2), newStatus, req.params.id]
+    )
+    if (bill.vendor_id) {
+      await db.query(
+        `UPDATE books_vendors SET
+           ap_balance = GREATEST(0, COALESCE(ap_balance,0) - $1),
+           ytd_paid   = COALESCE(ytd_paid,0) + $1,
+           updated_at = NOW()
+         WHERE id=$2`,
+        [payAmount, bill.vendor_id]
+      )
+    }
+    res.json({ success: true, data: updated })
+  } catch (e) { next(e) }
+})
+
+// ════════════════════════════════════════
+// CASH FLOW REPORT
+// ════════════════════════════════════════
+
+booksRouter.get('/reports/cash-flow', async (req, res, next) => {
+  try {
+    const lid = landlordScope(req.user)
+    const { startDate, endDate } = req.query
+    const start = (startDate as string) || new Date(new Date().getFullYear(), 0, 1).toISOString().split('T')[0]
+    const end   = (endDate   as string) || new Date().toISOString().split('T')[0]
+
+    const [rentRows, incomeRows, expenseRows, payrollRows, billRows, disbRows] = await Promise.all([
+      db.query(
+        `SELECT COALESCE(SUM(p.amount),0) AS total
+         FROM payments p JOIN units u ON u.id=p.unit_id JOIN landlords l ON l.id=u.landlord_id
+         WHERE (l.id=$1::uuid OR $1 IS NULL) AND p.status='settled' AND p.due_date BETWEEN $2 AND $3`,
+        [lid, start, end]
+      ).catch(() => ({ rows: [{ total: 0 }] })),
+      db.query(
+        `SELECT COALESCE(SUM(amount),0) AS total FROM books_transactions
+         WHERE (landlord_id=$1 OR $1 IS NULL) AND type='income' AND date BETWEEN $2 AND $3`,
+        [lid, start, end]
+      ),
+      db.query(
+        `SELECT COALESCE(SUM(amount),0) AS total FROM books_transactions
+         WHERE (landlord_id=$1 OR $1 IS NULL) AND type='expense' AND date BETWEEN $2 AND $3`,
+        [lid, start, end]
+      ),
+      db.query(
+        `SELECT COALESCE(SUM(total_net),0) AS total FROM payroll_runs
+         WHERE (landlord_id=$1 OR $1 IS NULL) AND status='approved' AND pay_date BETWEEN $2 AND $3`,
+        [lid, start, end]
+      ),
+      db.query(
+        `SELECT COALESCE(SUM(amount_paid),0) AS total FROM books_bills
+         WHERE (landlord_id=$1 OR $1 IS NULL) AND status IN ('paid','partial') AND paid_at BETWEEN $2 AND $3`,
+        [lid, start, end]
+      ),
+      db.query(
+        `SELECT COALESCE(SUM(d.amount),0) AS total FROM disbursements d
+         JOIN landlords l ON l.id=d.landlord_id
+         WHERE (l.id=$1::uuid OR $1 IS NULL) AND d.status='settled' AND d.target_date BETWEEN $2 AND $3`,
+        [lid, start, end]
+      ).catch(() => ({ rows: [{ total: 0 }] })),
+    ])
+
+    const rentCollected = +rentRows.rows[0]?.total || 0
+    const otherIncome   = +incomeRows.rows[0]?.total || 0
+    const expenses      = +expenseRows.rows[0]?.total || 0
+    const payroll       = +payrollRows.rows[0]?.total || 0
+    const bills         = +billRows.rows[0]?.total || 0
+    const disbursements = +disbRows.rows[0]?.total || 0
+    const totalInflows  = rentCollected + otherIncome
+    const totalOutflows = expenses + payroll + bills
+    const opNet         = totalInflows - totalOutflows
+
+    res.json({
+      success: true,
+      data: {
+        period: { start, end },
+        operating: {
+          inflows:  { rentCollected, otherIncome, total: totalInflows },
+          outflows: { expenses, payroll, bills, total: totalOutflows },
+          net: opNet,
+        },
+        financing: { disbursements, total: disbursements },
+        netCashFlow: opNet - disbursements,
+      }
+    })
+  } catch (e) { next(e) }
+})
+
+// ════════════════════════════════════════
+// OWNER STATEMENTS REPORT
+// ════════════════════════════════════════
+
+booksRouter.get('/reports/owner-statements', async (req, res, next) => {
+  try {
+    const lid = landlordScope(req.user)
+    const { startDate, endDate } = req.query
+    const now   = new Date()
+    const start = (startDate as string) || new Date(now.getFullYear(), now.getMonth(), 1).toISOString().split('T')[0]
+    const end   = (endDate   as string) || now.toISOString().split('T')[0]
+
+    const { rows: landlords } = await db.query(
+      `SELECT l.id, l.business_name, u.first_name, u.last_name, u.email
+       FROM landlords l JOIN users u ON u.id = l.user_id
+       WHERE (l.id = $1::uuid OR $1 IS NULL)
+       ORDER BY l.business_name, u.last_name`,
+      [lid]
+    )
+
+    const statements = await Promise.all(landlords.map(async (landlord: any) => {
+      const { rows: properties } = await db.query(
+        `SELECT p.id, p.name,
+                COUNT(u.id) AS unit_count,
+                COUNT(u.id) FILTER (WHERE u.status='active') AS occupied,
+                COALESCE(SUM(u.rent_amount) FILTER (WHERE u.status='active'), 0) AS expected_rent,
+                COALESCE(
+                  (SELECT SUM(py.amount) FROM payments py
+                   JOIN units u2 ON u2.id = py.unit_id
+                   WHERE u2.property_id = p.id
+                     AND py.status='settled'
+                     AND py.due_date BETWEEN $2 AND $3), 0
+                ) AS collected
+         FROM properties p
+         LEFT JOIN units u ON u.property_id = p.id
+         WHERE p.landlord_id = $1
+         GROUP BY p.id ORDER BY p.name`,
+        [landlord.id, start, end]
+      )
+      const { rows: disbRows } = await db.query(
+        `SELECT COALESCE(SUM(amount),0) AS total FROM disbursements
+         WHERE landlord_id=$1 AND status='settled' AND target_date BETWEEN $2 AND $3`,
+        [landlord.id, start, end]
+      ).catch(() => ({ rows: [{ total: 0 }] }))
+
+      const totalExpected  = properties.reduce((s: number, p: any) => s + +p.expected_rent, 0)
+      const totalCollected = properties.reduce((s: number, p: any) => s + +p.collected, 0)
+      const totalDisbursed = +disbRows[0]?.total || 0
+
+      return { landlord, properties, totalExpected, totalCollected, totalDisbursed, variance: totalCollected - totalExpected }
+    }))
+
+    res.json({ success: true, data: statements })
+  } catch (e) { next(e) }
+})
+
+// ════════════════════════════════════════
+// TAX SUMMARY
+// ════════════════════════════════════════
+
+booksRouter.get('/tax/summary', async (req, res, next) => {
+  try {
+    const lid  = landlordScope(req.user)
+    const year = req.query.year || new Date().getFullYear()
+    const start = `${year}-01-01`
+    const end   = `${year}-12-31`
+
+    const [payrollRows, contractors, employees] = await Promise.all([
+      db.query(
+        `SELECT COALESCE(SUM(total_gross),0) AS ytd_gross,
+                COALESCE(SUM(total_federal_tax),0) AS ytd_federal,
+                COALESCE(SUM(total_state_tax),0) AS ytd_state,
+                COALESCE(SUM(total_ss),0) AS ytd_ss,
+                COALESCE(SUM(total_medicare),0) AS ytd_medicare,
+                COALESCE(SUM(total_net),0) AS ytd_net,
+                COUNT(*) AS run_count
+         FROM payroll_runs
+         WHERE (landlord_id=$1 OR $1 IS NULL) AND status='approved'
+           AND pay_date BETWEEN $2 AND $3`,
+        [lid, start, end]
+      ),
+      db.query(
+        `SELECT id, first_name, last_name, business_name, entity_type, ytd_paid, w9_on_file
+         FROM books_contractors
+         WHERE (landlord_id=$1 OR $1 IS NULL) AND ytd_paid >= 600
+         ORDER BY ytd_paid DESC`,
+        [lid]
+      ),
+      db.query(
+        `SELECT first_name, last_name, ytd_gross, ytd_federal_tax, ytd_state_tax,
+                ytd_ss, ytd_medicare, ytd_net
+         FROM books_employees
+         WHERE (landlord_id=$1 OR $1 IS NULL) AND ytd_gross > 0
+         ORDER BY last_name, first_name`,
+        [lid]
+      ),
+    ])
+
+    const p = payrollRows.rows[0]
+    const employerSS       = +p.ytd_ss
+    const employerMedicare = +p.ytd_medicare
+    const totalTaxLiability = +p.ytd_federal + +p.ytd_state + +p.ytd_ss * 2 + +p.ytd_medicare * 2
+
+    const filingDeadlines = [
+      { form: 'Form 941', description: "Employer's Quarterly Federal Tax Return", q1: 'Apr 30', q2: 'Jul 31', q3: 'Oct 31', q4: 'Jan 31' },
+      { form: 'Form 940', description: 'Annual Federal Unemployment (FUTA) Tax Return', due: `Jan 31, ${+year+1}` },
+      { form: 'W-2 / W-3', description: 'Wage and Tax Statements to employees and SSA', due: `Jan 31, ${+year+1}` },
+      { form: '1099-NEC', description: 'Nonemployee Compensation (contractors paid $600+)', due: `Jan 31, ${+year+1}` },
+      { form: 'AZ A1-QRT', description: 'Arizona Quarterly Withholding Tax Return', q1: 'Apr 30', q2: 'Jul 31', q3: 'Oct 31', q4: 'Jan 31' },
+      { form: 'AZ A1-R', description: 'Arizona Annual Withholding Reconciliation', due: `Feb 28, ${+year+1}` },
+    ]
+
+    res.json({
+      success: true,
+      data: {
+        year,
+        payroll: { ...p, employer_ss: employerSS, employer_medicare: employerMedicare, total_tax_liability: totalTaxLiability.toFixed(2) },
+        contractors1099: contractors.rows,
+        employees: employees.rows,
+        filingDeadlines,
+      }
+    })
+  } catch (e) { next(e) }
+})
+
 // Rent roll — sync from GAM
 booksRouter.get('/rent-roll', async (req, res, next) => {
   try {
@@ -1094,8 +1246,8 @@ booksRouter.get('/rent-roll', async (req, res, next) => {
       `SELECT
           u.unit_number, u.rent_amount, u.status, u.on_time_pay_active,
           p.name AS property_name,
-          t_user.first_name AS tenant_first, t_user.last_name AS tenant_last,
-          t_user.email AS tenant_email,
+          vuo.primary_first_name AS tenant_first, vuo.primary_last_name AS tenant_last,
+          vuo.primary_email AS tenant_email,
           ten.ach_verified, ten.on_time_pay_enrolled,
           (SELECT SUM(amount) FROM payments
            WHERE unit_id=u.id AND status='settled'
@@ -1105,8 +1257,8 @@ booksRouter.get('/rent-roll', async (req, res, next) => {
         FROM units u
         JOIN properties p ON p.id = u.property_id
         JOIN landlords l ON l.id = u.landlord_id
-        LEFT JOIN tenants ten ON ten.id = u.tenant_id
-        LEFT JOIN users t_user ON t_user.id = ten.user_id
+        LEFT JOIN v_unit_occupancy vuo ON vuo.unit_id = u.id
+        LEFT JOIN tenants ten ON ten.id = vuo.primary_tenant_id
         WHERE ($1::uuid IS NULL OR l.id = $1::uuid)
           AND ($2::boolean OR l.user_id = $3::uuid)
         ORDER BY p.name, u.unit_number`,

@@ -42,11 +42,12 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
     // Look up landlord from active lease if not provided
     if (!landlordId && tenant) {
       const leaseInfo = await queryOne<any>(`
-        SELECT l.id as landlord_id, un.id as unit_id FROM leases le
+        SELECT l.id as landlord_id, un.id as unit_id FROM lease_tenants lt
+        JOIN leases le ON le.id=lt.lease_id
         JOIN units un ON un.id=le.unit_id
         JOIN properties p ON p.id=un.property_id
         JOIN landlords l ON l.id=p.landlord_id
-        WHERE le.tenant_id=$1 AND le.status='active' LIMIT 1`, [tenant.id])
+        WHERE lt.tenant_id=$1 AND lt.status='active' AND le.status='active' LIMIT 1`, [tenant.id])
       if (leaseInfo) {
         landlordId = leaseInfo.landlord_id
         unitId = unitId || leaseInfo.unit_id

@@ -82,7 +82,6 @@ export function RegisterPage() {
               { icon: '💸', title: 'On-Time Pay SLA', desc: 'Rent initiated every 1st — guaranteed' },
               { icon: '🏦', title: 'Automated ACH', desc: 'No checks, no chasing tenants' },
               { icon: '📊', title: 'Full portfolio view', desc: 'Every unit, every payment, one dashboard' },
-              { icon: '⚡', title: '$15/unit/month', desc: 'Everything included, no hidden fees' },
             ].map(f => (
               <div key={f.title} style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
                 <div style={{ width: 38, height: 38, borderRadius: 10, background: 'var(--bg-2)', border: '1px solid var(--border-0)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '1rem', flexShrink: 0 }}>{f.icon}</div>

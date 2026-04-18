@@ -115,3 +115,39 @@ export async function emailMaintenanceCreated(landlordEmail: string, tenantName:
     )
   )
 }
+
+// ── E-SIGN EMAILS ─────────────────────────────────────────────
+
+export async function emailSigningRequest(to: string, signerName: string, documentTitle: string, unitLabel: string, landlordName: string, signingUrl: string) {
+  await send(to, `Please sign: ${documentTitle}`,
+    base(
+      h('Document Ready for Your Signature') +
+      p(`Hi ${signerName},`) +
+      p(`<strong style="color:#eef1f8">${landlordName}</strong> has sent you a document to review and sign:`) +
+      `<div style="margin:12px 0;padding:12px 16px;background:#0a0f14;border-radius:8px;border-left:3px solid #c9a227">
+        <div style="font-weight:700;color:#eef1f8;margin-bottom:2px">${documentTitle}</div>
+        <div style="font-size:.82rem;color:#b8c4d8">${unitLabel}</div>
+      </div>` +
+      p('Please review the document carefully before signing. This is a legally binding agreement under UETA and the federal E-SIGN Act.') +
+      btn('Review & Sign Document', signingUrl) +
+      `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">Sign in to your GAM account to access this document.</div>`
+    )
+  )
+}
+
+export async function emailSigningCompleted(to: string, signerName: string, documentTitle: string, unitLabel: string, pdfUrl?: string, portalUrl = 'http://localhost:3002') {
+  await send(to, `✅ Document fully signed: ${documentTitle}`,
+    base(
+      h('Document Fully Executed') +
+      p(`Hi ${signerName},`) +
+      p(`All parties have signed <strong style="color:#eef1f8">${documentTitle}</strong> for ${unitLabel}.`) +
+      `<div style="margin:12px 0;padding:12px 16px;background:#0a0f14;border-radius:8px">
+        <div style="font-size:.75rem;color:#4a5568;text-transform:uppercase;letter-spacing:.06em">Status</div>
+        <div style="font-weight:700;color:#22c55e;margin-top:2px">Fully Executed</div>
+        <div style="font-size:.75rem;color:#4a5568;text-transform:uppercase;letter-spacing:.06em;margin-top:10px">Signed On</div>
+        <div style="color:#eef1f8;margin-top:2px">${new Date().toLocaleDateString()}</div>
+      </div>` +
+      (pdfUrl ? btn('Download Signed Document', pdfUrl) : btn('View in Portal', portalUrl))
+    )
+  )
+}

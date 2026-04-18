@@ -1,5 +1,6 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
+import { useSearchParams } from 'react-router-dom'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
 import {
   Wrench, Plus, X, Check, Clock, AlertTriangle, MessageSquare,
@@ -8,7 +9,7 @@ import {
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
 const PRI_COLORS: Record<string,string> = { emergency:'badge-red', high:'badge-amber', normal:'badge-blue', low:'badge-muted' }
-const ST_COLORS: Record<string,string>  = { open:'badge-amber', assigned:'badge-blue', in_progress:'badge-blue', completed:'badge-green', cancelled:'badge-muted' }
+const ST_COLORS: Record<string,string>  = { open:'badge-amber', awaiting_approval:'badge-amber', assigned:'badge-blue', in_progress:'badge-blue', completed:'badge-green', cancelled:'badge-muted' }
 const STATUS_FLOW = ['open','assigned','in_progress','completed']
 
 function RequestDetailModal({ request: r, onClose }: { request: any; onClose: () => void }) {
@@ -25,6 +26,11 @@ function RequestDetailModal({ request: r, onClose }: { request: any; onClose: ()
 
   const updateMut = useMutation(
     (body: any) => apiPatch(`/maintenance/${r.id}`, body),
+    { onSuccess: () => { qc.invalidateQueries('maintenance'); qc.invalidateQueries(['maint-detail', r.id]) } }
+  )
+
+  const approveMut = useMutation(
+    () => apiPost(`/maintenance/${r.id}/approve`, {}),
     { onSuccess: () => { qc.invalidateQueries('maintenance'); qc.invalidateQueries(['maint-detail', r.id]) } }
   )
 
@@ -139,6 +145,27 @@ function RequestDetailModal({ request: r, onClose }: { request: any; onClose: ()
               </div>
             </div>
 
+            {/* Man Hours */}
+            <div style={{ marginBottom: 10 }}>
+              <label style={{ fontSize: '.68rem', color: 'var(--text-3)', display: 'block', marginBottom: 3 }}>Man Hours</label>
+              <div style={{ display: 'flex', gap: 6 }}>
+                <input className="input" type="number" step="0.5" min="0" placeholder="0.0"
+                  defaultValue={req.man_hours || ''}
+                  onChange={e => setEditCost(e.target.value)}
+                  id={`man-hours-${r.id}`}
+                  style={{ width: '100%', fontSize: '.78rem' }} />
+                <button className="btn btn-ghost btn-sm" onClick={() => {
+                  const val = (document.getElementById(`man-hours-${r.id}`) as HTMLInputElement)?.value
+                  if (val) updateMut.mutate({ manHours: parseFloat(val) })
+                }}><Check size={12} /></button>
+              </div>
+              {req.man_hours && req.actual_cost && (
+                <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginTop: 3 }}>
+                  Cost/hr: {fmt(req.actual_cost / req.man_hours)}
+                </div>
+              )}
+            </div>
+
             {/* Assign */}
             <div style={{ marginBottom: 10 }}>
               <label style={{ fontSize: '.68rem', color: 'var(--text-3)', display: 'block', marginBottom: 3 }}>Assigned To</label>
@@ -150,7 +177,17 @@ function RequestDetailModal({ request: r, onClose }: { request: any; onClose: ()
 
             {/* Quick status buttons */}
             <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-              {req.status !== 'completed' && req.status !== 'cancelled' && (
+              {req.status === 'awaiting_approval' && (
+                <>
+                  <button className="btn btn-sm btn-primary" onClick={() => approveMut.mutate()}>
+                    <Check size={12} /> Approve
+                  </button>
+                  <button className="btn btn-sm btn-ghost" onClick={() => updateMut.mutate({ status: 'cancelled' })} style={{ color: 'var(--red)' }}>
+                    <X size={12} /> Reject
+                  </button>
+                </>
+              )}
+              {req.status !== 'completed' && req.status !== 'cancelled' && req.status !== 'awaiting_approval' && (
                 <button className="btn btn-sm btn-primary" onClick={() => updateMut.mutate({ status: 'completed', actualCost: editCost ? parseFloat(editCost) : undefined })}>
                   <Check size={12} /> Mark Complete
                 </button>
@@ -207,14 +244,71 @@ function RequestDetailModal({ request: r, onClose }: { request: any; onClose: ()
   )
 }
 
+
+function CostBreakdownModal({ requests, onClose }: { requests: any[]; onClose: () => void }) {
+  const fmt2 = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
+  const completed = requests.filter((r: any) => r.status === 'completed' && r.actual_cost)
+  const now = new Date()
+  const sDay   = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+  const sWeek  = new Date(sDay); sWeek.setDate(sDay.getDate() - sDay.getDay())
+  const sMonth = new Date(now.getFullYear(), now.getMonth(), 1)
+  const sYear  = new Date(now.getFullYear(), 0, 1)
+  const sum = (arr: any[]) => arr.reduce((s: number, r: any) => s + (+r.actual_cost || 0), 0)
+  const hrs = (arr: any[]) => arr.reduce((s: number, r: any) => s + (+r.man_hours || 0), 0)
+  const fil = (d: Date) => completed.filter((r: any) => new Date(r.completed_at || r.updated_at) >= d)
+  const rows: [string, any[]][] = [['Today', fil(sDay)], ['This Week', fil(sWeek)], ['This Month', fil(sMonth)], ['YTD', fil(sYear)], ['All Time', completed]]
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" style={{ maxWidth: 560 }} onClick={(e) => e.stopPropagation()}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
+          <div className="modal-title">Maintenance Cost Breakdown</div>
+          <button className="btn btn-ghost btn-sm" onClick={onClose}><X size={14} /></button>
+        </div>
+        <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+          <thead>
+            <tr style={{ background: 'var(--bg-2)' }}>
+              {['Period','Jobs','Total Cost','Avg/Job','Man Hrs'].map(h => (
+                <th key={h} style={{ padding: '8px 12px', textAlign: h==='Period'?'left':'right', fontSize: '.65rem', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.08em' }}>{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map(([label, items]) => (
+              <tr key={label} style={{ borderBottom: '1px solid var(--border-0)' }}>
+                <td style={{ padding: '10px 12px', color: 'var(--text-2)', fontSize: '.82rem' }}>{label}</td>
+                <td style={{ padding: '10px 12px', textAlign: 'right', fontFamily: 'var(--font-mono)', color: 'var(--text-0)' }}>{items.length}</td>
+                <td style={{ padding: '10px 12px', textAlign: 'right', fontFamily: 'var(--font-mono)', fontWeight: 700, color: 'var(--gold)' }}>{fmt2(sum(items))}</td>
+                <td style={{ padding: '10px 12px', textAlign: 'right', fontFamily: 'var(--font-mono)', color: 'var(--text-3)' }}>{items.length > 0 ? fmt2(sum(items) / items.length) : '—'}</td>
+                <td style={{ padding: '10px 12px', textAlign: 'right', fontFamily: 'var(--font-mono)', color: 'var(--text-3)' }}>{hrs(items) > 0 ? hrs(items).toFixed(1) + ' hrs' : '—'}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {completed.length === 0 && <div style={{ padding: 32, textAlign: 'center', color: 'var(--text-3)' }}>No completed requests with costs yet.</div>}
+      </div>
+    </div>
+  )
+}
+
 export function MaintenancePage() {
   const qc = useQueryClient()
   const [showAdd, setShowAdd] = useState(false)
   const [selectedRequest, setSelectedRequest] = useState<any>(null)
+  const [searchParams, setSearchParams] = useSearchParams()
   const [filterStatus, setFilterStatus] = useState('all')
   const [filterPriority, setFilterPriority] = useState('all')
+  const [showCostBreakdown, setShowCostBreakdown] = useState(false)
 
   const { data: requests = [], isLoading } = useQuery<any[]>('maintenance', () => apiGet('/maintenance'))
+
+  // Deep-link: ?open=<requestId> opens the detail modal directly once requests load
+  useEffect(() => {
+    const openId = searchParams.get('open')
+    if (openId && !selectedRequest && requests?.length) {
+      const found = (requests as any[]).find((r: any) => r.id === openId)
+      if (found) setSelectedRequest(found)
+    }
+  }, [searchParams, requests])
   const { data: stats } = useQuery('maint-stats', () => apiGet<any>('/maintenance/stats/summary'))
   const { data: units = [] } = useQuery<any[]>('units', () => apiGet('/units'))
 
@@ -266,13 +360,14 @@ export function MaintenancePage() {
       {stats && (
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5,1fr)', gap: 12, marginBottom: 20 }}>
           {[
-            { label: 'Open',        val: (stats as any).open_count,        color: 'var(--amber)' },
-            { label: 'Assigned',    val: (stats as any).assigned_count,    color: 'var(--blue)' },
-            { label: 'In Progress', val: (stats as any).in_progress_count, color: 'var(--blue)' },
-            { label: 'Completed',   val: (stats as any).completed_count,   color: 'var(--green)' },
-            { label: 'Total Cost',  val: fmt((stats as any).total_cost), color: 'var(--text-0)' },
+            { label: 'Open',        val: (stats as any).open_count,        color: 'var(--amber)',  filter: 'open' },
+            { label: 'Assigned',    val: (stats as any).assigned_count,    color: 'var(--blue)',   filter: 'assigned' },
+            { label: 'In Progress', val: (stats as any).in_progress_count, color: 'var(--blue)',   filter: 'in_progress' },
+            { label: 'Completed',   val: (stats as any).completed_count,   color: 'var(--green)',  filter: 'completed' },
+            { label: 'Total Cost',  val: fmt((stats as any).total_cost),   color: 'var(--text-0)', filter: 'cost' },
           ].map(s => (
-            <div key={s.label} className="card" style={{ padding: '12px 14px' }}>
+            <div key={s.label} className="card" style={{ padding: '12px 14px', cursor: 'pointer', border: filterStatus===s.filter?'1px solid var(--gold)':'1px solid var(--border-1)' }}
+              onClick={() => s.filter==='cost' ? setShowCostBreakdown(true) : setFilterStatus(filterStatus===s.filter?'all':s.filter)}>
               <div style={{ fontSize: '.62rem', fontWeight: 700, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.08em', marginBottom: 5 }}>{s.label}</div>
               <div style={{ fontFamily: 'var(--font-mono)', fontSize: '.95rem', fontWeight: 700, color: s.color }}>{s.val}</div>
             </div>
@@ -388,7 +483,14 @@ export function MaintenancePage() {
         </div>
       )}
 
-      {selectedRequest && <RequestDetailModal request={selectedRequest} onClose={() => setSelectedRequest(null)} />}
+      {selectedRequest && <RequestDetailModal request={selectedRequest} onClose={() => {
+        setSelectedRequest(null)
+        if (searchParams.get('open')) {
+          searchParams.delete('open')
+          setSearchParams(searchParams, { replace: true })
+        }
+      }} />}
+      {showCostBreakdown && <CostBreakdownModal requests={(requests as any[])} onClose={() => setShowCostBreakdown(false)} />}
     </div>
   )
 }

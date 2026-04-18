@@ -1,7 +1,7 @@
 import dotenv from 'dotenv'
 dotenv.config({ path: '/Users/gold/Downloads/gam/apps/api/.env' })
 
-import { Pool } from 'pg'
+import { Pool, PoolClient } from 'pg'
 
 export const db = new Pool({
   host:     process.env.DB_HOST     || 'localhost',
@@ -26,4 +26,24 @@ export async function query<T = any>(sql: string, params?: any[]): Promise<T[]> 
 export async function queryOne<T = any>(sql: string, params?: any[]): Promise<T | null> {
   const rows = await query<T>(sql, params)
   return rows[0] ?? null
+}
+
+/**
+ * Get a dedicated client from the pool for transactions.
+ * CALLER MUST call client.release() in a finally block.
+ * Usage:
+ *   const client = await getClient()
+ *   try {
+ *     await client.query('BEGIN')
+ *     // ... queries ...
+ *     await client.query('COMMIT')
+ *   } catch (e) {
+ *     await client.query('ROLLBACK')
+ *     throw e
+ *   } finally {
+ *     client.release()
+ *   }
+ */
+export async function getClient(): Promise<PoolClient> {
+  return await db.connect()
 }

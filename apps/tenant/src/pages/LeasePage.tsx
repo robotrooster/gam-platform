@@ -368,7 +368,7 @@ export function LeasePage() {
             <div style={{ marginBottom:12 }}><strong>Monthly Rent:</strong> ${lease.rent_amount}</div>
             <div style={{ marginBottom:12 }}><strong>Security Deposit:</strong> ${lease.security_deposit}</div>
             <div style={{ borderTop:'1px solid var(--border-0)', paddingTop:16, marginTop:16, fontSize:'.75rem', color:'var(--text-3)' }}>
-              This lease is governed by Arizona Residential Landlord and Tenant Act (A.R.S. Title 33). By signing electronically, both parties agree to the terms stated herein. This electronic signature is legally binding under UETA (A.R.S. § 44-7001 et seq.) and the federal E-SIGN Act.
+              By signing electronically, both parties agree to the terms stated herein. This electronic signature is legally binding under the federal E-SIGN Act and equivalent state-level electronic signature laws. Consult your local laws for any jurisdiction-specific requirements.
             </div>
           </div>
         )}

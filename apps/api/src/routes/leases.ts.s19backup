@@ -1,0 +1,206 @@
+import { Router } from 'express'
+import { z } from 'zod'
+import { query, queryOne } from '../db'
+import { requireAuth, requireLandlord } from '../middleware/auth'
+import { AppError } from '../middleware/errorHandler'
+
+export const leasesRouter = Router()
+leasesRouter.use(requireAuth)
+
+// ── LIST LEASES ──────────────────────────────────────────────
+leasesRouter.get('/', async (req, res, next) => {
+  try {
+    const filter = req.user!.role === 'landlord' ? "AND l.landlord_id='" + req.user!.profileId + "'"
+                 : req.user!.role === 'tenant'   ? "AND l.tenant_id='" + req.user!.profileId + "'" : ''
+    const leases = await query<any>(
+      "SELECT l.*, u.unit_number, p.name AS property_name, " +
+      "tu.first_name AS tenant_first, tu.last_name AS tenant_last " +
+      "FROM leases l " +
+      "JOIN units u ON u.id = l.unit_id " +
+      "JOIN properties p ON p.id = u.property_id " +
+      "JOIN tenants t ON t.id = l.tenant_id " +
+      "JOIN users tu ON tu.id = t.user_id " +
+      "WHERE 1=1 " + filter + " ORDER BY l.start_date DESC"
+    )
+    res.json({ success: true, data: leases })
+  } catch (e) { next(e) }
+})
+
+// ── GET ONE LEASE ────────────────────────────────────────────
+leasesRouter.get('/:id', async (req, res, next) => {
+  try {
+    const lease = await queryOne<any>(
+      "SELECT l.*, u.unit_number, p.name AS property_name, " +
+      "tu.first_name AS tenant_first, tu.last_name AS tenant_last " +
+      "FROM leases l " +
+      "JOIN units u ON u.id = l.unit_id " +
+      "JOIN properties p ON p.id = u.property_id " +
+      "JOIN tenants t ON t.id = l.tenant_id " +
+      "JOIN users tu ON tu.id = t.user_id " +
+      "WHERE l.id = $1",
+      [req.params.id]
+    )
+    if (!lease) throw new AppError(404, 'Lease not found')
+
+    if (req.user!.role === 'tenant' && lease.tenant_id !== req.user!.profileId) {
+      throw new AppError(403, 'Forbidden')
+    }
+    if (req.user!.role === 'landlord' && lease.landlord_id !== req.user!.profileId) {
+      throw new AppError(403, 'Forbidden')
+    }
+    res.json({ success: true, data: lease })
+  } catch (e) { next(e) }
+})
+
+// ── CREATE LEASE ─────────────────────────────────────────────
+// Unit status is NOT flipped to 'active' here — activation is a separate landlord step.
+// Tenant assignment is set on the unit for reference; billing gates on unit.status='active'.
+leasesRouter.post('/', requireLandlord, async (req, res, next) => {
+  try {
+    const body = z.object({
+      unitId: z.string().uuid(),
+      tenantId: z.string().uuid(),
+      startDate: z.string(),
+      endDate: z.string().nullable().optional(),
+      rentAmount: z.number().positive(),
+      securityDeposit: z.number().min(0),
+      leaseType: z.enum(['month_to_month', 'fixed_term', 'nightly', 'weekly', 'nnn_commercial']),
+      autoRenew: z.boolean().optional().default(false),
+      autoRenewMode: z.enum(['extend_same_term', 'convert_to_month_to_month']).nullable().optional(),
+      noticeDaysRequired: z.number().int().min(0).optional().default(30),
+      expirationNoticeDays: z.number().int().min(0).optional().default(60),
+      needsReview: z.boolean().optional().default(false),
+    }).parse(req.body)
+
+    if (body.leaseType === 'month_to_month' && body.endDate) {
+      throw new AppError(400, 'Month-to-month leases cannot have an end date')
+    }
+    if (body.leaseType !== 'month_to_month' && !body.endDate) {
+      throw new AppError(400, body.leaseType + ' leases require an end date')
+    }
+    if (body.autoRenew && !body.autoRenewMode) {
+      throw new AppError(400, 'auto_renew_mode is required when auto_renew is true')
+    }
+    const autoRenewMode = body.autoRenew ? body.autoRenewMode : null
+
+    const [lease] = await query<any>(
+      "INSERT INTO leases (" +
+      "  unit_id, tenant_id, landlord_id, start_date, end_date, " +
+      "  rent_amount, security_deposit, " +
+      "  lease_type, auto_renew, auto_renew_mode, " +
+      "  notice_days_required, expiration_notice_days, needs_review" +
+      ") VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *",
+      [
+        body.unitId, body.tenantId, req.user!.profileId,
+        body.startDate, body.endDate || null,
+        body.rentAmount, body.securityDeposit,
+        body.leaseType, body.autoRenew, autoRenewMode,
+        body.noticeDaysRequired, body.expirationNoticeDays, body.needsReview
+      ]
+    )
+
+    await query('UPDATE units SET tenant_id=$1 WHERE id=$2', [body.tenantId, body.unitId])
+    res.status(201).json({ success: true, data: lease })
+  } catch (e) { next(e) }
+})
+
+// ── UPDATE LEASE ─────────────────────────────────────────────
+// Landlord can edit all lease fields. If status moves to expired/terminated,
+// the unit is vacated automatically.
+leasesRouter.patch('/:id', requireLandlord, async (req, res, next) => {
+  try {
+    const body = z.object({
+      status: z.enum(['pending', 'active', 'expired', 'terminated']).optional(),
+      startDate: z.string().optional(),
+      endDate: z.string().nullable().optional(),
+      rentAmount: z.number().positive().optional(),
+      securityDeposit: z.number().min(0).optional(),
+      leaseType: z.enum(['month_to_month', 'fixed_term', 'nightly', 'weekly', 'nnn_commercial']).optional(),
+      autoRenew: z.boolean().optional(),
+      autoRenewMode: z.enum(['extend_same_term', 'convert_to_month_to_month']).nullable().optional(),
+      noticeDaysRequired: z.number().int().min(0).optional(),
+      expirationNoticeDays: z.number().int().min(0).optional(),
+      needsReview: z.boolean().optional(),
+      lateFeeGraceDays: z.number().int().min(0).optional(),
+      lateFeeAmount: z.number().min(0).optional(),
+    }).parse(req.body)
+
+    const lease = await queryOne<any>('SELECT * FROM leases WHERE id=$1', [req.params.id])
+    if (!lease) throw new AppError(404, 'Lease not found')
+    if (lease.landlord_id !== req.user!.profileId) throw new AppError(403, 'Forbidden')
+
+    const finalLeaseType = body.leaseType ?? lease.lease_type
+    const finalEndDate = body.endDate === undefined ? lease.end_date : body.endDate
+    const finalAutoRenew = body.autoRenew ?? lease.auto_renew
+    let finalAutoRenewMode: string | null
+    if (body.autoRenewMode !== undefined) {
+      finalAutoRenewMode = body.autoRenewMode
+    } else {
+      finalAutoRenewMode = lease.auto_renew_mode
+    }
+
+    if (finalLeaseType === 'month_to_month' && finalEndDate) {
+      throw new AppError(400, 'Month-to-month leases cannot have an end date')
+    }
+    if (finalLeaseType !== 'month_to_month' && !finalEndDate) {
+      throw new AppError(400, finalLeaseType + ' leases require an end date')
+    }
+    if (finalAutoRenew && !finalAutoRenewMode) {
+      throw new AppError(400, 'auto_renew_mode is required when auto_renew is true')
+    }
+    if (!finalAutoRenew) finalAutoRenewMode = null
+
+    const fields: Record<string, any> = {
+      status: body.status,
+      start_date: body.startDate,
+      end_date: body.endDate === undefined ? undefined : body.endDate,
+      rent_amount: body.rentAmount,
+      security_deposit: body.securityDeposit,
+      lease_type: body.leaseType,
+      auto_renew: body.autoRenew,
+      auto_renew_mode: body.autoRenewMode === undefined ? undefined : finalAutoRenewMode,
+      notice_days_required: body.noticeDaysRequired,
+      expiration_notice_days: body.expirationNoticeDays,
+      needs_review: body.needsReview,
+      late_fee_grace_days: body.lateFeeGraceDays,
+      late_fee_amount: body.lateFeeAmount,
+    }
+
+    const setParts: string[] = []
+    const values: any[] = []
+    let i = 1
+    for (const [col, val] of Object.entries(fields)) {
+      if (val === undefined) continue
+      setParts.push(col + '=$' + i)
+      values.push(val)
+      i++
+    }
+
+    if (body.autoRenew === false && body.autoRenewMode === undefined && lease.auto_renew_mode !== null) {
+      setParts.push('auto_renew_mode=$' + i)
+      values.push(null)
+      i++
+    }
+
+    if (setParts.length === 0) {
+      return res.json({ success: true, data: lease })
+    }
+
+    values.push(req.params.id)
+    await query('UPDATE leases SET ' + setParts.join(', ') + ' WHERE id=$' + i, values)
+
+    if (body.status === 'expired' || body.status === 'terminated') {
+      await query(
+        "UPDATE units SET status='vacant', tenant_id=NULL WHERE id=$1",
+        [lease.unit_id]
+      )
+      await query(
+        'UPDATE leases SET terminated_at=NOW() WHERE id=$1 AND terminated_at IS NULL',
+        [lease.id]
+      )
+    }
+
+    const updated = await queryOne<any>('SELECT * FROM leases WHERE id=$1', [req.params.id])
+    res.json({ success: true, data: updated })
+  } catch (e) { next(e) }
+})

@@ -1118,9 +1118,9 @@ function App() {
       <Routes>
         <Route path="/login" element={<LoginPage />} />
         <Route path="/accept-invite" element={<AcceptInvitePage />} />
+        <Route path="/background-check" element={<BackgroundCheckPage />} />
         <Route path="/" element={token ? <Layout /> : <Navigate to="/login" replace />}>
           <Route index element={<DefaultPage />} />
-          <Route path="background-check" element={<BackgroundCheckPage />} />
           <Route path="notifications"    element={<TenantNotificationsPage />} />
           <Route path="home"             element={<HomePage />} />
           <Route path="payments"         element={<PaymentsPage />} />

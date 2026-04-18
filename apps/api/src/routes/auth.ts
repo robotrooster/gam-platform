@@ -151,3 +151,54 @@ authRouter.patch('/me', requireAuth, async (req, res, next) => {
     res.json({ success: true, data: user })
   } catch(e) { next(e) }
 })
+
+// POST /api/auth/register-prospect — public, creates tenant account from listings page
+authRouter.post('/register-prospect', async (req, res, next) => {
+  try {
+    const { firstName, lastName, email, password, phone, unitId, landlordId } = req.body
+    if (!firstName || !lastName || !email || !password)
+      throw new AppError(400, 'firstName, lastName, email, password required')
+    if (password.length < 8)
+      throw new AppError(400, 'Password must be at least 8 characters')
+
+    // Check email not already taken
+    const existing = await queryOne('SELECT id FROM users WHERE email=$1', [email])
+    if (existing) throw new AppError(409, 'An account with this email already exists. Please sign in.')
+
+    const hash = await bcrypt.hash(password, 12)
+
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+
+      // Create user
+      const { rows: [user] } = await client.query(
+        `INSERT INTO users (email, password_hash, role, first_name, last_name, phone)
+         VALUES ($1,$2,'tenant',$3,$4,$5) RETURNING *`,
+        [email, hash, firstName, lastName, phone || null]
+      )
+
+      // Create tenant profile
+      const { rows: [tenant] } = await client.query(
+        `INSERT INTO tenants (user_id) VALUES ($1) RETURNING *`,
+        [user.id]
+      )
+
+      // Unit assignment happens via e-sign, not at signup.
+      // unitId in the request body is ignored here; landlord sends a lease
+      // document through /api/esign after the account exists.
+
+      await client.query('COMMIT')
+
+      // Issue token
+      const token = jwt.sign(
+        { userId: user.id, role: 'tenant', profileId: tenant.id, landlordId: landlordId || null },
+        process.env.JWT_SECRET || 'gam_dev_secret',
+        { expiresIn: '7d' }
+      )
+
+      res.status(201).json({ success: true, data: { token, user: { id: user.id, email: user.email, firstName, lastName, role: 'tenant' } } })
+    } catch (e) { await client.query('ROLLBACK'); throw e }
+    finally { client.release() }
+  } catch (e) { next(e) }
+})

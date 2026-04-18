@@ -7,7 +7,8 @@ disbursementsRouter.use(requireAuth)
 
 disbursementsRouter.get('/', async (req, res, next) => {
   try {
-    const filter = req.user!.role !== 'admin' ? `WHERE d.landlord_id='${req.user!.profileId}'` : ''
+    const isAdmin = req.user!.role === 'admin' || req.user!.role === 'super_admin'
+    const filter = isAdmin ? '' : `WHERE d.landlord_id='${req.user!.profileId}'`
     const disbs = await query<any>(`
       SELECT d.*, u.first_name, u.last_name
       FROM disbursements d

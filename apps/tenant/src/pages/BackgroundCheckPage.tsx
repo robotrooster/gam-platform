@@ -42,7 +42,7 @@ export function BackgroundCheckPage() {
   const [addrWarn, setAddrWarn] = useState(false)
   const searchTimer = useRef<any>(null)
   const verifyTimer = useRef<any>(null)
-  const [form, setForm] = useState({ firstName:'', lastName:'', dob:'', ssn:'', street1:'', street2:'', city:'', state:'AZ', zip:'', years:'', empStatus:'employed', employer:'', empPhone:'', income:'', prevName:'', prevPhone:'', prevEmail:'', consentCredit:false, consentCriminal:false })
+  const [form, setForm] = useState({ firstName:'', lastName:'', dob:'', ssn:'', email:'', password:'', confirmPassword:'', street1:'', street2:'', city:'', state:'AZ', zip:'', years:'', empStatus:'employed', employer:'', empPhone:'', income:'', prevName:'', prevPhone:'', prevEmail:'', consentCredit:false, consentCriminal:false })
   const set = (k: string, v: any) => setForm(f=>({...f,[k]:v}))
   const { data: status, refetch } = useQuery('bg-status', () => get('/background/status'))
   const { data: me } = useQuery('tenant-me', () => get('/tenants/me'))
@@ -68,7 +68,32 @@ export function BackgroundCheckPage() {
       setUploading(false);
     }
   }
-  const submitMut = useMutation(() => post('/background/submit', { firstName:form.firstName, lastName:form.lastName, dateOfBirth:form.dob, ssn:form.ssn.replace(/\D/g,''), street1:form.street1, street2:form.street2||null, city:form.city, state:form.state, zip:form.zip, yearsAtAddress:parseInt(form.years)||null, employmentStatus:form.empStatus, employerName:form.employer||null, employerPhone:form.empPhone||null, monthlyIncome:parseFloat(form.income)||null, prevLandlordName:form.prevName||null, prevLandlordPhone:form.prevPhone||null, prevLandlordEmail:form.prevEmail||null, idDocumentUrl:idUrl||null, incomeDocUrls:incomeFiles.map(f=>f.url), consentCredit:form.consentCredit, consentCriminal:form.consentCriminal, consentPool:form.consentPool, landlordId:(me as any)?.landlord_id||null, unitId:(me as any)?.unit_id||null, timeToComplete:Math.round((Date.now()-startTime)/1000), idVerification:idNameMatch||null }), { onSuccess: () => refetch() })
+  const submitMut = useMutation(async () => {
+    let token = tok()
+    // If no token, create account first
+    if (!token) {
+      const params = new URLSearchParams(window.location.search)
+      const unitId = params.get('unitId')
+      const landlordId = params.get('landlordId')
+      const regRes = await fetch(`${API}/api/auth/register-prospect`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          firstName: form.firstName, lastName: form.lastName,
+          email: form.email, password: form.password,
+          unitId: unitId || null, landlordId: landlordId || null,
+        })
+      }).then(r => r.json())
+      if (!regRes.success) throw new Error(regRes.error || 'Account creation failed')
+      token = regRes.data.token
+      localStorage.setItem('gam_tenant_token', token)
+    }
+    return fetch(`${API}/api/background/submit`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ firstName:form.firstName, lastName:form.lastName, dateOfBirth:form.dob, ssn:form.ssn.replace(/\D/g,''), street1:form.street1, street2:form.street2||null, city:form.city, state:form.state, zip:form.zip, yearsAtAddress:parseInt(form.years)||null, employmentStatus:form.empStatus, employerName:form.employer||null, employerPhone:form.empPhone||null, monthlyIncome:parseFloat(form.income)||null, prevLandlordName:form.prevName||null, prevLandlordPhone:form.prevPhone||null, prevLandlordEmail:form.prevEmail||null, idDocumentUrl:idUrl||null, incomeDocUrls:incomeFiles.map(f=>f.url), consentCredit:form.consentCredit, consentCriminal:form.consentCriminal, consentPool:form.consentPool, landlordId:(me as any)?.landlord_id||null, unitId:(me as any)?.unit_id||(new URLSearchParams(window.location.search).get('unitId'))||null, timeToComplete:Math.round((Date.now()-startTime)/1000), idVerification:idNameMatch||null })
+    }).then(r => r.json())
+  }, { onSuccess: () => refetch() })
   const ssnFmt = (d: string) => d.length<=3?d:d.length<=5?d.slice(0,3)+'-'+d.slice(3):d.slice(0,3)+'-'+d.slice(3,5)+'-'+d.slice(5)
   const ssnDisplay = () => { const d=form.ssn; return showSsn?ssnFmt(d):ssnFmt(d).replace(/\d/g,'•') }
   const today = new Date()
@@ -236,7 +261,7 @@ export function BackgroundCheckPage() {
   }, [(status as any)?.status, (status as any)?.check?.decided_at])
 
   const canNext=[
-    !!(validName(form.firstName)&&validName(form.lastName)&&validDob&&validSsn),
+    !!(validName(form.firstName)&&validName(form.lastName)&&validDob&&validSsn&&form.email.includes('@')&&form.password.length>=8&&form.password===(form as any).confirmPassword),
     !!(form.street1.length>=5&&form.city.length>=2&&validZip&&(addrVerified||addrWarn)),
     !!(validPrev&&validIncome&&incomeFiles.length>=2&&form.income&&((['employed','part_time','self_employed'].includes(form.empStatus)?(form.employer&&form.empPhone):true))),
     !!(idUrl),
@@ -314,6 +339,11 @@ export function BackgroundCheckPage() {
             <div><label style={lbl}>Last Name *</label><input style={{...inp,borderColor:form.lastName&&!validName(form.lastName)?'#ef4444':undefined}} value={form.lastName} onChange={e=>set('lastName',e.target.value.replace(/[^a-zA-Z\-' ]/g,''))} placeholder="Smith"/></div>
           </div>
           <div style={{marginBottom:10}}><label style={lbl}>Date of Birth * (18+)</label><input style={{...inp,borderColor:form.dob&&!validDob?'#ef4444':undefined,colorScheme:'dark',cursor:'pointer'}} type="date" value={form.dob} onChange={e=>set('dob',e.target.value)} max={minDob.toISOString().split('T')[0]}/>{form.dob&&!validDob&&<div style={{color:'#ef4444',fontSize:'.68rem',marginTop:3}}>Must be at least 18 years old</div>}</div>
+          <div style={{marginBottom:10}}><label style={lbl}>Email Address *</label><input style={inp} type="email" value={form.email} onChange={e=>set('email',e.target.value)} placeholder="jane@email.com" required/></div>
+          <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:10}}>
+            <div><label style={lbl}>Password *</label><input style={inp} type="password" value={form.password} onChange={e=>set('password',e.target.value)} placeholder="Min 8 characters"/></div>
+            <div><label style={lbl}>Confirm Password *</label><input style={{...inp,borderColor:form.password&&form.confirmPassword&&form.password!==form.confirmPassword?'#ef4444':undefined}} type="password" value={(form as any).confirmPassword||''} onChange={e=>set('confirmPassword',e.target.value)} placeholder="Repeat password"/></div>
+          </div>
           <div><label style={lbl}>Social Security Number *</label><div style={{position:'relative'}}><input style={{...inp,borderColor:form.ssn&&!validSsn?'#ef4444':undefined}} type="text" inputMode="numeric" value={ssnDisplay()} onChange={e=>{const d=e.target.value.replace(/\D/g,'');set('ssn',d.slice(0,9))}} onFocus={()=>setShowSsn(true)} onBlur={()=>setShowSsn(false)} placeholder="XXX-XX-XXXX"/><span style={{position:'absolute',right:10,top:'50%',transform:'translateY(-50%)',fontSize:'.75rem',color:'#4a5568',cursor:'pointer'}} onClick={()=>setShowSsn(s=>!s)}>{showSsn?'🙈':'👁'}</span></div>{form.ssn&&!validSsn&&<div style={{color:'#ef4444',fontSize:'.68rem',marginTop:3}}>{ssnDigits.length<9?(9-ssnDigits.length)+' more digits required':'Invalid SSN format'}</div>}{validSsn&&<div style={{color:'#22c55e',fontSize:'.68rem',marginTop:3}}>✓ Format verified — stored encrypted</div>}</div>
         </div>}
         {step===1&&<div>

@@ -119,8 +119,8 @@ pmRouter.get('/dashboard', requireAuth, async (req, res, next) => {
         fp.percent_rate, fp.flat_amount,
         COUNT(DISTINCT p.id) as property_count,
         COUNT(DISTINCT un.id) as unit_count,
-        COUNT(DISTINCT un.id) FILTER (WHERE un.tenant_id IS NOT NULL) as occupied_count,
-        COALESCE(SUM(un.rent_amount) FILTER (WHERE un.tenant_id IS NOT NULL), 0) as collected_rent,
+        COUNT(DISTINCT un.id) FILTER (WHERE vuo.is_occupied) as occupied_count,
+        COALESCE(SUM(un.rent_amount) FILTER (WHERE vuo.is_occupied), 0) as collected_rent,
         COALESCE(SUM(un.rent_amount), 0) as max_rent
       FROM pm_landlord_connections plc
       JOIN landlords l ON l.id = plc.landlord_id
@@ -128,6 +128,7 @@ pmRouter.get('/dashboard', requireAuth, async (req, res, next) => {
       LEFT JOIN pm_fee_plans fp ON fp.id = plc.fee_plan_id
       LEFT JOIN properties p ON p.landlord_id = l.id
       LEFT JOIN units un ON un.property_id = p.id
+      LEFT JOIN v_unit_occupancy vuo ON vuo.unit_id = un.id
       WHERE plc.pm_company_id = $1 AND plc.status = 'active'
       GROUP BY l.id, u.first_name, u.last_name, u.email, plc.fee_plan_id,
         fp.name, fp.fee_type, fp.percent_rate, fp.flat_amount`,
@@ -180,12 +181,13 @@ pmRouter.get('/report/:token', async (req, res, next) => {
         COUNT(DISTINCT plc.landlord_id) as client_count,
         COUNT(DISTINCT p.id) as property_count,
         COUNT(DISTINCT un.id) as unit_count,
-        COUNT(DISTINCT un.id) FILTER (WHERE un.tenant_id IS NOT NULL) as occupied_count,
-        COALESCE(SUM(un.rent_amount) FILTER (WHERE un.tenant_id IS NOT NULL), 0) as collected_rent,
+        COUNT(DISTINCT un.id) FILTER (WHERE vuo.is_occupied) as occupied_count,
+        COALESCE(SUM(un.rent_amount) FILTER (WHERE vuo.is_occupied), 0) as collected_rent,
         COALESCE(SUM(un.rent_amount), 0) as max_rent
       FROM pm_landlord_connections plc
       JOIN properties p ON p.landlord_id = plc.landlord_id
       JOIN units un ON un.property_id = p.id
+      LEFT JOIN v_unit_occupancy vuo ON vuo.unit_id = un.id
       WHERE plc.pm_company_id = $1 AND plc.status = 'active'`, [company.id])
 
     res.json({

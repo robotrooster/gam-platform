@@ -27,7 +27,15 @@ tenantsRouter.get('/me', async (req, res, next) => {
         END AS deposit_fully_funded
       FROM tenants t
       JOIN users u ON u.id = t.user_id
-      LEFT JOIN units un ON un.tenant_id = t.id
+      LEFT JOIN LATERAL (
+        SELECT un2.*
+        FROM v_lease_active_tenants vlat
+        JOIN leases l ON l.id = vlat.lease_id AND l.status = 'active'
+        JOIN units un2 ON un2.id = l.unit_id
+        WHERE vlat.tenant_id = t.id
+        ORDER BY (vlat.role = 'primary') DESC
+        LIMIT 1
+      ) un ON TRUE
       LEFT JOIN properties pr ON pr.id = un.property_id
       LEFT JOIN security_deposits sd ON sd.tenant_id = t.id
       WHERE t.id = $1`, [req.user!.profileId])
@@ -289,13 +297,9 @@ tenantsRouter.post('/invite', async (req, res, next) => {
       JOIN landlords l ON l.id = u.landlord_id
       WHERE u.id = $1`, [unitId])
     if (!unit) return res.status(404).json({ success: false, error: 'Unit not found' })
-    if (unit.landlord_user_id !== req.user!.userId && req.user!.role !== 'admin') {
+    if (unit.landlord_user_id !== req.user!.userId && req.user!.role !== 'admin' && req.user!.role !== 'super_admin') {
       return res.status(403).json({ success: false, error: 'Forbidden' })
     }
-    if (unit.tenant_id) {
-      return res.status(409).json({ success: false, error: 'Unit already has a tenant' })
-    }
-
     const crypto = require('crypto')
     const inviteToken = crypto.randomBytes(32).toString('hex')
     const tempHash = '$2b$10$placeholder_invite_pending'
@@ -316,9 +320,8 @@ tenantsRouter.post('/invite', async (req, res, next) => {
 
     const tenantId = tenant?.id || (await queryOne<any>('SELECT id FROM tenants WHERE user_id=$1', [user!.id]))?.id
 
-    // Assign tenant to unit
-    await query('UPDATE units SET tenant_id=$1, status=$2 WHERE id=$3',
-      [tenantId, 'active', unitId])
+    // Unit assignment happens via e-sign, not invite. Landlord sends lease
+    // through /api/esign once the tenant account exists.
 
     // Store invite token on user
     await query('UPDATE users SET email_verify_token=$1 WHERE id=$2', [inviteToken, user!.id])
@@ -388,9 +391,14 @@ tenantsRouter.get('/invite-info', async (req, res, next) => {
 
     const unit = await queryOne<any>(`
       SELECT u.unit_number, u.rent_amount, p.name as property_name, p.street1, p.city, p.state
-      FROM units u JOIN properties p ON p.id=u.property_id
-      JOIN tenants t ON t.id=u.tenant_id
-      WHERE t.user_id=$1`, [user.id])
+      FROM v_lease_active_tenants vlat
+      JOIN tenants t ON t.id = vlat.tenant_id
+      JOIN leases l ON l.id = vlat.lease_id AND l.status = 'active'
+      JOIN units u ON u.id = l.unit_id
+      JOIN properties p ON p.id = u.property_id
+      WHERE t.user_id = $1
+      ORDER BY (vlat.role = 'primary') DESC
+      LIMIT 1`, [user.id])
 
     res.json({ success: true, data: { user, unit } })
   } catch (e) { next(e) }
@@ -408,23 +416,17 @@ tenantsRouter.get('/:id/profile', async (req, res, next) => {
       WHERE t.id = $1`, [req.params.id])
     if (!tenant) throw new AppError(404, 'Tenant not found')
 
-    // All units ever occupied (current + historical via leases)
+    // All units ever occupied (current + historical via lease_tenants)
     const units = await query<any>(`
       SELECT DISTINCT u.id, u.unit_number, u.rent_amount, u.status,
         p.name as property_name, p.street1, p.city, p.state,
         l.start_date, l.end_date,
-        CASE WHEN u.tenant_id = $1 THEN true ELSE false END as is_current
-      FROM leases l
+        (lt.status = 'active' AND l.status = 'active') as is_current
+      FROM lease_tenants lt
+      JOIN leases l ON l.id = lt.lease_id
       JOIN units u ON u.id = l.unit_id
       JOIN properties p ON p.id = u.property_id
-      WHERE l.tenant_id = $1
-      UNION
-      SELECT u.id, u.unit_number, u.rent_amount, u.status,
-        p.name as property_name, p.street1, p.city, p.state,
-        NULL as start_date, NULL as end_date, true as is_current
-      FROM units u
-      JOIN properties p ON p.id = u.property_id
-      WHERE u.tenant_id = $1
+      WHERE lt.tenant_id = $1
       ORDER BY is_current DESC, start_date DESC`, [req.params.id])
 
     // Full payment history across all units
@@ -507,101 +509,18 @@ tenantsRouter.get('/:id/profile', async (req, res, next) => {
 
 // POST /api/tenants/:id/transfer — move tenant to a new unit
 tenantsRouter.post('/:id/transfer', requireAuth, requireLandlord, async (req, res, next) => {
-  try {
-    const { newUnitId, newRentAmount, effectiveDate, notes } = req.body
-    if (!newUnitId || !newRentAmount || !effectiveDate) {
-      return res.status(400).json({ success: false, error: 'newUnitId, newRentAmount, and effectiveDate required' })
-    }
-
-    // Get tenant
-    const tenant = await queryOne<any>('SELECT * FROM tenants WHERE id=$1', [req.params.id])
-    if (!tenant) throw new AppError(404, 'Tenant not found')
-
-    // Get current unit
-    const currentUnit = await queryOne<any>(`
-      SELECT u.*, l.id as lease_id FROM units u
-      LEFT JOIN leases l ON l.unit_id = u.id AND l.tenant_id = $1 AND l.status = 'active'
-      WHERE u.tenant_id = $1`, [req.params.id])
-    if (!currentUnit) throw new AppError(400, 'Tenant has no current unit')
-
-    // Get new unit — verify it belongs to same landlord and is vacant
-    const newUnit = await queryOne<any>('SELECT * FROM units WHERE id=$1 AND landlord_id=$2', [newUnitId, req.user!.profileId])
-    if (!newUnit) throw new AppError(404, 'New unit not found or access denied')
-    if (newUnit.tenant_id) throw new AppError(400, 'New unit is already occupied')
-
-    // Calculate proration if rent changed and mid-month transfer
-    const transferDate = new Date(effectiveDate)
-    const oldRent = parseFloat(currentUnit.rent_amount)
-    const newRent = parseFloat(newRentAmount)
-    const rentChanged = Math.abs(oldRent - newRent) > 0.01
-    let proratedAmount = null
-
-    if (rentChanged) {
-      const daysInMonth = new Date(transferDate.getFullYear(), transferDate.getMonth() + 1, 0).getDate()
-      const daysRemaining = daysInMonth - transferDate.getDate() + 1
-      proratedAmount = (newRent / daysInMonth) * daysRemaining
-    }
-
-    const isImmediate = new Date(effectiveDate) <= new Date()
-
-    if (isImmediate) {
-      // Execute transfer now
-      // 1. End current lease
-      if (currentUnit.lease_id) {
-        await query('UPDATE leases SET status=$1, end_date=$2 WHERE id=$3', ['ended', effectiveDate, currentUnit.lease_id])
-      }
-
-      // 2. Vacate old unit
-      await query('UPDATE units SET tenant_id=NULL, status=$1 WHERE id=$2', ['vacant', currentUnit.id])
-
-      // 3. Create new lease
-      await query(`
-        INSERT INTO leases (unit_id, tenant_id, start_date, status, rent_amount)
-        VALUES ($1, $2, $3, 'active', $4)`,
-        [newUnitId, req.params.id, effectiveDate, newRent])
-
-      // 4. Assign tenant to new unit with new rent
-      await query('UPDATE units SET tenant_id=$1, rent_amount=$2, status=$3 WHERE id=$4',
-        [req.params.id, newRent, 'active', newUnitId])
-
-      // 5. Copy maintenance history reference (not actual requests)
-      await query(`
-        INSERT INTO maintenance_requests
-          (unit_id, tenant_id, title, description, priority, status, actual_cost, created_at, notes)
-        SELECT $1, tenant_id, title, '[Transferred from Unit '||$2||'] '||title,
-          priority, status, actual_cost, created_at,
-          'Read-only copy — original request on Unit '||$3
-        FROM maintenance_requests
-        WHERE unit_id = $4 AND tenant_id = $5
-        ON CONFLICT DO NOTHING`,
-        [newUnitId, currentUnit.unit_number, currentUnit.unit_number, currentUnit.id, req.params.id])
-    } else {
-      // Schedule for future — store in a transfers table
-      await query(`
-        INSERT INTO scheduled_transfers
-          (tenant_id, from_unit_id, to_unit_id, new_rent_amount, effective_date, status, notes, prorated_amount)
-        VALUES ($1,$2,$3,$4,$5,'scheduled',$6,$7)`,
-        [req.params.id, currentUnit.id, newUnitId, newRent, effectiveDate, notes || null, proratedAmount])
-    }
-
-    res.json({
-      success: true,
-      data: {
-        transferred: isImmediate,
-        scheduled: !isImmediate,
-        effectiveDate,
-        fromUnit: currentUnit.unit_number,
-        toUnit: newUnit.unit_number,
-        oldRent,
-        newRent,
-        proratedAmount,
-        rentChanged,
-      }
-    })
-  } catch (e) { next(e) }
+  // Removed S20. Unit transfers are not a distinct operation under the
+  // multi-tenant lease model. The equivalent workflow is:
+  //   1. Terminate the existing lease (PATCH /leases/:id status=terminated)
+  //   2. Create a new e-sign document for the new unit with the same tenant(s)
+  //   3. All parties sign → new lease row created on the new unit
+  // This endpoint intentionally returns 501 until a purpose-built flow exists.
+  res.status(501).json({
+    success: false,
+    error: 'Unit transfer endpoint retired. Terminate the current lease and create a new lease via e-sign on the new unit.'
+  })
 })
 
-// GET /api/tenants/:id/available-units — vacant units for transfer
 tenantsRouter.get('/:id/available-units', requireAuth, requireLandlord, async (req, res, next) => {
   try {
     const units = await query<any>(`
@@ -609,7 +528,11 @@ tenantsRouter.get('/:id/available-units', requireAuth, requireLandlord, async (r
         p.name as property_name, p.street1, p.city
       FROM units u
       JOIN properties p ON p.id = u.property_id
-      WHERE u.landlord_id = $1 AND u.tenant_id IS NULL AND u.status = 'vacant'
+      WHERE u.landlord_id = $1 AND u.status = 'vacant'
+        AND NOT EXISTS (
+          SELECT 1 FROM leases l
+          WHERE l.unit_id = u.id AND l.status IN ('active', 'pending')
+        )
       ORDER BY p.name, u.unit_number`,
       [req.user!.profileId])
     res.json({ success: true, data: units })
@@ -679,47 +602,36 @@ tenantsRouter.get('/lease', requireAuth, async (req, res, next) => {
   try {
     const tenant = await queryOne<any>('SELECT t.id FROM tenants t WHERE t.user_id=$1', [req.user!.userId])
     if (!tenant) throw new AppError(404, 'Tenant not found')
-    const unit = await queryOne<any>('SELECT * FROM units WHERE tenant_id=$1', [tenant.id])
+    const unit = await queryOne<any>(`
+      SELECT u.* FROM units u
+      JOIN leases l ON l.unit_id = u.id AND l.status = 'active'
+      JOIN lease_tenants lt ON lt.lease_id = l.id AND lt.tenant_id = $1 AND lt.status = 'active'
+      LIMIT 1`, [tenant.id])
     if (!unit) throw new AppError(404, 'No active unit')
     const lease = await queryOne<any>(`
       SELECT l.*, p.name as property_name, u.unit_number,
         lu.first_name || ' ' || lu.last_name as landlord_name,
-        tu.first_name || ' ' || tu.last_name as tenant_name
+        COALESCE(vuo.primary_first_name || ' ' || vuo.primary_last_name, '') as tenant_name
       FROM leases l
       JOIN units u ON u.id = l.unit_id
       JOIN properties p ON p.id = u.property_id
       JOIN landlords la ON la.id = l.landlord_id
       JOIN users lu ON lu.id = la.user_id
-      LEFT JOIN tenants te ON te.id = u.tenant_id
-      LEFT JOIN users tu ON tu.id = te.user_id
-      WHERE l.unit_id = $1 AND l.status IN ('pending','active','active')
+      LEFT JOIN v_unit_occupancy vuo ON vuo.unit_id = u.id
+      WHERE l.unit_id = $1 AND l.status IN ('pending','active')
       ORDER BY l.created_at DESC LIMIT 1`, [unit.id])
     res.json({ success: true, data: lease })
   } catch (e) { next(e) }
 })
 
 tenantsRouter.post('/lease/sign', requireAuth, async (req, res, next) => {
-  try {
-    const { signature, signatureType } = req.body
-    if (!signature) throw new AppError(400, 'Signature required')
-    const tenant = await queryOne<any>('SELECT t.id FROM tenants t WHERE t.user_id=$1', [req.user!.userId])
-    if (!tenant) throw new AppError(404, 'Tenant not found')
-    const unit = await queryOne<any>('SELECT * FROM units WHERE tenant_id=$1', [tenant.id])
-    if (!unit) throw new AppError(404, 'No active unit')
-    const lease = await queryOne<any>("SELECT * FROM leases WHERE unit_id=$1 AND status IN ('pending','active') ORDER BY created_at DESC LIMIT 1", [unit.id])
-    if (!lease) throw new AppError(404, 'No lease found')
-    if (lease.signed_by_tenant || lease.tenant_signed_at) throw new AppError(400, 'Already signed')
-    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress
-    const ua = req.headers['user-agent']
-    await query("UPDATE leases SET signed_by_tenant=TRUE, tenant_signature=$1, tenant_signed_at=NOW(), tenant_signed_ip=$2, status='active' WHERE id=$3", [signature, ip, lease.id])
-    await query(`INSERT INTO lease_signature_audit (lease_id, signer_role, signer_name, signer_email, signature, ip_address, user_agent, signed_at)
-      SELECT $1, 'tenant', u.first_name || ' ' || u.last_name, u.email, $2, $3, $4, NOW()
-      FROM users u WHERE u.id=$5`, [lease.id, signature, ip, ua, req.user!.userId])
-    if (lease.signed_by_landlord) {
-      await query("UPDATE units SET on_time_pay_active=TRUE, status='active' WHERE id=$1", [unit.id])
-    }
-    res.json({ success: true })
-  } catch (e) { next(e) }
+  // Removed S20. Tenant signing is handled exclusively by the e-sign flow.
+  // Tenants sign documents at POST /api/esign/sign/:documentId after a
+  // landlord creates a lease_documents record and sends it.
+  res.status(410).json({
+    success: false,
+    error: 'Direct lease signing is no longer supported. Signatures are handled through e-sign at /api/esign/sign/:documentId.'
+  })
 })
 
 tenantsRouter.get('/work-trade', requireAuth, async (req, res, next) => {

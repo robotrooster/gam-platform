@@ -16,6 +16,9 @@ nohup npm run dev --workspace=apps/admin     > /tmp/gam-admin.log     2>&1 & ech
 nohup npm run dev --workspace=apps/marketing > /tmp/gam-marketing.log 2>&1 & echo "  Marketing → :3004"
 nohup npm run dev --workspace=apps/pos       > /tmp/gam-pos.log       2>&1 & echo "  POS       → :3005"
 nohup npm run dev --workspace=apps/books     > /tmp/gam-books.log     2>&1 & echo "  Books     → :3006"
+nohup npm run dev --workspace=apps/listings  > /tmp/gam-listings.log  2>&1 & echo "  Listings  → :3008"
+nohup npm run dev --workspace=apps/admin-ops > /tmp/gam-admin-ops.log 2>&1 & echo "  AdminOps  → :3009"
+nohup npm run dev --workspace=apps/admin-ops > /tmp/gam-admin-ops.log 2>&1 & echo "  AdminOps  → :3009"
 sleep 4
 
 echo ""

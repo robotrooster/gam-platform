@@ -1,4 +1,6 @@
 import express from 'express'
+import path from 'path'
+import fs from 'fs'
 import { scheduleOtpCron } from './services/otpScheduler'
 import cors from 'cors'
 import helmet from 'helmet'
@@ -9,7 +11,7 @@ import { errorHandler } from './middleware/errorHandler'
 import { authRouter }         from './routes/auth'
 import { landlordsRouter }    from './routes/landlords'
 import { tenantsRouter }      from './routes/tenants'
-import { propertiesRouter }   from './routes/properties'
+import { propertiesRouter, publicPropertiesRouter } from './routes/properties'
 import { unitsRouter }        from './routes/units'
 import { leasesRouter }       from './routes/leases'
 import { paymentsRouter }     from './routes/payments'
@@ -38,6 +40,9 @@ import { schedulerInit }      from './jobs/scheduler'
 dotenv.config()
 
 const app  = express()
+const uploadsDir = path.join(process.cwd(), 'uploads')
+if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true })
+app.use('/uploads', express.static(uploadsDir))
 const PORT = process.env.PORT || 4000
 
 // ── MIDDLEWARE ──────────────────────────────────────────────
@@ -52,6 +57,7 @@ app.use(cors({
     'http://localhost:3006',
     'http://localhost:3007',
     'http://localhost:3008',
+    'http://localhost:3009',
   ,'https://experience.arcgis.com'],
   credentials: true,
 }))
@@ -77,6 +83,7 @@ app.use('/api/auth',          authRouter)
 app.use('/api/landlords',     landlordsRouter)
 app.use('/api/tenants',       tenantsRouter)
 app.use('/api/properties',    propertiesRouter)
+app.use('/api/public/properties', publicPropertiesRouter)
 app.use('/api/units',         unitsRouter)
 app.use('/api/leases',        leasesRouter)
 app.use('/api/payments',      paymentsRouter)

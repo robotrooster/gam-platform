@@ -47,7 +47,7 @@ export function UnitsPage() {
       {evictionUnits.length > 0 && (
         <div className="alert alert-danger">
           <AlertTriangle size={16} />
-          <div><strong>{evictionUnits.length} unit(s) in Eviction Mode.</strong> All tenant ACH hard-blocked. Per A.R.S. § 33-1371(A): accepting ANY rent waives your eviction rights.</div>
+          <div><strong>{evictionUnits.length} unit(s) in Eviction Mode.</strong> All tenant ACH hard-blocked. Warning: in many jurisdictions, accepting rent while pursuing eviction may waive your right to proceed. Check your local laws before accepting any payment.</div>
         </div>
       )}
 

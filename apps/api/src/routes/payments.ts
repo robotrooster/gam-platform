@@ -62,7 +62,8 @@ paymentsRouter.post('/initiate-rent-collection', requireAdmin, async (req, res, 
         t.float_fee_active, t.income_arrival_day, t.id AS tenant_profile_id,
         l.stripe_account_id
       FROM units u
-      JOIN tenants t ON t.id = u.tenant_id
+      JOIN v_unit_occupancy vuo ON vuo.unit_id = u.id
+      JOIN tenants t ON t.id = vuo.primary_tenant_id
       JOIN landlords l ON l.id = u.landlord_id
       WHERE u.status = 'active'
         AND u.payment_block = FALSE

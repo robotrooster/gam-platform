@@ -1,7 +1,7 @@
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react'
 import ReactDOM from 'react-dom/client'
 import { BrowserRouter, Routes, Route, Navigate, NavLink, Outlet, useNavigate } from 'react-router-dom'
-import { QueryClient, QueryClientProvider, useQuery, useMutation } from 'react-query'
+import { QueryClient, QueryClientProvider, useQuery, useMutation, useQueryClient } from 'react-query'
 import axios from 'axios'
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, BarChart, Bar } from 'recharts'
 import { formatCurrency, getReservePhase, PLATFORM_FEES, RESERVE_CONFIG } from '@gam/shared'
@@ -58,7 +58,7 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
   return <Ctx.Provider value={{ user, token, loading, login, logout }}>{children}</Ctx.Provider>
 }
 
-const qc=new QueryClient({defaultOptions:{queries:{retry:1,staleTime:15000}}})
+const qc=new QueryClient({defaultOptions:{queries:{retry:1,staleTime:30000,refetchOnWindowFocus:false}}})
 
 // ── STYLES ────────────────────────────────────────────────────
 const css=`
@@ -145,6 +145,7 @@ a{color:var(--gold);text-decoration:none}
 // ── LAYOUT ────────────────────────────────────────────────────
 function Layout(){
   const{user,logout,loading}=useAuth();const navigate=useNavigate()
+  const isSuperAdmin=user?.role==='super_admin'
   if(loading||!user)return<div className="loading">Loading…</div>
   return(
     <div className="shell">
@@ -156,22 +157,22 @@ function Layout(){
         <nav className="nav">
           <div className="nl">Platform</div>
           <NavLink to="/overview" className={({isActive})=>`ni${isActive?' active':''}`}>📊 Overview</NavLink>
+          <NavLink to="/onboarding" className={({isActive})=>`ni${isActive?' active':''}`}>🚀 Onboarding</NavLink>
           <NavLink to="/landlords" className={({isActive})=>`ni${isActive?' active':''}`}>🏢 Landlords</NavLink>
           <NavLink to="/tenants" className={({isActive})=>`ni${isActive?' active':''}`}>👤 Tenants</NavLink>
+          <NavLink to="/property-reviews" className={({isActive})=>`ni${isActive?' active':''}`}>📋 Property Reviews</NavLink>
           <NavLink to="/units" className={({isActive})=>`ni${isActive?' active':''}`}>🚪 Units</NavLink>
           <div className="nl" style={{marginTop:8}}>Finance</div>
           <NavLink to="/payments" className={({isActive})=>`ni${isActive?' active':''}`}>💳 Payments</NavLink>
           <NavLink to="/disbursements" className={({isActive})=>`ni${isActive?' active':''}`}>💸 Disbursements</NavLink>
-          <NavLink to="/reserve" className={({isActive})=>`ni${isActive?' active':''}`}>🏦 Reserve & Float</NavLink>
+          {isSuperAdmin&&<NavLink to="/reserve" className={({isActive})=>`ni${isActive?' active':''}`}>🏦 Reserve & Float</NavLink>}
           <div className="nl" style={{marginTop:8}}>Compliance</div>
-          <NavLink to="/nacha" className={({isActive})=>`ni${isActive?' active':''}`}>⚡ NACHA Monitor</NavLink>
-          <NavLink to="/maintenance" className={({isActive})=>`ni${isActive?' active':''}`}>🔧 Maintenance</NavLink>
+          {isSuperAdmin&&<NavLink to="/nacha" className={({isActive})=>`ni${isActive?' active':''}`}>⚡ NACHA Monitor</NavLink>}
           <div className="nl" style={{marginTop:8}}>Community</div>
-          <NavLink to="/bulletin" className={({isActive})=>`ni${isActive?' active':''}`}>📋 Bulletin Board</NavLink>
+          {isSuperAdmin&&<NavLink to="/bulletin" className={({isActive})=>`ni${isActive?' active':''}`}>📋 Bulletin Board</NavLink>}
           <div className="nl" style={{marginTop:8}}>Tools</div>
-          <button className="ni" onClick={()=>{const t=localStorage.getItem('gam_admin_token');window.open('http://localhost:3006'+(t?'?token='+t:''),'_blank')}}>📒 GAM Books</button>
-          <div className="nl" style={{marginTop:8}}>External</div>
-          <button className="ni" onClick={()=>{const t=localStorage.getItem('gam_admin_token');window.open('http://localhost:3006'+(t?`?token=${t}`:''),'_blank')}}>📒 GAM Books</button>
+          {isSuperAdmin&&<button className="ni" onClick={()=>{const t=localStorage.getItem('gam_admin_token');window.open('http://localhost:3006'+(t?'?token='+t:''),'_blank')}}>📒 GAM Books</button>}
+
         </nav>
         <div className="sfooter">
           <div style={{padding:'6px 10px',marginBottom:4}}>
@@ -192,42 +193,264 @@ function Layout(){
 }
 
 // ── OVERVIEW ──────────────────────────────────────────────────
+function AdminOnboardingOverview(){
+  const{user}=useAuth()
+  const{data:stats,isLoading}=useQuery('onboarding-overview',()=>get<any>('/admin/onboarding/overview'),{enabled:!!user,staleTime:30000,refetchOnWindowFocus:false})
+  const{data:tenants=[],isLoading:tLoading}=useQuery<any[]>('admin-tenants',()=>get('/admin/tenants'),{enabled:!!user,staleTime:30000,refetchOnWindowFocus:false})
+  const{data:landlords=[],isLoading:lLoading}=useQuery<any[]>('onboarding-landlords',()=>get('/landlords'),{enabled:!!user,staleTime:30000,refetchOnWindowFocus:false})
+  const[selectedLandlord,setSelectedLandlord]=React.useState<any>(null)
+  const[selectedTenant,setSelectedTenant]=React.useState<any>(null)
+  const{data:landlordDetail}=useQuery(['landlord-detail',selectedLandlord?.id],()=>get<any>('/admin/onboarding/landlord/'+selectedLandlord.id),{enabled:!!selectedLandlord?.id,staleTime:15000})
+  const{data:tenantDetail}=useQuery(['tenant-detail',selectedTenant?.id],()=>get<any>('/admin/onboarding/tenant/'+selectedTenant.id),{enabled:!!selectedTenant?.id,staleTime:15000})
+  const[resending,setResending]=React.useState<string|null>(null)
+  const[resendMsg,setResendMsg]=React.useState('')
+  const[tab,setTab]=React.useState<'landlords'|'tenants'>('landlords')
+
+  const resend=async(type:string,targetId:string)=>{
+    setResending(type+targetId)
+    try{
+      await post('/admin/onboarding/resend',{type,targetId})
+      setResendMsg('Notification queued successfully')
+      setTimeout(()=>setResendMsg(''),3000)
+    }catch(e:any){setResendMsg('Failed: '+e.message)}
+    finally{setResending(null)}
+  }
+
+  return(
+    <div>
+      <div className="ph">
+        <div><h1 className="pt">Onboarding Console</h1><p className="ps">Help landlords and tenants complete setup</p></div>
+      </div>
+
+      {resendMsg&&<div className={`alert ${resendMsg.startsWith('Failed')?'ae':'ag'}`} style={{marginBottom:12}}>{resendMsg}</div>}
+
+      <div className="grid4" style={{marginBottom:20}}>
+        <div className="kpi" style={{cursor:'pointer',borderColor:tab==='landlords'?'var(--gold)':'var(--b1)'}} onClick={()=>setTab('landlords')}>
+          <div className="kl">Landlords — No Bank</div>
+          <div className={`kv ${(stats?.landlords_no_bank||0)>0?'r':'g'}`}>{stats?.landlords_no_bank||0}</div>
+          <div className="ks">Bank account not verified</div>
+        </div>
+        <div className="kpi" style={{cursor:'pointer',borderColor:tab==='tenants'?'var(--gold)':'var(--b1)'}} onClick={()=>setTab('tenants')}>
+          <div className="kl">Tenants — No ACH</div>
+          <div className={`kv ${(stats?.tenants_no_ach||0)>0?'a':'g'}`}>{stats?.tenants_no_ach||0}</div>
+          <div className="ks">ACH not verified</div>
+        </div>
+        <div className="kpi">
+          <div className="kl">Tenants — No Flex</div>
+          <div className={`kv ${(stats?.tenants_no_flex||0)>0?'a':'g'}`}>{stats?.tenants_no_flex||0}</div>
+          <div className="ks">No flex products enrolled</div>
+        </div>
+        <div className="kpi">
+          <div className="kl">Vacant Units</div>
+          <div className="kv b">{stats?.vacant_units||0}</div>
+          <div className="ks">{stats?.units_no_tenant||0} without tenant assigned</div>
+        </div>
+      </div>
+
+      <div className="tabs" style={{marginBottom:16}}>
+        <button className={`tab ${tab==='landlords'?'on':''}`} onClick={()=>setTab('landlords')}>🏢 Landlords ({(landlords as any[]).length})</button>
+        <button className={`tab ${tab==='tenants'?'on':''}`} onClick={()=>setTab('tenants')}>👤 Tenants ({(tenants as any[]).length})</button>
+      </div>
+
+      <div className="grid2" style={{gap:16}}>
+        {/* LEFT — list */}
+        <div className="card" style={{padding:0}}>
+          {tab==='landlords'&&(lLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}>Loading…</div>:(
+              <table className="tbl">
+                <thead><tr><th>Landlord</th><th>Properties</th><th>Units</th><th>Bank</th><th>Onboarded</th></tr></thead>
+                <tbody>
+                  {(landlords as any[]).map((l:any)=>(
+                    <tr key={l.id} style={{cursor:'pointer',background:selectedLandlord?.id===l.id?'rgba(201,162,39,.05)':''}} onClick={()=>{setSelectedLandlord(l);setSelectedTenant(null)}}>
+                      <td><div style={{fontWeight:600,color:'var(--t0)',fontSize:'.78rem'}}>{l.first_name} {l.last_name}</div><div style={{fontSize:'.65rem',color:'var(--t3)'}}>{l.email}</div></td>
+                      <td className="mono">{l.property_count}</td>
+                      <td className="mono">{l.unit_count}</td>
+                      <td><span className={`badge ${l.stripe_bank_verified?'bg2':'br'}`}>{l.stripe_bank_verified?'✓':'Missing'}</span></td>
+                      <td><span className={`badge ${l.onboarding_complete?'bg2':'ba'}`}>{l.onboarding_complete?'Done':'Pending'}</span></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            ))}
+          {tab==='tenants'&&(tLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}>Loading…</div>:(
+              <table className="tbl">
+                <thead><tr><th>Tenant</th><th>Unit</th><th>ACH</th><th>OTP</th><th>Flex</th></tr></thead>
+                <tbody>
+                  {(tenants as any[]).map((t:any)=>(
+                    <tr key={t.id} style={{cursor:'pointer',background:selectedTenant?.id===t.id?'rgba(201,162,39,.05)':''}} onClick={()=>{setSelectedTenant(t);setSelectedLandlord(null)}}>
+                      <td><div style={{fontWeight:600,color:'var(--t0)',fontSize:'.78rem'}}>{t.first_name} {t.last_name}</div><div style={{fontSize:'.65rem',color:'var(--t3)'}}>{t.email}</div></td>
+                      <td style={{fontSize:'.72rem'}}>{t.property_name?`${t.property_name} · ${t.unit_number}`:<span style={{color:'var(--t3)'}}>—</span>}</td>
+                      <td><span className={`badge ${t.ach_verified?'bg2':'br'}`}>{t.ach_verified?'✓':'No'}</span></td>
+                      <td><span className={`badge ${t.on_time_pay_enrolled?'bgold':'bmu'}`}>{t.on_time_pay_enrolled?'✓':'—'}</span></td>
+                      <td><span className={`badge ${(t.credit_reporting_enrolled||t.flex_deposit_enrolled||t.float_fee_active)?'bg2':'bmu'}`}>{(t.credit_reporting_enrolled||t.flex_deposit_enrolled||t.float_fee_active)?'Active':'None'}</span></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            ))}
+        </div>
+
+        {/* RIGHT — detail panel */}
+        <div>
+          {!selectedLandlord&&!selectedTenant&&(
+            <div className="card" style={{textAlign:'center',padding:'48px 20px',color:'var(--t3)'}}>
+              <div style={{fontSize:'2rem',marginBottom:12}}>👆</div>
+              Select a landlord or tenant to view their onboarding status
+            </div>
+          )}
+
+          {selectedLandlord&&landlordDetail&&(
+            <div className="card">
+              <div style={{marginBottom:16,paddingBottom:12,borderBottom:'1px solid var(--b0)'}}>
+                <div style={{fontFamily:'var(--font-d)',fontWeight:800,fontSize:'1.1rem',color:'var(--t0)'}}>{landlordDetail.landlord.first_name} {landlordDetail.landlord.last_name}</div>
+                <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:2}}>{landlordDetail.landlord.email} · {landlordDetail.landlord.business_name||'No business name'}</div>
+              </div>
+
+              <div className="ct">Onboarding Checklist</div>
+              {landlordDetail.checklist.map((item:any)=>(
+                <div key={item.key} style={{display:'flex',alignItems:'center',gap:10,padding:'7px 0',borderBottom:'1px solid var(--b0)'}}>
+                  <span style={{fontSize:'1rem'}}>{item.done?'✅':'⬜'}</span>
+                  <span style={{fontSize:'.82rem',color:item.done?'var(--t0)':'var(--t2)',flex:1}}>{item.label}</span>
+                  {!item.done&&<span className="badge br">Incomplete</span>}
+                </div>
+              ))}
+
+              <div style={{marginTop:16}}>
+                <div className="ct">Quick Actions</div>
+                <div style={{display:'flex',flexDirection:'column',gap:8}}>
+                  <button className="btn bg-btn" disabled={!!resending} onClick={()=>resend('landlord_setup',selectedLandlord.id)}>
+                    {resending==='landlord_setup'+selectedLandlord.id?'Sending…':'📧 Resend Setup Email'}
+                  </button>
+                  {!landlordDetail.landlord.stripe_bank_verified&&(
+                    <button className="btn bg-btn" disabled={!!resending} onClick={()=>resend('bank_verification',selectedLandlord.id)}>
+                      {resending==='bank_verification'+selectedLandlord.id?'Sending…':'🏦 Resend Bank Verification'}
+                    </button>
+                  )}
+                  {landlordDetail.counts.unit_count>0&&landlordDetail.counts.units_with_tenants===0&&(
+                    <button className="btn bg-btn" disabled={!!resending} onClick={()=>resend('tenant_invite_reminder',selectedLandlord.id)}>
+                      {resending==='tenant_invite_reminder'+selectedLandlord.id?'Sending…':'👤 Resend Tenant Invite Reminder'}
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              <div style={{marginTop:12,display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:8}}>
+                <div style={{textAlign:'center',padding:'10px',background:'var(--bg3)',borderRadius:8}}>
+                  <div style={{fontFamily:'var(--font-d)',fontSize:'1.2rem',fontWeight:700,color:'var(--t0)'}}>{landlordDetail.counts.property_count}</div>
+                  <div style={{fontSize:'.65rem',color:'var(--t3)'}}>Properties</div>
+                </div>
+                <div style={{textAlign:'center',padding:'10px',background:'var(--bg3)',borderRadius:8}}>
+                  <div style={{fontFamily:'var(--font-d)',fontSize:'1.2rem',fontWeight:700,color:'var(--t0)'}}>{landlordDetail.counts.unit_count}</div>
+                  <div style={{fontSize:'.65rem',color:'var(--t3)'}}>Units</div>
+                </div>
+                <div style={{textAlign:'center',padding:'10px',background:'var(--bg3)',borderRadius:8}}>
+                  <div style={{fontFamily:'var(--font-d)',fontSize:'1.2rem',fontWeight:700,color:'var(--t0)'}}>{landlordDetail.counts.active_leases}</div>
+                  <div style={{fontSize:'.65rem',color:'var(--t3)'}}>Leases</div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {selectedTenant&&tenantDetail&&(
+            <div className="card">
+              <div style={{marginBottom:16,paddingBottom:12,borderBottom:'1px solid var(--b0)'}}>
+                <div style={{fontFamily:'var(--font-d)',fontWeight:800,fontSize:'1.1rem',color:'var(--t0)'}}>{tenantDetail.tenant.first_name} {tenantDetail.tenant.last_name}</div>
+                <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:2}}>{tenantDetail.tenant.email}</div>
+                {tenantDetail.tenant.unit_number&&<div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:2}}>{tenantDetail.tenant.property_name} · Unit {tenantDetail.tenant.unit_number}</div>}
+              </div>
+
+              <div className="ct">Onboarding Checklist</div>
+              {tenantDetail.checklist.map((item:any)=>(
+                <div key={item.key} style={{display:'flex',alignItems:'center',gap:10,padding:'7px 0',borderBottom:'1px solid var(--b0)'}}>
+                  <span style={{fontSize:'1rem'}}>{item.done?'✅':'⬜'}</span>
+                  <span style={{fontSize:'.82rem',color:item.done?'var(--t0)':'var(--t2)',flex:1}}>{item.label}</span>
+                  {!item.done&&<span className="badge br">Incomplete</span>}
+                </div>
+              ))}
+
+              <div style={{marginTop:16}}>
+                <div className="ct">Quick Actions</div>
+                <div style={{display:'flex',flexDirection:'column',gap:8}}>
+                  <button className="btn bg-btn" disabled={!!resending} onClick={()=>resend('tenant_invite',selectedTenant.id)}>
+                    {resending==='tenant_invite'+selectedTenant.id?'Sending…':'📧 Resend Invite Email'}
+                  </button>
+                  {!tenantDetail.tenant.ach_verified&&(
+                    <button className="btn bg-btn" disabled={!!resending} onClick={()=>resend('ach_enrollment',selectedTenant.id)}>
+                      {resending==='ach_enrollment'+selectedTenant.id?'Sending…':'🏦 Resend ACH Enrollment'}
+                    </button>
+                  )}
+                  {tenantDetail.tenant.ach_verified&&!tenantDetail.tenant.on_time_pay_enrolled&&(
+                    <button className="btn bg-btn" disabled={!!resending} onClick={()=>resend('otp_enrollment',selectedTenant.id)}>
+                      {resending==='otp_enrollment'+selectedTenant.id?'Sending…':'⚡ Send OTP Enrollment Nudge'}
+                    </button>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function Overview(){
   const{user}=useAuth()
-  const{data:stats,isLoading}=useQuery(['admin-overview',user?.id],()=>get<any>('/admin/overview'),{refetchInterval:30000,enabled:!!user,staleTime:10000})
+  const isSuperAdmin=user?.role==='super_admin'
+  const{data:income}=useQuery('income-projection',()=>get<any>('/admin/income/projection'),{enabled:!!user,staleTime:60000,refetchOnWindowFocus:false})
+  const{data:stats,isLoading}=useQuery(['admin-overview',user?.id],()=>get<any>('/admin/overview'),{refetchInterval:30000,enabled:!!user,staleTime:30000,keepPreviousData:true})
   const{phase,rate}=getReservePhase(stats?.active_units||0)
   const reserveTarget=RESERVE_CONFIG.DEFAULT_RATE*RESERVE_CONFIG.TARGET_MONTHS*(stats?.active_units||0)*(600)
   const reservePct=stats?.reserve_balance?Math.min((stats.reserve_balance/Math.max(reserveTarget,1))*100,100):0
 
   const trendData=[{m:'Oct',r:1800},{m:'Nov',r:2100},{m:'Dec',r:2400},{m:'Jan',r:2700},{m:'Feb',r:3000},{m:'Mar',r:stats?.monthly_rent_volume||0}]
 
-  if(isLoading)return<div style={{padding:32,color:'var(--t3)'}}>Loading platform data…</div>
+  if(isLoading&&!stats)return<div style={{padding:32,color:'var(--t3)'}}>Loading platform data…</div>
 
   return(
     <div>
       <div className="ph">
         <div><h1 className="pt">Platform Overview</h1><p className="ps">Real-time operations snapshot · Auto-refreshes every 30s</p></div>
         <div style={{display:'flex',gap:8}}>
-          <span className={`badge ${phase===1?'ba':phase===2?'bb':'bg2'}`}>Reserve Phase {phase} — {(rate*100).toFixed(0)}%</span>
-          <span className="badge bgold">⚡ On-Time Pay Active</span>
         </div>
       </div>
 
-      {(stats?.eviction_mode_units||0)>0&&<div className="alert ae">🚫 <strong>{stats.eviction_mode_units} unit(s) in Eviction Mode</strong> — All tenant ACH hard-blocked per A.R.S. § 33-1371. No disbursement until cleared.</div>}
+      {(stats?.eviction_mode_units||0)>0&&<div className="alert ae">🚫 <strong>{stats.eviction_mode_units} unit(s) in Eviction Mode</strong> — All tenant ACH hard-blocked. No disbursement until cleared.</div>}
       {(stats?.zero_tolerance_events||0)>0&&<div className="alert ae">⚠️ <strong>NACHA Zero-Tolerance Event</strong> — Manual review required. Check NACHA Monitor.</div>}
 
-      <div className="grid4" style={{marginBottom:16}}>
-        <div className="kpi"><div className="kl">Active Units</div><div className="kv g">{(stats?.active_units||0).toLocaleString()}</div><div className="ks">{stats?.vacant_units||0} vacant · {stats?.total_landlords||0} landlords</div></div>
-        <div className="kpi"><div className="kl">Monthly Rent Volume</div><div className="kv gold">{formatCurrency(stats?.monthly_rent_volume||0)}</div><div className="ks">across {stats?.active_units||0} units</div></div>
-        <div className="kpi"><div className="kl">Reserve Balance</div><div className={`kv ${reservePct>=100?'g':reservePct>=50?'a':'r'}`}>{formatCurrency(stats?.reserve_balance||0)}</div><div className="ks">{reservePct.toFixed(0)}% of target · Phase {phase}</div></div>
-        <div className="kpi"><div className="kl">Float Balance</div><div className="kv b">{formatCurrency(stats?.float_balance||0)}</div><div className="ks">4.5% APY · covers disbursements</div></div>
-        <div className="kpi"><div className="kl">Pending Payments</div><div className={`kv ${(stats?.pending_payments||0)>20?'r':'a'}`}>{stats?.pending_payments||0}</div><div className="ks">awaiting ACH settlement</div></div>
-        <div className="kpi"><div className="kl">Pending Disbursements</div><div className={`kv ${(stats?.pending_disbursements||0)>0?'a':'g'}`}>{stats?.pending_disbursements||0}</div><div className="ks">landlord payouts queued</div></div>
-        <div className="kpi"><div className="kl">Open Maintenance</div><div className="kv">{stats?.open_maintenance||0}</div><div className="ks">unresolved requests</div></div>
-        <div className="kpi"><div className="kl">Total Tenants</div><div className="kv b">{(stats?.total_tenants||0).toLocaleString()}</div><div className="ks">{stats?.total_landlords||0} landlords registered</div></div>
+      {/* ── Row 1: Landlords + Tenants ── */}
+      <div className="grid2" style={{marginBottom:12}}>
+        <div className="kpi"><div className="kl">Landlords</div><div className="kv gold">{(stats?.total_landlords||0).toLocaleString()}</div><div className="ks">on platform</div></div>
+        <div className="kpi"><div className="kl">Total Tenants</div><div className="kv b">{(stats?.total_tenants||0).toLocaleString()}</div><div className="ks">across all properties</div></div>
       </div>
 
-      <div className="grid2">
+      {/* ── Row 2: Units + Flex + Rent Volume ── */}
+      <div className="grid3" style={{marginBottom:12}}>
+        <div className="kpi"><div className="kl">Active Units</div><div className="kv g">{(stats?.active_units||0).toLocaleString()}</div><div className="ks">{stats?.vacant_units||0} vacant</div></div>
+        <div className="kpi">
+          <div className="kl">Flex Products</div>
+          <div className="kv gold">{(stats?.flex_otp||0)+(stats?.flex_credit||0)+(stats?.flex_deposit||0)+(stats?.flex_pay||0)}</div>
+          <div className="ks" style={{marginTop:6,display:'grid',gridTemplateColumns:'1fr 1fr',gap:'2px 12px'}}>
+            <span>⚡ OTP: <strong style={{color:'var(--t0)'}}>{stats?.flex_otp||0}</strong></span>
+            <span>💳 Credit: <strong style={{color:'var(--t0)'}}>{stats?.flex_credit||0}</strong></span>
+            <span>🏦 Deposit: <strong style={{color:'var(--t0)'}}>{stats?.flex_deposit||0}</strong></span>
+            <span>💸 Pay: <strong style={{color:'var(--t0)'}}>{stats?.flex_pay||0}</strong></span>
+          </div>
+        </div>
+        {isSuperAdmin&&<div className="kpi"><div className="kl">Monthly Rent Volume</div><div className="kv gold">{formatCurrency(stats?.monthly_rent_volume||0)}</div><div className="ks">across {stats?.active_units||0} units</div></div>}
+        {!isSuperAdmin&&<div className="kpi"><div className="kl">Vacant Units</div><div className="kv b">{stats?.vacant_units||0}</div><div className="ks">available to fill</div></div>}
+      </div>
+
+      {/* ── Row 3: Super admin financial ── */}
+      {isSuperAdmin&&<div className="grid4" style={{marginBottom:12}}>
+        <div className="kpi"><div className="kl">Reserve Balance</div><div className={`kv ${reservePct>=100?'g':reservePct>=50?'a':'r'}`}>{formatCurrency(stats?.reserve_balance||0)}</div><div className="ks">{reservePct.toFixed(0)}% of target</div></div>
+        <div className="kpi"><div className="kl">Float Balance</div><div className="kv b">{formatCurrency(stats?.float_balance||0)}</div><div className="ks">4.5% APY</div></div>
+        <div className="kpi"><div className="kl">Pending Payments</div><div className={`kv ${(stats?.pending_payments||0)>20?'r':'a'}`}>{stats?.pending_payments||0}</div><div className="ks">awaiting ACH settlement</div></div>
+        <div className="kpi"><div className="kl">Pending Disbursements</div><div className={`kv ${(stats?.pending_disbursements||0)>0?'a':'g'}`}>{stats?.pending_disbursements||0}</div><div className="ks">landlord payouts queued</div></div>
+      </div>}
+
+
+
+      {isSuperAdmin&&<div className="grid2">
         <div className="card">
           <div className="ct">Monthly Rent Volume Trend</div>
           <ResponsiveContainer width="100%" height={180}>
@@ -249,7 +472,55 @@ function Overview(){
           <div className="dr"><span className="dk">Float balance</span><span className="dv mono">{formatCurrency(stats?.float_balance||0)}</span></div>
           <div className="dr"><span className="dk">Float APY income</span><span className="dv mono" style={{color:'var(--green)'}}>+{formatCurrency((stats?.float_balance||0)*.045/12)}/mo</span></div>
         </div>
-      </div>
+      </div>}
+      {isSuperAdmin&&<>
+      {/* ── Projected Platform Income ── */}
+      {(()=>{
+        const streams=[
+          {label:'OTP Unit Fees',     value:income?.monthly?.otp_unit_fees||0,    detail:`${income?.counts?.otp_units||0} units × $15`,    color:'#c9a227'},
+          {label:'Direct Pay Fees',   value:income?.monthly?.direct_unit_fees||0, detail:`${income?.counts?.direct_units||0} units × $5`,   color:'#3b82f6'},
+          {label:'FlexPay Fees',      value:income?.monthly?.flex_pay_fees||0,    detail:`${income?.counts?.flex_pay||0} tenants × $20`,    color:'#22c55e'},
+          {label:'Background Checks', value:income?.monthly?.bg_check_fees||0,    detail:`${income?.counts?.bg_checks||0} checks × $15`,    color:'#a855f7'},
+        ]
+        const total=income?.monthly?.total||0
+        return(
+          <div className="card" style={{marginTop:4,background:'linear-gradient(135deg,rgba(201,162,39,.06) 0%,rgba(8,10,12,0) 60%)',border:'1px solid rgba(201,162,39,.2)'}}>
+            <div style={{display:'flex',alignItems:'flex-start',justifyContent:'space-between',marginBottom:24}}>
+              <div>
+                <div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.12em',marginBottom:6}}>Projected Platform Revenue</div>
+                <div style={{fontFamily:'var(--font-d)',fontSize:'2.8rem',fontWeight:800,color:'var(--gold)',lineHeight:1}}>{formatCurrency(total)}</div>
+                <div style={{fontSize:'.78rem',color:'var(--t3)',marginTop:6}}>per month · based on current enrollment</div>
+              </div>
+              <div style={{textAlign:'right'}}>
+                <div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.12em',marginBottom:6}}>Annual Run Rate</div>
+                <div style={{fontFamily:'var(--font-d)',fontSize:'1.8rem',fontWeight:800,color:'var(--green)',lineHeight:1}}>{formatCurrency(income?.annual||0)}</div>
+                <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:6}}>projected ARR</div>
+              </div>
+            </div>
+            <div style={{display:'flex',flexDirection:'column',gap:12}}>
+              {streams.map((s:any)=>{
+                const pct=total>0?Math.max((s.value/total)*100,0):0
+                return(
+                  <div key={s.label}>
+                    <div style={{display:'flex',justifyContent:'space-between',alignItems:'baseline',marginBottom:5}}>
+                      <div style={{display:'flex',alignItems:'center',gap:8}}>
+                        <div style={{width:8,height:8,borderRadius:'50%',background:s.color,flexShrink:0}}/>
+                        <span style={{fontSize:'.78rem',color:'var(--t1)',fontWeight:500}}>{s.label}</span>
+                        <span style={{fontSize:'.68rem',color:'var(--t3)'}}>{s.detail}</span>
+                      </div>
+                      <span style={{fontFamily:'var(--font-m)',fontSize:'.82rem',color:'var(--t0)',fontWeight:600}}>{formatCurrency(s.value)}</span>
+                    </div>
+                    <div style={{height:6,background:'var(--bg3)',borderRadius:3,overflow:'hidden'}}>
+                      <div style={{height:'100%',width:`${pct}%`,background:s.color,borderRadius:3,transition:'width .4s ease',opacity:.85}}/>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        )
+      })()}
+      </> }
     </div>
   )
 }
@@ -257,30 +528,95 @@ function Overview(){
 // ── LANDLORDS ─────────────────────────────────────────────────
 function Landlords(){
   const{user}=useAuth()
-  const{data:landlords=[],isLoading}=useQuery<any[]>('landlords',()=>get('/landlords'),{enabled:!!user})
+  const{data:landlords=[],isLoading}=useQuery<any[]>('landlords',()=>get('/landlords'),{enabled:!!user,refetchOnWindowFocus:false})
+  const[lSearch,setLSearch]=React.useState('')
+  const sortedLandlords=React.useMemo(()=>[...(landlords as any[])].sort((a,b)=>{
+    const aInc=(!a.stripe_bank_verified||!a.onboarding_complete)?0:1
+    const bInc=(!b.stripe_bank_verified||!b.onboarding_complete)?0:1
+    return aInc-bInc
+  }),[landlords])
+  const filteredLandlords=React.useMemo(()=>lSearch?sortedLandlords.filter((l:any)=>`${l.first_name} ${l.last_name} ${l.email} ${l.business_name||""}`.toLowerCase().includes(lSearch.toLowerCase())):sortedLandlords,[sortedLandlords,lSearch])
+  const[selected,setSelected]=React.useState<any>(null)
+  const{data:detail}=useQuery(['landlord-detail',selected?.id],()=>get<any>('/admin/onboarding/landlord/'+selected.id),{enabled:!!selected?.id,staleTime:15000})
+  const[resending,setResending]=React.useState<string|null>(null)
+  const[msg,setMsg]=React.useState('')
+
+  const resend=async(type:string,id:string)=>{
+    setResending(type)
+    try{ await post('/admin/onboarding/resend',{type,targetId:id}); setMsg('Notification queued'); setTimeout(()=>setMsg(''),3000) }
+    catch(e:any){ setMsg('Failed: '+e.message) }
+    finally{ setResending(null) }
+  }
+
   return(
     <div>
-      <div className="ph"><div><h1 className="pt">Landlords</h1><p className="ps">{landlords.length} registered</p></div></div>
-      <div className="card" style={{padding:0}}>
-        {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}>Loading…</div>:(
-          <table className="tbl">
-            <thead><tr><th>Landlord</th><th>Business</th><th>Tier</th><th>Properties</th><th>Units</th><th>Occupied</th><th>Bank</th><th>Onboarded</th></tr></thead>
-            <tbody>
-              {landlords.length?landlords.map((l:any)=>(
-                <tr key={l.id}>
-                  <td><div style={{fontWeight:600,color:'var(--t0)'}}>{l.first_name} {l.last_name}</div><div style={{fontSize:'.68rem',color:'var(--t3)'}}>{l.email}</div></td>
-                  <td style={{fontSize:'.78rem'}}>{l.business_name||'—'}</td>
-                  <td><span className="badge bgold">{l.volume_tier}</span></td>
-                  <td className="mono">{l.property_count}</td>
-                  <td className="mono">{l.unit_count}</td>
-                  <td className="mono" style={{color:'var(--green)'}}>{l.occupied_count}</td>
-                  <td><span className={`badge ${l.stripe_bank_verified?'bg2':'ba'}`}>{l.stripe_bank_verified?'Verified':'Pending'}</span></td>
-                  <td><span className={`badge ${l.onboarding_complete?'bg2':'ba'}`}>{l.onboarding_complete?'Complete':'Pending'}</span></td>
-                </tr>
-              )):<tr><td colSpan={8} style={{textAlign:'center',color:'var(--t3)',padding:32}}>No landlords yet.</td></tr>}
-            </tbody>
-          </table>
-        )}
+      <div className="ph"><div><h1 className="pt">Landlords</h1><p className="ps">{(landlords as any[]).length} registered</p></div></div>
+      {msg&&<div className={`alert ${msg.startsWith('F')?'ae':'ag'}`} style={{marginBottom:12}}>{msg}</div>}
+      <div className="grid2" style={{gap:16,alignItems:'start'}}>
+        <div className="card" style={{padding:0}}>
+          <div style={{padding:'10px 12px',borderBottom:'1px solid var(--b0)'}}><input type="text" placeholder="Search landlords…" value={lSearch} onChange={e=>setLSearch(e.target.value)} style={{width:'100%',background:'var(--bg3)',border:'1px solid var(--b1)',borderRadius:7,color:'var(--t0)',padding:'7px 10px',fontSize:'.78rem',outline:'none'}}/></div>
+          {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}>Loading…</div>:(
+            <table className="tbl">
+              <thead><tr><th>Landlord</th><th>Business</th><th>Units</th><th>Bank</th><th>Onboarded</th></tr></thead>
+              <tbody>
+                {filteredLandlords.length?filteredLandlords.map((l:any)=>(
+                  <tr key={l.id} style={{cursor:'pointer',background:selected?.id===l.id?'rgba(201,162,39,.05)':''}} onClick={()=>setSelected(l)}>
+                    <td><div style={{fontWeight:600,color:'var(--t0)'}}>{l.first_name} {l.last_name}</div><div style={{fontSize:'.68rem',color:'var(--t3)'}}>{l.email}</div></td>
+                    <td style={{fontSize:'.78rem'}}>{l.business_name||'—'}</td>
+                    <td className="mono">{l.unit_count} <span style={{color:'var(--t3)'}}>({l.occupied_count} occ)</span></td>
+                    <td><span className={`badge ${l.stripe_bank_verified?'bg2':'br'}`}>{l.stripe_bank_verified?'✓':'Missing'}</span></td>
+                    <td><span className={`badge ${l.onboarding_complete?'bg2':'ba'}`}>{l.onboarding_complete?'Done':'Pending'}</span></td>
+                  </tr>
+                )):<tr><td colSpan={5} style={{textAlign:'center',color:'var(--t3)',padding:32}}>No landlords yet.</td></tr>}
+              </tbody>
+            </table>
+          )}
+        </div>
+        <div>
+          {!selected&&<div className="card" style={{textAlign:'center',padding:'48px 20px',color:'var(--t3)'}}>Select a landlord to view details</div>}
+          {selected&&detail&&(
+            <div className="card">
+              <div style={{marginBottom:16,paddingBottom:12,borderBottom:'1px solid var(--b0)'}}>
+                <div style={{fontFamily:'var(--font-d)',fontWeight:800,fontSize:'1.1rem',color:'var(--t0)'}}>{detail.landlord.first_name} {detail.landlord.last_name}</div>
+                <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:2}}>{detail.landlord.email}</div>
+                {detail.landlord.business_name&&<div style={{fontSize:'.72rem',color:'var(--t2)',marginTop:2}}>{detail.landlord.business_name}</div>}
+                {detail.landlord.phone&&<div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:2}}>{detail.landlord.phone}</div>}
+              </div>
+              <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:8,marginBottom:16}}>
+                <div style={{textAlign:'center',padding:'10px',background:'var(--bg3)',borderRadius:8}}>
+                  <div style={{fontFamily:'var(--font-d)',fontSize:'1.3rem',fontWeight:700,color:'var(--t0)'}}>{detail.counts.property_count}</div>
+                  <div style={{fontSize:'.65rem',color:'var(--t3)'}}>Properties</div>
+                </div>
+                <div style={{textAlign:'center',padding:'10px',background:'var(--bg3)',borderRadius:8}}>
+                  <div style={{fontFamily:'var(--font-d)',fontSize:'1.3rem',fontWeight:700,color:'var(--t0)'}}>{detail.counts.unit_count}</div>
+                  <div style={{fontSize:'.65rem',color:'var(--t3)'}}>Units</div>
+                </div>
+                <div style={{textAlign:'center',padding:'10px',background:'var(--bg3)',borderRadius:8}}>
+                  <div style={{fontFamily:'var(--font-d)',fontSize:'1.3rem',fontWeight:700,color:'var(--t0)'}}>{detail.counts.units_with_tenants}</div>
+                  <div style={{fontSize:'.65rem',color:'var(--t3)'}}>With Tenants</div>
+                </div>
+              </div>
+              <div className="ct">Onboarding Checklist</div>
+              {detail.checklist.map((item:any)=>(
+                <div key={item.key} style={{display:'flex',alignItems:'center',gap:10,padding:'7px 0',borderBottom:'1px solid var(--b0)'}}>
+                  <span>{item.done?'✅':'⬜'}</span>
+                  <span style={{fontSize:'.82rem',color:item.done?'var(--t0)':'var(--t2)',flex:1}}>{item.label}</span>
+                  {!item.done&&<span className="badge br">Incomplete</span>}
+                </div>
+              ))}
+              <div style={{marginTop:16,display:'flex',flexDirection:'column',gap:8}}>
+                <button className="btn bg-btn" disabled={!!resending} onClick={()=>resend('landlord_setup',selected.id)}>
+                  {resending==='landlord_setup'?'Sending…':'📧 Resend Setup Email'}
+                </button>
+                {!detail.landlord.stripe_bank_verified&&(
+                  <button className="btn bg-btn" disabled={!!resending} onClick={()=>resend('bank_verification',selected.id)}>
+                    {resending==='bank_verification'?'Sending…':'🏦 Resend Bank Verification'}
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
       </div>
     </div>
   )
@@ -289,34 +625,76 @@ function Landlords(){
 // ── UNITS ─────────────────────────────────────────────────────
 function Units(){
   const{user}=useAuth()
-  const{data:units=[],isLoading}=useQuery<any[]>('units',()=>get('/units'),{enabled:!!user})
-  const eviction=units.filter((u:any)=>u.payment_block)
-  const delinquent=units.filter((u:any)=>u.status==='delinquent')
+  const{data:units=[],isLoading}=useQuery<any[]>('units',()=>get('/units'),{enabled:!!user,refetchOnWindowFocus:false})
+  const[selected,setSelected]=React.useState<any>(null)
+  const[uSearch,setUSearch]=React.useState('')
+  const filteredUnits=React.useMemo(()=>{
+    const u=units as any[]
+    if(!uSearch)return u
+    const q=uSearch.toLowerCase()
+    return u.filter((u:any)=>`${u.unit_number} ${u.property_name} ${u.tenant_first||''} ${u.tenant_last||''} ${u.tenant_email||''}`.toLowerCase().includes(q))
+  },[units,uSearch])
+  const eviction=(units as any[]).filter((u:any)=>u.payment_block)
+  const delinquent=(units as any[]).filter((u:any)=>u.status==='delinquent')
   return(
     <div>
-      <div className="ph"><div><h1 className="pt">Units</h1><p className="ps">{units.length} total · {units.filter((u:any)=>u.status==='active').length} active</p></div></div>
+      <div className="ph"><div><h1 className="pt">Units</h1><p className="ps">{(units as any[]).length} total · {(units as any[]).filter((u:any)=>u.status==='active').length} active</p></div></div>
       {eviction.length>0&&<div className="alert ae">🚫 {eviction.length} unit(s) in Eviction Mode — ACH blocked</div>}
       {delinquent.length>0&&<div className="alert aw">⚡ {delinquent.length} delinquent unit(s) in cure window</div>}
-      <div className="card" style={{padding:0}}>
-        {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}>Loading…</div>:(
-          <table className="tbl">
-            <thead><tr><th>Unit</th><th>Property</th><th>Tenant</th><th>Rent</th><th>Status</th><th>OTP</th><th>Eviction</th><th>ACH</th></tr></thead>
-            <tbody>
-              {units.map((u:any)=>(
-                <tr key={u.id} style={{background:u.payment_block?'rgba(239,68,68,.03)':''}}>
-                  <td className="mono" style={{color:'var(--t0)',fontWeight:600}}>{u.unit_number}</td>
-                  <td style={{fontSize:'.75rem'}}>{u.property_name}</td>
-                  <td style={{fontSize:'.75rem'}}>{u.tenant_first?`${u.tenant_first} ${u.tenant_last}`:<span style={{color:'var(--t3)'}}>Vacant</span>}</td>
-                  <td className="mono">{formatCurrency(u.rent_amount)}</td>
-                  <td><span className={`badge ${u.status==='active'?'bg2':u.status==='delinquent'?'ba':u.status==='suspended'?'br':'bmu'}`}>{u.status.replace('_',' ')}</span></td>
-                  <td>{u.on_time_pay_active?<span className="badge bg2">Active</span>:<span style={{color:'var(--t3)'}}>—</span>}</td>
-                  <td>{u.payment_block?<span className="badge br">🚫 BLOCKED</span>:<span style={{color:'var(--t3)'}}>—</span>}</td>
-                  <td>{u.ach_verified?<span className="badge bg2">✓</span>:<span className="badge ba">Pending</span>}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
+      <div className="grid2" style={{gap:16,alignItems:'start'}}>
+        <div className="card" style={{padding:0}}>
+          <div style={{padding:'10px 12px',borderBottom:'1px solid var(--b0)'}}><input type="text" placeholder="Search units, properties, tenants…" value={uSearch} onChange={e=>setUSearch(e.target.value)} style={{width:'100%',background:'var(--bg3)',border:'1px solid var(--b1)',borderRadius:7,color:'var(--t0)',padding:'7px 10px',fontSize:'.78rem',outline:'none'}}/></div>
+          {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}>Loading…</div>:(
+            <table className="tbl">
+              <thead><tr><th>Unit</th><th>Property</th><th>Tenant</th><th>Rent</th><th>Status</th><th>ACH</th></tr></thead>
+              <tbody>
+                {filteredUnits.map((u:any)=>(
+                  <tr key={u.id} style={{cursor:'pointer',background:selected?.id===u.id?'rgba(201,162,39,.05)':u.payment_block?'rgba(239,68,68,.03)':''}} onClick={()=>setSelected(u)}>
+                    <td className="mono" style={{color:'var(--t0)',fontWeight:600}}>{u.unit_number}</td>
+                    <td style={{fontSize:'.75rem'}}>{u.property_name}</td>
+                    <td style={{fontSize:'.75rem'}}>{u.tenant_first?`${u.tenant_first} ${u.tenant_last}`:<span style={{color:'var(--t3)'}}>Vacant</span>}</td>
+                    <td className="mono">{formatCurrency(u.rent_amount)}</td>
+                    <td><span className={`badge ${u.status==='active'?'bg2':u.status==='delinquent'?'ba':u.status==='suspended'?'br':'bmu'}`}>{u.status.replace('_',' ')}</span></td>
+                    <td>{u.ach_verified?<span className="badge bg2">✓</span>:<span className="badge ba">Pending</span>}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+        <div>
+          {!selected&&<div className="card" style={{textAlign:'center',padding:'48px 20px',color:'var(--t3)'}}>Select a unit to view details</div>}
+          {selected&&(
+            <div className="card">
+              <div style={{marginBottom:16,paddingBottom:12,borderBottom:'1px solid var(--b0)'}}>
+                <div style={{fontFamily:'var(--font-d)',fontWeight:800,fontSize:'1.1rem',color:'var(--t0)'}}>Unit {selected.unit_number}</div>
+                <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:2}}>{selected.property_name}</div>
+                {selected.street1&&<div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:2}}>{selected.street1}, {selected.city}</div>}
+              </div>
+              <div className="ct">Unit Info</div>
+              <div className="dr"><span className="dk">Status</span><span className={`badge ${selected.status==='active'?'bg2':selected.status==='delinquent'?'ba':selected.status==='suspended'?'br':'bmu'}`}>{selected.status.replace('_',' ')}</span></div>
+              <div className="dr"><span className="dk">Rent</span><span className="dv mono">{formatCurrency(selected.rent_amount)}/mo</span></div>
+              <div className="dr"><span className="dk">Deposit</span><span className="dv mono">{formatCurrency(selected.security_deposit||0)}</span></div>
+              <div className="dr"><span className="dk">Bedrooms</span><span className="dv">{selected.bedrooms||'—'}</span></div>
+              <div className="dr"><span className="dk">Bathrooms</span><span className="dv">{selected.bathrooms||'—'}</span></div>
+              <div className="dr"><span className="dk">Sq Ft</span><span className="dv">{selected.sqft?.toLocaleString()||'—'}</span></div>
+              <div className="dr"><span className="dk">Listed</span><span className={`badge ${selected.listed_vacant?'bg2':'bmu'}`}>{selected.listed_vacant?'Yes':'No'}</span></div>
+              {selected.on_time_pay_active&&<div className="dr"><span className="dk">On-Time Pay</span><span className="badge bgold">Active</span></div>}
+              {selected.payment_block&&<div className="dr"><span className="dk">Eviction Mode</span><span className="badge br">🚫 BLOCKED</span></div>}
+              {selected.tenant_first&&<>
+                <div className="ct" style={{marginTop:16}}>Tenant</div>
+                <div className="dr"><span className="dk">Name</span><span className="dv">{selected.tenant_first} {selected.tenant_last}</span></div>
+                <div className="dr"><span className="dk">Email</span><span className="dv" style={{fontSize:'.75rem'}}>{selected.tenant_email||'—'}</span></div>
+                <div className="dr"><span className="dk">ACH</span><span className={`badge ${selected.ach_verified?'bg2':'ba'}`}>{selected.ach_verified?'Verified':'Pending'}</span></div>
+                {selected.ssi_ssdi&&<div className="dr"><span className="dk">SSI/SSDI</span><span className="badge bgold">Yes</span></div>}
+                {selected.late_payment_count>0&&<div className="dr"><span className="dk">Late Payments</span><span className="dv mono" style={{color:'var(--amber)'}}>{selected.late_payment_count}</span></div>}
+              </>}
+              {!selected.tenant_first&&(
+                <div style={{marginTop:12,padding:'12px',background:'var(--bg3)',borderRadius:8,fontSize:'.78rem',color:'var(--t3)',textAlign:'center'}}>Vacant — no tenant assigned</div>
+              )}
+            </div>
+          )}
+        </div>
       </div>
     </div>
   )
@@ -377,35 +755,59 @@ function NachaMonitor(){
   )
 }
 
-// ── PAYMENTS + DISBURSEMENTS + RESERVE (stubs) ────────────────
+// ── PAYMENTS ─────────────────────────────────────────────────────────────
 function Payments(){
   const{user}=useAuth()
   const{data:payments=[],isLoading}=useQuery<any[]>('payments',()=>get('/payments'),{enabled:!!user})
+  const[selected,setSelected]=React.useState<any>(null)
+  const[pSearch,setPSearch]=React.useState('')
+  const filteredPayments=React.useMemo(()=>pSearch?((payments as any[]).filter((p:any)=>`${p.property_name||''} ${p.unit_number||''} ${p.tenant_first||''} ${p.tenant_last||''} ${p.type} ${p.status}`.toLowerCase().includes(pSearch.toLowerCase()))):(payments as any[]),[payments,pSearch])
   const ST:Record<string,string>={settled:'bg2',pending:'ba',failed:'br',returned:'br',processing:'bb'}
   return(
     <div>
       <div className="ph"><div><h1 className="pt">Payments</h1><p className="ps">All ACH collections platform-wide</p></div></div>
       <div className="card" style={{padding:0}}>
+          <div style={{padding:'10px 12px',borderBottom:'1px solid var(--b0)'}}><input type="text" placeholder="Search payments…" value={pSearch} onChange={e=>setPSearch(e.target.value)} style={{width:'100%',background:'var(--bg3)',border:'1px solid var(--b1)',borderRadius:7,color:'var(--t0)',padding:'7px 10px',fontSize:'.78rem',outline:'none'}}/></div>
         {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}>Loading…</div>:(
           <table className="tbl">
-            <thead><tr><th>Due</th><th>Unit</th><th>Type</th><th>Amount</th><th>Status</th><th>Entry</th><th>Return</th><th>Zero-Tol</th></tr></thead>
+            <thead><tr><th>Due</th><th>Property · Unit</th><th>Tenant</th><th>Type</th><th>Amount</th><th>Status</th><th>Return</th></tr></thead>
             <tbody>
-              {payments.length?payments.map((p:any)=>(
-                <tr key={p.id} style={{background:p.zero_tolerance_flag?'rgba(239,68,68,.03)':''}}>
+              {filteredPayments.length?filteredPayments.map((p:any)=>(
+                <tr key={p.id} style={{cursor:'pointer',background:p.zero_tolerance_flag?'rgba(239,68,68,.03)':selected?.id===p.id?'rgba(201,162,39,.04)':''}} onClick={()=>setSelected(p)}>
                   <td className="mono" style={{fontSize:'.72rem'}}>{new Date(p.due_date).toLocaleDateString()}</td>
-                  <td className="mono">{p.unit_number||'—'}</td>
+                  <td style={{fontSize:'.75rem'}}><span style={{color:'var(--t3)'}}>{p.property_name||'—'}</span>{p.property_name&&' · '}<span className="mono">{p.unit_number||'—'}</span></td>
+                  <td style={{fontSize:'.75rem'}}>{p.tenant_first?`${p.tenant_first} ${p.tenant_last}`:<span style={{color:'var(--t3)'}}>—</span>}</td>
                   <td><span className="badge bmu">{p.type}</span></td>
                   <td className="mono" style={{color:'var(--t0)',fontWeight:600}}>{formatCurrency(p.amount)}</td>
                   <td><span className={`badge ${ST[p.status]||'bmu'}`}>{p.status}</span></td>
-                  <td className="mono" style={{fontSize:'.7rem',color:'var(--t3)'}}>{p.entry_description}</td>
                   <td>{p.return_code?<span className={`badge ${p.zero_tolerance_flag?'br':'ba'}`}>{p.return_code}</span>:<span style={{color:'var(--t3)'}}>—</span>}</td>
-                  <td>{p.zero_tolerance_flag?<span className="badge br">🚫</span>:<span style={{color:'var(--t3)'}}>—</span>}</td>
                 </tr>
-              )):<tr><td colSpan={8} style={{textAlign:'center',color:'var(--t3)',padding:32}}>No payments yet.</td></tr>}
+              )):<tr><td colSpan={7} style={{textAlign:'center',color:'var(--t3)',padding:32}}>{pSearch?'No payments match your search.':'No payments yet.'}</td></tr>}
             </tbody>
           </table>
         )}
       </div>
+      {selected&&(
+        <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,.7)',zIndex:200,display:'flex',alignItems:'center',justifyContent:'center',padding:20}} onClick={e=>{if(e.target===e.currentTarget)setSelected(null)}}>
+          <div style={{background:'var(--bg2)',border:'1px solid var(--b1)',borderRadius:12,padding:24,width:'100%',maxWidth:480}}>
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:20,paddingBottom:14,borderBottom:'1px solid var(--b0)'}}>
+              <span style={{fontFamily:'var(--font-d)',fontWeight:700,color:'var(--t0)',fontSize:'1.1rem'}}>Payment Detail</span>
+              <button onClick={()=>setSelected(null)} style={{background:'none',border:'none',color:'var(--t3)',fontSize:'1.2rem',cursor:'pointer'}}>✕</button>
+            </div>
+            <div className="dr"><span className="dk">Property</span><span className="dv">{selected.property_name||'—'}</span></div>
+            <div className="dr"><span className="dk">Unit</span><span className="dv mono">{selected.unit_number||'—'}</span></div>
+            <div className="dr"><span className="dk">Tenant</span><span className="dv">{selected.tenant_first?`${selected.tenant_first} ${selected.tenant_last}`:'—'}</span></div>
+            {selected.tenant_email&&<div className="dr"><span className="dk">Email</span><span className="dv" style={{fontSize:'.75rem'}}>{selected.tenant_email}</span></div>}
+            <div className="dr"><span className="dk">Type</span><span className="dv">{selected.type}</span></div>
+            <div className="dr"><span className="dk">Amount</span><span className="dv mono" style={{color:'var(--gold)',fontWeight:700}}>{formatCurrency(selected.amount)}</span></div>
+            <div className="dr"><span className="dk">Due Date</span><span className="dv mono">{new Date(selected.due_date).toLocaleDateString()}</span></div>
+            <div className="dr"><span className="dk">Status</span><span className={`badge ${ST[selected.status]||'bmu'}`}>{selected.status}</span></div>
+            {selected.entry_description&&<div className="dr"><span className="dk">Entry</span><span className="dv mono" style={{fontSize:'.72rem'}}>{selected.entry_description}</span></div>}
+            {selected.return_code&&<div className="dr"><span className="dk">Return Code</span><span className={`badge ${selected.zero_tolerance_flag?'br':'ba'}`}>{selected.return_code}</span></div>}
+            {selected.zero_tolerance_flag&&<div className="alert ae" style={{marginTop:12}}>🚫 Zero-tolerance return — ACH suspended</div>}
+          </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -413,16 +815,19 @@ function Payments(){
 function Disbursements(){
   const{user}=useAuth()
   const{data:disbs=[],isLoading}=useQuery<any[]>('disbs',()=>get('/disbursements'),{enabled:!!user})
+  const[dSearch,setDSearch]=React.useState('')
+  const filteredDisbs=React.useMemo(()=>dSearch?((disbs as any[]).filter((d:any)=>`${d.first_name||''} ${d.last_name||''} ${d.status}`.toLowerCase().includes(dSearch.toLowerCase()))):(disbs as any[]),[disbs,dSearch])
   return(
     <div>
       <div className="ph"><div><h1 className="pt">Disbursements</h1><p className="ps">On-Time Pay SLA — initiated on or before 1st business day</p></div></div>
       <div className="alert agold">⚡ <strong>On-Time Pay SLA:</strong> Platform initiates disbursements on the last business day before the 1st. Reserve funds the gap if tenant ACH hasn't settled.</div>
       <div className="card" style={{padding:0}}>
+        <div style={{padding:'10px 12px',borderBottom:'1px solid var(--b0)'}}><input type="text" placeholder="Search disbursements…" value={dSearch} onChange={e=>setDSearch(e.target.value)} style={{width:'100%',background:'var(--bg3)',border:'1px solid var(--b1)',borderRadius:7,color:'var(--t0)',padding:'7px 10px',fontSize:'.78rem',outline:'none'}}/></div>
         {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}>Loading…</div>:(
           <table className="tbl">
             <thead><tr><th>Landlord</th><th>Target Date</th><th>Amount</th><th>Units</th><th>Status</th><th>From Reserve</th><th>Settled</th></tr></thead>
             <tbody>
-              {disbs.length?disbs.map((d:any)=>(
+              {filteredDisbs.length?filteredDisbs.map((d:any)=>(
                 <tr key={d.id}>
                   <td style={{fontSize:'.75rem'}}>{d.first_name} {d.last_name}</td>
                   <td className="mono" style={{fontSize:'.75rem'}}>{new Date(d.target_date).toLocaleDateString()}</td>
@@ -458,7 +863,7 @@ function Reserve(){
           <div className="dr"><span className="dk">Coverage</span><span className={`badge ${pct>=100?'bg2':pct>=50?'ba':'br'}`}>{pct.toFixed(0)}%</span></div>
           <div className="dr"><span className="dk">Phase</span><span className={`badge ${phase===1?'ba':phase===2?'bb':'bg2'}`}>Phase {phase} — {(rate*100).toFixed(0)}% contribution rate</span></div>
           <div style={{marginTop:14,fontSize:'.78rem',color:'var(--t3)',lineHeight:1.5}}>
-            Reserve is operational working capital — NOT insurance reserves. Platform fulfills Disbursement SLA as service obligation per agent-of-payee structure (A.R.S. § 33-1314).<br/><strong style={{color:'var(--amber)'}}>Attorney review required before launch.</strong>
+            Reserve is operational working capital — NOT insurance reserves. Platform fulfills Disbursement SLA as service obligation per agent-of-payee structure.<br/><strong style={{color:'var(--amber)'}}>Attorney review required before launch.</strong>
           </div>
         </div>
         <div className="card">
@@ -477,34 +882,88 @@ function Reserve(){
 
 function Tenants(){
   const{user}=useAuth()
-  const{data:units=[],isLoading}=useQuery<any[]>('units',()=>get('/units'),{enabled:!!user})
-  const tenants=units.filter((u:any)=>u.tenant_first)
+  const{data:tenants=[],isLoading}=useQuery<any[]>('admin-tenants-page',()=>get('/admin/tenants'),{enabled:!!user,refetchOnWindowFocus:false})
+  const sortedTenants=React.useMemo(()=>[...(tenants as any[])].sort((a,b)=>{
+    const aInc=(!a.ach_verified||(!a.on_time_pay_enrolled&&!a.credit_reporting_enrolled&&!a.flex_deposit_enrolled&&!a.float_fee_active))?0:1
+    const bInc=(!b.ach_verified||(!b.on_time_pay_enrolled&&!b.credit_reporting_enrolled&&!b.flex_deposit_enrolled&&!b.float_fee_active))?0:1
+    return aInc-bInc
+  }),[tenants])
+  const[tSearch,setTSearch]=React.useState('')
+  const filteredTenants=React.useMemo(()=>tSearch?sortedTenants.filter((t:any)=>`${t.first_name} ${t.last_name} ${t.email} ${t.unit_number||''} ${t.property_name||""}`.toLowerCase().includes(tSearch.toLowerCase())):sortedTenants,[sortedTenants,tSearch])
+  const[selected,setSelected]=React.useState<any>(null)
+  const{data:detail}=useQuery(['tenant-detail',selected?.id],()=>get<any>('/admin/onboarding/tenant/'+selected.id),{enabled:!!selected?.id,staleTime:15000})
+  const[resending,setResending]=React.useState<string|null>(null)
+  const[msg,setMsg]=React.useState('')
+
+  const resend=async(type:string,id:string)=>{
+    setResending(type)
+    try{ await post('/admin/onboarding/resend',{type,targetId:id}); setMsg('Notification queued'); setTimeout(()=>setMsg(''),3000) }
+    catch(e:any){ setMsg('Failed: '+e.message) }
+    finally{ setResending(null) }
+  }
+
   return(
     <div>
-      <div className="ph"><div><h1 className="pt">Tenants</h1><p className="ps">{tenants.length} active</p></div></div>
-      <div className="card" style={{padding:0}}>
-        {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}>Loading…</div>:(
-          <table className="tbl">
-            <thead><tr><th>Tenant</th><th>Unit</th><th>ACH</th><th>OTP</th><th>SSI</th><th>Credit</th><th>Late Count</th></tr></thead>
-            <tbody>
-              {tenants.map((u:any)=>(
-                <tr key={u.id}>
-                  <td><div style={{fontWeight:600,color:'var(--t0)',fontSize:'.78rem'}}>{u.tenant_first} {u.tenant_last}</div><div style={{fontSize:'.65rem',color:'var(--t3)'}}>{u.tenant_email}</div></td>
-                  <td className="mono">{u.unit_number}</td>
-                  <td><span className={`badge ${u.ach_verified?'bg2':'ba'}`}>{u.ach_verified?'✓':'Pending'}</span></td>
-                  <td><span className={`badge ${u.on_time_pay_enrolled?'bgold':'bmu'}`}>{u.on_time_pay_enrolled?'Active':'—'}</span></td>
-                  <td>{u.ssi_ssdi?<span className="badge bgold">SSI/SSDI</span>:<span style={{color:'var(--t3)'}}>—</span>}</td>
-                  <td><span className={`badge ${u.credit_reporting_enrolled?'bg2':'bmu'}`}>{u.credit_reporting_enrolled?'Active':'—'}</span></td>
-                  <td className="mono" style={{color:u.late_payment_count>1?'var(--amber)':'var(--t3)'}}>{u.late_payment_count||0}</td>
-                </tr>
+      <div className="ph"><div><h1 className="pt">Tenants</h1><p className="ps">{(tenants as any[]).length} registered</p></div></div>
+      {msg&&<div className={`alert ${msg.startsWith('F')?'ae':'ag'}`} style={{marginBottom:12}}>{msg}</div>}
+      <div className="grid2" style={{gap:16,alignItems:'start'}}>
+        <div className="card" style={{padding:0}}>
+          <div style={{padding:'10px 12px',borderBottom:'1px solid var(--b0)'}}><input type="text" placeholder="Search tenants…" value={tSearch} onChange={e=>setTSearch(e.target.value)} style={{width:'100%',background:'var(--bg3)',border:'1px solid var(--b1)',borderRadius:7,color:'var(--t0)',padding:'7px 10px',fontSize:'.78rem',outline:'none'}}/></div>
+          {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}>Loading…</div>:(
+            <table className="tbl">
+              <thead><tr><th>Tenant</th><th>Unit</th><th>ACH</th><th>Flex</th><th>Late</th></tr></thead>
+              <tbody>
+                {filteredTenants.map((t:any)=>(
+                  <tr key={t.id} style={{cursor:'pointer',background:selected?.id===t.id?'rgba(201,162,39,.05)':''}} onClick={()=>setSelected(t)}>
+                    <td><div style={{fontWeight:600,color:'var(--t0)',fontSize:'.78rem'}}>{t.first_name} {t.last_name}</div><div style={{fontSize:'.65rem',color:'var(--t3)'}}>{t.email}</div></td>
+                    <td style={{fontSize:'.72rem'}}>{t.unit_number?<span><span style={{color:'var(--t3)'}}>{t.property_name}</span> · {t.unit_number}</span>:<span style={{color:'var(--t3)'}}>—</span>}</td>
+                    <td><span className={`badge ${t.ach_verified?'bg2':'br'}`}>{t.ach_verified?'✓':'No'}</span></td>
+                    <td><span className={`badge ${(t.on_time_pay_enrolled||t.credit_reporting_enrolled||t.flex_deposit_enrolled||t.float_fee_active)?'bg2':'bmu'}`}>{(t.on_time_pay_enrolled||t.credit_reporting_enrolled||t.flex_deposit_enrolled||t.float_fee_active)?'Active':'None'}</span></td>
+                    <td className="mono" style={{color:(t.late_payment_count||0)>1?'var(--amber)':'var(--t3)'}}>{t.late_payment_count||0}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+        <div>
+          {!selected&&<div className="card" style={{textAlign:'center',padding:'48px 20px',color:'var(--t3)'}}>Select a tenant to view details</div>}
+          {selected&&detail&&(
+            <div className="card">
+              <div style={{marginBottom:16,paddingBottom:12,borderBottom:'1px solid var(--b0)'}}>
+                <div style={{fontFamily:'var(--font-d)',fontWeight:800,fontSize:'1.1rem',color:'var(--t0)'}}>{detail.tenant.first_name} {detail.tenant.last_name}</div>
+                <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:2}}>{detail.tenant.email}</div>
+                {detail.tenant.phone&&<div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:2}}>{detail.tenant.phone}</div>}
+                {detail.tenant.unit_number&&<div style={{fontSize:'.72rem',color:'var(--t2)',marginTop:4}}>{detail.tenant.property_name} · Unit {detail.tenant.unit_number}</div>}
+                {detail.tenant.landlord_first&&<div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:2}}>Landlord: {detail.tenant.landlord_first} {detail.tenant.landlord_last}</div>}
+              </div>
+              <div className="ct">Onboarding Checklist</div>
+              {detail.checklist.map((item:any)=>(
+                <div key={item.key} style={{display:'flex',alignItems:'center',gap:10,padding:'7px 0',borderBottom:'1px solid var(--b0)'}}>
+                  <span>{item.done?'✅':'⬜'}</span>
+                  <span style={{fontSize:'.82rem',color:item.done?'var(--t0)':'var(--t2)',flex:1}}>{item.label}</span>
+                  {!item.done&&<span className="badge br">Incomplete</span>}
+                </div>
               ))}
-            </tbody>
-          </table>
-        )}
+              <div style={{marginTop:16,display:'flex',flexDirection:'column',gap:8}}>
+                <button className="btn bg-btn" disabled={!!resending} onClick={()=>resend('tenant_invite',selected.id)}>
+                  {resending==='tenant_invite'?'Sending…':'📧 Resend Invite'}
+                </button>
+                {!detail.tenant.ach_verified&&(
+                  <button className="btn bg-btn" disabled={!!resending} onClick={()=>resend('ach_enrollment',selected.id)}>
+                    {resending==='ach_enrollment'?'Sending…':'🏦 Resend ACH Enrollment'}
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
       </div>
     </div>
   )
 }
+
+
 
 function Maintenance(){
   const{user}=useAuth()
@@ -547,14 +1006,17 @@ function BulletinBoard(){
   const[revealedIds,setRevealedIds]=React.useState<Record<string,any>>({})
   const[revealLoading,setRevealLoading]=React.useState<string|null>(null)
   const[filterTab,setFilterTab]=React.useState<'all'|'flagged'|'pinned'>('all')
+  const[bSearch,setBSearch]=React.useState('')
+  const[bDate,setBDate]=React.useState(new Date().toISOString().split('T')[0])
 
-  const{data:posts=[],isLoading,refetch}=useQuery<any[]>('bulletin-admin',()=>get('/admin/bulletin'),{enabled:!!user})
+  const{data:posts=[],isLoading,refetch}=useQuery<any[]>(['bulletin-admin',bDate],()=>get('/admin/bulletin?date='+bDate),{enabled:!!user,staleTime:15000})
 
+  const searched = bSearch?(posts as any[]).filter((p:any)=>`${p.content} ${p.alias}`.toLowerCase().includes(bSearch.toLowerCase())):(posts as any[])
   const filtered = filterTab==='flagged'
-    ? (posts as any[]).filter((p:any)=>p.flag_count>0)
+    ? searched.filter((p:any)=>p.flag_count>0)
     : filterTab==='pinned'
-      ? (posts as any[]).filter((p:any)=>p.pinned)
-      : posts as any[]
+      ? searched.filter((p:any)=>p.pinned)
+      : searched
 
   const revealIdentity=async(postId:string)=>{
     if(!isSuperAdmin)return
@@ -586,9 +1048,14 @@ function BulletinBoard(){
       </div>
 
       {isSuperAdmin&&<div className="alert agold" style={{marginBottom:16}}>⚠ Identity reveals are logged and auditable. Only reveal for legitimate moderation purposes.</div>}
+      <div style={{display:'flex',gap:10,marginBottom:16,alignItems:'center'}}>
+        <input type="date" value={bDate} onChange={e=>setBDate(e.target.value)} style={{background:'var(--bg2)',border:'1px solid var(--b1)',borderRadius:7,color:'var(--t0)',padding:'7px 10px',fontSize:'.78rem',outline:'none'}}/>
+        <input type="text" placeholder="Search posts…" value={bSearch} onChange={e=>setBSearch(e.target.value)} style={{flex:1,background:'var(--bg2)',border:'1px solid var(--b1)',borderRadius:7,color:'var(--t0)',padding:'7px 10px',fontSize:'.78rem',outline:'none'}}/>
+        <button className="btn bg bsm" onClick={()=>setBDate(new Date().toISOString().split('T')[0])}>Today</button>
+      </div>
 
       <div className="tabs" style={{marginBottom:20}}>
-        <button className={"tab "+(filterTab==='all'?'on':'')} onClick={()=>setFilterTab('all')}>All Posts ({(posts as any[]).length})</button>
+        <button className={"tab "+(filterTab==='all'?'on':'')} onClick={()=>setFilterTab('all')}>All Posts ({searched.length})</button>
         <button className={"tab "+(filterTab==='flagged'?'on':'')} onClick={()=>setFilterTab('flagged')} style={{color:(posts as any[]).filter((p:any)=>p.flag_count>0).length>0?'var(--red)':undefined}}>
           Flagged ({(posts as any[]).filter((p:any)=>p.flag_count>0).length})
         </button>
@@ -655,11 +1122,11 @@ function BulletinBoard(){
 
 // ── LOGIN ─────────────────────────────────────────────────────
 function LoginPage(){
+  const{login}=useAuth();const navigate=useNavigate()
   React.useEffect(()=>{
     localStorage.removeItem('gam_admin_token')
     delete api.defaults.headers.common['Authorization']
   },[])
-  const{login}=useAuth();const navigate=useNavigate()
   const[email,setEmail]=useState('');const[pw,setPw]=useState('');const[err,setErr]=useState('');const[loading,setLoading]=useState(false)
   const onSubmit=async(e:React.FormEvent)=>{
     e.preventDefault();setLoading(true);setErr('')
@@ -689,6 +1156,20 @@ function LoginPage(){
   )
 }
 
+
+// ── SUPER ADMIN GUARD ─────────────────────────────────────────────────
+function SuperAdminGuard({children}:{children:React.ReactNode}){
+  const{user}=useAuth()
+  if(user?.role!=='super_admin')return(
+    <div style={{padding:48,textAlign:'center'}}>
+      <div style={{fontSize:'2rem',marginBottom:12}}>🔒</div>
+      <h2 style={{color:'var(--t0)',marginBottom:8}}>Super Admin Only</h2>
+      <p style={{color:'var(--t3)',fontSize:'.85rem'}}>This section requires super_admin access.</p>
+    </div>
+  )
+  return<>{children}</>
+}
+
 // ── APP ───────────────────────────────────────────────────────
 function App(){
   const{token,user,loading}=useAuth()
@@ -699,19 +1180,113 @@ function App(){
         <Route path="/login" element={user?<Navigate to="/overview" replace/>:<LoginPage/>}/>
         <Route path="/" element={(user&&(user.role==='admin'||user.role==='super_admin'))?<Layout/>:<Navigate to="/login" replace/>}>
           <Route index element={<Navigate to="/overview" replace/>}/>
-          <Route path="overview"      element={<Overview/>}/>
+          <Route path="overview"      element={user?.role==='super_admin'?<Overview/>:<AdminOnboardingOverview/>}/>
+          <Route path="onboarding"    element={<AdminOnboardingOverview/>}/>
           <Route path="landlords"     element={<Landlords/>}/>
           <Route path="tenants"       element={<Tenants/>}/>
+          <Route path="property-reviews" element={<PropertyReviews/>}/>
           <Route path="units"         element={<Units/>}/>
           <Route path="payments"      element={<Payments/>}/>
           <Route path="disbursements" element={<Disbursements/>}/>
-          <Route path="reserve"       element={<Reserve/>}/>
-          <Route path="nacha"         element={<NachaMonitor/>}/>
+          <Route path="reserve"       element={<SuperAdminGuard><Reserve/></SuperAdminGuard>}/>
+          <Route path="nacha"         element={<SuperAdminGuard><NachaMonitor/></SuperAdminGuard>}/>
           <Route path="maintenance"   element={<Maintenance/>}/>
-          <Route path="bulletin"      element={<BulletinBoard/>}/>
+          <Route path="bulletin"      element={<SuperAdminGuard><BulletinBoard/></SuperAdminGuard>}/>
         </Route>
       </Routes>
     </BrowserRouter>
+  )
+}
+
+function PropertyReviews(){
+  const[status,setStatus]=React.useState<'pending'|'resolved'>('pending')
+  const[selected,setSelected]=React.useState<any>(null)
+  const[resolution,setResolution]=React.useState<'approved_separate'|'merged'|'rejected'>('approved_separate')
+  const[notes,setNotes]=React.useState('')
+  const qcLocal=useQueryClient()
+  const{data:flags=[],isLoading}=useQuery(['property-flags',status],()=>get<any[]>(`/admin/property-flags?status=${status}`))
+  const resolveMut=useMutation(
+    (body:{id:string;resolution:string;notes:string})=>api.post(`/admin/property-flags/${body.id}/resolve`,{resolution:body.resolution,notes:body.notes}),
+    {onSuccess:()=>{qcLocal.invalidateQueries('property-flags');setSelected(null);setNotes('')}}
+  )
+  const fmtDate=(d:string)=>new Date(d).toLocaleString()
+  const fmtAddr=(p:any,pre:string)=>`${p[pre+'street1']}${p[pre+'street2']?' '+p[pre+'street2']:''}, ${p[pre+'city']}, ${p[pre+'state']} ${p[pre+'zip']}`
+  const fmtLL=(p:any,pre:string)=>`${p[pre+'landlord_first']} ${p[pre+'landlord_last']}${p[pre+'landlord_business']?' — '+p[pre+'landlord_business']:''}`
+  return(
+    <div>
+      <div className="ph"><div><h1 className="pt">Property Reviews</h1><p className="ps">Flagged duplicate addresses awaiting review</p></div></div>
+      <div className="tabs">
+        <button className={`tab ${status==='pending'?'on':''}`} onClick={()=>{setStatus('pending');setSelected(null)}}>🕒 Pending ({status==='pending'?(flags as any[]).length:'…'})</button>
+        <button className={`tab ${status==='resolved'?'on':''}`} onClick={()=>{setStatus('resolved');setSelected(null)}}>✅ Resolved</button>
+      </div>
+      <div style={{display:'grid',gridTemplateColumns:selected?'1fr 1.4fr':'1fr',gap:16}}>
+        <div className="card">
+          {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}>Loading…</div>:
+            (flags as any[]).length===0?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}>No {status} flags.</div>:
+            <table className="tbl">
+              <thead><tr><th>Detected</th><th>New Property</th><th>Conflicts With</th><th>Status</th></tr></thead>
+              <tbody>
+                {(flags as any[]).map((f:any)=>(
+                  <tr key={f.id} onClick={()=>setSelected(f)} style={{cursor:'pointer',background:selected?.id===f.id?'var(--b1)':undefined}}>
+                    <td style={{fontSize:'.72rem',color:'var(--t3)'}}>{fmtDate(f.detected_at)}</td>
+                    <td><div style={{fontWeight:600}}>{f.new_name}</div><div style={{fontSize:'.7rem',color:'var(--t3)'}}>{f.new_street1}, {f.new_city}</div></td>
+                    <td><div style={{fontWeight:600}}>{f.orig_name}</div><div style={{fontSize:'.7rem',color:'var(--t3)'}}>{f.orig_landlord_first} {f.orig_landlord_last}</div></td>
+                    <td><span style={{fontSize:'.7rem',padding:'2px 8px',borderRadius:4,background:f.resolved_at?'var(--b1)':'var(--gold)',color:f.resolved_at?'var(--t3)':'#000'}}>{f.resolved_at?f.resolution:'pending'}</span></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>}
+        </div>
+        {selected&&(
+          <div className="card" style={{padding:20}}>
+            <h3 style={{margin:'0 0 16px 0',fontSize:'.95rem'}}>Side-by-side comparison</h3>
+            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:16,marginBottom:20}}>
+              <div style={{border:'1px solid var(--gold)',borderRadius:8,padding:14}}>
+                <div style={{fontSize:'.7rem',color:'var(--gold)',fontWeight:700,marginBottom:8}}>NEW SUBMISSION</div>
+                <div style={{fontWeight:600,marginBottom:4}}>{selected.new_name}</div>
+                <div style={{fontSize:'.75rem',marginBottom:8}}>{fmtAddr(selected,'new_')}</div>
+                <div style={{fontSize:'.7rem',color:'var(--t3)',marginBottom:4}}>Landlord</div>
+                <div style={{fontSize:'.78rem',marginBottom:4}}>{fmtLL(selected,'new_')}</div>
+                <div style={{fontSize:'.7rem',color:'var(--t3)'}}>{selected.new_landlord_email}</div>
+                <div style={{fontSize:'.7rem',color:'var(--t3)',marginTop:8}}>Created {fmtDate(selected.new_created_at)}</div>
+              </div>
+              <div style={{border:'1px solid var(--b1)',borderRadius:8,padding:14}}>
+                <div style={{fontSize:'.7rem',color:'var(--t3)',fontWeight:700,marginBottom:8}}>EXISTING PROPERTY</div>
+                <div style={{fontWeight:600,marginBottom:4}}>{selected.orig_name}</div>
+                <div style={{fontSize:'.75rem',marginBottom:8}}>{fmtAddr(selected,'orig_')}</div>
+                <div style={{fontSize:'.7rem',color:'var(--t3)',marginBottom:4}}>Landlord</div>
+                <div style={{fontSize:'.78rem',marginBottom:4}}>{fmtLL(selected,'orig_')}</div>
+                <div style={{fontSize:'.7rem',color:'var(--t3)'}}>{selected.orig_landlord_email}</div>
+                <div style={{fontSize:'.7rem',color:'var(--t3)',marginTop:8}}>Created {fmtDate(selected.orig_created_at)}</div>
+              </div>
+            </div>
+            {!selected.resolved_at?<>
+              <div style={{marginBottom:12}}>
+                <label style={{fontSize:'.72rem',fontWeight:600,color:'var(--t3)',display:'block',marginBottom:6}}>RESOLUTION</label>
+                <select value={resolution} onChange={e=>setResolution(e.target.value as any)} className="input" style={{width:'100%'}}>
+                  <option value="approved_separate">Approved — legitimate separate listings (both active)</option>
+                  <option value="merged">Merged — handled manually, close flag (both active)</option>
+                  <option value="rejected">Rejected — block new submission</option>
+                </select>
+              </div>
+              <div style={{marginBottom:12}}>
+                <label style={{fontSize:'.72rem',fontWeight:600,color:'var(--t3)',display:'block',marginBottom:6}}>NOTES (OPTIONAL)</label>
+                <textarea value={notes} onChange={e=>setNotes(e.target.value)} className="input" style={{width:'100%',minHeight:80,resize:'vertical'}} placeholder="Context for audit trail…"/>
+              </div>
+              <button className="btn b-gold" style={{width:'100%'}} disabled={resolveMut.isLoading} onClick={()=>resolveMut.mutate({id:selected.id,resolution,notes})}>
+                {resolveMut.isLoading?'Saving…':'Submit Resolution'}
+              </button>
+            </>:<>
+              <div style={{padding:14,background:'var(--b1)',borderRadius:8}}>
+                <div style={{fontSize:'.7rem',color:'var(--t3)',marginBottom:4}}>Resolved {fmtDate(selected.resolved_at)}</div>
+                <div style={{fontSize:'.85rem',fontWeight:600,marginBottom:6}}>{selected.resolution}</div>
+                {selected.notes&&<div style={{fontSize:'.78rem',color:'var(--t1)'}}>{selected.notes}</div>}
+              </div>
+            </>}
+          </div>
+        )}
+      </div>
+    </div>
   )
 }
 

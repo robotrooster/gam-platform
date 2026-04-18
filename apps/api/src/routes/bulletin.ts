@@ -1,6 +1,7 @@
 import { Router } from 'express'
 import { query, queryOne } from '../db'
-import { requireAuth, requireTenant } from '../middleware/auth'
+import { requireAuth, requireTenant, requireLandlord } from '../middleware/auth'
+import { db } from '../db'
 import { AppError } from '../middleware/errorHandler'
 
 export const bulletinRouter = Router()
@@ -16,10 +17,18 @@ function randomAlias(): string {
 // ── Helper: get tenant location info ─────────────────────────
 async function getTenantLocation(userId: string) {
   return queryOne<any>(`
-    SELECT t.id, u.property_id, p.city, p.state
+    SELECT t.id, un.property_id, p.city, p.state
     FROM tenants t
-    JOIN units u ON u.tenant_id = t.id
-    JOIN properties p ON p.id = u.property_id
+    JOIN LATERAL (
+      SELECT u.id, u.property_id
+      FROM v_lease_active_tenants vlat
+      JOIN leases l ON l.id = vlat.lease_id AND l.status = 'active'
+      JOIN units u ON u.id = l.unit_id
+      WHERE vlat.tenant_id = t.id
+      ORDER BY (vlat.role = 'primary') DESC
+      LIMIT 1
+    ) un ON TRUE
+    JOIN properties p ON p.id = un.property_id
     WHERE t.user_id = $1`, [userId])
 }
 
@@ -194,7 +203,15 @@ bulletinRouter.get('/:id/reveal', async (req, res, next) => {
        FROM bulletin_posts bp
        JOIN tenants t  ON t.id  = bp.tenant_id
        JOIN users u    ON u.id  = t.user_id
-       JOIN units un   ON un.tenant_id = t.id
+       LEFT JOIN LATERAL (
+         SELECT u2.id, u2.unit_number
+         FROM v_lease_active_tenants vlat
+         JOIN leases l ON l.id = vlat.lease_id AND l.status = 'active'
+         JOIN units u2 ON u2.id = l.unit_id
+         WHERE vlat.tenant_id = t.id
+         ORDER BY (vlat.role = 'primary') DESC
+         LIMIT 1
+       ) un ON TRUE
        JOIN properties p ON p.id = bp.property_id
        WHERE bp.id = $1`, [req.params.id]
     )
@@ -202,4 +219,38 @@ bulletinRouter.get('/:id/reveal', async (req, res, next) => {
 
     res.json({ success: true, data: post })
   } catch(e) { next(e) }
+})
+
+// ── GET /api/bulletin/landlord — read-only view for landlords ──
+bulletinRouter.get('/landlord', requireLandlord, async (req, res, next) => {
+  try {
+    const { date, search } = req.query
+    const landlordId = req.user!.profileId
+
+    // Get all property_ids for this landlord
+    const { rows: properties } = await db.query(
+      'SELECT id FROM properties WHERE landlord_id=$1', [landlordId]
+    )
+    if (!properties.length) return res.json({ success: true, data: [] })
+
+    const propertyIds = properties.map((p: any) => p.id)
+    const placeholders = propertyIds.map((_: any, i: number) => `$${i + 1}`).join(',')
+
+    const dateFilter = date ? `AND DATE(created_at) = '${date}'` : `AND DATE(created_at) = CURRENT_DATE`
+    const searchFilter = search ? `AND content ILIKE '%' || '${(search as string).replace(/'/g,"''")}' || '%'` : ''
+
+    const { rows: posts } = await db.query(
+      `SELECT id, scope, alias, content, upvote_count, flag_count, total_votes, pinned, created_at, property_id, city, state
+       FROM bulletin_posts
+       WHERE property_id IN (${placeholders})
+         AND (is_removed IS NULL OR is_removed = FALSE)
+         ${dateFilter}
+         ${searchFilter}
+       ORDER BY pinned DESC, created_at DESC
+       LIMIT 500`,
+      propertyIds
+    )
+
+    res.json({ success: true, data: posts })
+  } catch (e) { next(e) }
 })

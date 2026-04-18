@@ -44,6 +44,6 @@ export function requireRole(...roles: UserRole[]) {
   }
 }
 
-export const requireAdmin    = requireRole(UserRole.ADMIN)
-export const requireLandlord = requireRole(UserRole.ADMIN, UserRole.LANDLORD)
-export const requireTenant   = requireRole(UserRole.ADMIN, UserRole.TENANT)
+export const requireAdmin    = requireRole(UserRole.ADMIN, UserRole.SUPER_ADMIN)
+export const requireLandlord = requireRole(UserRole.ADMIN, UserRole.SUPER_ADMIN, UserRole.LANDLORD)
+export const requireTenant   = requireRole(UserRole.ADMIN, UserRole.SUPER_ADMIN, UserRole.TENANT)

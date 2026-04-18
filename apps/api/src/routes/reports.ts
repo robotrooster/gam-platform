@@ -36,21 +36,23 @@ reportsRouter.get('/monthly-statement', async (req, res, next) => {
     // Properties with units
     const properties = await query<any>(`
       SELECT p.*, COUNT(u.id) as total_units,
-        COUNT(u.id) FILTER (WHERE u.tenant_id IS NOT NULL) as occupied_units
+        COUNT(u.id) FILTER (WHERE vuo.is_occupied) as occupied_units
       FROM properties p
       LEFT JOIN units u ON u.property_id = p.id
+      LEFT JOIN v_unit_occupancy vuo ON vuo.unit_id = u.id
       WHERE p.landlord_id = $1
       GROUP BY p.id ORDER BY p.name`, [landlordId])
 
     // Unit detail for the month
     const units = await query<any>(`
       SELECT u.*, p.name as property_name,
-        us.first_name as tenant_first, us.last_name as tenant_last,
-        us.email as tenant_email
+        vuo.primary_first_name as tenant_first,
+        vuo.primary_last_name as tenant_last,
+        vuo.primary_email as tenant_email,
+        vuo.is_occupied
       FROM units u
       JOIN properties p ON p.id = u.property_id
-      LEFT JOIN tenants t ON t.id = u.tenant_id
-      LEFT JOIN users us ON us.id = t.user_id
+      LEFT JOIN v_unit_occupancy vuo ON vuo.unit_id = u.id
       WHERE u.landlord_id = $1
       ORDER BY p.name, u.unit_number`, [landlordId])
 
@@ -106,10 +108,10 @@ reportsRouter.get('/monthly-statement', async (req, res, next) => {
     let pmFee = 0
     if (pmPlan) {
       if (pmPlan.fee_type === 'percent') pmFee = totalCollected * (parseFloat(pmPlan.percent_rate) / 100)
-      else if (pmPlan.fee_type === 'flat') pmFee = units.filter((u:any) => u.tenant_id).length * parseFloat(pmPlan.flat_amount)
+      else if (pmPlan.fee_type === 'flat') pmFee = units.filter((u:any) => u.is_occupied).length * parseFloat(pmPlan.flat_amount)
       else if (pmPlan.fee_type === 'hybrid') {
         pmFee = (totalCollected * (parseFloat(pmPlan.percent_rate) / 100))
-              + (units.filter((u:any) => u.tenant_id).length * parseFloat(pmPlan.flat_amount))
+              + (units.filter((u:any) => u.is_occupied).length * parseFloat(pmPlan.flat_amount))
       }
     }
 
@@ -124,8 +126,8 @@ reportsRouter.get('/monthly-statement', async (req, res, next) => {
         summary: {
           totalCollected, totalPlatformFees, totalMaintCost,
           totalMaintFees, pmFee, netToOwner,
-          occupiedUnits:  units.filter((u:any) => u.tenant_id).length,
-          vacantUnits:    units.filter((u:any) => !u.tenant_id).length,
+          occupiedUnits:  units.filter((u:any) => u.is_occupied).length,
+          vacantUnits:    units.filter((u:any) => !u.is_occupied).length,
           settledPayments: payments.filter((p:any) => p.status === 'settled').length,
           latePayments:    payments.filter((p:any) => p.status === 'late').length,
           failedPayments:  payments.filter((p:any) => p.status === 'failed').length,
@@ -190,7 +192,9 @@ reportsRouter.get('/tax-summary', async (req, res, next) => {
     // Security deposits held
     const depositStats = await queryOne<any>(`
       SELECT COALESCE(SUM(security_deposit), 0) as total_deposits
-      FROM units WHERE landlord_id=$1 AND tenant_id IS NOT NULL`, [landlordId])
+      FROM units WHERE landlord_id=$1 AND id IN (
+        SELECT unit_id FROM v_unit_occupancy WHERE is_occupied
+      )`, [landlordId])
 
     // Monthly breakdown
     const monthlyBreakdown = await query<any>(`
@@ -246,12 +250,13 @@ reportsRouter.get('/property-pl', async (req, res, next) => {
     const properties = await query<any>(`
       SELECT p.*,
         COUNT(DISTINCT u.id) as total_units,
-        COUNT(DISTINCT u.id) FILTER (WHERE u.tenant_id IS NOT NULL) as occupied_units,
+        COUNT(DISTINCT u.id) FILTER (WHERE vuo.is_occupied) as occupied_units,
         COALESCE(SUM(pm.amount) FILTER (WHERE pm.status='settled' AND pm.due_date >= $2 AND pm.due_date <= $3), 0) as rent_collected,
         COALESCE(SUM(mr.actual_cost) FILTER (WHERE mr.completed_at >= $2 AND mr.completed_at <= $3), 0) as maint_cost,
         COALESCE(SUM(mr.platform_fee) FILTER (WHERE mr.completed_at >= $2 AND mr.completed_at <= $3), 0) as maint_fees
       FROM properties p
       LEFT JOIN units u ON u.property_id = p.id
+      LEFT JOIN v_unit_occupancy vuo ON vuo.unit_id = u.id
       LEFT JOIN payments pm ON pm.unit_id = u.id
       LEFT JOIN maintenance_requests mr ON mr.unit_id = u.id
       WHERE p.landlord_id = $1
@@ -296,10 +301,11 @@ reportsRouter.get('/pm-client', async (req, res, next) => {
     const properties = await query<any>(`
       SELECT p.*,
         COUNT(DISTINCT u.id) as total_units,
-        COUNT(DISTINCT u.id) FILTER (WHERE u.tenant_id IS NOT NULL) as occupied,
+        COUNT(DISTINCT u.id) FILTER (WHERE vuo.is_occupied) as occupied,
         COALESCE(SUM(pm.amount) FILTER (WHERE pm.status='settled'), 0) as rent_collected
       FROM properties p
       LEFT JOIN units u ON u.property_id = p.id
+      LEFT JOIN v_unit_occupancy vuo ON vuo.unit_id = u.id
       LEFT JOIN payments pm ON pm.unit_id = u.id AND pm.due_date >= $2 AND pm.due_date <= $3
       WHERE p.landlord_id = $1
       GROUP BY p.id ORDER BY p.name`, [landlordId, start, end])

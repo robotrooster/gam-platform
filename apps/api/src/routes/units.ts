@@ -4,6 +4,7 @@ import { query, queryOne } from '../db'
 import { requireAuth, requireLandlord } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { UnitStatus, calcNetPerUnit, getReservePhase, PLATFORM_FEES } from '@gam/shared'
+import { formatUnitNumber } from '../lib/format'
 
 export const unitsRouter = Router()
 unitsRouter.use(requireAuth)
@@ -11,19 +12,21 @@ unitsRouter.use(requireAuth)
 // GET /api/units  — landlord sees their units, admin sees all
 unitsRouter.get('/', async (req, res, next) => {
   try {
-    const landlordFilter = req.user!.role !== 'admin'
-      ? `AND u.landlord_id = '${req.user!.profileId}'` : ''
+    const isAdmin = req.user!.role === 'admin' || req.user!.role === 'super_admin'
+    const landlordFilter = isAdmin
+      ? '' : `AND u.landlord_id = '${req.user!.profileId}'`
     const propertyFilter = req.query.propertyId ? `AND u.property_id = '${req.query.propertyId}'` : ''
     const units = await query<any>(`
       SELECT u.*,
         p.name AS property_name, p.street1, p.city, p.state, p.zip,
-        t.id AS tenant_id,
-        us.first_name AS tenant_first, us.last_name AS tenant_last, us.email AS tenant_email
+        vuo.primary_tenant_id AS tenant_id,
+        vuo.primary_first_name AS tenant_first,
+        vuo.primary_last_name AS tenant_last,
+        vuo.primary_email AS tenant_email,
+        vuo.tenant_count
       FROM units u
       JOIN properties p ON p.id = u.property_id
-      LEFT JOIN tenants te ON te.id = u.tenant_id
-      LEFT JOIN users us ON us.id = te.user_id
-      LEFT JOIN tenants t ON t.id = u.tenant_id
+      LEFT JOIN v_unit_occupancy vuo ON vuo.unit_id = u.id
       WHERE 1=1 ${landlordFilter} ${propertyFilter}
       ORDER BY p.name, u.unit_number
     `)
@@ -39,16 +42,21 @@ unitsRouter.get('/:id', async (req, res, next) => {
         p.street1, p.city, p.state, p.zip,
         ul.first_name AS landlord_first, ul.last_name AS landlord_last,
         te.ssi_ssdi, te.on_time_pay_enrolled, te.ach_verified,
-        tu.first_name AS tenant_first, tu.last_name AS tenant_last, tu.email AS tenant_email, tu.phone AS tenant_phone
+        vuo.primary_first_name AS tenant_first,
+        vuo.primary_last_name AS tenant_last,
+        vuo.primary_email AS tenant_email,
+        vuo.primary_phone AS tenant_phone,
+        vuo.primary_tenant_id AS tenant_id,
+        vuo.tenant_count
       FROM units u
       JOIN properties p ON p.id = u.property_id
       JOIN landlords l ON l.id = u.landlord_id
       JOIN users ul ON ul.id = l.user_id
-      LEFT JOIN tenants te ON te.id = u.tenant_id
-      LEFT JOIN users tu ON tu.id = te.user_id
+      LEFT JOIN v_unit_occupancy vuo ON vuo.unit_id = u.id
+      LEFT JOIN tenants te ON te.id = vuo.primary_tenant_id
       WHERE u.id = $1`, [req.params.id])
     if (!unit) throw new AppError(404, 'Unit not found')
-    if (req.user!.role !== 'admin' && unit.landlord_id !== req.user!.profileId) {
+    if (req.user!.role !== 'admin' && req.user!.role !== 'super_admin' && unit.landlord_id !== req.user!.profileId) {
       throw new AppError(403, 'Forbidden')
     }
     res.json({ success: true, data: unit })
@@ -79,7 +87,7 @@ unitsRouter.post('/', requireLandlord, async (req, res, next) => {
       INSERT INTO units (property_id, landlord_id, unit_number, bedrooms, bathrooms, sqft, rent_amount, security_deposit)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
       RETURNING *`,
-      [body.propertyId, req.user!.profileId, body.unitNumber, body.bedrooms,
+      [body.propertyId, req.user!.profileId, formatUnitNumber(body.unitNumber), body.bedrooms,
        body.bathrooms, body.sqft ?? null, body.rentAmount, body.securityDeposit]
     )
     res.status(201).json({ success: true, data: unit })
@@ -95,7 +103,7 @@ unitsRouter.patch('/:id/status', requireLandlord, async (req, res, next) => {
 
     const unit = await queryOne<any>(`SELECT * FROM units WHERE id = $1`, [req.params.id])
     if (!unit) throw new AppError(404, 'Unit not found')
-    if (unit.landlord_id !== req.user!.profileId && req.user!.role !== 'admin') {
+    if (unit.landlord_id !== req.user!.profileId && req.user!.role !== 'admin' && req.user!.role !== 'super_admin') {
       throw new AppError(403, 'Forbidden')
     }
     const [updated] = await query<any>(
@@ -106,7 +114,7 @@ unitsRouter.patch('/:id/status', requireLandlord, async (req, res, next) => {
 })
 
 // POST /api/units/:id/eviction-mode — Eviction mode — HARD BLOCK all tenant ACH
-// Legal basis: ARS 33-1371(A) — accepting any rent waives eviction right
+// Hard-blocks tenant ACH while eviction is active. Landlord is responsible for knowing their local eviction rules.
 unitsRouter.post('/:id/eviction-mode', requireLandlord, async (req, res, next) => {
   try {
     const { enable, confirm } = z.object({
@@ -133,7 +141,7 @@ unitsRouter.post('/:id/eviction-mode', requireLandlord, async (req, res, next) =
       success: true,
       data: updated,
       message: enable
-        ? '⚠️ EVICTION MODE ACTIVE — All tenant ACH hard blocked per ARS 33-1371'
+        ? '⚠️ EVICTION MODE ACTIVE — All tenant ACH hard blocked. Check your local laws before accepting any payment.'
         : 'Eviction mode deactivated — ACH collections resumed'
     })
   } catch (e) { next(e) }
@@ -311,12 +319,11 @@ unitsRouter.get('/schedule/master', requireLandlord, async (req, res, next) => {
         u.nightly_rate, u.weekly_rate, u.is_bookable, u.lease_types_allowed,
         u.check_in_time, u.check_out_time, u.amenities, u.unit_description,
         p.name as property_name,
-        usr.first_name as tenant_first, usr.last_name as tenant_last
+        vuo.primary_first_name as tenant_first,
+        vuo.primary_last_name as tenant_last
       FROM units u
       JOIN properties p ON p.id = u.property_id
-      LEFT JOIN leases l ON l.unit_id = u.id AND l.status = 'active'
-      LEFT JOIN tenants t ON t.id = l.tenant_id
-      LEFT JOIN users usr ON usr.id = t.user_id
+      LEFT JOIN v_unit_occupancy vuo ON vuo.unit_id = u.id
       WHERE u.landlord_id=$1 ${unitType ? "AND u.unit_type=$2" : ""}
       ORDER BY u.unit_type, p.name, u.unit_number`,
       unitType ? [req.user!.profileId, unitType] : [req.user!.profileId])
@@ -334,16 +341,82 @@ unitsRouter.get('/schedule/master', requireLandlord, async (req, res, next) => {
     // Get active leases in range
     const leases = await query<any>(`
       SELECT l.*, u.unit_number, u.unit_type, p.name as property_name,
-        usr.first_name, usr.last_name
+        vlat.first_name, vlat.last_name
       FROM leases l
       JOIN units u ON u.id = l.unit_id
       JOIN properties p ON p.id = u.property_id
-      JOIN tenants t ON t.id = l.tenant_id
-      JOIN users usr ON usr.id = t.user_id
+      LEFT JOIN LATERAL (
+        SELECT first_name, last_name
+        FROM v_lease_active_tenants
+        WHERE lease_id = l.id AND role = 'primary'
+        LIMIT 1
+      ) vlat ON TRUE
       WHERE u.landlord_id=$1 AND l.status='active'
         AND l.end_date >= $2 AND l.start_date <= $3
       ORDER BY l.start_date`, [req.user!.profileId, fromDate, toDate])
 
     res.json({ success: true, data: { units, bookings, leases, range: { from: fromDate, to: toDate } } })
+  } catch (e) { next(e) }
+})
+
+
+// ─── UNIT ACTIVATION / AVAILABILITY (landlord-controlled) ──────
+
+// POST /api/units/:id/mark-available — vacant → available (listed, no billing yet)
+unitsRouter.post('/:id/mark-available', requireLandlord, async (req, res, next) => {
+  try {
+    const unit = await queryOne<any>('SELECT * FROM units WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
+    if (!unit) throw new AppError(404, 'Unit not found')
+    if (unit.status !== 'vacant') throw new AppError(400, `Cannot mark available from status '${unit.status}'. Only vacant units can be marked available.`)
+    const updated = await queryOne<any>(`UPDATE units SET status='available', updated_at=NOW() WHERE id=$1 RETURNING *`, [req.params.id])
+    res.json({ success: true, data: updated })
+  } catch (e) { next(e) }
+})
+
+// POST /api/units/:id/mark-vacant — available → vacant (withdraw from listing)
+unitsRouter.post('/:id/mark-vacant', requireLandlord, async (req, res, next) => {
+  try {
+    const unit = await queryOne<any>('SELECT * FROM units WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
+    if (!unit) throw new AppError(404, 'Unit not found')
+    if (unit.status !== 'available') throw new AppError(400, `Cannot mark vacant from status '${unit.status}'. Only available units can be marked vacant.`)
+    const updated = await queryOne<any>(`UPDATE units SET status='vacant', updated_at=NOW() WHERE id=$1 RETURNING *`, [req.params.id])
+    res.json({ success: true, data: updated })
+  } catch (e) { next(e) }
+})
+
+// POST /api/units/:id/activate — gate: lease + tenant + rent. Optional scheduledFor ISO datetime (UTC).
+unitsRouter.post('/:id/activate', requireLandlord, async (req, res, next) => {
+  try {
+    const body = z.object({ scheduledFor: z.string().datetime().optional() }).parse(req.body)
+    const unit = await queryOne<any>('SELECT * FROM units WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
+    if (!unit) throw new AppError(404, 'Unit not found')
+    if (unit.status === 'active') throw new AppError(400, 'Unit is already active')
+    if (!unit.rent_amount || unit.rent_amount <= 0) throw new AppError(400, 'Cannot activate without a rent amount')
+
+    const activeLease = await queryOne<any>(`SELECT id FROM leases WHERE unit_id=$1 AND status='active' ORDER BY created_at DESC LIMIT 1`, [req.params.id])
+    if (!activeLease) throw new AppError(400, 'Cannot activate without an active lease')
+
+    if (body.scheduledFor) {
+      const when = new Date(body.scheduledFor)
+      if (isNaN(when.getTime())) throw new AppError(400, 'Invalid scheduledFor datetime')
+      if (when.getTime() <= Date.now()) throw new AppError(400, 'scheduledFor must be in the future')
+      const updated = await queryOne<any>(`UPDATE units SET scheduled_activation_at=$1, scheduled_activation_by=$2, updated_at=NOW() WHERE id=$3 RETURNING *`, [when, req.user!.id, req.params.id])
+      return res.json({ success: true, data: updated, scheduled: true })
+    }
+
+    // Immediate activation
+    const updated = await queryOne<any>(`UPDATE units SET status='active', scheduled_activation_at=NULL, scheduled_activation_by=NULL, updated_at=NOW() WHERE id=$1 RETURNING *`, [req.params.id])
+    res.json({ success: true, data: updated, scheduled: false })
+  } catch (e) { next(e) }
+})
+
+// POST /api/units/:id/cancel-scheduled-activation
+unitsRouter.post('/:id/cancel-scheduled-activation', requireLandlord, async (req, res, next) => {
+  try {
+    const unit = await queryOne<any>('SELECT * FROM units WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
+    if (!unit) throw new AppError(404, 'Unit not found')
+    if (!unit.scheduled_activation_at) throw new AppError(400, 'No scheduled activation to cancel')
+    const updated = await queryOne<any>(`UPDATE units SET scheduled_activation_at=NULL, scheduled_activation_by=NULL, updated_at=NOW() WHERE id=$1 RETURNING *`, [req.params.id])
+    res.json({ success: true, data: updated })
   } catch (e) { next(e) }
 })

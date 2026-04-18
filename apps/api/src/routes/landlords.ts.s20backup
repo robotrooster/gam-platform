@@ -1,0 +1,418 @@
+import { Router } from 'express'
+import { query, queryOne } from '../db'
+import { requireAuth, requireAdmin, requireLandlord } from '../middleware/auth'
+import { AppError } from '../middleware/errorHandler'
+
+export const landlordsRouter = Router()
+landlordsRouter.use(requireAuth)
+
+landlordsRouter.get('/', requireAdmin, async (_req, res, next) => {
+  try {
+    const landlords = await query<any>(`
+      SELECT l.*, u.first_name, u.last_name, u.email, u.phone,
+        COUNT(DISTINCT p.id)::int AS property_count,
+        COUNT(DISTINCT u2.id)::int AS unit_count,
+        COUNT(DISTINCT u2.id) FILTER (WHERE u2.status='active')::int AS occupied_count
+      FROM landlords l
+      JOIN users u ON u.id = l.user_id
+      LEFT JOIN properties p ON p.landlord_id = l.id
+      LEFT JOIN units u2 ON u2.landlord_id = l.id
+      GROUP BY l.id, u.first_name, u.last_name, u.email, u.phone
+      ORDER BY u.last_name`)
+    res.json({ success: true, data: landlords })
+  } catch (e) { next(e) }
+})
+
+
+
+// ── FLEXCHARGE LANDLORD ROUTES ────────────────────────────────────────────
+
+landlordsRouter.get('/flexcharge', requireAuth, requireLandlord, async (req, res, next) => {
+  try {
+    const accounts = await query<any>(`
+      SELECT fca.*, u.first_name, u.last_name, u.email, un.unit_number
+      FROM flex_charge_accounts fca
+      JOIN tenants t ON t.id = fca.tenant_id
+      JOIN users u ON u.id = t.user_id
+      LEFT JOIN units un ON un.tenant_id = t.id
+      WHERE fca.landlord_id = $1
+      ORDER BY u.last_name`, [req.user!.profileId])
+    res.json({ success: true, data: accounts })
+  } catch (e) { next(e) }
+})
+
+landlordsRouter.post('/flexcharge', requireAuth, requireLandlord, async (req, res, next) => {
+  try {
+    const { tenantId, creditLimit } = req.body
+    if (!tenantId) return res.status(400).json({ success: false, error: 'tenantId required' })
+    const tenant = await queryOne<any>(`
+      SELECT t.id FROM tenants t JOIN units u ON u.tenant_id = t.id
+      WHERE t.id=$1 AND u.landlord_id=$2`, [tenantId, req.user!.profileId])
+    if (!tenant) return res.status(403).json({ success: false, error: 'Tenant not found or not yours' })
+    await query(`
+      INSERT INTO flex_charge_accounts (tenant_id, landlord_id, credit_limit, status)
+      VALUES ($1, $2, $3, 'active')
+      ON CONFLICT (tenant_id) DO UPDATE SET credit_limit=$3, status='active', updated_at=NOW()`,
+      [tenantId, req.user!.profileId, creditLimit || null])
+    res.json({ success: true })
+  } catch (e) { next(e) }
+})
+
+landlordsRouter.delete('/flexcharge/:tenantId', requireAuth, requireLandlord, async (req, res, next) => {
+  try {
+    await query(`UPDATE flex_charge_accounts SET status='suspended', updated_at=NOW()
+      WHERE tenant_id=$1 AND landlord_id=$2`, [req.params.tenantId, req.user!.profileId])
+    res.json({ success: true })
+  } catch (e) { next(e) }
+})
+
+landlordsRouter.patch('/flexcharge/:tenantId', requireAuth, requireLandlord, async (req, res, next) => {
+  try {
+    const { creditLimit } = req.body
+    await query(`UPDATE flex_charge_accounts SET credit_limit=$1, updated_at=NOW()
+      WHERE tenant_id=$2 AND landlord_id=$3`, [creditLimit, req.params.tenantId, req.user!.profileId])
+    res.json({ success: true })
+  } catch (e) { next(e) }
+})
+
+// ── GET /api/landlords/theme ───────────────────────────────────────────────
+landlordsRouter.get('/theme', requireAuth, async (req, res, next) => {
+  try {
+    const row = await queryOne(
+      'SELECT theme_accent, font_style FROM landlords WHERE id=$1',
+      [req.user.profileId]
+    )
+    res.json({ success: true, data: row })
+  } catch (e) { next(e) }
+})
+
+// ── PATCH /api/landlords/theme ─────────────────────────────────────────────
+landlordsRouter.patch('/theme', requireAuth, async (req, res, next) => {
+  try {
+    const { themeAccent, fontStyle } = req.body
+    await query(
+      'UPDATE landlords SET theme_accent=$1, font_style=$2 WHERE id=$3',
+      [themeAccent || null, fontStyle || null, req.user.profileId]
+    )
+    res.json({ success: true })
+  } catch (e) { next(e) }
+})
+
+landlordsRouter.get('/:id', async (req, res, next) => {
+  try {
+    const id = req.params.id === 'me' ? req.user!.profileId : req.params.id
+    if (req.user!.role !== 'admin' && req.user!.role !== 'super_admin' && id !== req.user!.profileId)
+      throw new AppError(403, 'Forbidden')
+    const landlord = await queryOne<any>(`
+      SELECT l.*, u.first_name, u.last_name, u.email, u.phone
+      FROM landlords l JOIN users u ON u.id = l.user_id WHERE l.id = $1`, [id])
+    if (!landlord) throw new AppError(404, 'Landlord not found')
+    res.json({ success: true, data: landlord })
+  } catch (e) { next(e) }
+})
+
+landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
+  try {
+    const id = req.params.id === 'me' ? req.user!.profileId : req.params.id
+    if (req.user!.role !== 'admin' && req.user!.role !== 'super_admin' && id !== req.user!.profileId) throw new AppError(403,'Forbidden')
+    const [stats] = await query<any>(`
+      SELECT
+        COUNT(*) FILTER (WHERE u.status='active')::int AS active_units,
+        COUNT(*) FILTER (WHERE u.status='direct_pay')::int AS direct_pay_units,
+        COUNT(*) FILTER (WHERE u.status='vacant')::int AS vacant_units,
+        COUNT(*) FILTER (WHERE u.status='delinquent')::int AS delinquent_units,
+        COUNT(*) FILTER (WHERE u.status='suspended')::int AS suspended_units,
+        COUNT(*) FILTER (WHERE u.payment_block=TRUE)::int AS eviction_mode_units,
+        COALESCE(SUM(CASE WHEN u.status='active' THEN u.rent_amount ELSE 0 END),0) AS monthly_rent_volume,
+        COUNT(DISTINCT p.id)::int AS property_count
+      FROM units u
+      JOIN properties p ON p.id = u.property_id
+      WHERE u.landlord_id = $1`, [id])
+    const [upcoming] = await query<any>(`
+      SELECT COUNT(*)::int AS count,
+        COALESCE(SUM(d.amount),0) AS amount
+      FROM disbursements d
+      WHERE d.landlord_id = $1 AND d.status='pending'`, [id])
+    // Real monthly revenue trend (last 6 months)
+    const trend = await query<any>(`
+      SELECT 
+        TO_CHAR(DATE_TRUNC('month', p.created_at), 'Mon') as month,
+        COALESCE(SUM(p.amount),0)::float as revenue
+      FROM payments p
+      WHERE p.landlord_id = $1
+        AND p.status IN ('completed','settled')
+        AND p.created_at >= NOW() - INTERVAL '6 months'
+      GROUP BY DATE_TRUNC('month', p.created_at)
+      ORDER BY DATE_TRUNC('month', p.created_at) ASC`, [id])
+
+    // Real maintenance stats
+    const [maintenance] = await query<any>(`
+      SELECT
+        COUNT(*) FILTER (WHERE status='open')::int as open_requests,
+        COUNT(*) FILTER (WHERE status='in_progress')::int as in_progress,
+        COUNT(*) FILTER (WHERE status='completed' AND created_at > NOW()-INTERVAL '30 days')::int as completed_30d
+      FROM maintenance_requests
+      WHERE landlord_id = $1`, [id])
+
+    // Recent background checks pending review
+    const [bgPending] = await query<any>(`
+      SELECT COUNT(*)::int as count
+      FROM background_checks
+      WHERE landlord_id = $1 AND status = 'submitted'`, [id])
+
+    const [otpStats] = await query<any>(`
+      SELECT
+        COUNT(*)::int AS otp_units,
+        COALESCE(SUM(u.rent_amount),0)::float AS projected_otp_disbursement
+      FROM tenants t
+      JOIN lease_tenants lt ON lt.tenant_id = t.id AND lt.status = 'active'
+      JOIN leases l ON l.id = lt.lease_id AND l.status = 'active'
+      JOIN units u ON u.id = l.unit_id
+      WHERE u.landlord_id = $1
+        AND t.on_time_pay_enrolled = TRUE
+        AND u.status = 'active'`, [id])
+
+    res.json({ success: true, data: { ...stats, upcoming_disbursement: upcoming, trend, maintenance, bg_pending: bgPending?.count||0, otp_units: otpStats?.otp_units||0, projected_otp_disbursement: otpStats?.projected_otp_disbursement||0 } })
+  } catch (e) { next(e) }
+})
+
+// POST /api/landlords/complete-onboarding
+landlordsRouter.post('/complete-onboarding', requireAuth, requireLandlord, async (req, res, next) => {
+  try {
+    const { signature, agreedAt } = req.body
+    if (!signature) return res.status(400).json({ success: false, error: 'Signature required' })
+
+    await query(`
+      UPDATE landlords SET
+        onboarding_complete = TRUE,
+        agreement_signed_at = NOW(),
+        agreement_signature = $1
+      WHERE id = $2`,
+      [signature, req.user!.profileId]
+    )
+
+    // Also update user profile phone/business if provided
+    const landlord = await queryOne<any>('SELECT * FROM landlords WHERE id=$1', [req.user!.profileId])
+
+    res.json({ success: true, data: { onboardingComplete: true } })
+  } catch (e) { next(e) }
+})
+
+// PATCH /api/landlords/me — update landlord settings
+landlordsRouter.patch('/me', requireAuth, requireLandlord, async (req, res, next) => {
+  try {
+    const { businessName, ein, bgCheckFee, bgCheckFeeMin, maintApprovalThreshold } = req.body
+    await query(`
+      UPDATE landlords SET
+        business_name = COALESCE($1, business_name),
+        ein = COALESCE($2, ein),
+        bg_check_fee = COALESCE($3, bg_check_fee),
+        bg_check_fee_min = COALESCE($4, bg_check_fee_min),
+        maint_approval_threshold = COALESCE($5, maint_approval_threshold),
+        updated_at = NOW()
+      WHERE id = $6`,
+      [businessName||null, ein||null, bgCheckFee||null, bgCheckFeeMin||null, maintApprovalThreshold||null, req.user!.profileId]
+    )
+    const updated = await queryOne<any>('SELECT * FROM landlords WHERE id=$1', [req.user!.profileId])
+    res.json({ success: true, data: updated })
+  } catch(e) { next(e) }
+})
+
+
+// ── GET /api/landlords/me/todos ───────────────────────────────────────────
+// Returns actionable signals for the dashboard to-do card.
+// Three categories: lease issues, ACH issues, high-$ maintenance.
+landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
+  try {
+    const landlordId = req.user!.profileId
+
+    // Pull landlord record for stripe_bank_verified flag
+    const landlord = await queryOne<any>(
+      'SELECT stripe_bank_verified FROM landlords WHERE id=$1',
+      [landlordId]
+    )
+
+    // ── LEASE ISSUES ──────────────────────────────────────
+    // needs_review OR expiring within that lease's own expiration_notice_days window
+    const leaseRows = await query<any>(`
+      SELECT
+        l.id,
+        l.end_date,
+        l.needs_review,
+        l.expiration_notice_days,
+        u.unit_number,
+        p.name AS property_name,
+        tu.first_name AS tenant_first,
+        tu.last_name AS tenant_last,
+        CASE
+          WHEN l.needs_review = true THEN 'needs_review'
+          WHEN l.end_date IS NOT NULL
+            AND l.end_date <= CURRENT_DATE + (l.expiration_notice_days || ' days')::interval
+            AND l.end_date >= CURRENT_DATE
+          THEN 'expiring_soon'
+          ELSE NULL
+        END AS issue_type,
+        EXTRACT(DAY FROM l.end_date::timestamp - NOW())::int AS days_remaining
+      FROM leases l
+      JOIN units u ON u.id = l.unit_id
+      JOIN properties p ON p.id = u.property_id
+      LEFT JOIN lease_tenants lt ON lt.lease_id = l.id AND lt.role = 'primary' AND lt.status = 'active'
+      LEFT JOIN tenants t ON t.id = lt.tenant_id
+      LEFT JOIN users tu ON tu.id = t.user_id
+      WHERE l.landlord_id = $1
+        AND l.status = 'active'
+        AND (
+          l.needs_review = true
+          OR (
+            l.end_date IS NOT NULL
+            AND l.end_date <= CURRENT_DATE + (l.expiration_notice_days || ' days')::interval
+            AND l.end_date >= CURRENT_DATE
+          )
+        )
+      ORDER BY
+        CASE WHEN l.needs_review = true THEN 0 ELSE 1 END,
+        l.end_date NULLS LAST
+    `, [landlordId])
+
+    const leases = leaseRows.map((l: any) => {
+      const tenantName = [l.tenant_first, l.tenant_last].filter(Boolean).join(' ') || 'Unassigned'
+      const unitLabel = 'Unit ' + l.unit_number + (l.property_name ? ' — ' + l.property_name : '')
+      if (l.issue_type === 'needs_review') {
+        return {
+          id: l.id,
+          type: 'needs_review',
+          title: 'Lease needs review: ' + unitLabel,
+          subtitle: 'Imported with default values. Confirm terms with ' + tenantName + '.',
+          href: '/leases?open=' + l.id,
+        }
+      }
+      return {
+        id: l.id,
+        type: 'expiring_soon',
+        title: 'Lease expiring: ' + unitLabel,
+        subtitle: (l.days_remaining != null ? l.days_remaining + ' days' : 'Soon')
+          + ' remaining — ' + tenantName,
+        href: '/leases?open=' + l.id,
+      }
+    })
+
+    // ── ACH ISSUES ────────────────────────────────────────
+    const ach: any[] = []
+
+    // 1. Landlord's own bank not verified
+    if (!landlord?.stripe_bank_verified) {
+      ach.push({
+        id: 'landlord-bank',
+        type: 'landlord_bank',
+        title: 'Connect and verify your bank account',
+        subtitle: 'Required to receive On-Time Pay disbursements.',
+        href: '/settings',
+      })
+    }
+
+    // 2. Active units with unverified tenant ACH
+    const unverifiedTenants = await query<any>(`
+      SELECT
+        u.id AS unit_id,
+        u.unit_number,
+        p.name AS property_name,
+        tu.first_name AS tenant_first,
+        tu.last_name AS tenant_last
+      FROM units u
+      JOIN properties p ON p.id = u.property_id
+      JOIN tenants t ON t.id = u.tenant_id
+      JOIN users tu ON tu.id = t.user_id
+      WHERE u.landlord_id = $1
+        AND u.status = 'active'
+        AND (t.ach_verified = false OR t.ach_verified IS NULL)
+      ORDER BY u.unit_number
+    `, [landlordId])
+
+    for (const t of unverifiedTenants) {
+      const tenantName = [t.tenant_first, t.tenant_last].filter(Boolean).join(' ') || 'Tenant'
+      ach.push({
+        id: 'tenant-ach-' + t.unit_id,
+        type: 'tenant_ach',
+        title: tenantName + ' — ACH not verified (Unit ' + t.unit_number + ')',
+        subtitle: 'Tenant has not completed bank verification. Rent pulls will fail.',
+        href: '/units/' + t.unit_id,
+      })
+    }
+
+    // 3. Recent failed rent pulls (last 30 days)
+    const failed = await query<any>(`
+      SELECT DISTINCT ON (p.unit_id)
+        p.id AS payment_id,
+        p.unit_id,
+        p.status,
+        p.return_reason,
+        p.due_date,
+        u.unit_number,
+        tu.first_name AS tenant_first,
+        tu.last_name AS tenant_last
+      FROM payments p
+      JOIN units u ON u.id = p.unit_id
+      LEFT JOIN tenants t ON t.id = p.tenant_id
+      LEFT JOIN users tu ON tu.id = t.user_id
+      WHERE p.landlord_id = $1
+        AND p.type = 'rent'
+        AND p.status IN ('failed', 'returned')
+        AND p.due_date >= CURRENT_DATE - INTERVAL '30 days'
+      ORDER BY p.unit_id, p.due_date DESC
+    `, [landlordId])
+
+    for (const f of failed) {
+      const tenantName = [f.tenant_first, f.tenant_last].filter(Boolean).join(' ') || 'Tenant'
+      const statusLabel = f.status === 'returned' ? 'Returned' : 'Failed'
+      ach.push({
+        id: 'payment-' + f.payment_id,
+        type: 'recent_failure',
+        title: statusLabel + ' rent pull — Unit ' + f.unit_number,
+        subtitle: tenantName + (f.return_reason ? ' · ' + f.return_reason : '')
+          + ' · Due ' + new Date(f.due_date).toLocaleDateString(),
+        href: '/units/' + f.unit_id,
+      })
+    }
+
+    // ── MAINTENANCE (awaiting approval) ───────────────────
+    const maintRows = await query<any>(`
+      SELECT
+        mr.id,
+        mr.title,
+        mr.estimated_cost,
+        u.unit_number,
+        p.name AS property_name
+      FROM maintenance_requests mr
+      JOIN units u ON u.id = mr.unit_id
+      JOIN properties p ON p.id = u.property_id
+      WHERE mr.landlord_id = $1
+        AND mr.status = 'awaiting_approval'
+      ORDER BY mr.created_at DESC
+    `, [landlordId])
+
+    const maintenance = maintRows.map((m: any) => ({
+      id: m.id,
+      type: 'awaiting_approval',
+      title: m.title + ' — Unit ' + m.unit_number,
+      subtitle: 'Awaiting approval'
+        + (m.estimated_cost != null ? ' · Estimated $' + Number(m.estimated_cost).toLocaleString() : ''),
+      href: '/maintenance?open=' + m.id,
+    }))
+
+    res.json({
+      success: true,
+      data: {
+        leases,
+        ach,
+        maintenance,
+        counts: {
+          leases: leases.length,
+          ach: ach.length,
+          maintenance: maintenance.length,
+          total: leases.length + ach.length + maintenance.length,
+        },
+      },
+    })
+  } catch (e) { next(e) }
+})
+

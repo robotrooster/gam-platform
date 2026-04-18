@@ -1,0 +1,835 @@
+import { Router } from 'express'
+import { query, queryOne, getClient } from '../db'
+import { requireAuth, requireLandlord } from '../middleware/auth'
+import { AppError } from '../middleware/errorHandler'
+import { stampPdf } from '../services/pdfStamp'
+import { emailSigningRequest, emailSigningCompleted } from '../services/email'
+import { createNotification } from '../services/notifications'
+import crypto from 'crypto'
+import multer from 'multer'
+import path from 'path'
+import fs from 'fs'
+
+export const esignRouter = Router()
+
+// ─────────────────────────────────────────────────────────────
+// CONFIG
+// ─────────────────────────────────────────────────────────────
+
+const LANDLORD_APP_URL = process.env.LANDLORD_APP_URL || 'http://localhost:3001'
+const TENANT_APP_URL   = process.env.TENANT_APP_URL   || 'http://localhost:3002'
+
+const LEASE_COLUMNS = [
+  'tenant_name','tenant_email','landlord_name',
+  'rent_amount','start_date','end_date',
+  'security_deposit','rent_due_day',
+  'late_fee_grace_days','late_fee_amount',
+  'lease_type','auto_renew','auto_renew_mode',
+  'notice_days_required','expiration_notice_days',
+  'tenant_signature','landlord_signature',
+  'tenant_initial','landlord_initial',
+  'date_signed','custom_text'
+]
+
+// Signer roles: exactly one 'primary', zero-or-more 'co_tenant_N', at least one
+// 'landlord', optional 'witness'. Template slots that aren't filled at document
+// creation time get their fields pruned (see POST /documents).
+const TENANT_ROLE_PATTERN = /^(primary|co_tenant_\d+)$/
+function isTenantRole(role: string): boolean { return TENANT_ROLE_PATTERN.test(role) }
+
+// ─────────────────────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────────────────────
+
+type Bucket = 'residential' | 'storage' | 'commercial'
+function bucketFor(unitType: string): Bucket {
+  if (unitType === 'storage') return 'storage'
+  if (unitType === 'commercial') return 'commercial'
+  return 'residential'
+}
+
+/**
+ * For a SET of tenants signing a new lease together, check each one's existing
+ * active/pending leases for bucket-overlap. If ANY tenant conflicts, return
+ * the conflict. Prevents double-booking roommates.
+ */
+async function canTenantsSignNewLease(
+  tenantIds: string[],
+  newUnitId: string,
+  newStartDate: string,
+  newEndDate: string | null,
+  excludeLeaseId?: string
+): Promise<{ ok: boolean; reason?: string; conflictingTenantId?: string; conflictingLeaseId?: string }> {
+  if (!tenantIds.length) return { ok: false, reason: 'No tenants provided' }
+  const newUnit = await queryOne<any>('SELECT unit_type FROM units WHERE id=$1', [newUnitId])
+  if (!newUnit) return { ok: false, reason: 'Unit not found' }
+  const newBucket = bucketFor(newUnit.unit_type)
+
+  for (const tenantId of tenantIds) {
+    const actives = await query<any>(`
+      SELECT l.id, l.start_date, l.end_date, u.unit_type, u.unit_number,
+        tu.first_name || ' ' || tu.last_name as tenant_name
+      FROM lease_tenants lt
+      JOIN leases l ON l.id = lt.lease_id
+      JOIN units u ON u.id = l.unit_id
+      JOIN tenants t ON t.id = lt.tenant_id
+      JOIN users tu ON tu.id = t.user_id
+      WHERE lt.tenant_id = $1
+        AND lt.status IN ('active','pending_add')
+        AND l.status IN ('active','pending')
+        AND ($2::uuid IS NULL OR l.id != $2)`,
+      [tenantId, excludeLeaseId || null])
+
+    for (const l of actives as any[]) {
+      if (bucketFor(l.unit_type) !== newBucket) continue
+      const aStart = new Date(l.start_date)
+      const aEnd   = l.end_date ? new Date(l.end_date) : null
+      const bStart = new Date(newStartDate)
+      const bEnd   = newEndDate ? new Date(newEndDate) : null
+      const overlaps =
+        (aEnd === null || aEnd >= bStart) &&
+        (bEnd === null || bEnd >= aStart)
+      if (overlaps) {
+        return {
+          ok: false,
+          reason: `Tenant ${l.tenant_name} has an overlapping ${newBucket} lease (Unit ${l.unit_number}).`,
+          conflictingTenantId: tenantId,
+          conflictingLeaseId: l.id
+        }
+      }
+    }
+  }
+  return { ok: true }
+}
+
+async function checkPlatformBlock(userId: string): Promise<{ ok: boolean; reason?: string }> {
+  const tenant = await queryOne<any>(
+    'SELECT platform_status FROM tenants WHERE user_id=$1', [userId])
+  if (!tenant) return { ok: true } // not a tenant (landlord signer)
+  if (tenant.platform_status === 'blocked') {
+    return { ok: false, reason: 'Your GAM account has an outstanding balance. Contact support to resolve.' }
+  }
+  if (tenant.platform_status === 'suspended') {
+    return { ok: false, reason: 'Your GAM account is suspended. Contact support.' }
+  }
+  return { ok: true }
+}
+
+/**
+ * Resolve the primary tenant signer + all co-tenant signers from a document,
+ * loading their tenant_id for each. Returns null if required tenants are missing.
+ */
+async function getDocumentTenantSigners(documentId: string): Promise<{
+  primary: { signerId: string; userId: string; tenantId: string; name: string; email: string } | null,
+  coTenants: Array<{ signerId: string; userId: string; tenantId: string; name: string; email: string; role: string }>
+}> {
+  const rows = await query<any>(`
+    SELECT s.id as signer_id, s.user_id, s.role, s.name, s.email, t.id as tenant_id
+    FROM lease_document_signers s
+    JOIN users u ON u.id = s.user_id
+    LEFT JOIN tenants t ON t.user_id = s.user_id
+    WHERE s.document_id=$1
+    ORDER BY s.order_index`, [documentId])
+
+  let primary = null
+  const coTenants: any[] = []
+  for (const r of rows as any[]) {
+    if (!isTenantRole(r.role)) continue
+    const record = { signerId: r.signer_id, userId: r.user_id, tenantId: r.tenant_id, name: r.name, email: r.email, role: r.role }
+    if (r.role === 'primary') primary = record
+    else coTenants.push(record)
+  }
+  return { primary, coTenants }
+}
+
+/**
+ * On final signer completion: build leases + lease_tenants atomically.
+ * Throws AppError on any failure, rolling back the transaction so we never
+ * leave a half-built lease.
+ */
+async function buildLeaseFromDocument(documentId: string): Promise<{ leaseId: string; status: string; primaryTenantId: string }> {
+  const client = await getClient()
+  try {
+    await client.query('BEGIN')
+
+    const doc = await client.query(
+      `SELECT d.*, u.unit_type
+       FROM lease_documents d LEFT JOIN units u ON u.id = d.unit_id
+       WHERE d.id=$1`, [documentId]).then(r => r.rows[0])
+    if (!doc) throw new AppError(404, 'Document not found')
+    if (!doc.unit_id) throw new AppError(400, 'Document has no unit — cannot build lease')
+
+    // Read all field values mapped to lease columns
+    const fields = await client.query(
+      `SELECT lease_column, value, signer_role FROM lease_document_fields
+       WHERE document_id=$1 AND lease_column IS NOT NULL`, [documentId]).then(r => r.rows)
+    const vals: Record<string, string | null> = {}
+    for (const f of fields) {
+      if (!f.lease_column) continue
+      if (['tenant_signature','landlord_signature','tenant_initial','landlord_initial','date_signed','custom_text'].includes(f.lease_column)) continue
+      vals[f.lease_column] = f.value
+    }
+
+    // Gather all tenant signers
+    const tenantRows = await client.query(
+      `SELECT s.id, s.user_id, s.role, s.name, s.email, s.order_index, t.id as tenant_id
+       FROM lease_document_signers s
+       JOIN users u ON u.id=s.user_id
+       LEFT JOIN tenants t ON t.user_id=s.user_id
+       WHERE s.document_id=$1
+       ORDER BY s.order_index`, [documentId]).then(r => r.rows)
+
+    const tenantSigners = tenantRows.filter((r:any) => isTenantRole(r.role))
+    const primarySigner = tenantSigners.find((r:any) => r.role === 'primary')
+    if (!primarySigner) throw new AppError(400, 'No primary tenant signer found')
+    if (!primarySigner.tenant_id) throw new AppError(400, `Primary signer ${primarySigner.email} has no tenant profile`)
+    for (const t of tenantSigners) {
+      if (!t.tenant_id) throw new AppError(400, `Signer ${t.email} has no tenant profile`)
+    }
+
+    // Platform block check on every tenant (belt & suspenders)
+    for (const t of tenantSigners) {
+      const blk = await checkPlatformBlock(t.user_id)
+      if (!blk.ok) throw new AppError(403, `${t.name}: ${blk.reason}`)
+    }
+
+    // Required fields
+    const startDate = vals.start_date
+    const rentAmount = vals.rent_amount
+    if (!startDate) throw new AppError(400, 'Template missing start_date field — cannot build lease')
+    if (!rentAmount) throw new AppError(400, 'Template missing rent_amount field — cannot build lease')
+
+    // Overlap check across EVERY tenant
+    const allTenantIds = tenantSigners.map((t:any) => t.tenant_id)
+    const ov = await canTenantsSignNewLease(allTenantIds, doc.unit_id, startDate, vals.end_date || null)
+    if (!ov.ok) throw new AppError(409, ov.reason || 'Lease overlap detected')
+
+    // Status: future start → pending, today/past → active
+    const today = new Date(); today.setHours(0,0,0,0)
+    const start = new Date(startDate)
+    const leaseStatus = start > today ? 'pending' : 'active'
+
+    const leaseType = vals.lease_type || 'fixed_term'
+    const autoRenew = vals.auto_renew === 'true' || vals.auto_renew === 'yes'
+    const autoRenewMode = autoRenew ? (vals.auto_renew_mode || 'convert_to_month_to_month') : null
+
+    // INSERT lease (no tenant_id column anymore — lives in lease_tenants)
+    const lease = await client.query(`
+      INSERT INTO leases (
+        unit_id, landlord_id, status,
+        start_date, end_date, rent_amount, rent_due_day,
+        security_deposit, late_fee_grace_days, late_fee_amount,
+        lease_type, auto_renew, auto_renew_mode,
+        notice_days_required, expiration_notice_days,
+        signed_by_landlord, signed_by_tenant, signed_at,
+        needs_review
+      ) VALUES (
+        $1,$2,$3,
+        $4,$5,$6,$7,
+        $8,$9,$10,
+        $11,$12,$13,
+        $14,$15,
+        TRUE, TRUE, NOW(),
+        FALSE
+      ) RETURNING id, status`,
+      [
+        doc.unit_id, doc.landlord_id, leaseStatus,
+        startDate, vals.end_date || null, rentAmount, parseInt(vals.rent_due_day || '1'),
+        vals.security_deposit || 0, parseInt(vals.late_fee_grace_days || '5'), vals.late_fee_amount || 15,
+        leaseType, autoRenew, autoRenewMode,
+        parseInt(vals.notice_days_required || '30'), parseInt(vals.expiration_notice_days || '60')
+      ]).then(r => r.rows[0])
+
+    // INSERT lease_tenants rows — one per signer, with per-tenant supersedes chain
+    for (const t of tenantSigners) {
+      // Each tenant's supersedes points at their own most recent removed lease_tenants row
+      const priorLt = await client.query(`
+        SELECT id FROM lease_tenants
+        WHERE tenant_id=$1 AND status='removed'
+        ORDER BY removed_at DESC NULLS LAST, created_at DESC
+        LIMIT 1`, [t.tenant_id]).then(r => r.rows[0])
+
+      const role = t.role === 'primary' ? 'primary' : 'co_tenant'
+      await client.query(`
+        INSERT INTO lease_tenants (
+          lease_id, tenant_id, role, status,
+          added_at, added_reason, financial_responsibility,
+          add_document_id, supersedes_lease_tenant_id
+        ) VALUES ($1,$2,$3,'active', NOW(), 'original', 'joint_several', $4, $5)`,
+        [lease.id, t.tenant_id, role, documentId, priorLt?.id || null])
+    }
+
+    // Link document → lease
+    await client.query('UPDATE lease_documents SET lease_id=$1 WHERE id=$2', [lease.id, documentId])
+
+    // If activating now, set unit primary-tenant pointer + status (S20 bridge; S21 drops this column)
+    if (leaseStatus === 'active') {
+      await client.query(
+        `UPDATE units SET status='active', updated_at=NOW() WHERE id=$1`,
+        [doc.unit_id])
+    }
+
+    await client.query('COMMIT')
+    return { leaseId: lease.id, status: leaseStatus, primaryTenantId: primarySigner.tenant_id }
+  } catch (e) {
+    await client.query('ROLLBACK')
+    throw e
+  } finally {
+    client.release()
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// TEMPLATES
+// ─────────────────────────────────────────────────────────────
+
+esignRouter.get('/templates', requireAuth, requireLandlord, async (req, res, next) => {
+  try {
+    const templates = await query<any>(`
+      SELECT t.*, COUNT(f.id)::int as field_count
+      FROM lease_templates t
+      LEFT JOIN lease_template_fields f ON f.template_id = t.id
+      WHERE t.landlord_id = $1 AND t.is_active = TRUE
+      GROUP BY t.id ORDER BY t.created_at DESC`, [req.user!.profileId])
+    res.json({ success: true, data: templates })
+  } catch (e) { next(e) }
+})
+
+esignRouter.post('/templates', requireAuth, requireLandlord, async (req, res, next) => {
+  try {
+    const { name, description, basePdfUrl, pageCount } = req.body
+    if (!name) throw new AppError(400, 'Template name required')
+    const t = await queryOne<any>(`
+      INSERT INTO lease_templates (landlord_id, name, description, base_pdf_url, page_count)
+      VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+      [req.user!.profileId, name, description||null, basePdfUrl||null, pageCount||1])
+    res.status(201).json({ success: true, data: t })
+  } catch (e) { next(e) }
+})
+
+esignRouter.get('/templates/:id', requireAuth, requireLandlord, async (req, res, next) => {
+  try {
+    const template = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
+    if (!template) throw new AppError(404, 'Template not found')
+    const fields = await query<any>('SELECT * FROM lease_template_fields WHERE template_id=$1 ORDER BY page, sort_order, y', [template.id])
+    res.json({ success: true, data: { ...template, fields } })
+  } catch (e) { next(e) }
+})
+
+esignRouter.patch('/templates/:id', requireAuth, requireLandlord, async (req, res, next) => {
+  try {
+    const { name, description, basePdfUrl, pageCount, isActive } = req.body
+    const t = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
+    if (!t) throw new AppError(404, 'Template not found')
+    const updated = await queryOne<any>(`
+      UPDATE lease_templates SET name=$1, description=$2, base_pdf_url=$3, page_count=$4, is_active=$5, updated_at=NOW()
+      WHERE id=$6 RETURNING *`,
+      [name??t.name, description??t.description, basePdfUrl??t.base_pdf_url, pageCount??t.page_count, isActive??t.is_active, t.id])
+    res.json({ success: true, data: updated })
+  } catch (e) { next(e) }
+})
+
+esignRouter.delete('/templates/:id', requireAuth, requireLandlord, async (req, res, next) => {
+  try {
+    await query('UPDATE lease_templates SET is_active=FALSE WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
+    res.json({ success: true })
+  } catch (e) { next(e) }
+})
+
+esignRouter.put('/templates/:id/fields', requireAuth, requireLandlord, async (req, res, next) => {
+  try {
+    const { fields } = req.body
+    const template = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
+    if (!template) throw new AppError(404, 'Template not found')
+
+    for (const f of (fields || [])) {
+      if (f.leaseColumn && !LEASE_COLUMNS.includes(f.leaseColumn)) {
+        throw new AppError(400, `Invalid lease_column: ${f.leaseColumn}`)
+      }
+      if (f.signerRole && !(f.signerRole === 'landlord' || f.signerRole === 'witness' || isTenantRole(f.signerRole))) {
+        throw new AppError(400, `Invalid signer_role: ${f.signerRole}`)
+      }
+    }
+
+    await query('DELETE FROM lease_template_fields WHERE template_id=$1', [template.id])
+    for (const f of (fields || [])) {
+      await query(`INSERT INTO lease_template_fields
+        (template_id, field_type, signer_role, label, lease_column, page, x, y, width, height, required, sort_order, font_css)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+        [template.id, f.fieldType, f.signerRole, f.label||null, f.leaseColumn||null,
+         f.page||1, f.x, f.y, f.width||200, f.height||50, f.required??true, f.sortOrder||0, f.fontCss||null])
+    }
+    const updated = await query<any>('SELECT * FROM lease_template_fields WHERE template_id=$1 ORDER BY page, sort_order', [template.id])
+    res.json({ success: true, data: updated })
+  } catch (e) { next(e) }
+})
+
+esignRouter.delete('/templates/:id/fields/:fieldId', requireAuth, requireLandlord, async (req, res, next) => {
+  try {
+    await query('DELETE FROM lease_template_fields WHERE id=$1 AND template_id=$2', [req.params.fieldId, req.params.id])
+    res.json({ success: true })
+  } catch (e) { next(e) }
+})
+
+// ─────────────────────────────────────────────────────────────
+// DOCUMENTS
+// ─────────────────────────────────────────────────────────────
+
+esignRouter.get('/documents', requireAuth, requireLandlord, async (req, res, next) => {
+  try {
+    const docs = await query<any>(`
+      SELECT d.*, u.unit_number, p.name as property_name,
+        COUNT(DISTINCT s.id)::int as signer_count,
+        COUNT(DISTINCT s.id) FILTER (WHERE s.status='signed')::int as signed_count
+      FROM lease_documents d
+      LEFT JOIN units u ON u.id = d.unit_id
+      LEFT JOIN properties p ON p.id = u.property_id
+      LEFT JOIN lease_document_signers s ON s.document_id = d.id
+      WHERE d.landlord_id = $1
+      GROUP BY d.id, u.unit_number, p.name
+      ORDER BY d.created_at DESC`, [req.user!.profileId])
+    res.json({ success: true, data: docs })
+  } catch (e) { next(e) }
+})
+
+/**
+ * Create a document from a template.
+ * Signer validation:
+ *   - Every signer must have a userId (GAM account required)
+ *   - Exactly one role='primary'
+ *   - At least one role='landlord'
+ *   - co_tenant_N roles: zero or more, must match pattern co_tenant_1..N
+ *   - Optional role='witness'
+ * Template fields assigned to signer roles that aren't filled get pruned
+ * (so a template with co_tenant_1..4 slots used on a 2-tenant document only
+ *  copies fields for primary + co_tenant_1).
+ */
+esignRouter.post('/documents', requireAuth, requireLandlord, async (req, res, next) => {
+  try {
+    const { templateId, unitId, title, signers, basePdfUrl } = req.body
+    if (!title || !signers?.length) throw new AppError(400, 'title and signers required')
+
+    // Validate signer shape
+    const primaryCount = signers.filter((s:any) => s.role === 'primary').length
+    const landlordCount = signers.filter((s:any) => s.role === 'landlord').length
+    if (primaryCount !== 1) throw new AppError(400, 'Exactly one primary tenant signer required')
+    if (landlordCount < 1) throw new AppError(400, 'At least one landlord signer required')
+    for (const s of signers) {
+      if (!s.userId) throw new AppError(400, `Signer ${s.email || s.name} must have a userId — GAM account required before signing`)
+      if (!(s.role === 'landlord' || s.role === 'witness' || isTenantRole(s.role))) {
+        throw new AppError(400, `Invalid signer role: ${s.role}`)
+      }
+    }
+
+    // Resolve each tenant signer's tenant_id up front for overlap pre-check
+    const tenantSignerIds: string[] = []
+    for (const s of signers) {
+      if (!isTenantRole(s.role)) continue
+      const t = await queryOne<any>('SELECT id FROM tenants WHERE user_id=$1', [s.userId])
+      if (!t) throw new AppError(400, `Signer ${s.email} has no tenant profile — cannot sign as tenant`)
+      tenantSignerIds.push(t.id)
+    }
+
+    let pdfUrl = basePdfUrl
+    if (templateId) {
+      const tmpl = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id=$2', [templateId, req.user!.profileId])
+      if (!tmpl) throw new AppError(404, 'Template not found')
+      pdfUrl = pdfUrl || tmpl.base_pdf_url
+    }
+
+    const doc = await queryOne<any>(`
+      INSERT INTO lease_documents (template_id, landlord_id, unit_id, title, base_pdf_url)
+      VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+      [templateId||null, req.user!.profileId, unitId||null, title, pdfUrl||null])
+
+    // Create signers
+    for (const s of signers) {
+      const token = crypto.randomBytes(32).toString('hex')
+      await query(`INSERT INTO lease_document_signers
+        (document_id, user_id, role, name, email, phone, order_index, token)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+        [doc!.id, s.userId, s.role, s.name, s.email, s.phone||null, s.orderIndex||1, token])
+    }
+
+    // Copy template fields, matching by signer_role. Prune fields whose role
+    // isn't among the actual signers on this document.
+    if (templateId) {
+      const filledRoles = new Set(signers.map((s:any) => s.role))
+      const tmplFields = await query<any>('SELECT * FROM lease_template_fields WHERE template_id=$1', [templateId])
+      const docSigners = await query<any>('SELECT * FROM lease_document_signers WHERE document_id=$1', [doc!.id])
+      for (const f of tmplFields as any[]) {
+        if (f.signer_role && !filledRoles.has(f.signer_role)) continue // prune unused slot
+        const signer = (docSigners as any[]).find(s => s.role === f.signer_role)
+        await query(`INSERT INTO lease_document_fields
+          (document_id, template_field_id, signer_id, field_type, signer_role, label, lease_column, page, x, y, width, height, required, font_css)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+          [doc!.id, f.id, signer?.id||null, f.field_type, f.signer_role, f.label, f.lease_column,
+           f.page, f.x, f.y, f.width, f.height, f.required, f.font_css])
+      }
+    }
+
+    res.status(201).json({ success: true, data: doc })
+  } catch (e) { next(e) }
+})
+
+esignRouter.get('/documents/:id', requireAuth, async (req, res, next) => {
+  try {
+    const doc = await queryOne<any>(`
+      SELECT d.*, u.unit_number, p.name as property_name,
+        lu.first_name || ' ' || lu.last_name as landlord_name
+      FROM lease_documents d
+      LEFT JOIN units u ON u.id = d.unit_id
+      LEFT JOIN properties p ON p.id = u.property_id
+      JOIN landlords la ON la.id = d.landlord_id
+      JOIN users lu ON lu.id = la.user_id
+      WHERE d.id = $1`, [req.params.id])
+    if (!doc) throw new AppError(404, 'Document not found')
+
+    const isOwner = doc.landlord_id === req.user!.profileId
+    const isSigner = await queryOne<any>('SELECT 1 FROM lease_document_signers WHERE document_id=$1 AND user_id=$2', [doc.id, req.user!.userId])
+    if (!isOwner && !isSigner) throw new AppError(403, 'Not authorized for this document')
+
+    const signers = await query<any>('SELECT * FROM lease_document_signers WHERE document_id=$1 ORDER BY order_index', [doc.id])
+    const fields  = await query<any>('SELECT * FROM lease_document_fields WHERE document_id=$1 ORDER BY page, y', [doc.id])
+    res.json({ success: true, data: { ...doc, signers, fields } })
+  } catch (e) { next(e) }
+})
+
+// ─────────────────────────────────────────────────────────────
+// SEND DOCUMENT
+// ─────────────────────────────────────────────────────────────
+
+esignRouter.post('/documents/:id/send', requireAuth, requireLandlord, async (req, res, next) => {
+  try {
+    const doc = await queryOne<any>(`
+      SELECT d.*, u.unit_number, p.name as property_name, lu.first_name || ' ' || lu.last_name as landlord_name
+      FROM lease_documents d
+      LEFT JOIN units u ON u.id=d.unit_id LEFT JOIN properties p ON p.id=u.property_id
+      JOIN landlords la ON la.id=d.landlord_id JOIN users lu ON lu.id=la.user_id
+      WHERE d.id=$1 AND d.landlord_id=$2`, [req.params.id, req.user!.profileId])
+    if (!doc) throw new AppError(404, 'Document not found')
+    if (doc.status === 'completed') throw new AppError(400, 'Document already completed')
+    if (doc.status === 'voided')    throw new AppError(400, 'Document has been voided')
+
+    // Fast-fail overlap pre-check before we start emailing anyone
+    const { primary, coTenants } = await getDocumentTenantSigners(doc.id)
+    if (primary && doc.unit_id) {
+      // Try to infer proposed start/end from field defaults if available
+      const vals = await query<any>(`
+        SELECT lease_column, value FROM lease_document_fields
+        WHERE document_id=$1 AND lease_column IN ('start_date','end_date') AND value IS NOT NULL`, [doc.id])
+      const startVal = (vals as any[]).find(v => v.lease_column === 'start_date')?.value
+      const endVal   = (vals as any[]).find(v => v.lease_column === 'end_date')?.value
+      if (startVal) {
+        const allTenantIds = [primary.tenantId, ...coTenants.map(c => c.tenantId)]
+        const ov = await canTenantsSignNewLease(allTenantIds, doc.unit_id, startVal, endVal || null)
+        if (!ov.ok) throw new AppError(409, `Cannot send: ${ov.reason}`)
+      }
+    }
+
+    const signers = await query<any>('SELECT * FROM lease_document_signers WHERE document_id=$1 ORDER BY order_index', [doc.id])
+    const firstSigner = (signers as any[]).find(s => s.order_index === 1) || (signers as any[])[0]
+    if (!firstSigner) throw new AppError(400, 'No signers configured')
+
+    const unitLabel = doc.unit_number ? `Unit ${doc.unit_number} — ${doc.property_name}` : (doc.title || 'GAM Document')
+    const signingUrl = `${TENANT_APP_URL}/sign/${doc.id}`
+
+    await emailSigningRequest(firstSigner.email, firstSigner.name, doc.title, unitLabel, doc.landlord_name, signingUrl)
+    await createNotification({
+      userId: firstSigner.user_id,
+      type: 'esign_request',
+      title: 'Document ready to sign',
+      body: `${doc.landlord_name} sent you "${doc.title}" for ${unitLabel}.`,
+      data: { documentId: doc.id },
+      sendEmail: false
+    })
+
+    await query("UPDATE lease_documents SET status='sent', sent_at=NOW(), updated_at=NOW() WHERE id=$1", [doc.id])
+    await query("UPDATE lease_document_signers SET status='sent', invite_sent=TRUE WHERE id=$1", [firstSigner.id])
+
+    res.json({ success: true, data: { sentTo: firstSigner.email } })
+  } catch (e) { next(e) }
+})
+
+// ─────────────────────────────────────────────────────────────
+// VOID
+// ─────────────────────────────────────────────────────────────
+
+esignRouter.post('/documents/:id/void', requireAuth, requireLandlord, async (req, res, next) => {
+  try {
+    const { reason } = req.body
+    const doc = await queryOne<any>('SELECT * FROM lease_documents WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
+    if (!doc) throw new AppError(404, 'Document not found')
+    if (doc.status === 'completed') throw new AppError(400, 'Cannot void a completed document')
+    await query("UPDATE lease_documents SET status='voided', voided_at=NOW(), void_reason=$1, updated_at=NOW() WHERE id=$2",
+      [reason||null, doc.id])
+    res.json({ success: true })
+  } catch (e) { next(e) }
+})
+
+// ─────────────────────────────────────────────────────────────
+// SIGNING
+// ─────────────────────────────────────────────────────────────
+
+esignRouter.get('/sign/:documentId', requireAuth, async (req, res, next) => {
+  try {
+    const signer = await queryOne<any>(`
+      SELECT * FROM lease_document_signers
+      WHERE document_id=$1 AND user_id=$2`,
+      [req.params.documentId, req.user!.userId])
+    if (!signer) throw new AppError(403, 'You are not a signer on this document')
+    if (signer.status === 'signed') throw new AppError(400, 'Already signed')
+
+    const doc = await queryOne<any>(`
+      SELECT d.*, u.unit_number, p.name as property_name, lu.first_name || ' ' || lu.last_name as landlord_name
+      FROM lease_documents d
+      LEFT JOIN units u ON u.id=d.unit_id LEFT JOIN properties p ON p.id=u.property_id
+      JOIN landlords la ON la.id=d.landlord_id JOIN users lu ON lu.id=la.user_id
+      WHERE d.id=$1`, [signer.document_id])
+    if (!doc) throw new AppError(404, 'Document not found')
+    if (doc.status === 'voided') throw new AppError(400, 'Document has been voided')
+    if (doc.status === 'completed') throw new AppError(400, 'Document fully executed')
+
+    const fields = await query<any>(`
+      SELECT * FROM lease_document_fields
+      WHERE document_id=$1 AND signer_role=$2
+      ORDER BY page, y`, [doc.id, signer.role])
+
+    if (signer.status === 'sent') {
+      await query("UPDATE lease_document_signers SET status='viewed', viewed_at=NOW() WHERE id=$1", [signer.id])
+    }
+
+    res.json({ success: true, data: { signer, document: doc, fields } })
+  } catch (e) { next(e) }
+})
+
+esignRouter.post('/sign/:documentId', requireAuth, async (req, res, next) => {
+  try {
+    const { fieldValues } = req.body
+
+    const signer = await queryOne<any>(`
+      SELECT * FROM lease_document_signers
+      WHERE document_id=$1 AND user_id=$2`,
+      [req.params.documentId, req.user!.userId])
+    if (!signer) throw new AppError(403, 'You are not a signer on this document')
+    if (signer.status === 'signed') throw new AppError(400, 'Already signed')
+
+    // Platform block check on tenant roles
+    if (isTenantRole(signer.role)) {
+      const blk = await checkPlatformBlock(req.user!.userId)
+      if (!blk.ok) throw new AppError(403, blk.reason || 'Account blocked from signing')
+    }
+
+    const doc = await queryOne<any>(`
+      SELECT d.*, u.unit_number, u.unit_type, p.name as property_name,
+        lu.first_name || ' ' || lu.last_name as landlord_name, lu.email as landlord_email
+      FROM lease_documents d
+      LEFT JOIN units u ON u.id=d.unit_id LEFT JOIN properties p ON p.id=u.property_id
+      JOIN landlords la ON la.id=d.landlord_id JOIN users lu ON lu.id=la.user_id
+      WHERE d.id=$1`, [signer.document_id])
+    if (!doc) throw new AppError(404, 'Document not found')
+    if (doc.status === 'voided') throw new AppError(400, 'Document has been voided')
+
+    // Re-check overlap on EVERY signing (another roommate may have taken a conflicting lease
+    // between send time and now)
+    const { primary, coTenants } = await getDocumentTenantSigners(doc.id)
+    if (primary && doc.unit_id) {
+      const vals = await query<any>(`
+        SELECT lease_column, value FROM lease_document_fields
+        WHERE document_id=$1 AND lease_column IN ('start_date','end_date') AND value IS NOT NULL`, [doc.id])
+      const startVal = (vals as any[]).find(v => v.lease_column === 'start_date')?.value
+      const endVal   = (vals as any[]).find(v => v.lease_column === 'end_date')?.value
+      if (startVal) {
+        const allTenantIds = [primary.tenantId, ...coTenants.map(c => c.tenantId)]
+        const ov = await canTenantsSignNewLease(allTenantIds, doc.unit_id, startVal, endVal || null)
+        if (!ov.ok) throw new AppError(409, ov.reason || 'Lease overlap detected')
+      }
+    }
+
+    const ip = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress
+    const ua = req.headers['user-agent']
+
+    for (const fv of (fieldValues || [])) {
+      await query(`
+        UPDATE lease_document_fields
+        SET value=$1, signed_at=NOW(), signer_id=$2
+        WHERE id=$3 AND document_id=$4`,
+        [fv.value, signer.id, fv.fieldId, doc.id])
+    }
+
+    await query(`
+      UPDATE lease_document_signers
+      SET status='signed', signed_at=NOW(), ip_address=$1, user_agent=$2
+      WHERE id=$3`,
+      [ip, ua, signer.id])
+
+    await query("UPDATE lease_documents SET status='in_progress', updated_at=NOW() WHERE id=$1", [doc.id])
+
+    const remaining = await queryOne<any>(
+      "SELECT COUNT(*)::int as count FROM lease_document_signers WHERE document_id=$1 AND status != 'signed'",
+      [doc.id])
+
+    if (remaining?.count === 0) {
+      await query("UPDATE lease_documents SET status='completed', completed_at=NOW(), updated_at=NOW() WHERE id=$1", [doc.id])
+
+      let leaseResult: { leaseId: string; status: string; primaryTenantId: string } | null = null
+      try {
+        leaseResult = await buildLeaseFromDocument(doc.id)
+      } catch (e: any) {
+        console.error('[ESIGN] buildLeaseFromDocument failed:', e.message)
+        await query("UPDATE lease_documents SET void_reason=$1 WHERE id=$2",
+          [`Lease build failed: ${e.message}`, doc.id])
+      }
+
+      // Stamp PDF
+      let executedUrl: string | null = null
+      try {
+        if (doc.base_pdf_url) {
+          const allFields = await query<any>('SELECT * FROM lease_document_fields WHERE document_id=$1', [doc.id])
+          const allSigners = await query<any>('SELECT * FROM lease_document_signers WHERE document_id=$1', [doc.id])
+          const sourcePdfPath = doc.base_pdf_url.split('/').pop()
+          const sourcePath = path.join(uploadDir, sourcePdfPath)
+          if (fs.existsSync(sourcePath)) {
+            const executedFilename = 'executed-' + doc.id + '.pdf'
+            const outputPath = path.join(uploadDir, executedFilename)
+            const signerInfo = (allSigners as any[]).map(s => ({ name:s.name, email:s.email, role:s.role, signed_at:s.signed_at }))
+            await stampPdf(sourcePath, (allFields as any[]).map(f => ({
+              page: parseInt(f.page)||1, x: parseFloat(f.x)||0, y: parseFloat(f.y)||0,
+              width: parseFloat(f.width)||100, height: parseFloat(f.height)||30,
+              field_type: f.field_type, value: f.value, font_css: f.font_css
+            })), signerInfo, outputPath)
+            executedUrl = '/api/esign/files/' + executedFilename
+            await query('UPDATE lease_documents SET executed_pdf_url=$1 WHERE id=$2', [executedUrl, doc.id])
+          }
+        }
+      } catch(e) { console.error('[ESIGN] PDF stamp failed:', e) }
+
+      const allSigners = await query<any>('SELECT * FROM lease_document_signers WHERE document_id=$1', [doc.id])
+      const unitLabel = doc.unit_number ? `Unit ${doc.unit_number} — ${doc.property_name}` : doc.title
+      for (const s of allSigners as any[]) {
+        await emailSigningCompleted(s.email, s.name, doc.title, unitLabel, executedUrl || undefined)
+        await createNotification({
+          userId: s.user_id,
+          type: 'esign_completed',
+          title: 'Document fully executed',
+          body: `"${doc.title}" has been signed by all parties.`,
+          data: { documentId: doc.id, leaseId: leaseResult?.leaseId || null },
+          sendEmail: false
+        })
+      }
+
+      res.json({ success: true, data: { completed: true, leaseId: leaseResult?.leaseId, leaseStatus: leaseResult?.status } })
+    } else {
+      const nextSigner = await queryOne<any>(`
+        SELECT * FROM lease_document_signers
+        WHERE document_id=$1 AND status='pending'
+        ORDER BY order_index LIMIT 1`, [doc.id])
+      if (nextSigner) {
+        const unitLabel = doc.unit_number ? `Unit ${doc.unit_number} — ${doc.property_name}` : doc.title
+        const signingUrl = `${TENANT_APP_URL}/sign/${doc.id}`
+        await emailSigningRequest(nextSigner.email, nextSigner.name, doc.title, unitLabel, doc.landlord_name, signingUrl)
+        await createNotification({
+          userId: nextSigner.user_id,
+          type: 'esign_request',
+          title: 'Document ready to sign',
+          body: `"${doc.title}" is awaiting your signature.`,
+          data: { documentId: doc.id },
+          sendEmail: false
+        })
+        await query("UPDATE lease_document_signers SET status='sent', invite_sent=TRUE WHERE id=$1", [nextSigner.id])
+      }
+      res.json({ success: true, data: { completed: false, nextSigner: nextSigner?.email } })
+    }
+  } catch (e) { next(e) }
+})
+
+// ─────────────────────────────────────────────────────────────
+// PENDING QUEUES
+// ─────────────────────────────────────────────────────────────
+
+esignRouter.get('/pending', requireAuth, async (req, res, next) => {
+  try {
+    const pending = await query<any>(`
+      SELECT d.id as document_id, s.role, s.status, d.title, d.base_pdf_url,
+        u.unit_number, p.name as property_name,
+        lu.first_name || ' ' || lu.last_name as landlord_name
+      FROM lease_document_signers s
+      JOIN lease_documents d ON d.id = s.document_id
+      LEFT JOIN units u ON u.id = d.unit_id
+      LEFT JOIN properties p ON p.id = u.property_id
+      JOIN landlords l ON l.id = d.landlord_id
+      JOIN users lu ON lu.id = l.user_id
+      WHERE s.user_id = $1
+        AND s.status IN ('sent','viewed')
+        AND d.status NOT IN ('completed','voided')
+      ORDER BY s.created_at DESC`, [req.user!.userId])
+    res.json({ success: true, data: pending })
+  } catch(e) { next(e) }
+})
+
+esignRouter.get('/landlord-pending', requireAuth, requireLandlord, async (req, res, next) => {
+  try {
+    const landlordUser = await queryOne<any>('SELECT user_id FROM landlords WHERE id=$1', [req.user!.profileId])
+    const pending = await query<any>(`
+      SELECT d.id as document_id, s.status, s.name, d.title, d.status as doc_status,
+        u.unit_number, p.name as property_name, d.base_pdf_url,
+        (SELECT name FROM lease_document_signers WHERE document_id=d.id AND role='primary' LIMIT 1) as primary_tenant_name,
+        (SELECT status FROM lease_document_signers WHERE document_id=d.id AND role='primary' LIMIT 1) as primary_tenant_status
+      FROM lease_document_signers s
+      JOIN lease_documents d ON d.id = s.document_id
+      LEFT JOIN units u ON u.id = d.unit_id
+      LEFT JOIN properties p ON p.id = u.property_id
+      WHERE d.landlord_id = $1
+        AND s.user_id = $2
+        AND s.status IN ('sent','viewed')
+        AND d.status NOT IN ('completed','voided')
+      ORDER BY s.created_at DESC`, [req.user!.profileId, landlordUser?.user_id])
+    res.json({ success: true, data: pending })
+  } catch(e) { next(e) }
+})
+
+// ─────────────────────────────────────────────────────────────
+// FILE UPLOAD
+// ─────────────────────────────────────────────────────────────
+
+const uploadDir = path.join(process.cwd(), 'uploads', 'leases')
+if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true })
+
+const storage = multer.diskStorage({
+  destination: uploadDir,
+  filename: (req: any, file: any, cb: any) => {
+    const unique = Date.now() + '-' + Math.random().toString(36).slice(2)
+    cb(null, unique + path.extname(file.originalname))
+  }
+})
+
+const upload = multer({
+  storage,
+  limits: { fileSize: 20 * 1024 * 1024 },
+  fileFilter: (req: any, file: any, cb: any) => {
+    if (file.mimetype === 'application/pdf') cb(null, true)
+    else cb(new Error('PDF only'))
+  }
+})
+
+esignRouter.post('/upload', requireAuth, requireLandlord, upload.single('file'), async (req: any, res: any, next: any) => {
+  try {
+    if (!req.file) throw new AppError(400, 'No file uploaded')
+    const fileUrl = '/api/esign/files/' + req.file.filename
+    let pageCount = 1
+    try {
+      const fileBuffer = fs.readFileSync(req.file.path).toString('binary')
+      const matches = fileBuffer.match(/\/Type\s*\/Page[^s]/g)
+      if (matches) pageCount = matches.length
+    } catch(e) { /* fallback to 1 */ }
+    res.json({ success: true, data: { url: fileUrl, filename: req.file.originalname, size: req.file.size, pageCount } })
+  } catch (e) { next(e) }
+})
+
+esignRouter.get('/files/:filename', async (req: any, res: any, next: any) => {
+  try {
+    const filePath = path.join(uploadDir, req.params.filename)
+    if (!fs.existsSync(filePath)) throw new AppError(404, 'File not found')
+    res.sendFile(filePath)
+  } catch (e) { next(e) }
+})

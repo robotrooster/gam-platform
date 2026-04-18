@@ -1,10 +1,10 @@
-import { useState } from 'react'
+import React, { useState } from 'react'
 import { useQuery } from 'react-query'
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
 import { apiGet } from '../lib/api'
 import { useNavigate } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
-import { AlertTriangle, CheckCircle, TrendingUp, ArrowDownToLine, Clock } from 'lucide-react'
+import { AlertTriangle, CheckCircle, TrendingUp, ArrowDownToLine, Clock, FileText, CreditCard, Wrench, ChevronRight } from 'lucide-react'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 const PLATFORM_FEES = { ACTIVE_UNIT: 15 }
 
@@ -83,7 +83,7 @@ export function DashboardPage() {
         <div className="alert alert-danger" style={{cursor:'pointer'}} onClick={()=>navigate('/units?status=eviction')}>
           <AlertTriangle size={16} />
           <div>
-            <strong>{stats!.eviction_mode_units} unit(s) in Eviction Mode</strong> — All tenant ACH hard blocked per A.R.S. § 33-1371. No rent will be collected. Disbursement held.
+            <strong>{stats!.eviction_mode_units} unit(s) in Eviction Mode</strong> — All tenant ACH hard blocked. No rent will be collected. Disbursement held. Check your local laws before accepting any payment.
           </div>
           <span style={{marginLeft:'auto',fontSize:'.78rem',fontWeight:600}}>View →</span>
         </div>
@@ -223,40 +223,8 @@ export function DashboardPage() {
         </div>
       </div>
 
-      {/* Units table */}
-      <div className="card mt-16">
-        <div className="card-header">
-          <span className="card-title">Unit Overview</span>
-          <a href="/units" className="btn btn-ghost btn-sm">View all →</a>
-        </div>
-        <div className="data-table-wrap">
-          <table className="data-table">
-            <thead><tr>
-              <th>Unit</th><th>Property</th><th>Tenant</th><th>Rent</th><th>Status</th><th>On-Time Pay</th>
-            </tr></thead>
-            <tbody>
-              {units?.length ? units.map((u: any) => (
-                <tr key={u.id} style={{cursor:'pointer'}} onClick={() => window.location.href=`/units/${u.id}`}>
-                  <td className="mono" style={{color:'var(--text-0)',fontWeight:600}}>{u.unit_number}</td>
-                  <td>{u.property_name}</td>
-                  <td style={{color: u.tenant_first ? 'var(--text-1)' : 'var(--text-3)'}}>
-                    {u.tenant_first ? `${u.tenant_first} ${u.tenant_last}` : '—'}
-                  </td>
-                  <td className="mono">{fmt(u.rent_amount)}</td>
-                  <td><span className={`badge ${unitStatusBadge(u.status)}`}>{u.status.replace('_',' ')}</span></td>
-                  <td>
-                    {u.on_time_pay_active
-                      ? <span className="flex items-center gap-8"><span className="status-dot dot-green" /><span style={{fontSize:'.75rem',color:'var(--green)'}}>Active</span></span>
-                      : <span style={{color:'var(--text-3)',fontSize:'.75rem'}}>—</span>}
-                  </td>
-                </tr>
-              )) : (
-                <tr><td colSpan={6} style={{textAlign:'center',color:'var(--text-3)',padding:'32px'}}>No units added yet. <a href="/properties">Add a property →</a></td></tr>
-              )}
-            </tbody>
-          </table>
-        </div>
-      </div>
+      {/* To-Do List */}
+      <TodoCard />
 
       {showFeeModal && (
         <div className="modal-overlay" onClick={()=>setShowFeeModal(false)}>
@@ -302,6 +270,214 @@ export function DashboardPage() {
               </div>
             </div>
           </div>
+        </div>
+      )}
+
+      {/* Bulletin Board */}
+      <BulletinBoard />
+    </div>
+  )
+}
+
+
+function TodoCard() {
+  const navigate = useNavigate()
+  const [expanded, setExpanded] = React.useState<{ leases: boolean; ach: boolean; maintenance: boolean }>({ leases: false, ach: false, maintenance: false })
+
+  const { data: todos, isLoading } = useQuery<any>(
+    'landlord-todos',
+    () => apiGet('/landlords/me/todos'),
+    { staleTime: 30000 } // 30s
+  )
+
+  if (isLoading) {
+    return (
+      <div className="card mt-16" style={{ padding: 32, textAlign: 'center', color: 'var(--text-3)' }}>
+        Loading to-dos…
+      </div>
+    )
+  }
+
+  const counts = todos?.counts || { leases: 0, ach: 0, maintenance: 0, total: 0 }
+
+  // All-clear state
+  if (counts.total === 0) {
+    return (
+      <div className="card mt-16">
+        <div className="card-header">
+          <span className="card-title">To-Do</span>
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '32px 0', gap: 10 }}>
+          <CheckCircle size={32} style={{ color: 'var(--green)', opacity: 0.8 }} />
+          <div style={{ fontSize: '.88rem', color: 'var(--text-1)', fontWeight: 600 }}>All clear</div>
+          <div style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>Nothing needs your attention right now.</div>
+        </div>
+      </div>
+    )
+  }
+
+  const sections = [
+    { key: 'leases', label: 'Lease Issues', icon: FileText, color: 'var(--gold)', items: todos?.leases || [] },
+    { key: 'ach', label: 'ACH Issues', icon: CreditCard, color: 'var(--amber)', items: todos?.ach || [] },
+    { key: 'maintenance', label: 'High-$ Maintenance', icon: Wrench, color: 'var(--blue)', items: todos?.maintenance || [] },
+  ]
+
+  return (
+    <div className="card mt-16">
+      <div className="card-header">
+        <span className="card-title">To-Do</span>
+        <span style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>
+          {counts.total} item{counts.total === 1 ? '' : 's'} need{counts.total === 1 ? 's' : ''} attention
+        </span>
+      </div>
+
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 16, marginTop: 8 }}>
+        {sections.map(section => {
+          if (section.items.length === 0) return null
+          const isExpanded = expanded[section.key as keyof typeof expanded]
+          const visible = isExpanded ? section.items : section.items.slice(0, 3)
+          const Icon = section.icon
+
+          return (
+            <div key={section.key}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+                <Icon size={14} style={{ color: section.color }} />
+                <span style={{ fontSize: '.78rem', fontWeight: 700, color: 'var(--text-1)', textTransform: 'uppercase', letterSpacing: '.06em' }}>
+                  {section.label}
+                </span>
+                <span style={{ fontSize: '.68rem', color: 'var(--text-3)', fontWeight: 600 }}>
+                  ({section.items.length})
+                </span>
+              </div>
+
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                {visible.map((item: any) => (
+                  <div
+                    key={item.id}
+                    onClick={() => navigate(item.href)}
+                    style={{
+                      padding: '10px 12px',
+                      background: 'var(--bg-2)',
+                      border: '1px solid var(--border-0)',
+                      borderRadius: 8,
+                      cursor: 'pointer',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 10,
+                      transition: 'border-color .12s, background .12s',
+                    }}
+                    onMouseEnter={e => { e.currentTarget.style.borderColor = section.color; e.currentTarget.style.background = 'var(--bg-3)' }}
+                    onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--border-0)'; e.currentTarget.style.background = 'var(--bg-2)' }}
+                  >
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: '.82rem', fontWeight: 600, color: 'var(--text-0)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {item.title}
+                      </div>
+                      <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {item.subtitle}
+                      </div>
+                    </div>
+                    <ChevronRight size={14} style={{ color: 'var(--text-3)', flexShrink: 0 }} />
+                  </div>
+                ))}
+              </div>
+
+              {section.items.length > 3 && (
+                <button
+                  onClick={() => setExpanded(e => ({ ...e, [section.key]: !isExpanded }))}
+                  style={{
+                    marginTop: 6,
+                    padding: '4px 8px',
+                    background: 'transparent',
+                    border: 'none',
+                    color: 'var(--text-3)',
+                    fontSize: '.72rem',
+                    cursor: 'pointer',
+                    fontWeight: 600,
+                  }}
+                >
+                  {isExpanded ? 'Show less' : `Show all ${section.items.length}`}
+                </button>
+              )}
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+function BulletinBoard() {
+  const API = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
+  const tok = () => localStorage.getItem('gam_token')
+  const [date, setDate] = React.useState(new Date().toISOString().split('T')[0])
+  const [search, setSearch] = React.useState('')
+  const [posts, setPosts] = React.useState<any[]>([])
+  const [loading, setLoading] = React.useState(false)
+
+  const fetchPosts = async (d = date, s = search) => {
+    setLoading(true)
+    try {
+      const params = new URLSearchParams({ date: d })
+      if (s) params.append('search', s)
+      const res = await fetch(`${API}/api/bulletin/landlord?${params}`, {
+        headers: { Authorization: `Bearer ${tok()}` }
+      })
+      const data = await res.json()
+      setPosts(data.data || [])
+    } catch { setPosts([]) }
+    finally { setLoading(false) }
+  }
+
+  React.useEffect(() => { fetchPosts() }, [date])
+
+  return (
+    <div className="card" style={{ marginTop: 24 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16, flexWrap: 'wrap', gap: 10 }}>
+        <div>
+          <div className="card-title" style={{ marginBottom: 2 }}>Community Bulletin Board</div>
+          <div style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>Read-only · Posts from your tenants</div>
+        </div>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+          <input type="date" value={date} onChange={e => setDate(e.target.value)}
+            style={{ background: 'var(--bg-2)', border: '1px solid var(--border-1)', borderRadius: 7, color: 'var(--text-0)', padding: '6px 10px', fontSize: '.78rem', outline: 'none' }} />
+          <button onClick={() => setDate(new Date().toISOString().split('T')[0])}
+            style={{ padding: '6px 12px', borderRadius: 7, border: '1px solid var(--border-1)', background: 'var(--bg-2)', color: 'var(--text-2)', fontSize: '.75rem', cursor: 'pointer' }}>
+            Today
+          </button>
+          <input type="text" placeholder="Search posts…" value={search} onChange={e => setSearch(e.target.value)}
+            onKeyDown={e => e.key === 'Enter' && fetchPosts(date, search)}
+            style={{ background: 'var(--bg-2)', border: '1px solid var(--border-1)', borderRadius: 7, color: 'var(--text-0)', padding: '6px 10px', fontSize: '.78rem', outline: 'none', width: 180 }} />
+          <button onClick={() => fetchPosts(date, search)}
+            style={{ padding: '6px 12px', borderRadius: 7, border: 'none', background: 'var(--gold)', color: '#060809', fontSize: '.75rem', fontWeight: 600, cursor: 'pointer' }}>
+            Search
+          </button>
+        </div>
+      </div>
+      {loading && <div style={{ padding: 32, textAlign: 'center', color: 'var(--text-3)' }}>Loading…</div>}
+      {!loading && posts.length === 0 && (
+        <div style={{ padding: 32, textAlign: 'center', color: 'var(--text-3)', fontSize: '.85rem' }}>
+          No posts for {new Date(date + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' })}
+        </div>
+      )}
+      {!loading && posts.length > 0 && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+          {posts.map((post: any) => (
+            <div key={post.id} style={{ padding: '12px 14px', background: 'var(--bg-2)', border: '1px solid var(--border-0)', borderRadius: 10 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                <span style={{ fontFamily: 'var(--font-mono)', fontSize: '.72rem', color: 'var(--gold)', fontWeight: 600 }}>{post.alias}</span>
+                {post.pinned && <span style={{ fontSize: '.65rem', color: 'var(--amber)' }}>📌 Pinned</span>}
+                <span style={{ fontSize: '.65rem', color: 'var(--text-3)', marginLeft: 'auto' }}>
+                  {new Date(post.created_at).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })}
+                </span>
+              </div>
+              <div style={{ fontSize: '.85rem', color: 'var(--text-1)', lineHeight: 1.6, marginBottom: 6 }}>{post.content}</div>
+              <div style={{ display: 'flex', gap: 12, fontSize: '.7rem', color: 'var(--text-3)' }}>
+                <span>👍 {post.upvote_count || 0}</span>
+                <span style={{ textTransform: 'capitalize' }}>📍 {post.scope}</span>
+              </div>
+            </div>
+          ))}
         </div>
       )}
     </div>

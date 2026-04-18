@@ -97,7 +97,7 @@ export async function sendLatePaymentNotice({
           <p style="color:#8a96b0;margin-bottom:16px">Hi ${landlordName},</p>
           <p style="color:#c4ccde;margin-bottom:16px">Tenant <strong style="color:#f0f2f7">${tenantName}</strong> at <strong style="color:#f0f2f7">${propertyName} Unit ${unitNumber}</strong> has not paid rent of $${amount.toLocaleString()} — now ${daysLate} days overdue.</p>
           <p style="color:#8a96b0;font-size:.875rem">Your On-Time Pay disbursement was funded from our reserve. We are continuing to attempt ACH collection. You will be notified when payment settles.</p>
-          <p style="color:#555f7a;font-size:.8rem;margin-top:16px">If you wish to file for eviction, activate Eviction Mode in your dashboard first — this hard-blocks all ACH per A.R.S. § 33-1371.</p>
+          <p style="color:#555f7a;font-size:.8rem;margin-top:16px">If you wish to file for eviction, activate Eviction Mode in your dashboard first — this hard-blocks all ACH. Check your local laws before accepting any payment during an eviction process.</p>
         </div>
       </div>
     `,
