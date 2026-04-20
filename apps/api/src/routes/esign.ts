@@ -28,7 +28,8 @@ const LEASE_COLUMNS = [
   'notice_days_required','expiration_notice_days',
   'tenant_signature','landlord_signature',
   'tenant_initial','landlord_initial',
-  'date_signed','custom_text'
+  'date_signed','custom_text',
+  'unit_number','property_name','property_address'
 ]
 
 // Signer roles: exactly one 'primary', zero-or-more 'co_tenant_N', at least one
@@ -827,6 +828,52 @@ esignRouter.get('/batches', requireAuth, requireLandlord, async (req, res, next)
   }
 })
 
+/**
+ * Resolve a unit_id from prefillValues at send time.
+ * If prefillValues.unit_number is present, match against landlord's units.
+ * - 0 matches → throws 400
+ * - 1 match → returns that unitId
+ * - >1 matches → requires prefillValues.property_address to disambiguate via
+ *   case-insensitive partial match on composed street1+street2+city+state+zip.
+ * Returns null when unit_number is not provided (caller falls back to the unitId
+ * already on the request body from the tenant-lookup path).
+ */
+async function resolveUnitFromPrefill(
+  landlordId: string,
+  prefillValues: Record<string,string>
+): Promise<string|null> {
+  const unitNumber = (prefillValues?.unit_number || '').trim()
+  if (!unitNumber) return null
+  const matches = await query<any>(
+    `SELECT u.id, u.unit_number, p.street1, p.street2, p.city, p.state, p.zip, p.name AS property_name
+       FROM units u
+       JOIN properties p ON p.id = u.property_id
+      WHERE u.landlord_id = $1 AND u.unit_number = $2`,
+    [landlordId, unitNumber]
+  )
+  if (matches.length === 0) {
+    throw new AppError(400, `No unit matches unit number '${unitNumber}' for this landlord.`)
+  }
+  if (matches.length === 1) return matches[0].id
+  // Ambiguous — require property_address disambiguator
+  const addressHint = (prefillValues?.property_address || '').trim()
+  if (!addressHint) {
+    throw new AppError(400, `Ambiguous: ${matches.length} units match '${unitNumber}'. Specify the Property address in Document Values.`)
+  }
+  const hint = addressHint.toLowerCase()
+  const filtered = matches.filter((m: any) => {
+    const composed = [m.street1, m.street2, m.city, m.state, m.zip].filter(Boolean).join(' ').toLowerCase()
+    return composed.includes(hint)
+  })
+  if (filtered.length === 0) {
+    throw new AppError(400, `No unit '${unitNumber}' matches property address containing '${addressHint}'.`)
+  }
+  if (filtered.length > 1) {
+    throw new AppError(400, `Still ambiguous: ${filtered.length} units match '${unitNumber}' at addresses containing '${addressHint}'. Be more specific.`)
+  }
+  return filtered[0].id
+}
+
 esignRouter.post('/documents', requireAuth, requireLandlord, async (req, res, next) => {
   const client = await getClient()
   try {
@@ -860,12 +907,18 @@ esignRouter.post('/documents', requireAuth, requireLandlord, async (req, res, ne
       pdfUrl = pdfUrl || tmpl.base_pdf_url
     }
 
+    // Unit resolver — if the template binds unit_number and the landlord filled
+    // it in the Document Values form, match against this landlord's units. On
+    // success, override any unitId that came from the tenant-lookup fallback.
+    const resolvedUnitId = await resolveUnitFromPrefill(req.user!.profileId, prefillValues || {})
+    const finalUnitId = resolvedUnitId || unitId || null
+
     await client.query('BEGIN')
 
     const doc = await createDocumentRecord(client, {
       landlordId: req.user!.profileId,
       templateId: templateId || null,
-      unitId: unitId || null,
+      unitId: finalUnitId,
       leaseId: null,
       title,
       basePdfUrl: pdfUrl || null,

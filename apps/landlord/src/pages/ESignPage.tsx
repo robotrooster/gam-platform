@@ -35,6 +35,9 @@ const DATA_LABELS: Record<string, Array<{value:string; label:string}>> = {
     { value:'notice_days_required',   label:'Notice days required' },
     { value:'expiration_notice_days', label:'Expiration notice days' },
     { value:'custom_text',            label:'Custom text (entered at send time)' },
+    { value:'unit_number',            label:'Unit number' },
+    { value:'property_name',          label:'Property name' },
+    { value:'property_address',       label:'Property address' },
   ],
   date: [
     { value:'start_date',  label:'Lease start date' },
