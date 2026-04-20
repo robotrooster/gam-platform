@@ -53,15 +53,15 @@ function RequestDetailModal({ request: r, onClose }: { request: any; onClose: ()
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
               <span className={`badge ${PRI_COLORS[req.priority]}`}>{req.priority}</span>
               <span className={`badge ${ST_COLORS[req.status]}`}>{req.status?.replace('_',' ')}</span>
-              {parseInt(req.comment_count) > 0 && (
+              {parseInt(req.commentCount) > 0 && (
                 <span style={{ fontSize: '.65rem', color: 'var(--text-3)', display: 'flex', alignItems: 'center', gap: 3 }}>
-                  <MessageSquare size={10} /> {req.comment_count}
+                  <MessageSquare size={10} /> {req.commentCount}
                 </span>
               )}
             </div>
             <div style={{ fontFamily: 'var(--font-display)', fontSize: '1rem', fontWeight: 800, color: 'var(--text-0)' }}>{req.title}</div>
             <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 2 }}>
-              Unit {req.unit_number} · {req.property_name} · {req.tenant_first} {req.tenant_last}
+              Unit {req.unitNumber} · {req.propertyName} · {req.tenantFirst} {req.tenantLast}
             </div>
           </div>
           <button className="btn btn-ghost btn-sm" onClick={onClose} style={{ padding: 6, flexShrink: 0 }}><X size={15} /></button>
@@ -99,10 +99,10 @@ function RequestDetailModal({ request: r, onClose }: { request: any; onClose: ()
             <div style={{ fontSize: '.82rem', color: 'var(--text-1)', lineHeight: 1.6, marginBottom: 12, background: 'var(--bg-2)', border: '1px solid var(--border-0)', borderRadius: 8, padding: '10px 12px' }}>
               {req.description}
             </div>
-            {req.tenant_notes && (
+            {req.tenantNotes && (
               <div style={{ fontSize: '.78rem', color: 'var(--text-2)', background: 'var(--bg-2)', border: '1px solid var(--border-0)', borderRadius: 8, padding: '8px 12px', marginBottom: 8 }}>
                 <span style={{ fontSize: '.65rem', color: 'var(--text-3)', display: 'block', marginBottom: 4 }}>Tenant notes:</span>
-                {req.tenant_notes}
+                {req.tenantNotes}
               </div>
             )}
             <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
@@ -122,7 +122,7 @@ function RequestDetailModal({ request: r, onClose }: { request: any; onClose: ()
             <div style={{ marginBottom: 10 }}>
               <label style={{ fontSize: '.68rem', color: 'var(--text-3)', display: 'block', marginBottom: 3 }}>Scheduled Date</label>
               <div style={{ display: 'flex', gap: 6 }}>
-                <input className="input" type="datetime-local" value={editSchedule || req.scheduled_at?.slice(0,16) || ''} onChange={e => setEditSchedule(e.target.value)} style={{ flex: 1, fontSize: '.78rem' }} />
+                <input className="input" type="datetime-local" value={editSchedule || req.scheduledAt?.slice(0,16) || ''} onChange={e => setEditSchedule(e.target.value)} style={{ flex: 1, fontSize: '.78rem' }} />
                 <button className="btn btn-ghost btn-sm" onClick={() => updateMut.mutate({ scheduledAt: editSchedule || undefined })}>
                   <Check size={12} />
                 </button>
@@ -132,12 +132,12 @@ function RequestDetailModal({ request: r, onClose }: { request: any; onClose: ()
             {/* Cost */}
             <div style={{ marginBottom: 10 }}>
               <label style={{ fontSize: '.68rem', color: 'var(--text-3)', display: 'block', marginBottom: 3 }}>
-                Actual Cost {req.actual_cost && <span style={{ color: 'var(--gold)' }}>→ Platform fee: {fmt(req.actual_cost * 0.08)}</span>}
+                Actual Cost {req.actualCost && <span style={{ color: 'var(--gold)' }}>→ Platform fee: {fmt(req.actualCost * 0.08)}</span>}
               </label>
               <div style={{ display: 'flex', gap: 6 }}>
                 <div style={{ position: 'relative', flex: 1 }}>
                   <DollarSign size={12} style={{ position: 'absolute', left: 9, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-3)' }} />
-                  <input className="input" type="number" placeholder="0.00" value={editCost || req.actual_cost || ''} onChange={e => setEditCost(e.target.value)} style={{ width: '100%', paddingLeft: 24, fontSize: '.78rem' }} />
+                  <input className="input" type="number" placeholder="0.00" value={editCost || req.actualCost || ''} onChange={e => setEditCost(e.target.value)} style={{ width: '100%', paddingLeft: 24, fontSize: '.78rem' }} />
                 </div>
                 <button className="btn btn-ghost btn-sm" onClick={() => updateMut.mutate({ actualCost: parseFloat(editCost), status: 'completed' })}>
                   <Check size={12} />
@@ -150,7 +150,7 @@ function RequestDetailModal({ request: r, onClose }: { request: any; onClose: ()
               <label style={{ fontSize: '.68rem', color: 'var(--text-3)', display: 'block', marginBottom: 3 }}>Man Hours</label>
               <div style={{ display: 'flex', gap: 6 }}>
                 <input className="input" type="number" step="0.5" min="0" placeholder="0.0"
-                  defaultValue={req.man_hours || ''}
+                  defaultValue={req.manHours || ''}
                   onChange={e => setEditCost(e.target.value)}
                   id={`man-hours-${r.id}`}
                   style={{ width: '100%', fontSize: '.78rem' }} />
@@ -159,9 +159,9 @@ function RequestDetailModal({ request: r, onClose }: { request: any; onClose: ()
                   if (val) updateMut.mutate({ manHours: parseFloat(val) })
                 }}><Check size={12} /></button>
               </div>
-              {req.man_hours && req.actual_cost && (
+              {req.manHours && req.actualCost && (
                 <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginTop: 3 }}>
-                  Cost/hr: {fmt(req.actual_cost / req.man_hours)}
+                  Cost/hr: {fmt(req.actualCost / req.manHours)}
                 </div>
               )}
             </div>
@@ -169,9 +169,9 @@ function RequestDetailModal({ request: r, onClose }: { request: any; onClose: ()
             {/* Assign */}
             <div style={{ marginBottom: 10 }}>
               <label style={{ fontSize: '.68rem', color: 'var(--text-3)', display: 'block', marginBottom: 3 }}>Assigned To</label>
-              <div style={{ fontSize: '.78rem', color: req.assigned_first ? 'var(--text-0)' : 'var(--text-3)', padding: '6px 0' }}>
-                {req.assigned_first ? `${req.assigned_first} ${req.assigned_last}` : 'Unassigned'}
-                {req.assigned_at && <span style={{ fontSize: '.65rem', color: 'var(--text-3)', marginLeft: 6 }}>{new Date(req.assigned_at).toLocaleDateString()}</span>}
+              <div style={{ fontSize: '.78rem', color: req.assignedFirst ? 'var(--text-0)' : 'var(--text-3)', padding: '6px 0' }}>
+                {req.assignedFirst ? `${req.assignedFirst} ${req.assignedLast}` : 'Unassigned'}
+                {req.assignedAt && <span style={{ fontSize: '.65rem', color: 'var(--text-3)', marginLeft: 6 }}>{new Date(req.assignedAt).toLocaleDateString()}</span>}
               </div>
             </div>
 
@@ -207,16 +207,16 @@ function RequestDetailModal({ request: r, onClose }: { request: any; onClose: ()
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 12, maxHeight: 240, overflowY: 'auto' }}>
             {isLoading && <div style={{ color: 'var(--text-3)', fontSize: '.78rem' }}>Loading…</div>}
             {comments.map((c: any) => (
-              <div key={c.id} style={{ display: 'flex', gap: 10, padding: '8px 10px', borderRadius: 8, background: c.is_internal ? 'rgba(201,162,39,.04)' : 'var(--bg-2)', border: `1px solid ${c.is_internal ? 'rgba(201,162,39,.15)' : 'var(--border-0)'}` }}>
+              <div key={c.id} style={{ display: 'flex', gap: 10, padding: '8px 10px', borderRadius: 8, background: c.isInternal ? 'rgba(201,162,39,.04)' : 'var(--bg-2)', border: `1px solid ${c.isInternal ? 'rgba(201,162,39,.15)' : 'var(--border-0)'}` }}>
                 <div style={{ width: 28, height: 28, borderRadius: '50%', background: c.role === 'tenant' ? 'rgba(74,158,255,.15)' : c.role === 'maintenance' ? 'rgba(30,219,122,.15)' : 'rgba(201,162,39,.15)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, fontSize: '.65rem', fontWeight: 800, color: c.role === 'tenant' ? 'var(--blue)' : c.role === 'maintenance' ? 'var(--green)' : 'var(--gold)' }}>
-                  {c.first_name?.[0]}{c.last_name?.[0]}
+                  {c.firstName?.[0]}{c.lastName?.[0]}
                 </div>
                 <div style={{ flex: 1 }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 2 }}>
-                    <span style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-0)' }}>{c.first_name} {c.last_name}</span>
+                    <span style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-0)' }}>{c.firstName} {c.lastName}</span>
                     <span style={{ fontSize: '.62rem', color: 'var(--text-3)', textTransform: 'capitalize' }}>{c.role}</span>
-                    {c.is_internal && <span style={{ fontSize: '.58rem', color: 'var(--amber)', background: 'rgba(201,162,39,.1)', padding: '1px 5px', borderRadius: 4 }}>Internal</span>}
-                    <span style={{ fontSize: '.62rem', color: 'var(--text-3)', marginLeft: 'auto' }}>{new Date(c.created_at).toLocaleString()}</span>
+                    {c.isInternal && <span style={{ fontSize: '.58rem', color: 'var(--amber)', background: 'rgba(201,162,39,.1)', padding: '1px 5px', borderRadius: 4 }}>Internal</span>}
+                    <span style={{ fontSize: '.62rem', color: 'var(--text-3)', marginLeft: 'auto' }}>{new Date(c.createdAt).toLocaleString()}</span>
                   </div>
                   <div style={{ fontSize: '.78rem', color: 'var(--text-1)', lineHeight: 1.5 }}>{c.message}</div>
                 </div>
@@ -247,15 +247,15 @@ function RequestDetailModal({ request: r, onClose }: { request: any; onClose: ()
 
 function CostBreakdownModal({ requests, onClose }: { requests: any[]; onClose: () => void }) {
   const fmt2 = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
-  const completed = requests.filter((r: any) => r.status === 'completed' && r.actual_cost)
+  const completed = requests.filter((r: any) => r.status === 'completed' && r.actualCost)
   const now = new Date()
   const sDay   = new Date(now.getFullYear(), now.getMonth(), now.getDate())
   const sWeek  = new Date(sDay); sWeek.setDate(sDay.getDate() - sDay.getDay())
   const sMonth = new Date(now.getFullYear(), now.getMonth(), 1)
   const sYear  = new Date(now.getFullYear(), 0, 1)
-  const sum = (arr: any[]) => arr.reduce((s: number, r: any) => s + (+r.actual_cost || 0), 0)
-  const hrs = (arr: any[]) => arr.reduce((s: number, r: any) => s + (+r.man_hours || 0), 0)
-  const fil = (d: Date) => completed.filter((r: any) => new Date(r.completed_at || r.updated_at) >= d)
+  const sum = (arr: any[]) => arr.reduce((s: number, r: any) => s + (+r.actualCost || 0), 0)
+  const hrs = (arr: any[]) => arr.reduce((s: number, r: any) => s + (+r.manHours || 0), 0)
+  const fil = (d: Date) => completed.filter((r: any) => new Date(r.completedAt || r.updatedAt) >= d)
   const rows: [string, any[]][] = [['Today', fil(sDay)], ['This Week', fil(sWeek)], ['This Month', fil(sMonth)], ['YTD', fil(sYear)], ['All Time', completed]]
   return (
     <div className="modal-overlay" onClick={onClose}>
@@ -334,7 +334,7 @@ export function MaintenancePage() {
         <div>
           <h1 className="page-title">Maintenance</h1>
           <p className="page-subtitle">
-            {(stats as any)?.open_count || 0} open · {(stats as any)?.in_progress_count || 0} in progress
+            {(stats as any)?.openCount || 0} open · {(stats as any)?.inProgressCount || 0} in progress
             {emergencies.length > 0 && <span style={{ color: 'var(--red)', marginLeft: 8 }}>· {emergencies.length} emergency</span>}
           </p>
         </div>
@@ -350,7 +350,7 @@ export function MaintenancePage() {
           <div style={{ flex: 1 }}>
             <span style={{ fontSize: '.82rem', fontWeight: 700, color: 'var(--red)' }}>{emergencies.length} Emergency Request{emergencies.length > 1 ? 's' : ''} — Immediate Attention Required</span>
             <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 2 }}>
-              {emergencies.map((e: any) => `Unit ${e.unit_number}: ${e.title}`).join(' · ')}
+              {emergencies.map((e: any) => `Unit ${e.unitNumber}: ${e.title}`).join(' · ')}
             </div>
           </div>
         </div>
@@ -360,11 +360,11 @@ export function MaintenancePage() {
       {stats && (
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5,1fr)', gap: 12, marginBottom: 20 }}>
           {[
-            { label: 'Open',        val: (stats as any).open_count,        color: 'var(--amber)',  filter: 'open' },
-            { label: 'Assigned',    val: (stats as any).assigned_count,    color: 'var(--blue)',   filter: 'assigned' },
-            { label: 'In Progress', val: (stats as any).in_progress_count, color: 'var(--blue)',   filter: 'in_progress' },
-            { label: 'Completed',   val: (stats as any).completed_count,   color: 'var(--green)',  filter: 'completed' },
-            { label: 'Total Cost',  val: fmt((stats as any).total_cost),   color: 'var(--text-0)', filter: 'cost' },
+            { label: 'Open',        val: (stats as any).openCount,        color: 'var(--amber)',  filter: 'open' },
+            { label: 'Assigned',    val: (stats as any).assignedCount,    color: 'var(--blue)',   filter: 'assigned' },
+            { label: 'In Progress', val: (stats as any).inProgressCount, color: 'var(--blue)',   filter: 'in_progress' },
+            { label: 'Completed',   val: (stats as any).completedCount,   color: 'var(--green)',  filter: 'completed' },
+            { label: 'Total Cost',  val: fmt((stats as any).totalCost),   color: 'var(--text-0)', filter: 'cost' },
           ].map(s => (
             <div key={s.label} className="card" style={{ padding: '12px 14px', cursor: 'pointer', border: filterStatus===s.filter?'1px solid var(--gold)':'1px solid var(--border-1)' }}
               onClick={() => s.filter==='cost' ? setShowCostBreakdown(true) : setFilterStatus(filterStatus===s.filter?'all':s.filter)}>
@@ -412,23 +412,23 @@ export function MaintenancePage() {
             <tbody>
               {filtered.map((r: any) => (
                 <tr key={r.id} onClick={() => setSelectedRequest(r)} style={{ cursor: 'pointer' }}>
-                  <td className="mono" style={{ fontSize: '.72rem' }}>{new Date(r.created_at).toLocaleDateString()}</td>
+                  <td className="mono" style={{ fontSize: '.72rem' }}>{new Date(r.createdAt).toLocaleDateString()}</td>
                   <td>
-                    <div className="mono">{r.unit_number}</div>
-                    <div style={{ fontSize: '.65rem', color: 'var(--text-3)' }}>{r.property_name}</div>
+                    <div className="mono">{r.unitNumber}</div>
+                    <div style={{ fontSize: '.65rem', color: 'var(--text-3)' }}>{r.propertyName}</div>
                   </td>
                   <td>
                     <div style={{ color: 'var(--text-0)', fontWeight: 500, fontSize: '.82rem' }}>{r.title}</div>
                     <div style={{ fontSize: '.65rem', color: 'var(--text-3)', display: 'flex', alignItems: 'center', gap: 4 }}>
-                      {r.tenant_first} {r.tenant_last}
-                      {parseInt(r.comment_count) > 0 && <span style={{ display: 'flex', alignItems: 'center', gap: 2 }}><MessageSquare size={9} />{r.comment_count}</span>}
+                      {r.tenantFirst} {r.tenantLast}
+                      {parseInt(r.commentCount) > 0 && <span style={{ display: 'flex', alignItems: 'center', gap: 2 }}><MessageSquare size={9} />{r.commentCount}</span>}
                     </div>
                   </td>
                   <td><span className={`badge ${PRI_COLORS[r.priority]}`}>{r.priority}</span></td>
                   <td><span className={`badge ${ST_COLORS[r.status]}`}>{r.status?.replace('_',' ')}</span></td>
-                  <td style={{ fontSize: '.75rem' }}>{r.assigned_first ? `${r.assigned_first} ${r.assigned_last}` : <span style={{ color: 'var(--text-3)' }}>—</span>}</td>
-                  <td className="mono" style={{ fontSize: '.72rem' }}>{r.scheduled_at ? new Date(r.scheduled_at).toLocaleDateString() : <span style={{ color: 'var(--text-3)' }}>—</span>}</td>
-                  <td className="mono">{r.actual_cost ? fmt(r.actual_cost) : <span style={{ color: 'var(--text-3)' }}>—</span>}</td>
+                  <td style={{ fontSize: '.75rem' }}>{r.assignedFirst ? `${r.assignedFirst} ${r.assignedLast}` : <span style={{ color: 'var(--text-3)' }}>—</span>}</td>
+                  <td className="mono" style={{ fontSize: '.72rem' }}>{r.scheduledAt ? new Date(r.scheduledAt).toLocaleDateString() : <span style={{ color: 'var(--text-3)' }}>—</span>}</td>
+                  <td className="mono">{r.actualCost ? fmt(r.actualCost) : <span style={{ color: 'var(--text-3)' }}>—</span>}</td>
                   <td onClick={e => e.stopPropagation()}>
                     <button className="btn btn-ghost btn-sm" onClick={() => setSelectedRequest(r)}>View</button>
                   </td>
@@ -451,7 +451,7 @@ export function MaintenancePage() {
               <label style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', display: 'block', marginBottom: 5 }}>Unit *</label>
               <select className="input" style={{ width: '100%' }} value={form.unitId} onChange={e => setF('unitId', e.target.value)}>
                 <option value="">Select unit…</option>
-                {(units as any[]).map((u: any) => <option key={u.id} value={u.id}>Unit {u.unit_number} — {u.property_name}</option>)}
+                {(units as any[]).map((u: any) => <option key={u.id} value={u.id}>Unit {u.unitNumber} — {u.propertyName}</option>)}
               </select>
             </div>
             <div style={{ marginBottom: 12 }}>

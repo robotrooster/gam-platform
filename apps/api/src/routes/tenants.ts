@@ -332,6 +332,7 @@ tenantsRouter.post('/invite', async (req, res, next) => {
     res.json({
       success: true,
       data: {
+        userId: user!.id,
         tenantId,
         email,
         inviteToken,

@@ -17,7 +17,7 @@ export function InviteTenantModal({ onClose }: Props) {
   const [copied, setCopied] = useState(false)
 
   const { data: units = [] } = useQuery<any[]>('vacant-units', () =>
-    apiGet('/units').then((all: any[]) => all.filter(u => !u.tenant_id))
+    apiGet('/units').then((all: any[]) => all.filter(u => !u.tenantId))
   )
 
   const inviteMut = useMutation(
@@ -209,7 +209,7 @@ export function InviteTenantModal({ onClose }: Props) {
                     </div>
                     <div style={{ flex: 1 }}>
                       <div style={{ fontSize: '.85rem', fontWeight: 600, color: 'var(--text-0)' }}>
-                        Unit {u.unit_number} <span style={{ fontSize: '.72rem', color: 'var(--text-3)', fontWeight: 400 }}>· {u.property_name}</span>
+                        Unit {u.unitNumber} <span style={{ fontSize: '.72rem', color: 'var(--text-3)', fontWeight: 400 }}>· {u.propertyName}</span>
                       </div>
                       <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 1 }}>
                         {u.bedrooms === 0 ? 'Studio' : `${u.bedrooms}bd`} · {u.bathrooms}ba
@@ -217,7 +217,7 @@ export function InviteTenantModal({ onClose }: Props) {
                       </div>
                     </div>
                     <div style={{ textAlign: 'right', flexShrink: 0 }}>
-                      <div style={{ fontFamily: 'var(--font-mono)', fontSize: '.85rem', color: 'var(--gold)', fontWeight: 600 }}>{fmt(u.rent_amount)}</div>
+                      <div style={{ fontFamily: 'var(--font-mono)', fontSize: '.85rem', color: 'var(--gold)', fontWeight: 600 }}>{fmt(u.rentAmount)}</div>
                       <div style={{ fontSize: '.65rem', color: 'var(--text-3)' }}>/month</div>
                     </div>
                     {form.unitId === u.id && <Check size={16} style={{ color: 'var(--gold)', flexShrink: 0 }} />}
@@ -255,11 +255,11 @@ export function InviteTenantModal({ onClose }: Props) {
                   <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                     <DoorOpen size={14} style={{ color: 'var(--text-3)' }} />
                     <div>
-                      <div style={{ fontSize: '.8rem', fontWeight: 600, color: 'var(--text-0)' }}>Unit {selectedUnit.unit_number}</div>
-                      <div style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>{selectedUnit.property_name}</div>
+                      <div style={{ fontSize: '.8rem', fontWeight: 600, color: 'var(--text-0)' }}>Unit {selectedUnit.unitNumber}</div>
+                      <div style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>{selectedUnit.propertyName}</div>
                     </div>
                   </div>
-                  <div style={{ fontFamily: 'var(--font-mono)', fontSize: '.85rem', color: 'var(--gold)', fontWeight: 600 }}>{fmt(selectedUnit.rent_amount)}/mo</div>
+                  <div style={{ fontFamily: 'var(--font-mono)', fontSize: '.85rem', color: 'var(--gold)', fontWeight: 600 }}>{fmt(selectedUnit.rentAmount)}/mo</div>
                 </div>
               )}
 

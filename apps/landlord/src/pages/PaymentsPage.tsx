@@ -84,7 +84,7 @@ function PaymentDetailModal({ payment: p, onClose }: { payment: any; onClose: ()
               {fmt(p.amount)} · {p.type?.replace('_', ' ')}
             </div>
           </div>
-          {p.zero_tolerance_flag && (
+          {p.zeroToleranceFlag && (
             <span className="badge badge-red">Zero Tolerance</span>
           )}
         </div>
@@ -98,36 +98,36 @@ function PaymentDetailModal({ payment: p, onClose }: { payment: any; onClose: ()
           </div>
           {row('Amount', fmt(p.amount), { mono: true, color: 'var(--text-0)' })}
           {row('Type', p.type?.replace('_', ' '))}
-          {row('Entry Description', p.entry_description, { mono: true })}
-          {row('Due Date', p.due_date ? new Date(p.due_date).toLocaleDateString() : null, { mono: true })}
-          {row('Processed', p.processed_at ? new Date(p.processed_at).toLocaleString() : null, { mono: true })}
-          {row('Settled', p.settled_at ? new Date(p.settled_at).toLocaleString() : null, { mono: true })}
-          {row('Retry Count', p.retry_count ?? 0, { mono: true })}
+          {row('Entry Description', p.entryDescription, { mono: true })}
+          {row('Due Date', p.dueDate ? new Date(p.dueDate).toLocaleDateString() : null, { mono: true })}
+          {row('Processed', p.processedAt ? new Date(p.processedAt).toLocaleString() : null, { mono: true })}
+          {row('Settled', p.settledAt ? new Date(p.settledAt).toLocaleString() : null, { mono: true })}
+          {row('Retry Count', p.retryCount ?? 0, { mono: true })}
 
           {/* Unit & Tenant */}
           <div style={{ fontSize: '.72rem', fontWeight: 700, color: 'var(--gold)', textTransform: 'uppercase', letterSpacing: '.08em', margin: '16px 0 4px 0' }}>
             Unit
           </div>
-          {row('Unit', p.unit_number, { mono: true })}
-          {row('Property', p.property_name)}
+          {row('Unit', p.unitNumber, { mono: true })}
+          {row('Property', p.propertyName)}
 
           {/* Stripe & ACH refs */}
           <div style={{ fontSize: '.72rem', fontWeight: 700, color: 'var(--gold)', textTransform: 'uppercase', letterSpacing: '.08em', margin: '16px 0 4px 0' }}>
             Stripe & ACH
           </div>
-          {row('Payment Intent ID', p.stripe_payment_intent_id, { mono: true })}
-          {row('Charge ID', p.stripe_charge_id, { mono: true })}
-          {row('ACH Trace Number', p.ach_trace_number, { mono: true })}
+          {row('Payment Intent ID', p.stripePaymentIntentId, { mono: true })}
+          {row('Charge ID', p.stripeChargeId, { mono: true })}
+          {row('ACH Trace Number', p.achTraceNumber, { mono: true })}
 
           {/* Returns (only if present) */}
-          {(p.return_code || p.return_reason) && (
+          {(p.returnCode || p.returnReason) && (
             <>
               <div style={{ fontSize: '.72rem', fontWeight: 700, color: 'var(--red)', textTransform: 'uppercase', letterSpacing: '.08em', margin: '16px 0 4px 0' }}>
                 Return Details
               </div>
-              {row('Return Code', p.return_code, { mono: true, color: 'var(--red)' })}
-              {row('Return Reason', p.return_reason, { color: 'var(--red)' })}
-              {p.zero_tolerance_flag && row('Zero Tolerance Flag', 'Yes', { color: 'var(--red)' })}
+              {row('Return Code', p.returnCode, { mono: true, color: 'var(--red)' })}
+              {row('Return Reason', p.returnReason, { color: 'var(--red)' })}
+              {p.zeroToleranceFlag && row('Zero Tolerance Flag', 'Yes', { color: 'var(--red)' })}
             </>
           )}
 
@@ -156,7 +156,7 @@ function PaymentDetailModal({ payment: p, onClose }: { payment: any; onClose: ()
           <div style={{ fontSize: '.72rem', fontWeight: 700, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.08em', margin: '16px 0 4px 0' }}>
             Metadata
           </div>
-          {row('Created', p.created_at ? new Date(p.created_at).toLocaleString() : null, { mono: true })}
+          {row('Created', p.createdAt ? new Date(p.createdAt).toLocaleString() : null, { mono: true })}
         </div>
 
         {/* Footer */}
@@ -204,15 +204,15 @@ export function PaymentsPage() {
                   onClick={() => setSelected(p)}
                   style={{ cursor: 'pointer' }}
                 >
-                  <td className="mono">{p.due_date ? new Date(p.due_date).toLocaleDateString() : '—'}</td>
-                  <td className="mono">{p.unit_number || '—'}</td>
+                  <td className="mono">{p.dueDate ? new Date(p.dueDate).toLocaleDateString() : '—'}</td>
+                  <td className="mono">{p.unitNumber || '—'}</td>
                   <td><span className="badge badge-muted">{p.type}</span></td>
                   <td className="mono" style={{ color: 'var(--text-0)' }}>{fmt(p.amount)}</td>
                   <td><span className={'badge ' + (STATUS_MAP[p.status] || 'badge-muted')}>{p.status}</span></td>
-                  <td className="mono" style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>{p.entry_description}</td>
+                  <td className="mono" style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>{p.entryDescription}</td>
                   <td>
-                    {p.return_code
-                      ? <span className={'badge ' + (p.zero_tolerance_flag ? 'badge-red' : 'badge-amber')}>{p.return_code}</span>
+                    {p.returnCode
+                      ? <span className={'badge ' + (p.zeroToleranceFlag ? 'badge-red' : 'badge-amber')}>{p.returnCode}</span>
                       : <span style={{ color: 'var(--text-3)' }}>—</span>}
                   </td>
                 </tr>

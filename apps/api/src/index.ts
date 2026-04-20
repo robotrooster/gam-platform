@@ -8,6 +8,7 @@ import morgan from 'morgan'
 import rateLimit from 'express-rate-limit'
 import dotenv from 'dotenv'
 import { errorHandler } from './middleware/errorHandler'
+import { camelCaseKeys } from './lib/caseConversion'
 import { authRouter }         from './routes/auth'
 import { landlordsRouter }    from './routes/landlords'
 import { tenantsRouter }      from './routes/tenants'
@@ -67,6 +68,15 @@ app.use('/webhooks/stripe', express.raw({ type: 'application/json' }))
 
 app.use(express.json())
 app.use(express.urlencoded({ extended: true }))
+
+// Outgoing camelCase middleware — converts snake_case DB keys to camelCase
+// wire format on the way out. DB stays snake_case; frontend sees camelCase.
+app.use((_req, res, next) => {
+  const originalJson = res.json.bind(res)
+  res.json = (body: any) => originalJson(camelCaseKeys(body))
+  next()
+})
+
 app.use(morgan('dev'))
 
 // Rate limiting

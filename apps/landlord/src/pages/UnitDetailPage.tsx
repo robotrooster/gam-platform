@@ -42,9 +42,9 @@ export function UnitDetailPage() {
   // Init listing form from unit data
   if (unit && !listingInit) {
     setListingForm({
-      availableDate: unit.available_date ? unit.available_date.split('T')[0] : '',
-      listingDescription: unit.listing_description || '',
-      listedVacant: unit.listed_vacant || false,
+      availableDate: unit.availableDate ? unit.availableDate.split('T')[0] : '',
+      listingDescription: unit.listingDescription || '',
+      listedVacant: unit.listedVacant || false,
       bedrooms: unit.bedrooms?.toString() || '',
       bathrooms: unit.bathrooms?.toString() || '',
       sqft: unit.sqft?.toString() || '',
@@ -111,15 +111,15 @@ export function UnitDetailPage() {
         <div className="flex items-center gap-12">
           <button className="btn btn-ghost btn-sm" onClick={() => navigate('/units')}><ArrowLeft size={15} /></button>
           <div>
-            <h1 className="page-title">Unit {unit.unit_number}</h1>
-            <p className="page-subtitle">{unit.property_name} - {unit.street1}, {unit.city}</p>
+            <h1 className="page-title">Unit {unit.unitNumber}</h1>
+            <p className="page-subtitle">{unit.propertyName} - {unit.street1}, {unit.city}</p>
           </div>
         </div>
         <div className="flex gap-8">
-          {unit.payment_block && <span className="badge badge-red"><Shield size={10} /> Eviction Mode</span>}
-          {unit.on_time_pay_active && <span className="badge badge-green"><CheckCircle size={10} /> On-Time Pay Active</span>}
-          {unit.scheduled_activation_at && (
-            <span className="badge badge-amber" title={'Scheduled: ' + new Date(unit.scheduled_activation_at).toLocaleString()}>
+          {unit.paymentBlock && <span className="badge badge-red"><Shield size={10} /> Eviction Mode</span>}
+          {unit.onTimePayActive && <span className="badge badge-green"><CheckCircle size={10} /> On-Time Pay Active</span>}
+          {unit.scheduledActivationAt && (
+            <span className="badge badge-amber" title={'Scheduled: ' + new Date(unit.scheduledActivationAt).toLocaleString()}>
               ⏰ Activation scheduled
             </span>
           )}
@@ -138,16 +138,16 @@ export function UnitDetailPage() {
               </button>
             </>
           )}
-          {unit.scheduled_activation_at && (
+          {unit.scheduledActivationAt && (
             <button className="btn btn-sm btn-ghost" onClick={() => cancelSchedMut.mutate()} disabled={cancelSchedMut.isLoading}>
               Cancel schedule
             </button>
           )}
           <button
-            className={'btn btn-sm ' + (unit.payment_block ? 'btn-secondary' : 'btn-danger')}
+            className={'btn btn-sm ' + (unit.paymentBlock ? 'btn-secondary' : 'btn-danger')}
             onClick={() => { setEvictModal(true); setEvictConfirm(false) }}
           >
-            <Shield size={13} /> {unit.payment_block ? 'Deactivate Eviction Mode' : 'Activate Eviction Mode'}
+            <Shield size={13} /> {unit.paymentBlock ? 'Deactivate Eviction Mode' : 'Activate Eviction Mode'}
           </button>
         </div>
       </div>
@@ -156,21 +156,21 @@ export function UnitDetailPage() {
         <div className="card">
           <div className="card-title" style={{ marginBottom: 16 }}>Unit Details</div>
           <div className="data-row"><span className="data-key">Status</span><span className={'badge badge-' + (unit.status === 'active' ? 'green' : unit.status === 'vacant' ? 'muted' : 'amber')}>{unit.status}</span></div>
-          <div className="data-row"><span className="data-key">Rent</span><span className="data-val mono">{fmt(unit.rent_amount)}/mo</span></div>
-          <div className="data-row"><span className="data-key">Deposit</span><span className="data-val mono">{fmt(unit.security_deposit)}</span></div>
+          <div className="data-row"><span className="data-key">Rent</span><span className="data-val mono">{fmt(unit.rentAmount)}/mo</span></div>
+          <div className="data-row"><span className="data-key">Deposit</span><span className="data-val mono">{fmt(unit.securityDeposit)}</span></div>
           <div className="data-row"><span className="data-key">Bedrooms</span><span className="data-val">{unit.bedrooms}</span></div>
           <div className="data-row"><span className="data-key">Bathrooms</span><span className="data-val">{unit.bathrooms}</span></div>
         </div>
 
         <div className="card">
           <div className="card-title" style={{ marginBottom: 16 }}>Tenant</div>
-          {unit.tenant_first ? (
+          {unit.tenantFirst ? (
             <>
-              <div className="data-row"><span className="data-key">Name</span><span className="data-val">{unit.tenant_first} {unit.tenant_last}</span></div>
-              <div className="data-row"><span className="data-key">Email</span><span className="data-val">{unit.tenant_email}</span></div>
-              <div className="data-row"><span className="data-key">ACH</span><span className={'badge ' + (unit.ach_verified ? 'badge-green' : 'badge-amber')}>{unit.ach_verified ? 'Verified' : 'Pending'}</span></div>
-              <div className="data-row"><span className="data-key">SSI/SSDI</span><span className="data-val">{unit.ssi_ssdi ? 'Yes' : 'No'}</span></div>
-              <div className="data-row"><span className="data-key">On-Time Pay</span><span className={'badge ' + (unit.on_time_pay_enrolled ? 'badge-green' : 'badge-muted')}>{unit.on_time_pay_enrolled ? 'Enrolled' : 'Not enrolled'}</span></div>
+              <div className="data-row"><span className="data-key">Name</span><span className="data-val">{unit.tenantFirst} {unit.tenantLast}</span></div>
+              <div className="data-row"><span className="data-key">Email</span><span className="data-val">{unit.tenantEmail}</span></div>
+              <div className="data-row"><span className="data-key">ACH</span><span className={'badge ' + (unit.achVerified ? 'badge-green' : 'badge-amber')}>{unit.achVerified ? 'Verified' : 'Pending'}</span></div>
+              <div className="data-row"><span className="data-key">SSI/SSDI</span><span className="data-val">{unit.ssiSsdi ? 'Yes' : 'No'}</span></div>
+              <div className="data-row"><span className="data-key">On-Time Pay</span><span className={'badge ' + (unit.onTimePayEnrolled ? 'badge-green' : 'badge-muted')}>{unit.onTimePayEnrolled ? 'Enrolled' : 'Not enrolled'}</span></div>
             </>
           ) : (
             <div style={{ color: 'var(--text-3)', fontSize: '.875rem', padding: '16px 0' }}>No tenant assigned.</div>
@@ -182,11 +182,11 @@ export function UnitDetailPage() {
           <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:10, marginBottom:20 }}>
             <div style={{ background:"var(--bg-2)", border:"1px solid var(--border-0)", borderRadius:10, padding:"12px 14px" }}>
               <div style={{ fontSize:".65rem", fontWeight:700, color:"var(--text-3)", textTransform:"uppercase", marginBottom:6 }}>Net Monthly</div>
-              <div style={{ fontFamily:"var(--font-mono)", fontSize:".95rem", fontWeight:700, color:"var(--green)" }}>{fmt(unit.rent_amount-(unit.status==="vacant"?0:unit.status==="direct_pay"?5:15))}</div>
+              <div style={{ fontFamily:"var(--font-mono)", fontSize:".95rem", fontWeight:700, color:"var(--green)" }}>{fmt(unit.rentAmount-(unit.status==="vacant"?0:unit.status==="direct_pay"?5:15))}</div>
             </div>
             <div style={{ background:"var(--bg-2)", border:"1px solid var(--border-0)", borderRadius:10, padding:"12px 14px" }}>
               <div style={{ fontSize:".65rem", fontWeight:700, color:"var(--text-3)", textTransform:"uppercase", marginBottom:6 }}>Projected Yearly</div>
-              <div style={{ fontFamily:"var(--font-mono)", fontSize:".95rem", fontWeight:700, color:"var(--gold)" }}>{fmt((unit.rent_amount-(unit.status==="vacant"?0:unit.status==="direct_pay"?5:15))*12)}</div>
+              <div style={{ fontFamily:"var(--font-mono)", fontSize:".95rem", fontWeight:700, color:"var(--gold)" }}>{fmt((unit.rentAmount-(unit.status==="vacant"?0:unit.status==="direct_pay"?5:15))*12)}</div>
             </div>
             <div style={{ background:"var(--bg-2)", border:"1px solid var(--border-0)", borderRadius:10, padding:"12px 14px" }}>
               <div style={{ fontSize:".65rem", fontWeight:700, color:"var(--text-3)", textTransform:"uppercase", marginBottom:6 }}>Lifetime Net</div>
@@ -200,17 +200,17 @@ export function UnitDetailPage() {
           <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:16 }}>
             <div>
               <div style={{ fontSize:".68rem", fontWeight:700, color:"var(--text-3)", textTransform:"uppercase", letterSpacing:".08em", marginBottom:8 }}>Monthly Breakdown</div>
-              <div className="data-row"><span className="data-key">Rent</span><span className="data-val mono">{fmt(unit.rent_amount)}/mo</span></div>
+              <div className="data-row"><span className="data-key">Rent</span><span className="data-val mono">{fmt(unit.rentAmount)}/mo</span></div>
               <div className="data-row"><span className="data-key">Platform fee</span><span className="data-val mono" style={{ color:unit.status==="vacant"?"var(--text-3)":"var(--red)" }}>{unit.status==="vacant"?"Free (vacant)":unit.status==="direct_pay"?"-5.00/mo (direct pay)":"-15.00/mo (on-time pay)"}</span></div>
-              <div className="data-row" style={{ borderTop:"1px solid var(--border-1)", paddingTop:8, marginTop:4 }}><span className="data-key" style={{ fontWeight:700 }}>Net monthly</span><span className="data-val mono" style={{ color:"var(--green)", fontWeight:700 }}>{fmt(unit.rent_amount-(unit.status==="vacant"?0:unit.status==="direct_pay"?5:15))}/mo</span></div>
-              <div className="data-row"><span className="data-key">Projected yearly</span><span className="data-val mono" style={{ color:"var(--gold)" }}>{fmt((unit.rent_amount-(unit.status==="vacant"?0:unit.status==="direct_pay"?5:15))*12)}</span></div>
+              <div className="data-row" style={{ borderTop:"1px solid var(--border-1)", paddingTop:8, marginTop:4 }}><span className="data-key" style={{ fontWeight:700 }}>Net monthly</span><span className="data-val mono" style={{ color:"var(--green)", fontWeight:700 }}>{fmt(unit.rentAmount-(unit.status==="vacant"?0:unit.status==="direct_pay"?5:15))}/mo</span></div>
+              <div className="data-row"><span className="data-key">Projected yearly</span><span className="data-val mono" style={{ color:"var(--gold)" }}>{fmt((unit.rentAmount-(unit.status==="vacant"?0:unit.status==="direct_pay"?5:15))*12)}</span></div>
             </div>
             <div>
               <div style={{ fontSize:".68rem", fontWeight:700, color:"var(--text-3)", textTransform:"uppercase", letterSpacing:".08em", marginBottom:8 }}>Maintenance Costs</div>
-              {(maintenance as any[]).filter((m:any)=>m.actual_cost).length===0
+              {(maintenance as any[]).filter((m:any)=>m.actualCost).length===0
                 ? <div style={{ fontSize:".78rem", color:"var(--text-3)" }}>No costs recorded.</div>
-                : (maintenance as any[]).filter((m:any)=>m.actual_cost).slice(0,5).map((m:any)=>(
-                    <div key={m.id} className="data-row"><span className="data-key" style={{ fontSize:".73rem" }}>{m.title}</span><span className="data-val mono" style={{ color:"var(--red)", fontSize:".73rem" }}>−{fmt(m.actual_cost)}</span></div>
+                : (maintenance as any[]).filter((m:any)=>m.actualCost).slice(0,5).map((m:any)=>(
+                    <div key={m.id} className="data-row"><span className="data-key" style={{ fontSize:".73rem" }}>{m.title}</span><span className="data-val mono" style={{ color:"var(--red)", fontSize:".73rem" }}>−{fmt(m.actualCost)}</span></div>
                   ))
               }
               {econ && econ.lifetimeMaintCost > 0 && (<div className="data-row" style={{ borderTop:"1px solid var(--border-1)", paddingTop:8, marginTop:4 }}><span className="data-key" style={{ fontWeight:700 }}>Lifetime total</span><span className="data-val mono" style={{ color:"var(--red)", fontWeight:700 }}>−{fmt(econ.lifetimeMaintCost)}</span></div>)}
@@ -316,7 +316,7 @@ export function UnitDetailPage() {
       {activateModal && (
         <div className="modal-overlay" onClick={() => setActivateModal(false)}>
           <div className="modal" style={{ maxWidth: 520 }} onClick={e => e.stopPropagation()}>
-            <div className="modal-title">Activate Unit {unit.unit_number}</div>
+            <div className="modal-title">Activate Unit {unit.unitNumber}</div>
             <p style={{ fontSize: '.82rem', color: 'var(--text-2)', marginBottom: 16 }}>
               Activation starts billing based on lease terms. Rent collection, disbursements, and platform fees begin at the activation time.
             </p>
@@ -406,8 +406,8 @@ export function UnitDetailPage() {
       {evictModal && (
         <div className="modal-overlay" onClick={() => setEvictModal(false)}>
           <div className="modal" onClick={e => e.stopPropagation()}>
-            <div className="modal-title">{unit.payment_block ? 'Deactivate Eviction Mode' : 'Activate Eviction Mode'} - Unit {unit.unit_number}</div>
-            {!unit.payment_block ? (
+            <div className="modal-title">{unit.paymentBlock ? 'Deactivate Eviction Mode' : 'Activate Eviction Mode'} - Unit {unit.unitNumber}</div>
+            {!unit.paymentBlock ? (
               <>
                 <div className="alert alert-danger">
                   <AlertTriangle size={16} />
@@ -416,7 +416,7 @@ export function UnitDetailPage() {
                 <p style={{ fontSize: '.875rem', color: 'var(--text-2)', marginBottom: 20 }}>No rent collected and no disbursement made until deactivated.</p>
                 <label style={{ display: 'flex', alignItems: 'flex-start', gap: 12, marginBottom: 20, cursor: 'pointer' }}>
                   <input type="checkbox" checked={evictConfirm} onChange={e => setEvictConfirm(e.target.checked)} style={{ marginTop: 3 }} />
-                  <span style={{ fontSize: '.82rem', color: 'var(--text-1)' }}>I understand. Activate Eviction Mode for Unit {unit.unit_number}.</span>
+                  <span style={{ fontSize: '.82rem', color: 'var(--text-1)' }}>I understand. Activate Eviction Mode for Unit {unit.unitNumber}.</span>
                 </label>
                 <div className="modal-footer">
                   <button className="btn btn-ghost" onClick={() => setEvictModal(false)}>Cancel</button>

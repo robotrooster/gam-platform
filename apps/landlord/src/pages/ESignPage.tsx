@@ -2,6 +2,7 @@
 import { useState, useRef, useCallback, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPatch, apiDelete, apiPut } from '../lib/api'
+import { useAuth } from '../context/AuthContext'
 import { Plus, X, FileText, Send, Settings, Eye, Trash2, ChevronRight, Check, AlertCircle, Download, MoreVertical } from 'lucide-react'
 
 const FIELD_TYPES = [
@@ -13,9 +14,9 @@ const FIELD_TYPES = [
   { type:'radio_group',label:'Multiple Choice', icon:'🔘', color:'#ec4899', w:180, h:30 },
 ]
 
-const SIGNER_ROLES = ['landlord','tenant_1','tenant_2','tenant_3','witness']
+const SIGNER_ROLES = ['landlord','primary','co_tenant_1','co_tenant_2','witness']
 const ROLE_COLORS: Record<string,string> = {
-  landlord:'#c9a227', tenant_1:'#22c55e', tenant_2:'#4a9eff', tenant_3:'#a78bfa', witness:'#f59e0b'
+  landlord:'#c9a227', primary:'#22c55e', co_tenant_1:'#4a9eff', co_tenant_2:'#a78bfa', witness:'#f59e0b'
 }
 
 // ── FIELD ITEM ON CANVAS ──────────────────────────────────────
@@ -159,7 +160,7 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
   const [fields, setFields] = useState<any[]>(template.fields || [])
   const [selectedField, setSelectedField] = useState<string|null>(null)
   const [activeTool, setActiveTool] = useState<string|null>(null)
-  const [activeRole, setActiveRole] = useState('tenant_1')
+  const [activeRole, setActiveRole] = useState('primary')
   const [currentPage, setCurrentPage] = useState(1)
   const [scale, setScale] = useState(0.9)
   const canvasRef = useRef<HTMLDivElement>(null)
@@ -234,9 +235,9 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
           <span style={{ fontSize:'.72rem', color:'var(--text-3)', minWidth:36, textAlign:'center' as const }}>{Math.round(scale*100)}%</span>
           <button className="btn btn-ghost btn-sm" onClick={() => setScale(s => Math.min(1.8, s + 0.1))} title="Zoom in">+</button>
         </div>
-        <div style={{ fontSize:'.72rem', color:'var(--text-3)' }}>Page {currentPage} of {template.page_count}</div>
+        <div style={{ fontSize:'.72rem', color:'var(--text-3)' }}>Page {currentPage} of {template.pageCount}</div>
         {currentPage > 1 && <button className="btn btn-ghost btn-sm" onClick={() => setCurrentPage(p => p-1)}>← Prev</button>}
-        {currentPage < template.page_count && <button className="btn btn-ghost btn-sm" onClick={() => setCurrentPage(p => p+1)}>Next →</button>}
+        {currentPage < template.pageCount && <button className="btn btn-ghost btn-sm" onClick={() => setCurrentPage(p => p+1)}>Next →</button>}
         <button className="btn btn-primary btn-sm" onClick={() => saveMut.mutate()} disabled={saveMut.isLoading}>
           {saveMut.isLoading ? <span className="spinner" /> : <><Check size={13} /> Save Fields</>}
         </button>
@@ -291,7 +292,7 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
                   <input className="input" value={sel.groupName||''} onChange={e => updateSelected('groupName', e.target.value)} placeholder="e.g. lease_type" style={{ width:'100%', fontSize:'.75rem' }} />
                 </div>
               )}
-              {sel.fieldType === 'initials' && template.page_count > 1 && (
+              {sel.fieldType === 'initials' && template.pageCount > 1 && (
                 <button
                   className="btn btn-ghost btn-sm"
                   style={{ width:'100%', justifyContent:'center', marginBottom:8, fontSize:'.7rem', color:'#ec4899', borderColor:'rgba(236,72,153,.3)' }}
@@ -299,13 +300,13 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
                     const base = fields.find(f => f.id === selectedField)
                     if (!base) return
                     const existing = fields.filter(f => f.fieldType==='initials' && f.signerRole===base.signerRole && f.id!==base.id).map(f=>f.page)
-                    const newFields = Array.from({ length: template.page_count }, (_, i) => i+1)
+                    const newFields = Array.from({ length: template.pageCount }, (_, i) => i+1)
                       .filter(pg => pg !== base.page && !existing.includes(pg))
                       .map(pg => ({ ...base, id: `f_${Date.now()}_${pg}`, page: pg }))
                     if (newFields.length === 0) return alert('Already stamped to all pages')
                     setFields(prev => [...prev, ...newFields])
                   }}>
-                  🔘 Stamp to all {template.page_count} pages
+                  🔘 Stamp to all {template.pageCount} pages
                 </button>
               )}
               <label style={{ display:'flex', alignItems:'center', gap:6, cursor:'pointer', fontSize:'.72rem', color:'var(--text-2)' }}>
@@ -334,9 +335,9 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
         <div style={{ flex:1, overflow:'auto', background:'#2a2a2a', display:'flex', alignItems:'flex-start', justifyContent:'center', padding:20 }}>
           <div style={{ position:'relative', width: pdfW * scale, height: pdfH * scale, flexShrink:0 }}>
             {/* PDF background rendered with PDF.js */}
-            {template.base_pdf_url ? (
+            {template.basePdfUrl ? (
               <PDFCanvas
-                url={`${template.base_pdf_url.startsWith('http') ? '' : 'http://localhost:4000'}${template.base_pdf_url}`}
+                url={`${template.basePdfUrl.startsWith('http') ? '' : 'http://localhost:4000'}${template.basePdfUrl}`}
                 page={currentPage}
                 width={pdfW * scale}
                 height={pdfH * scale}
@@ -370,39 +371,74 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
 // ── SEND DOCUMENT MODAL ────────────────────────────────────────────
 function SendDocumentModal({ onClose }) {
   const qc = useQueryClient()
+  const { user: authUser } = useAuth()
   const [templateId, setTemplateId] = useState('')
   const [tenantEmails, setTenantEmails] = useState([''])
+  const [tenantNames, setTenantNames] = useState([{ firstName: '', lastName: '' }])
   const [searches, setSearches] = useState([''])
   const [sending, setSending] = useState(false)
   const [error, setError] = useState('')
   const { data: templates = [] } = useQuery('esign-templates', () => apiGet('/esign/templates'))
   const { data: units = [] } = useQuery('units', () => apiGet('/units'))
-  const existingTenants = units.filter(u => u.tenant_email).map(u => ({ email: u.tenant_email, name: u.tenant_first + ' ' + u.tenant_last, unit: u.unit_number, unitId: u.id, propertyName: u.property_name }))
+  const existingTenants = units.filter(u => u.tenantEmail).map(u => ({ email: u.tenantEmail, name: u.tenantFirst + ' ' + u.tenantLast, unit: u.unitNumber, unitId: u.id, propertyName: u.propertyName }))
   const selectedTemplate = templates.find(t => t.id === templateId)
   const setEmail = (i, val) => { setTenantEmails(prev => prev.map((e,j) => j===i?val:e)); setSearches(prev => prev.map((e,j) => j===i?val:e)) }
   const selectTenant = (i, tenant) => { setTenantEmails(prev => prev.map((e,j) => j===i?tenant.email:e)); setSearches(prev => prev.map((e,j) => j===i?tenant.email:e)) }
   const handleSend = async () => {
     if (!templateId) { setError('Please select a template'); return }
+    if (!authUser) { setError('Not logged in'); return }
     const validEmails = tenantEmails.filter(e => e.trim())
     if (!validEmails.length) { setError('Please enter at least one tenant email'); return }
+    // Pick unitId from first tenant (required by backend for original_lease to build lease)
+    const firstTenant = existingTenants.find(t => t.email === validEmails[0].trim())
     setSending(true); setError('')
     try {
+      // Phase 1: Provision (or reuse) a user account for each tenant and collect their userId.
+      // Backend /tenants/invite creates users+tenants rows if missing, reuses if present, returns userId.
       const signers = []
       let order = 1
-      for (const email of validEmails) {
-        const existing = existingTenants.find(t => t.email === email.trim())
-        signers.push({ role: 'tenant_' + order, name: existing ? existing.name : email.split('@')[0], email: email.trim(), phone: null, orderIndex: order, userId: null, unitId: existing ? existing.unitId : null })
+      for (let i = 0; i < validEmails.length; i++) {
+        const email = validEmails[i].trim()
+        const existing = existingTenants.find(t => t.email === email)
+        const nameParts = existing
+          ? { firstName: existing.name.split(' ')[0] || 'Tenant', lastName: existing.name.split(' ').slice(1).join(' ') || '' }
+          : { firstName: (tenantNames[i]?.firstName || email.split('@')[0]), lastName: (tenantNames[i]?.lastName || '') }
+        // Provision. Needs unitId per invite endpoint contract.
+        const inviteRes: any = await apiPost('/tenants/invite', {
+          email,
+          firstName: nameParts.firstName,
+          lastName: nameParts.lastName,
+          phone: null,
+          unitId: firstTenant?.unitId || null,
+        })
+        const userId = inviteRes.data.userId
+        signers.push({
+          role: order === 1 ? 'primary' : 'co_tenant_' + (order - 1),
+          name: (nameParts.firstName + ' ' + nameParts.lastName).trim() || email,
+          email,
+          phone: null,
+          orderIndex: order,
+          userId,
+          unitId: existing ? existing.unitId : (firstTenant?.unitId || null),
+        })
         order++
       }
-      signers.push({ role: 'landlord', name: 'James Demo', email: 'james@demo.dev', phone: null, orderIndex: order, userId: null })
-      const firstTenant = existingTenants.find(t => t.email === validEmails[0].trim())
+      // Landlord signer from AuthContext
+      signers.push({
+        role: 'landlord',
+        name: (authUser.firstName + ' ' + authUser.lastName).trim(),
+        email: authUser.email,
+        phone: null,
+        orderIndex: order,
+        userId: authUser.id,
+      })
       const unitId = firstTenant ? firstTenant.unitId : null
       const title = selectedTemplate ? selectedTemplate.name + (firstTenant ? ' — Unit ' + firstTenant.unit : '') : 'Lease Agreement'
       const res = await apiPost('/esign/documents', { templateId, unitId, title, signers })
       await apiPost('/esign/documents/' + res.data.id + '/send', {})
       qc.invalidateQueries('esign-documents')
       onClose()
-    } catch(e) { setError(e.message || 'Failed to send') }
+    } catch(e: any) { setError(e.message || 'Failed to send') }
     setSending(false)
   }
   return (
@@ -416,7 +452,7 @@ function SendDocumentModal({ onClose }) {
           <label style={{ fontSize:'.72rem', fontWeight:600, color:'var(--text-3)', textTransform:'uppercase', letterSpacing:'.06em', display:'block', marginBottom:6 }}>Template *</label>
           <select className='input' style={{ width:'100%' }} value={templateId} onChange={e => setTemplateId(e.target.value)} autoFocus>
             <option value=''>Select a template…</option>
-            {templates.map(t => <option key={t.id} value={t.id}>{t.name} ({t.field_count} fields)</option>)}
+            {templates.map(t => <option key={t.id} value={t.id}>{t.name} ({t.fieldCount} fields)</option>)}
           </select>
         </div>
         <div style={{ marginBottom:16 }}>
@@ -446,7 +482,7 @@ function SendDocumentModal({ onClose }) {
         {templateId && tenantEmails.some(e => e.trim()) && (
           <div style={{ padding:'10px 14px', background:'var(--bg-2)', border:'1px solid var(--border-0)', borderRadius:10, marginBottom:16, fontSize:'.75rem', color:'var(--text-2)', lineHeight:1.8 }}>
             <div><strong>Template:</strong> {selectedTemplate && selectedTemplate.name}</div>
-            <div><strong>Signing order:</strong> {tenantEmails.filter(e=>e).map((_,i) => 'Tenant ' + (i+1)).join(' → ')} → Landlord</div>
+            <div><strong>Signing order:</strong> {tenantEmails.filter(e=>e).map((_,i) => i === 0 ? 'Primary tenant' : 'Co-tenant ' + i).join(' → ')} → Landlord</div>
             <div style={{ marginTop:6, fontSize:'.68rem', color:'var(--text-3)' }}>Each signer receives a signing request + portal invite email.</div>
           </div>
         )}
@@ -540,14 +576,14 @@ export function ESignPage() {
                 {(documents as any[]).map(d => (
                   <tr key={d.id}>
                     <td style={{ fontWeight:600, color:'var(--text-0)' }}>{d.title}</td>
-                    <td style={{ fontSize:'.75rem' }}>{d.property_name} · Unit {d.unit_number}</td>
+                    <td style={{ fontSize:'.75rem' }}>{d.propertyName} · Unit {d.unitNumber}</td>
                     <td><span className={`badge ${STATUS_COLORS[d.status]||'badge-muted'}`}>{d.status.replace('_',' ')}</span></td>
-                    <td style={{ fontSize:'.75rem' }}>{d.signed_count}/{d.signer_count} signed</td>
-                    <td style={{ fontSize:'.72rem', color:'var(--text-3)' }}>{d.sent_at ? new Date(d.sent_at).toLocaleDateString() : '—'}</td>
-                    <td style={{ fontSize:'.72rem', color: d.completed_at ? 'var(--green)' : 'var(--text-3)' }}>{d.completed_at ? new Date(d.completed_at).toLocaleDateString() : '—'}</td>
+                    <td style={{ fontSize:'.75rem' }}>{d.signedCount}/{d.signerCount} signed</td>
+                    <td style={{ fontSize:'.72rem', color:'var(--text-3)' }}>{d.sentAt ? new Date(d.sentAt).toLocaleDateString() : '—'}</td>
+                    <td style={{ fontSize:'.72rem', color: d.completedAt ? 'var(--green)' : 'var(--text-3)' }}>{d.completedAt ? new Date(d.completedAt).toLocaleDateString() : '—'}</td>
                     <td>
                       <div style={{ display:'flex', gap:6 }}>
-                        {d.completed_pdf_url && <a href={d.completed_pdf_url} className="btn btn-ghost btn-sm"><Download size={12} /></a>}
+                        {d.completedPdfUrl && <a href={d.completedPdfUrl} className="btn btn-ghost btn-sm"><Download size={12} /></a>}
                         {d.status !== 'completed' && d.status !== 'voided' && (
                           <button className="btn btn-ghost btn-sm" style={{ color:'var(--red)' }} onClick={() => { if(window.confirm('Void this document?')) voidMut.mutate(d.id) }}><X size={12} /></button>
                         )}
@@ -579,7 +615,7 @@ export function ESignPage() {
                   <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start', marginBottom:10 }}>
                     <div>
                       <div style={{ fontWeight:700, color:'var(--text-0)', marginBottom:2 }}>{t.name}</div>
-                      <div style={{ fontSize:'.72rem', color:'var(--text-3)' }}>{t.field_count} fields · {t.page_count} pages</div>
+                      <div style={{ fontSize:'.72rem', color:'var(--text-3)' }}>{t.fieldCount} fields · {t.pageCount} pages</div>
                     </div>
                     <FileText size={18} style={{ color:'var(--text-3)' }} />
                   </div>

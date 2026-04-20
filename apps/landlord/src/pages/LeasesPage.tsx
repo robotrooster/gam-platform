@@ -56,7 +56,7 @@ export function LeasesPage() {
     }
   }
 
-  const needsReviewCount = (leases as any[]).filter(l => l.needs_review).length
+  const needsReviewCount = (leases as any[]).filter(l => l.needsReview).length
 
   return (
     <div>
@@ -109,7 +109,7 @@ export function LeasesPage() {
             </thead>
             <tbody>
               {(leases as any[]).length ? (leases as any[]).map((l: any) => {
-                const tenantName = [l.tenant_first, l.tenant_last].filter(Boolean).join(' ') || '—'
+                const tenantName = [l.tenantFirst, l.tenantLast].filter(Boolean).join(' ') || '—'
                 return (
                   <tr
                     key={l.id}
@@ -117,10 +117,10 @@ export function LeasesPage() {
                     style={{ cursor: 'pointer' }}
                     className="row-clickable"
                   >
-                    <td className="mono">{l.unit_number || '—'}</td>
+                    <td className="mono">{l.unitNumber || '—'}</td>
                     <td>
                       {tenantName}
-                      {l.needs_review && (
+                      {l.needsReview && (
                         <span
                           title="Needs review"
                           style={{
@@ -144,15 +144,15 @@ export function LeasesPage() {
                       )}
                     </td>
                     <td style={{ fontSize: '.78rem', color: 'var(--text-2)' }}>
-                      {LEASE_TYPE_LABELS[l.lease_type] || l.lease_type || '—'}
+                      {LEASE_TYPE_LABELS[l.leaseType] || l.leaseType || '—'}
                     </td>
-                    <td className="mono">{l.start_date ? new Date(l.start_date).toLocaleDateString() : '—'}</td>
+                    <td className="mono">{l.startDate ? new Date(l.startDate).toLocaleDateString() : '—'}</td>
                     <td className="mono">
-                      {l.end_date
-                        ? new Date(l.end_date).toLocaleDateString()
+                      {l.endDate
+                        ? new Date(l.endDate).toLocaleDateString()
                         : <span style={{ color: 'var(--text-3)' }}>MTM</span>}
                     </td>
-                    <td className="mono" style={{ color: 'var(--text-0)' }}>{fmt(l.rent_amount)}</td>
+                    <td className="mono" style={{ color: 'var(--text-0)' }}>{fmt(l.rentAmount)}</td>
                     <td>
                       <span className={'badge ' + (STATUS_MAP[l.status] || 'badge-muted')}>
                         {l.status?.replace('_', ' ') || '—'}

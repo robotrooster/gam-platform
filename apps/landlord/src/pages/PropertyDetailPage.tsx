@@ -27,11 +27,11 @@ export function PropertyDetailPage() {
   if (propLoading) return <div style={{ color:'var(--text-3)', padding:32 }}>Loading…</div>
   if (!property) return <div className="empty-state"><h3>Property not found</h3></div>
 
-  const occupied  = (units as any[]).filter(u => u.tenant_id).length
-  const vacant    = (units as any[]).filter(u => !u.tenant_id).length
-  const revenue   = (units as any[]).filter(u => u.tenant_id).reduce((s,u) => s + parseFloat(u.rent_amount||0), 0)
+  const occupied  = (units as any[]).filter(u => u.tenantId).length
+  const vacant    = (units as any[]).filter(u => !u.tenantId).length
+  const revenue   = (units as any[]).filter(u => u.tenantId).reduce((s,u) => s + parseFloat(u.rentAmount||0), 0)
   const occupancy = units.length > 0 ? Math.round((occupied / units.length) * 100) : 0
-  const maxRevenue  = (units as any[]).reduce((s, u) => s + parseFloat(u.rent_amount||0), 0)
+  const maxRevenue  = (units as any[]).reduce((s, u) => s + parseFloat(u.rentAmount||0), 0)
 
   return (
     <div>
@@ -115,24 +115,24 @@ export function PropertyDetailPage() {
               {(units as any[]).map((u: any) => (
                 <tr key={u.id} style={{ cursor:'pointer' }} onClick={() => navigate(`/units/${u.id}`)}>
                   <td>
-                    <div style={{ fontFamily:'var(--font-mono)', fontWeight:700, color:'var(--text-0)' }}>{u.unit_number}</div>
+                    <div style={{ fontFamily:'var(--font-mono)', fontWeight:700, color:'var(--text-0)' }}>{u.unitNumber}</div>
                   </td>
                   <td>
-                    {u.tenant_first ? (
+                    {u.tenantFirst ? (
                       <div>
-                        <div style={{ fontSize:'.82rem', fontWeight:600, color:'var(--text-0)' }}>{u.tenant_first} {u.tenant_last}</div>
-                        <div style={{ fontSize:'.68rem', color:'var(--text-3)' }}>{u.tenant_email}</div>
+                        <div style={{ fontSize:'.82rem', fontWeight:600, color:'var(--text-0)' }}>{u.tenantFirst} {u.tenantLast}</div>
+                        <div style={{ fontSize:'.68rem', color:'var(--text-3)' }}>{u.tenantEmail}</div>
                       </div>
                     ) : (
                       <span style={{ color:'var(--text-3)', fontSize:'.78rem' }}>Vacant</span>
                     )}
                   </td>
-                  <td className="mono">{fmt(u.rent_amount)}/mo</td>
+                  <td className="mono">{fmt(u.rentAmount)}/mo</td>
                   <td><span className={`badge ${STATUS_COLORS[u.status] || 'badge-muted'}`}>{u.status?.replace('_',' ')}</span></td>
                   <td style={{ fontSize:'.78rem' }}>{u.bedrooms}bd / {u.bathrooms}ba</td>
                   <td className="mono" style={{ fontSize:'.75rem' }}>{u.sqft ? u.sqft.toLocaleString() : '—'}</td>
                   <td>
-                    {u.on_time_pay_active
+                    {u.onTimePayActive
                       ? <span className="badge badge-green">Active</span>
                       : <span className="badge badge-muted">Inactive</span>
                     }

@@ -279,7 +279,7 @@ function SignatureSetup({ name, initials, onComplete }: { name:string; initials:
 type Stage = 'signing'|'review'|'done'
 
 export function SignPage() {
-  const { token } = useParams<{ token:string }>()
+  const { documentId } = useParams<{ documentId:string }>()
   const navigate = useNavigate()
   const [stage, setStage]             = useState<Stage>('signing')
   const [fieldValues, setFieldValues] = useState<Record<string,string>>({})
@@ -297,12 +297,12 @@ export function SignPage() {
   const canvasRef    = useRef<HTMLCanvasElement>(null)
   const scaleRef     = useRef(1)
 
-  const { data, isLoading, error } = useQuery(['sign', token],
-    () => authFetch('/esign/sign/'+token).then(r=>r.json()).then(r=>{ if(!r.success)throw new Error(r.error); return r.data }),
+  const { data, isLoading, error } = useQuery(['sign', documentId],
+    () => authFetch('/esign/sign/'+documentId).then(r=>r.json()).then(r=>{ if(!r.success)throw new Error(r.error); return r.data }),
     { retry:false }
   )
   const submitMut = useMutation(
-    () => authFetch('/esign/sign/'+token, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ fieldValues: Object.entries(fieldValues).map(([fieldId,value])=>({fieldId,value})) }) }).then(r=>r.json()),
+    () => authFetch('/esign/sign/'+documentId, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ fieldValues: Object.entries(fieldValues).map(([fieldId,value])=>({fieldId,value})) }) }).then(r=>r.json()),
     { onSuccess:(res:any)=>{ setAllDone(res.completed); setStage('done') } }
   )
 

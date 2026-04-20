@@ -35,10 +35,10 @@ export function MaintenancePortalPage() {
 
   const myShift = (shiftData as any)?.myShift
   const activeStaff = (shiftData as any)?.active || []
-  const lowStock = (parts as any[]).filter(p => p.quantity <= p.min_quantity)
+  const lowStock = (parts as any[]).filter(p => p.quantity <= p.minQuantity)
   const pendingPurchases = (purchases as any[]).filter(p => p.status === 'pending')
   const todayTasks = (tasks as any[]).filter(t => !t.completed)
-  const overdueScheduled = (scheduled as any[]).filter(s => s.next_due && new Date(s.next_due) <= new Date())
+  const overdueScheduled = (scheduled as any[]).filter(s => s.nextDue && new Date(s.nextDue) <= new Date())
 
   const TABS: {id:Tab, label:string, icon:any, badge?:number}[] = [
     { id:'shift',      label:'Shift',       icon:Clock,        badge: activeStaff.length },
@@ -92,7 +92,7 @@ export function MaintenancePortalPage() {
           {myShift && (
             <div className="card" style={{ marginBottom:16, padding:16, background:'rgba(34,197,94,.06)', border:'1px solid rgba(34,197,94,.2)' }}>
               <div style={{ fontWeight:700, color:'var(--green)', marginBottom:4 }}>✓ You are clocked in</div>
-              <div style={{ fontSize:'.78rem', color:'var(--text-3)' }}>Since {new Date(myShift.clocked_in_at).toLocaleTimeString()}</div>
+              <div style={{ fontSize:'.78rem', color:'var(--text-3)' }}>Since {new Date(myShift.clockedInAt).toLocaleTimeString()}</div>
             </div>
           )}
           <div className="card" style={{ padding:0 }}>
@@ -105,9 +105,9 @@ export function MaintenancePortalPage() {
                 <tbody>
                   {activeStaff.map((s:any) => (
                     <tr key={s.id}>
-                      <td><div style={{ fontWeight:600, color:'var(--text-0)' }}>{s.first_name} {s.last_name}</div></td>
-                      <td style={{ fontSize:'.78rem', color:'var(--text-3)' }}>{new Date(s.clocked_in_at).toLocaleTimeString()}</td>
-                      <td className="mono" style={{ fontSize:'.78rem' }}>{parseFloat(s.hours_on_shift).toFixed(1)}h</td>
+                      <td><div style={{ fontWeight:600, color:'var(--text-0)' }}>{s.firstName} {s.lastName}</div></td>
+                      <td style={{ fontSize:'.78rem', color:'var(--text-3)' }}>{new Date(s.clockedInAt).toLocaleTimeString()}</td>
+                      <td className="mono" style={{ fontSize:'.78rem' }}>{parseFloat(s.hoursOnShift).toFixed(1)}h</td>
                     </tr>
                   ))}
                 </tbody>
@@ -128,9 +128,9 @@ export function MaintenancePortalPage() {
               <tbody>
                 {(workOrders as any[]).map((o:any) => (
                   <tr key={o.id}>
-                    <td><div style={{ fontWeight:600 }}>{o.property_name}</div><div style={{ fontSize:'.72rem', color:'var(--text-3)' }}>Unit {o.unit_number}</div></td>
+                    <td><div style={{ fontWeight:600 }}>{o.propertyName}</div><div style={{ fontSize:'.72rem', color:'var(--text-3)' }}>Unit {o.unitNumber}</div></td>
                     <td style={{ maxWidth:200 }}><div style={{ fontWeight:600, fontSize:'.82rem' }}>{o.title}</div><div style={{ fontSize:'.72rem', color:'var(--text-3)', overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{o.description}</div></td>
-                    <td style={{ fontSize:'.78rem' }}><div>{o.tenant_name||'—'}</div>{o.tenant_phone&&<div style={{ color:'var(--text-3)' }}>{o.tenant_phone}</div>}</td>
+                    <td style={{ fontSize:'.78rem' }}><div>{o.tenantName||'—'}</div>{o.tenantPhone&&<div style={{ color:'var(--text-3)' }}>{o.tenantPhone}</div>}</td>
                     <td><span className={`badge ${PRIORITY_COLORS[o.priority]||'badge-muted'}`}>{o.priority}</span></td>
                     <td><span className="badge badge-amber">{o.status}</span></td>
                   </tr>
@@ -159,7 +159,7 @@ export function MaintenancePortalPage() {
                       <div style={{ fontWeight:600, color:'var(--text-0)', textDecoration:t.completed?'line-through':'none' }}>{t.title}</div>
                       {t.description && <div style={{ fontSize:'.72rem', color:'var(--text-3)' }}>{t.description}</div>}
                     </div>
-                    {t.assigned_name && <div style={{ fontSize:'.72rem', color:'var(--text-3)', display:'flex', alignItems:'center', gap:4 }}><User size={11}/>{t.assigned_name}</div>}
+                    {t.assignedName && <div style={{ fontSize:'.72rem', color:'var(--text-3)', display:'flex', alignItems:'center', gap:4 }}><User size={11}/>{t.assignedName}</div>}
                     {t.recurrence !== 'none' && <span className="badge badge-blue">{t.recurrence}</span>}
                   </div>
                 ))}
@@ -205,12 +205,12 @@ export function MaintenancePortalPage() {
                 <thead><tr><th>Part</th><th>SKU</th><th>Location</th><th>Stock</th><th>Min</th><th>Cost</th></tr></thead>
                 <tbody>
                   {(parts as any[]).map((p:any) => (
-                    <tr key={p.id} style={{ background: p.quantity<=p.min_quantity ? 'rgba(239,68,68,.04)' : '' }}>
+                    <tr key={p.id} style={{ background: p.quantity<=p.minQuantity ? 'rgba(239,68,68,.04)' : '' }}>
                       <td><div style={{ fontWeight:600 }}>{p.name}</div>{p.description&&<div style={{ fontSize:'.7rem', color:'var(--text-3)' }}>{p.description}</div>}</td>
                       <td className="mono" style={{ fontSize:'.75rem' }}>{p.sku||'—'}</td>
                       <td style={{ fontSize:'.78rem' }}>{p.location||'—'}</td>
-                      <td><span style={{ fontWeight:700, color:p.quantity<=p.min_quantity?'var(--red)':'var(--green)' }}>{p.quantity} {p.unit}</span></td>
-                      <td style={{ fontSize:'.78rem', color:'var(--text-3)' }}>{p.min_quantity}</td>
+                      <td><span style={{ fontWeight:700, color:p.quantity<=p.minQuantity?'var(--red)':'var(--green)' }}>{p.quantity} {p.unit}</span></td>
+                      <td style={{ fontSize:'.78rem', color:'var(--text-3)' }}>{p.minQuantity}</td>
                       <td className="mono" style={{ fontSize:'.78rem' }}>{p.cost ? fmt(p.cost) : '—'}</td>
                     </tr>
                   ))}
@@ -258,14 +258,14 @@ export function MaintenancePortalPage() {
                     const items = typeof p.items==='string' ? JSON.parse(p.items) : p.items||[]
                     return (
                       <tr key={p.id}>
-                        <td><div style={{ fontWeight:600 }}>{p.requested_by_name}</div><div style={{ fontSize:'.7rem', color:'var(--text-3)' }}>{new Date(p.created_at).toLocaleDateString()}</div></td>
+                        <td><div style={{ fontWeight:600 }}>{p.requestedByName}</div><div style={{ fontSize:'.7rem', color:'var(--text-3)' }}>{new Date(p.createdAt).toLocaleDateString()}</div></td>
                         <td style={{ fontSize:'.78rem' }}>{items.map((i:any)=>i.name).join(', ')}</td>
-                        <td className="mono" style={{ fontSize:'.78rem' }}>{p.total_estimate ? fmt(p.total_estimate) : '—'}</td>
+                        <td className="mono" style={{ fontSize:'.78rem' }}>{p.totalEstimate ? fmt(p.totalEstimate) : '—'}</td>
                         <td><span className={`badge ${p.status==='approved'?'badge-green':p.status==='denied'?'badge-red':p.status==='purchased'?'badge-blue':'badge-amber'}`}>{p.status}</span></td>
                         <td>
                           {p.status==='pending' && (
                             <div style={{ display:'flex', gap:6 }}>
-                              <button className="btn btn-primary btn-sm" onClick={()=>approvePurchaseMut.mutate({ id:p.id, budgetLimit:p.total_estimate })}>Approve</button>
+                              <button className="btn btn-primary btn-sm" onClick={()=>approvePurchaseMut.mutate({ id:p.id, budgetLimit:p.totalEstimate })}>Approve</button>
                               <button className="btn btn-ghost btn-sm" onClick={()=>{}}>Deny</button>
                             </div>
                           )}
@@ -318,14 +318,14 @@ export function MaintenancePortalPage() {
               <thead><tr><th>Task</th><th>Property</th><th>Recurrence</th><th>Next Due</th><th>Assigned</th><th></th></tr></thead>
               <tbody>
                 {(scheduled as any[]).map((s:any) => {
-                  const overdue = s.next_due && new Date(s.next_due) <= new Date()
+                  const overdue = s.nextDue && new Date(s.nextDue) <= new Date()
                   return (
                     <tr key={s.id} style={{ background:overdue?'rgba(239,68,68,.04)':'' }}>
                       <td><div style={{ fontWeight:600 }}>{s.title}</div>{s.description&&<div style={{ fontSize:'.7rem', color:'var(--text-3)' }}>{s.description}</div>}</td>
-                      <td style={{ fontSize:'.78rem' }}><div>{s.property_name||'All properties'}</div>{s.unit_number&&<div style={{ color:'var(--text-3)' }}>Unit {s.unit_number}</div>}</td>
+                      <td style={{ fontSize:'.78rem' }}><div>{s.propertyName||'All properties'}</div>{s.unitNumber&&<div style={{ color:'var(--text-3)' }}>Unit {s.unitNumber}</div>}</td>
                       <td><span className="badge badge-blue">{s.recurrence}</span></td>
-                      <td style={{ fontSize:'.78rem', color:overdue?'var(--red)':'var(--text-2)', fontWeight:overdue?700:400 }}>{s.next_due ? new Date(s.next_due).toLocaleDateString() : '—'}{overdue&&' ⚠️'}</td>
-                      <td style={{ fontSize:'.78rem' }}>{s.assigned_name||'Unassigned'}</td>
+                      <td style={{ fontSize:'.78rem', color:overdue?'var(--red)':'var(--text-2)', fontWeight:overdue?700:400 }}>{s.nextDue ? new Date(s.nextDue).toLocaleDateString() : '—'}{overdue&&' ⚠️'}</td>
+                      <td style={{ fontSize:'.78rem' }}>{s.assignedName||'Unassigned'}</td>
                       <td><button className="btn btn-primary btn-sm" onClick={()=>completedScheduledMut.mutate(s.id)}>Complete</button></td>
                     </tr>
                   )

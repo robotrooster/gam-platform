@@ -19,12 +19,12 @@ export function WorkTradePage() {
             <tbody>
               {agreements.length ? agreements.map((a: any) => (
                 <tr key={a.id}>
-                  <td style={{fontWeight:500}}>{a.tenant_name || '—'}</td>
-                  <td className="mono">{a.unit_number || '—'}</td>
-                  <td style={{fontSize:'.88rem'}}>{a.role_description || '—'}</td>
-                  <td className="mono">{a.hours_per_month ?? '—'}</td>
-                  <td className="mono" style={{color:'var(--green)'}}>{fmt(a.monthly_credit)}</td>
-                  <td className="mono">{a.start_date ? new Date(a.start_date).toLocaleDateString() : '—'}</td>
+                  <td style={{fontWeight:500}}>{a.tenantName || '—'}</td>
+                  <td className="mono">{a.unitNumber || '—'}</td>
+                  <td style={{fontSize:'.88rem'}}>{a.roleDescription || '—'}</td>
+                  <td className="mono">{a.hoursPerMonth ?? '—'}</td>
+                  <td className="mono" style={{color:'var(--green)'}}>{fmt(a.monthlyCredit)}</td>
+                  <td className="mono">{a.startDate ? new Date(a.startDate).toLocaleDateString() : '—'}</td>
                   <td><span className={`badge ${STATUS_MAP[a.status]||'badge-muted'}`}>{a.status || '—'}</span></td>
                 </tr>
               )) : (

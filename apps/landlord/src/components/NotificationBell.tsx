@@ -175,17 +175,17 @@ export function NotificationBell() {
                   const route = TYPE_ROUTES[n.type]
                   if (route) { setOpen(false); window.location.href = route }
                 }}
-                  style={{ display:'flex', gap:10, padding:'10px 16px', borderBottom:'1px solid var(--border-0)', cursor: n.is_read ? 'default' : 'pointer', background: n.is_read ? 'transparent' : 'rgba(201,162,39,.03)', transition:'background .12s' }}
-                  onMouseEnter={e => !n.is_read && ((e.currentTarget as any).style.background = 'rgba(201,162,39,.06)')}
-                  onMouseLeave={e => !n.is_read && ((e.currentTarget as any).style.background = 'rgba(201,162,39,.03)')}
+                  style={{ display:'flex', gap:10, padding:'10px 16px', borderBottom:'1px solid var(--border-0)', cursor: n.isRead ? 'default' : 'pointer', background: n.isRead ? 'transparent' : 'rgba(201,162,39,.03)', transition:'background .12s' }}
+                  onMouseEnter={e => !n.isRead && ((e.currentTarget as any).style.background = 'rgba(201,162,39,.06)')}
+                  onMouseLeave={e => !n.isRead && ((e.currentTarget as any).style.background = 'rgba(201,162,39,.03)')}
                 >
                   <div style={{ fontSize:'1.1rem', flexShrink:0, marginTop:1 }}>{TYPE_ICONS[n.type] || '🔔'}</div>
                   <div style={{ flex:1, minWidth:0 }}>
-                    <div style={{ fontSize:'.78rem', fontWeight: n.is_read ? 500 : 700, color:'var(--text-0)', marginBottom:2 }}>{n.title}</div>
+                    <div style={{ fontSize:'.78rem', fontWeight: n.isRead ? 500 : 700, color:'var(--text-0)', marginBottom:2 }}>{n.title}</div>
                     <div style={{ fontSize:'.7rem', color:'var(--text-3)', lineHeight:1.4, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{n.body}</div>
-                    <div style={{ fontSize:'.62rem', color:'var(--text-3)', marginTop:3 }}>{timeAgo(n.created_at)}</div>
+                    <div style={{ fontSize:'.62rem', color:'var(--text-3)', marginTop:3 }}>{timeAgo(n.createdAt)}</div>
                   </div>
-                  {!n.is_read && <div style={{ width:6, height:6, borderRadius:'50%', background:'var(--gold)', flexShrink:0, marginTop:6 }} />}
+                  {!n.isRead && <div style={{ width:6, height:6, borderRadius:'50%', background:'var(--gold)', flexShrink:0, marginTop:6 }} />}
                 </div>
               ))
             )}

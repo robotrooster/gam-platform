@@ -34,9 +34,10 @@ export function AcceptInvitePage() {
         phone: form.phone || undefined,
         ssiSsdi: form.ssiSsdi,
       })
-      // Store token and redirect to tenant portal
-      localStorage.setItem('gam_token', res.data.token)
-      navigate('/')
+      // Store token under tenant portal's expected key + respect next= param
+      localStorage.setItem('gam_tenant_token', res.data.token)
+      const next = params.get('next')
+      navigate(next || '/')
     } catch (e: any) {
       setError(e?.response?.data?.error || 'Something went wrong. Please try again.')
       setSubmitting(false)

@@ -19,12 +19,12 @@ export function ApplicantPoolPage() {
             <tbody>
               {applicants.length ? applicants.map((a: any) => (
                 <tr key={a.id}>
-                  <td style={{fontWeight:500}}>{a.first_name} {a.last_name}</td>
-                  <td className="mono">{a.applied_at ? new Date(a.applied_at).toLocaleDateString() : '—'}</td>
-                  <td className="mono">{a.desired_unit || <span style={{color:'var(--text-3)'}}>any</span>}</td>
-                  <td className="mono">{fmt(a.monthly_income)}/mo</td>
-                  <td><span className={`badge ${a.risk_score >= 70 ? 'badge-red' : a.risk_score >= 40 ? 'badge-amber' : 'badge-green'}`}>{a.risk_score ?? '—'}</span></td>
-                  <td><span className={`badge ${a.bg_check_status === 'approved' ? 'badge-green' : a.bg_check_status === 'pending' ? 'badge-amber' : 'badge-muted'}`}>{a.bg_check_status || 'not started'}</span></td>
+                  <td style={{fontWeight:500}}>{a.firstName} {a.lastName}</td>
+                  <td className="mono">{a.appliedAt ? new Date(a.appliedAt).toLocaleDateString() : '—'}</td>
+                  <td className="mono">{a.desiredUnit || <span style={{color:'var(--text-3)'}}>any</span>}</td>
+                  <td className="mono">{fmt(a.monthlyIncome)}/mo</td>
+                  <td><span className={`badge ${a.riskScore >= 70 ? 'badge-red' : a.riskScore >= 40 ? 'badge-amber' : 'badge-green'}`}>{a.riskScore ?? '—'}</span></td>
+                  <td><span className={`badge ${a.bgCheckStatus === 'approved' ? 'badge-green' : a.bgCheckStatus === 'pending' ? 'badge-amber' : 'badge-muted'}`}>{a.bgCheckStatus || 'not started'}</span></td>
                   <td><span className={`badge ${STATUS_MAP[a.status]||'badge-muted'}`}>{a.status || '—'}</span></td>
                 </tr>
               )) : (

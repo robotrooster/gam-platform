@@ -58,19 +58,19 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
   )
 
   const [form, setForm] = useState({
-    unit_id: preselectedUnitId || '',
-    tenant_id: preselectedTenantId || '',
-    lease_type: 'fixed_term' as LeaseType,
-    start_date: '',
-    end_date: '',
-    rent_amount: '',
-    security_deposit: '',
-    auto_renew: false,
-    auto_renew_mode: 'extend_same_term' as AutoRenewMode,
-    notice_days_required: '30',
-    expiration_notice_days: '60',
-    late_fee_grace_days: '5',
-    late_fee_amount: '15.00',
+    unitId: preselectedUnitId || '',
+    tenantId: preselectedTenantId || '',
+    leaseType: 'fixed_term' as LeaseType,
+    startDate: '',
+    endDate: '',
+    rentAmount: '',
+    securityDeposit: '',
+    autoRenew: false,
+    autoRenewMode: 'extend_same_term' as AutoRenewMode,
+    noticeDaysRequired: '30',
+    expirationNoticeDays: '60',
+    lateFeeGraceDays: '5',
+    lateFeeAmount: '15.00',
     status: 'pending' as 'pending' | 'active' | 'expired' | 'terminated',
   })
   const [errors, setErrors] = useState<Record<string, string>>({})
@@ -80,19 +80,19 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
   useEffect(() => {
     if (existingLease) {
       setForm({
-        unit_id: existingLease.unit_id || '',
-        tenant_id: existingLease.tenant_id || '',
-        lease_type: existingLease.lease_type || 'fixed_term',
-        start_date: existingLease.start_date ? String(existingLease.start_date).slice(0, 10) : '',
-        end_date: existingLease.end_date ? String(existingLease.end_date).slice(0, 10) : '',
-        rent_amount: existingLease.rent_amount != null ? String(existingLease.rent_amount) : '',
-        security_deposit: existingLease.security_deposit != null ? String(existingLease.security_deposit) : '',
-        auto_renew: Boolean(existingLease.auto_renew),
-        auto_renew_mode: existingLease.auto_renew_mode || 'extend_same_term',
-        notice_days_required: String(existingLease.notice_days_required ?? 30),
-        expiration_notice_days: String(existingLease.expiration_notice_days ?? 60),
-        late_fee_grace_days: String(existingLease.late_fee_grace_days ?? 5),
-        late_fee_amount: existingLease.late_fee_amount != null ? String(existingLease.late_fee_amount) : '15.00',
+        unitId: existingLease.unitId || '',
+        tenantId: existingLease.tenantId || '',
+        leaseType: existingLease.leaseType || 'fixed_term',
+        startDate: existingLease.startDate ? String(existingLease.startDate).slice(0, 10) : '',
+        endDate: existingLease.endDate ? String(existingLease.endDate).slice(0, 10) : '',
+        rentAmount: existingLease.rentAmount != null ? String(existingLease.rentAmount) : '',
+        securityDeposit: existingLease.securityDeposit != null ? String(existingLease.securityDeposit) : '',
+        autoRenew: Boolean(existingLease.autoRenew),
+        autoRenewMode: existingLease.autoRenewMode || 'extend_same_term',
+        noticeDaysRequired: String(existingLease.noticeDaysRequired ?? 30),
+        expirationNoticeDays: String(existingLease.expirationNoticeDays ?? 60),
+        lateFeeGraceDays: String(existingLease.lateFeeGraceDays ?? 5),
+        lateFeeAmount: existingLease.lateFeeAmount != null ? String(existingLease.lateFeeAmount) : '15.00',
         status: existingLease.status || 'pending',
       })
     }
@@ -106,10 +106,10 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
 
   // When lease_type changes to month_to_month, clear end_date
   useEffect(() => {
-    if (form.lease_type === 'month_to_month' && form.end_date) {
-      setForm(f => ({ ...f, end_date: '' }))
+    if (form.leaseType === 'month_to_month' && form.endDate) {
+      setForm(f => ({ ...f, endDate: '' }))
     }
-  }, [form.lease_type])
+  }, [form.leaseType])
 
   const createMut = useMutation(
     (data: any) => apiPost('/leases', data),
@@ -142,20 +142,20 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
 
   const validate = () => {
     const errs: Record<string, string> = {}
-    if (!form.unit_id) errs.unit_id = 'Select a unit'
-    if (!form.tenant_id) errs.tenant_id = 'Select a tenant'
-    if (!form.start_date) errs.start_date = 'Start date required'
-    if (form.lease_type !== 'month_to_month' && !form.end_date) {
-      errs.end_date = 'End date required for ' + LEASE_TYPE_LABELS[form.lease_type].toLowerCase() + ' leases'
+    if (!form.unitId) errs.unitId = 'Select a unit'
+    if (!form.tenantId) errs.tenantId = 'Select a tenant'
+    if (!form.startDate) errs.startDate = 'Start date required'
+    if (form.leaseType !== 'month_to_month' && !form.endDate) {
+      errs.endDate = 'End date required for ' + LEASE_TYPE_LABELS[form.leaseType].toLowerCase() + ' leases'
     }
-    if (form.lease_type === 'month_to_month' && form.end_date) {
-      errs.end_date = 'Month-to-month leases cannot have an end date'
+    if (form.leaseType === 'month_to_month' && form.endDate) {
+      errs.endDate = 'Month-to-month leases cannot have an end date'
     }
-    if (!form.rent_amount || isNaN(Number(form.rent_amount)) || Number(form.rent_amount) <= 0) {
-      errs.rent_amount = 'Valid rent required'
+    if (!form.rentAmount || isNaN(Number(form.rentAmount)) || Number(form.rentAmount) <= 0) {
+      errs.rentAmount = 'Valid rent required'
     }
-    if (form.security_deposit && isNaN(Number(form.security_deposit))) {
-      errs.security_deposit = 'Invalid amount'
+    if (form.securityDeposit && isNaN(Number(form.securityDeposit))) {
+      errs.securityDeposit = 'Invalid amount'
     }
     setErrors(errs)
     return Object.keys(errs).length === 0
@@ -165,41 +165,41 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
     if (!validate()) return
 
     const payload: any = {
-      leaseType: form.lease_type,
-      startDate: form.start_date,
-      endDate: form.lease_type === 'month_to_month' ? null : form.end_date,
-      rentAmount: Number(form.rent_amount),
-      securityDeposit: Number(form.security_deposit) || 0,
-      autoRenew: form.auto_renew,
-      autoRenewMode: form.auto_renew ? form.auto_renew_mode : null,
-      noticeDaysRequired: Number(form.notice_days_required) || 30,
-      expirationNoticeDays: Number(form.expiration_notice_days) || 60,
-      lateFeeGraceDays: Number(form.late_fee_grace_days) || 0,
-      lateFeeAmount: Number(form.late_fee_amount) || 0,
+      leaseType: form.leaseType,
+      startDate: form.startDate,
+      endDate: form.leaseType === 'month_to_month' ? null : form.endDate,
+      rentAmount: Number(form.rentAmount),
+      securityDeposit: Number(form.securityDeposit) || 0,
+      autoRenew: form.autoRenew,
+      autoRenewMode: form.autoRenew ? form.autoRenewMode : null,
+      noticeDaysRequired: Number(form.noticeDaysRequired) || 30,
+      expirationNoticeDays: Number(form.expirationNoticeDays) || 60,
+      lateFeeGraceDays: Number(form.lateFeeGraceDays) || 0,
+      lateFeeAmount: Number(form.lateFeeAmount) || 0,
     }
 
     if (isEdit) {
       // On edit, include status and needsReview clearing
       payload.status = form.status
-      if (existingLease?.needs_review) {
+      if (existingLease?.needsReview) {
         payload.needsReview = false
       }
       updateMut.mutate(payload)
     } else {
       // On create, include unit + tenant
-      payload.unitId = form.unit_id
-      payload.tenantId = form.tenant_id
+      payload.unitId = form.unitId
+      payload.tenantId = form.tenantId
       createMut.mutate(payload)
     }
   }
 
   const isLoading = createMut.isLoading || updateMut.isLoading
-  const needsReview = isEdit && existingLease?.needs_review
+  const needsReview = isEdit && existingLease?.needsReview
 
   // For create mode, filter units to those without an active lease
   const availableUnits = isEdit
     ? (units as any[])
-    : (units as any[]).filter(u => !u.tenant_id)
+    : (units as any[]).filter(u => !u.tenantId)
 
   if (isEdit && loadingLease) {
     return (
@@ -250,7 +250,7 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
             <label style={LABEL_STYLE}>Unit *</label>
             <select
               className="input"
-              value={form.unit_id}
+              value={form.unitId}
               onChange={e => set('unit_id', e.target.value)}
               disabled={isEdit}
               style={{ width: '100%' }}
@@ -258,18 +258,18 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
               <option value="">— Select a unit —</option>
               {availableUnits.map((u: any) => (
                 <option key={u.id} value={u.id}>
-                  {u.unit_number} {u.property_name ? '— ' + u.property_name : ''}
+                  {u.unitNumber} {u.propertyName ? '— ' + u.propertyName : ''}
                 </option>
               ))}
             </select>
-            {errors.unit_id && <div style={{ color: 'var(--red)', fontSize: '.72rem', marginTop: 4 }}>{errors.unit_id}</div>}
+            {errors.unitId && <div style={{ color: 'var(--red)', fontSize: '.72rem', marginTop: 4 }}>{errors.unitId}</div>}
           </div>
 
           <div style={{ marginBottom: 14 }}>
             <label style={LABEL_STYLE}>Tenant *</label>
             <select
               className="input"
-              value={form.tenant_id}
+              value={form.tenantId}
               onChange={e => set('tenant_id', e.target.value)}
               disabled={isEdit}
               style={{ width: '100%' }}
@@ -277,11 +277,11 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
               <option value="">— Select a tenant —</option>
               {(tenants as any[]).map((t: any) => (
                 <option key={t.id} value={t.id}>
-                  {t.first_name} {t.last_name} {t.email ? '(' + t.email + ')' : ''}
+                  {t.firstName} {t.lastName} {t.email ? '(' + t.email + ')' : ''}
                 </option>
               ))}
             </select>
-            {errors.tenant_id && <div style={{ color: 'var(--red)', fontSize: '.72rem', marginTop: 4 }}>{errors.tenant_id}</div>}
+            {errors.tenantId && <div style={{ color: 'var(--red)', fontSize: '.72rem', marginTop: 4 }}>{errors.tenantId}</div>}
           </div>
 
           {/* TERMS */}
@@ -291,7 +291,7 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
             <label style={LABEL_STYLE}>Lease Type *</label>
             <select
               className="input"
-              value={form.lease_type}
+              value={form.leaseType}
               onChange={e => set('lease_type', e.target.value)}
               style={{ width: '100%' }}
             >
@@ -307,26 +307,26 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
               <input
                 className="input"
                 type="date"
-                value={form.start_date}
+                value={form.startDate}
                 onChange={e => set('start_date', e.target.value)}
                 style={{ width: '100%' }}
               />
-              {errors.start_date && <div style={{ color: 'var(--red)', fontSize: '.72rem', marginTop: 4 }}>{errors.start_date}</div>}
+              {errors.startDate && <div style={{ color: 'var(--red)', fontSize: '.72rem', marginTop: 4 }}>{errors.startDate}</div>}
             </div>
             <div>
               <label style={LABEL_STYLE}>
-                End Date {form.lease_type !== 'month_to_month' && '*'}
+                End Date {form.leaseType !== 'month_to_month' && '*'}
               </label>
               <input
                 className="input"
                 type="date"
-                value={form.end_date}
+                value={form.endDate}
                 onChange={e => set('end_date', e.target.value)}
-                disabled={form.lease_type === 'month_to_month'}
+                disabled={form.leaseType === 'month_to_month'}
                 style={{ width: '100%' }}
-                placeholder={form.lease_type === 'month_to_month' ? 'N/A' : ''}
+                placeholder={form.leaseType === 'month_to_month' ? 'N/A' : ''}
               />
-              {errors.end_date && <div style={{ color: 'var(--red)', fontSize: '.72rem', marginTop: 4 }}>{errors.end_date}</div>}
+              {errors.endDate && <div style={{ color: 'var(--red)', fontSize: '.72rem', marginTop: 4 }}>{errors.endDate}</div>}
             </div>
           </div>
 
@@ -365,12 +365,12 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
                   type="number"
                   step="0.01"
                   placeholder="0.00"
-                  value={form.rent_amount}
+                  value={form.rentAmount}
                   onChange={e => set('rent_amount', e.target.value)}
                   style={{ width: '100%', paddingLeft: 30 }}
                 />
               </div>
-              {errors.rent_amount && <div style={{ color: 'var(--red)', fontSize: '.72rem', marginTop: 4 }}>{errors.rent_amount}</div>}
+              {errors.rentAmount && <div style={{ color: 'var(--red)', fontSize: '.72rem', marginTop: 4 }}>{errors.rentAmount}</div>}
             </div>
             <div>
               <label style={LABEL_STYLE}>Security Deposit</label>
@@ -381,12 +381,12 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
                   type="number"
                   step="0.01"
                   placeholder="0.00"
-                  value={form.security_deposit}
+                  value={form.securityDeposit}
                   onChange={e => set('security_deposit', e.target.value)}
                   style={{ width: '100%', paddingLeft: 30 }}
                 />
               </div>
-              {errors.security_deposit && <div style={{ color: 'var(--red)', fontSize: '.72rem', marginTop: 4 }}>{errors.security_deposit}</div>}
+              {errors.securityDeposit && <div style={{ color: 'var(--red)', fontSize: '.72rem', marginTop: 4 }}>{errors.securityDeposit}</div>}
             </div>
           </div>
 
@@ -397,7 +397,7 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
             <label style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer' }}>
               <input
                 type="checkbox"
-                checked={form.auto_renew}
+                checked={form.autoRenew}
                 onChange={e => set('auto_renew', e.target.checked)}
                 style={{ width: 16, height: 16, cursor: 'pointer' }}
               />
@@ -408,7 +408,7 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
             </div>
           </div>
 
-          {form.auto_renew && (
+          {form.autoRenew && (
             <div style={{ marginBottom: 14, marginLeft: 26 }}>
               <label style={LABEL_STYLE}>Auto-Renew Mode</label>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
@@ -424,11 +424,11 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
                       borderRadius: 8,
                       cursor: 'pointer',
                       transition: 'all .12s',
-                      border: '1px solid ' + (form.auto_renew_mode === opt.value ? 'var(--gold)' : 'var(--border-0)'),
-                      background: form.auto_renew_mode === opt.value ? 'rgba(201,162,39,.06)' : 'var(--bg-2)',
+                      border: '1px solid ' + (form.autoRenewMode === opt.value ? 'var(--gold)' : 'var(--border-0)'),
+                      background: form.autoRenewMode === opt.value ? 'rgba(201,162,39,.06)' : 'var(--bg-2)',
                     }}
                   >
-                    <div style={{ fontSize: '.78rem', fontWeight: 600, color: form.auto_renew_mode === opt.value ? 'var(--gold)' : 'var(--text-1)' }}>
+                    <div style={{ fontSize: '.78rem', fontWeight: 600, color: form.autoRenewMode === opt.value ? 'var(--gold)' : 'var(--text-1)' }}>
                       {opt.label}
                     </div>
                     <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginTop: 2 }}>{opt.desc}</div>
@@ -445,7 +445,7 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
                 className="input"
                 type="number"
                 min="0"
-                value={form.notice_days_required}
+                value={form.noticeDaysRequired}
                 onChange={e => set('notice_days_required', e.target.value)}
                 style={{ width: '100%' }}
               />
@@ -459,7 +459,7 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
                 className="input"
                 type="number"
                 min="0"
-                value={form.expiration_notice_days}
+                value={form.expirationNoticeDays}
                 onChange={e => set('expiration_notice_days', e.target.value)}
                 style={{ width: '100%' }}
               />
@@ -479,7 +479,7 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
                 className="input"
                 type="number"
                 min="0"
-                value={form.late_fee_grace_days}
+                value={form.lateFeeGraceDays}
                 onChange={e => set('late_fee_grace_days', e.target.value)}
                 style={{ width: '100%' }}
               />
@@ -492,7 +492,7 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
                   className="input"
                   type="number"
                   step="0.01"
-                  value={form.late_fee_amount}
+                  value={form.lateFeeAmount}
                   onChange={e => set('late_fee_amount', e.target.value)}
                   style={{ width: '100%', paddingLeft: 30 }}
                 />

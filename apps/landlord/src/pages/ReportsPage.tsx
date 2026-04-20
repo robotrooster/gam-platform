@@ -13,9 +13,9 @@ export function ReportsPage() {
       {isLoading ? <div style={{padding:32,color:'var(--text-3)',textAlign:'center'}}>Loading…</div> : (
         <div style={{display:'grid',gap:16}}>
           <div className="kpi-grid" style={{gridTemplateColumns:'repeat(3, 1fr)'}}>
-            <div className="kpi-card"><div className="kpi-label">Total Collected MTD</div><div className="kpi-value green">{fmt(report?.collected_mtd)}</div></div>
+            <div className="kpi-card"><div className="kpi-label">Total Collected MTD</div><div className="kpi-value green">{fmt(report?.collectedMtd)}</div></div>
             <div className="kpi-card"><div className="kpi-label">Outstanding Balance</div><div className="kpi-value" style={{color:'var(--amber)'}}>{fmt(report?.outstanding)}</div></div>
-            <div className="kpi-card"><div className="kpi-label">Occupancy Rate</div><div className="kpi-value">{report?.occupancy_rate != null ? `${report.occupancy_rate}%` : '—'}</div></div>
+            <div className="kpi-card"><div className="kpi-label">Occupancy Rate</div><div className="kpi-value">{report?.occupancyRate != null ? `${report.occupancyRate}%` : '—'}</div></div>
           </div>
           <div className="card">
             <div className="card-header"><span className="card-title">Monthly Breakdown</span></div>

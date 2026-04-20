@@ -9,17 +9,17 @@ const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minim
 const PLATFORM_FEES = { ACTIVE_UNIT: 15 }
 
 interface DashStats {
-  active_units: number
-  direct_pay_units: number
-  vacant_units: number
-  delinquent_units: number
-  suspended_units: number
-  eviction_mode_units: number
-  monthly_rent_volume: number
-  property_count: number
-  upcoming_disbursement: { count: number; amount: number }
-  otp_units?: number
-  projected_otp_disbursement?: number
+  activeUnits: number
+  directPayUnits: number
+  vacantUnits: number
+  delinquentUnits: number
+  suspendedUnits: number
+  evictionModeUnits: number
+  monthlyRentVolume: number
+  propertyCount: number
+  upcomingDisbursement: { count: number; amount: number }
+  otpUnits?: number
+  projectedOtpDisbursement?: number
 }
 
 const unitStatusBadge = (s: string) => {
@@ -53,7 +53,7 @@ export function DashboardPage() {
     { select: (d: any) => d?.slice(0, 5) }
   )
 
-  const totalUnits = (stats?.active_units || 0) + (stats?.direct_pay_units || 0) + (stats?.vacant_units || 0)
+  const totalUnits = (stats?.activeUnits || 0) + (stats?.directPayUnits || 0) + (stats?.vacantUnits || 0)
 
   // Pad trend to always show 6 months
   const trendData = (() => {
@@ -79,19 +79,19 @@ export function DashboardPage() {
   return (
     <div>
       {/* Alerts */}
-      {(stats?.eviction_mode_units || 0) > 0 && (
+      {(stats?.evictionModeUnits || 0) > 0 && (
         <div className="alert alert-danger" style={{cursor:'pointer'}} onClick={()=>navigate('/units?status=eviction')}>
           <AlertTriangle size={16} />
           <div>
-            <strong>{stats!.eviction_mode_units} unit(s) in Eviction Mode</strong> — All tenant ACH hard blocked. No rent will be collected. Disbursement held. Check your local laws before accepting any payment.
+            <strong>{stats!.evictionModeUnits} unit(s) in Eviction Mode</strong> — All tenant ACH hard blocked. No rent will be collected. Disbursement held. Check your local laws before accepting any payment.
           </div>
           <span style={{marginLeft:'auto',fontSize:'.78rem',fontWeight:600}}>View →</span>
         </div>
       )}
-      {(stats?.delinquent_units || 0) > 0 && (
+      {(stats?.delinquentUnits || 0) > 0 && (
         <div className="alert alert-warn" style={{cursor:'pointer'}} onClick={()=>navigate('/units?status=delinquent')}>
           <Clock size={16} />
-          <strong>{stats!.delinquent_units} delinquent unit(s)</strong> — In cure window. Late fees accruing.
+          <strong>{stats!.delinquentUnits} delinquent unit(s)</strong> — In cure window. Late fees accruing.
           <span style={{marginLeft:'auto',fontSize:'.78rem',fontWeight:600}}>View →</span>
         </div>
       )}
@@ -101,27 +101,27 @@ export function DashboardPage() {
       <div className="kpi-grid" style={{gridTemplateColumns:"repeat(3, 1fr)"}}>
         <div className="kpi-card" style={{cursor:'pointer'}} onClick={()=>navigate('/units')}>
           <div className="kpi-label">Active Units</div>
-          <div className="kpi-value green">{stats?.active_units || 0}</div>
-          <div className="kpi-sub">{stats?.direct_pay_units || 0} direct pay · {stats?.vacant_units || 0} vacant</div>
+          <div className="kpi-value green">{stats?.activeUnits || 0}</div>
+          <div className="kpi-sub">{stats?.directPayUnits || 0} direct pay · {stats?.vacantUnits || 0} vacant</div>
         </div>
         <div className="kpi-card">
           <div className="kpi-label">Monthly Rent Volume</div>
-          <div className="kpi-value gold">{fmt(stats?.monthly_rent_volume || 0)}</div>
-          <div className="kpi-sub">across {stats?.active_units || 0} occupied units</div>
+          <div className="kpi-value gold">{fmt(stats?.monthlyRentVolume || 0)}</div>
+          <div className="kpi-sub">across {stats?.activeUnits || 0} occupied units</div>
         </div>
         <div className="kpi-card" style={{cursor:'pointer'}} onClick={()=>navigate('/maintenance')}>
           <div className="kpi-label">Maintenance</div>
-          <div className="kpi-value" style={{fontSize:'1.4rem'}}>{(stats as any)?.maintenance?.open_requests||0} open</div>
-          <div className="kpi-sub">{(stats as any)?.maintenance?.in_progress||0} in progress · {(stats as any)?.maintenance?.completed_30d||0} done this month</div>
+          <div className="kpi-value" style={{fontSize:'1.4rem'}}>{(stats as any)?.maintenance?.openRequests||0} open</div>
+          <div className="kpi-sub">{(stats as any)?.maintenance?.inProgress||0} in progress · {(stats as any)?.maintenance?.completed30d||0} done this month</div>
         </div>
         <div className="kpi-card" style={{cursor:'pointer'}} onClick={()=>navigate('/background')}>
           <div className="kpi-label">Applications</div>
-          <div className="kpi-value" style={{fontSize:'1.4rem',color:(stats as any)?.bg_pending>0?'var(--amber)':'var(--green)'}}>{(stats as any)?.bg_pending||0}</div>
-          <div className="kpi-sub">{(stats as any)?.bg_pending>0?'pending review':'no pending applications'}</div>
+          <div className="kpi-value" style={{fontSize:'1.4rem',color:(stats as any)?.bgPending>0?'var(--amber)':'var(--green)'}}>{(stats as any)?.bgPending||0}</div>
+          <div className="kpi-sub">{(stats as any)?.bgPending>0?'pending review':'no pending applications'}</div>
         </div>
         <div className="kpi-card">
           <div className="kpi-label">Next Disbursement</div>
-          <div className="kpi-value" style={{fontSize:'1.4rem'}}>{fmt(stats?.upcoming_disbursement?.amount || 0)}</div>
+          <div className="kpi-value" style={{fontSize:'1.4rem'}}>{fmt(stats?.upcomingDisbursement?.amount || 0)}</div>
           <div className="kpi-sub flex items-center gap-8">
             <span className="status-dot dot-green" />
             On-Time Pay SLA — 1st of month
@@ -129,8 +129,8 @@ export function DashboardPage() {
         </div>
         <div className="kpi-card" style={{cursor:'pointer'}} onClick={()=>setShowFeeModal(true)}>
           <div className="kpi-label">Platform Fee / Mo</div>
-          <div className="kpi-value">{fmt(((stats?.otp_units||0) * 15) + (Math.max(0,(stats?.active_units||0)-(stats?.otp_units||0)) * 5))}</div>
-          <div className="kpi-sub">{stats?.otp_units||0} OTP × $15 · {Math.max(0,(stats?.active_units||0)-(stats?.otp_units||0))} direct × $5</div>
+          <div className="kpi-value">{fmt(((stats?.otpUnits||0) * 15) + (Math.max(0,(stats?.activeUnits||0)-(stats?.otpUnits||0)) * 5))}</div>
+          <div className="kpi-sub">{stats?.otpUnits||0} OTP × $15 · {Math.max(0,(stats?.activeUnits||0)-(stats?.otpUnits||0))} direct × $5</div>
         </div>
       </div>
 
@@ -142,25 +142,25 @@ export function DashboardPage() {
         <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr 1fr',gap:20}}>
           <div>
             <div className="kpi-label">Qualified Units</div>
-            <div className="kpi-value" style={{color:'var(--gold)',fontSize:'1.8rem'}}>{stats?.otp_units || 0}</div>
-            <div className="kpi-sub">of {stats?.active_units || 0} active units</div>
+            <div className="kpi-value" style={{color:'var(--gold)',fontSize:'1.8rem'}}>{stats?.otpUnits || 0}</div>
+            <div className="kpi-sub">of {stats?.activeUnits || 0} active units</div>
           </div>
           <div>
             <div className="kpi-label">Unit Qualification Rate</div>
             <div className="kpi-value" style={{color:'var(--gold)',fontSize:'1.8rem'}}>
-              {stats?.active_units ? Math.round(((stats?.otp_units || 0) / stats.active_units) * 100) : 0}%
+              {stats?.activeUnits ? Math.round(((stats?.otpUnits || 0) / stats.activeUnits) * 100) : 0}%
             </div>
             <div className="kpi-sub">of occupied portfolio</div>
           </div>
           <div>
             <div className="kpi-label">Projected Disbursement</div>
-            <div className="kpi-value" style={{color:'var(--green)',fontSize:'1.8rem'}}>{fmt(stats?.projected_otp_disbursement || 0)}</div>
+            <div className="kpi-value" style={{color:'var(--green)',fontSize:'1.8rem'}}>{fmt(stats?.projectedOtpDisbursement || 0)}</div>
             <div className="kpi-sub">guaranteed to landlord</div>
           </div>
           <div>
             <div className="kpi-label">% of Rent Volume</div>
             <div className="kpi-value" style={{color:'var(--green)',fontSize:'1.8rem'}}>
-              {stats?.monthly_rent_volume ? Math.round(((stats?.projected_otp_disbursement || 0) / stats.monthly_rent_volume) * 100) : 0}%
+              {stats?.monthlyRentVolume ? Math.round(((stats?.projectedOtpDisbursement || 0) / stats.monthlyRentVolume) * 100) : 0}%
             </div>
             <div className="kpi-sub">of total monthly income</div>
           </div>
@@ -208,11 +208,11 @@ export function DashboardPage() {
               <tbody>
                 {disbursements.map((d: any) => (
                   <tr key={d.id}>
-                    <td className="mono">{new Date(d.target_date).toLocaleDateString()}</td>
+                    <td className="mono">{new Date(d.targetDate).toLocaleDateString()}</td>
                     <td className="mono" style={{color:'var(--green)'}}>{fmt(d.amount)}</td>
-                    <td className="mono">{d.unit_count}</td>
+                    <td className="mono">{d.unitCount}</td>
                     <td><span className={`badge ${d.status === 'settled' ? 'badge-green' : d.status === 'pending' ? 'badge-amber' : 'badge-red'}`}>{d.status}</span></td>
-                    <td><span className={`badge ${d.from_reserve ? 'badge-gold' : 'badge-muted'}`}>{d.from_reserve ? 'Reserve' : 'Collected'}</span></td>
+                    <td><span className={`badge ${d.fromReserve ? 'badge-gold' : 'badge-muted'}`}>{d.fromReserve ? 'Reserve' : 'Collected'}</span></td>
                   </tr>
                 ))}
               </tbody>
@@ -241,19 +241,19 @@ export function DashboardPage() {
                 <tbody>
                   <tr>
                     <td>OTP Enrolled</td>
-                    <td className="mono">{stats?.otp_units || 0}</td>
+                    <td className="mono">{stats?.otpUnits || 0}</td>
                     <td className="mono">$15/unit</td>
-                    <td className="mono" style={{color:'var(--green)'}}>{fmt((stats?.otp_units || 0) * 15)}</td>
+                    <td className="mono" style={{color:'var(--green)'}}>{fmt((stats?.otpUnits || 0) * 15)}</td>
                   </tr>
                   <tr>
                     <td>Direct Pay</td>
-                    <td className="mono">{Math.max(0,(stats?.active_units||0)-(stats?.otp_units||0))}</td>
+                    <td className="mono">{Math.max(0,(stats?.activeUnits||0)-(stats?.otpUnits||0))}</td>
                     <td className="mono">$5/unit</td>
-                    <td className="mono" style={{color:'var(--green)'}}>{fmt(Math.max(0,(stats?.active_units||0)-(stats?.otp_units||0)) * 5)}</td>
+                    <td className="mono" style={{color:'var(--green)'}}>{fmt(Math.max(0,(stats?.activeUnits||0)-(stats?.otpUnits||0)) * 5)}</td>
                   </tr>
                   <tr>
                     <td>Vacant</td>
-                    <td className="mono">{stats?.vacant_units || 0}</td>
+                    <td className="mono">{stats?.vacantUnits || 0}</td>
                     <td className="mono">$0/unit</td>
                     <td className="mono" style={{color:'var(--text-3)'}}>—</td>
                   </tr>
@@ -261,7 +261,7 @@ export function DashboardPage() {
                 <tfoot>
                   <tr style={{borderTop:'1px solid var(--border-2)'}}>
                     <td colSpan={3} style={{fontWeight:600}}>Total Monthly Fee</td>
-                    <td className="mono" style={{fontWeight:600,color:'var(--gold)'}}>{fmt(((stats?.otp_units||0) * 15) + (Math.max(0,(stats?.active_units||0)-(stats?.otp_units||0)) * 5))}</td>
+                    <td className="mono" style={{fontWeight:600,color:'var(--gold)'}}>{fmt(((stats?.otpUnits||0) * 15) + (Math.max(0,(stats?.activeUnits||0)-(stats?.otpUnits||0)) * 5))}</td>
                   </tr>
                 </tfoot>
               </table>
@@ -468,12 +468,12 @@ function BulletinBoard() {
                 <span style={{ fontFamily: 'var(--font-mono)', fontSize: '.72rem', color: 'var(--gold)', fontWeight: 600 }}>{post.alias}</span>
                 {post.pinned && <span style={{ fontSize: '.65rem', color: 'var(--amber)' }}>📌 Pinned</span>}
                 <span style={{ fontSize: '.65rem', color: 'var(--text-3)', marginLeft: 'auto' }}>
-                  {new Date(post.created_at).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })}
+                  {new Date(post.createdAt).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })}
                 </span>
               </div>
               <div style={{ fontSize: '.85rem', color: 'var(--text-1)', lineHeight: 1.6, marginBottom: 6 }}>{post.content}</div>
               <div style={{ display: 'flex', gap: 12, fontSize: '.7rem', color: 'var(--text-3)' }}>
-                <span>👍 {post.upvote_count || 0}</span>
+                <span>👍 {post.upvoteCount || 0}</span>
                 <span style={{ textTransform: 'capitalize' }}>📍 {post.scope}</span>
               </div>
             </div>

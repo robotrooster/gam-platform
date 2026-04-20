@@ -14,15 +14,15 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
   const navigate = useNavigate()
   const [step, setStep] = useState(preselectedPropertyId ? 1 : 0)
   const [form, setForm] = useState({
-    property_id:      preselectedPropertyId || '',
-    unit_number:      '',
+    propertyId:       preselectedPropertyId || '',
+    unitNumber:       '',
     bedrooms:         1,
     bathrooms:        1,
     sqft:             '',
-    rent_amount:      '',
-    security_deposit: '',
+    rentAmount:       '',
+    securityDeposit:  '',
     status:           'vacant',
-    listed_vacant:    true,
+    listedVacant:     true,
   })
   const [errors, setErrors] = useState<Record<string, string>>({})
 
@@ -39,7 +39,7 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
     }
   )
 
-  const selectedProperty = (properties as any[]).find(p => p.id === form.property_id)
+  const selectedProperty = (properties as any[]).find(p => p.id === form.propertyId)
 
   const set = (key: string, val: any) => {
     setForm(f => ({ ...f, [key]: val }))
@@ -48,13 +48,13 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
 
   const validateStep = () => {
     const errs: Record<string, string> = {}
-    if (step === 0 && !form.property_id) errs.property_id = 'Select a property'
-    if (step === 1 && !form.unit_number.trim()) errs.unit_number = 'Unit number required'
+    if (step === 0 && !form.propertyId) errs.propertyId = 'Select a property'
+    if (step === 1 && !form.unitNumber.trim()) errs.unitNumber = 'Unit number required'
     if (step === 2) {
-      if (!form.rent_amount || isNaN(Number(form.rent_amount)) || Number(form.rent_amount) <= 0)
-        errs.rent_amount = 'Valid rent amount required'
-      if (form.security_deposit && isNaN(Number(form.security_deposit)))
-        errs.security_deposit = 'Invalid amount'
+      if (!form.rentAmount || isNaN(Number(form.rentAmount)) || Number(form.rentAmount) <= 0)
+        errs.rentAmount = 'Valid rent amount required'
+      if (form.securityDeposit && isNaN(Number(form.securityDeposit)))
+        errs.securityDeposit = 'Invalid amount'
     }
     setErrors(errs)
     return Object.keys(errs).length === 0
@@ -65,13 +65,13 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
 
   const submit = () => {
     createMut.mutate({
-      propertyId:      form.property_id,
-      unitNumber:      form.unit_number.trim(),
+      propertyId:      form.propertyId,
+      unitNumber:      form.unitNumber.trim(),
       bedrooms:         Number(form.bedrooms),
       bathrooms:        Number(form.bathrooms),
       sqft:             form.sqft ? Number(form.sqft) : null,
-      rentAmount:      Number(form.rent_amount),
-      securityDeposit: Number(form.security_deposit) || 0,
+      rentAmount:      Number(form.rentAmount),
+      securityDeposit: Number(form.securityDeposit) || 0,
       status:           form.status,
     })
   }
@@ -126,28 +126,28 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
                     onClick={() => set('property_id', p.id)}
                     style={{
                       padding: '12px 14px', borderRadius: 10, cursor: 'pointer', transition: 'all .12s',
-                      border: `1px solid ${form.property_id === p.id ? 'var(--gold)' : 'var(--border-0)'}`,
-                      background: form.property_id === p.id ? 'rgba(201,162,39,.06)' : 'var(--bg-2)',
+                      border: `1px solid ${form.propertyId === p.id ? 'var(--gold)' : 'var(--border-0)'}`,
+                      background: form.propertyId === p.id ? 'rgba(201,162,39,.06)' : 'var(--bg-2)',
                       display: 'flex', alignItems: 'center', gap: 12,
                     }}
                   >
                     <div style={{
                       width: 36, height: 36, borderRadius: 8, flexShrink: 0,
-                      background: form.property_id === p.id ? 'rgba(201,162,39,.15)' : 'var(--bg-3)',
+                      background: form.propertyId === p.id ? 'rgba(201,162,39,.15)' : 'var(--bg-3)',
                       display: 'flex', alignItems: 'center', justifyContent: 'center',
                     }}>
-                      <Building2 size={16} style={{ color: form.property_id === p.id ? 'var(--gold)' : 'var(--text-3)' }} />
+                      <Building2 size={16} style={{ color: form.propertyId === p.id ? 'var(--gold)' : 'var(--text-3)' }} />
                     </div>
                     <div style={{ flex: 1 }}>
                       <div style={{ fontSize: '.85rem', fontWeight: 600, color: 'var(--text-0)' }}>{p.name}</div>
                       <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 1 }}>{p.street1}, {p.city}, {p.state}</div>
                     </div>
-                    {form.property_id === p.id && <Check size={16} style={{ color: 'var(--gold)', flexShrink: 0 }} />}
+                    {form.propertyId === p.id && <Check size={16} style={{ color: 'var(--gold)', flexShrink: 0 }} />}
                   </div>
                 ))}
               </div>
             )}
-            {errors.property_id && <div style={{ color: 'var(--red)', fontSize: '.72rem', marginTop: 8 }}>{errors.property_id}</div>}
+            {errors.propertyId && <div style={{ color: 'var(--red)', fontSize: '.72rem', marginTop: 8 }}>{errors.propertyId}</div>}
           </div>
         )}
 
@@ -165,12 +165,12 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
               <input
                 className="input"
                 placeholder="e.g. 101, A1, Site 42, Lot 7"
-                value={form.unit_number}
+                value={form.unitNumber}
                 onChange={e => set('unit_number', e.target.value)}
                 autoFocus
                 style={{ width: '100%' }}
               />
-              {errors.unit_number && <div style={{ color: 'var(--red)', fontSize: '.72rem', marginTop: 4 }}>{errors.unit_number}</div>}
+              {errors.unitNumber && <div style={{ color: 'var(--red)', fontSize: '.72rem', marginTop: 4 }}>{errors.unitNumber}</div>}
             </div>
 
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12, marginBottom: 14 }}>
@@ -229,7 +229,7 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
         {step === 2 && (
           <div>
             <div style={{ fontSize: '.82rem', color: 'var(--text-2)', marginBottom: 16 }}>
-              Set the rent and deposit for unit <strong style={{ color: 'var(--text-0)' }}>{form.unit_number}</strong>
+              Set the rent and deposit for unit <strong style={{ color: 'var(--text-0)' }}>{form.unitNumber}</strong>
             </div>
 
             <div style={{ marginBottom: 14 }}>
@@ -242,13 +242,13 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
                   className="input"
                   type="number"
                   placeholder="0.00"
-                  value={form.rent_amount}
+                  value={form.rentAmount}
                   onChange={e => set('rent_amount', e.target.value)}
                   autoFocus
                   style={{ width: '100%', paddingLeft: 30 }}
                 />
               </div>
-              {errors.rent_amount && <div style={{ color: 'var(--red)', fontSize: '.72rem', marginTop: 4 }}>{errors.rent_amount}</div>}
+              {errors.rentAmount && <div style={{ color: 'var(--red)', fontSize: '.72rem', marginTop: 4 }}>{errors.rentAmount}</div>}
             </div>
 
             <div style={{ marginBottom: 20 }}>
@@ -261,12 +261,12 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
                   className="input"
                   type="number"
                   placeholder="0.00"
-                  value={form.security_deposit}
+                  value={form.securityDeposit}
                   onChange={e => set('security_deposit', e.target.value)}
                   style={{ width: '100%', paddingLeft: 30 }}
                 />
               </div>
-              {errors.security_deposit && <div style={{ color: 'var(--red)', fontSize: '.72rem', marginTop: 4 }}>{errors.security_deposit}</div>}
+              {errors.securityDeposit && <div style={{ color: 'var(--red)', fontSize: '.72rem', marginTop: 4 }}>{errors.securityDeposit}</div>}
             </div>
 
           </div>
@@ -287,7 +287,7 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
                 </div>
                 <div>
                   <div style={{ fontFamily: 'var(--font-mono)', fontSize: '.9rem', fontWeight: 700, color: 'var(--text-0)' }}>
-                    Unit {form.unit_number}
+                    Unit {form.unitNumber}
                   </div>
                   <div style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>{selectedProperty?.name}</div>
                 </div>
@@ -302,8 +302,8 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
                 { label: 'Bedrooms', val: form.bedrooms === 0 ? 'Studio' : `${form.bedrooms} bed` },
                 { label: 'Bathrooms', val: `${form.bathrooms} bath` },
                 form.sqft ? { label: 'Square feet', val: `${Number(form.sqft).toLocaleString()} sq ft` } : null,
-                { label: 'Monthly rent', val: fmt(Number(form.rent_amount)) },
-                { label: 'Security deposit', val: form.security_deposit ? fmt(Number(form.security_deposit)) : '$0.00' },
+                { label: 'Monthly rent', val: fmt(Number(form.rentAmount)) },
+                { label: 'Security deposit', val: form.securityDeposit ? fmt(Number(form.securityDeposit)) : '$0.00' },
                 { label: 'Platform fee', val: '$15.00/month' },
               ].filter(Boolean).map((row: any) => (
                 <div key={row.label} style={{ display: 'flex', justifyContent: 'space-between', padding: '8px 16px', borderBottom: '1px solid var(--border-0)', fontSize: '.78rem' }}>
@@ -332,7 +332,7 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
           )}
 
           {step < STEPS.length - 1 ? (
-            <button className="btn btn-primary" onClick={next} disabled={step === 0 && !form.property_id}>
+            <button className="btn btn-primary" onClick={next} disabled={step === 0 && !form.propertyId}>
               Next <ChevronRight size={14} />
             </button>
           ) : (

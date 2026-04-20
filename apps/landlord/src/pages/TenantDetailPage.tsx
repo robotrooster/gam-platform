@@ -68,7 +68,7 @@ function FlexChargePanel({ tenantId, tenantName, chargeAccount, refetch, creditL
             <div style={{ fontWeight: 700, color: 'var(--text-0)' }}>Transaction History</div>
             <div style={{ textAlign: 'right' }}>
               <div style={{ fontFamily: 'var(--font-mono)', fontSize: '1.2rem', fontWeight: 800, color: 'var(--gold)' }}>
-                ${parseFloat(chargeAccount.current_balance || 0).toFixed(2)}
+                ${parseFloat(chargeAccount.currentBalance || 0).toFixed(2)}
               </div>
               <div style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>Current balance</div>
             </div>
@@ -81,7 +81,7 @@ function FlexChargePanel({ tenantId, tenantName, chargeAccount, refetch, creditL
               <tbody>
                 {txns.map((tx: any) => (
                   <tr key={tx.id}>
-                    <td className="mono" style={{ fontSize: '.75rem' }}>{new Date(tx.created_at).toLocaleDateString()}</td>
+                    <td className="mono" style={{ fontSize: '.75rem' }}>{new Date(tx.createdAt).toLocaleDateString()}</td>
                     <td style={{ color: 'var(--text-0)' }}>{tx.description}</td>
                     <td className="mono" style={{ fontWeight: 600 }}>${parseFloat(tx.amount).toFixed(2)}</td>
                     <td><span className={`badge ${tx.status === 'pulled' ? 'badge-green' : tx.status === 'disputed' ? 'badge-red' : 'badge-amber'}`}>{tx.status}</span></td>
@@ -107,7 +107,7 @@ export function TenantDetailPage() {
   const { data: chargeAccount, refetch: refetchCharge } = useQuery(
     ['flexcharge', id],
     () => apiGet<any[]>('/landlords/flexcharge').then((accounts: any[]) =>
-      accounts.find((a: any) => a.tenant_id === id) || null
+      accounts.find((a: any) => a.tenantId === id) || null
     ),
     { enabled: tab === 'flexcharge' }
   )
@@ -115,7 +115,7 @@ export function TenantDetailPage() {
   if (isLoading) return <div style={{ color: 'var(--text-3)', padding: 32 }}>Loading...</div>
   if (!data) return <div className="empty-state"><h3>Tenant not found</h3></div>
   const { tenant, units, payments, maintenance, workTrade, stats } = data
-  const currentUnit = units?.find((u: any) => u.is_current)
+  const currentUnit = units?.find((u: any) => u.isCurrent)
   const onTimeColor = stats.onTimeRate >= 90 ? 'var(--green)' : stats.onTimeRate >= 75 ? 'var(--amber)' : 'var(--red)'
   const onTimeLabel = stats.onTimeRate >= 90 ? 'Excellent' : stats.onTimeRate >= 75 ? 'Good' : 'Needs Attention'
   return (
@@ -125,14 +125,14 @@ export function TenantDetailPage() {
           <button className="btn btn-ghost btn-sm" onClick={() => navigate('/tenants')}><ArrowLeft size={15} /></button>
           <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
             <div style={{ width: 48, height: 48, borderRadius: '50%', background: 'linear-gradient(135deg, var(--gold-dark), var(--gold))', display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: 'var(--font-display)', fontSize: '1rem', fontWeight: 800, color: 'var(--bg-0)', flexShrink: 0 }}>
-              {tenant.first_name?.[0]}{tenant.last_name?.[0]}
+              {tenant.firstName?.[0]}{tenant.lastName?.[0]}
             </div>
             <div>
-              <h1 className="page-title" style={{ marginBottom: 2 }}>{tenant.first_name} {tenant.last_name}</h1>
+              <h1 className="page-title" style={{ marginBottom: 2 }}>{tenant.firstName} {tenant.lastName}</h1>
               <p className="page-subtitle">
-                {currentUnit ? `Unit ${currentUnit.unit_number} - ${currentUnit.property_name}` : 'No current unit'}
-                {tenant.ssi_ssdi && <span className="badge badge-gold" style={{ marginLeft: 8 }}>SSI/SSDI</span>}
-                {tenant.on_time_pay_enrolled && <span className="badge badge-green" style={{ marginLeft: 6 }}>On-Time Pay</span>}
+                {currentUnit ? `Unit ${currentUnit.unitNumber} - ${currentUnit.propertyName}` : 'No current unit'}
+                {tenant.ssiSsdi && <span className="badge badge-gold" style={{ marginLeft: 8 }}>SSI/SSDI</span>}
+                {tenant.onTimePayEnrolled && <span className="badge badge-green" style={{ marginLeft: 6 }}>On-Time Pay</span>}
               </p>
             </div>
           </div>
@@ -150,7 +150,7 @@ export function TenantDetailPage() {
       </div>
 
       {tab === 'flexcharge' && (
-        <FlexChargePanel tenantId={id!} tenantName={tenant.first_name + ' ' + tenant.last_name}
+        <FlexChargePanel tenantId={id!} tenantName={tenant.firstName + ' ' + tenant.lastName}
           chargeAccount={chargeAccount} refetch={refetchCharge}
           creditLimit={creditLimit} setCreditLimit={setCreditLimit}
           limitSaved={limitSaved} setLimitSaved={setLimitSaved} qc={qc} />
@@ -180,9 +180,9 @@ export function TenantDetailPage() {
               {[
                 { label: 'Email', val: tenant.email },
                 { label: 'Phone', val: tenant.phone || '--' },
-                { label: 'ACH Verified', val: tenant.ach_verified ? 'Verified' : 'Pending', color: tenant.ach_verified ? 'var(--green)' : 'var(--amber)' },
-                { label: 'Credit Reporting', val: tenant.credit_reporting_enrolled ? 'Active' : '--' },
-                { label: 'Member Since', val: new Date(tenant.account_created).toLocaleDateString() },
+                { label: 'ACH Verified', val: tenant.achVerified ? 'Verified' : 'Pending', color: tenant.achVerified ? 'var(--green)' : 'var(--amber)' },
+                { label: 'Credit Reporting', val: tenant.creditReportingEnrolled ? 'Active' : '--' },
+                { label: 'Member Since', val: new Date(tenant.accountCreated).toLocaleDateString() },
               ].map(row => (
                 <div key={row.label} className="data-row">
                   <span className="data-key">{row.label}</span>
@@ -220,17 +220,17 @@ export function TenantDetailPage() {
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
               {units?.length === 0 && <div style={{ color: 'var(--text-3)', fontSize: '.82rem' }}>No unit history.</div>}
               {units?.map((u: any) => (
-                <div key={u.id} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 12px', borderRadius: 10, background: 'var(--bg-2)', border: '1px solid ' + (u.is_current ? 'rgba(201,162,39,.3)' : 'var(--border-0)') }}>
+                <div key={u.id} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 12px', borderRadius: 10, background: 'var(--bg-2)', border: '1px solid ' + (u.isCurrent ? 'rgba(201,162,39,.3)' : 'var(--border-0)') }}>
                   <div style={{ flex: 1 }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                      <span style={{ fontSize: '.85rem', fontWeight: 600, color: 'var(--text-0)' }}>Unit {u.unit_number}</span>
-                      {u.is_current && <span className="badge badge-green">Current</span>}
+                      <span style={{ fontSize: '.85rem', fontWeight: 600, color: 'var(--text-0)' }}>Unit {u.unitNumber}</span>
+                      {u.isCurrent && <span className="badge badge-green">Current</span>}
                     </div>
-                    <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 1 }}>{u.property_name} - {u.street1}, {u.city}</div>
+                    <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 1 }}>{u.propertyName} - {u.street1}, {u.city}</div>
                   </div>
                   <div style={{ textAlign: 'right' }}>
-                    <div style={{ fontFamily: 'var(--font-mono)', fontSize: '.82rem', color: 'var(--gold)', fontWeight: 600 }}>{fmt(u.rent_amount)}/mo</div>
-                    {u.start_date && <div style={{ fontSize: '.65rem', color: 'var(--text-3)', marginTop: 1 }}>{new Date(u.start_date).toLocaleDateString()} - {u.end_date ? new Date(u.end_date).toLocaleDateString() : 'Present'}</div>}
+                    <div style={{ fontFamily: 'var(--font-mono)', fontSize: '.82rem', color: 'var(--gold)', fontWeight: 600 }}>{fmt(u.rentAmount)}/mo</div>
+                    {u.startDate && <div style={{ fontSize: '.65rem', color: 'var(--text-3)', marginTop: 1 }}>{new Date(u.startDate).toLocaleDateString()} - {u.endDate ? new Date(u.endDate).toLocaleDateString() : 'Present'}</div>}
                   </div>
                   <button className="btn btn-ghost btn-sm" onClick={() => navigate('/units/' + u.id)}>View</button>
                 </div>
@@ -248,9 +248,9 @@ export function TenantDetailPage() {
                 <tbody>
                   {payments?.map((p: any) => (
                     <tr key={p.id}>
-                      <td className="mono" style={{ fontSize: '.72rem' }}>{new Date(p.due_date).toLocaleDateString()}</td>
-                      <td style={{ fontSize: '.78rem' }}>{p.property_name}</td>
-                      <td className="mono">{p.unit_number}</td>
+                      <td className="mono" style={{ fontSize: '.72rem' }}>{new Date(p.dueDate).toLocaleDateString()}</td>
+                      <td style={{ fontSize: '.78rem' }}>{p.propertyName}</td>
+                      <td className="mono">{p.unitNumber}</td>
                       <td className="mono">{fmt(p.amount)}</td>
                       <td><span className={`badge ${p.status === 'settled' ? 'badge-green' : p.status === 'failed' ? 'badge-red' : 'badge-amber'}`}>{p.status}</span></td>
                     </tr>
@@ -270,12 +270,12 @@ export function TenantDetailPage() {
                 <tbody>
                   {maintenance?.map((m: any) => (
                     <tr key={m.id}>
-                      <td className="mono" style={{ fontSize: '.72rem' }}>{new Date(m.created_at).toLocaleDateString()}</td>
-                      <td className="mono">{m.unit_number}</td>
+                      <td className="mono" style={{ fontSize: '.72rem' }}>{new Date(m.createdAt).toLocaleDateString()}</td>
+                      <td className="mono">{m.unitNumber}</td>
                       <td style={{ fontSize: '.78rem' }}>{m.title}</td>
                       <td><span className={`badge ${m.priority === 'emergency' ? 'badge-red' : m.priority === 'high' ? 'badge-amber' : 'badge-blue'}`}>{m.priority}</span></td>
                       <td><span className={`badge ${m.status === 'completed' ? 'badge-green' : 'badge-amber'}`}>{m.status?.replace('_', ' ')}</span></td>
-                      <td className="mono">{m.actual_cost ? fmt(m.actual_cost) : '--'}</td>
+                      <td className="mono">{m.actualCost ? fmt(m.actualCost) : '--'}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -288,7 +288,7 @@ export function TenantDetailPage() {
       {showTransfer && currentUnit && (
         <TransferTenantModal
           tenantId={id!}
-          tenantName={tenant.first_name + ' ' + tenant.last_name}
+          tenantName={tenant.firstName + ' ' + tenant.lastName}
           currentUnit={currentUnit}
           onClose={() => setShowTransfer(false)}
         />

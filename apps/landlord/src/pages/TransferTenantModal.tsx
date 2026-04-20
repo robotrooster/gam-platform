@@ -7,14 +7,14 @@ const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minim
 interface Props {
   tenantId: string
   tenantName: string
-  currentUnit: { id: string; unit_number: string; rent_amount: number; property_name: string }
+  currentUnit: { id: string; unitNumber: string; rentAmount: number; propertyName: string }
   onClose: () => void
 }
 
 export function TransferTenantModal({ tenantId, tenantName, currentUnit, onClose }: Props) {
   const qc = useQueryClient()
   const [selectedUnit, setSelectedUnit] = useState<any>(null)
-  const [newRent, setNewRent] = useState(currentUnit.rent_amount.toString())
+  const [newRent, setNewRent] = useState(currentUnit.rentAmount.toString())
   const [effectiveDate, setEffectiveDate] = useState(new Date().toISOString().split('T')[0])
   const [notes, setNotes] = useState('')
   const [result, setResult] = useState<any>(null)
@@ -36,7 +36,7 @@ export function TransferTenantModal({ tenantId, tenantName, currentUnit, onClose
     }
   )
 
-  const oldRent = parseFloat(currentUnit.rent_amount.toString())
+  const oldRent = parseFloat(currentUnit.rentAmount.toString())
   const newRentNum = parseFloat(newRent) || 0
   const rentChanged = Math.abs(oldRent - newRentNum) > 0.01
   const transferDate = new Date(effectiveDate)
@@ -104,7 +104,7 @@ export function TransferTenantModal({ tenantId, tenantName, currentUnit, onClose
           <DoorOpen size={14} style={{ color: 'var(--text-3)' }} />
           <div style={{ flex: 1 }}>
             <div style={{ fontSize: '.78rem', fontWeight: 600, color: 'var(--text-0)' }}>{tenantName}</div>
-            <div style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>Currently in Unit {currentUnit.unit_number} · {currentUnit.property_name} · {fmt(currentUnit.rent_amount)}/mo</div>
+            <div style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>Currently in Unit {currentUnit.unitNumber} · {currentUnit.propertyName} · {fmt(currentUnit.rentAmount)}/mo</div>
           </div>
           <ArrowRight size={16} style={{ color: 'var(--gold)' }} />
         </div>
@@ -119,15 +119,15 @@ export function TransferTenantModal({ tenantId, tenantName, currentUnit, onClose
           ) : (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 220, overflowY: 'auto' }}>
               {(availableUnits as any[]).map((u: any) => (
-                <div key={u.id} onClick={() => { setSelectedUnit(u); setNewRent(u.rent_amount.toString()) }}
+                <div key={u.id} onClick={() => { setSelectedUnit(u); setNewRent(u.rentAmount.toString()) }}
                   style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 12px', borderRadius: 8, cursor: 'pointer', transition: 'all .12s', border: `1px solid ${selectedUnit?.id === u.id ? 'var(--gold)' : 'var(--border-0)'}`, background: selectedUnit?.id === u.id ? 'rgba(201,162,39,.06)' : 'var(--bg-2)' }}>
                   <DoorOpen size={14} style={{ color: selectedUnit?.id === u.id ? 'var(--gold)' : 'var(--text-3)' }} />
                   <div style={{ flex: 1 }}>
-                    <div style={{ fontSize: '.82rem', fontWeight: 600, color: 'var(--text-0)' }}>Unit {u.unit_number}</div>
-                    <div style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>{u.property_name} · {u.bedrooms}bd/{u.bathrooms}ba{u.sqft ? ` · ${u.sqft} sqft` : ''}</div>
+                    <div style={{ fontSize: '.82rem', fontWeight: 600, color: 'var(--text-0)' }}>Unit {u.unitNumber}</div>
+                    <div style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>{u.propertyName} · {u.bedrooms}bd/{u.bathrooms}ba{u.sqft ? ` · ${u.sqft} sqft` : ''}</div>
                   </div>
                   <div style={{ textAlign: 'right' }}>
-                    <div style={{ fontFamily: 'var(--font-mono)', fontSize: '.82rem', color: 'var(--gold)', fontWeight: 600 }}>{fmt(u.rent_amount)}/mo</div>
+                    <div style={{ fontFamily: 'var(--font-mono)', fontSize: '.82rem', color: 'var(--gold)', fontWeight: 600 }}>{fmt(u.rentAmount)}/mo</div>
                   </div>
                   {selectedUnit?.id === u.id && <Check size={14} style={{ color: 'var(--gold)', flexShrink: 0 }} />}
                 </div>

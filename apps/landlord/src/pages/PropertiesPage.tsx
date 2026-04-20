@@ -50,7 +50,7 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
     zip:         property?.zip || '',
     description: property?.description || '',
     amenities:   property?.amenities || [] as string[],
-    unit_types:  property?.unit_types || [] as string[],
+    unitTypes:   property?.unitTypes || [] as string[],
   })
   const [errors, setErrors] = useState<Record<string, string>>({})
   const [addrSuggestions, setAddrSuggestions] = useState<any[]>([])
@@ -68,16 +68,16 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
         qc.invalidateQueries('properties')
         if (isEdit) { onClose(); return }
         const pid = res?.data?.id || res?.id
-        if (pid && form.unit_types.length > 0) {
+        if (pid && form.unitTypes.length > 0) {
           setCreatedPropId(pid)
           // Init unit groups
           const groups: Record<string, any> = {}
-          form.unit_types.forEach((t: string) => {
+          form.unitTypes.forEach((t: string) => {
             const ut = UNIT_TYPES.find(u => u.value === t)
             groups[t] = { count: '', prefix: ut?.prefix || 'UNIT', rentAmount: '', securityDeposit: '' }
           })
           // Init one batch per selected type
-          const initBatches = form.unit_types.map((t: string) => {
+          const initBatches = form.unitTypes.map((t: string) => {
             const ut = UNIT_TYPES.find((u: any) => u.value === t)
             return { id: Math.random().toString(36).slice(2), type: t, count: '', prefix: ut?.prefix || 'UNIT', rentAmount: '', securityDeposit: '', bedrooms: '' }
           })
@@ -97,7 +97,7 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
 
   const set = (k: string, v: any) => { setForm(f => ({ ...f, [k]: v })); setErrors(e => ({ ...e, [k]: '' })) }
   const toggleAmenity = (a: string) => set('amenities', form.amenities.includes(a) ? form.amenities.filter((x: string) => x !== a) : [...form.amenities, a])
-  const toggleUnitType = (t: string) => set('unit_types', form.unit_types.includes(t) ? form.unit_types.filter((x: string) => x !== t) : [...form.unit_types, t])
+  const toggleUnitType = (t: string) => set('unit_types', form.unitTypes.includes(t) ? form.unitTypes.filter((x: string) => x !== t) : [...form.unitTypes, t])
 
   const searchAddr = async (val: string) => {
     if (val.length < 3) { setAddrSuggestions([]); setShowAddrSugg(false); return }
@@ -112,9 +112,9 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
   const pickAddr = (s: any) => {
     const ctx = s.context || []
     const getCtx = (id: string) => ctx.find((c: any) => c.id.startsWith(id))?.text || ''
-    const street = s.place_name ? s.place_name.split(',')[0] : s.text || ''
+    const street = s.placeName ? s.placeName.split(',')[0] : s.text || ''
     const city = getCtx('place')
-    const stateShort = ctx.find((c: any) => c.id.startsWith('region'))?.short_code?.replace('US-', '') || form.state
+    const stateShort = ctx.find((c: any) => c.id.startsWith('region'))?.shortCode?.replace('US-', '') || form.state
     const zip = getCtx('postcode')
     setForm(f => ({ ...f, street1: street || f.street1, city: city || f.city, state: stateShort || f.state, zip: zip || f.zip }))
     setAddrSuggestions([]); setShowAddrSugg(false); setAddrVerified(true)
@@ -187,7 +187,7 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
               <label style={lbl}>Unit Types <span style={{ fontWeight: 400, textTransform: 'none' }}>(select all that apply)</span></label>
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 6 }}>
                 {UNIT_TYPES.map(t => {
-                  const on = form.unit_types.includes(t.value)
+                  const on = form.unitTypes.includes(t.value)
                   return (
                     <div key={t.value} onClick={() => toggleUnitType(t.value)} style={{ padding: '6px 8px', borderRadius: 8, cursor: 'pointer', border: `1px solid ${on ? 'var(--gold)' : 'var(--border-0)'}`, background: on ? 'rgba(201,162,39,.08)' : 'var(--bg-2)', textAlign: 'center', transition: 'all .12s' }}>
                       <div style={{ fontSize: '1rem', marginBottom: 1 }}>{t.icon}</div>
@@ -222,8 +222,8 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
                       <div key={i} onMouseDown={() => pickAddr(s)} style={{ padding: '8px 12px', cursor: 'pointer', borderBottom: i < addrSuggestions.length-1 ? '1px solid var(--border-0)' : 'none' }}
                         onMouseEnter={e => (e.currentTarget as HTMLElement).style.background = 'var(--bg-3)'}
                         onMouseLeave={e => (e.currentTarget as HTMLElement).style.background = ''}>
-                        <div style={{ fontSize: '.8rem', fontWeight: 600, color: 'var(--text-0)' }}>{s.place_name?.split(',')[0] || s.text}</div>
-                        <div style={{ fontSize: '.68rem', color: 'var(--text-3)' }}>{s.place_name?.split(',').slice(1, 3).join(',').trim()}</div>
+                        <div style={{ fontSize: '.8rem', fontWeight: 600, color: 'var(--text-0)' }}>{s.placeName?.split(',')[0] || s.text}</div>
+                        <div style={{ fontSize: '.68rem', color: 'var(--text-3)' }}>{s.placeName?.split(',').slice(1, 3).join(',').trim()}</div>
                       </div>
                     ))}
                   </div>
@@ -282,7 +282,7 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
           <div className="modal-footer">
             <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
             <button className="btn btn-primary" onClick={submitStep1} disabled={propMut.isLoading}>
-              {propMut.isLoading ? <span className="spinner" /> : <><Check size={14} /> {isEdit ? 'Save Changes' : form.unit_types.length > 0 ? 'Next: Create Units →' : 'Add Property'}</>}
+              {propMut.isLoading ? <span className="spinner" /> : <><Check size={14} /> {isEdit ? 'Save Changes' : form.unitTypes.length > 0 ? 'Next: Create Units →' : 'Add Property'}</>}
             </button>
           </div>
         </>}
@@ -293,7 +293,7 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
           </div>
 
           <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-            {form.unit_types.map((type: string) => {
+            {form.unitTypes.map((type: string) => {
               const ut = UNIT_TYPES.find((u: any) => u.value === type)!
               const typeBatches = batches.filter(b => b.type === type)
               const showBeds = ['apartment','house','mobile_home'].includes(type)
@@ -388,17 +388,17 @@ export function PropertiesPage() {
 
   // Compute stats per property
   const propStats = (props as any[]).map(p => {
-    const propUnits = (units as any[]).filter(u => u.property_id === p.id)
-    const occupied  = propUnits.filter(u => u.tenant_id).length
-    const vacant    = propUnits.filter(u => !u.tenant_id).length
-    const monthlyRevenue = propUnits.filter(u => u.tenant_id).reduce((s, u) => s + parseFloat(u.rent_amount || 0), 0)
+    const propUnits = (units as any[]).filter(u => u.propertyId === p.id)
+    const occupied  = propUnits.filter(u => u.tenantId).length
+    const vacant    = propUnits.filter(u => !u.tenantId).length
+    const monthlyRevenue = propUnits.filter(u => u.tenantId).reduce((s, u) => s + parseFloat(u.rentAmount || 0), 0)
     return { ...p, totalUnits: propUnits.length, occupied, vacant, monthlyRevenue }
   })
 
   const totalUnits    = propStats.reduce((s, p) => s + p.totalUnits, 0)
   const totalOccupied = propStats.reduce((s, p) => s + p.occupied, 0)
   const totalRevenue  = propStats.reduce((s, p) => s + p.monthlyRevenue, 0)
-  const superMaxRevenue = (units as any[]).reduce((s, u) => s + parseFloat(u.rent_amount||0), 0)
+  const superMaxRevenue = (units as any[]).reduce((s, u) => s + parseFloat(u.rentAmount||0), 0)
 
   return (
     <div>

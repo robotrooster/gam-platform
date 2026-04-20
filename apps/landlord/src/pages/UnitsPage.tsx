@@ -26,14 +26,14 @@ export function UnitsPage() {
 
   const filtered = units.filter((u: any) => {
     const matchSearch = search === '' ||
-      u.unit_number.toLowerCase().includes(search.toLowerCase()) ||
-      u.property_name?.toLowerCase().includes(search.toLowerCase()) ||
-      `${u.tenant_first} ${u.tenant_last}`.toLowerCase().includes(search.toLowerCase())
+      u.unitNumber.toLowerCase().includes(search.toLowerCase()) ||
+      u.propertyName?.toLowerCase().includes(search.toLowerCase()) ||
+      `${u.tenantFirst} ${u.tenantLast}`.toLowerCase().includes(search.toLowerCase())
     const matchFilter = filter === 'all' || u.status === filter
     return matchSearch && matchFilter
   })
 
-  const evictionUnits = units.filter((u: any) => u.payment_block)
+  const evictionUnits = units.filter((u: any) => u.paymentBlock)
 
   return (
     <div>
@@ -77,14 +77,14 @@ export function UnitsPage() {
               <tbody>
                 {filtered.map((u: any) => (
                   <tr key={u.id} onClick={() => navigate('/units/' + u.id)} style={{ cursor: 'pointer' }}>
-                    <td><span className="mono" style={{ color: 'var(--text-0)', fontWeight: 600 }}>{u.unit_number}</span></td>
-                    <td style={{ fontSize: '.82rem' }}>{u.property_name}<br /><span style={{ color: 'var(--text-3)', fontSize: '.72rem' }}>{u.city}, {u.state}</span></td>
+                    <td><span className="mono" style={{ color: 'var(--text-0)', fontWeight: 600 }}>{u.unitNumber}</span></td>
+                    <td style={{ fontSize: '.82rem' }}>{u.propertyName}<br /><span style={{ color: 'var(--text-3)', fontSize: '.72rem' }}>{u.city}, {u.state}</span></td>
                     <td style={{ fontSize: '.82rem' }}>
-                      {u.tenant_first
-                        ? <><span style={{ color: 'var(--text-0)' }}>{u.tenant_first} {u.tenant_last}</span><br /><span style={{ color: 'var(--text-3)', fontSize: '.72rem' }}>{u.tenant_email}</span></>
+                      {u.tenantFirst
+                        ? <><span style={{ color: 'var(--text-0)' }}>{u.tenantFirst} {u.tenantLast}</span><br /><span style={{ color: 'var(--text-3)', fontSize: '.72rem' }}>{u.tenantEmail}</span></>
                         : <span style={{ color: 'var(--text-3)' }}>Vacant</span>}
                     </td>
-                    <td className="mono">{fmt(u.rent_amount)}</td>
+                    <td className="mono">{fmt(u.rentAmount)}</td>
                     <td onClick={e => e.stopPropagation()}>
                       <select value={u.status} onChange={e => setStatusMut.mutate({ id: u.id, status: e.target.value })}
                         style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '.75rem', color: 'inherit', padding: 0 }}>
@@ -93,12 +93,12 @@ export function UnitsPage() {
                       <span className={'badge ' + (STATUS_COLORS[u.status] || 'badge-muted')} style={{ marginLeft: 4 }}>{u.status.replace('_', ' ')}</span>
                     </td>
                     <td>
-                      {u.on_time_pay_active
+                      {u.onTimePayActive
                         ? <span style={{ color: 'var(--green)', fontSize: '.75rem' }}>Active</span>
                         : <span style={{ color: 'var(--text-3)', fontSize: '.75rem' }}>-</span>}
                     </td>
                     <td>
-                      {u.payment_block
+                      {u.paymentBlock
                         ? <span className="badge badge-red"><Shield size={10} /> BLOCKED</span>
                         : <span style={{ color: 'var(--text-3)', fontSize: '.75rem' }}>-</span>}
                     </td>

@@ -19,11 +19,11 @@ export function TeamPage() {
             <tbody>
               {members.length ? members.map((m: any) => (
                 <tr key={m.id}>
-                  <td style={{fontWeight:500}}>{m.first_name} {m.last_name}</td>
+                  <td style={{fontWeight:500}}>{m.firstName} {m.lastName}</td>
                   <td style={{fontSize:'.82rem',color:'var(--text-3)'}}>{m.email || '—'}</td>
                   <td><span className={`badge ${ROLE_MAP[m.role]||'badge-muted'}`}>{m.role || '—'}</span></td>
-                  <td style={{fontSize:'.82rem'}}>{m.property_count ?? '—'}</td>
-                  <td className="mono" style={{fontSize:'.82rem',color:'var(--text-3)'}}>{m.last_active ? new Date(m.last_active).toLocaleDateString() : '—'}</td>
+                  <td style={{fontSize:'.82rem'}}>{m.propertyCount ?? '—'}</td>
+                  <td className="mono" style={{fontSize:'.82rem',color:'var(--text-3)'}}>{m.lastActive ? new Date(m.lastActive).toLocaleDateString() : '—'}</td>
                   <td><span className={`badge ${m.active ? 'badge-green' : 'badge-red'}`}>{m.active ? 'active' : 'inactive'}</span></td>
                 </tr>
               )) : (

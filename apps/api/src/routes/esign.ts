@@ -1275,7 +1275,7 @@ esignRouter.post('/documents/addendum-terms/batch', requireAuth, requireLandlord
       const roster = rostersByLease.get(lease.id)!
       const tenantSigners = roster.map((r, idx) => ({
         userId: r.user_id,
-        role: roster.length === 1 ? 'tenant' : (idx === 0 ? 'tenant_1' : `tenant_${idx + 1}`),
+        role: idx === 0 ? 'primary' : `co_tenant_${idx}`,
         name: `${r.first_name} ${r.last_name}`,
         email: r.email,
         orderIndex: idx + 2,
@@ -1482,7 +1482,12 @@ esignRouter.post('/documents/:id/send', requireAuth, requireLandlord, async (req
     if (!firstSigner) throw new AppError(400, 'No signers configured')
 
     const unitLabel = doc.unit_number ? `Unit ${doc.unit_number} — ${doc.property_name}` : (doc.title || 'GAM Document')
-    const signingUrl = `${TENANT_APP_URL}/sign/${doc.id}`
+
+    // Branch signing URL: unactivated tenants land on /accept-invite first, then get redirected to /sign
+    const firstSignerUser = await queryOne<any>('SELECT email_verified, email_verify_token FROM users WHERE id=$1', [firstSigner.user_id])
+    const signingUrl = (firstSignerUser && !firstSignerUser.email_verified && firstSignerUser.email_verify_token)
+      ? `${TENANT_APP_URL}/accept-invite?token=${firstSignerUser.email_verify_token}&next=${encodeURIComponent('/sign/' + doc.id)}`
+      : `${TENANT_APP_URL}/sign/${doc.id}`
 
     await emailSigningRequest(firstSigner.email, firstSigner.name, doc.title, unitLabel, doc.landlord_name, signingUrl)
     await createNotification({
@@ -1730,7 +1735,11 @@ esignRouter.post('/sign/:documentId', requireAuth, async (req, res, next) => {
       if (nextSigner) {
         const unitLabel = doc.unit_number ? `Unit ${doc.unit_number} — ${doc.property_name}` : doc.title
         const signingUrl = `${TENANT_APP_URL}/sign/${doc.id}`
-        await emailSigningRequest(nextSigner.email, nextSigner.name, doc.title, unitLabel, doc.landlord_name, signingUrl)
+        const nextSignerUser = await queryOne<any>('SELECT email_verified, email_verify_token FROM users WHERE id=$1', [nextSigner.user_id])
+        const nextSigningUrl = (nextSignerUser && !nextSignerUser.email_verified && nextSignerUser.email_verify_token)
+          ? `${TENANT_APP_URL}/accept-invite?token=${nextSignerUser.email_verify_token}&next=${encodeURIComponent('/sign/' + doc.id)}`
+          : signingUrl
+        await emailSigningRequest(nextSigner.email, nextSigner.name, doc.title, unitLabel, doc.landlord_name, nextSigningUrl)
         await createNotification({
           userId: nextSigner.user_id,
           type: 'esign_request',

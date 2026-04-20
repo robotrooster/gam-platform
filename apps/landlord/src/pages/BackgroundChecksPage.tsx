@@ -19,12 +19,12 @@ export function BackgroundChecksPage() {
             <tbody>
               {checks.length ? checks.map((c: any) => (
                 <tr key={c.id}>
-                  <td>{c.applicant_name || '—'}</td>
-                  <td className="mono">{c.unit_number || '—'}</td>
-                  <td className="mono">{c.submitted_at ? new Date(c.submitted_at).toLocaleDateString() : '—'}</td>
-                  <td><span className={`badge ${c.risk_score >= 70 ? 'badge-red' : c.risk_score >= 40 ? 'badge-amber' : 'badge-green'}`}>{c.risk_score ?? '—'}</span></td>
+                  <td>{c.applicantName || '—'}</td>
+                  <td className="mono">{c.unitNumber || '—'}</td>
+                  <td className="mono">{c.submittedAt ? new Date(c.submittedAt).toLocaleDateString() : '—'}</td>
+                  <td><span className={`badge ${c.riskScore >= 70 ? 'badge-red' : c.riskScore >= 40 ? 'badge-amber' : 'badge-green'}`}>{c.riskScore ?? '—'}</span></td>
                   <td><span className={`badge ${STATUS_MAP[c.status]||'badge-muted'}`}>{c.status || '—'}</span></td>
-                  <td style={{fontSize:'.82rem',color:'var(--text-3)'}}>{c.decision_note || '—'}</td>
+                  <td style={{fontSize:'.82rem',color:'var(--text-3)'}}>{c.decisionNote || '—'}</td>
                 </tr>
               )) : (
                 <tr><td colSpan={6} style={{textAlign:'center',color:'var(--text-3)',padding:32}}>No background checks yet.</td></tr>

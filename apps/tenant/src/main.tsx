@@ -151,9 +151,9 @@ function LeaseNavLink() {
       headers: { Authorization: 'Bearer ' + localStorage.getItem('gam_tenant_token') }
     }).then(r=>r.json()).then(r=>r.data||[])
   )
-  const token = (pendingDocs as any[])[0]?.token
-  return token
-    ? <NavLink to={'/sign/'+token} className={({isActive})=>`ni${isActive?' active':''}`}>📋 Lease</NavLink>
+  const pendingDocId = (pendingDocs as any[])[0]?.document_id
+  return pendingDocId
+    ? <NavLink to={'/sign/'+pendingDocId} className={({isActive})=>`ni${isActive?' active':''}`}>📋 Lease</NavLink>
     : <NavLink to="/lease" className={({isActive})=>`ni${isActive?' active':''}`}>📋 Lease</NavLink>
 }
 
@@ -1126,7 +1126,7 @@ function App() {
           <Route path="payments"         element={<PaymentsPage />} />
           <Route path="maintenance"      element={<MaintenancePage />} />
           <Route path="lease"            element={<LeasePage />} />
-          <Route path="sign/:token"      element={<SignPage />} />
+          <Route path="sign/:documentId" element={<SignPage />} />
           <Route path="services"         element={<ServicesPage />} />
           <Route path="profile"          element={<ProfilePage />} />
         </Route>

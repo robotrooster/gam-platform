@@ -71,8 +71,8 @@ function SetupModal({ onClose }: { onClose: () => void }) {
               <div style={{ fontSize:'.82rem', fontWeight:700, color:'var(--green)', marginBottom:4 }}>✓ Company Created — {company.name}</div>
               <div style={{ fontSize:'.72rem', color:'var(--text-3)', marginBottom:8 }}>Share this access code with landlords to connect:</div>
               <div style={{ display:'flex', alignItems:'center', gap:8 }}>
-                <div style={{ fontFamily:'var(--font-mono)', fontSize:'1.2rem', fontWeight:800, color:'var(--gold)', background:'var(--bg-3)', padding:'6px 14px', borderRadius:8, letterSpacing:'.12em' }}>{company.access_code}</div>
-                <button className="btn btn-ghost btn-sm" onClick={() => navigator.clipboard.writeText(company.access_code)}><Copy size={13} /></button>
+                <div style={{ fontFamily:'var(--font-mono)', fontSize:'1.2rem', fontWeight:800, color:'var(--gold)', background:'var(--bg-3)', padding:'6px 14px', borderRadius:8, letterSpacing:'.12em' }}>{company.accessCode}</div>
+                <button className="btn btn-ghost btn-sm" onClick={() => navigator.clipboard.writeText(company.accessCode)}><Copy size={13} /></button>
               </div>
             </div>
 
@@ -196,9 +196,9 @@ function ConnectModal({ onClose }: { onClose: () => void }) {
                       <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center' }}>
                         <span style={{ fontSize:'.82rem', fontWeight:600, color:'var(--text-0)' }}>{plan.name}</span>
                         <span style={{ fontFamily:'var(--font-mono)', fontSize:'.78rem', color:'var(--gold)' }}>
-                          {plan.fee_type==='percent' ? `${plan.percent_rate}% of rent` :
-                           plan.fee_type==='flat' ? `$${plan.flat_amount}/unit/mo` :
-                           `${plan.percent_rate}% + $${plan.flat_amount}/unit`}
+                          {plan.feeType==='percent' ? `${plan.percentRate}% of rent` :
+                           plan.feeType==='flat' ? `$${plan.flatAmount}/unit/mo` :
+                           `${plan.percentRate}% + $${plan.flatAmount}/unit`}
                         </span>
                       </div>
                       {plan.description && <div style={{ fontSize:'.68rem', color:'var(--text-3)', marginTop:2 }}>{plan.description}</div>}
@@ -268,13 +268,13 @@ export function PMDashboardPage() {
       <div className="page-header">
         <div>
           <h1 className="page-title">{company.name}</h1>
-          <p className="page-subtitle">PM Dashboard · Access Code: <span style={{ fontFamily:'var(--font-mono)', color:'var(--gold)', fontWeight:700, letterSpacing:'.1em' }}>{company.access_code}</span></p>
+          <p className="page-subtitle">PM Dashboard · Access Code: <span style={{ fontFamily:'var(--font-mono)', color:'var(--gold)', fontWeight:700, letterSpacing:'.1em' }}>{company.accessCode}</span></p>
         </div>
         <div style={{ display:'flex', gap:8 }}>
-          <button className="btn btn-ghost" onClick={() => navigator.clipboard.writeText(company.access_code)}>
+          <button className="btn btn-ghost" onClick={() => navigator.clipboard.writeText(company.accessCode)}>
             <Copy size={14} /> Copy Code
           </button>
-          <a href={`/pm/report/${company.report_token}`} target="_blank" rel="noreferrer" className="btn btn-ghost">
+          <a href={`/pm/report/${company.reportToken}`} target="_blank" rel="noreferrer" className="btn btn-ghost">
             <ExternalLink size={14} /> Shareable Report
           </a>
         </div>
@@ -307,18 +307,18 @@ export function PMDashboardPage() {
           </thead>
           <tbody>
             {landlords.length === 0 && (
-              <tr><td colSpan={8} style={{ textAlign:'center', color:'var(--text-3)', padding:32 }}>No clients connected yet. Share your access code: <strong>{company.access_code}</strong></td></tr>
+              <tr><td colSpan={8} style={{ textAlign:'center', color:'var(--text-3)', padding:32 }}>No clients connected yet. Share your access code: <strong>{company.accessCode}</strong></td></tr>
             )}
             {landlords.map((l: any) => {
-              const occ = l.unit_count > 0 ? Math.round((l.occupied_count / l.unit_count) * 100) : 0
+              const occ = l.unitCount > 0 ? Math.round((l.occupiedCount / l.unitCount) * 100) : 0
               return (
                 <tr key={l.id}>
                   <td>
-                    <div style={{ fontWeight:600, color:'var(--text-0)', fontSize:'.82rem' }}>{l.first_name} {l.last_name}</div>
+                    <div style={{ fontWeight:600, color:'var(--text-0)', fontSize:'.82rem' }}>{l.firstName} {l.lastName}</div>
                     <div style={{ fontSize:'.68rem', color:'var(--text-3)' }}>{l.email}</div>
                   </td>
-                  <td className="mono">{l.property_count}</td>
-                  <td className="mono">{l.unit_count}</td>
+                  <td className="mono">{l.propertyCount}</td>
+                  <td className="mono">{l.unitCount}</td>
                   <td>
                     <div style={{ display:'flex', alignItems:'center', gap:8 }}>
                       <div style={{ flex:1, height:4, background:'var(--bg-3)', borderRadius:2, overflow:'hidden', minWidth:60 }}>
@@ -327,16 +327,16 @@ export function PMDashboardPage() {
                       <span style={{ fontSize:'.72rem', color: occ >= 80 ? 'var(--green)' : 'var(--amber)', minWidth:30 }}>{occ}%</span>
                     </div>
                   </td>
-                  <td className="mono">{fmt(l.collected_rent)}</td>
-                  <td className="mono" style={{ color:'var(--text-3)' }}>{fmt(l.max_rent)}</td>
+                  <td className="mono">{fmt(l.collectedRent)}</td>
+                  <td className="mono" style={{ color:'var(--text-3)' }}>{fmt(l.maxRent)}</td>
                   <td style={{ fontSize:'.75rem' }}>
-                    {l.plan_name ? (
+                    {l.planName ? (
                       <div>
-                        <div style={{ fontWeight:600 }}>{l.plan_name}</div>
+                        <div style={{ fontWeight:600 }}>{l.planName}</div>
                         <div style={{ color:'var(--text-3)' }}>
-                          {l.fee_type==='percent' ? `${l.percent_rate}%` :
-                           l.fee_type==='flat' ? `$${l.flat_amount}/unit` :
-                           `${l.percent_rate}% + $${l.flat_amount}`}
+                          {l.feeType==='percent' ? `${l.percentRate}%` :
+                           l.feeType==='flat' ? `$${l.flatAmount}/unit` :
+                           `${l.percentRate}% + $${l.flatAmount}`}
                         </div>
                       </div>
                     ) : '—'}

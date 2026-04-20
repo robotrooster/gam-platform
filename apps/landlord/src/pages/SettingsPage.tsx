@@ -16,7 +16,7 @@ export function SettingsPage() {
 
   useEffect(() => {
     if (me) {
-      setThreshold(me.maint_approval_threshold != null ? String(me.maint_approval_threshold) : '500')
+      setThreshold(me.maintApprovalThreshold != null ? String(me.maintApprovalThreshold) : '500')
     }
   }, [me])
 
@@ -33,7 +33,7 @@ export function SettingsPage() {
 
   const thresholdNum = Number(threshold)
   const thresholdValid = !isNaN(thresholdNum) && thresholdNum >= 0
-  const thresholdChanged = me && Number(me.maint_approval_threshold || 500) !== thresholdNum
+  const thresholdChanged = me && Number(me.maintApprovalThreshold || 500) !== thresholdNum
 
   return (
     <div>
@@ -55,7 +55,7 @@ export function SettingsPage() {
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginTop: 12 }}>
               <div>
                 <div style={{ fontSize: '.78rem', color: 'var(--text-3)', marginBottom: 4 }}>Business Name</div>
-                <div style={{ fontWeight: 500 }}>{me?.business_name || '—'}</div>
+                <div style={{ fontWeight: 500 }}>{me?.businessName || '—'}</div>
               </div>
               <div>
                 <div style={{ fontSize: '.78rem', color: 'var(--text-3)', marginBottom: 4 }}>EIN</div>
@@ -63,7 +63,7 @@ export function SettingsPage() {
               </div>
               <div>
                 <div style={{ fontSize: '.78rem', color: 'var(--text-3)', marginBottom: 4 }}>Name</div>
-                <div style={{ fontWeight: 500 }}>{[me?.first_name, me?.last_name].filter(Boolean).join(' ') || '—'}</div>
+                <div style={{ fontWeight: 500 }}>{[me?.firstName, me?.lastName].filter(Boolean).join(' ') || '—'}</div>
               </div>
               <div>
                 <div style={{ fontSize: '.78rem', color: 'var(--text-3)', marginBottom: 4 }}>Email</div>
@@ -78,12 +78,12 @@ export function SettingsPage() {
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginTop: 12 }}>
               <div>
                 <div style={{ fontSize: '.78rem', color: 'var(--text-3)', marginBottom: 4 }}>Volume Tier</div>
-                <div><span className="badge badge-green">{me?.volume_tier || 'standard'}</span></div>
+                <div><span className="badge badge-green">{me?.volumeTier || 'standard'}</span></div>
               </div>
               <div>
                 <div style={{ fontSize: '.78rem', color: 'var(--text-3)', marginBottom: 4 }}>Stripe Bank</div>
                 <div>
-                  {me?.stripe_bank_verified
+                  {me?.stripeBankVerified
                     ? <span className="badge badge-green">Verified</span>
                     : <span className="badge badge-amber">Not Verified</span>}
                 </div>

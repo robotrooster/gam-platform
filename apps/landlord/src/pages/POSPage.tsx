@@ -32,10 +32,10 @@ export function POSPage() {
 
   // Item management state
   const [editItem, setEditItem] = useState<any>(null)
-  const [newItem, setNewItem] = useState({ name:'', category:'misc', icon:'📦', sell_price:'', cost_price:'', tax_rate:'0', charge_eligible:true, stock_qty:'0', stock_min:'5', stock_max:'50' })
+  const [newItem, setNewItem] = useState({ name:'', category:'misc', icon:'📦', sellPrice:'', costPrice:'', taxRate:'0', chargeEligible:true, stockQty:'0', stockMin:'5', stockMax:'50' })
 
   // Tax rate state
-  const [newTax, setNewTax] = useState({ name:'', rate:'', tax_type:'state', applies_to:'all' })
+  const [newTax, setNewTax] = useState({ name:'', rate:'', taxType:'state', appliesTo:'all' })
 
   // Discount state
   const [newDiscount, setNewDiscount] = useState({ name:'', type:'percent', value:'', code:'' })
@@ -55,7 +55,7 @@ export function POSPage() {
     setCart(c => {
       const ex = c.find(x => x.id === item.id)
       if (ex) return c.map(x => x.id===item.id ? {...x,qty:x.qty+1} : x)
-      return [...c, { id:item.id, name:item.name, price:Number(item.sell_price), qty:1, tax:Number(item.tax_rate), cat:item.category, icon:item.icon, chargeEligible:item.charge_eligible }]
+      return [...c, { id:item.id, name:item.name, price:Number(item.sellPrice), qty:1, tax:Number(item.taxRate), cat:item.category, icon:item.icon, chargeEligible:item.chargeEligible }]
     })
   }
   const addOpenItem = () => {
@@ -107,8 +107,8 @@ export function POSPage() {
     { onSuccess: () => qc.invalidateQueries('pos-items') }
   )
   const createItemMut = useMutation(
-    () => apiPost('/pos/items', { ...newItem, costPrice:Number(newItem.cost_price), sellPrice:Number(newItem.sell_price), taxRate:Number(newItem.tax_rate), chargeEligible:newItem.charge_eligible, stockQty:Number(newItem.stock_qty), stockMin:Number(newItem.stock_min), stockMax:Number(newItem.stock_max) }),
-    { onSuccess: () => { qc.invalidateQueries('pos-items'); setNewItem({ name:'', category:'misc', icon:'📦', sell_price:'', cost_price:'', tax_rate:'0', charge_eligible:true, stock_qty:'0', stock_min:'5', stock_max:'50' }) } }
+    () => apiPost('/pos/items', { ...newItem, costPrice:Number(newItem.costPrice), sellPrice:Number(newItem.sellPrice), taxRate:Number(newItem.taxRate), chargeEligible:newItem.chargeEligible, stockQty:Number(newItem.stockQty), stockMin:Number(newItem.stockMin), stockMax:Number(newItem.stockMax) }),
+    { onSuccess: () => { qc.invalidateQueries('pos-items'); setNewItem({ name:'', category:'misc', icon:'📦', sellPrice:'', costPrice:'', taxRate:'0', chargeEligible:true, stockQty:'0', stockMin:'5', stockMax:'50' }) } }
   )
   const updateItemMut = useMutation(
     (data:any) => apiPatch(`/pos/items/${editItem.id}`, data),
@@ -117,8 +117,8 @@ export function POSPage() {
 
   // Tax mutations
   const createTaxMut = useMutation(
-    () => apiPost('/pos/tax-rates', { ...newTax, rate:Number(newTax.rate)/100, taxType:newTax.tax_type, appliesTo:newTax.applies_to==='all'?['all']:[newTax.applies_to] }),
-    { onSuccess: () => { qc.invalidateQueries('pos-tax-rates'); setNewTax({ name:'', rate:'', tax_type:'state', applies_to:'all' }) } }
+    () => apiPost('/pos/tax-rates', { ...newTax, rate:Number(newTax.rate)/100, taxType:newTax.taxType, appliesTo:newTax.appliesTo==='all'?['all']:[newTax.appliesTo] }),
+    { onSuccess: () => { qc.invalidateQueries('pos-tax-rates'); setNewTax({ name:'', rate:'', taxType:'state', appliesTo:'all' }) } }
   )
   const deleteTaxMut = useMutation(
     (id:string) => apiDel(`/pos/tax-rates/${id}`),
@@ -137,7 +137,7 @@ export function POSPage() {
 
   // Refund mutation
   const refundMut = useMutation(
-    () => apiPost(`/pos/transactions/${refundModal.tx?.id}/refund`, { amount:Number(refundAmt)||refundModal.tx?.total, reason:refundReason, refundMethod:refundModal.tx?.payment_method }),
+    () => apiPost(`/pos/transactions/${refundModal.tx?.id}/refund`, { amount:Number(refundAmt)||refundModal.tx?.total, reason:refundReason, refundMethod:refundModal.tx?.paymentMethod }),
     { onSuccess: () => { qc.invalidateQueries('pos-transactions'); setRefundModal({show:false,tx:null}); setRefundAmt(''); setRefundReason('') } }
   )
   const voidMut = useMutation(
@@ -210,17 +210,17 @@ export function POSPage() {
             </div>
             {/* Item grid */}
             <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(130px,1fr))',gap:10}}>
-              {visibleItems.filter((i:any)=>i.is_active).map((item:any) => (
+              {visibleItems.filter((i:any)=>i.isActive).map((item:any) => (
                 <button key={item.id} onClick={()=>addToCart(item)}
                   style={{background:'var(--bg-2)',border:'1px solid var(--border-1)',borderRadius:'var(--r-lg)',padding:16,cursor:'pointer',textAlign:'left'}}
                   onMouseEnter={e=>(e.currentTarget.style.borderColor='var(--gold)')}
                   onMouseLeave={e=>(e.currentTarget.style.borderColor='var(--border-1)')}>
                   <div style={{fontSize:'1.4rem',marginBottom:6}}>{item.icon}</div>
                   <div style={{fontSize:'.82rem',fontWeight:600,color:'var(--text-0)',marginBottom:2}}>{item.name}</div>
-                  <div style={{fontSize:'.88rem',color:'var(--gold)',fontWeight:700}}>{fmt(item.sell_price)}</div>
+                  <div style={{fontSize:'.88rem',color:'var(--gold)',fontWeight:700}}>{fmt(item.sellPrice)}</div>
                   <div style={{display:'flex',gap:4,marginTop:4,flexWrap:'wrap'}}>
-                    {item.charge_eligible && <span style={{fontSize:'.65rem',background:'var(--gold-bg)',color:'var(--gold)',padding:'1px 4px',borderRadius:3}}>⚡ charge</span>}
-                    {item.stock_qty < 999 && <span style={{fontSize:'.65rem',color:item.stock_qty<=item.stock_min?'var(--amber)':'var(--text-3)'}}>{item.stock_qty} left</span>}
+                    {item.chargeEligible && <span style={{fontSize:'.65rem',background:'var(--gold-bg)',color:'var(--gold)',padding:'1px 4px',borderRadius:3}}>⚡ charge</span>}
+                    {item.stockQty < 999 && <span style={{fontSize:'.65rem',color:item.stockQty<=item.stockMin?'var(--amber)':'var(--text-3)'}}>{item.stockQty} left</span>}
                   </div>
                 </button>
               ))}
@@ -304,7 +304,7 @@ export function POSPage() {
               <div style={{marginBottom:10}}>
                 <select className="form-select" value={tenantId} onChange={e=>setTenantId(e.target.value)} style={{width:'100%'}}>
                   <option value="">Select tenant…</option>
-                  {(tenants as any[]).map((t:any) => <option key={t.id} value={t.id}>{t.first_name} {t.last_name} — {t.unit_number||'no unit'}</option>)}
+                  {(tenants as any[]).map((t:any) => <option key={t.id} value={t.id}>{t.firstName} {t.lastName} — {t.unitNumber||'no unit'}</option>)}
                 </select>
                 {chargeBlocked && <div style={{fontSize:'.72rem',color:'var(--red)',marginTop:4}}>⚠ Cart contains items not eligible for charge account</div>}
               </div>
@@ -328,11 +328,11 @@ export function POSPage() {
               <tbody>
                 {(txns as any[]).length ? (txns as any[]).map((t:any) => (
                   <tr key={t.id}>
-                    <td className="mono">{new Date(t.created_at).toLocaleDateString()}</td>
-                    <td style={{color:'var(--text-3)',fontSize:'.82rem'}}>{t.item_count} items</td>
+                    <td className="mono">{new Date(t.createdAt).toLocaleDateString()}</td>
+                    <td style={{color:'var(--text-3)',fontSize:'.82rem'}}>{t.itemCount} items</td>
                     <td className="mono">{fmt(t.subtotal)}</td>
                     <td className="mono" style={{fontWeight:600}}>{fmt(t.total)}</td>
-                    <td><span className={`badge ${METHOD_MAP[t.payment_method]||'badge-muted'}`}>{t.payment_method}</span></td>
+                    <td><span className={`badge ${METHOD_MAP[t.paymentMethod]||'badge-muted'}`}>{t.paymentMethod}</span></td>
                     <td><span className={`badge ${STATUS_MAP[t.status]||'badge-muted'}`}>{t.status||'completed'}</span></td>
                     <td>
                       {(t.status==='completed') && (
@@ -341,7 +341,7 @@ export function POSPage() {
                           <button className="btn btn-ghost btn-sm" style={{color:'var(--red)'}} onClick={()=>voidMut.mutate(t.id)}>Void</button>
                         </div>
                       )}
-                      {t.status==='refunded' && <span style={{fontSize:'.75rem',color:'var(--text-3)'}}>−{fmt(t.refund_amount)}</span>}
+                      {t.status==='refunded' && <span style={{fontSize:'.75rem',color:'var(--text-3)'}}>−{fmt(t.refundAmount)}</span>}
                     </td>
                   </tr>
                 )) : <tr><td colSpan={7} style={{textAlign:'center',color:'var(--text-3)',padding:32}}>No transactions yet.</td></tr>}
@@ -365,16 +365,16 @@ export function POSPage() {
                   {CATEGORIES.map(c=><option key={c} value={c}>{c}</option>)}
                 </select>
               </div>
-              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Sell Price</div><input className="form-input" type="number" value={newItem.sell_price} onChange={e=>setNewItem(s=>({...s,sell_price:e.target.value}))} style={{width:'100%'}} /></div>
-              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Cost Price</div><input className="form-input" type="number" value={newItem.cost_price} onChange={e=>setNewItem(s=>({...s,cost_price:e.target.value}))} style={{width:'100%'}} /></div>
-              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Tax Rate %</div><input className="form-input" type="number" value={newItem.tax_rate} onChange={e=>setNewItem(s=>({...s,tax_rate:e.target.value}))} style={{width:'100%'}} /></div>
-              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Stock Qty</div><input className="form-input" type="number" value={newItem.stock_qty} onChange={e=>setNewItem(s=>({...s,stock_qty:e.target.value}))} style={{width:'100%'}} /></div>
+              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Sell Price</div><input className="form-input" type="number" value={newItem.sellPrice} onChange={e=>setNewItem(s=>({...s,sellPrice:e.target.value}))} style={{width:'100%'}} /></div>
+              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Cost Price</div><input className="form-input" type="number" value={newItem.costPrice} onChange={e=>setNewItem(s=>({...s,costPrice:e.target.value}))} style={{width:'100%'}} /></div>
+              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Tax Rate %</div><input className="form-input" type="number" value={newItem.taxRate} onChange={e=>setNewItem(s=>({...s,taxRate:e.target.value}))} style={{width:'100%'}} /></div>
+              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Stock Qty</div><input className="form-input" type="number" value={newItem.stockQty} onChange={e=>setNewItem(s=>({...s,stockQty:e.target.value}))} style={{width:'100%'}} /></div>
               <div style={{display:'flex',alignItems:'center',gap:8,paddingTop:20}}>
-                <input type="checkbox" id="ce" checked={newItem.charge_eligible} onChange={e=>setNewItem(s=>({...s,charge_eligible:e.target.checked}))} />
+                <input type="checkbox" id="ce" checked={newItem.chargeEligible} onChange={e=>setNewItem(s=>({...s,chargeEligible:e.target.checked}))} />
                 <label htmlFor="ce" style={{fontSize:'.82rem'}}>Charge eligible</label>
               </div>
             </div>
-            <button className="btn btn-primary" style={{marginTop:12}} onClick={()=>createItemMut.mutate()} disabled={!newItem.name||!newItem.sell_price}>Add Item</button>
+            <button className="btn btn-primary" style={{marginTop:12}} onClick={()=>createItemMut.mutate()} disabled={!newItem.name||!newItem.sellPrice}>Add Item</button>
           </div>
 
           {/* Items table */}
@@ -386,24 +386,24 @@ export function POSPage() {
                   <tr key={item.id}>
                     <td style={{fontWeight:500}}>{item.icon} {item.name}</td>
                     <td><span className="badge badge-muted">{item.category}</span></td>
-                    <td className="mono">{fmt(item.cost_price)}</td>
-                    <td className="mono" style={{color:'var(--gold)',fontWeight:600}}>{fmt(item.sell_price)}</td>
-                    <td className="mono">{pct(item.tax_rate)}</td>
-                    <td className="mono">{item.stock_qty >= 999 ? '∞' : item.stock_qty}</td>
+                    <td className="mono">{fmt(item.costPrice)}</td>
+                    <td className="mono" style={{color:'var(--gold)',fontWeight:600}}>{fmt(item.sellPrice)}</td>
+                    <td className="mono">{pct(item.taxRate)}</td>
+                    <td className="mono">{item.stockQty >= 999 ? '∞' : item.stockQty}</td>
                     <td>
-                      <button onClick={()=>toggleChargeMut.mutate({id:item.id,val:!item.charge_eligible})}
-                        style={{background:item.charge_eligible?'var(--gold-bg)':'var(--bg-3)',border:`1px solid ${item.charge_eligible?'var(--gold)':'var(--border-1)'}`,borderRadius:4,padding:'2px 8px',cursor:'pointer',fontSize:'.75rem',color:item.charge_eligible?'var(--gold)':'var(--text-3)',fontWeight:item.charge_eligible?700:400}}>
-                        {item.charge_eligible?'Yes':'No'}
+                      <button onClick={()=>toggleChargeMut.mutate({id:item.id,val:!item.chargeEligible})}
+                        style={{background:item.chargeEligible?'var(--gold-bg)':'var(--bg-3)',border:`1px solid ${item.chargeEligible?'var(--gold)':'var(--border-1)'}`,borderRadius:4,padding:'2px 8px',cursor:'pointer',fontSize:'.75rem',color:item.chargeEligible?'var(--gold)':'var(--text-3)',fontWeight:item.chargeEligible?700:400}}>
+                        {item.chargeEligible?'Yes':'No'}
                       </button>
                     </td>
                     <td>
-                      <button onClick={()=>toggleActiveMut.mutate({id:item.id,val:!item.is_active})}
-                        style={{background:item.is_active?'var(--bg-2)':'var(--bg-3)',border:'1px solid var(--border-1)',borderRadius:4,padding:'2px 8px',cursor:'pointer',fontSize:'.75rem',color:item.is_active?'var(--green)':'var(--text-3)'}}>
-                        {item.is_active?'Active':'Off'}
+                      <button onClick={()=>toggleActiveMut.mutate({id:item.id,val:!item.isActive})}
+                        style={{background:item.isActive?'var(--bg-2)':'var(--bg-3)',border:'1px solid var(--border-1)',borderRadius:4,padding:'2px 8px',cursor:'pointer',fontSize:'.75rem',color:item.isActive?'var(--green)':'var(--text-3)'}}>
+                        {item.isActive?'Active':'Off'}
                       </button>
                     </td>
                     <td>
-                      <button className="btn btn-ghost btn-sm" onClick={()=>setEditItem({...item, _sell:String(item.sell_price), _cost:String(item.cost_price), _tax:String(Number(item.tax_rate)*100), _stock:String(item.stock_qty), _min:String(item.stock_min), _max:String(item.stock_max)})}>Edit</button>
+                      <button className="btn btn-ghost btn-sm" onClick={()=>setEditItem({...item, _sell:String(item.sellPrice), _cost:String(item.costPrice), _tax:String(Number(item.taxRate)*100), _stock:String(item.stockQty), _min:String(item.stockMin), _max:String(item.stockMax)})}>Edit</button>
                     </td>
                   </tr>
                 ))}
@@ -422,12 +422,12 @@ export function POSPage() {
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Name</div><input className="form-input" placeholder="AZ State Tax" value={newTax.name} onChange={e=>setNewTax(s=>({...s,name:e.target.value}))} style={{width:'100%'}} /></div>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Rate %</div><input className="form-input" type="number" placeholder="8.00" value={newTax.rate} onChange={e=>setNewTax(s=>({...s,rate:e.target.value}))} style={{width:'100%'}} /></div>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Type</div>
-                <select className="form-select" value={newTax.tax_type} onChange={e=>setNewTax(s=>({...s,tax_type:e.target.value}))} style={{width:'100%'}}>
+                <select className="form-select" value={newTax.taxType} onChange={e=>setNewTax(s=>({...s,taxType:e.target.value}))} style={{width:'100%'}}>
                   {TAX_TYPES.map(t=><option key={t} value={t}>{t}</option>)}
                 </select>
               </div>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Applies To</div>
-                <select className="form-select" value={newTax.applies_to} onChange={e=>setNewTax(s=>({...s,applies_to:e.target.value}))} style={{width:'100%'}}>
+                <select className="form-select" value={newTax.appliesTo} onChange={e=>setNewTax(s=>({...s,appliesTo:e.target.value}))} style={{width:'100%'}}>
                   <option value="all">All categories</option>
                   {CATEGORIES.map(c=><option key={c} value={c}>{c}</option>)}
                 </select>
@@ -442,10 +442,10 @@ export function POSPage() {
                 {(taxRates as any[]).length ? (taxRates as any[]).map((r:any) => (
                   <tr key={r.id}>
                     <td style={{fontWeight:500}}>{r.name}</td>
-                    <td><span className="badge badge-muted">{r.tax_type}</span></td>
+                    <td><span className="badge badge-muted">{r.taxType}</span></td>
                     <td className="mono">{pct(r.rate)}</td>
-                    <td style={{fontSize:'.82rem'}}>{Array.isArray(r.applies_to)?r.applies_to.join(', '):r.applies_to}</td>
-                    <td><span className={`badge ${r.is_active?'badge-green':'badge-red'}`}>{r.is_active?'active':'inactive'}</span></td>
+                    <td style={{fontSize:'.82rem'}}>{Array.isArray(r.appliesTo)?r.appliesTo.join(', '):r.appliesTo}</td>
+                    <td><span className={`badge ${r.isActive?'badge-green':'badge-red'}`}>{r.isActive?'active':'inactive'}</span></td>
                     <td><button className="btn btn-ghost btn-sm" style={{color:'var(--red)'}} onClick={()=>deleteTaxMut.mutate(r.id)}>Remove</button></td>
                   </tr>
                 )) : <tr><td colSpan={6} style={{textAlign:'center',color:'var(--text-3)',padding:32}}>No tax rates configured.</td></tr>}
@@ -524,7 +524,7 @@ export function POSPage() {
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Stock Max</div>
                 <input className="form-input" style={{width:'100%'}} type="number" value={editItem._max} onChange={e=>setEditItem((s:any)=>({...s,_max:e.target.value}))} /></div>
               <div style={{display:'flex',alignItems:'center',gap:8,paddingTop:20}}>
-                <input type="checkbox" id="ec" checked={editItem.charge_eligible} onChange={e=>setEditItem((s:any)=>({...s,charge_eligible:e.target.checked}))} />
+                <input type="checkbox" id="ec" checked={editItem.chargeEligible} onChange={e=>setEditItem((s:any)=>({...s,chargeEligible:e.target.checked}))} />
                 <label htmlFor="ec" style={{fontSize:'.82rem'}}>Charge eligible</label>
               </div>
               <div style={{gridColumn:'1/-1',marginTop:8}}>
@@ -533,7 +533,7 @@ export function POSPage() {
                   sellPrice:Number(editItem._sell), costPrice:Number(editItem._cost),
                   taxRate:Number(editItem._tax)/100, stockQty:Number(editItem._stock),
                   stockMin:Number(editItem._min), stockMax:Number(editItem._max),
-                  chargeEligible:editItem.charge_eligible
+                  chargeEligible:editItem.chargeEligible
                 })} disabled={updateItemMut.isLoading}>
                   {updateItemMut.isLoading?'Saving…':'Save Changes'}
                 </button>
