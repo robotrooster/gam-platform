@@ -15,6 +15,33 @@ const FIELD_TYPES = [
 ]
 
 const SIGNER_ROLES = ['landlord','primary','co_tenant_1','co_tenant_2','witness']
+
+// Keep in sync with lease_template_fields.lease_column CHECK constraint (21 values).
+// Only the text/date subset is surfaced in the Field Properties dropdown today —
+// signature/initial/date_signed bindings are implied by field type + signer role.
+const DATA_LABELS: Record<string, Array<{value:string; label:string}>> = {
+  text: [
+    { value:'tenant_name',            label:'Tenant name' },
+    { value:'tenant_email',           label:'Tenant email' },
+    { value:'landlord_name',          label:'Landlord name' },
+    { value:'rent_amount',            label:'Rent amount' },
+    { value:'security_deposit',       label:'Security deposit' },
+    { value:'rent_due_day',           label:'Rent due day' },
+    { value:'late_fee_grace_days',    label:'Late fee grace days' },
+    { value:'late_fee_amount',        label:'Late fee amount' },
+    { value:'lease_type',             label:'Lease type' },
+    { value:'auto_renew',             label:'Auto-renew (Yes/No)' },
+    { value:'auto_renew_mode',        label:'Auto-renew mode' },
+    { value:'notice_days_required',   label:'Notice days required' },
+    { value:'expiration_notice_days', label:'Expiration notice days' },
+    { value:'custom_text',            label:'Custom text (entered at send time)' },
+  ],
+  date: [
+    { value:'start_date',  label:'Lease start date' },
+    { value:'end_date',    label:'Lease end date' },
+    { value:'date_signed', label:'Date signed' },
+  ],
+}
 const ROLE_COLORS: Record<string,string> = {
   landlord:'#c9a227', primary:'#22c55e', co_tenant_1:'#4a9eff', co_tenant_2:'#a78bfa', witness:'#f59e0b'
 }
@@ -214,7 +241,8 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
   const saveMut = useMutation(
     () => apiPut(`/esign/templates/${template.id}/fields`, { fields: fields.map(f => ({
       fieldType: f.fieldType, signerRole: f.signerRole, label: f.label,
-      page: f.page, x: f.x, y: f.y, width: f.width, height: f.height, required: f.required
+      page: f.page, x: f.x, y: f.y, width: f.width, height: f.height, required: f.required,
+      leaseColumn: f.leaseColumn || null
     })) }),
     { onSuccess: () => { qc.invalidateQueries('esign-templates'); onClose() } }
   )
@@ -279,6 +307,16 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
                 <input className="input" value={sel.label||''} onChange={e => updateSelected('label', e.target.value)} style={{ width:'100%', fontSize:'.75rem' }} />
               </div>
               <div style={{ fontSize:'.65rem', color:'var(--text-3)', marginBottom:8 }}>Drag edges to resize field</div>
+              {(sel.fieldType === 'text' || sel.fieldType === 'date') && (
+                <div style={{ marginBottom:8 }}>
+                  <label style={{ fontSize:'.65rem', color:'var(--text-3)', display:'block', marginBottom:3 }}>Data label</label>
+                  <select className="input" value={sel.leaseColumn||''} onChange={e => updateSelected('leaseColumn', e.target.value || null)} style={{ width:'100%', fontSize:'.75rem' }}>
+                    <option value="">— None (static field) —</option>
+                    {DATA_LABELS[sel.fieldType]?.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                  </select>
+                  <div style={{ fontSize:'.62rem', color:'var(--text-3)', marginTop:2 }}>Auto-fills from lease data at send time</div>
+                </div>
+              )}
               {sel.fieldType === 'radio_group' && (
                 <div style={{ marginBottom:8 }}>
                   <label style={{ fontSize:'.65rem', color:'var(--text-3)', display:'block', marginBottom:3 }}>Options (comma separated)</label>
