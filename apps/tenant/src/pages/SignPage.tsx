@@ -339,13 +339,13 @@ export function SignPage() {
     await renderPageImperative(pdf, 1)
   }, [renderPageImperative])
 
-  useEffect(() => { if (data?.document?.base_pdf_url && setupDone) loadPdf(data.document.base_pdf_url) }, [data, setupDone])
+  useEffect(() => { if (data?.document?.basePdfUrl && setupDone) loadPdf(data.document.basePdfUrl) }, [data, setupDone])
   useEffect(() => { if (pdfRef.current && setupDone) renderPageImperative(pdfRef.current, currentPage) }, [currentPage, setupDone])
   useEffect(() => {
     if (!data?.fields) return
     const today = new Date().toLocaleDateString()
     const updates: Record<string,string> = {}
-    data.fields.filter((f:any)=>f.field_type==='date').forEach((f:any)=>{ updates[f.id]=today })
+    data.fields.filter((f:any)=>f.fieldType==='date').forEach((f:any)=>{ updates[f.id]=today })
     if (Object.keys(updates).length) setFieldValues(prev=>({...prev,...updates}))
   }, [data])
 
@@ -370,19 +370,19 @@ export function SignPage() {
   const allFilled = unfilledRequired.length === 0
 
   const handleFieldClick = (field:any) => {
-    if (field.field_type==='signature' && savedSig) {
+    if (field.fieldType==='signature' && savedSig) {
       setFieldValues(p=>({...p,[field.id]:savedSig.value}))
       if(savedSig.font) setFieldFonts(p=>({...p,[field.id]:savedSig.font!}))
       setTimeout(()=>jumpToNext(field.id), 150)
       return
     }
-    if (field.field_type==='initials' && savedInit) {
+    if (field.fieldType==='initials' && savedInit) {
       setFieldValues(p=>({...p,[field.id]:savedInit.value}))
       if(savedInit.font) setFieldFonts(p=>({...p,[field.id]:savedInit.font!}))
       setTimeout(()=>jumpToNext(field.id), 150)
       return
     }
-    if (field.field_type==='date') {
+    if (field.fieldType==='date') {
       setFieldValues(p=>({...p,[field.id]:new Date().toLocaleDateString()}))
       setTimeout(()=>jumpToNext(field.id), 150)
       return
@@ -391,12 +391,12 @@ export function SignPage() {
   }
 
   const handleSave = (value:string, font?:string) => {
-    if (activeField.field_type==='signature') {
+    if (activeField.fieldType==='signature') {
       setSavedSig({value,font})
       const initials = signer.name.split(' ').filter(Boolean).map((n:string)=>n[0].toUpperCase()).join('')
       setSavedInit({value:initials, font})
     }
-    if (activeField.field_type==='initials') setSavedInit({value,font})
+    if (activeField.fieldType==='initials') setSavedInit({value,font})
     const filledId = activeField.id
     setFieldValues(p=>({...p,[filledId]:value}))
     if (font) setFieldFonts(p=>({...p,[filledId]:font}))
@@ -482,7 +482,7 @@ export function SignPage() {
             const val = fieldValues[f.id]||''
             const isNext = nextField?.id===f.id
             const colors: Record<string,string> = { signature:'#c9a227', initials:'#4a9eff', date:'#22c55e', text:'#a78bfa', checkbox:'#f59e0b', radio_group:'#ec4899' }
-            const color = colors[f.field_type]||'#c9a227'
+            const color = colors[f.fieldType]||'#c9a227'
             return (
               <div key={f.id} id={'field-'+f.id}
                 onClick={()=>!val&&handleFieldClick(f)}
@@ -495,12 +495,12 @@ export function SignPage() {
                   boxShadow:isNext&&!val?`0 0 0 3px ${color}55`:'', zIndex:val?4:isNext?6:5
                 }}>
                 {val ? (
-                  (f.field_type==='signature'||f.field_type==='initials') && val.startsWith('data:')
+                  (f.fieldType==='signature'||f.fieldType==='initials') && val.startsWith('data:')
                     ? <img src={val} style={{ width:'100%', height:'100%', objectFit:'contain' }}/>
                     : <span style={{ fontFamily:fieldFonts[f.id]||'inherit', fontSize:Math.max(9,f.height*s*0.5), color:'#1a1a1a', padding:4, whiteSpace:'nowrap' as const, overflow:'hidden', textOverflow:'ellipsis' }}>{val}</span>
                 ) : (
                   <span style={{ fontSize:Math.max(7,f.height*s*0.28), color:isNext?color:'#aaa', fontWeight:700, pointerEvents:'none' }}>
-                    {f.field_type==='signature'?'Sign':f.field_type==='initials'?'Initial':f.field_type==='date'?'Date':f.field_type==='checkbox'?'☐':'Click'}
+                    {f.fieldType==='signature'?'Sign':f.fieldType==='initials'?'Initial':f.fieldType==='date'?'Date':f.fieldType==='checkbox'?'☐':'Click'}
                   </span>
                 )}
               </div>
@@ -513,21 +513,21 @@ export function SignPage() {
         <PenTool size={13}/> Click highlighted fields to sign. Use <strong>Next Field</strong> to jump to the next one.
       </div>}
 
-      {activeField && (activeField.field_type==='signature'||activeField.field_type==='initials') && (
-        <SignatureChooser name={signer.name} type={activeField.field_type} onSelect={handleSave} onClose={()=>setActiveField(null)}/>
+      {activeField && (activeField.fieldType==='signature'||activeField.fieldType==='initials') && (
+        <SignatureChooser name={signer.name} type={activeField.fieldType} onSelect={handleSave} onClose={()=>setActiveField(null)}/>
       )}
 
-      {activeField && activeField.field_type!=='signature' && activeField.field_type!=='initials' && (
+      {activeField && activeField.fieldType!=='signature' && activeField.fieldType!=='initials' && (
         <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,.6)', zIndex:1000, display:'flex', alignItems:'center', justifyContent:'center', padding:20 }}>
           <div style={{ background:'white', borderRadius:16, padding:24, maxWidth:360, width:'100%' }}>
-            <div style={{ fontWeight:700, color:'#1a1a1a', marginBottom:14 }}>{activeField.label||activeField.field_type}</div>
-            {activeField.field_type==='checkbox' && (
+            <div style={{ fontWeight:700, color:'#1a1a1a', marginBottom:14 }}>{activeField.label||activeField.fieldType}</div>
+            {activeField.fieldType==='checkbox' && (
               <label style={{ display:'flex', alignItems:'center', gap:10, cursor:'pointer', padding:'11px', border:'1px solid #e5e7eb', borderRadius:8, marginBottom:14 }}>
                 <input type="checkbox" defaultChecked={fieldValues[activeField.id]==='checked'} onChange={e=>setFieldValues(p=>({...p,[activeField.id]:e.target.checked?'checked':''}))} style={{ width:20, height:20 }}/>
                 <span>{activeField.label||'I agree'}</span>
               </label>
             )}
-            {activeField.field_type==='radio_group' && (
+            {activeField.fieldType==='radio_group' && (
               <div style={{ display:'flex', flexDirection:'column' as const, gap:7, marginBottom:14 }}>
                 {(activeField.options||'Yes,No').split(',').map((opt:string)=>opt.trim()).map((opt:string)=>(
                   <label key={opt} style={{ display:'flex', alignItems:'center', gap:10, cursor:'pointer', padding:'9px 13px', border:`2px solid ${fieldValues[activeField.id]===opt?'#c9a227':'#e5e7eb'}`, borderRadius:8 }}>
@@ -537,7 +537,7 @@ export function SignPage() {
                 ))}
               </div>
             )}
-            {activeField.field_type==='text' && (
+            {activeField.fieldType==='text' && (
               <input defaultValue={fieldValues[activeField.id]||''} onChange={e=>setFieldValues(p=>({...p,[activeField.id]:e.target.value}))}
                 placeholder={activeField.label||'Enter text'} style={{ width:'100%', padding:'9px 12px', border:'1px solid #e5e7eb', borderRadius:8, fontSize:'.9rem', outline:'none', boxSizing:'border-box' as const, marginBottom:14 }}/>
             )}
@@ -557,8 +557,8 @@ export function SignPage() {
             <div style={{ display:'flex', flexDirection:'column' as const, gap:7, marginBottom:18 }}>
               {allFields.filter((f:any)=>fieldValues[f.id]).map((f:any)=>(
                 <div key={f.id} style={{ display:'flex', alignItems:'center', justifyContent:'space-between', padding:'7px 11px', background:'#f8f8f5', borderRadius:8 }}>
-                  <span style={{ fontSize:'.75rem', color:'#999', textTransform:'capitalize' as const }}>{f.field_type.replace('_',' ')} · p{f.page}</span>
-                  {(f.field_type==='signature'||f.field_type==='initials') && fieldValues[f.id].startsWith('data:')
+                  <span style={{ fontSize:'.75rem', color:'#999', textTransform:'capitalize' as const }}>{f.fieldType.replace('_',' ')} · p{f.page}</span>
+                  {(f.fieldType==='signature'||f.fieldType==='initials') && fieldValues[f.id].startsWith('data:')
                     ? <img src={fieldValues[f.id]} style={{ height:28, maxWidth:110, objectFit:'contain' }}/>
                     : <span style={{ fontFamily:fieldFonts[f.id]||'inherit', fontSize:'.95rem', color:'#1a1a1a', fontWeight:600 }}>{fieldValues[f.id]}</span>
                   }

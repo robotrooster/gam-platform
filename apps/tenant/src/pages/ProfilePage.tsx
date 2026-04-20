@@ -44,14 +44,14 @@ export function ProfilePage() {
 
   useEffect(() => {
     if (me) {
-      setFirstName(me.first_name || '')
-      setLastName(me.last_name || '')
+      setFirstName(me.firstName || '')
+      setLastName(me.lastName || '')
       setPhone(me.phone || '')
       setEmail(me.email || '')
       setBio(me.bio || '')
-      setAccent(me.theme_accent || '#c9a227')
-      setFontStyle(me.font_style || 'default')
-      setAvatarUrl(me.avatar_url || null)
+      setAccent(me.themeAccent || '#c9a227')
+      setFontStyle(me.fontStyle || 'default')
+      setAvatarUrl(me.avatarUrl || null)
     }
   }, [me])
 
@@ -86,12 +86,12 @@ export function ProfilePage() {
   const getPref = (type: string, channel: 'email'|'sms'|'in_app') => {
     const p = (notifPrefs as any[]).find((x: any) => x.type === type)
     if (!p) return channel !== 'sms'
-    return channel === 'email' ? p.email_enabled : channel === 'sms' ? p.sms_enabled : p.in_app_enabled
+    return channel === 'email' ? p.emailEnabled : channel === 'sms' ? p.smsEnabled : p.inAppEnabled
   }
 
   const togglePref = (type: string, channel: string, val: boolean) => {
     const p = (notifPrefs as any[]).find((x: any) => x.type === type) || {}
-    prefMut.mutate({ type, email_enabled: p.email_enabled ?? true, sms_enabled: p.sms_enabled ?? false, in_app_enabled: p.in_app_enabled ?? true, [channel]: val })
+    prefMut.mutate({ type, email_enabled: p.emailEnabled ?? true, sms_enabled: p.smsEnabled ?? false, in_app_enabled: p.inAppEnabled ?? true, [channel]: val })
   }
 
   const s = (label: string, color = 'var(--text-3)') => ({

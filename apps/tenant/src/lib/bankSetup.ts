@@ -26,7 +26,7 @@ async function initBankSetup(clientSecret, onSuccess, onError) {
     });
     if (error) { onError(error.message); return; }
     if (setupIntent.status === 'succeeded') {
-      onSuccess(setupIntent.payment_method);
+      onSuccess(setupIntent.paymentMethod);
     }
   });
 }

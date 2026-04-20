@@ -91,7 +91,7 @@ export function BackgroundCheckPage() {
     return fetch(`${API}/api/background/submit`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-      body: JSON.stringify({ firstName:form.firstName, lastName:form.lastName, dateOfBirth:form.dob, ssn:form.ssn.replace(/\D/g,''), street1:form.street1, street2:form.street2||null, city:form.city, state:form.state, zip:form.zip, yearsAtAddress:parseInt(form.years)||null, employmentStatus:form.empStatus, employerName:form.employer||null, employerPhone:form.empPhone||null, monthlyIncome:parseFloat(form.income)||null, prevLandlordName:form.prevName||null, prevLandlordPhone:form.prevPhone||null, prevLandlordEmail:form.prevEmail||null, idDocumentUrl:idUrl||null, incomeDocUrls:incomeFiles.map(f=>f.url), consentCredit:form.consentCredit, consentCriminal:form.consentCriminal, consentPool:form.consentPool, landlordId:(me as any)?.landlord_id||null, unitId:(me as any)?.unit_id||(new URLSearchParams(window.location.search).get('unitId'))||null, timeToComplete:Math.round((Date.now()-startTime)/1000), idVerification:idNameMatch||null })
+      body: JSON.stringify({ firstName:form.firstName, lastName:form.lastName, dateOfBirth:form.dob, ssn:form.ssn.replace(/\D/g,''), street1:form.street1, street2:form.street2||null, city:form.city, state:form.state, zip:form.zip, yearsAtAddress:parseInt(form.years)||null, employmentStatus:form.empStatus, employerName:form.employer||null, employerPhone:form.empPhone||null, monthlyIncome:parseFloat(form.income)||null, prevLandlordName:form.prevName||null, prevLandlordPhone:form.prevPhone||null, prevLandlordEmail:form.prevEmail||null, idDocumentUrl:idUrl||null, incomeDocUrls:incomeFiles.map(f=>f.url), consentCredit:form.consentCredit, consentCriminal:form.consentCriminal, consentPool:form.consentPool, landlordId:(me as any)?.landlordId||null, unitId:(me as any)?.unitId||(new URLSearchParams(window.location.search).get('unitId'))||null, timeToComplete:Math.round((Date.now()-startTime)/1000), idVerification:idNameMatch||null })
     }).then(r => r.json())
   }, { onSuccess: () => refetch() })
   const ssnFmt = (d: string) => d.length<=3?d:d.length<=5?d.slice(0,3)+'-'+d.slice(3):d.slice(0,3)+'-'+d.slice(3,5)+'-'+d.slice(5)
@@ -202,9 +202,9 @@ export function BackgroundCheckPage() {
   const pickSuggestion = (s: any) => {
     const ctx = s.context||[]
     const getCtx = (id: string) => ctx.find((c: any)=>c.id.startsWith(id))?.text||''
-    const street = s.place_name ? s.place_name.split(',')[0] : s.text||''
+    const street = s.placeName ? s.placeName.split(',')[0] : s.text||''
     const city = getCtx('place')
-    const stateShort = ctx.find((c: any)=>c.id.startsWith('region'))?.short_code?.replace('US-','')||form.state
+    const stateShort = ctx.find((c: any)=>c.id.startsWith('region'))?.shortCode?.replace('US-','')||form.state
     const zip = getCtx('postcode')
     setForm(f=>({...f, street1:street||f.street1, city:city||f.city, state:stateShort||f.state, zip:zip||f.zip}))
     setSuggestions([]); setShowSugg(false); setAddrVerified(true); setAddrWarn(false)
@@ -243,8 +243,8 @@ export function BackgroundCheckPage() {
   // Countdown timer for denied status
   useEffect(() => {
     const check = (status as any)?.check
-    if ((status as any)?.status !== 'denied' || !check?.decided_at) return
-    const reapply = new Date(check.decided_at).getTime() + 90*24*60*60*1000
+    if ((status as any)?.status !== 'denied' || !check?.decidedAt) return
+    const reapply = new Date(check.decidedAt).getTime() + 90*24*60*60*1000
     const tick = () => {
       const diff = reapply - Date.now()
       if (diff <= 0) { setCountdown('Eligible now'); return }
@@ -258,7 +258,7 @@ export function BackgroundCheckPage() {
     tick()
     const interval = setInterval(tick, 50)
     return () => clearInterval(interval)
-  }, [(status as any)?.status, (status as any)?.check?.decided_at])
+  }, [(status as any)?.status, (status as any)?.check?.decidedAt])
 
   const canNext=[
     !!(validName(form.firstName)&&validName(form.lastName)&&validDob&&validSsn&&form.email.includes('@')&&form.password.length>=8&&form.password===(form as any).confirmPassword),
@@ -286,7 +286,7 @@ export function BackgroundCheckPage() {
     </div>
   )
   if((status as any)?.status==='denied'){
-    const decidedAt = (status as any)?.check?.decided_at ? new Date((status as any).check.decided_at) : null
+    const decidedAt = (status as any)?.check?.decidedAt ? new Date((status as any).check.decidedAt) : null
     const reapplyDate = decidedAt ? new Date(decidedAt.getTime() + 90*24*60*60*1000) : null
     const daysLeft = reapplyDate ? Math.max(0, Math.ceil((reapplyDate.getTime()-Date.now())/(24*60*60*1000))) : null
     return(
@@ -294,7 +294,7 @@ export function BackgroundCheckPage() {
         <div style={{width:72,height:72,borderRadius:'50%',background:'rgba(239,68,68,.1)',border:'2px solid #ef4444',display:'flex',alignItems:'center',justifyContent:'center'}}><XCircle size={32} style={{color:'#ef4444'}}/></div>
         <h2 style={{color:'#eef1f8',margin:0}}>Application Not Approved</h2>
         <p style={{color:'#4a5568',maxWidth:380,lineHeight:1.6}}>
-          {(status as any)?.check?.decision_notes || 'Your application did not meet the requirements at this time.'}
+          {(status as any)?.check?.decisionNotes || 'Your application did not meet the requirements at this time.'}
         </p>
         {daysLeft !== null && daysLeft > 0 && countdown && (
           <div style={{padding:'16px 24px',background:'#0a0d10',border:'1px solid #1e2530',borderRadius:12}}>
@@ -364,8 +364,8 @@ export function BackgroundCheckPage() {
               <div style={{position:'absolute',top:'100%',left:0,right:0,background:'#0f1319',border:'1px solid #1e2530',borderRadius:8,zIndex:100,overflow:'hidden',boxShadow:'0 8px 24px rgba(0,0,0,.5)'}}>
                 {suggestions.slice(0,5).map((s,i)=>(
                   <div key={i} onMouseDown={()=>pickSuggestion(s)} style={{padding:'9px 12px',cursor:'pointer',borderBottom:i<4?'1px solid #1e2530':'none'}} onMouseEnter={e=>(e.currentTarget as HTMLElement).style.background='#1a2030'} onMouseLeave={e=>(e.currentTarget as HTMLElement).style.background=''}>
-                    <div style={{fontSize:'.8rem',fontWeight:600,color:'#eef1f8'}}>{s.place_name ? s.place_name.split(',')[0] : s.text || ''}</div>
-                    <div style={{fontSize:'.7rem',color:'#4a5568',marginTop:2}}>{s.place_name ? s.place_name.split(',').slice(1,3).join(',').trim() : ''}</div>
+                    <div style={{fontSize:'.8rem',fontWeight:600,color:'#eef1f8'}}>{s.placeName ? s.placeName.split(',')[0] : s.text || ''}</div>
+                    <div style={{fontSize:'.7rem',color:'#4a5568',marginTop:2}}>{s.placeName ? s.placeName.split(',').slice(1,3).join(',').trim() : ''}</div>
                   </div>
                 ))}
               </div>

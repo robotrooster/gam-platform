@@ -17,8 +17,8 @@ export function WorkTradePage() {
     try {
       // Get tenant's unit, then agreement
       const me = await apiGet('/tenants/me')
-      if (!(me as any).unit_id) { setLoading(false); return }
-      const agreement = await apiGet(`/work-trade/unit/${(me as any).unit_id}`)
+      if (!(me as any).unitId) { setLoading(false); return }
+      const agreement = await apiGet(`/work-trade/unit/${(me as any).unitId}`)
       if (!agreement) { setLoading(false); return }
       const detail = await apiGet(`/work-trade/${(agreement as any).id}`)
       setData(detail)
@@ -74,12 +74,12 @@ export function WorkTradePage() {
   const pending = logs.filter((l: any) => l.status === 'pending')
   const approved = logs.filter((l: any) => l.status === 'approved')
   const rejected = logs.filter((l: any) => l.status === 'rejected')
-  const monthlyCommit = parseFloat(agreement.weekly_hours) * (52 / 12)
+  const monthlyCommit = parseFloat(agreement.weeklyHours) * (52 / 12)
   const hoursLeft = Math.max(0, monthlyCommit - stats.hoursThisPeriod)
   const progress = Math.min(100, (stats.hoursThisPeriod / monthlyCommit) * 100)
 
   const typeColors: Record<string, string> = { full: '#1edb7a', partial: '#c9a227', credit: '#4a9eff' }
-  const typeColor = typeColors[agreement.trade_type] || '#c9a227'
+  const typeColor = typeColors[agreement.tradeType] || '#c9a227'
 
   return (
     <div style={style.page}>
@@ -96,18 +96,18 @@ export function WorkTradePage() {
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
           <div>
             <div style={{ fontSize: '1rem', fontWeight: 800, color: '#eef1f8' }}>Work Trade Agreement</div>
-            <div style={{ fontSize: '.72rem', color: '#7a8aaa', marginTop: 2 }}>Unit {agreement.unit_number} · {agreement.property_name}</div>
+            <div style={{ fontSize: '.72rem', color: '#7a8aaa', marginTop: 2 }}>Unit {agreement.unitNumber} · {agreement.propertyName}</div>
           </div>
           <span style={{ fontSize: '.65rem', padding: '3px 10px', borderRadius: 10, background: `${typeColor}18`, border: `1px solid ${typeColor}40`, color: typeColor, fontWeight: 700, textTransform: 'uppercase' as const }}>
-            {agreement.trade_type} trade
+            {agreement.tradeType} trade
           </span>
         </div>
 
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 10, marginBottom: 14 }}>
           {[
-            { label: 'Your Rate', val: `${fmt(agreement.hourly_rate)}/hr` },
-            { label: 'Weekly Hours', val: `${agreement.weekly_hours} hrs` },
-            { label: 'Cash Due', val: fmt(agreement.cash_rent) },
+            { label: 'Your Rate', val: `${fmt(agreement.hourlyRate)}/hr` },
+            { label: 'Weekly Hours', val: `${agreement.weeklyHours} hrs` },
+            { label: 'Cash Due', val: fmt(agreement.cashRent) },
           ].map(s => (
             <div key={s.label} style={{ background: '#0f1318', border: '1px solid #1e2530', borderRadius: 8, padding: '10px 12px' }}>
               <div style={style.label}>{s.label}</div>
@@ -186,8 +186,8 @@ export function WorkTradePage() {
                 <div style={{ flex: 1 }}>
                   <div style={{ fontSize: '.78rem', color: '#eef1f8', fontWeight: 500 }}>{log.description}</div>
                   <div style={{ fontSize: '.68rem', color: '#7a8aaa', marginTop: 2 }}>
-                    {new Date(log.work_date).toLocaleDateString()} · {log.hours}h
-                    {log.credit_value ? ` · ${fmt(log.credit_value)} credit` : ''}
+                    {new Date(log.workDate).toLocaleDateString()} · {log.hours}h
+                    {log.creditValue ? ` · ${fmt(log.creditValue)} credit` : ''}
                   </div>
                 </div>
                 <span style={{

@@ -215,7 +215,7 @@ export function LeasePage() {
   const signature = signMode === 'type' ? typedSig : drawnSig
   const canSign   = agreed && scrolled && signature.length > 2
 
-  const countdown = useCountdown((lease as any)?.end_date || null)
+  const countdown = useCountdown((lease as any)?.endDate || null)
 
   if (isLoading) return <div style={{ padding:32, color:'var(--text-3)', textAlign:'center' }}>Loading lease…</div>
 
@@ -230,11 +230,11 @@ export function LeasePage() {
     </div>
   )
 
-  const daysToExpiry = lease.end_date
-    ? Math.ceil((new Date(lease.end_date).getTime() - Date.now()) / 86400000) : null
-  const needsTenantSig = lease.signed_by_landlord && !lease.signed_by_tenant
-  const fullyExecuted = lease.signed_by_landlord && lease.signed_by_tenant
-  const showRenewalSurvey = daysToExpiry !== null && daysToExpiry <= 60 && daysToExpiry > 0 && !renewalSubmitted && !lease.tenant_renewal_intent && fullyExecuted
+  const daysToExpiry = lease.endDate
+    ? Math.ceil((new Date(lease.endDate).getTime() - Date.now()) / 86400000) : null
+  const needsTenantSig = lease.signedByLandlord && !lease.signedByTenant
+  const fullyExecuted = lease.signedByLandlord && lease.signedByTenant
+  const showRenewalSurvey = daysToExpiry !== null && daysToExpiry <= 60 && daysToExpiry > 0 && !renewalSubmitted && !lease.tenantRenewalIntent && fullyExecuted
 
   return (
     <div>
@@ -242,8 +242,8 @@ export function LeasePage() {
         <div>
           <h1 style={{ fontFamily:'var(--font-display)', fontSize:'1.4rem', fontWeight:800, color:'var(--text-0)', marginBottom:4 }}>Lease Agreement</h1>
           <p style={{ fontSize:'.82rem', color:'var(--text-3)' }}>
-            {lease.property_name} · Unit {lease.unit_number}
-            {lease.start_date && ` · ${new Date(lease.start_date).toLocaleDateString()} – ${new Date(lease.end_date).toLocaleDateString()}`}
+            {lease.propertyName} · Unit {lease.unitNumber}
+            {lease.startDate && ` · ${new Date(lease.startDate).toLocaleDateString()} – ${new Date(lease.endDate).toLocaleDateString()}`}
           </p>
         </div>
 
@@ -252,7 +252,7 @@ export function LeasePage() {
         <div style={{ background:'rgba(201,162,39,.08)', border:'1px solid rgba(201,162,39,.3)', borderRadius:12, padding:'16px 20px', marginBottom:20, display:'flex', alignItems:'center', justifyContent:'space-between', gap:16 }}>
           <div>
             <div style={{ fontWeight:700, color:'var(--gold, #c9a227)', marginBottom:4 }}>📋 Document Awaiting Your Signature</div>
-            <div style={{ fontSize:'.82rem', color:'var(--text-2)' }}>{(pendingDocs as any[])[0].title} · {(pendingDocs as any[])[0].property_name}</div>
+            <div style={{ fontSize:'.82rem', color:'var(--text-2)' }}>{(pendingDocs as any[])[0].title} · {(pendingDocs as any[])[0].propertyName}</div>
           </div>
           <button onClick={()=>navigate('/sign/'+(pendingDocs as any[])[0].token)}
             style={{ padding:'10px 20px', borderRadius:8, border:'none', background:'var(--gold, #c9a227)', color:'#060809', fontWeight:700, cursor:'pointer', whiteSpace:'nowrap' as const, flexShrink:0 }}>
@@ -267,7 +267,7 @@ export function LeasePage() {
           <CheckCircle size={18} style={{ color:'var(--green)', flexShrink:0 }} />
           <div>
             <div style={{ fontSize:'.82rem', fontWeight:700, color:'var(--green)' }}>Lease Fully Executed</div>
-            <div style={{ fontSize:'.72rem', color:'var(--text-3)' }}>Signed by all parties{lease.tenant_signed_at ? ' · ' + new Date(lease.tenant_signed_at).toLocaleString() : ''}</div>
+            <div style={{ fontSize:'.72rem', color:'var(--text-3)' }}>Signed by all parties{lease.tenantSignedAt ? ' · ' + new Date(lease.tenantSignedAt).toLocaleString() : ''}</div>
           </div>
         </div>
       ) : needsTenantSig ? (
@@ -285,7 +285,7 @@ export function LeasePage() {
       )}
 
       {/* Expiry countdown */}
-      {lease.end_date && daysToExpiry !== null && daysToExpiry > 0 && (
+      {lease.endDate && daysToExpiry !== null && daysToExpiry > 0 && (
         <div style={{ padding:'16px 20px', background: daysToExpiry <= 30 ? 'rgba(239,68,68,.06)' : daysToExpiry <= 60 ? 'rgba(245,158,11,.06)' : 'rgba(201,162,39,.04)', border:`1px solid ${daysToExpiry<=30?'rgba(239,68,68,.25)':daysToExpiry<=60?'rgba(245,158,11,.25)':'rgba(201,162,39,.2)'}`, borderRadius:12, marginBottom:20 }}>
           <div style={{ fontSize:'.65rem', color:'var(--t3)', textTransform:'uppercase', letterSpacing:'.1em', fontWeight:600, marginBottom:10 }}>
             {daysToExpiry <= 30 ? '🚨 Lease Expires Soon' : daysToExpiry <= 60 ? '⚠️ Lease Expiring' : '📅 Lease Term Remaining'}
@@ -310,7 +310,7 @@ export function LeasePage() {
             </div>
           </div>
           <div style={{ fontSize:'.7rem', color:'var(--t3)', marginTop:10 }}>
-            Expires {new Date(lease.end_date).toLocaleDateString('en-US',{weekday:'long',year:'numeric',month:'long',day:'numeric'})}
+            Expires {new Date(lease.endDate).toLocaleDateString('en-US',{weekday:'long',year:'numeric',month:'long',day:'numeric'})}
           </div>
         </div>
       )}
@@ -349,24 +349,24 @@ export function LeasePage() {
       <div style={{ background:'var(--bg-2)', border:'1px solid var(--border-0)', borderRadius:12, overflow:'hidden', marginBottom:20 }}>
         <div style={{ padding:'14px 18px', borderBottom:'1px solid var(--border-0)', display:'flex', justifyContent:'space-between', alignItems:'center' }}>
           <div style={{ fontFamily:'var(--font-display)', fontSize:'.85rem', fontWeight:700, color:'var(--text-0)' }}>📄 {fullyExecuted ? 'Executed Lease Agreement' : 'Lease Document'}</div>
-          {fullyExecuted && lease.document_url && (
-            <a href={lease.document_url?.startsWith('http') ? lease.document_url : API_URL + lease.document_url} download="lease-agreement.pdf" className="btn btn-ghost btn-sm" style={{ textDecoration:'none', fontSize:'.72rem', display:'flex', alignItems:'center', gap:4 }}>
+          {fullyExecuted && lease.documentUrl && (
+            <a href={lease.documentUrl?.startsWith('http') ? lease.documentUrl : API_URL + lease.documentUrl} download="lease-agreement.pdf" className="btn btn-ghost btn-sm" style={{ textDecoration:'none', fontSize:'.72rem', display:'flex', alignItems:'center', gap:4 }}>
               <Download size={12}/> Download PDF
             </a>
           )}
         </div>
-        {lease.document_url ? (
-          <PdfViewer url={lease.document_url?.startsWith('http') ? lease.document_url : API_URL + lease.document_url} token={localStorage.getItem('gam_tenant_token')||''}/>
+        {lease.documentUrl ? (
+          <PdfViewer url={lease.documentUrl?.startsWith('http') ? lease.documentUrl : API_URL + lease.documentUrl} token={localStorage.getItem('gam_tenant_token')||''}/>
         ) : (
           <div ref={leaseDocRef} onScroll={e => { const el = e.currentTarget; if (el.scrollTop + el.clientHeight >= el.scrollHeight - 30) setScrolled(true) }}
             style={{ padding:24, maxHeight:400, overflowY:'auto', fontSize:'.82rem', color:'var(--text-2)', lineHeight:1.9 }}>
             <div style={{ fontFamily:'var(--font-display)', fontSize:'1rem', fontWeight:800, color:'var(--text-0)', textAlign:'center', marginBottom:20 }}>RESIDENTIAL LEASE AGREEMENT</div>
-            <div style={{ marginBottom:12 }}><strong>Landlord:</strong> {lease.landlord_name}</div>
-            <div style={{ marginBottom:12 }}><strong>Tenant:</strong> {lease.tenant_name}</div>
-            <div style={{ marginBottom:12 }}><strong>Property:</strong> {lease.property_name}, Unit {lease.unit_number}</div>
-            <div style={{ marginBottom:12 }}><strong>Term:</strong> {new Date(lease.start_date).toLocaleDateString()} to {new Date(lease.end_date).toLocaleDateString()}</div>
-            <div style={{ marginBottom:12 }}><strong>Monthly Rent:</strong> ${lease.rent_amount}</div>
-            <div style={{ marginBottom:12 }}><strong>Security Deposit:</strong> ${lease.security_deposit}</div>
+            <div style={{ marginBottom:12 }}><strong>Landlord:</strong> {lease.landlordName}</div>
+            <div style={{ marginBottom:12 }}><strong>Tenant:</strong> {lease.tenantName}</div>
+            <div style={{ marginBottom:12 }}><strong>Property:</strong> {lease.propertyName}, Unit {lease.unitNumber}</div>
+            <div style={{ marginBottom:12 }}><strong>Term:</strong> {new Date(lease.startDate).toLocaleDateString()} to {new Date(lease.endDate).toLocaleDateString()}</div>
+            <div style={{ marginBottom:12 }}><strong>Monthly Rent:</strong> ${lease.rentAmount}</div>
+            <div style={{ marginBottom:12 }}><strong>Security Deposit:</strong> ${lease.securityDeposit}</div>
             <div style={{ borderTop:'1px solid var(--border-0)', paddingTop:16, marginTop:16, fontSize:'.75rem', color:'var(--text-3)' }}>
               By signing electronically, both parties agree to the terms stated herein. This electronic signature is legally binding under the federal E-SIGN Act and equivalent state-level electronic signature laws. Consult your local laws for any jurisdiction-specific requirements.
             </div>
@@ -417,7 +417,7 @@ export function LeasePage() {
             </div>
           )}
 
-          {!scrolled && !lease.document_url && (
+          {!scrolled && !lease.documentUrl && (
             <div style={{ fontSize:'.72rem', color:'var(--amber)', marginBottom:12 }}>↑ Please scroll through the full lease before signing</div>
           )}
 
@@ -434,8 +434,8 @@ export function LeasePage() {
         <div style={{ background:'var(--bg-2)', border:'1px solid var(--border-0)', borderRadius:10, padding:16, marginTop:16 }}>
           <div style={{ fontSize:'.72rem', fontWeight:700, color:'var(--text-3)', textTransform:'uppercase' as const, letterSpacing:'.07em', marginBottom:10 }}>Signature Audit Trail</div>
           {[
-            lease.landlord_signed_at && { role:'Landlord', sig: "Landlord", at: lease.landlord_signed_at },
-            lease.tenant_signed_at   && { role:'Tenant',   sig: signature,   at: lease.tenant_signed_at },
+            lease.landlordSignedAt && { role:'Landlord', sig: "Landlord", at: lease.landlordSignedAt },
+            lease.tenantSignedAt   && { role:'Tenant',   sig: signature,   at: lease.tenantSignedAt },
           ].filter(Boolean).map((s: any) => (
             <div key={s.role} style={{ display:'flex', alignItems:'center', gap:10, padding:'8px 0', borderBottom:'1px solid var(--border-0)' }}>
               <CheckCircle size={14} style={{ color:'var(--green)', flexShrink:0 }} />

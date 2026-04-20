@@ -33,7 +33,7 @@ export function MaintenancePage() {
     setSubmitting(true)
     try {
       const me: any = await apiGet('/tenants/me')
-      await apiPost('/maintenance', { ...form, unitId: me.unit_id })
+      await apiPost('/maintenance', { ...form, unitId: me.unitId })
       setShowAdd(false)
       setForm({ title:'', description:'', priority:'normal', photos:[] })
       load()
@@ -77,17 +77,17 @@ export function MaintenancePage() {
                 <span style={{ fontSize:'.65rem', padding:'2px 8px', borderRadius:10, background:'#141920', border:'1px solid #252e3d', color:'#b8c4d8', fontWeight:600 }}>{ST_LABELS[req.status] || req.status}</span>
               </div>
             </div>
-            <div style={{ fontSize:'.7rem', color:'#7a8aaa' }}>{new Date(req.created_at).toLocaleDateString()}</div>
+            <div style={{ fontSize:'.7rem', color:'#7a8aaa' }}>{new Date(req.createdAt).toLocaleDateString()}</div>
           </div>
           <div style={{ fontSize:'.82rem', color:'#b8c4d8', lineHeight:1.6 }}>{req.description}</div>
-          {req.scheduled_at && (
+          {req.scheduledAt && (
             <div style={{ marginTop:10, padding:'7px 10px', background:'rgba(201,162,39,.06)', border:'1px solid rgba(201,162,39,.2)', borderRadius:7, fontSize:'.72rem', color:'#c9a227', display:'flex', alignItems:'center', gap:6 }}>
-              <Clock size={12} /> Scheduled: {new Date(req.scheduled_at).toLocaleString()}
+              <Clock size={12} /> Scheduled: {new Date(req.scheduledAt).toLocaleString()}
             </div>
           )}
-          {req.status === 'completed' && req.actual_cost && (
+          {req.status === 'completed' && req.actualCost && (
             <div style={{ marginTop:8, padding:'7px 10px', background:'rgba(30,219,122,.06)', border:'1px solid rgba(30,219,122,.2)', borderRadius:7, fontSize:'.72rem', color:'#1edb7a', display:'flex', alignItems:'center', gap:6 }}>
-              <Check size={12} /> Completed · Cost: ${parseFloat(req.actual_cost).toFixed(2)}
+              <Check size={12} /> Completed · Cost: ${parseFloat(req.actualCost).toFixed(2)}
             </div>
           )}
         </div>
@@ -100,8 +100,8 @@ export function MaintenancePage() {
             {comments.map((c: any) => (
               <div key={c.id} style={{ padding:'8px 10px', background:'#0f1318', border:'1px solid #1e2530', borderRadius:8 }}>
                 <div style={{ display:'flex', justifyContent:'space-between', marginBottom:3 }}>
-                  <span style={{ fontSize:'.7rem', fontWeight:600, color: c.role==='tenant'?'#4a9eff':'#c9a227' }}>{c.first_name} {c.last_name} <span style={{ fontWeight:400, color:'#7a8aaa', textTransform:'capitalize' as const }}>({c.role})</span></span>
-                  <span style={{ fontSize:'.62rem', color:'#7a8aaa' }}>{new Date(c.created_at).toLocaleString()}</span>
+                  <span style={{ fontSize:'.7rem', fontWeight:600, color: c.role==='tenant'?'#4a9eff':'#c9a227' }}>{c.firstName} {c.lastName} <span style={{ fontWeight:400, color:'#7a8aaa', textTransform:'capitalize' as const }}>({c.role})</span></span>
+                  <span style={{ fontSize:'.62rem', color:'#7a8aaa' }}>{new Date(c.createdAt).toLocaleString()}</span>
                 </div>
                 <div style={{ fontSize:'.78rem', color:'#b8c4d8', lineHeight:1.5 }}>{c.message}</div>
               </div>
@@ -151,16 +151,16 @@ export function MaintenancePage() {
                 <div style={{ display:'flex', alignItems:'center', gap:6, marginBottom:4 }}>
                   <span style={{ fontSize:'.65rem', padding:'2px 7px', borderRadius:10, background:`${PRI_COLORS[r.priority]}15`, border:`1px solid ${PRI_COLORS[r.priority]}35`, color:PRI_COLORS[r.priority], fontWeight:700, textTransform:'capitalize' as const }}>{r.priority}</span>
                   <span style={{ fontSize:'.65rem', color:'#7a8aaa', fontWeight:600, textTransform:'capitalize' as const }}>{ST_LABELS[r.status]}</span>
-                  {parseInt(r.comment_count) > 0 && <span style={{ fontSize:'.62rem', color:'#7a8aaa', display:'flex', alignItems:'center', gap:2 }}><MessageSquare size={9} />{r.comment_count}</span>}
+                  {parseInt(r.commentCount) > 0 && <span style={{ fontSize:'.62rem', color:'#7a8aaa', display:'flex', alignItems:'center', gap:2 }}><MessageSquare size={9} />{r.commentCount}</span>}
                 </div>
                 <div style={{ fontSize:'.88rem', fontWeight:700, color:'#eef1f8' }}>{r.title}</div>
-                <div style={{ fontSize:'.72rem', color:'#7a8aaa', marginTop:2 }}>{new Date(r.created_at).toLocaleDateString()}</div>
+                <div style={{ fontSize:'.72rem', color:'#7a8aaa', marginTop:2 }}>{new Date(r.createdAt).toLocaleDateString()}</div>
               </div>
               <div style={{ color:'#c9a227', fontSize:'.75rem' }}>→</div>
             </div>
-            {r.scheduled_at && (
+            {r.scheduledAt && (
               <div style={{ marginTop:8, fontSize:'.7rem', color:'#c9a227', display:'flex', alignItems:'center', gap:4 }}>
-                <Clock size={10} /> Scheduled {new Date(r.scheduled_at).toLocaleDateString()}
+                <Clock size={10} /> Scheduled {new Date(r.scheduledAt).toLocaleDateString()}
               </div>
             )}
           </div>

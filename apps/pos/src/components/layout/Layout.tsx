@@ -115,13 +115,13 @@ export function Layout() {
   const { data: themeData } = useQuery(
     'landlord-theme',
     () => apiGet('/landlords/theme').then((d: any) => {
-      try { localStorage.setItem('gam_landlord_theme', JSON.stringify({ accent: d?.theme_accent, fontKey: d?.font_style })) } catch {}
+      try { localStorage.setItem('gam_landlord_theme', JSON.stringify({ accent: d?.themeAccent, fontKey: d?.fontStyle })) } catch {}
       return d
     }),
     { staleTime: 60000 }
   )
-  const accent  = (themeData as any)?.theme_accent || cachedTheme.accent || '#c9a227'
-  const fontKey = (themeData as any)?.font_style   || cachedTheme.fontKey || 'default'
+  const accent  = (themeData as any)?.themeAccent || cachedTheme.accent || '#c9a227'
+  const fontKey = (themeData as any)?.fontStyle   || cachedTheme.fontKey || 'default'
   const font    = LL_FONTS[fontKey] || LL_FONTS.default
   const themeCss = `${font.imp}
 :root{--gold:${accent};--gold-dim:${accent}99;--gold-glow:${accent}26;--gold-bg:${accent}14;--font-display:${font.display};--font-body:${font.family};}

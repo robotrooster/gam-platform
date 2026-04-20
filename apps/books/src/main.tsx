@@ -39,7 +39,7 @@ function AuthProvider({children}:{children:React.ReactNode}){
     api.get('/auth/me').then(res=>{
       const u=res.data.data
       if(!u||!ALLOWED_ROLES.includes(u.role)){logout();return}
-      setUser({id:u.id,email:u.email,role:u.role,firstName:u.first_name||u.firstName||'',lastName:u.last_name||u.lastName||'',landlordId:u.landlord_id||u.landlordId})
+      setUser({id:u.id,email:u.email,role:u.role,firstName:u.firstName||u.firstName||'',lastName:u.lastName||u.lastName||'',landlordId:u.landlordId||u.landlordId})
     }).catch(logout).finally(()=>setLoading(false))
   },[logout])
   const login=async(email:string,password:string)=>{
@@ -48,7 +48,7 @@ function AuthProvider({children}:{children:React.ReactNode}){
     if(!u||!ALLOWED_ROLES.includes(u.role))throw new Error('GAM Books requires Admin or Landlord access')
     localStorage.setItem('gam_books_token',tk)
     api.defaults.headers.common['Authorization']='Bearer '+tk
-    setUser({id:u.id,email:u.email,role:u.role,firstName:u.firstName||u.first_name||'',lastName:u.lastName||u.last_name||'',landlordId:u.landlord_id||u.landlordId})
+    setUser({id:u.id,email:u.email,role:u.role,firstName:u.firstName||u.firstName||'',lastName:u.lastName||u.lastName||'',landlordId:u.landlordId||u.landlordId})
   }
   const setActiveClient=(id:string,name:string)=>{
     localStorage.setItem('gam_books_client',id)
@@ -267,10 +267,10 @@ function Dashboard(){
         </div>
         <div className="card">
           <div className="ct">YTD Payroll Summary</div>
-          <div className="dr"><span className="dk">Employee gross pay</span><span className="dv mono">{formatCurrency((employees as any[]).reduce((s:number,e:any)=>s+(+e.ytd_gross||0),0))}</span></div>
-          <div className="dr"><span className="dk">Contractor payments</span><span className="dv mono">{formatCurrency((contractors as any[]).reduce((s:number,c:any)=>s+(+c.ytd_paid||0),0))}</span></div>
-          <div className="dr"><span className="dk">Vendor payments</span><span className="dv mono">{formatCurrency((vendors as any[]).reduce((s:number,v:any)=>s+(+v.ytd_paid||0),0))}</span></div>
-          <div className="dr" style={{borderTop:'1px solid var(--b1)',paddingTop:8,marginTop:4}}><span className="dk" style={{fontWeight:700}}>Total YTD disbursed</span><span className="dv mono" style={{color:'var(--gold)',fontWeight:700}}>{formatCurrency((employees as any[]).reduce((s:number,e:any)=>s+(+e.ytd_gross||0),0)+(contractors as any[]).reduce((s:number,c:any)=>s+(+c.ytd_paid||0),0)+(vendors as any[]).reduce((s:number,v:any)=>s+(+v.ytd_paid||0),0))}</span></div>
+          <div className="dr"><span className="dk">Employee gross pay</span><span className="dv mono">{formatCurrency((employees as any[]).reduce((s:number,e:any)=>s+(+e.ytdGross||0),0))}</span></div>
+          <div className="dr"><span className="dk">Contractor payments</span><span className="dv mono">{formatCurrency((contractors as any[]).reduce((s:number,c:any)=>s+(+c.ytdPaid||0),0))}</span></div>
+          <div className="dr"><span className="dk">Vendor payments</span><span className="dv mono">{formatCurrency((vendors as any[]).reduce((s:number,v:any)=>s+(+v.ytdPaid||0),0))}</span></div>
+          <div className="dr" style={{borderTop:'1px solid var(--b1)',paddingTop:8,marginTop:4}}><span className="dk" style={{fontWeight:700}}>Total YTD disbursed</span><span className="dv mono" style={{color:'var(--gold)',fontWeight:700}}>{formatCurrency((employees as any[]).reduce((s:number,e:any)=>s+(+e.ytdGross||0),0)+(contractors as any[]).reduce((s:number,c:any)=>s+(+c.ytdPaid||0),0)+(vendors as any[]).reduce((s:number,v:any)=>s+(+v.ytdPaid||0),0))}</span></div>
         </div>
       </div>
     </div>
@@ -362,7 +362,7 @@ function ChartOfAccounts(){
                   <td><span className={`badge ${TYPE_COLORS[a.type]||'bmu'}`}>{TYPE_LABELS[a.type]||a.type}</span></td>
                   <td style={{fontSize:'.72rem',color:'var(--t3)'}}>{a.subtype||'—'}</td>
                   <td className="mono">{formatCurrency(a.balance)}</td>
-                  <td>{a.is_system?<span className="badge bmu">System</span>:<span style={{color:'var(--t3)'}}>—</span>}</td>
+                  <td>{a.isSystem?<span className="badge bmu">System</span>:<span style={{color:'var(--t3)'}}>—</span>}</td>
                   <td><button className="btn bd bsm" onClick={()=>deactivate(a.id)}>Deactivate</button></td>
                 </tr>
               )):<tr><td colSpan={7}><div className="empty">No {tab==='all'?'':TYPE_LABELS[tab].toLowerCase()} accounts.</div></td></tr>}
@@ -412,7 +412,7 @@ function Employees(){
   const f=(k:string)=>(e:React.ChangeEvent<HTMLInputElement|HTMLSelectElement>)=>setForm(p=>({...p,[k]:e.target.value}))
 
   const activeEmp=(employees as any[]).filter((e:any)=>e.status==='active')
-  const ytdGross=(employees as any[]).reduce((s:number,e:any)=>s+(+e.ytd_gross||0),0)
+  const ytdGross=(employees as any[]).reduce((s:number,e:any)=>s+(+e.ytdGross||0),0)
 
   const calcPaycheck=(rate:number,freq:string,type:string)=>{
     const periods:Record<string,number>={weekly:52,biweekly:26,semimonthly:24,monthly:12}
@@ -445,8 +445,8 @@ function Employees(){
       <div className="grid4" style={{marginBottom:16}}>
         <div className="kpi"><div className="kl">Active W-2</div><div className="kv b">{activeEmp.length}</div><div className="ks">Receiving payroll</div></div>
         <div className="kpi"><div className="kl">YTD Gross Pay</div><div className="kv gold">{formatCurrency(ytdGross)}</div><div className="ks">All employees</div></div>
-        <div className="kpi"><div className="kl">YTD Federal W/H</div><div className="kv a">{formatCurrency((employees as any[]).reduce((s:number,e:any)=>s+(+e.ytd_federal_tax||0),0))}</div><div className="ks">Withheld YTD</div></div>
-        <div className="kpi"><div className="kl">YTD AZ State W/H</div><div className="kv t">{formatCurrency((employees as any[]).reduce((s:number,e:any)=>s+(+e.ytd_state_tax||0),0))}</div><div className="ks">AZ flat 2.5%</div></div>
+        <div className="kpi"><div className="kl">YTD Federal W/H</div><div className="kv a">{formatCurrency((employees as any[]).reduce((s:number,e:any)=>s+(+e.ytdFederalTax||0),0))}</div><div className="ks">Withheld YTD</div></div>
+        <div className="kpi"><div className="kl">YTD AZ State W/H</div><div className="kv t">{formatCurrency((employees as any[]).reduce((s:number,e:any)=>s+(+e.ytdStateTax||0),0))}</div><div className="ks">AZ flat 2.5%</div></div>
       </div>
 
       <div className="card" style={{padding:0}}>
@@ -456,13 +456,13 @@ function Employees(){
             <tbody>
               {(employees as any[]).length?(employees as any[]).map((emp:any)=>(
                 <tr key={emp.id}>
-                  <td><div style={{fontWeight:600,color:'var(--t0)'}}>{emp.first_name} {emp.last_name}</div><div style={{fontSize:'.68rem',color:'var(--t3)'}}>{emp.email||'—'}</div></td>
+                  <td><div style={{fontWeight:600,color:'var(--t0)'}}>{emp.firstName} {emp.lastName}</div><div style={{fontSize:'.68rem',color:'var(--t3)'}}>{emp.email||'—'}</div></td>
                   <td style={{fontSize:'.75rem'}}>{emp.title||'—'}{emp.department&&<div style={{fontSize:'.68rem',color:'var(--t3)'}}>{emp.department}</div>}</td>
-                  <td><span className={`badge ${emp.pay_type==='salary'?'bb':'ba'}`}>{emp.pay_type}</span></td>
-                  <td className="mono">{emp.pay_type==='salary'?formatCurrency(emp.pay_rate)+'/yr':formatCurrency(emp.pay_rate)+'/hr'}</td>
-                  <td style={{fontSize:'.75rem',color:'var(--t2)'}}>{emp.pay_frequency}</td>
-                  <td className="mono" style={{color:'var(--green)'}}>{formatCurrency(calcPaycheck(+emp.pay_rate,emp.pay_frequency,emp.pay_type))}</td>
-                  <td className="mono">{formatCurrency(emp.ytd_gross)}</td>
+                  <td><span className={`badge ${emp.payType==='salary'?'bb':'ba'}`}>{emp.payType}</span></td>
+                  <td className="mono">{emp.payType==='salary'?formatCurrency(emp.payRate)+'/yr':formatCurrency(emp.payRate)+'/hr'}</td>
+                  <td style={{fontSize:'.75rem',color:'var(--t2)'}}>{emp.payFrequency}</td>
+                  <td className="mono" style={{color:'var(--green)'}}>{formatCurrency(calcPaycheck(+emp.payRate,emp.payFrequency,emp.payType))}</td>
+                  <td className="mono">{formatCurrency(emp.ytdGross)}</td>
                   <td><span className={`badge ${emp.status==='active'?'bg2':'bmu'}`}>{emp.status}</span></td>
                   <td><button className="btn bg-btn bsm" onClick={()=>toggleStatus(emp.id,emp.status)}>{emp.status==='active'?'Deactivate':'Activate'}</button></td>
                 </tr>
@@ -542,7 +542,7 @@ function Contractors(){
   const f=(k:string)=>(e:React.ChangeEvent<HTMLInputElement|HTMLSelectElement>)=>setForm(p=>({...p,[k]:e.target.value}))
 
   const active=(contractors as any[]).filter((c:any)=>c.status==='active')
-  const w9Missing=(contractors as any[]).filter((c:any)=>!c.w9_on_file&&+c.ytd_paid>=600)
+  const w9Missing=(contractors as any[]).filter((c:any)=>!c.w9OnFile&&+c.ytdPaid>=600)
 
   const add=async(e:React.FormEvent)=>{
     e.preventDefault();setSaving(true);setErr('')
@@ -569,9 +569,9 @@ function Contractors(){
 
       <div className="grid4" style={{marginBottom:16}}>
         <div className="kpi"><div className="kl">Active Contractors</div><div className="kv gold">{active.length}</div><div className="ks">{(contractors as any[]).length} total</div></div>
-        <div className="kpi"><div className="kl">YTD Contractor Pay</div><div className="kv t">{formatCurrency((contractors as any[]).reduce((s:number,c:any)=>s+(+c.ytd_paid||0),0))}</div><div className="ks">Total disbursed</div></div>
-        <div className="kpi"><div className="kl">W-9 on File</div><div className={`kv ${w9Missing.length>0?'r':'g'}`}>{(contractors as any[]).filter((c:any)=>c.w9_on_file).length}/{(contractors as any[]).length}</div><div className="ks">Required for 1099</div></div>
-        <div className="kpi"><div className="kl">1099-NEC Needed</div><div className={`kv ${w9Missing.length>0?'a':'g'}`}>{(contractors as any[]).filter((c:any)=>+c.ytd_paid>=600).length}</div><div className="ks">Paid $600+ YTD</div></div>
+        <div className="kpi"><div className="kl">YTD Contractor Pay</div><div className="kv t">{formatCurrency((contractors as any[]).reduce((s:number,c:any)=>s+(+c.ytdPaid||0),0))}</div><div className="ks">Total disbursed</div></div>
+        <div className="kpi"><div className="kl">W-9 on File</div><div className={`kv ${w9Missing.length>0?'r':'g'}`}>{(contractors as any[]).filter((c:any)=>c.w9OnFile).length}/{(contractors as any[]).length}</div><div className="ks">Required for 1099</div></div>
+        <div className="kpi"><div className="kl">1099-NEC Needed</div><div className={`kv ${w9Missing.length>0?'a':'g'}`}>{(contractors as any[]).filter((c:any)=>+c.ytdPaid>=600).length}</div><div className="ks">Paid $600+ YTD</div></div>
       </div>
 
       <div className="card" style={{padding:0}}>
@@ -582,20 +582,20 @@ function Contractors(){
               {(contractors as any[]).length?(contractors as any[]).map((c:any)=>(
                 <tr key={c.id}>
                   <td>
-                    <div style={{fontWeight:600,color:'var(--t0)'}}>{c.business_name||[c.first_name,c.last_name].filter(Boolean).join(' ')||'—'}</div>
-                    {c.business_name&&<div style={{fontSize:'.68rem',color:'var(--t3)'}}>{[c.first_name,c.last_name].filter(Boolean).join(' ')}</div>}
+                    <div style={{fontWeight:600,color:'var(--t0)'}}>{c.businessName||[c.firstName,c.lastName].filter(Boolean).join(' ')||'—'}</div>
+                    {c.businessName&&<div style={{fontSize:'.68rem',color:'var(--t3)'}}>{[c.firstName,c.lastName].filter(Boolean).join(' ')}</div>}
                     <div style={{fontSize:'.65rem',color:'var(--t3)'}}>{c.email||''}</div>
                   </td>
                   <td style={{fontSize:'.75rem'}}>{c.trade||'—'}</td>
-                  <td><span className="badge bmu">{c.entity_type?.replace('_',' ')||'—'}</span></td>
-                  <td className="mono">{c.pay_rate?formatCurrency(c.pay_rate)+'/'+c.pay_unit:'—'}</td>
-                  <td className="mono" style={{color:+c.ytd_paid>=600?'var(--amber)':'var(--t1)'}}>{formatCurrency(c.ytd_paid)}</td>
+                  <td><span className="badge bmu">{c.entityType?.replace('_',' ')||'—'}</span></td>
+                  <td className="mono">{c.payRate?formatCurrency(c.payRate)+'/'+c.payUnit:'—'}</td>
+                  <td className="mono" style={{color:+c.ytdPaid>=600?'var(--amber)':'var(--t1)'}}>{formatCurrency(c.ytdPaid)}</td>
                   <td>
-                    <button className={`badge ${c.w9_on_file?'bg2':'br'}`} style={{cursor:'pointer',border:'none'}} onClick={()=>toggleW9(c.id,c.w9_on_file)}>
-                      {c.w9_on_file?'✓ On File':'Missing'}
+                    <button className={`badge ${c.w9OnFile?'bg2':'br'}`} style={{cursor:'pointer',border:'none'}} onClick={()=>toggleW9(c.id,c.w9OnFile)}>
+                      {c.w9OnFile?'✓ On File':'Missing'}
                     </button>
                   </td>
-                  <td>{+c.ytd_paid>=600?<span className="badge ba">Required</span>:<span style={{color:'var(--t3)'}}>—</span>}</td>
+                  <td>{+c.ytdPaid>=600?<span className="badge ba">Required</span>:<span style={{color:'var(--t3)'}}>—</span>}</td>
                   <td><span className={`badge ${c.status==='active'?'bg2':'bmu'}`}>{c.status}</span></td>
                 </tr>
               )):<tr><td colSpan={8}><div className="empty">No contractors yet.</div></td></tr>}
@@ -670,7 +670,7 @@ function Vendors(){
   const[form,setForm]=useState(init)
   const f=(k:string)=>(e:React.ChangeEvent<HTMLInputElement|HTMLSelectElement|HTMLTextAreaElement>)=>setForm(p=>({...p,[k]:e.target.value}))
 
-  const overdue=(vendors as any[]).filter((v:any)=>+v.ap_balance>0)
+  const overdue=(vendors as any[]).filter((v:any)=>+v.apBalance>0)
 
   const add=async(e:React.FormEvent)=>{
     e.preventDefault();setSaving(true);setErr('')
@@ -690,8 +690,8 @@ function Vendors(){
 
       <div className="grid4" style={{marginBottom:16}}>
         <div className="kpi"><div className="kl">Active Vendors</div><div className="kv t">{(vendors as any[]).length}</div><div className="ks">In your vendor list</div></div>
-        <div className="kpi"><div className="kl">Total AP Balance</div><div className={`kv ${overdue.length>0?'r':'g'}`}>{formatCurrency((vendors as any[]).reduce((s:number,v:any)=>s+(+v.ap_balance||0),0))}</div><div className="ks">Outstanding bills</div></div>
-        <div className="kpi"><div className="kl">YTD Vendor Payments</div><div className="kv gold">{formatCurrency((vendors as any[]).reduce((s:number,v:any)=>s+(+v.ytd_paid||0),0))}</div><div className="ks">Total paid YTD</div></div>
+        <div className="kpi"><div className="kl">Total AP Balance</div><div className={`kv ${overdue.length>0?'r':'g'}`}>{formatCurrency((vendors as any[]).reduce((s:number,v:any)=>s+(+v.apBalance||0),0))}</div><div className="ks">Outstanding bills</div></div>
+        <div className="kpi"><div className="kl">YTD Vendor Payments</div><div className="kv gold">{formatCurrency((vendors as any[]).reduce((s:number,v:any)=>s+(+v.ytdPaid||0),0))}</div><div className="ks">Total paid YTD</div></div>
         <div className="kpi"><div className="kl">Vendors with Balance</div><div className={`kv ${overdue.length>0?'a':'g'}`}>{overdue.length}</div><div className="ks">Open AP</div></div>
       </div>
 
@@ -705,12 +705,12 @@ function Vendors(){
               {(vendors as any[]).length?(vendors as any[]).map((v:any)=>(
                 <tr key={v.id}>
                   <td><div style={{fontWeight:600,color:'var(--t0)'}}>{v.name}</div></td>
-                  <td><div style={{fontSize:'.75rem'}}>{v.contact_name||'—'}</div><div style={{fontSize:'.65rem',color:'var(--t3)'}}>{v.email||''}</div></td>
+                  <td><div style={{fontSize:'.75rem'}}>{v.contactName||'—'}</div><div style={{fontSize:'.65rem',color:'var(--t3)'}}>{v.email||''}</div></td>
                   <td>{v.category?<span className="badge bmu">{v.category}</span>:<span style={{color:'var(--t3)'}}>—</span>}</td>
-                  <td style={{fontSize:'.75rem',color:'var(--t2)'}}>{v.payment_terms?.replace('_',' ')||'—'}</td>
-                  <td className="mono" style={{color:+v.ap_balance>0?'var(--red)':'var(--t3)'}}>{+v.ap_balance>0?formatCurrency(v.ap_balance):'—'}</td>
-                  <td className="mono">{formatCurrency(v.ytd_paid)}</td>
-                  <td className="mono" style={{fontSize:'.72rem',color:'var(--t3)'}}>{v.account_number||'—'}</td>
+                  <td style={{fontSize:'.75rem',color:'var(--t2)'}}>{v.paymentTerms?.replace('_',' ')||'—'}</td>
+                  <td className="mono" style={{color:+v.apBalance>0?'var(--red)':'var(--t3)'}}>{+v.apBalance>0?formatCurrency(v.apBalance):'—'}</td>
+                  <td className="mono">{formatCurrency(v.ytdPaid)}</td>
+                  <td className="mono" style={{fontSize:'.72rem',color:'var(--t3)'}}>{v.accountNumber||'—'}</td>
                 </tr>
               )):<tr><td colSpan={7}><div className="empty">No vendors yet. Add vendors to track bills and AP.</div></td></tr>}
             </tbody>
@@ -870,14 +870,14 @@ function RunPayroll(){
                     const periods:Record<string,number>={weekly:52,biweekly:26,semimonthly:24,monthly:12}
                     const ppy=periods[freq]||26
                     const h=+(hoursMap[emp.id]||'80')
-                    const gross=emp.pay_type==='salary'?(+emp.pay_rate/ppy):(+emp.pay_rate*h)
+                    const gross=emp.payType==='salary'?(+emp.payRate/ppy):(+emp.payRate*h)
                     return(
                       <tr key={emp.id} style={{background:selectedIds.includes(emp.id)?'rgba(201,162,39,.04)':''}}>
                         <td><input type="checkbox" checked={selectedIds.includes(emp.id)} onChange={()=>toggleEmp(emp.id)} style={{width:'auto',cursor:'pointer'}}/></td>
-                        <td><div style={{fontWeight:600,color:'var(--t0)'}}>{emp.first_name} {emp.last_name}</div><div style={{fontSize:'.68rem',color:'var(--t3)'}}>{emp.title||''}</div></td>
-                        <td><span className={`badge ${emp.pay_type==='salary'?'bb':'ba'}`}>{emp.pay_type}</span></td>
-                        <td className="mono">{emp.pay_type==='salary'?formatCurrency(emp.pay_rate)+'/yr':formatCurrency(emp.pay_rate)+'/hr'}</td>
-                        <td>{emp.pay_type==='hourly'?(
+                        <td><div style={{fontWeight:600,color:'var(--t0)'}}>{emp.firstName} {emp.lastName}</div><div style={{fontSize:'.68rem',color:'var(--t3)'}}>{emp.title||''}</div></td>
+                        <td><span className={`badge ${emp.payType==='salary'?'bb':'ba'}`}>{emp.payType}</span></td>
+                        <td className="mono">{emp.payType==='salary'?formatCurrency(emp.payRate)+'/yr':formatCurrency(emp.payRate)+'/hr'}</td>
+                        <td>{emp.payType==='hourly'?(
                           <input type="number" min="0" step="0.5" style={{width:80}} value={hoursMap[emp.id]||'80'} onChange={e=>setHoursMap(m=>({...m,[emp.id]:e.target.value}))} disabled={!selectedIds.includes(emp.id)}/>
                         ):<span style={{color:'var(--t3)'}}>—</span>}</td>
                         <td className="mono" style={{color:'var(--green)'}}>{formatCurrency(gross)}</td>
@@ -901,10 +901,10 @@ function RunPayroll(){
       {step==='review'&&draftRun&&(
         <div>
           <div className="grid4" style={{marginBottom:16}}>
-            <div className="kpi"><div className="kl">Total Gross Pay</div><div className="kv gold">{formatCurrency(draftRun.total_gross)}</div><div className="ks">{draftRun.employee_count} employees · {fmtFreq(draftRun.pay_frequency)}</div></div>
-            <div className="kpi"><div className="kl">Total Taxes</div><div className="kv r">{formatCurrency((+draftRun.total_federal_tax)+(+draftRun.total_state_tax)+(+draftRun.total_ss)+(+draftRun.total_medicare))}</div><div className="ks">Fed + AZ + SS + Medicare</div></div>
-            <div className="kpi"><div className="kl">Total Net Pay</div><div className="kv g">{formatCurrency(draftRun.total_net)}</div><div className="ks">Employee take-home</div></div>
-            <div className="kpi"><div className="kl">Pay Date</div><div className="kv b" style={{fontSize:'1.1rem'}}>{new Date(draftRun.pay_date+'T12:00:00').toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'})}</div><div className="ks">Period: {new Date(draftRun.period_start+'T12:00:00').toLocaleDateString()} – {new Date(draftRun.period_end+'T12:00:00').toLocaleDateString()}</div></div>
+            <div className="kpi"><div className="kl">Total Gross Pay</div><div className="kv gold">{formatCurrency(draftRun.totalGross)}</div><div className="ks">{draftRun.employeeCount} employees · {fmtFreq(draftRun.payFrequency)}</div></div>
+            <div className="kpi"><div className="kl">Total Taxes</div><div className="kv r">{formatCurrency((+draftRun.totalFederalTax)+(+draftRun.totalStateTax)+(+draftRun.totalSs)+(+draftRun.totalMedicare))}</div><div className="ks">Fed + AZ + SS + Medicare</div></div>
+            <div className="kpi"><div className="kl">Total Net Pay</div><div className="kv g">{formatCurrency(draftRun.totalNet)}</div><div className="ks">Employee take-home</div></div>
+            <div className="kpi"><div className="kl">Pay Date</div><div className="kv b" style={{fontSize:'1.1rem'}}>{new Date(draftRun.payDate+'T12:00:00').toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'})}</div><div className="ks">Period: {new Date(draftRun.periodStart+'T12:00:00').toLocaleDateString()} – {new Date(draftRun.periodEnd+'T12:00:00').toLocaleDateString()}</div></div>
           </div>
 
           <div className="card" style={{marginBottom:16,padding:0}}>
@@ -914,26 +914,26 @@ function RunPayroll(){
               <tbody>
                 {draftRun.lines?.map((line:any)=>(
                   <tr key={line.id}>
-                    <td><div style={{fontWeight:600,color:'var(--t0)'}}>{line.first_name} {line.last_name}</div><div style={{fontSize:'.68rem',color:'var(--t3)'}}>{line.title||''}{line.hours_worked?' · '+line.hours_worked+' hrs':''}</div></td>
-                    <td><span className={`badge ${line.pay_type==='salary'?'bb':'ba'}`}>{line.pay_type}</span></td>
-                    <td className="mono" style={{color:'var(--t0)',fontWeight:600}}>{formatCurrency(line.gross_pay)}</td>
-                    <td className="mono" style={{color:'var(--red)'}}>{formatCurrency(line.federal_tax)}</td>
-                    <td className="mono" style={{color:'var(--amber)'}}>{formatCurrency(line.ss_tax)}</td>
-                    <td className="mono" style={{color:'var(--amber)'}}>{formatCurrency(line.medicare_tax)}</td>
-                    <td className="mono" style={{color:'var(--amber)'}}>{formatCurrency(line.state_tax)}</td>
-                    <td className="mono" style={{color:'var(--green)',fontWeight:700}}>{formatCurrency(line.net_pay)}</td>
+                    <td><div style={{fontWeight:600,color:'var(--t0)'}}>{line.firstName} {line.lastName}</div><div style={{fontSize:'.68rem',color:'var(--t3)'}}>{line.title||''}{line.hoursWorked?' · '+line.hoursWorked+' hrs':''}</div></td>
+                    <td><span className={`badge ${line.payType==='salary'?'bb':'ba'}`}>{line.payType}</span></td>
+                    <td className="mono" style={{color:'var(--t0)',fontWeight:600}}>{formatCurrency(line.grossPay)}</td>
+                    <td className="mono" style={{color:'var(--red)'}}>{formatCurrency(line.federalTax)}</td>
+                    <td className="mono" style={{color:'var(--amber)'}}>{formatCurrency(line.ssTax)}</td>
+                    <td className="mono" style={{color:'var(--amber)'}}>{formatCurrency(line.medicareTax)}</td>
+                    <td className="mono" style={{color:'var(--amber)'}}>{formatCurrency(line.stateTax)}</td>
+                    <td className="mono" style={{color:'var(--green)',fontWeight:700}}>{formatCurrency(line.netPay)}</td>
                   </tr>
                 ))}
               </tbody>
               <tfoot>
                 <tr style={{background:'var(--bg3)'}}>
                   <td colSpan={2} style={{padding:'10px 12px',fontWeight:700,color:'var(--t0)',fontFamily:'var(--font-d)'}}>TOTALS</td>
-                  <td className="mono" style={{fontWeight:700,color:'var(--gold)',padding:'10px 12px'}}>{formatCurrency(draftRun.total_gross)}</td>
-                  <td className="mono" style={{color:'var(--red)',padding:'10px 12px'}}>{formatCurrency(draftRun.total_federal_tax)}</td>
-                  <td className="mono" style={{color:'var(--amber)',padding:'10px 12px'}}>{formatCurrency(draftRun.total_ss)}</td>
-                  <td className="mono" style={{color:'var(--amber)',padding:'10px 12px'}}>{formatCurrency(draftRun.total_medicare)}</td>
-                  <td className="mono" style={{color:'var(--amber)',padding:'10px 12px'}}>{formatCurrency(draftRun.total_state_tax)}</td>
-                  <td className="mono" style={{fontWeight:700,color:'var(--green)',padding:'10px 12px'}}>{formatCurrency(draftRun.total_net)}</td>
+                  <td className="mono" style={{fontWeight:700,color:'var(--gold)',padding:'10px 12px'}}>{formatCurrency(draftRun.totalGross)}</td>
+                  <td className="mono" style={{color:'var(--red)',padding:'10px 12px'}}>{formatCurrency(draftRun.totalFederalTax)}</td>
+                  <td className="mono" style={{color:'var(--amber)',padding:'10px 12px'}}>{formatCurrency(draftRun.totalSs)}</td>
+                  <td className="mono" style={{color:'var(--amber)',padding:'10px 12px'}}>{formatCurrency(draftRun.totalMedicare)}</td>
+                  <td className="mono" style={{color:'var(--amber)',padding:'10px 12px'}}>{formatCurrency(draftRun.totalStateTax)}</td>
+                  <td className="mono" style={{fontWeight:700,color:'var(--green)',padding:'10px 12px'}}>{formatCurrency(draftRun.totalNet)}</td>
                 </tr>
               </tfoot>
             </table>
@@ -941,10 +941,10 @@ function RunPayroll(){
 
           <div className="card" style={{marginBottom:16}}>
             <div className="ct">Employer Tax Liability (this run)</div>
-            <div className="dr"><span className="dk">Employer SS match (6.2%)</span><span className="dv mono" style={{color:'var(--amber)'}}>{formatCurrency(draftRun.total_ss)}</span></div>
-            <div className="dr"><span className="dk">Employer Medicare match (1.45%)</span><span className="dv mono" style={{color:'var(--amber)'}}>{formatCurrency(draftRun.total_medicare)}</span></div>
-            <div className="dr"><span className="dk">Total employer tax cost</span><span className="dv mono" style={{color:'var(--red)',fontWeight:700}}>{formatCurrency((+draftRun.total_ss)+(+draftRun.total_medicare))}</span></div>
-            <div className="dr"><span className="dk">Total cost to employer (gross + employer taxes)</span><span className="dv mono" style={{color:'var(--gold)',fontWeight:700}}>{formatCurrency((+draftRun.total_gross)+(+draftRun.total_ss)+(+draftRun.total_medicare))}</span></div>
+            <div className="dr"><span className="dk">Employer SS match (6.2%)</span><span className="dv mono" style={{color:'var(--amber)'}}>{formatCurrency(draftRun.totalSs)}</span></div>
+            <div className="dr"><span className="dk">Employer Medicare match (1.45%)</span><span className="dv mono" style={{color:'var(--amber)'}}>{formatCurrency(draftRun.totalMedicare)}</span></div>
+            <div className="dr"><span className="dk">Total employer tax cost</span><span className="dv mono" style={{color:'var(--red)',fontWeight:700}}>{formatCurrency((+draftRun.totalSs)+(+draftRun.totalMedicare))}</span></div>
+            <div className="dr"><span className="dk">Total cost to employer (gross + employer taxes)</span><span className="dv mono" style={{color:'var(--gold)',fontWeight:700}}>{formatCurrency((+draftRun.totalGross)+(+draftRun.totalSs)+(+draftRun.totalMedicare))}</span></div>
           </div>
 
           <div style={{display:'flex',gap:12,justifyContent:'flex-end'}}>
@@ -961,8 +961,8 @@ function RunPayroll(){
         <div className="card" style={{textAlign:'center',padding:'60px 20px'}}>
           <div style={{fontSize:'3rem',marginBottom:16}}>✅</div>
           <h2 style={{color:'var(--green)',marginBottom:8}}>Payroll Approved!</h2>
-          <p style={{color:'var(--t2)',marginBottom:4}}>Total gross: <strong style={{color:'var(--t0)'}}>{formatCurrency(draftRun?.total_gross)}</strong></p>
-          <p style={{color:'var(--t2)',marginBottom:24}}>Net pay: <strong style={{color:'var(--green)'}}>{formatCurrency(draftRun?.total_net)}</strong> for {draftRun?.employee_count} employee{draftRun?.employee_count!==1?'s':''}</p>
+          <p style={{color:'var(--t2)',marginBottom:4}}>Total gross: <strong style={{color:'var(--t0)'}}>{formatCurrency(draftRun?.totalGross)}</strong></p>
+          <p style={{color:'var(--t2)',marginBottom:24}}>Net pay: <strong style={{color:'var(--green)'}}>{formatCurrency(draftRun?.totalNet)}</strong> for {draftRun?.employeeCount} employee{draftRun?.employeeCount!==1?'s':''}</p>
           <p style={{color:'var(--t3)',fontSize:'.8rem',marginBottom:24}}>YTD totals have been updated. View the run in Pay History.</p>
           <div style={{display:'flex',gap:12,justifyContent:'center'}}>
             <button className="btn bg-btn" onClick={()=>{setStep('setup');setDraftRun(null);setSelectedIds([]);setHoursMap({})}}>Run Another Payroll</button>
@@ -1006,12 +1006,12 @@ function PayHistory(){
               <tbody>
                 {(runs as any[]).length?(runs as any[]).map((r:any)=>(
                   <tr key={r.id} style={{cursor:'pointer',background:selected?.id===r.id?'rgba(201,162,39,.05)':''}} onClick={()=>setSelected(r)}>
-                    <td className="mono" style={{color:'var(--t0)',fontWeight:600}}>{new Date(r.pay_date+'T12:00:00').toLocaleDateString()}</td>
-                    <td style={{fontSize:'.68rem',color:'var(--t3)'}}>{new Date(r.period_start+'T12:00:00').toLocaleDateString()} – {new Date(r.period_end+'T12:00:00').toLocaleDateString()}</td>
-                    <td><span className="badge bmu" style={{fontSize:'.6rem'}}>{r.pay_frequency}</span></td>
-                    <td className="mono">{r.employee_count}</td>
-                    <td className="mono" style={{color:'var(--gold)'}}>{formatCurrency(r.total_gross)}</td>
-                    <td className="mono" style={{color:'var(--green)'}}>{formatCurrency(r.total_net)}</td>
+                    <td className="mono" style={{color:'var(--t0)',fontWeight:600}}>{new Date(r.payDate+'T12:00:00').toLocaleDateString()}</td>
+                    <td style={{fontSize:'.68rem',color:'var(--t3)'}}>{new Date(r.periodStart+'T12:00:00').toLocaleDateString()} – {new Date(r.periodEnd+'T12:00:00').toLocaleDateString()}</td>
+                    <td><span className="badge bmu" style={{fontSize:'.6rem'}}>{r.payFrequency}</span></td>
+                    <td className="mono">{r.employeeCount}</td>
+                    <td className="mono" style={{color:'var(--gold)'}}>{formatCurrency(r.totalGross)}</td>
+                    <td className="mono" style={{color:'var(--green)'}}>{formatCurrency(r.totalNet)}</td>
                     <td><span className={`badge ${STATUS[r.status]||'bmu'}`}>{r.status}</span></td>
                   </tr>
                 )):<tr><td colSpan={7}><div className="empty">No payroll runs yet.</div></td></tr>}
@@ -1026,26 +1026,26 @@ function PayHistory(){
             <div className="card">
               <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:16}}>
                 <div>
-                  <div style={{fontFamily:'var(--font-d)',fontWeight:700,color:'var(--t0)'}}>Pay Date: {new Date(runDetail.pay_date+'T12:00:00').toLocaleDateString()}</div>
-                  <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:2}}>{new Date(runDetail.period_start+'T12:00:00').toLocaleDateString()} – {new Date(runDetail.period_end+'T12:00:00').toLocaleDateString()} · {runDetail.pay_frequency}</div>
+                  <div style={{fontFamily:'var(--font-d)',fontWeight:700,color:'var(--t0)'}}>Pay Date: {new Date(runDetail.payDate+'T12:00:00').toLocaleDateString()}</div>
+                  <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:2}}>{new Date(runDetail.periodStart+'T12:00:00').toLocaleDateString()} – {new Date(runDetail.periodEnd+'T12:00:00').toLocaleDateString()} · {runDetail.payFrequency}</div>
                 </div>
                 <span className={`badge ${STATUS[runDetail.status]||'bmu'}`}>{runDetail.status}</span>
               </div>
-              <div className="dr"><span className="dk">Gross Pay</span><span className="dv mono" style={{color:'var(--gold)'}}>{formatCurrency(runDetail.total_gross)}</span></div>
-              <div className="dr"><span className="dk">Federal W/H</span><span className="dv mono" style={{color:'var(--red)'}}>{formatCurrency(runDetail.total_federal_tax)}</span></div>
-              <div className="dr"><span className="dk">SS + Medicare</span><span className="dv mono" style={{color:'var(--amber)'}}>{formatCurrency((+runDetail.total_ss)+(+runDetail.total_medicare))}</span></div>
-              <div className="dr"><span className="dk">AZ State Tax</span><span className="dv mono" style={{color:'var(--amber)'}}>{formatCurrency(runDetail.total_state_tax)}</span></div>
-              <div className="dr" style={{borderTop:'1px solid var(--b1)',paddingTop:8,marginTop:4}}><span className="dk" style={{fontWeight:700}}>Net Pay</span><span className="dv mono" style={{color:'var(--green)',fontWeight:700}}>{formatCurrency(runDetail.total_net)}</span></div>
+              <div className="dr"><span className="dk">Gross Pay</span><span className="dv mono" style={{color:'var(--gold)'}}>{formatCurrency(runDetail.totalGross)}</span></div>
+              <div className="dr"><span className="dk">Federal W/H</span><span className="dv mono" style={{color:'var(--red)'}}>{formatCurrency(runDetail.totalFederalTax)}</span></div>
+              <div className="dr"><span className="dk">SS + Medicare</span><span className="dv mono" style={{color:'var(--amber)'}}>{formatCurrency((+runDetail.totalSs)+(+runDetail.totalMedicare))}</span></div>
+              <div className="dr"><span className="dk">AZ State Tax</span><span className="dv mono" style={{color:'var(--amber)'}}>{formatCurrency(runDetail.totalStateTax)}</span></div>
+              <div className="dr" style={{borderTop:'1px solid var(--b1)',paddingTop:8,marginTop:4}}><span className="dk" style={{fontWeight:700}}>Net Pay</span><span className="dv mono" style={{color:'var(--green)',fontWeight:700}}>{formatCurrency(runDetail.totalNet)}</span></div>
 
               <div style={{marginTop:16}}>
                 <div className="ct">Employee Lines</div>
                 {runDetail.lines?.map((l:any)=>(
                   <div key={l.id} style={{padding:'8px 0',borderBottom:'1px solid var(--b0)',display:'flex',justifyContent:'space-between',alignItems:'center'}}>
                     <div>
-                      <div style={{fontSize:'.82rem',fontWeight:600,color:'var(--t0)'}}>{l.first_name} {l.last_name}</div>
-                      <div style={{fontSize:'.68rem',color:'var(--t3)'}}>Gross {formatCurrency(l.gross_pay)} · Net {formatCurrency(l.net_pay)}</div>
+                      <div style={{fontSize:'.82rem',fontWeight:600,color:'var(--t0)'}}>{l.firstName} {l.lastName}</div>
+                      <div style={{fontSize:'.68rem',color:'var(--t3)'}}>Gross {formatCurrency(l.grossPay)} · Net {formatCurrency(l.netPay)}</div>
                     </div>
-                    <span className="mono" style={{color:'var(--green)',fontWeight:600}}>{formatCurrency(l.net_pay)}</span>
+                    <span className="mono" style={{color:'var(--green)',fontWeight:600}}>{formatCurrency(l.netPay)}</span>
                   </div>
                 ))}
               </div>
@@ -1127,10 +1127,10 @@ function JournalEntries(){
               <tbody>
                 {(entries as any[]).length?(entries as any[]).map((e:any)=>(
                   <tr key={e.id} style={{cursor:'pointer',background:selectedEntry?.id===e.id?'rgba(201,162,39,.05)':''}} onClick={()=>setSelectedEntry(e)}>
-                    <td className="mono" style={{color:'var(--t3)',fontSize:'.7rem'}}>{e.entry_number}</td>
+                    <td className="mono" style={{color:'var(--t3)',fontSize:'.7rem'}}>{e.entryNumber}</td>
                     <td className="mono" style={{fontSize:'.75rem'}}>{new Date(e.date+'T12:00:00').toLocaleDateString()}</td>
                     <td style={{color:'var(--t0)',fontSize:'.78rem'}}>{e.description}</td>
-                    <td className="mono">{formatCurrency(e.total_debits)}</td>
+                    <td className="mono">{formatCurrency(e.totalDebits)}</td>
                     <td><span className={`badge ${STATUS[e.status]||'bmu'}`}>{e.status}</span></td>
                   </tr>
                 )):<tr><td colSpan={5}><div className="empty">No journal entries yet.</div></td></tr>}
@@ -1145,7 +1145,7 @@ function JournalEntries(){
             <div className="card">
               <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:16}}>
                 <div>
-                  <div style={{fontFamily:'var(--font-d)',fontWeight:700,color:'var(--t0)',marginBottom:4}}>Entry #{entryDetail.entry_number}</div>
+                  <div style={{fontFamily:'var(--font-d)',fontWeight:700,color:'var(--t0)',marginBottom:4}}>Entry #{entryDetail.entryNumber}</div>
                   <div style={{fontSize:'.72rem',color:'var(--t3)'}}>{new Date(entryDetail.date+'T12:00:00').toLocaleDateString()} · {entryDetail.type}</div>
                   <div style={{fontSize:'.82rem',color:'var(--t1)',marginTop:4}}>{entryDetail.description}</div>
                   {entryDetail.reference&&<div style={{fontSize:'.7rem',color:'var(--t3)',marginTop:2}}>Ref: {entryDetail.reference}</div>}
@@ -1157,7 +1157,7 @@ function JournalEntries(){
                 <tbody>
                   {entryDetail.lines?.map((l:any)=>(
                     <tr key={l.id}>
-                      <td><div style={{fontWeight:600,color:'var(--t0)',fontSize:'.75rem'}}>{l.code} · {l.account_name}</div></td>
+                      <td><div style={{fontWeight:600,color:'var(--t0)',fontSize:'.75rem'}}>{l.code} · {l.accountName}</div></td>
                       <td style={{fontSize:'.72rem',color:'var(--t3)'}}>{l.description||'—'}</td>
                       <td className="mono" style={{textAlign:'right',color:+l.debit>0?'var(--t0)':'var(--t3)'}}>{+l.debit>0?formatCurrency(l.debit):'—'}</td>
                       <td className="mono" style={{textAlign:'right',color:+l.credit>0?'var(--t0)':'var(--t3)'}}>{+l.credit>0?formatCurrency(l.credit):'—'}</td>
@@ -1167,8 +1167,8 @@ function JournalEntries(){
                 <tfoot>
                   <tr style={{background:'var(--bg3)'}}>
                     <td colSpan={2} style={{padding:'8px 12px',fontWeight:700,color:'var(--t0)',fontSize:'.72rem'}}>TOTALS</td>
-                    <td className="mono" style={{textAlign:'right',fontWeight:700,padding:'8px 12px'}}>{formatCurrency(entryDetail.total_debits)}</td>
-                    <td className="mono" style={{textAlign:'right',fontWeight:700,padding:'8px 12px'}}>{formatCurrency(entryDetail.total_credits)}</td>
+                    <td className="mono" style={{textAlign:'right',fontWeight:700,padding:'8px 12px'}}>{formatCurrency(entryDetail.totalDebits)}</td>
+                    <td className="mono" style={{textAlign:'right',fontWeight:700,padding:'8px 12px'}}>{formatCurrency(entryDetail.totalCredits)}</td>
                   </tr>
                 </tfoot>
               </table>
@@ -1303,7 +1303,7 @@ function Transactions(){
                   <td className="mono" style={{fontSize:'.72rem'}}>{new Date(t.date+'T12:00:00').toLocaleDateString()}</td>
                   <td style={{color:'var(--t0)',fontSize:'.78rem'}}>{t.description}</td>
                   <td style={{fontSize:'.72rem',color:'var(--t2)'}}>{t.category||'—'}</td>
-                  <td style={{fontSize:'.72rem',color:'var(--t3)'}}>{t.account_name?t.code+' · '+t.account_name:'—'}</td>
+                  <td style={{fontSize:'.72rem',color:'var(--t3)'}}>{t.accountName?t.code+' · '+t.accountName:'—'}</td>
                   <td className="mono" style={{color:t.type==='income'?'var(--green)':'var(--red)',fontWeight:600}}>{t.type==='income'?'+':'-'}{formatCurrency(t.amount)}</td>
                   <td><span className={t.type==='income'?'badge bg2':'badge br'}>{t.type}</span></td>
                   <td>{t.reconciled?<span className="badge bg2">✓</span>:<button className="btn bg-btn bsm" onClick={()=>reconcile(t.id)}>Mark</button>}</td>
@@ -1436,8 +1436,8 @@ function BillsAP(){
   const f=(k:string)=>(e:React.ChangeEvent<HTMLInputElement|HTMLSelectElement|HTMLTextAreaElement>)=>setForm(p=>({...p,[k]:e.target.value}))
 
   const filtered=tab==='all'?(bills as any[]):(bills as any[]).filter((b:any)=>tab==='open'?b.status==='open'||b.status==='partial':b.status==='paid')
-  const totalOpen=(bills as any[]).filter((b:any)=>b.status==='open'||b.status==='partial').reduce((s:number,b:any)=>s+(+b.amount-+b.amount_paid),0)
-  const overdue=(bills as any[]).filter((b:any)=>b.due_date&&new Date(b.due_date)<new Date()&&b.status!=='paid')
+  const totalOpen=(bills as any[]).filter((b:any)=>b.status==='open'||b.status==='partial').reduce((s:number,b:any)=>s+(+b.amount-+b.amountPaid),0)
+  const overdue=(bills as any[]).filter((b:any)=>b.dueDate&&new Date(b.dueDate)<new Date()&&b.status!=='paid')
 
   const add=async(e:React.FormEvent)=>{
     e.preventDefault();setSaving(true);setErr('')
@@ -1470,7 +1470,7 @@ function BillsAP(){
         <div className="kpi"><div className="kl">Open Bills</div><div className="kv a">{(bills as any[]).filter((b:any)=>b.status==='open').length}</div><div className="ks">Awaiting payment</div></div>
         <div className="kpi"><div className="kl">Total Outstanding</div><div className="kv r">{formatCurrency(totalOpen)}</div><div className="ks">AP balance</div></div>
         <div className="kpi"><div className="kl">Overdue</div><div className={`kv ${overdue.length>0?'r':'g'}`}>{overdue.length}</div><div className="ks">Past due date</div></div>
-        <div className="kpi"><div className="kl">Paid This Month</div><div className="kv g">{formatCurrency((bills as any[]).filter((b:any)=>b.status==='paid'&&b.paid_at&&new Date(b.paid_at)>=new Date(new Date().getFullYear(),new Date().getMonth(),1)).reduce((s:number,b:any)=>s+(+b.amount_paid),0))}</div><div className="ks">Cleared bills</div></div>
+        <div className="kpi"><div className="kl">Paid This Month</div><div className="kv g">{formatCurrency((bills as any[]).filter((b:any)=>b.status==='paid'&&b.paidAt&&new Date(b.paidAt)>=new Date(new Date().getFullYear(),new Date().getMonth(),1)).reduce((s:number,b:any)=>s+(+b.amountPaid),0))}</div><div className="ks">Cleared bills</div></div>
       </div>
 
       <div className="tabs">
@@ -1485,18 +1485,18 @@ function BillsAP(){
             <thead><tr><th>Date</th><th>Vendor</th><th>Description</th><th>Due</th><th>Amount</th><th>Paid</th><th>Balance</th><th>Status</th><th></th></tr></thead>
             <tbody>
               {(filtered as any[]).length?(filtered as any[]).map((b:any)=>{
-                const isOverdue=b.due_date&&new Date(b.due_date)<new Date()&&b.status!=='paid'
+                const isOverdue=b.dueDate&&new Date(b.dueDate)<new Date()&&b.status!=='paid'
                 return(
                   <tr key={b.id} style={{background:isOverdue?'rgba(239,68,68,.03)':''}}>
                     <td className="mono" style={{fontSize:'.72rem'}}>{new Date(b.date+'T12:00:00').toLocaleDateString()}</td>
-                    <td style={{fontSize:'.75rem',color:'var(--t0)'}}>{b.vendor_name||'—'}</td>
+                    <td style={{fontSize:'.75rem',color:'var(--t0)'}}>{b.vendorName||'—'}</td>
                     <td style={{fontSize:'.78rem'}}>{b.description}</td>
-                    <td className="mono" style={{fontSize:'.72rem',color:isOverdue?'var(--red)':'var(--t3)'}}>{b.due_date?new Date(b.due_date+'T12:00:00').toLocaleDateString():'—'}{isOverdue&&' ⚠'}</td>
+                    <td className="mono" style={{fontSize:'.72rem',color:isOverdue?'var(--red)':'var(--t3)'}}>{b.dueDate?new Date(b.dueDate+'T12:00:00').toLocaleDateString():'—'}{isOverdue&&' ⚠'}</td>
                     <td className="mono">{formatCurrency(b.amount)}</td>
-                    <td className="mono" style={{color:'var(--green)'}}>{+b.amount_paid>0?formatCurrency(b.amount_paid):'—'}</td>
-                    <td className="mono" style={{color:'var(--red)',fontWeight:600}}>{formatCurrency(+b.amount-+b.amount_paid)}</td>
+                    <td className="mono" style={{color:'var(--green)'}}>{+b.amountPaid>0?formatCurrency(b.amountPaid):'—'}</td>
+                    <td className="mono" style={{color:'var(--red)',fontWeight:600}}>{formatCurrency(+b.amount-+b.amountPaid)}</td>
                     <td><span className={`badge ${STATUS[b.status]||'bmu'}`}>{b.status}</span></td>
-                    <td>{b.status!=='paid'&&<button className="btn bp bsm" onClick={()=>payBill(b.id,+b.amount-+b.amount_paid)}>Pay Full</button>}</td>
+                    <td>{b.status!=='paid'&&<button className="btn bp bsm" onClick={()=>payBill(b.id,+b.amount-+b.amountPaid)}>Pay Full</button>}</td>
                   </tr>
                 )
               }):<tr><td colSpan={9}><div className="empty">No {tab==='open'?'open ':''}bills.</div></td></tr>}
@@ -1646,7 +1646,7 @@ function OwnerStatements(){
               <div key={s.landlord.id} className="card" style={{cursor:'pointer',borderColor:selected?.landlord?.id===s.landlord.id?'rgba(201,162,39,.4)':'var(--b1)'}} onClick={()=>setSelected(s)}>
                 <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start'}}>
                   <div>
-                    <div style={{fontWeight:700,color:'var(--t0)',fontFamily:'var(--font-d)'}}>{s.landlord.business_name||s.landlord.first_name+' '+s.landlord.last_name}</div>
+                    <div style={{fontWeight:700,color:'var(--t0)',fontFamily:'var(--font-d)'}}>{s.landlord.businessName||s.landlord.firstName+' '+s.landlord.lastName}</div>
                     <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:2}}>{s.landlord.email}</div>
                   </div>
                   <span className={s.variance>=0?'badge bg2':'badge br'}>{s.variance>=0?'✓ Collected':'⚠ Short'}</span>
@@ -1665,17 +1665,17 @@ function OwnerStatements(){
             {selected&&(
               <div className="card">
                 <div style={{marginBottom:16,paddingBottom:14,borderBottom:'1px solid var(--b0)'}}>
-                  <div style={{fontFamily:'var(--font-d)',fontWeight:800,fontSize:'1.1rem',color:'var(--t0)'}}>{selected.landlord.business_name||selected.landlord.first_name+' '+selected.landlord.last_name}</div>
+                  <div style={{fontFamily:'var(--font-d)',fontWeight:800,fontSize:'1.1rem',color:'var(--t0)'}}>{selected.landlord.businessName||selected.landlord.firstName+' '+selected.landlord.lastName}</div>
                   <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:2}}>{new Date(startDate+'T12:00:00').toLocaleDateString()} – {new Date(endDate+'T12:00:00').toLocaleDateString()}</div>
                 </div>
 
                 {selected.properties.map((p:any)=>(
                   <div key={p.id} style={{marginBottom:16,paddingBottom:14,borderBottom:'1px solid var(--b0)'}}>
                     <div style={{fontWeight:600,color:'var(--t0)',marginBottom:8}}>{p.name}</div>
-                    <div className="dr"><span className="dk">Units</span><span className="dv mono">{p.occupied}/{p.unit_count} occupied</span></div>
-                    <div className="dr"><span className="dk">Expected Rent</span><span className="dv mono">{formatCurrency(p.expected_rent)}</span></div>
+                    <div className="dr"><span className="dk">Units</span><span className="dv mono">{p.occupied}/{p.unitCount} occupied</span></div>
+                    <div className="dr"><span className="dk">Expected Rent</span><span className="dv mono">{formatCurrency(p.expectedRent)}</span></div>
                     <div className="dr"><span className="dk">Collected</span><span className="dv mono" style={{color:'var(--green)'}}>{formatCurrency(p.collected)}</span></div>
-                    <div className="dr"><span className="dk">Variance</span><span className="dv mono" style={{color:(+p.collected-+p.expected_rent)>=0?'var(--green)':'var(--red)'}}>{formatCurrency(+p.collected-+p.expected_rent)}</span></div>
+                    <div className="dr"><span className="dk">Variance</span><span className="dv mono" style={{color:(+p.collected-+p.expectedRent)>=0?'var(--green)':'var(--red)'}}>{formatCurrency(+p.collected-+p.expectedRent)}</span></div>
                   </div>
                 ))}
 
@@ -1715,25 +1715,25 @@ function TaxCenter(){
       </div>
 
       <div className="grid4" style={{marginBottom:16}}>
-        <div className="kpi"><div className="kl">YTD Gross Payroll</div><div className="kv gold">{formatCurrency(payroll.ytd_gross||0)}</div><div className="ks">{payroll.run_count||0} approved runs</div></div>
-        <div className="kpi"><div className="kl">Employee Tax W/H</div><div className="kv r">{formatCurrency((+payroll.ytd_federal||0)+(+payroll.ytd_state||0)+(+payroll.ytd_ss||0)+(+payroll.ytd_medicare||0))}</div><div className="ks">Fed + AZ + SS + Medicare</div></div>
-        <div className="kpi"><div className="kl">Employer Tax Match</div><div className="kv a">{formatCurrency((+payroll.employer_ss||0)+(+payroll.employer_medicare||0))}</div><div className="ks">SS + Medicare match</div></div>
-        <div className="kpi"><div className="kl">Total Tax Liability</div><div className="kv r">{formatCurrency(payroll.total_tax_liability||0)}</div><div className="ks">Employee + employer</div></div>
+        <div className="kpi"><div className="kl">YTD Gross Payroll</div><div className="kv gold">{formatCurrency(payroll.ytdGross||0)}</div><div className="ks">{payroll.runCount||0} approved runs</div></div>
+        <div className="kpi"><div className="kl">Employee Tax W/H</div><div className="kv r">{formatCurrency((+payroll.ytdFederal||0)+(+payroll.ytdState||0)+(+payroll.ytdSs||0)+(+payroll.ytdMedicare||0))}</div><div className="ks">Fed + AZ + SS + Medicare</div></div>
+        <div className="kpi"><div className="kl">Employer Tax Match</div><div className="kv a">{formatCurrency((+payroll.employerSs||0)+(+payroll.employerMedicare||0))}</div><div className="ks">SS + Medicare match</div></div>
+        <div className="kpi"><div className="kl">Total Tax Liability</div><div className="kv r">{formatCurrency(payroll.totalTaxLiability||0)}</div><div className="ks">Employee + employer</div></div>
       </div>
 
       {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}><span className="spinner" style={{display:'inline-block'}}/></div>:(
         <div className="grid2" style={{gap:16,marginBottom:16}}>
           <div className="card">
             <div className="ct">Payroll Tax Breakdown ({year})</div>
-            <div className="dr"><span className="dk">Federal Income W/H (employee)</span><span className="dv mono" style={{color:'var(--red)'}}>{formatCurrency(payroll.ytd_federal||0)}</span></div>
-            <div className="dr"><span className="dk">Social Security (employee 6.2%)</span><span className="dv mono" style={{color:'var(--amber)'}}>{formatCurrency(payroll.ytd_ss||0)}</span></div>
-            <div className="dr"><span className="dk">Medicare (employee 1.45%)</span><span className="dv mono" style={{color:'var(--amber)'}}>{formatCurrency(payroll.ytd_medicare||0)}</span></div>
-            <div className="dr"><span className="dk">AZ State W/H (employee 2.5%)</span><span className="dv mono" style={{color:'var(--amber)'}}>{formatCurrency(payroll.ytd_state||0)}</span></div>
-            <div className="dr" style={{borderTop:'1px solid var(--b1)',paddingTop:6,marginTop:4}}><span className="dk">Employer SS match (6.2%)</span><span className="dv mono" style={{color:'var(--red)'}}>{formatCurrency(payroll.employer_ss||0)}</span></div>
-            <div className="dr"><span className="dk">Employer Medicare match (1.45%)</span><span className="dv mono" style={{color:'var(--red)'}}>{formatCurrency(payroll.employer_medicare||0)}</span></div>
+            <div className="dr"><span className="dk">Federal Income W/H (employee)</span><span className="dv mono" style={{color:'var(--red)'}}>{formatCurrency(payroll.ytdFederal||0)}</span></div>
+            <div className="dr"><span className="dk">Social Security (employee 6.2%)</span><span className="dv mono" style={{color:'var(--amber)'}}>{formatCurrency(payroll.ytdSs||0)}</span></div>
+            <div className="dr"><span className="dk">Medicare (employee 1.45%)</span><span className="dv mono" style={{color:'var(--amber)'}}>{formatCurrency(payroll.ytdMedicare||0)}</span></div>
+            <div className="dr"><span className="dk">AZ State W/H (employee 2.5%)</span><span className="dv mono" style={{color:'var(--amber)'}}>{formatCurrency(payroll.ytdState||0)}</span></div>
+            <div className="dr" style={{borderTop:'1px solid var(--b1)',paddingTop:6,marginTop:4}}><span className="dk">Employer SS match (6.2%)</span><span className="dv mono" style={{color:'var(--red)'}}>{formatCurrency(payroll.employerSs||0)}</span></div>
+            <div className="dr"><span className="dk">Employer Medicare match (1.45%)</span><span className="dv mono" style={{color:'var(--red)'}}>{formatCurrency(payroll.employerMedicare||0)}</span></div>
             <div className="dr" style={{borderTop:'2px solid var(--b1)',paddingTop:8,marginTop:8}}>
               <span style={{fontWeight:700,color:'var(--t0)',fontFamily:'var(--font-d)'}}>Total Liability</span>
-              <span style={{fontFamily:'var(--font-m)',fontWeight:700,color:'var(--red)',fontSize:'1rem'}}>{formatCurrency(payroll.total_tax_liability||0)}</span>
+              <span style={{fontFamily:'var(--font-m)',fontWeight:700,color:'var(--red)',fontSize:'1rem'}}>{formatCurrency(payroll.totalTaxLiability||0)}</span>
             </div>
           </div>
 
@@ -1758,19 +1758,19 @@ function TaxCenter(){
       {(contractors as any[]).length>0&&(
         <div className="card" style={{marginBottom:16}}>
           <div className="ct">1099-NEC Required ({year}) — Contractors Paid $600+</div>
-          {(contractors as any[]).filter((c:any)=>!c.w9_on_file).length>0&&(
-            <div className="alert aw" style={{marginBottom:12}}>⚠ {(contractors as any[]).filter((c:any)=>!c.w9_on_file).length} contractor(s) missing W-9. Collect before Jan 31.</div>
+          {(contractors as any[]).filter((c:any)=>!c.w9OnFile).length>0&&(
+            <div className="alert aw" style={{marginBottom:12}}>⚠ {(contractors as any[]).filter((c:any)=>!c.w9OnFile).length} contractor(s) missing W-9. Collect before Jan 31.</div>
           )}
           <table className="tbl">
             <thead><tr><th>Contractor</th><th>Entity</th><th>YTD Paid</th><th>W-9</th><th>1099 Status</th></tr></thead>
             <tbody>
               {(contractors as any[]).map((c:any)=>(
                 <tr key={c.id}>
-                  <td style={{fontWeight:600,color:'var(--t0)'}}>{c.business_name||[c.first_name,c.last_name].filter(Boolean).join(' ')}</td>
-                  <td><span className="badge bmu">{c.entity_type}</span></td>
-                  <td className="mono" style={{color:'var(--amber)',fontWeight:600}}>{formatCurrency(c.ytd_paid)}</td>
-                  <td>{c.w9_on_file?<span className="badge bg2">✓ On File</span>:<span className="badge br">Missing</span>}</td>
-                  <td><span className={c.w9_on_file?'badge bg2':'badge ba'}>{c.w9_on_file?'Ready to File':'Needs W-9'}</span></td>
+                  <td style={{fontWeight:600,color:'var(--t0)'}}>{c.businessName||[c.firstName,c.lastName].filter(Boolean).join(' ')}</td>
+                  <td><span className="badge bmu">{c.entityType}</span></td>
+                  <td className="mono" style={{color:'var(--amber)',fontWeight:600}}>{formatCurrency(c.ytdPaid)}</td>
+                  <td>{c.w9OnFile?<span className="badge bg2">✓ On File</span>:<span className="badge br">Missing</span>}</td>
+                  <td><span className={c.w9OnFile?'badge bg2':'badge ba'}>{c.w9OnFile?'Ready to File':'Needs W-9'}</span></td>
                 </tr>
               ))}
             </tbody>
@@ -1786,13 +1786,13 @@ function TaxCenter(){
             <tbody>
               {employees.map((e:any,i:number)=>(
                 <tr key={i}>
-                  <td style={{fontWeight:600,color:'var(--t0)'}}>{e.first_name} {e.last_name}</td>
-                  <td className="mono" style={{color:'var(--gold)'}}>{formatCurrency(e.ytd_gross)}</td>
-                  <td className="mono" style={{color:'var(--red)'}}>{formatCurrency(e.ytd_federal_tax)}</td>
-                  <td className="mono" style={{color:'var(--amber)'}}>{formatCurrency(e.ytd_state_tax)}</td>
-                  <td className="mono" style={{color:'var(--amber)'}}>{formatCurrency(e.ytd_ss)}</td>
-                  <td className="mono" style={{color:'var(--amber)'}}>{formatCurrency(e.ytd_medicare)}</td>
-                  <td className="mono" style={{color:'var(--green)',fontWeight:700}}>{formatCurrency(e.ytd_net)}</td>
+                  <td style={{fontWeight:600,color:'var(--t0)'}}>{e.firstName} {e.lastName}</td>
+                  <td className="mono" style={{color:'var(--gold)'}}>{formatCurrency(e.ytdGross)}</td>
+                  <td className="mono" style={{color:'var(--red)'}}>{formatCurrency(e.ytdFederalTax)}</td>
+                  <td className="mono" style={{color:'var(--amber)'}}>{formatCurrency(e.ytdStateTax)}</td>
+                  <td className="mono" style={{color:'var(--amber)'}}>{formatCurrency(e.ytdSs)}</td>
+                  <td className="mono" style={{color:'var(--amber)'}}>{formatCurrency(e.ytdMedicare)}</td>
+                  <td className="mono" style={{color:'var(--green)',fontWeight:700}}>{formatCurrency(e.ytdNet)}</td>
                 </tr>
               ))}
             </tbody>
@@ -1829,18 +1829,18 @@ function RentRoll(){
             <thead><tr><th>Unit</th><th>Property</th><th>Tenant</th><th>Rent</th><th>Collected MTD</th><th>Variance</th><th>Status</th><th>ACH</th><th>OTP</th></tr></thead>
             <tbody>
               {units.length?units.map((u:any)=>{
-                const variance=(+u.collected_mtd||0)-(u.status!=='vacant'?+u.rent_amount:0)
+                const variance=(+u.collectedMtd||0)-(u.status!=='vacant'?+u.rentAmount:0)
                 return(
-                  <tr key={u.unit_number+u.property_name}>
-                    <td className="mono" style={{fontWeight:600,color:'var(--t0)'}}>{u.unit_number}</td>
-                    <td style={{fontSize:'.75rem'}}>{u.property_name}</td>
-                    <td style={{fontSize:'.75rem'}}>{u.tenant_first?u.tenant_first+' '+u.tenant_last:<span style={{color:'var(--t3)'}}>Vacant</span>}</td>
-                    <td className="mono">{formatCurrency(u.rent_amount)}</td>
-                    <td className="mono" style={{color:'var(--green)'}}>{+u.collected_mtd>0?formatCurrency(u.collected_mtd):'—'}</td>
+                  <tr key={u.unitNumber+u.propertyName}>
+                    <td className="mono" style={{fontWeight:600,color:'var(--t0)'}}>{u.unitNumber}</td>
+                    <td style={{fontSize:'.75rem'}}>{u.propertyName}</td>
+                    <td style={{fontSize:'.75rem'}}>{u.tenantFirst?u.tenantFirst+' '+u.tenantLast:<span style={{color:'var(--t3)'}}>Vacant</span>}</td>
+                    <td className="mono">{formatCurrency(u.rentAmount)}</td>
+                    <td className="mono" style={{color:'var(--green)'}}>{+u.collectedMtd>0?formatCurrency(u.collectedMtd):'—'}</td>
                     <td className="mono" style={{color:variance>=0?'var(--green)':'var(--red)'}}>{u.status!=='vacant'?formatCurrency(variance):'—'}</td>
                     <td><span className={`badge ${u.status==='active'?'bg2':u.status==='delinquent'?'ba':u.status==='vacant'?'bmu':'br'}`}>{u.status}</span></td>
-                    <td>{u.ach_verified?<span className="badge bg2">✓</span>:<span style={{color:'var(--t3)'}}>—</span>}</td>
-                    <td>{u.on_time_pay_enrolled?<span className="badge bgold">OTP</span>:<span style={{color:'var(--t3)'}}>—</span>}</td>
+                    <td>{u.achVerified?<span className="badge bg2">✓</span>:<span style={{color:'var(--t3)'}}>—</span>}</td>
+                    <td>{u.onTimePayEnrolled?<span className="badge bgold">OTP</span>:<span style={{color:'var(--t3)'}}>—</span>}</td>
                   </tr>
                 )
               }):<tr><td colSpan={9}><div className="empty">No units found.</div></td></tr>}
@@ -1893,7 +1893,7 @@ function ProfitLoss(){
               {income.map((a:any)=>(
                 <div key={a.code} className="dr">
                   <span className="dk">{a.code} · {a.name}</span>
-                  <span className="dv mono" style={{color:'var(--green)'}}>{formatCurrency(a.period_amount)}</span>
+                  <span className="dv mono" style={{color:'var(--green)'}}>{formatCurrency(a.periodAmount)}</span>
                 </div>
               ))}
               {income.length===0&&!gamRent&&<div style={{color:'var(--t3)',fontSize:'.78rem',padding:'8px 0'}}>No income recorded. Post journal entries or transactions.</div>}
@@ -1908,7 +1908,7 @@ function ProfitLoss(){
               {expenses.map((a:any)=>(
                 <div key={a.code} className="dr">
                   <span className="dk">{a.code} · {a.name}</span>
-                  <span className="dv mono" style={{color:'var(--red)'}}>{formatCurrency(a.period_amount)}</span>
+                  <span className="dv mono" style={{color:'var(--red)'}}>{formatCurrency(a.periodAmount)}</span>
                 </div>
               ))}
               {expenses.length===0&&<div style={{color:'var(--t3)',fontSize:'.78rem',padding:'8px 0'}}>No expenses recorded.</div>}
@@ -2017,13 +2017,13 @@ function ClientSwitcher(){
         <div style={{position:'absolute',right:0,top:'calc(100% + 6px)',background:'var(--bg2)',border:'1px solid var(--b1)',borderRadius:10,minWidth:220,zIndex:100,boxShadow:'0 8px 32px rgba(0,0,0,.4)',overflow:'hidden'}}>
           <div style={{padding:'8px 12px',borderBottom:'1px solid var(--b0)',fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.08em'}}>Switch Client</div>
           {(clients as any[]).map((cl:any)=>(
-            <button key={cl.landlord_id} onClick={()=>{setActiveClient(cl.landlord_id,cl.business_name||cl.first_name+' '+cl.last_name);setOpen(false)}}
-              style={{width:'100%',padding:'10px 14px',background:activeClientId===cl.landlord_id?'rgba(201,162,39,.08)':'none',border:'none',textAlign:'left',cursor:'pointer',display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+            <button key={cl.landlordId} onClick={()=>{setActiveClient(cl.landlordId,cl.businessName||cl.firstName+' '+cl.lastName);setOpen(false)}}
+              style={{width:'100%',padding:'10px 14px',background:activeClientId===cl.landlordId?'rgba(201,162,39,.08)':'none',border:'none',textAlign:'left',cursor:'pointer',display:'flex',justifyContent:'space-between',alignItems:'center'}}>
               <div>
-                <div style={{fontWeight:600,color:'var(--t0)',fontSize:'.82rem'}}>{cl.business_name||cl.first_name+' '+cl.last_name}</div>
-                <div style={{fontSize:'.65rem',color:'var(--t3)'}}>{cl.employee_count} emp · {cl.contractor_count} contractors</div>
+                <div style={{fontWeight:600,color:'var(--t0)',fontSize:'.82rem'}}>{cl.businessName||cl.firstName+' '+cl.lastName}</div>
+                <div style={{fontSize:'.65rem',color:'var(--t3)'}}>{cl.employeeCount} emp · {cl.contractorCount} contractors</div>
               </div>
-              {activeClientId===cl.landlord_id&&<span style={{color:'var(--gold)'}}>✓</span>}
+              {activeClientId===cl.landlordId&&<span style={{color:'var(--gold)'}}>✓</span>}
             </button>
           ))}
           <div style={{padding:'8px 12px',borderTop:'1px solid var(--b0)'}}>
@@ -2090,27 +2090,27 @@ function MyClients(){
 
       <div style={{display:'grid',gap:12}}>
         {(clients as any[]).map((cl:any)=>(
-          <div key={cl.landlord_id} className="card" style={{borderColor:activeClientId===cl.landlord_id?'rgba(201,162,39,.4)':'var(--b1)'}}>
+          <div key={cl.landlordId} className="card" style={{borderColor:activeClientId===cl.landlordId?'rgba(201,162,39,.4)':'var(--b1)'}}>
             <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',gap:16}}>
               <div style={{flex:1}}>
                 <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:8}}>
-                  <h3 style={{color:'var(--t0)',fontSize:'1rem'}}>{cl.business_name||cl.first_name+' '+cl.last_name}</h3>
-                  {activeClientId===cl.landlord_id&&<span className="badge bgold">Active</span>}
+                  <h3 style={{color:'var(--t0)',fontSize:'1rem'}}>{cl.businessName||cl.firstName+' '+cl.lastName}</h3>
+                  {activeClientId===cl.landlordId&&<span className="badge bgold">Active</span>}
                   <span className={cl.status==='active'?'badge bg2':'badge br'}>{cl.status}</span>
                 </div>
                 <div style={{display:'flex',gap:20,fontSize:'.75rem',color:'var(--t3)',flexWrap:'wrap'}}>
-                  <span>👤 {cl.first_name} {cl.last_name} ({cl.email})</span>
-                  <span>👥 {cl.employee_count} employees</span>
-                  <span>🔧 {cl.contractor_count} contractors</span>
-                  <span>▶ {cl.payroll_run_count} payroll runs</span>
-                  <span>📅 Since {new Date(cl.access_since).toLocaleDateString()}</span>
+                  <span>👤 {cl.firstName} {cl.lastName} ({cl.email})</span>
+                  <span>👥 {cl.employeeCount} employees</span>
+                  <span>🔧 {cl.contractorCount} contractors</span>
+                  <span>▶ {cl.payrollRunCount} payroll runs</span>
+                  <span>📅 Since {new Date(cl.accessSince).toLocaleDateString()}</span>
                 </div>
               </div>
               <div style={{display:'flex',gap:8,flexShrink:0}}>
-                <button className="btn bp bsm" onClick={()=>setActiveClient(cl.landlord_id,cl.business_name||cl.first_name+' '+cl.last_name)}>
-                  {activeClientId===cl.landlord_id?'✓ Active':'Switch To'}
+                <button className="btn bp bsm" onClick={()=>setActiveClient(cl.landlordId,cl.businessName||cl.firstName+' '+cl.lastName)}>
+                  {activeClientId===cl.landlordId?'✓ Active':'Switch To'}
                 </button>
-                {isAdmin&&<button className="btn bd bsm" onClick={()=>revoke('',cl.landlord_id)}>Revoke</button>}
+                {isAdmin&&<button className="btn bd bsm" onClick={()=>revoke('',cl.landlordId)}>Revoke</button>}
               </div>
             </div>
           </div>
@@ -2126,10 +2126,10 @@ function MyClients(){
               <tbody>
                 {(allBookkeepers as any[]).map((bk:any)=>(
                   <tr key={bk.id}>
-                    <td style={{fontWeight:600,color:'var(--t0)'}}>{bk.first_name} {bk.last_name}</td>
+                    <td style={{fontWeight:600,color:'var(--t0)'}}>{bk.firstName} {bk.lastName}</td>
                     <td style={{fontSize:'.75rem'}}>{bk.email}</td>
-                    <td className="mono">{bk.client_count}</td>
-                    <td style={{fontSize:'.72rem',color:'var(--t3)'}}>{new Date(bk.created_at).toLocaleDateString()}</td>
+                    <td className="mono">{bk.clientCount}</td>
+                    <td style={{fontSize:'.72rem',color:'var(--t3)'}}>{new Date(bk.createdAt).toLocaleDateString()}</td>
                   </tr>
                 ))}
               </tbody>

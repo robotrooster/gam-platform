@@ -81,7 +81,7 @@ export function AcceptInvitePage() {
 
         {step === 0 && (
           <div style={{ background: '#0a0d10', border: '1px solid #1e2530', borderRadius: 16, padding: 28 }}>
-            <div style={{ fontSize: '1.1rem', fontWeight: 800, color: '#eef1f8', marginBottom: 6 }}>Welcome, {user?.first_name}! 👋</div>
+            <div style={{ fontSize: '1.1rem', fontWeight: 800, color: '#eef1f8', marginBottom: 6 }}>Welcome, {user?.firstName}! 👋</div>
             <div style={{ fontSize: '.82rem', color: '#7a8aaa', marginBottom: 20, lineHeight: 1.6 }}>
               Your landlord has invited you to manage your tenancy through GAM.
             </div>
@@ -92,11 +92,11 @@ export function AcceptInvitePage() {
                 <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
                   <div style={{ width: 40, height: 40, borderRadius: 10, background: 'rgba(201,162,39,.12)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#c9a227' }}>🚪</div>
                   <div style={{ flex: 1 }}>
-                    <div style={{ fontSize: '.95rem', fontWeight: 700, color: '#eef1f8' }}>Unit {unit.unit_number}</div>
-                    <div style={{ fontSize: '.72rem', color: '#7a8aaa', marginTop: 2 }}>{unit.property_name} · {unit.street1}, {unit.city}</div>
+                    <div style={{ fontSize: '.95rem', fontWeight: 700, color: '#eef1f8' }}>Unit {unit.unitNumber}</div>
+                    <div style={{ fontSize: '.72rem', color: '#7a8aaa', marginTop: 2 }}>{unit.propertyName} · {unit.street1}, {unit.city}</div>
                   </div>
                   <div style={{ textAlign: 'right' }}>
-                    <div style={{ fontSize: '.95rem', color: '#c9a227', fontWeight: 700 }}>{fmt(unit.rent_amount)}</div>
+                    <div style={{ fontSize: '.95rem', color: '#c9a227', fontWeight: 700 }}>{fmt(unit.rentAmount)}</div>
                     <div style={{ fontSize: '.65rem', color: '#7a8aaa' }}>per month</div>
                   </div>
                 </div>

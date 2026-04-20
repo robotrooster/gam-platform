@@ -71,7 +71,7 @@ export function TenantNotificationsPage() {
                   {!n.read && <div style={{ width:8, height:8, borderRadius:'50%', background:'#c9a227', flexShrink:0, marginTop:4 }}/>}
                 </div>
                 <div style={{ fontSize:'.65rem', color:'#2a3040', marginTop:8, textAlign:'right' }}>
-                  {new Date(n.created_at).toLocaleString()}
+                  {new Date(n.createdAt).toLocaleString()}
                 </div>
               </div>
             )

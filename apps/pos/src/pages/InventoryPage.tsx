@@ -20,10 +20,10 @@ export function InventoryPage() {
                   <td style={{fontWeight:500}}>{item.name || '—'}</td>
                   <td className="mono" style={{fontSize:'.78rem',color:'var(--text-3)'}}>{item.sku || '—'}</td>
                   <td><span className="badge badge-muted">{item.category || '—'}</span></td>
-                  <td className="mono"><span style={{color: item.quantity <= (item.reorder_point || 0) ? 'var(--amber)' : 'var(--text-0)'}}>{item.quantity ?? '—'}</span></td>
-                  <td className="mono">{fmt(item.unit_price)}</td>
-                  <td className="mono" style={{color:'var(--green)'}}>{fmt((item.quantity || 0) * (item.unit_price || 0))}</td>
-                  <td><span className={`badge ${item.quantity <= 0 ? 'badge-red' : item.quantity <= (item.reorder_point || 0) ? 'badge-amber' : 'badge-green'}`}>{item.quantity <= 0 ? 'out of stock' : item.quantity <= (item.reorder_point || 0) ? 'low stock' : 'in stock'}</span></td>
+                  <td className="mono"><span style={{color: item.quantity <= (item.reorderPoint || 0) ? 'var(--amber)' : 'var(--text-0)'}}>{item.quantity ?? '—'}</span></td>
+                  <td className="mono">{fmt(item.unitPrice)}</td>
+                  <td className="mono" style={{color:'var(--green)'}}>{fmt((item.quantity || 0) * (item.unitPrice || 0))}</td>
+                  <td><span className={`badge ${item.quantity <= 0 ? 'badge-red' : item.quantity <= (item.reorderPoint || 0) ? 'badge-amber' : 'badge-green'}`}>{item.quantity <= 0 ? 'out of stock' : item.quantity <= (item.reorderPoint || 0) ? 'low stock' : 'in stock'}</span></td>
                 </tr>
               )) : (
                 <tr><td colSpan={7} style={{textAlign:'center',color:'var(--text-3)',padding:32}}>No inventory items yet.</td></tr>
