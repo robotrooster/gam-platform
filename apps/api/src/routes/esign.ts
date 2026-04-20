@@ -196,16 +196,23 @@ async function createDocumentRecord(client: any, opts: {
       'SELECT * FROM lease_document_signers WHERE document_id=$1',
       [doc.id]).then((r: any) => r.rows)
 
+    const prefillValues: Record<string,string> = (opts as any).prefillValues || {}
     for (const f of tmplFields as any[]) {
       if (f.signer_role && !filledRoles.has(f.signer_role)) continue
       const signer = (docSigners as any[]).find((s: any) => s.role === f.signer_role)
+      // If this field is bound to a lease_column and the send form supplied a value,
+      // persist it now so it auto-renders for signers. Signature/initial/date_signed
+      // are filled by signers themselves and are never prefilled here.
+      const prefill = f.lease_column && prefillValues[f.lease_column] != null
+        ? String(prefillValues[f.lease_column])
+        : null
       await client.query(`
         INSERT INTO lease_document_fields
           (document_id, template_field_id, signer_id, field_type, signer_role, label, lease_column,
-           page, x, y, width, height, required, font_css)
-        VALUES ($1,$2,$3,$4,$5,$6,$7, $8,$9,$10,$11,$12,$13,$14)`,
+           page, x, y, width, height, required, font_css, value)
+        VALUES ($1,$2,$3,$4,$5,$6,$7, $8,$9,$10,$11,$12,$13,$14,$15)`,
         [doc.id, f.id, signer?.id || null, f.field_type, f.signer_role, f.label, f.lease_column,
-         f.page, f.x, f.y, f.width, f.height, f.required, f.font_css])
+         f.page, f.x, f.y, f.width, f.height, f.required, f.font_css, prefill])
     }
   }
 
@@ -823,7 +830,7 @@ esignRouter.get('/batches', requireAuth, requireLandlord, async (req, res, next)
 esignRouter.post('/documents', requireAuth, requireLandlord, async (req, res, next) => {
   const client = await getClient()
   try {
-    const { templateId, unitId, title, signers, basePdfUrl } = req.body
+    const { templateId, unitId, title, signers, basePdfUrl, prefillValues } = req.body
     if (!title || !signers?.length) throw new AppError(400, 'title and signers required')
 
     // Validate signer shape
@@ -865,8 +872,9 @@ esignRouter.post('/documents', requireAuth, requireLandlord, async (req, res, ne
       documentType: 'original_lease',
       targetLeaseTenantId: null,
       promoteLeaseTenantId: null,
-      signers
-    })
+      signers,
+      prefillValues: prefillValues || {}
+    } as any)
 
     await client.query('COMMIT')
     res.status(201).json({ success: true, data: doc })

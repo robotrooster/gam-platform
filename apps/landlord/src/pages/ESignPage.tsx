@@ -416,7 +416,24 @@ function SendDocumentModal({ onClose }) {
   const [searches, setSearches] = useState([''])
   const [sending, setSending] = useState(false)
   const [error, setError] = useState('')
+  const [prefillValues, setPrefillValues] = useState<Record<string,string>>({})
   const { data: templates = [] } = useQuery('esign-templates', () => apiGet('/esign/templates'))
+  // Full template (with fields) — only fetched once a template is picked.
+  const { data: fullTemplate } = useQuery<any>(
+    ['esign-template', templateId],
+    () => apiGet(`/esign/templates/${templateId}`),
+    { enabled: !!templateId }
+  )
+  // Fields bound to a lease_column are the ones the landlord fills at send time.
+  // De-dupe by leaseColumn so the same column on multiple signer roles appears once.
+  const uniqueBoundFields: any[] = Array.from(
+    new Map(
+      ((fullTemplate?.fields || []) as any[])
+        .filter((f: any) => !!f.leaseColumn)
+        .map((f: any) => [f.leaseColumn, f])
+    ).values()
+  )
+  const onTemplateChange = (id: string) => { setTemplateId(id); setPrefillValues({}) }
   const { data: units = [] } = useQuery('units', () => apiGet('/units'))
   const existingTenants = units.filter(u => u.tenantEmail).map(u => ({ email: u.tenantEmail, name: u.tenantFirst + ' ' + u.tenantLast, unit: u.unitNumber, unitId: u.id, propertyName: u.propertyName }))
   const selectedTemplate = templates.find(t => t.id === templateId)
@@ -472,7 +489,7 @@ function SendDocumentModal({ onClose }) {
       })
       const unitId = firstTenant ? firstTenant.unitId : null
       const title = selectedTemplate ? selectedTemplate.name + (firstTenant ? ' — Unit ' + firstTenant.unit : '') : 'Lease Agreement'
-      const res = await apiPost('/esign/documents', { templateId, unitId, title, signers })
+      const res = await apiPost('/esign/documents', { templateId, unitId, title, signers, prefillValues })
       await apiPost('/esign/documents/' + res.data.id + '/send', {})
       qc.invalidateQueries('esign-documents')
       onClose()
@@ -488,7 +505,7 @@ function SendDocumentModal({ onClose }) {
         </div>
         <div style={{ marginBottom:16 }}>
           <label style={{ fontSize:'.72rem', fontWeight:600, color:'var(--text-3)', textTransform:'uppercase', letterSpacing:'.06em', display:'block', marginBottom:6 }}>Template *</label>
-          <select className='input' style={{ width:'100%' }} value={templateId} onChange={e => setTemplateId(e.target.value)} autoFocus>
+          <select className='input' style={{ width:'100%' }} value={templateId} onChange={e => onTemplateChange(e.target.value)} autoFocus>
             <option value=''>Select a template…</option>
             {templates.map(t => <option key={t.id} value={t.id}>{t.name} ({t.fieldCount} fields)</option>)}
           </select>
@@ -517,6 +534,25 @@ function SendDocumentModal({ onClose }) {
           })}
           <button className='btn btn-ghost btn-sm' onClick={() => { setTenantEmails(prev => [...prev,'']); setSearches(prev => [...prev,'']) }}><Plus size={12} /> Add another tenant</button>
         </div>
+        {uniqueBoundFields.length > 0 && (
+          <div style={{ marginBottom:16 }}>
+            <label style={{ fontSize:'.72rem', fontWeight:600, color:'var(--text-3)', textTransform:'uppercase', letterSpacing:'.06em', display:'block', marginBottom:6 }}>Document Values</label>
+            <div style={{ padding:'10px 12px', background:'var(--bg-2)', border:'1px solid var(--border-0)', borderRadius:10, display:'flex', flexDirection:'column', gap:8 }}>
+              {uniqueBoundFields.map((f: any) => {
+                const meta = (DATA_LABELS[f.fieldType] || []).find((o: any) => o.value === f.leaseColumn)
+                const niceLabel = meta ? meta.label : f.leaseColumn
+                const inputType = f.fieldType === 'date' ? 'date' : 'text'
+                return (
+                  <div key={f.leaseColumn}>
+                    <label style={{ fontSize:'.68rem', color:'var(--text-3)', display:'block', marginBottom:2 }}>{niceLabel}</label>
+                    <input className='input' type={inputType} value={prefillValues[f.leaseColumn] || ''} onChange={e => setPrefillValues(prev => ({ ...prev, [f.leaseColumn]: e.target.value }))} style={{ width:'100%', fontSize:'.78rem' }} />
+                  </div>
+                )
+              })}
+              <div style={{ fontSize:'.62rem', color:'var(--text-3)', marginTop:2 }}>Blank values can be left for the signer to fill in.</div>
+            </div>
+          </div>
+        )}
         {templateId && tenantEmails.some(e => e.trim()) && (
           <div style={{ padding:'10px 14px', background:'var(--bg-2)', border:'1px solid var(--border-0)', borderRadius:10, marginBottom:16, fontSize:'.75rem', color:'var(--text-2)', lineHeight:1.8 }}>
             <div><strong>Template:</strong> {selectedTemplate && selectedTemplate.name}</div>
