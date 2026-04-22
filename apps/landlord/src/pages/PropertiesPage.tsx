@@ -4,6 +4,7 @@ import { useNavigate } from 'react-router-dom'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
 import { Building2, Plus, MapPin, Home, ChevronRight, DoorOpen, Users, DollarSign, X, Check, Edit2 } from 'lucide-react'
 import { AddUnitModal } from './AddUnitModal'
+import { UNIT_TYPES, UNIT_TYPE_LABEL, UNIT_TYPE_PREFIX, UNIT_TYPE_ICON, UNIT_TYPE_HAS_BEDROOMS, UnitType } from '@gam/shared'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
 const PROPERTY_TYPES = [
@@ -26,15 +27,14 @@ const TYPE_COLORS: Record<string, string> = {
   rv_nightly:  'var(--gold)',
 }
 
-const UNIT_TYPES = [
-  { value: 'apartment',   label: 'Apartment',   prefix: 'APT', icon: '🏢' },
-  { value: 'house',       label: 'House',        prefix: 'HSE', icon: '🏠' },
-  { value: 'mobile_home', label: 'Mobile Home',  prefix: 'MH',  icon: '🏡' },
-  { value: 'rv_spot',     label: 'RV Spot',      prefix: 'RV',  icon: '🚐' },
-  { value: 'storage',     label: 'Storage',      prefix: 'STG', icon: '📦' },
-  { value: 'commercial',  label: 'Commercial',   prefix: 'COM', icon: '🏪' },
-  { value: 'other',       label: 'Other',        prefix: 'UNIT',icon: '🔑' },
-]
+// Unit type options derived from @gam/shared single source of truth.
+// Removed: 'house' (DB CHECK uses 'single_family'), 'other' (not in CHECK).
+const UNIT_TYPE_OPTIONS = UNIT_TYPES.map(value => ({
+  value,
+  label:  UNIT_TYPE_LABEL[value],
+  prefix: UNIT_TYPE_PREFIX[value],
+  icon:   UNIT_TYPE_ICON[value],
+}))
 
 function AddEditModal({ property, onClose }: { property?: any; onClose: () => void }) {
   const qc = useQueryClient()
@@ -73,12 +73,12 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
           // Init unit groups
           const groups: Record<string, any> = {}
           form.unitTypes.forEach((t: string) => {
-            const ut = UNIT_TYPES.find(u => u.value === t)
+            const ut = UNIT_TYPE_OPTIONS.find(u => u.value === t)
             groups[t] = { count: '', prefix: ut?.prefix || 'UNIT', rentAmount: '', securityDeposit: '' }
           })
           // Init one batch per selected type
           const initBatches = form.unitTypes.map((t: string) => {
-            const ut = UNIT_TYPES.find((u: any) => u.value === t)
+            const ut = UNIT_TYPE_OPTIONS.find((u: any) => u.value === t)
             return { id: Math.random().toString(36).slice(2), type: t, count: '', prefix: ut?.prefix || 'UNIT', rentAmount: '', securityDeposit: '', bedrooms: '' }
           })
           setBatches(initBatches)
@@ -148,7 +148,7 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
   }
 
   const addBatch = (type: string) => {
-    const ut = UNIT_TYPES.find(u => u.value === type)
+    const ut = UNIT_TYPE_OPTIONS.find(u => u.value === type)
     setBatches(b => [...b, { id: Math.random().toString(36).slice(2), type, count: '', prefix: ut?.prefix || 'UNIT', rentAmount: '', securityDeposit: '', bedrooms: '' }])
   }
 
@@ -186,7 +186,7 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
             <div style={{ marginBottom: 12 }}>
               <label style={lbl}>Unit Types <span style={{ fontWeight: 400, textTransform: 'none' }}>(select all that apply)</span></label>
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 6 }}>
-                {UNIT_TYPES.map(t => {
+                {UNIT_TYPE_OPTIONS.map(t => {
                   const on = form.unitTypes.includes(t.value)
                   return (
                     <div key={t.value} onClick={() => toggleUnitType(t.value)} style={{ padding: '6px 8px', borderRadius: 8, cursor: 'pointer', border: `1px solid ${on ? 'var(--gold)' : 'var(--border-0)'}`, background: on ? 'rgba(201,162,39,.08)' : 'var(--bg-2)', textAlign: 'center', transition: 'all .12s' }}>
@@ -294,9 +294,9 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
 
           <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
             {form.unitTypes.map((type: string) => {
-              const ut = UNIT_TYPES.find((u: any) => u.value === type)!
+              const ut = UNIT_TYPE_OPTIONS.find((u: any) => u.value === type)!
               const typeBatches = batches.filter(b => b.type === type)
-              const showBeds = ['apartment','house','mobile_home'].includes(type)
+              const showBeds = UNIT_TYPE_HAS_BEDROOMS[type as UnitType] ?? false
               return (
                 <div key={type} style={{ padding: 14, background: 'var(--bg-2)', border: '1px solid var(--border-0)', borderRadius: 10 }}>
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>

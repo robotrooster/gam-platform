@@ -2,6 +2,7 @@
 import { useState, useRef, useCallback, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPatch, apiDelete, apiPut } from '../lib/api'
+import { LEASE_COLUMNS, LEASE_COLUMN_LABEL, LEASE_COLUMN_INPUT } from '@gam/shared'
 import { useAuth } from '../context/AuthContext'
 import { Plus, X, FileText, Send, Settings, Eye, Trash2, ChevronRight, Check, AlertCircle, Download, MoreVertical } from 'lucide-react'
 
@@ -16,34 +17,17 @@ const FIELD_TYPES = [
 
 const SIGNER_ROLES = ['landlord','primary','co_tenant_1','co_tenant_2','witness']
 
-// Keep in sync with lease_template_fields.lease_column CHECK constraint (21 values).
-// Only the text/date subset is surfaced in the Field Properties dropdown today —
-// signature/initial/date_signed bindings are implied by field type + signer role.
+// DATA_LABELS derived from the shared lease_column registry. Single source
+// of truth is @gam/shared — adding a value there automatically surfaces it
+// (or not, if LEASE_COLUMN_INPUT is 'implicit'). No local drift possible.
+// Signature/initial bindings are 'implicit' (field type + signer role).
 const DATA_LABELS: Record<string, Array<{value:string; label:string}>> = {
-  text: [
-    { value:'tenant_name',            label:'Tenant name' },
-    { value:'tenant_email',           label:'Tenant email' },
-    { value:'landlord_name',          label:'Landlord name' },
-    { value:'rent_amount',            label:'Rent amount' },
-    { value:'security_deposit',       label:'Security deposit' },
-    { value:'rent_due_day',           label:'Rent due day' },
-    { value:'late_fee_grace_days',    label:'Late fee grace days' },
-    { value:'late_fee_amount',        label:'Late fee amount' },
-    { value:'lease_type',             label:'Lease type' },
-    { value:'auto_renew',             label:'Auto-renew (Yes/No)' },
-    { value:'auto_renew_mode',        label:'Auto-renew mode' },
-    { value:'notice_days_required',   label:'Notice days required' },
-    { value:'expiration_notice_days', label:'Expiration notice days' },
-    { value:'custom_text',            label:'Custom text (entered at send time)' },
-    { value:'unit_number',            label:'Unit number' },
-    { value:'property_name',          label:'Property name' },
-    { value:'property_address',       label:'Property address' },
-  ],
-  date: [
-    { value:'start_date',  label:'Lease start date' },
-    { value:'end_date',    label:'Lease end date' },
-    { value:'date_signed', label:'Date signed' },
-  ],
+  text: LEASE_COLUMNS
+    .filter(c => LEASE_COLUMN_INPUT[c] === 'text')
+    .map(c => ({ value: c, label: LEASE_COLUMN_LABEL[c] })),
+  date: LEASE_COLUMNS
+    .filter(c => LEASE_COLUMN_INPUT[c] === 'date')
+    .map(c => ({ value: c, label: LEASE_COLUMN_LABEL[c] })),
 }
 const ROLE_COLORS: Record<string,string> = {
   landlord:'#c9a227', primary:'#22c55e', co_tenant_1:'#4a9eff', co_tenant_2:'#a78bfa', witness:'#f59e0b'

@@ -15,7 +15,7 @@ const registerSchema = z.object({
   firstName: z.string().min(1),
   lastName:  z.string().min(1),
   phone:     z.string().optional(),
-  role:      z.enum([UserRole.LANDLORD, UserRole.TENANT]),
+  role:      z.enum(['landlord', 'tenant']),
 })
 
 const loginSchema = z.object({
@@ -46,7 +46,7 @@ authRouter.post('/register', async (req, res, next) => {
       ).then(r => r.rows)
 
       let profileId: string
-      if (body.role === UserRole.LANDLORD) {
+      if (body.role === 'landlord') {
         const [l] = await client.query(
           `INSERT INTO landlords (user_id) VALUES ($1) RETURNING id`, [user.id]
         ).then(r => r.rows)

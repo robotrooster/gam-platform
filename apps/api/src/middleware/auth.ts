@@ -1,6 +1,6 @@
 import { Request, Response, NextFunction } from 'express'
 import jwt from 'jsonwebtoken'
-import { UserRole } from '@gam/shared'
+import { UserRole, LandlordAssignableRole } from '@gam/shared'
 
 export interface AuthPayload {
   userId:      string
@@ -44,6 +44,18 @@ export function requireRole(...roles: UserRole[]) {
   }
 }
 
-export const requireAdmin    = requireRole(UserRole.ADMIN, UserRole.SUPER_ADMIN)
-export const requireLandlord = requireRole(UserRole.ADMIN, UserRole.SUPER_ADMIN, UserRole.LANDLORD)
-export const requireTenant   = requireRole(UserRole.ADMIN, UserRole.SUPER_ADMIN, UserRole.TENANT)
+export const requireAdmin    = requireRole('admin', 'super_admin')
+export const requireLandlord = requireRole('admin', 'super_admin', 'landlord')
+export const requireTenant   = requireRole('admin', 'super_admin', 'tenant')
+
+// Landlord-assignable role wrappers. Also allow admin/super_admin/landlord
+// for oversight — landlords need to be able to hit these endpoints to
+// manage their scoped users.
+export function requireLandlordAssignableRole(...roles: LandlordAssignableRole[]) {
+  return requireRole('admin', 'super_admin', 'landlord', ...roles)
+}
+
+export const requirePropertyManager = requireLandlordAssignableRole('property_manager')
+export const requireOnsiteManager   = requireLandlordAssignableRole('onsite_manager')
+export const requireMaintenance     = requireLandlordAssignableRole('maintenance')
+export const requireBookkeeper      = requireLandlordAssignableRole('bookkeeper')

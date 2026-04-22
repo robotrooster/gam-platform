@@ -26,13 +26,13 @@ import { stripeRouter }       from './routes/stripe'
 import { teamRouter }         from './routes/team'
 import { workTradeRouter }    from './routes/workTrade'
 import { posRouter }          from './routes/pos'
-import { pmRouter }           from './routes/pm'
 import { reportsRouter }      from './routes/reports'
 import { maintenancePortalRouter } from './routes/maintenance-portal'
 import { esignRouter }        from './routes/esign'
 import { backgroundRouter }   from './routes/background'
 import { announcementsRouter }  from './routes/announcements'
 import { booksRouter } from './routes/books'
+import { scopesRouter, invitationsRouter } from './routes/scopes'
 import { bulletinRouter }      from './routes/bulletin'
 import { notificationsRouter } from './routes/notifications'
 import { fitnessRouter }      from './routes/fitness'
@@ -106,7 +106,6 @@ app.use('/api/team',          teamRouter)
 app.use('/api/work-trade',    workTradeRouter)
 app.use('/api/stripe',        stripeRouter)
 app.use('/api/pos',           posRouter)
-app.use('/api/pm',            pmRouter)
 app.use('/api/reports',       reportsRouter)
 // Allow PDF embedding for file routes
 app.use('/api/esign/files', (req, res, next) => {
@@ -128,6 +127,8 @@ app.use('/api/bulletin',       bulletinRouter)
 app.use('/api/fitness',        fitnessRouter)
 app.use('/api/notifications',  notificationsRouter)
 app.use('/api/books',          booksRouter)
+app.use('/api/scopes',         scopesRouter)
+app.use('/api/invitations',    invitationsRouter)
 app.use('/webhooks',          webhooksRouter)
 
 app.use(errorHandler)

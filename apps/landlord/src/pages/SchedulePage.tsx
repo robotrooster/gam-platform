@@ -1,10 +1,10 @@
 import { useState, useRef, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
+import { UNIT_TYPES } from '@gam/shared'
 
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
-const UNIT_TYPES = ['residential','rv_spot','storage','parking','short_term_cabin']
 const UNIT_TYPE_LABELS: Record<string,string> = {
   residential:'🏠 Residential', rv_spot:'🚐 RV Spot', storage:'📦 Storage',
   parking:'🅿️ Parking', short_term_cabin:'🏕️ Short-Term Cabin'

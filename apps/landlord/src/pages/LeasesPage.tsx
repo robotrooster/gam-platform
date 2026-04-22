@@ -3,25 +3,18 @@ import { useQuery } from 'react-query'
 import { useSearchParams } from 'react-router-dom'
 import { apiGet } from '../lib/api'
 import { Plus, AlertTriangle } from 'lucide-react'
+import { LEASE_TYPE_LABEL, LeaseStatus, LEASE_STATUS_LABEL } from '@gam/shared'
 import { LeaseFormModal } from './LeaseFormModal'
 
 const fmt = (n: any) => n != null
   ? '$' + Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
   : '—'
 
-const STATUS_MAP: Record<string, string> = {
-  active: 'badge-green',
-  expired: 'badge-red',
-  pending: 'badge-amber',
+const STATUS_MAP: Record<LeaseStatus, string> = {
+  pending:    'badge-amber',
+  active:     'badge-green',
+  expired:    'badge-red',
   terminated: 'badge-muted',
-}
-
-const LEASE_TYPE_LABELS: Record<string, string> = {
-  month_to_month: 'Month-to-month',
-  fixed_term: 'Fixed term',
-  nightly: 'Nightly',
-  weekly: 'Weekly',
-  nnn_commercial: 'NNN Commercial',
 }
 
 export function LeasesPage() {
@@ -144,7 +137,7 @@ export function LeasesPage() {
                       )}
                     </td>
                     <td style={{ fontSize: '.78rem', color: 'var(--text-2)' }}>
-                      {LEASE_TYPE_LABELS[l.leaseType] || l.leaseType || '—'}
+                      {LEASE_TYPE_LABEL[l.leaseType as keyof typeof LEASE_TYPE_LABEL] || l.leaseType || '—'}
                     </td>
                     <td className="mono">{l.startDate ? new Date(l.startDate).toLocaleDateString() : '—'}</td>
                     <td className="mono">
@@ -154,7 +147,7 @@ export function LeasesPage() {
                     </td>
                     <td className="mono" style={{ color: 'var(--text-0)' }}>{fmt(l.rentAmount)}</td>
                     <td>
-                      <span className={'badge ' + (STATUS_MAP[l.status] || 'badge-muted')}>
+                      <span className={'badge ' + (STATUS_MAP[l.status as LeaseStatus] || 'badge-muted')}>
                         {l.status?.replace('_', ' ') || '—'}
                       </span>
                     </td>

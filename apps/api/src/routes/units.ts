@@ -3,7 +3,7 @@ import { z } from 'zod'
 import { query, queryOne } from '../db'
 import { requireAuth, requireLandlord } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
-import { UnitStatus, calcNetPerUnit, getReservePhase, PLATFORM_FEES } from '@gam/shared'
+import { UnitStatus, calcNetPerUnit, getReservePhase, PLATFORM_FEES, UNIT_STATUSES } from '@gam/shared'
 import { formatUnitNumber } from '../lib/format'
 
 export const unitsRouter = Router()
@@ -98,7 +98,7 @@ unitsRouter.post('/', requireLandlord, async (req, res, next) => {
 unitsRouter.patch('/:id/status', requireLandlord, async (req, res, next) => {
   try {
     const { status } = z.object({
-      status: z.nativeEnum(UnitStatus)
+      status: z.enum([...UNIT_STATUSES] as [string, ...string[]])
     }).parse(req.body)
 
     const unit = await queryOne<any>(`SELECT * FROM units WHERE id = $1`, [req.params.id])

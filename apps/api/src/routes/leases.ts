@@ -1,6 +1,7 @@
 import { Router } from 'express'
 import { z } from 'zod'
 import { query, queryOne } from '../db'
+import { LEASE_TYPES, AUTO_RENEW_MODES, LEASE_STATUSES } from '@gam/shared'
 import { requireAuth, requireLandlord } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 
@@ -134,14 +135,14 @@ leasesRouter.get('/:id', async (req, res, next) => {
 leasesRouter.patch('/:id', requireLandlord, async (req, res, next) => {
   try {
     const body = z.object({
-      status: z.enum(['pending', 'active', 'expired', 'terminated']).optional(),
+      status: z.enum(LEASE_STATUSES).optional(),
       startDate: z.string().optional(),
       endDate: z.string().nullable().optional(),
       rentAmount: z.number().positive().optional(),
       securityDeposit: z.number().min(0).optional(),
-      leaseType: z.enum(['month_to_month', 'fixed_term', 'nightly', 'weekly', 'nnn_commercial']).optional(),
+      leaseType: z.enum(LEASE_TYPES).optional(),
       autoRenew: z.boolean().optional(),
-      autoRenewMode: z.enum(['extend_same_term', 'convert_to_month_to_month']).nullable().optional(),
+      autoRenewMode: z.enum(AUTO_RENEW_MODES).nullable().optional(),
       noticeDaysRequired: z.number().int().min(0).optional(),
       expirationNoticeDays: z.number().int().min(0).optional(),
       needsReview: z.boolean().optional(),

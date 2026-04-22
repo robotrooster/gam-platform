@@ -1,4 +1,5 @@
 import { Resend } from 'resend'
+import { LandlordAssignableRole, LANDLORD_ASSIGNABLE_ROLE_LABEL } from '@gam/shared'
 
 const resend = new Resend(process.env.RESEND_API_KEY)
 const FROM = process.env.EMAIL_FROM || 'GAM Platform <onboarding@resend.dev>'
@@ -148,6 +149,21 @@ export async function emailSigningCompleted(to: string, signerName: string, docu
         <div style="color:#eef1f8;margin-top:2px">${new Date().toLocaleDateString()}</div>
       </div>` +
       (pdfUrl ? btn('Download Signed Document', pdfUrl) : btn('View in Portal', portalUrl))
+    )
+  )
+}
+
+// ── INVITATION EMAILS ─────────────────────────────────────────
+
+export async function emailInvitation(to: string, inviterName: string, role: LandlordAssignableRole, acceptUrl: string) {
+  const roleLabel = LANDLORD_ASSIGNABLE_ROLE_LABEL[role]
+  await send(to, `${inviterName} invited you to join GAM as ${roleLabel}`,
+    base(
+      h("You've been invited") +
+      p(`<strong style="color:#eef1f8">${inviterName}</strong> has invited you to join Gold Asset Management as a <strong style="color:#eef1f8">${roleLabel}</strong>.`) +
+      p('Click below to accept and set up your account. This invitation expires in 24 hours.') +
+      btn('Accept Invitation', acceptUrl) +
+      `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">If you were not expecting this invitation, you can safely ignore this email.</div>`
     )
   )
 }

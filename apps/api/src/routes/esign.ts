@@ -1,4 +1,13 @@
 import { Router } from 'express'
+import {
+  LeaseDocumentType,
+  UnitType,
+  LeaseColumn,
+  LeaseColumnVals,
+  LEASE_COLUMN_CATEGORY,
+  WRITABLE_LEASE_COLUMN_SPECS,
+  WritableLeaseColumnSqlValue,
+} from '@gam/shared'
 import { query, queryOne, getClient } from '../db'
 import { requireAuth, requireLandlord } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
@@ -19,19 +28,6 @@ export const esignRouter = Router()
 const LANDLORD_APP_URL = process.env.LANDLORD_APP_URL || 'http://localhost:3001'
 const TENANT_APP_URL   = process.env.TENANT_APP_URL   || 'http://localhost:3002'
 
-const LEASE_COLUMNS = [
-  'tenant_name','tenant_email','landlord_name',
-  'rent_amount','start_date','end_date',
-  'security_deposit','rent_due_day',
-  'late_fee_grace_days','late_fee_amount',
-  'lease_type','auto_renew','auto_renew_mode',
-  'notice_days_required','expiration_notice_days',
-  'tenant_signature','landlord_signature',
-  'tenant_initial','landlord_initial',
-  'date_signed','custom_text',
-  'unit_number','property_name','property_address'
-]
-
 // Signer roles: exactly one 'primary', zero-or-more 'co_tenant_N', at least one
 // 'landlord', optional 'witness'. Template slots that aren't filled at document
 // creation time get their fields pruned (see POST /documents).
@@ -43,7 +39,7 @@ function isTenantRole(role: string): boolean { return TENANT_ROLE_PATTERN.test(r
 // ─────────────────────────────────────────────────────────────
 
 type Bucket = 'residential' | 'storage' | 'commercial'
-function bucketFor(unitType: string): Bucket {
+function bucketFor(unitType: UnitType): Bucket {
   if (unitType === 'storage') return 'storage'
   if (unitType === 'commercial') return 'commercial'
   return 'residential'
@@ -158,7 +154,7 @@ async function createDocumentRecord(client: any, opts: {
   leaseId: string | null,
   title: string,
   basePdfUrl: string | null,
-  documentType: 'original_lease' | 'addendum_add' | 'addendum_remove' | 'addendum_terms',
+  documentType: LeaseDocumentType,
   targetLeaseTenantId: string | null,
   promoteLeaseTenantId: string | null,
   signers: Array<{ userId: string, role: string, name: string, email: string, phone?: string | null, orderIndex?: number }>
@@ -349,11 +345,16 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
   const fields = await client.query(
     `SELECT lease_column, value, signer_role FROM lease_document_fields
      WHERE document_id=$1 AND lease_column IS NOT NULL`, [doc.id]).then(r => r.rows)
-  const vals: Record<string, string | null> = {}
+  // Only writable columns make it into `vals` — signature + identity columns
+  // filtered out via shared category map. No hand-maintained blacklist.
+  const vals: LeaseColumnVals = {}
   for (const f of fields) {
-    if (!f.lease_column) continue
-    if (['tenant_signature','landlord_signature','tenant_initial','landlord_initial','date_signed','custom_text'].includes(f.lease_column)) continue
-    vals[f.lease_column] = f.value
+    const col = f.lease_column as LeaseColumn | null
+    if (!col) continue
+    if (!(col in LEASE_COLUMN_CATEGORY)) continue
+    if (LEASE_COLUMN_CATEGORY[col] !== 'writable') continue
+    if (f.value == null) continue
+    vals[col] = f.value
   }
 
   // Gather all tenant signers
@@ -395,36 +396,39 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
   const start = new Date(startDate)
   const leaseStatus = start > today ? 'pending' : 'active'
 
-  const leaseType = vals.lease_type || 'fixed_term'
-  const autoRenew = vals.auto_renew === 'true' || vals.auto_renew === 'yes'
-  const autoRenewMode = autoRenew ? (vals.auto_renew_mode || 'convert_to_month_to_month') : null
+  // INSERT lease — writable-column portion dynamically assembled from the
+  // shared spec registry. Adding a new writable value to WRITABLE_LEASE_COLUMN_SPECS
+  // in @gam/shared automatically wires it into lease creation; no change here.
+  // Object.entries preserves insertion order → column list and values align pairwise.
+  const writableCols: string[] = []
+  const writablePlaceholders: string[] = []
+  const writableValues: WritableLeaseColumnSqlValue[] = []
+  let paramIdx = 1
+  for (const [, spec] of Object.entries(WRITABLE_LEASE_COLUMN_SPECS)) {
+    writableCols.push(spec.dbColumn)
+    writablePlaceholders.push('$' + paramIdx)
+    writableValues.push(spec.parse(vals))
+    paramIdx++
+  }
+  // Fixed-shape tail columns (not driven by lease_column fields)
+  const tailCols = ['unit_id', 'landlord_id', 'status']
+  const tailValues: (string | null)[] = [doc.unit_id, doc.landlord_id, leaseStatus]
+  const tailPlaceholders = tailCols.map((_, i) => '$' + (paramIdx + i))
 
-  // INSERT lease
-  const lease = await client.query(`
-    INSERT INTO leases (
-      unit_id, landlord_id, status,
-      start_date, end_date, rent_amount, rent_due_day,
-      security_deposit, late_fee_grace_days, late_fee_amount,
-      lease_type, auto_renew, auto_renew_mode,
-      notice_days_required, expiration_notice_days,
-      signed_by_landlord, signed_by_tenant, signed_at,
-      needs_review
-    ) VALUES (
-      $1,$2,$3,
-      $4,$5,$6,$7,
-      $8,$9,$10,
-      $11,$12,$13,
-      $14,$15,
-      TRUE, TRUE, NOW(),
-      FALSE
-    ) RETURNING id, status`,
-    [
-      doc.unit_id, doc.landlord_id, leaseStatus,
-      startDate, vals.end_date || null, rentAmount, parseInt(vals.rent_due_day || '1'),
-      vals.security_deposit || 0, parseInt(vals.late_fee_grace_days || '5'), vals.late_fee_amount || 15,
-      leaseType, autoRenew, autoRenewMode,
-      parseInt(vals.notice_days_required || '30'), parseInt(vals.expiration_notice_days || '60')
-    ]).then(r => r.rows[0])
+  const lease = await client.query(
+    `INSERT INTO leases (
+       ${writableCols.join(', ')},
+       ${tailCols.join(', ')},
+       signed_by_landlord, signed_by_tenant, signed_at,
+       needs_review
+     ) VALUES (
+       ${writablePlaceholders.join(', ')},
+       ${tailPlaceholders.join(', ')},
+       TRUE, TRUE, NOW(),
+       FALSE
+     ) RETURNING id, status`,
+    [...writableValues, ...tailValues]
+  ).then(r => r.rows[0])
 
   // INSERT lease_tenants rows — one per signer, with per-tenant supersedes chain
   for (const t of tenantSigners) {
@@ -745,7 +749,7 @@ esignRouter.put('/templates/:id/fields', requireAuth, requireLandlord, async (re
     if (!template) throw new AppError(404, 'Template not found')
 
     for (const f of (fields || [])) {
-      if (f.leaseColumn && !LEASE_COLUMNS.includes(f.leaseColumn)) {
+      if (f.leaseColumn && !(f.leaseColumn in LEASE_COLUMN_CATEGORY)) {
         throw new AppError(400, `Invalid lease_column: ${f.leaseColumn}`)
       }
       if (f.signerRole && !(f.signerRole === 'landlord' || f.signerRole === 'witness' || isTenantRole(f.signerRole))) {

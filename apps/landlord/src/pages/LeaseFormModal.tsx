@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useMutation, useQuery, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
+import { LeaseType, LEASE_TYPE_LABEL, AutoRenewMode } from '@gam/shared'
 import { X, Check, DollarSign, AlertTriangle } from 'lucide-react'
 
 interface Props {
@@ -8,17 +9,6 @@ interface Props {
   leaseId?: string  // if provided, modal is in edit mode
   preselectedUnitId?: string
   preselectedTenantId?: string
-}
-
-type LeaseType = 'month_to_month' | 'fixed_term' | 'nightly' | 'weekly' | 'nnn_commercial'
-type AutoRenewMode = 'extend_same_term' | 'convert_to_month_to_month'
-
-const LEASE_TYPE_LABELS: Record<LeaseType, string> = {
-  month_to_month: 'Month-to-month',
-  fixed_term: 'Fixed term',
-  nightly: 'Nightly',
-  weekly: 'Weekly',
-  nnn_commercial: 'NNN Commercial',
 }
 
 const LABEL_STYLE: React.CSSProperties = {
@@ -146,7 +136,7 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
     if (!form.tenantId) errs.tenantId = 'Select a tenant'
     if (!form.startDate) errs.startDate = 'Start date required'
     if (form.leaseType !== 'month_to_month' && !form.endDate) {
-      errs.endDate = 'End date required for ' + LEASE_TYPE_LABELS[form.leaseType].toLowerCase() + ' leases'
+      errs.endDate = 'End date required for ' + LEASE_TYPE_LABEL[form.leaseType].toLowerCase() + ' leases'
     }
     if (form.leaseType === 'month_to_month' && form.endDate) {
       errs.endDate = 'Month-to-month leases cannot have an end date'
@@ -295,8 +285,8 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
               onChange={e => set('lease_type', e.target.value)}
               style={{ width: '100%' }}
             >
-              {(Object.keys(LEASE_TYPE_LABELS) as LeaseType[]).map(k => (
-                <option key={k} value={k}>{LEASE_TYPE_LABELS[k]}</option>
+              {(Object.keys(LEASE_TYPE_LABEL) as LeaseType[]).map(k => (
+                <option key={k} value={k}>{LEASE_TYPE_LABEL[k]}</option>
               ))}
             </select>
           </div>

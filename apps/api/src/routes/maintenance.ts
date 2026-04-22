@@ -4,7 +4,7 @@ import { query, queryOne } from '../db'
 import { requireAuth, requireLandlord } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { routeMaintenanceNotification, notifyMaintenanceUpdated } from '../services/notifications'
-import { PLATFORM_FEES } from '@gam/shared'
+import { PLATFORM_FEES, MAINTENANCE_PRIORITIES } from '@gam/shared'
 
 export const maintenanceRouter = Router()
 maintenanceRouter.use(requireAuth)
@@ -76,7 +76,7 @@ maintenanceRouter.post('/', async (req, res, next) => {
       unitId:      z.string().uuid(),
       title:       z.string().min(3),
       description: z.string().min(5),
-      priority:    z.enum(['emergency','high','normal','low']).default('normal'),
+      priority:    z.enum(MAINTENANCE_PRIORITIES).default('normal'),
       photos:      z.array(z.string()).optional(),
     }).parse(req.body)
 

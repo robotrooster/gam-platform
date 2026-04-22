@@ -109,6 +109,31 @@ async function processLeaseEnds() {
   } catch(e) { console.error('[SCHEDULER] lease end processor:', e) }
 }
 
+// ── INVITATION EXPIRY ───────────────────────────────────────
+// Hourly — flips pending invitations past expires_at to 'expired'
+// and writes an invitation.expired platform_events row with actor null
+// (expiry is a system event, not a user action).
+async function processInvitationExpiry() {
+  try {
+    const expired = await query<any>(`
+      UPDATE invitations
+      SET status = 'expired'
+      WHERE status = 'pending' AND expires_at < NOW()
+      RETURNING id
+    `)
+    for (const row of expired) {
+      await query(`
+        INSERT INTO platform_events
+          (subject_type, subject_id, event_type, actor_user_id, payload)
+        VALUES ('invitation', $1, 'invitation.expired', NULL, '{}'::jsonb)
+      `, [row.id])
+    }
+    if (expired.length > 0) {
+      console.log(`[InvitationExpiry] ${expired.length} invitation(s) expired`)
+    }
+  } catch(e) { console.error('[SCHEDULER] invitation expiry:', e) }
+}
+
 async function checkLowStock() {
   try {
     const landlords = await query('SELECT DISTINCT landlord_id FROM pos_items WHERE is_active=TRUE')
@@ -427,6 +452,10 @@ export function schedulerInit() {
     } catch (e) { console.error('[Scheduler] FlexCharge pull error:', e) }
   })
 
+  // ── INVITATION EXPIRY ───────────────────────────────────────
+  // Hourly at :10 — expire pending invitations past 24h TTL
+  cron.schedule('10 * * * *', processInvitationExpiry)
+
   // Run every hour — flip scheduled-activation units to active once due
   cron.schedule('5 * * * *', async () => {
     try {
@@ -464,5 +493,6 @@ export function schedulerInit() {
   console.log('   ✓ FlexDeposit pulls:    Daily 9am')
   console.log('   ✓ Utility billing:      15th of month, 10am')
   console.log('   ✓ NACHA monitoring:     Daily 8am')
-  console.log('   ✓ Unit activations:     Hourly at :05\n')
+  console.log('   ✓ Unit activations:     Hourly at :05')
+  console.log('   ✓ Invitation expiry:    Hourly at :10\n')
 }
