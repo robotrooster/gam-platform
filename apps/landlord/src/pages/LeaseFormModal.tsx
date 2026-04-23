@@ -60,7 +60,7 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
     noticeDaysRequired: '30',
     expirationNoticeDays: '60',
     lateFeeGraceDays: '5',
-    lateFeeAmount: '15.00',
+    lateFeeInitialAmount: '15.00',
     status: 'pending' as 'pending' | 'active' | 'expired' | 'terminated',
   })
   const [errors, setErrors] = useState<Record<string, string>>({})
@@ -82,7 +82,7 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
         noticeDaysRequired: String(existingLease.noticeDaysRequired ?? 30),
         expirationNoticeDays: String(existingLease.expirationNoticeDays ?? 60),
         lateFeeGraceDays: String(existingLease.lateFeeGraceDays ?? 5),
-        lateFeeAmount: existingLease.lateFeeAmount != null ? String(existingLease.lateFeeAmount) : '15.00',
+        lateFeeInitialAmount: existingLease.lateFeeInitialAmount != null ? String(existingLease.lateFeeInitialAmount) : '15.00',
         status: existingLease.status || 'pending',
       })
     }
@@ -165,7 +165,7 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
       noticeDaysRequired: Number(form.noticeDaysRequired) || 30,
       expirationNoticeDays: Number(form.expirationNoticeDays) || 60,
       lateFeeGraceDays: Number(form.lateFeeGraceDays) || 0,
-      lateFeeAmount: Number(form.lateFeeAmount) || 0,
+      lateFeeInitialAmount: Number(form.lateFeeInitialAmount) || 0,
     }
 
     if (isEdit) {
@@ -482,8 +482,8 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
                   className="input"
                   type="number"
                   step="0.01"
-                  value={form.lateFeeAmount}
-                  onChange={e => set('late_fee_amount', e.target.value)}
+                  value={form.lateFeeInitialAmount}
+                  onChange={e => set('late_fee_initial_amount', e.target.value)}
                   style={{ width: '100%', paddingLeft: 30 }}
                 />
               </div>

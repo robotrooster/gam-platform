@@ -398,76 +398,134 @@ export const LEASE_DOCUMENT_TYPE_LABEL: Record<LeaseDocumentType, string> = {
   addendum_terms:  'Change Lease Terms',
 }
 
-// Lease column identifiers — values that can be assigned to template fields
-// via lease_template_fields.lease_column. Single source of truth for the
-// lease_template_fields.lease_column CHECK constraint (24 values).
+// ============================================================================
+// LEASE COLUMN TAGS (PDF template editor → lease_template_fields.lease_column)
+// ----------------------------------------------------------------------------
+// Single source of truth for the lease_template_fields.lease_column CHECK (58
+// values as of S24). Every tag the landlord can bind to a PDF field lives
+// here. Category drives how the tag is consumed at lease-build time:
 //
-// Category determines how the value is consumed at lease-build time:
-//   - 'writable'  → participates in INSERT INTO leases (...)
-//   - 'identity'  → display + unit matching, never written to leases
-//   - 'signature' → pure document display (signatures, initials, etc.)
+//   - 'writable'    → writes directly to the leases row at finalize
+//   - 'identity'    → display + unit-identity validation, never written
+//   - 'signature'   → pure PDF display (signatures, initials)
+//   - 'fee_row'     → writes a row to lease_fees (S24+, consumed S29)
+//   - 'utility_row' → writes a row to lease_utility_assignments (S24+, S29)
 //
-// Adding a value: edit LEASE_COLUMNS, the compiler forces CATEGORY + LABEL +
-// INPUT updates. Adding a *writable* value: also add a WRITABLE_LEASE_COLUMN_SPECS
-// entry or the object literal fails to typecheck.
+// Adding a tag: edit LEASE_COLUMNS, compiler forces CATEGORY + LABEL + INPUT
+// updates. Adding a 'writable' tag: also add a WRITABLE_LEASE_COLUMN_SPECS
+// entry. Adding a 'fee_row' tag: also add a FEE_ROW_SPECS entry. Adding a
+// 'utility_row' tag: also add a UTILITY_ROW_SPECS entry. Object literals
+// won't typecheck otherwise.
+// ============================================================================
+
 export const LEASE_COLUMNS = [
-  // writable — columns on the leases table
-  'rent_amount', 'start_date', 'end_date',
-  'security_deposit', 'rent_due_day',
-  'late_fee_grace_days', 'late_fee_amount',
-  'lease_type', 'auto_renew', 'auto_renew_mode',
-  'notice_days_required', 'expiration_notice_days',
-  // identity — display + unit matching
+  // identity — unit + party identification
   'tenant_name', 'tenant_email', 'landlord_name',
   'unit_number', 'property_name', 'property_address',
-  // signature — pure document display, never written to leases
+  // signature — PDF display only
   'tenant_signature', 'landlord_signature',
   'tenant_initial', 'landlord_initial',
-  'date_signed', 'custom_text',
+  'date_signed',
+  // writable (leases table) — core terms
+  'rent_amount', 'start_date', 'end_date', 'security_deposit',
+  'rent_due_day', 'lease_type', 'auto_renew', 'auto_renew_mode',
+  'notice_days_required', 'expiration_notice_days',
+  // writable (leases table) — late fee snapshot columns (see S24)
+  // Granular tag encoding: amount + (type, period) collapsed into tag name.
+  // Parser for each tag writes BOTH the amount column AND its sibling type /
+  // period column on leases. Property-level config is billing source of truth;
+  // lease columns are legal/audit snapshot.
+  'late_fee_grace_days',
+  'late_fee_initial_flat', 'late_fee_initial_percent',
+  'late_fee_accrual_flat_daily', 'late_fee_accrual_flat_weekly', 'late_fee_accrual_flat_monthly',
+  'late_fee_accrual_percent_daily', 'late_fee_accrual_percent_weekly', 'late_fee_accrual_percent_monthly',
+  'late_fee_cap_flat', 'late_fee_cap_percent',
+  // fee_row (lease_fees table) — one row per tag at finalize
+  'pet_deposit', 'key_deposit', 'cleaning_deposit',
+  'move_in_fee', 'cleaning_fee', 'pet_fee', 'application_fee',
+  'amenity_fee', 'hoa_transfer_fee', 'lease_prep_fee',
+  'pet_rent', 'parking_rent', 'storage_rent', 'amenity_fee_monthly',
+  'trash_fee', 'pest_control_fee', 'technology_fee',
+  'last_month_rent', 'early_termination_fee', 'other_fee',
+  // utility_row (lease_utility_assignments table) — per-utility responsibility
+  'utility_water_responsibility', 'utility_gas_responsibility',
+  'utility_electric_responsibility', 'utility_sewer_responsibility',
+  'utility_trash_responsibility',
+  // free-text escape
+  'custom_text',
 ] as const
 export type LeaseColumn = typeof LEASE_COLUMNS[number]
 
-export type LeaseColumnCategory = 'writable' | 'identity' | 'signature'
+export type LeaseColumnCategory = 'writable' | 'identity' | 'signature' | 'fee_row' | 'utility_row'
 export const LEASE_COLUMN_CATEGORY: Record<LeaseColumn, LeaseColumnCategory> = {
-  rent_amount:            'writable',
-  start_date:             'writable',
-  end_date:               'writable',
-  security_deposit:       'writable',
-  rent_due_day:           'writable',
-  late_fee_grace_days:    'writable',
-  late_fee_amount:        'writable',
-  lease_type:             'writable',
-  auto_renew:             'writable',
-  auto_renew_mode:        'writable',
-  notice_days_required:   'writable',
-  expiration_notice_days: 'writable',
+  // identity
   tenant_name:            'identity',
   tenant_email:           'identity',
   landlord_name:          'identity',
   unit_number:            'identity',
   property_name:          'identity',
   property_address:       'identity',
+  // signature
   tenant_signature:       'signature',
   landlord_signature:     'signature',
   tenant_initial:         'signature',
   landlord_initial:       'signature',
   date_signed:            'signature',
+  // writable — core
+  rent_amount:            'writable',
+  start_date:             'writable',
+  end_date:               'writable',
+  security_deposit:       'writable',
+  rent_due_day:           'writable',
+  lease_type:             'writable',
+  auto_renew:             'writable',
+  auto_renew_mode:        'writable',
+  notice_days_required:   'writable',
+  expiration_notice_days: 'writable',
+  // writable — late fee snapshots
+  late_fee_grace_days:                  'writable',
+  late_fee_initial_flat:                'writable',
+  late_fee_initial_percent:             'writable',
+  late_fee_accrual_flat_daily:          'writable',
+  late_fee_accrual_flat_weekly:         'writable',
+  late_fee_accrual_flat_monthly:        'writable',
+  late_fee_accrual_percent_daily:       'writable',
+  late_fee_accrual_percent_weekly:      'writable',
+  late_fee_accrual_percent_monthly:     'writable',
+  late_fee_cap_flat:                    'writable',
+  late_fee_cap_percent:                 'writable',
+  // fee_row
+  pet_deposit:            'fee_row',
+  key_deposit:            'fee_row',
+  cleaning_deposit:       'fee_row',
+  move_in_fee:            'fee_row',
+  cleaning_fee:           'fee_row',
+  pet_fee:                'fee_row',
+  application_fee:        'fee_row',
+  amenity_fee:            'fee_row',
+  hoa_transfer_fee:       'fee_row',
+  lease_prep_fee:         'fee_row',
+  pet_rent:               'fee_row',
+  parking_rent:           'fee_row',
+  storage_rent:           'fee_row',
+  amenity_fee_monthly:    'fee_row',
+  trash_fee:              'fee_row',
+  pest_control_fee:       'fee_row',
+  technology_fee:         'fee_row',
+  last_month_rent:        'fee_row',
+  early_termination_fee:  'fee_row',
+  other_fee:              'fee_row',
+  // utility_row
+  utility_water_responsibility:    'utility_row',
+  utility_gas_responsibility:      'utility_row',
+  utility_electric_responsibility: 'utility_row',
+  utility_sewer_responsibility:    'utility_row',
+  utility_trash_responsibility:    'utility_row',
+  // signature-category catch-all
   custom_text:            'signature',
 }
 
 export const LEASE_COLUMN_LABEL: Record<LeaseColumn, string> = {
-  rent_amount:            'Rent amount',
-  start_date:             'Lease start date',
-  end_date:               'Lease end date',
-  security_deposit:       'Security deposit',
-  rent_due_day:           'Rent due day',
-  late_fee_grace_days:    'Late fee grace days',
-  late_fee_amount:        'Late fee amount',
-  lease_type:             'Lease type',
-  auto_renew:             'Auto-renew (Yes/No)',
-  auto_renew_mode:        'Auto-renew mode',
-  notice_days_required:   'Notice days required',
-  expiration_notice_days: 'Expiration notice days',
   tenant_name:            'Tenant name',
   tenant_email:           'Tenant email',
   landlord_name:          'Landlord name',
@@ -479,6 +537,52 @@ export const LEASE_COLUMN_LABEL: Record<LeaseColumn, string> = {
   tenant_initial:         'Tenant initial',
   landlord_initial:       'Landlord initial',
   date_signed:            'Date signed',
+  rent_amount:            'Rent amount',
+  start_date:             'Lease start date',
+  end_date:               'Lease end date',
+  security_deposit:       'Security deposit',
+  rent_due_day:           'Rent due day',
+  lease_type:             'Lease type',
+  auto_renew:             'Auto-renew (Yes/No)',
+  auto_renew_mode:        'Auto-renew mode',
+  notice_days_required:   'Notice days required',
+  expiration_notice_days: 'Expiration notice days',
+  late_fee_grace_days:                  'Late fee grace days',
+  late_fee_initial_flat:                'Late fee — initial (flat $)',
+  late_fee_initial_percent:             'Late fee — initial (% of rent)',
+  late_fee_accrual_flat_daily:          'Late fee — daily accrual (flat $)',
+  late_fee_accrual_flat_weekly:         'Late fee — weekly accrual (flat $)',
+  late_fee_accrual_flat_monthly:        'Late fee — monthly accrual (flat $)',
+  late_fee_accrual_percent_daily:       'Late fee — daily accrual (% of rent)',
+  late_fee_accrual_percent_weekly:      'Late fee — weekly accrual (% of rent)',
+  late_fee_accrual_percent_monthly:     'Late fee — monthly accrual (% of rent)',
+  late_fee_cap_flat:                    'Late fee — cap (flat $)',
+  late_fee_cap_percent:                 'Late fee — cap (% of rent)',
+  pet_deposit:            'Pet deposit',
+  key_deposit:            'Key deposit',
+  cleaning_deposit:       'Cleaning deposit',
+  move_in_fee:            'Move-in fee',
+  cleaning_fee:           'Cleaning fee',
+  pet_fee:                'Pet fee (non-refundable)',
+  application_fee:        'Application fee',
+  amenity_fee:            'Amenity fee (one-time)',
+  hoa_transfer_fee:       'HOA transfer fee',
+  lease_prep_fee:         'Lease preparation fee',
+  pet_rent:               'Pet rent (monthly)',
+  parking_rent:           'Parking rent (monthly)',
+  storage_rent:           'Storage rent (monthly)',
+  amenity_fee_monthly:    'Amenity fee (monthly)',
+  trash_fee:              'Trash fee (monthly)',
+  pest_control_fee:       'Pest control fee (monthly)',
+  technology_fee:         'Technology fee (monthly)',
+  last_month_rent:        'Last month rent',
+  early_termination_fee:  'Early termination fee',
+  other_fee:              'Other fee',
+  utility_water_responsibility:    'Utility — water (tenant responsible?)',
+  utility_gas_responsibility:      'Utility — gas (tenant responsible?)',
+  utility_electric_responsibility: 'Utility — electric (tenant responsible?)',
+  utility_sewer_responsibility:    'Utility — sewer (tenant responsible?)',
+  utility_trash_responsibility:    'Utility — trash (tenant responsible?)',
   custom_text:            'Custom text (entered at send time)',
 }
 
@@ -487,18 +591,6 @@ export const LEASE_COLUMN_LABEL: Record<LeaseColumn, string> = {
 //   - 'implicit'      → bound via field type + signer role, never in dropdown
 export type LeaseColumnInput = 'text' | 'date' | 'implicit'
 export const LEASE_COLUMN_INPUT: Record<LeaseColumn, LeaseColumnInput> = {
-  rent_amount:            'text',
-  start_date:             'date',
-  end_date:               'date',
-  security_deposit:       'text',
-  rent_due_day:           'text',
-  late_fee_grace_days:    'text',
-  late_fee_amount:        'text',
-  lease_type:             'text',
-  auto_renew:             'text',
-  auto_renew_mode:        'text',
-  notice_days_required:   'text',
-  expiration_notice_days: 'text',
   tenant_name:            'text',
   tenant_email:           'text',
   landlord_name:          'text',
@@ -510,111 +602,408 @@ export const LEASE_COLUMN_INPUT: Record<LeaseColumn, LeaseColumnInput> = {
   tenant_initial:         'implicit',
   landlord_initial:       'implicit',
   date_signed:            'date',
+  rent_amount:            'text',
+  start_date:             'date',
+  end_date:               'date',
+  security_deposit:       'text',
+  rent_due_day:           'text',
+  lease_type:             'text',
+  auto_renew:             'text',
+  auto_renew_mode:        'text',
+  notice_days_required:   'text',
+  expiration_notice_days: 'text',
+  late_fee_grace_days:                  'text',
+  late_fee_initial_flat:                'text',
+  late_fee_initial_percent:             'text',
+  late_fee_accrual_flat_daily:          'text',
+  late_fee_accrual_flat_weekly:         'text',
+  late_fee_accrual_flat_monthly:        'text',
+  late_fee_accrual_percent_daily:       'text',
+  late_fee_accrual_percent_weekly:      'text',
+  late_fee_accrual_percent_monthly:     'text',
+  late_fee_cap_flat:                    'text',
+  late_fee_cap_percent:                 'text',
+  pet_deposit:            'text',
+  key_deposit:            'text',
+  cleaning_deposit:       'text',
+  move_in_fee:            'text',
+  cleaning_fee:           'text',
+  pet_fee:                'text',
+  application_fee:        'text',
+  amenity_fee:            'text',
+  hoa_transfer_fee:       'text',
+  lease_prep_fee:         'text',
+  pet_rent:               'text',
+  parking_rent:           'text',
+  storage_rent:           'text',
+  amenity_fee_monthly:    'text',
+  trash_fee:              'text',
+  pest_control_fee:       'text',
+  technology_fee:         'text',
+  last_month_rent:        'text',
+  early_termination_fee:  'text',
+  other_fee:              'text',
+  utility_water_responsibility:    'text',
+  utility_gas_responsibility:      'text',
+  utility_electric_responsibility: 'text',
+  utility_sewer_responsibility:    'text',
+  utility_trash_responsibility:    'text',
   custom_text:            'text',
 }
 
-// Subset union of LeaseColumn that writes to the leases table. Must mirror
-// every entry in LEASE_COLUMN_CATEGORY marked 'writable'. Keep in sync.
+// ============================================================================
+// WRITABLE LEASE COLUMN SPECS — parsers that turn collected tag values into
+// SQL-ready values destined for columns on the `leases` table.
+// ----------------------------------------------------------------------------
+// Spec shape (S24+): parse returns Record<string, SqlValue>. A single tag may
+// write multiple columns (e.g. late_fee_initial_flat → writes both
+// late_fee_initial_amount and late_fee_initial_type on leases).
+//
+// Consumer (buildLeaseFromDocument in esign.ts) iterates spec entries, calls
+// parse(vals), unpacks the returned record into INSERT columns/values.
+// ============================================================================
+
 export type WritableLeaseColumn =
   | 'rent_amount'
   | 'start_date'
   | 'end_date'
   | 'security_deposit'
   | 'rent_due_day'
-  | 'late_fee_grace_days'
-  | 'late_fee_amount'
   | 'lease_type'
   | 'auto_renew'
   | 'auto_renew_mode'
   | 'notice_days_required'
   | 'expiration_notice_days'
+  | 'late_fee_grace_days'
+  | 'late_fee_initial_flat'
+  | 'late_fee_initial_percent'
+  | 'late_fee_accrual_flat_daily'
+  | 'late_fee_accrual_flat_weekly'
+  | 'late_fee_accrual_flat_monthly'
+  | 'late_fee_accrual_percent_daily'
+  | 'late_fee_accrual_percent_weekly'
+  | 'late_fee_accrual_percent_monthly'
+  | 'late_fee_cap_flat'
+  | 'late_fee_cap_percent'
 
-// Bag of lease_column values collected from a signed document. Undefined =
-// template didn't bind that column.
 export type LeaseColumnVals = Partial<Record<LeaseColumn, string>>
 
-// SQL-ready value returned from a parse function.
 export type WritableLeaseColumnSqlValue = string | number | boolean | null
 
-// Per-writable spec: DB column on the `leases` table + parser that turns the
-// collected string bag into a SQL-ready value. Parsers may throw on required
-// fields (start_date, rent_amount).
 export interface WritableLeaseColumnSpec {
-  dbColumn: string
-  parse: (vals: LeaseColumnVals) => WritableLeaseColumnSqlValue
+  // parse returns a record of leases-table column names → SQL values.
+  // A single tag may contribute multiple columns (sibling type/period writes).
+  parse: (vals: LeaseColumnVals) => Record<string, WritableLeaseColumnSqlValue>
 }
 
 export const WRITABLE_LEASE_COLUMN_SPECS: Record<WritableLeaseColumn, WritableLeaseColumnSpec> = {
   rent_amount: {
-    dbColumn: 'rent_amount',
     parse: (v) => {
       if (!v.rent_amount) throw new Error('Template missing rent_amount field — cannot build lease')
-      return v.rent_amount
+      return { rent_amount: v.rent_amount }
     },
   },
   start_date: {
-    dbColumn: 'start_date',
     parse: (v) => {
       if (!v.start_date) throw new Error('Template missing start_date field — cannot build lease')
-      return v.start_date
+      return { start_date: v.start_date }
     },
   },
   end_date: {
-    dbColumn: 'end_date',
-    parse: (v) => v.end_date || null,
+    parse: (v) => ({ end_date: v.end_date || null }),
   },
   security_deposit: {
-    dbColumn: 'security_deposit',
-    parse: (v) => v.security_deposit || 0,
+    parse: (v) => ({ security_deposit: v.security_deposit || 0 }),
   },
   rent_due_day: {
-    dbColumn: 'rent_due_day',
-    parse: (v) => parseInt(v.rent_due_day || '1'),
-  },
-  late_fee_grace_days: {
-    dbColumn: 'late_fee_grace_days',
-    parse: (v) => parseInt(v.late_fee_grace_days || '5'),
-  },
-  late_fee_amount: {
-    dbColumn: 'late_fee_amount',
-    parse: (v) => v.late_fee_amount || 15,
+    parse: (v) => ({ rent_due_day: parseInt(v.rent_due_day || '1') }),
   },
   lease_type: {
-    dbColumn: 'lease_type',
-    parse: (v) => v.lease_type || 'fixed_term',
+    parse: (v) => ({ lease_type: v.lease_type || 'fixed_term' }),
   },
   auto_renew: {
-    dbColumn: 'auto_renew',
-    parse: (v) => v.auto_renew === 'true' || v.auto_renew === 'yes',
+    parse: (v) => ({ auto_renew: v.auto_renew === 'true' || v.auto_renew === 'yes' }),
   },
   auto_renew_mode: {
-    dbColumn: 'auto_renew_mode',
     parse: (v) => {
       const autoRenew = v.auto_renew === 'true' || v.auto_renew === 'yes'
-      return autoRenew ? (v.auto_renew_mode || 'convert_to_month_to_month') : null
+      return { auto_renew_mode: autoRenew ? (v.auto_renew_mode || 'convert_to_month_to_month') : null }
     },
   },
   notice_days_required: {
-    dbColumn: 'notice_days_required',
-    parse: (v) => parseInt(v.notice_days_required || '30'),
+    parse: (v) => ({ notice_days_required: parseInt(v.notice_days_required || '30') }),
   },
   expiration_notice_days: {
-    dbColumn: 'expiration_notice_days',
-    parse: (v) => parseInt(v.expiration_notice_days || '60'),
+    parse: (v) => ({ expiration_notice_days: parseInt(v.expiration_notice_days || '60') }),
+  },
+  late_fee_grace_days: {
+    parse: (v): Record<string, WritableLeaseColumnSqlValue> => ({ late_fee_grace_days: parseInt(v.late_fee_grace_days || '5') }),
+  },
+  // Late fee granular tags → each writes an amount column + its sibling
+  // type/period columns on leases. Property-level config is the billing
+  // source of truth; these columns are the legal snapshot of the signed PDF.
+  late_fee_initial_flat: {
+    parse: (v): Record<string, WritableLeaseColumnSqlValue> => v.late_fee_initial_flat != null
+      ? { late_fee_initial_amount: v.late_fee_initial_flat, late_fee_initial_type: 'flat' }
+      : {},
+  },
+  late_fee_initial_percent: {
+    parse: (v): Record<string, WritableLeaseColumnSqlValue> => v.late_fee_initial_percent != null
+      ? { late_fee_initial_amount: v.late_fee_initial_percent, late_fee_initial_type: 'percent_of_rent' }
+      : {},
+  },
+  late_fee_accrual_flat_daily: {
+    parse: (v): Record<string, WritableLeaseColumnSqlValue> => v.late_fee_accrual_flat_daily != null
+      ? { late_fee_accrual_amount: v.late_fee_accrual_flat_daily, late_fee_accrual_type: 'flat', late_fee_accrual_period: 'daily' }
+      : {},
+  },
+  late_fee_accrual_flat_weekly: {
+    parse: (v): Record<string, WritableLeaseColumnSqlValue> => v.late_fee_accrual_flat_weekly != null
+      ? { late_fee_accrual_amount: v.late_fee_accrual_flat_weekly, late_fee_accrual_type: 'flat', late_fee_accrual_period: 'weekly' }
+      : {},
+  },
+  late_fee_accrual_flat_monthly: {
+    parse: (v): Record<string, WritableLeaseColumnSqlValue> => v.late_fee_accrual_flat_monthly != null
+      ? { late_fee_accrual_amount: v.late_fee_accrual_flat_monthly, late_fee_accrual_type: 'flat', late_fee_accrual_period: 'monthly' }
+      : {},
+  },
+  late_fee_accrual_percent_daily: {
+    parse: (v): Record<string, WritableLeaseColumnSqlValue> => v.late_fee_accrual_percent_daily != null
+      ? { late_fee_accrual_amount: v.late_fee_accrual_percent_daily, late_fee_accrual_type: 'percent_of_rent', late_fee_accrual_period: 'daily' }
+      : {},
+  },
+  late_fee_accrual_percent_weekly: {
+    parse: (v): Record<string, WritableLeaseColumnSqlValue> => v.late_fee_accrual_percent_weekly != null
+      ? { late_fee_accrual_amount: v.late_fee_accrual_percent_weekly, late_fee_accrual_type: 'percent_of_rent', late_fee_accrual_period: 'weekly' }
+      : {},
+  },
+  late_fee_accrual_percent_monthly: {
+    parse: (v): Record<string, WritableLeaseColumnSqlValue> => v.late_fee_accrual_percent_monthly != null
+      ? { late_fee_accrual_amount: v.late_fee_accrual_percent_monthly, late_fee_accrual_type: 'percent_of_rent', late_fee_accrual_period: 'monthly' }
+      : {},
+  },
+  late_fee_cap_flat: {
+    parse: (v): Record<string, WritableLeaseColumnSqlValue> => v.late_fee_cap_flat != null
+      ? { late_fee_cap_amount: v.late_fee_cap_flat, late_fee_cap_type: 'flat' }
+      : {},
+  },
+  late_fee_cap_percent: {
+    parse: (v): Record<string, WritableLeaseColumnSqlValue> => v.late_fee_cap_percent != null
+      ? { late_fee_cap_amount: v.late_fee_cap_percent, late_fee_cap_type: 'percent_of_rent' }
+      : {},
   },
 }
 
-// Lease type classifier for the leases.lease_type column.
-// Single source of truth for leases_lease_type_check CHECK constraint (5 values).
-// NOTE: distinct from unit_bookings.booking_type — short-term bookings use a
-// separate 3-value classifier on a different table. Do not conflate.
-export const LEASE_TYPES = ['month_to_month', 'fixed_term', 'nightly', 'weekly', 'nnn_commercial'] as const
+// ============================================================================
+// FEE ROW SPECS — tags that create a row in lease_fees at finalize (S24+).
+// Consumer (buildLeaseFromDocument rebuild at S29) iterates FEE_ROW_SPECS,
+// calls parse(vals), inserts one lease_fees row per non-null result.
+// ============================================================================
+
+export type FeeRowTag =
+  | 'pet_deposit' | 'key_deposit' | 'cleaning_deposit'
+  | 'move_in_fee' | 'cleaning_fee' | 'pet_fee' | 'application_fee'
+  | 'amenity_fee' | 'hoa_transfer_fee' | 'lease_prep_fee'
+  | 'pet_rent' | 'parking_rent' | 'storage_rent' | 'amenity_fee_monthly'
+  | 'trash_fee' | 'pest_control_fee' | 'technology_fee'
+  | 'last_month_rent' | 'early_termination_fee' | 'other_fee'
+
+export type FeeType = FeeRowTag
+export const FEE_TYPES: readonly FeeType[] = [
+  'pet_deposit', 'key_deposit', 'cleaning_deposit',
+  'move_in_fee', 'cleaning_fee', 'pet_fee', 'application_fee',
+  'amenity_fee', 'hoa_transfer_fee', 'lease_prep_fee',
+  'pet_rent', 'parking_rent', 'storage_rent', 'amenity_fee_monthly',
+  'trash_fee', 'pest_control_fee', 'technology_fee',
+  'last_month_rent', 'early_termination_fee', 'other_fee',
+] as const
+
+export type FeeDueTiming = 'move_in' | 'monthly_ongoing' | 'move_out' | 'other'
+export const FEE_DUE_TIMINGS: readonly FeeDueTiming[] = ['move_in', 'monthly_ongoing', 'move_out', 'other'] as const
+
+// Per-fee-type metadata: default refundability + default timing.
+// Landlord can override at review page; these are starting values.
+export interface FeeTypeMeta {
+  isRefundable: boolean
+  dueTiming: FeeDueTiming
+}
+export const FEE_TYPE_META: Record<FeeType, FeeTypeMeta> = {
+  pet_deposit:            { isRefundable: true,  dueTiming: 'move_in' },
+  key_deposit:            { isRefundable: true,  dueTiming: 'move_in' },
+  cleaning_deposit:       { isRefundable: true,  dueTiming: 'move_in' },
+  move_in_fee:            { isRefundable: false, dueTiming: 'move_in' },
+  cleaning_fee:           { isRefundable: false, dueTiming: 'move_out' },
+  pet_fee:                { isRefundable: false, dueTiming: 'move_in' },
+  application_fee:        { isRefundable: false, dueTiming: 'move_in' },
+  amenity_fee:            { isRefundable: false, dueTiming: 'move_in' },
+  hoa_transfer_fee:       { isRefundable: false, dueTiming: 'move_in' },
+  lease_prep_fee:         { isRefundable: false, dueTiming: 'move_in' },
+  pet_rent:               { isRefundable: false, dueTiming: 'monthly_ongoing' },
+  parking_rent:           { isRefundable: false, dueTiming: 'monthly_ongoing' },
+  storage_rent:           { isRefundable: false, dueTiming: 'monthly_ongoing' },
+  amenity_fee_monthly:    { isRefundable: false, dueTiming: 'monthly_ongoing' },
+  trash_fee:              { isRefundable: false, dueTiming: 'monthly_ongoing' },
+  pest_control_fee:       { isRefundable: false, dueTiming: 'monthly_ongoing' },
+  technology_fee:         { isRefundable: false, dueTiming: 'monthly_ongoing' },
+  last_month_rent:        { isRefundable: true,  dueTiming: 'move_in' },
+  early_termination_fee:  { isRefundable: false, dueTiming: 'other' },
+  other_fee:              { isRefundable: false, dueTiming: 'other' },
+}
+
+export interface FeeRowSpec {
+  // parse returns a single lease_fees row ready to insert, or null if the
+  // tag was not bound / value empty.
+  parse: (vals: LeaseColumnVals) => null | {
+    fee_type: FeeType
+    amount: string
+    is_refundable: boolean
+    due_timing: FeeDueTiming
+  }
+}
+
+function makeFeeRowSpec(tag: FeeType): FeeRowSpec {
+  return {
+    parse: (v) => {
+      const val = v[tag]
+      if (val == null || val === '') return null
+      const meta = FEE_TYPE_META[tag]
+      return {
+        fee_type: tag,
+        amount: val,
+        is_refundable: meta.isRefundable,
+        due_timing: meta.dueTiming,
+      }
+    },
+  }
+}
+
+export const FEE_ROW_SPECS: Record<FeeRowTag, FeeRowSpec> = {
+  pet_deposit:            makeFeeRowSpec('pet_deposit'),
+  key_deposit:            makeFeeRowSpec('key_deposit'),
+  cleaning_deposit:       makeFeeRowSpec('cleaning_deposit'),
+  move_in_fee:            makeFeeRowSpec('move_in_fee'),
+  cleaning_fee:           makeFeeRowSpec('cleaning_fee'),
+  pet_fee:                makeFeeRowSpec('pet_fee'),
+  application_fee:        makeFeeRowSpec('application_fee'),
+  amenity_fee:            makeFeeRowSpec('amenity_fee'),
+  hoa_transfer_fee:       makeFeeRowSpec('hoa_transfer_fee'),
+  lease_prep_fee:         makeFeeRowSpec('lease_prep_fee'),
+  pet_rent:               makeFeeRowSpec('pet_rent'),
+  parking_rent:           makeFeeRowSpec('parking_rent'),
+  storage_rent:           makeFeeRowSpec('storage_rent'),
+  amenity_fee_monthly:    makeFeeRowSpec('amenity_fee_monthly'),
+  trash_fee:              makeFeeRowSpec('trash_fee'),
+  pest_control_fee:       makeFeeRowSpec('pest_control_fee'),
+  technology_fee:         makeFeeRowSpec('technology_fee'),
+  last_month_rent:        makeFeeRowSpec('last_month_rent'),
+  early_termination_fee:  makeFeeRowSpec('early_termination_fee'),
+  other_fee:              makeFeeRowSpec('other_fee'),
+}
+
+// ============================================================================
+// UTILITY ROW SPECS — tags that create a row in lease_utility_assignments
+// at finalize (S24+, consumed S29). Tag value 'true'/'yes' (or any truthy)
+// = tenant is responsible = row gets created. Empty/null/falsy = no row =
+// landlord covers. At review page, landlord additionally selects WHICH meter
+// this assignment ties to (resolved out-of-band from tag).
+// ============================================================================
+
+export type UtilityType = 'water' | 'gas' | 'electric' | 'sewer' | 'trash'
+export const UTILITY_TYPES: readonly UtilityType[] = ['water', 'gas', 'electric', 'sewer', 'trash'] as const
+
+export type UtilityRowTag =
+  | 'utility_water_responsibility'
+  | 'utility_gas_responsibility'
+  | 'utility_electric_responsibility'
+  | 'utility_sewer_responsibility'
+  | 'utility_trash_responsibility'
+
+export const UTILITY_TAG_TO_TYPE: Record<UtilityRowTag, UtilityType> = {
+  utility_water_responsibility:    'water',
+  utility_gas_responsibility:      'gas',
+  utility_electric_responsibility: 'electric',
+  utility_sewer_responsibility:    'sewer',
+  utility_trash_responsibility:    'trash',
+}
+
+export interface UtilityRowSpec {
+  // parse returns { utilityType, tenantResponsible } or null if unbound.
+  // Meter resolution happens at review page (landlord picks which meter).
+  parse: (vals: LeaseColumnVals) => null | {
+    utility_type: UtilityType
+    tenant_responsible: boolean
+  }
+}
+
+function makeUtilityRowSpec(tag: UtilityRowTag): UtilityRowSpec {
+  return {
+    parse: (v) => {
+      const val = v[tag]
+      if (val == null || val === '') return null
+      const truthy = val === 'true' || val === 'yes' || val === '1' || val.toLowerCase() === 'tenant'
+      return {
+        utility_type: UTILITY_TAG_TO_TYPE[tag],
+        tenant_responsible: truthy,
+      }
+    },
+  }
+}
+
+export const UTILITY_ROW_SPECS: Record<UtilityRowTag, UtilityRowSpec> = {
+  utility_water_responsibility:    makeUtilityRowSpec('utility_water_responsibility'),
+  utility_gas_responsibility:      makeUtilityRowSpec('utility_gas_responsibility'),
+  utility_electric_responsibility: makeUtilityRowSpec('utility_electric_responsibility'),
+  utility_sewer_responsibility:    makeUtilityRowSpec('utility_sewer_responsibility'),
+  utility_trash_responsibility:    makeUtilityRowSpec('utility_trash_responsibility'),
+}
+
+// Utility meter configuration enums (consumed S27 utility UI + billing).
+export type UtilityBillingMethod = 'submeter' | 'rubs' | 'master_bill_to_landlord'
+export const UTILITY_BILLING_METHODS: readonly UtilityBillingMethod[] =
+  ['submeter', 'rubs', 'master_bill_to_landlord'] as const
+
+export type RubsAllocationMethod = 'occupant_count' | 'sqft' | 'bedrooms' | 'equal_split'
+export const RUBS_ALLOCATION_METHODS: readonly RubsAllocationMethod[] =
+  ['occupant_count', 'sqft', 'bedrooms', 'equal_split'] as const
+
+// ============================================================================
+// LATE FEE ENUMS (properties.* + leases.* column value domains, consumed S26)
+// ============================================================================
+
+export type LateFeeAmountType = 'flat' | 'percent_of_rent'
+export const LATE_FEE_AMOUNT_TYPES: readonly LateFeeAmountType[] = ['flat', 'percent_of_rent'] as const
+
+export type LateFeeAccrualPeriod = 'daily' | 'weekly' | 'monthly'
+export const LATE_FEE_ACCRUAL_PERIODS: readonly LateFeeAccrualPeriod[] = ['daily', 'weekly', 'monthly'] as const
+
+// ============================================================================
+// DEPOSIT ENUMS (properties.deposit_* + security_deposits.held_by, S24+)
+// ============================================================================
+
+export type DepositHandlingMode = 'gam_escrow' | 'landlord_held'
+export const DEPOSIT_HANDLING_MODES: readonly DepositHandlingMode[] = ['gam_escrow', 'landlord_held'] as const
+
+export type DepositHeldBy = DepositHandlingMode
+export const DEPOSIT_HELD_BY_VALUES = DEPOSIT_HANDLING_MODES
+
+export type DepositInterestMethod = 'simple' | 'compound'
+export const DEPOSIT_INTEREST_METHODS: readonly DepositInterestMethod[] = ['simple', 'compound'] as const
+
+export type DepositInterestCadence = 'annual' | 'at_return' | 'on_anniversary'
+export const DEPOSIT_INTEREST_CADENCES: readonly DepositInterestCadence[] =
+  ['annual', 'at_return', 'on_anniversary'] as const
+
+// ============================================================================
+// LEASE TYPE (leases.lease_type column)
+// S24: nightly + weekly removed — short-term bookings live in unit_bookings
+// with their own booking_type classifier. Do not conflate.
+// ============================================================================
+
+export const LEASE_TYPES = ['month_to_month', 'fixed_term', 'nnn_commercial'] as const
 export type LeaseType = typeof LEASE_TYPES[number]
 export const LEASE_TYPE_LABEL: Record<LeaseType, string> = {
   month_to_month: 'Month-to-month',
   fixed_term:     'Fixed term',
-  nightly:        'Nightly',
-  weekly:         'Weekly',
   nnn_commercial: 'NNN Commercial',
 }
 

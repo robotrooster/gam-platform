@@ -6,7 +6,6 @@ import {
   LeaseColumnVals,
   LEASE_COLUMN_CATEGORY,
   WRITABLE_LEASE_COLUMN_SPECS,
-  WritableLeaseColumnSqlValue,
 } from '@gam/shared'
 import { query, queryOne, getClient } from '../db'
 import { requireAuth, requireLandlord } from '../middleware/auth'
@@ -345,8 +344,10 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
   const fields = await client.query(
     `SELECT lease_column, value, signer_role FROM lease_document_fields
      WHERE document_id=$1 AND lease_column IS NOT NULL`, [doc.id]).then(r => r.rows)
-  // Only writable columns make it into `vals` — signature + identity columns
-  // filtered out via shared category map. No hand-maintained blacklist.
+  // Only writable columns make it into `vals` for the leases INSERT.
+  // fee_row + utility_row tags are collected at S29+ (buildLeaseFromDocument
+  // rebuild) and written to lease_fees / lease_utility_assignments separately.
+  // signature + identity tags are filtered out via the shared category map.
   const vals: LeaseColumnVals = {}
   for (const f of fields) {
     const col = f.lease_column as LeaseColumn | null
@@ -402,13 +403,16 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
   // Object.entries preserves insertion order → column list and values align pairwise.
   const writableCols: string[] = []
   const writablePlaceholders: string[] = []
-  const writableValues: WritableLeaseColumnSqlValue[] = []
+  const writableValues: (string | number | boolean | null)[] = []
   let paramIdx = 1
   for (const [, spec] of Object.entries(WRITABLE_LEASE_COLUMN_SPECS)) {
-    writableCols.push(spec.dbColumn)
-    writablePlaceholders.push('$' + paramIdx)
-    writableValues.push(spec.parse(vals))
-    paramIdx++
+    const parsed = spec.parse(vals)
+    for (const [col, val] of Object.entries(parsed)) {
+      writableCols.push(col)
+      writablePlaceholders.push('$' + paramIdx)
+      writableValues.push(val)
+      paramIdx++
+    }
   }
   // Fixed-shape tail columns (not driven by lease_column fields)
   const tailCols = ['unit_id', 'landlord_id', 'status']

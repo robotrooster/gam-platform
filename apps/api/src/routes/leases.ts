@@ -147,7 +147,7 @@ leasesRouter.patch('/:id', requireLandlord, async (req, res, next) => {
       expirationNoticeDays: z.number().int().min(0).optional(),
       needsReview: z.boolean().optional(),
       lateFeeGraceDays: z.number().int().min(0).optional(),
-      lateFeeAmount: z.number().min(0).optional(),
+      lateFeeInitialAmount: z.number().min(0).optional(),
       terminationReason: z.string().optional(),
     }).strict().parse(req.body)
 
@@ -187,7 +187,7 @@ leasesRouter.patch('/:id', requireLandlord, async (req, res, next) => {
       expiration_notice_days: body.expirationNoticeDays,
       needs_review: body.needsReview,
       late_fee_grace_days: body.lateFeeGraceDays,
-      late_fee_amount: body.lateFeeAmount,
+      late_fee_initial_amount: body.lateFeeInitialAmount,
       termination_reason: body.terminationReason,
     }
 
