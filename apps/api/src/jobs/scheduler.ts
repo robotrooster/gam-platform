@@ -1,6 +1,7 @@
 import cron from 'node-cron'
 import { notifyLeaseExpiring, notifyLowStock } from '../services/notifications'
 import { query, queryOne } from '../db'
+import { generateRentAndFees } from './rentGeneration'
 
 // ============================================================
 // GAM PAYMENT SCHEDULER
@@ -481,7 +482,9 @@ export function schedulerInit() {
     } catch (e) { console.error('[Scheduler] Activation scheduler error:', e) }
   })
 
-  console.log('   ✓ Lease expiry notices: Daily 8am (per lease expiration_notice_days)')
+  registerRentGenerationCron()
+
+    console.log('   ✓ Lease expiry notices: Daily 8am (per lease expiration_notice_days)')
   console.log('   ✓ Lease end processor:  Daily 2am (auto-renew or expire)')
   console.log('   ✓ Low stock check:      Daily 9am')
   console.log('   ✓ FlexPay pulls:        Daily 6am (per tenant date)')
@@ -494,5 +497,21 @@ export function schedulerInit() {
   console.log('   ✓ Utility billing:      15th of month, 10am')
   console.log('   ✓ NACHA monitoring:     Daily 8am')
   console.log('   ✓ Unit activations:     Hourly at :05')
-  console.log('   ✓ Invitation expiry:    Hourly at :10\n')
+  console.log('   ✓ Invitation expiry:    Hourly at :10')
+  console.log('   ✓ Rent + fee gen:       Daily 1am Phoenix (S25)\n')
+}
+
+
+// === S25: rent + recurring fee generation ===
+// Daily 1am Phoenix-local (08:00 UTC). Idempotent via partial unique indexes.
+// Generates next billing-cycle rent row + monthly_ongoing fee rows for every active lease.
+export function registerRentGenerationCron() {
+  cron.schedule('0 8 * * *', async () => {
+    try {
+      const result = await generateRentAndFees()
+      console.log(`[S25 rent-gen] processed=${result.leasesProcessed} rents=${result.rentsInserted} fees=${result.feesInserted}`)
+    } catch (e) {
+      console.error('[S25 rent-gen] error:', e)
+    }
+  })
 }
