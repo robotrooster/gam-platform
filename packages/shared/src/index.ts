@@ -1473,3 +1473,42 @@ export function formatCurrency(amount: number): string {
 // === S25: businessDay + paymentAllocation re-exports ===
 export * from './businessDay'
 export * from './paymentAllocation'
+
+// ============================================================
+// S26a: Invoice types
+// ============================================================
+
+export const INVOICE_STATUSES = ['pending', 'partial', 'settled', 'void'] as const
+export type InvoiceStatus = typeof INVOICE_STATUSES[number]
+
+export interface Invoice {
+  id: string
+  landlord_id: string
+  tenant_id: string | null
+  lease_id: string
+  unit_id: string
+  invoice_number: string
+  due_date: string  // YYYY-MM-DD
+  subtotal_rent: string       // numeric -> string from pg
+  subtotal_fees: string
+  subtotal_utilities: string
+  subtotal_deposits: string
+  subtotal_late_fees: string
+  total_amount: string
+  status: InvoiceStatus
+  sent_at: string | null
+  viewed_at: string | null
+  pdf_url: string | null
+  notes: string | null
+  created_at: string
+  updated_at: string
+}
+
+/**
+ * Format an invoice number from its year + sequence number.
+ * Format: INV-YYYY-NNNNN (5-digit zero-padded sequence).
+ * Example: formatInvoiceNumber(2026, 42) === 'INV-2026-00042'
+ */
+export function formatInvoiceNumber(year: number, sequence: number): string {
+  return `INV-${year}-${String(sequence).padStart(5, '0')}`
+}

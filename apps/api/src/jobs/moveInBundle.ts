@@ -1,13 +1,16 @@
 import { DateTime } from 'luxon'
-import { daysInMonth } from '@gam/shared'
-import { query } from '../db'
+import type { PoolClient } from 'pg'
+import { daysInMonth, formatInvoiceNumber } from '@gam/shared'
+import { getClient, query } from '../db'
 
 // ============================================================
-// S25: Move-in bundle generator (dormant until S29 wires into buildLeaseFromDocument)
-// Triggered at lease finalize — not on daily cron.
-// Generates: prorated first-month rent (if start_date.day > 1) + all move_in fees.
-// Proration: actual-days-in-month, rent * days_remaining / days_in_month, round half-even to cent.
-// Move-in day is occupied and paid for: days_remaining = daysInMonth - startDay + 1.
+// S26a: Move-in invoice generator (replaces S25 moveInBundle)
+// Called at lease finalize — NOT by daily cron.
+// Creates one invoice dated lease.start_date containing:
+//   - Rent (prorated if start_date.day > 1, full rent if day=1)
+//   - All move_in fees from lease_fees
+//   - Security deposit from leases.security_deposit (if > 0)
+// Idempotent via ux_invoices_lease_due_date.
 // ============================================================
 
 interface MoveInInputs {
@@ -16,12 +19,17 @@ interface MoveInInputs {
   tenant_id: string | null
   landlord_id: string
   rent_amount: number
-  start_date: string  // YYYY-MM-DD
+  security_deposit: number    // from leases.security_deposit
+  start_date: string          // YYYY-MM-DD
 }
 
 export interface MoveInBundleResult {
-  proratedRentInserted: boolean
+  invoiceCreated: boolean
+  invoiceId: string | null
+  invoiceNumber: string | null
+  rentAmount: number
   moveInFeesInserted: number
+  depositInserted: boolean
 }
 
 /** Banker's rounding (half-even) to cents. */
@@ -31,53 +39,151 @@ export function roundHalfEvenCents(value: number): number {
   const diff = cents - floor
   if (diff < 0.5) return floor / 100
   if (diff > 0.5) return (floor + 1) / 100
-  // exactly .5 -> round to even
   return (floor % 2 === 0 ? floor : floor + 1) / 100
 }
 
-/** Prorated rent for a mid-month move-in. Returns 0 if start_date is the 1st. */
-export function proratedFirstMonthRent(rentAmount: number, startDate: string): number {
+/** Rent for the move-in invoice. Prorated if start_date.day > 1, full rent if day == 1. */
+export function moveInRentAmount(rentAmount: number, startDate: string): number {
   const dt = DateTime.fromISO(startDate, { zone: 'utc' })
-  if (dt.day === 1) return 0
+  if (dt.day === 1) return roundHalfEvenCents(rentAmount)
   const dim = daysInMonth(dt.year, dt.month)
   const daysRemaining = dim - dt.day + 1
   return roundHalfEvenCents(rentAmount * daysRemaining / dim)
 }
 
-export async function generateMoveInBundle(inputs: MoveInInputs): Promise<MoveInBundleResult> {
-  let proratedRentInserted = false
-  let moveInFeesInserted = 0
+async function allocateInvoiceNumber(
+  client: PoolClient,
+  landlordId: string,
+  year: number
+): Promise<string> {
+  const r = await client.query(
+    `INSERT INTO invoice_sequences (landlord_id, year, next_number)
+     VALUES ($1, $2, 2)
+     ON CONFLICT (landlord_id, year)
+     DO UPDATE SET next_number = invoice_sequences.next_number + 1
+     RETURNING next_number`,
+    [landlordId, year]
+  )
+  const nextAfter = r.rows[0].next_number as number
+  return formatInvoiceNumber(year, nextAfter - 1)
+}
 
-  // Prorated rent (or full rent if start_date is 1st — but generator cron handles day-1 rent, so skip here)
-  const prorated = proratedFirstMonthRent(inputs.rent_amount, inputs.start_date)
-  if (prorated > 0) {
-    const r = await query(`
-      INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
-      VALUES ($1, $2, $3, $4, 'rent', $5, 'pending', $6, $7)
-      ON CONFLICT DO NOTHING
-      RETURNING id
-    `, [inputs.unit_id, inputs.lease_id, inputs.tenant_id, inputs.landlord_id, prorated, inputs.start_date,
-        `Prorated rent ${inputs.start_date}`])
-    proratedRentInserted = r.length > 0
+export async function generateMoveInInvoice(
+  inputs: MoveInInputs
+): Promise<MoveInBundleResult> {
+  const rentForMoveIn = moveInRentAmount(inputs.rent_amount, inputs.start_date)
+
+  const fees = await query<{
+    id: string; fee_type: string; amount: string; description: string | null
+  }>(
+    `SELECT id, fee_type, amount, description
+     FROM lease_fees
+     WHERE lease_id = $1 AND due_timing = 'move_in'`,
+    [inputs.lease_id]
+  )
+
+  const client = await getClient()
+  try {
+    await client.query('BEGIN')
+
+    const year = DateTime.fromISO(inputs.start_date).year
+    const invoiceNumber = await allocateInvoiceNumber(client, inputs.landlord_id, year)
+
+    const feesTotal = fees.reduce((s, f) => s + Number(f.amount), 0)
+    const depositAmount = Number(inputs.security_deposit) || 0
+    const totalAmount = rentForMoveIn + feesTotal + depositAmount
+
+    const invoiceRes = await client.query(
+      `INSERT INTO invoices (
+         landlord_id, tenant_id, lease_id, unit_id,
+         invoice_number, due_date,
+         subtotal_rent, subtotal_fees, subtotal_deposits, total_amount
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+       ON CONFLICT (lease_id, due_date) DO NOTHING
+       RETURNING id`,
+      [
+        inputs.landlord_id, inputs.tenant_id, inputs.lease_id, inputs.unit_id,
+        invoiceNumber, inputs.start_date,
+        rentForMoveIn.toFixed(2),
+        feesTotal.toFixed(2),
+        depositAmount.toFixed(2),
+        totalAmount.toFixed(2),
+      ]
+    )
+
+    if (invoiceRes.rows.length === 0) {
+      await client.query('ROLLBACK')
+      return {
+        invoiceCreated: false,
+        invoiceId: null,
+        invoiceNumber: null,
+        rentAmount: rentForMoveIn,
+        moveInFeesInserted: 0,
+        depositInserted: false,
+      }
+    }
+
+    const invoiceId = invoiceRes.rows[0].id as string
+
+    await client.query(
+      `INSERT INTO payments (
+         invoice_id, unit_id, lease_id, tenant_id, landlord_id,
+         type, amount, status, due_date, entry_description
+       ) VALUES ($1, $2, $3, $4, $5, 'rent', $6, 'pending', $7, $8)`,
+      [
+        invoiceId, inputs.unit_id, inputs.lease_id, inputs.tenant_id, inputs.landlord_id,
+        rentForMoveIn.toFixed(2), inputs.start_date,
+        `Move-in rent ${inputs.start_date}`,
+      ]
+    )
+
+    let moveInFeesInserted = 0
+    for (const fee of fees) {
+      await client.query(
+        `INSERT INTO payments (
+           invoice_id, unit_id, lease_id, tenant_id, landlord_id,
+           type, amount, status, due_date, entry_description, lease_fee_id
+         ) VALUES ($1, $2, $3, $4, $5, 'fee', $6, 'pending', $7, $8, $9)`,
+        [
+          invoiceId, inputs.unit_id, inputs.lease_id, inputs.tenant_id, inputs.landlord_id,
+          fee.amount, inputs.start_date,
+          `${fee.fee_type}${fee.description ? ' — ' + fee.description : ''} ${inputs.start_date}`,
+          fee.id,
+        ]
+      )
+      moveInFeesInserted++
+    }
+
+    let depositInserted = false
+    if (depositAmount > 0) {
+      await client.query(
+        `INSERT INTO payments (
+           invoice_id, unit_id, lease_id, tenant_id, landlord_id,
+           type, amount, status, due_date, entry_description
+         ) VALUES ($1, $2, $3, $4, $5, 'deposit', $6, 'pending', $7, $8)`,
+        [
+          invoiceId, inputs.unit_id, inputs.lease_id, inputs.tenant_id, inputs.landlord_id,
+          depositAmount.toFixed(2), inputs.start_date,
+          `Security deposit ${inputs.start_date}`,
+        ]
+      )
+      depositInserted = true
+    }
+
+    await client.query('COMMIT')
+
+    return {
+      invoiceCreated: true,
+      invoiceId,
+      invoiceNumber,
+      rentAmount: rentForMoveIn,
+      moveInFeesInserted,
+      depositInserted,
+    }
+  } catch (e) {
+    await client.query('ROLLBACK')
+    throw e
+  } finally {
+    client.release()
   }
-
-  // All move_in fees on this lease
-  const fees = await query<{ id: string; fee_type: string; amount: string; description: string | null }>(`
-    SELECT id, fee_type, amount, description
-    FROM lease_fees
-    WHERE lease_id = $1 AND due_timing = 'move_in'
-  `, [inputs.lease_id])
-
-  for (const fee of fees) {
-    const r = await query(`
-      INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description, lease_fee_id)
-      VALUES ($1, $2, $3, $4, 'fee', $5, 'pending', $6, $7, $8)
-      ON CONFLICT DO NOTHING
-      RETURNING id
-    `, [inputs.unit_id, inputs.lease_id, inputs.tenant_id, inputs.landlord_id, fee.amount, inputs.start_date,
-        `${fee.fee_type}${fee.description ? ' — ' + fee.description : ''} ${inputs.start_date}`, fee.id])
-    if (r.length > 0) moveInFeesInserted++
-  }
-
-  return { proratedRentInserted, moveInFeesInserted }
 }
