@@ -1512,3 +1512,5 @@ export interface Invoice {
 export function formatInvoiceNumber(year: number, sequence: number): string {
   return `INV-${year}-${String(sequence).padStart(5, '0')}`
 }
+
+export * from './lateFees';

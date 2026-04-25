@@ -107,6 +107,18 @@ export async function generateInvoices(
       AND (l.needs_review IS NULL OR l.needs_review = false)
   `)
 
+  return runGeneration(leases, nowUtc)
+}
+
+/**
+ * Per-lease loop that does the actual work. Shared between the legacy
+ * global generateInvoices() and the per-tz generateInvoicesForTimezone().
+ */
+async function runGeneration(
+  leases: ActiveLease[],
+  nowUtc: Date
+): Promise<InvoiceGenResult> {
+
   let invoicesInserted = 0
   let rentsInserted = 0
   let feesInserted = 0
@@ -226,4 +238,64 @@ export async function generateInvoices(
     feesInserted,
     leasesProcessed: leases.length,
   }
+}
+
+// ----- S26b-tz: per-timezone scoped variant + manager registration -----
+
+import { registerEngine } from './timezoneCronManager'
+
+/**
+ * Run invoice generation scoped to leases whose property is in the given
+ * timezone. Called by per-tz cron at 7am local on each property's due date
+ * (with 5 follow-up ticks at :10/:20/:30/:40/:50 to catch the boundary).
+ *
+ * The per-lease loop (in generateInvoices above) computes everything in the
+ * property's local timezone via Luxon, so we just need to scope the lease
+ * query by p.timezone here. The cron firing window is the gate that ensures
+ * 7am-local timing per locked product decision.
+ */
+export async function generateInvoicesForTimezone(
+  tz: string,
+  nowUtc: Date = new Date()
+): Promise<InvoiceGenResult> {
+  const leases = await query<ActiveLease>(`
+    SELECT l.id, l.unit_id, l.landlord_id, l.rent_amount, l.rent_due_day,
+           l.start_date, l.end_date,
+           vlat.primary_tenant_id AS tenant_id,
+           p.timezone AS property_tz
+    FROM leases l
+    JOIN units u ON u.id = l.unit_id
+    JOIN properties p ON p.id = u.property_id
+    LEFT JOIN v_lease_active_tenants vlat ON vlat.lease_id = l.id
+    WHERE l.status = 'active'
+      AND (l.needs_review IS NULL OR l.needs_review = false)
+      AND p.timezone = $1
+  `, [tz])
+
+  return runGeneration(leases, nowUtc)
+}
+
+/**
+ * Register the invoice-generation engine with the timezone cron manager.
+ * Cron expression: minutes 0,10,20,30,40,50 of hour 7 in property timezone.
+ * (6 firings per timezone per day, all within 07:00-07:59 local.)
+ */
+export function registerInvoiceEngine(): void {
+  registerEngine('invoices', {
+    cronExpr: '0,10,20,30,40,50 7 * * *',
+    handler: async (tz: string) => {
+      try {
+        const r = await generateInvoicesForTimezone(tz)
+        if (r.invoicesInserted > 0 || r.rentsInserted > 0 || r.feesInserted > 0) {
+          console.log(
+            `[InvoiceGen][${tz}] invoices=${r.invoicesInserted} ` +
+            `rents=${r.rentsInserted} fees=${r.feesInserted}`
+          )
+        }
+      } catch (e) {
+        console.error(`[InvoiceGen][${tz}] error:`, e)
+      }
+    },
+    label: 'Invoice generation',
+  })
 }

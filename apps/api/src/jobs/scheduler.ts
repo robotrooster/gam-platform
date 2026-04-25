@@ -1,7 +1,9 @@
 import cron from 'node-cron'
 import { notifyLeaseExpiring, notifyLowStock } from '../services/notifications'
 import { query, queryOne } from '../db'
-import { generateInvoices } from './invoiceGeneration'
+import { generateInvoices, registerInvoiceEngine } from './invoiceGeneration'
+import { registerLateFeeEngine } from './lateFees'
+import { registerRefreshCron, refreshTimezoneCrons, summary as tzCronSummary } from './timezoneCronManager'
 
 // ============================================================
 // GAM PAYMENT SCHEDULER
@@ -482,7 +484,18 @@ export function schedulerInit() {
     } catch (e) { console.error('[Scheduler] Activation scheduler error:', e) }
   })
 
-  registerInvoiceGenerationCron()
+  registerInvoiceEngine()
+  registerLateFeeEngine()
+  registerRefreshCron()
+  // initial population — async, will populate per-tz crons on next tick
+  refreshTimezoneCrons().then(({ added }) => {
+    const sum = tzCronSummary()
+    for (const [engineId, info] of Object.entries(sum)) {
+      console.log(
+        `   \u2713 \${info.label.padEnd(22)} \${info.tzCount} timezone(s) registered (S26b-tz)`
+      )
+    }
+  }).catch(e => console.error('[Scheduler] Initial tz cron refresh error:', e))
 
     console.log('   ✓ Lease expiry notices: Daily 8am (per lease expiration_notice_days)')
   console.log('   ✓ Lease end processor:  Daily 2am (auto-renew or expire)')
@@ -498,7 +511,7 @@ export function schedulerInit() {
   console.log('   ✓ NACHA monitoring:     Daily 8am')
   console.log('   ✓ Unit activations:     Hourly at :05')
   console.log('   ✓ Invitation expiry:    Hourly at :10')
-  console.log('   ✓ Invoice generation:   Daily 1am Phoenix (S26a)\n')
+  console.log('   ✓ Tz refresh:           Daily 3am UTC\n')
 }
 
 
@@ -506,13 +519,3 @@ export function schedulerInit() {
 // Daily 1am Phoenix-local (08:00 UTC). Idempotent via ux_invoices_lease_due_date.
 // Generates an invoice per active lease for each missed/current cycle due date,
 // with rent + monthly_ongoing fee children. Catch-up window: 30 days.
-export function registerInvoiceGenerationCron() {
-  cron.schedule('0 8 * * *', async () => {
-    try {
-      const result = await generateInvoices()
-      console.log(`[S26a invoice-gen] processed=${result.leasesProcessed} invoices=${result.invoicesInserted} rents=${result.rentsInserted} fees=${result.feesInserted}`)
-    } catch (e) {
-      console.error('[S26a invoice-gen] error:', e)
-    }
-  })
-}
