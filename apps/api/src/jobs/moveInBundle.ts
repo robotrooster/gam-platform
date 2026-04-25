@@ -1,7 +1,7 @@
 import { DateTime } from 'luxon'
 import type { PoolClient } from 'pg'
 import { daysInMonth, formatInvoiceNumber } from '@gam/shared'
-import { getClient, query } from '../db'
+import { getClient } from '../db'
 
 // ============================================================
 // S26a: Move-in invoice generator (replaces S25 moveInBundle)
@@ -69,22 +69,34 @@ async function allocateInvoiceNumber(
 }
 
 export async function generateMoveInInvoice(
-  inputs: MoveInInputs
+  inputs: MoveInInputs,
+  externalClient?: PoolClient
 ): Promise<MoveInBundleResult> {
   const rentForMoveIn = moveInRentAmount(inputs.rent_amount, inputs.start_date)
 
-  const fees = await query<{
-    id: string; fee_type: string; amount: string; description: string | null
-  }>(
+  // S28: optional caller-owned transaction. When externalClient is provided,
+  // skip BEGIN/COMMIT/ROLLBACK/release — caller owns the tx lifecycle.
+  // Standalone call path (no externalClient) preserved for catch-up backfill
+  // and any other one-shot invoice generation.
+  const ownsTx = !externalClient
+  const client: PoolClient = externalClient || await getClient()
+
+  // Query fees on the same connection as the writes. When caller owns the
+  // transaction, lease_fees rows they just inserted are invisible from a
+  // separate pool connection at READ COMMITTED. Reading via `client` ensures
+  // we see the in-flight inserts.
+  const feesRes = await client.query(
     `SELECT id, fee_type, amount, description
      FROM lease_fees
      WHERE lease_id = $1 AND due_timing = 'move_in'`,
     [inputs.lease_id]
   )
+  const fees = feesRes.rows as Array<{
+    id: string; fee_type: string; amount: string; description: string | null
+  }>
 
-  const client = await getClient()
   try {
-    await client.query('BEGIN')
+    if (ownsTx) await client.query('BEGIN')
 
     const year = DateTime.fromISO(inputs.start_date).year
     const invoiceNumber = await allocateInvoiceNumber(client, inputs.landlord_id, year)
@@ -112,7 +124,10 @@ export async function generateMoveInInvoice(
     )
 
     if (invoiceRes.rows.length === 0) {
-      await client.query('ROLLBACK')
+      // Idempotent skip — invoice already exists for (lease_id, due_date).
+      // Owns-tx case: roll back the BEGIN we issued (nothing else dirty).
+      // Caller-owns case: do nothing — caller decides commit vs rollback.
+      if (ownsTx) await client.query('ROLLBACK')
       return {
         invoiceCreated: false,
         invoiceId: null,
@@ -170,7 +185,7 @@ export async function generateMoveInInvoice(
       depositInserted = true
     }
 
-    await client.query('COMMIT')
+    if (ownsTx) await client.query('COMMIT')
 
     return {
       invoiceCreated: true,
@@ -181,9 +196,9 @@ export async function generateMoveInInvoice(
       depositInserted,
     }
   } catch (e) {
-    await client.query('ROLLBACK')
+    if (ownsTx) await client.query('ROLLBACK')
     throw e
   } finally {
-    client.release()
+    if (ownsTx) client.release()
   }
 }

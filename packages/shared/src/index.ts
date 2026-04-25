@@ -525,6 +525,64 @@ export const LEASE_COLUMN_CATEGORY: Record<LeaseColumn, LeaseColumnCategory> = {
   custom_text:            'signature',
 }
 
+// ============================================================================
+// SEND-TIME VALIDATION
+// ============================================================================
+// At POST /documents/:id/send the landlord transitions a document from draft
+// to sent (signing pipeline open). Before that flip we enforce: every tagged
+// field with a value-bearing category (writable / fee_row / utility_row) must
+// already have a non-empty value filled in by the landlord. Identity and
+// signature categories are exempt — identity gets pulled from system data at
+// sign render time, signatures are filled by signers.
+//
+// Rationale: tenants cannot sign blank fields. Landlord must complete the
+// document before tenants are invited to sign.
+//
+// Pure function — takes the rows, returns violations. DB query lives in caller.
+// ============================================================================
+
+export const LEASE_COLUMN_VALUE_BEARING_CATEGORIES: readonly LeaseColumnCategory[] =
+  ['writable', 'fee_row', 'utility_row'] as const
+
+export interface LeaseDocumentFieldRow {
+  lease_column: LeaseColumn | null
+  value: string | null
+}
+
+export interface SendTimeValidationViolation {
+  lease_column: LeaseColumn
+  category: LeaseColumnCategory
+  reason: 'unfilled'
+}
+
+/**
+ * Returns violations for send-time validation. Empty array = document is
+ * data-complete and may transition to 'sent'. Non-empty array = block send,
+ * surface the list to the landlord so they can fill the missing fields.
+ *
+ * Rule: every row with a value-bearing lease_column category must have a
+ * non-null, non-empty (after-trim) value.
+ */
+export function validateLeaseDocumentForSend(
+  rows: readonly LeaseDocumentFieldRow[]
+): SendTimeValidationViolation[] {
+  const violations: SendTimeValidationViolation[] = []
+  for (const row of rows) {
+    if (!row.lease_column) continue
+    const category = LEASE_COLUMN_CATEGORY[row.lease_column]
+    if (!LEASE_COLUMN_VALUE_BEARING_CATEGORIES.includes(category)) continue
+    const filled = row.value != null && row.value.trim().length > 0
+    if (!filled) {
+      violations.push({
+        lease_column: row.lease_column,
+        category,
+        reason: 'unfilled',
+      })
+    }
+  }
+  return violations
+}
+
 export const LEASE_COLUMN_LABEL: Record<LeaseColumn, string> = {
   tenant_name:            'Tenant name',
   tenant_email:           'Tenant email',

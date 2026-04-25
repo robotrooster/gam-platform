@@ -5,9 +5,14 @@ import {
   LeaseColumn,
   LeaseColumnVals,
   LEASE_COLUMN_CATEGORY,
+  LEASE_COLUMN_LABEL,
   WRITABLE_LEASE_COLUMN_SPECS,
+  FEE_ROW_SPECS,
+  UTILITY_ROW_SPECS,
+  validateLeaseDocumentForSend,
 } from '@gam/shared'
 import { query, queryOne, getClient } from '../db'
+import { generateMoveInInvoice } from '../jobs/moveInBundle'
 import { requireAuth, requireLandlord } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { stampPdf } from '../services/pdfStamp'
@@ -345,8 +350,8 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
     `SELECT lease_column, value, signer_role FROM lease_document_fields
      WHERE document_id=$1 AND lease_column IS NOT NULL`, [doc.id]).then(r => r.rows)
   // Only writable columns make it into `vals` for the leases INSERT.
-  // fee_row + utility_row tags are collected at S29+ (buildLeaseFromDocument
-  // rebuild) and written to lease_fees / lease_utility_assignments separately.
+  // fee_row + utility_row tags are written below to lease_fees and
+  // lease_utility_responsibilities respectively (S28 wired the chain).
   // signature + identity tags are filtered out via the shared category map.
   const vals: LeaseColumnVals = {}
   for (const f of fields) {
@@ -455,12 +460,68 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
   // Link document → lease
   await client.query('UPDATE lease_documents SET lease_id=$1 WHERE id=$2', [lease.id, doc.id])
 
+  // ────────────────────────────────────────────────────────────────────────
+  // S28: write lease_fees rows from FEE_ROW_SPECS
+  // Each spec returns null when the tag is not bound; non-null = INSERT.
+  // ────────────────────────────────────────────────────────────────────────
+  for (const [, spec] of Object.entries(FEE_ROW_SPECS)) {
+    const parsed = spec.parse(vals)
+    if (!parsed) continue
+    await client.query(
+      `INSERT INTO lease_fees (
+         lease_id, fee_type, amount, is_refundable, due_timing
+       ) VALUES ($1, $2, $3, $4, $5)`,
+      [lease.id, parsed.fee_type, parsed.amount, parsed.is_refundable, parsed.due_timing]
+    )
+  }
+
+  // ────────────────────────────────────────────────────────────────────────
+  // S28: write lease_utility_responsibilities rows from UTILITY_ROW_SPECS
+  // One row per tagged utility recording who is contractually responsible.
+  // Meter pointer (lease_utility_assignments) is a separate operational
+  // concern set by landlord later.
+  // ────────────────────────────────────────────────────────────────────────
+  for (const [, spec] of Object.entries(UTILITY_ROW_SPECS)) {
+    const parsed = spec.parse(vals)
+    if (!parsed) continue
+    await client.query(
+      `INSERT INTO lease_utility_responsibilities (
+         lease_id, utility_type, tenant_responsible
+       ) VALUES ($1, $2, $3)`,
+      [lease.id, parsed.utility_type, parsed.tenant_responsible]
+    )
+  }
+
   // If activating now, set unit status
   if (leaseStatus === 'active') {
     await client.query(
       `UPDATE units SET status='active', updated_at=NOW() WHERE id=$1`,
       [doc.unit_id])
   }
+
+  // ────────────────────────────────────────────────────────────────────────
+  // S28: generate move-in invoice on the same transaction. Reads
+  // lease_fees rows we just inserted via the same client (visible because
+  // shared connection at READ COMMITTED). Throws on failure → outer
+  // buildLeaseFromDocument catches → entire chain rolls back atomically.
+  // ────────────────────────────────────────────────────────────────────────
+  const rentAmountNum = Number(vals.rent_amount)
+  const securityDepositNum = Number(vals.security_deposit) || 0
+  if (!Number.isFinite(rentAmountNum) || rentAmountNum <= 0) {
+    throw new AppError(400, `Invalid rent_amount: ${vals.rent_amount}`)
+  }
+  await generateMoveInInvoice(
+    {
+      lease_id: lease.id,
+      unit_id: doc.unit_id,
+      tenant_id: primarySigner.tenant_id,
+      landlord_id: doc.landlord_id,
+      rent_amount: rentAmountNum,
+      security_deposit: securityDepositNum,
+      start_date: startDate,
+    },
+    client
+  )
 
   return { leaseId: lease.id, status: leaseStatus, primaryTenantId: primarySigner.tenant_id }
 }
@@ -1547,6 +1608,45 @@ esignRouter.post('/documents/:id/send', requireAuth, requireLandlord, async (req
     }
 
     const signers = await query<any>('SELECT * FROM lease_document_signers WHERE document_id=$1 ORDER BY order_index', [doc.id])
+
+    // ────────────────────────────────────────────────────────────────────────
+    // S28: Landlord-first signer check.
+    // Landlord fills the writable/fee/utility values during template completion
+    // and signs first to lock the inputs. Tenants then sign accepting those
+    // values. If a tenant signed first, they would either sign blank fields
+    // or the landlord could alter values after acceptance — both unacceptable.
+    // ────────────────────────────────────────────────────────────────────────
+    const sortedSigners = [...(signers as any[])].sort(
+      (a, b) => (a.order_index ?? 0) - (b.order_index ?? 0)
+    )
+    const firstByOrder = sortedSigners[0]
+    if (!firstByOrder) throw new AppError(400, 'No signers configured')
+    if (firstByOrder.role !== 'landlord') {
+      throw new AppError(
+        400,
+        'Landlord must be the first signer. Reorder signers so the landlord signs first.'
+      )
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // S28: Every tagged value-bearing field must be filled before send.
+    // Categories writable / fee_row / utility_row carry contractual data
+    // entered by the landlord. Identity fills from system data at render
+    // time; signature fills at sign time — both exempt.
+    // ────────────────────────────────────────────────────────────────────────
+    const fieldRows = await query<{ lease_column: LeaseColumn | null; value: string | null }>(
+      'SELECT lease_column, value FROM lease_document_fields WHERE document_id=$1',
+      [doc.id]
+    )
+    const violations = validateLeaseDocumentForSend(fieldRows as any)
+    if (violations.length > 0) {
+      const labels = violations.map(v => LEASE_COLUMN_LABEL[v.lease_column])
+      throw new AppError(
+        400,
+        `Cannot send: ${violations.length} tagged field(s) need values: ${labels.join(', ')}`
+      )
+    }
+
     const firstSigner = (signers as any[]).find(s => s.order_index === 1) || (signers as any[])[0]
     if (!firstSigner) throw new AppError(400, 'No signers configured')
 
