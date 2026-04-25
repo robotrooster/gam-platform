@@ -400,7 +400,7 @@ unitsRouter.post('/:id/activate', requireLandlord, async (req, res, next) => {
       const when = new Date(body.scheduledFor)
       if (isNaN(when.getTime())) throw new AppError(400, 'Invalid scheduledFor datetime')
       if (when.getTime() <= Date.now()) throw new AppError(400, 'scheduledFor must be in the future')
-      const updated = await queryOne<any>(`UPDATE units SET scheduled_activation_at=$1, scheduled_activation_by=$2, updated_at=NOW() WHERE id=$3 RETURNING *`, [when, req.user!.id, req.params.id])
+      const updated = await queryOne<any>(`UPDATE units SET scheduled_activation_at=$1, scheduled_activation_by=$2, updated_at=NOW() WHERE id=$3 RETURNING *`, [when, req.user!.userId, req.params.id])
       return res.json({ success: true, data: updated, scheduled: true })
     }
 

@@ -1,5 +1,5 @@
 import { Router } from 'express'
-import { pool } from '../db'
+import { db } from '../db'
 import { requireAuth } from '../middleware/auth'
 
 export const announcementsRouter = Router()
@@ -7,7 +7,7 @@ announcementsRouter.use(requireAuth)
 
 announcementsRouter.get('/', async (req, res, next) => {
   try {
-    const { rows } = await pool.query(`
+    const { rows } = await db.query(`
       SELECT id, title, body, priority, created_at
       FROM platform_announcements
       WHERE active = true
