@@ -249,8 +249,8 @@ maintenanceRouter.post('/:id/approve', requireLandlord, async (req, res, next) =
         unitNumber: unit?.unit_number,
         requestTitle: request.title,
         newStatus: nextStatus,
-        scheduledAt: null,
-        notes: null
+        scheduledAt: undefined,
+        notes: undefined
       })
     } catch(e) { console.error('[NOTIFY] maintenance approve:', e) }
 

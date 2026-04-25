@@ -91,7 +91,7 @@ landlordsRouter.get('/theme', requireAuth, async (req, res, next) => {
   try {
     const row = await queryOne(
       'SELECT theme_accent, font_style FROM landlords WHERE id=$1',
-      [req.user.profileId]
+      [req.user!.profileId]
     )
     res.json({ success: true, data: row })
   } catch (e) { next(e) }
@@ -103,7 +103,7 @@ landlordsRouter.patch('/theme', requireAuth, async (req, res, next) => {
     const { themeAccent, fontStyle } = req.body
     await query(
       'UPDATE landlords SET theme_accent=$1, font_style=$2 WHERE id=$3',
-      [themeAccent || null, fontStyle || null, req.user.profileId]
+      [themeAccent || null, fontStyle || null, req.user!.profileId]
     )
     res.json({ success: true })
   } catch (e) { next(e) }

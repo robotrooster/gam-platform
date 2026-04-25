@@ -393,12 +393,12 @@ const DEFAULT_CATEGORIES = [
 
 posRouter.get('/categories', requireLandlord, async (req, res, next) => {
   try {
-    let cats = await query('SELECT * FROM pos_categories WHERE landlord_id=$1 AND is_active=TRUE ORDER BY sort_order, name', [req.user.profileId])
+    let cats = await query('SELECT * FROM pos_categories WHERE landlord_id=$1 AND is_active=TRUE ORDER BY sort_order, name', [req.user!.profileId])
     if (cats.length === 0) {
       for (const cat of DEFAULT_CATEGORIES) {
-        await query('INSERT INTO pos_categories (landlord_id,name,icon,sort_order) VALUES ($1,$2,$3,$4)', [req.user.profileId, cat.name, cat.icon, cat.sort_order])
+        await query('INSERT INTO pos_categories (landlord_id,name,icon,sort_order) VALUES ($1,$2,$3,$4)', [req.user!.profileId, cat.name, cat.icon, cat.sort_order])
       }
-      cats = await query('SELECT * FROM pos_categories WHERE landlord_id=$1 ORDER BY sort_order, name', [req.user.profileId])
+      cats = await query('SELECT * FROM pos_categories WHERE landlord_id=$1 ORDER BY sort_order, name', [req.user!.profileId])
     }
     res.json({ success: true, data: cats })
   } catch (e) { next(e) }
@@ -407,7 +407,7 @@ posRouter.get('/categories', requireLandlord, async (req, res, next) => {
 posRouter.post('/categories', requireLandlord, async (req, res, next) => {
   try {
     const { name, icon, sortOrder } = req.body
-    const cat = await queryOne('INSERT INTO pos_categories (landlord_id,name,icon,sort_order) VALUES ($1,$2,$3,$4) RETURNING *', [req.user.profileId, name, icon||'📦', sortOrder||0])
+    const cat = await queryOne('INSERT INTO pos_categories (landlord_id,name,icon,sort_order) VALUES ($1,$2,$3,$4) RETURNING *', [req.user!.profileId, name, icon||'📦', sortOrder||0])
     res.status(201).json({ success: true, data: cat })
   } catch (e) { next(e) }
 })
@@ -415,7 +415,7 @@ posRouter.post('/categories', requireLandlord, async (req, res, next) => {
 posRouter.patch('/categories/:id', requireLandlord, async (req, res, next) => {
   try {
     const { name, icon, sortOrder, isActive } = req.body
-    const cat = await queryOne('SELECT * FROM pos_categories WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user.profileId])
+    const cat = await queryOne('SELECT * FROM pos_categories WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
     if (!cat) { res.status(404).json({ success: false, error: 'Not found' }); return }
     const updated = await queryOne('UPDATE pos_categories SET name=$1,icon=$2,sort_order=$3,is_active=$4 WHERE id=$5 RETURNING *', [name||cat.name, icon||cat.icon, sortOrder||cat.sort_order, isActive!==undefined?isActive:cat.is_active, cat.id])
     res.json({ success: true, data: updated })
@@ -424,7 +424,7 @@ posRouter.patch('/categories/:id', requireLandlord, async (req, res, next) => {
 
 posRouter.delete('/categories/:id', requireLandlord, async (req, res, next) => {
   try {
-    await query('UPDATE pos_categories SET is_active=FALSE WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user.profileId])
+    await query('UPDATE pos_categories SET is_active=FALSE WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
     res.json({ success: true })
   } catch (e) { next(e) }
 })
@@ -441,7 +441,7 @@ posRouter.get('/items/:id/variants', requireLandlord, async (req, res, next) => 
 posRouter.post('/items/:id/variants', requireLandlord, async (req, res, next) => {
   try {
     const { name, costPrice, sellPrice, stockQty, stockMin, sortOrder } = req.body
-    const item = await queryOne('SELECT * FROM pos_items WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user.profileId])
+    const item = await queryOne('SELECT * FROM pos_items WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
     if (!item) { res.status(404).json({ success: false, error: 'Not found' }); return }
     await query('UPDATE pos_items SET has_variants=TRUE WHERE id=$1', [item.id])
     const variant = await queryOne('INSERT INTO pos_item_variants (item_id,name,cost_price,sell_price,stock_qty,stock_min,sort_order) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *', [item.id, name, costPrice||0, sellPrice, stockQty||0, stockMin||5, sortOrder||0])

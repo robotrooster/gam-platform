@@ -159,7 +159,7 @@ backgroundRouter.patch('/:id/decision', requireAuth, requireLandlord, async (req
         if (check.street1 && check.city) {
           const addr = encodeURIComponent(check.street1+' '+check.city+' '+check.state+' '+check.zip+' USA')
           const geo = await fetch('https://nominatim.openstreetmap.org/search?q='+addr+'&format=json&limit=1',{headers:{'User-Agent':'GAM-Platform/1.0'}})
-          const geoData = await geo.json()
+          const geoData: any = await geo.json()
           if (geoData?.[0]){lat=geoData[0].lat;lon=geoData[0].lon}
         }
         const entry = await queryOne<any>('INSERT INTO application_pool (background_check_id,user_id,consent_pool,employment_status,monthly_income,zip,city,state,lat,lon,risk_level,risk_score) VALUES ($1,$2,TRUE,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id',
@@ -283,7 +283,7 @@ backgroundRouter.post('/:id/add-to-pool', requireAuth, requireLandlord, async (r
     try {
       const addr = encodeURIComponent(`${check.street1} ${check.city} ${check.state} ${check.zip} USA`)
       const geo = await fetch(`https://nominatim.openstreetmap.org/search?q=${addr}&format=json&limit=1`, { headers: { 'User-Agent': 'GAM-Platform/1.0' } })
-      const geoData = await geo.json()
+      const geoData: any = await geo.json()
       if (geoData?.[0]) { lat = geoData[0].lat; lon = geoData[0].lon }
     } catch(e) {}
 

@@ -59,7 +59,8 @@ app.use(cors({
     'http://localhost:3007',
     'http://localhost:3008',
     'http://localhost:3009',
-  ,'https://experience.arcgis.com'],
+    'https://experience.arcgis.com',
+  ],
   credentials: true,
 }))
 

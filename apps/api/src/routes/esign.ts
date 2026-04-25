@@ -348,7 +348,7 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
   // Read all field values mapped to lease columns
   const fields = await client.query(
     `SELECT lease_column, value, signer_role FROM lease_document_fields
-     WHERE document_id=$1 AND lease_column IS NOT NULL`, [doc.id]).then(r => r.rows)
+     WHERE document_id=$1 AND lease_column IS NOT NULL`, [doc.id]).then((r: any) => r.rows)
   // Only writable columns make it into `vals` for the leases INSERT.
   // fee_row + utility_row tags are written below to lease_fees and
   // lease_utility_responsibilities respectively (S28 wired the chain).
@@ -370,7 +370,7 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
      JOIN users u ON u.id=s.user_id
      LEFT JOIN tenants t ON t.user_id=s.user_id
      WHERE s.document_id=$1
-     ORDER BY s.order_index`, [doc.id]).then(r => r.rows)
+     ORDER BY s.order_index`, [doc.id]).then((r: any) => r.rows)
 
   const tenantSigners = tenantRows.filter((r:any) => isTenantRole(r.role))
   const primarySigner = tenantSigners.find((r:any) => r.role === 'primary')
@@ -437,7 +437,7 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
        FALSE
      ) RETURNING id, status`,
     [...writableValues, ...tailValues]
-  ).then(r => r.rows[0])
+  ).then((r: any) => r.rows[0])
 
   // INSERT lease_tenants rows — one per signer, with per-tenant supersedes chain
   for (const t of tenantSigners) {
@@ -445,7 +445,7 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
       SELECT id FROM lease_tenants
       WHERE tenant_id=$1 AND status='removed'
       ORDER BY removed_at DESC NULLS LAST, created_at DESC
-      LIMIT 1`, [t.tenant_id]).then(r => r.rows[0])
+      LIMIT 1`, [t.tenant_id]).then((r: any) => r.rows[0])
 
     const role = t.role === 'primary' ? 'primary' : 'co_tenant'
     await client.query(`
