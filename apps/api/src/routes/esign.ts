@@ -1590,6 +1590,7 @@ esignRouter.post('/documents/:id/send', requireAuth, requireLandlord, async (req
     if (!doc) throw new AppError(404, 'Document not found')
     if (doc.status === 'completed') throw new AppError(400, 'Document already completed')
     if (doc.status === 'voided')    throw new AppError(400, 'Document has been voided')
+    if (doc.status === 'execution_failed') throw new AppError(400, 'Document execution failed - create a new document instead')
 
     // Fast-fail overlap pre-check before we start emailing anyone
     const { primary, coTenants } = await getDocumentTenantSigners(doc.id)
@@ -1669,7 +1670,7 @@ esignRouter.post('/documents/:id/send', requireAuth, requireLandlord, async (req
     })
 
     await query("UPDATE lease_documents SET status='sent', sent_at=NOW(), updated_at=NOW() WHERE id=$1", [doc.id])
-    await query("UPDATE lease_document_signers SET status='sent', invite_sent=TRUE WHERE id=$1", [firstSigner.id])
+    await query("UPDATE lease_document_signers SET status='sent', invite_sent=TRUE, invite_sent_at=NOW() WHERE id=$1", [firstSigner.id])
 
     res.json({ success: true, data: { sentTo: firstSigner.email } })
   } catch (e) { next(e) }
@@ -1693,7 +1694,16 @@ esignRouter.post('/documents/:id/void', requireAuth, requireLandlord, async (req
     if (!doc) throw new AppError(404, 'Document not found')
     if (doc.status === 'completed') throw new AppError(400, 'Cannot void a completed document')
     if (doc.status === 'voided') throw new AppError(400, 'Document is already voided')
-    if (doc.sent_at) throw new AppError(409, 'Cannot void a sent document — create a superseding document instead')
+
+    // S29 item 6: Allow voiding sent-but-unsigned docs (typo recall, mistakes
+    // before any party has signed). Lock voiding once ANY signer has signed —
+    // at that point the legally clean path is to create a superseding document.
+    // This also unblocks voiding execution_failed docs so landlords can clear
+    // them from their dashboard while admin investigates.
+    const anySigned = await queryOne<any>(
+      "SELECT 1 FROM lease_document_signers WHERE document_id=$1 AND signed_at IS NOT NULL LIMIT 1",
+      [doc.id])
+    if (anySigned) throw new AppError(409, 'Cannot void after signing has begun — create a superseding document instead')
 
     // Cascade lease_tenants state by document_type
     switch (doc.document_type) {
@@ -1766,6 +1776,7 @@ esignRouter.get('/sign/:documentId', requireAuth, async (req, res, next) => {
     if (!doc) throw new AppError(404, 'Document not found')
     if (doc.status === 'voided') throw new AppError(400, 'Document has been voided')
     if (doc.status === 'completed') throw new AppError(400, 'Document fully executed')
+    if (doc.status === 'execution_failed') throw new AppError(400, 'Document execution failed - contact your landlord')
 
     const fields = await query<any>(`
       SELECT * FROM lease_document_fields
@@ -1806,6 +1817,7 @@ esignRouter.post('/sign/:documentId', requireAuth, async (req, res, next) => {
       WHERE d.id=$1`, [signer.document_id])
     if (!doc) throw new AppError(404, 'Document not found')
     if (doc.status === 'voided') throw new AppError(400, 'Document has been voided')
+    if (doc.status === 'execution_failed') throw new AppError(400, 'Document execution failed - contact your landlord')
 
     // Re-check overlap on EVERY signing (another roommate may have taken a conflicting lease
     // between send time and now)
@@ -1823,15 +1835,52 @@ esignRouter.post('/sign/:documentId', requireAuth, async (req, res, next) => {
       }
     }
 
+    // S29 item 3: Server-side required-field validation. Frontend gates on this
+    // but malicious clients can bypass the gate. Verify every required field
+    // assigned to this signer's role will have a non-empty value after this
+    // submission completes (either submitted now or already in the DB).
+    const requiredFields = await query<any>(`
+      SELECT id, label, field_type, value
+      FROM lease_document_fields
+      WHERE document_id=$1 AND signer_role=$2 AND required=TRUE`,
+      [doc.id, signer.role])
+    const submittedById = new Map<string, string>()
+    for (const fv of (fieldValues || [])) {
+      if (fv.value != null && String(fv.value).trim() !== '') {
+        submittedById.set(fv.fieldId, String(fv.value))
+      }
+    }
+    const missingRequired: string[] = []
+    for (const f of (requiredFields as any[])) {
+      const submitted = submittedById.get(f.id)
+      const existing = (f.value != null && String(f.value).trim() !== '') ? f.value : null
+      if (!submitted && !existing) {
+        missingRequired.push(f.label || `${f.field_type} field`)
+      }
+    }
+    if (missingRequired.length > 0) {
+      throw new AppError(400, `Missing required fields: ${missingRequired.join(', ')}`)
+    }
+
     const ip = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress
     const ua = req.headers['user-agent']
 
+    // S29 item 2: Field-value spoofing fix. The original UPDATE matched only
+    // on field id + document id, which let a malicious signer overwrite ANY
+    // field — including ones already signed by another party. Two extra
+    // conditions on the WHERE:
+    //   - signer_role match: you can only update fields assigned to your role
+    //   - signed_at IS NULL OR signer_id=you: only touch unsigned fields, or
+    //     fields you yourself previously signed.
+    // Spoof attempts silently no-op (filtered out by the WHERE).
     for (const fv of (fieldValues || [])) {
       await query(`
         UPDATE lease_document_fields
         SET value=$1, signed_at=NOW(), signer_id=$2
-        WHERE id=$3 AND document_id=$4`,
-        [fv.value, signer.id, fv.fieldId, doc.id])
+        WHERE id=$3 AND document_id=$4
+          AND signer_role=$5
+          AND (signed_at IS NULL OR signer_id=$2)`,
+        [fv.value, signer.id, fv.fieldId, doc.id, signer.role])
     }
 
     await query(`
@@ -1847,16 +1896,25 @@ esignRouter.post('/sign/:documentId', requireAuth, async (req, res, next) => {
       [doc.id])
 
     if (remaining?.count === 0) {
-      await query("UPDATE lease_documents SET status='completed', completed_at=NOW(), updated_at=NOW() WHERE id=$1", [doc.id])
-
+      // S29 item 5: Build lease BEFORE marking document completed. If build
+      // fails, park the doc in execution_failed state for admin investigation.
+      // Signatures are real but no lease record exists, so 'completed' would
+      // be a lie. Tenant frontend still gets completed:true (their work is
+      // done); the failure is a landlord/admin-side issue surfaced in the
+      // landlord dashboard via execution_failed status.
       let leaseResult: { leaseId: string; status: string; primaryTenantId: string } | null = null
       try {
         leaseResult = await buildLeaseFromDocument(doc.id)
       } catch (e: any) {
-        console.error('[ESIGN] buildLeaseFromDocument failed:', e.message)
-        await query("UPDATE lease_documents SET void_reason=$1 WHERE id=$2",
+        console.error('[ESIGN] buildLeaseFromDocument failed for document', doc.id, '-', e.message)
+        // TODO(admin-notifications): surface to admin notification system once that surface is built
+        await query(
+          "UPDATE lease_documents SET status='execution_failed', execution_failed_at=NOW(), void_reason=$1, updated_at=NOW() WHERE id=$2",
           [`Lease build failed: ${e.message}`, doc.id])
+        return res.json({ success: true, data: { completed: true, executionFailed: true, reason: e.message } })
       }
+
+      await query("UPDATE lease_documents SET status='completed', completed_at=NOW(), updated_at=NOW() WHERE id=$1", [doc.id])
 
       // Stamp PDF
       let executedUrl: string | null = null
@@ -1917,7 +1975,7 @@ esignRouter.post('/sign/:documentId', requireAuth, async (req, res, next) => {
           data: { documentId: doc.id },
           sendEmail: false
         })
-        await query("UPDATE lease_document_signers SET status='sent', invite_sent=TRUE WHERE id=$1", [nextSigner.id])
+        await query("UPDATE lease_document_signers SET status='sent', invite_sent=TRUE, invite_sent_at=NOW() WHERE id=$1", [nextSigner.id])
       }
       res.json({ success: true, data: { completed: false, nextSigner: nextSigner?.email } })
     }

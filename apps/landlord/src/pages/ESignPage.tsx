@@ -437,8 +437,10 @@ function SendDocumentModal({ onClose }) {
     try {
       // Phase 1: Provision (or reuse) a user account for each tenant and collect their userId.
       // Backend /tenants/invite creates users+tenants rows if missing, reuses if present, returns userId.
+      // S29 item 1: Backend (S28) requires landlord at orderIndex 1 — primary tenant gets 2,
+      // co-tenants get 3+. Landlord signer is pushed to the FRONT of the array below.
       const signers = []
-      let order = 1
+      let order = 2
       for (let i = 0; i < validEmails.length; i++) {
         const email = validEmails[i].trim()
         const existing = existingTenants.find(t => t.email === email)
@@ -455,7 +457,7 @@ function SendDocumentModal({ onClose }) {
         })
         const userId = inviteRes.data.userId
         signers.push({
-          role: order === 1 ? 'primary' : 'co_tenant_' + (order - 1),
+          role: order === 2 ? 'primary' : 'co_tenant_' + (order - 2),
           name: (nameParts.firstName + ' ' + nameParts.lastName).trim() || email,
           email,
           phone: null,
@@ -465,13 +467,13 @@ function SendDocumentModal({ onClose }) {
         })
         order++
       }
-      // Landlord signer from AuthContext
-      signers.push({
+      // S29 item 1: Landlord signs FIRST (orderIndex 1), then tenants in their slots.
+      signers.unshift({
         role: 'landlord',
         name: (authUser.firstName + ' ' + authUser.lastName).trim(),
         email: authUser.email,
         phone: null,
-        orderIndex: order,
+        orderIndex: 1,
         userId: authUser.id,
       })
       const unitId = firstTenant ? firstTenant.unitId : null
@@ -543,7 +545,7 @@ function SendDocumentModal({ onClose }) {
         {templateId && tenantEmails.some(e => e.trim()) && (
           <div style={{ padding:'10px 14px', background:'var(--bg-2)', border:'1px solid var(--border-0)', borderRadius:10, marginBottom:16, fontSize:'.75rem', color:'var(--text-2)', lineHeight:1.8 }}>
             <div><strong>Template:</strong> {selectedTemplate && selectedTemplate.name}</div>
-            <div><strong>Signing order:</strong> {tenantEmails.filter(e=>e).map((_,i) => i === 0 ? 'Primary tenant' : 'Co-tenant ' + i).join(' → ')} → Landlord</div>
+            <div><strong>Signing order:</strong> {['Landlord', ...tenantEmails.filter(e=>e).map((_,i) => i === 0 ? 'Primary tenant' : 'Co-tenant ' + i)].join(' → ')}</div>
             <div style={{ marginTop:6, fontSize:'.68rem', color:'var(--text-3)' }}>Each signer receives a signing request + portal invite email.</div>
           </div>
         )}

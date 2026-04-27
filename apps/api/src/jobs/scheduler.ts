@@ -1,5 +1,6 @@
 import cron from 'node-cron'
 import { notifyLeaseExpiring, notifyLowStock } from '../services/notifications'
+import { emailSigningReminder, emailDocumentAutoVoided } from '../services/email'
 import { query, queryOne } from '../db'
 import { generateInvoices, registerInvoiceEngine } from './invoiceGeneration'
 import { registerLateFeeEngine } from './lateFees'
@@ -135,6 +136,97 @@ async function processInvitationExpiry() {
       console.log(`[InvitationExpiry] ${expired.length} invitation(s) expired`)
     }
   } catch(e) { console.error('[SCHEDULER] invitation expiry:', e) }
+}
+
+// ── ESIGN TIMEOUTS (S29 item 4) ─────────────────────────────
+// Every 15 min: 2h reminder (one-shot per signer) + 24h auto-void.
+// Reminder anchor is invite_sent_at (per-signer), so when the cascade
+// flips the next signer to 'sent', their 2h clock resets correctly.
+// Auto-void uses cascade-first ordering for idempotent re-runs:
+// pending_add/pending_remove cleanup is a no-op once already updated,
+// so a partial failure is safely re-tried on the next cycle.
+async function processEsignTimeouts() {
+  try {
+    // Pass 1: reminders
+    const remind = await query<any>(`
+      SELECT s.id, s.email, s.name,
+             d.id as doc_id, d.title,
+             u.unit_number, p.name as property_name,
+             lu.first_name || ' ' || lu.last_name as landlord_name
+      FROM lease_document_signers s
+      JOIN lease_documents d ON d.id = s.document_id
+      LEFT JOIN units u ON u.id = d.unit_id
+      LEFT JOIN properties p ON p.id = u.property_id
+      JOIN landlords la ON la.id = d.landlord_id
+      JOIN users lu ON lu.id = la.user_id
+      WHERE s.status IN ('sent','viewed')
+        AND s.reminder_sent_at IS NULL
+        AND s.invite_sent_at IS NOT NULL
+        AND s.invite_sent_at < NOW() - INTERVAL '2 hours'
+        AND d.status NOT IN ('completed','voided','execution_failed')
+    `)
+    for (const r of remind as any[]) {
+      try {
+        const unitLabel = r.unit_number ? `Unit ${r.unit_number} — ${r.property_name}` : r.title
+        const signingUrl = `${process.env.TENANT_APP_URL || 'http://localhost:3002'}/sign/${r.doc_id}`
+        await emailSigningReminder(r.email, r.name, r.title, unitLabel, r.landlord_name, signingUrl)
+        await query(`UPDATE lease_document_signers SET reminder_sent_at=NOW() WHERE id=$1`, [r.id])
+      } catch(e) {
+        console.error('[ESIGN-TIMEOUTS] reminder failed for signer', r.id, ':', e)
+      }
+    }
+    if ((remind as any[]).length > 0) {
+      console.log(`[ESIGN-TIMEOUTS] sent ${(remind as any[]).length} reminder(s)`)
+    }
+
+    // Pass 2: auto-void
+    // TODO(deferred): extract cascade switch into shared helper to dedupe with esign.ts void route
+    const expired = await query<any>(`
+      SELECT d.id, d.title, d.document_type, d.landlord_id,
+             u.unit_number, p.name as property_name
+      FROM lease_documents d
+      LEFT JOIN units u ON u.id = d.unit_id
+      LEFT JOIN properties p ON p.id = u.property_id
+      WHERE d.status='sent'
+        AND d.sent_at IS NOT NULL
+        AND d.sent_at < NOW() - INTERVAL '24 hours'
+    `)
+    for (const d of expired as any[]) {
+      try {
+        switch (d.document_type) {
+          case 'addendum_add':
+            await query(`UPDATE lease_tenants SET status='void', updated_at=NOW() WHERE add_document_id=$1 AND status='pending_add'`, [d.id])
+            break
+          case 'addendum_remove':
+            await query(`UPDATE lease_tenants SET status='active', remove_document_id=NULL, updated_at=NOW() WHERE remove_document_id=$1 AND status='pending_remove'`, [d.id])
+            break
+          // addendum_terms + original_lease: no cascade needed
+        }
+        await query(`UPDATE lease_documents SET status='voided', voided_at=NOW(), void_reason=$1, updated_at=NOW() WHERE id=$2`,
+          ['auto-voided: signers did not respond within 24 hours', d.id])
+
+        const unitLabel = d.unit_number ? `Unit ${d.unit_number} — ${d.property_name}` : d.title
+        const recipients = await query<any>(`
+          SELECT email, name FROM lease_document_signers WHERE document_id=$1
+          UNION ALL
+          SELECT lu.email, (lu.first_name || ' ' || lu.last_name) as name
+          FROM landlords la JOIN users lu ON lu.id = la.user_id WHERE la.id=$2
+        `, [d.id, d.landlord_id])
+        for (const rcp of recipients as any[]) {
+          try {
+            await emailDocumentAutoVoided(rcp.email, rcp.name, d.title, unitLabel)
+          } catch(e) {
+            console.error('[ESIGN-TIMEOUTS] auto-void email failed for', rcp.email, ':', e)
+          }
+        }
+      } catch(e) {
+        console.error('[ESIGN-TIMEOUTS] auto-void failed for doc', d.id, ':', e)
+      }
+    }
+    if ((expired as any[]).length > 0) {
+      console.log(`[ESIGN-TIMEOUTS] auto-voided ${(expired as any[]).length} document(s)`)
+    }
+  } catch(e) { console.error('[SCHEDULER] esign timeouts:', e) }
 }
 
 async function checkLowStock() {
@@ -458,6 +550,9 @@ export function schedulerInit() {
   // ── INVITATION EXPIRY ───────────────────────────────────────
   // Hourly at :10 — expire pending invitations past 24h TTL
   cron.schedule('10 * * * *', processInvitationExpiry)
+
+  // S29 item 4: e-sign reminders (2h) + auto-void (24h). Every 15 min.
+  cron.schedule('*/15 * * * *', processEsignTimeouts)
 
   // Run every hour — flip scheduled-activation units to active once due
   cron.schedule('5 * * * *', async () => {

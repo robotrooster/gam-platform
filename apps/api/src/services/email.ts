@@ -153,6 +153,40 @@ export async function emailSigningCompleted(to: string, signerName: string, docu
   )
 }
 
+// ── ESIGN REMINDER + AUTO-VOID EMAILS (S29) ───────────────
+
+export async function emailSigningReminder(to: string, signerName: string, documentTitle: string, unitLabel: string, landlordName: string, signingUrl: string) {
+  await send(to, `Reminder: please sign ${documentTitle}`,
+    base(
+      h('Reminder: Document Awaiting Your Signature') +
+      p(`Hi ${signerName},`) +
+      p(`This is a reminder that <strong style="color:#eef1f8">${landlordName}</strong> sent you a document to review and sign, and it has not yet been signed:`) +
+      `<div style="margin:12px 0;padding:12px 16px;background:#0a0f14;border-radius:8px;border-left:3px solid #c9a227">
+        <div style="font-weight:700;color:#eef1f8;margin-bottom:2px">${documentTitle}</div>
+        <div style="font-size:.82rem;color:#b8c4d8">${unitLabel}</div>
+      </div>` +
+      p('If the document is not signed within 24 hours of being sent, it will be automatically voided.') +
+      btn('Review & Sign Document', signingUrl) +
+      `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">Sign in to your GAM account to access this document.</div>`
+    )
+  )
+}
+
+export async function emailDocumentAutoVoided(to: string, recipientName: string, documentTitle: string, unitLabel: string) {
+  await send(to, `Document auto-voided: ${documentTitle}`,
+    base(
+      h('Document Has Been Auto-Voided') +
+      p(`Hi ${recipientName},`) +
+      p('The following document was automatically voided because it was not signed by all parties within 24 hours of being sent:') +
+      `<div style="margin:12px 0;padding:12px 16px;background:#0a0f14;border-radius:8px;border-left:3px solid #c9a227">
+        <div style="font-weight:700;color:#eef1f8;margin-bottom:2px">${documentTitle}</div>
+        <div style="font-size:.82rem;color:#b8c4d8">${unitLabel}</div>
+      </div>` +
+      p('No action is required. If you still need to complete this signing, please contact the landlord to send a new document.')
+    )
+  )
+}
+
 // ── INVITATION EMAILS ─────────────────────────────────────────
 
 export async function emailInvitation(to: string, inviterName: string, role: LandlordAssignableRole, acceptUrl: string) {
