@@ -8,7 +8,7 @@ import {
   LayoutDashboard, Building2, DoorOpen, Users, CreditCard,
   ArrowDownToLine, Wrench, FileText, LogOut, Settings,
   ShoppingCart, Shield, Package, BarChart2, ScrollText,
-  UserSearch, ClipboardList, HeartHandshake, PenTool
+  UserSearch, ClipboardList, HeartHandshake, PenTool, UserPlus
 } from 'lucide-react'
 
 const NAV_ITEMS = [
@@ -19,6 +19,7 @@ const NAV_ITEMS = [
   { to: '/units',         icon: DoorOpen,         label: 'Unit Overview',    section: null,          roles: ['landlord','property_manager','onsite_manager'] },
   { to: '/schedule',      icon: DoorOpen,         label: 'Master Schedule',  section: null,          roles: ['landlord','property_manager','onsite_manager'] },
   { to: '/tenants',       icon: Users,            label: 'Tenants',          section: null,          roles: ['landlord','property_manager'] },
+  { to: '/tenant-onboarding', icon: UserPlus,        label: 'Tenant Onboarding', section: null,         roles: ['landlord','property_manager'] },
   { to: '/leases',        icon: ScrollText,       label: 'Leases',           section: null,          roles: ['landlord','property_manager'] },
   { to: '/esign',         icon: PenTool,          label: 'E-Sign',           section: null,          roles: ['landlord','property_manager'] },
   // Financials

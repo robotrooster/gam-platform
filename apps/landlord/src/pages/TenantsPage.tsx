@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useQuery } from 'react-query'
 import { apiGet } from '../lib/api'
-import { Users, Plus } from 'lucide-react'
+import { Users, Plus, UserPlus } from 'lucide-react'
 import { InviteTenantModal } from './InviteTenantModal'
 
 export function TenantsPage() {
@@ -15,7 +15,14 @@ export function TenantsPage() {
     <div>
       <div className="page-header">
         <div><h1 className="page-title">Tenants</h1><p className="page-subtitle">{tenants.length} active tenants</p></div>
-        <button className="btn btn-primary" onClick={() => setShowInvite(true)}><Plus size={15} /> Invite Tenant</button>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button className="btn btn-ghost" onClick={() => navigate('/tenant-onboarding')}>
+            <UserPlus size={15} /> Onboard Existing Tenant
+          </button>
+          <button className="btn btn-primary" onClick={() => setShowInvite(true)}>
+            <Plus size={15} /> Invite Tenant
+          </button>
+        </div>
       </div>
       {isLoading ? <div style={{color:'var(--text-3)',padding:32}}>Loading…</div> : (
         <div className="card" style={{padding:0}}>

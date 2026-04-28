@@ -661,3 +661,42 @@ CREATE TABLE IF NOT EXISTS books_access (
   updated_at TIMESTAMPTZ DEFAULT NOW(),
   UNIQUE(bookkeeper_user_id, landlord_id)
 );
+
+
+-- ── PENDING TENANT INTENTS (S29c-2-A: limbo-state onboarding queue) ────
+-- A landlord-scoped queue of in-flight tenant onboardings that don't have a
+-- lease yet. Lifecycle: created when landlord types name+email+phone with no
+-- lease info; transitions through PDF upload + parse; resolved when a lease
+-- is built from the parser output (or deleted if abandoned/wrong).
+--
+-- The tenant + user rows are created at intent time so the parser's matching
+-- logic has something to compare against. Activation email does NOT fire
+-- until the lease is created from this intent.
+CREATE TABLE IF NOT EXISTS pending_tenant_intents (
+  id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  landlord_id        UUID NOT NULL REFERENCES landlords(id) ON DELETE CASCADE,
+  tenant_id          UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  parser_status      TEXT NOT NULL DEFAULT 'not_uploaded'
+    CHECK (parser_status IN ('not_uploaded','parsing','parsed','mismatch','error','resolved')),
+  imported_pdf_url   TEXT,
+  parser_output      JSONB,           -- Full extracted data when parser_status in ('parsed','mismatch')
+  parser_flags       JSONB,           -- Array of {category, severity, message, field?, expected?, actual?}
+  parser_error       TEXT,            -- Populated when parser_status='error'
+  parser_started_at  TIMESTAMPTZ,
+  parser_finished_at TIMESTAMPTZ,
+  resolved_at        TIMESTAMPTZ,
+  resolved_lease_id  UUID REFERENCES leases(id) ON DELETE SET NULL,
+  created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  -- A tenant can only be in one active intent at a time. Once resolved or
+  -- deleted, the row is gone (cascade) so a new intent can be opened.
+  UNIQUE (tenant_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_tenant_intents_landlord
+  ON pending_tenant_intents (landlord_id)
+  WHERE resolved_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_pending_tenant_intents_parser_status
+  ON pending_tenant_intents (parser_status)
+  WHERE parser_status IN ('parsing','parsed','mismatch','error');

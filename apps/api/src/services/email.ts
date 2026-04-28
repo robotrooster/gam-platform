@@ -201,3 +201,30 @@ export async function emailInvitation(to: string, inviterName: string, role: Lan
     )
   )
 }
+
+// S29c — onboarding activation email (existing-tenant migration flow)
+export async function emailTenantOnboarded(
+  to: string,
+  tenantName: string,
+  landlordName: string,
+  propertyAddress: string,
+  unitLabel: string,
+  activationUrl: string
+) {
+  await send(to, `${landlordName} added you to GAM for ${unitLabel}`,
+    base(
+      h('Welcome to GAM') +
+      p(`Hi ${tenantName},`) +
+      p(`Your landlord <strong style="color:#eef1f8">${landlordName}</strong> has added you to GAM, the platform they use to manage your tenancy.`) +
+      `<div style="margin:12px 0;padding:12px 16px;background:#0a0f14;border-radius:8px;border-left:3px solid #c9a227">
+        <div style="font-weight:700;color:#eef1f8;margin-bottom:2px">${propertyAddress}</div>
+        <div style="font-size:.82rem;color:#b8c4d8">${unitLabel}</div>
+      </div>` +
+      p('Click below to activate your account and set a password. There is no application or background check required — your landlord has already onboarded you.') +
+      btn('Activate Your Account', activationUrl) +
+      p('Once activated, you can view your lease, set up rent payments, and submit maintenance requests through the GAM tenant portal.') +
+      `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">If you have questions, reach out to your landlord directly.</div>`
+    )
+  )
+}
+

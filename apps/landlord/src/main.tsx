@@ -19,6 +19,7 @@ import { DisbursementsPage } from './pages/DisbursementsPage'
 import { MaintenancePage } from './pages/MaintenancePage'
 import { DocumentsPage }   from './pages/DocumentsPage'
 import { OnboardingPage }  from './pages/OnboardingPage'
+import { TenantOnboardingPage } from './pages/TenantOnboardingPage'
 import { ReportsPage } from './pages/ReportsPage'
 import { ESignPage } from './pages/ESignPage'
 import { BackgroundChecksPage } from './pages/BackgroundChecksPage'
@@ -86,6 +87,7 @@ export default function App() {
               <Route path="units/:id"      element={<UnitDetailPage />} />
               <Route path="tenants"        element={<TenantsPage />} />
               <Route path="tenants/:id"      element={<TenantDetailPage />} />
+              <Route path="tenant-onboarding" element={<TenantOnboardingPage />} />
               <Route path="documents"      element={<DocumentsPage />} />
               <Route path="leases"         element={<LeasesPage />} />
               <Route path="esign"          element={<ESignPage />} />

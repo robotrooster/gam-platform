@@ -124,9 +124,14 @@ export function UnitDetailPage() {
             </span>
           )}
           {unit.status === 'vacant' && (
-            <button className="btn btn-sm btn-secondary" onClick={() => markAvailMut.mutate()} disabled={markAvailMut.isLoading}>
-              {markAvailMut.isLoading ? 'Saving…' : 'Mark Available'}
-            </button>
+            <>
+              <button className="btn btn-sm btn-primary" onClick={() => navigate('/tenant-onboarding')}>
+                Onboard Existing Tenant
+              </button>
+              <button className="btn btn-sm btn-secondary" onClick={() => markAvailMut.mutate()} disabled={markAvailMut.isLoading}>
+                {markAvailMut.isLoading ? 'Saving…' : 'Mark Available'}
+              </button>
+            </>
           )}
           {unit.status === 'available' && (
             <>

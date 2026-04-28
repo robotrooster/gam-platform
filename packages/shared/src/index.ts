@@ -1058,6 +1058,15 @@ export const DEPOSIT_INTEREST_CADENCES: readonly DepositInterestCadence[] =
 // ============================================================================
 
 export const LEASE_TYPES = ['month_to_month', 'fixed_term', 'nnn_commercial'] as const
+
+// S29c — onboarding source (where the tenant entered the platform)
+export type OnboardingSource = 'applied' | 'onboarded'
+export const ONBOARDING_SOURCES: readonly OnboardingSource[] = ['applied', 'onboarded'] as const
+
+// S29c — lease source (e-signed in GAM vs imported from off-platform)
+export type LeaseSource = 'esigned' | 'imported'
+export const LEASE_SOURCES: readonly LeaseSource[] = ['esigned', 'imported'] as const
+
 export type LeaseType = typeof LEASE_TYPES[number]
 export const LEASE_TYPE_LABEL: Record<LeaseType, string> = {
   month_to_month: 'Month-to-month',
