@@ -3,10 +3,8 @@ import { useQuery } from 'react-query'
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
 import { apiGet } from '../lib/api'
 import { useNavigate } from 'react-router-dom'
-import { useAuth } from '../context/AuthContext'
 import { AlertTriangle, CheckCircle, TrendingUp, ArrowDownToLine, Clock, FileText, CreditCard, Wrench, ChevronRight } from 'lucide-react'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
-const PLATFORM_FEES = { ACTIVE_UNIT: 15 }
 
 interface DashStats {
   activeUnits: number
@@ -22,16 +20,7 @@ interface DashStats {
   projectedOtpDisbursement?: number
 }
 
-const unitStatusBadge = (s: string) => {
-  const map: Record<string, string> = {
-    active: 'badge-green', direct_pay: 'badge-blue',
-    vacant: 'badge-muted', delinquent: 'badge-amber', suspended: 'badge-red'
-  }
-  return map[s] || 'badge-muted'
-}
-
 export function DashboardPage() {
-  const { user } = useAuth()
   const navigate = useNavigate()
   const [showFeeModal, setShowFeeModal] = useState(false)
 
@@ -41,19 +30,11 @@ export function DashboardPage() {
     { staleTime: Infinity }
   )
 
-  const { data: units } = useQuery(
-    'units-recent',
-    () => apiGet<any[]>('/units'),
-    { select: (d: any) => d?.slice(0, 8) }
-  )
-
   const { data: disbursements } = useQuery(
     'disbursements-recent',
     () => apiGet<any[]>('/disbursements'),
     { select: (d: any) => d?.slice(0, 5) }
   )
-
-  const totalUnits = (stats?.activeUnits || 0) + (stats?.directPayUnits || 0) + (stats?.vacantUnits || 0)
 
   // Pad trend to always show 6 months
   const trendData = (() => {
@@ -134,6 +115,10 @@ export function DashboardPage() {
         </div>
       </div>
 
+      {/* S159: PM cut MTD vs net to owner — only renders when there's
+            an active PM linkage with measurable cut this month. */}
+      <PmCutThisMonthCard />
+
       {/* OTP Pipeline */}
       <div className="card" style={{marginBottom:20,background:'rgba(201,162,39,.04)',border:'1px solid rgba(201,162,39,.2)'}}>
         <div className="card-header">
@@ -203,18 +188,22 @@ export function DashboardPage() {
           {disbursements?.length ? (
             <table className="data-table">
               <thead><tr>
-                <th>Date</th><th>Amount</th><th>Units</th><th>Status</th><th>SLA</th>
+                <th>Date</th><th>Amount</th><th>Trigger</th><th>Status</th>
               </tr></thead>
               <tbody>
-                {disbursements.map((d: any) => (
-                  <tr key={d.id}>
-                    <td className="mono">{new Date(d.targetDate).toLocaleDateString()}</td>
-                    <td className="mono" style={{color:'var(--green)'}}>{fmt(d.amount)}</td>
-                    <td className="mono">{d.unitCount}</td>
-                    <td><span className={`badge ${d.status === 'settled' ? 'badge-green' : d.status === 'pending' ? 'badge-amber' : 'badge-red'}`}>{d.status}</span></td>
-                    <td><span className={`badge ${d.fromReserve ? 'badge-gold' : 'badge-muted'}`}>{d.fromReserve ? 'Reserve' : 'Collected'}</span></td>
-                  </tr>
-                ))}
+                {disbursements.map((d: any) => {
+                  const dateStr = d.createdAt ?? d.targetDate
+                  return (
+                    <tr key={d.id}>
+                      <td className="mono">{dateStr ? new Date(dateStr).toLocaleDateString() : '—'}</td>
+                      <td className="mono" style={{color:'var(--green)'}}>{fmt(d.amount)}</td>
+                      <td style={{fontSize:'.78rem'}}>
+                        {d.triggerType === 'auto_friday' ? 'Auto-Friday' : d.triggerType === 'manual_on_demand' ? 'Manual' : (d.triggerType ?? '—')}
+                      </td>
+                      <td><span className={`badge ${d.status === 'settled' ? 'badge-green' : d.status === 'pending' || d.status === 'processing' ? 'badge-amber' : 'badge-red'}`}>{d.status}</span></td>
+                    </tr>
+                  )
+                })}
               </tbody>
             </table>
           ) : (
@@ -480,6 +469,59 @@ function BulletinBoard() {
           ))}
         </div>
       )}
+    </div>
+  )
+}
+
+// S159: dashboard tile showing PM cut MTD vs net to owner. Hides itself
+// when no PM is contracted (no rows or all zeros). Pulls from the
+// existing /me/pm-impact endpoint with from/to set to current month.
+function PmCutThisMonthCard() {
+  const navigate = useNavigate()
+  const monthStart = (() => { const d = new Date(); d.setDate(1); return d.toISOString().slice(0,10) })()
+  const today = new Date().toISOString().slice(0,10)
+
+  const { data } = useQuery<{ rows: Array<{
+    propertyId: string; propertyName: string; pmCompanyId: string | null;
+    pmCompanyName: string | null; pmCompanyCut: string; ownerNet: string;
+  }>; from: string | null; to: string | null }>(
+    ['pm-impact-mtd', monthStart, today],
+    () => apiGet(`/landlords/me/pm-impact?from=${monthStart}&to=${today}`),
+    { staleTime: 5 * 60 * 1000 },
+  )
+
+  if (!data || data.rows.length === 0) return null
+
+  const totals = data.rows.reduce((acc, r) => {
+    acc.cut    += Number(r.pmCompanyCut) || 0
+    acc.net    += Number(r.ownerNet) || 0
+    if (r.pmCompanyId) acc.linkedProps += 1
+    return acc
+  }, { cut: 0, net: 0, linkedProps: 0 })
+
+  if (totals.cut === 0 && totals.linkedProps === 0) return null
+
+  return (
+    <div className="card" style={{ marginBottom: 20, cursor: 'pointer', background: 'rgba(201,162,39,.04)', border: '1px solid rgba(201,162,39,.2)' }}
+         onClick={() => navigate('/disbursements')}>
+      <div className="card-header">
+        <span className="card-title">PM Cut This Month</span>
+        <span style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>
+          across {totals.linkedProps} {totals.linkedProps === 1 ? 'property' : 'properties'}
+        </span>
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20 }}>
+        <div>
+          <div className="kpi-label">PM Cut</div>
+          <div className="kpi-value gold">{fmt(totals.cut)}</div>
+          <div className="kpi-sub">routed to your PM company</div>
+        </div>
+        <div>
+          <div className="kpi-label">Net to You</div>
+          <div className="kpi-value green">{fmt(totals.net)}</div>
+          <div className="kpi-sub">owner share after PM + GAM fees</div>
+        </div>
+      </div>
     </div>
   )
 }

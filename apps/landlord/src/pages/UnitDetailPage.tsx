@@ -4,9 +4,9 @@ import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
 import { ArrowLeft, Shield, CheckCircle, AlertTriangle, Camera, Trash2, ExternalLink } from 'lucide-react'
 
-const getReservePhase = (pct: number) => ({ phase: pct >= 90 ? 'full' : pct >= 70 ? 'growth' : 'early' })
-
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
+const API_URL = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
+const LISTINGS_URL = (import.meta as any).env?.VITE_LISTINGS_APP_URL || 'http://localhost:3008'
 
 export function UnitDetailPage() {
   const { id } = useParams()
@@ -26,7 +26,6 @@ export function UnitDetailPage() {
 
   const { data: unit, isLoading } = useQuery(['unit', id], () => apiGet<any>('/units/' + id))
   const { data: econ } = useQuery(['unit-econ', id], () => apiGet<any>('/units/' + id + '/economics'))
-  const { data: payments = [] } = useQuery(['unit-payments', id], () => apiGet<any[]>('/payments?unitId=' + id))
   const { data: maintenance = [] } = useQuery(['unit-maint', id], () => apiGet<any[]>('/maintenance?unitId=' + id))
 
   const markAvailMut = useMutation(() => apiPost('/units/' + id + '/mark-available', {}), { onSuccess: () => qc.invalidateQueries(['unit', id]) })
@@ -75,7 +74,7 @@ export function UnitDetailPage() {
     try {
       const fd = new FormData()
       Array.from(files).forEach(f => fd.append('photos', f))
-      await fetch('http://localhost:4000/api/properties/units/' + id + '/photos', {
+      await fetch(`${API_URL}/api/properties/units/${id}/photos`, {
         method: 'POST',
         headers: { Authorization: 'Bearer ' + localStorage.getItem('gam_token') },
         body: fd,
@@ -88,7 +87,7 @@ export function UnitDetailPage() {
   }
 
   const deletePhoto = async (photoId: string) => {
-    await fetch('http://localhost:4000/api/properties/units/' + id + '/photos/' + photoId, {
+    await fetch(`${API_URL}/api/properties/units/${id}/photos/${photoId}`, {
       method: 'DELETE',
       headers: { Authorization: 'Bearer ' + localStorage.getItem('gam_token') },
     })
@@ -102,8 +101,6 @@ export function UnitDetailPage() {
 
   if (isLoading) return <div style={{ color: 'var(--text-3)', padding: 32 }}>Loading...</div>
   if (!unit) return <div className="empty-state"><h3>Unit not found</h3></div>
-
-  const { phase } = getReservePhase(econ?.occupiedPortfolio || 0)
 
   return (
     <div>
@@ -293,7 +290,7 @@ export function UnitDetailPage() {
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(120px, 1fr))', gap: 8 }}>
               {(photos as any[]).map((p: any) => (
                 <div key={p.id} style={{ position: 'relative', borderRadius: 8, overflow: 'hidden', aspectRatio: '4/3', background: 'var(--bg-2)' }}>
-                  <img src={'http://localhost:4000' + p.url} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                  <img src={`${API_URL}${p.url}`} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
                   <button onClick={() => deletePhoto(p.id)} style={{ position: 'absolute', top: 4, right: 4, background: 'rgba(0,0,0,.6)', border: 'none', borderRadius: '50%', width: 24, height: 24, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', color: '#fff' }}>
                     <Trash2 size={12} />
                   </button>
@@ -309,7 +306,7 @@ export function UnitDetailPage() {
         </div>
 
         <div style={{ display: 'flex', gap: 10, marginTop: 16, paddingTop: 14, borderTop: '1px solid var(--border-0)', justifyContent: 'space-between', alignItems: 'center' }}>
-          <a href="http://localhost:3008" target="_blank" rel="noreferrer" style={{ fontSize: '.78rem', color: 'var(--text-3)', display: 'flex', alignItems: 'center', gap: 4 }}>
+          <a href={LISTINGS_URL} target="_blank" rel="noreferrer" style={{ fontSize: '.78rem', color: 'var(--text-3)', display: 'flex', alignItems: 'center', gap: 4 }}>
             <ExternalLink size={12} /> View public listings page
           </a>
           <button className="btn btn-primary btn-sm" onClick={saveListing} disabled={savingListing}>
@@ -339,7 +336,7 @@ export function UnitDetailPage() {
                 <div style={{ flex: 1 }}>
                   <div style={{ fontWeight: 600, fontSize: '.85rem' }}>Schedule for later</div>
                   <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginBottom: schedChoice === 'later' ? 10 : 0 }}>
-                    Time zone of the unit (based on state: <strong>{unit.state || 'AZ'}</strong>).
+                    Time zone of the unit (based on state: <strong>{unit.state || '—'}</strong>).
                   </div>
                   {schedChoice === 'later' && (
                     <input
@@ -384,7 +381,7 @@ export function UnitDetailPage() {
                       TN:'America/Chicago',TX:'America/Chicago',UT:'America/Denver',VT:'America/New_York',VA:'America/New_York',WA:'America/Los_Angeles',
                       WV:'America/New_York',WI:'America/Chicago',WY:'America/Denver'
                     }
-                    const tz = STATE_TZ[(unit.state || 'AZ').toUpperCase()] || 'America/Phoenix'
+                    const tz = STATE_TZ[(unit.state || '').toUpperCase()] || 'America/Phoenix'
                     // Compute tz offset for that wall moment
                     const asIfUtc = new Date(schedLocal + 'Z')
                     const offsetFmt = new Intl.DateTimeFormat('en-US', { timeZone: tz, timeZoneName: 'shortOffset' })

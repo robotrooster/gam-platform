@@ -1,7 +1,10 @@
 import { Router } from 'express'
+import { z } from 'zod'
 import { query, queryOne } from '../db'
-import { requireAuth, requireLandlord } from '../middleware/auth'
+import { requireAuth, requirePerm } from '../middleware/auth'
 import { sendBulkNotification } from '../services/notifications'
+import { resolveLandlordIdForUser } from '../lib/scope'
+import { AppError } from '../middleware/errorHandler'
 
 export const notificationsRouter = Router()
 notificationsRouter.use(requireAuth)
@@ -9,7 +12,16 @@ notificationsRouter.use(requireAuth)
 // GET /api/notifications — get user's notifications
 notificationsRouter.get('/', async (req, res, next) => {
   try {
-    const limit  = parseInt(req.query.limit as string) || 20
+    // S409 (S402 finding): pre-fix used `parseInt(limit) || 20` which
+    // accepted negative values (LIMIT -1 → 500 from postgres 22023)
+    // and unbounded positives (?limit=999999 → potential heap blow-up
+    // on huge notification tables). Clamp to [1, 200]. Self-DoS only
+    // since the query is caller-scoped, but no reason to leave the
+    // edge cases sharp.
+    const rawLimit = parseInt(req.query.limit as string)
+    const limit = Number.isFinite(rawLimit) && rawLimit > 0
+      ? Math.min(rawLimit, 200)
+      : 20
     const unread = req.query.unread === 'true'
     const notes  = await query<any>(`
       SELECT * FROM notifications
@@ -51,9 +63,21 @@ notificationsRouter.get('/preferences', async (req, res, next) => {
 })
 
 // PATCH /api/notifications/preferences
+// S409 (S402 finding): pre-fix had no validation on body. Type could be
+// any string of any length, and the bool flags were trusted as-is.
+// Codebase has 15+ notification types and growing, so a hard allow-list
+// would be brittle — soft format validation (snake_case, max 64 chars)
+// catches the realistic abuse (random spam) without locking us into
+// per-type maintenance.
+const prefsPatchSchema = z.object({
+  type:          z.string().regex(/^[a-z][a-z0-9_]{0,63}$/, 'type must be snake_case, ≤64 chars'),
+  emailEnabled:  z.boolean(),
+  smsEnabled:    z.boolean(),
+  inAppEnabled:  z.boolean(),
+})
 notificationsRouter.patch('/preferences', async (req, res, next) => {
   try {
-    const { type, emailEnabled, smsEnabled, inAppEnabled } = req.body
+    const { type, emailEnabled, smsEnabled, inAppEnabled } = prefsPatchSchema.parse(req.body)
     await query(`INSERT INTO notification_preferences (user_id,type,email_enabled,sms_enabled,in_app_enabled)
       VALUES ($1,$2,$3,$4,$5)
       ON CONFLICT (user_id,type) DO UPDATE SET email_enabled=$3,sms_enabled=$4,in_app_enabled=$5`,
@@ -63,12 +87,19 @@ notificationsRouter.patch('/preferences', async (req, res, next) => {
 })
 
 // POST /api/notifications/bulk — landlord sends bulk message
-notificationsRouter.post('/bulk', requireLandlord, async (req, res, next) => {
+// S129: opened to property_manager via notifications.send_bulk.
+notificationsRouter.post('/bulk', requirePerm('notifications.send_bulk'), async (req, res, next) => {
   try {
     const { title, body, propertyId, sendEmail, sendSMS } = req.body
     if (!title || !body) return res.status(400).json({ success: false, error: 'title and body required' })
+    if (propertyId !== undefined && propertyId !== null && propertyId !== '' &&
+        !/^[0-9a-f-]{36}$/i.test(String(propertyId))) {
+      return res.status(400).json({ success: false, error: 'propertyId must be a uuid' })
+    }
+    const landlordId = resolveLandlordIdForUser(req.user!)
+    if (!landlordId) throw new AppError(400, 'No landlord scope on this user')
     const result = await sendBulkNotification({
-      landlordId: req.user!.profileId, propertyId, title, body, sendEmail, sendSMS
+      landlordId, propertyId: propertyId || undefined, title, body, sendEmail, sendSMS
     })
     res.json({ success: true, data: result })
   } catch (e) { next(e) }

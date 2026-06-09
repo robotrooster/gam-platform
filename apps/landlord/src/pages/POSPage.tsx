@@ -25,10 +25,13 @@ export function POSPage() {
   const [appliedDiscount, setAppliedDiscount] = useState<any>(null)
   const [discountCode, setDiscountCode] = useState('')
   const [openItem, setOpenItem] = useState({ name:'', price:'', show:false })
-  const [noteModal, setNoteModal] = useState<{show:boolean; txId:string}>({show:false,txId:''})
   const [refundModal, setRefundModal] = useState<{show:boolean; tx:any}>({show:false,tx:null})
   const [refundAmt, setRefundAmt] = useState('')
   const [refundReason, setRefundReason] = useState('')
+  // S339: refund_method enforcement. Cashier picks cash or check for
+  // cash/card sales; FlexCharge sales reverse on the open account
+  // (server forces 'charge' regardless of what we send).
+  const [refundMethod, setRefundMethod] = useState<'cash'|'check'>('cash')
 
   // Item management state
   const [editItem, setEditItem] = useState<any>(null)
@@ -73,7 +76,6 @@ export function POSPage() {
   const total = discountedSubtotal + taxAmount + surcharge
   const changeDue = method==='cash' ? Math.max(0, Number(cashGiven)-total) : 0
   const chargeBlocked = method==='charge' && cart.some(i => !i.chargeEligible)
-  const canCharge = method==='charge' && !!tenantId && !chargeBlocked
 
   const applyDiscountCode = () => {
     const d = (discounts as any[]).find((x:any) => x.code?.toLowerCase() === discountCode.toLowerCase())
@@ -137,8 +139,8 @@ export function POSPage() {
 
   // Refund mutation
   const refundMut = useMutation(
-    () => apiPost(`/pos/transactions/${refundModal.tx?.id}/refund`, { amount:Number(refundAmt)||refundModal.tx?.total, reason:refundReason, refundMethod:refundModal.tx?.paymentMethod }),
-    { onSuccess: () => { qc.invalidateQueries('pos-transactions'); setRefundModal({show:false,tx:null}); setRefundAmt(''); setRefundReason('') } }
+    () => apiPost(`/pos/transactions/${refundModal.tx?.id}/refund`, { amount:Number(refundAmt)||refundModal.tx?.total, reason:refundReason, refundMethod }),
+    { onSuccess: () => { qc.invalidateQueries('pos-transactions'); setRefundModal({show:false,tx:null}); setRefundAmt(''); setRefundReason(''); setRefundMethod('cash') } }
   )
   const voidMut = useMutation(
     (id:string) => apiPost(`/pos/transactions/${id}/void`, { reason:'Voided by cashier' }),
@@ -174,7 +176,7 @@ export function POSPage() {
             <div style={{display:'flex',justifyContent:'space-between'}}><span style={{color:'var(--text-3)'}}>Subtotal</span><span>{fmt(receipt.subtotal)}</span></div>
             {receipt.discountAmt > 0 && <div style={{display:'flex',justifyContent:'space-between',color:'var(--green)'}}><span>Discount</span><span>−{fmt(receipt.discountAmt)}</span></div>}
             {receipt.taxAmount > 0 && <div style={{display:'flex',justifyContent:'space-between'}}><span style={{color:'var(--text-3)'}}>Tax</span><span>{fmt(receipt.taxAmount)}</span></div>}
-            {receipt.surcharge > 0 && <div style={{display:'flex',justifyContent:'space-between'}}><span style={{color:'var(--text-3)'}}>FlexCharge fee</span><span>{fmt(receipt.surcharge)}</span></div>}
+            {receipt.surcharge > 0 && <div style={{display:'flex',justifyContent:'space-between'}}><span style={{color:'var(--text-3)'}}>Card surcharge</span><span>{fmt(receipt.surcharge)}</span></div>}
             <div style={{display:'flex',justifyContent:'space-between',fontWeight:700,fontSize:'1rem',borderTop:'1px solid var(--border-1)',paddingTop:8,marginTop:4}}>
               <span>Total</span><span style={{color:'var(--gold)'}}>{fmt(receipt.total)}</span>
             </div>
@@ -273,7 +275,7 @@ export function POSPage() {
               <div style={{display:'flex',justifyContent:'space-between'}}><span style={{color:'var(--text-3)'}}>Subtotal</span><span>{fmt(subtotal)}</span></div>
               {discountAmt>0 && <div style={{display:'flex',justifyContent:'space-between',color:'var(--green)'}}><span>Discount</span><span>−{fmt(discountAmt)}</span></div>}
               {taxAmount>0 && <div style={{display:'flex',justifyContent:'space-between'}}><span style={{color:'var(--text-3)'}}>Tax</span><span>{fmt(taxAmount)}</span></div>}
-              {surcharge>0 && <div style={{display:'flex',justifyContent:'space-between'}}><span style={{color:'var(--text-3)'}}>FlexCharge (1%)</span><span>{fmt(surcharge)}</span></div>}
+              {surcharge>0 && <div style={{display:'flex',justifyContent:'space-between'}}><span style={{color:'var(--text-3)'}}>Card surcharge (1%)</span><span>{fmt(surcharge)}</span></div>}
               <div style={{display:'flex',justifyContent:'space-between',fontWeight:700,fontSize:'.95rem',borderTop:'1px solid var(--border-1)',paddingTop:6,marginTop:2}}>
                 <span>Total</span><span style={{color:'var(--gold)'}}>{fmt(total)}</span>
               </div>
@@ -419,7 +421,7 @@ export function POSPage() {
           <div className="card">
             <div className="card-header"><span className="card-title">Add Tax Rate</span></div>
             <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:12,marginTop:12}}>
-              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Name</div><input className="form-input" placeholder="AZ State Tax" value={newTax.name} onChange={e=>setNewTax(s=>({...s,name:e.target.value}))} style={{width:'100%'}} /></div>
+              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Name</div><input className="form-input" placeholder="State Tax" value={newTax.name} onChange={e=>setNewTax(s=>({...s,name:e.target.value}))} style={{width:'100%'}} /></div>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Rate %</div><input className="form-input" type="number" placeholder="8.00" value={newTax.rate} onChange={e=>setNewTax(s=>({...s,rate:e.target.value}))} style={{width:'100%'}} /></div>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Type</div>
                 <select className="form-select" value={newTax.taxType} onChange={e=>setNewTax(s=>({...s,taxType:e.target.value}))} style={{width:'100%'}}>
@@ -566,6 +568,17 @@ export function POSPage() {
               <div style={{fontSize:'.85rem',color:'var(--text-3)'}}>Original total: <strong style={{color:'var(--text-0)'}}>{fmt(refundModal.tx?.total)}</strong></div>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Refund Amount (leave blank for full)</div><input className="form-input" style={{width:'100%'}} type="number" placeholder={refundModal.tx?.total} value={refundAmt} onChange={e=>setRefundAmt(e.target.value)} /></div>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Reason</div><input className="form-input" style={{width:'100%'}} placeholder="Customer returned item" value={refundReason} onChange={e=>setRefundReason(e.target.value)} /></div>
+              {refundModal.tx?.paymentMethod === 'charge' ? (
+                <div style={{fontSize:'.8rem',color:'var(--text-3)',padding:'8px 12px',background:'var(--bg-2)',borderRadius:4}}>Reverses on FlexCharge account (no cash payout).</div>
+              ) : (
+                <div>
+                  <div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Refund Method</div>
+                  <div style={{display:'flex',gap:12}}>
+                    <label style={{display:'flex',alignItems:'center',gap:4,cursor:'pointer'}}><input type="radio" checked={refundMethod==='cash'} onChange={()=>setRefundMethod('cash')} /> Cash</label>
+                    <label style={{display:'flex',alignItems:'center',gap:4,cursor:'pointer'}}><input type="radio" checked={refundMethod==='check'} onChange={()=>setRefundMethod('check')} /> Check</label>
+                  </div>
+                </div>
+              )}
               <button className="btn btn-primary" onClick={()=>refundMut.mutate()} disabled={refundMut.isLoading}>Process Refund</button>
             </div>
           </div>

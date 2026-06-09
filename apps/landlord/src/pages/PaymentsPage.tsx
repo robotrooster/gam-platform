@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { useQuery } from 'react-query'
 import { apiGet } from '../lib/api'
 import { X, AlertTriangle, CheckCircle, Clock, XCircle } from 'lucide-react'
@@ -6,6 +7,16 @@ import { X, AlertTriangle, CheckCircle, Clock, XCircle } from 'lucide-react'
 const fmt = (n: any) => n != null
   ? '$' + Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
   : '—'
+
+// S262: actual amount the landlord received (gross - amount retained
+// by GAM for the tenant's outstanding balances). When supersedence
+// happened, this is strictly less than payment.amount.
+function netToBank(p: any): number {
+  return Number(p.amount ?? 0) - Number(p.gamSupersedenceAmount ?? 0)
+}
+function isPartial(p: any): boolean {
+  return Number(p.gamSupersedenceAmount ?? 0) > 0.005
+}
 
 const STATUS_MAP: Record<string, string> = {
   settled: 'badge-green',
@@ -78,10 +89,10 @@ function PaymentDetailModal({ payment: p, onClose }: { payment: any; onClose: ()
           <StatusIcon size={20} style={{ color: statusColor, flexShrink: 0 }} />
           <div style={{ flex: 1 }}>
             <div style={{ fontSize: '.92rem', fontWeight: 700, color: 'var(--text-0)', textTransform: 'capitalize' }}>
-              {p.status}
+              {p.status}{isPartial(p) && <span style={{ color: 'var(--amber)', fontWeight: 700 }}> · partial</span>}
             </div>
             <div style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>
-              {fmt(p.amount)} · {p.type?.replace('_', ' ')}
+              {isPartial(p) ? `${fmt(netToBank(p))} net to bank` : fmt(p.amount)} · {p.type?.replace('_', ' ')}
             </div>
           </div>
           {p.zeroToleranceFlag && (
@@ -96,7 +107,19 @@ function PaymentDetailModal({ payment: p, onClose }: { payment: any; onClose: ()
           <div style={{ fontSize: '.72rem', fontWeight: 700, color: 'var(--gold)', textTransform: 'uppercase', letterSpacing: '.08em', margin: '8px 0 4px 0' }}>
             Payment
           </div>
-          {row('Amount', fmt(p.amount), { mono: true, color: 'var(--text-0)' })}
+          {/* S262: partial-payment detail — show the gross + retained
+              + net split when supersedence diverted any of this
+              payment. Copy is generic ("retained for tenant balances")
+              with no product disclosure. */}
+          {isPartial(p) ? (
+            <>
+              {row('Collected from tenant', fmt(p.amount), { mono: true, color: 'var(--text-0)' })}
+              {row('Retained for tenant balances', fmt(p.gamSupersedenceAmount), { mono: true, color: 'var(--amber)' })}
+              {row('Net to your bank', fmt(netToBank(p)), { mono: true, color: 'var(--text-0)' })}
+            </>
+          ) : (
+            row('Amount', fmt(p.amount), { mono: true, color: 'var(--text-0)' })
+          )}
           {row('Type', p.type?.replace('_', ' '))}
           {row('Entry Description', p.entryDescription, { mono: true })}
           {row('Due Date', p.dueDate ? new Date(p.dueDate).toLocaleDateString() : null, { mono: true })}
@@ -171,6 +194,7 @@ function PaymentDetailModal({ payment: p, onClose }: { payment: any; onClose: ()
 export function PaymentsPage() {
   const { data: payments = [], isLoading } = useQuery<any[]>('payments', () => apiGet('/payments'))
   const [selected, setSelected] = useState<any>(null)
+  const navigate = useNavigate()
 
   return (
     <div>
@@ -179,13 +203,16 @@ export function PaymentsPage() {
           <h1 className="page-title">Payments</h1>
           <p className="page-subtitle">Tenant ACH collections</p>
         </div>
+        <button className="btn btn-ghost" onClick={() => navigate('/payment-history-onboarding')}>
+          Import payment history
+        </button>
       </div>
 
-      <div className="card" style={{ padding: 0 }}>
+      <div className="card" style={{ padding: 0, overflowX: 'auto' }}>
         {isLoading ? (
           <div style={{ padding: 32, color: 'var(--text-3)', textAlign: 'center' }}>Loading…</div>
         ) : (
-          <table className="data-table">
+          <table className="data-table" style={{ minWidth: 880 }}>
             <thead>
               <tr>
                 <th>Due</th>
@@ -198,7 +225,10 @@ export function PaymentsPage() {
               </tr>
             </thead>
             <tbody>
-              {(payments as any[]).length ? (payments as any[]).map((p: any) => (
+              {(payments as any[]).length ? (payments as any[]).map((p: any) => {
+                const partial = isPartial(p)
+                const net = netToBank(p)
+                return (
                 <tr
                   key={p.id}
                   onClick={() => setSelected(p)}
@@ -207,8 +237,26 @@ export function PaymentsPage() {
                   <td className="mono">{p.dueDate ? new Date(p.dueDate).toLocaleDateString() : '—'}</td>
                   <td className="mono">{p.unitNumber || '—'}</td>
                   <td><span className="badge badge-muted">{p.type}</span></td>
-                  <td className="mono" style={{ color: 'var(--text-0)' }}>{fmt(p.amount)}</td>
-                  <td><span className={'badge ' + (STATUS_MAP[p.status] || 'badge-muted')}>{p.status}</span></td>
+                  <td className="mono" style={{ color: 'var(--text-0)' }}>
+                    {/* S262: when supersedence diverted part of the gross,
+                        show the NET (what landed in the landlord's bank)
+                        as the primary number, with the gross underneath
+                        in muted text. No "paid in full" copy. */}
+                    {partial ? (
+                      <>
+                        <div>{fmt(net)}</div>
+                        <div style={{ fontSize: '.68rem', color: 'var(--text-3)', fontWeight: 400, marginTop: 2 }}>
+                          of {fmt(p.amount)} collected
+                        </div>
+                      </>
+                    ) : fmt(p.amount)}
+                  </td>
+                  <td>
+                    <span className={'badge ' + (STATUS_MAP[p.status] || 'badge-muted')}>{p.status}</span>
+                    {partial && (
+                      <span className="badge badge-amber" style={{ marginLeft: 6 }}>partial</span>
+                    )}
+                  </td>
                   <td className="mono" style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>{p.entryDescription}</td>
                   <td>
                     {p.returnCode
@@ -216,7 +264,7 @@ export function PaymentsPage() {
                       : <span style={{ color: 'var(--text-3)' }}>—</span>}
                   </td>
                 </tr>
-              )) : (
+              )}) : (
                 <tr>
                   <td colSpan={7} style={{ textAlign: 'center', color: 'var(--text-3)', padding: 32 }}>
                     No payments yet.

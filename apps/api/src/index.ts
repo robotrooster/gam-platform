@@ -1,20 +1,36 @@
+// Sentry instrumentation MUST be the first import — it patches
+// modules at load time via OpenTelemetry, so any module imported
+// before it won't get auto-instrumented.
+import './instrument'
+import * as Sentry from '@sentry/node'
+
 import express from 'express'
 import path from 'path'
 import fs from 'fs'
-import { scheduleOtpCron } from './services/otpScheduler'
+// S86: scheduleOtpCron import removed. The cron's INSERT references the
+// pre-S64 disbursements shape (landlord_id + scheduled_date + unit_count
+// columns that no longer exist) AND its tenant query JOINs against
+// units.tenant_id (column was dropped when lease_tenants/v_unit_occupancy
+// landed). Re-enable once Item 16 batch 3+ wires real OTP infra against
+// the current schema. See services/otpScheduler.ts header comment.
 import cors from 'cors'
 import helmet from 'helmet'
-import morgan from 'morgan'
 import rateLimit from 'express-rate-limit'
+import { logger, httpLogger } from './lib/logger'
+import { validateEnv } from './lib/validateEnv'
 import dotenv from 'dotenv'
 import { errorHandler } from './middleware/errorHandler'
 import { camelCaseKeys } from './lib/caseConversion'
 import { authRouter }         from './routes/auth'
+import { totpRouter }         from './routes/totp'
 import { landlordsRouter }    from './routes/landlords'
 import { tenantsRouter }      from './routes/tenants'
 import { propertiesRouter, publicPropertiesRouter } from './routes/properties'
 import { unitsRouter }        from './routes/units'
 import { leasesRouter }       from './routes/leases'
+import { subleasesRouter }    from './routes/subleases'
+import { subleaseInvitationsRouter } from './routes/subleaseInvitations'
+import { posCustomerOnboardingRouter } from './routes/posCustomerOnboarding'
 import { paymentsRouter }     from './routes/payments'
 import { disbursementsRouter } from './routes/disbursements'
 import { maintenanceRouter }  from './routes/maintenance'
@@ -23,7 +39,6 @@ import { utilityRouter }      from './routes/utility'
 import { adminRouter }        from './routes/admin'
 import { webhooksRouter }     from './routes/webhooks'
 import { stripeRouter }       from './routes/stripe'
-import { teamRouter }         from './routes/team'
 import { workTradeRouter }    from './routes/workTrade'
 import { posRouter }          from './routes/pos'
 import { reportsRouter }      from './routes/reports'
@@ -33,12 +48,29 @@ import { backgroundRouter }   from './routes/background'
 import { announcementsRouter }  from './routes/announcements'
 import { booksRouter } from './routes/books'
 import { scopesRouter, invitationsRouter } from './routes/scopes'
+import { pmRouter } from './routes/pm'
+import { creditRouter }       from './routes/credit'
+import { bookingsRouter }     from './routes/bookings'
+import { inspectionsRouter }  from './routes/inspections'
+import { agentRouter, salesAgentRouter } from './routes/agent'
+import { entryRequestsRouter } from './routes/entryRequests'
 import { bulletinRouter }      from './routes/bulletin'
 import { notificationsRouter } from './routes/notifications'
+import { bankAccountsRouter } from './routes/bankAccounts'
+import { adminBankAccountsRouter } from './routes/admin/bankAccounts'
+import { financesRouter }      from './routes/finances'
+import { withdrawalsRouter }   from './routes/withdrawals'
 import { fitnessRouter }      from './routes/fitness'
 import { schedulerInit }      from './jobs/scheduler'
 
 dotenv.config()
+
+// S280: validate required env BEFORE building the app. Throws and
+// kills the process if a critical var (e.g. JWT_SECRET) is unset —
+// safer than booting against a misconfigured runtime that would
+// silently fail-closed on every request OR (with a hardcoded
+// fallback that S277/S278 removed) issue forgeable tokens.
+validateEnv()
 
 const app  = express()
 const uploadsDir = path.join(process.cwd(), 'uploads')
@@ -50,15 +82,16 @@ const PORT = process.env.PORT || 4000
 app.use(helmet())
 app.use(cors({
   origin: [
-    process.env.LANDLORD_APP_URL || 'http://localhost:3001',
-    process.env.TENANT_APP_URL   || 'http://localhost:3002',
-    process.env.ADMIN_APP_URL    || 'http://localhost:3003',
-    process.env.MARKETING_URL    || 'http://localhost:3004',
-    process.env.POS_APP_URL      || 'http://localhost:3005',
-    'http://localhost:3006',
-    'http://localhost:3007',
-    'http://localhost:3008',
-    'http://localhost:3009',
+    process.env.LANDLORD_APP_URL       || 'http://localhost:3001',
+    process.env.TENANT_APP_URL         || 'http://localhost:3002',
+    process.env.ADMIN_APP_URL          || 'http://localhost:3003',
+    process.env.MARKETING_URL          || 'http://localhost:3004',
+    process.env.POS_APP_URL            || 'http://localhost:3005',
+    process.env.BOOKS_APP_URL          || 'http://localhost:3006',
+    process.env.PROPERTY_INTEL_APP_URL || 'http://localhost:3007',
+    process.env.LISTINGS_APP_URL       || 'http://localhost:3008',
+    process.env.ADMIN_OPS_APP_URL      || 'http://localhost:3009',
+    process.env.PM_COMPANY_APP_URL     || 'http://localhost:3011',
     'https://experience.arcgis.com',
   ],
   credentials: true,
@@ -66,6 +99,14 @@ app.use(cors({
 
 // Stripe webhooks need raw body — must be before express.json()
 app.use('/webhooks/stripe', express.raw({ type: 'application/json' }))
+
+// S422: background-check provider webhooks (Checkr, etc.) also need
+// raw body for HMAC verification. The provider's HMAC is computed
+// against the exact bytes they sent — re-stringifying parsed JSON
+// drifts (key order, whitespace), so verify would fail in production.
+// Must be before express.json() so the route handler receives a
+// Buffer rather than a parsed object.
+app.use('/api/background/webhook', express.raw({ type: 'application/json' }))
 
 app.use(express.json())
 app.use(express.urlencoded({ extended: true }))
@@ -78,7 +119,10 @@ app.use((_req, res, next) => {
   next()
 })
 
-app.use(morgan('dev'))
+// Structured request logging. pino-http attaches `req.log` (a child
+// logger tagged with the request id) to every request and emits a
+// one-line summary when the response finishes. Replaces morgan.
+app.use(httpLogger)
 
 // Rate limiting
 const limiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 200 })
@@ -87,23 +131,41 @@ app.use('/api/', limiter)
 const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 100 })
 app.use('/api/auth/', authLimiter)
 
+// S282: tighter limit on /login specifically. The per-account
+// lockout (S280) covers a single account being attacked — this
+// covers a single IP being attacked across many accounts (credential
+// stuffing with a stolen email list). 10 attempts per 15min per IP;
+// successful logins don't count toward the limit
+// (skipSuccessfulRequests=true) so a user who occasionally typos
+// their password isn't rate-limited.
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  skipSuccessfulRequests: true,
+  message: { success: false, error: 'Too many login attempts from this IP. Try again later.' },
+})
+app.use('/api/auth/login', loginLimiter)
+
 // ── ROUTES ──────────────────────────────────────────────────
 app.get('/health', (_req, res) => res.json({ status: 'ok', ts: new Date() }))
 
 app.use('/api/auth',          authRouter)
+app.use('/api/auth/totp',     totpRouter)
 app.use('/api/landlords',     landlordsRouter)
 app.use('/api/tenants',       tenantsRouter)
 app.use('/api/properties',    propertiesRouter)
 app.use('/api/public/properties', publicPropertiesRouter)
 app.use('/api/units',         unitsRouter)
 app.use('/api/leases',        leasesRouter)
+app.use('/api/subleases',     subleasesRouter)
+app.use('/api/sublease-invitations', subleaseInvitationsRouter)
+app.use('/api/pos-customer-onboarding', posCustomerOnboardingRouter)
 app.use('/api/payments',      paymentsRouter)
 app.use('/api/disbursements', disbursementsRouter)
 app.use('/api/maintenance',   maintenanceRouter)
 app.use('/api/documents',     documentsRouter)
 app.use('/api/utility',       utilityRouter)
 app.use('/api/admin',         adminRouter)
-app.use('/api/team',          teamRouter)
 app.use('/api/work-trade',    workTradeRouter)
 app.use('/api/stripe',        stripeRouter)
 app.use('/api/pos',           posRouter)
@@ -127,21 +189,39 @@ app.use('/api/bulletin',       bulletinRouter)
   app.use('/api/background',    backgroundRouter)
 app.use('/api/fitness',        fitnessRouter)
 app.use('/api/notifications',  notificationsRouter)
+app.use('/api/bank-accounts',  bankAccountsRouter)
+app.use('/api/admin',          adminBankAccountsRouter)
+app.use('/api/users',          financesRouter)
+app.use('/api/users',          withdrawalsRouter)
 app.use('/api/books',          booksRouter)
 app.use('/api/scopes',         scopesRouter)
 app.use('/api/invitations',    invitationsRouter)
+app.use('/api/pm',             pmRouter)
+app.use('/api/credit',         creditRouter)
+app.use('/api/bookings',       bookingsRouter)
+app.use('/api/inspections',    inspectionsRouter)
+app.use('/api/agent',          agentRouter)
+app.use('/api/sales',          salesAgentRouter)
+app.use('/api/entry-requests', entryRequestsRouter)
 app.use('/webhooks',          webhooksRouter)
+
+// Sentry's express error handler must come AFTER all routes and
+// BEFORE the custom errorHandler. It captures the exception (when a
+// DSN is configured) then calls next(err) so the custom handler can
+// shape the JSON response. No-op when SENTRY_DSN is unset.
+Sentry.setupExpressErrorHandler(app)
 
 app.use(errorHandler)
 
 // ── START ────────────────────────────────────────────────────
-scheduleOtpCron()
 app.listen(PORT, () => {
-  console.log(`\n🏢 GAM API running on http://localhost:${PORT}`)
-  console.log(`   Landlord app:  ${process.env.LANDLORD_APP_URL || 'http://localhost:3001'}`)
-  console.log(`   Tenant app:    ${process.env.TENANT_APP_URL   || 'http://localhost:3002'}`)
-  console.log(`   Admin app:     ${process.env.ADMIN_APP_URL    || 'http://localhost:3003'}`)
-  console.log(`   Marketing:     ${process.env.MARKETING_URL    || 'http://localhost:3004'}`)
+  logger.info({
+    port: PORT,
+    landlordApp:  process.env.LANDLORD_APP_URL || 'http://localhost:3001',
+    tenantApp:    process.env.TENANT_APP_URL   || 'http://localhost:3002',
+    adminApp:     process.env.ADMIN_APP_URL    || 'http://localhost:3003',
+    marketing:    process.env.MARKETING_URL    || 'http://localhost:3004',
+  }, 'GAM API listening')
   schedulerInit()
 })
 

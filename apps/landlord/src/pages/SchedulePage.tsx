@@ -9,7 +9,7 @@ const UNIT_TYPE_LABELS: Record<string,string> = {
   residential:'🏠 Residential', rv_spot:'🚐 RV Spot', storage:'📦 Storage',
   parking:'🅿️ Parking', short_term_cabin:'🏕️ Short-Term Cabin'
 }
-const LEASE_TYPES = ['nightly','weekly','month_to_month','long_term']
+const SCHEDULE_BOOKING_TYPES = ['nightly','weekly','month_to_month','long_term']
 const LEASE_TYPE_LABELS: Record<string,string> = {
   nightly:'Nightly', weekly:'Weekly', month_to_month:'Month-to-Month', long_term:'Long Term'
 }
@@ -132,9 +132,6 @@ export function SchedulePage() {
       onError: () => { alert('Cannot move booking — date conflict on that unit.') }
     }
   )
-
-  const getBookingsForUnit = (unitId: string) => bookings.filter(b => b.unitId === unitId)
-  const getLeasesForUnit = (unitId: string) => leases.filter(l => l.unitId === unitId)
 
   const getBookingForDate = (unitId: string, date: string) => {
     return bookings.find(b => b.unitId === unitId && date >= b.checkIn && date < b.checkOut) ||
@@ -371,7 +368,6 @@ export function SchedulePage() {
                       : null
                     const isDragTarget = !!(previewEnd && dragOver && dragOver.unitId === unit.id && d >= dragOver.date && d < previewEnd)
                     const isGhostCell = !!(dragging && dragBooking.current && booking?.id === dragging)
-                    const isBeingDragged = dragging === booking?.id
 
                     return (
                       <td
@@ -399,23 +395,64 @@ export function SchedulePage() {
                             {d === dragOver?.date ? (dragBooking.current?.guestName||'↔').slice(0,8) : ''}
                           </div>
                         ) : isBooked ? (
-                          <div
-                            draggable={!isLease}
-                            onDragStart={e => !isLease && onDragStart(e, booking)}
-                            onDragEnd={onDragEnd}
-                            style={{
-                              background: isLease ? 'var(--blue)' : 'var(--green)',
-                              borderRadius:3, height:24,
-                              display:'flex', alignItems:'center', justifyContent:'center',
-                              fontSize:'.6rem', color:'#fff', overflow:'hidden',
-                              whiteSpace:'nowrap', padding:'0 2px',
-                              opacity: isGhostCell ? 0.2 : 0.85,
-                              cursor: isLease ? 'default' : 'grab',
-                            }}
-                            title={booking.guestName || booking.firstName || 'Tenant'}
-                          >
-                            {isStart && !isGhostCell ? (booking.guestName||booking.firstName||'●').slice(0,8) : ''}
-                          </div>
+                          (() => {
+                            // S200: ack-needed badge — booking on a property with
+                            // requires_booking_acknowledgment ON and no
+                            // acknowledgment_signed_at timestamp yet, on an active
+                            // (not cancelled / checked_out / no_show) booking.
+                            //
+                            // S312: response-interceptor camelizes the keys, so the
+                            // frontend reads camelCase here. There is still a
+                            // latent backend gap — the bookings GET
+                            // (apps/api/src/routes/units.ts:286) does not join
+                            // properties, so `requiresBookingAcknowledgment` is
+                            // undefined on each booking row and the badge never
+                            // renders. Fix requires API-side: JOIN properties in
+                            // GET /units/:id/bookings and surface the flag.
+                            const needsAck =
+                              !isLease
+                              && booking.requiresBookingAcknowledgment === true
+                              && !booking.acknowledgmentSignedAt
+                              && booking.status !== 'cancelled'
+                              && booking.status !== 'checked_out'
+                              && booking.status !== 'no_show'
+                            return (
+                              <div
+                                draggable={!isLease}
+                                onDragStart={e => !isLease && onDragStart(e, booking)}
+                                onDragEnd={onDragEnd}
+                                style={{
+                                  background: isLease ? 'var(--blue)' : 'var(--green)',
+                                  borderRadius:3, height:24,
+                                  display:'flex', alignItems:'center', justifyContent:'center',
+                                  fontSize:'.6rem', color:'#fff', overflow:'hidden',
+                                  whiteSpace:'nowrap', padding:'0 2px',
+                                  opacity: isGhostCell ? 0.2 : 0.85,
+                                  cursor: isLease ? 'default' : 'grab',
+                                  position:'relative',
+                                  border: needsAck ? '1px solid var(--amber)' : 'none',
+                                }}
+                                title={
+                                  (booking.guestName || booking.firstName || 'Tenant')
+                                  + (needsAck ? ' — Property-rules acknowledgment pending' : '')
+                                }
+                              >
+                                {isStart && !isGhostCell ? (booking.guestName||booking.firstName||'●').slice(0,8) : ''}
+                                {needsAck && isStart && (
+                                  <span
+                                    style={{
+                                      position:'absolute',
+                                      top:-3, right:-3,
+                                      width:8, height:8,
+                                      borderRadius:'50%',
+                                      background:'var(--amber)',
+                                      border:'1px solid var(--bg-1)',
+                                    }}
+                                  />
+                                )}
+                              </div>
+                            )
+                          })()
                         ) : (
                           <div
                             style={{height:24, background: unit.isBookable ? 'transparent' : 'var(--bg-3)', borderRadius:3, opacity:.3}}
@@ -436,6 +473,7 @@ export function SchedulePage() {
           <span><span style={{display:'inline-block',width:12,height:12,background:'var(--green)',borderRadius:2,marginRight:4}}/>Booking (draggable)</span>
           <span><span style={{display:'inline-block',width:12,height:12,background:'var(--blue)',borderRadius:2,marginRight:4}}/>Lease</span>
           <span><span style={{display:'inline-block',width:12,height:12,background:'var(--gold)',borderRadius:2,opacity:.3,marginRight:4}}/>Today</span>
+          <span><span style={{display:'inline-block',width:8,height:8,borderRadius:'50%',background:'var(--amber)',marginRight:4,verticalAlign:'middle'}}/>Ack pending</span>
           <span>· Double-click empty cell to book · Drag block to move</span>
         </div>
         </div>
@@ -610,7 +648,7 @@ export function SchedulePage() {
                 <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Phone</div><input className="form-input" style={{width:'100%'}} value={newBooking.guestPhone} onChange={e=>setNewBooking(s=>({...s,guestPhone:e.target.value}))} /></div>
                 <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Lease Type</div>
                   <select className="form-select" style={{width:'100%'}} value={newBooking.leaseType} onChange={e=>setNewBooking(s=>({...s,leaseType:e.target.value}))}>
-                    {(bookingModal.unit?.leaseTypesAllowed||LEASE_TYPES).map((lt:string)=><option key={lt} value={lt}>{LEASE_TYPE_LABELS[lt]||lt}</option>)}
+                    {(bookingModal.unit?.leaseTypesAllowed||SCHEDULE_BOOKING_TYPES).map((lt:string)=><option key={lt} value={lt}>{LEASE_TYPE_LABELS[lt]||lt}</option>)}
                   </select>
                 </div>
                 <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Check-in</div><input className="form-input" type="date" style={{width:'100%'}} value={newBooking.checkIn} onChange={e=>setNewBooking(s=>({...s,checkIn:e.target.value}))} /></div>

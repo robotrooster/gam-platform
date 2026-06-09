@@ -216,8 +216,6 @@ router.get('/mobile-homes/search', async (req: Request, res: Response) => {
   }
 });
 
-export default router;
-
 router.post('/bulk-update', async (req: Request, res: Response) => {
   try {
     const { rows } = req.body;

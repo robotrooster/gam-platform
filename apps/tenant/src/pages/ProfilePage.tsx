@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
-import { User, Bell, Lock, Check, AlertCircle, Palette } from 'lucide-react'
+import { User, Check, AlertCircle } from 'lucide-react'
 
 import axios from 'axios'
 const API_URL = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
@@ -12,9 +12,7 @@ function patchReq(path: string, body: any) { return api.patch(path, body).then(r
 const NOTIF_TYPES = [
   { type:'payment_failed',              label:'Payment Failed',         desc:'When your rent payment fails' },
   { type:'maintenance_updated',         label:'Maintenance Updates',    desc:'Status changes on your requests' },
-  { type:'lease_expiring_60',           label:'Lease Expiry (60 days)', desc:'60-day renewal reminder' },
-  { type:'lease_expiring_30',           label:'Lease Expiry (30 days)', desc:'30-day urgent reminder' },
-  { type:'lease_renewal_survey',        label:'Renewal Survey',         desc:'When landlord requests renewal intent' },
+  { type:'lease_expiring',              label:'Lease Expiry',           desc:'Reminders as your lease end date approaches' },
   { type:'bulk_message',                label:'Landlord Messages',      desc:'Announcements from your landlord' },
   { type:'maintenance_building_notice', label:'Building Notices',       desc:'Maintenance affecting multiple units' },
 ]
@@ -40,10 +38,14 @@ export function ProfilePage() {
   const [showEmailWarn, setShowEmailWarn] = useState(false)
 
   const { data: me } = useQuery('tenant-me-profile', () => get<any>('/tenants/me'))
-  const { data: notifPrefs = [] } = useQuery<any[]>('notif-prefs-tenant', () => get('/notifications/preferences'))
+  const { data: notifPrefs = [] } = useQuery<any[]>('notif-prefs-tenant', () => get<any[]>('/notifications/preferences'))
 
   useEffect(() => {
     if (me) {
+      // S312: API responses now pass through applyCamelizeInterceptor
+      // (apps/tenant/src/lib/api.ts), so camelCase reads against the
+      // /tenants/me response work correctly. S311 had reverted these
+      // to snake_case as a stopgap before the transformer landed.
       setFirstName(me.firstName || '')
       setLastName(me.lastName || '')
       setPhone(me.phone || '')
@@ -94,7 +96,7 @@ export function ProfilePage() {
     prefMut.mutate({ type, email_enabled: p.emailEnabled ?? true, sms_enabled: p.smsEnabled ?? false, in_app_enabled: p.inAppEnabled ?? true, [channel]: val })
   }
 
-  const s = (label: string, color = 'var(--text-3)') => ({
+  const s = (_label: string, color = 'var(--text-3)') => ({
     fontSize:'.72rem' as const, fontWeight:600 as const, color, textTransform:'uppercase' as const, letterSpacing:'.06em' as const, display:'block' as const, marginBottom:5
   })
 

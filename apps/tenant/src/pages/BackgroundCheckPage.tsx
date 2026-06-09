@@ -1,8 +1,17 @@
 import { useState, useRef, useEffect } from 'react'
 import { useQuery, useMutation } from 'react-query'
 import { Shield, Upload, Check, AlertCircle, Lock, Clock, XCircle } from 'lucide-react'
+import { loadStripe, Stripe as StripeJs } from '@stripe/stripe-js'
+import { Elements, PaymentElement, useStripe, useElements } from '@stripe/react-stripe-js'
 
 const API = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
+
+// S84: Stripe Elements wiring for the applicant intake fee. When the
+// publishable key is unset (dev without Stripe creds, or test envs) the
+// component falls back to a mock-pay button that uses the pi_intake_mock_*
+// prefix accepted by the backend in non-production.
+const STRIPE_PK = (import.meta as any).env?.VITE_STRIPE_PUBLISHABLE_KEY || ''
+const stripePromise: Promise<StripeJs | null> | null = STRIPE_PK ? loadStripe(STRIPE_PK) : null
 const tok = () => localStorage.getItem('gam_tenant_token')
 const get = (p: string) => fetch(`${API}/api${p}`,{headers:{Authorization:`Bearer ${tok()}`}}).then(r=>r.json()).then(r=>r.data??r)
 const post = (p: string, b: any) => fetch(`${API}/api${p}`,{method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${tok()}`},body:JSON.stringify(b)}).then(r=>r.json())
@@ -17,7 +26,7 @@ export function BackgroundCheckPage() {
   const [step, setStep] = useState(0)
   const [idFile, setIdFile] = useState<File|null>(null)
   const [idUrl, setIdUrl] = useState('')
-  const [uploading, setUploading] = useState(false)
+  const [, setUploading] = useState(false)
   const [idVerifying, setIdVerifying] = useState(false)
   const [incomeFiles, setIncomeFiles] = useState<{file:File,url:string}[]>([])
   const [incomeUploading, setIncomeUploading] = useState(false)
@@ -29,6 +38,9 @@ export function BackgroundCheckPage() {
   const [idNameMatch, setIdNameMatch] = useState<any>(null)
   const [showSsn, setShowSsn] = useState(false)
   const [paid, setPaid] = useState(false)
+  const [paymentIntentId, setPaymentIntentId] = useState<string>('')
+  const [paymentClientSecret, setPaymentClientSecret] = useState<string>('')
+  const [paymentInitError, setPaymentInitError] = useState<string>('')
   const [startTime] = useState(Date.now())
   const [countdown, setCountdown] = useState('')
   const fileRef = useRef<HTMLInputElement>(null)
@@ -42,7 +54,7 @@ export function BackgroundCheckPage() {
   const [addrWarn, setAddrWarn] = useState(false)
   const searchTimer = useRef<any>(null)
   const verifyTimer = useRef<any>(null)
-  const [form, setForm] = useState({ firstName:'', lastName:'', dob:'', ssn:'', email:'', password:'', confirmPassword:'', street1:'', street2:'', city:'', state:'AZ', zip:'', years:'', empStatus:'employed', employer:'', empPhone:'', income:'', prevName:'', prevPhone:'', prevEmail:'', consentCredit:false, consentCriminal:false })
+  const [form, setForm] = useState({ firstName:'', lastName:'', dob:'', ssn:'', email:'', password:'', confirmPassword:'', street1:'', street2:'', city:'', state:'', zip:'', years:'', empStatus:'employed', employer:'', empPhone:'', income:'', prevName:'', prevPhone:'', prevEmail:'', consentCredit:false, consentCriminal:false, consentPool:false, acceptedTerms:false })
   const set = (k: string, v: any) => setForm(f=>({...f,[k]:v}))
   const { data: status, refetch } = useQuery('bg-status', () => get('/background/status'))
   const { data: me } = useQuery('tenant-me', () => get('/tenants/me'))
@@ -68,30 +80,16 @@ export function BackgroundCheckPage() {
       setUploading(false);
     }
   }
+  // Account creation is moved to the step-5 effect below so the
+  // /background/payment-intent call (which requires auth) can run before
+  // submit. By the time submitMut fires, a token already exists.
   const submitMut = useMutation(async () => {
-    let token = tok()
-    // If no token, create account first
-    if (!token) {
-      const params = new URLSearchParams(window.location.search)
-      const unitId = params.get('unitId')
-      const landlordId = params.get('landlordId')
-      const regRes = await fetch(`${API}/api/auth/register-prospect`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          firstName: form.firstName, lastName: form.lastName,
-          email: form.email, password: form.password,
-          unitId: unitId || null, landlordId: landlordId || null,
-        })
-      }).then(r => r.json())
-      if (!regRes.success) throw new Error(regRes.error || 'Account creation failed')
-      token = regRes.data.token
-      localStorage.setItem('gam_tenant_token', token)
-    }
+    const token = tok()
+    if (!token) throw new Error('Account not created — return to payment step')
     return fetch(`${API}/api/background/submit`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-      body: JSON.stringify({ firstName:form.firstName, lastName:form.lastName, dateOfBirth:form.dob, ssn:form.ssn.replace(/\D/g,''), street1:form.street1, street2:form.street2||null, city:form.city, state:form.state, zip:form.zip, yearsAtAddress:parseInt(form.years)||null, employmentStatus:form.empStatus, employerName:form.employer||null, employerPhone:form.empPhone||null, monthlyIncome:parseFloat(form.income)||null, prevLandlordName:form.prevName||null, prevLandlordPhone:form.prevPhone||null, prevLandlordEmail:form.prevEmail||null, idDocumentUrl:idUrl||null, incomeDocUrls:incomeFiles.map(f=>f.url), consentCredit:form.consentCredit, consentCriminal:form.consentCriminal, consentPool:form.consentPool, landlordId:(me as any)?.landlordId||null, unitId:(me as any)?.unitId||(new URLSearchParams(window.location.search).get('unitId'))||null, timeToComplete:Math.round((Date.now()-startTime)/1000), idVerification:idNameMatch||null })
+      body: JSON.stringify({ firstName:form.firstName, lastName:form.lastName, dateOfBirth:form.dob, ssn:form.ssn.replace(/\D/g,''), street1:form.street1, street2:form.street2||null, city:form.city, state:form.state, zip:form.zip, yearsAtAddress:parseInt(form.years)||null, employmentStatus:form.empStatus, employerName:form.employer||null, employerPhone:form.empPhone||null, monthlyIncome:parseFloat(form.income)||null, prevLandlordName:form.prevName||null, prevLandlordPhone:form.prevPhone||null, prevLandlordEmail:form.prevEmail||null, idDocumentUrl:idUrl||null, incomeDocUrls:incomeFiles.map(f=>f.url), consentCredit:form.consentCredit, consentCriminal:form.consentCriminal, consentPool:form.consentPool, landlordId:(me as any)?.landlordId||null, unitId:(me as any)?.unitId||(new URLSearchParams(window.location.search).get('unitId'))||null, timeToComplete:Math.round((Date.now()-startTime)/1000), idVerification:idNameMatch||null, applicantPaymentIntentId:paymentIntentId })
     }).then(r => r.json())
   }, { onSuccess: () => refetch() })
   const ssnFmt = (d: string) => d.length<=3?d:d.length<=5?d.slice(0,3)+'-'+d.slice(3):d.slice(0,3)+'-'+d.slice(3,5)+'-'+d.slice(5)
@@ -240,6 +238,56 @@ export function BackgroundCheckPage() {
     }
     return()=>clearTimeout(verifyTimer.current)
   },[form.city,form.state,form.zip])
+  // S84: on entering step 5, ensure tenant account exists (so we have a
+  // token), then mint a Stripe PaymentIntent. Both flows write into
+  // paymentClientSecret + paymentIntentId; the Elements form uses the
+  // clientSecret to confirm, and submit attaches the intentId.
+  useEffect(() => {
+    if (step !== 5) return
+    if (paymentClientSecret || paymentIntentId) return
+    let cancelled = false
+    ;(async () => {
+      try {
+        let token = tok()
+        if (!token) {
+          const params = new URLSearchParams(window.location.search)
+          const unitId = params.get('unitId')
+          const landlordId = params.get('landlordId')
+          const regRes = await fetch(`${API}/api/auth/register-prospect`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              firstName: form.firstName, lastName: form.lastName,
+              email: form.email, password: form.password,
+              unitId: unitId || null, landlordId: landlordId || null,
+              acceptedTerms: true,
+            }),
+          }).then(r => r.json())
+          if (!regRes.success) {
+            if (!cancelled) setPaymentInitError(regRes.error || 'Account creation failed')
+            return
+          }
+          token = regRes.data.token
+          localStorage.setItem('gam_tenant_token', token!)
+        }
+        const piRes = await fetch(`${API}/api/background/payment-intent`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        }).then(r => r.json())
+        if (cancelled) return
+        if (!piRes.success) {
+          setPaymentInitError(piRes.error || 'Failed to initialize payment')
+          return
+        }
+        setPaymentClientSecret(piRes.data.clientSecret)
+        setPaymentIntentId(piRes.data.intentId)
+      } catch (e: any) {
+        if (!cancelled) setPaymentInitError(e?.message || 'Failed to initialize payment')
+      }
+    })()
+    return () => { cancelled = true }
+  }, [step])
+
   // Countdown timer for denied status
   useEffect(() => {
     const check = (status as any)?.check
@@ -265,7 +313,7 @@ export function BackgroundCheckPage() {
     !!(form.street1.length>=5&&form.city.length>=2&&validZip&&(addrVerified||addrWarn)),
     !!(validPrev&&validIncome&&incomeFiles.length>=2&&form.income&&((['employed','part_time','self_employed'].includes(form.empStatus)?(form.employer&&form.empPhone):true))),
     !!(idUrl),
-    !!(form.consentCredit&&form.consentCriminal),
+    !!(form.consentCredit&&form.consentCriminal&&form.acceptedTerms),
     paid,
   ]
   if((status as any)?.status==='submitted')return(
@@ -516,6 +564,18 @@ export function BackgroundCheckPage() {
                 <div style={{fontSize:'.75rem',color:'#4a5568',lineHeight:1.5}}>I consent to GAM notifying me of matching vacancies from other landlords on the platform. My report will only be shared after I confirm interest and authorize access. I pay nothing additional.</div>
               </div>
             </label>
+            <label style={{display:'flex',alignItems:'flex-start',gap:12,cursor:'pointer',marginBottom:14,padding:'14px 16px',background:form.acceptedTerms?'rgba(34,197,94,.06)':'#141a22',border:'1px solid '+(form.acceptedTerms?'rgba(34,197,94,.25)':'#1e2530'),borderRadius:10}}>
+              <input type="checkbox" checked={form.acceptedTerms} onChange={e=>set('acceptedTerms',e.target.checked)} style={{width:18,height:18,marginTop:2,flexShrink:0}}/>
+              <div>
+                <div style={{fontSize:'.82rem',fontWeight:700,color:'#eef1f8',marginBottom:4}}>Platform Terms &amp; Privacy</div>
+                <div style={{fontSize:'.75rem',color:'#4a5568',lineHeight:1.5}}>
+                  I agree to the{' '}
+                  <a href={`${(import.meta as any).env?.VITE_MARKETING_URL || 'http://localhost:3004'}/consumer/terms`} target="_blank" rel="noopener noreferrer" style={{color:'#c9a227'}}>Terms of Service</a>
+                  {' '}and{' '}
+                  <a href={`${(import.meta as any).env?.VITE_MARKETING_URL || 'http://localhost:3004'}/consumer/privacy`} target="_blank" rel="noopener noreferrer" style={{color:'#c9a227'}}>Privacy Policy</a>.
+                </div>
+              </div>
+            </label>
             <div style={{padding:'10px 14px',background:'#141a22',border:'1px solid #1e2530',borderRadius:8,fontSize:'.72rem',color:'#4a5568',lineHeight:1.5}}>By continuing I certify all information provided is accurate. Providing false information is grounds for immediate denial.</div>
         </div>}
         {step===5&&<div style={{textAlign:'center'}}>
@@ -527,8 +587,27 @@ export function BackgroundCheckPage() {
             <div style={{display:'flex',justifyContent:'space-between',marginBottom:12,fontSize:'.82rem'}}><span style={{color:'#4a5568'}}>Processing & Report Fee</span><span style={{color:'#eef1f8',fontFamily:'monospace'}}>$20.00</span></div>
             <div style={{display:'flex',justifyContent:'space-between',borderTop:'1px solid #1e2530',paddingTop:12,fontWeight:700}}><span style={{color:'#eef1f8'}}>Total</span><span style={{color:'#c9a227',fontFamily:'monospace',fontSize:'1.1rem'}}>$45.00</span></div>
           </div>
-          <div style={{background:'rgba(201,162,39,.06)',border:'1px solid rgba(201,162,39,.2)',borderRadius:8,padding:'10px 14px',marginBottom:16,fontSize:'.75rem',color:'#c9a227'}}>⚠️ Stripe is in test mode — no real charge will occur</div>
-          {!paid?<button onClick={()=>setPaid(true)} style={{width:'100%',padding:'14px',borderRadius:10,border:'none',background:'#c9a227',color:'#060809',fontWeight:700,fontSize:'.95rem',cursor:'pointer'}}>💳 Pay $45.00 — Submit Application</button>:<div style={{display:'flex',alignItems:'center',justifyContent:'center',gap:8,padding:'12px 20px',background:'rgba(34,197,94,.08)',border:'1px solid rgba(34,197,94,.25)',borderRadius:10,color:'#22c55e',fontWeight:700}}><Check size={18}/> Payment confirmed — click Submit below</div>}
+          {paymentInitError && (
+            <div style={{padding:'10px 14px',background:'rgba(239,68,68,.06)',border:'1px solid rgba(239,68,68,.25)',borderRadius:8,color:'#ef4444',fontSize:'.78rem',marginBottom:12}}>{paymentInitError}</div>
+          )}
+          {!paid && !paymentClientSecret && !paymentInitError && (
+            <div style={{fontSize:'.78rem',color:'#4a5568',marginBottom:12}}>Initializing payment…</div>
+          )}
+          {!paid && paymentClientSecret && (
+            !STRIPE_PK ? (
+              <>
+                <div style={{background:'rgba(201,162,39,.06)',border:'1px solid rgba(201,162,39,.2)',borderRadius:8,padding:'10px 14px',marginBottom:12,fontSize:'.75rem',color:'#c9a227'}}>⚠️ Stripe not configured — using mock payment (dev only)</div>
+                <button onClick={()=>setPaid(true)} style={{width:'100%',padding:'14px',borderRadius:10,border:'none',background:'#c9a227',color:'#060809',fontWeight:700,fontSize:'.95rem',cursor:'pointer'}}>💳 Confirm Mock Payment — $45.00</button>
+              </>
+            ) : (
+              <Elements stripe={stripePromise} options={{ clientSecret: paymentClientSecret, appearance: { theme: 'night' } }}>
+                <StripePayForm amount={45} onPaid={(intentId)=>{ setPaymentIntentId(intentId); setPaid(true) }} />
+              </Elements>
+            )
+          )}
+          {paid && (
+            <div style={{display:'flex',alignItems:'center',justifyContent:'center',gap:8,padding:'12px 20px',background:'rgba(34,197,94,.08)',border:'1px solid rgba(34,197,94,.25)',borderRadius:10,color:'#22c55e',fontWeight:700}}><Check size={18}/> Payment confirmed — click Submit below</div>
+          )}
           {submitMut.isError&&<div style={{color:'#ef4444',fontSize:'.75rem',marginTop:10,display:'flex',gap:6,justifyContent:'center'}}><AlertCircle size={12}/> Submission failed — please try again</div>}
         </div>}
       </div>
@@ -536,6 +615,52 @@ export function BackgroundCheckPage() {
         <button onClick={()=>step>0&&setStep(s=>s-1)} disabled={step===0} style={{padding:'10px 20px',borderRadius:8,border:'1px solid #1e2530',background:'transparent',color:step===0?'#4a5568':'#b8c4d8',cursor:step===0?'not-allowed':'pointer',fontSize:'.85rem'}}>← Back</button>
         {step<STEPS.length-1?<button onClick={()=>setStep(s=>s+1)} disabled={!canNext[step]} style={{flex:1,padding:'12px',borderRadius:8,border:'none',background:canNext[step]?'#c9a227':'#141a22',color:canNext[step]?'#060809':'#4a5568',fontWeight:700,cursor:canNext[step]?'pointer':'not-allowed',fontSize:'.88rem'}}>Continue →</button>:<button onClick={()=>submitMut.mutate()} disabled={!paid||submitMut.isLoading} style={{flex:1,padding:'12px',borderRadius:8,border:'none',background:paid?'#c9a227':'#141a22',color:paid?'#060809':'#4a5568',fontWeight:700,cursor:paid?'pointer':'not-allowed',fontSize:'.88rem'}}>{submitMut.isLoading?'Submitting...':'🔒 Submit Application'}</button>}
       </div>
+    </div>
+  )
+}
+
+// S84: card form rendered inside <Elements>. Uses Stripe hooks to confirm
+// the PaymentIntent client-side. On success, hands the verified intentId
+// back to the parent so /submit can attach it.
+function StripePayForm({ amount, onPaid }: { amount: number; onPaid: (intentId: string) => void }) {
+  const stripe = useStripe()
+  const elements = useElements()
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState('')
+
+  const handlePay = async () => {
+    if (!stripe || !elements) return
+    setSubmitting(true)
+    setError('')
+    const result = await stripe.confirmPayment({
+      elements,
+      confirmParams: { return_url: window.location.href },
+      redirect: 'if_required',
+    })
+    setSubmitting(false)
+    if (result.error) {
+      setError(result.error.message || 'Payment failed')
+      return
+    }
+    if (result.paymentIntent?.status === 'succeeded') {
+      onPaid(result.paymentIntent.id)
+    } else {
+      setError(`Payment status: ${result.paymentIntent?.status || 'unknown'}`)
+    }
+  }
+
+  return (
+    <div>
+      <div style={{background:'#0a0d10',border:'1px solid #1e2530',borderRadius:10,padding:14,marginBottom:12,textAlign:'left'}}>
+        <PaymentElement />
+      </div>
+      {error && (
+        <div style={{padding:'10px 14px',background:'rgba(239,68,68,.06)',border:'1px solid rgba(239,68,68,.25)',borderRadius:8,color:'#ef4444',fontSize:'.78rem',marginBottom:10}}>{error}</div>
+      )}
+      <button onClick={handlePay} disabled={!stripe || !elements || submitting}
+        style={{width:'100%',padding:'14px',borderRadius:10,border:'none',background:submitting?'#141a22':'#c9a227',color:submitting?'#4a5568':'#060809',fontWeight:700,fontSize:'.95rem',cursor:submitting?'not-allowed':'pointer'}}>
+        {submitting ? 'Processing payment…' : `💳 Pay $${amount.toFixed(2)}`}
+      </button>
     </div>
   )
 }

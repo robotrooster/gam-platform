@@ -1,4 +1,6 @@
 import { Router } from 'express'
+import { extractUploadFilename, resolveUploadPath } from '../lib/uploadPaths'
+import { cascadeLeaseTenantsOnVoid } from '../lib/leaseDocCascade'
 import {
   LeaseDocumentType,
   UnitType,
@@ -13,15 +15,18 @@ import {
 } from '@gam/shared'
 import { query, queryOne, getClient } from '../db'
 import { generateMoveInInvoice } from '../jobs/moveInBundle'
-import { requireAuth, requireLandlord } from '../middleware/auth'
+import { requireAuth, requirePerm } from '../middleware/auth'
+import { canManageLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
 import { stampPdf } from '../services/pdfStamp'
+import { createAdminNotification } from '../services/adminNotifications'
 import { emailSigningRequest, emailSigningCompleted } from '../services/email'
 import { createNotification } from '../services/notifications'
 import crypto from 'crypto'
 import multer from 'multer'
 import path from 'path'
 import fs from 'fs'
+import { logger } from '../lib/logger'
 
 export const esignRouter = Router()
 
@@ -323,6 +328,29 @@ async function buildLeaseFromDocument(documentId: string): Promise<{ leaseId: st
       case 'addendum_terms':
         result = await executeAddendumTerms(client, doc)
         break
+      case 'sublease_agreement': {
+        // S251: sublease completion. Different shape from lease docs —
+        // there's no lease build; we flip the linked subleases row to
+        // 'active' and stamp the document URL. Return shape stays
+        // lease-shaped (`leaseId`=sublease_id) so the dispatcher's
+        // return signature doesn't need to change; downstream
+        // consumers that key on it for sublease docs are aware.
+        // S337: pass the open client so the sublease flip runs inside
+        // buildLeaseFromDocument's BEGIN/COMMIT and rolls back atomically
+        // if anything downstream fails.
+        const { executeSubleaseAgreementCompletion } = await import('../services/subleaseDocuments')
+        const sub = await executeSubleaseAgreementCompletion({ documentId: doc.id }, client)
+        // Get the sublessor_tenant_id for the lease-shaped return.
+        const subleaseRow = await client.query(
+          'SELECT sublessor_tenant_id FROM subleases WHERE id=$1',
+          [sub.subleaseId]).then((r: any) => r.rows[0])
+        result = {
+          leaseId:         sub.subleaseId,
+          status:          sub.status,
+          primaryTenantId: subleaseRow?.sublessor_tenant_id ?? '',
+        }
+        break
+      }
       default:
         throw new AppError(400, `Unknown document_type: ${doc.document_type}`)
     }
@@ -338,6 +366,67 @@ async function buildLeaseFromDocument(documentId: string): Promise<{ leaseId: st
 }
 
 /**
+ * S111: post a one-time leasing fee for the contracted PM company when
+ * applicable. Reads properties.pm_company_id + pm_fee_plan_id via the unit;
+ * checks the plan's leasing_fee_amount; posts allocation_pm_company_fee
+ * ledger entry to the PM company's payout user. No-op for self-managed
+ * properties or plans without a leasing fee.
+ */
+async function postLeasingFeeIfApplicable(client: any, leaseId: string, unitId: string): Promise<void> {
+  const r = await client.query(`
+    SELECT p.id AS property_id,
+           p.pm_company_id, p.pm_fee_plan_id,
+           c.bank_account_id AS pm_bank_account_id,
+           ba.user_id AS pm_payout_user_id,
+           fp.leasing_fee_amount
+      FROM units u
+      JOIN properties p ON p.id = u.property_id
+ LEFT JOIN pm_companies c ON c.id = p.pm_company_id
+ LEFT JOIN pm_fee_plans fp ON fp.id = p.pm_fee_plan_id
+ LEFT JOIN user_bank_accounts ba ON ba.id = c.bank_account_id
+     WHERE u.id = $1`, [unitId])
+  if (r.rowCount === 0) return
+  const row = r.rows[0]
+  if (!row.pm_company_id || !row.pm_fee_plan_id) return
+  if (row.leasing_fee_amount === null || parseFloat(row.leasing_fee_amount) <= 0) return
+  if (!row.pm_payout_user_id) {
+    throw new AppError(409,
+      `PM company ${row.pm_company_id} has no bank routing — cannot post leasing fee.`)
+  }
+
+  const amount = round2Esign(parseFloat(row.leasing_fee_amount))
+
+  // Per-user advisory lock — same key allocation.ts uses.
+  await client.query(
+    `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+    [`user_balance:${row.pm_payout_user_id}`]
+  )
+  const prev = await client.query(
+    `SELECT balance_after FROM user_balance_ledger
+      WHERE user_id=$1
+      ORDER BY created_at DESC, id DESC LIMIT 1`,
+    [row.pm_payout_user_id]
+  )
+  const prevBal = prev.rows[0] ? parseFloat(prev.rows[0].balance_after) : 0
+  const newBal = round2Esign(prevBal + amount)
+
+  await client.query(
+    `INSERT INTO user_balance_ledger
+       (user_id, type, amount, balance_after, reference_id, reference_type,
+        property_id, bank_account_id, notes)
+     VALUES ($1, 'allocation_pm_company_fee', $2, $3, $4, 'lease',
+             $5, $6, $7)`,
+    [row.pm_payout_user_id, amount, newBal, leaseId, row.property_id,
+     row.pm_bank_account_id,
+     `PM company leasing fee on lease ${leaseId} (plan ${row.pm_fee_plan_id})`]
+  )
+}
+
+function round2Esign(n: number): number {
+  return Math.round(n * 100) / 100
+}
+
+/**
  * Execute an original_lease document: INSERT a new leases row + lease_tenants
  * rows for every tenant signer. Sets unit status to active if lease starts
  * today/past. Receives the already-open client — caller owns transaction.
@@ -349,16 +438,21 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
   const fields = await client.query(
     `SELECT lease_column, value, signer_role FROM lease_document_fields
      WHERE document_id=$1 AND lease_column IS NOT NULL`, [doc.id]).then((r: any) => r.rows)
-  // Only writable columns make it into `vals` for the leases INSERT.
-  // fee_row + utility_row tags are written below to lease_fees and
-  // lease_utility_responsibilities respectively (S28 wired the chain).
-  // signature + identity tags are filtered out via the shared category map.
+  // Drop identity + signature tags; writable + fee_row + utility_row tags
+  // all populate `vals`. WRITABLE_LEASE_COLUMN_SPECS / FEE_ROW_SPECS /
+  // UTILITY_ROW_SPECS each only read their own per-tag key from vals, so
+  // sharing the dict across all three downstream consumers is safe.
+  // S334 fix-it-right: previously this filter kept only 'writable', which
+  // silently zeroed out lease_fees + lease_utility_responsibilities at
+  // every completion (S28 chain wired but never executed). No production
+  // exposure because pre-launch.
   const vals: LeaseColumnVals = {}
   for (const f of fields) {
     const col = f.lease_column as LeaseColumn | null
     if (!col) continue
     if (!(col in LEASE_COLUMN_CATEGORY)) continue
-    if (LEASE_COLUMN_CATEGORY[col] !== 'writable') continue
+    const cat = LEASE_COLUMN_CATEGORY[col]
+    if (cat === 'identity' || cat === 'signature') continue
     if (f.value == null) continue
     vals[col] = f.value
   }
@@ -439,6 +533,11 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
     [...writableValues, ...tailValues]
   ).then((r: any) => r.rows[0])
 
+  // S196: security_deposit is now part of FEE_ROW_SPECS, which the
+  // loop below iterates and inserts into lease_fees automatically.
+  // The S195 dual-write helper call has been removed here — FEE_ROW
+  // pipeline is the canonical path.
+
   // INSERT lease_tenants rows — one per signer, with per-tenant supersedes chain
   for (const t of tenantSigners) {
     const priorLt = await client.query(`
@@ -461,17 +560,70 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
   await client.query('UPDATE lease_documents SET lease_id=$1 WHERE id=$2', [lease.id, doc.id])
 
   // ────────────────────────────────────────────────────────────────────────
+  // S111: PM company leasing fee. If this property is contracted to a PM
+  // company on a plan with leasing_fee_amount set, post a one-time
+  // 'allocation_pm_company_fee' ledger entry. Fires regardless of the
+  // plan's primary fee_type — composite plans (e.g. flat_monthly +
+  // leasing_fee_amount) both fire monthly and on lease creation.
+  // reference_id = lease.id, reference_type = 'lease' so it doesn't
+  // collide with rent-payment or monthly-accrual ledger references.
+  // Idempotent via the lease.id reference (lease can only be created
+  // once; if buildLeaseFromDocument is retried after a partial failure,
+  // the surrounding tx ROLLBACKs the whole chain).
+  await postLeasingFeeIfApplicable(client, lease.id, doc.unit_id)
+
+  // ────────────────────────────────────────────────────────────────────────
   // S28: write lease_fees rows from FEE_ROW_SPECS
   // Each spec returns null when the tag is not bound; non-null = INSERT.
+  // S154: each row is compared against the property's fee schedule
+  // (anti-discrimination policy). If amount/timing/refundable doesn't
+  // match a corresponding schedule row, is_override is flagged TRUE so
+  // landlord can document the rationale post-finalize.
   // ────────────────────────────────────────────────────────────────────────
+  const propertyId: string | undefined = await client.query(
+    `SELECT property_id FROM units WHERE id = $1`,
+    [doc.unit_id],
+  ).then((r: any) => r.rows[0]?.property_id)
+  const scheduleRows: any[] = propertyId
+    ? await client.query(
+        `SELECT fee_type, slot_index, description, amount, is_refundable, due_timing
+           FROM property_fee_schedules
+          WHERE property_id = $1`,
+        [propertyId],
+      ).then((r: any) => r.rows)
+    : []
+  // Index by fee_type for single-instance types (slot_index=0).
+  // other_fee comparison is best-effort: match the first slot since the
+  // doc parser only produces one other_fee row per lease.
+  const scheduleByType: Record<string, any> = {}
+  for (const s of scheduleRows) {
+    if (!scheduleByType[s.fee_type]) scheduleByType[s.fee_type] = s
+  }
+
   for (const [, spec] of Object.entries(FEE_ROW_SPECS)) {
     const parsed = spec.parse(vals)
     if (!parsed) continue
+
+    // Determine override flag: TRUE when no schedule row exists OR
+    // amount / timing / refundable differs.
+    const sched = scheduleByType[parsed.fee_type]
+    let isOverride = true
+    if (sched
+        && Number(sched.amount) === Number(parsed.amount)
+        && sched.is_refundable === parsed.is_refundable
+        && sched.due_timing === parsed.due_timing) {
+      isOverride = false
+    }
+    // If property has no schedule at all, treat as not-an-override
+    // (no policy to deviate from). Only flag when a schedule exists
+    // for this fee_type AND the lease row differs.
+    if (!sched) isOverride = false
+
     await client.query(
       `INSERT INTO lease_fees (
-         lease_id, fee_type, amount, is_refundable, due_timing
-       ) VALUES ($1, $2, $3, $4, $5)`,
-      [lease.id, parsed.fee_type, parsed.amount, parsed.is_refundable, parsed.due_timing]
+         lease_id, fee_type, amount, is_refundable, due_timing, is_override
+       ) VALUES ($1, $2, $3, $4, $5, $6)`,
+      [lease.id, parsed.fee_type, parsed.amount, parsed.is_refundable, parsed.due_timing, isOverride]
     )
   }
 
@@ -506,10 +658,12 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
   // buildLeaseFromDocument catches → entire chain rolls back atomically.
   // ────────────────────────────────────────────────────────────────────────
   const rentAmountNum = Number(vals.rent_amount)
-  const securityDepositNum = Number(vals.security_deposit) || 0
   if (!Number.isFinite(rentAmountNum) || rentAmountNum <= 0) {
     throw new AppError(400, `Invalid rent_amount: ${vals.rent_amount}`)
   }
+  // S196: security_deposit no longer passed as a separate input — it
+  // flows in via the lease_fees move_in iteration inside
+  // generateMoveInInvoice.
   await generateMoveInInvoice(
     {
       lease_id: lease.id,
@@ -517,11 +671,33 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
       tenant_id: primarySigner.tenant_id,
       landlord_id: doc.landlord_id,
       rent_amount: rentAmountNum,
-      security_deposit: securityDepositNum,
       start_date: startDate,
     },
     client
   )
+
+  // Credit ledger: emit lease_signed for every tenant signer + a
+  // single event for the landlord. Same transaction — if the ledger
+  // writes fail, the whole lease materialization rolls back. Imported
+  // lazily to keep esign.ts top-level imports tidy.
+  const { emitLeaseSignedTenant, emitLeaseSignedLandlord } =
+    await import('../services/creditLedgerEmitters')
+  const signedAt = new Date()
+  for (const t of tenantSigners) {
+    await emitLeaseSignedTenant(client, {
+      tenantId:    t.tenant_id,
+      leaseId:     lease.id,
+      documentId:  doc.id,
+      signedAt,
+    })
+  }
+  await emitLeaseSignedLandlord(client, {
+    landlordId:   doc.landlord_id,
+    leaseId:      lease.id,
+    documentId:   doc.id,
+    signedAt,
+    tenantCount:  tenantSigners.length,
+  })
 
   return { leaseId: lease.id, status: leaseStatus, primaryTenantId: primarySigner.tenant_id }
 }
@@ -736,7 +912,9 @@ async function executeAddendumTerms(client: any, doc: any): Promise<{ leaseId: s
 
   // Terms addendum is valid on any lease status that accepts amendments.
   // Block terminal states in case lease transitioned between creation and signing.
-  if (lease.status === 'expired' || lease.status === 'terminated' || lease.status === 'voided') {
+  // S71: 'voided' branch dropped — leases_status_check only allows
+  // pending/active/expired/terminated, so 'voided' was unreachable.
+  if (lease.status === 'expired' || lease.status === 'terminated') {
     throw new AppError(409, `Cannot amend terms: lease is ${lease.status}`)
   }
 
@@ -754,7 +932,47 @@ async function executeAddendumTerms(client: any, doc: any): Promise<{ leaseId: s
 // TEMPLATES
 // ─────────────────────────────────────────────────────────────
 
-esignRouter.get('/templates', requireAuth, requireLandlord, async (req, res, next) => {
+// S235: witness signer provisioning. Witnesses are external parties
+// (property staff, notaries, neighbors) who attest to a signing without
+// being tenants, landlords, or platform staff. They need a `users` row
+// to satisfy the lease_document_signers.user_id FK + the esign /documents
+// userId-required validation, but NOT a `tenants` row (the existing
+// /tenants/invite path was wrong for them — required unitId and bound
+// the user as a tenant, with all the tenant-side implications). This
+// endpoint creates the minimal user account, idempotent on email, with
+// role='tenant' (the generic CHECK-allowed role) but no tenants row.
+// The signing role on `lease_document_signers.role='witness'` is what
+// drives field assignments — users.role is irrelevant for that path.
+esignRouter.post('/witnesses/provision', requireAuth, requirePerm('leases.create'), async (req, res, next) => {
+  try {
+    const { email, firstName, lastName } = req.body
+    if (!email || !firstName) {
+      throw new AppError(400, 'email and firstName required')
+    }
+    const emailNorm = String(email).trim().toLowerCase()
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailNorm)) {
+      throw new AppError(400, 'Invalid email format')
+    }
+
+    // Reuse if a user already exists with this email (any role).
+    const existing = await queryOne<{ id: string }>(
+      `SELECT id FROM users WHERE lower(email) = $1`,
+      [emailNorm])
+    if (existing) {
+      return res.json({ success: true, data: { userId: existing.id, reused: true } })
+    }
+
+    const tempHash = '$2b$10$placeholder_invite_pending'
+    const created = await queryOne<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name)
+       VALUES ($1, $2, 'tenant', $3, $4)
+       RETURNING id`,
+      [emailNorm, tempHash, String(firstName).trim(), String(lastName || '').trim()])
+    res.status(201).json({ success: true, data: { userId: created!.id, reused: false } })
+  } catch (e) { next(e) }
+})
+
+esignRouter.get('/templates', requireAuth, requirePerm('leases.create'), async (req, res, next) => {
   try {
     const templates = await query<any>(`
       SELECT t.*, COUNT(f.id)::int as field_count
@@ -766,7 +984,7 @@ esignRouter.get('/templates', requireAuth, requireLandlord, async (req, res, nex
   } catch (e) { next(e) }
 })
 
-esignRouter.post('/templates', requireAuth, requireLandlord, async (req, res, next) => {
+esignRouter.post('/templates', requireAuth, requirePerm('leases.create'), async (req, res, next) => {
   try {
     const { name, description, basePdfUrl, pageCount } = req.body
     if (!name) throw new AppError(400, 'Template name required')
@@ -778,7 +996,7 @@ esignRouter.post('/templates', requireAuth, requireLandlord, async (req, res, ne
   } catch (e) { next(e) }
 })
 
-esignRouter.get('/templates/:id', requireAuth, requireLandlord, async (req, res, next) => {
+esignRouter.get('/templates/:id', requireAuth, requirePerm('leases.create'), async (req, res, next) => {
   try {
     const template = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
     if (!template) throw new AppError(404, 'Template not found')
@@ -787,7 +1005,7 @@ esignRouter.get('/templates/:id', requireAuth, requireLandlord, async (req, res,
   } catch (e) { next(e) }
 })
 
-esignRouter.patch('/templates/:id', requireAuth, requireLandlord, async (req, res, next) => {
+esignRouter.patch('/templates/:id', requireAuth, requirePerm('leases.create'), async (req, res, next) => {
   try {
     const { name, description, basePdfUrl, pageCount, isActive } = req.body
     const t = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
@@ -800,14 +1018,14 @@ esignRouter.patch('/templates/:id', requireAuth, requireLandlord, async (req, re
   } catch (e) { next(e) }
 })
 
-esignRouter.delete('/templates/:id', requireAuth, requireLandlord, async (req, res, next) => {
+esignRouter.delete('/templates/:id', requireAuth, requirePerm('leases.create'), async (req, res, next) => {
   try {
     await query('UPDATE lease_templates SET is_active=FALSE WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
     res.json({ success: true })
   } catch (e) { next(e) }
 })
 
-esignRouter.put('/templates/:id/fields', requireAuth, requireLandlord, async (req, res, next) => {
+esignRouter.put('/templates/:id/fields', requireAuth, requirePerm('leases.create'), async (req, res, next) => {
   try {
     const { fields } = req.body
     const template = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
@@ -835,8 +1053,18 @@ esignRouter.put('/templates/:id/fields', requireAuth, requireLandlord, async (re
   } catch (e) { next(e) }
 })
 
-esignRouter.delete('/templates/:id/fields/:fieldId', requireAuth, requireLandlord, async (req, res, next) => {
+esignRouter.delete('/templates/:id/fields/:fieldId', requireAuth, requirePerm('leases.create'), async (req, res, next) => {
   try {
+    // S393 fix: verify template ownership before deleting a field.
+    // Pre-fix, a caller knowing both a stranger template UUID and a
+    // field UUID matching that template could DELETE the stranger's
+    // field — the SQL only required (fieldId, templateId) match.
+    // Same class as the S390 variants cross-tenant fix on
+    // pos_item_variants.
+    const template = await queryOne<{ id: string }>(
+      'SELECT id FROM lease_templates WHERE id=$1 AND landlord_id=$2',
+      [req.params.id, req.user!.profileId])
+    if (!template) throw new AppError(404, 'Template not found')
     await query('DELETE FROM lease_template_fields WHERE id=$1 AND template_id=$2', [req.params.fieldId, req.params.id])
     res.json({ success: true })
   } catch (e) { next(e) }
@@ -846,7 +1074,7 @@ esignRouter.delete('/templates/:id/fields/:fieldId', requireAuth, requireLandlor
 // DOCUMENTS
 // ─────────────────────────────────────────────────────────────
 
-esignRouter.get('/documents', requireAuth, requireLandlord, async (req, res, next) => {
+esignRouter.get('/documents', requireAuth, requirePerm('leases.create'), async (req, res, next) => {
   try {
     const docs = await query<any>(`
       SELECT d.*, u.unit_number, p.name as property_name,
@@ -875,7 +1103,7 @@ esignRouter.get('/documents', requireAuth, requireLandlord, async (req, res, nex
  * (so a template with co_tenant_1..4 slots used on a 2-tenant document only
  *  copies fields for primary + co_tenant_1).
  */
-esignRouter.get('/batches', requireAuth, requireLandlord, async (req, res, next) => {
+esignRouter.get('/batches', requireAuth, requirePerm('leases.create'), async (req, res, next) => {
   try {
     const batches = await query<any>(`
       SELECT
@@ -943,7 +1171,7 @@ async function resolveUnitFromPrefill(
   return filtered[0].id
 }
 
-esignRouter.post('/documents', requireAuth, requireLandlord, async (req, res, next) => {
+esignRouter.post('/documents', requireAuth, requirePerm('leases.create'), async (req, res, next) => {
   const client = await getClient()
   try {
     const { templateId, unitId, title, signers, basePdfUrl, prefillValues } = req.body
@@ -1008,7 +1236,7 @@ esignRouter.post('/documents', requireAuth, requireLandlord, async (req, res, ne
   }
 })
 
-esignRouter.post('/documents/addendum-add', requireAuth, requireLandlord, async (req, res, next) => {
+esignRouter.post('/documents/addendum-add', requireAuth, requirePerm('leases.create'), async (req, res, next) => {
   const client = await getClient()
   try {
     const { leaseId, templateId, title, signers, basePdfUrl } = req.body
@@ -1020,7 +1248,7 @@ esignRouter.post('/documents/addendum-add', requireAuth, requireLandlord, async 
       'SELECT id, landlord_id, unit_id, status, start_date, end_date FROM leases WHERE id=$1',
       [leaseId])
     if (!lease) throw new AppError(404, 'Lease not found')
-    if (lease.landlord_id !== req.user!.profileId) throw new AppError(403, 'Not your lease')
+    if (!canManageLandlordResource(req.user, lease.landlord_id)) throw new AppError(403, 'Not your lease')
     if (lease.status !== 'active') {
       throw new AppError(409, `Cannot add tenant: lease is ${lease.status}, not active`)
     }
@@ -1142,7 +1370,7 @@ esignRouter.post('/documents/addendum-add', requireAuth, requireLandlord, async 
   }
 })
 
-esignRouter.post('/documents/addendum-remove', requireAuth, requireLandlord, async (req, res, next) => {
+esignRouter.post('/documents/addendum-remove', requireAuth, requirePerm('leases.terminate'), async (req, res, next) => {
   const client = await getClient()
   try {
     const { leaseId, targetLeaseTenantId, promoteLeaseTenantId, templateId, title, signers, basePdfUrl } = req.body
@@ -1155,7 +1383,7 @@ esignRouter.post('/documents/addendum-remove', requireAuth, requireLandlord, asy
       'SELECT id, landlord_id, unit_id, status FROM leases WHERE id=$1',
       [leaseId])
     if (!lease) throw new AppError(404, 'Lease not found')
-    if (lease.landlord_id !== req.user!.profileId) throw new AppError(403, 'Not your lease')
+    if (!canManageLandlordResource(req.user, lease.landlord_id)) throw new AppError(403, 'Not your lease')
     if (lease.status !== 'active') {
       throw new AppError(409, `Cannot remove tenant: lease is ${lease.status}, not active`)
     }
@@ -1293,7 +1521,7 @@ esignRouter.post('/documents/addendum-remove', requireAuth, requireLandlord, asy
   }
 })
 
-esignRouter.post('/documents/addendum-terms/batch', requireAuth, requireLandlord, async (req, res, next) => {
+esignRouter.post('/documents/addendum-terms/batch', requireAuth, requirePerm('leases.create'), async (req, res, next) => {
   const client = await getClient()
   try {
     const { title, templateId, scopeType, scopeRef } = req.body
@@ -1447,7 +1675,7 @@ esignRouter.post('/documents/addendum-terms/batch', requireAuth, requireLandlord
   }
 })
 
-esignRouter.post('/documents/addendum-terms', requireAuth, requireLandlord, async (req, res, next) => {
+esignRouter.post('/documents/addendum-terms', requireAuth, requirePerm('leases.create'), async (req, res, next) => {
   const client = await getClient()
   try {
     const { leaseId, templateId, title, signers, basePdfUrl } = req.body
@@ -1460,8 +1688,9 @@ esignRouter.post('/documents/addendum-terms', requireAuth, requireLandlord, asyn
       'SELECT id, landlord_id, unit_id, status FROM leases WHERE id=$1',
       [leaseId])
     if (!lease) throw new AppError(404, 'Lease not found')
-    if (lease.landlord_id !== req.user!.profileId) throw new AppError(403, 'Not your lease')
-    if (lease.status === 'expired' || lease.status === 'terminated' || lease.status === 'voided') {
+    if (!canManageLandlordResource(req.user, lease.landlord_id)) throw new AppError(403, 'Not your lease')
+    // S71: 'voided' branch dropped — unreachable per leases_status_check.
+    if (lease.status === 'expired' || lease.status === 'terminated') {
       throw new AppError(409, `Cannot amend terms: lease is ${lease.status}`)
     }
 
@@ -1579,7 +1808,7 @@ esignRouter.get('/documents/:id', requireAuth, async (req, res, next) => {
 // SEND DOCUMENT
 // ─────────────────────────────────────────────────────────────
 
-esignRouter.post('/documents/:id/send', requireAuth, requireLandlord, async (req, res, next) => {
+esignRouter.post('/documents/:id/send', requireAuth, requirePerm('leases.sign'), async (req, res, next) => {
   try {
     const doc = await queryOne<any>(`
       SELECT d.*, u.unit_number, p.name as property_name, lu.first_name || ' ' || lu.last_name as landlord_name
@@ -1654,12 +1883,13 @@ esignRouter.post('/documents/:id/send', requireAuth, requireLandlord, async (req
     const unitLabel = doc.unit_number ? `Unit ${doc.unit_number} — ${doc.property_name}` : (doc.title || 'GAM Document')
 
     // Branch signing URL: unactivated tenants land on /accept-invite first, then get redirected to /sign
-    const firstSignerUser = await queryOne<any>('SELECT email_verified, email_verify_token FROM users WHERE id=$1', [firstSigner.user_id])
-    const signingUrl = (firstSignerUser && !firstSignerUser.email_verified && firstSignerUser.email_verify_token)
-      ? `${TENANT_APP_URL}/accept-invite?token=${firstSignerUser.email_verify_token}&next=${encodeURIComponent('/sign/' + doc.id)}`
+    // S410 (S377): read tenant_invite_token (was email_verify_token).
+    const firstSignerUser = await queryOne<any>('SELECT email_verified, tenant_invite_token FROM users WHERE id=$1', [firstSigner.user_id])
+    const signingUrl = (firstSignerUser && !firstSignerUser.email_verified && firstSignerUser.tenant_invite_token)
+      ? `${TENANT_APP_URL}/accept-invite?token=${firstSignerUser.tenant_invite_token}&next=${encodeURIComponent('/sign/' + doc.id)}`
       : `${TENANT_APP_URL}/sign/${doc.id}`
 
-    await emailSigningRequest(firstSigner.email, firstSigner.name, doc.title, unitLabel, doc.landlord_name, signingUrl)
+    await emailSigningRequest(firstSigner.email, firstSigner.name, doc.title, unitLabel, doc.landlord_name, signingUrl, { landlordId: doc.landlord_id, documentId: doc.id })
     await createNotification({
       userId: firstSigner.user_id,
       type: 'esign_request',
@@ -1680,7 +1910,7 @@ esignRouter.post('/documents/:id/send', requireAuth, requireLandlord, async (req
 // VOID
 // ─────────────────────────────────────────────────────────────
 
-esignRouter.post('/documents/:id/void', requireAuth, requireLandlord, async (req, res, next) => {
+esignRouter.post('/documents/:id/void', requireAuth, requirePerm('leases.terminate'), async (req, res, next) => {
   const client = await getClient()
   try {
     const { reason } = req.body
@@ -1706,39 +1936,7 @@ esignRouter.post('/documents/:id/void', requireAuth, requireLandlord, async (req
     if (anySigned) throw new AppError(409, 'Cannot void after signing has begun — create a superseding document instead')
 
     // Cascade lease_tenants state by document_type
-    switch (doc.document_type) {
-      case 'addendum_add': {
-        // The pending_add row (if any) becomes 'void' — preserves audit trail
-        // that this tenant tried to join but the addendum was cancelled.
-        // Leave add_document_id populated intentionally for auditability.
-        await client.query(
-          `UPDATE lease_tenants
-             SET status='void', updated_at=NOW()
-           WHERE add_document_id=$1 AND status='pending_add'`,
-          [doc.id])
-        break
-      }
-      case 'addendum_remove': {
-        // The pending_remove row reverts to active. Null out remove_document_id
-        // because the row returns to normal and should not carry a stale pointer.
-        await client.query(
-          `UPDATE lease_tenants
-             SET status='active',
-                 remove_document_id=NULL,
-                 updated_at=NOW()
-           WHERE remove_document_id=$1 AND status='pending_remove'`,
-          [doc.id])
-        break
-      }
-      case 'addendum_terms':
-      case 'original_lease':
-      default: {
-        // No cascade needed. addendum_terms has no lease_tenants side effects.
-        // original_lease creates lease_tenants only on execution (post-completion),
-        // so voiding before completion means no rows exist to cascade.
-        break
-      }
-    }
+    await cascadeLeaseTenantsOnVoid(client.query.bind(client), doc)
 
     await client.query(
       "UPDATE lease_documents SET status='voided', voided_at=NOW(), void_reason=$1, updated_at=NOW() WHERE id=$2",
@@ -1765,67 +1963,142 @@ esignRouter.get('/sign/:documentId', requireAuth, async (req, res, next) => {
       WHERE document_id=$1 AND user_id=$2`,
       [req.params.documentId, req.user!.userId])
     if (!signer) throw new AppError(403, 'You are not a signer on this document')
-    if (signer.status === 'signed') throw new AppError(400, 'Already signed')
 
     const doc = await queryOne<any>(`
-      SELECT d.*, u.unit_number, p.name as property_name, lu.first_name || ' ' || lu.last_name as landlord_name
+      SELECT d.*, u.unit_number, p.name as property_name, p.state as property_state,
+             p.landlord_id as property_landlord_id,
+             lu.first_name || ' ' || lu.last_name as landlord_name
       FROM lease_documents d
       LEFT JOIN units u ON u.id=d.unit_id LEFT JOIN properties p ON p.id=u.property_id
       JOIN landlords la ON la.id=d.landlord_id JOIN users lu ON lu.id=la.user_id
       WHERE d.id=$1`, [signer.document_id])
     if (!doc) throw new AppError(404, 'Document not found')
-    if (doc.status === 'voided') throw new AppError(400, 'Document has been voided')
-    if (doc.status === 'completed') throw new AppError(400, 'Document fully executed')
-    if (doc.status === 'execution_failed') throw new AppError(400, 'Document execution failed - contact your landlord')
 
-    const fields = await query<any>(`
-      SELECT * FROM lease_document_fields
-      WHERE document_id=$1 AND signer_role=$2
-      ORDER BY page, y`, [doc.id, signer.role])
+    // S235: read-only re-open. Pre-S235 the GET threw on terminal states
+    // (signed / completed / voided / execution_failed), so a tenant who'd
+    // signed could never re-open the doc to see what they'd agreed to.
+    // Now the route serves a read-only payload for those states, with
+    // all-roles fields (so the user sees the full executed state, not
+    // just their own role's slots) and the executed_pdf_url when ready.
+    const docTerminal =
+      doc.status === 'completed' || doc.status === 'voided' || doc.status === 'execution_failed'
+    const signerTerminal = signer.status === 'signed' || signer.status === 'declined'
+    const readOnly = docTerminal || signerTerminal
 
-    if (signer.status === 'sent') {
+    const fields = await query<any>(
+      readOnly
+        ? `SELECT * FROM lease_document_fields WHERE document_id=$1 ORDER BY page, y`
+        : `SELECT * FROM lease_document_fields WHERE document_id=$1 AND signer_role=$2 ORDER BY page, y`,
+      readOnly ? [doc.id] : [doc.id, signer.role])
+
+    if (!readOnly && signer.status === 'sent') {
       await query("UPDATE lease_document_signers SET status='viewed', viewed_at=NOW() WHERE id=$1", [signer.id])
     }
 
-    res.json({ success: true, data: { signer, document: doc, fields } })
+    // S194: deposit-interest context for the signer. When this is an
+    // original_lease or addendum_terms document at a property in a
+    // state with a statutory rate (or per-landlord override), surface
+    // the rate so the tenant knows up-front what interest their deposit
+    // will accrue. Skipped for documents at properties without a rate
+    // (most states have no statute) or document types where deposit
+    // terms don't apply (addendum_add / addendum_remove are tenant-
+    // roster changes, not term changes).
+    let deposit_interest_context: any = null
+    const showsDepositTerms = doc.document_type === 'original_lease' || doc.document_type === 'addendum_terms'
+    if (showsDepositTerms && doc.property_state) {
+      const currentYear = new Date().getUTCFullYear()
+      const statutory = await queryOne<{
+        annual_rate_pct:  string
+        statute_citation: string
+      }>(
+        `SELECT annual_rate_pct::text AS annual_rate_pct, statute_citation
+           FROM state_deposit_interest_rates
+          WHERE state_code = $1 AND effective_year = $2
+          LIMIT 1`,
+        [doc.property_state, currentYear],
+      )
+      if (statutory) {
+        deposit_interest_context = {
+          source:           'statutory',
+          state_code:       doc.property_state,
+          effective_year:   currentYear,
+          annual_rate_pct:  statutory.annual_rate_pct,
+          statute_citation: statutory.statute_citation,
+        }
+      } else if (doc.property_landlord_id) {
+        // Fall through to landlord override.
+        const override = await queryOne<{
+          annual_rate_pct: string
+          source_notes:    string | null
+        }>(
+          `SELECT annual_rate_pct::text AS annual_rate_pct, source_notes
+             FROM landlord_deposit_interest_rate_overrides
+            WHERE landlord_id = $1 AND state_code = $2 AND effective_year = $3
+            LIMIT 1`,
+          [doc.property_landlord_id, doc.property_state, currentYear],
+        )
+        if (override) {
+          deposit_interest_context = {
+            source:           'landlord_override',
+            state_code:       doc.property_state,
+            effective_year:   currentYear,
+            annual_rate_pct:  override.annual_rate_pct,
+            statute_citation: null,
+            source_notes:     override.source_notes,
+          }
+        }
+      }
+    }
+
+    res.json({ success: true, data: { signer, document: doc, fields, deposit_interest_context, readOnly } })
   } catch (e) { next(e) }
 })
 
 esignRouter.post('/sign/:documentId', requireAuth, async (req, res, next) => {
+  const client = await getClient()
+  let txnDone = false
   try {
     const { fieldValues } = req.body
 
-    const signer = await queryOne<any>(`
-      SELECT * FROM lease_document_signers
-      WHERE document_id=$1 AND user_id=$2`,
+    await client.query('BEGIN')
+
+    // Phase A: pre-validation reads (inside txn for read-your-writes consistency)
+    const signerRes = await client.query(
+      `SELECT * FROM lease_document_signers WHERE document_id=$1 AND user_id=$2`,
       [req.params.documentId, req.user!.userId])
+    const signer = signerRes.rows[0]
     if (!signer) throw new AppError(403, 'You are not a signer on this document')
     if (signer.status === 'signed') throw new AppError(400, 'Already signed')
 
-    // Platform block check on tenant roles
+    // Platform block check on tenant roles. checkPlatformBlock uses the
+    // non-transactional query() — acceptable because tenant.platform_status
+    // is set by separate flows and the read-after-write race is benign here.
     if (isTenantRole(signer.role)) {
       const blk = await checkPlatformBlock(req.user!.userId)
       if (!blk.ok) throw new AppError(403, blk.reason || 'Account blocked from signing')
     }
 
-    const doc = await queryOne<any>(`
+    const docRes = await client.query(`
       SELECT d.*, u.unit_number, u.unit_type, p.name as property_name,
         lu.first_name || ' ' || lu.last_name as landlord_name, lu.email as landlord_email
       FROM lease_documents d
       LEFT JOIN units u ON u.id=d.unit_id LEFT JOIN properties p ON p.id=u.property_id
       JOIN landlords la ON la.id=d.landlord_id JOIN users lu ON lu.id=la.user_id
       WHERE d.id=$1`, [signer.document_id])
+    const doc = docRes.rows[0]
     if (!doc) throw new AppError(404, 'Document not found')
     if (doc.status === 'voided') throw new AppError(400, 'Document has been voided')
     if (doc.status === 'execution_failed') throw new AppError(400, 'Document execution failed - contact your landlord')
 
     // Re-check overlap on EVERY signing (another roommate may have taken a conflicting lease
-    // between send time and now)
+    // between send time and now). Helpers below use non-transactional query() —
+    // same pattern as platform block, acceptable race window.
     const { primary, coTenants } = await getDocumentTenantSigners(doc.id)
     if (primary && doc.unit_id) {
-      const vals = await query<any>(`
+      const valsRes = await client.query(`
         SELECT lease_column, value FROM lease_document_fields
         WHERE document_id=$1 AND lease_column IN ('start_date','end_date') AND value IS NOT NULL`, [doc.id])
+      const vals = valsRes.rows
       const startVal = (vals as any[]).find(v => v.lease_column === 'start_date')?.value
       const endVal   = (vals as any[]).find(v => v.lease_column === 'end_date')?.value
       if (startVal) {
@@ -1839,11 +2112,12 @@ esignRouter.post('/sign/:documentId', requireAuth, async (req, res, next) => {
     // but malicious clients can bypass the gate. Verify every required field
     // assigned to this signer's role will have a non-empty value after this
     // submission completes (either submitted now or already in the DB).
-    const requiredFields = await query<any>(`
+    const requiredFieldsRes = await client.query(`
       SELECT id, label, field_type, value
       FROM lease_document_fields
       WHERE document_id=$1 AND signer_role=$2 AND required=TRUE`,
       [doc.id, signer.role])
+    const requiredFields = requiredFieldsRes.rows
     const submittedById = new Map<string, string>()
     for (const fv of (fieldValues || [])) {
       if (fv.value != null && String(fv.value).trim() !== '') {
@@ -1865,6 +2139,7 @@ esignRouter.post('/sign/:documentId', requireAuth, async (req, res, next) => {
     const ip = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress
     const ua = req.headers['user-agent']
 
+    // Phase B: atomic writes — fields, signer status, document status.
     // S29 item 2: Field-value spoofing fix. The original UPDATE matched only
     // on field id + document id, which let a malicious signer overwrite ANY
     // field — including ones already signed by another party. Two extra
@@ -1874,7 +2149,7 @@ esignRouter.post('/sign/:documentId', requireAuth, async (req, res, next) => {
     //     fields you yourself previously signed.
     // Spoof attempts silently no-op (filtered out by the WHERE).
     for (const fv of (fieldValues || [])) {
-      await query(`
+      await client.query(`
         UPDATE lease_document_fields
         SET value=$1, signed_at=NOW(), signer_id=$2
         WHERE id=$3 AND document_id=$4
@@ -1883,13 +2158,20 @@ esignRouter.post('/sign/:documentId', requireAuth, async (req, res, next) => {
         [fv.value, signer.id, fv.fieldId, doc.id, signer.role])
     }
 
-    await query(`
+    await client.query(`
       UPDATE lease_document_signers
       SET status='signed', signed_at=NOW(), ip_address=$1, user_agent=$2
       WHERE id=$3`,
       [ip, ua, signer.id])
 
-    await query("UPDATE lease_documents SET status='in_progress', updated_at=NOW() WHERE id=$1", [doc.id])
+    await client.query("UPDATE lease_documents SET status='in_progress', updated_at=NOW() WHERE id=$1", [doc.id])
+
+    await client.query('COMMIT')
+    txnDone = true
+
+    // Phase C: post-commit side effects (off-txn). The signature is durable
+    // at this point; downstream failures (email, PDF stamp, lease build) get
+    // their own handling without rolling back the signature.
 
     const remaining = await queryOne<any>(
       "SELECT COUNT(*)::int as count FROM lease_document_signers WHERE document_id=$1 AND status != 'signed'",
@@ -1906,12 +2188,38 @@ esignRouter.post('/sign/:documentId', requireAuth, async (req, res, next) => {
       try {
         leaseResult = await buildLeaseFromDocument(doc.id)
       } catch (e: any) {
-        console.error('[ESIGN] buildLeaseFromDocument failed for document', doc.id, '-', e.message)
-        // TODO(admin-notifications): surface to admin notification system once that surface is built
+        logger.error('[ESIGN] buildLeaseFromDocument failed for document', doc.id, '-', e.message)
+        // S132: critical — signed document but no lease materialized.
+        // Tenant signed a legal contract that didn't translate to an
+        // active lease in the system. Manual remediation needed.
+        await createAdminNotification({
+          severity: 'critical',
+          category: 'esign_lease_build_failed',
+          title:    `Lease build failed for signed document ${doc.id}`,
+          body:     e.message,
+          context:  { document_id: doc.id },
+        })
         await query(
           "UPDATE lease_documents SET status='execution_failed', execution_failed_at=NOW(), void_reason=$1, updated_at=NOW() WHERE id=$2",
           [`Lease build failed: ${e.message}`, doc.id])
         return res.json({ success: true, data: { completed: true, executionFailed: true, reason: e.message } })
+      }
+
+      // S119 post-commit: fire Stripe Transfer for any PM company leasing
+      // fee that landed on the ledger as a ghost. Only fires when the
+      // property is contracted to a PM company with leasing_fee_amount > 0.
+      try {
+        const { firePmTransfersForReference } = await import('../services/stripeConnect')
+        await firePmTransfersForReference('lease', leaseResult.leaseId)
+      } catch (e) {
+        logger.error({ err: e, ctx: leaseResult.leaseId }, '[pm_transfer] post-commit firing failed for lease')
+        await createAdminNotification({
+          severity: 'warn',
+          category: 'pm_transfer_post_commit_failed',
+          title:    `PM leasing fee transfer failed for lease ${leaseResult.leaseId}`,
+          body:     e instanceof Error ? e.message : String(e),
+          context:  { lease_id: leaseResult.leaseId, document_id: doc.id },
+        })
       }
 
       await query("UPDATE lease_documents SET status='completed', completed_at=NOW(), updated_at=NOW() WHERE id=$1", [doc.id])
@@ -1922,7 +2230,8 @@ esignRouter.post('/sign/:documentId', requireAuth, async (req, res, next) => {
         if (doc.base_pdf_url) {
           const allFields = await query<any>('SELECT * FROM lease_document_fields WHERE document_id=$1', [doc.id])
           const allSigners = await query<any>('SELECT * FROM lease_document_signers WHERE document_id=$1', [doc.id])
-          const sourcePdfPath = doc.base_pdf_url.split('/').pop()
+          const sourcePdfPath = extractUploadFilename(doc.base_pdf_url)
+          if (sourcePdfPath) {
           const sourcePath = path.join(uploadDir, sourcePdfPath)
           if (fs.existsSync(sourcePath)) {
             const executedFilename = 'executed-' + doc.id + '.pdf'
@@ -1936,13 +2245,14 @@ esignRouter.post('/sign/:documentId', requireAuth, async (req, res, next) => {
             executedUrl = '/api/esign/files/' + executedFilename
             await query('UPDATE lease_documents SET executed_pdf_url=$1 WHERE id=$2', [executedUrl, doc.id])
           }
+          }
         }
-      } catch(e) { console.error('[ESIGN] PDF stamp failed:', e) }
+      } catch(e) { logger.error({ err: e }, '[ESIGN] PDF stamp failed:') }
 
       const allSigners = await query<any>('SELECT * FROM lease_document_signers WHERE document_id=$1', [doc.id])
       const unitLabel = doc.unit_number ? `Unit ${doc.unit_number} — ${doc.property_name}` : doc.title
       for (const s of allSigners as any[]) {
-        await emailSigningCompleted(s.email, s.name, doc.title, unitLabel, executedUrl || undefined)
+        await emailSigningCompleted(s.email, s.name, doc.title, unitLabel, executedUrl || undefined, undefined, { landlordId: doc.landlord_id, documentId: doc.id })
         await createNotification({
           userId: s.user_id,
           type: 'esign_completed',
@@ -1962,11 +2272,12 @@ esignRouter.post('/sign/:documentId', requireAuth, async (req, res, next) => {
       if (nextSigner) {
         const unitLabel = doc.unit_number ? `Unit ${doc.unit_number} — ${doc.property_name}` : doc.title
         const signingUrl = `${TENANT_APP_URL}/sign/${doc.id}`
-        const nextSignerUser = await queryOne<any>('SELECT email_verified, email_verify_token FROM users WHERE id=$1', [nextSigner.user_id])
-        const nextSigningUrl = (nextSignerUser && !nextSignerUser.email_verified && nextSignerUser.email_verify_token)
-          ? `${TENANT_APP_URL}/accept-invite?token=${nextSignerUser.email_verify_token}&next=${encodeURIComponent('/sign/' + doc.id)}`
+        // S410 (S377): read tenant_invite_token (was email_verify_token).
+        const nextSignerUser = await queryOne<any>('SELECT email_verified, tenant_invite_token FROM users WHERE id=$1', [nextSigner.user_id])
+        const nextSigningUrl = (nextSignerUser && !nextSignerUser.email_verified && nextSignerUser.tenant_invite_token)
+          ? `${TENANT_APP_URL}/accept-invite?token=${nextSignerUser.tenant_invite_token}&next=${encodeURIComponent('/sign/' + doc.id)}`
           : signingUrl
-        await emailSigningRequest(nextSigner.email, nextSigner.name, doc.title, unitLabel, doc.landlord_name, nextSigningUrl)
+        await emailSigningRequest(nextSigner.email, nextSigner.name, doc.title, unitLabel, doc.landlord_name, nextSigningUrl, { landlordId: doc.landlord_id, documentId: doc.id })
         await createNotification({
           userId: nextSigner.user_id,
           type: 'esign_request',
@@ -1979,7 +2290,135 @@ esignRouter.post('/sign/:documentId', requireAuth, async (req, res, next) => {
       }
       res.json({ success: true, data: { completed: false, nextSigner: nextSigner?.email } })
     }
-  } catch (e) { next(e) }
+  } catch (e) {
+    if (!txnDone) {
+      try { await client.query('ROLLBACK') } catch {}
+    }
+    next(e)
+  } finally {
+    client.release()
+  }
+})
+
+// S234: signer-side decline. The schema's signer status enum has
+// included 'declined' since the original migration but no path ever
+// flipped a row to that state. Here it is. Semantics:
+//   - Decline by ANY signer voids the entire document (one decline =
+//     no point continuing the chain — the doc is dead). Mirrors the
+//     existing auto-void on expiry.
+//   - Reason is captured if provided (optional, max 1000 chars).
+//   - Landlord gets an email with the reason + an in-app notification.
+//   - Idempotent: re-clicking decline on an already-declined signer
+//     row returns the existing decline state without firing another
+//     notification.
+esignRouter.post('/sign/:documentId/decline', requireAuth, async (req, res, next) => {
+  const client = await getClient()
+  try {
+    const reason = req.body?.reason != null ? String(req.body.reason).trim().slice(0, 1000) : null
+
+    await client.query('BEGIN')
+
+    const signerRes = await client.query(
+      `SELECT * FROM lease_document_signers WHERE document_id=$1 AND user_id=$2 FOR UPDATE`,
+      [req.params.documentId, req.user!.userId])
+    const signer = signerRes.rows[0]
+    if (!signer) throw new AppError(403, 'You are not a signer on this document')
+    if (signer.status === 'signed') throw new AppError(400, 'You have already signed this document')
+
+    // Idempotent: already declined → return existing state.
+    if (signer.status === 'declined') {
+      await client.query('COMMIT')
+      return res.json({
+        success: true,
+        data: {
+          status: 'declined',
+          declined_at: signer.declined_at,
+          decline_reason: signer.decline_reason,
+          alreadyDeclined: true,
+        },
+      })
+    }
+
+    const docRes = await client.query(
+      `SELECT d.*, u.unit_number, p.name AS property_name,
+              lu.id AS landlord_user_id,
+              lu.first_name AS landlord_first, lu.last_name AS landlord_last,
+              lu.email AS landlord_email
+         FROM lease_documents d
+         LEFT JOIN units u ON u.id = d.unit_id
+         LEFT JOIN properties p ON p.id = u.property_id
+         JOIN landlords la ON la.id = d.landlord_id
+         JOIN users lu ON lu.id = la.user_id
+        WHERE d.id = $1`,
+      [signer.document_id])
+    const doc = docRes.rows[0]
+    if (!doc) throw new AppError(404, 'Document not found')
+    if (doc.status === 'voided' || doc.status === 'execution_failed') {
+      throw new AppError(400, `Document is already ${doc.status} — nothing to decline`)
+    }
+
+    await client.query(
+      `UPDATE lease_document_signers
+          SET status = 'declined',
+              declined_at = NOW(),
+              decline_reason = $1
+        WHERE id = $2`,
+      [reason, signer.id])
+
+    await client.query(
+      `UPDATE lease_documents SET status = 'voided', updated_at = NOW() WHERE id = $1`,
+      [doc.id])
+
+    // S29c-2-A: any pending lease/tenant rows tied to this document
+    // need to be cascade-voided so the limbo state doesn't strand
+    // tenants in /pending. Same helper the auto-void cron uses.
+    try {
+      await cascadeLeaseTenantsOnVoid(client.query.bind(client), { id: doc.id, document_type: doc.document_type })
+    } catch (e) {
+      logger.error({ err: e }, '[esign-decline] cascadeLeaseTenantsOnVoid failed:')
+    }
+
+    await client.query('COMMIT')
+
+    // Notify the landlord. Email + in-app notification, both fire-and-
+    // forget — webhook caller already got their 200 back at this point.
+    const unitLabel = [doc.property_name, doc.unit_number ? `Unit ${doc.unit_number}` : null]
+      .filter(Boolean).join(' · ') || 'Document'
+    const landlordName = `${doc.landlord_first || ''} ${doc.landlord_last || ''}`.trim() || 'there'
+    const signerName  = signer.name || (req.user!.email ?? 'A signer')
+
+    const { emailDocumentDeclined } = await import('../services/email')
+    emailDocumentDeclined(
+      doc.landlord_email, landlordName, signerName, signer.role,
+      doc.title || 'Lease document', unitLabel, reason,
+      { landlordId: doc.landlord_id, documentId: doc.id },
+    ).catch(e => logger.error({ err: e }, '[EMAIL] esign decline:'))
+
+    createNotification({
+      userId: doc.landlord_user_id,
+      landlordId: doc.landlord_id,
+      type: 'esign_document_declined',
+      title: `${signerName} declined to sign`,
+      body: `${signerName} (${signer.role}) declined "${doc.title || 'lease document'}". ` +
+            (reason ? `Reason: ${reason}` : 'No reason provided.'),
+      data: { documentId: doc.id, signerId: signer.id, decline_reason: reason },
+    }).catch(e => logger.error({ err: e }, '[NOTIFY] esign decline:'))
+
+    res.json({
+      success: true,
+      data: {
+        status: 'declined',
+        declined_at: new Date().toISOString(),
+        decline_reason: reason,
+        documentVoided: true,
+      },
+    })
+  } catch (e) {
+    try { await client.query('ROLLBACK') } catch {}
+    next(e)
+  } finally {
+    client.release()
+  }
 })
 
 // ─────────────────────────────────────────────────────────────
@@ -2006,7 +2445,7 @@ esignRouter.get('/pending', requireAuth, async (req, res, next) => {
   } catch(e) { next(e) }
 })
 
-esignRouter.get('/landlord-pending', requireAuth, requireLandlord, async (req, res, next) => {
+esignRouter.get('/landlord-pending', requireAuth, requirePerm('leases.sign'), async (req, res, next) => {
   try {
     const landlordUser = await queryOne<any>('SELECT user_id FROM landlords WHERE id=$1', [req.user!.profileId])
     const pending = await query<any>(`
@@ -2037,8 +2476,16 @@ if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true })
 const storage = multer.diskStorage({
   destination: uploadDir,
   filename: (req: any, file: any, cb: any) => {
+    // S394 fix: force .pdf extension based on MIME, NOT from attacker-
+    // controlled originalname. Pre-fix, a caller could upload a file
+    // with mimetype=application/pdf (passes fileFilter) and
+    // originalname=evil.html, and the saved filename would carry the
+    // .html extension. GET /files/:filename serves via res.sendFile
+    // which auto-detects Content-Type from extension → text/html →
+    // XSS in the authorized viewer's browser (signer or landlord).
+    // Same class as the S380 avatar-upload finding.
     const unique = Date.now() + '-' + Math.random().toString(36).slice(2)
-    cb(null, unique + path.extname(file.originalname))
+    cb(null, unique + '.pdf')
   }
 })
 
@@ -2051,7 +2498,7 @@ const upload = multer({
   }
 })
 
-esignRouter.post('/upload', requireAuth, requireLandlord, upload.single('file'), async (req: any, res: any, next: any) => {
+esignRouter.post('/upload', requireAuth, requirePerm('leases.create'), upload.single('file'), async (req: any, res: any, next: any) => {
   try {
     if (!req.file) throw new AppError(400, 'No file uploaded')
     const fileUrl = '/api/esign/files/' + req.file.filename
@@ -2065,10 +2512,41 @@ esignRouter.post('/upload', requireAuth, requireLandlord, upload.single('file'),
   } catch (e) { next(e) }
 })
 
-esignRouter.get('/files/:filename', async (req: any, res: any, next: any) => {
+esignRouter.get('/files/:filename', requireAuth, async (req: any, res: any, next: any) => {
   try {
-    const filePath = path.join(uploadDir, req.params.filename)
+    const filePath = resolveUploadPath(uploadDir, req.params.filename)
+    if (!filePath) throw new AppError(400, 'Invalid filename')
     if (!fs.existsSync(filePath)) throw new AppError(404, 'File not found')
+
+    // Authorization: caller must be the landlord on the document OR a signer.
+    // Match the requested filename against either base_pdf_url or executed_pdf_url
+    // (URLs are stored as '/api/esign/files/<filename>' so we match on suffix).
+    const userId = req.user!.userId
+    const profileId = req.user!.profileId
+    const role = req.user!.role
+    const filename = req.params.filename
+    const urlSuffix = '/api/esign/files/' + filename
+
+    const doc = await queryOne<any>(`
+      SELECT id, landlord_id
+      FROM lease_documents
+      WHERE base_pdf_url = $1 OR executed_pdf_url = $1
+      LIMIT 1`, [urlSuffix])
+
+    if (!doc) throw new AppError(404, 'File not found')
+
+    let authorized = false
+    if (role === 'landlord' && profileId && doc.landlord_id === profileId) {
+      authorized = true
+    }
+    if (!authorized) {
+      const signer = await queryOne<any>(
+        'SELECT 1 FROM lease_document_signers WHERE document_id=$1 AND user_id=$2 LIMIT 1',
+        [doc.id, userId])
+      if (signer) authorized = true
+    }
+    if (!authorized) throw new AppError(403, 'Not authorized to view this file')
+
     res.sendFile(filePath)
   } catch (e) { next(e) }
 })

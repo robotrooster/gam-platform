@@ -8,7 +8,7 @@ export function LoginPage() {
   const navigate = useNavigate()
   const [err, setErr] = useState('')
   const [loading, setLoading] = useState(false)
-  const { register, handleSubmit, formState: { errors } } = useForm<{email:string;password:string}>()
+  const { register, handleSubmit } = useForm<{email:string;password:string}>()
 
   const onSubmit = async (d: {email:string;password:string}) => {
     setLoading(true); setErr('')

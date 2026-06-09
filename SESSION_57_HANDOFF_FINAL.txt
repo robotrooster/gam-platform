@@ -1,0 +1,178 @@
+Session 57 Handoff — Schema diff harness + properties audit + backup cleanup
+
+Date: April 29, 2026
+
+WHAT SHIPPED
+
+Schema diff harness. apps/api/scripts/diff-schema.ts (387 lines). Pairs with the S56 migration runner — runner enforces edit-history immutability of applied migrations; harness catches code-vs-schema drift. Scans every .ts file under apps/api/src/ (skipping migrations/, node_modules/, dist/, *.sNNbackup), extracts INSERT/UPDATE column references via regex, queries information_schema.columns for actual columns per table, prints drift report. Three exit modes: default (acked drift suppressed, exit 1 only on unacked), --all (show everything, exit 1 on any drift), --verbose (also list DB cols no code touches). Wired as `npm run schema:diff` in apps/api/package.json. First real run found 30 missing tables and 70 missing columns across 9 tables, surfaced as the foundational deliverable of the session.
+
+Acks file. apps/api/scripts/diff-schema.acks (139 lines, 100 entries). Format: T:table, C:table.column, W:table (wildcard, all col drift on table, USE SPARINGLY), A:relpath:line (anti-pattern false positive). Each ack must reference a closure session — a deferred item that will fix it. When that session runs, the relevant lines come out. The acks file IS the deferred-work index in code form, machine-readable, file:line precise.
+
+Six real bugs fixed mid-session (the harness handed us the list):
+
+notifications.ts:190. UPDATE maintenance_requests SET approval_required=TRUE → status='awaiting_approval'. The boolean column never existed; S18 migration replaced the design with a status enum but missed this one write site. Read-side verified fully wired (MaintenancePage.tsx :12, :180, :190 all consume the awaiting_approval status correctly).
+
+seed.ts. Two INSERT INTO units blocks (units1, units2) referenced units.tenant_id which doesn't exist on the table. Stripped from SQL and from params. Seed has been silently throwing on every fresh DB seed.
+
+leases.ts:225. UPDATE units SET status='vacant', tenant_id=NULL on lease termination — same dropped column. Throws on every lease-end. Stripped tenant_id=NULL.
+
+properties.ts PATCH /:id $9 reused twice. Lines 124 and 128 both bound to $9 (the JSON-stringified amenities array). Effect: PATCH calls passing only unit_types silently dropped the change AND wrote amenities JSON into unit_types (text[] cast would error on real call). unit_types updates have been broken since the route was written.
+
+properties.ts PATCH /:id phantom columns. description and amenities aren't columns on the table. Route was reading these fields off raw, placing them in COALESCE clauses, throwing column-does-not-exist at runtime. Stripped from destructure, from SQL, from params. Path A chosen — match schema, not extend it. If property descriptions/amenities are wanted later, they come back as a real feature with frontend, listings, and search-index implications, not a one-column add.
+
+properties.ts GET / SQL injection. Line 19: WHERE p.landlord_id = '${'${'}req.user!.profileId{'}'}' string-interpolated into SQL. JWT-derived profileId, so attacker would need a forged JWT, but this is the canonical pattern that turns into a real CVE. Parameterized via $1 and a qParams array.
+
+Properties endpoint audit closed. Two acks removed (C:properties.amenities, C:properties.description). Subsystem fully reconciled with schema.
+
+18 backup files ripped from apps/api/src/routes/. ~436KB of frozen text from S19/S20/S21 e-sign rebuild and adjacent work. Pre-rip verified: zero imports anywhere in api/landlord/tenant, harness already filtering by extension. pm.ts.s20backup preserved — it's the only on-disk reference for the PM subsystem build session, since the live pm.ts is itself queued for rip-or-build. Files removed: admin.ts.s19backup, admin.ts.s20backup, auth.ts.s20backup, background.ts.s19backup, books.ts.s20backup, bulletin.ts.s20backup, esign.ts.s19backup, esign.ts.s20backup, esign.ts.s21backup, landlords.ts.s19backup, landlords.ts.s20backup, leases.ts.s19backup, maintenance.ts.s20backup, payments.ts.s20backup, reports.ts.s20backup, tenants.ts.s19backup, tenants.ts.s20backup, units.ts.s20backup.
+
+Three new deferred items uncovered by the harness and acked: Work-trade subsystem build (work_trade_agreements, work_trade_logs, work_trade_periods), Admin audit log subsystem (admin_action_log), Utility billing subsystem build (utility_bills + the live route at routes/utility.ts that queries the phantom table + tenant/main.tsx:1049 that fetches it).
+
+NEW STANDING RULES
+
+S57-1: zsh interactive_comments is off by default. The shell does NOT honor # as a comment character in interactive paste mode. A line like `# === foo ===` becomes a command attempt where zsh tries to execute `# ===` and prints "== not found". Cost us roughly 30 minutes mid-session. Going forward: paste blocks for terminal use have ZERO `#` comments at the shell level. Comments live inside heredocs (where the body is opaque to zsh) or get dropped. If a comment is genuinely needed, use `: # comment` form which zsh evaluates as the no-op builtin `:` ignoring the rest.
+
+S57-2: psql output goes through the pager unless explicitly bypassed. Default PAGER on macOS is `less`, which paginates anything over a screenful and breaks scripted recon by stopping mid-output at a `:` prompt. Going forward: every psql invocation in a scripted block prefixes `PAGER=cat`. Example: `PAGER=cat psql -d gam -c "\d properties"`.
+
+S57-3: Python r-string triple-quote heredoc is THE file-write pattern for paste blocks. The pattern is `python3 - <<'PYEND'` with file content assigned to a variable using r-prefix and the triple-quote string form. Then write via `open(path,'w').write(var)`. The single-quoted heredoc delimiter prevents shell expansion of the body. The r-prefix prevents Python escape-sequence interpretation. The triple quotes preserve newlines verbatim. This pattern survives content with backticks, dollar signs, em dashes, single quotes, and anything else that would have broken older heredoc-and-cat patterns. Edge case caught while writing this very handoff: the file content itself cannot contain a literal triple-quote sequence — if it must, build that sequence at runtime with a TQ variable and concatenate. Use this pattern for ANY file write longer than 5 lines.
+
+S57-4: Don't trust handoff memo numbers about disk artifacts — recon first. The S56 deferred memo said "3 backup files cleanup in routes/" and reality was 19 files spanning 13 route files across 3 sessions, ~436KB. Same shape as the S29c-2-E claim about a Python diff harness that S56 caught (didn't exist on disk). Pattern: when a memo references something on disk with a number, ls before scoping. Memo numbers are hand-written; disk truth isn't.
+
+S57-5: macOS BSD rm -v output differs from GNU. zsh on macOS uses BSD `rm`, which prints bare paths to stdout when -v is passed. GNU `rm -v` prints `removed 'path'`. If a verification step downstream checks for the GNU format string, it'll fail on macOS. The deletes still happen — verification just needs to read what BSD prints (bare paths) or check via `ls` after. Same general note for `cp -v`, `mv -v`.
+
+S57-6: The harness only scans INSERT and UPDATE. SELECT-only drift (a route that queries a phantom table without writing to it) will NOT show in harness output. Discovered while ripping utility.ts: the route had only a SELECT against utility_bills, harness had nothing to flag. Implication: harness is necessary but not sufficient — it catches the dangerous category (silent write no-ops, $9-style param renumbering bugs) but won't catch every category. Adding SELECT scanning to the harness is itself deferred work; not a priority because SELECT failures are loud at runtime (query errors with shape mismatches) where INSERT/UPDATE failures can be silent (column doesn't exist sometimes throws, sometimes the surrounding ON CONFLICT or COALESCE swallows it).
+
+S57-7: Chat client autolinks dotted strings that look like domains. When recon output renders things like req.params.id or p.id as hyperlinks (with bracketed-URL syntax wrapping them), that's the chat UI rendering, NOT a real URL in the file. Don't chase phantom bugs because of formatting in the recon output. Always trust what's on disk over what the chat shows. The autolinking can also hit filenames in shell commands; if a paste block fails with a no-such-file error pointing at a bracketed-URL filename, the issue is at the paste boundary, not on disk.
+
+DEFERRED — pick foundation-first
+
+(Carry forward from S56 with closures and additions noted)
+
+NEW deferrals from S57:
+
+Work-trade subsystem build. routes/workTrade.ts references nonexistent tables work_trade_agreements, work_trade_logs, work_trade_periods. Either full build or rip. No incremental fixes. Tables sound real product-shaped (work-trade as in tenant trades labor for rent reduction).
+
+Admin audit log subsystem. routes/admin.ts:227 references nonexistent table admin_action_log. Either build the audit logging table + the surrounding write paths + admin UI to view it, or rip the route's reference.
+
+Utility billing subsystem build. routes/utility.ts is mounted at /api/utility, has a single GET /bills endpoint that queries phantom utility_bills table with same SQL-injection shape as properties had (string interp on profileId). Tenant portal main.tsx:1049 calls /utility/bills via useQuery. Five real utility tables exist as scaffolding (utility_meters, utility_meter_readings, utility_meter_units, lease_utility_assignments, lease_utility_responsibilities) for the subsystem groundwork. Full build needed: schema for utility_bills (or how charges roll up from meter readings), generation cadence, tenant-side display, allocation methods (RUBS, sub-metered, flat). Until then, the broken state is inert — tenant portal swallows the 500 and renders empty.
+
+UNCHANGED from S56:
+
+Schema diff harness — S57 closed this. Removed.
+
+Background check subsystem audit. routes/background.ts has 8 ref sites missing background_check_status + background_check_id on tenants, plus background_checks table missing 6+ columns referenced by route code, plus tables application_pool / pool_match_requests / tenant_notifications don't exist. CHECK constraint too narrow (rejects approved/denied that the route writes). Full subsystem audit, same rule as PM — no incremental fixes. One full session. Acks file has the exact column list to reconcile (C:background_checks.* + T:application_pool/pool_match_requests/tenant_notifications + C:tenants.background_check_id/status).
+
+Properties endpoint $9 placeholder — S57 closed this. Removed.
+
+PM subsystem. apps/api/src/routes/pm.ts references nonexistent tables pm_companies, pm_fee_plans, and nonexistent columns. Either full build or rip pm.ts entirely. No incremental fixes. pm.ts.s20backup preserved on disk as reference for this session.
+
+GAM Books AZ tax logic genericization. apps/api/src/routes/books.ts contains hardcoded AZ A1-QRT, AZ A1-R quarterly withholding forms and AZ flat-rate logic. Either genericize with state-aware lookups or scope-lock as AZ-only with explicit disclaimer.
+
+Master Schedule finish-or-strip. SchedulePage.tsx + GET /units/schedule/master + 8 stub columns on units + empty unit_bookings table. No booking flow UI exists.
+
+ReportsPage endpoint build. ReportsPage.tsx calls GET /api/reports/summary which doesn't exist. Page renders empty dashes. Needs endpoint design (collected MTD, outstanding balance, occupancy, monthly rollup, PM vs landlord splits) + build.
+
+E-sign frontend. Backend done (S19). Frontend deferred to S20 originally, ConfirmIntentModal entity arrays shipped S29c-2-F. Visual + e2e smoke deferred to backend-complete consolidation per the standing UI/UX rule.
+
+S23d Tier 1 CHECK migrations. 11 of 14 still pending the next infra session.
+
+Two parallel email systems consolidation. services/email.ts (Resend) vs lib/email.ts (nodemailer). Single system, single sender. Has known npm audit blockers tied to it.
+
+Notifications schema rebuild. Dead notification types still listed in NotificationBell and tenant notification preferences (lease_expiring_60, lease_expiring_30, lease_renewal_survey from pre-S18 scheduler). Plus 7 missing columns on the notifications table (data, email_sent, email_sent_at, landlord_id, read_at, sms_sent, sms_sent_at) and notification_preferences table doesn't exist.
+
+Source PDF path resolution rebuild. Currently split('/').pop() — fragile.
+
+E-sign /files/:filename auth gap. /files/:filename is open to anyone; the equivalent /me/pending-tenants/:intentId/document is auth-gated.
+
+POST /sign/:documentId transaction wrap. Multi-statement writes without atomicity.
+
+
+Void cascade switch → shared helper. Duplicated across e-sign routes.
+
+pdf.js loader extraction. Duplicated 6 sites, candidate for shared module.
+
+Witness in send modal.
+
+Tenant draft persistence (in-progress signing state).
+
+Tenant decline path with reason + landlord notification.
+
+Tenant view-only re-open of executed/in-flight docs.
+
+Movie-font signature styles → professional fonts.
+
+Initials lock-to-name (low-priority edge case).
+
+Permission gating audit across landlord portal (every screen + route needs role+scope filtering).
+
+Short-term booking acknowledgment docs on unit_bookings.
+
+Payment-method surcharge passthrough at property level.
+
+Consolidated landlord-side ACH pull optimization.
+
+Guarantor/cosigner billing flow.
+
+Flex Suite reintroduction (post-capital, post-legal review). Acks: T:flex_charge_accounts, T:flex_charge_transactions, C:tenants.flexpay_*.
+
+OTP enablement (feature-gated). Acks: C:disbursements.platform_fee/scheduled_date/type, C:tenants.otp_qualified_at. otpScheduler.ts:65 INSERT references three columns not on disbursements table; will throw at runtime if scheduler ever fires. Currently disabled.
+
+Property late-fee edit confirmation modal (with addendum/notice-period reminder).
+
+Lease-change addendum workflow with legal notice timing.
+
+Deposit interest accrual engine.
+
+Landlord disbursement engine that nets tenant-owed deposit interest from monthly payouts.
+
+leases.security_deposit deprecation into lease_fees.
+
+S26a catch-up window admin endpoint (POST /admin/invoices/backfill, date range + dry-run).
+
+lease_fees.due_timing='move_out' and 'other' not consumed by any generator yet.
+
+Email-failure surface to landlord UI. Spans /commit and inherits through /onboard-tenant-pending and /resolve when activation email lands at resolve time.
+
+Punch-list-resubmit limbo dispatch. Pure-lease-blocker rows after fix should go to limbo automatically.
+
+5 broken bookkeeper endpoints in routes/books.ts.
+
+routes/utility.ts dormant + has SQL injection — RECLASSIFIED in S57. Not dormant — actively mounted, actively called from tenant portal, returns 500. Rolled into Utility billing subsystem build above.
+
+Empty stub utility tables in live DB — RECLASSIFIED in S57. The five utility tables in the DB are real subsystem groundwork, not empty stubs. The S56 memo's "empty stub utility tables" claim was incorrect or referred to something else.
+
+ConfirmIntentModal noUnusedLocals strict-mode hygiene pass on landlord (~20 hits across Layout, NotificationBell, BackgroundChecksPage, DashboardPage, DisbursementsPage, DocumentsPage, InviteTenantModal, LeasesPage, LoginPage, plus likely more downstream).
+
+End-to-end /resolve smoke including landlord-overridden entity rows.
+
+Sublease subsystem full build.
+
+Cross-platform audit trail validation.
+
+Tenant-pool endpoint.
+
+Platform-specific CSV import mappings (Buildium, AppFolio, DoorLoop, Yardi, RentManager, Propertyware, Rentec Direct, TenantCloud + 1-2 TBD).
+
+Tenant-pool picker + unit picker with consent rule.
+
+5 of 8 npm audit vulnerabilities (nodemailer pending email consolidation; uuid via node-cron + svix + resend pending major-version session).
+
+Team UI rebuild (single team_member_scopes table). Acks: T:team_property_access, C:team_members.invite_email/invite_token.
+
+Backup file cleanup — S57 closed this. Removed (18 of 19 ripped, pm.ts.s20backup preserved per PM build session).
+
+Harness extension — scan SELECT references too. NEW: not blocking, but worth a future session. Currently harness only catches INSERT/UPDATE drift. SELECT-only drift on phantom tables (utility.ts shape) won't surface. Lower priority because SELECT errors are loud at runtime; INSERT/UPDATE failures can be silent.
+
+NUMBERING
+
+S57 was the 57th chat with Claude on this codebase. Session count = chat count, regardless of topic. Future sessions: clean increment. Next is S58. No letters, no sub-prefixes.
+
+CLOSED THIS SESSION (removed from deferred list)
+
+Schema diff harness build.
+Properties endpoint $9 placeholder + missing amenities column audit.
+3 backup files cleanup in routes/ (was wildly undercounted — actual closure is 18 of 19, with pm.ts.s20backup preserved by design).
+routes/utility.ts dormant flag (reclassified — rolled into utility billing subsystem build).
+Empty stub utility tables flag (reclassified — those tables are real subsystem groundwork).
+
+End of S57 handoff.

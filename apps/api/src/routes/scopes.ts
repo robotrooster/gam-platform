@@ -3,15 +3,18 @@ import { z } from 'zod'
 import crypto from 'crypto'
 import bcrypt from 'bcryptjs'
 import { query, queryOne, getClient } from '../db'
-import { requireAuth, requireLandlord } from '../middleware/auth'
+import { requireAuth, requirePerm } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { emailInvitation } from '../services/email'
+import { createNotification } from '../services/notifications'
+import { fetchAccountStatus } from '../services/stripeConnect'
 import {
   LANDLORD_ASSIGNABLE_ROLES,
   LandlordAssignableRole,
   MAINTENANCE_JOB_CATEGORIES,
   BOOKKEEPER_ACCESS_LEVELS,
 } from '@gam/shared'
+import { logger } from '../lib/logger'
 
 // ── Shared helpers ────────────────────────────────────────────────
 
@@ -33,8 +36,9 @@ const pmScopeSchema = z.object({
 })
 
 const osScopeSchema = z.object({
-  propertyIds: z.array(z.string().uuid()).default([]),
-  unitIds:     z.array(z.string().uuid()).default([]),
+  propertyIds:   z.array(z.string().uuid()).default([]),
+  unitIds:       z.array(z.string().uuid()).default([]),
+  allProperties: z.boolean().default(false),  // S187
 })
 
 const mwScopeSchema = z.object({
@@ -61,14 +65,20 @@ function isAssignableRole(s: string): s is LandlordAssignableRole {
   return (LANDLORD_ASSIGNABLE_ROLES as readonly string[]).includes(s)
 }
 
-// Only landlords manage their own scoped users. Admin/super_admin can
-// optionally pass ?landlordId=... but we do not expose that in the UI yet.
+// Resolve the landlord_id whose team the caller is acting on.
+// - landlord: their own profileId
+// - admin/super_admin: explicit ?landlordId= or body.landlordId
+// - property_manager (S81, with team.invite or team.manage_permissions perm):
+//   their scope's landlordId. They cannot act on any other landlord.
 function getLandlordIdFromReq(req: any): string {
   if (req.user?.role === 'landlord') return req.user.profileId
   if (req.user?.role === 'admin' || req.user?.role === 'super_admin') {
     const lid = req.query?.landlordId || req.body?.landlordId
     if (!lid) throw new AppError(400, 'landlordId required for admin calls')
     return String(lid)
+  }
+  if (req.user?.role === 'property_manager' && req.user?.landlordId) {
+    return req.user.landlordId
   }
   throw new AppError(403, 'Only landlords may manage scoped users')
 }
@@ -93,9 +103,10 @@ async function insertScopeRow(
     case 'onsite_manager': {
       const { rows } = await client.query(
         `INSERT INTO onsite_manager_scopes
-           (user_id, landlord_id, property_ids, unit_ids)
-         VALUES ($1,$2,$3,$4) RETURNING *`,
-        [userId, landlordId, payload.propertyIds, payload.unitIds])
+           (user_id, landlord_id, property_ids, unit_ids, all_properties)
+         VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+        [userId, landlordId, payload.propertyIds, payload.unitIds,
+         payload.allProperties])
       return rows[0]
     }
     case 'maintenance': {
@@ -138,8 +149,193 @@ function buildAcceptUrl(token: string): string {
 export const scopesRouter = Router()
 scopesRouter.use(requireAuth)
 
+// GET /api/scopes/team — unified roll-up across all 4 scope tables + invitations.
+// S80 / Item 8b. Single endpoint feeds the landlord TeamPage view so the
+// frontend doesn't have to query four endpoints and merge client-side.
+// Registered BEFORE /:roleType so Express doesn't match 'team' as a roleType.
+scopesRouter.get('/team', requirePerm('team.invite', 'team.manage_permissions'), async (req, res, next) => {
+  try {
+    const landlordId = getLandlordIdFromReq(req)
+
+    // S168: surface direct_deposit_enabled (per-manager opt-in toggle) and
+    // the cached Connect-readiness flags from users so TeamPage can render
+    // both the toggle state and the manager's onboarding progress without
+    // a second round-trip.
+    const pmRows = await query<any>(
+      `SELECT 'property_manager' AS role, s.user_id, s.permissions,
+              jsonb_build_object(
+                'propertyIds', s.property_ids,
+                'unitIds', s.unit_ids,
+                'allProperties', s.all_properties,
+                'maintApprovalCeilingCents', s.maint_approval_ceiling_cents
+              ) AS scope,
+              s.direct_deposit_enabled,
+              u.connect_charges_enabled,
+              u.connect_payouts_enabled,
+              u.connect_details_submitted,
+              s.created_at, s.updated_at,
+              u.email, u.first_name, u.last_name, u.phone
+         FROM property_manager_scopes s JOIN users u ON u.id = s.user_id
+        WHERE s.landlord_id = $1`, [landlordId])
+
+    const omRows = await query<any>(
+      `SELECT 'onsite_manager' AS role, s.user_id, s.permissions,
+              jsonb_build_object(
+                'propertyIds', s.property_ids,
+                'unitIds', s.unit_ids,
+                'allProperties', s.all_properties
+              ) AS scope,
+              s.created_at, s.updated_at,
+              u.email, u.first_name, u.last_name, u.phone
+         FROM onsite_manager_scopes s JOIN users u ON u.id = s.user_id
+        WHERE s.landlord_id = $1`, [landlordId])
+
+    const mwRows = await query<any>(
+      `SELECT 'maintenance' AS role, s.user_id, s.permissions,
+              jsonb_build_object(
+                'propertyIds', s.property_ids,
+                'unitIds', s.unit_ids,
+                'jobCategories', s.job_categories,
+                'allProperties', s.all_properties
+              ) AS scope,
+              s.created_at, s.updated_at,
+              u.email, u.first_name, u.last_name, u.phone
+         FROM maintenance_worker_scopes s JOIN users u ON u.id = s.user_id
+        WHERE s.landlord_id = $1`, [landlordId])
+
+    const bkRows = await query<any>(
+      `SELECT 'bookkeeper' AS role, s.user_id,
+              jsonb_build_object('access_level', s.access_level) AS permissions,
+              jsonb_build_object('accessLevel', s.access_level) AS scope,
+              s.created_at, s.updated_at,
+              u.email, u.first_name, u.last_name, u.phone
+         FROM bookkeeper_scopes s JOIN users u ON u.id = s.user_id
+        WHERE s.landlord_id = $1`, [landlordId])
+
+    const members = [...pmRows, ...omRows, ...mwRows, ...bkRows]
+      .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
+
+    const invitations = await query<any>(
+      `SELECT id, email, role, status, expires_at, created_at, accepted_at, revoked_at
+         FROM invitations
+        WHERE landlord_id = $1 AND status = 'pending'
+        ORDER BY created_at DESC`, [landlordId])
+
+    res.json({ success: true, data: { members, invitations } })
+  } catch (e) { next(e) }
+})
+
+// PATCH /api/scopes/property_manager/:userId/direct-deposit — landlord
+// flips the per-manager Connect opt-in toggle. Only valid for the
+// property_manager role; other worker roles have no rent-share allocation
+// path so they don't need a Connect account. On false→true, an in-app
+// notification fires to the manager telling them to onboard.
+//
+// S168: locks the CLAUDE.md spec — manager Connect is opt-in by the
+// landlord, default off. Allocation_manager_fee Stripe Transfers
+// silent-skip until the manager completes Connect onboarding.
+scopesRouter.patch(
+  '/property_manager/:userId/direct-deposit',
+  requirePerm('team.manage_permissions'),
+  async (req, res, next) => {
+    try {
+      const landlordId = getLandlordIdFromReq(req)
+      const body = z.object({ enabled: z.boolean() }).parse(req.body)
+
+      // S236: self-target guard. CLAUDE.md spec: manager Connect is
+      // opt-in by the LANDLORD, default off. A manager with
+      // team.manage_permissions managing another manager is delegated
+      // team work; a manager flipping their own toggle is privilege
+      // escalation around the landlord's financial-routing decision.
+      if (req.user!.role === 'property_manager' && req.params.userId === req.user!.userId) {
+        throw new AppError(403, 'Managers cannot flip their own direct-deposit toggle. Ask your landlord to enable it.')
+      }
+
+      // Snapshot the prior state so we only fire the notification on a
+      // genuine false→true transition, not on idempotent re-enables.
+      const before = await queryOne<{ direct_deposit_enabled: boolean }>(
+        `SELECT direct_deposit_enabled
+           FROM property_manager_scopes
+          WHERE user_id = $1 AND landlord_id = $2`,
+        [req.params.userId, landlordId])
+      if (!before) throw new AppError(404, 'Scope row not found')
+
+      const updated = await queryOne<any>(
+        `UPDATE property_manager_scopes
+            SET direct_deposit_enabled = $1, updated_at = NOW()
+          WHERE user_id = $2 AND landlord_id = $3
+          RETURNING *`,
+        [body.enabled, req.params.userId, landlordId])
+
+      if (body.enabled && !before.direct_deposit_enabled) {
+        const manager = await queryOne<{ email: string; first_name: string }>(
+          `SELECT email, first_name FROM users WHERE id = $1`,
+          [req.params.userId])
+        if (manager) {
+          const inviterName = await getInviterName(landlordId)
+          const portalBase = process.env.LANDLORD_PORTAL_URL || 'http://localhost:3001'
+          createNotification({
+            userId:    req.params.userId,
+            landlordId,
+            type:      'manager_direct_deposit_enabled',
+            title:     'Direct Deposit Enabled — Set Up Stripe Connect',
+            body:      `${inviterName} enabled direct deposit on your account. ` +
+                       `Visit Banking in the portal to complete Stripe Connect onboarding ` +
+                       `before your manager fees can be paid out.`,
+            data:      { landlordId, portalUrl: `${portalBase}/banking` },
+            sendEmail: true,
+            emailTo:   manager.email,
+            emailSubject: 'Direct Deposit Enabled — Action Required',
+          }).catch(e => logger.error({ err: e }, '[NOTIFY] manager direct-deposit enable'))
+        }
+      }
+
+      res.json({ success: true, data: updated })
+    } catch (e) { next(e) }
+  }
+)
+
+// GET /api/scopes/property_manager/:userId/connect-status — returns the
+// manager's live Stripe Connect account state so the landlord can see
+// exactly which KYC items the manager hasn't filled in. Verifies the
+// caller actually employs this manager (scope row exists under their
+// landlord_id) before proxying to Stripe. Stripe errors propagate.
+//
+// S168 follow-on: complement to the direct-deposit toggle. When a
+// manager sits on "Awaiting onboarding" or "Verifying" for too long,
+// the landlord can drill into requirements_currently_due to nudge them
+// with specifics ("you need to upload an ID document" beats "finish
+// stripe onboarding").
+scopesRouter.get(
+  '/property_manager/:userId/connect-status',
+  requirePerm('team.manage_permissions'),
+  async (req, res, next) => {
+    try {
+      const landlordId = getLandlordIdFromReq(req)
+
+      // Authorize: caller must employ this manager.
+      const scope = await queryOne<{ id: string }>(
+        `SELECT id FROM property_manager_scopes
+          WHERE user_id = $1 AND landlord_id = $2`,
+        [req.params.userId, landlordId])
+      if (!scope) throw new AppError(404, 'Manager not found in your team')
+
+      const userRow = await queryOne<{ stripe_connect_account_id: string | null }>(
+        `SELECT stripe_connect_account_id FROM users WHERE id = $1`,
+        [req.params.userId])
+      const connectAccountId = userRow?.stripe_connect_account_id ?? null
+      if (!connectAccountId) {
+        return res.json({ success: true, data: { exists: false } })
+      }
+
+      const status = await fetchAccountStatus(connectAccountId)
+      res.json({ success: true, data: { exists: true, connectAccountId, ...status } })
+    } catch (e) { next(e) }
+  }
+)
+
 // GET /api/scopes/:roleType — scoped users + invitations for this role
-scopesRouter.get('/:roleType', requireLandlord, async (req, res, next) => {
+scopesRouter.get('/:roleType', requirePerm('team.invite', 'team.manage_permissions'), async (req, res, next) => {
   try {
     const role = req.params.roleType
     if (!isAssignableRole(role)) throw new AppError(400, 'Invalid roleType')
@@ -166,7 +362,7 @@ scopesRouter.get('/:roleType', requireLandlord, async (req, res, next) => {
 })
 
 // POST /api/scopes/:roleType/invite
-scopesRouter.post('/:roleType/invite', requireLandlord, async (req, res, next) => {
+scopesRouter.post('/:roleType/invite', requirePerm('team.invite'), async (req, res, next) => {
   try {
     const role = req.params.roleType
     if (!isAssignableRole(role)) throw new AppError(400, 'Invalid roleType')
@@ -218,8 +414,8 @@ scopesRouter.post('/:roleType/invite', requireLandlord, async (req, res, next) =
       await client.query('COMMIT')
 
       const inviterName = await getInviterName(landlordId)
-      emailInvitation(body.email, inviterName, role, buildAcceptUrl(token))
-        .catch(e => console.error('[EMAIL] invite failed', e))
+      emailInvitation(body.email, inviterName, role, buildAcceptUrl(token), { landlordId, invitationId: invitation.id })
+        .catch(e => logger.error({ err: e }, '[EMAIL] invite failed'))
 
       res.status(201).json({ success: true, data: invitation })
     } catch (e: any) {
@@ -234,13 +430,52 @@ scopesRouter.post('/:roleType/invite', requireLandlord, async (req, res, next) =
   } catch (e) { next(e) }
 })
 
+// PATCH /api/scopes/:roleType/:userId/permissions — sub-permission toggle update.
+// S80 / Item 8a. Replaces full-scope PATCH for the permissions field only.
+// Bookkeeper rejected — use PATCH /scopes/bookkeeper/:userId for accessLevel.
+scopesRouter.patch('/:roleType/:userId/permissions', requirePerm('team.manage_permissions'), async (req, res, next) => {
+  try {
+    const role = req.params.roleType
+    if (!isAssignableRole(role)) throw new AppError(400, 'Invalid roleType')
+    if (role === 'bookkeeper') throw new AppError(400, 'Bookkeeper uses accessLevel, not permissions toggles')
+    const landlordId = getLandlordIdFromReq(req)
+    const body = z.object({ permissions: z.record(z.boolean()) }).parse(req.body)
+    const table = SCOPE_TABLES[role]
+
+    // S236: self-edit guard. Without this, a property_manager who has
+    // `team.manage_permissions` could grant themselves every other
+    // sub-permission in the catalog — a permanent privilege escalation
+    // around the landlord's intended scope. Owner roles (admin /
+    // super_admin / landlord) bypass since they hold all perms by
+    // definition.
+    if (req.user!.role === 'property_manager' && req.params.userId === req.user!.userId) {
+      throw new AppError(403, 'Managers cannot edit their own permissions. Ask your landlord to update them.')
+    }
+
+    const updated = await queryOne<any>(
+      `UPDATE ${table} SET permissions = $1, updated_at = NOW()
+        WHERE user_id = $2 AND landlord_id = $3 RETURNING *`,
+      [JSON.stringify(body.permissions), req.params.userId, landlordId])
+    if (!updated) throw new AppError(404, 'Scope row not found')
+    res.json({ success: true, data: updated })
+  } catch (e) { next(e) }
+})
+
 // PATCH /api/scopes/:roleType/:userId — update scope row
-scopesRouter.patch('/:roleType/:userId', requireLandlord, async (req, res, next) => {
+scopesRouter.patch('/:roleType/:userId', requirePerm('team.manage_permissions'), async (req, res, next) => {
   try {
     const role = req.params.roleType
     if (!isAssignableRole(role)) throw new AppError(400, 'Invalid roleType')
     const landlordId = getLandlordIdFromReq(req)
     const scope = validateScopePayload(role, req.body)
+
+    // S236: self-edit guard. Same reasoning as the /permissions
+    // sibling — a manager could grant themselves access to additional
+    // properties/units (or for PM, set their own approval ceiling)
+    // without the landlord's knowledge.
+    if (req.user!.role === 'property_manager' && req.params.userId === req.user!.userId) {
+      throw new AppError(403, 'Managers cannot edit their own scope. Ask your landlord to update it.')
+    }
 
     let updated: any = null
     switch (role) {
@@ -283,7 +518,7 @@ scopesRouter.patch('/:roleType/:userId', requireLandlord, async (req, res, next)
 })
 
 // DELETE /api/scopes/:roleType/:userId — remove scope row (revoke access)
-scopesRouter.delete('/:roleType/:userId', requireLandlord, async (req, res, next) => {
+scopesRouter.delete('/:roleType/:userId', requirePerm('team.manage_permissions'), async (req, res, next) => {
   try {
     const role = req.params.roleType
     if (!isAssignableRole(role)) throw new AppError(400, 'Invalid roleType')
@@ -299,7 +534,7 @@ scopesRouter.delete('/:roleType/:userId', requireLandlord, async (req, res, next
 })
 
 // POST /api/scopes/invitations/:id/resend — new token, reset expiry
-scopesRouter.post('/invitations/:id/resend', requireLandlord, async (req, res, next) => {
+scopesRouter.post('/invitations/:id/resend', requirePerm('team.invite'), async (req, res, next) => {
   try {
     const landlordId = getLandlordIdFromReq(req)
     const inv = await queryOne<any>(
@@ -324,8 +559,8 @@ scopesRouter.post('/invitations/:id/resend', requireLandlord, async (req, res, n
       await client.query('COMMIT')
 
       const inviterName = await getInviterName(landlordId)
-      emailInvitation(inv.email, inviterName, inv.role, buildAcceptUrl(token))
-        .catch(e => console.error('[EMAIL] resend failed', e))
+      emailInvitation(inv.email, inviterName, inv.role, buildAcceptUrl(token), { landlordId, invitationId: inv.id })
+        .catch(e => logger.error({ err: e }, '[EMAIL] resend failed'))
 
       res.json({ success: true, data: upd.rows[0] })
     } catch (e) {
@@ -338,7 +573,7 @@ scopesRouter.post('/invitations/:id/resend', requireLandlord, async (req, res, n
 })
 
 // POST /api/scopes/invitations/:id/revoke
-scopesRouter.post('/invitations/:id/revoke', requireLandlord, async (req, res, next) => {
+scopesRouter.post('/invitations/:id/revoke', requirePerm('team.invite'), async (req, res, next) => {
   try {
     const landlordId = getLandlordIdFromReq(req)
     const inv = await queryOne<any>(
@@ -490,8 +725,18 @@ invitationsRouter.post('/:token/accept', async (req, res, next) => {
 
       await client.query('COMMIT')
       res.json({ success: true, data: { userId: user.id, role, scope: scopeRow } })
-    } catch (e) {
+    } catch (e: any) {
       await client.query('ROLLBACK')
+      // S349: the invite-time onsite-manager uniqueness guard (scopes.ts:378)
+      // is racy — two landlords can each create pending invites for the
+      // same email before either is accepted. The schema enforces
+      // platform-wide one-landlord-per-onsite-manager via
+      // UNIQUE(user_id) on onsite_manager_scopes; pre-S349 the
+      // accept-time race produced a 500 with the raw postgres
+      // constraint-violation message. Translate to a clean 409.
+      if (e?.code === '23505' && e?.constraint === 'onsite_manager_scopes_user_id_key') {
+        return next(new AppError(409, 'This user is already an on-site manager for another landlord'))
+      }
       throw e
     } finally {
       client.release()

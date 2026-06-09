@@ -1,120 +1,30 @@
 import { useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { useQuery, useMutation, useQueryClient } from 'react-query'
-import { apiGet, apiPost, apiPatch, apiDelete } from '../lib/api'
-import { ArrowLeft, DoorOpen, Building2, CreditCard, Wrench, TrendingUp, Clock, CheckCircle, XCircle } from 'lucide-react'
+import { useQuery } from 'react-query'
+import { apiGet } from '../lib/api'
+import { ArrowLeft } from 'lucide-react'
 import { TransferTenantModal } from './TransferTenantModal'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
-function FlexChargePanel({ tenantId, tenantName, chargeAccount, refetch, creditLimit, setCreditLimit, limitSaved, setLimitSaved, qc }: any) {
-  const enableMut = useMutation(
-    () => apiPost('/landlords/flexcharge', { tenantId, creditLimit: creditLimit ? parseFloat(creditLimit) : null }),
-    { onSuccess: () => { refetch(); qc.invalidateQueries(['flexcharge', tenantId]) } }
-  )
-  const disableMut = useMutation(
-    () => apiDelete('/landlords/flexcharge/' + tenantId),
-    { onSuccess: () => { refetch(); qc.invalidateQueries(['flexcharge', tenantId]) } }
-  )
-  const updateLimitMut = useMutation(
-    () => apiPatch('/landlords/flexcharge/' + tenantId, { creditLimit: creditLimit ? parseFloat(creditLimit) : null }),
-    { onSuccess: () => { refetch(); setLimitSaved(true); setTimeout(() => setLimitSaved(false), 2000) } }
-  )
-  const isActive = chargeAccount?.status === 'active'
-  const isDisqualified = chargeAccount?.status === 'disqualified'
-  const txns = chargeAccount?.transactions || []
-  return (
-    <div>
-      <div className="card" style={{ marginBottom: 20 }}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
-          <div>
-            <div style={{ fontWeight: 700, color: 'var(--text-0)', marginBottom: 4 }}>FlexCharge Account</div>
-            <div style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>
-              {!chargeAccount ? 'Not enabled for this tenant'
-                : isDisqualified ? 'Disqualified — tenant disputed a charge'
-                : isActive ? 'Active — tenant appears in POS charge list'
-                : 'Suspended'}
-            </div>
-          </div>
-          <div style={{ display: 'flex', gap: 8 }}>
-            {!chargeAccount || !isActive ? (
-              <button className="btn btn-primary" disabled={enableMut.isLoading} onClick={() => enableMut.mutate()}>
-                {enableMut.isLoading ? <span className="spinner" /> : '+ Enable FlexCharge'}
-              </button>
-            ) : (
-              <button className="btn btn-danger" disabled={disableMut.isLoading}
-                onClick={() => { if (confirm('Suspend FlexCharge for ' + tenantName + '?')) disableMut.mutate() }}>
-                {disableMut.isLoading ? <span className="spinner" /> : 'Suspend'}
-              </button>
-            )}
-          </div>
-        </div>
-        {chargeAccount && (
-          <div style={{ display: 'flex', alignItems: 'flex-end', gap: 12 }}>
-            <div style={{ flex: 1 }}>
-              <label className="form-label">Credit Limit (blank = no limit)</label>
-              <input className="form-input" type="number" min={0} step={10}
-                value={creditLimit} onChange={e => setCreditLimit(e.target.value)}
-                placeholder="e.g. 500" style={{ maxWidth: 160 }} />
-            </div>
-            <button className="btn btn-secondary" disabled={updateLimitMut.isLoading} onClick={() => updateLimitMut.mutate()}>
-              {limitSaved ? 'Saved' : 'Update Limit'}
-            </button>
-          </div>
-        )}
-      </div>
-      {chargeAccount && (
-        <div className="card" style={{ padding: 0 }}>
-          <div style={{ padding: '16px 20px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid var(--border-0)' }}>
-            <div style={{ fontWeight: 700, color: 'var(--text-0)' }}>Transaction History</div>
-            <div style={{ textAlign: 'right' }}>
-              <div style={{ fontFamily: 'var(--font-mono)', fontSize: '1.2rem', fontWeight: 800, color: 'var(--gold)' }}>
-                ${parseFloat(chargeAccount.currentBalance || 0).toFixed(2)}
-              </div>
-              <div style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>Current balance</div>
-            </div>
-          </div>
-          {txns.length === 0 ? (
-            <div style={{ padding: 32, textAlign: 'center', color: 'var(--text-3)', fontSize: '.82rem' }}>No charges yet.</div>
-          ) : (
-            <table className="data-table">
-              <thead><tr><th>Date</th><th>Description</th><th>Amount</th><th>Status</th></tr></thead>
-              <tbody>
-                {txns.map((tx: any) => (
-                  <tr key={tx.id}>
-                    <td className="mono" style={{ fontSize: '.75rem' }}>{new Date(tx.createdAt).toLocaleDateString()}</td>
-                    <td style={{ color: 'var(--text-0)' }}>{tx.description}</td>
-                    <td className="mono" style={{ fontWeight: 600 }}>${parseFloat(tx.amount).toFixed(2)}</td>
-                    <td><span className={`badge ${tx.status === 'pulled' ? 'badge-green' : tx.status === 'disputed' ? 'badge-red' : 'badge-amber'}`}>{tx.status}</span></td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
-        </div>
-      )}
-    </div>
-  )
-}
+// S252: legacy per-tenant FlexChargePanel removed. The new schema
+// scopes FlexCharge accounts per (customer, property); a tenant can
+// hold separate tabs at different properties, so a tenant-detail
+// view isn't the right surface anymore. Dedicated landlord
+// FlexCharge dashboard lands in S254.
 
 export function TenantDetailPage() {
   const { id } = useParams()
   const navigate = useNavigate()
   const [showTransfer, setShowTransfer] = useState(false)
   const [tab, setTab] = useState('overview')
-  const [creditLimit, setCreditLimit] = useState('')
-  const [limitSaved, setLimitSaved] = useState(false)
-  const qc = useQueryClient()
-  const { data: chargeAccount, refetch: refetchCharge } = useQuery(
-    ['flexcharge', id],
-    () => apiGet<any[]>('/landlords/flexcharge').then((accounts: any[]) =>
-      accounts.find((a: any) => a.tenantId === id) || null
-    ),
-    { enabled: tab === 'flexcharge' }
-  )
+  // S252: per-tenant FlexCharge query removed alongside the legacy
+  // panel. New flex_charge_accounts schema is (customer, property)
+  // keyed; consult the FlexCharge dashboard (S254) for per-property
+  // account management.
   const { data, isLoading } = useQuery(['tenant-profile', id], () => apiGet<any>(`/tenants/${id}/profile`))
   if (isLoading) return <div style={{ color: 'var(--text-3)', padding: 32 }}>Loading...</div>
   if (!data) return <div className="empty-state"><h3>Tenant not found</h3></div>
-  const { tenant, units, payments, maintenance, workTrade, stats } = data
+  const { tenant, units, payments, maintenance, stats } = data
   const currentUnit = units?.find((u: any) => u.isCurrent)
   const onTimeColor = stats.onTimeRate >= 90 ? 'var(--green)' : stats.onTimeRate >= 75 ? 'var(--amber)' : 'var(--red)'
   const onTimeLabel = stats.onTimeRate >= 90 ? 'Excellent' : stats.onTimeRate >= 75 ? 'Good' : 'Needs Attention'
@@ -150,10 +60,14 @@ export function TenantDetailPage() {
       </div>
 
       {tab === 'flexcharge' && (
-        <FlexChargePanel tenantId={id!} tenantName={tenant.firstName + ' ' + tenant.lastName}
-          chargeAccount={chargeAccount} refetch={refetchCharge}
-          creditLimit={creditLimit} setCreditLimit={setCreditLimit}
-          limitSaved={limitSaved} setLimitSaved={setLimitSaved} qc={qc} />
+        <div className="card" style={{ padding: 24, textAlign: 'center' }}>
+          <div style={{ fontWeight: 700, color: 'var(--text-0)', marginBottom: 8 }}>FlexCharge Account</div>
+          <div style={{ fontSize: '.82rem', color: 'var(--text-3)', lineHeight: 1.5, maxWidth: 480, margin: '0 auto' }}>
+            FlexCharge accounts are now scoped per-property (a tenant can hold separate tabs at different properties).
+            Manage from the dedicated FlexCharge dashboard — landing in a follow-up session. The per-tenant
+            single-account view here has been retired.
+          </div>
+        </div>
       )}
 
       {tab === 'overview' && (

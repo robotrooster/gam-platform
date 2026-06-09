@@ -5,7 +5,12 @@ interface AuthUser {
   id: string; email: string; role: string
   firstName: string; lastName: string; profileId: string
   onboardingComplete?: boolean
-  stripeBankVerified?: boolean
+  bankAccountReady?: boolean
+  // S82: worker-role users carry their scope's landlordId + the
+  // sub-permission map. Owner roles (admin/super_admin/landlord) get
+  // null for both — they're handled by role-based gates, not perms.
+  landlordId?: string | null
+  permissions?: Record<string, boolean | string> | null
 }
 
 interface AuthCtx {

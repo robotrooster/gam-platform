@@ -9,36 +9,20 @@ function authFetch(path: string, opts: RequestInit = {}) {
   return fetch(API + '/api' + path, { ...opts, headers: { Authorization: 'Bearer ' + tok(), ...(opts.headers||{}) } })
 }
 
+// S233: replaced movie-font signature options (Terminator / Matrix /
+// Blade Runner / Mad Max) with system-fallback professional ones.
+// Identical replacement to apps/tenant/src/pages/SignPage.tsx.
 const SIG_FONTS = [
-  { id:'elegant',     name:'Elegant',        css:"italic 42px Georgia, serif" },
-  { id:'terminator',  name:'Terminator',     css:"terminator" },
-  { id:'matrix',      name:'Matrix',         css:"matrix" },
-  { id:'bladerunner', name:'Blade Runner',   css:"bladerunner" },
-  { id:'teamfury',    name:'Mad Max',        css:"teamfury" },
+  { id:'elegant',  name:'Elegant',  css:"italic 42px Georgia, 'Times New Roman', serif" },
+  { id:'script',   name:'Script',   css:"40px 'Snell Roundhand', 'Edwardian Script ITC', 'Apple Chancery', cursive" },
+  { id:'cursive',  name:'Cursive',  css:"40px 'Brush Script MT', 'Lucida Handwriting', cursive" },
+  { id:'classic',  name:'Classic',  css:"italic 40px 'Palatino Linotype', 'Book Antiqua', Palatino, serif" },
+  { id:'modern',   name:'Modern',   css:"italic 38px Garamond, 'Times New Roman', serif" },
 ]
-const FONT_LINK = ""
 
 // Canvas-rendered signature preview — visually distinct styles regardless of system fonts
 function SigPreview({ text, fontCss, small }: { text:string; fontCss:string; small?:boolean }) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
-
-  // Inject @font-face for custom fonts once
-  useEffect(() => {
-    if (document.querySelector('style[data-gam-fonts]')) return
-    const style = document.createElement('style')
-    style.setAttribute('data-gam-fonts','1')
-    style.textContent = `
-      @font-face { font-family: 'Terminator'; src: url('/fonts/terminator.ttf'); }
-      @font-face { font-family: 'Matrix'; src: url('/fonts/matrix.ttf'); }
-      @font-face { font-family: 'BladeRunner'; src: url('/fonts/bladerunner.ttf'); }
-      @font-face { font-family: 'TeamFury'; src: url('/fonts/teamfury.ttf'); }
-    `
-    document.head.appendChild(style)
-    // Preload fonts
-    ;['Terminator','Matrix','BladeRunner','TeamFury'].forEach(f => {
-      new FontFace(f, `url('/fonts/${f.toLowerCase()}.ttf')`).load().then(font => document.fonts.add(font)).catch(()=>{})
-    })
-  }, [])
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -49,33 +33,10 @@ function SigPreview({ text, fontCss, small }: { text:string; fontCss:string; sma
     canvas.width = w; canvas.height = h
     ctx.clearRect(0, 0, w, h)
 
-    const movieFonts: Record<string,string> = {
-      terminator: 'Terminator',
-      matrix: 'Matrix',
-      bladerunner: 'BladeRunner',
-      teamfury: 'TeamFury',
-    }
-    if (movieFonts[fontCss]) {
-      const fontFamily = movieFonts[fontCss]
-      const fontSize = small ? 26 : 34
-      const fontStr = `${fontSize}px '${fontFamily}'`
-      const drawIt = () => {
-        ctx.clearRect(0,0,w,h)
-        ctx.font = fontStr
-        ctx.textBaseline = 'middle'
-        ctx.fillStyle = '#1a1a1a'
-        ctx.fillText(text, 6, h/2, w-12)
-      }
-      document.fonts.load(fontStr).then(drawIt).catch(drawIt)
-    } else {
-      ctx.font = fontCss
-      ctx.textBaseline = 'middle'
-      ctx.fillStyle = '#1a1a1a'
-      if (fontCss.includes('Arial')) {
-        ctx.transform(1, 0.02, -0.02, 1, 0, 0)
-      }
-      ctx.fillText(text, 8, h/2, w-16)
-    }
+    ctx.font = fontCss
+    ctx.textBaseline = 'middle'
+    ctx.fillStyle = '#1a1a1a'
+    ctx.fillText(text, 8, h/2, w-16)
   }, [text, fontCss, small])
   return <canvas ref={canvasRef} style={{ display:'block', maxWidth:'100%' }}/>
 }
@@ -87,13 +48,6 @@ function SignatureChooser({ name, type, onSelect, onClose }: { name:string; type
   const [typedVal, setTypedVal] = useState(type==='initials' ? initials : name)
   const fileRef = useRef<HTMLInputElement>(null)
   const currentFont = SIG_FONTS.find(f=>f.id===selectedFont)
-
-  useEffect(() => {
-    if (!document.querySelector('link[href*="googleapis"]')) {
-      const link = document.createElement('link')
-      link.rel='stylesheet'; link.href=FONT_LINK; document.head.appendChild(link)
-    }
-  }, [])
 
   return (
     <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,.75)', zIndex:2000, display:'flex', alignItems:'center', justifyContent:'center', padding:20 }}>
@@ -161,9 +115,10 @@ function SignatureChooser({ name, type, onSelect, onClose }: { name:string; type
   )
 }
 // ── UPFRONT SIGNATURE + INITIALS SETUP ───────────────────────
+// S234: name + initials locked to the signer record (same fix as the
+// tenant SignPage). See that file for the full reasoning.
 function SignatureSetup({ name, initials, onComplete }: { name:string; initials:string; onComplete:(sig:string,init:string,font:string)=>void }) {
   const [selectedFont, setSelectedFont] = useState(SIG_FONTS[0].id)
-  const [typedName, setTypedName] = useState(name)
   const [tab, setTab] = useState<'type'|'upload'>('type')
   const [uploadedSig, setUploadedSig] = useState<string|null>(null)
   const fileRef = useRef<HTMLInputElement>(null)
@@ -181,25 +136,7 @@ function SignatureSetup({ name, initials, onComplete }: { name:string; initials:
 
   const handleComplete = () => {
     if (tab==='upload' && uploadedSig) { onComplete(uploadedSig, initials, currentFont.css); return }
-    // Render to canvas dataURL for special fonts
-    const movieFontMap: Record<string,string> = { terminator:'Terminator', matrix:'Matrix', bladerunner:'BladeRunner', teamfury:'TeamFury' }
-    if (movieFontMap[currentFont.css]) {
-      const fontFamily = movieFontMap[currentFont.css]
-      const renderToDataUrl = (text: string, small: boolean) => {
-        const canvas = document.createElement('canvas')
-        const w = small?130:250; const h = small?54:64
-        canvas.width=w; canvas.height=h
-        const ctx = canvas.getContext('2d')!
-        ctx.font = `${small?26:34}px '${fontFamily}'`
-        ctx.textBaseline = 'middle'
-        ctx.fillStyle = '#1a1a1a'
-        ctx.fillText(text, 6, h/2, w-12)
-        return canvas.toDataURL()
-      }
-      onComplete(renderToDataUrl(typedName,false), renderToDataUrl(initials,true), currentFont.css)
-      return
-    }
-    onComplete(typedName, initials, currentFont.css)
+    onComplete(name, initials, currentFont.css)
   }
 
   return (
@@ -224,9 +161,8 @@ function SignatureSetup({ name, initials, onComplete }: { name:string; initials:
           {tab==='type' && (
             <>
               <div style={{ marginBottom:14 }}>
-                <label style={{ fontSize:'.68rem', fontWeight:600, color:'#999', textTransform:'uppercase' as const, letterSpacing:'.06em', display:'block', marginBottom:5 }}>Your Name</label>
-                <input value={typedName} onChange={e=>setTypedName(e.target.value)}
-                  style={{ width:'100%', padding:'9px 13px', border:'1px solid #e5e7eb', borderRadius:9, fontSize:'1rem', outline:'none', boxSizing:'border-box' as const }}/>
+                <label style={{ fontSize:'.68rem', fontWeight:600, color:'#999', textTransform:'uppercase' as const, letterSpacing:'.06em', display:'block', marginBottom:5 }}>Your Name <span style={{ fontWeight:400, textTransform:'none', letterSpacing:0, color:'#bbb' }}>(on file — contact your admin to update)</span></label>
+                <div style={{ padding:'9px 13px', background:'#f5f5f0', borderRadius:9, fontSize:'1rem', color:'#666', border:'1px solid #eee' }}>{name}</div>
               </div>
               <div style={{ marginBottom:16 }}>
                 <label style={{ fontSize:'.68rem', fontWeight:600, color:'#999', textTransform:'uppercase' as const, letterSpacing:'.06em', display:'block', marginBottom:8 }}>Select Font Style</label>
@@ -234,7 +170,7 @@ function SignatureSetup({ name, initials, onComplete }: { name:string; initials:
                   {SIG_FONTS.map(font=>(
                     <div key={font.id} onClick={()=>setSelectedFont(font.id)}
                       style={{ padding:'10px 14px', border:`2px solid ${selectedFont===font.id?'#c9a227':'#e5e7eb'}`, borderRadius:9, cursor:'pointer', background:selectedFont===font.id?'#fffbf0':'white', display:'flex', alignItems:'center', justifyContent:'space-between' }}>
-                      <SigPreview text={typedName||'Your Name'} fontCss={font.css}/>
+                      <SigPreview text={name} fontCss={font.css}/>
                       <span style={{ fontSize:'.65rem', color:'#bbb' }}>{font.name}</span>
                     </div>
                   ))}
@@ -244,7 +180,7 @@ function SignatureSetup({ name, initials, onComplete }: { name:string; initials:
               <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:10, marginBottom:16 }}>
                 <div style={{ padding:'12px', background:'#f8f8f5', borderRadius:9, textAlign:'center' as const }}>
                   <div style={{ fontSize:'.65rem', color:'#bbb', marginBottom:4 }}>SIGNATURE</div>
-                  <SigPreview text={typedName||'Your Name'} fontCss={currentFont.css}/>
+                  <SigPreview text={name} fontCss={currentFont.css}/>
                 </div>
                 <div style={{ padding:'12px', background:'#f8f8f5', borderRadius:9, textAlign:'center' as const }}>
                   <div style={{ fontSize:'.65rem', color:'#bbb', marginBottom:4 }}>INITIALS</div>
@@ -266,7 +202,7 @@ function SignatureSetup({ name, initials, onComplete }: { name:string; initials:
               <p style={{ fontSize:'.75rem', color:'#aaa', textAlign:'center' as const }}>Your initials will use the first font style with your initials derived from your name.</p>
             </>
           )}
-          <button onClick={handleComplete} disabled={tab==='type'?!typedName.trim():!uploadedSig}
+          <button onClick={handleComplete} disabled={tab==='type'?false:!uploadedSig}
             style={{ width:'100%', padding:'14px', borderRadius:11, border:'none', background:'#c9a227', color:'white', fontWeight:700, cursor:'pointer', fontSize:'.95rem' }}>
             Continue to Document →
           </button>
@@ -359,8 +295,17 @@ export function SignPage() {
     </div>
   )
 
-  const { signer, document:doc, fields } = data
+  const { signer, document:doc, fields, readOnly } = data
   const allFields = fields || []
+
+  // S235: read-only re-open. Same pattern as tenant SignPage —
+  // backend serves terminal-state docs (and post-sign signers) with
+  // readOnly:true so the landlord can re-open executed leases without
+  // hitting the throw the GET previously emitted.
+  if (readOnly) {
+    return <ReadOnlyView doc={doc} signer={signer} fields={allFields} onBack={()=>navigate('/')} />
+  }
+
   const requiredFields = allFields.filter((f:any)=>f.required)
   const unfilledRequired = requiredFields.filter((f:any)=>!fieldValues[f.id]?.trim())
   const nextField = unfilledRequired[0]
@@ -579,6 +524,104 @@ export function SignPage() {
           </div>
         </div>
       )}
+    </div>
+  )
+}
+
+// S235: read-only re-open view. Mirror of apps/tenant/src/pages/SignPage.tsx
+// — same shape, same backend payload contract.
+function ReadOnlyView({
+  doc, signer, fields, onBack,
+}: {
+  doc: any
+  signer: any
+  fields: any[]
+  onBack: () => void
+}) {
+  const status = doc?.status as string
+  const signerStatus = signer?.status as string
+  const banner: { tone: 'green'|'gold'|'red'|'muted'; label: string; sub: string } =
+    status === 'completed'         ? { tone:'green', label:'Fully executed', sub:'All parties have signed.' } :
+    status === 'voided'            ? { tone:'red',   label:'Voided',         sub: doc?.voidReason || 'This document was voided and is no longer in effect.' } :
+    status === 'execution_failed'  ? { tone:'red',   label:'Execution failed', sub:'A problem occurred during execution. Investigate via the e-sign dashboard.' } :
+    signerStatus === 'signed'      ? { tone:'green', label:'You signed',     sub:'Awaiting other parties to complete.' } :
+    signerStatus === 'declined'    ? { tone:'red',   label:'You declined',   sub: signer?.declineReason ? `Reason: ${signer.declineReason}` : 'No reason was provided.' } :
+                                     { tone:'muted', label:'Read-only',       sub:'' }
+  const pdfUrl = doc?.executedPdfUrl || doc?.basePdfUrl
+  const filledFields = (fields || []).filter((f:any) => f.value != null && String(f.value).trim() !== '')
+
+  return (
+    <div style={{ maxWidth: 820, margin: '0 auto', padding: '24px 16px' }}>
+      <button onClick={onBack} className="btn btn-ghost btn-sm" style={{ marginBottom: 16 }}>← Back to portal</button>
+
+      <div style={{
+        display:'flex', alignItems:'flex-start', gap: 12, padding: '14px 18px', borderRadius: 12,
+        background:
+          banner.tone === 'green' ? 'rgba(34,197,94,.08)' :
+          banner.tone === 'red'   ? 'rgba(220,76,76,.08)' :
+          banner.tone === 'gold'  ? 'rgba(201,162,39,.08)' :
+                                    'var(--bg-2)',
+        border: `1px solid ${
+          banner.tone === 'green' ? 'rgba(34,197,94,.25)' :
+          banner.tone === 'red'   ? 'rgba(220,76,76,.25)' :
+          banner.tone === 'gold'  ? 'rgba(201,162,39,.25)' :
+                                    'var(--border-0)'
+        }`,
+        marginBottom: 14,
+      }}>
+        <div style={{ flex: 1 }}>
+          <div style={{ fontWeight: 700, color: 'var(--text-0)', marginBottom: 4 }}>
+            {doc?.title || 'Document'} — <span style={{
+              color:
+                banner.tone === 'green' ? 'var(--green)' :
+                banner.tone === 'red'   ? 'var(--red, #dc4c4c)' :
+                banner.tone === 'gold'  ? 'var(--gold)' :
+                                          'var(--text-2)',
+            }}>{banner.label}</span>
+          </div>
+          <div style={{ fontSize: '.82rem', color: 'var(--text-2)', lineHeight: 1.5 }}>
+            {banner.sub}
+          </div>
+        </div>
+      </div>
+
+      {pdfUrl ? (
+        <div style={{ background:'#525659', borderRadius: 12, overflow: 'hidden', marginBottom: 16 }}>
+          <iframe
+            src={pdfUrl}
+            style={{ width: '100%', height: '78vh', border: 'none', display: 'block' }}
+            title={doc?.title || 'Document'}
+          />
+        </div>
+      ) : (
+        <div style={{ padding: 20, background: 'var(--bg-2)', border: '1px solid var(--border-0)', borderRadius: 10, color: 'var(--text-3)', fontSize: '.85rem', marginBottom: 16 }}>
+          The document PDF is not available to display here.
+        </div>
+      )}
+
+      {filledFields.length > 0 && (
+        <div style={{ background: 'var(--bg-1)', border: '1px solid var(--border-0)', borderRadius: 10, padding: 14, marginBottom: 16 }}>
+          <div style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.05em', marginBottom: 8 }}>
+            Field values ({filledFields.length})
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: 8 }}>
+            {filledFields.map((f:any) => (
+              <div key={f.id} style={{ padding: '6px 10px', background: 'var(--bg-2)', borderRadius: 6, fontSize: '.78rem' }}>
+                <div style={{ color: 'var(--text-3)', fontSize: '.7rem' }}>{f.label || f.fieldType}</div>
+                <div style={{ color: 'var(--text-1)' }}>
+                  {f.fieldType === 'signature' || f.fieldType === 'initials'
+                    ? <em style={{ color: 'var(--text-3)' }}>(signed)</em>
+                    : String(f.value).slice(0, 80)}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <div style={{ fontSize: '.7rem', color: 'var(--text-3)', textAlign: 'center' }}>
+        UETA &amp; E-SIGN Act compliant · Read-only re-open
+      </div>
     </div>
   )
 }

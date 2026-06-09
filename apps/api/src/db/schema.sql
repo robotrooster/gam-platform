@@ -1,702 +1,12368 @@
 -- ============================================================
--- GOLD ASSET MANAGEMENT — COMPLETE DATABASE SCHEMA
--- PostgreSQL
+-- GAM DATABASE SCHEMA — AUTO-GENERATED SNAPSHOT
 -- ============================================================
-
--- Extensions
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
-CREATE EXTENSION IF NOT EXISTS "pgcrypto";
-
--- ── USERS ────────────────────────────────────────────────────
-
-CREATE TABLE users (
-  id            UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  email         TEXT UNIQUE NOT NULL,
-  password_hash TEXT NOT NULL,
-  role          TEXT NOT NULL CHECK (role IN ('admin','landlord','tenant')),
-  first_name    TEXT NOT NULL,
-  last_name     TEXT NOT NULL,
-  phone         TEXT,
-  email_verified BOOLEAN DEFAULT FALSE,
-  email_verify_token TEXT,
-  reset_token   TEXT,
-  reset_token_expires TIMESTAMPTZ,
-  last_login_at TIMESTAMPTZ,
-  created_at    TIMESTAMPTZ DEFAULT NOW(),
-  updated_at    TIMESTAMPTZ DEFAULT NOW()
-);
-
--- ── LANDLORDS ────────────────────────────────────────────────
-
-CREATE TABLE landlords (
-  id                   UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  user_id              UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  business_name        TEXT,
-  ein                  TEXT,                           -- Encrypted in app layer
-  stripe_account_id    TEXT,                           -- Stripe Connect
-  stripe_bank_verified BOOLEAN DEFAULT FALSE,
-  onboarding_complete  BOOLEAN DEFAULT FALSE,
-  volume_tier          TEXT DEFAULT 'standard'         -- standard/growth/professional/enterprise/partner
-    CHECK (volume_tier IN ('standard','growth','professional','enterprise','partner')),
-  annual_contract      BOOLEAN DEFAULT FALSE,
-  notes                TEXT,
-  created_at           TIMESTAMPTZ DEFAULT NOW(),
-  updated_at           TIMESTAMPTZ DEFAULT NOW()
-);
-
--- ── TENANTS ──────────────────────────────────────────────────
-
-CREATE TABLE tenants (
-  id                           UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  user_id                      UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  stripe_customer_id           TEXT,
-  ach_verified                 BOOLEAN DEFAULT FALSE,
-  bank_last4                   TEXT,
-  bank_routing_last4           TEXT,
-  ssi_ssdi                     BOOLEAN DEFAULT FALSE,
-  income_arrival_day           INTEGER CHECK (income_arrival_day BETWEEN 1 AND 28),
-  on_time_pay_enrolled         BOOLEAN DEFAULT FALSE,  -- Float service opt-in
-  float_fee_active             BOOLEAN DEFAULT FALSE,  -- $20/mo active
-  credit_reporting_enrolled    BOOLEAN DEFAULT FALSE,
-  flex_deposit_enrolled        BOOLEAN DEFAULT FALSE,
-  late_payment_count           INTEGER DEFAULT 0,
-  on_time_pay_invite_sent_at   TIMESTAMPTZ,            -- Invite sent after 2 late payments
-  created_at                   TIMESTAMPTZ DEFAULT NOW(),
-  updated_at                   TIMESTAMPTZ DEFAULT NOW()
-);
-
--- ── PROPERTIES ───────────────────────────────────────────────
-
-CREATE TABLE properties (
-  id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  landlord_id UUID NOT NULL REFERENCES landlords(id) ON DELETE CASCADE,
-  name        TEXT NOT NULL,
-  street1     TEXT NOT NULL,
-  street2     TEXT,
-  city        TEXT NOT NULL,
-  state       TEXT NOT NULL DEFAULT 'AZ',
-  zip         TEXT NOT NULL,
-  type        TEXT NOT NULL DEFAULT 'residential'
-    CHECK (type IN ('residential','rv_longterm','rv_weekly','rv_nightly')),
-  created_at  TIMESTAMPTZ DEFAULT NOW(),
-  updated_at  TIMESTAMPTZ DEFAULT NOW()
-);
-
--- ── UNITS ────────────────────────────────────────────────────
-
-CREATE TABLE units (
-  id                UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  property_id       UUID NOT NULL REFERENCES properties(id) ON DELETE CASCADE,
-  landlord_id       UUID NOT NULL REFERENCES landlords(id),
-  tenant_id         UUID REFERENCES tenants(id),
-  unit_number       TEXT NOT NULL,
-  bedrooms          INTEGER NOT NULL DEFAULT 1,
-  bathrooms         DECIMAL(3,1) NOT NULL DEFAULT 1.0,
-  sqft              INTEGER,
-  status            TEXT NOT NULL DEFAULT 'vacant'
-    CHECK (status IN ('active','direct_pay','vacant','delinquent','suspended')),
-  rent_amount       DECIMAL(10,2) NOT NULL,
-  security_deposit  DECIMAL(10,2) NOT NULL DEFAULT 0,
-  on_time_pay_active BOOLEAN DEFAULT FALSE,
-  payment_block     BOOLEAN DEFAULT FALSE,             -- Eviction mode — ARS 33-1371
-  payment_block_set_at TIMESTAMPTZ,
-  payment_block_set_by UUID REFERENCES users(id),
-  listed_vacant     BOOLEAN DEFAULT TRUE,              -- Auto-list vacant units
-  created_at        TIMESTAMPTZ DEFAULT NOW(),
-  updated_at        TIMESTAMPTZ DEFAULT NOW(),
-  UNIQUE (property_id, unit_number)
-);
-
--- ── LEASES ───────────────────────────────────────────────────
-
-CREATE TABLE leases (
-  id               UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  unit_id          UUID NOT NULL REFERENCES units(id),
-  tenant_id        UUID NOT NULL REFERENCES tenants(id),
-  landlord_id      UUID NOT NULL REFERENCES landlords(id),
-  status           TEXT NOT NULL DEFAULT 'pending'
-    CHECK (status IN ('pending','active','expired','terminated')),
-  start_date       DATE NOT NULL,
-  end_date         DATE NOT NULL,
-  rent_amount      DECIMAL(10,2) NOT NULL,
-  rent_due_day     INTEGER NOT NULL DEFAULT 1,
-  security_deposit DECIMAL(10,2) NOT NULL DEFAULT 0,
-  late_fee_grace_days  INTEGER DEFAULT 5,
-  late_fee_amount      DECIMAL(10,2) DEFAULT 15.00,
-  signed_by_landlord   BOOLEAN DEFAULT FALSE,
-  signed_by_tenant     BOOLEAN DEFAULT FALSE,
-  signed_at            TIMESTAMPTZ,
-  terminated_at        TIMESTAMPTZ,
-  termination_reason   TEXT,
-  created_at           TIMESTAMPTZ DEFAULT NOW(),
-  updated_at           TIMESTAMPTZ DEFAULT NOW()
-);
-
--- ── PAYMENTS ─────────────────────────────────────────────────
-
-CREATE TABLE payments (
-  id                      UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  unit_id                 UUID REFERENCES units(id),
-  lease_id                UUID REFERENCES leases(id),
-  tenant_id               UUID REFERENCES tenants(id),
-  landlord_id             UUID NOT NULL REFERENCES landlords(id),
-  type                    TEXT NOT NULL
-    CHECK (type IN ('rent','fee','deposit','utility','float_fee','late_fee','platform_fee')),
-  amount                  DECIMAL(10,2) NOT NULL,
-  status                  TEXT NOT NULL DEFAULT 'pending'
-    CHECK (status IN ('pending','processing','settled','failed','returned')),
-  stripe_payment_intent_id TEXT,
-  stripe_charge_id         TEXT,
-  ach_trace_number         TEXT,
-  entry_description        TEXT NOT NULL               -- RENT/SUBSCRIP/DEPOSIT/UTILITY/ONTIMEPAY
-    CHECK (entry_description IN ('RENT','SUBSCRIP','DEPOSIT','UTILITY','ONTIMEPAY')),
-  return_code              TEXT,
-  return_reason            TEXT,
-  zero_tolerance_flag      BOOLEAN DEFAULT FALSE,       -- R05/R07/R10/R29
-  due_date                 DATE NOT NULL,
-  processed_at             TIMESTAMPTZ,
-  settled_at               TIMESTAMPTZ,
-  retry_count              INTEGER DEFAULT 0,
-  notes                    TEXT,
-  created_at               TIMESTAMPTZ DEFAULT NOW()
-);
-
--- ── DISBURSEMENTS ────────────────────────────────────────────
-
-CREATE TABLE disbursements (
-  id                  UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  landlord_id         UUID NOT NULL REFERENCES landlords(id),
-  amount              DECIMAL(10,2) NOT NULL,
-  unit_count          INTEGER NOT NULL,
-  status              TEXT NOT NULL DEFAULT 'pending'
-    CHECK (status IN ('pending','processing','settled','failed')),
-  stripe_payout_id    TEXT,
-  from_reserve        BOOLEAN DEFAULT FALSE,           -- SLA funded from reserve
-  reserve_amount      DECIMAL(10,2) DEFAULT 0,
-  -- SLA: initiated on or before 1st business day of month
-  target_date         DATE NOT NULL,
-  initiated_at        TIMESTAMPTZ,
-  settled_at          TIMESTAMPTZ,
-  notes               TEXT,
-  created_at          TIMESTAMPTZ DEFAULT NOW()
-);
-
--- ── RESERVE FUND ─────────────────────────────────────────────
-
-CREATE TABLE reserve_fund_ledger (
-  id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  type            TEXT NOT NULL
-    CHECK (type IN ('contribution','disbursement_cover','replenishment','interest','adjustment')),
-  amount          DECIMAL(10,2) NOT NULL,              -- Positive = in, negative = out
-  balance_after   DECIMAL(10,2) NOT NULL,
-  reference_id    UUID,                                -- disbursement_id or payment_id
-  notes           TEXT,
-  created_at      TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE TABLE reserve_fund_state (
-  id                   UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  balance              DECIMAL(10,2) NOT NULL DEFAULT 0,
-  target_balance       DECIMAL(10,2) NOT NULL DEFAULT 0,
-  phase                INTEGER NOT NULL DEFAULT 1 CHECK (phase IN (1,2,3)),
-  reserve_rate         DECIMAL(5,4) NOT NULL DEFAULT 1.00,
-  monthly_contribution DECIMAL(10,2) DEFAULT 0,
-  updated_at           TIMESTAMPTZ DEFAULT NOW()
-);
-
--- ── FLOAT ACCOUNT ────────────────────────────────────────────
-
-CREATE TABLE float_account_state (
-  id               UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  balance          DECIMAL(10,2) NOT NULL DEFAULT 25000, -- $25K seed
-  seed_capital     DECIMAL(10,2) NOT NULL DEFAULT 25000,
-  apy              DECIMAL(5,4) NOT NULL DEFAULT 0.045,
-  monthly_interest DECIMAL(10,2) DEFAULT 0,
-  updated_at       TIMESTAMPTZ DEFAULT NOW()
-);
-
--- ── SECURITY DEPOSITS ────────────────────────────────────────
-
-CREATE TABLE security_deposits (
-  id                    UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  unit_id               UUID NOT NULL REFERENCES units(id),
-  lease_id              UUID NOT NULL REFERENCES leases(id),
-  tenant_id             UUID NOT NULL REFERENCES tenants(id),
-  total_amount          DECIMAL(10,2) NOT NULL,
-  collected_amount      DECIMAL(10,2) NOT NULL DEFAULT 0,
-  status                TEXT NOT NULL DEFAULT 'pending'
-    CHECK (status IN ('pending','funded','partial','disbursed','claimed')),
-  flex_deposit_enabled  BOOLEAN DEFAULT FALSE,
-  installment_count     INTEGER,
-  installment_amount    DECIMAL(10,2),
-  installments_paid     INTEGER DEFAULT 0,
-  installments_remaining INTEGER,
-  next_installment_date DATE,
-  interest_accrued      DECIMAL(10,2) DEFAULT 0,       -- Platform keeps per ARS 33-1321
-  disbursed_to_landlord DECIMAL(10,2) DEFAULT 0,
-  disbursed_at          TIMESTAMPTZ,
-  damage_claimed        DECIMAL(10,2) DEFAULT 0,
-  notes                 TEXT,
-  created_at            TIMESTAMPTZ DEFAULT NOW(),
-  updated_at            TIMESTAMPTZ DEFAULT NOW()
-);
-
--- ── MAINTENANCE ───────────────────────────────────────────────
-
-CREATE TABLE contractors (
-  id                  UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  name                TEXT NOT NULL,
-  business_name       TEXT NOT NULL,
-  phone               TEXT NOT NULL,
-  email               TEXT UNIQUE NOT NULL,
-  azroc_license       TEXT NOT NULL,                   -- AZ Registrar of Contractors — required
-  insurance_verified  BOOLEAN DEFAULT FALSE,
-  insurance_expiry    DATE,
-  listing_tier        TEXT CHECK (listing_tier IN ('featured','premium','exclusive')),
-  listing_fee         DECIMAL(10,2),
-  trades              TEXT[] DEFAULT '{}',
-  rating              DECIMAL(3,2),
-  completed_jobs      INTEGER DEFAULT 0,
-  active              BOOLEAN DEFAULT TRUE,
-  created_at          TIMESTAMPTZ DEFAULT NOW(),
-  updated_at          TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE TABLE maintenance_requests (
-  id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  unit_id         UUID NOT NULL REFERENCES units(id),
-  tenant_id       UUID REFERENCES tenants(id),
-  landlord_id     UUID NOT NULL REFERENCES landlords(id),
-  contractor_id   UUID REFERENCES contractors(id),
-  title           TEXT NOT NULL,
-  description     TEXT NOT NULL,
-  priority        TEXT NOT NULL DEFAULT 'normal'
-    CHECK (priority IN ('emergency','high','normal','low')),
-  status          TEXT NOT NULL DEFAULT 'open'
-    CHECK (status IN ('open','assigned','in_progress','completed','cancelled')),
-  estimated_cost  DECIMAL(10,2),
-  actual_cost     DECIMAL(10,2),
-  platform_fee    DECIMAL(10,2),                       -- 8% of actual_cost
-  scheduled_at    TIMESTAMPTZ,
-  completed_at    TIMESTAMPTZ,
-  photos          TEXT[] DEFAULT '{}',
-  tenant_notes    TEXT,
-  landlord_notes  TEXT,
-  created_at      TIMESTAMPTZ DEFAULT NOW(),
-  updated_at      TIMESTAMPTZ DEFAULT NOW()
-);
-
--- ── UTILITY BILLING ───────────────────────────────────────────
-
-CREATE TABLE utility_bills (
-  id               UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  unit_id          UUID NOT NULL REFERENCES units(id),
-  tenant_id        UUID NOT NULL REFERENCES tenants(id),
-  utility_type     TEXT NOT NULL,                      -- electricity/water/gas/sewer
-  opening_reading  DECIMAL(12,4) NOT NULL,
-  closing_reading  DECIMAL(12,4) NOT NULL,
-  opening_date     DATE NOT NULL,
-  closing_date     DATE NOT NULL,
-  usage_amount     DECIMAL(12,4) NOT NULL,
-  rate_per_unit    DECIMAL(10,6) NOT NULL,
-  utility_cost     DECIMAL(10,2) NOT NULL,
-  admin_fee        DECIMAL(10,2) NOT NULL DEFAULT 0,   -- AZ: actual cost + admin fee ONLY
-  total_amount     DECIMAL(10,2) NOT NULL,
-  payment_id       UUID REFERENCES payments(id),
-  status           TEXT NOT NULL DEFAULT 'pending'
-    CHECK (status IN ('pending','processing','settled','failed')),
-  billed_at        DATE NOT NULL,
-  due_date         DATE NOT NULL,
-  created_at       TIMESTAMPTZ DEFAULT NOW()
-);
-
--- ── DOCUMENTS ────────────────────────────────────────────────
-
-CREATE TABLE documents (
-  id           UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  lease_id     UUID REFERENCES leases(id),
-  unit_id      UUID REFERENCES units(id),
-  tenant_id    UUID REFERENCES tenants(id),
-  landlord_id  UUID NOT NULL REFERENCES landlords(id),
-  type         TEXT NOT NULL
-    CHECK (type IN ('lease','addendum','move_in_checklist','move_out_checklist','notice','other')),
-  name         TEXT NOT NULL,
-  url          TEXT NOT NULL,                          -- S3 or storage URL
-  file_size    INTEGER,
-  mime_type    TEXT,
-  signed_by_tenant   BOOLEAN DEFAULT FALSE,
-  signed_by_landlord BOOLEAN DEFAULT FALSE,
-  signed_at    TIMESTAMPTZ,
-  created_at   TIMESTAMPTZ DEFAULT NOW()
-);
-
--- ── BACKGROUND CHECKS ────────────────────────────────────────
-
-CREATE TABLE background_checks (
-  id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  unit_id         UUID REFERENCES units(id),
-  landlord_id     UUID NOT NULL REFERENCES landlords(id),
-  applicant_name  TEXT NOT NULL,
-  applicant_email TEXT NOT NULL,
-  amount_charged  DECIMAL(10,2) DEFAULT 40.00,         -- Applicant pays $40
-  platform_net    DECIMAL(10,2) DEFAULT 15.00,         -- Platform nets $15
-  provider_ref    TEXT,                                 -- Provider reference ID
-  status          TEXT DEFAULT 'pending'
-    CHECK (status IN ('pending','processing','complete','failed')),
-  result_url      TEXT,
-  created_at      TIMESTAMPTZ DEFAULT NOW()
-);
-
--- ── NACHA FRAUD MONITORING (Phase 2 — June 22, 2026) ─────────
-
-CREATE TABLE ach_monitoring_log (
-  id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  payment_id      UUID REFERENCES payments(id),
-  event_type      TEXT NOT NULL
-    CHECK (event_type IN ('first_sender','velocity_flag','return_received','zero_tolerance_block')),
-  tenant_id       UUID REFERENCES tenants(id),
-  bank_fingerprint TEXT,                               -- Hashed routing+account
-  amount          DECIMAL(10,2),
-  return_code     TEXT,
-  flagged         BOOLEAN DEFAULT FALSE,
-  resolved        BOOLEAN DEFAULT FALSE,
-  notes           TEXT,
-  created_at      TIMESTAMPTZ DEFAULT NOW()
-);
-
--- ── NOTIFICATIONS ─────────────────────────────────────────────
-
-CREATE TABLE notifications (
-  id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  user_id     UUID NOT NULL REFERENCES users(id),
-  type        TEXT NOT NULL,
-  title       TEXT NOT NULL,
-  body        TEXT NOT NULL,
-  read        BOOLEAN DEFAULT FALSE,
-  action_url  TEXT,
-  created_at  TIMESTAMPTZ DEFAULT NOW()
-);
-
--- ── AUDIT LOG ────────────────────────────────────────────────
-
-CREATE TABLE audit_log (
-  id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  user_id     UUID REFERENCES users(id),
-  action      TEXT NOT NULL,
-  entity_type TEXT,
-  entity_id   UUID,
-  old_value   JSONB,
-  new_value   JSONB,
-  ip_address  TEXT,
-  created_at  TIMESTAMPTZ DEFAULT NOW()
-);
-
--- ── INDEXES ───────────────────────────────────────────────────
-
-CREATE INDEX idx_users_email          ON users(email);
-CREATE INDEX idx_landlords_user_id    ON landlords(user_id);
-CREATE INDEX idx_tenants_user_id      ON tenants(user_id);
-CREATE INDEX idx_properties_landlord  ON properties(landlord_id);
-CREATE INDEX idx_units_property       ON units(property_id);
-CREATE INDEX idx_units_landlord       ON units(landlord_id);
-CREATE INDEX idx_units_tenant         ON units(tenant_id);
-CREATE INDEX idx_units_status         ON units(status);
-CREATE INDEX idx_leases_unit          ON leases(unit_id);
-CREATE INDEX idx_leases_tenant        ON leases(tenant_id);
-CREATE INDEX idx_payments_unit        ON payments(unit_id);
-CREATE INDEX idx_payments_tenant      ON payments(tenant_id);
-CREATE INDEX idx_payments_landlord    ON payments(landlord_id);
-CREATE INDEX idx_payments_status      ON payments(status);
-CREATE INDEX idx_payments_due_date    ON payments(due_date);
-CREATE INDEX idx_disbursements_landlord ON disbursements(landlord_id);
-CREATE INDEX idx_disbursements_target   ON disbursements(target_date);
-CREATE INDEX idx_maintenance_unit     ON maintenance_requests(unit_id);
-CREATE INDEX idx_maintenance_status   ON maintenance_requests(status);
-CREATE INDEX idx_notifications_user   ON notifications(user_id, read);
-CREATE INDEX idx_audit_entity         ON audit_log(entity_type, entity_id);
-
--- ── UPDATED_AT TRIGGER ────────────────────────────────────────
-
-CREATE OR REPLACE FUNCTION update_updated_at()
-RETURNS TRIGGER AS $$
-BEGIN NEW.updated_at = NOW(); RETURN NEW; END;
-$$ LANGUAGE plpgsql;
-
-CREATE TRIGGER trg_users_updated_at       BEFORE UPDATE ON users        FOR EACH ROW EXECUTE FUNCTION update_updated_at();
-CREATE TRIGGER trg_landlords_updated_at   BEFORE UPDATE ON landlords    FOR EACH ROW EXECUTE FUNCTION update_updated_at();
-CREATE TRIGGER trg_tenants_updated_at     BEFORE UPDATE ON tenants      FOR EACH ROW EXECUTE FUNCTION update_updated_at();
-CREATE TRIGGER trg_properties_updated_at  BEFORE UPDATE ON properties   FOR EACH ROW EXECUTE FUNCTION update_updated_at();
-CREATE TRIGGER trg_units_updated_at       BEFORE UPDATE ON units        FOR EACH ROW EXECUTE FUNCTION update_updated_at();
-CREATE TRIGGER trg_leases_updated_at      BEFORE UPDATE ON leases       FOR EACH ROW EXECUTE FUNCTION update_updated_at();
-CREATE TRIGGER trg_maintenance_updated_at BEFORE UPDATE ON maintenance_requests FOR EACH ROW EXECUTE FUNCTION update_updated_at();
-CREATE TRIGGER trg_deposits_updated_at    BEFORE UPDATE ON security_deposits    FOR EACH ROW EXECUTE FUNCTION update_updated_at();
-
--- Team members (property managers, on-site managers, maintenance staff)
-CREATE TABLE IF NOT EXISTS team_members (
-  id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  landlord_id  UUID NOT NULL REFERENCES landlords(id) ON DELETE CASCADE,
-  user_id      UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  role         TEXT NOT NULL DEFAULT 'property_manager',
-  permissions  JSONB,
-  status       TEXT NOT NULL DEFAULT 'active',
-  invited_at   TIMESTAMPTZ DEFAULT NOW(),
-  created_at   TIMESTAMPTZ DEFAULT NOW(),
-  updated_at   TIMESTAMPTZ DEFAULT NOW(),
-  UNIQUE(landlord_id, user_id)
-);
-
--- ── BOOKS MODULE ──────────────────────────────────────────────────────
-
-CREATE TABLE IF NOT EXISTS books_accounts (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  landlord_id UUID REFERENCES landlords(id) ON DELETE CASCADE,
-  code VARCHAR(20) NOT NULL,
-  name VARCHAR(200) NOT NULL,
-  type VARCHAR(50) NOT NULL,
-  subtype VARCHAR(50),
-  description TEXT,
-  is_system BOOLEAN DEFAULT FALSE,
-  balance DECIMAL(12,2) DEFAULT 0,
-  active BOOLEAN DEFAULT TRUE,
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  updated_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS books_employees (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  landlord_id UUID REFERENCES landlords(id) ON DELETE CASCADE,
-  first_name VARCHAR(100) NOT NULL,
-  last_name VARCHAR(100) NOT NULL,
-  email VARCHAR(200),
-  phone VARCHAR(20),
-  address TEXT,
-  ssn_last4 VARCHAR(4),
-  pay_type VARCHAR(20) NOT NULL DEFAULT 'salary',
-  pay_rate DECIMAL(10,2) NOT NULL DEFAULT 0,
-  pay_frequency VARCHAR(20) DEFAULT 'biweekly',
-  filing_status VARCHAR(20) DEFAULT 'single',
-  federal_allowances INT DEFAULT 0,
-  az_withholding_pct DECIMAL(5,2) DEFAULT 2.5,
-  title VARCHAR(100),
-  department VARCHAR(100),
-  start_date DATE,
-  end_date DATE,
-  status VARCHAR(20) DEFAULT 'active',
-  ytd_gross DECIMAL(12,2) DEFAULT 0,
-  ytd_federal_tax DECIMAL(12,2) DEFAULT 0,
-  ytd_state_tax DECIMAL(12,2) DEFAULT 0,
-  ytd_ss DECIMAL(12,2) DEFAULT 0,
-  ytd_medicare DECIMAL(12,2) DEFAULT 0,
-  ytd_net DECIMAL(12,2) DEFAULT 0,
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  updated_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS books_contractors (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  landlord_id UUID REFERENCES landlords(id) ON DELETE CASCADE,
-  first_name VARCHAR(100),
-  last_name VARCHAR(100),
-  business_name VARCHAR(200),
-  email VARCHAR(200),
-  phone VARCHAR(20),
-  address TEXT,
-  ein VARCHAR(10),
-  ssn_last4 VARCHAR(4),
-  entity_type VARCHAR(30) DEFAULT 'individual',
-  trade VARCHAR(100),
-  pay_rate DECIMAL(10,2),
-  pay_unit VARCHAR(20) DEFAULT 'project',
-  status VARCHAR(20) DEFAULT 'active',
-  ytd_paid DECIMAL(12,2) DEFAULT 0,
-  w9_on_file BOOLEAN DEFAULT FALSE,
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  updated_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS books_vendors (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  landlord_id UUID REFERENCES landlords(id) ON DELETE CASCADE,
-  name VARCHAR(200) NOT NULL,
-  contact_name VARCHAR(200),
-  email VARCHAR(200),
-  phone VARCHAR(20),
-  address TEXT,
-  category VARCHAR(100),
-  payment_terms VARCHAR(50) DEFAULT 'net30',
-  account_number VARCHAR(100),
-  tax_id VARCHAR(20),
-  ap_balance DECIMAL(12,2) DEFAULT 0,
-  ytd_paid DECIMAL(12,2) DEFAULT 0,
-  status VARCHAR(20) DEFAULT 'active',
-  notes TEXT,
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  updated_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS books_bills (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  landlord_id UUID REFERENCES landlords(id) ON DELETE CASCADE,
-  vendor_id UUID REFERENCES books_vendors(id),
-  bill_number VARCHAR(100),
-  date DATE NOT NULL,
-  due_date DATE,
-  description TEXT NOT NULL,
-  amount DECIMAL(12,2) NOT NULL,
-  amount_paid DECIMAL(12,2) DEFAULT 0,
-  status VARCHAR(20) DEFAULT 'open',
-  category VARCHAR(100),
-  account_id UUID REFERENCES books_accounts(id),
-  notes TEXT,
-  paid_at TIMESTAMPTZ,
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  updated_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS payroll_runs (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  landlord_id UUID REFERENCES landlords(id) ON DELETE CASCADE,
-  period_start DATE NOT NULL,
-  period_end DATE NOT NULL,
-  pay_date DATE NOT NULL,
-  pay_frequency VARCHAR(20) NOT NULL,
-  status VARCHAR(20) NOT NULL DEFAULT 'draft',
-  total_gross DECIMAL(12,2) DEFAULT 0,
-  total_federal_tax DECIMAL(12,2) DEFAULT 0,
-  total_state_tax DECIMAL(12,2) DEFAULT 0,
-  total_ss DECIMAL(12,2) DEFAULT 0,
-  total_medicare DECIMAL(12,2) DEFAULT 0,
-  total_net DECIMAL(12,2) DEFAULT 0,
-  employee_count INT DEFAULT 0,
-  notes TEXT,
-  approved_at TIMESTAMPTZ,
-  approved_by UUID REFERENCES users(id),
-  voided_at TIMESTAMPTZ,
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  updated_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS payroll_run_lines (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  run_id UUID NOT NULL REFERENCES payroll_runs(id) ON DELETE CASCADE,
-  employee_id UUID NOT NULL REFERENCES books_employees(id),
-  pay_type VARCHAR(20) NOT NULL,
-  hours_worked DECIMAL(8,2),
-  gross_pay DECIMAL(10,2) NOT NULL,
-  federal_tax DECIMAL(10,2) NOT NULL DEFAULT 0,
-  state_tax DECIMAL(10,2) NOT NULL DEFAULT 0,
-  ss_tax DECIMAL(10,2) NOT NULL DEFAULT 0,
-  medicare_tax DECIMAL(10,2) NOT NULL DEFAULT 0,
-  other_deductions DECIMAL(10,2) DEFAULT 0,
-  net_pay DECIMAL(10,2) NOT NULL,
-  memo TEXT,
-  created_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS journal_entries (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  landlord_id UUID REFERENCES landlords(id) ON DELETE CASCADE,
-  entry_number SERIAL,
-  date DATE NOT NULL,
-  description TEXT NOT NULL,
-  reference TEXT,
-  type VARCHAR(30) DEFAULT 'manual',
-  status VARCHAR(20) DEFAULT 'posted',
-  total_debits DECIMAL(12,2) DEFAULT 0,
-  total_credits DECIMAL(12,2) DEFAULT 0,
-  created_by UUID REFERENCES users(id),
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  updated_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS journal_entry_lines (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  entry_id UUID NOT NULL REFERENCES journal_entries(id) ON DELETE CASCADE,
-  account_id UUID NOT NULL REFERENCES books_accounts(id),
-  description TEXT,
-  debit DECIMAL(12,2) NOT NULL DEFAULT 0,
-  credit DECIMAL(12,2) NOT NULL DEFAULT 0,
-  created_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS books_transactions (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  landlord_id UUID REFERENCES landlords(id) ON DELETE CASCADE,
-  date DATE NOT NULL,
-  description TEXT NOT NULL,
-  amount DECIMAL(12,2) NOT NULL,
-  type VARCHAR(20) NOT NULL,
-  category VARCHAR(100),
-  account_id UUID REFERENCES books_accounts(id),
-  reference TEXT,
-  reconciled BOOLEAN DEFAULT FALSE,
-  reconciled_at TIMESTAMPTZ,
-  source VARCHAR(30) DEFAULT 'manual',
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  updated_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS bank_reconciliations (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  landlord_id UUID REFERENCES landlords(id) ON DELETE CASCADE,
-  account_id UUID REFERENCES books_accounts(id),
-  period_start DATE NOT NULL,
-  period_end DATE NOT NULL,
-  statement_balance DECIMAL(12,2) NOT NULL,
-  book_balance DECIMAL(12,2) NOT NULL,
-  difference DECIMAL(12,2) GENERATED ALWAYS AS (statement_balance - book_balance) STORED,
-  status VARCHAR(20) DEFAULT 'open',
-  completed_at TIMESTAMPTZ,
-  created_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS books_access (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  bookkeeper_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  landlord_id UUID NOT NULL REFERENCES landlords(id) ON DELETE CASCADE,
-  permissions JSONB DEFAULT '{"read":true,"write":true,"payroll":true,"reports":true}'::jsonb,
-  status VARCHAR(20) DEFAULT 'active',
-  invited_by UUID REFERENCES users(id),
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  updated_at TIMESTAMPTZ DEFAULT NOW(),
-  UNIQUE(bookkeeper_user_id, landlord_id)
-);
-
-
--- ── PENDING TENANT INTENTS (S29c-2-A: limbo-state onboarding queue) ────
--- A landlord-scoped queue of in-flight tenant onboardings that don't have a
--- lease yet. Lifecycle: created when landlord types name+email+phone with no
--- lease info; transitions through PDF upload + parse; resolved when a lease
--- is built from the parser output (or deleted if abandoned/wrong).
 --
--- The tenant + user rows are created at intent time so the parser's matching
--- logic has something to compare against. Activation email does NOT fire
--- until the lease is created from this intent.
-CREATE TABLE IF NOT EXISTS pending_tenant_intents (
-  id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  landlord_id        UUID NOT NULL REFERENCES landlords(id) ON DELETE CASCADE,
-  tenant_id          UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-  parser_status      TEXT NOT NULL DEFAULT 'not_uploaded'
-    CHECK (parser_status IN ('not_uploaded','parsing','parsed','mismatch','error','resolved')),
-  imported_pdf_url   TEXT,
-  parser_output      JSONB,           -- Full extracted data when parser_status in ('parsed','mismatch')
-  parser_flags       JSONB,           -- Array of {category, severity, message, field?, expected?, actual?}
-  parser_error       TEXT,            -- Populated when parser_status='error'
-  parser_started_at  TIMESTAMPTZ,
-  parser_finished_at TIMESTAMPTZ,
-  resolved_at        TIMESTAMPTZ,
-  resolved_lease_id  UUID REFERENCES leases(id) ON DELETE SET NULL,
-  created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  -- A tenant can only be in one active intent at a time. Once resolved or
-  -- deleted, the row is gone (cascade) so a new intent can be opened.
-  UNIQUE (tenant_id)
+-- DO NOT EDIT THIS FILE.
+--
+-- This file is regenerated automatically after every successful
+-- migration run by apps/api/src/db/migrate.ts. It is a flat
+-- snapshot of the live dev database, produced by pg_dump.
+--
+-- Source of truth for SCHEMA CHANGES is the migrations directory:
+--   apps/api/src/db/migrations/
+--
+-- This file is the source of truth for CURRENT STATE — useful for
+-- answering "what columns does table X have right now?" without
+-- replaying migrations in order.
+--
+-- To regenerate manually:  npm run db:dump-schema
+-- ============================================================
+--
+-- PostgreSQL database dump
+--
+
+\restrict P8lsRG5ev0VJk65MBOr7BiC5ccQRLTsKmMfT7PHUhiuFDPr0Cvmq7i29cCSMpQv
+
+-- Dumped from database version 16.13 (Homebrew)
+-- Dumped by pg_dump version 16.13 (Homebrew)
+
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+SET idle_in_transaction_session_timeout = 0;
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+SELECT pg_catalog.set_config('search_path', '', false);
+SET check_function_bodies = false;
+SET xmloption = content;
+SET client_min_messages = warning;
+SET row_security = off;
+
+--
+-- Name: pgcrypto; Type: EXTENSION; Schema: -; Owner: -
+--
+
+CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;
+
+
+--
+-- Name: EXTENSION pgcrypto; Type: COMMENT; Schema: -; Owner: -
+--
+
+COMMENT ON EXTENSION pgcrypto IS 'cryptographic functions';
+
+
+--
+-- Name: uuid-ossp; Type: EXTENSION; Schema: -; Owner: -
+--
+
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp" WITH SCHEMA public;
+
+
+--
+-- Name: EXTENSION "uuid-ossp"; Type: COMMENT; Schema: -; Owner: -
+--
+
+COMMENT ON EXTENSION "uuid-ossp" IS 'generate universally unique identifiers (UUIDs)';
+
+
+--
+-- Name: vector; Type: EXTENSION; Schema: -; Owner: -
+--
+
+CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public;
+
+
+--
+-- Name: EXTENSION vector; Type: COMMENT; Schema: -; Owner: -
+--
+
+COMMENT ON EXTENSION vector IS 'vector data type and ivfflat and hnsw access methods';
+
+
+--
+-- Name: fn_invoice_late_fee_subtotal_rollup_single(uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.fn_invoice_late_fee_subtotal_rollup_single(p_invoice_id uuid) RETURNS void
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  UPDATE invoices
+  SET subtotal_late_fees = COALESCE((
+    SELECT SUM(amount)
+    FROM payments
+    WHERE invoice_id = p_invoice_id
+      AND type = 'late_fee'
+      AND status IN ('pending', 'processing', 'settled')
+  ), 0)
+  WHERE id = p_invoice_id;
+END;
+$$;
+
+
+--
+-- Name: fn_invoice_late_fee_subtotal_rollup_trigger(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.fn_invoice_late_fee_subtotal_rollup_trigger() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    IF NEW.type = 'late_fee' AND NEW.invoice_id IS NOT NULL THEN
+      PERFORM fn_invoice_late_fee_subtotal_rollup_single(NEW.invoice_id);
+    END IF;
+    RETURN NEW;
+  ELSIF TG_OP = 'UPDATE' THEN
+    IF OLD.type = 'late_fee' AND OLD.invoice_id IS NOT NULL THEN
+      PERFORM fn_invoice_late_fee_subtotal_rollup_single(OLD.invoice_id);
+    END IF;
+    IF NEW.type = 'late_fee' AND NEW.invoice_id IS NOT NULL
+       AND (OLD.type IS DISTINCT FROM 'late_fee'
+            OR OLD.invoice_id IS DISTINCT FROM NEW.invoice_id) THEN
+      PERFORM fn_invoice_late_fee_subtotal_rollup_single(NEW.invoice_id);
+    END IF;
+    RETURN NEW;
+  ELSIF TG_OP = 'DELETE' THEN
+    IF OLD.type = 'late_fee' AND OLD.invoice_id IS NOT NULL THEN
+      PERFORM fn_invoice_late_fee_subtotal_rollup_single(OLD.invoice_id);
+    END IF;
+    RETURN OLD;
+  END IF;
+  RETURN NULL;
+END;
+$$;
+
+
+--
+-- Name: fn_invoice_status_rollup(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.fn_invoice_status_rollup() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  IF (TG_OP = 'DELETE') THEN
+    IF OLD.invoice_id IS NOT NULL THEN
+      PERFORM fn_invoice_status_rollup_single(OLD.invoice_id);
+    END IF;
+    RETURN OLD;
+  END IF;
+
+  IF (TG_OP = 'UPDATE' AND OLD.invoice_id IS DISTINCT FROM NEW.invoice_id
+      AND OLD.invoice_id IS NOT NULL) THEN
+    PERFORM fn_invoice_status_rollup_single(OLD.invoice_id);
+  END IF;
+
+  IF NEW.invoice_id IS NOT NULL THEN
+    PERFORM fn_invoice_status_rollup_single(NEW.invoice_id);
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: fn_invoice_status_rollup_single(uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.fn_invoice_status_rollup_single(p_invoice_id uuid) RETURNS void
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+  v_total_children   INTEGER;
+  v_settled_children INTEGER;
+  v_current_status   TEXT;
+  v_new_status       TEXT;
+BEGIN
+  SELECT status INTO v_current_status FROM invoices WHERE id = p_invoice_id;
+  IF v_current_status = 'void' THEN
+    RETURN;
+  END IF;
+
+  SELECT
+    COUNT(*),
+    COUNT(*) FILTER (WHERE status = 'settled')
+  INTO v_total_children, v_settled_children
+  FROM payments
+  WHERE invoice_id = p_invoice_id;
+
+  IF v_total_children = 0 THEN
+    v_new_status := 'pending';
+  ELSIF v_settled_children = 0 THEN
+    v_new_status := 'pending';
+  ELSIF v_settled_children = v_total_children THEN
+    v_new_status := 'settled';
+  ELSE
+    v_new_status := 'partial';
+  END IF;
+
+  IF v_new_status IS DISTINCT FROM v_current_status THEN
+    UPDATE invoices
+    SET status = v_new_status, updated_at = now()
+    WHERE id = p_invoice_id;
+  END IF;
+END;
+$$;
+
+
+--
+-- Name: fn_invoices_updated_at(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.fn_invoices_updated_at() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  NEW.updated_at := now();
+  RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: fn_pos_items_log_price_change(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.fn_pos_items_log_price_change() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+  actor_id uuid;
+BEGIN
+  IF NEW.sell_price IS DISTINCT FROM OLD.sell_price
+     OR NEW.cost_price IS DISTINCT FROM OLD.cost_price THEN
+    -- Read actor from session GUC if set by the route layer; ignore
+    -- error if unset (direct SQL writes log with NULL changed_by).
+    BEGIN
+      actor_id := current_setting('gam.user_id', true)::uuid;
+    EXCEPTION WHEN OTHERS THEN
+      actor_id := NULL;
+    END;
+
+    INSERT INTO pos_price_history
+      (item_id, old_price, new_price, old_cost, new_cost, changed_by)
+    VALUES
+      (NEW.id, OLD.sell_price, NEW.sell_price, OLD.cost_price, NEW.cost_price, actor_id);
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: update_updated_at(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.update_updated_at() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN NEW.updated_at = NOW(); RETURN NEW; END;
+$$;
+
+
+SET default_tablespace = '';
+
+SET default_table_access_method = heap;
+
+--
+-- Name: ach_monitoring_log; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.ach_monitoring_log (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    payment_id uuid,
+    event_type text NOT NULL,
+    tenant_id uuid,
+    bank_fingerprint text,
+    amount numeric(10,2),
+    return_code text,
+    flagged boolean DEFAULT false,
+    resolved boolean DEFAULT false,
+    notes text,
+    created_at timestamp with time zone DEFAULT now(),
+    CONSTRAINT ach_monitoring_log_event_type_check CHECK ((event_type = ANY (ARRAY['first_sender'::text, 'velocity_flag'::text, 'return_received'::text, 'zero_tolerance_block'::text])))
 );
 
-CREATE INDEX IF NOT EXISTS idx_pending_tenant_intents_landlord
-  ON pending_tenant_intents (landlord_id)
-  WHERE resolved_at IS NULL;
 
-CREATE INDEX IF NOT EXISTS idx_pending_tenant_intents_parser_status
-  ON pending_tenant_intents (parser_status)
-  WHERE parser_status IN ('parsing','parsed','mismatch','error');
+--
+-- Name: ach_monitoring_log_archive; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.ach_monitoring_log_archive (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    payment_id uuid,
+    event_type text NOT NULL,
+    tenant_id uuid,
+    bank_fingerprint text,
+    amount numeric(10,2),
+    return_code text,
+    flagged boolean DEFAULT false,
+    resolved boolean DEFAULT false,
+    notes text,
+    created_at timestamp with time zone DEFAULT now(),
+    archived_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT ach_monitoring_log_event_type_check CHECK ((event_type = ANY (ARRAY['first_sender'::text, 'velocity_flag'::text, 'return_received'::text, 'zero_tolerance_block'::text])))
+);
+
+
+--
+-- Name: admin_action_log; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.admin_action_log (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    admin_user_id uuid NOT NULL,
+    action_type text NOT NULL,
+    target_id uuid,
+    target_type text,
+    notes text,
+    metadata jsonb,
+    ip_address text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: admin_action_log_archive; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.admin_action_log_archive (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    admin_user_id uuid NOT NULL,
+    action_type text NOT NULL,
+    target_id uuid,
+    target_type text,
+    notes text,
+    metadata jsonb,
+    ip_address text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    archived_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: admin_notifications; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.admin_notifications (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    severity text NOT NULL,
+    category text NOT NULL,
+    title text NOT NULL,
+    body text,
+    context jsonb,
+    acknowledged_at timestamp with time zone,
+    acknowledged_by uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT admin_notifications_severity_check CHECK ((severity = ANY (ARRAY['info'::text, 'warn'::text, 'critical'::text])))
+);
+
+
+--
+-- Name: admin_notifications_archive; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.admin_notifications_archive (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    severity text NOT NULL,
+    category text NOT NULL,
+    title text NOT NULL,
+    body text,
+    context jsonb,
+    acknowledged_at timestamp with time zone,
+    acknowledged_by uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    archived_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT admin_notifications_severity_check CHECK ((severity = ANY (ARRAY['info'::text, 'warn'::text, 'critical'::text])))
+);
+
+
+--
+-- Name: adverse_action_notices; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.adverse_action_notices (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    background_check_id uuid NOT NULL,
+    tenant_user_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    cra_name text NOT NULL,
+    cra_address text NOT NULL,
+    cra_phone text NOT NULL,
+    cra_website text,
+    decision_basis text,
+    risk_factors jsonb DEFAULT '[]'::jsonb NOT NULL,
+    notice_text text NOT NULL,
+    dispute_window_days integer DEFAULT 60 NOT NULL,
+    notice_sent_at timestamp with time zone DEFAULT now() NOT NULL,
+    email_message_id text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: agent_interaction_logs; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.agent_interaction_logs (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    conversation_id uuid NOT NULL,
+    turn_index integer DEFAULT 0 NOT NULL,
+    agent_type text NOT NULL,
+    audience text NOT NULL,
+    profile_id text NOT NULL,
+    agent_name text NOT NULL,
+    handled_by_tier text NOT NULL,
+    outcome text NOT NULL,
+    property_id uuid,
+    landlord_id uuid,
+    actor_user_id uuid,
+    actor_role text NOT NULL,
+    actor_subject_id text NOT NULL,
+    escalation_count smallint DEFAULT 0 NOT NULL,
+    escalated_to_human boolean DEFAULT false NOT NULL,
+    escalations jsonb DEFAULT '[]'::jsonb NOT NULL,
+    tool_invocation_count smallint DEFAULT 0 NOT NULL,
+    tool_names text[] DEFAULT '{}'::text[] NOT NULL,
+    tool_invocations jsonb DEFAULT '[]'::jsonb NOT NULL,
+    latency_ms integer,
+    prompt_tokens integer,
+    completion_tokens integer,
+    model text,
+    grounded boolean,
+    knowledge_chunk_ids uuid[] DEFAULT '{}'::uuid[] NOT NULL,
+    user_message text NOT NULL,
+    agent_reply text NOT NULL,
+    human_handoff jsonb,
+    error_detail text,
+    metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT agent_interaction_logs_agent_type_check CHECK ((agent_type = ANY (ARRAY['customer_service'::text, 'sales'::text]))),
+    CONSTRAINT agent_interaction_logs_audience_check CHECK ((audience = ANY (ARRAY['tenant'::text, 'landlord'::text, 'prospect'::text]))),
+    CONSTRAINT agent_interaction_logs_handled_by_tier_check CHECK ((handled_by_tier = ANY (ARRAY['entry'::text, 'escalation'::text, 'human'::text]))),
+    CONSTRAINT agent_interaction_logs_outcome_check CHECK ((outcome = ANY (ARRAY['answered_entry'::text, 'answered_escalation'::text, 'action_taken'::text, 'escalated_to_senior'::text, 'escalated_to_human'::text, 'abandoned'::text, 'error'::text])))
+);
+
+
+--
+-- Name: agent_knowledge_chunks; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.agent_knowledge_chunks (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    scope text NOT NULL,
+    source text,
+    title text,
+    content text NOT NULL,
+    embedding public.vector(1024) NOT NULL,
+    metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT agent_knowledge_chunks_scope_check CHECK ((scope = ANY (ARRAY['tenant'::text, 'landlord'::text, 'shared'::text, 'sales'::text])))
+);
+
+
+--
+-- Name: application_pool; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.application_pool (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    background_check_id uuid NOT NULL,
+    user_id uuid NOT NULL,
+    status text DEFAULT 'available'::text NOT NULL,
+    consent_pool boolean DEFAULT true NOT NULL,
+    employment_status text,
+    monthly_income numeric,
+    zip text,
+    city text,
+    state text,
+    lat numeric,
+    lon numeric,
+    risk_level text,
+    risk_score integer,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT application_pool_status_check CHECK ((status = ANY (ARRAY['available'::text, 'matched'::text, 'inactive'::text, 'expired'::text])))
+);
+
+
+--
+-- Name: audit_log; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.audit_log (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    user_id uuid,
+    action text NOT NULL,
+    entity_type text,
+    entity_id uuid,
+    old_value jsonb,
+    new_value jsonb,
+    ip_address text,
+    created_at timestamp with time zone DEFAULT now()
+);
+
+
+--
+-- Name: audit_log_archive; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.audit_log_archive (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    user_id uuid,
+    action text NOT NULL,
+    entity_type text,
+    entity_id uuid,
+    old_value jsonb,
+    new_value jsonb,
+    ip_address text,
+    created_at timestamp with time zone DEFAULT now(),
+    archived_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: background_checks; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.background_checks (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    unit_id uuid,
+    landlord_id uuid NOT NULL,
+    amount_charged numeric(10,2) DEFAULT 40.00,
+    platform_net numeric(10,2) DEFAULT 15.00,
+    provider_ref text,
+    status text DEFAULT 'pending'::text,
+    result_url text,
+    created_at timestamp with time zone DEFAULT now(),
+    tenant_id uuid,
+    user_id uuid NOT NULL,
+    first_name text,
+    last_name text,
+    date_of_birth date,
+    ssn_encrypted text,
+    ssn_last4 text,
+    street1 text,
+    street2 text,
+    city text,
+    state text,
+    zip text,
+    years_at_address numeric,
+    employment_status text,
+    employer_name text,
+    employer_phone text,
+    monthly_income numeric,
+    prev_landlord_name text,
+    prev_landlord_phone text,
+    prev_landlord_email text,
+    id_document_url text,
+    income_document_urls jsonb DEFAULT '[]'::jsonb NOT NULL,
+    consent_credit boolean DEFAULT false NOT NULL,
+    consent_criminal boolean DEFAULT false NOT NULL,
+    consent_pool boolean DEFAULT false NOT NULL,
+    consent_signed_at timestamp with time zone,
+    consent_ip text,
+    risk_score integer,
+    risk_level text,
+    risk_flags jsonb DEFAULT '[]'::jsonb NOT NULL,
+    ip_address text,
+    user_agent text,
+    decision_notes text,
+    decided_at timestamp with time zone,
+    decided_by uuid,
+    provider_name text DEFAULT 'mock'::text NOT NULL,
+    applicant_redirect_url text,
+    webhook_received_at timestamp with time zone,
+    report_summary jsonb,
+    failure_reason text,
+    expires_at timestamp with time zone,
+    pool_entry_id uuid,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    applicant_payment_intent_id text,
+    CONSTRAINT background_checks_risk_level_check CHECK (((risk_level IS NULL) OR (risk_level = ANY (ARRAY['low'::text, 'medium'::text, 'high'::text, 'very_high'::text])))),
+    CONSTRAINT background_checks_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'awaiting_applicant'::text, 'submitted'::text, 'processing'::text, 'complete'::text, 'failed'::text, 'cancelled'::text, 'approved'::text, 'denied'::text, 'expired'::text])))
+);
+
+
+--
+-- Name: bank_reconciliations; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.bank_reconciliations (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    landlord_id uuid,
+    account_id uuid,
+    period_start date NOT NULL,
+    period_end date NOT NULL,
+    statement_balance numeric(12,2) NOT NULL,
+    book_balance numeric(12,2) NOT NULL,
+    difference numeric(12,2) GENERATED ALWAYS AS ((statement_balance - book_balance)) STORED,
+    status character varying(20) DEFAULT 'open'::character varying,
+    completed_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now()
+);
+
+
+--
+-- Name: bookkeeper_scopes; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.bookkeeper_scopes (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    user_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    access_level text DEFAULT 'read_only'::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT bookkeeper_scopes_access_level_check CHECK ((access_level = ANY (ARRAY['read_only'::text, 'read_write'::text])))
+);
+
+
+--
+-- Name: books_accounts; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.books_accounts (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    landlord_id uuid,
+    code character varying(20) NOT NULL,
+    name character varying(200) NOT NULL,
+    type character varying(50) NOT NULL,
+    subtype character varying(50),
+    description text,
+    is_system boolean DEFAULT false,
+    balance numeric(12,2) DEFAULT 0,
+    active boolean DEFAULT true,
+    created_at timestamp with time zone DEFAULT now(),
+    updated_at timestamp with time zone DEFAULT now()
+);
+
+
+--
+-- Name: books_bills; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.books_bills (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    landlord_id uuid,
+    vendor_id uuid,
+    bill_number character varying(100),
+    date date NOT NULL,
+    due_date date,
+    description text NOT NULL,
+    amount numeric(12,2) NOT NULL,
+    amount_paid numeric(12,2) DEFAULT 0,
+    status character varying(20) DEFAULT 'open'::character varying,
+    category character varying(100),
+    account_id uuid,
+    notes text,
+    paid_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now(),
+    updated_at timestamp with time zone DEFAULT now()
+);
+
+
+--
+-- Name: books_contractors; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.books_contractors (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    landlord_id uuid,
+    first_name character varying(100),
+    last_name character varying(100),
+    business_name character varying(200),
+    email character varying(200),
+    phone character varying(20),
+    address text,
+    ein character varying(10),
+    ssn_last4 character varying(4),
+    entity_type character varying(30) DEFAULT 'individual'::character varying,
+    trade character varying(100),
+    pay_rate numeric(10,2),
+    pay_unit character varying(20) DEFAULT 'project'::character varying,
+    status character varying(20) DEFAULT 'active'::character varying,
+    ytd_paid numeric(12,2) DEFAULT 0,
+    w9_on_file boolean DEFAULT false,
+    created_at timestamp with time zone DEFAULT now(),
+    updated_at timestamp with time zone DEFAULT now()
+);
+
+
+--
+-- Name: books_employees; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.books_employees (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    landlord_id uuid,
+    first_name character varying(100) NOT NULL,
+    last_name character varying(100) NOT NULL,
+    email character varying(200),
+    phone character varying(20),
+    address text,
+    ssn_last4 character varying(4),
+    pay_type character varying(20) DEFAULT 'salary'::character varying NOT NULL,
+    pay_rate numeric(10,2) DEFAULT 0 NOT NULL,
+    pay_frequency character varying(20) DEFAULT 'biweekly'::character varying,
+    filing_status character varying(20) DEFAULT 'single'::character varying,
+    federal_allowances integer DEFAULT 0,
+    state_withholding_pct numeric(5,2) DEFAULT 0,
+    title character varying(100),
+    department character varying(100),
+    start_date date,
+    end_date date,
+    status character varying(20) DEFAULT 'active'::character varying,
+    ytd_gross numeric(12,2) DEFAULT 0,
+    ytd_federal_tax numeric(12,2) DEFAULT 0,
+    ytd_state_tax numeric(12,2) DEFAULT 0,
+    ytd_ss numeric(12,2) DEFAULT 0,
+    ytd_medicare numeric(12,2) DEFAULT 0,
+    ytd_net numeric(12,2) DEFAULT 0,
+    created_at timestamp with time zone DEFAULT now(),
+    updated_at timestamp with time zone DEFAULT now()
+);
+
+
+--
+-- Name: books_transactions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.books_transactions (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    landlord_id uuid,
+    date date NOT NULL,
+    description text NOT NULL,
+    amount numeric(12,2) NOT NULL,
+    type character varying(20) NOT NULL,
+    category character varying(100),
+    account_id uuid,
+    reference text,
+    reconciled boolean DEFAULT false,
+    reconciled_at timestamp with time zone,
+    source character varying(30) DEFAULT 'manual'::character varying,
+    created_at timestamp with time zone DEFAULT now(),
+    updated_at timestamp with time zone DEFAULT now()
+);
+
+
+--
+-- Name: books_vendors; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.books_vendors (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    landlord_id uuid,
+    name character varying(200) NOT NULL,
+    contact_name character varying(200),
+    email character varying(200),
+    phone character varying(20),
+    address text,
+    category character varying(100),
+    payment_terms character varying(50) DEFAULT 'net30'::character varying,
+    account_number character varying(100),
+    tax_id character varying(20),
+    ap_balance numeric(12,2) DEFAULT 0,
+    ytd_paid numeric(12,2) DEFAULT 0,
+    status character varying(20) DEFAULT 'active'::character varying,
+    notes text,
+    created_at timestamp with time zone DEFAULT now(),
+    updated_at timestamp with time zone DEFAULT now(),
+    credit_balance numeric(12,2) DEFAULT 0
+);
+
+
+--
+-- Name: COLUMN books_vendors.credit_balance; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.books_vendors.credit_balance IS 'S413/S386: accumulated credit from overpayments. Future bill-pay flows can consume this before charging the landlord.';
+
+
+--
+-- Name: bulletin_posts; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.bulletin_posts (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid,
+    property_id uuid,
+    city text,
+    state text,
+    scope text DEFAULT 'property'::text,
+    content text NOT NULL,
+    alias text,
+    upvote_count integer DEFAULT 0,
+    flag_count integer DEFAULT 0,
+    total_votes integer DEFAULT 0,
+    pinned boolean DEFAULT false,
+    is_removed boolean DEFAULT false,
+    removed_at timestamp with time zone,
+    removed_by uuid,
+    created_at timestamp with time zone DEFAULT now()
+);
+
+
+--
+-- Name: bulletin_reveal_log; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.bulletin_reveal_log (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    post_id uuid,
+    revealed_by text,
+    admin_id uuid,
+    created_at timestamp with time zone DEFAULT now()
+);
+
+
+--
+-- Name: bulletin_reveal_log_archive; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.bulletin_reveal_log_archive (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    post_id uuid,
+    revealed_by text,
+    admin_id uuid,
+    created_at timestamp with time zone DEFAULT now(),
+    archived_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: bulletin_votes; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.bulletin_votes (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    post_id uuid,
+    tenant_id uuid,
+    vote_type text,
+    created_at timestamp with time zone DEFAULT now()
+);
+
+
+--
+-- Name: connect_disputes; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.connect_disputes (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    stripe_dispute_id text NOT NULL,
+    stripe_charge_id text NOT NULL,
+    stripe_payment_intent_id text,
+    stripe_account_id text,
+    payment_id uuid,
+    landlord_id uuid,
+    amount numeric(10,2) NOT NULL,
+    currency text DEFAULT 'usd'::text NOT NULL,
+    reason text,
+    status text NOT NULL,
+    evidence_due_by timestamp with time zone,
+    evidence_submitted_at timestamp with time zone,
+    response_notes text,
+    outcome text,
+    outcome_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT connect_disputes_status_check CHECK ((status = ANY (ARRAY['warning_needs_response'::text, 'warning_under_review'::text, 'warning_closed'::text, 'needs_response'::text, 'under_review'::text, 'charge_refunded'::text, 'won'::text, 'lost'::text])))
+);
+
+
+--
+-- Name: connect_payouts; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.connect_payouts (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    stripe_payout_id text NOT NULL,
+    stripe_account_id text NOT NULL,
+    user_id uuid,
+    pm_company_id uuid,
+    amount numeric(10,2) NOT NULL,
+    currency text DEFAULT 'usd'::text NOT NULL,
+    status text DEFAULT 'pending'::text NOT NULL,
+    destination_bank_id text,
+    destination_bank_last4 text,
+    arrival_date date,
+    failure_code text,
+    failure_message text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT connect_payouts_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'paid'::text, 'failed'::text, 'canceled'::text, 'in_transit'::text])))
+);
+
+
+--
+-- Name: contractors; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.contractors (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    name text NOT NULL,
+    business_name text NOT NULL,
+    phone text NOT NULL,
+    email text NOT NULL,
+    contractor_license_number text,
+    insurance_verified boolean DEFAULT false,
+    insurance_expiry date,
+    listing_tier text,
+    listing_fee numeric(10,2),
+    trades text[] DEFAULT '{}'::text[],
+    rating numeric(3,2),
+    completed_jobs integer DEFAULT 0,
+    active boolean DEFAULT true,
+    created_at timestamp with time zone DEFAULT now(),
+    updated_at timestamp with time zone DEFAULT now(),
+    contractor_license_state text,
+    CONSTRAINT contractors_listing_tier_check CHECK ((listing_tier = ANY (ARRAY['featured'::text, 'premium'::text, 'exclusive'::text])))
+);
+
+
+--
+-- Name: credit_disputes; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.credit_disputes (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    disputed_event_id uuid NOT NULL,
+    disputing_subject_id uuid NOT NULL,
+    dispute_open_event_id uuid NOT NULL,
+    status text NOT NULL,
+    resolution_event_id uuid,
+    reason text NOT NULL,
+    notes text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    resolved_at timestamp with time zone,
+    CONSTRAINT credit_disputes_reason_check CHECK ((reason = ANY (ARRAY['factual_inaccuracy'::text, 'attestation_invalid'::text, 'identity_mismatch'::text, 'other'::text]))),
+    CONSTRAINT credit_disputes_status_check CHECK ((status = ANY (ARRAY['open'::text, 'evidence_pending'::text, 'resolved_upheld'::text, 'resolved_corrected'::text, 'resolved_no_change'::text])))
+);
+
+
+--
+-- Name: credit_events; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.credit_events (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    subject_id uuid NOT NULL,
+    event_type text NOT NULL,
+    event_data jsonb DEFAULT '{}'::jsonb NOT NULL,
+    occurred_at timestamp with time zone NOT NULL,
+    recorded_at timestamp with time zone DEFAULT now() NOT NULL,
+    attestation_source text NOT NULL,
+    attestation_evidence jsonb DEFAULT '{}'::jsonb NOT NULL,
+    dimension_tags text[] DEFAULT '{}'::text[] NOT NULL,
+    network_visibility text NOT NULL,
+    prev_hash bytea,
+    this_hash bytea NOT NULL,
+    superseded_by uuid,
+    superseded_reason text,
+    CONSTRAINT credit_events_network_visibility_check CHECK ((network_visibility = ANY (ARRAY['private_to_subject'::text, 'visible_to_current_landlord'::text, 'visible_to_gam_network'::text])))
+);
+
+
+--
+-- Name: credit_hardship_contexts; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.credit_hardship_contexts (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    subject_id uuid NOT NULL,
+    category text NOT NULL,
+    start_date date NOT NULL,
+    end_date date,
+    note text,
+    event_id uuid NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT credit_hardship_contexts_category_check CHECK ((category = ANY (ARRAY['medical'::text, 'job_loss'::text, 'family_death'::text, 'natural_disaster'::text, 'military_deployment'::text, 'other'::text])))
+);
+
+
+--
+-- Name: credit_merkle_anchors; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.credit_merkle_anchors (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    merkle_root bytea NOT NULL,
+    event_count_at_anchor bigint NOT NULL,
+    earliest_event_id uuid NOT NULL,
+    latest_event_id uuid NOT NULL,
+    anchored_at timestamp with time zone DEFAULT now() NOT NULL,
+    external_attestation jsonb
+);
+
+
+--
+-- Name: credit_score_formulas; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.credit_score_formulas (
+    version text NOT NULL,
+    definition jsonb NOT NULL,
+    description text NOT NULL,
+    effective_from timestamp with time zone NOT NULL,
+    effective_to timestamp with time zone,
+    published_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: credit_scores; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.credit_scores (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    subject_id uuid NOT NULL,
+    composite_score numeric(20,2) NOT NULL,
+    confidence_low numeric(20,2) NOT NULL,
+    confidence_high numeric(20,2) NOT NULL,
+    dimension_scores jsonb DEFAULT '{}'::jsonb NOT NULL,
+    event_count integer NOT NULL,
+    formula_version text NOT NULL,
+    disclosure_scope text DEFAULT 'gam_internal_only'::text NOT NULL,
+    ledger_merkle_root bytea NOT NULL,
+    computed_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT credit_scores_disclosure_scope_check CHECK ((disclosure_scope = 'gam_internal_only'::text))
+);
+
+
+--
+-- Name: credit_stats; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.credit_stats (
+    subject_id uuid NOT NULL,
+    payment_stats jsonb DEFAULT '{}'::jsonb NOT NULL,
+    property_stats jsonb DEFAULT '{}'::jsonb NOT NULL,
+    tenancy_stats jsonb DEFAULT '{}'::jsonb NOT NULL,
+    community_stats jsonb DEFAULT '{}'::jsonb NOT NULL,
+    cooperation_stats jsonb DEFAULT '{}'::jsonb NOT NULL,
+    computed_at timestamp with time zone DEFAULT now() NOT NULL,
+    ledger_event_count_at_computation bigint NOT NULL
+);
+
+
+--
+-- Name: credit_subjects; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.credit_subjects (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    subject_type text NOT NULL,
+    subject_ref_id uuid NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT credit_subjects_subject_type_check CHECK ((subject_type = ANY (ARRAY['tenant'::text, 'landlord'::text, 'manager'::text, 'property'::text])))
+);
+
+
+--
+-- Name: csv_import_attempts; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.csv_import_attempts (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    landlord_id uuid NOT NULL,
+    import_type text NOT NULL,
+    platform_key text NOT NULL,
+    claimed_platform_name text,
+    column_headers jsonb DEFAULT '[]'::jsonb NOT NULL,
+    sample_rows jsonb DEFAULT '[]'::jsonb NOT NULL,
+    row_count integer DEFAULT 0 NOT NULL,
+    blockers integer DEFAULT 0 NOT NULL,
+    warnings integer DEFAULT 0 NOT NULL,
+    status text DEFAULT 'validated'::text NOT NULL,
+    reviewed_by uuid,
+    reviewed_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT csv_import_attempts_import_type_check CHECK ((import_type = ANY (ARRAY['tenant'::text, 'property'::text, 'payment'::text]))),
+    CONSTRAINT csv_import_attempts_status_check CHECK ((status = ANY (ARRAY['validated'::text, 'committed'::text, 'reviewed'::text])))
+);
+
+
+--
+-- Name: daily_tasks; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.daily_tasks (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    landlord_id uuid NOT NULL,
+    title text NOT NULL,
+    description text,
+    assigned_to uuid,
+    due_date date,
+    recurrence text DEFAULT 'none'::text NOT NULL,
+    completed boolean DEFAULT false NOT NULL,
+    completed_at timestamp with time zone,
+    completed_by uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT daily_tasks_recurrence_check CHECK ((recurrence = ANY (ARRAY['none'::text, 'daily'::text, 'weekly'::text, 'monthly'::text])))
+);
+
+
+--
+-- Name: deposit_returns; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.deposit_returns (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    lease_id uuid NOT NULL,
+    tenant_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    security_deposit_id uuid,
+    total_deposit numeric(10,2) NOT NULL,
+    cleaning_fee_amount numeric(10,2) DEFAULT 0 NOT NULL,
+    damage_lines jsonb DEFAULT '[]'::jsonb NOT NULL,
+    other_deductions jsonb DEFAULT '[]'::jsonb NOT NULL,
+    total_deductions numeric(10,2) NOT NULL,
+    refund_amount numeric(10,2) DEFAULT 0 NOT NULL,
+    gap_amount numeric(10,2) DEFAULT 0 NOT NULL,
+    status text DEFAULT 'draft'::text NOT NULL,
+    refund_payment_id uuid,
+    gap_payment_id uuid,
+    gap_charge_failed boolean DEFAULT false NOT NULL,
+    gap_charge_failure_reason text,
+    finalized_at timestamp with time zone,
+    finalized_by_user_id uuid,
+    notes text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    unpaid_balance_amount numeric(10,2) DEFAULT 0 NOT NULL,
+    CONSTRAINT deposit_returns_status_check CHECK ((status = ANY (ARRAY['draft'::text, 'sent_refund'::text, 'sent_gap'::text, 'sent_zero'::text, 'sent_carried_forward'::text, 'disputed'::text])))
+);
+
+
+--
+-- Name: COLUMN deposit_returns.unpaid_balance_amount; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.deposit_returns.unpaid_balance_amount IS 'Sum of the auto-swept unpaid payments (rent / utility / late_fee / fee with status pending or failed) that the deposit covers. Snapshotted at draft create + recomputed on applyDeductions + refreshed at finalize.';
+
+
+--
+-- Name: disbursements; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.disbursements (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    landlord_id uuid,
+    amount numeric(10,2) NOT NULL,
+    unit_count integer,
+    status text DEFAULT 'pending'::text NOT NULL,
+    stripe_payout_id text,
+    from_reserve boolean DEFAULT false,
+    reserve_amount numeric(10,2) DEFAULT 0,
+    target_date date,
+    initiated_at timestamp with time zone,
+    settled_at timestamp with time zone,
+    notes text,
+    created_at timestamp with time zone DEFAULT now(),
+    user_id uuid,
+    trigger_type text,
+    fee_charged numeric(10,2) DEFAULT 0,
+    bank_account_id uuid,
+    CONSTRAINT disbursements_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'processing'::text, 'settled'::text, 'failed'::text]))),
+    CONSTRAINT disbursements_trigger_type_check CHECK (((trigger_type IS NULL) OR (trigger_type = ANY (ARRAY['auto_friday'::text, 'manual_on_demand'::text, 'otp_legacy'::text]))))
+);
+
+
+--
+-- Name: document_batches; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.document_batches (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    landlord_id uuid NOT NULL,
+    title text NOT NULL,
+    template_id uuid NOT NULL,
+    scope_type text NOT NULL,
+    scope_ref jsonb,
+    status text DEFAULT 'active'::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    voided_at timestamp with time zone,
+    voided_by uuid,
+    CONSTRAINT document_batches_scope_type_check CHECK ((scope_type = ANY (ARRAY['units'::text, 'property'::text, 'landlord_all'::text]))),
+    CONSTRAINT document_batches_status_check CHECK ((status = ANY (ARRAY['active'::text, 'voided'::text])))
+);
+
+
+--
+-- Name: documents; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.documents (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    lease_id uuid,
+    unit_id uuid,
+    tenant_id uuid,
+    landlord_id uuid NOT NULL,
+    type text NOT NULL,
+    name text NOT NULL,
+    url text NOT NULL,
+    file_size integer,
+    mime_type text,
+    signed_by_tenant boolean DEFAULT false,
+    signed_by_landlord boolean DEFAULT false,
+    signed_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now(),
+    CONSTRAINT documents_type_check CHECK ((type = ANY (ARRAY['lease'::text, 'addendum'::text, 'move_in_checklist'::text, 'move_out_checklist'::text, 'notice'::text, 'other'::text])))
+);
+
+
+--
+-- Name: email_send_log; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.email_send_log (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    to_email text NOT NULL,
+    subject text NOT NULL,
+    category text,
+    status text NOT NULL,
+    error_message text,
+    landlord_id uuid,
+    related_entity_type text,
+    related_entity_id uuid,
+    metadata jsonb,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT email_send_log_status_check CHECK ((status = ANY (ARRAY['sent'::text, 'failed'::text])))
+);
+
+
+--
+-- Name: email_send_log_archive; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.email_send_log_archive (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    to_email text NOT NULL,
+    subject text NOT NULL,
+    category text,
+    status text NOT NULL,
+    error_message text,
+    landlord_id uuid,
+    related_entity_type text,
+    related_entity_id uuid,
+    metadata jsonb,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    archived_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT email_send_log_status_check CHECK ((status = ANY (ARRAY['sent'::text, 'failed'::text])))
+);
+
+
+--
+-- Name: emergency_contacts; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.emergency_contacts (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    tenant_id uuid NOT NULL,
+    name text NOT NULL,
+    phone text,
+    email text,
+    relationship text,
+    notes text,
+    sort_order integer DEFAULT 0 NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: external_account_links; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.external_account_links (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    subject_id uuid NOT NULL,
+    category text NOT NULL,
+    provider text NOT NULL,
+    provider_kind text NOT NULL,
+    account_ref_external text NOT NULL,
+    display_label text,
+    consent_granted_at timestamp with time zone DEFAULT now() NOT NULL,
+    consent_revoked_at timestamp with time zone,
+    last_polled_at timestamp with time zone,
+    last_event_emitted_at timestamp with time zone,
+    metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT external_account_links_category_check CHECK ((category = ANY (ARRAY['utility'::text, 'telecom'::text, 'auto_loan'::text, 'insurance'::text, 'child_support'::text, 'medical'::text, 'subscription'::text, 'bank_account'::text, 'credit_card'::text, 'student_loan'::text, 'mortgage'::text]))),
+    CONSTRAINT external_account_links_provider_kind_check CHECK ((provider_kind = ANY (ARRAY['plaid'::text, 'mx'::text, 'finicity'::text, 'carrier_direct'::text, 'lender_direct'::text, 'gam_bill_pay'::text, 'manual_upload'::text])))
+);
+
+
+--
+-- Name: fitness_body_weight_logs; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.fitness_body_weight_logs (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    user_id uuid NOT NULL,
+    weight_lbs numeric(6,2) NOT NULL,
+    logged_date date DEFAULT CURRENT_DATE NOT NULL,
+    created_at timestamp with time zone DEFAULT now()
+);
+
+
+--
+-- Name: fitness_days; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.fitness_days (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    routine_id uuid NOT NULL,
+    day_number integer NOT NULL,
+    title text NOT NULL,
+    subtitle text,
+    sort_order integer DEFAULT 0 NOT NULL,
+    created_at timestamp with time zone DEFAULT now()
+);
+
+
+--
+-- Name: fitness_exercises; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.fitness_exercises (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    section_id uuid NOT NULL,
+    name text NOT NULL,
+    sets integer,
+    reps_min integer,
+    reps_max integer,
+    notes text,
+    sort_order integer DEFAULT 0 NOT NULL
+);
+
+
+--
+-- Name: fitness_milestones; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.fitness_milestones (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    user_id uuid NOT NULL,
+    milestone_type text NOT NULL,
+    achieved_at timestamp with time zone DEFAULT now(),
+    total_lbs_at_achievement numeric(16,2)
+);
+
+
+--
+-- Name: fitness_profiles; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.fitness_profiles (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    user_id uuid NOT NULL,
+    height_inches integer,
+    weight_lbs numeric(6,2),
+    age integer,
+    goal_physique text,
+    target_weight_lbs numeric(6,2),
+    experience_level text,
+    injuries text[],
+    available_equipment text[],
+    days_per_week integer,
+    minutes_per_session integer,
+    fitness_goal text,
+    onboarding_complete boolean DEFAULT false,
+    created_at timestamp with time zone DEFAULT now(),
+    updated_at timestamp with time zone DEFAULT now(),
+    CONSTRAINT fitness_profiles_experience_level_check CHECK ((experience_level = ANY (ARRAY['beginner'::text, 'intermediate'::text, 'advanced'::text]))),
+    CONSTRAINT fitness_profiles_fitness_goal_check CHECK ((fitness_goal = ANY (ARRAY['recomp'::text, 'bulk'::text, 'cut'::text, 'athletic'::text])))
+);
+
+
+--
+-- Name: fitness_routines; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.fitness_routines (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    user_id uuid NOT NULL,
+    name text NOT NULL,
+    description text,
+    is_active boolean DEFAULT true,
+    is_preset boolean DEFAULT false,
+    created_at timestamp with time zone DEFAULT now(),
+    updated_at timestamp with time zone DEFAULT now()
+);
+
+
+--
+-- Name: fitness_sections; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.fitness_sections (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    day_id uuid NOT NULL,
+    label text NOT NULL,
+    sort_order integer DEFAULT 0 NOT NULL
+);
+
+
+--
+-- Name: fitness_set_logs; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.fitness_set_logs (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    log_id uuid NOT NULL,
+    user_id uuid NOT NULL,
+    exercise_id uuid,
+    exercise_name text NOT NULL,
+    weight_lbs numeric(8,2) DEFAULT 0,
+    reps integer DEFAULT 0 NOT NULL,
+    is_counted boolean DEFAULT false,
+    logged_at timestamp with time zone DEFAULT now()
+);
+
+
+--
+-- Name: fitness_workout_logs; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.fitness_workout_logs (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    user_id uuid NOT NULL,
+    day_id uuid,
+    day_title text,
+    logged_date date DEFAULT CURRENT_DATE NOT NULL,
+    completed_at timestamp with time zone,
+    duration_minutes integer,
+    notes text,
+    created_at timestamp with time zone DEFAULT now()
+);
+
+
+--
+-- Name: flex_charge_accounts; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.flex_charge_accounts (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    tenant_id uuid,
+    pos_customer_id uuid,
+    property_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    credit_limit numeric(10,2) NOT NULL,
+    status text DEFAULT 'active'::text NOT NULL,
+    disqualified_until timestamp with time zone,
+    disqualified_reason text,
+    notes text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT flex_charge_accounts_credit_limit_nonneg CHECK ((credit_limit >= (0)::numeric)),
+    CONSTRAINT flex_charge_accounts_customer_xor CHECK ((((tenant_id IS NOT NULL) AND (pos_customer_id IS NULL)) OR ((tenant_id IS NULL) AND (pos_customer_id IS NOT NULL)))),
+    CONSTRAINT flex_charge_accounts_status_check CHECK ((status = ANY (ARRAY['active'::text, 'suspended'::text, 'disqualified'::text])))
+);
+
+
+--
+-- Name: flex_charge_statements; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.flex_charge_statements (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    account_id uuid NOT NULL,
+    cycle_month date NOT NULL,
+    balance numeric(10,2) NOT NULL,
+    service_fee numeric(10,2) NOT NULL,
+    total_due numeric(10,2) NOT NULL,
+    due_date date NOT NULL,
+    status text DEFAULT 'open'::text NOT NULL,
+    payment_id uuid,
+    billed_at timestamp with time zone,
+    settled_at timestamp with time zone,
+    failed_reason text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT flex_charge_stmt_balance_nonneg CHECK (((balance >= (0)::numeric) AND (service_fee >= (0)::numeric) AND (total_due >= (0)::numeric))),
+    CONSTRAINT flex_charge_stmt_status_check CHECK ((status = ANY (ARRAY['open'::text, 'billed'::text, 'paid'::text, 'failed'::text, 'voided'::text])))
+);
+
+
+--
+-- Name: flex_charge_transactions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.flex_charge_transactions (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    account_id uuid NOT NULL,
+    pos_transaction_id uuid,
+    statement_id uuid,
+    amount numeric(10,2) NOT NULL,
+    status text DEFAULT 'pending'::text NOT NULL,
+    disputed_at timestamp with time zone,
+    dispute_reason text,
+    refunded_at timestamp with time zone,
+    notes text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT flex_charge_tx_amount_nonzero CHECK ((amount <> (0)::numeric)),
+    CONSTRAINT flex_charge_tx_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'billed'::text, 'paid'::text, 'disputed'::text, 'refunded'::text])))
+);
+
+
+--
+-- Name: flex_deposit_custody_charges; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.flex_deposit_custody_charges (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    tenant_id uuid NOT NULL,
+    cycle_month date NOT NULL,
+    amount numeric(10,2) NOT NULL,
+    payment_id uuid,
+    status text DEFAULT 'pending'::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT fdcc_amount_positive CHECK ((amount > (0)::numeric)),
+    CONSTRAINT fdcc_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'settled'::text, 'failed'::text])))
+);
+
+
+--
+-- Name: flex_deposit_installments; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.flex_deposit_installments (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    security_deposit_id uuid NOT NULL,
+    tenant_id uuid NOT NULL,
+    installment_number integer NOT NULL,
+    installment_count integer NOT NULL,
+    amount numeric(10,2) NOT NULL,
+    due_date date NOT NULL,
+    status text DEFAULT 'pending'::text NOT NULL,
+    payment_id uuid,
+    attempted_at timestamp with time zone,
+    settled_at timestamp with time zone,
+    defaulted_at timestamp with time zone,
+    default_reason text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    primary_pull_date date,
+    retry_pull_date date,
+    attempt_count integer DEFAULT 0 NOT NULL,
+    CONSTRAINT flex_deposit_installments_amount_positive CHECK ((amount > (0)::numeric)),
+    CONSTRAINT flex_deposit_installments_count_check CHECK (((installment_count >= 2) AND (installment_count <= 4))),
+    CONSTRAINT flex_deposit_installments_number_check CHECK (((installment_number >= 1) AND (installment_number <= installment_count))),
+    CONSTRAINT flex_deposit_installments_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'settled'::text, 'failed'::text, 'defaulted'::text])))
+);
+
+
+--
+-- Name: COLUMN flex_deposit_installments.primary_pull_date; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.flex_deposit_installments.primary_pull_date IS 'S260: first ACH pull attempt date. Computed at enrollment as rent_due_day − 5 for the installment cycle month.';
+
+
+--
+-- Name: COLUMN flex_deposit_installments.retry_pull_date; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.flex_deposit_installments.retry_pull_date IS 'S260: second ACH pull attempt date, fires only if primary failed. Computed at enrollment as rent_due_day − 1 for the installment cycle month.';
+
+
+--
+-- Name: COLUMN flex_deposit_installments.attempt_count; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.flex_deposit_installments.attempt_count IS 'S260: count of ACH pulls fired for this installment (0/1/2). 0=untouched, 1=primary attempted, 2=both attempted (defaulted if neither settled).';
+
+
+--
+-- Name: flexpay_advances; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.flexpay_advances (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    cycle_month date NOT NULL,
+    tenant_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    unit_id uuid NOT NULL,
+    lease_id uuid NOT NULL,
+    rent_amount numeric(10,2) NOT NULL,
+    tenant_fee_amount numeric(10,2) NOT NULL,
+    pull_day integer NOT NULL,
+    grace_advance_suppressed boolean DEFAULT false NOT NULL,
+    stripe_transfer_id text,
+    transfer_attempted_at timestamp with time zone,
+    transfer_error text,
+    fronted_at timestamp with time zone,
+    rent_payment_id uuid,
+    fee_payment_id uuid,
+    pulled_at timestamp with time zone,
+    reconciled_at timestamp with time zone,
+    defaulted_at timestamp with time zone,
+    default_reason text,
+    status text DEFAULT 'pending'::text NOT NULL,
+    notes text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT flexpay_advances_amount_positive CHECK (((rent_amount > (0)::numeric) AND (tenant_fee_amount > (0)::numeric))),
+    CONSTRAINT flexpay_advances_pull_day_check CHECK (((pull_day >= 1) AND (pull_day <= 28))),
+    CONSTRAINT flexpay_advances_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'fronted'::text, 'pulled'::text, 'reconciled'::text, 'nsf'::text, 'defaulted'::text])))
+);
+
+
+--
+-- Name: flexsuite_enrollment_acceptances; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.flexsuite_enrollment_acceptances (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    user_id uuid NOT NULL,
+    product_type text NOT NULL,
+    template_version text NOT NULL,
+    populated_content jsonb NOT NULL,
+    rendered_text text NOT NULL,
+    content_hash text NOT NULL,
+    accepted_at timestamp with time zone DEFAULT now() NOT NULL,
+    accepted_ip text,
+    accepted_user_agent text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT flexsuite_enrollment_acceptances_product_type_check CHECK ((product_type = ANY (ARRAY['flexpay'::text, 'flexdeposit'::text])))
+);
+
+
+--
+-- Name: TABLE flexsuite_enrollment_acceptances; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.flexsuite_enrollment_acceptances IS 'Audit record per FlexPay / FlexDeposit enrollment click-through. Stores the populated terms text the tenant saw at acceptance, hash-anchored. Structural defense for SLA-not-loan / subscription characterization.';
+
+
+--
+-- Name: float_account_state; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.float_account_state (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    balance numeric(10,2) DEFAULT 25000 NOT NULL,
+    seed_capital numeric(10,2) DEFAULT 25000 NOT NULL,
+    apy numeric(5,4) DEFAULT 0.045 NOT NULL,
+    monthly_interest numeric(10,2) DEFAULT 0,
+    updated_at timestamp with time zone DEFAULT now()
+);
+
+
+--
+-- Name: invitations; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.invitations (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    email text NOT NULL,
+    landlord_id uuid NOT NULL,
+    role text NOT NULL,
+    scope_payload jsonb DEFAULT '{}'::jsonb NOT NULL,
+    invited_by_user_id uuid NOT NULL,
+    status text DEFAULT 'pending'::text NOT NULL,
+    token text NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    accepted_at timestamp with time zone,
+    accepted_user_id uuid,
+    revoked_at timestamp with time zone,
+    revoked_by_user_id uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT invitations_role_check CHECK ((role = ANY (ARRAY['property_manager'::text, 'onsite_manager'::text, 'maintenance'::text, 'bookkeeper'::text]))),
+    CONSTRAINT invitations_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'accepted'::text, 'expired'::text, 'revoked'::text])))
+);
+
+
+--
+-- Name: invoice_sequences; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.invoice_sequences (
+    landlord_id uuid NOT NULL,
+    year integer NOT NULL,
+    next_number integer DEFAULT 1 NOT NULL
+);
+
+
+--
+-- Name: invoices; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.invoices (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    landlord_id uuid NOT NULL,
+    tenant_id uuid,
+    lease_id uuid NOT NULL,
+    unit_id uuid NOT NULL,
+    invoice_number text NOT NULL,
+    due_date date NOT NULL,
+    subtotal_rent numeric(12,2) DEFAULT 0 NOT NULL,
+    subtotal_fees numeric(12,2) DEFAULT 0 NOT NULL,
+    subtotal_utilities numeric(12,2) DEFAULT 0 NOT NULL,
+    subtotal_deposits numeric(12,2) DEFAULT 0 NOT NULL,
+    subtotal_late_fees numeric(12,2) DEFAULT 0 NOT NULL,
+    total_amount numeric(12,2) NOT NULL,
+    status text DEFAULT 'pending'::text NOT NULL,
+    sent_at timestamp with time zone,
+    viewed_at timestamp with time zone,
+    pdf_url text,
+    notes text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT invoices_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'partial'::text, 'settled'::text, 'void'::text]))),
+    CONSTRAINT invoices_subtotal_deposits_check CHECK ((subtotal_deposits >= (0)::numeric)),
+    CONSTRAINT invoices_subtotal_fees_check CHECK ((subtotal_fees >= (0)::numeric)),
+    CONSTRAINT invoices_subtotal_late_fees_check CHECK ((subtotal_late_fees >= (0)::numeric)),
+    CONSTRAINT invoices_subtotal_rent_check CHECK ((subtotal_rent >= (0)::numeric)),
+    CONSTRAINT invoices_subtotal_utilities_check CHECK ((subtotal_utilities >= (0)::numeric)),
+    CONSTRAINT invoices_total_amount_check CHECK ((total_amount >= (0)::numeric))
+);
+
+
+--
+-- Name: journal_entries; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.journal_entries (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    landlord_id uuid,
+    entry_number integer NOT NULL,
+    date date NOT NULL,
+    description text NOT NULL,
+    reference text,
+    type character varying(30) DEFAULT 'manual'::character varying,
+    status character varying(20) DEFAULT 'posted'::character varying,
+    total_debits numeric(12,2) DEFAULT 0,
+    total_credits numeric(12,2) DEFAULT 0,
+    created_by uuid,
+    created_at timestamp with time zone DEFAULT now(),
+    updated_at timestamp with time zone DEFAULT now()
+);
+
+
+--
+-- Name: journal_entries_entry_number_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.journal_entries_entry_number_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: journal_entries_entry_number_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.journal_entries_entry_number_seq OWNED BY public.journal_entries.entry_number;
+
+
+--
+-- Name: journal_entry_lines; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.journal_entry_lines (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    entry_id uuid NOT NULL,
+    account_id uuid NOT NULL,
+    description text,
+    debit numeric(12,2) DEFAULT 0 NOT NULL,
+    credit numeric(12,2) DEFAULT 0 NOT NULL,
+    created_at timestamp with time zone DEFAULT now()
+);
+
+
+--
+-- Name: landlord_deposit_interest_rate_overrides; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.landlord_deposit_interest_rate_overrides (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    landlord_id uuid NOT NULL,
+    state_code text NOT NULL,
+    effective_year integer NOT NULL,
+    annual_rate_pct numeric(6,4) NOT NULL,
+    source_notes text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT ldior_rate_check CHECK (((annual_rate_pct >= (0)::numeric) AND (annual_rate_pct <= (100)::numeric))),
+    CONSTRAINT ldior_state_check CHECK (((state_code = upper(state_code)) AND (length(state_code) = 2))),
+    CONSTRAINT ldior_year_check CHECK (((effective_year >= 2020) AND (effective_year <= 2100)))
+);
+
+
+--
+-- Name: TABLE landlord_deposit_interest_rate_overrides; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.landlord_deposit_interest_rate_overrides IS 'Per-landlord, per-state, per-year deposit interest rate. Falls back path when state_deposit_interest_rates has no row for the (state, year). Used for variable-rate statutory states (NY/NJ/CT/IL/PA/NH) where the rate depends on the landlord''s bank.';
+
+
+--
+-- Name: COLUMN landlord_deposit_interest_rate_overrides.source_notes; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.landlord_deposit_interest_rate_overrides.source_notes IS 'Free-text — landlord captures their bank name + current passbook rate, the state-published rate, or the date they verified it. Audit trail for "why this rate".';
+
+
+--
+-- Name: landlord_platform_fee_overrides; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.landlord_platform_fee_overrides (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    landlord_id uuid NOT NULL,
+    rate_per_unit numeric(10,2),
+    min_per_property numeric(10,2),
+    effective_from date DEFAULT CURRENT_DATE NOT NULL,
+    effective_until date,
+    set_by_user_id uuid,
+    reason text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT landlord_pfo_at_least_one CHECK (((rate_per_unit IS NOT NULL) OR (min_per_property IS NOT NULL))),
+    CONSTRAINT landlord_pfo_effective_range CHECK (((effective_until IS NULL) OR (effective_until > effective_from))),
+    CONSTRAINT landlord_pfo_min_nonneg CHECK (((min_per_property IS NULL) OR (min_per_property >= (0)::numeric))),
+    CONSTRAINT landlord_pfo_rate_nonneg CHECK (((rate_per_unit IS NULL) OR (rate_per_unit >= (0)::numeric)))
+);
+
+
+--
+-- Name: landlords; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.landlords (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    user_id uuid NOT NULL,
+    business_name text,
+    ein text,
+    onboarding_complete boolean DEFAULT false,
+    volume_tier text DEFAULT 'standard'::text,
+    annual_contract boolean DEFAULT false,
+    notes text,
+    created_at timestamp with time zone DEFAULT now(),
+    updated_at timestamp with time zone DEFAULT now(),
+    maint_approval_threshold numeric(10,2) DEFAULT 500 NOT NULL,
+    theme_accent text,
+    font_style text,
+    agreement_signed_at timestamp with time zone,
+    agreement_signature text,
+    management_type text,
+    network_tier text DEFAULT 'tier_2_full'::text NOT NULL,
+    default_entry_notice_hours integer DEFAULT 24 NOT NULL,
+    default_early_termination_months_rent numeric(5,2),
+    otp_rollout_enabled boolean DEFAULT false NOT NULL,
+    default_pm_company_id uuid,
+    flex_charge_disqualified_until timestamp with time zone,
+    flex_charge_disqualified_reason text,
+    background_provider text DEFAULT 'mock'::text NOT NULL,
+    CONSTRAINT landlords_background_provider_check CHECK ((background_provider = ANY (ARRAY['mock'::text, 'checkr'::text]))),
+    CONSTRAINT landlords_network_tier_check CHECK ((network_tier = 'tier_2_full'::text)),
+    CONSTRAINT landlords_volume_tier_check CHECK ((volume_tier = ANY (ARRAY['standard'::text, 'growth'::text, 'professional'::text, 'enterprise'::text, 'partner'::text])))
+);
+
+
+--
+-- Name: COLUMN landlords.background_provider; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.landlords.background_provider IS 'S423: which background-check provider this landlord uses. Default mock; flip to checkr once Checkr is provisioned for the landlord.';
+
+
+--
+-- Name: lease_document_fields; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.lease_document_fields (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    document_id uuid NOT NULL,
+    template_field_id uuid,
+    signer_id uuid,
+    field_type text NOT NULL,
+    signer_role text,
+    label text,
+    lease_column text,
+    page integer DEFAULT 1,
+    x double precision,
+    y double precision,
+    width double precision,
+    height double precision,
+    required boolean DEFAULT true,
+    value text,
+    font_css text,
+    signed_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now(),
+    CONSTRAINT lease_document_fields_lease_column_check CHECK (((lease_column IS NULL) OR (lease_column = ANY (ARRAY['tenant_name'::text, 'tenant_email'::text, 'landlord_name'::text, 'unit_number'::text, 'property_name'::text, 'property_address'::text, 'tenant_signature'::text, 'landlord_signature'::text, 'tenant_initial'::text, 'landlord_initial'::text, 'date_signed'::text, 'rent_amount'::text, 'start_date'::text, 'end_date'::text, 'security_deposit'::text, 'rent_due_day'::text, 'lease_type'::text, 'auto_renew'::text, 'auto_renew_mode'::text, 'notice_days_required'::text, 'expiration_notice_days'::text, 'late_fee_grace_days'::text, 'late_fee_initial_flat'::text, 'late_fee_initial_percent'::text, 'late_fee_accrual_flat_daily'::text, 'late_fee_accrual_flat_weekly'::text, 'late_fee_accrual_flat_monthly'::text, 'late_fee_accrual_percent_daily'::text, 'late_fee_accrual_percent_weekly'::text, 'late_fee_accrual_percent_monthly'::text, 'late_fee_cap_flat'::text, 'late_fee_cap_percent'::text, 'pet_deposit'::text, 'key_deposit'::text, 'cleaning_deposit'::text, 'move_in_fee'::text, 'cleaning_fee'::text, 'pet_fee'::text, 'application_fee'::text, 'amenity_fee'::text, 'hoa_transfer_fee'::text, 'lease_prep_fee'::text, 'pet_rent'::text, 'parking_rent'::text, 'storage_rent'::text, 'amenity_fee_monthly'::text, 'trash_fee'::text, 'pest_control_fee'::text, 'technology_fee'::text, 'last_month_rent'::text, 'early_termination_fee'::text, 'other_fee'::text, 'utility_water_responsibility'::text, 'utility_gas_responsibility'::text, 'utility_electric_responsibility'::text, 'utility_sewer_responsibility'::text, 'utility_trash_responsibility'::text, 'custom_text'::text]))))
+);
+
+
+--
+-- Name: lease_document_signers; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.lease_document_signers (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    document_id uuid NOT NULL,
+    user_id uuid NOT NULL,
+    role text NOT NULL,
+    name text NOT NULL,
+    email text NOT NULL,
+    phone text,
+    order_index integer DEFAULT 1 NOT NULL,
+    token text NOT NULL,
+    status text DEFAULT 'pending'::text NOT NULL,
+    invite_sent boolean DEFAULT false,
+    viewed_at timestamp with time zone,
+    signed_at timestamp with time zone,
+    signature_data text,
+    ip_address text,
+    user_agent text,
+    created_at timestamp with time zone DEFAULT now(),
+    invite_sent_at timestamp with time zone,
+    reminder_sent_at timestamp with time zone,
+    declined_at timestamp with time zone,
+    decline_reason text,
+    CONSTRAINT lease_document_signers_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'sent'::text, 'viewed'::text, 'signed'::text, 'declined'::text])))
+);
+
+
+--
+-- Name: lease_documents; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.lease_documents (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    template_id uuid,
+    landlord_id uuid NOT NULL,
+    unit_id uuid,
+    lease_id uuid,
+    title text NOT NULL,
+    base_pdf_url text,
+    executed_pdf_url text,
+    status text DEFAULT 'pending'::text NOT NULL,
+    page_count integer DEFAULT 1,
+    sent_at timestamp with time zone,
+    completed_at timestamp with time zone,
+    voided_at timestamp with time zone,
+    void_reason text,
+    created_at timestamp with time zone DEFAULT now(),
+    updated_at timestamp with time zone DEFAULT now(),
+    document_type text DEFAULT 'original_lease'::text NOT NULL,
+    target_lease_tenant_id uuid,
+    promote_lease_tenant_id uuid,
+    batch_id uuid,
+    execution_failed_at timestamp with time zone,
+    CONSTRAINT lease_documents_addendum_fields_check CHECK ((((document_type = 'addendum_remove'::text) AND (target_lease_tenant_id IS NOT NULL)) OR ((document_type = ANY (ARRAY['original_lease'::text, 'addendum_add'::text, 'addendum_terms'::text, 'sublease_agreement'::text])) AND (target_lease_tenant_id IS NULL) AND (promote_lease_tenant_id IS NULL)))),
+    CONSTRAINT lease_documents_document_type_check CHECK ((document_type = ANY (ARRAY['original_lease'::text, 'addendum_add'::text, 'addendum_remove'::text, 'addendum_terms'::text, 'sublease_agreement'::text]))),
+    CONSTRAINT lease_documents_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'sent'::text, 'in_progress'::text, 'completed'::text, 'voided'::text, 'execution_failed'::text])))
+);
+
+
+--
+-- Name: lease_fees; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.lease_fees (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    lease_id uuid NOT NULL,
+    fee_type text NOT NULL,
+    amount numeric NOT NULL,
+    is_refundable boolean NOT NULL,
+    due_timing text NOT NULL,
+    description text,
+    created_at timestamp with time zone DEFAULT now(),
+    updated_at timestamp with time zone DEFAULT now(),
+    is_override boolean DEFAULT false NOT NULL,
+    override_reason text,
+    CONSTRAINT lease_fees_amount_check CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT lease_fees_due_timing_check CHECK ((due_timing = ANY (ARRAY['move_in'::text, 'monthly_ongoing'::text, 'move_out'::text, 'other'::text]))),
+    CONSTRAINT lease_fees_fee_type_check CHECK ((fee_type = ANY (ARRAY['security_deposit'::text, 'pet_deposit'::text, 'key_deposit'::text, 'cleaning_deposit'::text, 'move_in_fee'::text, 'cleaning_fee'::text, 'pet_fee'::text, 'application_fee'::text, 'amenity_fee'::text, 'hoa_transfer_fee'::text, 'lease_prep_fee'::text, 'pet_rent'::text, 'parking_rent'::text, 'storage_rent'::text, 'amenity_fee_monthly'::text, 'trash_fee'::text, 'pest_control_fee'::text, 'technology_fee'::text, 'last_month_rent'::text, 'early_termination_fee'::text, 'other_fee'::text])))
+);
+
+
+--
+-- Name: lease_occupants; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.lease_occupants (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    lease_id uuid NOT NULL,
+    full_name text NOT NULL,
+    relationship_to_primary_tenant text,
+    date_of_birth date,
+    is_minor boolean DEFAULT false NOT NULL,
+    requires_background_check boolean DEFAULT false NOT NULL,
+    background_check_id uuid,
+    notes text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: lease_pets; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.lease_pets (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    lease_id uuid NOT NULL,
+    name text,
+    species text NOT NULL,
+    breed text,
+    color text,
+    age_years numeric(4,1),
+    weight_lbs numeric(6,1),
+    is_service_animal boolean DEFAULT false NOT NULL,
+    is_emotional_support boolean DEFAULT false NOT NULL,
+    service_animal_documentation_url text,
+    license_county text,
+    license_number text,
+    vaccinations_current boolean,
+    vet_name text,
+    vet_phone text,
+    notes text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT lease_pets_species_check CHECK ((species = ANY (ARRAY['dog'::text, 'cat'::text, 'bird'::text, 'reptile'::text, 'fish'::text, 'small_mammal'::text, 'livestock'::text, 'other'::text])))
+);
+
+
+--
+-- Name: lease_template_fields; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.lease_template_fields (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    template_id uuid NOT NULL,
+    field_type text NOT NULL,
+    signer_role text,
+    label text,
+    lease_column text,
+    page integer DEFAULT 1,
+    x double precision,
+    y double precision,
+    width double precision DEFAULT 200,
+    height double precision DEFAULT 50,
+    required boolean DEFAULT true,
+    sort_order integer DEFAULT 0,
+    font_css text,
+    created_at timestamp with time zone DEFAULT now(),
+    CONSTRAINT lease_template_fields_lease_column_check CHECK (((lease_column IS NULL) OR (lease_column = ANY (ARRAY['tenant_name'::text, 'tenant_email'::text, 'landlord_name'::text, 'unit_number'::text, 'property_name'::text, 'property_address'::text, 'tenant_signature'::text, 'landlord_signature'::text, 'tenant_initial'::text, 'landlord_initial'::text, 'date_signed'::text, 'rent_amount'::text, 'start_date'::text, 'end_date'::text, 'security_deposit'::text, 'rent_due_day'::text, 'lease_type'::text, 'auto_renew'::text, 'auto_renew_mode'::text, 'notice_days_required'::text, 'expiration_notice_days'::text, 'late_fee_grace_days'::text, 'late_fee_initial_flat'::text, 'late_fee_initial_percent'::text, 'late_fee_accrual_flat_daily'::text, 'late_fee_accrual_flat_weekly'::text, 'late_fee_accrual_flat_monthly'::text, 'late_fee_accrual_percent_daily'::text, 'late_fee_accrual_percent_weekly'::text, 'late_fee_accrual_percent_monthly'::text, 'late_fee_cap_flat'::text, 'late_fee_cap_percent'::text, 'pet_deposit'::text, 'key_deposit'::text, 'cleaning_deposit'::text, 'move_in_fee'::text, 'cleaning_fee'::text, 'pet_fee'::text, 'application_fee'::text, 'amenity_fee'::text, 'hoa_transfer_fee'::text, 'lease_prep_fee'::text, 'pet_rent'::text, 'parking_rent'::text, 'storage_rent'::text, 'amenity_fee_monthly'::text, 'trash_fee'::text, 'pest_control_fee'::text, 'technology_fee'::text, 'last_month_rent'::text, 'early_termination_fee'::text, 'other_fee'::text, 'utility_water_responsibility'::text, 'utility_gas_responsibility'::text, 'utility_electric_responsibility'::text, 'utility_sewer_responsibility'::text, 'utility_trash_responsibility'::text, 'custom_text'::text]))))
+);
+
+
+--
+-- Name: lease_templates; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.lease_templates (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    landlord_id uuid NOT NULL,
+    name text NOT NULL,
+    description text,
+    base_pdf_url text,
+    page_count integer DEFAULT 1,
+    is_active boolean DEFAULT true NOT NULL,
+    created_at timestamp with time zone DEFAULT now(),
+    updated_at timestamp with time zone DEFAULT now()
+);
+
+
+--
+-- Name: lease_tenants; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.lease_tenants (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    lease_id uuid NOT NULL,
+    tenant_id uuid NOT NULL,
+    role text NOT NULL,
+    status text DEFAULT 'active'::text NOT NULL,
+    added_at timestamp with time zone,
+    removed_at timestamp with time zone,
+    added_reason text,
+    removed_reason text,
+    financial_responsibility text DEFAULT 'joint_several'::text NOT NULL,
+    responsibility_pct numeric(5,2),
+    add_document_id uuid,
+    remove_document_id uuid,
+    supersedes_lease_tenant_id uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT lease_tenants_added_reason_check CHECK (((added_reason IS NULL) OR (added_reason = ANY (ARRAY['original'::text, 'roommate_added'::text, 'replacement'::text])))),
+    CONSTRAINT lease_tenants_financial_responsibility_check CHECK ((financial_responsibility = ANY (ARRAY['joint_several'::text, 'split_equal'::text, 'split_custom'::text]))),
+    CONSTRAINT lease_tenants_removed_reason_check CHECK (((removed_reason IS NULL) OR (removed_reason = ANY (ARRAY['moved_out'::text, 'replaced'::text, 'lease_ended'::text])))),
+    CONSTRAINT lease_tenants_role_check CHECK ((role = ANY (ARRAY['primary'::text, 'co_tenant'::text]))),
+    CONSTRAINT lease_tenants_status_check CHECK ((status = ANY (ARRAY['pending_add'::text, 'active'::text, 'pending_remove'::text, 'removed'::text, 'void'::text])))
+);
+
+
+--
+-- Name: lease_termination_requests; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.lease_termination_requests (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    lease_id uuid NOT NULL,
+    tenant_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    requested_at timestamp with time zone DEFAULT now() NOT NULL,
+    requested_by_user_id uuid NOT NULL,
+    reason text,
+    fee_amount numeric(10,2) NOT NULL,
+    fee_basis text NOT NULL,
+    fee_payment_id uuid,
+    fee_paid_at timestamp with time zone,
+    fee_charge_failed boolean DEFAULT false NOT NULL,
+    fee_charge_failure_reason text,
+    fee_waived_at timestamp with time zone,
+    fee_waived_by_user_id uuid,
+    fee_waiver_reason text,
+    terminated_at timestamp with time zone,
+    status text DEFAULT 'requested'::text NOT NULL,
+    notes text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT lease_termination_requests_fee_basis_check CHECK ((fee_basis = ANY (ARRAY['lease_specific'::text, 'landlord_default'::text, 'no_policy'::text]))),
+    CONSTRAINT lease_termination_requests_status_check CHECK ((status = ANY (ARRAY['requested'::text, 'fee_paid'::text, 'fee_waived'::text, 'terminated'::text, 'cancelled'::text, 'failed'::text])))
+);
+
+
+--
+-- Name: lease_utility_assignments; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.lease_utility_assignments (
+    lease_id uuid NOT NULL,
+    meter_id uuid NOT NULL,
+    created_at timestamp with time zone DEFAULT now()
+);
+
+
+--
+-- Name: lease_utility_responsibilities; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.lease_utility_responsibilities (
+    lease_id uuid NOT NULL,
+    utility_type text NOT NULL,
+    tenant_responsible boolean NOT NULL,
+    created_at timestamp with time zone DEFAULT now(),
+    CONSTRAINT lease_utility_responsibilities_utility_type_check CHECK ((utility_type = ANY (ARRAY['water'::text, 'gas'::text, 'electric'::text, 'sewer'::text, 'trash'::text])))
+);
+
+
+--
+-- Name: lease_vehicles; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.lease_vehicles (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    lease_id uuid NOT NULL,
+    owner_tenant_id uuid,
+    vehicle_type text NOT NULL,
+    year integer,
+    make text,
+    model text,
+    color text,
+    license_plate text,
+    plate_state text,
+    registration_expiry date,
+    parking_spot_assignment text,
+    notes text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT lease_vehicles_vehicle_type_check CHECK ((vehicle_type = ANY (ARRAY['car'::text, 'truck'::text, 'suv'::text, 'van'::text, 'motorcycle'::text, 'scooter'::text, 'utility_trailer'::text, 'boat'::text, 'other'::text])))
+);
+
+
+--
+-- Name: leases; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.leases (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    unit_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    status text DEFAULT 'pending'::text NOT NULL,
+    start_date date NOT NULL,
+    end_date date,
+    rent_amount numeric(10,2) NOT NULL,
+    rent_due_day integer DEFAULT 1 NOT NULL,
+    late_fee_grace_days integer DEFAULT 5,
+    late_fee_initial_amount numeric(10,2) DEFAULT 15.00,
+    signed_by_landlord boolean DEFAULT false,
+    signed_by_tenant boolean DEFAULT false,
+    signed_at timestamp with time zone,
+    terminated_at timestamp with time zone,
+    termination_reason text,
+    created_at timestamp with time zone DEFAULT now(),
+    updated_at timestamp with time zone DEFAULT now(),
+    lease_type text NOT NULL,
+    auto_renew boolean DEFAULT false NOT NULL,
+    auto_renew_mode text,
+    notice_days_required integer DEFAULT 30 NOT NULL,
+    expiration_notice_days integer DEFAULT 60 NOT NULL,
+    needs_review boolean DEFAULT false NOT NULL,
+    expiration_notice_sent_at timestamp with time zone,
+    late_fee_enabled boolean DEFAULT true NOT NULL,
+    late_fee_initial_type text DEFAULT 'flat'::text NOT NULL,
+    late_fee_accrual_amount numeric,
+    late_fee_accrual_type text,
+    late_fee_accrual_period text,
+    late_fee_cap_amount numeric,
+    late_fee_cap_type text,
+    lease_source text DEFAULT 'esigned'::text NOT NULL,
+    imported_pdf_url text,
+    subleasing_allowed text DEFAULT 'with_consent'::text NOT NULL,
+    extraction_extras jsonb,
+    supersedes_lease_id uuid,
+    import_extra_data jsonb,
+    CONSTRAINT leases_auto_renew_mode_check CHECK (((auto_renew_mode IS NULL) OR (auto_renew_mode = ANY (ARRAY['extend_same_term'::text, 'convert_to_month_to_month'::text])))),
+    CONSTRAINT leases_auto_renew_mode_required CHECK (((auto_renew = false) OR (auto_renew_mode IS NOT NULL))),
+    CONSTRAINT leases_late_fee_accrual_period_check CHECK ((late_fee_accrual_period = ANY (ARRAY['daily'::text, 'weekly'::text, 'monthly'::text]))),
+    CONSTRAINT leases_late_fee_accrual_type_check CHECK ((late_fee_accrual_type = ANY (ARRAY['flat'::text, 'percent_of_rent'::text]))),
+    CONSTRAINT leases_late_fee_cap_type_check CHECK ((late_fee_cap_type = ANY (ARRAY['flat'::text, 'percent_of_rent'::text]))),
+    CONSTRAINT leases_late_fee_initial_type_check CHECK ((late_fee_initial_type = ANY (ARRAY['flat'::text, 'percent_of_rent'::text]))),
+    CONSTRAINT leases_lease_source_check CHECK ((lease_source = ANY (ARRAY['esigned'::text, 'imported'::text]))),
+    CONSTRAINT leases_lease_type_check CHECK ((lease_type = ANY (ARRAY['month_to_month'::text, 'fixed_term'::text, 'nnn_commercial'::text]))),
+    CONSTRAINT leases_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'active'::text, 'expired'::text, 'terminated'::text]))),
+    CONSTRAINT leases_subleasing_allowed_check CHECK ((subleasing_allowed = ANY (ARRAY['prohibited'::text, 'with_consent'::text, 'allowed'::text])))
+);
+
+
+--
+-- Name: liability_insurance_policies; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.liability_insurance_policies (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    lease_id uuid NOT NULL,
+    carrier_name text,
+    policy_number text,
+    expiry_date date,
+    document_url text,
+    notes text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: maintenance_comments; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.maintenance_comments (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    request_id uuid NOT NULL,
+    user_id uuid,
+    role text,
+    message text NOT NULL,
+    is_internal boolean DEFAULT false,
+    created_at timestamp with time zone DEFAULT now()
+);
+
+
+--
+-- Name: maintenance_requests; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.maintenance_requests (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    unit_id uuid NOT NULL,
+    tenant_id uuid,
+    landlord_id uuid NOT NULL,
+    contractor_id uuid,
+    title text NOT NULL,
+    description text NOT NULL,
+    priority text DEFAULT 'normal'::text NOT NULL,
+    status text DEFAULT 'open'::text NOT NULL,
+    estimated_cost numeric(10,2),
+    actual_cost numeric(10,2),
+    platform_fee numeric(10,2),
+    scheduled_at timestamp with time zone,
+    completed_at timestamp with time zone,
+    photos text[] DEFAULT '{}'::text[],
+    tenant_notes text,
+    landlord_notes text,
+    created_at timestamp with time zone DEFAULT now(),
+    updated_at timestamp with time zone DEFAULT now(),
+    man_hours numeric(6,2),
+    assigned_at timestamp with time zone,
+    category text DEFAULT 'general'::text NOT NULL,
+    CONSTRAINT maintenance_requests_category_check CHECK ((category = ANY (ARRAY['general'::text, 'plumbing'::text, 'electrical'::text, 'hvac'::text, 'appliance'::text, 'landscape'::text, 'pest'::text, 'cleaning'::text, 'roofing'::text, 'structural'::text, 'pool'::text, 'locksmith'::text]))),
+    CONSTRAINT maintenance_requests_priority_check CHECK ((priority = ANY (ARRAY['emergency'::text, 'high'::text, 'normal'::text, 'low'::text]))),
+    CONSTRAINT maintenance_requests_status_check CHECK ((status = ANY (ARRAY['open'::text, 'awaiting_approval'::text, 'assigned'::text, 'in_progress'::text, 'completed'::text, 'cancelled'::text])))
+);
+
+
+--
+-- Name: maintenance_worker_scopes; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.maintenance_worker_scopes (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    user_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    property_ids uuid[] DEFAULT '{}'::uuid[] NOT NULL,
+    unit_ids uuid[] DEFAULT '{}'::uuid[] NOT NULL,
+    job_categories text[] DEFAULT '{}'::text[] NOT NULL,
+    all_properties boolean DEFAULT false NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    permissions jsonb DEFAULT '{}'::jsonb NOT NULL,
+    CONSTRAINT maintenance_worker_scopes_job_categories_check CHECK ((job_categories <@ ARRAY['general'::text, 'plumbing'::text, 'electrical'::text, 'hvac'::text, 'appliance'::text, 'landscape'::text, 'pest'::text, 'cleaning'::text, 'roofing'::text, 'structural'::text, 'pool'::text, 'locksmith'::text]))
+);
+
+
+--
+-- Name: mobile_homes; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.mobile_homes (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    current_owner_tenant_id uuid,
+    unit_id uuid,
+    year integer,
+    make text,
+    model text,
+    serial_number text,
+    hud_label_number text,
+    length_ft numeric(5,1),
+    width_ft numeric(5,1),
+    manufactured_date date,
+    removed_at timestamp with time zone,
+    removed_reason text,
+    notes text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: monthly_fee_accruals; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.monthly_fee_accruals (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    property_id uuid NOT NULL,
+    accrual_month date NOT NULL,
+    flat_monthly_fee numeric(10,2) DEFAULT 0,
+    per_unit_fee numeric(10,2) DEFAULT 0,
+    occupied_unit_count integer DEFAULT 0 NOT NULL,
+    total_amount numeric(10,2) NOT NULL,
+    manager_user_id uuid NOT NULL,
+    bank_account_id uuid,
+    ledger_entry_id uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT monthly_fee_accruals_first_of_month CHECK ((EXTRACT(day FROM accrual_month) = (1)::numeric))
+);
+
+
+--
+-- Name: notification_preferences; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.notification_preferences (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    user_id uuid NOT NULL,
+    type text NOT NULL,
+    email_enabled boolean DEFAULT true NOT NULL,
+    sms_enabled boolean DEFAULT false NOT NULL,
+    in_app_enabled boolean DEFAULT true NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: notifications; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.notifications (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    user_id uuid NOT NULL,
+    type text NOT NULL,
+    title text NOT NULL,
+    body text NOT NULL,
+    read boolean DEFAULT false,
+    action_url text,
+    created_at timestamp with time zone DEFAULT now(),
+    data jsonb,
+    landlord_id uuid,
+    read_at timestamp with time zone,
+    email_sent boolean DEFAULT false NOT NULL,
+    email_sent_at timestamp with time zone,
+    sms_sent boolean DEFAULT false NOT NULL,
+    sms_sent_at timestamp with time zone
+);
+
+
+--
+-- Name: onsite_manager_scopes; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.onsite_manager_scopes (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    user_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    property_ids uuid[] DEFAULT '{}'::uuid[] NOT NULL,
+    unit_ids uuid[] DEFAULT '{}'::uuid[] NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    permissions jsonb DEFAULT '{}'::jsonb NOT NULL,
+    all_properties boolean DEFAULT false NOT NULL
+);
+
+
+--
+-- Name: otp_advances; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.otp_advances (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    cycle_month date NOT NULL,
+    tenant_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    unit_id uuid NOT NULL,
+    lease_id uuid NOT NULL,
+    rent_amount numeric(10,2) NOT NULL,
+    fee_amount numeric(10,2) NOT NULL,
+    advance_amount numeric(10,2) NOT NULL,
+    status text DEFAULT 'pending'::text NOT NULL,
+    advance_payment_id uuid,
+    reconciled_with_payment_id uuid,
+    advanced_at timestamp with time zone,
+    reconciled_at timestamp with time zone,
+    defaulted_at timestamp with time zone,
+    default_reason text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    stripe_transfer_id text,
+    transfer_attempted_at timestamp with time zone,
+    transfer_error text,
+    CONSTRAINT otp_advances_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'advanced'::text, 'reconciled'::text, 'defaulted'::text])))
+);
+
+
+--
+-- Name: parts_inventory; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.parts_inventory (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    landlord_id uuid NOT NULL,
+    name text NOT NULL,
+    description text,
+    sku text,
+    quantity integer DEFAULT 0 NOT NULL,
+    min_quantity integer DEFAULT 0 NOT NULL,
+    unit text DEFAULT 'each'::text NOT NULL,
+    location text,
+    cost numeric(10,2),
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT parts_inventory_quantity_nonneg CHECK ((quantity >= 0))
+);
+
+
+--
+-- Name: payments; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.payments (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    unit_id uuid,
+    lease_id uuid,
+    tenant_id uuid,
+    landlord_id uuid NOT NULL,
+    type text NOT NULL,
+    amount numeric(10,2) NOT NULL,
+    status text DEFAULT 'pending'::text NOT NULL,
+    stripe_payment_intent_id text,
+    stripe_charge_id text,
+    ach_trace_number text,
+    entry_description text NOT NULL,
+    return_code text,
+    return_reason text,
+    zero_tolerance_flag boolean DEFAULT false,
+    due_date date NOT NULL,
+    processed_at timestamp with time zone,
+    settled_at timestamp with time zone,
+    retry_count integer DEFAULT 0,
+    notes text,
+    created_at timestamp with time zone DEFAULT now(),
+    lease_fee_id uuid,
+    invoice_id uuid,
+    next_retry_at timestamp with time zone,
+    last_retry_at timestamp with time zone,
+    platform_held boolean DEFAULT false NOT NULL,
+    sublease_credit_applied boolean DEFAULT false NOT NULL,
+    gam_supersedence_amount numeric(10,2) DEFAULT 0 NOT NULL,
+    gam_supersedence_breakdown jsonb,
+    gam_supersedence_applied_at timestamp with time zone,
+    import_source text,
+    imported_at timestamp with time zone,
+    import_extra_data jsonb,
+    CONSTRAINT payments_entry_description_check CHECK ((entry_description = ANY (ARRAY['RENT'::text, 'SUBSCRIP'::text, 'DEPOSIT'::text, 'UTILITY'::text, 'ONTIMEPAY'::text, 'LATEFEE'::text, 'FLEXPAY'::text]))),
+    CONSTRAINT payments_gam_supersedence_amount_nonneg CHECK ((gam_supersedence_amount >= (0)::numeric)),
+    CONSTRAINT payments_retry_count_check CHECK (((retry_count >= 0) AND (retry_count <= 2))),
+    CONSTRAINT payments_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'processing'::text, 'settled'::text, 'failed'::text, 'returned'::text, 'paid_via_deposit'::text]))),
+    CONSTRAINT payments_type_check CHECK ((type = ANY (ARRAY['rent'::text, 'fee'::text, 'deposit'::text, 'utility'::text, 'float_fee'::text, 'late_fee'::text, 'platform_fee'::text])))
+);
+
+
+--
+-- Name: COLUMN payments.gam_supersedence_amount; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.payments.gam_supersedence_amount IS 'S261: dollar amount of this payment redirected to satisfy older GAM-owed debts. Captured at PI creation, distributed FIFO on settlement.';
+
+
+--
+-- Name: COLUMN payments.gam_supersedence_breakdown; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.payments.gam_supersedence_breakdown IS 'S261: ordered FIFO list of which GAM debts this payment satisfied. Shape: [{source, ref_id, amount, satisfied_at}]. Source ∈ flexdeposit_installment | flexdeposit_acceleration | flexcharge_statement | flexpay_advance | custody_charge. NULL until applyTenantSupersedence runs.';
+
+
+--
+-- Name: COLUMN payments.gam_supersedence_applied_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.payments.gam_supersedence_applied_at IS 'S261: idempotency stamp — set once when applyTenantSupersedence completes for this payment. NULL means the boost has not yet been distributed.';
+
+
+--
+-- Name: COLUMN payments.import_source; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.payments.import_source IS 'Phase B: which prior platform brought this payment in via CSV import (buildium / appfolio / doorloop / yardi / rentmanager / propertyware / rentec / tenantcloud / generic). NULL = native GAM payment.';
+
+
+--
+-- Name: COLUMN payments.imported_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.payments.imported_at IS 'Phase B: timestamp the import commit ran. Distinct from settled_at (which carries the historical payment date from the source CSV).';
+
+
+--
+-- Name: payroll_run_lines; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.payroll_run_lines (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    run_id uuid NOT NULL,
+    employee_id uuid NOT NULL,
+    pay_type character varying(20) NOT NULL,
+    hours_worked numeric(8,2),
+    gross_pay numeric(10,2) NOT NULL,
+    federal_tax numeric(10,2) DEFAULT 0 NOT NULL,
+    state_tax numeric(10,2) DEFAULT 0 NOT NULL,
+    ss_tax numeric(10,2) DEFAULT 0 NOT NULL,
+    medicare_tax numeric(10,2) DEFAULT 0 NOT NULL,
+    other_deductions numeric(10,2) DEFAULT 0,
+    net_pay numeric(10,2) NOT NULL,
+    memo text,
+    created_at timestamp with time zone DEFAULT now()
+);
+
+
+--
+-- Name: payroll_runs; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.payroll_runs (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    landlord_id uuid,
+    period_start date NOT NULL,
+    period_end date NOT NULL,
+    pay_date date NOT NULL,
+    pay_frequency character varying(20) NOT NULL,
+    status character varying(20) DEFAULT 'draft'::character varying NOT NULL,
+    total_gross numeric(12,2) DEFAULT 0,
+    total_federal_tax numeric(12,2) DEFAULT 0,
+    total_state_tax numeric(12,2) DEFAULT 0,
+    total_ss numeric(12,2) DEFAULT 0,
+    total_medicare numeric(12,2) DEFAULT 0,
+    total_net numeric(12,2) DEFAULT 0,
+    employee_count integer DEFAULT 0,
+    notes text,
+    approved_at timestamp with time zone,
+    approved_by uuid,
+    voided_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now(),
+    updated_at timestamp with time zone DEFAULT now()
+);
+
+
+--
+-- Name: pending_tenant_intents; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pending_tenant_intents (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    landlord_id uuid NOT NULL,
+    tenant_id uuid NOT NULL,
+    parser_status text DEFAULT 'not_uploaded'::text NOT NULL,
+    imported_pdf_url text,
+    parser_output jsonb,
+    parser_flags jsonb,
+    parser_error text,
+    parser_started_at timestamp with time zone,
+    parser_finished_at timestamp with time zone,
+    resolved_at timestamp with time zone,
+    resolved_lease_id uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT pending_tenant_intents_parser_status_check CHECK ((parser_status = ANY (ARRAY['not_uploaded'::text, 'parsing'::text, 'parsed'::text, 'mismatch'::text, 'error'::text, 'resolved'::text])))
+);
+
+
+--
+-- Name: platform_announcements; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.platform_announcements (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    title text NOT NULL,
+    body text,
+    priority text DEFAULT 'info'::text NOT NULL,
+    active boolean DEFAULT true NOT NULL,
+    expires_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT platform_announcements_priority_check CHECK ((priority = ANY (ARRAY['info'::text, 'warning'::text, 'critical'::text])))
+);
+
+
+--
+-- Name: platform_claim_promotions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.platform_claim_promotions (
+    normalized_name text NOT NULL,
+    promoted_at timestamp with time zone DEFAULT now() NOT NULL,
+    promoted_by uuid,
+    notes text,
+    example_raw_name text
+);
+
+
+--
+-- Name: platform_events; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.platform_events (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    subject_type text NOT NULL,
+    subject_id uuid NOT NULL,
+    event_type text NOT NULL,
+    actor_user_id uuid,
+    payload jsonb DEFAULT '{}'::jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT platform_events_event_type_check CHECK ((event_type = ANY (ARRAY['invitation.created'::text, 'invitation.resent'::text, 'invitation.viewed'::text, 'invitation.accepted'::text, 'invitation.expired'::text, 'invitation.revoked'::text]))),
+    CONSTRAINT platform_events_subject_type_check CHECK ((subject_type = 'invitation'::text))
+);
+
+
+--
+-- Name: platform_fee_accruals; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.platform_fee_accruals (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    landlord_id uuid NOT NULL,
+    property_id uuid NOT NULL,
+    accrual_month date NOT NULL,
+    long_term_unit_count integer DEFAULT 0 NOT NULL,
+    short_stay_nights integer DEFAULT 0 NOT NULL,
+    short_stay_equivalent integer DEFAULT 0 NOT NULL,
+    total_billable integer DEFAULT 0 NOT NULL,
+    rate_per_unit numeric(10,2) NOT NULL,
+    min_per_property numeric(10,2) NOT NULL,
+    total_amount numeric(10,2) NOT NULL,
+    payer text NOT NULL,
+    platform_revenue_ledger_id uuid,
+    tenant_charge_id uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT platform_fee_accruals_payer_check CHECK ((payer = ANY (ARRAY['landlord'::text, 'tenant'::text])))
+);
+
+
+--
+-- Name: platform_fee_config; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.platform_fee_config (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    rate_per_unit numeric(10,2) DEFAULT 2.00 NOT NULL,
+    min_per_property numeric(10,2) DEFAULT 10.00 NOT NULL,
+    effective_from date DEFAULT CURRENT_DATE NOT NULL,
+    effective_until date,
+    set_by_user_id uuid,
+    notes text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT platform_fee_config_effective_range CHECK (((effective_until IS NULL) OR (effective_until > effective_from))),
+    CONSTRAINT platform_fee_config_min_nonneg CHECK ((min_per_property >= (0)::numeric)),
+    CONSTRAINT platform_fee_config_rate_nonneg CHECK ((rate_per_unit >= (0)::numeric))
+);
+
+
+--
+-- Name: platform_processing_rates; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.platform_processing_rates (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    payment_method text NOT NULL,
+    customer_facing_flat numeric(10,4),
+    customer_facing_percent numeric(6,4),
+    stripe_cost_flat numeric(10,4),
+    stripe_cost_percent numeric(6,4),
+    effective_from timestamp with time zone DEFAULT now() NOT NULL,
+    effective_until timestamp with time zone,
+    notes text,
+    created_at timestamp with time zone DEFAULT now(),
+    CONSTRAINT platform_processing_rates_effective_window_check CHECK (((effective_until IS NULL) OR (effective_until > effective_from))),
+    CONSTRAINT platform_processing_rates_payment_method_check CHECK ((payment_method = ANY (ARRAY['ach'::text, 'card'::text])))
+);
+
+
+--
+-- Name: platform_revenue_ledger; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.platform_revenue_ledger (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    type text NOT NULL,
+    amount numeric(10,2) NOT NULL,
+    balance_after numeric(10,2) NOT NULL,
+    reference_id uuid,
+    reference_type text,
+    property_id uuid,
+    notes text,
+    created_at timestamp with time zone DEFAULT now(),
+    CONSTRAINT platform_revenue_ledger_type_check CHECK ((type = ANY (ARRAY['banking_spread'::text, 'manual_withdrawal_fee'::text, 'placement_fee_share'::text, 'platform_fee_subscription'::text, 'adjustment'::text])))
+);
+
+
+--
+-- Name: platform_review_status; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.platform_review_status (
+    platform_key text NOT NULL,
+    import_type text NOT NULL,
+    mapping_status text DEFAULT 'unverified'::text NOT NULL,
+    verified_at timestamp with time zone,
+    verified_by uuid,
+    notes text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT platform_review_status_import_type_check CHECK ((import_type = ANY (ARRAY['tenant'::text, 'property'::text, 'payment'::text]))),
+    CONSTRAINT platform_review_status_mapping_status_check CHECK ((mapping_status = ANY (ARRAY['unverified'::text, 'verified'::text])))
+);
+
+
+--
+-- Name: pm_companies; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pm_companies (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    name text NOT NULL,
+    business_email text,
+    business_phone text,
+    business_street1 text,
+    business_city text,
+    business_state text,
+    business_zip text,
+    ein text,
+    bank_account_id uuid,
+    status text DEFAULT 'active'::text NOT NULL,
+    created_by_user_id uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    stripe_connect_account_id text,
+    stripe_connect_status_synced_at timestamp with time zone,
+    connect_charges_enabled boolean DEFAULT false NOT NULL,
+    connect_payouts_enabled boolean DEFAULT false NOT NULL,
+    connect_details_submitted boolean DEFAULT false NOT NULL,
+    CONSTRAINT pm_companies_status_check CHECK ((status = ANY (ARRAY['active'::text, 'inactive'::text, 'suspended'::text])))
+);
+
+
+--
+-- Name: pm_fee_plans; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pm_fee_plans (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    pm_company_id uuid NOT NULL,
+    name text NOT NULL,
+    fee_type text NOT NULL,
+    percent numeric(5,2),
+    flat_amount numeric(10,2),
+    floor_amount numeric(10,2),
+    ceiling_amount numeric(10,2),
+    leasing_fee_amount numeric(10,2),
+    maintenance_markup_pct numeric(5,2),
+    status text DEFAULT 'active'::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT pm_fee_plans_fee_type_check CHECK ((fee_type = ANY (ARRAY['percent_of_rent'::text, 'flat_monthly'::text, 'percent_with_floor'::text, 'percent_with_ceiling'::text, 'per_unit'::text, 'leasing_fee'::text, 'maintenance_markup_pct'::text]))),
+    CONSTRAINT pm_fee_plans_floor_ceiling CHECK (((floor_amount IS NULL) OR (ceiling_amount IS NULL) OR (floor_amount <= ceiling_amount))),
+    CONSTRAINT pm_fee_plans_markup_range CHECK (((maintenance_markup_pct IS NULL) OR ((maintenance_markup_pct >= (0)::numeric) AND (maintenance_markup_pct <= (100)::numeric)))),
+    CONSTRAINT pm_fee_plans_percent_range CHECK (((percent IS NULL) OR ((percent >= (0)::numeric) AND (percent <= (100)::numeric)))),
+    CONSTRAINT pm_fee_plans_status_check CHECK ((status = ANY (ARRAY['active'::text, 'inactive'::text, 'deprecated'::text])))
+);
+
+
+--
+-- Name: pm_invitations; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pm_invitations (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    pm_company_id uuid NOT NULL,
+    email text NOT NULL,
+    role text DEFAULT 'staff'::text NOT NULL,
+    permissions jsonb DEFAULT '{}'::jsonb NOT NULL,
+    invited_by_user_id uuid NOT NULL,
+    status text DEFAULT 'pending'::text NOT NULL,
+    token text NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    accepted_at timestamp with time zone,
+    accepted_user_id uuid,
+    revoked_at timestamp with time zone,
+    revoked_by_user_id uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT pm_invitations_role_check CHECK ((role = ANY (ARRAY['owner'::text, 'manager'::text, 'staff'::text]))),
+    CONSTRAINT pm_invitations_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'accepted'::text, 'expired'::text, 'revoked'::text])))
+);
+
+
+--
+-- Name: pm_monthly_fee_accruals; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pm_monthly_fee_accruals (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    property_id uuid NOT NULL,
+    pm_company_id uuid NOT NULL,
+    pm_fee_plan_id uuid NOT NULL,
+    accrual_month date NOT NULL,
+    fee_type text NOT NULL,
+    flat_amount numeric(10,2),
+    per_unit_amount numeric(10,2),
+    occupied_unit_count integer DEFAULT 0 NOT NULL,
+    total_amount numeric(10,2) NOT NULL,
+    pm_payout_user_id uuid NOT NULL,
+    bank_account_id uuid,
+    ledger_entry_id uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT pm_monthly_fee_accruals_fee_type_check CHECK ((fee_type = ANY (ARRAY['flat_monthly'::text, 'per_unit'::text])))
+);
+
+
+--
+-- Name: pm_property_invitations; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pm_property_invitations (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    direction text NOT NULL,
+    pm_company_id uuid NOT NULL,
+    property_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    invited_email text NOT NULL,
+    invited_by_user_id uuid NOT NULL,
+    proposed_scope text DEFAULT 'manage'::text NOT NULL,
+    proposed_fee_plan_id uuid,
+    token text NOT NULL,
+    status text DEFAULT 'pending'::text NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    accepted_at timestamp with time zone,
+    accepted_user_id uuid,
+    rejected_at timestamp with time zone,
+    rejected_reason text,
+    revoked_at timestamp with time zone,
+    revoked_by_user_id uuid,
+    replaced_pm_company_id uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT pm_property_invitations_direction_check CHECK ((direction = ANY (ARRAY['owner_to_pm'::text, 'pm_to_owner'::text]))),
+    CONSTRAINT pm_property_invitations_scope_check CHECK ((proposed_scope = ANY (ARRAY['manage'::text, 'view'::text]))),
+    CONSTRAINT pm_property_invitations_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'accepted'::text, 'rejected'::text, 'expired'::text, 'revoked'::text])))
+);
+
+
+--
+-- Name: pm_staff; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pm_staff (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    pm_company_id uuid NOT NULL,
+    user_id uuid NOT NULL,
+    role text DEFAULT 'staff'::text NOT NULL,
+    permissions jsonb DEFAULT '{}'::jsonb NOT NULL,
+    status text DEFAULT 'active'::text NOT NULL,
+    invited_by_user_id uuid,
+    joined_at timestamp with time zone,
+    removed_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT pm_staff_role_check CHECK ((role = ANY (ARRAY['owner'::text, 'manager'::text, 'staff'::text]))),
+    CONSTRAINT pm_staff_status_check CHECK ((status = ANY (ARRAY['active'::text, 'inactive'::text, 'removed'::text])))
+);
+
+
+--
+-- Name: pool_match_requests; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pool_match_requests (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    pool_entry_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    unit_id uuid,
+    status text DEFAULT 'pending'::text NOT NULL,
+    landlord_message text,
+    tenant_response text,
+    payment_intent_id text,
+    report_fee_paid boolean DEFAULT false NOT NULL,
+    requested_at timestamp with time zone DEFAULT now() NOT NULL,
+    responded_at timestamp with time zone,
+    purchased_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT pool_match_requests_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'interested'::text, 'not_interested'::text, 'report_purchased'::text, 'expired'::text])))
+);
+
+
+--
+-- Name: pos_categories; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pos_categories (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    landlord_id uuid NOT NULL,
+    name text NOT NULL,
+    icon text,
+    sort_order integer DEFAULT 0 NOT NULL,
+    is_active boolean DEFAULT true NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    property_id uuid
+);
+
+
+--
+-- Name: COLUMN pos_categories.property_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.pos_categories.property_id IS 'Property this category applies at. NULL = landlord-wide (default; legacy posture). Property-scoped categories only appear in dropdowns at that property — landlord-wide categories appear everywhere.';
+
+
+--
+-- Name: pos_customer_invitations; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pos_customer_invitations (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    token text NOT NULL,
+    pos_customer_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    status text DEFAULT 'sent'::text NOT NULL,
+    setup_intent_id text,
+    accepted_at timestamp with time zone,
+    cancelled_at timestamp with time zone,
+    expires_at timestamp with time zone NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT pos_customer_invitations_status_check CHECK ((status = ANY (ARRAY['sent'::text, 'in_progress'::text, 'accepted'::text, 'expired'::text, 'cancelled'::text])))
+);
+
+
+--
+-- Name: pos_customers; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pos_customers (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    landlord_id uuid NOT NULL,
+    first_name text NOT NULL,
+    last_name text NOT NULL,
+    email text NOT NULL,
+    phone text,
+    stripe_customer_id text,
+    ach_verified boolean DEFAULT false NOT NULL,
+    bank_last4 text,
+    notes text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    archived_at timestamp with time zone
+);
+
+
+--
+-- Name: pos_discounts; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pos_discounts (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    landlord_id uuid NOT NULL,
+    name text NOT NULL,
+    type text NOT NULL,
+    value numeric(10,2) NOT NULL,
+    code text,
+    is_active boolean DEFAULT true NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT pos_discounts_type_check CHECK ((type = ANY (ARRAY['percent'::text, 'fixed'::text, 'bogo'::text, 'other'::text])))
+);
+
+
+--
+-- Name: pos_eod_settlements; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pos_eod_settlements (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    landlord_id uuid NOT NULL,
+    business_day date NOT NULL,
+    cash_sales numeric(12,2) DEFAULT 0 NOT NULL,
+    card_sales numeric(12,2) DEFAULT 0 NOT NULL,
+    charge_sales numeric(12,2) DEFAULT 0 NOT NULL,
+    cash_refunds numeric(12,2) DEFAULT 0 NOT NULL,
+    card_refunds numeric(12,2) DEFAULT 0 NOT NULL,
+    charge_refunds numeric(12,2) DEFAULT 0 NOT NULL,
+    tax_collected numeric(12,2) DEFAULT 0 NOT NULL,
+    surcharge_collected numeric(12,2) DEFAULT 0 NOT NULL,
+    platform_fee_total numeric(12,2) DEFAULT 0 NOT NULL,
+    tx_count integer DEFAULT 0 NOT NULL,
+    refund_count integer DEFAULT 0 NOT NULL,
+    voided_count integer DEFAULT 0 NOT NULL,
+    opening_float numeric(10,2) DEFAULT 0 NOT NULL,
+    cash_drawer_actual numeric(10,2),
+    cash_drawer_expected numeric(10,2) GENERATED ALWAYS AS (((opening_float + cash_sales) - cash_refunds)) STORED,
+    cash_drawer_variance numeric(10,2) GENERATED ALWAYS AS ((cash_drawer_actual - ((opening_float + cash_sales) - cash_refunds))) STORED,
+    status text DEFAULT 'auto_closed'::text NOT NULL,
+    closed_at timestamp with time zone DEFAULT now() NOT NULL,
+    closed_by uuid,
+    notes text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    check_refunds numeric(12,2) DEFAULT 0 NOT NULL,
+    CONSTRAINT pos_eod_settlements_status_check CHECK ((status = ANY (ARRAY['auto_closed'::text, 'manually_closed'::text, 'reopened'::text])))
+);
+
+
+--
+-- Name: pos_inventory_log; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pos_inventory_log (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    item_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    change_qty integer NOT NULL,
+    reason text NOT NULL,
+    notes text,
+    reference_id uuid,
+    stock_before integer NOT NULL,
+    stock_after integer NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT pos_inventory_log_reason_check CHECK ((reason = ANY (ARRAY['adjustment'::text, 'sale'::text, 'po_received'::text, 'return'::text, 'manual'::text, 'other'::text])))
+);
+
+
+--
+-- Name: pos_item_variants; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pos_item_variants (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    item_id uuid NOT NULL,
+    name text NOT NULL,
+    cost_price numeric(10,2) DEFAULT 0 NOT NULL,
+    sell_price numeric(10,2) NOT NULL,
+    stock_qty integer DEFAULT 0 NOT NULL,
+    stock_min integer DEFAULT 5 NOT NULL,
+    sort_order integer DEFAULT 0 NOT NULL,
+    is_active boolean DEFAULT true NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT pos_item_variants_stock_qty_nonneg CHECK ((stock_qty >= 0))
+);
+
+
+--
+-- Name: pos_items; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pos_items (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    landlord_id uuid NOT NULL,
+    name text NOT NULL,
+    icon text,
+    cost_price numeric(10,2) DEFAULT 0 NOT NULL,
+    sell_price numeric(10,2) NOT NULL,
+    margin_pct numeric(6,2),
+    tax_rate numeric(5,4) DEFAULT 0 NOT NULL,
+    charge_eligible boolean DEFAULT true NOT NULL,
+    stock_qty integer DEFAULT 0 NOT NULL,
+    stock_min integer DEFAULT 0 NOT NULL,
+    stock_max integer DEFAULT 0 NOT NULL,
+    vendor_id uuid,
+    shelf_label_enabled boolean DEFAULT true NOT NULL,
+    has_variants boolean DEFAULT false NOT NULL,
+    is_active boolean DEFAULT true NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    property_id uuid NOT NULL,
+    category_id uuid NOT NULL,
+    CONSTRAINT pos_items_stock_qty_nonneg CHECK ((stock_qty >= 0))
+);
+
+
+--
+-- Name: COLUMN pos_items.property_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.pos_items.property_id IS 'Property this POS item belongs to. NOT NULL post-S241 — per-property is the v1 posture (different LLC operators per property is common). Low-stock notifications route via the property''s responsible party (per services/responsibleParty.ts).';
+
+
+--
+-- Name: pos_price_history; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pos_price_history (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    item_id uuid NOT NULL,
+    old_price numeric(10,2),
+    new_price numeric(10,2),
+    old_cost numeric(10,2),
+    new_cost numeric(10,2),
+    changed_by uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: pos_purchase_order_items; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pos_purchase_order_items (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    po_id uuid NOT NULL,
+    item_id uuid,
+    item_name text NOT NULL,
+    qty_ordered numeric(10,3) NOT NULL,
+    unit_cost numeric(10,2) NOT NULL,
+    subtotal numeric(10,2) NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT pos_purchase_order_items_qty_ordered_pos CHECK ((qty_ordered > (0)::numeric))
+);
+
+
+--
+-- Name: pos_purchase_orders; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pos_purchase_orders (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    landlord_id uuid NOT NULL,
+    vendor_id uuid NOT NULL,
+    status text DEFAULT 'draft'::text NOT NULL,
+    po_number text NOT NULL,
+    notes text,
+    expected_date date,
+    subtotal numeric(10,2) DEFAULT 0 NOT NULL,
+    approved_at timestamp with time zone,
+    sent_at timestamp with time zone,
+    received_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT pos_purchase_orders_status_check CHECK ((status = ANY (ARRAY['draft'::text, 'approved'::text, 'sent'::text, 'received'::text, 'cancelled'::text])))
+);
+
+
+--
+-- Name: pos_refunds; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pos_refunds (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    transaction_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    amount numeric(10,2) NOT NULL,
+    reason text,
+    items jsonb,
+    refund_method text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT pos_refunds_method_check CHECK ((refund_method = ANY (ARRAY['cash'::text, 'check'::text, 'charge'::text])))
+);
+
+
+--
+-- Name: pos_session_items; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pos_session_items (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    session_id uuid NOT NULL,
+    item_id uuid,
+    item_variant_id uuid,
+    item_name text NOT NULL,
+    item_category text,
+    qty numeric(10,3) NOT NULL,
+    unit_price numeric(10,2) NOT NULL,
+    cost_price numeric(10,2) DEFAULT 0 NOT NULL,
+    tax_rate numeric(5,4) DEFAULT 0 NOT NULL,
+    discount_amount numeric(10,2) DEFAULT 0 NOT NULL,
+    subtotal numeric(10,2) NOT NULL,
+    notes text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT pos_session_items_amounts_nonneg CHECK (((unit_price >= (0)::numeric) AND (cost_price >= (0)::numeric) AND (tax_rate >= (0)::numeric) AND (discount_amount >= (0)::numeric) AND (subtotal >= (0)::numeric))),
+    CONSTRAINT pos_session_items_qty_pos CHECK ((qty > (0)::numeric))
+);
+
+
+--
+-- Name: TABLE pos_session_items; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.pos_session_items IS 'S263: line items on an open POS session. Shape mirrors pos_transaction_items so checkout can copy them across cleanly. item_id can be NULL for ad-hoc / non-catalog items.';
+
+
+--
+-- Name: pos_sessions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pos_sessions (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    property_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    opened_by_user_id uuid NOT NULL,
+    pos_customer_id uuid,
+    tenant_id uuid,
+    status text DEFAULT 'open'::text NOT NULL,
+    subtotal numeric(10,2) DEFAULT 0 NOT NULL,
+    tax_amount numeric(10,2) DEFAULT 0 NOT NULL,
+    discount_amount numeric(10,2) DEFAULT 0 NOT NULL,
+    total numeric(10,2) DEFAULT 0 NOT NULL,
+    notes text,
+    opened_at timestamp with time zone DEFAULT now() NOT NULL,
+    closed_at timestamp with time zone,
+    completed_transaction_id uuid,
+    void_reason text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT pos_sessions_amounts_nonneg CHECK (((subtotal >= (0)::numeric) AND (tax_amount >= (0)::numeric) AND (discount_amount >= (0)::numeric) AND (total >= (0)::numeric))),
+    CONSTRAINT pos_sessions_customer_xor CHECK ((NOT ((pos_customer_id IS NOT NULL) AND (tenant_id IS NOT NULL)))),
+    CONSTRAINT pos_sessions_status_check CHECK ((status = ANY (ARRAY['open'::text, 'completed'::text, 'voided'::text])))
+);
+
+
+--
+-- Name: TABLE pos_sessions; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.pos_sessions IS 'S263: server-of-record cart state for POS terminals. Replaces the client-side useState cart on apps/pos.';
+
+
+--
+-- Name: COLUMN pos_sessions.pos_customer_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.pos_sessions.pos_customer_id IS 'S263: optional FK to pos_customers.id when the session is for a known POS customer.';
+
+
+--
+-- Name: COLUMN pos_sessions.tenant_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.pos_sessions.tenant_id IS 'S263: optional FK to tenants.id when the session is for a tenant (e.g., FlexCharge tab).';
+
+
+--
+-- Name: COLUMN pos_sessions.completed_transaction_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.pos_sessions.completed_transaction_id IS 'S263: FK to pos_transactions.id once /checkout fires. NULL while open.';
+
+
+--
+-- Name: pos_tax_rates; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pos_tax_rates (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    landlord_id uuid NOT NULL,
+    name text NOT NULL,
+    rate numeric(7,4) NOT NULL,
+    tax_type text NOT NULL,
+    applies_to text[] DEFAULT ARRAY['all'::text] NOT NULL,
+    is_active boolean DEFAULT true NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    property_id uuid
+);
+
+
+--
+-- Name: COLUMN pos_tax_rates.property_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.pos_tax_rates.property_id IS 'Property this tax rate applies at. NULL = landlord-wide (legacy posture). Forward-looking: wire cart math to filter applicable rates by the property the sale is recorded at.';
+
+
+--
+-- Name: pos_terminal_readers; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pos_terminal_readers (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    landlord_id uuid NOT NULL,
+    property_id uuid NOT NULL,
+    stripe_reader_id text NOT NULL,
+    nickname text NOT NULL,
+    status text DEFAULT 'active'::text NOT NULL,
+    registered_at timestamp with time zone DEFAULT now() NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT pos_terminal_readers_status_check CHECK ((status = ANY (ARRAY['active'::text, 'archived'::text])))
+);
+
+
+--
+-- Name: pos_transaction_items; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pos_transaction_items (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    transaction_id uuid NOT NULL,
+    item_id uuid,
+    item_name text NOT NULL,
+    item_category text,
+    qty numeric(10,3) NOT NULL,
+    unit_price numeric(10,2) NOT NULL,
+    cost_price numeric(10,2) DEFAULT 0 NOT NULL,
+    tax_rate numeric(5,4) DEFAULT 0 NOT NULL,
+    subtotal numeric(10,2) NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT pos_transaction_items_qty_pos CHECK ((qty > (0)::numeric))
+);
+
+
+--
+-- Name: pos_transactions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pos_transactions (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    landlord_id uuid NOT NULL,
+    tenant_id uuid,
+    cashier_id uuid NOT NULL,
+    payment_method text NOT NULL,
+    subtotal numeric(10,2) NOT NULL,
+    tax_amount numeric(10,2) DEFAULT 0 NOT NULL,
+    surcharge numeric(10,2) DEFAULT 0 NOT NULL,
+    total numeric(10,2) NOT NULL,
+    change_given numeric(10,2) DEFAULT 0 NOT NULL,
+    platform_fee numeric(10,2) DEFAULT 0 NOT NULL,
+    status text DEFAULT 'completed'::text NOT NULL,
+    refund_amount numeric(10,2) DEFAULT 0 NOT NULL,
+    refunded_at timestamp with time zone,
+    void_reason text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    stripe_payment_intent_id text,
+    pos_customer_id uuid,
+    CONSTRAINT pos_transactions_payment_method_check CHECK ((payment_method = ANY (ARRAY['cash'::text, 'card'::text, 'charge'::text]))),
+    CONSTRAINT pos_transactions_status_check CHECK ((status = ANY (ARRAY['completed'::text, 'refunded'::text, 'partial_refund'::text, 'voided'::text])))
+);
+
+
+--
+-- Name: pos_vendors; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pos_vendors (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    landlord_id uuid NOT NULL,
+    name text NOT NULL,
+    contact_name text,
+    email text,
+    phone text,
+    address text,
+    lead_time_days integer DEFAULT 3 NOT NULL,
+    notes text,
+    is_active boolean DEFAULT true NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: properties; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.properties (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    landlord_id uuid NOT NULL,
+    name text NOT NULL,
+    street1 text NOT NULL,
+    street2 text,
+    city text NOT NULL,
+    state text NOT NULL,
+    zip text NOT NULL,
+    type text DEFAULT 'mixed'::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now(),
+    updated_at timestamp with time zone DEFAULT now(),
+    unit_types text[] DEFAULT '{}'::text[],
+    review_status text DEFAULT 'active'::text NOT NULL,
+    timezone text DEFAULT 'America/Phoenix'::text NOT NULL,
+    late_fee_enabled boolean DEFAULT true NOT NULL,
+    late_fee_grace_days integer DEFAULT 5 NOT NULL,
+    late_fee_initial_amount numeric DEFAULT 15.00 NOT NULL,
+    late_fee_initial_type text DEFAULT 'flat'::text NOT NULL,
+    late_fee_accrual_amount numeric,
+    late_fee_accrual_type text,
+    late_fee_accrual_period text,
+    late_fee_cap_amount numeric,
+    late_fee_cap_type text,
+    deposit_handling_mode text DEFAULT 'landlord_held'::text NOT NULL,
+    deposit_interest_rate_annual numeric,
+    deposit_interest_accrual_method text,
+    deposit_interest_payment_cadence text,
+    owner_user_id uuid NOT NULL,
+    managed_by_user_id uuid NOT NULL,
+    pm_company_id uuid,
+    pm_fee_plan_id uuid,
+    requires_booking_acknowledgment boolean DEFAULT false NOT NULL,
+    subleasing_allowed boolean DEFAULT false NOT NULL,
+    sublease_agreement_template_url text,
+    flex_charge_default_credit_limit numeric(10,2) DEFAULT 500.00 NOT NULL,
+    flexcharge_enabled boolean DEFAULT false NOT NULL,
+    CONSTRAINT properties_deposit_handling_mode_check CHECK ((deposit_handling_mode = ANY (ARRAY['gam_escrow'::text, 'landlord_held'::text]))),
+    CONSTRAINT properties_deposit_interest_accrual_method_check CHECK ((deposit_interest_accrual_method = ANY (ARRAY['simple'::text, 'compound'::text]))),
+    CONSTRAINT properties_deposit_interest_payment_cadence_check CHECK ((deposit_interest_payment_cadence = ANY (ARRAY['annual'::text, 'at_return'::text, 'on_anniversary'::text]))),
+    CONSTRAINT properties_late_fee_accrual_period_check CHECK ((late_fee_accrual_period = ANY (ARRAY['daily'::text, 'weekly'::text, 'monthly'::text]))),
+    CONSTRAINT properties_late_fee_accrual_type_check CHECK ((late_fee_accrual_type = ANY (ARRAY['flat'::text, 'percent_of_rent'::text]))),
+    CONSTRAINT properties_late_fee_cap_type_check CHECK ((late_fee_cap_type = ANY (ARRAY['flat'::text, 'percent_of_rent'::text]))),
+    CONSTRAINT properties_late_fee_initial_type_check CHECK ((late_fee_initial_type = ANY (ARRAY['flat'::text, 'percent_of_rent'::text]))),
+    CONSTRAINT properties_review_status_check CHECK ((review_status = ANY (ARRAY['active'::text, 'pending_review'::text, 'rejected'::text])))
+);
+
+
+--
+-- Name: COLUMN properties.requires_booking_acknowledgment; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.properties.requires_booking_acknowledgment IS 'When true, bookings on this property require landlord/staff to mark acknowledged after collecting signature on property-rules doc.';
+
+
+--
+-- Name: COLUMN properties.flexcharge_enabled; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.properties.flexcharge_enabled IS 'S309: per-Location FlexCharge enablement gate. When FALSE (default), createFlexChargeAccount rejects new accounts at this property with a 403 and the landlord-side create UI hides the property from the dropdown. Existing flex_charge_accounts continue to function regardless of this flag — the gate applies to NEW account creation only.';
+
+
+--
+-- Name: property_allocation_rules; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.property_allocation_rules (
+    property_id uuid NOT NULL,
+    rent_percent numeric(5,2),
+    rent_percent_floor numeric(10,2),
+    rent_percent_ceiling numeric(10,2),
+    flat_monthly_fee numeric(10,2),
+    per_unit_fee numeric(10,2),
+    placement_fee_type text,
+    placement_fee_value numeric(10,2),
+    maintenance_markup_percent numeric(5,2),
+    created_at timestamp with time zone DEFAULT now(),
+    updated_at timestamp with time zone DEFAULT now(),
+    owner_bank_account_id uuid,
+    ach_fee_payer text NOT NULL,
+    card_fee_payer text NOT NULL,
+    platform_fee_payer text DEFAULT 'landlord'::text NOT NULL,
+    CONSTRAINT property_allocation_rules_ach_fee_payer_check CHECK ((ach_fee_payer = ANY (ARRAY['landlord'::text, 'tenant'::text]))),
+    CONSTRAINT property_allocation_rules_card_fee_payer_check CHECK ((card_fee_payer = ANY (ARRAY['landlord'::text, 'tenant'::text]))),
+    CONSTRAINT property_allocation_rules_placement_fee_paired CHECK (((placement_fee_type IS NULL) = (placement_fee_value IS NULL))),
+    CONSTRAINT property_allocation_rules_placement_fee_type_check CHECK (((placement_fee_type IS NULL) OR (placement_fee_type = ANY (ARRAY['flat'::text, 'percent_of_first_month'::text])))),
+    CONSTRAINT property_allocation_rules_platform_fee_payer_check CHECK ((platform_fee_payer = ANY (ARRAY['landlord'::text, 'tenant'::text])))
+);
+
+
+--
+-- Name: property_duplicate_flags; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.property_duplicate_flags (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    property_id uuid NOT NULL,
+    conflicting_property_id uuid NOT NULL,
+    reason text DEFAULT 'duplicate_address'::text NOT NULL,
+    normalized_key text,
+    detected_at timestamp with time zone DEFAULT now() NOT NULL,
+    resolved_at timestamp with time zone,
+    resolved_by uuid,
+    resolution text,
+    notes text,
+    CONSTRAINT property_duplicate_flags_resolution_check CHECK ((resolution = ANY (ARRAY['approved_separate'::text, 'merged'::text, 'rejected'::text])))
+);
+
+
+--
+-- Name: property_fee_schedules; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.property_fee_schedules (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    property_id uuid NOT NULL,
+    fee_type text NOT NULL,
+    slot_index integer DEFAULT 0 NOT NULL,
+    description text,
+    amount numeric(10,2) NOT NULL,
+    is_refundable boolean NOT NULL,
+    due_timing text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT property_fee_schedules_amount_check CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT property_fee_schedules_due_timing_check CHECK ((due_timing = ANY (ARRAY['move_in'::text, 'monthly_ongoing'::text, 'move_out'::text, 'other'::text]))),
+    CONSTRAINT property_fee_schedules_fee_type_check CHECK ((fee_type = ANY (ARRAY['security_deposit'::text, 'pet_deposit'::text, 'key_deposit'::text, 'cleaning_deposit'::text, 'move_in_fee'::text, 'cleaning_fee'::text, 'pet_fee'::text, 'application_fee'::text, 'amenity_fee'::text, 'hoa_transfer_fee'::text, 'lease_prep_fee'::text, 'pet_rent'::text, 'parking_rent'::text, 'storage_rent'::text, 'amenity_fee_monthly'::text, 'trash_fee'::text, 'pest_control_fee'::text, 'technology_fee'::text, 'last_month_rent'::text, 'early_termination_fee'::text, 'other_fee'::text]))),
+    CONSTRAINT property_fee_schedules_slot_index_check CHECK ((slot_index >= 0))
+);
+
+
+--
+-- Name: property_manager_scopes; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.property_manager_scopes (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    user_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    property_ids uuid[] DEFAULT '{}'::uuid[] NOT NULL,
+    unit_ids uuid[] DEFAULT '{}'::uuid[] NOT NULL,
+    all_properties boolean DEFAULT false NOT NULL,
+    maint_approval_ceiling_cents integer,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    permissions jsonb DEFAULT '{}'::jsonb NOT NULL,
+    direct_deposit_enabled boolean DEFAULT false NOT NULL
+);
+
+
+--
+-- Name: purchase_requests; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.purchase_requests (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    landlord_id uuid NOT NULL,
+    requested_by uuid NOT NULL,
+    approved_by uuid,
+    approved_at timestamp with time zone,
+    work_order_id uuid,
+    items jsonb DEFAULT '[]'::jsonb NOT NULL,
+    notes text,
+    total_estimate numeric(10,2),
+    budget_limit numeric(10,2),
+    status text DEFAULT 'pending'::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT purchase_requests_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'approved'::text, 'denied'::text])))
+);
+
+
+--
+-- Name: reserve_fund_ledger; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.reserve_fund_ledger (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    type text NOT NULL,
+    amount numeric(10,2) NOT NULL,
+    balance_after numeric(10,2) NOT NULL,
+    reference_id uuid,
+    notes text,
+    created_at timestamp with time zone DEFAULT now(),
+    CONSTRAINT reserve_fund_ledger_type_check CHECK ((type = ANY (ARRAY['contribution'::text, 'disbursement_cover'::text, 'replenishment'::text, 'interest'::text, 'adjustment'::text])))
+);
+
+
+--
+-- Name: reserve_fund_state; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.reserve_fund_state (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    balance numeric(10,2) DEFAULT 0 NOT NULL,
+    target_balance numeric(10,2) DEFAULT 0 NOT NULL,
+    phase integer DEFAULT 1 NOT NULL,
+    reserve_rate numeric(5,4) DEFAULT 1.00 NOT NULL,
+    monthly_contribution numeric(10,2) DEFAULT 0,
+    updated_at timestamp with time zone DEFAULT now(),
+    CONSTRAINT reserve_fund_state_phase_check CHECK ((phase = ANY (ARRAY[1, 2, 3])))
+);
+
+
+--
+-- Name: rvs; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.rvs (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    current_owner_tenant_id uuid,
+    unit_id uuid,
+    year integer,
+    make text,
+    model text,
+    vin text,
+    length_ft numeric(5,1),
+    num_slides integer DEFAULT 0 NOT NULL,
+    hookup_class text,
+    license_plate text,
+    plate_state text,
+    plate_expiry_date date,
+    removed_at timestamp with time zone,
+    removed_reason text,
+    notes text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT rvs_hookup_class_check CHECK (((hookup_class IS NULL) OR (hookup_class = ANY (ARRAY['20amp'::text, '30amp'::text, '50amp'::text, 'shore_only'::text, 'none'::text]))))
+);
+
+
+--
+-- Name: sales_leads; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.sales_leads (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    conversation_id uuid,
+    name text,
+    email text,
+    phone text,
+    portfolio_size text,
+    property_type text,
+    notes text,
+    status text DEFAULT 'new'::text NOT NULL,
+    source text DEFAULT 'sales_agent'::text NOT NULL,
+    metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT sales_leads_status_check CHECK ((status = ANY (ARRAY['new'::text, 'contacted'::text, 'qualified'::text, 'converted'::text, 'closed'::text])))
+);
+
+
+--
+-- Name: scheduled_maintenance; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.scheduled_maintenance (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    landlord_id uuid NOT NULL,
+    title text NOT NULL,
+    description text,
+    recurrence text NOT NULL,
+    property_id uuid,
+    unit_id uuid,
+    assigned_to uuid,
+    next_due date,
+    last_completed date,
+    estimated_hours numeric(6,2),
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT scheduled_maintenance_recurrence_check CHECK ((recurrence = ANY (ARRAY['weekly'::text, 'monthly'::text, 'quarterly'::text, 'biannual'::text, 'annual'::text])))
+);
+
+
+--
+-- Name: schema_migrations; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.schema_migrations (
+    filename text NOT NULL,
+    applied_at timestamp with time zone DEFAULT now() NOT NULL,
+    checksum text NOT NULL
+);
+
+
+--
+-- Name: security_deposit_interest_accruals; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.security_deposit_interest_accruals (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    security_deposit_id uuid NOT NULL,
+    lease_id uuid NOT NULL,
+    accrual_month date NOT NULL,
+    state_code text NOT NULL,
+    effective_year integer NOT NULL,
+    annual_rate_pct numeric(6,4) NOT NULL,
+    principal_amount numeric(10,2) NOT NULL,
+    days_held integer NOT NULL,
+    days_in_month integer NOT NULL,
+    interest_amount numeric(10,4) NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT security_deposit_interest_accruals_days_held_check CHECK (((days_held >= 0) AND (days_held <= days_in_month))),
+    CONSTRAINT security_deposit_interest_accruals_month_check CHECK ((EXTRACT(day FROM accrual_month) = (1)::numeric))
+);
+
+
+--
+-- Name: TABLE security_deposit_interest_accruals; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.security_deposit_interest_accruals IS 'Per-month, per-deposit interest accrual log. Idempotent via UNIQUE(security_deposit_id, accrual_month). The cumulative sum of interest_amount writes back to security_deposits.interest_accrued.';
+
+
+--
+-- Name: COLUMN security_deposit_interest_accruals.accrual_month; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.security_deposit_interest_accruals.accrual_month IS 'First day of the month being accrued for. CHECK constraint enforces day-1.';
+
+
+--
+-- Name: COLUMN security_deposit_interest_accruals.days_held; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.security_deposit_interest_accruals.days_held IS 'Number of days during accrual_month the deposit was held. Full month = days_in_month; partial first/last month is computed from collection date / disbursement date.';
+
+
+--
+-- Name: COLUMN security_deposit_interest_accruals.interest_amount; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.security_deposit_interest_accruals.interest_amount IS 'principal_amount * (annual_rate_pct / 100) * (days_held / 365). Stored at 4 decimal places for accuracy across many small accruals; rounded to 2 decimals at the cumulative writeback point.';
+
+
+--
+-- Name: security_deposits; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.security_deposits (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    unit_id uuid NOT NULL,
+    lease_id uuid NOT NULL,
+    tenant_id uuid NOT NULL,
+    total_amount numeric(10,2) NOT NULL,
+    collected_amount numeric(10,2) DEFAULT 0 NOT NULL,
+    status text DEFAULT 'pending'::text NOT NULL,
+    flex_deposit_enabled boolean DEFAULT false,
+    installment_count integer,
+    installment_amount numeric(10,2),
+    installments_paid integer DEFAULT 0,
+    installments_remaining integer,
+    next_installment_date date,
+    interest_accrued numeric(10,2) DEFAULT 0,
+    disbursed_to_landlord numeric(10,2) DEFAULT 0,
+    disbursed_at timestamp with time zone,
+    damage_claimed numeric(10,2) DEFAULT 0,
+    notes text,
+    created_at timestamp with time zone DEFAULT now(),
+    updated_at timestamp with time zone DEFAULT now(),
+    held_by text NOT NULL,
+    flex_deposit_plan_status text,
+    gam_advance_amount numeric(10,2) DEFAULT 0,
+    portability_status text DEFAULT 'none'::text NOT NULL,
+    portability_authorized_at timestamp with time zone,
+    portability_authorized_signature text,
+    portability_authorized_ip text,
+    portability_target_lease_id uuid,
+    carried_from_deposit_id uuid,
+    balance_due_full_at timestamp with time zone,
+    balance_due_total numeric(10,2),
+    CONSTRAINT security_deposits_held_by_check CHECK ((held_by = ANY (ARRAY['gam_escrow'::text, 'landlord'::text]))),
+    CONSTRAINT security_deposits_plan_status_check CHECK (((flex_deposit_plan_status IS NULL) OR (flex_deposit_plan_status = ANY (ARRAY['active'::text, 'completed'::text, 'accelerated'::text, 'in_default'::text])))),
+    CONSTRAINT security_deposits_portability_status_check CHECK ((portability_status = ANY (ARRAY['none'::text, 'pending_auth'::text, 'authorized'::text, 'carried_forward'::text, 'pending_transfer'::text, 'declined'::text]))),
+    CONSTRAINT security_deposits_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'funded'::text, 'partial'::text, 'disbursed'::text, 'claimed'::text])))
+);
+
+
+--
+-- Name: COLUMN security_deposits.balance_due_full_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.security_deposits.balance_due_full_at IS 'S260: timestamp when 2-strike acceleration fired. NULL until the second consecutive installment defaults.';
+
+
+--
+-- Name: COLUMN security_deposits.balance_due_total; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.security_deposits.balance_due_total IS 'S260: full remaining balance owed at the moment acceleration fired (sum of unpaid installments). Single ACH pull attempted at this amount.';
+
+
+--
+-- Name: shifts; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.shifts (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    user_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    clocked_in_at timestamp with time zone DEFAULT now() NOT NULL,
+    clocked_out_at timestamp with time zone,
+    notes text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: state_deposit_interest_rates; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.state_deposit_interest_rates (
+    state_code text NOT NULL,
+    effective_year integer NOT NULL,
+    annual_rate_pct numeric(6,4) NOT NULL,
+    statute_citation text NOT NULL,
+    source_url text,
+    notes text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT state_deposit_interest_rates_rate_check CHECK (((annual_rate_pct >= (0)::numeric) AND (annual_rate_pct <= (100)::numeric))),
+    CONSTRAINT state_deposit_interest_rates_state_check CHECK (((state_code = upper(state_code)) AND (length(state_code) = 2))),
+    CONSTRAINT state_deposit_interest_rates_year_check CHECK (((effective_year >= 2020) AND (effective_year <= 2100)))
+);
+
+
+--
+-- Name: TABLE state_deposit_interest_rates; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.state_deposit_interest_rates IS 'Per-state, per-year deposit interest rate catalog. Annual-refresh migration cadence per CLAUDE.md S177 carve-out. States not listed have no statutory accrual requirement.';
+
+
+--
+-- Name: state_landlord_tenant_acts; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.state_landlord_tenant_acts (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    state_code text NOT NULL,
+    act_key text NOT NULL,
+    act_name text NOT NULL,
+    unit_types text[] DEFAULT '{}'::text[] NOT NULL,
+    official_url text,
+    summary text,
+    source_date date NOT NULL,
+    effective_year integer NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT slta_state_check CHECK (((state_code = upper(state_code)) AND (length(state_code) = 2))),
+    CONSTRAINT slta_year_check CHECK (((effective_year >= 2020) AND (effective_year <= 2100)))
+);
+
+
+--
+-- Name: state_law_provisions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.state_law_provisions (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    act_id uuid NOT NULL,
+    state_code text NOT NULL,
+    topic text NOT NULL,
+    rule_kind text NOT NULL,
+    threshold_numeric numeric(12,2),
+    threshold_unit text,
+    summary text NOT NULL,
+    statute_citation text,
+    source_url text,
+    source_date date NOT NULL,
+    effective_year integer NOT NULL,
+    notes text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT slp_rule_kind_check CHECK ((rule_kind = ANY (ARRAY['min'::text, 'max'::text, 'required'::text, 'info'::text]))),
+    CONSTRAINT slp_state_check CHECK (((state_code = upper(state_code)) AND (length(state_code) = 2))),
+    CONSTRAINT slp_year_check CHECK (((effective_year >= 2020) AND (effective_year <= 2100)))
+);
+
+
+--
+-- Name: state_law_section_texts; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.state_law_section_texts (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    state_code text NOT NULL,
+    act_key text NOT NULL,
+    section_number text NOT NULL,
+    section_title text,
+    full_text text NOT NULL,
+    source_url text,
+    source_date date NOT NULL,
+    effective_year integer NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    search_tsv tsvector GENERATED ALWAYS AS (to_tsvector('english'::regconfig, ((COALESCE(section_title, ''::text) || ' '::text) || COALESCE(full_text, ''::text)))) STORED,
+    CONSTRAINT slst_state_check CHECK (((state_code = upper(state_code)) AND (length(state_code) = 2))),
+    CONSTRAINT slst_year_check CHECK (((effective_year >= 2020) AND (effective_year <= 2100)))
+);
+
+
+--
+-- Name: state_tax_forms; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.state_tax_forms (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    state_code text NOT NULL,
+    form_code text NOT NULL,
+    form_name text NOT NULL,
+    agency text NOT NULL,
+    agency_url text,
+    category text NOT NULL,
+    frequency text NOT NULL,
+    due_dates jsonb NOT NULL,
+    applies_to text NOT NULL,
+    statute text,
+    notes text,
+    effective_year integer NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    filing_method text DEFAULT 'paper_form'::text NOT NULL,
+    CONSTRAINT state_tax_forms_applies_check CHECK ((applies_to = ANY (ARRAY['all_landlords'::text, 'with_employees_in_state'::text, 'with_property_in_state'::text, 'with_contractors_paid_600'::text]))),
+    CONSTRAINT state_tax_forms_category_check CHECK ((category = ANY (ARRAY['withholding'::text, 'unemployment'::text, 'reconciliation'::text, 'income'::text, 'sales_tax'::text, 'other'::text]))),
+    CONSTRAINT state_tax_forms_filing_method_check CHECK ((filing_method = ANY (ARRAY['paper_form'::text, 'online_portal'::text]))),
+    CONSTRAINT state_tax_forms_frequency_check CHECK ((frequency = ANY (ARRAY['quarterly'::text, 'annual'::text, 'monthly'::text, 'biennial'::text]))),
+    CONSTRAINT state_tax_forms_state_check CHECK (((state_code = upper(state_code)) AND (length(state_code) = 2))),
+    CONSTRAINT state_tax_forms_year_check CHECK (((effective_year >= 2020) AND (effective_year <= 2100)))
+);
+
+
+--
+-- Name: TABLE state_tax_forms; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.state_tax_forms IS 'S203 / S177 carve-out: hardcoded per-state tax form catalog with annual-refresh migration cadence. GAM surfaces deadlines; never files forms.';
+
+
+--
+-- Name: COLUMN state_tax_forms.filing_method; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.state_tax_forms.filing_method IS 'S207: paper_form (form_code is official agency code) vs online_portal (form_code is descriptive label, file via agency_url). Source of truth for values: packages/shared/src/index.ts FILING_METHOD_VALUES.';
+
+
+--
+-- Name: subleases; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.subleases (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    master_lease_id uuid NOT NULL,
+    sublessee_tenant_id uuid,
+    sublessor_tenant_id uuid NOT NULL,
+    status text DEFAULT 'pending'::text NOT NULL,
+    start_date date NOT NULL,
+    end_date date,
+    sub_monthly_amount numeric(10,2) NOT NULL,
+    master_share_amount numeric(10,2) NOT NULL,
+    landlord_consent_date date,
+    sublease_document_url text,
+    notes text,
+    terminated_at timestamp with time zone,
+    terminated_reason text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    sublessee_invitation_id uuid,
+    sublease_document_id uuid,
+    CONSTRAINT subleases_distinct_parties CHECK ((sublessee_tenant_id <> sublessor_tenant_id)),
+    CONSTRAINT subleases_share_not_negative CHECK ((master_share_amount >= (0)::numeric)),
+    CONSTRAINT subleases_status_check CHECK ((status = ANY (ARRAY['pending_invite'::text, 'pending'::text, 'awaiting_signatures'::text, 'active'::text, 'terminated'::text]))),
+    CONSTRAINT subleases_sub_amount_positive CHECK ((sub_monthly_amount > (0)::numeric))
+);
+
+
+--
+-- Name: sublessee_invitations; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.sublessee_invitations (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    token text NOT NULL,
+    sublessor_tenant_id uuid NOT NULL,
+    master_lease_id uuid NOT NULL,
+    sublessee_email text NOT NULL,
+    sub_monthly_amount numeric(10,2) NOT NULL,
+    master_share_amount numeric(10,2) NOT NULL,
+    start_date date NOT NULL,
+    end_date date,
+    notes text,
+    status text DEFAULT 'sent'::text NOT NULL,
+    accepted_tenant_id uuid,
+    accepted_at timestamp with time zone,
+    cancelled_at timestamp with time zone,
+    expires_at timestamp with time zone NOT NULL,
+    sublease_id uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT sublessee_invitations_amounts_check CHECK (((sub_monthly_amount > (0)::numeric) AND (master_share_amount >= (0)::numeric))),
+    CONSTRAINT sublessee_invitations_dates_check CHECK (((end_date IS NULL) OR (end_date >= start_date))),
+    CONSTRAINT sublessee_invitations_status_check CHECK ((status = ANY (ARRAY['sent'::text, 'accepted'::text, 'expired'::text, 'cancelled'::text])))
+);
+
+
+--
+-- Name: sublessor_credit_balances; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.sublessor_credit_balances (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    sublease_id uuid NOT NULL,
+    sublessor_tenant_id uuid NOT NULL,
+    balance numeric(10,2) DEFAULT 0 NOT NULL,
+    total_earned numeric(10,2) DEFAULT 0 NOT NULL,
+    total_withdrawn numeric(10,2) DEFAULT 0 NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT sublessor_credit_balances_balance_nonneg CHECK ((balance >= (0)::numeric))
+);
+
+
+--
+-- Name: system_features; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.system_features (
+    key text NOT NULL,
+    enabled boolean DEFAULT false NOT NULL,
+    description text NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_by_user_id uuid
+);
+
+
+--
+-- Name: tenant_identifications; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.tenant_identifications (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    tenant_id uuid NOT NULL,
+    id_type text NOT NULL,
+    id_number text NOT NULL,
+    issuing_state text,
+    issuing_country text DEFAULT 'US'::text NOT NULL,
+    expiry_date date,
+    document_url text,
+    is_primary boolean DEFAULT false NOT NULL,
+    verified_at timestamp with time zone,
+    verified_by uuid,
+    notes text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT tenant_identifications_id_type_check CHECK ((id_type = ANY (ARRAY['drivers_license'::text, 'state_id'::text, 'passport'::text, 'military_id'::text, 'tribal_id'::text, 'permanent_resident_card'::text, 'other'::text])))
+);
+
+
+--
+-- Name: tenant_notifications; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.tenant_notifications (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    user_id uuid NOT NULL,
+    type text NOT NULL,
+    title text NOT NULL,
+    body text,
+    data jsonb,
+    read boolean DEFAULT false NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: tenants; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.tenants (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    user_id uuid NOT NULL,
+    stripe_customer_id text,
+    ach_verified boolean DEFAULT false,
+    bank_last4 text,
+    bank_routing_last4 text,
+    ssi_ssdi boolean DEFAULT false,
+    income_arrival_day integer,
+    on_time_pay_enrolled boolean DEFAULT false,
+    float_fee_active boolean DEFAULT false,
+    credit_reporting_enrolled boolean DEFAULT false,
+    flex_deposit_enrolled boolean DEFAULT false,
+    late_payment_count integer DEFAULT 0,
+    on_time_pay_invite_sent_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now(),
+    updated_at timestamp with time zone DEFAULT now(),
+    theme_accent text,
+    font_style text,
+    bio text,
+    avatar_url text,
+    platform_status text DEFAULT 'active'::text NOT NULL,
+    onboarding_source text DEFAULT 'applied'::text NOT NULL,
+    date_of_birth date,
+    mailing_address text,
+    background_check_id uuid,
+    background_check_status text DEFAULT 'not_started'::text NOT NULL,
+    otp_disqualified_until timestamp with time zone,
+    otp_disqualified_reason text,
+    flexpay_enrolled boolean DEFAULT false NOT NULL,
+    flexpay_pull_day integer,
+    flexpay_monthly_fee numeric(5,2),
+    flexpay_enrolled_at timestamp with time zone,
+    flexpay_disqualified_until timestamp with time zone,
+    flexpay_disqualified_reason text,
+    flex_deposit_disqualified_until timestamp with time zone,
+    flex_deposit_disqualified_reason text,
+    CONSTRAINT tenants_background_check_status_check CHECK ((background_check_status = ANY (ARRAY['not_started'::text, 'submitted'::text, 'approved'::text, 'denied'::text, 'cancelled'::text, 'expired'::text]))),
+    CONSTRAINT tenants_flexpay_pull_day_check CHECK (((flexpay_pull_day IS NULL) OR ((flexpay_pull_day >= 1) AND (flexpay_pull_day <= 28)))),
+    CONSTRAINT tenants_income_arrival_day_check CHECK (((income_arrival_day >= 1) AND (income_arrival_day <= 28))),
+    CONSTRAINT tenants_onboarding_source_check CHECK ((onboarding_source = ANY (ARRAY['applied'::text, 'onboarded'::text]))),
+    CONSTRAINT tenants_platform_status_check CHECK ((platform_status = ANY (ARRAY['active'::text, 'suspended'::text, 'blocked'::text])))
+);
+
+
+--
+-- Name: unit_applications; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.unit_applications (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    unit_id uuid,
+    landlord_id uuid,
+    first_name text NOT NULL,
+    last_name text NOT NULL,
+    email text NOT NULL,
+    phone text,
+    move_in_date date,
+    monthly_income numeric(10,2),
+    occupants integer DEFAULT 1,
+    has_pets boolean DEFAULT false,
+    pet_description text,
+    message text,
+    status text DEFAULT 'pending'::text,
+    created_at timestamp with time zone DEFAULT now(),
+    updated_at timestamp with time zone DEFAULT now()
+);
+
+
+--
+-- Name: unit_bookings; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.unit_bookings (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    unit_id uuid NOT NULL,
+    tenant_id uuid,
+    guest_name text,
+    guest_email text,
+    guest_phone text,
+    check_in date NOT NULL,
+    check_out date NOT NULL,
+    nights integer,
+    total_amount numeric(10,2),
+    status text DEFAULT 'confirmed'::text NOT NULL,
+    notes text,
+    created_at timestamp with time zone DEFAULT now(),
+    updated_at timestamp with time zone DEFAULT now(),
+    landlord_id uuid NOT NULL,
+    lease_type text NOT NULL,
+    nightly_rate numeric(10,2),
+    weekly_rate numeric(10,2),
+    platform_fee numeric(10,2) DEFAULT 0 NOT NULL,
+    source text DEFAULT 'direct'::text NOT NULL,
+    acknowledgment_signed_at timestamp with time zone,
+    CONSTRAINT unit_bookings_lease_type_check CHECK ((lease_type = ANY (ARRAY['nightly'::text, 'weekly'::text, 'month_to_month'::text, 'long_term'::text, 'lease_hold'::text]))),
+    CONSTRAINT unit_bookings_status_check CHECK ((status = ANY (ARRAY['tentative'::text, 'confirmed'::text, 'checked_in'::text, 'checked_out'::text, 'cancelled'::text, 'no_show'::text])))
+);
+
+
+--
+-- Name: COLUMN unit_bookings.acknowledgment_signed_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.unit_bookings.acknowledgment_signed_at IS 'Stamped via PATCH /units/:id/bookings/:bookingId/acknowledge once landlord/staff confirms guest signed the property rules. NULL while pending.';
+
+
+--
+-- Name: unit_entry_request_responses; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.unit_entry_request_responses (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    request_id uuid NOT NULL,
+    responder_user_id uuid NOT NULL,
+    decision text NOT NULL,
+    responded_at timestamp with time zone DEFAULT now() NOT NULL,
+    reason text,
+    evidence jsonb DEFAULT '{}'::jsonb NOT NULL,
+    CONSTRAINT unit_entry_request_responses_decision_check CHECK ((decision = ANY (ARRAY['granted'::text, 'denied'::text])))
+);
+
+
+--
+-- Name: unit_entry_requests; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.unit_entry_requests (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    unit_id uuid NOT NULL,
+    lease_id uuid,
+    tenant_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    requested_by_user_id uuid NOT NULL,
+    reason text NOT NULL,
+    reason_category text NOT NULL,
+    notice_given_at timestamp with time zone DEFAULT now() NOT NULL,
+    proposed_entry_window_start timestamp with time zone NOT NULL,
+    proposed_entry_window_end timestamp with time zone NOT NULL,
+    notice_window_hours integer NOT NULL,
+    status text DEFAULT 'pending'::text NOT NULL,
+    entry_actual_at timestamp with time zone,
+    notes text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT unit_entry_requests_reason_category_check CHECK ((reason_category = ANY (ARRAY['maintenance'::text, 'inspection'::text, 'showing'::text, 'emergency'::text, 'other'::text]))),
+    CONSTRAINT unit_entry_requests_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'granted'::text, 'denied'::text, 'completed'::text, 'breached'::text, 'cancelled'::text])))
+);
+
+
+--
+-- Name: unit_inspection_items; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.unit_inspection_items (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    inspection_id uuid NOT NULL,
+    area text NOT NULL,
+    item_label text NOT NULL,
+    condition text NOT NULL,
+    notes text,
+    estimated_repair_cost numeric(10,2),
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT unit_inspection_items_condition_check CHECK ((condition = ANY (ARRAY['good'::text, 'fair'::text, 'damaged'::text, 'missing'::text, 'na'::text])))
+);
+
+
+--
+-- Name: unit_inspection_photos; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.unit_inspection_photos (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    inspection_id uuid NOT NULL,
+    item_id uuid,
+    photo_url text NOT NULL,
+    caption text,
+    uploaded_by uuid NOT NULL,
+    uploaded_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: unit_inspection_signatures; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.unit_inspection_signatures (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    inspection_id uuid NOT NULL,
+    signer_user_id uuid NOT NULL,
+    signer_role text NOT NULL,
+    signed_at timestamp with time zone DEFAULT now() NOT NULL,
+    signature_evidence jsonb DEFAULT '{}'::jsonb NOT NULL,
+    CONSTRAINT unit_inspection_signatures_signer_role_check CHECK ((signer_role = ANY (ARRAY['tenant'::text, 'landlord'::text, 'inspector'::text])))
+);
+
+
+--
+-- Name: unit_inspections; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.unit_inspections (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    unit_id uuid NOT NULL,
+    lease_id uuid,
+    tenant_id uuid,
+    landlord_id uuid NOT NULL,
+    inspection_type text NOT NULL,
+    status text DEFAULT 'draft'::text NOT NULL,
+    comparison_inspection_id uuid,
+    scheduled_for timestamp with time zone,
+    conducted_at timestamp with time zone,
+    conducted_by_user_id uuid,
+    finalized_at timestamp with time zone,
+    notes text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    reminder_sent_at timestamp with time zone,
+    CONSTRAINT unit_inspections_inspection_type_check CHECK ((inspection_type = ANY (ARRAY['move_in'::text, 'move_out'::text, 'periodic'::text]))),
+    CONSTRAINT unit_inspections_status_check CHECK ((status = ANY (ARRAY['draft'::text, 'tenant_signed'::text, 'landlord_signed'::text, 'finalized'::text, 'disputed'::text, 'cancelled'::text])))
+);
+
+
+--
+-- Name: unit_photos; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.unit_photos (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    unit_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    url text NOT NULL,
+    caption text,
+    sort_order integer DEFAULT 0,
+    created_at timestamp with time zone DEFAULT now()
+);
+
+
+--
+-- Name: units; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.units (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    property_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    unit_number text NOT NULL,
+    bedrooms integer DEFAULT 1 NOT NULL,
+    bathrooms numeric(3,1) DEFAULT 1.0 NOT NULL,
+    sqft integer,
+    status text DEFAULT 'vacant'::text NOT NULL,
+    rent_amount numeric(10,2) NOT NULL,
+    security_deposit numeric(10,2) DEFAULT 0 NOT NULL,
+    on_time_pay_active boolean DEFAULT false,
+    payment_block boolean DEFAULT false,
+    payment_block_set_at timestamp with time zone,
+    payment_block_set_by uuid,
+    listed_vacant boolean DEFAULT true,
+    created_at timestamp with time zone DEFAULT now(),
+    updated_at timestamp with time zone DEFAULT now(),
+    available_date date,
+    listing_description text,
+    unit_type text DEFAULT 'apartment'::text,
+    scheduled_activation_at timestamp with time zone,
+    scheduled_activation_by uuid,
+    nightly_rate numeric(10,2),
+    weekly_rate numeric(10,2),
+    is_bookable boolean DEFAULT false NOT NULL,
+    lease_types_allowed text[] DEFAULT '{}'::text[],
+    check_in_time time without time zone,
+    check_out_time time without time zone,
+    amenities text[] DEFAULT ARRAY[]::text[],
+    unit_description text,
+    monthly_rate numeric(10,2),
+    min_stay_nights integer,
+    max_stay_nights integer,
+    import_extra_data jsonb,
+    CONSTRAINT units_status_check CHECK ((status = ANY (ARRAY['vacant'::text, 'available'::text, 'active'::text, 'direct_pay'::text, 'delinquent'::text, 'suspended'::text]))),
+    CONSTRAINT units_unit_type_check CHECK ((unit_type = ANY (ARRAY['apartment'::text, 'single_family'::text, 'rv_spot'::text, 'mobile_home'::text, 'storage'::text, 'commercial'::text])))
+);
+
+
+--
+-- Name: user_balance_ledger; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.user_balance_ledger (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    user_id uuid NOT NULL,
+    type text NOT NULL,
+    amount numeric(10,2) NOT NULL,
+    balance_after numeric(10,2) NOT NULL,
+    reference_id uuid,
+    reference_type text,
+    property_id uuid,
+    notes text,
+    created_at timestamp with time zone DEFAULT now(),
+    bank_account_id uuid,
+    stripe_transfer_id text,
+    CONSTRAINT user_balance_ledger_type_check CHECK ((type = ANY (ARRAY['allocation_owner_share'::text, 'allocation_manager_fee'::text, 'allocation_pm_company_fee'::text, 'placement_fee'::text, 'maintenance_markup'::text, 'withdrawal_auto'::text, 'withdrawal_manual'::text, 'withdrawal_fee'::text, 'adjustment'::text])))
+);
+
+
+--
+-- Name: user_bank_accounts; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.user_bank_accounts (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    user_id uuid NOT NULL,
+    nickname text NOT NULL,
+    account_holder_name text NOT NULL,
+    account_type text NOT NULL,
+    routing_number text NOT NULL,
+    account_number_last4 text NOT NULL,
+    account_number_encrypted text NOT NULL,
+    status text DEFAULT 'active'::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now(),
+    updated_at timestamp with time zone DEFAULT now(),
+    account_holder_type text DEFAULT 'individual'::text NOT NULL,
+    CONSTRAINT user_bank_accounts_account_holder_type_check CHECK ((account_holder_type = ANY (ARRAY['individual'::text, 'business'::text]))),
+    CONSTRAINT user_bank_accounts_account_number_last4_length_check CHECK ((length(account_number_last4) = 4)),
+    CONSTRAINT user_bank_accounts_account_type_check CHECK ((account_type = ANY (ARRAY['checking'::text, 'savings'::text]))),
+    CONSTRAINT user_bank_accounts_routing_number_length_check CHECK ((length(routing_number) = 9)),
+    CONSTRAINT user_bank_accounts_status_check CHECK ((status = ANY (ARRAY['active'::text, 'archived'::text])))
+);
+
+
+--
+-- Name: user_totp_recovery_codes; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.user_totp_recovery_codes (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    user_id uuid NOT NULL,
+    code_hash text NOT NULL,
+    used_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: users; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.users (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    email text NOT NULL,
+    password_hash text NOT NULL,
+    role text NOT NULL,
+    first_name text NOT NULL,
+    last_name text NOT NULL,
+    phone text,
+    email_verified boolean DEFAULT false,
+    email_verify_token text,
+    reset_token text,
+    reset_token_expires timestamp with time zone,
+    last_login_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now(),
+    updated_at timestamp with time zone DEFAULT now(),
+    default_management_payout_bank_account_id uuid,
+    stripe_connect_account_id text,
+    stripe_connect_status_synced_at timestamp with time zone,
+    connect_charges_enabled boolean DEFAULT false NOT NULL,
+    connect_payouts_enabled boolean DEFAULT false NOT NULL,
+    connect_details_submitted boolean DEFAULT false NOT NULL,
+    failed_login_count integer DEFAULT 0 NOT NULL,
+    locked_until timestamp with time zone,
+    email_verified_at timestamp with time zone,
+    totp_enabled boolean DEFAULT false NOT NULL,
+    totp_secret text,
+    totp_enrolled_at timestamp with time zone,
+    accepted_tos_at timestamp with time zone,
+    accepted_privacy_at timestamp with time zone,
+    tenant_invite_token text,
+    tenant_invite_expires_at timestamp with time zone,
+    landlord_invite_token text,
+    landlord_invite_expires_at timestamp with time zone,
+    email_verify_token_expires_at timestamp with time zone,
+    CONSTRAINT users_role_check CHECK ((role = ANY (ARRAY['admin'::text, 'super_admin'::text, 'landlord'::text, 'tenant'::text, 'bookkeeper'::text, 'property_manager'::text, 'onsite_manager'::text, 'maintenance'::text])))
+);
+
+
+--
+-- Name: COLUMN users.accepted_tos_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.users.accepted_tos_at IS 'Timestamp when this user accepted the Terms of Service at registration. NULL = pre-acceptance-gate user; not yet re-prompted.';
+
+
+--
+-- Name: COLUMN users.accepted_privacy_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.users.accepted_privacy_at IS 'Timestamp when this user accepted the Privacy Policy at registration. NULL = pre-acceptance-gate user; not yet re-prompted.';
+
+
+--
+-- Name: COLUMN users.tenant_invite_token; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.users.tenant_invite_token IS 'S410/S377: separate from email_verify_token. Used by tenant invite + esign signing flows.';
+
+
+--
+-- Name: COLUMN users.tenant_invite_expires_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.users.tenant_invite_expires_at IS 'S410/S377: NULL means no expiry check (pre-S410 row); NOT NULL enforced by accept route.';
+
+
+--
+-- Name: COLUMN users.landlord_invite_token; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.users.landlord_invite_token IS 'S410/S377: separate from email_verify_token. Used by admin landlord create + re-invite.';
+
+
+--
+-- Name: COLUMN users.landlord_invite_expires_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.users.landlord_invite_expires_at IS 'S410/S377: NULL means no expiry check (pre-S410 row); NOT NULL enforced by accept route.';
+
+
+--
+-- Name: COLUMN users.email_verify_token_expires_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.users.email_verify_token_expires_at IS 'S410/S377: 7-day expiry window on the email verification link.';
+
+
+--
+-- Name: utility_bills; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.utility_bills (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    meter_id uuid NOT NULL,
+    unit_id uuid NOT NULL,
+    tenant_id uuid NOT NULL,
+    lease_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    billing_cycle_month date NOT NULL,
+    usage_amount numeric(12,4),
+    allocation_method text,
+    allocation_basis numeric(12,4),
+    rate_per_unit numeric(10,4),
+    base_fee_share numeric(10,2) DEFAULT 0 NOT NULL,
+    charge_amount numeric(10,2) NOT NULL,
+    status text DEFAULT 'unbilled'::text NOT NULL,
+    billed_at timestamp with time zone,
+    paid_at timestamp with time zone,
+    payment_id uuid,
+    notes text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT utility_bills_status_check CHECK ((status = ANY (ARRAY['unbilled'::text, 'billed'::text, 'paid'::text, 'disputed'::text, 'void'::text])))
+);
+
+
+--
+-- Name: utility_meter_readings; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.utility_meter_readings (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    meter_id uuid NOT NULL,
+    reading_date date NOT NULL,
+    reading_value numeric NOT NULL,
+    billing_cycle_month date NOT NULL,
+    created_by_user_id uuid NOT NULL,
+    created_at timestamp with time zone DEFAULT now()
+);
+
+
+--
+-- Name: utility_meter_units; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.utility_meter_units (
+    meter_id uuid NOT NULL,
+    unit_id uuid NOT NULL,
+    created_at timestamp with time zone DEFAULT now()
+);
+
+
+--
+-- Name: utility_meters; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.utility_meters (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    property_id uuid NOT NULL,
+    utility_type text NOT NULL,
+    label text NOT NULL,
+    billing_method text NOT NULL,
+    rate_per_unit numeric,
+    base_fee numeric DEFAULT 0 NOT NULL,
+    rubs_allocation_method text,
+    created_at timestamp with time zone DEFAULT now(),
+    updated_at timestamp with time zone DEFAULT now(),
+    CONSTRAINT utility_meters_billing_method_check CHECK ((billing_method = ANY (ARRAY['submeter'::text, 'rubs'::text, 'master_bill_to_landlord'::text]))),
+    CONSTRAINT utility_meters_check CHECK ((((billing_method = 'rubs'::text) AND (rubs_allocation_method IS NOT NULL)) OR ((billing_method <> 'rubs'::text) AND (rubs_allocation_method IS NULL)))),
+    CONSTRAINT utility_meters_rubs_allocation_method_check CHECK ((rubs_allocation_method = ANY (ARRAY['occupant_count'::text, 'sqft'::text, 'bedrooms'::text, 'equal_split'::text]))),
+    CONSTRAINT utility_meters_utility_type_check CHECK ((utility_type = ANY (ARRAY['water'::text, 'gas'::text, 'electric'::text, 'sewer'::text, 'trash'::text])))
+);
+
+
+--
+-- Name: v_lease_active_tenants; Type: VIEW; Schema: public; Owner: -
+--
+
+CREATE VIEW public.v_lease_active_tenants AS
+ SELECT lt.lease_id,
+    lt.id AS lease_tenant_id,
+    lt.tenant_id,
+    lt.role,
+    lt.status,
+    lt.financial_responsibility,
+    lt.responsibility_pct,
+    lt.added_at,
+    us.first_name,
+    us.last_name,
+    us.email,
+    us.phone
+   FROM ((public.lease_tenants lt
+     JOIN public.tenants t ON ((t.id = lt.tenant_id)))
+     JOIN public.users us ON ((us.id = t.user_id)))
+  WHERE (lt.status = 'active'::text);
+
+
+--
+-- Name: v_unit_occupancy; Type: VIEW; Schema: public; Owner: -
+--
+
+CREATE VIEW public.v_unit_occupancy AS
+ SELECT u.id AS unit_id,
+    (primary_info.tenant_id IS NOT NULL) AS is_occupied,
+    primary_info.tenant_id AS primary_tenant_id,
+    primary_info.first_name AS primary_first_name,
+    primary_info.last_name AS primary_last_name,
+    primary_info.email AS primary_email,
+    primary_info.phone AS primary_phone,
+    primary_info.lease_id AS active_lease_id,
+    COALESCE(counts.tenant_count, 0) AS tenant_count
+   FROM ((public.units u
+     LEFT JOIN LATERAL ( SELECT t.id AS tenant_id,
+            us.first_name,
+            us.last_name,
+            us.email,
+            us.phone,
+            l.id AS lease_id
+           FROM (((public.leases l
+             JOIN public.lease_tenants lt ON ((lt.lease_id = l.id)))
+             JOIN public.tenants t ON ((t.id = lt.tenant_id)))
+             JOIN public.users us ON ((us.id = t.user_id)))
+          WHERE ((l.unit_id = u.id) AND (l.status = 'active'::text) AND (lt.status = 'active'::text) AND (lt.role = 'primary'::text))
+         LIMIT 1) primary_info ON (true))
+     LEFT JOIN LATERAL ( SELECT (count(*))::integer AS tenant_count
+           FROM (public.leases l
+             JOIN public.lease_tenants lt ON ((lt.lease_id = l.id)))
+          WHERE ((l.unit_id = u.id) AND (l.status = 'active'::text) AND (lt.status = 'active'::text))) counts ON (true));
+
+
+--
+-- Name: work_trade_agreements; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.work_trade_agreements (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    unit_id uuid NOT NULL,
+    tenant_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    trade_type text NOT NULL,
+    hourly_rate numeric(10,2) NOT NULL,
+    weekly_hours numeric(6,2) NOT NULL,
+    market_rent numeric(10,2) NOT NULL,
+    cash_rent numeric(10,2) DEFAULT 0 NOT NULL,
+    trade_credit_max numeric(10,2) NOT NULL,
+    duties text,
+    start_date date NOT NULL,
+    end_date date,
+    renewal_terms text,
+    status text DEFAULT 'active'::text NOT NULL,
+    ytd_value numeric(10,2) DEFAULT 0 NOT NULL,
+    flag_1099 boolean DEFAULT false NOT NULL,
+    tax_year integer DEFAULT (EXTRACT(year FROM CURRENT_DATE))::integer NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT work_trade_agreements_status_check CHECK ((status = ANY (ARRAY['active'::text, 'paused'::text, 'ended'::text]))),
+    CONSTRAINT work_trade_agreements_trade_type_check CHECK ((trade_type = ANY (ARRAY['full'::text, 'partial'::text, 'credit'::text])))
+);
+
+
+--
+-- Name: work_trade_logs; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.work_trade_logs (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    agreement_id uuid NOT NULL,
+    tenant_id uuid NOT NULL,
+    submitted_by uuid NOT NULL,
+    work_date date NOT NULL,
+    hours numeric(6,2) NOT NULL,
+    description text NOT NULL,
+    status text DEFAULT 'pending'::text NOT NULL,
+    reviewed_by uuid,
+    reviewed_at timestamp with time zone,
+    rejection_reason text,
+    credit_value numeric(10,2),
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT work_trade_logs_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'approved'::text, 'rejected'::text])))
+);
+
+
+--
+-- Name: work_trade_periods; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.work_trade_periods (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    agreement_id uuid NOT NULL,
+    period_month integer NOT NULL,
+    period_year integer NOT NULL,
+    hours_committed numeric(6,2) NOT NULL,
+    hours_worked numeric(6,2) DEFAULT 0 NOT NULL,
+    hours_short numeric(6,2) DEFAULT 0 NOT NULL,
+    credit_earned numeric(10,2) DEFAULT 0 NOT NULL,
+    shortfall_charge numeric(10,2) DEFAULT 0 NOT NULL,
+    cash_due numeric(10,2) NOT NULL,
+    status text DEFAULT 'open'::text NOT NULL,
+    reconciled_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT work_trade_periods_month_check CHECK (((period_month >= 1) AND (period_month <= 12))),
+    CONSTRAINT work_trade_periods_status_check CHECK ((status = ANY (ARRAY['open'::text, 'reconciled'::text])))
+);
+
+
+--
+-- Name: journal_entries entry_number; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.journal_entries ALTER COLUMN entry_number SET DEFAULT nextval('public.journal_entries_entry_number_seq'::regclass);
+
+
+--
+-- Name: ach_monitoring_log ach_monitoring_log_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.ach_monitoring_log
+    ADD CONSTRAINT ach_monitoring_log_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: admin_action_log admin_action_log_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_action_log
+    ADD CONSTRAINT admin_action_log_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: admin_notifications admin_notifications_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_notifications
+    ADD CONSTRAINT admin_notifications_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: adverse_action_notices adverse_action_notices_one_per_check; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.adverse_action_notices
+    ADD CONSTRAINT adverse_action_notices_one_per_check UNIQUE (background_check_id);
+
+
+--
+-- Name: adverse_action_notices adverse_action_notices_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.adverse_action_notices
+    ADD CONSTRAINT adverse_action_notices_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: agent_interaction_logs agent_interaction_logs_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.agent_interaction_logs
+    ADD CONSTRAINT agent_interaction_logs_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: agent_knowledge_chunks agent_knowledge_chunks_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.agent_knowledge_chunks
+    ADD CONSTRAINT agent_knowledge_chunks_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: application_pool application_pool_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.application_pool
+    ADD CONSTRAINT application_pool_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: audit_log audit_log_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.audit_log
+    ADD CONSTRAINT audit_log_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: background_checks background_checks_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.background_checks
+    ADD CONSTRAINT background_checks_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: bank_reconciliations bank_reconciliations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bank_reconciliations
+    ADD CONSTRAINT bank_reconciliations_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: bookkeeper_scopes bookkeeper_scopes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bookkeeper_scopes
+    ADD CONSTRAINT bookkeeper_scopes_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: bookkeeper_scopes bookkeeper_scopes_user_id_landlord_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bookkeeper_scopes
+    ADD CONSTRAINT bookkeeper_scopes_user_id_landlord_id_key UNIQUE (user_id, landlord_id);
+
+
+--
+-- Name: books_accounts books_accounts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.books_accounts
+    ADD CONSTRAINT books_accounts_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: books_bills books_bills_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.books_bills
+    ADD CONSTRAINT books_bills_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: books_contractors books_contractors_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.books_contractors
+    ADD CONSTRAINT books_contractors_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: books_employees books_employees_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.books_employees
+    ADD CONSTRAINT books_employees_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: books_transactions books_transactions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.books_transactions
+    ADD CONSTRAINT books_transactions_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: books_vendors books_vendors_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.books_vendors
+    ADD CONSTRAINT books_vendors_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: bulletin_posts bulletin_posts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bulletin_posts
+    ADD CONSTRAINT bulletin_posts_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: bulletin_reveal_log bulletin_reveal_log_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bulletin_reveal_log
+    ADD CONSTRAINT bulletin_reveal_log_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: bulletin_votes bulletin_votes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bulletin_votes
+    ADD CONSTRAINT bulletin_votes_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: bulletin_votes bulletin_votes_post_id_tenant_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bulletin_votes
+    ADD CONSTRAINT bulletin_votes_post_id_tenant_id_key UNIQUE (post_id, tenant_id);
+
+
+--
+-- Name: connect_disputes connect_disputes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connect_disputes
+    ADD CONSTRAINT connect_disputes_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: connect_disputes connect_disputes_unique_stripe_id; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connect_disputes
+    ADD CONSTRAINT connect_disputes_unique_stripe_id UNIQUE (stripe_dispute_id);
+
+
+--
+-- Name: connect_payouts connect_payouts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connect_payouts
+    ADD CONSTRAINT connect_payouts_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: connect_payouts connect_payouts_unique_stripe_id; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connect_payouts
+    ADD CONSTRAINT connect_payouts_unique_stripe_id UNIQUE (stripe_payout_id);
+
+
+--
+-- Name: contractors contractors_email_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.contractors
+    ADD CONSTRAINT contractors_email_key UNIQUE (email);
+
+
+--
+-- Name: contractors contractors_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.contractors
+    ADD CONSTRAINT contractors_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: credit_disputes credit_disputes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.credit_disputes
+    ADD CONSTRAINT credit_disputes_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: credit_events credit_events_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.credit_events
+    ADD CONSTRAINT credit_events_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: credit_hardship_contexts credit_hardship_contexts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.credit_hardship_contexts
+    ADD CONSTRAINT credit_hardship_contexts_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: credit_merkle_anchors credit_merkle_anchors_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.credit_merkle_anchors
+    ADD CONSTRAINT credit_merkle_anchors_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: credit_score_formulas credit_score_formulas_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.credit_score_formulas
+    ADD CONSTRAINT credit_score_formulas_pkey PRIMARY KEY (version);
+
+
+--
+-- Name: credit_scores credit_scores_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.credit_scores
+    ADD CONSTRAINT credit_scores_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: credit_stats credit_stats_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.credit_stats
+    ADD CONSTRAINT credit_stats_pkey PRIMARY KEY (subject_id);
+
+
+--
+-- Name: credit_subjects credit_subjects_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.credit_subjects
+    ADD CONSTRAINT credit_subjects_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: credit_subjects credit_subjects_subject_type_subject_ref_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.credit_subjects
+    ADD CONSTRAINT credit_subjects_subject_type_subject_ref_id_key UNIQUE (subject_type, subject_ref_id);
+
+
+--
+-- Name: csv_import_attempts csv_import_attempts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.csv_import_attempts
+    ADD CONSTRAINT csv_import_attempts_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: daily_tasks daily_tasks_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.daily_tasks
+    ADD CONSTRAINT daily_tasks_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: deposit_returns deposit_returns_lease_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.deposit_returns
+    ADD CONSTRAINT deposit_returns_lease_id_key UNIQUE (lease_id);
+
+
+--
+-- Name: deposit_returns deposit_returns_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.deposit_returns
+    ADD CONSTRAINT deposit_returns_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: disbursements disbursements_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.disbursements
+    ADD CONSTRAINT disbursements_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: document_batches document_batches_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.document_batches
+    ADD CONSTRAINT document_batches_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: documents documents_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.documents
+    ADD CONSTRAINT documents_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: email_send_log email_send_log_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.email_send_log
+    ADD CONSTRAINT email_send_log_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: emergency_contacts emergency_contacts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.emergency_contacts
+    ADD CONSTRAINT emergency_contacts_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: external_account_links external_account_links_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.external_account_links
+    ADD CONSTRAINT external_account_links_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: flex_deposit_custody_charges fdcc_cycle_tenant_uniq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.flex_deposit_custody_charges
+    ADD CONSTRAINT fdcc_cycle_tenant_uniq UNIQUE (cycle_month, tenant_id);
+
+
+--
+-- Name: fitness_body_weight_logs fitness_body_weight_logs_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.fitness_body_weight_logs
+    ADD CONSTRAINT fitness_body_weight_logs_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: fitness_body_weight_logs fitness_body_weight_logs_user_id_logged_date_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.fitness_body_weight_logs
+    ADD CONSTRAINT fitness_body_weight_logs_user_id_logged_date_key UNIQUE (user_id, logged_date);
+
+
+--
+-- Name: fitness_days fitness_days_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.fitness_days
+    ADD CONSTRAINT fitness_days_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: fitness_exercises fitness_exercises_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.fitness_exercises
+    ADD CONSTRAINT fitness_exercises_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: fitness_milestones fitness_milestones_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.fitness_milestones
+    ADD CONSTRAINT fitness_milestones_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: fitness_profiles fitness_profiles_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.fitness_profiles
+    ADD CONSTRAINT fitness_profiles_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: fitness_profiles fitness_profiles_user_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.fitness_profiles
+    ADD CONSTRAINT fitness_profiles_user_id_key UNIQUE (user_id);
+
+
+--
+-- Name: fitness_routines fitness_routines_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.fitness_routines
+    ADD CONSTRAINT fitness_routines_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: fitness_sections fitness_sections_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.fitness_sections
+    ADD CONSTRAINT fitness_sections_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: fitness_set_logs fitness_set_logs_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.fitness_set_logs
+    ADD CONSTRAINT fitness_set_logs_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: fitness_workout_logs fitness_workout_logs_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.fitness_workout_logs
+    ADD CONSTRAINT fitness_workout_logs_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: flex_charge_accounts flex_charge_accounts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.flex_charge_accounts
+    ADD CONSTRAINT flex_charge_accounts_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: flex_charge_statements flex_charge_statements_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.flex_charge_statements
+    ADD CONSTRAINT flex_charge_statements_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: flex_charge_statements flex_charge_stmt_cycle_account_uniq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.flex_charge_statements
+    ADD CONSTRAINT flex_charge_stmt_cycle_account_uniq UNIQUE (account_id, cycle_month);
+
+
+--
+-- Name: flex_charge_transactions flex_charge_transactions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.flex_charge_transactions
+    ADD CONSTRAINT flex_charge_transactions_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: flex_deposit_custody_charges flex_deposit_custody_charges_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.flex_deposit_custody_charges
+    ADD CONSTRAINT flex_deposit_custody_charges_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: flex_deposit_installments flex_deposit_installments_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.flex_deposit_installments
+    ADD CONSTRAINT flex_deposit_installments_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: flex_deposit_installments flex_deposit_installments_uniq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.flex_deposit_installments
+    ADD CONSTRAINT flex_deposit_installments_uniq UNIQUE (security_deposit_id, installment_number);
+
+
+--
+-- Name: flexpay_advances flexpay_advances_cycle_tenant_uniq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.flexpay_advances
+    ADD CONSTRAINT flexpay_advances_cycle_tenant_uniq UNIQUE (cycle_month, tenant_id);
+
+
+--
+-- Name: flexpay_advances flexpay_advances_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.flexpay_advances
+    ADD CONSTRAINT flexpay_advances_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: flexsuite_enrollment_acceptances flexsuite_enrollment_acceptances_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.flexsuite_enrollment_acceptances
+    ADD CONSTRAINT flexsuite_enrollment_acceptances_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: float_account_state float_account_state_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.float_account_state
+    ADD CONSTRAINT float_account_state_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: invitations invitations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.invitations
+    ADD CONSTRAINT invitations_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: invitations invitations_token_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.invitations
+    ADD CONSTRAINT invitations_token_key UNIQUE (token);
+
+
+--
+-- Name: invoice_sequences invoice_sequences_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.invoice_sequences
+    ADD CONSTRAINT invoice_sequences_pkey PRIMARY KEY (landlord_id, year);
+
+
+--
+-- Name: invoices invoices_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.invoices
+    ADD CONSTRAINT invoices_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: journal_entries journal_entries_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.journal_entries
+    ADD CONSTRAINT journal_entries_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: journal_entry_lines journal_entry_lines_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.journal_entry_lines
+    ADD CONSTRAINT journal_entry_lines_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: landlord_deposit_interest_rate_overrides landlord_deposit_interest_rate_overrides_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.landlord_deposit_interest_rate_overrides
+    ADD CONSTRAINT landlord_deposit_interest_rate_overrides_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: landlord_platform_fee_overrides landlord_platform_fee_overrides_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.landlord_platform_fee_overrides
+    ADD CONSTRAINT landlord_platform_fee_overrides_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: landlords landlords_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.landlords
+    ADD CONSTRAINT landlords_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: landlord_deposit_interest_rate_overrides ldior_unique_landlord_state_year; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.landlord_deposit_interest_rate_overrides
+    ADD CONSTRAINT ldior_unique_landlord_state_year UNIQUE (landlord_id, state_code, effective_year);
+
+
+--
+-- Name: lease_document_fields lease_document_fields_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_document_fields
+    ADD CONSTRAINT lease_document_fields_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: lease_document_signers lease_document_signers_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_document_signers
+    ADD CONSTRAINT lease_document_signers_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: lease_document_signers lease_document_signers_token_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_document_signers
+    ADD CONSTRAINT lease_document_signers_token_key UNIQUE (token);
+
+
+--
+-- Name: lease_documents lease_documents_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_documents
+    ADD CONSTRAINT lease_documents_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: lease_fees lease_fees_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_fees
+    ADD CONSTRAINT lease_fees_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: lease_occupants lease_occupants_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_occupants
+    ADD CONSTRAINT lease_occupants_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: lease_pets lease_pets_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_pets
+    ADD CONSTRAINT lease_pets_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: lease_template_fields lease_template_fields_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_template_fields
+    ADD CONSTRAINT lease_template_fields_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: lease_templates lease_templates_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_templates
+    ADD CONSTRAINT lease_templates_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: lease_tenants lease_tenants_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_tenants
+    ADD CONSTRAINT lease_tenants_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: lease_termination_requests lease_termination_requests_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_termination_requests
+    ADD CONSTRAINT lease_termination_requests_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: lease_utility_assignments lease_utility_assignments_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_utility_assignments
+    ADD CONSTRAINT lease_utility_assignments_pkey PRIMARY KEY (lease_id, meter_id);
+
+
+--
+-- Name: lease_utility_responsibilities lease_utility_responsibilities_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_utility_responsibilities
+    ADD CONSTRAINT lease_utility_responsibilities_pkey PRIMARY KEY (lease_id, utility_type);
+
+
+--
+-- Name: lease_vehicles lease_vehicles_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_vehicles
+    ADD CONSTRAINT lease_vehicles_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: leases leases_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.leases
+    ADD CONSTRAINT leases_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: liability_insurance_policies liability_insurance_policies_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.liability_insurance_policies
+    ADD CONSTRAINT liability_insurance_policies_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: maintenance_comments maintenance_comments_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.maintenance_comments
+    ADD CONSTRAINT maintenance_comments_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: maintenance_requests maintenance_requests_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.maintenance_requests
+    ADD CONSTRAINT maintenance_requests_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: maintenance_worker_scopes maintenance_worker_scopes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.maintenance_worker_scopes
+    ADD CONSTRAINT maintenance_worker_scopes_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: maintenance_worker_scopes maintenance_worker_scopes_user_id_landlord_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.maintenance_worker_scopes
+    ADD CONSTRAINT maintenance_worker_scopes_user_id_landlord_id_key UNIQUE (user_id, landlord_id);
+
+
+--
+-- Name: mobile_homes mobile_homes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.mobile_homes
+    ADD CONSTRAINT mobile_homes_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: monthly_fee_accruals monthly_fee_accruals_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.monthly_fee_accruals
+    ADD CONSTRAINT monthly_fee_accruals_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: notification_preferences notification_preferences_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.notification_preferences
+    ADD CONSTRAINT notification_preferences_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: notifications notifications_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.notifications
+    ADD CONSTRAINT notifications_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: onsite_manager_scopes onsite_manager_scopes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.onsite_manager_scopes
+    ADD CONSTRAINT onsite_manager_scopes_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: onsite_manager_scopes onsite_manager_scopes_user_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.onsite_manager_scopes
+    ADD CONSTRAINT onsite_manager_scopes_user_id_key UNIQUE (user_id);
+
+
+--
+-- Name: otp_advances otp_advances_cycle_month_tenant_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.otp_advances
+    ADD CONSTRAINT otp_advances_cycle_month_tenant_id_key UNIQUE (cycle_month, tenant_id);
+
+
+--
+-- Name: otp_advances otp_advances_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.otp_advances
+    ADD CONSTRAINT otp_advances_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: parts_inventory parts_inventory_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.parts_inventory
+    ADD CONSTRAINT parts_inventory_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: payments payments_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payments
+    ADD CONSTRAINT payments_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: payroll_run_lines payroll_run_lines_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payroll_run_lines
+    ADD CONSTRAINT payroll_run_lines_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: payroll_runs payroll_runs_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payroll_runs
+    ADD CONSTRAINT payroll_runs_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: pending_tenant_intents pending_tenant_intents_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pending_tenant_intents
+    ADD CONSTRAINT pending_tenant_intents_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: pending_tenant_intents pending_tenant_intents_tenant_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pending_tenant_intents
+    ADD CONSTRAINT pending_tenant_intents_tenant_id_key UNIQUE (tenant_id);
+
+
+--
+-- Name: platform_announcements platform_announcements_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.platform_announcements
+    ADD CONSTRAINT platform_announcements_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: platform_claim_promotions platform_claim_promotions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.platform_claim_promotions
+    ADD CONSTRAINT platform_claim_promotions_pkey PRIMARY KEY (normalized_name);
+
+
+--
+-- Name: platform_events platform_events_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.platform_events
+    ADD CONSTRAINT platform_events_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: platform_fee_accruals platform_fee_accruals_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.platform_fee_accruals
+    ADD CONSTRAINT platform_fee_accruals_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: platform_fee_accruals platform_fee_accruals_unique; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.platform_fee_accruals
+    ADD CONSTRAINT platform_fee_accruals_unique UNIQUE (landlord_id, property_id, accrual_month);
+
+
+--
+-- Name: platform_fee_config platform_fee_config_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.platform_fee_config
+    ADD CONSTRAINT platform_fee_config_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: platform_processing_rates platform_processing_rates_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.platform_processing_rates
+    ADD CONSTRAINT platform_processing_rates_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: platform_revenue_ledger platform_revenue_ledger_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.platform_revenue_ledger
+    ADD CONSTRAINT platform_revenue_ledger_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: platform_review_status platform_review_status_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.platform_review_status
+    ADD CONSTRAINT platform_review_status_pkey PRIMARY KEY (platform_key, import_type);
+
+
+--
+-- Name: pm_companies pm_companies_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pm_companies
+    ADD CONSTRAINT pm_companies_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: pm_fee_plans pm_fee_plans_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pm_fee_plans
+    ADD CONSTRAINT pm_fee_plans_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: pm_invitations pm_invitations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pm_invitations
+    ADD CONSTRAINT pm_invitations_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: pm_monthly_fee_accruals pm_monthly_fee_accruals_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pm_monthly_fee_accruals
+    ADD CONSTRAINT pm_monthly_fee_accruals_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: pm_monthly_fee_accruals pm_monthly_fee_accruals_unique; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pm_monthly_fee_accruals
+    ADD CONSTRAINT pm_monthly_fee_accruals_unique UNIQUE (property_id, accrual_month, pm_company_id);
+
+
+--
+-- Name: pm_property_invitations pm_property_invitations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pm_property_invitations
+    ADD CONSTRAINT pm_property_invitations_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: pm_staff pm_staff_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pm_staff
+    ADD CONSTRAINT pm_staff_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: pm_staff pm_staff_unique_membership; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pm_staff
+    ADD CONSTRAINT pm_staff_unique_membership UNIQUE (pm_company_id, user_id);
+
+
+--
+-- Name: pool_match_requests pool_match_requests_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pool_match_requests
+    ADD CONSTRAINT pool_match_requests_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: pool_match_requests pool_match_requests_unique_landlord_per_entry; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pool_match_requests
+    ADD CONSTRAINT pool_match_requests_unique_landlord_per_entry UNIQUE (pool_entry_id, landlord_id);
+
+
+--
+-- Name: pos_categories pos_categories_landlord_name_uniq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_categories
+    ADD CONSTRAINT pos_categories_landlord_name_uniq UNIQUE (landlord_id, name);
+
+
+--
+-- Name: pos_categories pos_categories_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_categories
+    ADD CONSTRAINT pos_categories_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: pos_customer_invitations pos_customer_invitations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_customer_invitations
+    ADD CONSTRAINT pos_customer_invitations_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: pos_customer_invitations pos_customer_invitations_token_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_customer_invitations
+    ADD CONSTRAINT pos_customer_invitations_token_key UNIQUE (token);
+
+
+--
+-- Name: pos_customers pos_customers_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_customers
+    ADD CONSTRAINT pos_customers_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: pos_discounts pos_discounts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_discounts
+    ADD CONSTRAINT pos_discounts_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: pos_eod_settlements pos_eod_settlements_one_per_day; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_eod_settlements
+    ADD CONSTRAINT pos_eod_settlements_one_per_day UNIQUE (landlord_id, business_day);
+
+
+--
+-- Name: pos_eod_settlements pos_eod_settlements_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_eod_settlements
+    ADD CONSTRAINT pos_eod_settlements_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: pos_inventory_log pos_inventory_log_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_inventory_log
+    ADD CONSTRAINT pos_inventory_log_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: pos_item_variants pos_item_variants_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_item_variants
+    ADD CONSTRAINT pos_item_variants_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: pos_items pos_items_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_items
+    ADD CONSTRAINT pos_items_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: pos_price_history pos_price_history_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_price_history
+    ADD CONSTRAINT pos_price_history_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: pos_purchase_order_items pos_purchase_order_items_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_purchase_order_items
+    ADD CONSTRAINT pos_purchase_order_items_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: pos_purchase_orders pos_purchase_orders_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_purchase_orders
+    ADD CONSTRAINT pos_purchase_orders_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: pos_purchase_orders pos_purchase_orders_po_number_uniq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_purchase_orders
+    ADD CONSTRAINT pos_purchase_orders_po_number_uniq UNIQUE (landlord_id, po_number);
+
+
+--
+-- Name: pos_refunds pos_refunds_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_refunds
+    ADD CONSTRAINT pos_refunds_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: pos_session_items pos_session_items_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_session_items
+    ADD CONSTRAINT pos_session_items_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: pos_sessions pos_sessions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_sessions
+    ADD CONSTRAINT pos_sessions_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: pos_tax_rates pos_tax_rates_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_tax_rates
+    ADD CONSTRAINT pos_tax_rates_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: pos_terminal_readers pos_terminal_readers_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_terminal_readers
+    ADD CONSTRAINT pos_terminal_readers_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: pos_transaction_items pos_transaction_items_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_transaction_items
+    ADD CONSTRAINT pos_transaction_items_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: pos_transactions pos_transactions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_transactions
+    ADD CONSTRAINT pos_transactions_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: pos_vendors pos_vendors_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_vendors
+    ADD CONSTRAINT pos_vendors_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: properties properties_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.properties
+    ADD CONSTRAINT properties_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: property_allocation_rules property_allocation_rules_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_allocation_rules
+    ADD CONSTRAINT property_allocation_rules_pkey PRIMARY KEY (property_id);
+
+
+--
+-- Name: property_duplicate_flags property_duplicate_flags_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_duplicate_flags
+    ADD CONSTRAINT property_duplicate_flags_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: property_fee_schedules property_fee_schedules_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_fee_schedules
+    ADD CONSTRAINT property_fee_schedules_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: property_fee_schedules property_fee_schedules_property_id_fee_type_slot_index_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_fee_schedules
+    ADD CONSTRAINT property_fee_schedules_property_id_fee_type_slot_index_key UNIQUE (property_id, fee_type, slot_index);
+
+
+--
+-- Name: property_manager_scopes property_manager_scopes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_manager_scopes
+    ADD CONSTRAINT property_manager_scopes_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: property_manager_scopes property_manager_scopes_user_id_landlord_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_manager_scopes
+    ADD CONSTRAINT property_manager_scopes_user_id_landlord_id_key UNIQUE (user_id, landlord_id);
+
+
+--
+-- Name: purchase_requests purchase_requests_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.purchase_requests
+    ADD CONSTRAINT purchase_requests_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: reserve_fund_ledger reserve_fund_ledger_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.reserve_fund_ledger
+    ADD CONSTRAINT reserve_fund_ledger_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: reserve_fund_state reserve_fund_state_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.reserve_fund_state
+    ADD CONSTRAINT reserve_fund_state_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: rvs rvs_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.rvs
+    ADD CONSTRAINT rvs_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: sales_leads sales_leads_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sales_leads
+    ADD CONSTRAINT sales_leads_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: scheduled_maintenance scheduled_maintenance_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.scheduled_maintenance
+    ADD CONSTRAINT scheduled_maintenance_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: schema_migrations schema_migrations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.schema_migrations
+    ADD CONSTRAINT schema_migrations_pkey PRIMARY KEY (filename);
+
+
+--
+-- Name: security_deposit_interest_accruals security_deposit_interest_accruals_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.security_deposit_interest_accruals
+    ADD CONSTRAINT security_deposit_interest_accruals_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: security_deposit_interest_accruals security_deposit_interest_accruals_unique_month; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.security_deposit_interest_accruals
+    ADD CONSTRAINT security_deposit_interest_accruals_unique_month UNIQUE (security_deposit_id, accrual_month);
+
+
+--
+-- Name: security_deposits security_deposits_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.security_deposits
+    ADD CONSTRAINT security_deposits_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: shifts shifts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.shifts
+    ADD CONSTRAINT shifts_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: state_law_provisions slp_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.state_law_provisions
+    ADD CONSTRAINT slp_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: state_law_section_texts slst_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.state_law_section_texts
+    ADD CONSTRAINT slst_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: state_law_section_texts slst_unique; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.state_law_section_texts
+    ADD CONSTRAINT slst_unique UNIQUE (state_code, act_key, section_number, effective_year);
+
+
+--
+-- Name: state_landlord_tenant_acts slta_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.state_landlord_tenant_acts
+    ADD CONSTRAINT slta_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: state_landlord_tenant_acts slta_unique; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.state_landlord_tenant_acts
+    ADD CONSTRAINT slta_unique UNIQUE (state_code, act_key, effective_year);
+
+
+--
+-- Name: state_deposit_interest_rates state_deposit_interest_rates_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.state_deposit_interest_rates
+    ADD CONSTRAINT state_deposit_interest_rates_pkey PRIMARY KEY (state_code, effective_year);
+
+
+--
+-- Name: state_tax_forms state_tax_forms_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.state_tax_forms
+    ADD CONSTRAINT state_tax_forms_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: state_tax_forms state_tax_forms_unique; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.state_tax_forms
+    ADD CONSTRAINT state_tax_forms_unique UNIQUE (state_code, form_code, effective_year);
+
+
+--
+-- Name: subleases subleases_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.subleases
+    ADD CONSTRAINT subleases_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: sublessee_invitations sublessee_invitations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sublessee_invitations
+    ADD CONSTRAINT sublessee_invitations_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: sublessee_invitations sublessee_invitations_token_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sublessee_invitations
+    ADD CONSTRAINT sublessee_invitations_token_key UNIQUE (token);
+
+
+--
+-- Name: sublessor_credit_balances sublessor_credit_balances_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sublessor_credit_balances
+    ADD CONSTRAINT sublessor_credit_balances_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: sublessor_credit_balances sublessor_credit_balances_sublease_uniq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sublessor_credit_balances
+    ADD CONSTRAINT sublessor_credit_balances_sublease_uniq UNIQUE (sublease_id);
+
+
+--
+-- Name: system_features system_features_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.system_features
+    ADD CONSTRAINT system_features_pkey PRIMARY KEY (key);
+
+
+--
+-- Name: tenant_identifications tenant_identifications_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_identifications
+    ADD CONSTRAINT tenant_identifications_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: tenant_notifications tenant_notifications_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_notifications
+    ADD CONSTRAINT tenant_notifications_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: tenants tenants_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenants
+    ADD CONSTRAINT tenants_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: unit_applications unit_applications_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_applications
+    ADD CONSTRAINT unit_applications_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: unit_bookings unit_bookings_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_bookings
+    ADD CONSTRAINT unit_bookings_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: unit_entry_request_responses unit_entry_request_responses_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_entry_request_responses
+    ADD CONSTRAINT unit_entry_request_responses_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: unit_entry_request_responses unit_entry_request_responses_request_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_entry_request_responses
+    ADD CONSTRAINT unit_entry_request_responses_request_id_key UNIQUE (request_id);
+
+
+--
+-- Name: unit_entry_requests unit_entry_requests_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_entry_requests
+    ADD CONSTRAINT unit_entry_requests_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: unit_inspection_items unit_inspection_items_inspection_id_area_item_label_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_inspection_items
+    ADD CONSTRAINT unit_inspection_items_inspection_id_area_item_label_key UNIQUE (inspection_id, area, item_label);
+
+
+--
+-- Name: unit_inspection_items unit_inspection_items_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_inspection_items
+    ADD CONSTRAINT unit_inspection_items_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: unit_inspection_photos unit_inspection_photos_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_inspection_photos
+    ADD CONSTRAINT unit_inspection_photos_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: unit_inspection_signatures unit_inspection_signatures_inspection_id_signer_user_id_sig_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_inspection_signatures
+    ADD CONSTRAINT unit_inspection_signatures_inspection_id_signer_user_id_sig_key UNIQUE (inspection_id, signer_user_id, signer_role);
+
+
+--
+-- Name: unit_inspection_signatures unit_inspection_signatures_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_inspection_signatures
+    ADD CONSTRAINT unit_inspection_signatures_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: unit_inspections unit_inspections_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_inspections
+    ADD CONSTRAINT unit_inspections_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: unit_photos unit_photos_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_photos
+    ADD CONSTRAINT unit_photos_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: units units_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.units
+    ADD CONSTRAINT units_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: units units_property_id_unit_number_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.units
+    ADD CONSTRAINT units_property_id_unit_number_key UNIQUE (property_id, unit_number);
+
+
+--
+-- Name: user_balance_ledger user_balance_ledger_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.user_balance_ledger
+    ADD CONSTRAINT user_balance_ledger_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: user_bank_accounts user_bank_accounts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.user_bank_accounts
+    ADD CONSTRAINT user_bank_accounts_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: user_totp_recovery_codes user_totp_recovery_codes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.user_totp_recovery_codes
+    ADD CONSTRAINT user_totp_recovery_codes_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: users users_email_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.users
+    ADD CONSTRAINT users_email_key UNIQUE (email);
+
+
+--
+-- Name: users users_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.users
+    ADD CONSTRAINT users_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: utility_bills utility_bills_one_per_meter_unit_cycle; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_bills
+    ADD CONSTRAINT utility_bills_one_per_meter_unit_cycle UNIQUE (meter_id, unit_id, billing_cycle_month);
+
+
+--
+-- Name: utility_bills utility_bills_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_bills
+    ADD CONSTRAINT utility_bills_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: utility_meter_readings utility_meter_readings_meter_id_billing_cycle_month_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_meter_readings
+    ADD CONSTRAINT utility_meter_readings_meter_id_billing_cycle_month_key UNIQUE (meter_id, billing_cycle_month);
+
+
+--
+-- Name: utility_meter_readings utility_meter_readings_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_meter_readings
+    ADD CONSTRAINT utility_meter_readings_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: utility_meter_units utility_meter_units_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_meter_units
+    ADD CONSTRAINT utility_meter_units_pkey PRIMARY KEY (meter_id, unit_id);
+
+
+--
+-- Name: utility_meters utility_meters_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_meters
+    ADD CONSTRAINT utility_meters_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: work_trade_agreements work_trade_agreements_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.work_trade_agreements
+    ADD CONSTRAINT work_trade_agreements_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: work_trade_logs work_trade_logs_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.work_trade_logs
+    ADD CONSTRAINT work_trade_logs_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: work_trade_periods work_trade_periods_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.work_trade_periods
+    ADD CONSTRAINT work_trade_periods_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: work_trade_periods work_trade_periods_unique_per_agreement_month; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.work_trade_periods
+    ADD CONSTRAINT work_trade_periods_unique_per_agreement_month UNIQUE (agreement_id, period_month, period_year);
+
+
+--
+-- Name: agent_interaction_logs_actor_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX agent_interaction_logs_actor_idx ON public.agent_interaction_logs USING btree (actor_user_id);
+
+
+--
+-- Name: agent_interaction_logs_conversation_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX agent_interaction_logs_conversation_idx ON public.agent_interaction_logs USING btree (conversation_id, turn_index);
+
+
+--
+-- Name: agent_interaction_logs_created_at_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX agent_interaction_logs_created_at_idx ON public.agent_interaction_logs USING btree (created_at DESC);
+
+
+--
+-- Name: agent_interaction_logs_error_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX agent_interaction_logs_error_idx ON public.agent_interaction_logs USING btree (created_at DESC) WHERE (outcome = 'error'::text);
+
+
+--
+-- Name: agent_interaction_logs_human_queue_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX agent_interaction_logs_human_queue_idx ON public.agent_interaction_logs USING btree (created_at DESC) WHERE escalated_to_human;
+
+
+--
+-- Name: agent_interaction_logs_landlord_report_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX agent_interaction_logs_landlord_report_idx ON public.agent_interaction_logs USING btree (landlord_id, property_id, agent_type, outcome, created_at DESC);
+
+
+--
+-- Name: agent_knowledge_chunks_embedding_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX agent_knowledge_chunks_embedding_idx ON public.agent_knowledge_chunks USING hnsw (embedding public.vector_cosine_ops);
+
+
+--
+-- Name: agent_knowledge_chunks_scope_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX agent_knowledge_chunks_scope_idx ON public.agent_knowledge_chunks USING btree (scope);
+
+
+--
+-- Name: background_checks_applicant_pi_uniq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX background_checks_applicant_pi_uniq ON public.background_checks USING btree (applicant_payment_intent_id) WHERE (applicant_payment_intent_id IS NOT NULL);
+
+
+--
+-- Name: flex_charge_accounts_pos_customer_property_uniq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX flex_charge_accounts_pos_customer_property_uniq ON public.flex_charge_accounts USING btree (pos_customer_id, property_id) WHERE (pos_customer_id IS NOT NULL);
+
+
+--
+-- Name: flex_charge_accounts_tenant_property_uniq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX flex_charge_accounts_tenant_property_uniq ON public.flex_charge_accounts USING btree (tenant_id, property_id) WHERE (tenant_id IS NOT NULL);
+
+
+--
+-- Name: float_account_state_singleton; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX float_account_state_singleton ON public.float_account_state USING btree ((true));
+
+
+--
+-- Name: idx_admin_action_log_action; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_admin_action_log_action ON public.admin_action_log USING btree (action_type, created_at DESC);
+
+
+--
+-- Name: idx_admin_action_log_admin; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_admin_action_log_admin ON public.admin_action_log USING btree (admin_user_id, created_at DESC);
+
+
+--
+-- Name: idx_admin_action_log_target; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_admin_action_log_target ON public.admin_action_log USING btree (target_id) WHERE (target_id IS NOT NULL);
+
+
+--
+-- Name: idx_admin_notifications_category; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_admin_notifications_category ON public.admin_notifications USING btree (category, created_at DESC);
+
+
+--
+-- Name: idx_admin_notifications_severity; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_admin_notifications_severity ON public.admin_notifications USING btree (severity, created_at DESC);
+
+
+--
+-- Name: idx_admin_notifications_unacked; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_admin_notifications_unacked ON public.admin_notifications USING btree (created_at DESC) WHERE (acknowledged_at IS NULL);
+
+
+--
+-- Name: idx_adverse_action_notices_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_adverse_action_notices_landlord ON public.adverse_action_notices USING btree (landlord_id, created_at DESC);
+
+
+--
+-- Name: idx_adverse_action_notices_tenant; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_adverse_action_notices_tenant ON public.adverse_action_notices USING btree (tenant_user_id, created_at DESC);
+
+
+--
+-- Name: idx_app_pool_created_desc; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_app_pool_created_desc ON public.application_pool USING btree (created_at DESC);
+
+
+--
+-- Name: idx_app_pool_risk_level; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_app_pool_risk_level ON public.application_pool USING btree (risk_level) WHERE (status = 'available'::text);
+
+
+--
+-- Name: idx_app_pool_state; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_app_pool_state ON public.application_pool USING btree (state) WHERE (status = 'available'::text);
+
+
+--
+-- Name: idx_app_pool_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_app_pool_status ON public.application_pool USING btree (status);
+
+
+--
+-- Name: idx_app_pool_user; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_app_pool_user ON public.application_pool USING btree (user_id);
+
+
+--
+-- Name: idx_audit_entity; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_audit_entity ON public.audit_log USING btree (entity_type, entity_id);
+
+
+--
+-- Name: idx_bgc_created_desc; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_bgc_created_desc ON public.background_checks USING btree (created_at DESC);
+
+
+--
+-- Name: idx_bgc_expires_at_active; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_bgc_expires_at_active ON public.background_checks USING btree (expires_at) WHERE ((status = ANY (ARRAY['complete'::text, 'approved'::text])) AND (expires_at IS NOT NULL));
+
+
+--
+-- Name: idx_bgc_ip_recent; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_bgc_ip_recent ON public.background_checks USING btree (ip_address, created_at);
+
+
+--
+-- Name: idx_bgc_landlord_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_bgc_landlord_id ON public.background_checks USING btree (landlord_id);
+
+
+--
+-- Name: idx_bgc_ssn_dob; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_bgc_ssn_dob ON public.background_checks USING btree (ssn_last4, date_of_birth);
+
+
+--
+-- Name: idx_bgc_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_bgc_status ON public.background_checks USING btree (status);
+
+
+--
+-- Name: idx_bgc_tenant_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_bgc_tenant_id ON public.background_checks USING btree (tenant_id);
+
+
+--
+-- Name: idx_bgc_user_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_bgc_user_id ON public.background_checks USING btree (user_id);
+
+
+--
+-- Name: idx_bookkeeper_scopes_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_bookkeeper_scopes_landlord ON public.bookkeeper_scopes USING btree (landlord_id);
+
+
+--
+-- Name: idx_bookkeeper_scopes_user; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_bookkeeper_scopes_user ON public.bookkeeper_scopes USING btree (user_id);
+
+
+--
+-- Name: idx_bp_created; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_bp_created ON public.bulletin_posts USING btree (created_at);
+
+
+--
+-- Name: idx_bp_property; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_bp_property ON public.bulletin_posts USING btree (property_id);
+
+
+--
+-- Name: idx_connect_disputes_landlord_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connect_disputes_landlord_status ON public.connect_disputes USING btree (landlord_id, status, created_at DESC);
+
+
+--
+-- Name: idx_connect_disputes_pending; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connect_disputes_pending ON public.connect_disputes USING btree (evidence_due_by) WHERE (status = ANY (ARRAY['warning_needs_response'::text, 'needs_response'::text]));
+
+
+--
+-- Name: idx_connect_payouts_account; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connect_payouts_account ON public.connect_payouts USING btree (stripe_account_id, created_at DESC);
+
+
+--
+-- Name: idx_connect_payouts_pm_company_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connect_payouts_pm_company_status ON public.connect_payouts USING btree (pm_company_id, status, created_at DESC) WHERE (pm_company_id IS NOT NULL);
+
+
+--
+-- Name: idx_connect_payouts_user_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connect_payouts_user_status ON public.connect_payouts USING btree (user_id, status, created_at DESC);
+
+
+--
+-- Name: idx_credit_disputes_event; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_credit_disputes_event ON public.credit_disputes USING btree (disputed_event_id);
+
+
+--
+-- Name: idx_credit_disputes_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_credit_disputes_status ON public.credit_disputes USING btree (status);
+
+
+--
+-- Name: idx_credit_disputes_subject; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_credit_disputes_subject ON public.credit_disputes USING btree (disputing_subject_id);
+
+
+--
+-- Name: idx_credit_events_active; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_credit_events_active ON public.credit_events USING btree (subject_id) WHERE (superseded_by IS NULL);
+
+
+--
+-- Name: idx_credit_events_chain; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_credit_events_chain ON public.credit_events USING btree (subject_id, recorded_at);
+
+
+--
+-- Name: idx_credit_events_dimensions; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_credit_events_dimensions ON public.credit_events USING gin (dimension_tags);
+
+
+--
+-- Name: idx_credit_events_subject; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_credit_events_subject ON public.credit_events USING btree (subject_id, occurred_at);
+
+
+--
+-- Name: idx_credit_events_type; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_credit_events_type ON public.credit_events USING btree (event_type);
+
+
+--
+-- Name: idx_credit_hardship_subject; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_credit_hardship_subject ON public.credit_hardship_contexts USING btree (subject_id, start_date);
+
+
+--
+-- Name: idx_credit_merkle_anchored; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_credit_merkle_anchored ON public.credit_merkle_anchors USING btree (anchored_at DESC);
+
+
+--
+-- Name: idx_credit_scores_subject; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_credit_scores_subject ON public.credit_scores USING btree (subject_id, computed_at DESC);
+
+
+--
+-- Name: idx_credit_subjects_ref; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_credit_subjects_ref ON public.credit_subjects USING btree (subject_type, subject_ref_id);
+
+
+--
+-- Name: idx_csv_import_attempts_claimed_platform; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_csv_import_attempts_claimed_platform ON public.csv_import_attempts USING btree (lower(claimed_platform_name)) WHERE (claimed_platform_name IS NOT NULL);
+
+
+--
+-- Name: idx_csv_import_attempts_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_csv_import_attempts_landlord ON public.csv_import_attempts USING btree (landlord_id);
+
+
+--
+-- Name: idx_csv_import_attempts_pending; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_csv_import_attempts_pending ON public.csv_import_attempts USING btree (created_at DESC) WHERE (status = ANY (ARRAY['validated'::text, 'committed'::text]));
+
+
+--
+-- Name: idx_csv_import_attempts_platform_committed; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_csv_import_attempts_platform_committed ON public.csv_import_attempts USING btree (platform_key, import_type) WHERE (status = 'committed'::text);
+
+
+--
+-- Name: idx_daily_tasks_landlord_today; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_daily_tasks_landlord_today ON public.daily_tasks USING btree (landlord_id, completed, due_date);
+
+
+--
+-- Name: idx_deposit_returns_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_deposit_returns_landlord ON public.deposit_returns USING btree (landlord_id);
+
+
+--
+-- Name: idx_deposit_returns_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_deposit_returns_status ON public.deposit_returns USING btree (status);
+
+
+--
+-- Name: idx_deposit_returns_tenant; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_deposit_returns_tenant ON public.deposit_returns USING btree (tenant_id);
+
+
+--
+-- Name: idx_disbursements_bank_account; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_disbursements_bank_account ON public.disbursements USING btree (bank_account_id) WHERE (bank_account_id IS NOT NULL);
+
+
+--
+-- Name: idx_disbursements_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_disbursements_landlord ON public.disbursements USING btree (landlord_id);
+
+
+--
+-- Name: idx_disbursements_target; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_disbursements_target ON public.disbursements USING btree (target_date);
+
+
+--
+-- Name: idx_disbursements_user; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_disbursements_user ON public.disbursements USING btree (user_id) WHERE (user_id IS NOT NULL);
+
+
+--
+-- Name: idx_document_batches_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_document_batches_landlord ON public.document_batches USING btree (landlord_id);
+
+
+--
+-- Name: idx_email_send_log_failed_recent; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_email_send_log_failed_recent ON public.email_send_log USING btree (created_at DESC) WHERE (status = 'failed'::text);
+
+
+--
+-- Name: idx_email_send_log_landlord_status_created; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_email_send_log_landlord_status_created ON public.email_send_log USING btree (landlord_id, status, created_at DESC);
+
+
+--
+-- Name: idx_emergency_contacts_tenant; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_emergency_contacts_tenant ON public.emergency_contacts USING btree (tenant_id);
+
+
+--
+-- Name: idx_external_account_links_category; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_external_account_links_category ON public.external_account_links USING btree (category);
+
+
+--
+-- Name: idx_external_account_links_polled; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_external_account_links_polled ON public.external_account_links USING btree (last_polled_at) WHERE (consent_revoked_at IS NULL);
+
+
+--
+-- Name: idx_external_account_links_subject; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_external_account_links_subject ON public.external_account_links USING btree (subject_id) WHERE (consent_revoked_at IS NULL);
+
+
+--
+-- Name: idx_fdcc_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_fdcc_status ON public.flex_deposit_custody_charges USING btree (status, cycle_month);
+
+
+--
+-- Name: idx_fdcc_tenant; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_fdcc_tenant ON public.flex_deposit_custody_charges USING btree (tenant_id, cycle_month DESC);
+
+
+--
+-- Name: idx_fitness_body_weight_user; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_fitness_body_weight_user ON public.fitness_body_weight_logs USING btree (user_id);
+
+
+--
+-- Name: idx_fitness_days_routine; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_fitness_days_routine ON public.fitness_days USING btree (routine_id);
+
+
+--
+-- Name: idx_fitness_exercises_section; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_fitness_exercises_section ON public.fitness_exercises USING btree (section_id);
+
+
+--
+-- Name: idx_fitness_milestones_user; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_fitness_milestones_user ON public.fitness_milestones USING btree (user_id);
+
+
+--
+-- Name: idx_fitness_profiles_user; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_fitness_profiles_user ON public.fitness_profiles USING btree (user_id);
+
+
+--
+-- Name: idx_fitness_routines_user; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_fitness_routines_user ON public.fitness_routines USING btree (user_id);
+
+
+--
+-- Name: idx_fitness_sections_day; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_fitness_sections_day ON public.fitness_sections USING btree (day_id);
+
+
+--
+-- Name: idx_fitness_set_logs_exercise; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_fitness_set_logs_exercise ON public.fitness_set_logs USING btree (exercise_name);
+
+
+--
+-- Name: idx_fitness_set_logs_log; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_fitness_set_logs_log ON public.fitness_set_logs USING btree (log_id);
+
+
+--
+-- Name: idx_fitness_set_logs_user; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_fitness_set_logs_user ON public.fitness_set_logs USING btree (user_id);
+
+
+--
+-- Name: idx_fitness_workout_logs_date; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_fitness_workout_logs_date ON public.fitness_workout_logs USING btree (logged_date);
+
+
+--
+-- Name: idx_fitness_workout_logs_user; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_fitness_workout_logs_user ON public.fitness_workout_logs USING btree (user_id);
+
+
+--
+-- Name: idx_flex_charge_accounts_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_flex_charge_accounts_landlord ON public.flex_charge_accounts USING btree (landlord_id);
+
+
+--
+-- Name: idx_flex_charge_accounts_property; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_flex_charge_accounts_property ON public.flex_charge_accounts USING btree (property_id);
+
+
+--
+-- Name: idx_flex_charge_accounts_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_flex_charge_accounts_status ON public.flex_charge_accounts USING btree (status);
+
+
+--
+-- Name: idx_flex_charge_stmt_account; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_flex_charge_stmt_account ON public.flex_charge_statements USING btree (account_id, cycle_month DESC);
+
+
+--
+-- Name: idx_flex_charge_stmt_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_flex_charge_stmt_status ON public.flex_charge_statements USING btree (status, due_date);
+
+
+--
+-- Name: idx_flex_charge_tx_account; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_flex_charge_tx_account ON public.flex_charge_transactions USING btree (account_id, created_at DESC);
+
+
+--
+-- Name: idx_flex_charge_tx_pos; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_flex_charge_tx_pos ON public.flex_charge_transactions USING btree (pos_transaction_id) WHERE (pos_transaction_id IS NOT NULL);
+
+
+--
+-- Name: idx_flex_charge_tx_statement; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_flex_charge_tx_statement ON public.flex_charge_transactions USING btree (statement_id) WHERE (statement_id IS NOT NULL);
+
+
+--
+-- Name: idx_flex_charge_tx_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_flex_charge_tx_status ON public.flex_charge_transactions USING btree (status);
+
+
+--
+-- Name: idx_flex_dep_inst_primary_pull; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_flex_dep_inst_primary_pull ON public.flex_deposit_installments USING btree (primary_pull_date) WHERE ((status = 'pending'::text) AND (attempt_count = 0));
+
+
+--
+-- Name: idx_flex_dep_inst_retry_pull; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_flex_dep_inst_retry_pull ON public.flex_deposit_installments USING btree (retry_pull_date) WHERE ((status = 'pending'::text) AND (attempt_count = 1));
+
+
+--
+-- Name: idx_flex_deposit_installments_deposit; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_flex_deposit_installments_deposit ON public.flex_deposit_installments USING btree (security_deposit_id);
+
+
+--
+-- Name: idx_flex_deposit_installments_due; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_flex_deposit_installments_due ON public.flex_deposit_installments USING btree (due_date) WHERE (status = 'pending'::text);
+
+
+--
+-- Name: idx_flex_deposit_installments_tenant; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_flex_deposit_installments_tenant ON public.flex_deposit_installments USING btree (tenant_id, due_date);
+
+
+--
+-- Name: idx_flexpay_advances_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_flexpay_advances_landlord ON public.flexpay_advances USING btree (landlord_id, cycle_month DESC);
+
+
+--
+-- Name: idx_flexpay_advances_pull_day; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_flexpay_advances_pull_day ON public.flexpay_advances USING btree (pull_day) WHERE (status = ANY (ARRAY['pending'::text, 'fronted'::text]));
+
+
+--
+-- Name: idx_flexpay_advances_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_flexpay_advances_status ON public.flexpay_advances USING btree (status);
+
+
+--
+-- Name: idx_flexpay_advances_stripe_transfer_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX idx_flexpay_advances_stripe_transfer_id ON public.flexpay_advances USING btree (stripe_transfer_id) WHERE (stripe_transfer_id IS NOT NULL);
+
+
+--
+-- Name: idx_flexpay_advances_tenant; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_flexpay_advances_tenant ON public.flexpay_advances USING btree (tenant_id, cycle_month DESC);
+
+
+--
+-- Name: idx_flexsuite_enrollment_acceptances_tenant; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_flexsuite_enrollment_acceptances_tenant ON public.flexsuite_enrollment_acceptances USING btree (tenant_id, product_type, accepted_at DESC);
+
+
+--
+-- Name: idx_invitations_email; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_invitations_email ON public.invitations USING btree (lower(email));
+
+
+--
+-- Name: idx_invitations_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_invitations_landlord ON public.invitations USING btree (landlord_id);
+
+
+--
+-- Name: idx_invitations_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_invitations_status ON public.invitations USING btree (status) WHERE (status = 'pending'::text);
+
+
+--
+-- Name: idx_invitations_token; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_invitations_token ON public.invitations USING btree (token);
+
+
+--
+-- Name: idx_invoices_due_date; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_invoices_due_date ON public.invoices USING btree (due_date);
+
+
+--
+-- Name: idx_invoices_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_invoices_landlord ON public.invoices USING btree (landlord_id);
+
+
+--
+-- Name: idx_invoices_lease; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_invoices_lease ON public.invoices USING btree (lease_id);
+
+
+--
+-- Name: idx_invoices_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_invoices_status ON public.invoices USING btree (status);
+
+
+--
+-- Name: idx_invoices_tenant; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_invoices_tenant ON public.invoices USING btree (tenant_id);
+
+
+--
+-- Name: idx_invoices_unit; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_invoices_unit ON public.invoices USING btree (unit_id);
+
+
+--
+-- Name: idx_landlord_pfo_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_landlord_pfo_landlord ON public.landlord_platform_fee_overrides USING btree (landlord_id, created_at DESC);
+
+
+--
+-- Name: idx_landlords_default_pm_company; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_landlords_default_pm_company ON public.landlords USING btree (default_pm_company_id) WHERE (default_pm_company_id IS NOT NULL);
+
+
+--
+-- Name: idx_landlords_user_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_landlords_user_id ON public.landlords USING btree (user_id);
+
+
+--
+-- Name: idx_ld_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_ld_landlord ON public.lease_documents USING btree (landlord_id);
+
+
+--
+-- Name: idx_ld_lease; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_ld_lease ON public.lease_documents USING btree (lease_id);
+
+
+--
+-- Name: idx_ld_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_ld_status ON public.lease_documents USING btree (status) WHERE (status = ANY (ARRAY['sent'::text, 'in_progress'::text]));
+
+
+--
+-- Name: idx_ld_unit; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_ld_unit ON public.lease_documents USING btree (unit_id);
+
+
+--
+-- Name: idx_ldf_document; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_ldf_document ON public.lease_document_fields USING btree (document_id);
+
+
+--
+-- Name: idx_ldf_signer; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_ldf_signer ON public.lease_document_fields USING btree (signer_id);
+
+
+--
+-- Name: idx_ldior_landlord_year; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_ldior_landlord_year ON public.landlord_deposit_interest_rate_overrides USING btree (landlord_id, effective_year);
+
+
+--
+-- Name: idx_lds_doc; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_lds_doc ON public.lease_document_signers USING btree (document_id);
+
+
+--
+-- Name: idx_lds_email; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_lds_email ON public.lease_document_signers USING btree (email);
+
+
+--
+-- Name: idx_lds_token; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_lds_token ON public.lease_document_signers USING btree (token);
+
+
+--
+-- Name: idx_lease_documents_batch; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_lease_documents_batch ON public.lease_documents USING btree (batch_id);
+
+
+--
+-- Name: idx_lease_fees_fee_type; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_lease_fees_fee_type ON public.lease_fees USING btree (fee_type);
+
+
+--
+-- Name: idx_lease_fees_lease_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_lease_fees_lease_id ON public.lease_fees USING btree (lease_id);
+
+
+--
+-- Name: idx_lease_occupants_lease; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_lease_occupants_lease ON public.lease_occupants USING btree (lease_id);
+
+
+--
+-- Name: idx_lease_pets_lease; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_lease_pets_lease ON public.lease_pets USING btree (lease_id);
+
+
+--
+-- Name: idx_lease_templates_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_lease_templates_landlord ON public.lease_templates USING btree (landlord_id) WHERE (is_active = true);
+
+
+--
+-- Name: idx_lease_termination_requests_lease; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_lease_termination_requests_lease ON public.lease_termination_requests USING btree (lease_id);
+
+
+--
+-- Name: idx_lease_termination_requests_one_active; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX idx_lease_termination_requests_one_active ON public.lease_termination_requests USING btree (lease_id) WHERE (status = 'requested'::text);
+
+
+--
+-- Name: idx_lease_termination_requests_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_lease_termination_requests_status ON public.lease_termination_requests USING btree (status);
+
+
+--
+-- Name: idx_lease_termination_requests_tenant; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_lease_termination_requests_tenant ON public.lease_termination_requests USING btree (tenant_id);
+
+
+--
+-- Name: idx_lease_utility_assignments_meter_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_lease_utility_assignments_meter_id ON public.lease_utility_assignments USING btree (meter_id);
+
+
+--
+-- Name: idx_lease_utility_responsibilities_lease_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_lease_utility_responsibilities_lease_id ON public.lease_utility_responsibilities USING btree (lease_id);
+
+
+--
+-- Name: idx_lease_vehicles_lease; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_lease_vehicles_lease ON public.lease_vehicles USING btree (lease_id);
+
+
+--
+-- Name: idx_leases_end_date_active; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_leases_end_date_active ON public.leases USING btree (end_date) WHERE ((status = 'active'::text) AND (end_date IS NOT NULL));
+
+
+--
+-- Name: idx_leases_unit; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_leases_unit ON public.leases USING btree (unit_id);
+
+
+--
+-- Name: idx_liability_insurance_lease; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_liability_insurance_lease ON public.liability_insurance_policies USING btree (lease_id);
+
+
+--
+-- Name: idx_ltf_template; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_ltf_template ON public.lease_template_fields USING btree (template_id);
+
+
+--
+-- Name: idx_maint_comments_request; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_maint_comments_request ON public.maintenance_comments USING btree (request_id);
+
+
+--
+-- Name: idx_maint_scopes_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_maint_scopes_landlord ON public.maintenance_worker_scopes USING btree (landlord_id);
+
+
+--
+-- Name: idx_maint_scopes_user; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_maint_scopes_user ON public.maintenance_worker_scopes USING btree (user_id);
+
+
+--
+-- Name: idx_maintenance_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_maintenance_status ON public.maintenance_requests USING btree (status);
+
+
+--
+-- Name: idx_maintenance_unit; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_maintenance_unit ON public.maintenance_requests USING btree (unit_id);
+
+
+--
+-- Name: idx_mobile_homes_owner; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_mobile_homes_owner ON public.mobile_homes USING btree (current_owner_tenant_id);
+
+
+--
+-- Name: idx_mobile_homes_unit; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_mobile_homes_unit ON public.mobile_homes USING btree (unit_id) WHERE (removed_at IS NULL);
+
+
+--
+-- Name: idx_monthly_fee_accruals_manager; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_monthly_fee_accruals_manager ON public.monthly_fee_accruals USING btree (manager_user_id, accrual_month DESC);
+
+
+--
+-- Name: idx_notifications_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_notifications_landlord ON public.notifications USING btree (landlord_id, created_at DESC) WHERE (landlord_id IS NOT NULL);
+
+
+--
+-- Name: idx_notifications_user; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_notifications_user ON public.notifications USING btree (user_id, read);
+
+
+--
+-- Name: idx_notifications_user_unread; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_notifications_user_unread ON public.notifications USING btree (user_id, created_at DESC) WHERE (read = false);
+
+
+--
+-- Name: idx_onsite_scopes_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_onsite_scopes_landlord ON public.onsite_manager_scopes USING btree (landlord_id);
+
+
+--
+-- Name: idx_otp_advances_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_otp_advances_landlord ON public.otp_advances USING btree (landlord_id, cycle_month DESC);
+
+
+--
+-- Name: idx_otp_advances_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_otp_advances_status ON public.otp_advances USING btree (status);
+
+
+--
+-- Name: idx_otp_advances_stripe_transfer_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX idx_otp_advances_stripe_transfer_id ON public.otp_advances USING btree (stripe_transfer_id) WHERE (stripe_transfer_id IS NOT NULL);
+
+
+--
+-- Name: idx_otp_advances_tenant; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_otp_advances_tenant ON public.otp_advances USING btree (tenant_id, cycle_month DESC);
+
+
+--
+-- Name: idx_parts_inventory_landlord_name; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_parts_inventory_landlord_name ON public.parts_inventory USING btree (landlord_id, name);
+
+
+--
+-- Name: idx_payments_ach_retry_due; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_payments_ach_retry_due ON public.payments USING btree (next_retry_at) WHERE ((status = 'failed'::text) AND (next_retry_at IS NOT NULL));
+
+
+--
+-- Name: idx_payments_due_date; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_payments_due_date ON public.payments USING btree (due_date);
+
+
+--
+-- Name: idx_payments_import_source; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_payments_import_source ON public.payments USING btree (import_source) WHERE (import_source IS NOT NULL);
+
+
+--
+-- Name: idx_payments_invoice_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_payments_invoice_id ON public.payments USING btree (invoice_id);
+
+
+--
+-- Name: idx_payments_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_payments_landlord ON public.payments USING btree (landlord_id);
+
+
+--
+-- Name: idx_payments_lease_fee_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_payments_lease_fee_id ON public.payments USING btree (lease_fee_id);
+
+
+--
+-- Name: idx_payments_platform_held_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_payments_platform_held_landlord ON public.payments USING btree (landlord_id) WHERE (platform_held = true);
+
+
+--
+-- Name: idx_payments_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_payments_status ON public.payments USING btree (status);
+
+
+--
+-- Name: idx_payments_tenant; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_payments_tenant ON public.payments USING btree (tenant_id);
+
+
+--
+-- Name: idx_payments_unit; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_payments_unit ON public.payments USING btree (unit_id);
+
+
+--
+-- Name: idx_pdf_conflicting; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pdf_conflicting ON public.property_duplicate_flags USING btree (conflicting_property_id);
+
+
+--
+-- Name: idx_pdf_property; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pdf_property ON public.property_duplicate_flags USING btree (property_id);
+
+
+--
+-- Name: idx_pdf_unresolved; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pdf_unresolved ON public.property_duplicate_flags USING btree (resolved_at) WHERE (resolved_at IS NULL);
+
+
+--
+-- Name: idx_pending_tenant_intents_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pending_tenant_intents_landlord ON public.pending_tenant_intents USING btree (landlord_id) WHERE (resolved_at IS NULL);
+
+
+--
+-- Name: idx_pending_tenant_intents_parser_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pending_tenant_intents_parser_status ON public.pending_tenant_intents USING btree (parser_status) WHERE (parser_status = ANY (ARRAY['parsing'::text, 'parsed'::text, 'mismatch'::text, 'error'::text]));
+
+
+--
+-- Name: idx_pfa_landlord_month; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pfa_landlord_month ON public.platform_fee_accruals USING btree (landlord_id, accrual_month DESC);
+
+
+--
+-- Name: idx_pfa_property_month; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pfa_property_month ON public.platform_fee_accruals USING btree (property_id, accrual_month DESC);
+
+
+--
+-- Name: idx_platform_announcements_active_priority; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_platform_announcements_active_priority ON public.platform_announcements USING btree (priority DESC, created_at DESC) WHERE (active = true);
+
+
+--
+-- Name: idx_platform_events_actor; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_platform_events_actor ON public.platform_events USING btree (actor_user_id);
+
+
+--
+-- Name: idx_platform_events_created; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_platform_events_created ON public.platform_events USING btree (created_at DESC);
+
+
+--
+-- Name: idx_platform_events_subject; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_platform_events_subject ON public.platform_events USING btree (subject_type, subject_id);
+
+
+--
+-- Name: idx_platform_events_type; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_platform_events_type ON public.platform_events USING btree (event_type);
+
+
+--
+-- Name: idx_platform_processing_rates_active; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_platform_processing_rates_active ON public.platform_processing_rates USING btree (payment_method, effective_from DESC);
+
+
+--
+-- Name: idx_platform_revenue_ledger_created; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_platform_revenue_ledger_created ON public.platform_revenue_ledger USING btree (created_at DESC);
+
+
+--
+-- Name: idx_platform_revenue_ledger_property; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_platform_revenue_ledger_property ON public.platform_revenue_ledger USING btree (property_id) WHERE (property_id IS NOT NULL);
+
+
+--
+-- Name: idx_platform_revenue_ledger_reference; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_platform_revenue_ledger_reference ON public.platform_revenue_ledger USING btree (reference_id) WHERE (reference_id IS NOT NULL);
+
+
+--
+-- Name: idx_pm_companies_connect_ready; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pm_companies_connect_ready ON public.pm_companies USING btree (id) WHERE ((connect_payouts_enabled = true) AND (connect_details_submitted = true));
+
+
+--
+-- Name: idx_pm_companies_created_by; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pm_companies_created_by ON public.pm_companies USING btree (created_by_user_id) WHERE (created_by_user_id IS NOT NULL);
+
+
+--
+-- Name: idx_pm_companies_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pm_companies_status ON public.pm_companies USING btree (status);
+
+
+--
+-- Name: idx_pm_companies_stripe_connect_account_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX idx_pm_companies_stripe_connect_account_id ON public.pm_companies USING btree (stripe_connect_account_id) WHERE (stripe_connect_account_id IS NOT NULL);
+
+
+--
+-- Name: idx_pm_fee_plans_company_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pm_fee_plans_company_status ON public.pm_fee_plans USING btree (pm_company_id, status);
+
+
+--
+-- Name: idx_pm_invitations_company_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pm_invitations_company_status ON public.pm_invitations USING btree (pm_company_id, status, created_at DESC);
+
+
+--
+-- Name: idx_pm_invitations_email_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pm_invitations_email_status ON public.pm_invitations USING btree (lower(email), status) WHERE (status = 'pending'::text);
+
+
+--
+-- Name: idx_pm_monthly_fee_accruals_pm_company; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pm_monthly_fee_accruals_pm_company ON public.pm_monthly_fee_accruals USING btree (pm_company_id, accrual_month DESC);
+
+
+--
+-- Name: idx_pm_monthly_fee_accruals_property_month; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pm_monthly_fee_accruals_property_month ON public.pm_monthly_fee_accruals USING btree (property_id, accrual_month DESC);
+
+
+--
+-- Name: idx_pm_property_invitations_email_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pm_property_invitations_email_status ON public.pm_property_invitations USING btree (lower(invited_email), status) WHERE (status = 'pending'::text);
+
+
+--
+-- Name: idx_pm_property_invitations_landlord_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pm_property_invitations_landlord_status ON public.pm_property_invitations USING btree (landlord_id, status, created_at DESC);
+
+
+--
+-- Name: idx_pm_property_invitations_pm_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pm_property_invitations_pm_status ON public.pm_property_invitations USING btree (pm_company_id, status, created_at DESC);
+
+
+--
+-- Name: idx_pm_property_invitations_property_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pm_property_invitations_property_status ON public.pm_property_invitations USING btree (property_id, status, created_at DESC);
+
+
+--
+-- Name: idx_pm_scopes_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pm_scopes_landlord ON public.property_manager_scopes USING btree (landlord_id);
+
+
+--
+-- Name: idx_pm_scopes_user; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pm_scopes_user ON public.property_manager_scopes USING btree (user_id);
+
+
+--
+-- Name: idx_pm_staff_company_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pm_staff_company_status ON public.pm_staff USING btree (pm_company_id, status);
+
+
+--
+-- Name: idx_pm_staff_user_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pm_staff_user_status ON public.pm_staff USING btree (user_id, status);
+
+
+--
+-- Name: idx_pmr_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pmr_landlord ON public.pool_match_requests USING btree (landlord_id);
+
+
+--
+-- Name: idx_pmr_pool_entry; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pmr_pool_entry ON public.pool_match_requests USING btree (pool_entry_id);
+
+
+--
+-- Name: idx_pmr_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pmr_status ON public.pool_match_requests USING btree (status);
+
+
+--
+-- Name: idx_pos_categories_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pos_categories_landlord ON public.pos_categories USING btree (landlord_id, sort_order, name) WHERE (is_active = true);
+
+
+--
+-- Name: idx_pos_categories_property; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pos_categories_property ON public.pos_categories USING btree (property_id) WHERE (property_id IS NOT NULL);
+
+
+--
+-- Name: idx_pos_customer_invitations_customer; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pos_customer_invitations_customer ON public.pos_customer_invitations USING btree (pos_customer_id);
+
+
+--
+-- Name: idx_pos_customer_invitations_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pos_customer_invitations_status ON public.pos_customer_invitations USING btree (status, expires_at);
+
+
+--
+-- Name: idx_pos_customer_invitations_token; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pos_customer_invitations_token ON public.pos_customer_invitations USING btree (token);
+
+
+--
+-- Name: idx_pos_customers_email; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pos_customers_email ON public.pos_customers USING btree (lower(email));
+
+
+--
+-- Name: idx_pos_customers_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pos_customers_landlord ON public.pos_customers USING btree (landlord_id) WHERE (archived_at IS NULL);
+
+
+--
+-- Name: idx_pos_discounts_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pos_discounts_landlord ON public.pos_discounts USING btree (landlord_id, name) WHERE (is_active = true);
+
+
+--
+-- Name: idx_pos_eod_landlord_day; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pos_eod_landlord_day ON public.pos_eod_settlements USING btree (landlord_id, business_day DESC);
+
+
+--
+-- Name: idx_pos_inventory_log_item_date; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pos_inventory_log_item_date ON public.pos_inventory_log USING btree (item_id, created_at DESC);
+
+
+--
+-- Name: idx_pos_inventory_log_landlord_date; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pos_inventory_log_landlord_date ON public.pos_inventory_log USING btree (landlord_id, created_at DESC);
+
+
+--
+-- Name: idx_pos_item_variants_item; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pos_item_variants_item ON public.pos_item_variants USING btree (item_id, sort_order, sell_price) WHERE (is_active = true);
+
+
+--
+-- Name: idx_pos_items_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pos_items_landlord ON public.pos_items USING btree (landlord_id, category_id, name) WHERE (is_active = true);
+
+
+--
+-- Name: idx_pos_items_low_stock; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pos_items_low_stock ON public.pos_items USING btree (landlord_id, stock_qty) WHERE ((is_active = true) AND (stock_qty <= stock_min) AND (stock_max < 999));
+
+
+--
+-- Name: idx_pos_items_property; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pos_items_property ON public.pos_items USING btree (property_id) WHERE (property_id IS NOT NULL);
+
+
+--
+-- Name: idx_pos_price_history_item; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pos_price_history_item ON public.pos_price_history USING btree (item_id, created_at DESC);
+
+
+--
+-- Name: idx_pos_purchase_order_items_po; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pos_purchase_order_items_po ON public.pos_purchase_order_items USING btree (po_id);
+
+
+--
+-- Name: idx_pos_purchase_orders_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pos_purchase_orders_landlord ON public.pos_purchase_orders USING btree (landlord_id, created_at DESC);
+
+
+--
+-- Name: idx_pos_purchase_orders_vendor; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pos_purchase_orders_vendor ON public.pos_purchase_orders USING btree (vendor_id, status);
+
+
+--
+-- Name: idx_pos_refunds_landlord_date; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pos_refunds_landlord_date ON public.pos_refunds USING btree (landlord_id, created_at DESC);
+
+
+--
+-- Name: idx_pos_refunds_tx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pos_refunds_tx ON public.pos_refunds USING btree (transaction_id);
+
+
+--
+-- Name: idx_pos_tax_rates_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pos_tax_rates_landlord ON public.pos_tax_rates USING btree (landlord_id, tax_type, name) WHERE (is_active = true);
+
+
+--
+-- Name: idx_pos_tax_rates_property; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pos_tax_rates_property ON public.pos_tax_rates USING btree (property_id) WHERE (property_id IS NOT NULL);
+
+
+--
+-- Name: idx_pos_terminal_readers_property_active; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pos_terminal_readers_property_active ON public.pos_terminal_readers USING btree (property_id) WHERE (status = 'active'::text);
+
+
+--
+-- Name: idx_pos_terminal_readers_stripe_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX idx_pos_terminal_readers_stripe_id ON public.pos_terminal_readers USING btree (landlord_id, stripe_reader_id);
+
+
+--
+-- Name: idx_pos_transaction_items_item; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pos_transaction_items_item ON public.pos_transaction_items USING btree (item_id) WHERE (item_id IS NOT NULL);
+
+
+--
+-- Name: idx_pos_transaction_items_tx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pos_transaction_items_tx ON public.pos_transaction_items USING btree (transaction_id);
+
+
+--
+-- Name: idx_pos_transactions_landlord_date; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pos_transactions_landlord_date ON public.pos_transactions USING btree (landlord_id, created_at DESC);
+
+
+--
+-- Name: idx_pos_transactions_pos_customer; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pos_transactions_pos_customer ON public.pos_transactions USING btree (pos_customer_id) WHERE (pos_customer_id IS NOT NULL);
+
+
+--
+-- Name: idx_pos_transactions_tenant; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pos_transactions_tenant ON public.pos_transactions USING btree (tenant_id, created_at DESC) WHERE (tenant_id IS NOT NULL);
+
+
+--
+-- Name: idx_pos_vendors_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pos_vendors_landlord ON public.pos_vendors USING btree (landlord_id, name) WHERE (is_active = true);
+
+
+--
+-- Name: idx_properties_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_properties_landlord ON public.properties USING btree (landlord_id);
+
+
+--
+-- Name: idx_properties_managed_by_user; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_properties_managed_by_user ON public.properties USING btree (managed_by_user_id);
+
+
+--
+-- Name: idx_properties_owner_user; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_properties_owner_user ON public.properties USING btree (owner_user_id);
+
+
+--
+-- Name: idx_properties_pm_company; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_properties_pm_company ON public.properties USING btree (pm_company_id) WHERE (pm_company_id IS NOT NULL);
+
+
+--
+-- Name: idx_property_allocation_rules_bank_account; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_property_allocation_rules_bank_account ON public.property_allocation_rules USING btree (owner_bank_account_id) WHERE (owner_bank_account_id IS NOT NULL);
+
+
+--
+-- Name: idx_property_fee_schedules_property; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_property_fee_schedules_property ON public.property_fee_schedules USING btree (property_id);
+
+
+--
+-- Name: idx_purchase_requests_landlord_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_purchase_requests_landlord_status ON public.purchase_requests USING btree (landlord_id, status, created_at DESC);
+
+
+--
+-- Name: idx_purchase_requests_work_order; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_purchase_requests_work_order ON public.purchase_requests USING btree (work_order_id) WHERE (work_order_id IS NOT NULL);
+
+
+--
+-- Name: idx_rvs_owner; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_rvs_owner ON public.rvs USING btree (current_owner_tenant_id);
+
+
+--
+-- Name: idx_rvs_unit; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_rvs_unit ON public.rvs USING btree (unit_id) WHERE (removed_at IS NULL);
+
+
+--
+-- Name: idx_scheduled_maintenance_landlord_due; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_scheduled_maintenance_landlord_due ON public.scheduled_maintenance USING btree (landlord_id, next_due);
+
+
+--
+-- Name: idx_sdi_accruals_deposit; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_sdi_accruals_deposit ON public.security_deposit_interest_accruals USING btree (security_deposit_id);
+
+
+--
+-- Name: idx_sdi_accruals_month; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_sdi_accruals_month ON public.security_deposit_interest_accruals USING btree (accrual_month);
+
+
+--
+-- Name: idx_security_deposits_carried_from; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_security_deposits_carried_from ON public.security_deposits USING btree (carried_from_deposit_id) WHERE (carried_from_deposit_id IS NOT NULL);
+
+
+--
+-- Name: idx_security_deposits_portability_pending; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_security_deposits_portability_pending ON public.security_deposits USING btree (portability_status) WHERE (portability_status = ANY (ARRAY['pending_auth'::text, 'authorized'::text, 'pending_transfer'::text]));
+
+
+--
+-- Name: idx_shifts_landlord_open; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_shifts_landlord_open ON public.shifts USING btree (landlord_id, clocked_in_at) WHERE (clocked_out_at IS NULL);
+
+
+--
+-- Name: idx_slp_lookup; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_slp_lookup ON public.state_law_provisions USING btree (state_code, topic, effective_year);
+
+
+--
+-- Name: idx_slst_lookup; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_slst_lookup ON public.state_law_section_texts USING btree (state_code, act_key);
+
+
+--
+-- Name: idx_slst_search; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_slst_search ON public.state_law_section_texts USING gin (search_tsv);
+
+
+--
+-- Name: idx_slta_lookup; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_slta_lookup ON public.state_landlord_tenant_acts USING btree (state_code, effective_year);
+
+
+--
+-- Name: idx_state_tax_forms_state_year; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_state_tax_forms_state_year ON public.state_tax_forms USING btree (state_code, effective_year);
+
+
+--
+-- Name: idx_subleases_active; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_subleases_active ON public.subleases USING btree (master_lease_id) WHERE (status = 'active'::text);
+
+
+--
+-- Name: idx_subleases_master; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_subleases_master ON public.subleases USING btree (master_lease_id);
+
+
+--
+-- Name: idx_subleases_sublessee; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_subleases_sublessee ON public.subleases USING btree (sublessee_tenant_id);
+
+
+--
+-- Name: idx_subleases_sublessor; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_subleases_sublessor ON public.subleases USING btree (sublessor_tenant_id);
+
+
+--
+-- Name: idx_sublessee_invitations_email; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_sublessee_invitations_email ON public.sublessee_invitations USING btree (sublessee_email);
+
+
+--
+-- Name: idx_sublessee_invitations_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_sublessee_invitations_status ON public.sublessee_invitations USING btree (status, expires_at);
+
+
+--
+-- Name: idx_sublessee_invitations_sublessor; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_sublessee_invitations_sublessor ON public.sublessee_invitations USING btree (sublessor_tenant_id);
+
+
+--
+-- Name: idx_sublessee_invitations_token; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_sublessee_invitations_token ON public.sublessee_invitations USING btree (token);
+
+
+--
+-- Name: idx_sublessor_credit_balances_tenant; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_sublessor_credit_balances_tenant ON public.sublessor_credit_balances USING btree (sublessor_tenant_id);
+
+
+--
+-- Name: idx_tenant_identifications_tenant; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_tenant_identifications_tenant ON public.tenant_identifications USING btree (tenant_id);
+
+
+--
+-- Name: idx_tenants_bgc_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_tenants_bgc_id ON public.tenants USING btree (background_check_id);
+
+
+--
+-- Name: idx_tenants_platform_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_tenants_platform_status ON public.tenants USING btree (platform_status) WHERE (platform_status <> 'active'::text);
+
+
+--
+-- Name: idx_tenants_user_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_tenants_user_id ON public.tenants USING btree (user_id);
+
+
+--
+-- Name: idx_tnotif_unread; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_tnotif_unread ON public.tenant_notifications USING btree (user_id, created_at DESC) WHERE (read = false);
+
+
+--
+-- Name: idx_tnotif_user; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_tnotif_user ON public.tenant_notifications USING btree (user_id);
+
+
+--
+-- Name: idx_unit_applications_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_unit_applications_landlord ON public.unit_applications USING btree (landlord_id);
+
+
+--
+-- Name: idx_unit_applications_unit; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_unit_applications_unit ON public.unit_applications USING btree (unit_id);
+
+
+--
+-- Name: idx_unit_bookings_landlord_dates; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_unit_bookings_landlord_dates ON public.unit_bookings USING btree (landlord_id, check_in, check_out);
+
+
+--
+-- Name: idx_unit_bookings_tenant; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_unit_bookings_tenant ON public.unit_bookings USING btree (tenant_id);
+
+
+--
+-- Name: idx_unit_bookings_unit_date; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_unit_bookings_unit_date ON public.unit_bookings USING btree (unit_id, check_in, check_out);
+
+
+--
+-- Name: idx_unit_bookings_unit_dates; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_unit_bookings_unit_dates ON public.unit_bookings USING btree (unit_id, check_in, check_out) WHERE (status <> ALL (ARRAY['cancelled'::text, 'no_show'::text]));
+
+
+--
+-- Name: idx_unit_entry_requests_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_unit_entry_requests_landlord ON public.unit_entry_requests USING btree (landlord_id);
+
+
+--
+-- Name: idx_unit_entry_requests_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_unit_entry_requests_status ON public.unit_entry_requests USING btree (status);
+
+
+--
+-- Name: idx_unit_entry_requests_tenant; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_unit_entry_requests_tenant ON public.unit_entry_requests USING btree (tenant_id);
+
+
+--
+-- Name: idx_unit_entry_requests_unit; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_unit_entry_requests_unit ON public.unit_entry_requests USING btree (unit_id);
+
+
+--
+-- Name: idx_unit_inspection_items_condition; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_unit_inspection_items_condition ON public.unit_inspection_items USING btree (condition);
+
+
+--
+-- Name: idx_unit_inspection_items_inspection; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_unit_inspection_items_inspection ON public.unit_inspection_items USING btree (inspection_id);
+
+
+--
+-- Name: idx_unit_inspection_photos_inspection; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_unit_inspection_photos_inspection ON public.unit_inspection_photos USING btree (inspection_id);
+
+
+--
+-- Name: idx_unit_inspection_photos_item; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_unit_inspection_photos_item ON public.unit_inspection_photos USING btree (item_id);
+
+
+--
+-- Name: idx_unit_inspection_signatures_inspection; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_unit_inspection_signatures_inspection ON public.unit_inspection_signatures USING btree (inspection_id);
+
+
+--
+-- Name: idx_unit_inspections_lease; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_unit_inspections_lease ON public.unit_inspections USING btree (lease_id);
+
+
+--
+-- Name: idx_unit_inspections_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_unit_inspections_status ON public.unit_inspections USING btree (status);
+
+
+--
+-- Name: idx_unit_inspections_tenant; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_unit_inspections_tenant ON public.unit_inspections USING btree (tenant_id);
+
+
+--
+-- Name: idx_unit_inspections_unit; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_unit_inspections_unit ON public.unit_inspections USING btree (unit_id);
+
+
+--
+-- Name: idx_unit_photos_unit; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_unit_photos_unit ON public.unit_photos USING btree (unit_id);
+
+
+--
+-- Name: idx_units_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_units_landlord ON public.units USING btree (landlord_id);
+
+
+--
+-- Name: idx_units_property; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_units_property ON public.units USING btree (property_id);
+
+
+--
+-- Name: idx_units_scheduled_activation; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_units_scheduled_activation ON public.units USING btree (scheduled_activation_at) WHERE (scheduled_activation_at IS NOT NULL);
+
+
+--
+-- Name: idx_units_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_units_status ON public.units USING btree (status);
+
+
+--
+-- Name: idx_user_balance_ledger_bank_account; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_user_balance_ledger_bank_account ON public.user_balance_ledger USING btree (bank_account_id) WHERE (bank_account_id IS NOT NULL);
+
+
+--
+-- Name: idx_user_balance_ledger_property; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_user_balance_ledger_property ON public.user_balance_ledger USING btree (property_id) WHERE (property_id IS NOT NULL);
+
+
+--
+-- Name: idx_user_balance_ledger_reference; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_user_balance_ledger_reference ON public.user_balance_ledger USING btree (reference_id) WHERE (reference_id IS NOT NULL);
+
+
+--
+-- Name: idx_user_balance_ledger_stripe_transfer_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX idx_user_balance_ledger_stripe_transfer_id ON public.user_balance_ledger USING btree (stripe_transfer_id) WHERE (stripe_transfer_id IS NOT NULL);
+
+
+--
+-- Name: idx_user_balance_ledger_user; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_user_balance_ledger_user ON public.user_balance_ledger USING btree (user_id);
+
+
+--
+-- Name: idx_user_balance_ledger_user_created; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_user_balance_ledger_user_created ON public.user_balance_ledger USING btree (user_id, created_at DESC);
+
+
+--
+-- Name: idx_user_bank_accounts_user_active; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_user_bank_accounts_user_active ON public.user_bank_accounts USING btree (user_id) WHERE (status = 'active'::text);
+
+
+--
+-- Name: idx_user_totp_recovery_codes_user_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_user_totp_recovery_codes_user_id ON public.user_totp_recovery_codes USING btree (user_id) WHERE (used_at IS NULL);
+
+
+--
+-- Name: idx_users_connect_ready; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_users_connect_ready ON public.users USING btree (id) WHERE ((connect_payouts_enabled = true) AND (connect_details_submitted = true));
+
+
+--
+-- Name: idx_users_default_management_bank; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_users_default_management_bank ON public.users USING btree (default_management_payout_bank_account_id) WHERE (default_management_payout_bank_account_id IS NOT NULL);
+
+
+--
+-- Name: idx_users_email; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_users_email ON public.users USING btree (email);
+
+
+--
+-- Name: idx_users_stripe_connect_account_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX idx_users_stripe_connect_account_id ON public.users USING btree (stripe_connect_account_id) WHERE (stripe_connect_account_id IS NOT NULL);
+
+
+--
+-- Name: idx_utility_bills_landlord_cycle; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_utility_bills_landlord_cycle ON public.utility_bills USING btree (landlord_id, billing_cycle_month DESC);
+
+
+--
+-- Name: idx_utility_bills_status_unbilled; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_utility_bills_status_unbilled ON public.utility_bills USING btree (status, billing_cycle_month) WHERE (status = 'unbilled'::text);
+
+
+--
+-- Name: idx_utility_bills_tenant_cycle; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_utility_bills_tenant_cycle ON public.utility_bills USING btree (tenant_id, billing_cycle_month DESC);
+
+
+--
+-- Name: idx_utility_meter_readings_billing_cycle; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_utility_meter_readings_billing_cycle ON public.utility_meter_readings USING btree (billing_cycle_month);
+
+
+--
+-- Name: idx_utility_meter_readings_meter_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_utility_meter_readings_meter_id ON public.utility_meter_readings USING btree (meter_id);
+
+
+--
+-- Name: idx_utility_meter_units_unit_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_utility_meter_units_unit_id ON public.utility_meter_units USING btree (unit_id);
+
+
+--
+-- Name: idx_utility_meters_property_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_utility_meters_property_id ON public.utility_meters USING btree (property_id);
+
+
+--
+-- Name: idx_work_trade_agreements_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_work_trade_agreements_landlord ON public.work_trade_agreements USING btree (landlord_id, created_at DESC);
+
+
+--
+-- Name: idx_work_trade_agreements_tenant; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_work_trade_agreements_tenant ON public.work_trade_agreements USING btree (tenant_id);
+
+
+--
+-- Name: idx_work_trade_agreements_unit; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_work_trade_agreements_unit ON public.work_trade_agreements USING btree (unit_id);
+
+
+--
+-- Name: idx_work_trade_logs_agreement; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_work_trade_logs_agreement ON public.work_trade_logs USING btree (agreement_id, work_date DESC);
+
+
+--
+-- Name: idx_work_trade_logs_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_work_trade_logs_status ON public.work_trade_logs USING btree (status) WHERE (status = 'pending'::text);
+
+
+--
+-- Name: idx_work_trade_periods_agreement; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_work_trade_periods_agreement ON public.work_trade_periods USING btree (agreement_id, period_year DESC, period_month DESC);
+
+
+--
+-- Name: invitations_unique_pending; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX invitations_unique_pending ON public.invitations USING btree (landlord_id, role, lower(email)) WHERE (status = 'pending'::text);
+
+
+--
+-- Name: landlord_pfo_one_active_per_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX landlord_pfo_one_active_per_landlord ON public.landlord_platform_fee_overrides USING btree (landlord_id) WHERE (effective_until IS NULL);
+
+
+--
+-- Name: lease_tenants_active_unique; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX lease_tenants_active_unique ON public.lease_tenants USING btree (lease_id, tenant_id) WHERE (status = ANY (ARRAY['pending_add'::text, 'active'::text, 'pending_remove'::text]));
+
+
+--
+-- Name: lease_tenants_lease; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX lease_tenants_lease ON public.lease_tenants USING btree (lease_id);
+
+
+--
+-- Name: lease_tenants_primary_active; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX lease_tenants_primary_active ON public.lease_tenants USING btree (lease_id) WHERE ((role = 'primary'::text) AND (status = 'active'::text));
+
+
+--
+-- Name: lease_tenants_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX lease_tenants_status ON public.lease_tenants USING btree (status);
+
+
+--
+-- Name: lease_tenants_supersedes; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX lease_tenants_supersedes ON public.lease_tenants USING btree (supersedes_lease_tenant_id) WHERE (supersedes_lease_tenant_id IS NOT NULL);
+
+
+--
+-- Name: lease_tenants_tenant; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX lease_tenants_tenant ON public.lease_tenants USING btree (tenant_id);
+
+
+--
+-- Name: platform_fee_config_one_active; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX platform_fee_config_one_active ON public.platform_fee_config USING btree (((effective_until IS NULL))) WHERE (effective_until IS NULL);
+
+
+--
+-- Name: pm_invitations_token_unique; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX pm_invitations_token_unique ON public.pm_invitations USING btree (token);
+
+
+--
+-- Name: pm_invitations_unique_pending; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX pm_invitations_unique_pending ON public.pm_invitations USING btree (pm_company_id, lower(email)) WHERE (status = 'pending'::text);
+
+
+--
+-- Name: pm_property_invitations_token_unique; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX pm_property_invitations_token_unique ON public.pm_property_invitations USING btree (token);
+
+
+--
+-- Name: pm_property_invitations_unique_pending; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX pm_property_invitations_unique_pending ON public.pm_property_invitations USING btree (pm_company_id, property_id) WHERE (status = 'pending'::text);
+
+
+--
+-- Name: pos_customers_email_landlord_uniq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX pos_customers_email_landlord_uniq ON public.pos_customers USING btree (landlord_id, lower(email));
+
+
+--
+-- Name: pos_discounts_code_uniq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX pos_discounts_code_uniq ON public.pos_discounts USING btree (landlord_id, code) WHERE (code IS NOT NULL);
+
+
+--
+-- Name: pos_session_items_session_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX pos_session_items_session_idx ON public.pos_session_items USING btree (session_id, created_at);
+
+
+--
+-- Name: pos_sessions_landlord_status_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX pos_sessions_landlord_status_idx ON public.pos_sessions USING btree (landlord_id, status, opened_at DESC);
+
+
+--
+-- Name: pos_sessions_property_open_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX pos_sessions_property_open_idx ON public.pos_sessions USING btree (property_id, opened_at DESC) WHERE (status = 'open'::text);
+
+
+--
+-- Name: pos_transactions_stripe_pi_uniq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX pos_transactions_stripe_pi_uniq ON public.pos_transactions USING btree (stripe_payment_intent_id) WHERE (stripe_payment_intent_id IS NOT NULL);
+
+
+--
+-- Name: reserve_fund_state_singleton; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX reserve_fund_state_singleton ON public.reserve_fund_state USING btree ((true));
+
+
+--
+-- Name: sales_leads_status_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX sales_leads_status_idx ON public.sales_leads USING btree (status, created_at DESC);
+
+
+--
+-- Name: shifts_one_open_per_user; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX shifts_one_open_per_user ON public.shifts USING btree (user_id) WHERE (clocked_out_at IS NULL);
+
+
+--
+-- Name: ux_invoices_landlord_number; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_invoices_landlord_number ON public.invoices USING btree (landlord_id, invoice_number);
+
+
+--
+-- Name: ux_invoices_lease_due_date; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_invoices_lease_due_date ON public.invoices USING btree (lease_id, due_date);
+
+
+--
+-- Name: ux_monthly_fee_accruals_property_month; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_monthly_fee_accruals_property_month ON public.monthly_fee_accruals USING btree (property_id, accrual_month);
+
+
+--
+-- Name: ux_notification_preferences_user_type; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_notification_preferences_user_type ON public.notification_preferences USING btree (user_id, type);
+
+
+--
+-- Name: ux_payments_fee_idempotent; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_payments_fee_idempotent ON public.payments USING btree (lease_fee_id, due_date) WHERE ((type = 'fee'::text) AND (status = ANY (ARRAY['pending'::text, 'processing'::text, 'settled'::text])));
+
+
+--
+-- Name: ux_payments_late_fee_idempotent; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_payments_late_fee_idempotent ON public.payments USING btree (invoice_id, due_date) WHERE ((type = 'late_fee'::text) AND (status = ANY (ARRAY['pending'::text, 'processing'::text, 'settled'::text])));
+
+
+--
+-- Name: ux_payments_rent_idempotent; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_payments_rent_idempotent ON public.payments USING btree (lease_id, due_date) WHERE ((type = 'rent'::text) AND (status = ANY (ARRAY['pending'::text, 'processing'::text, 'settled'::text])));
+
+
+--
+-- Name: ux_payments_unit_rent_due_date_active; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_payments_unit_rent_due_date_active ON public.payments USING btree (unit_id, due_date) WHERE ((type = 'rent'::text) AND (status <> ALL (ARRAY['failed'::text, 'returned'::text])));
+
+
+--
+-- Name: INDEX ux_payments_unit_rent_due_date_active; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON INDEX public.ux_payments_unit_rent_due_date_active IS 'S414/S407: prevents duplicate active rent payment rows for the same (unit, month). Failed and returned rows excluded so retry flows can insert fresh rows after a payment failure. Other payment types (fee, deposit, late_fee, etc.) are unconstrained — move-in invoices legitimately create multiple fee rows per (unit, due_date).';
+
+
+--
+-- Name: ux_platform_processing_rates_active_per_method; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_platform_processing_rates_active_per_method ON public.platform_processing_rates USING btree (payment_method) WHERE (effective_until IS NULL);
+
+
+--
+-- Name: ux_platform_revenue_ledger_idempotent; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_platform_revenue_ledger_idempotent ON public.platform_revenue_ledger USING btree (reference_id, reference_type, type) WHERE (reference_id IS NOT NULL);
+
+
+--
+-- Name: ux_user_balance_ledger_idempotent; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_user_balance_ledger_idempotent ON public.user_balance_ledger USING btree (reference_id, reference_type, type) WHERE (reference_id IS NOT NULL);
+
+
+--
+-- Name: ux_users_landlord_invite_token; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_users_landlord_invite_token ON public.users USING btree (landlord_invite_token) WHERE (landlord_invite_token IS NOT NULL);
+
+
+--
+-- Name: ux_users_tenant_invite_token; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_users_tenant_invite_token ON public.users USING btree (tenant_invite_token) WHERE (tenant_invite_token IS NOT NULL);
+
+
+--
+-- Name: pos_items pos_items_price_history_trg; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER pos_items_price_history_trg BEFORE UPDATE ON public.pos_items FOR EACH ROW EXECUTE FUNCTION public.fn_pos_items_log_price_change();
+
+
+--
+-- Name: application_pool trg_application_pool_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_application_pool_updated_at BEFORE UPDATE ON public.application_pool FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: background_checks trg_background_checks_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_background_checks_updated_at BEFORE UPDATE ON public.background_checks FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: security_deposits trg_deposits_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_deposits_updated_at BEFORE UPDATE ON public.security_deposits FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: emergency_contacts trg_emergency_contacts_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_emergency_contacts_updated_at BEFORE UPDATE ON public.emergency_contacts FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: invoices trg_invoices_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_invoices_updated_at BEFORE UPDATE ON public.invoices FOR EACH ROW EXECUTE FUNCTION public.fn_invoices_updated_at();
+
+
+--
+-- Name: landlords trg_landlords_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_landlords_updated_at BEFORE UPDATE ON public.landlords FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: lease_occupants trg_lease_occupants_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_lease_occupants_updated_at BEFORE UPDATE ON public.lease_occupants FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: lease_pets trg_lease_pets_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_lease_pets_updated_at BEFORE UPDATE ON public.lease_pets FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: lease_tenants trg_lease_tenants_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_lease_tenants_updated_at BEFORE UPDATE ON public.lease_tenants FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: lease_vehicles trg_lease_vehicles_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_lease_vehicles_updated_at BEFORE UPDATE ON public.lease_vehicles FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: leases trg_leases_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_leases_updated_at BEFORE UPDATE ON public.leases FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: liability_insurance_policies trg_liability_insurance_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_liability_insurance_updated_at BEFORE UPDATE ON public.liability_insurance_policies FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: maintenance_requests trg_maintenance_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_maintenance_updated_at BEFORE UPDATE ON public.maintenance_requests FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: mobile_homes trg_mobile_homes_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_mobile_homes_updated_at BEFORE UPDATE ON public.mobile_homes FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: notification_preferences trg_notification_preferences_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_notification_preferences_updated_at BEFORE UPDATE ON public.notification_preferences FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: payments trg_payments_invoice_late_fee_subtotal_rollup; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_payments_invoice_late_fee_subtotal_rollup AFTER INSERT OR DELETE OR UPDATE ON public.payments FOR EACH ROW EXECUTE FUNCTION public.fn_invoice_late_fee_subtotal_rollup_trigger();
+
+
+--
+-- Name: payments trg_payments_invoice_status_rollup; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_payments_invoice_status_rollup AFTER INSERT OR DELETE OR UPDATE OF status, invoice_id ON public.payments FOR EACH ROW EXECUTE FUNCTION public.fn_invoice_status_rollup();
+
+
+--
+-- Name: pool_match_requests trg_pool_match_requests_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_pool_match_requests_updated_at BEFORE UPDATE ON public.pool_match_requests FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: properties trg_properties_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_properties_updated_at BEFORE UPDATE ON public.properties FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: property_allocation_rules trg_property_allocation_rules_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_property_allocation_rules_updated_at BEFORE UPDATE ON public.property_allocation_rules FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: rvs trg_rvs_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_rvs_updated_at BEFORE UPDATE ON public.rvs FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: subleases trg_subleases_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_subleases_updated_at BEFORE UPDATE ON public.subleases FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: tenant_identifications trg_tenant_identifications_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_tenant_identifications_updated_at BEFORE UPDATE ON public.tenant_identifications FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: tenants trg_tenants_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_tenants_updated_at BEFORE UPDATE ON public.tenants FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: units trg_units_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_units_updated_at BEFORE UPDATE ON public.units FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: user_bank_accounts trg_user_bank_accounts_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_user_bank_accounts_updated_at BEFORE UPDATE ON public.user_bank_accounts FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: users trg_users_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_users_updated_at BEFORE UPDATE ON public.users FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: ach_monitoring_log ach_monitoring_log_payment_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.ach_monitoring_log
+    ADD CONSTRAINT ach_monitoring_log_payment_id_fkey FOREIGN KEY (payment_id) REFERENCES public.payments(id);
+
+
+--
+-- Name: ach_monitoring_log ach_monitoring_log_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.ach_monitoring_log
+    ADD CONSTRAINT ach_monitoring_log_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id);
+
+
+--
+-- Name: admin_action_log admin_action_log_admin_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_action_log
+    ADD CONSTRAINT admin_action_log_admin_user_id_fkey FOREIGN KEY (admin_user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: admin_notifications admin_notifications_acknowledged_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_notifications
+    ADD CONSTRAINT admin_notifications_acknowledged_by_fkey FOREIGN KEY (acknowledged_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: adverse_action_notices adverse_action_notices_background_check_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.adverse_action_notices
+    ADD CONSTRAINT adverse_action_notices_background_check_id_fkey FOREIGN KEY (background_check_id) REFERENCES public.background_checks(id) ON DELETE CASCADE;
+
+
+--
+-- Name: adverse_action_notices adverse_action_notices_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.adverse_action_notices
+    ADD CONSTRAINT adverse_action_notices_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: adverse_action_notices adverse_action_notices_tenant_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.adverse_action_notices
+    ADD CONSTRAINT adverse_action_notices_tenant_user_id_fkey FOREIGN KEY (tenant_user_id) REFERENCES public.users(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: agent_interaction_logs agent_interaction_logs_actor_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.agent_interaction_logs
+    ADD CONSTRAINT agent_interaction_logs_actor_user_id_fkey FOREIGN KEY (actor_user_id) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: agent_interaction_logs agent_interaction_logs_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.agent_interaction_logs
+    ADD CONSTRAINT agent_interaction_logs_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE SET NULL;
+
+
+--
+-- Name: agent_interaction_logs agent_interaction_logs_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.agent_interaction_logs
+    ADD CONSTRAINT agent_interaction_logs_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE SET NULL;
+
+
+--
+-- Name: application_pool application_pool_background_check_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.application_pool
+    ADD CONSTRAINT application_pool_background_check_id_fkey FOREIGN KEY (background_check_id) REFERENCES public.background_checks(id) ON DELETE CASCADE;
+
+
+--
+-- Name: application_pool application_pool_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.application_pool
+    ADD CONSTRAINT application_pool_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: audit_log audit_log_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.audit_log
+    ADD CONSTRAINT audit_log_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: background_checks background_checks_decided_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.background_checks
+    ADD CONSTRAINT background_checks_decided_by_fkey FOREIGN KEY (decided_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: background_checks background_checks_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.background_checks
+    ADD CONSTRAINT background_checks_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id);
+
+
+--
+-- Name: background_checks background_checks_pool_entry_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.background_checks
+    ADD CONSTRAINT background_checks_pool_entry_id_fkey FOREIGN KEY (pool_entry_id) REFERENCES public.application_pool(id) ON DELETE SET NULL;
+
+
+--
+-- Name: background_checks background_checks_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.background_checks
+    ADD CONSTRAINT background_checks_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id) ON DELETE SET NULL;
+
+
+--
+-- Name: background_checks background_checks_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.background_checks
+    ADD CONSTRAINT background_checks_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id);
+
+
+--
+-- Name: background_checks background_checks_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.background_checks
+    ADD CONSTRAINT background_checks_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: bank_reconciliations bank_reconciliations_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bank_reconciliations
+    ADD CONSTRAINT bank_reconciliations_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.books_accounts(id);
+
+
+--
+-- Name: bank_reconciliations bank_reconciliations_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bank_reconciliations
+    ADD CONSTRAINT bank_reconciliations_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: bookkeeper_scopes bookkeeper_scopes_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bookkeeper_scopes
+    ADD CONSTRAINT bookkeeper_scopes_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: bookkeeper_scopes bookkeeper_scopes_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bookkeeper_scopes
+    ADD CONSTRAINT bookkeeper_scopes_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: books_accounts books_accounts_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.books_accounts
+    ADD CONSTRAINT books_accounts_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: books_bills books_bills_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.books_bills
+    ADD CONSTRAINT books_bills_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.books_accounts(id);
+
+
+--
+-- Name: books_bills books_bills_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.books_bills
+    ADD CONSTRAINT books_bills_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: books_bills books_bills_vendor_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.books_bills
+    ADD CONSTRAINT books_bills_vendor_id_fkey FOREIGN KEY (vendor_id) REFERENCES public.books_vendors(id);
+
+
+--
+-- Name: books_contractors books_contractors_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.books_contractors
+    ADD CONSTRAINT books_contractors_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: books_employees books_employees_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.books_employees
+    ADD CONSTRAINT books_employees_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: books_transactions books_transactions_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.books_transactions
+    ADD CONSTRAINT books_transactions_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.books_accounts(id);
+
+
+--
+-- Name: books_transactions books_transactions_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.books_transactions
+    ADD CONSTRAINT books_transactions_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: books_vendors books_vendors_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.books_vendors
+    ADD CONSTRAINT books_vendors_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: bulletin_posts bulletin_posts_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bulletin_posts
+    ADD CONSTRAINT bulletin_posts_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE CASCADE;
+
+
+--
+-- Name: bulletin_posts bulletin_posts_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bulletin_posts
+    ADD CONSTRAINT bulletin_posts_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id) ON DELETE CASCADE;
+
+
+--
+-- Name: bulletin_reveal_log bulletin_reveal_log_post_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bulletin_reveal_log
+    ADD CONSTRAINT bulletin_reveal_log_post_id_fkey FOREIGN KEY (post_id) REFERENCES public.bulletin_posts(id) ON DELETE CASCADE;
+
+
+--
+-- Name: bulletin_votes bulletin_votes_post_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bulletin_votes
+    ADD CONSTRAINT bulletin_votes_post_id_fkey FOREIGN KEY (post_id) REFERENCES public.bulletin_posts(id) ON DELETE CASCADE;
+
+
+--
+-- Name: bulletin_votes bulletin_votes_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bulletin_votes
+    ADD CONSTRAINT bulletin_votes_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id) ON DELETE CASCADE;
+
+
+--
+-- Name: connect_disputes connect_disputes_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connect_disputes
+    ADD CONSTRAINT connect_disputes_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE SET NULL;
+
+
+--
+-- Name: connect_disputes connect_disputes_payment_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connect_disputes
+    ADD CONSTRAINT connect_disputes_payment_id_fkey FOREIGN KEY (payment_id) REFERENCES public.payments(id) ON DELETE SET NULL;
+
+
+--
+-- Name: connect_payouts connect_payouts_pm_company_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connect_payouts
+    ADD CONSTRAINT connect_payouts_pm_company_id_fkey FOREIGN KEY (pm_company_id) REFERENCES public.pm_companies(id) ON DELETE SET NULL;
+
+
+--
+-- Name: connect_payouts connect_payouts_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connect_payouts
+    ADD CONSTRAINT connect_payouts_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: credit_disputes credit_disputes_dispute_open_event_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.credit_disputes
+    ADD CONSTRAINT credit_disputes_dispute_open_event_id_fkey FOREIGN KEY (dispute_open_event_id) REFERENCES public.credit_events(id);
+
+
+--
+-- Name: credit_disputes credit_disputes_disputed_event_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.credit_disputes
+    ADD CONSTRAINT credit_disputes_disputed_event_id_fkey FOREIGN KEY (disputed_event_id) REFERENCES public.credit_events(id);
+
+
+--
+-- Name: credit_disputes credit_disputes_disputing_subject_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.credit_disputes
+    ADD CONSTRAINT credit_disputes_disputing_subject_id_fkey FOREIGN KEY (disputing_subject_id) REFERENCES public.credit_subjects(id);
+
+
+--
+-- Name: credit_disputes credit_disputes_resolution_event_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.credit_disputes
+    ADD CONSTRAINT credit_disputes_resolution_event_id_fkey FOREIGN KEY (resolution_event_id) REFERENCES public.credit_events(id);
+
+
+--
+-- Name: credit_events credit_events_subject_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.credit_events
+    ADD CONSTRAINT credit_events_subject_id_fkey FOREIGN KEY (subject_id) REFERENCES public.credit_subjects(id);
+
+
+--
+-- Name: credit_events credit_events_superseded_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.credit_events
+    ADD CONSTRAINT credit_events_superseded_by_fkey FOREIGN KEY (superseded_by) REFERENCES public.credit_events(id);
+
+
+--
+-- Name: credit_hardship_contexts credit_hardship_contexts_event_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.credit_hardship_contexts
+    ADD CONSTRAINT credit_hardship_contexts_event_id_fkey FOREIGN KEY (event_id) REFERENCES public.credit_events(id);
+
+
+--
+-- Name: credit_hardship_contexts credit_hardship_contexts_subject_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.credit_hardship_contexts
+    ADD CONSTRAINT credit_hardship_contexts_subject_id_fkey FOREIGN KEY (subject_id) REFERENCES public.credit_subjects(id);
+
+
+--
+-- Name: credit_merkle_anchors credit_merkle_anchors_earliest_event_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.credit_merkle_anchors
+    ADD CONSTRAINT credit_merkle_anchors_earliest_event_id_fkey FOREIGN KEY (earliest_event_id) REFERENCES public.credit_events(id);
+
+
+--
+-- Name: credit_merkle_anchors credit_merkle_anchors_latest_event_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.credit_merkle_anchors
+    ADD CONSTRAINT credit_merkle_anchors_latest_event_id_fkey FOREIGN KEY (latest_event_id) REFERENCES public.credit_events(id);
+
+
+--
+-- Name: credit_scores credit_scores_formula_version_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.credit_scores
+    ADD CONSTRAINT credit_scores_formula_version_fkey FOREIGN KEY (formula_version) REFERENCES public.credit_score_formulas(version);
+
+
+--
+-- Name: credit_scores credit_scores_subject_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.credit_scores
+    ADD CONSTRAINT credit_scores_subject_id_fkey FOREIGN KEY (subject_id) REFERENCES public.credit_subjects(id);
+
+
+--
+-- Name: credit_stats credit_stats_subject_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.credit_stats
+    ADD CONSTRAINT credit_stats_subject_id_fkey FOREIGN KEY (subject_id) REFERENCES public.credit_subjects(id);
+
+
+--
+-- Name: csv_import_attempts csv_import_attempts_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.csv_import_attempts
+    ADD CONSTRAINT csv_import_attempts_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: csv_import_attempts csv_import_attempts_reviewed_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.csv_import_attempts
+    ADD CONSTRAINT csv_import_attempts_reviewed_by_fkey FOREIGN KEY (reviewed_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: daily_tasks daily_tasks_assigned_to_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.daily_tasks
+    ADD CONSTRAINT daily_tasks_assigned_to_fkey FOREIGN KEY (assigned_to) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: daily_tasks daily_tasks_completed_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.daily_tasks
+    ADD CONSTRAINT daily_tasks_completed_by_fkey FOREIGN KEY (completed_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: daily_tasks daily_tasks_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.daily_tasks
+    ADD CONSTRAINT daily_tasks_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: deposit_returns deposit_returns_finalized_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.deposit_returns
+    ADD CONSTRAINT deposit_returns_finalized_by_user_id_fkey FOREIGN KEY (finalized_by_user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: deposit_returns deposit_returns_gap_payment_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.deposit_returns
+    ADD CONSTRAINT deposit_returns_gap_payment_id_fkey FOREIGN KEY (gap_payment_id) REFERENCES public.payments(id);
+
+
+--
+-- Name: deposit_returns deposit_returns_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.deposit_returns
+    ADD CONSTRAINT deposit_returns_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id);
+
+
+--
+-- Name: deposit_returns deposit_returns_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.deposit_returns
+    ADD CONSTRAINT deposit_returns_lease_id_fkey FOREIGN KEY (lease_id) REFERENCES public.leases(id);
+
+
+--
+-- Name: deposit_returns deposit_returns_refund_payment_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.deposit_returns
+    ADD CONSTRAINT deposit_returns_refund_payment_id_fkey FOREIGN KEY (refund_payment_id) REFERENCES public.payments(id);
+
+
+--
+-- Name: deposit_returns deposit_returns_security_deposit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.deposit_returns
+    ADD CONSTRAINT deposit_returns_security_deposit_id_fkey FOREIGN KEY (security_deposit_id) REFERENCES public.security_deposits(id);
+
+
+--
+-- Name: deposit_returns deposit_returns_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.deposit_returns
+    ADD CONSTRAINT deposit_returns_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id);
+
+
+--
+-- Name: disbursements disbursements_bank_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.disbursements
+    ADD CONSTRAINT disbursements_bank_account_id_fkey FOREIGN KEY (bank_account_id) REFERENCES public.user_bank_accounts(id);
+
+
+--
+-- Name: disbursements disbursements_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.disbursements
+    ADD CONSTRAINT disbursements_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id);
+
+
+--
+-- Name: disbursements disbursements_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.disbursements
+    ADD CONSTRAINT disbursements_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: document_batches document_batches_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.document_batches
+    ADD CONSTRAINT document_batches_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: document_batches document_batches_template_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.document_batches
+    ADD CONSTRAINT document_batches_template_id_fkey FOREIGN KEY (template_id) REFERENCES public.lease_templates(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: document_batches document_batches_voided_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.document_batches
+    ADD CONSTRAINT document_batches_voided_by_fkey FOREIGN KEY (voided_by) REFERENCES public.users(id);
+
+
+--
+-- Name: documents documents_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.documents
+    ADD CONSTRAINT documents_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id);
+
+
+--
+-- Name: documents documents_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.documents
+    ADD CONSTRAINT documents_lease_id_fkey FOREIGN KEY (lease_id) REFERENCES public.leases(id);
+
+
+--
+-- Name: documents documents_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.documents
+    ADD CONSTRAINT documents_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id);
+
+
+--
+-- Name: documents documents_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.documents
+    ADD CONSTRAINT documents_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id);
+
+
+--
+-- Name: email_send_log email_send_log_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.email_send_log
+    ADD CONSTRAINT email_send_log_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE SET NULL;
+
+
+--
+-- Name: emergency_contacts emergency_contacts_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.emergency_contacts
+    ADD CONSTRAINT emergency_contacts_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id) ON DELETE CASCADE;
+
+
+--
+-- Name: external_account_links external_account_links_subject_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.external_account_links
+    ADD CONSTRAINT external_account_links_subject_id_fkey FOREIGN KEY (subject_id) REFERENCES public.credit_subjects(id);
+
+
+--
+-- Name: fitness_body_weight_logs fitness_body_weight_logs_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.fitness_body_weight_logs
+    ADD CONSTRAINT fitness_body_weight_logs_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: fitness_days fitness_days_routine_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.fitness_days
+    ADD CONSTRAINT fitness_days_routine_id_fkey FOREIGN KEY (routine_id) REFERENCES public.fitness_routines(id) ON DELETE CASCADE;
+
+
+--
+-- Name: fitness_exercises fitness_exercises_section_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.fitness_exercises
+    ADD CONSTRAINT fitness_exercises_section_id_fkey FOREIGN KEY (section_id) REFERENCES public.fitness_sections(id) ON DELETE CASCADE;
+
+
+--
+-- Name: fitness_milestones fitness_milestones_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.fitness_milestones
+    ADD CONSTRAINT fitness_milestones_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: fitness_profiles fitness_profiles_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.fitness_profiles
+    ADD CONSTRAINT fitness_profiles_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: fitness_routines fitness_routines_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.fitness_routines
+    ADD CONSTRAINT fitness_routines_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: fitness_sections fitness_sections_day_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.fitness_sections
+    ADD CONSTRAINT fitness_sections_day_id_fkey FOREIGN KEY (day_id) REFERENCES public.fitness_days(id) ON DELETE CASCADE;
+
+
+--
+-- Name: fitness_set_logs fitness_set_logs_exercise_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.fitness_set_logs
+    ADD CONSTRAINT fitness_set_logs_exercise_id_fkey FOREIGN KEY (exercise_id) REFERENCES public.fitness_exercises(id) ON DELETE SET NULL;
+
+
+--
+-- Name: fitness_set_logs fitness_set_logs_log_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.fitness_set_logs
+    ADD CONSTRAINT fitness_set_logs_log_id_fkey FOREIGN KEY (log_id) REFERENCES public.fitness_workout_logs(id) ON DELETE CASCADE;
+
+
+--
+-- Name: fitness_set_logs fitness_set_logs_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.fitness_set_logs
+    ADD CONSTRAINT fitness_set_logs_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: fitness_workout_logs fitness_workout_logs_day_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.fitness_workout_logs
+    ADD CONSTRAINT fitness_workout_logs_day_id_fkey FOREIGN KEY (day_id) REFERENCES public.fitness_days(id) ON DELETE SET NULL;
+
+
+--
+-- Name: fitness_workout_logs fitness_workout_logs_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.fitness_workout_logs
+    ADD CONSTRAINT fitness_workout_logs_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: flex_charge_accounts flex_charge_accounts_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.flex_charge_accounts
+    ADD CONSTRAINT flex_charge_accounts_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id);
+
+
+--
+-- Name: flex_charge_accounts flex_charge_accounts_pos_customer_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.flex_charge_accounts
+    ADD CONSTRAINT flex_charge_accounts_pos_customer_id_fkey FOREIGN KEY (pos_customer_id) REFERENCES public.pos_customers(id);
+
+
+--
+-- Name: flex_charge_accounts flex_charge_accounts_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.flex_charge_accounts
+    ADD CONSTRAINT flex_charge_accounts_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id);
+
+
+--
+-- Name: flex_charge_accounts flex_charge_accounts_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.flex_charge_accounts
+    ADD CONSTRAINT flex_charge_accounts_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id);
+
+
+--
+-- Name: flex_charge_statements flex_charge_statements_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.flex_charge_statements
+    ADD CONSTRAINT flex_charge_statements_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.flex_charge_accounts(id);
+
+
+--
+-- Name: flex_charge_statements flex_charge_statements_payment_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.flex_charge_statements
+    ADD CONSTRAINT flex_charge_statements_payment_id_fkey FOREIGN KEY (payment_id) REFERENCES public.payments(id);
+
+
+--
+-- Name: flex_charge_transactions flex_charge_transactions_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.flex_charge_transactions
+    ADD CONSTRAINT flex_charge_transactions_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.flex_charge_accounts(id);
+
+
+--
+-- Name: flex_charge_transactions flex_charge_transactions_pos_transaction_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.flex_charge_transactions
+    ADD CONSTRAINT flex_charge_transactions_pos_transaction_id_fkey FOREIGN KEY (pos_transaction_id) REFERENCES public.pos_transactions(id);
+
+
+--
+-- Name: flex_charge_transactions flex_charge_tx_statement_fk; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.flex_charge_transactions
+    ADD CONSTRAINT flex_charge_tx_statement_fk FOREIGN KEY (statement_id) REFERENCES public.flex_charge_statements(id);
+
+
+--
+-- Name: flex_deposit_custody_charges flex_deposit_custody_charges_payment_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.flex_deposit_custody_charges
+    ADD CONSTRAINT flex_deposit_custody_charges_payment_id_fkey FOREIGN KEY (payment_id) REFERENCES public.payments(id);
+
+
+--
+-- Name: flex_deposit_custody_charges flex_deposit_custody_charges_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.flex_deposit_custody_charges
+    ADD CONSTRAINT flex_deposit_custody_charges_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id);
+
+
+--
+-- Name: flex_deposit_installments flex_deposit_installments_payment_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.flex_deposit_installments
+    ADD CONSTRAINT flex_deposit_installments_payment_id_fkey FOREIGN KEY (payment_id) REFERENCES public.payments(id);
+
+
+--
+-- Name: flex_deposit_installments flex_deposit_installments_security_deposit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.flex_deposit_installments
+    ADD CONSTRAINT flex_deposit_installments_security_deposit_id_fkey FOREIGN KEY (security_deposit_id) REFERENCES public.security_deposits(id);
+
+
+--
+-- Name: flex_deposit_installments flex_deposit_installments_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.flex_deposit_installments
+    ADD CONSTRAINT flex_deposit_installments_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id);
+
+
+--
+-- Name: flexpay_advances flexpay_advances_fee_payment_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.flexpay_advances
+    ADD CONSTRAINT flexpay_advances_fee_payment_id_fkey FOREIGN KEY (fee_payment_id) REFERENCES public.payments(id);
+
+
+--
+-- Name: flexpay_advances flexpay_advances_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.flexpay_advances
+    ADD CONSTRAINT flexpay_advances_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id);
+
+
+--
+-- Name: flexpay_advances flexpay_advances_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.flexpay_advances
+    ADD CONSTRAINT flexpay_advances_lease_id_fkey FOREIGN KEY (lease_id) REFERENCES public.leases(id);
+
+
+--
+-- Name: flexpay_advances flexpay_advances_rent_payment_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.flexpay_advances
+    ADD CONSTRAINT flexpay_advances_rent_payment_id_fkey FOREIGN KEY (rent_payment_id) REFERENCES public.payments(id);
+
+
+--
+-- Name: flexpay_advances flexpay_advances_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.flexpay_advances
+    ADD CONSTRAINT flexpay_advances_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id);
+
+
+--
+-- Name: flexpay_advances flexpay_advances_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.flexpay_advances
+    ADD CONSTRAINT flexpay_advances_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id);
+
+
+--
+-- Name: flexsuite_enrollment_acceptances flexsuite_enrollment_acceptances_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.flexsuite_enrollment_acceptances
+    ADD CONSTRAINT flexsuite_enrollment_acceptances_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id) ON DELETE CASCADE;
+
+
+--
+-- Name: flexsuite_enrollment_acceptances flexsuite_enrollment_acceptances_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.flexsuite_enrollment_acceptances
+    ADD CONSTRAINT flexsuite_enrollment_acceptances_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: invitations invitations_accepted_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.invitations
+    ADD CONSTRAINT invitations_accepted_user_id_fkey FOREIGN KEY (accepted_user_id) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: invitations invitations_invited_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.invitations
+    ADD CONSTRAINT invitations_invited_by_user_id_fkey FOREIGN KEY (invited_by_user_id) REFERENCES public.users(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: invitations invitations_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.invitations
+    ADD CONSTRAINT invitations_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: invitations invitations_revoked_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.invitations
+    ADD CONSTRAINT invitations_revoked_by_user_id_fkey FOREIGN KEY (revoked_by_user_id) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: invoice_sequences invoice_sequences_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.invoice_sequences
+    ADD CONSTRAINT invoice_sequences_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: invoices invoices_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.invoices
+    ADD CONSTRAINT invoices_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: invoices invoices_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.invoices
+    ADD CONSTRAINT invoices_lease_id_fkey FOREIGN KEY (lease_id) REFERENCES public.leases(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: invoices invoices_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.invoices
+    ADD CONSTRAINT invoices_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id) ON DELETE SET NULL;
+
+
+--
+-- Name: invoices invoices_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.invoices
+    ADD CONSTRAINT invoices_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: journal_entries journal_entries_created_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.journal_entries
+    ADD CONSTRAINT journal_entries_created_by_fkey FOREIGN KEY (created_by) REFERENCES public.users(id);
+
+
+--
+-- Name: journal_entries journal_entries_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.journal_entries
+    ADD CONSTRAINT journal_entries_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: journal_entry_lines journal_entry_lines_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.journal_entry_lines
+    ADD CONSTRAINT journal_entry_lines_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.books_accounts(id);
+
+
+--
+-- Name: journal_entry_lines journal_entry_lines_entry_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.journal_entry_lines
+    ADD CONSTRAINT journal_entry_lines_entry_id_fkey FOREIGN KEY (entry_id) REFERENCES public.journal_entries(id) ON DELETE CASCADE;
+
+
+--
+-- Name: landlord_deposit_interest_rate_overrides landlord_deposit_interest_rate_overrides_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.landlord_deposit_interest_rate_overrides
+    ADD CONSTRAINT landlord_deposit_interest_rate_overrides_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: landlord_platform_fee_overrides landlord_platform_fee_overrides_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.landlord_platform_fee_overrides
+    ADD CONSTRAINT landlord_platform_fee_overrides_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: landlord_platform_fee_overrides landlord_platform_fee_overrides_set_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.landlord_platform_fee_overrides
+    ADD CONSTRAINT landlord_platform_fee_overrides_set_by_user_id_fkey FOREIGN KEY (set_by_user_id) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: landlords landlords_default_pm_company_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.landlords
+    ADD CONSTRAINT landlords_default_pm_company_id_fkey FOREIGN KEY (default_pm_company_id) REFERENCES public.pm_companies(id) ON DELETE SET NULL;
+
+
+--
+-- Name: landlords landlords_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.landlords
+    ADD CONSTRAINT landlords_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: lease_document_fields lease_document_fields_document_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_document_fields
+    ADD CONSTRAINT lease_document_fields_document_id_fkey FOREIGN KEY (document_id) REFERENCES public.lease_documents(id) ON DELETE CASCADE;
+
+
+--
+-- Name: lease_document_fields lease_document_fields_signer_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_document_fields
+    ADD CONSTRAINT lease_document_fields_signer_id_fkey FOREIGN KEY (signer_id) REFERENCES public.lease_document_signers(id) ON DELETE SET NULL;
+
+
+--
+-- Name: lease_document_fields lease_document_fields_template_field_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_document_fields
+    ADD CONSTRAINT lease_document_fields_template_field_id_fkey FOREIGN KEY (template_field_id) REFERENCES public.lease_template_fields(id) ON DELETE SET NULL;
+
+
+--
+-- Name: lease_document_signers lease_document_signers_document_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_document_signers
+    ADD CONSTRAINT lease_document_signers_document_id_fkey FOREIGN KEY (document_id) REFERENCES public.lease_documents(id) ON DELETE CASCADE;
+
+
+--
+-- Name: lease_document_signers lease_document_signers_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_document_signers
+    ADD CONSTRAINT lease_document_signers_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: lease_documents lease_documents_batch_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_documents
+    ADD CONSTRAINT lease_documents_batch_id_fkey FOREIGN KEY (batch_id) REFERENCES public.document_batches(id) ON DELETE SET NULL;
+
+
+--
+-- Name: lease_documents lease_documents_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_documents
+    ADD CONSTRAINT lease_documents_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: lease_documents lease_documents_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_documents
+    ADD CONSTRAINT lease_documents_lease_id_fkey FOREIGN KEY (lease_id) REFERENCES public.leases(id) ON DELETE SET NULL;
+
+
+--
+-- Name: lease_documents lease_documents_promote_lease_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_documents
+    ADD CONSTRAINT lease_documents_promote_lease_tenant_id_fkey FOREIGN KEY (promote_lease_tenant_id) REFERENCES public.lease_tenants(id) ON DELETE SET NULL;
+
+
+--
+-- Name: lease_documents lease_documents_target_lease_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_documents
+    ADD CONSTRAINT lease_documents_target_lease_tenant_id_fkey FOREIGN KEY (target_lease_tenant_id) REFERENCES public.lease_tenants(id) ON DELETE SET NULL;
+
+
+--
+-- Name: lease_documents lease_documents_template_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_documents
+    ADD CONSTRAINT lease_documents_template_id_fkey FOREIGN KEY (template_id) REFERENCES public.lease_templates(id) ON DELETE SET NULL;
+
+
+--
+-- Name: lease_documents lease_documents_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_documents
+    ADD CONSTRAINT lease_documents_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id) ON DELETE SET NULL;
+
+
+--
+-- Name: lease_fees lease_fees_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_fees
+    ADD CONSTRAINT lease_fees_lease_id_fkey FOREIGN KEY (lease_id) REFERENCES public.leases(id) ON DELETE CASCADE;
+
+
+--
+-- Name: lease_occupants lease_occupants_background_check_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_occupants
+    ADD CONSTRAINT lease_occupants_background_check_id_fkey FOREIGN KEY (background_check_id) REFERENCES public.background_checks(id) ON DELETE SET NULL;
+
+
+--
+-- Name: lease_occupants lease_occupants_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_occupants
+    ADD CONSTRAINT lease_occupants_lease_id_fkey FOREIGN KEY (lease_id) REFERENCES public.leases(id) ON DELETE CASCADE;
+
+
+--
+-- Name: lease_pets lease_pets_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_pets
+    ADD CONSTRAINT lease_pets_lease_id_fkey FOREIGN KEY (lease_id) REFERENCES public.leases(id) ON DELETE CASCADE;
+
+
+--
+-- Name: lease_template_fields lease_template_fields_template_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_template_fields
+    ADD CONSTRAINT lease_template_fields_template_id_fkey FOREIGN KEY (template_id) REFERENCES public.lease_templates(id) ON DELETE CASCADE;
+
+
+--
+-- Name: lease_templates lease_templates_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_templates
+    ADD CONSTRAINT lease_templates_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: lease_tenants lease_tenants_add_document_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_tenants
+    ADD CONSTRAINT lease_tenants_add_document_id_fkey FOREIGN KEY (add_document_id) REFERENCES public.lease_documents(id);
+
+
+--
+-- Name: lease_tenants lease_tenants_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_tenants
+    ADD CONSTRAINT lease_tenants_lease_id_fkey FOREIGN KEY (lease_id) REFERENCES public.leases(id) ON DELETE CASCADE;
+
+
+--
+-- Name: lease_tenants lease_tenants_remove_document_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_tenants
+    ADD CONSTRAINT lease_tenants_remove_document_id_fkey FOREIGN KEY (remove_document_id) REFERENCES public.lease_documents(id);
+
+
+--
+-- Name: lease_tenants lease_tenants_supersedes_lease_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_tenants
+    ADD CONSTRAINT lease_tenants_supersedes_lease_tenant_id_fkey FOREIGN KEY (supersedes_lease_tenant_id) REFERENCES public.lease_tenants(id) ON DELETE SET NULL;
+
+
+--
+-- Name: lease_tenants lease_tenants_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_tenants
+    ADD CONSTRAINT lease_tenants_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id);
+
+
+--
+-- Name: lease_termination_requests lease_termination_requests_fee_payment_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_termination_requests
+    ADD CONSTRAINT lease_termination_requests_fee_payment_id_fkey FOREIGN KEY (fee_payment_id) REFERENCES public.payments(id);
+
+
+--
+-- Name: lease_termination_requests lease_termination_requests_fee_waived_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_termination_requests
+    ADD CONSTRAINT lease_termination_requests_fee_waived_by_user_id_fkey FOREIGN KEY (fee_waived_by_user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: lease_termination_requests lease_termination_requests_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_termination_requests
+    ADD CONSTRAINT lease_termination_requests_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id);
+
+
+--
+-- Name: lease_termination_requests lease_termination_requests_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_termination_requests
+    ADD CONSTRAINT lease_termination_requests_lease_id_fkey FOREIGN KEY (lease_id) REFERENCES public.leases(id);
+
+
+--
+-- Name: lease_termination_requests lease_termination_requests_requested_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_termination_requests
+    ADD CONSTRAINT lease_termination_requests_requested_by_user_id_fkey FOREIGN KEY (requested_by_user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: lease_termination_requests lease_termination_requests_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_termination_requests
+    ADD CONSTRAINT lease_termination_requests_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id);
+
+
+--
+-- Name: lease_utility_assignments lease_utility_assignments_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_utility_assignments
+    ADD CONSTRAINT lease_utility_assignments_lease_id_fkey FOREIGN KEY (lease_id) REFERENCES public.leases(id) ON DELETE CASCADE;
+
+
+--
+-- Name: lease_utility_assignments lease_utility_assignments_meter_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_utility_assignments
+    ADD CONSTRAINT lease_utility_assignments_meter_id_fkey FOREIGN KEY (meter_id) REFERENCES public.utility_meters(id) ON DELETE CASCADE;
+
+
+--
+-- Name: lease_utility_responsibilities lease_utility_responsibilities_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_utility_responsibilities
+    ADD CONSTRAINT lease_utility_responsibilities_lease_id_fkey FOREIGN KEY (lease_id) REFERENCES public.leases(id) ON DELETE CASCADE;
+
+
+--
+-- Name: lease_vehicles lease_vehicles_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_vehicles
+    ADD CONSTRAINT lease_vehicles_lease_id_fkey FOREIGN KEY (lease_id) REFERENCES public.leases(id) ON DELETE CASCADE;
+
+
+--
+-- Name: lease_vehicles lease_vehicles_owner_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_vehicles
+    ADD CONSTRAINT lease_vehicles_owner_tenant_id_fkey FOREIGN KEY (owner_tenant_id) REFERENCES public.tenants(id) ON DELETE SET NULL;
+
+
+--
+-- Name: leases leases_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.leases
+    ADD CONSTRAINT leases_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id);
+
+
+--
+-- Name: leases leases_supersedes_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.leases
+    ADD CONSTRAINT leases_supersedes_lease_id_fkey FOREIGN KEY (supersedes_lease_id) REFERENCES public.leases(id);
+
+
+--
+-- Name: leases leases_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.leases
+    ADD CONSTRAINT leases_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id);
+
+
+--
+-- Name: liability_insurance_policies liability_insurance_policies_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.liability_insurance_policies
+    ADD CONSTRAINT liability_insurance_policies_lease_id_fkey FOREIGN KEY (lease_id) REFERENCES public.leases(id) ON DELETE CASCADE;
+
+
+--
+-- Name: maintenance_comments maintenance_comments_request_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.maintenance_comments
+    ADD CONSTRAINT maintenance_comments_request_id_fkey FOREIGN KEY (request_id) REFERENCES public.maintenance_requests(id) ON DELETE CASCADE;
+
+
+--
+-- Name: maintenance_comments maintenance_comments_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.maintenance_comments
+    ADD CONSTRAINT maintenance_comments_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: maintenance_requests maintenance_requests_contractor_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.maintenance_requests
+    ADD CONSTRAINT maintenance_requests_contractor_id_fkey FOREIGN KEY (contractor_id) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: maintenance_requests maintenance_requests_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.maintenance_requests
+    ADD CONSTRAINT maintenance_requests_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id);
+
+
+--
+-- Name: maintenance_requests maintenance_requests_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.maintenance_requests
+    ADD CONSTRAINT maintenance_requests_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id);
+
+
+--
+-- Name: maintenance_requests maintenance_requests_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.maintenance_requests
+    ADD CONSTRAINT maintenance_requests_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id);
+
+
+--
+-- Name: maintenance_worker_scopes maintenance_worker_scopes_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.maintenance_worker_scopes
+    ADD CONSTRAINT maintenance_worker_scopes_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: maintenance_worker_scopes maintenance_worker_scopes_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.maintenance_worker_scopes
+    ADD CONSTRAINT maintenance_worker_scopes_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: mobile_homes mobile_homes_current_owner_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.mobile_homes
+    ADD CONSTRAINT mobile_homes_current_owner_tenant_id_fkey FOREIGN KEY (current_owner_tenant_id) REFERENCES public.tenants(id) ON DELETE SET NULL;
+
+
+--
+-- Name: mobile_homes mobile_homes_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.mobile_homes
+    ADD CONSTRAINT mobile_homes_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id) ON DELETE SET NULL;
+
+
+--
+-- Name: monthly_fee_accruals monthly_fee_accruals_bank_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.monthly_fee_accruals
+    ADD CONSTRAINT monthly_fee_accruals_bank_account_id_fkey FOREIGN KEY (bank_account_id) REFERENCES public.user_bank_accounts(id);
+
+
+--
+-- Name: monthly_fee_accruals monthly_fee_accruals_ledger_entry_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.monthly_fee_accruals
+    ADD CONSTRAINT monthly_fee_accruals_ledger_entry_id_fkey FOREIGN KEY (ledger_entry_id) REFERENCES public.user_balance_ledger(id);
+
+
+--
+-- Name: monthly_fee_accruals monthly_fee_accruals_manager_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.monthly_fee_accruals
+    ADD CONSTRAINT monthly_fee_accruals_manager_user_id_fkey FOREIGN KEY (manager_user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: monthly_fee_accruals monthly_fee_accruals_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.monthly_fee_accruals
+    ADD CONSTRAINT monthly_fee_accruals_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE CASCADE;
+
+
+--
+-- Name: notification_preferences notification_preferences_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.notification_preferences
+    ADD CONSTRAINT notification_preferences_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: notifications notifications_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.notifications
+    ADD CONSTRAINT notifications_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE SET NULL;
+
+
+--
+-- Name: notifications notifications_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.notifications
+    ADD CONSTRAINT notifications_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: onsite_manager_scopes onsite_manager_scopes_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.onsite_manager_scopes
+    ADD CONSTRAINT onsite_manager_scopes_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: onsite_manager_scopes onsite_manager_scopes_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.onsite_manager_scopes
+    ADD CONSTRAINT onsite_manager_scopes_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: otp_advances otp_advances_advance_payment_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.otp_advances
+    ADD CONSTRAINT otp_advances_advance_payment_id_fkey FOREIGN KEY (advance_payment_id) REFERENCES public.payments(id);
+
+
+--
+-- Name: otp_advances otp_advances_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.otp_advances
+    ADD CONSTRAINT otp_advances_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id);
+
+
+--
+-- Name: otp_advances otp_advances_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.otp_advances
+    ADD CONSTRAINT otp_advances_lease_id_fkey FOREIGN KEY (lease_id) REFERENCES public.leases(id);
+
+
+--
+-- Name: otp_advances otp_advances_reconciled_with_payment_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.otp_advances
+    ADD CONSTRAINT otp_advances_reconciled_with_payment_id_fkey FOREIGN KEY (reconciled_with_payment_id) REFERENCES public.payments(id);
+
+
+--
+-- Name: otp_advances otp_advances_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.otp_advances
+    ADD CONSTRAINT otp_advances_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id);
+
+
+--
+-- Name: otp_advances otp_advances_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.otp_advances
+    ADD CONSTRAINT otp_advances_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id);
+
+
+--
+-- Name: parts_inventory parts_inventory_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.parts_inventory
+    ADD CONSTRAINT parts_inventory_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: payments payments_invoice_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payments
+    ADD CONSTRAINT payments_invoice_id_fkey FOREIGN KEY (invoice_id) REFERENCES public.invoices(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: payments payments_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payments
+    ADD CONSTRAINT payments_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id);
+
+
+--
+-- Name: payments payments_lease_fee_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payments
+    ADD CONSTRAINT payments_lease_fee_id_fkey FOREIGN KEY (lease_fee_id) REFERENCES public.lease_fees(id) ON DELETE SET NULL;
+
+
+--
+-- Name: payments payments_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payments
+    ADD CONSTRAINT payments_lease_id_fkey FOREIGN KEY (lease_id) REFERENCES public.leases(id);
+
+
+--
+-- Name: payments payments_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payments
+    ADD CONSTRAINT payments_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id);
+
+
+--
+-- Name: payments payments_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payments
+    ADD CONSTRAINT payments_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id);
+
+
+--
+-- Name: payroll_run_lines payroll_run_lines_employee_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payroll_run_lines
+    ADD CONSTRAINT payroll_run_lines_employee_id_fkey FOREIGN KEY (employee_id) REFERENCES public.books_employees(id);
+
+
+--
+-- Name: payroll_run_lines payroll_run_lines_run_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payroll_run_lines
+    ADD CONSTRAINT payroll_run_lines_run_id_fkey FOREIGN KEY (run_id) REFERENCES public.payroll_runs(id) ON DELETE CASCADE;
+
+
+--
+-- Name: payroll_runs payroll_runs_approved_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payroll_runs
+    ADD CONSTRAINT payroll_runs_approved_by_fkey FOREIGN KEY (approved_by) REFERENCES public.users(id);
+
+
+--
+-- Name: payroll_runs payroll_runs_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payroll_runs
+    ADD CONSTRAINT payroll_runs_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: pending_tenant_intents pending_tenant_intents_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pending_tenant_intents
+    ADD CONSTRAINT pending_tenant_intents_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: pending_tenant_intents pending_tenant_intents_resolved_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pending_tenant_intents
+    ADD CONSTRAINT pending_tenant_intents_resolved_lease_id_fkey FOREIGN KEY (resolved_lease_id) REFERENCES public.leases(id) ON DELETE SET NULL;
+
+
+--
+-- Name: pending_tenant_intents pending_tenant_intents_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pending_tenant_intents
+    ADD CONSTRAINT pending_tenant_intents_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id) ON DELETE CASCADE;
+
+
+--
+-- Name: platform_claim_promotions platform_claim_promotions_promoted_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.platform_claim_promotions
+    ADD CONSTRAINT platform_claim_promotions_promoted_by_fkey FOREIGN KEY (promoted_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: platform_events platform_events_actor_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.platform_events
+    ADD CONSTRAINT platform_events_actor_user_id_fkey FOREIGN KEY (actor_user_id) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: platform_fee_accruals platform_fee_accruals_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.platform_fee_accruals
+    ADD CONSTRAINT platform_fee_accruals_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: platform_fee_accruals platform_fee_accruals_platform_revenue_ledger_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.platform_fee_accruals
+    ADD CONSTRAINT platform_fee_accruals_platform_revenue_ledger_id_fkey FOREIGN KEY (platform_revenue_ledger_id) REFERENCES public.platform_revenue_ledger(id) ON DELETE SET NULL;
+
+
+--
+-- Name: platform_fee_accruals platform_fee_accruals_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.platform_fee_accruals
+    ADD CONSTRAINT platform_fee_accruals_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: platform_fee_config platform_fee_config_set_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.platform_fee_config
+    ADD CONSTRAINT platform_fee_config_set_by_user_id_fkey FOREIGN KEY (set_by_user_id) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: platform_revenue_ledger platform_revenue_ledger_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.platform_revenue_ledger
+    ADD CONSTRAINT platform_revenue_ledger_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE SET NULL;
+
+
+--
+-- Name: platform_review_status platform_review_status_verified_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.platform_review_status
+    ADD CONSTRAINT platform_review_status_verified_by_fkey FOREIGN KEY (verified_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: pm_companies pm_companies_bank_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pm_companies
+    ADD CONSTRAINT pm_companies_bank_account_id_fkey FOREIGN KEY (bank_account_id) REFERENCES public.user_bank_accounts(id) ON DELETE SET NULL;
+
+
+--
+-- Name: pm_companies pm_companies_created_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pm_companies
+    ADD CONSTRAINT pm_companies_created_by_user_id_fkey FOREIGN KEY (created_by_user_id) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: pm_fee_plans pm_fee_plans_pm_company_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pm_fee_plans
+    ADD CONSTRAINT pm_fee_plans_pm_company_id_fkey FOREIGN KEY (pm_company_id) REFERENCES public.pm_companies(id) ON DELETE CASCADE;
+
+
+--
+-- Name: pm_invitations pm_invitations_accepted_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pm_invitations
+    ADD CONSTRAINT pm_invitations_accepted_user_id_fkey FOREIGN KEY (accepted_user_id) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: pm_invitations pm_invitations_invited_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pm_invitations
+    ADD CONSTRAINT pm_invitations_invited_by_user_id_fkey FOREIGN KEY (invited_by_user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: pm_invitations pm_invitations_pm_company_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pm_invitations
+    ADD CONSTRAINT pm_invitations_pm_company_id_fkey FOREIGN KEY (pm_company_id) REFERENCES public.pm_companies(id) ON DELETE CASCADE;
+
+
+--
+-- Name: pm_invitations pm_invitations_revoked_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pm_invitations
+    ADD CONSTRAINT pm_invitations_revoked_by_user_id_fkey FOREIGN KEY (revoked_by_user_id) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: pm_monthly_fee_accruals pm_monthly_fee_accruals_bank_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pm_monthly_fee_accruals
+    ADD CONSTRAINT pm_monthly_fee_accruals_bank_account_id_fkey FOREIGN KEY (bank_account_id) REFERENCES public.user_bank_accounts(id) ON DELETE SET NULL;
+
+
+--
+-- Name: pm_monthly_fee_accruals pm_monthly_fee_accruals_ledger_entry_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pm_monthly_fee_accruals
+    ADD CONSTRAINT pm_monthly_fee_accruals_ledger_entry_id_fkey FOREIGN KEY (ledger_entry_id) REFERENCES public.user_balance_ledger(id) ON DELETE SET NULL;
+
+
+--
+-- Name: pm_monthly_fee_accruals pm_monthly_fee_accruals_pm_company_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pm_monthly_fee_accruals
+    ADD CONSTRAINT pm_monthly_fee_accruals_pm_company_id_fkey FOREIGN KEY (pm_company_id) REFERENCES public.pm_companies(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: pm_monthly_fee_accruals pm_monthly_fee_accruals_pm_fee_plan_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pm_monthly_fee_accruals
+    ADD CONSTRAINT pm_monthly_fee_accruals_pm_fee_plan_id_fkey FOREIGN KEY (pm_fee_plan_id) REFERENCES public.pm_fee_plans(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: pm_monthly_fee_accruals pm_monthly_fee_accruals_pm_payout_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pm_monthly_fee_accruals
+    ADD CONSTRAINT pm_monthly_fee_accruals_pm_payout_user_id_fkey FOREIGN KEY (pm_payout_user_id) REFERENCES public.users(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: pm_monthly_fee_accruals pm_monthly_fee_accruals_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pm_monthly_fee_accruals
+    ADD CONSTRAINT pm_monthly_fee_accruals_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: pm_property_invitations pm_property_invitations_accepted_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pm_property_invitations
+    ADD CONSTRAINT pm_property_invitations_accepted_user_id_fkey FOREIGN KEY (accepted_user_id) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: pm_property_invitations pm_property_invitations_invited_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pm_property_invitations
+    ADD CONSTRAINT pm_property_invitations_invited_by_user_id_fkey FOREIGN KEY (invited_by_user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: pm_property_invitations pm_property_invitations_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pm_property_invitations
+    ADD CONSTRAINT pm_property_invitations_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: pm_property_invitations pm_property_invitations_pm_company_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pm_property_invitations
+    ADD CONSTRAINT pm_property_invitations_pm_company_id_fkey FOREIGN KEY (pm_company_id) REFERENCES public.pm_companies(id) ON DELETE CASCADE;
+
+
+--
+-- Name: pm_property_invitations pm_property_invitations_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pm_property_invitations
+    ADD CONSTRAINT pm_property_invitations_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE CASCADE;
+
+
+--
+-- Name: pm_property_invitations pm_property_invitations_proposed_fee_plan_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pm_property_invitations
+    ADD CONSTRAINT pm_property_invitations_proposed_fee_plan_id_fkey FOREIGN KEY (proposed_fee_plan_id) REFERENCES public.pm_fee_plans(id) ON DELETE SET NULL;
+
+
+--
+-- Name: pm_property_invitations pm_property_invitations_replaced_pm_company_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pm_property_invitations
+    ADD CONSTRAINT pm_property_invitations_replaced_pm_company_id_fkey FOREIGN KEY (replaced_pm_company_id) REFERENCES public.pm_companies(id) ON DELETE SET NULL;
+
+
+--
+-- Name: pm_property_invitations pm_property_invitations_revoked_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pm_property_invitations
+    ADD CONSTRAINT pm_property_invitations_revoked_by_user_id_fkey FOREIGN KEY (revoked_by_user_id) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: pm_staff pm_staff_invited_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pm_staff
+    ADD CONSTRAINT pm_staff_invited_by_user_id_fkey FOREIGN KEY (invited_by_user_id) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: pm_staff pm_staff_pm_company_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pm_staff
+    ADD CONSTRAINT pm_staff_pm_company_id_fkey FOREIGN KEY (pm_company_id) REFERENCES public.pm_companies(id) ON DELETE CASCADE;
+
+
+--
+-- Name: pm_staff pm_staff_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pm_staff
+    ADD CONSTRAINT pm_staff_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: pool_match_requests pool_match_requests_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pool_match_requests
+    ADD CONSTRAINT pool_match_requests_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: pool_match_requests pool_match_requests_pool_entry_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pool_match_requests
+    ADD CONSTRAINT pool_match_requests_pool_entry_id_fkey FOREIGN KEY (pool_entry_id) REFERENCES public.application_pool(id) ON DELETE CASCADE;
+
+
+--
+-- Name: pool_match_requests pool_match_requests_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pool_match_requests
+    ADD CONSTRAINT pool_match_requests_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id) ON DELETE SET NULL;
+
+
+--
+-- Name: pos_categories pos_categories_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_categories
+    ADD CONSTRAINT pos_categories_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: pos_categories pos_categories_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_categories
+    ADD CONSTRAINT pos_categories_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE SET NULL;
+
+
+--
+-- Name: pos_customer_invitations pos_customer_invitations_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_customer_invitations
+    ADD CONSTRAINT pos_customer_invitations_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id);
+
+
+--
+-- Name: pos_customer_invitations pos_customer_invitations_pos_customer_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_customer_invitations
+    ADD CONSTRAINT pos_customer_invitations_pos_customer_id_fkey FOREIGN KEY (pos_customer_id) REFERENCES public.pos_customers(id);
+
+
+--
+-- Name: pos_customers pos_customers_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_customers
+    ADD CONSTRAINT pos_customers_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id);
+
+
+--
+-- Name: pos_discounts pos_discounts_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_discounts
+    ADD CONSTRAINT pos_discounts_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: pos_eod_settlements pos_eod_settlements_closed_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_eod_settlements
+    ADD CONSTRAINT pos_eod_settlements_closed_by_fkey FOREIGN KEY (closed_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: pos_eod_settlements pos_eod_settlements_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_eod_settlements
+    ADD CONSTRAINT pos_eod_settlements_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: pos_inventory_log pos_inventory_log_item_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_inventory_log
+    ADD CONSTRAINT pos_inventory_log_item_id_fkey FOREIGN KEY (item_id) REFERENCES public.pos_items(id) ON DELETE CASCADE;
+
+
+--
+-- Name: pos_inventory_log pos_inventory_log_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_inventory_log
+    ADD CONSTRAINT pos_inventory_log_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: pos_item_variants pos_item_variants_item_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_item_variants
+    ADD CONSTRAINT pos_item_variants_item_id_fkey FOREIGN KEY (item_id) REFERENCES public.pos_items(id) ON DELETE CASCADE;
+
+
+--
+-- Name: pos_items pos_items_category_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_items
+    ADD CONSTRAINT pos_items_category_id_fkey FOREIGN KEY (category_id) REFERENCES public.pos_categories(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: pos_items pos_items_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_items
+    ADD CONSTRAINT pos_items_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: pos_items pos_items_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_items
+    ADD CONSTRAINT pos_items_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE SET NULL;
+
+
+--
+-- Name: pos_items pos_items_vendor_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_items
+    ADD CONSTRAINT pos_items_vendor_id_fkey FOREIGN KEY (vendor_id) REFERENCES public.pos_vendors(id) ON DELETE SET NULL;
+
+
+--
+-- Name: pos_price_history pos_price_history_changed_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_price_history
+    ADD CONSTRAINT pos_price_history_changed_by_fkey FOREIGN KEY (changed_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: pos_price_history pos_price_history_item_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_price_history
+    ADD CONSTRAINT pos_price_history_item_id_fkey FOREIGN KEY (item_id) REFERENCES public.pos_items(id) ON DELETE CASCADE;
+
+
+--
+-- Name: pos_purchase_order_items pos_purchase_order_items_item_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_purchase_order_items
+    ADD CONSTRAINT pos_purchase_order_items_item_id_fkey FOREIGN KEY (item_id) REFERENCES public.pos_items(id) ON DELETE SET NULL;
+
+
+--
+-- Name: pos_purchase_order_items pos_purchase_order_items_po_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_purchase_order_items
+    ADD CONSTRAINT pos_purchase_order_items_po_id_fkey FOREIGN KEY (po_id) REFERENCES public.pos_purchase_orders(id) ON DELETE CASCADE;
+
+
+--
+-- Name: pos_purchase_orders pos_purchase_orders_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_purchase_orders
+    ADD CONSTRAINT pos_purchase_orders_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: pos_purchase_orders pos_purchase_orders_vendor_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_purchase_orders
+    ADD CONSTRAINT pos_purchase_orders_vendor_id_fkey FOREIGN KEY (vendor_id) REFERENCES public.pos_vendors(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: pos_refunds pos_refunds_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_refunds
+    ADD CONSTRAINT pos_refunds_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: pos_refunds pos_refunds_transaction_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_refunds
+    ADD CONSTRAINT pos_refunds_transaction_id_fkey FOREIGN KEY (transaction_id) REFERENCES public.pos_transactions(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: pos_session_items pos_session_items_item_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_session_items
+    ADD CONSTRAINT pos_session_items_item_id_fkey FOREIGN KEY (item_id) REFERENCES public.pos_items(id);
+
+
+--
+-- Name: pos_session_items pos_session_items_item_variant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_session_items
+    ADD CONSTRAINT pos_session_items_item_variant_id_fkey FOREIGN KEY (item_variant_id) REFERENCES public.pos_item_variants(id);
+
+
+--
+-- Name: pos_session_items pos_session_items_session_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_session_items
+    ADD CONSTRAINT pos_session_items_session_id_fkey FOREIGN KEY (session_id) REFERENCES public.pos_sessions(id) ON DELETE CASCADE;
+
+
+--
+-- Name: pos_sessions pos_sessions_completed_transaction_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_sessions
+    ADD CONSTRAINT pos_sessions_completed_transaction_id_fkey FOREIGN KEY (completed_transaction_id) REFERENCES public.pos_transactions(id);
+
+
+--
+-- Name: pos_sessions pos_sessions_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_sessions
+    ADD CONSTRAINT pos_sessions_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id);
+
+
+--
+-- Name: pos_sessions pos_sessions_opened_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_sessions
+    ADD CONSTRAINT pos_sessions_opened_by_user_id_fkey FOREIGN KEY (opened_by_user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: pos_sessions pos_sessions_pos_customer_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_sessions
+    ADD CONSTRAINT pos_sessions_pos_customer_id_fkey FOREIGN KEY (pos_customer_id) REFERENCES public.pos_customers(id);
+
+
+--
+-- Name: pos_sessions pos_sessions_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_sessions
+    ADD CONSTRAINT pos_sessions_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id);
+
+
+--
+-- Name: pos_sessions pos_sessions_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_sessions
+    ADD CONSTRAINT pos_sessions_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id);
+
+
+--
+-- Name: pos_tax_rates pos_tax_rates_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_tax_rates
+    ADD CONSTRAINT pos_tax_rates_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: pos_tax_rates pos_tax_rates_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_tax_rates
+    ADD CONSTRAINT pos_tax_rates_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE SET NULL;
+
+
+--
+-- Name: pos_transaction_items pos_transaction_items_item_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_transaction_items
+    ADD CONSTRAINT pos_transaction_items_item_id_fkey FOREIGN KEY (item_id) REFERENCES public.pos_items(id) ON DELETE SET NULL;
+
+
+--
+-- Name: pos_transaction_items pos_transaction_items_transaction_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_transaction_items
+    ADD CONSTRAINT pos_transaction_items_transaction_id_fkey FOREIGN KEY (transaction_id) REFERENCES public.pos_transactions(id) ON DELETE CASCADE;
+
+
+--
+-- Name: pos_transactions pos_transactions_cashier_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_transactions
+    ADD CONSTRAINT pos_transactions_cashier_id_fkey FOREIGN KEY (cashier_id) REFERENCES public.users(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: pos_transactions pos_transactions_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_transactions
+    ADD CONSTRAINT pos_transactions_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: pos_transactions pos_transactions_pos_customer_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_transactions
+    ADD CONSTRAINT pos_transactions_pos_customer_id_fkey FOREIGN KEY (pos_customer_id) REFERENCES public.pos_customers(id);
+
+
+--
+-- Name: pos_transactions pos_transactions_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_transactions
+    ADD CONSTRAINT pos_transactions_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id) ON DELETE SET NULL;
+
+
+--
+-- Name: pos_vendors pos_vendors_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_vendors
+    ADD CONSTRAINT pos_vendors_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: properties properties_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.properties
+    ADD CONSTRAINT properties_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: properties properties_managed_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.properties
+    ADD CONSTRAINT properties_managed_by_user_id_fkey FOREIGN KEY (managed_by_user_id) REFERENCES public.users(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: properties properties_owner_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.properties
+    ADD CONSTRAINT properties_owner_user_id_fkey FOREIGN KEY (owner_user_id) REFERENCES public.users(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: properties properties_pm_company_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.properties
+    ADD CONSTRAINT properties_pm_company_id_fkey FOREIGN KEY (pm_company_id) REFERENCES public.pm_companies(id) ON DELETE SET NULL;
+
+
+--
+-- Name: properties properties_pm_fee_plan_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.properties
+    ADD CONSTRAINT properties_pm_fee_plan_id_fkey FOREIGN KEY (pm_fee_plan_id) REFERENCES public.pm_fee_plans(id) ON DELETE SET NULL;
+
+
+--
+-- Name: property_allocation_rules property_allocation_rules_owner_bank_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_allocation_rules
+    ADD CONSTRAINT property_allocation_rules_owner_bank_account_id_fkey FOREIGN KEY (owner_bank_account_id) REFERENCES public.user_bank_accounts(id);
+
+
+--
+-- Name: property_allocation_rules property_allocation_rules_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_allocation_rules
+    ADD CONSTRAINT property_allocation_rules_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE CASCADE;
+
+
+--
+-- Name: property_duplicate_flags property_duplicate_flags_conflicting_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_duplicate_flags
+    ADD CONSTRAINT property_duplicate_flags_conflicting_property_id_fkey FOREIGN KEY (conflicting_property_id) REFERENCES public.properties(id) ON DELETE CASCADE;
+
+
+--
+-- Name: property_duplicate_flags property_duplicate_flags_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_duplicate_flags
+    ADD CONSTRAINT property_duplicate_flags_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE CASCADE;
+
+
+--
+-- Name: property_duplicate_flags property_duplicate_flags_resolved_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_duplicate_flags
+    ADD CONSTRAINT property_duplicate_flags_resolved_by_fkey FOREIGN KEY (resolved_by) REFERENCES public.users(id);
+
+
+--
+-- Name: property_fee_schedules property_fee_schedules_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_fee_schedules
+    ADD CONSTRAINT property_fee_schedules_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE CASCADE;
+
+
+--
+-- Name: property_manager_scopes property_manager_scopes_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_manager_scopes
+    ADD CONSTRAINT property_manager_scopes_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: property_manager_scopes property_manager_scopes_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_manager_scopes
+    ADD CONSTRAINT property_manager_scopes_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: purchase_requests purchase_requests_approved_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.purchase_requests
+    ADD CONSTRAINT purchase_requests_approved_by_fkey FOREIGN KEY (approved_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: purchase_requests purchase_requests_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.purchase_requests
+    ADD CONSTRAINT purchase_requests_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: purchase_requests purchase_requests_requested_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.purchase_requests
+    ADD CONSTRAINT purchase_requests_requested_by_fkey FOREIGN KEY (requested_by) REFERENCES public.users(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: purchase_requests purchase_requests_work_order_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.purchase_requests
+    ADD CONSTRAINT purchase_requests_work_order_id_fkey FOREIGN KEY (work_order_id) REFERENCES public.maintenance_requests(id) ON DELETE SET NULL;
+
+
+--
+-- Name: rvs rvs_current_owner_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.rvs
+    ADD CONSTRAINT rvs_current_owner_tenant_id_fkey FOREIGN KEY (current_owner_tenant_id) REFERENCES public.tenants(id) ON DELETE SET NULL;
+
+
+--
+-- Name: rvs rvs_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.rvs
+    ADD CONSTRAINT rvs_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id) ON DELETE SET NULL;
+
+
+--
+-- Name: scheduled_maintenance scheduled_maintenance_assigned_to_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.scheduled_maintenance
+    ADD CONSTRAINT scheduled_maintenance_assigned_to_fkey FOREIGN KEY (assigned_to) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: scheduled_maintenance scheduled_maintenance_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.scheduled_maintenance
+    ADD CONSTRAINT scheduled_maintenance_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: scheduled_maintenance scheduled_maintenance_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.scheduled_maintenance
+    ADD CONSTRAINT scheduled_maintenance_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE SET NULL;
+
+
+--
+-- Name: scheduled_maintenance scheduled_maintenance_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.scheduled_maintenance
+    ADD CONSTRAINT scheduled_maintenance_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id) ON DELETE SET NULL;
+
+
+--
+-- Name: security_deposit_interest_accruals security_deposit_interest_accruals_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.security_deposit_interest_accruals
+    ADD CONSTRAINT security_deposit_interest_accruals_lease_id_fkey FOREIGN KEY (lease_id) REFERENCES public.leases(id) ON DELETE CASCADE;
+
+
+--
+-- Name: security_deposit_interest_accruals security_deposit_interest_accruals_security_deposit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.security_deposit_interest_accruals
+    ADD CONSTRAINT security_deposit_interest_accruals_security_deposit_id_fkey FOREIGN KEY (security_deposit_id) REFERENCES public.security_deposits(id) ON DELETE CASCADE;
+
+
+--
+-- Name: security_deposits security_deposits_carried_from_deposit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.security_deposits
+    ADD CONSTRAINT security_deposits_carried_from_deposit_id_fkey FOREIGN KEY (carried_from_deposit_id) REFERENCES public.security_deposits(id);
+
+
+--
+-- Name: security_deposits security_deposits_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.security_deposits
+    ADD CONSTRAINT security_deposits_lease_id_fkey FOREIGN KEY (lease_id) REFERENCES public.leases(id);
+
+
+--
+-- Name: security_deposits security_deposits_portability_target_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.security_deposits
+    ADD CONSTRAINT security_deposits_portability_target_lease_id_fkey FOREIGN KEY (portability_target_lease_id) REFERENCES public.leases(id);
+
+
+--
+-- Name: security_deposits security_deposits_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.security_deposits
+    ADD CONSTRAINT security_deposits_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id);
+
+
+--
+-- Name: security_deposits security_deposits_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.security_deposits
+    ADD CONSTRAINT security_deposits_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id);
+
+
+--
+-- Name: shifts shifts_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.shifts
+    ADD CONSTRAINT shifts_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: shifts shifts_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.shifts
+    ADD CONSTRAINT shifts_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: state_law_provisions slp_act_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.state_law_provisions
+    ADD CONSTRAINT slp_act_fkey FOREIGN KEY (act_id) REFERENCES public.state_landlord_tenant_acts(id) ON DELETE CASCADE;
+
+
+--
+-- Name: subleases subleases_invitation_fk; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.subleases
+    ADD CONSTRAINT subleases_invitation_fk FOREIGN KEY (sublessee_invitation_id) REFERENCES public.sublessee_invitations(id);
+
+
+--
+-- Name: subleases subleases_master_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.subleases
+    ADD CONSTRAINT subleases_master_lease_id_fkey FOREIGN KEY (master_lease_id) REFERENCES public.leases(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: subleases subleases_sublease_document_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.subleases
+    ADD CONSTRAINT subleases_sublease_document_id_fkey FOREIGN KEY (sublease_document_id) REFERENCES public.lease_documents(id);
+
+
+--
+-- Name: subleases subleases_sublessee_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.subleases
+    ADD CONSTRAINT subleases_sublessee_tenant_id_fkey FOREIGN KEY (sublessee_tenant_id) REFERENCES public.tenants(id);
+
+
+--
+-- Name: subleases subleases_sublessor_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.subleases
+    ADD CONSTRAINT subleases_sublessor_tenant_id_fkey FOREIGN KEY (sublessor_tenant_id) REFERENCES public.tenants(id);
+
+
+--
+-- Name: sublessee_invitations sublessee_invitations_accepted_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sublessee_invitations
+    ADD CONSTRAINT sublessee_invitations_accepted_tenant_id_fkey FOREIGN KEY (accepted_tenant_id) REFERENCES public.tenants(id);
+
+
+--
+-- Name: sublessee_invitations sublessee_invitations_master_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sublessee_invitations
+    ADD CONSTRAINT sublessee_invitations_master_lease_id_fkey FOREIGN KEY (master_lease_id) REFERENCES public.leases(id);
+
+
+--
+-- Name: sublessee_invitations sublessee_invitations_sublease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sublessee_invitations
+    ADD CONSTRAINT sublessee_invitations_sublease_id_fkey FOREIGN KEY (sublease_id) REFERENCES public.subleases(id);
+
+
+--
+-- Name: sublessee_invitations sublessee_invitations_sublessor_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sublessee_invitations
+    ADD CONSTRAINT sublessee_invitations_sublessor_tenant_id_fkey FOREIGN KEY (sublessor_tenant_id) REFERENCES public.tenants(id);
+
+
+--
+-- Name: sublessor_credit_balances sublessor_credit_balances_sublease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sublessor_credit_balances
+    ADD CONSTRAINT sublessor_credit_balances_sublease_id_fkey FOREIGN KEY (sublease_id) REFERENCES public.subleases(id);
+
+
+--
+-- Name: sublessor_credit_balances sublessor_credit_balances_sublessor_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sublessor_credit_balances
+    ADD CONSTRAINT sublessor_credit_balances_sublessor_tenant_id_fkey FOREIGN KEY (sublessor_tenant_id) REFERENCES public.tenants(id);
+
+
+--
+-- Name: system_features system_features_updated_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.system_features
+    ADD CONSTRAINT system_features_updated_by_user_id_fkey FOREIGN KEY (updated_by_user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: tenant_identifications tenant_identifications_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_identifications
+    ADD CONSTRAINT tenant_identifications_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id) ON DELETE CASCADE;
+
+
+--
+-- Name: tenant_identifications tenant_identifications_verified_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_identifications
+    ADD CONSTRAINT tenant_identifications_verified_by_fkey FOREIGN KEY (verified_by) REFERENCES public.users(id);
+
+
+--
+-- Name: tenant_notifications tenant_notifications_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_notifications
+    ADD CONSTRAINT tenant_notifications_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: tenants tenants_background_check_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenants
+    ADD CONSTRAINT tenants_background_check_id_fkey FOREIGN KEY (background_check_id) REFERENCES public.background_checks(id) ON DELETE SET NULL;
+
+
+--
+-- Name: tenants tenants_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenants
+    ADD CONSTRAINT tenants_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: unit_applications unit_applications_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_applications
+    ADD CONSTRAINT unit_applications_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE SET NULL;
+
+
+--
+-- Name: unit_applications unit_applications_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_applications
+    ADD CONSTRAINT unit_applications_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id) ON DELETE SET NULL;
+
+
+--
+-- Name: unit_bookings unit_bookings_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_bookings
+    ADD CONSTRAINT unit_bookings_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: unit_bookings unit_bookings_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_bookings
+    ADD CONSTRAINT unit_bookings_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id) ON DELETE SET NULL;
+
+
+--
+-- Name: unit_bookings unit_bookings_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_bookings
+    ADD CONSTRAINT unit_bookings_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id) ON DELETE CASCADE;
+
+
+--
+-- Name: unit_entry_request_responses unit_entry_request_responses_request_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_entry_request_responses
+    ADD CONSTRAINT unit_entry_request_responses_request_id_fkey FOREIGN KEY (request_id) REFERENCES public.unit_entry_requests(id) ON DELETE CASCADE;
+
+
+--
+-- Name: unit_entry_request_responses unit_entry_request_responses_responder_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_entry_request_responses
+    ADD CONSTRAINT unit_entry_request_responses_responder_user_id_fkey FOREIGN KEY (responder_user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: unit_entry_requests unit_entry_requests_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_entry_requests
+    ADD CONSTRAINT unit_entry_requests_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id);
+
+
+--
+-- Name: unit_entry_requests unit_entry_requests_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_entry_requests
+    ADD CONSTRAINT unit_entry_requests_lease_id_fkey FOREIGN KEY (lease_id) REFERENCES public.leases(id);
+
+
+--
+-- Name: unit_entry_requests unit_entry_requests_requested_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_entry_requests
+    ADD CONSTRAINT unit_entry_requests_requested_by_user_id_fkey FOREIGN KEY (requested_by_user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: unit_entry_requests unit_entry_requests_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_entry_requests
+    ADD CONSTRAINT unit_entry_requests_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id);
+
+
+--
+-- Name: unit_entry_requests unit_entry_requests_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_entry_requests
+    ADD CONSTRAINT unit_entry_requests_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id);
+
+
+--
+-- Name: unit_inspection_items unit_inspection_items_inspection_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_inspection_items
+    ADD CONSTRAINT unit_inspection_items_inspection_id_fkey FOREIGN KEY (inspection_id) REFERENCES public.unit_inspections(id) ON DELETE CASCADE;
+
+
+--
+-- Name: unit_inspection_photos unit_inspection_photos_inspection_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_inspection_photos
+    ADD CONSTRAINT unit_inspection_photos_inspection_id_fkey FOREIGN KEY (inspection_id) REFERENCES public.unit_inspections(id) ON DELETE CASCADE;
+
+
+--
+-- Name: unit_inspection_photos unit_inspection_photos_item_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_inspection_photos
+    ADD CONSTRAINT unit_inspection_photos_item_id_fkey FOREIGN KEY (item_id) REFERENCES public.unit_inspection_items(id) ON DELETE SET NULL;
+
+
+--
+-- Name: unit_inspection_photos unit_inspection_photos_uploaded_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_inspection_photos
+    ADD CONSTRAINT unit_inspection_photos_uploaded_by_fkey FOREIGN KEY (uploaded_by) REFERENCES public.users(id);
+
+
+--
+-- Name: unit_inspection_signatures unit_inspection_signatures_inspection_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_inspection_signatures
+    ADD CONSTRAINT unit_inspection_signatures_inspection_id_fkey FOREIGN KEY (inspection_id) REFERENCES public.unit_inspections(id) ON DELETE CASCADE;
+
+
+--
+-- Name: unit_inspection_signatures unit_inspection_signatures_signer_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_inspection_signatures
+    ADD CONSTRAINT unit_inspection_signatures_signer_user_id_fkey FOREIGN KEY (signer_user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: unit_inspections unit_inspections_comparison_inspection_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_inspections
+    ADD CONSTRAINT unit_inspections_comparison_inspection_id_fkey FOREIGN KEY (comparison_inspection_id) REFERENCES public.unit_inspections(id);
+
+
+--
+-- Name: unit_inspections unit_inspections_conducted_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_inspections
+    ADD CONSTRAINT unit_inspections_conducted_by_user_id_fkey FOREIGN KEY (conducted_by_user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: unit_inspections unit_inspections_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_inspections
+    ADD CONSTRAINT unit_inspections_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id);
+
+
+--
+-- Name: unit_inspections unit_inspections_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_inspections
+    ADD CONSTRAINT unit_inspections_lease_id_fkey FOREIGN KEY (lease_id) REFERENCES public.leases(id);
+
+
+--
+-- Name: unit_inspections unit_inspections_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_inspections
+    ADD CONSTRAINT unit_inspections_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id);
+
+
+--
+-- Name: unit_inspections unit_inspections_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_inspections
+    ADD CONSTRAINT unit_inspections_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id);
+
+
+--
+-- Name: unit_photos unit_photos_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_photos
+    ADD CONSTRAINT unit_photos_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: unit_photos unit_photos_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_photos
+    ADD CONSTRAINT unit_photos_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id) ON DELETE CASCADE;
+
+
+--
+-- Name: units units_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.units
+    ADD CONSTRAINT units_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id);
+
+
+--
+-- Name: units units_payment_block_set_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.units
+    ADD CONSTRAINT units_payment_block_set_by_fkey FOREIGN KEY (payment_block_set_by) REFERENCES public.users(id);
+
+
+--
+-- Name: units units_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.units
+    ADD CONSTRAINT units_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE CASCADE;
+
+
+--
+-- Name: units units_scheduled_activation_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.units
+    ADD CONSTRAINT units_scheduled_activation_by_fkey FOREIGN KEY (scheduled_activation_by) REFERENCES public.users(id);
+
+
+--
+-- Name: user_balance_ledger user_balance_ledger_bank_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.user_balance_ledger
+    ADD CONSTRAINT user_balance_ledger_bank_account_id_fkey FOREIGN KEY (bank_account_id) REFERENCES public.user_bank_accounts(id);
+
+
+--
+-- Name: user_balance_ledger user_balance_ledger_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.user_balance_ledger
+    ADD CONSTRAINT user_balance_ledger_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE SET NULL;
+
+
+--
+-- Name: user_balance_ledger user_balance_ledger_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.user_balance_ledger
+    ADD CONSTRAINT user_balance_ledger_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: user_bank_accounts user_bank_accounts_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.user_bank_accounts
+    ADD CONSTRAINT user_bank_accounts_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: user_totp_recovery_codes user_totp_recovery_codes_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.user_totp_recovery_codes
+    ADD CONSTRAINT user_totp_recovery_codes_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: users users_default_management_payout_bank_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.users
+    ADD CONSTRAINT users_default_management_payout_bank_account_id_fkey FOREIGN KEY (default_management_payout_bank_account_id) REFERENCES public.user_bank_accounts(id);
+
+
+--
+-- Name: utility_bills utility_bills_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_bills
+    ADD CONSTRAINT utility_bills_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: utility_bills utility_bills_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_bills
+    ADD CONSTRAINT utility_bills_lease_id_fkey FOREIGN KEY (lease_id) REFERENCES public.leases(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: utility_bills utility_bills_meter_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_bills
+    ADD CONSTRAINT utility_bills_meter_id_fkey FOREIGN KEY (meter_id) REFERENCES public.utility_meters(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: utility_bills utility_bills_payment_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_bills
+    ADD CONSTRAINT utility_bills_payment_id_fkey FOREIGN KEY (payment_id) REFERENCES public.payments(id) ON DELETE SET NULL;
+
+
+--
+-- Name: utility_bills utility_bills_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_bills
+    ADD CONSTRAINT utility_bills_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: utility_bills utility_bills_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_bills
+    ADD CONSTRAINT utility_bills_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: utility_meter_readings utility_meter_readings_created_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_meter_readings
+    ADD CONSTRAINT utility_meter_readings_created_by_user_id_fkey FOREIGN KEY (created_by_user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: utility_meter_readings utility_meter_readings_meter_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_meter_readings
+    ADD CONSTRAINT utility_meter_readings_meter_id_fkey FOREIGN KEY (meter_id) REFERENCES public.utility_meters(id) ON DELETE CASCADE;
+
+
+--
+-- Name: utility_meter_units utility_meter_units_meter_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_meter_units
+    ADD CONSTRAINT utility_meter_units_meter_id_fkey FOREIGN KEY (meter_id) REFERENCES public.utility_meters(id) ON DELETE CASCADE;
+
+
+--
+-- Name: utility_meter_units utility_meter_units_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_meter_units
+    ADD CONSTRAINT utility_meter_units_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id) ON DELETE CASCADE;
+
+
+--
+-- Name: utility_meters utility_meters_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_meters
+    ADD CONSTRAINT utility_meters_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE CASCADE;
+
+
+--
+-- Name: work_trade_agreements work_trade_agreements_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.work_trade_agreements
+    ADD CONSTRAINT work_trade_agreements_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: work_trade_agreements work_trade_agreements_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.work_trade_agreements
+    ADD CONSTRAINT work_trade_agreements_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: work_trade_agreements work_trade_agreements_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.work_trade_agreements
+    ADD CONSTRAINT work_trade_agreements_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: work_trade_logs work_trade_logs_agreement_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.work_trade_logs
+    ADD CONSTRAINT work_trade_logs_agreement_id_fkey FOREIGN KEY (agreement_id) REFERENCES public.work_trade_agreements(id) ON DELETE CASCADE;
+
+
+--
+-- Name: work_trade_logs work_trade_logs_reviewed_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.work_trade_logs
+    ADD CONSTRAINT work_trade_logs_reviewed_by_fkey FOREIGN KEY (reviewed_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: work_trade_logs work_trade_logs_submitted_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.work_trade_logs
+    ADD CONSTRAINT work_trade_logs_submitted_by_fkey FOREIGN KEY (submitted_by) REFERENCES public.users(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: work_trade_logs work_trade_logs_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.work_trade_logs
+    ADD CONSTRAINT work_trade_logs_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: work_trade_periods work_trade_periods_agreement_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.work_trade_periods
+    ADD CONSTRAINT work_trade_periods_agreement_id_fkey FOREIGN KEY (agreement_id) REFERENCES public.work_trade_agreements(id) ON DELETE CASCADE;
+
+
+--
+-- PostgreSQL database dump complete
+--
+
+\unrestrict P8lsRG5ev0VJk65MBOr7BiC5ccQRLTsKmMfT7PHUhiuFDPr0Cvmq7i29cCSMpQv
+

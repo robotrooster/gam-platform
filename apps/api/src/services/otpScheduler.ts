@@ -1,9 +1,32 @@
 import { query, queryOne } from '../db'
+import { logger } from '../lib/logger'
 
 // ── OTP Disbursement Scheduler ────────────────────────────────────────────
-// Runs on the 28th of each month.
-// Finds all tenants who qualified for OTP by the 23rd cutoff,
-// calculates per-landlord charges and queues disbursements for the 1st.
+//
+// S86 STATUS: DISABLED. The export remains so the file compiles and any
+// future re-enable site can find it, but `scheduleOtpCron` is no longer
+// called from index.ts. Two pre-existing schema breaks made the cron a
+// runtime landmine if it ever fired:
+//
+//   1. The tenant lookup JOINs `units u ON u.tenant_id = t.id`. The
+//      tenant_id column was dropped from units when the lease_tenants /
+//      v_unit_occupancy model landed (S26-ish). Use v_lease_active_tenants
+//      with a primary-role filter when rewriting.
+//
+//   2. The disbursements INSERT writes `landlord_id`, `scheduled_date`,
+//      `unit_count`, `type='otp_rent'`, `notes` columns that don't match
+//      the current 16a-era disbursements shape (user_id, bank_account_id,
+//      trigger_type, etc). Map to the current columns when rewriting.
+//
+// Re-enable once Item 16 batch 3+ wires real OTP infrastructure. The 28th-
+// cutoff cycle pattern itself is preserved here as a reference for what
+// the new implementation needs to express.
+//
+// Pre-S86: cron was scheduled in index.ts and would have crashed on first
+// fire (28th of month with any qualifying tenant). Kept disabled rather
+// than fixed because the OTP product isn't ready end-to-end yet — the
+// disbursement-firing rail is stub-only (Item 16 batch 2) and there's no
+// SetupIntent infra to enroll tenants (Item 16 batch 3+).
 
 export async function runOtpDisbursementCycle() {
   const now = new Date()
@@ -13,7 +36,7 @@ export async function runOtpDisbursementCycle() {
   // Cutoff: 23rd of current month at EOD
   const cutoff = new Date(year, now.getMonth(), 23, 23, 59, 59)
 
-  console.log(`[OTP] Running disbursement cycle for ${year}-${String(month).padStart(2,'0')}, cutoff: ${cutoff.toISOString()}`)
+  logger.info(`[OTP] Running disbursement cycle for ${year}-${String(month).padStart(2,'0')}, cutoff: ${cutoff.toISOString()}`)
 
   // Find all OTP-qualified tenants where qualification is before cutoff
   const qualifiedTenants = await query<any>(`
@@ -37,7 +60,7 @@ export async function runOtpDisbursementCycle() {
   `, [cutoff])
 
   if (!qualifiedTenants.length) {
-    console.log('[OTP] No qualifying tenants found for this cycle')
+    logger.info('[OTP] No qualifying tenants found for this cycle')
     return { processed: 0, landlords: 0 }
   }
 
@@ -58,7 +81,7 @@ export async function runOtpDisbursementCycle() {
     const totalRent = tenants.reduce((sum: number, t: any) => sum + parseFloat(t.rent_amount || 0), 0)
     const platformFee = unitCount * 15 // $15 per OTP unit
 
-    console.log(`[OTP] Landlord ${landlordId}: ${unitCount} units, rent $${totalRent.toFixed(2)}, fee $${platformFee}`)
+    logger.info(`[OTP] Landlord ${landlordId}: ${unitCount} units, rent $${totalRent.toFixed(2)}, fee $${platformFee}`)
 
     // Record the scheduled disbursement
     await query(`
@@ -79,7 +102,7 @@ export async function runOtpDisbursementCycle() {
     totalProcessed += unitCount
   }
 
-  console.log(`[OTP] Cycle complete: ${totalProcessed} tenants across ${Object.keys(byLandlord).length} landlords`)
+  logger.info(`[OTP] Cycle complete: ${totalProcessed} tenants across ${Object.keys(byLandlord).length} landlords`)
   return { processed: totalProcessed, landlords: Object.keys(byLandlord).length }
 }
 
@@ -92,14 +115,14 @@ export function scheduleOtpCron() {
     const now = new Date()
     if (now.getDate() === 28 && now.getMonth() !== lastRunMonth) {
       lastRunMonth = now.getMonth()
-      console.log('[OTP] 28th detected — running disbursement cycle')
+      logger.info('[OTP] 28th detected — running disbursement cycle')
       try {
         await runOtpDisbursementCycle()
       } catch (e) {
-        console.error('[OTP] Scheduler error:', e)
+        logger.error({ err: e }, '[OTP] Scheduler error:')
       }
     }
   }, 60 * 60 * 1000) // every hour
 
-  console.log('[OTP] Scheduler initialized — will run on the 28th of each month')
+  logger.info('[OTP] Scheduler initialized — will run on the 28th of each month')
 }

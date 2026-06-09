@@ -9,36 +9,23 @@ function authFetch(path: string, opts: RequestInit = {}) {
   return fetch(API + '/api' + path, { ...opts, headers: { Authorization: 'Bearer ' + tok(), ...(opts.headers||{}) } })
 }
 
+// S233: replaced movie-font signature options (Terminator / Matrix /
+// Blade Runner / Mad Max) with system-fallback professional ones.
+// Each entry is a CSS font shorthand; the canvas renderer uses the
+// string directly. Named fonts have generic fallbacks (cursive / serif)
+// so every OS renders something signature-shaped even if the specific
+// font isn't installed.
 const SIG_FONTS = [
-  { id:'elegant',     name:'Elegant',        css:"italic 42px Georgia, serif" },
-  { id:'terminator',  name:'Terminator',     css:"terminator" },
-  { id:'matrix',      name:'Matrix',         css:"matrix" },
-  { id:'bladerunner', name:'Blade Runner',   css:"bladerunner" },
-  { id:'teamfury',    name:'Mad Max',        css:"teamfury" },
+  { id:'elegant',  name:'Elegant',  css:"italic 42px Georgia, 'Times New Roman', serif" },
+  { id:'script',   name:'Script',   css:"40px 'Snell Roundhand', 'Edwardian Script ITC', 'Apple Chancery', cursive" },
+  { id:'cursive',  name:'Cursive',  css:"40px 'Brush Script MT', 'Lucida Handwriting', cursive" },
+  { id:'classic',  name:'Classic',  css:"italic 40px 'Palatino Linotype', 'Book Antiqua', Palatino, serif" },
+  { id:'modern',   name:'Modern',   css:"italic 38px Garamond, 'Times New Roman', serif" },
 ]
-const FONT_LINK = ""
 
 // Canvas-rendered signature preview — visually distinct styles regardless of system fonts
 function SigPreview({ text, fontCss, small }: { text:string; fontCss:string; small?:boolean }) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
-
-  // Inject @font-face for custom fonts once
-  useEffect(() => {
-    if (document.querySelector('style[data-gam-fonts]')) return
-    const style = document.createElement('style')
-    style.setAttribute('data-gam-fonts','1')
-    style.textContent = `
-      @font-face { font-family: 'Terminator'; src: url('/fonts/terminator.ttf'); }
-      @font-face { font-family: 'Matrix'; src: url('/fonts/matrix.ttf'); }
-      @font-face { font-family: 'BladeRunner'; src: url('/fonts/bladerunner.ttf'); }
-      @font-face { font-family: 'TeamFury'; src: url('/fonts/teamfury.ttf'); }
-    `
-    document.head.appendChild(style)
-    // Preload fonts
-    ;['Terminator','Matrix','BladeRunner','TeamFury'].forEach(f => {
-      new FontFace(f, `url('/fonts/${f.toLowerCase()}.ttf')`).load().then(font => document.fonts.add(font)).catch(()=>{})
-    })
-  }, [])
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -49,33 +36,10 @@ function SigPreview({ text, fontCss, small }: { text:string; fontCss:string; sma
     canvas.width = w; canvas.height = h
     ctx.clearRect(0, 0, w, h)
 
-    const movieFonts: Record<string,string> = {
-      terminator: 'Terminator',
-      matrix: 'Matrix',
-      bladerunner: 'BladeRunner',
-      teamfury: 'TeamFury',
-    }
-    if (movieFonts[fontCss]) {
-      const fontFamily = movieFonts[fontCss]
-      const fontSize = small ? 26 : 34
-      const fontStr = `${fontSize}px '${fontFamily}'`
-      const drawIt = () => {
-        ctx.clearRect(0,0,w,h)
-        ctx.font = fontStr
-        ctx.textBaseline = 'middle'
-        ctx.fillStyle = '#1a1a1a'
-        ctx.fillText(text, 6, h/2, w-12)
-      }
-      document.fonts.load(fontStr).then(drawIt).catch(drawIt)
-    } else {
-      ctx.font = fontCss
-      ctx.textBaseline = 'middle'
-      ctx.fillStyle = '#1a1a1a'
-      if (fontCss.includes('Arial')) {
-        ctx.transform(1, 0.02, -0.02, 1, 0, 0)
-      }
-      ctx.fillText(text, 8, h/2, w-16)
-    }
+    ctx.font = fontCss
+    ctx.textBaseline = 'middle'
+    ctx.fillStyle = '#1a1a1a'
+    ctx.fillText(text, 8, h/2, w-16)
   }, [text, fontCss, small])
   return <canvas ref={canvasRef} style={{ display:'block', maxWidth:'100%' }}/>
 }
@@ -87,13 +51,6 @@ function SignatureChooser({ name, type, onSelect, onClose }: { name:string; type
   const [typedVal, setTypedVal] = useState(type==='initials' ? initials : name)
   const fileRef = useRef<HTMLInputElement>(null)
   const currentFont = SIG_FONTS.find(f=>f.id===selectedFont)
-
-  useEffect(() => {
-    if (!document.querySelector('link[href*="googleapis"]')) {
-      const link = document.createElement('link')
-      link.rel='stylesheet'; link.href=FONT_LINK; document.head.appendChild(link)
-    }
-  }, [])
 
   return (
     <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,.75)', zIndex:2000, display:'flex', alignItems:'center', justifyContent:'center', padding:20 }}>
@@ -161,9 +118,14 @@ function SignatureChooser({ name, type, onSelect, onClose }: { name:string; type
   )
 }
 // ── UPFRONT SIGNATURE + INITIALS SETUP ───────────────────────
+// S234: name and initials are locked to the value on the signer record.
+// The pre-S234 setup let the tenant edit the typed name freely, which
+// (a) let them sign as any name they typed and (b) drifted from the
+// initials (which were always derived from the original name prop) so
+// the captured signature and initials images could disagree. Now both
+// flow from the same `name` prop — no editing, no drift.
 function SignatureSetup({ name, initials, onComplete }: { name:string; initials:string; onComplete:(sig:string,init:string,font:string)=>void }) {
   const [selectedFont, setSelectedFont] = useState(SIG_FONTS[0].id)
-  const [typedName, setTypedName] = useState(name)
   const [tab, setTab] = useState<'type'|'upload'>('type')
   const [uploadedSig, setUploadedSig] = useState<string|null>(null)
   const fileRef = useRef<HTMLInputElement>(null)
@@ -181,25 +143,7 @@ function SignatureSetup({ name, initials, onComplete }: { name:string; initials:
 
   const handleComplete = () => {
     if (tab==='upload' && uploadedSig) { onComplete(uploadedSig, initials, currentFont.css); return }
-    // Render to canvas dataURL for special fonts
-    const movieFontMap: Record<string,string> = { terminator:'Terminator', matrix:'Matrix', bladerunner:'BladeRunner', teamfury:'TeamFury' }
-    if (movieFontMap[currentFont.css]) {
-      const fontFamily = movieFontMap[currentFont.css]
-      const renderToDataUrl = (text: string, small: boolean) => {
-        const canvas = document.createElement('canvas')
-        const w = small?130:250; const h = small?54:64
-        canvas.width=w; canvas.height=h
-        const ctx = canvas.getContext('2d')!
-        ctx.font = `${small?26:34}px '${fontFamily}'`
-        ctx.textBaseline = 'middle'
-        ctx.fillStyle = '#1a1a1a'
-        ctx.fillText(text, 6, h/2, w-12)
-        return canvas.toDataURL()
-      }
-      onComplete(renderToDataUrl(typedName,false), renderToDataUrl(initials,true), currentFont.css)
-      return
-    }
-    onComplete(typedName, initials, currentFont.css)
+    onComplete(name, initials, currentFont.css)
   }
 
   return (
@@ -224,9 +168,8 @@ function SignatureSetup({ name, initials, onComplete }: { name:string; initials:
           {tab==='type' && (
             <>
               <div style={{ marginBottom:14 }}>
-                <label style={{ fontSize:'.68rem', fontWeight:600, color:'#999', textTransform:'uppercase' as const, letterSpacing:'.06em', display:'block', marginBottom:5 }}>Your Name</label>
-                <input value={typedName} onChange={e=>setTypedName(e.target.value)}
-                  style={{ width:'100%', padding:'9px 13px', border:'1px solid #e5e7eb', borderRadius:9, fontSize:'1rem', outline:'none', boxSizing:'border-box' as const }}/>
+                <label style={{ fontSize:'.68rem', fontWeight:600, color:'#999', textTransform:'uppercase' as const, letterSpacing:'.06em', display:'block', marginBottom:5 }}>Your Name <span style={{ fontWeight:400, textTransform:'none', letterSpacing:0, color:'#bbb' }}>(on file — contact your landlord to update)</span></label>
+                <div style={{ padding:'9px 13px', background:'#f5f5f0', borderRadius:9, fontSize:'1rem', color:'#666', border:'1px solid #eee' }}>{name}</div>
               </div>
               <div style={{ marginBottom:16 }}>
                 <label style={{ fontSize:'.68rem', fontWeight:600, color:'#999', textTransform:'uppercase' as const, letterSpacing:'.06em', display:'block', marginBottom:8 }}>Select Font Style</label>
@@ -234,7 +177,7 @@ function SignatureSetup({ name, initials, onComplete }: { name:string; initials:
                   {SIG_FONTS.map(font=>(
                     <div key={font.id} onClick={()=>setSelectedFont(font.id)}
                       style={{ padding:'10px 14px', border:`2px solid ${selectedFont===font.id?'#c9a227':'#e5e7eb'}`, borderRadius:9, cursor:'pointer', background:selectedFont===font.id?'#fffbf0':'white', display:'flex', alignItems:'center', justifyContent:'space-between' }}>
-                      <SigPreview text={typedName||'Your Name'} fontCss={font.css}/>
+                      <SigPreview text={name} fontCss={font.css}/>
                       <span style={{ fontSize:'.65rem', color:'#bbb' }}>{font.name}</span>
                     </div>
                   ))}
@@ -244,7 +187,7 @@ function SignatureSetup({ name, initials, onComplete }: { name:string; initials:
               <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:10, marginBottom:16 }}>
                 <div style={{ padding:'12px', background:'#f8f8f5', borderRadius:9, textAlign:'center' as const }}>
                   <div style={{ fontSize:'.65rem', color:'#bbb', marginBottom:4 }}>SIGNATURE</div>
-                  <SigPreview text={typedName||'Your Name'} fontCss={currentFont.css}/>
+                  <SigPreview text={name} fontCss={currentFont.css}/>
                 </div>
                 <div style={{ padding:'12px', background:'#f8f8f5', borderRadius:9, textAlign:'center' as const }}>
                   <div style={{ fontSize:'.65rem', color:'#bbb', marginBottom:4 }}>INITIALS</div>
@@ -266,7 +209,7 @@ function SignatureSetup({ name, initials, onComplete }: { name:string; initials:
               <p style={{ fontSize:'.75rem', color:'#aaa', textAlign:'center' as const }}>Your initials will use the first font style with your initials derived from your name.</p>
             </>
           )}
-          <button onClick={handleComplete} disabled={tab==='type'?!typedName.trim():!uploadedSig}
+          <button onClick={handleComplete} disabled={tab==='type'?false:!uploadedSig}
             style={{ width:'100%', padding:'14px', borderRadius:11, border:'none', background:'#c9a227', color:'white', fontWeight:700, cursor:'pointer', fontSize:'.95rem' }}>
             Continue to Document →
           </button>
@@ -276,7 +219,7 @@ function SignatureSetup({ name, initials, onComplete }: { name:string; initials:
   )
 }
 
-type Stage = 'signing'|'review'|'done'
+type Stage = 'signing'|'review'|'done'|'declined'
 
 export function SignPage() {
   const { documentId } = useParams<{ documentId:string }>()
@@ -301,9 +244,74 @@ export function SignPage() {
     () => authFetch('/esign/sign/'+documentId).then(r=>r.json()).then(r=>{ if(!r.success)throw new Error(r.error); return r.data }),
     { retry:false }
   )
+
+  // S234: tenant draft persistence. Save in-progress field values to
+  // localStorage keyed by document id so an accidental refresh / nav-
+  // away doesn't lose the work. Cleared on successful submit + on
+  // decline. Cross-device draft sync would need a server-side draft
+  // table — out of scope for this pass; localStorage handles the
+  // 90% case (same tenant, same browser, picked up where they left off).
+  const draftKey = `gam_esign_draft_${documentId}`
+  const draftHydratedRef = useRef(false)
+  // Hydrate once when the document data arrives. We wait for `data` so
+  // we know the document is real (not 404 / wrong-signer) before
+  // re-applying anything from storage.
+  useEffect(() => {
+    if (!data || draftHydratedRef.current) return
+    draftHydratedRef.current = true
+    try {
+      const raw = localStorage.getItem(draftKey)
+      if (!raw) return
+      const parsed = JSON.parse(raw) as { fieldValues?: Record<string,string>; fieldFonts?: Record<string,string> }
+      if (parsed.fieldValues && Object.keys(parsed.fieldValues).length > 0) {
+        setFieldValues(parsed.fieldValues)
+      }
+      if (parsed.fieldFonts && Object.keys(parsed.fieldFonts).length > 0) {
+        setFieldFonts(parsed.fieldFonts)
+      }
+    } catch {
+      // Stale / corrupted draft — drop it, start fresh.
+      try { localStorage.removeItem(draftKey) } catch {}
+    }
+  }, [data, draftKey])
+  // Persist on every field-value change once hydration ran.
+  useEffect(() => {
+    if (!draftHydratedRef.current) return
+    try {
+      const hasContent = Object.keys(fieldValues).length > 0 || Object.keys(fieldFonts).length > 0
+      if (!hasContent) {
+        localStorage.removeItem(draftKey)
+        return
+      }
+      localStorage.setItem(draftKey, JSON.stringify({ fieldValues, fieldFonts }))
+    } catch {}
+  }, [fieldValues, fieldFonts, draftKey])
+
+  const clearDraft = () => { try { localStorage.removeItem(draftKey) } catch {} }
+
   const submitMut = useMutation(
     () => authFetch('/esign/sign/'+documentId, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ fieldValues: Object.entries(fieldValues).map(([fieldId,value])=>({fieldId,value})) }) }).then(r=>r.json()),
-    { onSuccess:(res:any)=>{ setAllDone(res.completed); setStage('done') } }
+    { onSuccess:(res:any)=>{ clearDraft(); setAllDone(res.completed); setStage('done') } }
+  )
+  // S234: decline path. The tenant can refuse a sent doc with a reason.
+  // Backend voids the document on success — no path back.
+  const [showDeclineModal, setShowDeclineModal] = useState(false)
+  const [declineErr, setDeclineErr] = useState<string | null>(null)
+  const declineMut = useMutation(
+    (reason: string) => authFetch('/esign/sign/'+documentId+'/decline', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ reason }),
+    }).then(r=>r.json()),
+    {
+      onSuccess: (res:any) => {
+        if (!res?.success) { setDeclineErr(res?.error || 'Could not record decline'); return }
+        clearDraft()
+        setShowDeclineModal(false)
+        setStage('declined')
+      },
+      onError: (e:any) => setDeclineErr(e?.message || 'Could not record decline'),
+    },
   )
 
   const renderPageImperative = useCallback(async (pdf:any, pageNum:number) => {
@@ -359,8 +367,18 @@ export function SignPage() {
     </div>
   )
 
-  const { signer, document:doc, fields } = data
+  const { signer, document:doc, fields, readOnly } = data
   const allFields = fields || []
+
+  // S235: read-only re-open. Backend serves the executed state for
+  // terminal-status docs (completed / voided / execution_failed) and
+  // for any signer who has already signed or declined. Render a
+  // standalone view with the PDF + a status banner; no editable
+  // fields, no Sign button, no draft persistence.
+  if (readOnly) {
+    return <ReadOnlyView doc={doc} signer={signer} fields={allFields} onBack={()=>navigate('/')} />
+  }
+
   const requiredFields = allFields.filter((f:any)=>f.required)
   const unfilledRequired = requiredFields.filter((f:any)=>!fieldValues[f.id]?.trim())
   const nextField = unfilledRequired[0]
@@ -442,6 +460,21 @@ export function SignPage() {
     return <SignatureSetup name={signer.name} initials={initials} onComplete={(sig,init,font)=>{ setSavedSig({value:sig,font}); setSavedInit({value:init,font}); setSetupDone(true) }}/>
   }
 
+  if (stage==='declined') return (
+    <div style={{ display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', minHeight:'60vh', gap:16, textAlign:'center', padding:32 }}>
+      <div style={{ width:80, height:80, borderRadius:'50%', background:'rgba(220,76,76,.1)', border:'2px solid var(--red, #dc4c4c)', display:'flex', alignItems:'center', justifyContent:'center' }}>
+        <AlertCircle size={36} style={{ color:'var(--red, #dc4c4c)' }}/>
+      </div>
+      <h2 style={{ color:'var(--text-0)', margin:0 }}>You declined this document</h2>
+      <p style={{ color:'var(--text-3)', maxWidth:420, lineHeight:1.6 }}>
+        The document has been voided. {data?.document?.landlordName ? `${data.document.landlordName} has been notified` : 'The landlord has been notified'}
+        {' '}with your reason. If you'd like to revisit, contact them directly so they can prepare a new document.
+      </p>
+      <div style={{ fontSize:'.75rem', color:'var(--text-3)' }}>Declined: {new Date().toLocaleString()}</div>
+      <button onClick={()=>navigate('/')} className="btn btn-ghost" style={{ marginTop:8 }}>Back to portal</button>
+    </div>
+  )
+
   if (stage==='done') return (
     <div style={{ display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', minHeight:'60vh', gap:16, textAlign:'center', padding:32 }}>
       <div style={{ width:80, height:80, borderRadius:'50%', background:'rgba(34,197,94,.1)', border:'2px solid var(--green)', display:'flex', alignItems:'center', justifyContent:'center' }}><Check size={36} style={{ color:'var(--green)' }}/></div>
@@ -467,6 +500,18 @@ export function SignPage() {
           </>}
           {!allFilled && nextField && <button onClick={goToNextField} className="btn btn-primary btn-sm">Next Field <ArrowRight size={13}/></button>}
           {allFilled && <button onClick={()=>setStage('review')} className="btn btn-primary">Review & Sign <ArrowRight size={14}/></button>}
+          {/* S234: decline path. Always available pre-sign so a tenant
+              who can't proceed (wrong terms, wrong unit, etc.) doesn't
+              need to ghost the landlord — they can refuse with reason
+              and the landlord knows to follow up. */}
+          <button
+            onClick={() => { setDeclineErr(null); setShowDeclineModal(true) }}
+            className="btn btn-ghost btn-sm"
+            style={{ color:'var(--red, #dc4c4c)' }}
+            title="Refuse to sign — voids the document"
+          >
+            Decline
+          </button>
         </div>
       </div>
 
@@ -551,7 +596,7 @@ export function SignPage() {
 
       {stage==='review' && (
         <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,.75)', zIndex:1000, display:'flex', alignItems:'center', justifyContent:'center', padding:20 }}>
-          <div style={{ background:'white', borderRadius:20, maxWidth:460, width:'100%', padding:26 }}>
+          <div style={{ background:'white', borderRadius:20, maxWidth:460, width:'100%', padding:26, maxHeight:'90vh', overflowY:'auto' }}>
             <h2 style={{ color:'#1a1a1a', margin:'0 0 6px' }}>Review & Submit</h2>
             <p style={{ color:'#999', margin:'0 0 18px', fontSize:'.83rem' }}>Review your signatures before submitting.</p>
             <div style={{ display:'flex', flexDirection:'column' as const, gap:7, marginBottom:18 }}>
@@ -566,6 +611,29 @@ export function SignPage() {
                 </div>
               ))}
             </div>
+
+            {/* S194: deposit-interest awareness for the signer. Surfaces
+                the rate that will accrue on any security deposit so the
+                tenant knows what to expect at move-out. */}
+            {data.depositInterestContext && (
+              <div style={{ padding:'12px 14px', background:'#f0f9ff', border:'1px solid rgba(34,197,94,.25)', borderRadius:9, fontSize:'.78rem', color:'#1a1a1a', lineHeight:1.55, marginBottom:14 }}>
+                <div style={{ fontWeight:700, color:'#1a1a1a', marginBottom:5, fontSize:'.78rem' }}>
+                  Deposit interest in {data.depositInterestContext.stateCode}
+                </div>
+                <div style={{ color:'#444' }}>
+                  {data.depositInterestContext.source === 'statutory' ? (
+                    <>
+                      State law ({data.depositInterestContext.statuteCitation || data.depositInterestContext.stateCode}) requires {Number(data.depositInterestContext.annualRatePct).toFixed(2)}% annual interest on held security deposits. If your lease specifies a deposit, it accrues monthly and is paid out with your refund at move-out.
+                    </>
+                  ) : (
+                    <>
+                      Your landlord has set a {Number(data.depositInterestContext.annualRatePct).toFixed(2)}% annual interest rate for held security deposits in {data.depositInterestContext.stateCode} ({data.depositInterestContext.effectiveYear}). Interest accrues monthly and is paid out with your refund at move-out.
+                    </>
+                  )}
+                </div>
+              </div>
+            )}
+
             <div style={{ padding:'11px 14px', background:'#fffdf5', border:'1px solid rgba(201,162,39,.3)', borderRadius:9, fontSize:'.73rem', color:'#999', lineHeight:1.6, marginBottom:18 }}>
               By clicking Submit, you confirm your electronic signature is legally binding under UETA and the federal E-SIGN Act.
             </div>
@@ -579,6 +647,172 @@ export function SignPage() {
           </div>
         </div>
       )}
+
+      {showDeclineModal && (
+        <DeclineModal
+          documentTitle={doc.title}
+          isLoading={declineMut.isLoading}
+          error={declineErr}
+          onCancel={() => setShowDeclineModal(false)}
+          onConfirm={(reason) => declineMut.mutate(reason)}
+        />
+      )}
+    </div>
+  )
+}
+
+function DeclineModal({
+  documentTitle, isLoading, error, onCancel, onConfirm,
+}: {
+  documentTitle: string
+  isLoading: boolean
+  error: string | null
+  onCancel: () => void
+  onConfirm: (reason: string) => void
+}) {
+  const [reason, setReason] = useState('')
+
+  return (
+    <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,.75)', zIndex:2000, display:'flex', alignItems:'center', justifyContent:'center', padding:20 }}>
+      <div style={{ background:'white', borderRadius:14, width:'100%', maxWidth:460, padding:'22px 24px', boxShadow:'0 24px 80px rgba(0,0,0,.4)' }}>
+        <div style={{ display:'flex', alignItems:'center', gap:10, marginBottom:8 }}>
+          <AlertCircle size={20} style={{ color:'#dc4c4c' }}/>
+          <div style={{ fontWeight:800, fontSize:'1.05rem', color:'#1a1a1a' }}>Decline this document?</div>
+        </div>
+        <p style={{ fontSize:'.82rem', color:'#666', lineHeight:1.5, margin:'0 0 14px' }}>
+          Declining voids "<strong>{documentTitle}</strong>" — it can't be signed by anyone. Your landlord is notified with the reason you provide. There's no path to undo this; if the issue is fixable, the landlord prepares a new document and re-sends it.
+        </p>
+        <label style={{ fontSize:'.72rem', fontWeight:700, color:'#666', textTransform:'uppercase', letterSpacing:'.05em', display:'block', marginBottom:5 }}>
+          Reason <span style={{ fontWeight:400, textTransform:'none', letterSpacing:0 }}>(optional, but strongly recommended)</span>
+        </label>
+        <textarea
+          value={reason}
+          onChange={e => setReason(e.target.value)}
+          rows={4}
+          maxLength={1000}
+          placeholder="What about this document doesn't work? E.g. wrong unit, wrong dates, terms changed since we discussed."
+          style={{ width:'100%', padding:'10px 12px', borderRadius:8, border:'1px solid #e5e7eb', fontSize:'.85rem', fontFamily:'inherit', resize:'vertical', boxSizing:'border-box', color:'#1a1a1a', background:'#fafafa' }}
+        />
+        <div style={{ fontSize:'.7rem', color:'#999', marginTop:4, textAlign:'right' }}>{reason.length}/1000</div>
+        {error && (
+          <div style={{ marginTop:10, padding:'8px 12px', borderRadius:6, background:'rgba(220,76,76,.08)', border:'1px solid rgba(220,76,76,.25)', color:'#dc4c4c', fontSize:'.78rem' }}>
+            {error}
+          </div>
+        )}
+        <div style={{ display:'flex', gap:9, marginTop:16 }}>
+          <button onClick={onCancel} disabled={isLoading}
+            style={{ flex:1, padding:'11px', borderRadius:10, border:'1px solid #e5e7eb', background:'white', cursor:'pointer', fontWeight:600, color:'#1a1a1a' }}>
+            Cancel
+          </button>
+          <button onClick={() => onConfirm(reason.trim())} disabled={isLoading}
+            style={{ flex:1, padding:'11px', borderRadius:10, border:'none', background:'#dc4c4c', color:'white', fontWeight:700, cursor: isLoading?'wait':'pointer' }}>
+            {isLoading ? 'Declining…' : 'Decline document'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// S235: read-only re-open view. Backend flags `readOnly: true` for
+// terminal docs (completed/voided/execution_failed) and for signers
+// in terminal states (signed/declined). We show the executed PDF if
+// available, otherwise the base PDF, plus a banner reflecting status.
+// All fields (across all roles) come back with their values populated
+// — surfaced inline below the PDF for context, since not every viewer
+// has a PDF reader plugin available in-browser.
+function ReadOnlyView({
+  doc, signer, fields, onBack,
+}: {
+  doc: any
+  signer: any
+  fields: any[]
+  onBack: () => void
+}) {
+  const status = doc?.status as string
+  const signerStatus = signer?.status as string
+  const banner: { tone: 'green'|'gold'|'red'|'muted'; label: string; sub: string } =
+    status === 'completed'         ? { tone:'green', label:'Fully executed', sub:'All parties have signed.' } :
+    status === 'voided'            ? { tone:'red',   label:'Voided',         sub: doc?.voidReason || 'This document was voided and is no longer in effect.' } :
+    status === 'execution_failed'  ? { tone:'red',   label:'Execution failed', sub:'A problem occurred during execution. Contact your landlord for details.' } :
+    signerStatus === 'signed'      ? { tone:'green', label:'You signed',     sub:'Awaiting other parties to complete.' } :
+    signerStatus === 'declined'    ? { tone:'red',   label:'You declined',   sub: signer?.declineReason ? `Reason: ${signer.declineReason}` : 'No reason was provided.' } :
+                                     { tone:'muted', label:'Read-only',       sub:'' }
+  const pdfUrl = doc?.executedPdfUrl || doc?.basePdfUrl
+  const filledFields = (fields || []).filter((f:any) => f.value != null && String(f.value).trim() !== '')
+
+  return (
+    <div style={{ maxWidth: 820, margin: '0 auto', padding: '24px 16px' }}>
+      <button onClick={onBack} className="btn btn-ghost btn-sm" style={{ marginBottom: 16 }}>← Back to portal</button>
+
+      <div style={{
+        display:'flex', alignItems:'flex-start', gap: 12, padding: '14px 18px', borderRadius: 12,
+        background:
+          banner.tone === 'green' ? 'rgba(34,197,94,.08)' :
+          banner.tone === 'red'   ? 'rgba(220,76,76,.08)' :
+          banner.tone === 'gold'  ? 'rgba(201,162,39,.08)' :
+                                    'var(--bg-2)',
+        border: `1px solid ${
+          banner.tone === 'green' ? 'rgba(34,197,94,.25)' :
+          banner.tone === 'red'   ? 'rgba(220,76,76,.25)' :
+          banner.tone === 'gold'  ? 'rgba(201,162,39,.25)' :
+                                    'var(--border-0)'
+        }`,
+        marginBottom: 14,
+      }}>
+        <div style={{ flex: 1 }}>
+          <div style={{ fontWeight: 700, color: 'var(--text-0)', marginBottom: 4 }}>
+            {doc?.title || 'Document'} — <span style={{
+              color:
+                banner.tone === 'green' ? 'var(--green)' :
+                banner.tone === 'red'   ? 'var(--red, #dc4c4c)' :
+                banner.tone === 'gold'  ? 'var(--gold)' :
+                                          'var(--text-2)',
+            }}>{banner.label}</span>
+          </div>
+          <div style={{ fontSize: '.82rem', color: 'var(--text-2)', lineHeight: 1.5 }}>
+            {banner.sub}
+          </div>
+        </div>
+      </div>
+
+      {pdfUrl ? (
+        <div style={{ background:'#525659', borderRadius: 12, overflow: 'hidden', marginBottom: 16 }}>
+          <iframe
+            src={pdfUrl}
+            style={{ width: '100%', height: '78vh', border: 'none', display: 'block' }}
+            title={doc?.title || 'Document'}
+          />
+        </div>
+      ) : (
+        <div style={{ padding: 20, background: 'var(--bg-2)', border: '1px solid var(--border-0)', borderRadius: 10, color: 'var(--text-3)', fontSize: '.85rem', marginBottom: 16 }}>
+          The document PDF is not available to display here.
+        </div>
+      )}
+
+      {filledFields.length > 0 && (
+        <div style={{ background: 'var(--bg-1)', border: '1px solid var(--border-0)', borderRadius: 10, padding: 14, marginBottom: 16 }}>
+          <div style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.05em', marginBottom: 8 }}>
+            Field values ({filledFields.length})
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: 8 }}>
+            {filledFields.map((f:any) => (
+              <div key={f.id} style={{ padding: '6px 10px', background: 'var(--bg-2)', borderRadius: 6, fontSize: '.78rem' }}>
+                <div style={{ color: 'var(--text-3)', fontSize: '.7rem' }}>{f.label || f.fieldType}</div>
+                <div style={{ color: 'var(--text-1)' }}>
+                  {f.fieldType === 'signature' || f.fieldType === 'initials'
+                    ? <em style={{ color: 'var(--text-3)' }}>(signed)</em>
+                    : String(f.value).slice(0, 80)}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <div style={{ fontSize: '.7rem', color: 'var(--text-3)', textAlign: 'center' }}>
+        UETA &amp; E-SIGN Act compliant · Read-only re-open
+      </div>
     </div>
   )
 }

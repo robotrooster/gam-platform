@@ -1,13 +1,17 @@
 import { useState, useEffect, useRef } from 'react'
-import { useNavigate, useSearchParams } from 'react-router-dom'
+import { useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
-import { apiGet, apiPost, apiPatch } from '../lib/api'
+import { apiGet, apiPost } from '../lib/api'
 import { useAuth } from '../context/AuthContext'
 import {
   Check, Building2, CreditCard, FileText, User,
-  ChevronRight, ChevronLeft, AlertTriangle, ExternalLink,
-  MapPin, Phone, Mail, Briefcase, Shield, DollarSign
+  ChevronRight, ChevronLeft, AlertTriangle,
+  Landmark, Plus, X
 } from 'lucide-react'
+import {
+  ACCOUNT_TYPE_VALUES, ACCOUNT_HOLDER_TYPE_VALUES,
+  AccountType, AccountHolderType,
+} from '@gam/shared'
 
 const STEPS = [
   { id: 'profile',    label: 'Business Profile', icon: User,      desc: 'Tell us about yourself and your business' },
@@ -20,39 +24,34 @@ export function OnboardingPage() {
   const navigate = useNavigate()
   const { user, refresh } = useAuth()
   const qc = useQueryClient()
-  const [params] = useSearchParams()
-  const stripeStatus = params.get('stripe')
   const [step, setStep] = useState(0)
   const [completed, setCompleted] = useState<Set<number>>(new Set())
   const [signature, setSignature] = useState('')
   const [agreed, setAgreed] = useState(false)
   const agreementRef = useRef<HTMLDivElement>(null)
   const [scrolledAgreement, setScrolledAgreement] = useState(false)
+  const [showAddBank, setShowAddBank] = useState(false)
 
   // Profile form
-  const [profile, setProfile] = useState({ businessName: '', ein: '', phone: '', street1: '', city: '', state: 'AZ', zip: '' })
+  const [profile, setProfile] = useState({ businessName: '', ein: '', phone: '', street1: '', city: '', state: '', zip: '' })
   // Property form
-  const [property, setProperty] = useState({ name: '', street1: '', street2: '', city: '', state: 'AZ', zip: '', type: 'residential' })
+  const [property, setProperty] = useState({ name: '', street1: '', street2: '', city: '', state: '', zip: '', type: 'residential' })
   const [errors, setErrors] = useState<Record<string, string>>({})
 
-  const { data: stripeState, refetch: refetchStripe } = useQuery(
-    'stripe-status', () => apiGet('/stripe/connect/status'),
-    { onSuccess: (d: any) => { if (d?.verified) setCompleted(prev => new Set([...prev, 2])) } }
+  // S67: Banking step now reads the user's bank account catalog directly.
+  // Step 2 is complete when at least one active account exists.
+  const { data: bankAccounts = [] } = useQuery<any[]>(
+    'bank-accounts', () => apiGet('/bank-accounts')
   )
-
+  const activeBankAccounts = bankAccounts.filter((a: any) => a.status === 'active')
+  const bankReady = activeBankAccounts.length > 0
   useEffect(() => {
-    if (stripeStatus === 'success') { refetchStripe(); setStep(3) }
-    if (stripeStatus === 'refresh') setStep(2)
-  }, [stripeStatus])
+    if (bankReady) setCompleted(prev => new Set([...prev, 2]))
+  }, [bankReady])
 
   const addPropertyMut = useMutation(
     (data: any) => apiPost('/properties', data),
     { onSuccess: () => { setCompleted(prev => new Set([...prev, 1])); setStep(2) } }
-  )
-
-  const connectStripeMut = useMutation(
-    () => apiPost<any>('/stripe/connect/onboard'),
-    { onSuccess: (res: any) => { if (res.data?.url) window.location.href = res.data.url } }
   )
 
   const completeMut = useMutation(
@@ -91,7 +90,7 @@ export function OnboardingPage() {
     } else if (step === 1) {
       addPropertyMut.mutate(property)
     } else if (step === 2) {
-      if ((stripeState as any)?.verified) {
+      if (bankReady) {
         setCompleted(prev => new Set([...prev, 2]))
         setStep(3)
       }
@@ -217,7 +216,7 @@ export function OnboardingPage() {
                   </div>
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr auto auto', gap: 10 }}>
                     <input className="input" placeholder="City" value={profile.city} onChange={e => setProfile(p => ({ ...p, city: e.target.value }))} />
-                    <input className="input" placeholder="AZ" value={profile.state} onChange={e => setProfile(p => ({ ...p, state: e.target.value }))} style={{ width: 56 }} />
+                    <input className="input" placeholder="ST" value={profile.state} onChange={e => setProfile(p => ({ ...p, state: e.target.value }))} style={{ width: 56 }} />
                     <input className="input" placeholder="ZIP" value={profile.zip} onChange={e => setProfile(p => ({ ...p, zip: e.target.value }))} style={{ width: 88 }} />
                   </div>
                 </div>
@@ -256,7 +255,7 @@ export function OnboardingPage() {
                   </div>
                   <div>
                     <label style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', display: 'block', marginBottom: 5 }}>State</label>
-                    <input className="input" placeholder="AZ" value={property.state} onChange={e => setProperty(p => ({ ...p, state: e.target.value }))} style={{ width: 56 }} />
+                    <input className="input" placeholder="ST" value={property.state} onChange={e => setProperty(p => ({ ...p, state: e.target.value }))} style={{ width: 56 }} />
                   </div>
                   <div>
                     <label style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', display: 'block', marginBottom: 5 }}>ZIP *</label>
@@ -293,52 +292,50 @@ export function OnboardingPage() {
             {/* ── STEP 2: BANKING ── */}
             {step === 2 && (
               <div>
-                {(stripeState as any)?.verified ? (
+                {bankReady ? (
                   <div>
-                    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '32px 0', gap: 16 }}>
+                    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '24px 0', gap: 12 }}>
                       <div style={{ width: 64, height: 64, borderRadius: '50%', background: 'rgba(30,219,122,.12)', border: '2px solid var(--green)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                         <Check size={28} style={{ color: 'var(--green)' }} />
                       </div>
                       <div style={{ textAlign: 'center' }}>
-                        <div style={{ fontFamily: 'var(--font-display)', fontSize: '1.1rem', fontWeight: 800, color: 'var(--text-0)', marginBottom: 6 }}>Bank Account Connected</div>
-                        <div style={{ fontSize: '.82rem', color: 'var(--text-3)' }}>Your bank account is verified and ready to receive disbursements.</div>
+                        <div style={{ fontFamily: 'var(--font-display)', fontSize: '1.1rem', fontWeight: 800, color: 'var(--text-0)', marginBottom: 6 }}>Bank Account Added</div>
+                        <div style={{ fontSize: '.82rem', color: 'var(--text-3)' }}>You can route each property to one of your accounts from the Properties page.</div>
                       </div>
                     </div>
-                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-                      {[
-                        { icon: '💸', title: 'ACH Disbursements', desc: 'Rent deposited 1st business day' },
-                        { icon: '🔒', title: 'Stripe Secured', desc: 'Bank-level encryption' },
-                        { icon: '📊', title: 'Transaction History', desc: 'Full ledger in your dashboard' },
-                        { icon: '⚡', title: 'On-Time Pay Active', desc: 'SLA begins next billing cycle' },
-                      ].map(f => (
-                        <div key={f.title} style={{ background: 'var(--bg-2)', border: '1px solid var(--border-0)', borderRadius: 10, padding: '12px 14px', display: 'flex', alignItems: 'center', gap: 10 }}>
-                          <span style={{ fontSize: '1.2rem' }}>{f.icon}</span>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 14 }}>
+                      {activeBankAccounts.map((a: any) => (
+                        <div key={a.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '12px 14px', background: 'var(--bg-2)', border: '1px solid var(--border-0)', borderRadius: 10 }}>
                           <div>
-                            <div style={{ fontSize: '.78rem', fontWeight: 600, color: 'var(--text-0)' }}>{f.title}</div>
-                            <div style={{ fontSize: '.68rem', color: 'var(--text-3)' }}>{f.desc}</div>
+                            <div style={{ fontSize: '.85rem', fontWeight: 600, color: 'var(--text-0)' }}>{a.nickname}</div>
+                            <div style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>{a.accountHolderName} · {a.accountType} •••• {a.accountNumberLast4}</div>
                           </div>
+                          <Check size={16} style={{ color: 'var(--green)' }} />
                         </div>
                       ))}
                     </div>
+                    <button className="btn btn-ghost btn-sm" onClick={() => setShowAddBank(true)}>
+                      <Plus size={12} /> Add another account
+                    </button>
                   </div>
                 ) : (
                   <div>
                     <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-0)', borderRadius: 12, padding: 20, marginBottom: 20 }}>
                       <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 16 }}>
-                        <div style={{ width: 44, height: 44, borderRadius: 10, background: 'rgba(74,158,255,.1)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                          <CreditCard size={20} style={{ color: 'var(--blue)' }} />
+                        <div style={{ width: 44, height: 44, borderRadius: 10, background: 'rgba(201,162,39,.1)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                          <Landmark size={20} style={{ color: 'var(--gold)' }} />
                         </div>
                         <div>
-                          <div style={{ fontSize: '.88rem', fontWeight: 700, color: 'var(--text-0)' }}>Connect via Stripe</div>
-                          <div style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>Takes 2–3 minutes · Secure redirect</div>
+                          <div style={{ fontSize: '.88rem', fontWeight: 700, color: 'var(--text-0)' }}>Add a payout bank account</div>
+                          <div style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>Where rent disbursements land. Multiple LLCs? Add one per LLC.</div>
                         </div>
                       </div>
                       <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 16 }}>
                         {[
-                          'US checking or savings account required',
-                          'Business or personal account both accepted',
-                          'Bank credentials are never stored by GAM',
-                          'Stripe handles all ACH compliance and security',
+                          'US checking or savings account',
+                          'Personal or business (LLC) accounts both supported',
+                          'Account number encrypted at rest, last 4 only ever shown',
+                          'Multiple properties can share one account — collapses to a single ACH',
                         ].map(item => (
                           <div key={item} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '.78rem', color: 'var(--text-2)' }}>
                             <Check size={12} style={{ color: 'var(--green)', flexShrink: 0 }} /> {item}
@@ -347,10 +344,10 @@ export function OnboardingPage() {
                       </div>
                       <div style={{ background: 'rgba(255,184,32,.06)', border: '1px solid rgba(255,184,32,.2)', borderRadius: 8, padding: '8px 12px', fontSize: '.72rem', color: 'var(--amber)', display: 'flex', alignItems: 'flex-start', gap: 8, marginBottom: 16 }}>
                         <AlertTriangle size={13} style={{ flexShrink: 0, marginTop: 1 }} />
-                        Stripe payments are in test mode. No real money will move until attorney review is complete.
+                        Test mode. No real money will move until attorney review is complete.
                       </div>
-                      <button className="btn btn-primary" style={{ width: '100%', justifyContent: 'center', padding: 13 }} onClick={() => connectStripeMut.mutate()} disabled={connectStripeMut.isLoading}>
-                        {connectStripeMut.isLoading ? <span className="spinner" /> : <><ExternalLink size={14} /> Connect bank account via Stripe</>}
+                      <button className="btn btn-primary" style={{ width: '100%', justifyContent: 'center', padding: 13 }} onClick={() => setShowAddBank(true)}>
+                        <Plus size={14} /> Add Bank Account
                       </button>
                     </div>
                     <div style={{ textAlign: 'center' }}>
@@ -456,18 +453,167 @@ export function OnboardingPage() {
               <button
                 className="btn btn-primary"
                 onClick={handleNext}
-                disabled={addPropertyMut.isLoading || completeMut.isLoading || (step === 2 && !(stripeState as any)?.verified && !completed.has(2))}
+                disabled={addPropertyMut.isLoading || completeMut.isLoading || (step === 2 && !bankReady && !completed.has(2))}
                 style={{ padding: '10px 24px' }}
               >
                 {addPropertyMut.isLoading || completeMut.isLoading ? <span className="spinner" /> :
-                  step === STEPS.length - 1 ? <><Shield size={14} /> Sign & Activate</> :
-                  step === 2 && (stripeState as any)?.verified ? <>Continue <ChevronRight size={14} /></> :
+                  step === STEPS.length - 1 ? <>Sign & Activate</> :
                   <>Continue <ChevronRight size={14} /></>
                 }
               </button>
             </div>
 
           </div>
+        </div>
+      </div>
+
+      {showAddBank && (
+        <AddBankAccountInlineModal
+          onClose={() => setShowAddBank(false)}
+          onAdded={() => { qc.invalidateQueries('bank-accounts'); setShowAddBank(false) }}
+        />
+      )}
+    </div>
+  )
+}
+
+function AddBankAccountInlineModal({ onClose, onAdded }: { onClose: () => void; onAdded: () => void }) {
+  const [form, setForm] = useState({
+    nickname: '', accountHolderName: '',
+    accountHolderType: 'individual' as AccountHolderType,
+    accountType: 'checking' as AccountType,
+    routingNumber: '', accountNumber: '', confirm_accountNumber: '',
+  })
+  const [errors, setErrors] = useState<Record<string, string>>({})
+  const lbl: React.CSSProperties = {
+    fontSize: '.7rem', fontWeight: 600, color: 'var(--text-3)',
+    textTransform: 'uppercase', letterSpacing: '.06em',
+    display: 'block', marginBottom: 5,
+  }
+
+  const mut = useMutation(
+    (data: any) => apiPost('/bank-accounts', data),
+    {
+      onSuccess: () => onAdded(),
+      onError: (e: any) => setErrors({ submit: e?.response?.data?.error || 'Failed to add account' }),
+    }
+  )
+
+  const submit = () => {
+    const errs: Record<string, string> = {}
+    if (!form.nickname.trim()) errs.nickname = 'Required'
+    if (!form.accountHolderName.trim()) errs.accountHolderName = 'Required'
+    if (!/^\d{9}$/.test(form.routingNumber.replace(/\D/g, ''))) errs.routingNumber = 'Must be 9 digits'
+    const acct = form.accountNumber.replace(/\D/g, '')
+    if (acct.length < 4 || acct.length > 17) errs.accountNumber = 'Must be 4–17 digits'
+    if (form.accountNumber !== form.confirm_accountNumber) errs.confirm_accountNumber = "Account numbers don't match"
+    setErrors(errs)
+    if (Object.keys(errs).length > 0) return
+    mut.mutate({
+      nickname: form.nickname.trim(),
+      accountHolderName: form.accountHolderName.trim(),
+      accountHolderType: form.accountHolderType,
+      accountType: form.accountType,
+      routingNumber: form.routingNumber.replace(/\D/g, ''),
+      accountNumber: acct,
+    })
+  }
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" style={{ maxWidth: 520, width: '95vw' }} onClick={e => e.stopPropagation()}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
+          <div className="modal-title" style={{ marginBottom: 0 }}>Add Bank Account</div>
+          <button className="btn btn-ghost btn-sm" onClick={onClose} style={{ padding: 6 }}><X size={15} /></button>
+        </div>
+
+        <div style={{ marginBottom: 12 }}>
+          <label style={lbl}>Nickname</label>
+          <input className="input" style={{ width: '100%' }} value={form.nickname}
+            placeholder='e.g. "Acme Holdings LLC"'
+            onChange={e => setForm(f => ({ ...f, nickname: e.target.value }))} />
+          {errors.nickname && <div style={{ fontSize: '.68rem', color: 'var(--red)', marginTop: 4 }}>{errors.nickname}</div>}
+        </div>
+
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 12 }}>
+          <div>
+            <label style={lbl}>Holder Type</label>
+            <div style={{ display: 'flex', gap: 6 }}>
+              {ACCOUNT_HOLDER_TYPE_VALUES.map(v => (
+                <button key={v} type="button"
+                  onClick={() => setForm(f => ({ ...f, accountHolderType: v }))}
+                  style={{
+                    flex: 1, padding: '8px 10px', borderRadius: 8, cursor: 'pointer',
+                    fontSize: '.76rem', textTransform: 'capitalize',
+                    border: `1px solid ${form.accountHolderType === v ? 'var(--gold)' : 'var(--border-0)'}`,
+                    background: form.accountHolderType === v ? 'rgba(201,162,39,.08)' : 'var(--bg-2)',
+                    color: 'var(--text-0)',
+                  }}>{v}</button>
+              ))}
+            </div>
+          </div>
+          <div>
+            <label style={lbl}>Account Type</label>
+            <div style={{ display: 'flex', gap: 6 }}>
+              {ACCOUNT_TYPE_VALUES.map(v => (
+                <button key={v} type="button"
+                  onClick={() => setForm(f => ({ ...f, accountType: v }))}
+                  style={{
+                    flex: 1, padding: '8px 10px', borderRadius: 8, cursor: 'pointer',
+                    fontSize: '.76rem', textTransform: 'capitalize',
+                    border: `1px solid ${form.accountType === v ? 'var(--gold)' : 'var(--border-0)'}`,
+                    background: form.accountType === v ? 'rgba(201,162,39,.08)' : 'var(--bg-2)',
+                    color: 'var(--text-0)',
+                  }}>{v}</button>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        <div style={{ marginBottom: 12 }}>
+          <label style={lbl}>Account Holder Name</label>
+          <input className="input" style={{ width: '100%' }} value={form.accountHolderName}
+            placeholder={form.accountHolderType === 'business' ? 'Legal entity name' : 'Full name on account'}
+            onChange={e => setForm(f => ({ ...f, accountHolderName: e.target.value }))} />
+          {errors.accountHolderName && <div style={{ fontSize: '.68rem', color: 'var(--red)', marginTop: 4 }}>{errors.accountHolderName}</div>}
+        </div>
+
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 2fr', gap: 12, marginBottom: 12 }}>
+          <div>
+            <label style={lbl}>Routing #</label>
+            <input className="input" style={{ width: '100%' }} value={form.routingNumber}
+              inputMode="numeric" maxLength={9}
+              onChange={e => setForm(f => ({ ...f, routingNumber: e.target.value }))} />
+            {errors.routingNumber && <div style={{ fontSize: '.68rem', color: 'var(--red)', marginTop: 4 }}>{errors.routingNumber}</div>}
+          </div>
+          <div>
+            <label style={lbl}>Account #</label>
+            <input className="input" style={{ width: '100%' }} value={form.accountNumber}
+              inputMode="numeric"
+              onChange={e => setForm(f => ({ ...f, accountNumber: e.target.value }))} />
+            {errors.accountNumber && <div style={{ fontSize: '.68rem', color: 'var(--red)', marginTop: 4 }}>{errors.accountNumber}</div>}
+          </div>
+        </div>
+
+        <div style={{ marginBottom: 14 }}>
+          <label style={lbl}>Confirm Account #</label>
+          <input className="input" style={{ width: '100%' }} value={form.confirm_accountNumber}
+            inputMode="numeric"
+            onChange={e => setForm(f => ({ ...f, confirm_accountNumber: e.target.value }))} />
+          {errors.confirm_accountNumber && <div style={{ fontSize: '.68rem', color: 'var(--red)', marginTop: 4 }}>{errors.confirm_accountNumber}</div>}
+        </div>
+
+        {errors.submit && (
+          <div style={{ color: 'var(--red)', fontSize: '.78rem', background: 'rgba(255,71,87,.08)', border: '1px solid rgba(255,71,87,.2)', borderRadius: 8, padding: '8px 12px', marginBottom: 12 }}>
+            {errors.submit}
+          </div>
+        )}
+
+        <div className="modal-footer">
+          <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+          <button className="btn btn-primary" onClick={submit} disabled={mut.isLoading}>
+            {mut.isLoading ? <span className="spinner" /> : <><Check size={14} /> Add Account</>}
+          </button>
         </div>
       </div>
     </div>

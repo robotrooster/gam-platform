@@ -1,10 +1,10 @@
 import { useState, useRef } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
-import { useNavigate } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
-import { Building2, Plus, MapPin, Home, ChevronRight, DoorOpen, Users, DollarSign, X, Check, Edit2 } from 'lucide-react'
+import { Building2, Plus, MapPin, DoorOpen, Users, DollarSign, X, Check, Edit2, Landmark } from 'lucide-react'
 import { AddUnitModal } from './AddUnitModal'
-import { UNIT_TYPES, UNIT_TYPE_LABEL, UNIT_TYPE_PREFIX, UNIT_TYPE_ICON, UNIT_TYPE_HAS_BEDROOMS, UnitType } from '@gam/shared'
+import { UNIT_TYPES, UNIT_TYPE_LABEL, UNIT_TYPE_PREFIX, UNIT_TYPE_ICON, UNIT_TYPE_HAS_BEDROOMS, UnitType, FEE_PAYER_VALUES, type FeePayer } from '@gam/shared'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
 const PROPERTY_TYPES = [
@@ -36,6 +36,94 @@ const UNIT_TYPE_OPTIONS = UNIT_TYPES.map(value => ({
   icon:   UNIT_TYPE_ICON[value],
 }))
 
+// S173: compact display of the three fee_payer toggles on the property
+// card. Reads the same camelCase shape produced by GET /properties' jsonb
+// allocationRule join, with a legacy bankingFeePayer fallback for rows
+// created pre-S116. Renders nothing when no allocation rule is present
+// (defensive; every active property has one).
+function FeeConfigChips({ allocationRule }: { allocationRule: any }) {
+  if (!allocationRule) return null
+  const ach      = (allocationRule.achFeePayer      || allocationRule.bankingFeePayer || 'tenant') as FeePayer
+  const card     = (allocationRule.cardFeePayer     || allocationRule.bankingFeePayer || 'tenant') as FeePayer
+  const platform = (allocationRule.platformFeePayer || 'landlord')                                  as FeePayer
+  const chip = (label: string, payer: FeePayer) => (
+    <span
+      key={label}
+      title={`${label} fee: ${payer === 'tenant' ? 'tenant pays (added on top)' : 'landlord absorbs (deducted from gross)'}`}
+      style={{
+        fontSize:     '.62rem',
+        padding:      '2px 7px',
+        borderRadius: 10,
+        background:   'var(--bg-3)',
+        color:        'var(--text-2)',
+        border:       '1px solid var(--border-0)',
+        display:      'inline-flex',
+        alignItems:   'center',
+        gap:          4,
+        lineHeight:   1.5,
+      }}
+    >
+      <span style={{ color: 'var(--text-3)' }}>{label}</span>
+      <span style={{ color: payer === 'tenant' ? 'var(--gold)' : 'var(--text-1)', fontWeight: 600 }}>
+        {payer === 'tenant' ? 'tenant' : 'landlord'}
+      </span>
+    </span>
+  )
+  return (
+    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginBottom: 12 }}>
+      {chip('ACH', ach)}
+      {chip('Card', card)}
+      {chip('SaaS', platform)}
+    </div>
+  )
+}
+
+// S172: per-property fee toggles. Each fee (ACH / card / platform) has an
+// independent "tenant pays" vs "landlord absorbs" setting. Reused in
+// AddEditModal for create + edit flows.
+function FeePayerToggle({
+  label,
+  hint,
+  value,
+  onChange,
+}: {
+  label:    string
+  hint:     string
+  value:    FeePayer
+  onChange: (v: FeePayer) => void
+}) {
+  return (
+    <div style={{ marginBottom: 12 }}>
+      <div style={{ fontSize: '.74rem', fontWeight: 600, color: 'var(--text-1)', marginBottom: 2 }}>
+        {label}
+      </div>
+      <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginBottom: 6 }}>{hint}</div>
+      <div style={{ display: 'flex', gap: 6 }}>
+        {FEE_PAYER_VALUES.map((v) => (
+          <button
+            key={v}
+            type="button"
+            onClick={() => onChange(v)}
+            style={{
+              flex:         1,
+              padding:      '6px 10px',
+              borderRadius: 8,
+              cursor:       'pointer',
+              fontSize:     '.74rem',
+              border:       `1px solid ${value === v ? 'var(--gold)' : 'var(--border-0)'}`,
+              background:   value === v ? 'rgba(201,162,39,.08)' : 'var(--bg-2)',
+              color:        value === v ? 'var(--text-0)' : 'var(--text-2)',
+              textTransform: 'capitalize' as const,
+            }}
+          >
+            {v === 'tenant' ? 'Tenant pays' : 'Landlord absorbs'}
+          </button>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 function AddEditModal({ property, onClose }: { property?: any; onClose: () => void }) {
   const qc = useQueryClient()
   const isEdit = !!property
@@ -46,11 +134,88 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
     street1:     property?.street1 || '',
     street2:     property?.street2 || '',
     city:        property?.city || '',
-    state:       property?.state || 'AZ',
+    state:       property?.state || '',
     zip:         property?.zip || '',
     description: property?.description || '',
     amenities:   property?.amenities || [] as string[],
     unitTypes:   property?.unitTypes || [] as string[],
+    // S179 / B3: per-property booking acknowledgment toggle.
+    // S312: API responses now pass through the
+    // applyCamelizeInterceptor in lib/api.ts, so camelCase reads
+    // against the property record work correctly. Form-state keys
+    // remain snake_case because the PATCH body expects them that way.
+    requiresBookingAcknowledgment: property?.requiresBookingAcknowledgment ?? false,
+    // S247: per-property subleasing toggle. Drives the master switch
+    // on whether tenants at this property can request subleases at
+    // all. AND'd with leases.subleasingAllowed in the request route.
+    subleasingAllowed: property?.subleasingAllowed ?? false,
+    // S251: optional landlord-uploaded sublease agreement template URL.
+    // When set, overrides the GAM-default generated PDF at sublease
+    // approval time. Stored as URL string — file upload handling is
+    // a separate landlord-side feature; for now the landlord points
+    // GAM at a hosted PDF (e.g., their own S3 / Dropbox link).
+    subleaseAgreementTemplateUrl: property?.subleaseAgreementTemplateUrl ?? '',
+    // S309: per-property FlexCharge enablement gate. Default OFF
+    // (opt-in). When ON, the property appears in the FlexCharge create-
+    // account property dropdown and createFlexChargeAccount accepts
+    // requests against it. Existing accounts at the property continue
+    // to function regardless of this flag.
+    flexchargeEnabled: property?.flexchargeEnabled ?? false,
+    // S223: property-level late-fee policy. Defines defaults for new
+    // leases at this property; existing leases keep their current
+    // late-fee config. Edit-only — create flow uses schema defaults
+    // (enabled=true, grace=5, amount=15.00, type='flat') so landlord
+    // doesn't have to make a policy decision at property creation.
+    lateFeeEnabled:        property?.lateFeeEnabled        ?? true,
+    lateFeeGraceDays:     property?.lateFeeGraceDays != null ? String(property.lateFeeGraceDays) : '5',
+    lateFeeInitialAmount: property?.lateFeeInitialAmount != null ? String(property.lateFeeInitialAmount) : '15.00',
+    lateFeeInitialType:   (property?.lateFeeInitialType ?? 'flat') as 'flat' | 'percent_of_rent',
+    // S226: recurring accrual + cap. UI toggles derive their initial
+    // value from whether the property has the columns set. Toggling
+    // off sends null for the whole group on PATCH.
+    lateFeeAccrualEnabled: property?.lateFeeAccrualAmount != null && property?.lateFeeAccrualType != null && property?.lateFeeAccrualPeriod != null,
+    lateFeeAccrualAmount:  property?.lateFeeAccrualAmount != null ? String(property.lateFeeAccrualAmount) : '5.00',
+    lateFeeAccrualType:    (property?.lateFeeAccrualType ?? 'flat') as 'flat' | 'percent_of_rent',
+    lateFeeAccrualPeriod:  (property?.lateFeeAccrualPeriod ?? 'daily') as 'daily' | 'weekly' | 'monthly',
+    lateFeeCapEnabled:     property?.lateFeeCapAmount != null && property?.lateFeeCapType != null,
+    lateFeeCapAmount:      property?.lateFeeCapAmount != null ? String(property.lateFeeCapAmount) : '50.00',
+    lateFeeCapType:        (property?.lateFeeCapType ?? 'flat') as 'flat' | 'percent_of_rent',
+    // 16a: allocation rule — required at property creation.
+    // S172: three independent fee_payer toggles + payout bank account are
+    // editable in both create and edit modes; manager-fee math
+    // (rentPercent etc.) and placement / maintenance fields stay
+    // create-only because they affect retroactive ledger interpretation.
+    // S312: API responses now pass through applyCamelizeInterceptor
+    // (lib/api.ts), so the allocationRule jsonb (returned via
+    // to_jsonb(r.*) at apps/api/src/routes/properties.ts) lands in
+    // the frontend as `allocationRule.{achFeePayer,cardFeePayer,...}`.
+    // S311 had reverted these reads to snake_case as a stopgap; the
+    // transformer makes the camelCase reads the canonical posture
+    // again. Form-state keys remain snake_case because the
+    // allocation-rule PATCH body expects them that way. Legacy
+    // bankingFeePayer fallback covers properties created before S116.
+    allocationRule: {
+      achFeePayer:
+        (property?.allocationRule?.achFeePayer
+          || property?.allocationRule?.bankingFeePayer
+          || 'tenant') as FeePayer,
+      cardFeePayer:
+        (property?.allocationRule?.cardFeePayer
+          || property?.allocationRule?.bankingFeePayer
+          || 'tenant') as FeePayer,
+      platformFeePayer:
+        (property?.allocationRule?.platformFeePayer || 'landlord') as FeePayer,
+      rentPercent: property?.allocationRule?.rentPercent != null ? String(property.allocationRule.rentPercent) : '',
+      rentPercentFloor: property?.allocationRule?.rentPercentFloor != null ? String(property.allocationRule.rentPercentFloor) : '',
+      rentPercentCeiling: property?.allocationRule?.rentPercentCeiling != null ? String(property.allocationRule.rentPercentCeiling) : '',
+      flatMonthlyFee: property?.allocationRule?.flatMonthlyFee != null ? String(property.allocationRule.flatMonthlyFee) : '',
+      perUnitFee: property?.allocationRule?.perUnitFee != null ? String(property.allocationRule.perUnitFee) : '',
+      placementFeeType: (property?.allocationRule?.placementFeeType || '') as '' | 'flat' | 'percent_of_first_month',
+      placementFeeValue: property?.allocationRule?.placementFeeValue != null ? String(property.allocationRule.placementFeeValue) : '',
+      maintenanceMarkupPercent: property?.allocationRule?.maintenanceMarkupPercent != null ? String(property.allocationRule.maintenanceMarkupPercent) : '',
+      // S66: bank account routing target (UUID or null)
+      ownerBankAccountId: (property?.allocationRule?.ownerBankAccountId ?? null) as string | null,
+    },
   })
   const [errors, setErrors] = useState<Record<string, string>>({})
   const [addrSuggestions, setAddrSuggestions] = useState<any[]>([])
@@ -61,8 +226,43 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
   // Step 2: unit groups — one per selected type
   const [batches, setBatches] = useState<Array<{ id: string; type: string; count: string; prefix: string; rentAmount: string; securityDeposit: string; bedrooms: string }>>([])  
 
+  // S66: active bank accounts for the current user, used by the routing
+  // dropdown below. Only active accounts shown — archived rows still exist
+  // in the catalog but can't be assigned as a fresh routing target.
+  const { data: bankAccounts = [] } = useQuery<any[]>(
+    'bank-accounts', () => apiGet('/bank-accounts')
+  )
+  const activeBankAccounts = bankAccounts.filter(b => b.status === 'active')
+
   const propMut = useMutation(
-    (data: any) => isEdit ? apiPatch(`/properties/${property.id}`, data) : apiPost('/properties', data),
+    async (data: any) => {
+      if (isEdit) {
+        // Property core fields PATCH
+        const propRes = await apiPatch(`/properties/${property.id}`, data)
+        // S66 + S172: allocation-rule PATCH carries the editable fee_payer
+        // toggles + payout bank account. Build a delta of just what
+        // changed since unchanged values would no-op anyway.
+        const arNew = data.allocationRule ?? {}
+        // S312: read the saved allocationRule via camelCase keys
+        // after the response-interceptor transform.
+        const arOld = property?.allocationRule ?? {}
+        const allocPatch: Record<string, unknown> = {}
+        if (arNew.ownerBankAccountId !== (arOld.ownerBankAccountId ?? null)) {
+          allocPatch.ownerBankAccountId = arNew.ownerBankAccountId
+        }
+        const oldAch       = arOld.achFeePayer       || arOld.bankingFeePayer || 'tenant'
+        const oldCard      = arOld.cardFeePayer      || arOld.bankingFeePayer || 'tenant'
+        const oldPlatform  = arOld.platformFeePayer  || 'landlord'
+        if (arNew.achFeePayer      && arNew.achFeePayer      !== oldAch)      allocPatch.achFeePayer      = arNew.achFeePayer
+        if (arNew.cardFeePayer     && arNew.cardFeePayer     !== oldCard)     allocPatch.cardFeePayer     = arNew.cardFeePayer
+        if (arNew.platformFeePayer && arNew.platformFeePayer !== oldPlatform) allocPatch.platformFeePayer = arNew.platformFeePayer
+        if (Object.keys(allocPatch).length > 0) {
+          await apiPatch(`/properties/${property.id}/allocation-rule`, allocPatch)
+        }
+        return propRes
+      }
+      return apiPost('/properties', data)
+    },
     {
       onSuccess: (res: any) => {
         qc.invalidateQueries('properties')
@@ -97,7 +297,7 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
 
   const set = (k: string, v: any) => { setForm(f => ({ ...f, [k]: v })); setErrors(e => ({ ...e, [k]: '' })) }
   const toggleAmenity = (a: string) => set('amenities', form.amenities.includes(a) ? form.amenities.filter((x: string) => x !== a) : [...form.amenities, a])
-  const toggleUnitType = (t: string) => set('unit_types', form.unitTypes.includes(t) ? form.unitTypes.filter((x: string) => x !== t) : [...form.unitTypes, t])
+  const toggleUnitType = (t: string) => set('unitTypes', form.unitTypes.includes(t) ? form.unitTypes.filter((x: string) => x !== t) : [...form.unitTypes, t])
 
   const searchAddr = async (val: string) => {
     if (val.length < 3) { setAddrSuggestions([]); setShowAddrSugg(false); return }
@@ -129,7 +329,43 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
     if (!form.zip.trim())     errs.zip     = 'Required'
     setErrors(errs)
     if (Object.keys(errs).length > 0) return
-    propMut.mutate(form)
+    // 16a: convert string inputs to numbers/null for allocation rule
+    const ar = form.allocationRule
+    const num = (s: string) => s === '' ? null : parseFloat(s)
+    const payload = {
+      ...form,
+      // S223: late-fee fields are strings in form state (input values);
+      // PATCH expects numbers. Skip when not in edit mode — create flow
+      // uses schema defaults.
+      lateFeeGraceDays:     isEdit ? (form.lateFeeGraceDays     === '' ? null : parseInt(form.lateFeeGraceDays, 10))   : undefined,
+      lateFeeInitialAmount: isEdit ? (form.lateFeeInitialAmount === '' ? null : parseFloat(form.lateFeeInitialAmount)) : undefined,
+      lateFeeEnabled:        isEdit ? form.lateFeeEnabled        : undefined,
+      lateFeeInitialType:   isEdit ? form.lateFeeInitialType   : undefined,
+      // S226: accrual/cap. Toggle off → send null for the whole group
+      // (clears the columns); toggle on → send parsed values. Create
+      // mode skips entirely (schema defaults: all null = no accrual,
+      // no cap).
+      lateFeeAccrualAmount: isEdit ? (form.lateFeeAccrualEnabled ? (form.lateFeeAccrualAmount === '' ? null : parseFloat(form.lateFeeAccrualAmount)) : null) : undefined,
+      lateFeeAccrualType:   isEdit ? (form.lateFeeAccrualEnabled ? form.lateFeeAccrualType   : null) : undefined,
+      lateFeeAccrualPeriod: isEdit ? (form.lateFeeAccrualEnabled ? form.lateFeeAccrualPeriod : null) : undefined,
+      lateFeeCapAmount:     isEdit ? (form.lateFeeCapEnabled ? (form.lateFeeCapAmount === '' ? null : parseFloat(form.lateFeeCapAmount)) : null) : undefined,
+      lateFeeCapType:       isEdit ? (form.lateFeeCapEnabled ? form.lateFeeCapType : null) : undefined,
+      allocationRule: {
+        achFeePayer:       ar.achFeePayer,
+        cardFeePayer:      ar.cardFeePayer,
+        platformFeePayer:  ar.platformFeePayer,
+        rentPercent: num(ar.rentPercent),
+        rentPercentFloor: num(ar.rentPercentFloor),
+        rentPercentCeiling: num(ar.rentPercentCeiling),
+        flatMonthlyFee: num(ar.flatMonthlyFee),
+        perUnitFee: num(ar.perUnitFee),
+        placementFeeType: ar.placementFeeType === '' ? null : ar.placementFeeType,
+        placementFeeValue: num(ar.placementFeeValue),
+        maintenanceMarkupPercent: num(ar.maintenanceMarkupPercent),
+        ownerBankAccountId: ar.ownerBankAccountId,
+      },
+    }
+    propMut.mutate(payload)
   }
 
   const submitStep2 = () => {
@@ -247,7 +483,7 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
                 </div>
                 <div>
                   <label style={lbl}>State</label>
-                  <input className="input" placeholder="AZ" value={form.state} onChange={e => set('state', e.target.value)} style={{ width: '100%' }} />
+                  <input className="input" placeholder="State" value={form.state} onChange={e => set('state', e.target.value)} style={{ width: '100%' }} />
                 </div>
                 <div>
                   <label style={lbl}>ZIP *</label>
@@ -271,6 +507,392 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
               </div>
             </div>
 
+          </div>
+
+          {/* S179 / B3: per-property booking acknowledgment toggle.
+              When on, every booking on this property requires staff to mark
+              acknowledged after collecting signature on the property-rules
+              document. Default off; flip on for RV-park / short-stay
+              properties where rules need explicit guest sign-off. */}
+          <div style={{ marginBottom: 14, paddingTop: 10, borderTop: '1px solid var(--border-0)' }}>
+            <div style={{ fontSize: '.78rem', fontWeight: 600, marginBottom: 4, color: 'var(--text-2)' }}>
+              Booking policy
+            </div>
+            <label style={{
+              display:        'flex',
+              alignItems:     'flex-start',
+              gap:            10,
+              padding:        12,
+              borderRadius:   8,
+              border:         `1px solid ${form.requiresBookingAcknowledgment ? 'var(--gold)' : 'var(--border-0)'}`,
+              background:     form.requiresBookingAcknowledgment ? 'rgba(201,162,39,.06)' : 'var(--bg-2)',
+              cursor:         'pointer',
+              fontSize:       '.78rem',
+            }}>
+              <input
+                type="checkbox"
+                checked={form.requiresBookingAcknowledgment}
+                onChange={e => setForm(f => ({ ...f, requiresBookingAcknowledgment: e.target.checked }))}
+                style={{ marginTop: 3 }}
+              />
+              <div>
+                <div style={{ fontWeight: 600, color: 'var(--text-1)' }}>Require booking acknowledgment</div>
+                <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 3, lineHeight: 1.5 }}>
+                  Every booking on this property will track whether the guest signed the property
+                  rules. Staff mark each booking acknowledged after the signature is on file. Useful
+                  for RV parks and short-stay properties where house rules need explicit sign-off.
+                </div>
+              </div>
+            </label>
+          </div>
+
+          {/* S247: per-property subleasing toggle. Master switch driven
+              by the property's lease document. Default OFF (opt-in).
+              When on, individual leases can still further restrict via
+              leases.subleasingAllowed. */}
+          <div style={{ marginBottom: 14, paddingTop: 10, borderTop: '1px solid var(--border-0)' }}>
+            <div style={{ fontSize: '.78rem', fontWeight: 600, marginBottom: 4, color: 'var(--text-2)' }}>
+              Subleasing policy
+            </div>
+            <label style={{
+              display:        'flex',
+              alignItems:     'flex-start',
+              gap:            10,
+              padding:        12,
+              borderRadius:   8,
+              border:         `1px solid ${form.subleasingAllowed ? 'var(--gold)' : 'var(--border-0)'}`,
+              background:     form.subleasingAllowed ? 'rgba(201,162,39,.06)' : 'var(--bg-2)',
+              cursor:         'pointer',
+              fontSize:       '.78rem',
+            }}>
+              <input
+                type="checkbox"
+                checked={form.subleasingAllowed}
+                onChange={e => setForm(f => ({ ...f, subleasingAllowed: e.target.checked }))}
+                style={{ marginTop: 3 }}
+              />
+              <div>
+                <div style={{ fontWeight: 600, color: 'var(--text-1)' }}>Allow subleasing at this property</div>
+                <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 3, lineHeight: 1.5 }}>
+                  Tenants on leases at this property may request subleases (subject to each lease's
+                  own subleasing clause). Disable if your lease agreement prohibits subleasing.
+                  Check your local laws — some jurisdictions limit a landlord's ability to refuse
+                  subleases unreasonably.
+                </div>
+              </div>
+            </label>
+
+            {/* S251: optional template URL override. When set, the
+                landlord-provided PDF replaces the GAM-default
+                template at sublease document generation time. */}
+            {form.subleasingAllowed && (
+              <div style={{ marginTop: 12, paddingTop: 12, borderTop: '1px solid var(--border-0)' }}>
+                <div style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-2)', marginBottom: 5 }}>
+                  Custom sublease agreement template (optional)
+                </div>
+                <input
+                  className="form-input"
+                  type="url"
+                  placeholder="https://example.com/sublease-template.pdf"
+                  value={form.subleaseAgreementTemplateUrl}
+                  onChange={e => setForm(f => ({ ...f, subleaseAgreementTemplateUrl: e.target.value }))}
+                  style={{ width: '100%' }}
+                />
+                <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 6, lineHeight: 1.5 }}>
+                  Leave blank to use GAM's default sublease agreement template. To override, host
+                  your own PDF and paste the URL. Both parties (sublessor + sublessee) sign whatever
+                  template is set.
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* S309: per-property FlexCharge enablement gate. Default
+              OFF (opt-in). When OFF, this property does not appear in
+              the FlexCharge create-account property dropdown and the
+              backend rejects new account creation here with a 403.
+              Existing accounts (if any) continue to function. */}
+          <div style={{ marginBottom: 14, paddingTop: 10, borderTop: '1px solid var(--border-0)' }}>
+            <div style={{ fontSize: '.78rem', fontWeight: 600, marginBottom: 4, color: 'var(--text-2)' }}>
+              FlexCharge
+            </div>
+            <label style={{
+              display:        'flex',
+              alignItems:     'flex-start',
+              gap:            10,
+              padding:        12,
+              borderRadius:   8,
+              border:         `1px solid ${form.flexchargeEnabled ? 'var(--gold)' : 'var(--border-0)'}`,
+              background:     form.flexchargeEnabled ? 'rgba(201,162,39,.06)' : 'var(--bg-2)',
+              cursor:         'pointer',
+              fontSize:       '.78rem',
+            }}>
+              <input
+                type="checkbox"
+                checked={form.flexchargeEnabled}
+                onChange={e => setForm(f => ({ ...f, flexchargeEnabled: e.target.checked }))}
+                style={{ marginTop: 3 }}
+              />
+              <div>
+                <div style={{ fontWeight: 600, color: 'var(--text-1)' }}>Offer FlexCharge at this property</div>
+                <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 3, lineHeight: 1.5 }}>
+                  Enable a rolling charge account for tenants and POS customers at this property — typical at RV parks,
+                  extended-stay properties, and on-site stores where the account holder runs a tab for property-store
+                  purchases, utilities, services, etc. <strong>You are the creditor on FlexCharge</strong> — you set
+                  the credit limit, any finance charges, and the payment cadence; GAM provides the accounting software
+                  only. You are responsible for TILA, ECOA, FCRA, FDCPA, and state lending/usury-law compliance.
+                  Review the FlexCharge Business Account Agreement before enabling, and consult counsel in your state
+                  if you have not previously offered consumer credit.
+                </div>
+              </div>
+            </label>
+          </div>
+
+          {/* S223: property-level late-fee policy. Edit-only —
+              new properties pick up schema defaults
+              (enabled=true / grace=5 / amount=$15 / type='flat'). The
+              inline notice spells out Option B semantics: existing
+              leases keep their current late-fee config; this is a
+              forward-looking template, not a propagating change. */}
+          {isEdit && (
+            <div style={{ marginBottom: 14, paddingTop: 10, borderTop: '1px solid var(--border-0)' }}>
+              <div style={{ fontSize: '.78rem', fontWeight: 600, marginBottom: 4, color: 'var(--text-2)' }}>
+                Late-fee policy
+              </div>
+              <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginBottom: 10, lineHeight: 1.5 }}>
+                These settings define this property's default late-fee policy for new leases.
+                Existing leases keep their current late-fee configuration — changes here do not
+                propagate retroactively.
+              </div>
+              <label style={{
+                display:        'flex',
+                alignItems:     'flex-start',
+                gap:            10,
+                padding:        12,
+                borderRadius:   8,
+                border:         `1px solid ${form.lateFeeEnabled ? 'var(--gold)' : 'var(--border-0)'}`,
+                background:     form.lateFeeEnabled ? 'rgba(201,162,39,.06)' : 'var(--bg-2)',
+                cursor:         'pointer',
+                fontSize:       '.78rem',
+                marginBottom:   10,
+              }}>
+                <input
+                  type="checkbox"
+                  checked={form.lateFeeEnabled}
+                  onChange={e => setForm(f => ({ ...f, lateFeeEnabled: e.target.checked }))}
+                  style={{ marginTop: 3 }}
+                />
+                <div>
+                  <div style={{ fontWeight: 600, color: 'var(--text-1)' }}>Late fees enabled</div>
+                  <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 3 }}>
+                    Off = no late fees ever assessed at this property regardless of lease config.
+                  </div>
+                </div>
+              </label>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10, opacity: form.lateFeeEnabled ? 1 : 0.5 }}>
+                <div>
+                  <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginBottom: 4 }}>Grace period (days)</div>
+                  <input
+                    type="number"
+                    min="0"
+                    value={form.lateFeeGraceDays}
+                    disabled={!form.lateFeeEnabled}
+                    onChange={e => setForm(f => ({ ...f, lateFeeGraceDays: e.target.value }))}
+                    style={{ width: '100%', padding: '6px 10px', borderRadius: 8, border: '1px solid var(--border-0)', background: 'var(--bg-2)', fontSize: '.85rem', boxSizing: 'border-box' }}
+                  />
+                </div>
+                <div>
+                  <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginBottom: 4 }}>Initial fee</div>
+                  <input
+                    type="number"
+                    min="0"
+                    step="0.01"
+                    value={form.lateFeeInitialAmount}
+                    disabled={!form.lateFeeEnabled}
+                    onChange={e => setForm(f => ({ ...f, lateFeeInitialAmount: e.target.value }))}
+                    style={{ width: '100%', padding: '6px 10px', borderRadius: 8, border: '1px solid var(--border-0)', background: 'var(--bg-2)', fontSize: '.85rem', boxSizing: 'border-box' }}
+                  />
+                </div>
+                <div>
+                  <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginBottom: 4 }}>Fee type</div>
+                  <select
+                    value={form.lateFeeInitialType}
+                    disabled={!form.lateFeeEnabled}
+                    onChange={e => setForm(f => ({ ...f, lateFeeInitialType: e.target.value as 'flat' | 'percent_of_rent' }))}
+                    style={{ width: '100%', padding: '6px 10px', borderRadius: 8, border: '1px solid var(--border-0)', background: 'var(--bg-2)', fontSize: '.85rem', boxSizing: 'border-box', color: 'var(--text-0)' }}
+                  >
+                    <option value="flat">Flat $</option>
+                    <option value="percent_of_rent">% of rent</option>
+                  </select>
+                </div>
+              </div>
+
+              {/* S226: recurring accrual toggle + 3 inputs. Disabled when
+                  the parent late-fee toggle is off — accrual without a
+                  parent fee makes no sense. */}
+              <div style={{ marginTop: 14, opacity: form.lateFeeEnabled ? 1 : 0.4 }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: form.lateFeeEnabled ? 'pointer' : 'not-allowed', marginBottom: 8 }}>
+                  <input
+                    type="checkbox"
+                    checked={form.lateFeeAccrualEnabled}
+                    disabled={!form.lateFeeEnabled}
+                    onChange={e => setForm(f => ({ ...f, lateFeeAccrualEnabled: e.target.checked }))}
+                  />
+                  <span style={{ fontSize: '.78rem', color: 'var(--text-1)', fontWeight: 600 }}>Recurring accrual</span>
+                  <span style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>(continues to add up after the initial fee)</span>
+                </label>
+                {form.lateFeeAccrualEnabled && form.lateFeeEnabled && (
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 }}>
+                    <div>
+                      <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginBottom: 4 }}>Amount per period</div>
+                      <input
+                        type="number"
+                        min="0"
+                        step="0.01"
+                        value={form.lateFeeAccrualAmount}
+                        onChange={e => setForm(f => ({ ...f, lateFeeAccrualAmount: e.target.value }))}
+                        style={{ width: '100%', padding: '6px 10px', borderRadius: 8, border: '1px solid var(--border-0)', background: 'var(--bg-2)', fontSize: '.85rem', boxSizing: 'border-box' }}
+                      />
+                    </div>
+                    <div>
+                      <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginBottom: 4 }}>Type</div>
+                      <select
+                        value={form.lateFeeAccrualType}
+                        onChange={e => setForm(f => ({ ...f, lateFeeAccrualType: e.target.value as 'flat' | 'percent_of_rent' }))}
+                        style={{ width: '100%', padding: '6px 10px', borderRadius: 8, border: '1px solid var(--border-0)', background: 'var(--bg-2)', fontSize: '.85rem', boxSizing: 'border-box', color: 'var(--text-0)' }}
+                      >
+                        <option value="flat">Flat $</option>
+                        <option value="percent_of_rent">% of rent</option>
+                      </select>
+                    </div>
+                    <div>
+                      <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginBottom: 4 }}>Period</div>
+                      <select
+                        value={form.lateFeeAccrualPeriod}
+                        onChange={e => setForm(f => ({ ...f, lateFeeAccrualPeriod: e.target.value as 'daily' | 'weekly' | 'monthly' }))}
+                        style={{ width: '100%', padding: '6px 10px', borderRadius: 8, border: '1px solid var(--border-0)', background: 'var(--bg-2)', fontSize: '.85rem', boxSizing: 'border-box', color: 'var(--text-0)' }}
+                      >
+                        <option value="daily">Daily</option>
+                        <option value="weekly">Weekly</option>
+                        <option value="monthly">Monthly</option>
+                      </select>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* S226: maximum cap toggle + 2 inputs. Cap-edge writes a
+                  partial row of exactly the remaining amount, then stops
+                  (locked decision per S26b). Independent of accrual. */}
+              <div style={{ marginTop: 14, opacity: form.lateFeeEnabled ? 1 : 0.4 }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: form.lateFeeEnabled ? 'pointer' : 'not-allowed', marginBottom: 8 }}>
+                  <input
+                    type="checkbox"
+                    checked={form.lateFeeCapEnabled}
+                    disabled={!form.lateFeeEnabled}
+                    onChange={e => setForm(f => ({ ...f, lateFeeCapEnabled: e.target.checked }))}
+                  />
+                  <span style={{ fontSize: '.78rem', color: 'var(--text-1)', fontWeight: 600 }}>Maximum cap</span>
+                  <span style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>(total late fees per invoice cannot exceed this)</span>
+                </label>
+                {form.lateFeeCapEnabled && form.lateFeeEnabled && (
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+                    <div>
+                      <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginBottom: 4 }}>Cap amount</div>
+                      <input
+                        type="number"
+                        min="0"
+                        step="0.01"
+                        value={form.lateFeeCapAmount}
+                        onChange={e => setForm(f => ({ ...f, lateFeeCapAmount: e.target.value }))}
+                        style={{ width: '100%', padding: '6px 10px', borderRadius: 8, border: '1px solid var(--border-0)', background: 'var(--bg-2)', fontSize: '.85rem', boxSizing: 'border-box' }}
+                      />
+                    </div>
+                    <div>
+                      <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginBottom: 4 }}>Cap type</div>
+                      <select
+                        value={form.lateFeeCapType}
+                        onChange={e => setForm(f => ({ ...f, lateFeeCapType: e.target.value as 'flat' | 'percent_of_rent' }))}
+                        style={{ width: '100%', padding: '6px 10px', borderRadius: 8, border: '1px solid var(--border-0)', background: 'var(--bg-2)', fontSize: '.85rem', boxSizing: 'border-box', color: 'var(--text-0)' }}
+                      >
+                        <option value="flat">Flat $</option>
+                        <option value="percent_of_rent">% of rent</option>
+                      </select>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* 16a allocation rule.
+              S172: ACH / card / platform fee_payer toggles + payout bank
+              account are editable in both create and edit modes. Manager
+              fee (rentPercent) and other allocation math fields stay
+              create-only because they affect retroactive ledger
+              interpretation. */}
+          <div style={{ marginBottom: 14, paddingTop: 10, borderTop: '1px solid var(--border-0)' }}>
+            <div style={{ fontSize: '.78rem', fontWeight: 600, marginBottom: 4, color: 'var(--text-2)' }}>
+              Who pays each fee?
+            </div>
+            <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginBottom: 10, lineHeight: 1.5 }}>
+              Each can be passed through to the tenant (added on top of rent) or absorbed by the
+              landlord (deducted from gross). Toggles can be changed any time — they only affect
+              charges going forward.
+            </div>
+
+            <FeePayerToggle
+              label="ACH processing"
+              hint="1.0% capped at $6.00 per ACH debit"
+              value={form.allocationRule.achFeePayer}
+              onChange={(v) => setForm(f => ({ ...f, allocationRule: { ...f.allocationRule, achFeePayer: v } }))}
+            />
+            <FeePayerToggle
+              label="Card processing"
+              hint="3.25% per card charge (+1.5% on non-US-issued cards)"
+              value={form.allocationRule.cardFeePayer}
+              onChange={(v) => setForm(f => ({ ...f, allocationRule: { ...f.allocationRule, cardFeePayer: v } }))}
+            />
+            <FeePayerToggle
+              label="Platform SaaS fee"
+              hint="$2 per occupied unit per month (min $10/property/mo)"
+              value={form.allocationRule.platformFeePayer}
+              onChange={(v) => setForm(f => ({ ...f, allocationRule: { ...f.allocationRule, platformFeePayer: v } }))}
+            />
+
+            {!isEdit && <>
+              <div style={{ fontSize: '.78rem', fontWeight: 600, marginBottom: 6, marginTop: 10, color: 'var(--text-2)' }}>
+                Manager Fee (% of rent — optional, blank = owner-self-managed)
+              </div>
+              <input type="number" step="0.01" placeholder="e.g. 8 for 8%"
+                value={form.allocationRule.rentPercent}
+                onChange={e => setForm(f => ({ ...f, allocationRule: { ...f.allocationRule, rentPercent: e.target.value } }))}
+                style={{ width: '100%', padding: '8px 12px', borderRadius: 8, border: '1px solid var(--border-0)', background: 'var(--bg-2)', fontSize: '.85rem', boxSizing: 'border-box', marginBottom: 14 }} />
+            </>}
+
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
+              <Landmark size={12} color="var(--gold)" />
+              <span style={{ fontSize: '.78rem', fontWeight: 600, color: 'var(--text-2)' }}>
+                Payout Bank Account
+              </span>
+            </div>
+            <select
+              value={form.allocationRule.ownerBankAccountId ?? ''}
+              onChange={e => setForm(f => ({ ...f, allocationRule: { ...f.allocationRule, ownerBankAccountId: e.target.value || null } }))}
+              style={{ width: '100%', padding: '8px 12px', borderRadius: 8, border: '1px solid var(--border-0)', background: 'var(--bg-2)', fontSize: '.85rem', boxSizing: 'border-box', color: 'var(--text-0)' }}>
+              <option value="">— None (rent will accumulate, not pay out) —</option>
+              {activeBankAccounts.map(b => (
+                <option key={b.id} value={b.id}>
+                  {b.nickname} • {b.accountType} •••• {b.accountNumberLast4}
+                </option>
+              ))}
+            </select>
+            <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 6 }}>
+              Multiple properties can share one account — they collapse into a single Friday disbursement.{' '}
+              <Link to="/banking" style={{ color: 'var(--gold)', textDecoration: 'underline' }}>
+                + Add bank account
+              </Link>
+            </div>
           </div>
 
           {propMut.isError && (
@@ -377,7 +999,6 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
 }
 
 export function PropertiesPage() {
-  const qc = useQueryClient()
   const navigate = useNavigate()
   const [showAdd, setShowAdd] = useState(false)
   const [editProp, setEditProp] = useState<any>(null)
@@ -407,10 +1028,17 @@ export function PropertiesPage() {
           <h1 className="page-title">Properties</h1>
           <p className="page-subtitle">{(props as any[]).length} properties · {totalUnits} units · {totalOccupied} occupied</p>
         </div>
-        <button className="btn btn-primary" onClick={() => setShowAdd(true)}>
-          <Plus size={15} /> Add Property
-        </button>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button className="btn btn-ghost" onClick={() => navigate('/property-onboarding')}>
+            Bulk import CSV
+          </button>
+          <button className="btn btn-primary" onClick={() => setShowAdd(true)}>
+            <Plus size={15} /> Add Property
+          </button>
+        </div>
       </div>
+
+      <ConnectReadinessBanner />
 
       {/* Summary stats */}
       {(props as any[]).length > 0 && (
@@ -520,6 +1148,9 @@ export function PropertiesPage() {
                     </div>
                   )}
 
+                  {/* S173: fee config chips */}
+                  <FeeConfigChips allocationRule={p.allocationRule} />
+
                   {/* Actions */}
                   <div style={{ display: 'flex', gap: 8 }}>
                     <button className="btn btn-ghost btn-sm" style={{ flex: 1 }} onClick={e => { e.stopPropagation(); navigate(`/properties/${p.id}`) }}>
@@ -539,6 +1170,49 @@ export function PropertiesPage() {
       {showAdd && <AddEditModal onClose={() => setShowAdd(false)} />}
       {editProp && <AddEditModal property={editProp} onClose={() => setEditProp(null)} />}
       {addUnitForProp && <AddUnitModal preselectedPropertyId={addUnitForProp.id} onClose={() => setAddUnitForProp(null)} />}
+    </div>
+  )
+}
+
+// S161: surfaces a soft warning when the landlord hasn't completed
+// Stripe Connect onboarding. Doesn't block property creation — Nic's
+// rule that staffing/operations data should land before the rent rail
+// is up. Routes to /banking on click. Self-hides when onboarding is
+// done (cached `payoutsEnabled` = true).
+function ConnectReadinessBanner() {
+  const navigate = useNavigate()
+  // S321: snake_case reads were silently undefined post-S312 (response
+  // interceptor camelizes), so this banner never auto-hid after the
+  // landlord finished Stripe Connect onboarding. Reading camelCase
+  // now picks up the bridged values correctly.
+  const { data } = useQuery<{ payoutsEnabled?: boolean; detailsSubmitted?: boolean; exists?: boolean }>(
+    'stripe-connect-status-user',
+    () => apiGet('/stripe/connect/status?entity=user'),
+  )
+  if (!data) return null
+  if (data.payoutsEnabled && data.detailsSubmitted) return null
+
+  return (
+    <div className="card"
+         onClick={() => navigate('/banking')}
+         style={{
+           padding: 14, marginBottom: 16, cursor: 'pointer',
+           background: 'rgba(220,165,40,.08)',
+           border: '1px solid rgba(220,165,40,.3)',
+         }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+        <div>
+          <div style={{ fontWeight: 600, color: 'var(--gold)' }}>
+            Stripe Connect onboarding incomplete
+          </div>
+          <div style={{ fontSize: '.78rem', color: 'var(--text-2)', marginTop: 4 }}>
+            Properties can still be added now, but tenants won&apos;t be able to pay rent through GAM until you finish KYC.
+          </div>
+        </div>
+        <button className="btn btn-ghost btn-sm" onClick={(e) => { e.stopPropagation(); navigate('/banking') }}>
+          Open Banking →
+        </button>
+      </div>
     </div>
   )
 }

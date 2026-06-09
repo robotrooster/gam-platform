@@ -56,7 +56,7 @@ export function RegisterPage() {
     if (form.password.length < 8) { setErr('Password must be at least 8 characters'); return }
     setLoading(true); setErr('')
     try {
-      await apiPost('/auth/register', { ...form, role: 'landlord' })
+      await apiPost('/auth/register', { ...form, role: 'landlord', acceptedTerms: true })
       await login(form.email, form.password)
       navigate('/onboarding')
     } catch (e: any) {
@@ -94,7 +94,7 @@ export function RegisterPage() {
           </div>
         </div>
         <div style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>
-          © 2026 Gold Asset Management LLC · Arizona
+          © 2026 Gold Asset Management LLC
         </div>
       </div>
 
@@ -170,7 +170,10 @@ export function RegisterPage() {
               <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, cursor: 'pointer' }}>
                 <input type="checkbox" checked={agreed} onChange={e => setAgreed(e.target.checked)} style={{ marginTop: 2 }} />
                 <div style={{ fontSize: '.78rem', color: 'var(--text-2)', lineHeight: 1.5 }}>
-                  I agree to the <span style={{ color: 'var(--gold)', cursor: 'pointer' }}>Platform Participation Agreement</span> and <span style={{ color: 'var(--gold)', cursor: 'pointer' }}>On-Time Pay SLA</span>. I understand these are pending attorney review.
+                  I agree to the{' '}
+                  <a href={`${import.meta.env.VITE_MARKETING_URL || 'http://localhost:3004'}/business/terms`} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--gold)' }}>Terms of Service</a>
+                  {' '}and{' '}
+                  <a href={`${import.meta.env.VITE_MARKETING_URL || 'http://localhost:3004'}/business/privacy`} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--gold)' }}>Privacy Policy</a>.
                 </div>
               </label>
             </div>

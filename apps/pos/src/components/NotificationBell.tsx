@@ -1,10 +1,7 @@
 import { useState, useRef, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPatch, apiPost } from '../lib/api'
-import { Bell, X, Check, CheckCheck, Send } from 'lucide-react'
-import { useNavigate } from 'react-router-dom'
-import { useQuery as useAuthQuery } from 'react-query'
-import { apiGet as apiGetUnits } from '../lib/api'
+import { Bell, CheckCheck, Send } from 'lucide-react'
 
 const TYPE_ROUTES: Record<string, string> = {
   rent_collected:           '/reports',
@@ -17,9 +14,7 @@ const TYPE_ROUTES: Record<string, string> = {
   maintenance_approval_required: '/maintenance',
   maintenance_pm_alert:     '/maintenance',
   maintenance_building_notice: '/maintenance',
-  lease_expiring_60:        '/leases',
-  lease_expiring_30:        '/leases',
-  lease_renewal_survey:     '/leases',
+  lease_expiring:           '/leases',
   lease_renewal_action_required: '/leases',
   pos_low_stock:            '/inventory',
   tenant_invite_accepted:   '/tenants',
@@ -34,8 +29,7 @@ const TYPE_ICONS: Record<string, string> = {
   disbursement_sent:    '🏦',
   maintenance_submitted:'🔧',
   maintenance_updated:  '🔧',
-  lease_expiring_60:    '📋',
-  lease_expiring_30:    '🚨',
+  lease_expiring:       '📋',
   pos_low_stock:        '📦',
   tenant_invite_accepted:'👤',
   work_trade_reminder:  '⚡',
@@ -56,9 +50,8 @@ export function NotificationBell() {
   const [showBulk, setShowBulk] = useState(false)
   const [bulkForm, setBulkForm] = useState({ title:'', body:'', propertyId:'', sendEmail:true, sendSMS:false })
   const ref = useRef<HTMLDivElement>(null)
-  const navigate = useNavigate()
 
-  const { data, refetch } = useQuery(
+  const { data } = useQuery(
     'notifications',
     () => apiGet<any>('/notifications?limit=30'),
     { refetchInterval: 30000 } // poll every 30s

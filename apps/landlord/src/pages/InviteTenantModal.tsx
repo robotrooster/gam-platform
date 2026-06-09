@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from 'react-query'
 import { apiGet, apiPost } from '../lib/api'
-import { X, Mail, User, DoorOpen, Copy, Check, ChevronRight, ChevronLeft } from 'lucide-react'
+import { X, Mail, DoorOpen, Copy, Check, ChevronRight, ChevronLeft } from 'lucide-react'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
 interface Props { onClose: () => void }

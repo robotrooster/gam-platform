@@ -1,4 +1,4 @@
-import React, { useState } from 'react'
+import { useState } from 'react'
 import { NotificationBell } from '../NotificationBell'
 import { apiGet } from '../../lib/api'
 import { Outlet, NavLink, useNavigate } from 'react-router-dom'

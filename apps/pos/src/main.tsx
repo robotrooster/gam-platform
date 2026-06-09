@@ -1,3 +1,4 @@
+import { SentryErrorBoundary } from './lib/sentry'
 import React from 'react'
 import ReactDOM from 'react-dom/client'
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
@@ -58,5 +59,13 @@ export default function App() {
 }
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
-  <React.StrictMode><App /></React.StrictMode>
+  <React.StrictMode>
+    <SentryErrorBoundary fallback={<div style={{ padding: 40, textAlign: 'center', color: 'var(--text-0)' }}>
+      <div style={{ fontSize: '1.1rem', fontWeight: 600, marginBottom: 8 }}>Something went wrong</div>
+      <div style={{ fontSize: '.82rem', color: 'var(--text-3)', marginBottom: 16 }}>The error has been reported. Reload the page to try again.</div>
+      <button className="btn btn-primary" onClick={() => window.location.reload()}>Reload</button>
+    </div>}>
+      <App />
+    </SentryErrorBoundary>
+  </React.StrictMode>
 )

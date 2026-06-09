@@ -4,11 +4,14 @@
   "scripts": {
     "dev": "vite --port 3005",
     "build": "tsc && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "@gam/shared": "*",
     "@hookform/resolvers": "^3.3.4",
+    "@sentry/react": "^8.55.2",
     "@stripe/terminal-js": "^0.26.0",
     "axios": "^1.6.5",
     "clsx": "^2.1.0",
@@ -25,8 +28,11 @@
   "devDependencies": {
     "@types/react": "^18.2.47",
     "@types/react-dom": "^18.2.18",
-    "@vitejs/plugin-react": "^4.2.1",
+    "@vitejs/plugin-react": "^5.2.0",
+    "fake-indexeddb": "^6.2.5",
+    "jsdom": "^24.1.3",
     "typescript": "^5.3.3",
-    "vite": "^5.0.11"
+    "vite": "^8.0.0",
+    "vitest": "^1.6.1"
   }
 }

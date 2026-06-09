@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { apiGet, apiPost } from '../lib/api'
-import { Clock, Check, X, Plus, AlertCircle } from 'lucide-react'
+import { Clock, Check, X } from 'lucide-react'
 
 const fmt = (n: number) => n.toLocaleString('en-US', { style: 'currency', currency: 'USD' })
 
@@ -72,8 +72,6 @@ export function WorkTradePage() {
   const logs = data.logs || []
   const stats = data.stats || {}
   const pending = logs.filter((l: any) => l.status === 'pending')
-  const approved = logs.filter((l: any) => l.status === 'approved')
-  const rejected = logs.filter((l: any) => l.status === 'rejected')
   const monthlyCommit = parseFloat(agreement.weeklyHours) * (52 / 12)
   const hoursLeft = Math.max(0, monthlyCommit - stats.hoursThisPeriod)
   const progress = Math.min(100, (stats.hoursThisPeriod / monthlyCommit) * 100)

@@ -3,8 +3,8 @@ import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useSearchParams } from 'react-router-dom'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
 import {
-  Wrench, Plus, X, Check, Clock, AlertTriangle, MessageSquare,
-  User, Calendar, DollarSign, ChevronDown, ChevronUp, Send, Lock
+  Wrench, Plus, X, Check, AlertTriangle, MessageSquare,
+  DollarSign, Send, Lock
 } from 'lucide-react'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
@@ -392,7 +392,7 @@ export function MaintenancePage() {
       </div>
 
       {/* Requests */}
-      <div className="card" style={{ padding: 0 }}>
+      <div className="card" style={{ padding: 0, overflowX: 'auto' }}>
         {isLoading ? (
           <div style={{ padding: 32, color: 'var(--text-3)', textAlign: 'center' }}>Loading…</div>
         ) : filtered.length === 0 ? (
@@ -402,7 +402,7 @@ export function MaintenancePage() {
             <p>{filterStatus === 'all' ? 'No maintenance requests yet.' : `No ${filterStatus.replace('_',' ')} requests.`}</p>
           </div>
         ) : (
-          <table className="data-table">
+          <table className="data-table" style={{ minWidth: 980 }}>
             <thead>
               <tr>
                 <th>Date</th><th>Unit</th><th>Issue</th><th>Priority</th>

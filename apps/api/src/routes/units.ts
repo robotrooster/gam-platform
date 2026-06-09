@@ -1,7 +1,8 @@
 import { Router } from 'express'
 import { z } from 'zod'
 import { query, queryOne } from '../db'
-import { requireAuth, requireLandlord } from '../middleware/auth'
+import { requireAuth, requireLandlord, requirePerm } from '../middleware/auth'
+import { canAccessLandlordResource, canManageLandlordResource, canViewLandlordFinances } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
 import { UnitStatus, calcNetPerUnit, getReservePhase, PLATFORM_FEES, UNIT_STATUSES } from '@gam/shared'
 import { formatUnitNumber } from '../lib/format'
@@ -13,9 +14,20 @@ unitsRouter.use(requireAuth)
 unitsRouter.get('/', async (req, res, next) => {
   try {
     const isAdmin = req.user!.role === 'admin' || req.user!.role === 'super_admin'
+    const params: any[] = []
+    // S400 fix: pre-fix used req.user.profileId unconditionally, which is the
+    // landlord_id for role=landlord but the user_id for team roles (PM /
+    // maintenance_worker / onsite_manager). Team members got an empty list
+    // because user_id never matches units.landlord_id. Resolve to landlordId
+    // for team members. Same pattern as credit.ts (line 109).
+    const callerLandlordId = req.user!.role === 'landlord'
+      ? req.user!.profileId
+      : req.user!.landlordId
     const landlordFilter = isAdmin
-      ? '' : `AND u.landlord_id = '${req.user!.profileId}'`
-    const propertyFilter = req.query.propertyId ? `AND u.property_id = '${req.query.propertyId}'` : ''
+      ? '' : `AND u.landlord_id = $${params.push(callerLandlordId)}`
+    const propertyFilter = req.query.propertyId
+      ? `AND u.property_id = $${params.push(req.query.propertyId)}`
+      : ''
     const units = await query<any>(`
       SELECT u.*,
         p.name AS property_name, p.street1, p.city, p.state, p.zip,
@@ -29,7 +41,7 @@ unitsRouter.get('/', async (req, res, next) => {
       LEFT JOIN v_unit_occupancy vuo ON vuo.unit_id = u.id
       WHERE 1=1 ${landlordFilter} ${propertyFilter}
       ORDER BY p.name, u.unit_number
-    `)
+    `, params)
     res.json({ success: true, data: units })
   } catch (e) { next(e) }
 })
@@ -56,7 +68,7 @@ unitsRouter.get('/:id', async (req, res, next) => {
       LEFT JOIN tenants te ON te.id = vuo.primary_tenant_id
       WHERE u.id = $1`, [req.params.id])
     if (!unit) throw new AppError(404, 'Unit not found')
-    if (req.user!.role !== 'admin' && req.user!.role !== 'super_admin' && unit.landlord_id !== req.user!.profileId) {
+    if (!canAccessLandlordResource(req.user, unit.landlord_id)) {
       throw new AppError(403, 'Forbidden')
     }
     res.json({ success: true, data: unit })
@@ -64,7 +76,7 @@ unitsRouter.get('/:id', async (req, res, next) => {
 })
 
 // POST /api/units
-unitsRouter.post('/', requireLandlord, async (req, res, next) => {
+unitsRouter.post('/', requirePerm('units.create'), async (req, res, next) => {
   try {
     const body = z.object({
       propertyId:      z.string().uuid(),
@@ -76,18 +88,21 @@ unitsRouter.post('/', requireLandlord, async (req, res, next) => {
       securityDeposit: z.number().min(0).default(0),
     }).parse(req.body)
 
-    // Verify property belongs to this landlord
+    // Verify the calling user can manage units on this property's landlord.
     const prop = await queryOne<any>(
-      `SELECT id FROM properties WHERE id = $1 AND landlord_id = $2`,
-      [body.propertyId, req.user!.profileId]
+      `SELECT id, landlord_id FROM properties WHERE id = $1`,
+      [body.propertyId]
     )
-    if (!prop) throw new AppError(403, 'Property not found or not yours')
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canManageLandlordResource(req.user, prop.landlord_id)) {
+      throw new AppError(403, 'Forbidden')
+    }
 
     const [unit] = await query<any>(`
       INSERT INTO units (property_id, landlord_id, unit_number, bedrooms, bathrooms, sqft, rent_amount, security_deposit)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
       RETURNING *`,
-      [body.propertyId, req.user!.profileId, formatUnitNumber(body.unitNumber), body.bedrooms,
+      [body.propertyId, prop.landlord_id, formatUnitNumber(body.unitNumber), body.bedrooms,
        body.bathrooms, body.sqft ?? null, body.rentAmount, body.securityDeposit]
     )
     res.status(201).json({ success: true, data: unit })
@@ -95,7 +110,7 @@ unitsRouter.post('/', requireLandlord, async (req, res, next) => {
 })
 
 // PATCH /api/units/:id/status — set unit status
-unitsRouter.patch('/:id/status', requireLandlord, async (req, res, next) => {
+unitsRouter.patch('/:id/status', requirePerm('units.edit'), async (req, res, next) => {
   try {
     const { status } = z.object({
       status: z.enum([...UNIT_STATUSES] as [string, ...string[]])
@@ -103,7 +118,7 @@ unitsRouter.patch('/:id/status', requireLandlord, async (req, res, next) => {
 
     const unit = await queryOne<any>(`SELECT * FROM units WHERE id = $1`, [req.params.id])
     if (!unit) throw new AppError(404, 'Unit not found')
-    if (unit.landlord_id !== req.user!.profileId && req.user!.role !== 'admin' && req.user!.role !== 'super_admin') {
+    if (!canManageLandlordResource(req.user, unit.landlord_id)) {
       throw new AppError(403, 'Forbidden')
     }
     const [updated] = await query<any>(
@@ -124,15 +139,22 @@ unitsRouter.post('/:id/eviction-mode', requireLandlord, async (req, res, next) =
 
     const unit = await queryOne<any>(`SELECT * FROM units WHERE id = $1`, [req.params.id])
     if (!unit) throw new AppError(404, 'Unit not found')
-    if (unit.landlord_id !== req.user!.profileId && req.user!.role !== 'admin') {
+    // Eviction mode is high-stakes and legally fraught — landlord/admin only.
+    if (!canManageLandlordResource(req.user, unit.landlord_id, [])) {
       throw new AppError(403, 'Forbidden')
     }
 
+    // S400 fix: cast $2 to uuid. Postgres can't infer the type of a
+    // parameter that only appears inside a CASE expression assigned to a
+    // typed column, so pre-fix this UPDATE returned 42804 "column
+    // payment_block_set_by is of type uuid but expression is of type
+    // text" → 500 on every call. The eviction-mode toggle was effectively
+    // non-functional before this cast.
     const [updated] = await query<any>(`
       UPDATE units
       SET payment_block = $1,
           payment_block_set_at = CASE WHEN $1 THEN NOW() ELSE NULL END,
-          payment_block_set_by = CASE WHEN $1 THEN $2 ELSE NULL END
+          payment_block_set_by = CASE WHEN $1 THEN $2::uuid ELSE NULL END
       WHERE id = $3
       RETURNING *`,
       [enable, req.user!.userId, req.params.id]
@@ -150,8 +172,12 @@ unitsRouter.post('/:id/eviction-mode', requireLandlord, async (req, res, next) =
 // GET /api/units/:id/economics
 unitsRouter.get('/:id/economics', async (req, res, next) => {
   try {
-    const unit = await queryOne('SELECT * FROM units WHERE id = $1', [req.params.id])
+    const unit = await queryOne<any>('SELECT * FROM units WHERE id = $1', [req.params.id])
     if (!unit) throw new AppError(404, 'Unit not found')
+    // Per-unit P&L view is financial — landlord/admin only.
+    if (!canViewLandlordFinances(req.user, unit.landlord_id)) {
+      throw new AppError(403, 'Forbidden')
+    }
     const [{ count }] = await query('SELECT COUNT(*)::int AS count FROM units WHERE landlord_id = $1 AND status = $2', [unit.landlord_id, 'active'])
     const { rate } = getReservePhase(count)
     const econ = calcNetPerUnit(unit.rent_amount, rate)
@@ -178,13 +204,16 @@ const LEASE_TYPE_MATRIX: Record<string, string[]> = {
 }
 
 // PATCH /api/units/:id/type — set unit type and rates
-unitsRouter.patch('/:id/type', requireLandlord, async (req, res, next) => {
+unitsRouter.patch('/:id/type', requirePerm('units.edit'), async (req, res, next) => {
   try {
     const { unitType, nightlyRate, weeklyRate, monthlyRate, minStayNights, maxStayNights,
             checkInTime, checkOutTime, amenities, unitDescription, isBookable } = req.body
 
-    const unit = await queryOne<any>('SELECT * FROM units WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
+    const unit = await queryOne<any>('SELECT * FROM units WHERE id=$1', [req.params.id])
     if (!unit) throw new AppError(404, 'Unit not found')
+    if (!canManageLandlordResource(req.user, unit.landlord_id)) {
+      throw new AppError(403, 'Forbidden')
+    }
 
     const leaseTypesAllowed = LEASE_TYPE_MATRIX[unitType] || LEASE_TYPE_MATRIX['residential']
 
@@ -205,6 +234,12 @@ unitsRouter.patch('/:id/type', requireLandlord, async (req, res, next) => {
 // GET /api/units/:id/availability — get booked dates
 unitsRouter.get('/:id/availability', async (req, res, next) => {
   try {
+    const unit = await queryOne<any>('SELECT landlord_id FROM units WHERE id = $1', [req.params.id])
+    if (!unit) throw new AppError(404, 'Unit not found')
+    if (!canAccessLandlordResource(req.user, unit.landlord_id)) {
+      throw new AppError(403, 'Forbidden')
+    }
+
     const { from, to } = req.query
     const fromDate = from || new Date().toISOString().split('T')[0]
     const toDate = to || new Date(Date.now() + 90*24*60*60*1000).toISOString().split('T')[0]
@@ -220,17 +255,46 @@ unitsRouter.get('/:id/availability', async (req, res, next) => {
 })
 
 // POST /api/units/:id/bookings — create booking
-unitsRouter.post('/:id/bookings', requireLandlord, async (req, res, next) => {
+//
+// S354: added zod validation. Pre-S354 missing required fields
+// (leaseType / checkIn / checkOut) produced 500 from the DB NOT NULL
+// or CHECK violation instead of clean 400. checkOut <= checkIn was
+// also silently accepted, producing 0 or negative nights via the
+// Math.ceil calc. Both now caught at the zod / pre-INSERT layer.
+unitsRouter.post('/:id/bookings', requirePerm('guests.check_in', 'units.edit'), async (req, res, next) => {
   try {
-    const { guestName, guestEmail, guestPhone, leaseType, checkIn, checkOut,
-            tenantId, nightlyRate, weeklyRate, totalAmount, notes, source } = req.body
+    const body = z.object({
+      guestName:   z.string().nullish(),
+      guestEmail:  z.string().email().nullish(),
+      guestPhone:  z.string().nullish(),
+      leaseType:   z.enum(['nightly', 'weekly', 'month_to_month', 'long_term', 'lease_hold']),
+      checkIn:     z.string(),
+      checkOut:    z.string(),
+      tenantId:    z.string().uuid().nullish(),
+      nightlyRate: z.number().min(0).nullish(),
+      weeklyRate:  z.number().min(0).nullish(),
+      totalAmount: z.number().min(0).nullish(),
+      notes:       z.string().nullish(),
+      source:      z.string().nullish(),
+    }).parse(req.body)
 
-    const unit = await queryOne<any>('SELECT * FROM units WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
+    const checkInD  = new Date(body.checkIn)
+    const checkOutD = new Date(body.checkOut)
+    if (isNaN(checkInD.getTime())) throw new AppError(400, 'Invalid checkIn date')
+    if (isNaN(checkOutD.getTime())) throw new AppError(400, 'Invalid checkOut date')
+    if (checkOutD.getTime() <= checkInD.getTime()) {
+      throw new AppError(400, 'checkOut must be after checkIn')
+    }
+
+    const unit = await queryOne<any>('SELECT * FROM units WHERE id=$1', [req.params.id])
     if (!unit) throw new AppError(404, 'Unit not found')
+    if (!canManageLandlordResource(req.user, unit.landlord_id)) {
+      throw new AppError(403, 'Forbidden')
+    }
 
     // Check allowed lease types
-    if (unit.lease_types_allowed && !unit.lease_types_allowed.includes(leaseType)) {
-      throw new AppError(400, `Lease type '${leaseType}' not allowed for ${unit.unit_type} units`)
+    if (unit.lease_types_allowed && !unit.lease_types_allowed.includes(body.leaseType)) {
+      throw new AppError(400, `Lease type '${body.leaseType}' not allowed for ${unit.unit_type} units`)
     }
 
     // Check for conflicts
@@ -238,53 +302,71 @@ unitsRouter.post('/:id/bookings', requireLandlord, async (req, res, next) => {
       SELECT id FROM unit_bookings
       WHERE unit_id=$1 AND status NOT IN ('cancelled')
       AND check_in < $2 AND check_out > $3`,
-      [unit.id, checkOut, checkIn])
+      [unit.id, body.checkOut, body.checkIn])
     if (conflict) throw new AppError(409, 'Unit is already booked for those dates')
 
-    const nights = Math.ceil((new Date(checkOut).getTime() - new Date(checkIn).getTime()) / (1000*60*60*24))
-    const platformFee = (totalAmount || 0) * 0.05 // 5% platform fee on short-term
+    const nights = Math.ceil((checkOutD.getTime() - checkInD.getTime()) / (1000*60*60*24))
+    const platformFee = (body.totalAmount || 0) * 0.05 // 5% platform fee on short-term
 
     const booking = await queryOne<any>(`INSERT INTO unit_bookings
       (unit_id, landlord_id, tenant_id, guest_name, guest_email, guest_phone,
        lease_type, check_in, check_out, nights, nightly_rate, weekly_rate,
        total_amount, platform_fee, notes, source)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`,
-      [unit.id, req.user!.profileId, tenantId||null, guestName||null, guestEmail||null,
-       guestPhone||null, leaseType, checkIn, checkOut, nights,
-       nightlyRate||unit.nightly_rate||null, weeklyRate||unit.weekly_rate||null,
-       totalAmount||0, platformFee, notes||null, source||'direct'])
+      [unit.id, unit.landlord_id, body.tenantId ?? null, body.guestName ?? null, body.guestEmail ?? null,
+       body.guestPhone ?? null, body.leaseType, body.checkIn, body.checkOut, nights,
+       body.nightlyRate ?? unit.nightly_rate ?? null, body.weeklyRate ?? unit.weekly_rate ?? null,
+       body.totalAmount ?? 0, platformFee, body.notes ?? null, body.source ?? 'direct'])
 
     res.status(201).json({ success: true, data: booking })
   } catch (e) { next(e) }
 })
 
 // GET /api/units/:id/bookings — list bookings for a unit
-unitsRouter.get('/:id/bookings', requireLandlord, async (req, res, next) => {
+unitsRouter.get('/:id/bookings', requirePerm('guests.check_in', 'guests.check_out', 'units.view_status', 'units.edit'), async (req, res, next) => {
   try {
+    const unit = await queryOne<any>('SELECT landlord_id FROM units WHERE id=$1', [req.params.id])
+    if (!unit) throw new AppError(404, 'Unit not found')
+    if (!canAccessLandlordResource(req.user, unit.landlord_id)) {
+      throw new AppError(403, 'Forbidden')
+    }
+    // S313: JOIN properties to surface requires_booking_acknowledgment
+    // per booking row. SchedulePage's "ack needed" badge (S200) reads
+    // this flag from each booking; pre-S313 the column was undefined
+    // on the response so the badge never rendered. Mirrors the same
+    // JOIN already in bookings.ts § GET /bookings.
     const bookings = await query<any>(`
-      SELECT b.*, u.unit_number, u.unit_type
+      SELECT b.*,
+             u.unit_number,
+             u.unit_type,
+             p.requires_booking_acknowledgment
       FROM unit_bookings b
       JOIN units u ON u.id = b.unit_id
-      WHERE b.unit_id=$1 AND b.landlord_id=$2
-      ORDER BY b.check_in DESC`, [req.params.id, req.user!.profileId])
+      JOIN properties p ON p.id = u.property_id
+      WHERE b.unit_id=$1
+      ORDER BY b.check_in DESC`, [req.params.id])
     res.json({ success: true, data: bookings })
   } catch (e) { next(e) }
 })
 
 // PATCH /api/units/:id/bookings/:bookingId — update booking (status, move dates, swap unit)
-unitsRouter.patch('/:id/bookings/:bookingId', requireLandlord, async (req, res, next) => {
+unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('guests.check_in', 'guests.check_out', 'units.edit'), async (req, res, next) => {
   try {
     const { status, notes, checkIn, checkOut, unitId } = req.body
-    const booking = await queryOne<any>('SELECT * FROM unit_bookings WHERE id=$1 AND landlord_id=$2', [req.params.bookingId, req.user!.profileId])
+    const booking = await queryOne<any>('SELECT * FROM unit_bookings WHERE id=$1', [req.params.bookingId])
     if (!booking) throw new AppError(404, 'Booking not found')
+    if (!canManageLandlordResource(req.user, booking.landlord_id)) {
+      throw new AppError(403, 'Forbidden')
+    }
 
     const newUnitId = unitId || booking.unit_id
     const newCheckIn = checkIn || booking.check_in
     const newCheckOut = checkOut || booking.check_out
 
-    // If dates or unit changed, verify target unit exists and check for conflicts
+    // If dates or unit changed, verify target unit exists, belongs to the
+    // same landlord, and check for conflicts.
     if (checkIn || checkOut || unitId) {
-      const targetUnit = await queryOne<any>('SELECT * FROM units WHERE id=$1 AND landlord_id=$2', [newUnitId, req.user!.profileId])
+      const targetUnit = await queryOne<any>('SELECT * FROM units WHERE id=$1 AND landlord_id=$2', [newUnitId, booking.landlord_id])
       if (!targetUnit) throw new AppError(404, 'Target unit not found')
 
       const conflict = await queryOne<any>(`
@@ -307,12 +389,49 @@ unitsRouter.patch('/:id/bookings/:bookingId', requireLandlord, async (req, res, 
   } catch (e) { next(e) }
 })
 
+// PATCH /api/units/:id/bookings/:bookingId/acknowledge — S179 / B3.
+// Stamps acknowledgment_signed_at = NOW() once landlord/staff confirms the
+// guest signed the property rules. The toggle on properties
+// (requires_booking_acknowledgment) governs whether the booking should be
+// gated on this; today the column is informational and surface UI badging
+// is a follow-on session.
+unitsRouter.patch('/:id/bookings/:bookingId/acknowledge', requirePerm('guests.check_in', 'units.edit'), async (req, res, next) => {
+  try {
+    const booking = await queryOne<any>('SELECT * FROM unit_bookings WHERE id=$1', [req.params.bookingId])
+    if (!booking) throw new AppError(404, 'Booking not found')
+    if (!canManageLandlordResource(req.user, booking.landlord_id)) {
+      throw new AppError(403, 'Forbidden')
+    }
+    if (booking.acknowledgment_signed_at) {
+      // Idempotent: re-acknowledging is a no-op rather than an error so a
+      // double-click on the staff UI doesn't bounce.
+      return res.json({ success: true, data: booking })
+    }
+    const updated = await queryOne<any>(`
+      UPDATE unit_bookings
+         SET acknowledgment_signed_at = NOW(),
+             updated_at               = NOW()
+       WHERE id = $1
+       RETURNING *`,
+      [booking.id])
+    res.json({ success: true, data: updated })
+  } catch (e) { next(e) }
+})
+
 // GET /api/units/schedule — master schedule across all units for a landlord
-unitsRouter.get('/schedule/master', requireLandlord, async (req, res, next) => {
+unitsRouter.get('/schedule/master', requirePerm('guests.check_in', 'units.view_status', 'units.edit'), async (req, res, next) => {
   try {
     const { from, to, unitType } = req.query
     const fromDate = from || new Date().toISOString().split('T')[0]
     const toDate = to || new Date(Date.now() + 30*24*60*60*1000).toISOString().split('T')[0]
+
+    // S400 fix: same class as GET / above. For team-role callers (PM /
+    // maintenance_worker / onsite_manager) req.user.profileId is the user_id,
+    // not the landlord_id, so the WHERE landlord_id=$1 filter returned an
+    // empty schedule. Resolve to landlordId for team members.
+    const callerLandlordId = req.user!.role === 'landlord'
+      ? req.user!.profileId
+      : req.user!.landlordId
 
     const units = await query<any>(`
       SELECT u.id, u.unit_number, u.unit_type, u.status, u.rent_amount,
@@ -326,17 +445,21 @@ unitsRouter.get('/schedule/master', requireLandlord, async (req, res, next) => {
       LEFT JOIN v_unit_occupancy vuo ON vuo.unit_id = u.id
       WHERE u.landlord_id=$1 ${unitType ? "AND u.unit_type=$2" : ""}
       ORDER BY u.unit_type, p.name, u.unit_number`,
-      unitType ? [req.user!.profileId, unitType] : [req.user!.profileId])
+      unitType ? [callerLandlordId, unitType] : [callerLandlordId])
 
-    // Get all bookings in range
+    // Get all bookings in range. S200: include the property's
+    // requires_booking_acknowledgment flag so the schedule tile can
+    // render an ack-needed badge (companion to S191's BookingsPage
+    // surface).
     const bookings = await query<any>(`
-      SELECT b.*, u.unit_number, u.unit_type, p.name as property_name
+      SELECT b.*, u.unit_number, u.unit_type, p.name as property_name,
+             p.requires_booking_acknowledgment
       FROM unit_bookings b
       JOIN units u ON u.id = b.unit_id
       JOIN properties p ON p.id = u.property_id
       WHERE b.landlord_id=$1 AND b.status NOT IN ('cancelled')
         AND b.check_out >= $2 AND b.check_in <= $3
-      ORDER BY b.check_in`, [req.user!.profileId, fromDate, toDate])
+      ORDER BY b.check_in`, [callerLandlordId, fromDate, toDate])
 
     // Get active leases in range
     const leases = await query<any>(`
@@ -353,7 +476,7 @@ unitsRouter.get('/schedule/master', requireLandlord, async (req, res, next) => {
       ) vlat ON TRUE
       WHERE u.landlord_id=$1 AND l.status='active'
         AND l.end_date >= $2 AND l.start_date <= $3
-      ORDER BY l.start_date`, [req.user!.profileId, fromDate, toDate])
+      ORDER BY l.start_date`, [callerLandlordId, fromDate, toDate])
 
     res.json({ success: true, data: { units, bookings, leases, range: { from: fromDate, to: toDate } } })
   } catch (e) { next(e) }
@@ -363,10 +486,13 @@ unitsRouter.get('/schedule/master', requireLandlord, async (req, res, next) => {
 // ─── UNIT ACTIVATION / AVAILABILITY (landlord-controlled) ──────
 
 // POST /api/units/:id/mark-available — vacant → available (listed, no billing yet)
-unitsRouter.post('/:id/mark-available', requireLandlord, async (req, res, next) => {
+unitsRouter.post('/:id/mark-available', requirePerm('units.edit'), async (req, res, next) => {
   try {
-    const unit = await queryOne<any>('SELECT * FROM units WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
+    const unit = await queryOne<any>('SELECT * FROM units WHERE id=$1', [req.params.id])
     if (!unit) throw new AppError(404, 'Unit not found')
+    if (!canManageLandlordResource(req.user, unit.landlord_id)) {
+      throw new AppError(403, 'Forbidden')
+    }
     if (unit.status !== 'vacant') throw new AppError(400, `Cannot mark available from status '${unit.status}'. Only vacant units can be marked available.`)
     const updated = await queryOne<any>(`UPDATE units SET status='available', updated_at=NOW() WHERE id=$1 RETURNING *`, [req.params.id])
     res.json({ success: true, data: updated })
@@ -374,10 +500,13 @@ unitsRouter.post('/:id/mark-available', requireLandlord, async (req, res, next) 
 })
 
 // POST /api/units/:id/mark-vacant — available → vacant (withdraw from listing)
-unitsRouter.post('/:id/mark-vacant', requireLandlord, async (req, res, next) => {
+unitsRouter.post('/:id/mark-vacant', requirePerm('units.edit'), async (req, res, next) => {
   try {
-    const unit = await queryOne<any>('SELECT * FROM units WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
+    const unit = await queryOne<any>('SELECT * FROM units WHERE id=$1', [req.params.id])
     if (!unit) throw new AppError(404, 'Unit not found')
+    if (!canManageLandlordResource(req.user, unit.landlord_id)) {
+      throw new AppError(403, 'Forbidden')
+    }
     if (unit.status !== 'available') throw new AppError(400, `Cannot mark vacant from status '${unit.status}'. Only available units can be marked vacant.`)
     const updated = await queryOne<any>(`UPDATE units SET status='vacant', updated_at=NOW() WHERE id=$1 RETURNING *`, [req.params.id])
     res.json({ success: true, data: updated })
@@ -385,11 +514,17 @@ unitsRouter.post('/:id/mark-vacant', requireLandlord, async (req, res, next) => 
 })
 
 // POST /api/units/:id/activate — gate: lease + tenant + rent. Optional scheduledFor ISO datetime (UTC).
-unitsRouter.post('/:id/activate', requireLandlord, async (req, res, next) => {
+// S128: opened to property_manager with units.edit. Activation kicks off
+// billing but is fundamentally a unit-state change — same operational
+// surface as PATCH /:id/status, which is already units.edit.
+unitsRouter.post('/:id/activate', requirePerm('units.edit'), async (req, res, next) => {
   try {
     const body = z.object({ scheduledFor: z.string().datetime().optional() }).parse(req.body)
-    const unit = await queryOne<any>('SELECT * FROM units WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
+    const unit = await queryOne<any>('SELECT * FROM units WHERE id=$1', [req.params.id])
     if (!unit) throw new AppError(404, 'Unit not found')
+    if (!canManageLandlordResource(req.user, unit.landlord_id, ['property_manager'])) {
+      throw new AppError(403, 'Forbidden')
+    }
     if (unit.status === 'active') throw new AppError(400, 'Unit is already active')
     if (!unit.rent_amount || unit.rent_amount <= 0) throw new AppError(400, 'Cannot activate without a rent amount')
 
@@ -411,10 +546,14 @@ unitsRouter.post('/:id/activate', requireLandlord, async (req, res, next) => {
 })
 
 // POST /api/units/:id/cancel-scheduled-activation
-unitsRouter.post('/:id/cancel-scheduled-activation', requireLandlord, async (req, res, next) => {
+// S128: opened to property_manager with units.edit (same surface as activate).
+unitsRouter.post('/:id/cancel-scheduled-activation', requirePerm('units.edit'), async (req, res, next) => {
   try {
-    const unit = await queryOne<any>('SELECT * FROM units WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
+    const unit = await queryOne<any>('SELECT * FROM units WHERE id=$1', [req.params.id])
     if (!unit) throw new AppError(404, 'Unit not found')
+    if (!canManageLandlordResource(req.user, unit.landlord_id, ['property_manager'])) {
+      throw new AppError(403, 'Forbidden')
+    }
     if (!unit.scheduled_activation_at) throw new AppError(400, 'No scheduled activation to cancel')
     const updated = await queryOne<any>(`UPDATE units SET scheduled_activation_at=NULL, scheduled_activation_by=NULL, updated_at=NOW() WHERE id=$1 RETURNING *`, [req.params.id])
     res.json({ success: true, data: updated })

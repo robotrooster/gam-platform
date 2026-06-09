@@ -1,7 +1,6 @@
 import { useState, useEffect } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { apiGet, apiPost } from '../lib/api'
-import { Eye, EyeOff, Check, DoorOpen, Building2 } from 'lucide-react'
 
 export function AcceptInvitePage() {
   const [params] = useSearchParams()
@@ -11,7 +10,7 @@ export function AcceptInvitePage() {
   const [inviteInfo, setInviteInfo] = useState<any>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
-  const [form, setForm] = useState({ password: '', confirmPassword: '', phone: '', ssiSsdi: false })
+  const [form, setForm] = useState({ password: '', confirmPassword: '', phone: '', ssiSsdi: false, acceptedTerms: false })
   const [showPw, setShowPw] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [step, setStep] = useState(0)
@@ -26,6 +25,7 @@ export function AcceptInvitePage() {
   const handleSubmit = async () => {
     if (form.password.length < 8) { setError('Password must be at least 8 characters'); return }
     if (form.password !== form.confirmPassword) { setError('Passwords do not match'); return }
+    if (!form.acceptedTerms) { setError('You must accept the Terms of Service and Privacy Policy to continue'); return }
     setSubmitting(true)
     setError('')
     try {
@@ -33,6 +33,7 @@ export function AcceptInvitePage() {
         token, password: form.password,
         phone: form.phone || undefined,
         ssiSsdi: form.ssiSsdi,
+        acceptedTerms: true,
       })
       // Store token under tenant portal's expected key + respect next= param
       localStorage.setItem('gam_tenant_token', res.data.token)
@@ -149,12 +150,27 @@ export function AcceptInvitePage() {
               <input type="tel" style={inputStyle} placeholder="(555) 000-0000" value={form.phone} onChange={e => setForm(f => ({ ...f, phone: e.target.value }))} />
             </div>
 
-            <div style={{ marginBottom: 20, padding: '12px 14px', background: 'rgba(201,162,39,.06)', border: '1px solid rgba(201,162,39,.2)', borderRadius: 10 }}>
+            <div style={{ marginBottom: 14, padding: '12px 14px', background: 'rgba(201,162,39,.06)', border: '1px solid rgba(201,162,39,.2)', borderRadius: 10 }}>
               <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, cursor: 'pointer' }}>
                 <input type="checkbox" checked={form.ssiSsdi} onChange={e => setForm(f => ({ ...f, ssiSsdi: e.target.checked }))} style={{ marginTop: 2 }} />
                 <div>
                   <div style={{ fontSize: '.78rem', fontWeight: 600, color: '#eef1f8' }}>I receive SSI or SSDI benefits</div>
                   <div style={{ fontSize: '.7rem', color: '#7a8aaa', marginTop: 2, lineHeight: 1.5 }}>Enables On-Time Pay — we initiate rent on time even if your benefits arrive late. $20/month service fee.</div>
+                </div>
+              </label>
+            </div>
+
+            <div style={{ marginBottom: 20, padding: '12px 14px', background: form.acceptedTerms ? 'rgba(34,197,94,.06)' : '#141a22', border: '1px solid ' + (form.acceptedTerms ? 'rgba(34,197,94,.25)' : '#1e2530'), borderRadius: 10 }}>
+              <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, cursor: 'pointer' }}>
+                <input type="checkbox" checked={form.acceptedTerms} onChange={e => setForm(f => ({ ...f, acceptedTerms: e.target.checked }))} style={{ marginTop: 2 }} />
+                <div>
+                  <div style={{ fontSize: '.78rem', fontWeight: 600, color: '#eef1f8' }}>Platform Terms &amp; Privacy</div>
+                  <div style={{ fontSize: '.7rem', color: '#7a8aaa', marginTop: 2, lineHeight: 1.5 }}>
+                    I agree to the{' '}
+                    <a href={`${(import.meta as any).env?.VITE_MARKETING_URL || 'http://localhost:3004'}/consumer/terms`} target="_blank" rel="noopener noreferrer" style={{ color: '#c9a227' }}>Terms of Service</a>
+                    {' '}and{' '}
+                    <a href={`${(import.meta as any).env?.VITE_MARKETING_URL || 'http://localhost:3004'}/consumer/privacy`} target="_blank" rel="noopener noreferrer" style={{ color: '#c9a227' }}>Privacy Policy</a>.
+                  </div>
                 </div>
               </label>
             </div>
@@ -169,8 +185,8 @@ export function AcceptInvitePage() {
               <button onClick={() => setStep(0)} style={{ flex: 1, padding: 12, borderRadius: 10, border: '1px solid #252e3d', background: '#141920', color: '#7a8aaa', cursor: 'pointer', fontWeight: 600 }}>Back</button>
               <button
                 onClick={handleSubmit}
-                disabled={submitting || !form.password || !form.confirmPassword}
-                style={{ flex: 2, padding: 12, borderRadius: 10, border: 'none', background: submitting ? '#1a2028' : 'linear-gradient(135deg, #8a6c10, #c9a227)', color: '#060809', fontWeight: 700, cursor: submitting ? 'not-allowed' : 'pointer', opacity: (!form.password || !form.confirmPassword) ? .5 : 1 }}
+                disabled={submitting || !form.password || !form.confirmPassword || !form.acceptedTerms}
+                style={{ flex: 2, padding: 12, borderRadius: 10, border: 'none', background: submitting ? '#1a2028' : 'linear-gradient(135deg, #8a6c10, #c9a227)', color: '#060809', fontWeight: 700, cursor: submitting ? 'not-allowed' : 'pointer', opacity: (!form.password || !form.confirmPassword || !form.acceptedTerms) ? .5 : 1 }}
               >
                 {submitting ? '...' : 'Create Account & Sign In'}
               </button>

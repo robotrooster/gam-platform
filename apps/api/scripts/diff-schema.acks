@@ -1,0 +1,20 @@
+# Schema diff harness acknowledgements
+# Read by apps/api/scripts/diff-schema.ts
+#
+# PHILOSOPHY (set in S59):
+# Acks are reserved for legitimate harness limitations only.
+# Every phantom table or column is a build commitment tracked in the
+# deferred list — not suppressed here. The harness is intentionally loud.
+# When it reports zero drift, the launch checklist is done.
+#
+# Format:
+#   T:table_name             - missing table acked
+#   C:table.column           - missing column acked
+#   W:table_name             - wildcard, all col drift on table acked (USE SPARINGLY)
+#   A:relpath:line           - anti-pattern false positive acked
+#
+# Each ack must be a true harness limitation. Build-debt does NOT belong here.
+
+# Harness limitations (false positives, manually verified)
+# (none — the prior A:src/routes/esign.ts:430 ack was orphaned and
+#  removed S233 after the orphan-ack detector caught it.)

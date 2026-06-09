@@ -17,6 +17,7 @@
 import * as cron from 'node-cron'
 import type { ScheduledTask } from 'node-cron'
 import { query } from '../db'
+import { logger } from '../lib/logger'
 
 export type EngineId = 'lateFees' | 'invoices'
 
@@ -90,7 +91,7 @@ export async function refreshTimezoneCrons(): Promise<{
           try {
             await config.handler(tz)
           } catch (e) {
-            console.error(`[TzCron][${engineId}][${tz}] handler error:`, e)
+            logger.error({ err: e, engine_id: engineId, tz }, '[TzCron] handler error')
           }
         },
         { timezone: tz }
@@ -112,12 +113,10 @@ export function registerRefreshCron(): void {
     try {
       const { added, removed } = await refreshTimezoneCrons()
       if (added.length > 0 || removed.length > 0) {
-        console.log(
-          `[TzCron] Refresh: +${added.length} added, -${removed.length} removed`
-        )
+        logger.info({ added: added.length, removed: removed.length }, '[TzCron] refresh complete')
       }
     } catch (e) {
-      console.error('[TzCron] Refresh error:', e)
+      logger.error({ err: e }, '[TzCron] Refresh error')
     }
   })
 }

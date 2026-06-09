@@ -1,10 +1,17 @@
 import { Router } from 'express'
 import { z } from 'zod'
-import { query, queryOne } from '../db'
-import { requireAuth, requireLandlord } from '../middleware/auth'
+import { query, queryOne, getClient } from '../db'
+import { requireAuth, requirePerm } from '../middleware/auth'
+import { canAccessLandlordResource, canManageLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
 import { routeMaintenanceNotification, notifyMaintenanceUpdated } from '../services/notifications'
+import { createMaintenanceRequest } from '../services/maintenanceRequests'
 import { PLATFORM_FEES, MAINTENANCE_PRIORITIES } from '@gam/shared'
+import {
+  classifyMaintenanceTier,
+  emitMaintenanceResolvedEvents,
+} from '../services/creditLedgerEmitters'
+import { logger } from '../lib/logger'
 
 export const maintenanceRouter = Router()
 maintenanceRouter.use(requireAuth)
@@ -12,12 +19,27 @@ maintenanceRouter.use(requireAuth)
 // GET /api/maintenance
 maintenanceRouter.get('/', async (req, res, next) => {
   try {
-    const unitFilter = req.query.unitId ? `AND mr.unit_id = '${req.query.unitId}'` : ''
-    const roleFilter = req.user!.role === 'tenant'
-      ? `AND mr.tenant_id = '${req.user!.profileId}'`
-      : req.user!.role !== 'admin'
-        ? `AND mr.landlord_id = '${req.user!.profileId}'`
-        : ''
+    const params: any[] = []
+    const unitFilter = req.query.unitId
+      ? `AND mr.unit_id = $${params.push(req.query.unitId)}`
+      : ''
+    // S69: explicit branches per role. Pre-S69 used `role !== 'admin'`,
+    // which (a) trapped super_admin into a profileId filter, and (b)
+    // routed team-role users (PM, onsite_manager, maintenance) to the
+    // same wrong branch.
+    const role = req.user!.role
+    let roleFilter = ''
+    if (role === 'tenant') {
+      roleFilter = `AND mr.tenant_id = $${params.push(req.user!.profileId)}`
+    } else if (role === 'landlord') {
+      roleFilter = `AND mr.landlord_id = $${params.push(req.user!.profileId)}`
+    } else if (role === 'property_manager' || role === 'onsite_manager' || role === 'maintenance') {
+      if (!req.user!.landlordId) return res.json({ success: true, data: [] })
+      roleFilter = `AND mr.landlord_id = $${params.push(req.user!.landlordId)}`
+    } else if (role !== 'admin' && role !== 'super_admin') {
+      // Unknown role — empty rather than leak.
+      return res.json({ success: true, data: [] })
+    }
 
     const requests = await query<any>(`
       SELECT mr.*,
@@ -34,7 +56,7 @@ maintenanceRouter.get('/', async (req, res, next) => {
       WHERE 1=1 ${roleFilter} ${unitFilter}
       ORDER BY
         CASE mr.priority WHEN 'emergency' THEN 1 WHEN 'high' THEN 2 WHEN 'normal' THEN 3 ELSE 4 END,
-        mr.created_at DESC`)
+        mr.created_at DESC`, params)
     res.json({ success: true, data: requests })
   } catch (e) { next(e) }
 })
@@ -56,6 +78,16 @@ maintenanceRouter.get('/:id', async (req, res, next) => {
       LEFT JOIN users au ON au.id = mr.contractor_id
       WHERE mr.id = $1`, [req.params.id])
     if (!request) throw new AppError(404, 'Request not found')
+
+    // S69: pre-S69 had no scope check on this endpoint at all — any
+    // authenticated user could read any maintenance request.
+    if (req.user!.role === 'tenant') {
+      if (request.tenant_id !== req.user!.profileId) {
+        throw new AppError(403, 'Forbidden')
+      }
+    } else if (!canAccessLandlordResource(req.user, request.landlord_id)) {
+      throw new AppError(403, 'Forbidden')
+    }
 
     const comments = await query<any>(`
       SELECT mc.*, u.first_name, u.last_name, u.role
@@ -80,68 +112,36 @@ maintenanceRouter.post('/', async (req, res, next) => {
       photos:      z.array(z.string()).optional(),
     }).parse(req.body)
 
-    // Get unit and landlord
-    const unit = await queryOne<any>('SELECT * FROM units WHERE id=$1', [body.unitId])
-    if (!unit) throw new AppError(404, 'Unit not found')
+    // Create via the shared service (same path the agent's
+    // file_maintenance_request tool uses — one source of truth).
+    const request = await createMaintenanceRequest({
+      unitId:      body.unitId,
+      title:       body.title,
+      description: body.description,
+      priority:    body.priority,
+      photos:      body.photos,
+      actor: {
+        userId:    req.user!.userId,
+        role:      req.user!.role,
+        profileId: req.user!.profileId,
+      },
+    })
 
-    // Verify access — tenant must be on an active lease for this unit (primary or co-tenant)
-    if (req.user!.role === 'tenant') {
-      const onUnit = await queryOne<any>(`
-        SELECT 1 FROM v_lease_active_tenants vlat
-        JOIN leases l ON l.id = vlat.lease_id AND l.status = 'active'
-        WHERE l.unit_id = $1 AND vlat.tenant_id = $2 LIMIT 1`,
-        [body.unitId, req.user!.profileId])
-      if (!onUnit) throw new AppError(403, 'You are not assigned to this unit')
-    }
-
-    // Attribution: tenant filing → themselves; landlord filing → primary tenant on the unit
-    let tenantId: string | null
-    if (req.user!.role === 'tenant') {
-      tenantId = req.user!.profileId
-    } else {
-      const occ = await queryOne<any>(
-        `SELECT primary_tenant_id FROM v_unit_occupancy WHERE unit_id = $1`,
-        [body.unitId])
-      tenantId = occ?.primary_tenant_id || null
-    }
-
-    const request = await queryOne<any>(`
-      INSERT INTO maintenance_requests
-        (unit_id, tenant_id, landlord_id, title, description, priority, photos)
-      VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
-      [body.unitId, tenantId || null, unit.landlord_id,
-       body.title, body.description, body.priority,
-       body.photos || []])
-
-    // Auto-add first comment
-    await query(`INSERT INTO maintenance_comments (request_id, user_id, role, message)
-      VALUES ($1,$2,$3,$4)`,
-      [request!.id, req.user!.userId,
-       req.user!.role === 'tenant' ? 'tenant' : 'landlord',
-       `Request submitted: ${body.description}`])
-
-    // Notify landlord
-    try {
-      const landlord = await queryOne<any>(`SELECT u.email, u.first_name, l.id as landlord_id, u.id as user_id FROM landlords l JOIN users u ON u.id=l.user_id WHERE l.id=$1`, [req.user!.profileId || request.landlord_id])
-      const tenant = await queryOne<any>(`SELECT u.first_name, u.last_name FROM users u JOIN tenants t ON t.user_id=u.id WHERE t.id=$1`, [request.tenant_id])
-      const unit = await queryOne<any>(`SELECT unit_number, p.name as property_name FROM units u JOIN properties p ON p.id=u.property_id WHERE u.id=$1`, [request.unit_id])
-      if (landlord && tenant && unit) {
-        await routeMaintenanceNotification(request.id)
-      }
-    } catch(e) { console.error('[NOTIFY] maintenance submit:', e) }
     res.status(201).json({ success: true, data: request })
   } catch (e) { next(e) }
 })
 
 // PATCH /api/maintenance/:id — update status, assign, add cost, approve
-maintenanceRouter.patch('/:id', requireLandlord, async (req, res, next) => {
+maintenanceRouter.patch('/:id', requirePerm('work_orders.complete', 'work_orders.reassign', 'maintenance.approve_above_threshold'), async (req, res, next) => {
   try {
     const { status: rawStatus, assignedTo, estimatedCost, actualCost, scheduledAt, landlordNotes, manHours } = req.body
 
     const request = await queryOne<any>(
-      'SELECT * FROM maintenance_requests WHERE id=$1 AND landlord_id=$2',
-      [req.params.id, req.user!.profileId])
+      'SELECT * FROM maintenance_requests WHERE id=$1', [req.params.id])
     if (!request) throw new AppError(404, 'Request not found')
+    if (!canManageLandlordResource(req.user, request.landlord_id)) {
+      throw new AppError(403, 'Forbidden')
+    }
 
     // Auto-approval gate: if a new estimated cost is being set AND it exceeds the
     // landlord's threshold AND the caller didn't explicitly pick a status, flip to
@@ -153,7 +153,7 @@ maintenanceRouter.patch('/:id', requireLandlord, async (req, res, next) => {
     if (estimateIsNew && !rawStatus && request.status !== 'awaiting_approval') {
       const landlord = await queryOne<any>(
         'SELECT maint_approval_threshold FROM landlords WHERE id=$1',
-        [req.user!.profileId])
+        [request.landlord_id])
       const threshold = Number(landlord?.maint_approval_threshold ?? 500)
       if (estimatedCostNum > threshold) {
         effectiveStatus = 'awaiting_approval'
@@ -210,18 +210,51 @@ maintenanceRouter.patch('/:id', requireLandlord, async (req, res, next) => {
           notes: landlordNotes
         })
       }
-    } catch(e) { console.error('[NOTIFY] maintenance update:', e) }
+    } catch(e) { logger.error({ err: e }, '[NOTIFY] maintenance update:') }
+
+    // Credit ledger: when the request transitions to 'completed', emit a
+    // landlord-side resolution-tier event. Best-effort — failures get
+    // logged but don't kill the response (PATCH already committed).
+    if (
+      effectiveStatus === 'completed' &&
+      request.status !== 'completed' &&
+      request.created_at
+    ) {
+      try {
+        const tier = classifyMaintenanceTier({
+          createdAt:  new Date(request.created_at),
+          resolvedAt: new Date(),
+        })
+        const ledgerClient = await getClient()
+        try {
+          await emitMaintenanceResolvedEvents(ledgerClient, {
+            landlordId:   request.landlord_id,
+            requestId:    request.id,
+            resolvedAt:   new Date(),
+            responseTier: tier,
+          })
+        } finally {
+          ledgerClient.release()
+        }
+      } catch (e) {
+        logger.error({ err: e }, '[credit-ledger] maintenance resolved emit failed:')
+      }
+    }
+
     res.json({ success: true, data: updated })
   } catch (e) { next(e) }
 })
 
 // POST /api/maintenance/:id/approve — landlord approves a request in awaiting_approval
-maintenanceRouter.post('/:id/approve', requireLandlord, async (req, res, next) => {
+// Approval over the threshold is a financial/policy decision — landlord/admin only.
+maintenanceRouter.post('/:id/approve', requirePerm('maintenance.approve_above_threshold'), async (req, res, next) => {
   try {
     const request = await queryOne<any>(
-      'SELECT * FROM maintenance_requests WHERE id=$1 AND landlord_id=$2',
-      [req.params.id, req.user!.profileId])
+      'SELECT * FROM maintenance_requests WHERE id=$1', [req.params.id])
     if (!request) throw new AppError(404, 'Request not found')
+    if (!canManageLandlordResource(req.user, request.landlord_id, ['property_manager'])) {
+      throw new AppError(403, 'Forbidden')
+    }
     if (request.status !== 'awaiting_approval') {
       throw new AppError(400, 'Request is not awaiting approval')
     }
@@ -252,7 +285,7 @@ maintenanceRouter.post('/:id/approve', requireLandlord, async (req, res, next) =
         scheduledAt: undefined,
         notes: undefined
       })
-    } catch(e) { console.error('[NOTIFY] maintenance approve:', e) }
+    } catch(e) { logger.error({ err: e }, '[NOTIFY] maintenance approve:') }
 
     res.json({ success: true, data: updated })
   } catch (e) { next(e) }
@@ -267,8 +300,15 @@ maintenanceRouter.post('/:id/comments', async (req, res, next) => {
     const request = await queryOne<any>('SELECT * FROM maintenance_requests WHERE id=$1', [req.params.id])
     if (!request) throw new AppError(404, 'Request not found')
 
-    // Tenant can only comment on their own requests
-    if (req.user!.role === 'tenant' && request.tenant_id !== req.user!.profileId) {
+    // S69: tenant can only comment on their own requests; everyone else
+    // gated through the standard landlord-scope helper. Pre-S69 this
+    // endpoint allowed any non-tenant authenticated user to comment on
+    // any request platform-wide.
+    if (req.user!.role === 'tenant') {
+      if (request.tenant_id !== req.user!.profileId) {
+        throw new AppError(403, 'Forbidden')
+      }
+    } else if (!canAccessLandlordResource(req.user, request.landlord_id)) {
       throw new AppError(403, 'Forbidden')
     }
 
@@ -286,8 +326,23 @@ maintenanceRouter.post('/:id/comments', async (req, res, next) => {
 })
 
 // GET /api/maintenance/stats — summary for dashboard
-maintenanceRouter.get('/stats/summary', requireLandlord, async (req, res, next) => {
+// Scoped to whichever landlord the calling user belongs to. Admin sees
+// platform-wide rollup. Team roles inherit their landlord's scope via the
+// landlordId JWT claim.
+maintenanceRouter.get('/stats/summary', requirePerm('work_orders.complete', 'work_orders.reassign', 'maintenance.approve_above_threshold'), async (req, res, next) => {
   try {
+    const role = req.user!.role
+    const isAdmin = role === 'admin' || role === 'super_admin'
+    const params: any[] = []
+    let where = ''
+    if (role === 'landlord') {
+      where = `WHERE landlord_id = $${params.push(req.user!.profileId)}`
+    } else if (role === 'property_manager' || role === 'onsite_manager' || role === 'maintenance') {
+      if (!req.user!.landlordId) return res.json({ success: true, data: {} })
+      where = `WHERE landlord_id = $${params.push(req.user!.landlordId)}`
+    } else if (!isAdmin) {
+      return res.json({ success: true, data: {} })
+    }
     const stats = await queryOne<any>(`
       SELECT
         COUNT(*) FILTER (WHERE status = 'open') as open_count,
@@ -297,7 +352,7 @@ maintenanceRouter.get('/stats/summary', requireLandlord, async (req, res, next) 
         COUNT(*) FILTER (WHERE priority = 'emergency' AND status != 'completed') as emergency_count,
         COALESCE(SUM(actual_cost) FILTER (WHERE status = 'completed'), 0) as total_cost,
         COALESCE(SUM(platform_fee) FILTER (WHERE status = 'completed'), 0) as total_fees
-      FROM maintenance_requests WHERE landlord_id = $1`, [req.user!.profileId])
+      FROM maintenance_requests ${where}`, params)
     res.json({ success: true, data: stats })
   } catch (e) { next(e) }
 })

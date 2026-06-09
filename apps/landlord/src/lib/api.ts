@@ -1,5 +1,6 @@
 /// <reference types="vite/client" />
 import axios from 'axios'
+import { applyCamelizeInterceptor } from '@gam/shared'
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:4000'
 
@@ -7,6 +8,13 @@ export const api = axios.create({
   baseURL: `${API_URL}/api`,
   headers: { 'Content-Type': 'application/json' },
 })
+
+// S312: snake_case → camelCase response transform. Registered
+// BEFORE the auth interceptor so the camelize step runs on the
+// success path; the 401 redirect path doesn't touch r.data. See
+// packages/shared/src/camelize.ts for the passthrough rules
+// protecting JSONB blob columns.
+applyCamelizeInterceptor(api)
 
 // Attach JWT on every request
 api.interceptors.request.use((config) => {

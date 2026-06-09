@@ -3,7 +3,7 @@ import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useNavigate, Link } from 'react-router-dom'
 import { apiGet, apiPatch } from '../lib/api'
-import { Plus, Search, AlertTriangle, Shield, DoorOpen } from 'lucide-react'
+import { Search, AlertTriangle, Shield, DoorOpen } from 'lucide-react'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
 const STATUS_COLORS: Record<string, string> = {

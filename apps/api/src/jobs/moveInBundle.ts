@@ -1,15 +1,19 @@
 import { DateTime } from 'luxon'
 import type { PoolClient } from 'pg'
 import { daysInMonth, formatInvoiceNumber } from '@gam/shared'
-import { getClient } from '../db'
+import { getClient, queryOne } from '../db'
+import { logger } from '../lib/logger'
 
 // ============================================================
 // S26a: Move-in invoice generator (replaces S25 moveInBundle)
 // Called at lease finalize — NOT by daily cron.
 // Creates one invoice dated lease.start_date containing:
 //   - Rent (prorated if start_date.day > 1, full rent if day=1)
-//   - All move_in fees from lease_fees
-//   - Security deposit from leases.security_deposit (if > 0)
+//   - All move_in fees from lease_fees, INCLUDING security_deposit
+//     (S196: security_deposit is now a lease_fees row, not a column)
+// Security deposit specifically flows into a payments row with
+// type='deposit' (not 'fee') for historical audit clarity; all
+// other move_in lease_fees create type='fee' rows.
 // Idempotent via ux_invoices_lease_due_date.
 // ============================================================
 
@@ -19,7 +23,6 @@ interface MoveInInputs {
   tenant_id: string | null
   landlord_id: string
   rent_amount: number
-  security_deposit: number    // from leases.security_deposit
   start_date: string          // YYYY-MM-DD
 }
 
@@ -30,6 +33,18 @@ export interface MoveInBundleResult {
   rentAmount: number
   moveInFeesInserted: number
   depositInserted: boolean
+}
+
+/**
+ * Map a lease_fees.fee_type to the NACHA-shaped payments.entry_description
+ * enum (CHECK on payments.entry_description). Deposit-shape fee_types map
+ * to 'DEPOSIT'; last_month_rent maps to 'RENT' (it IS prepaid rent);
+ * everything else to 'SUBSCRIP'.
+ */
+function entryDescriptionForFeeType(feeType: string): 'DEPOSIT' | 'RENT' | 'SUBSCRIP' {
+  if (feeType === 'pet_deposit' || feeType === 'key_deposit' || feeType === 'cleaning_deposit') return 'DEPOSIT'
+  if (feeType === 'last_month_rent') return 'RENT'
+  return 'SUBSCRIP'
 }
 
 /** Banker's rounding (half-even) to cents. */
@@ -101,9 +116,46 @@ export async function generateMoveInInvoice(
     const year = DateTime.fromISO(inputs.start_date).year
     const invoiceNumber = await allocateInvoiceNumber(client, inputs.landlord_id, year)
 
-    const feesTotal = fees.reduce((s, f) => s + Number(f.amount), 0)
-    const depositAmount = Number(inputs.security_deposit) || 0
-    const totalAmount = rentForMoveIn + feesTotal + depositAmount
+    // S196: security_deposit is now a lease_fees row inside `fees`.
+    // Pull it out for the dedicated type='deposit' payment row, and
+    // exclude it from the fee-loop total so it doesn't double-count.
+    const depositFee = fees.find(f => f.fee_type === 'security_deposit')
+    const fullDepositAmount = depositFee ? Number(depositFee.amount) : 0
+    const nonDepositFees = fees.filter(f => f.fee_type !== 'security_deposit')
+    const feesTotal = nonDepositFees.reduce((s, f) => s + Number(f.amount), 0)
+
+    // S246: FlexDeposit branch. When the tenant has enrolled BEFORE
+    // move-in, the deposit line is excluded from the landlord-facing
+    // invoice entirely — landlord sees only rent + non-deposit fees;
+    // their "Security Deposits" page shows "funded" via the GAM
+    // gap-front Transfer. Tenant pays installment 1 alongside rent +
+    // fees in the combined move-in PI; remaining N-1 installments
+    // are scheduled via flex_deposit_installments rows (created at
+    // enroll time before this generator runs).
+    let depositAmountForInvoice = fullDepositAmount
+    let firstInstallmentAmount = 0
+    let flexDepositActive = false
+    let flexDepositSecurityDepositId: string | null = null
+    if (depositFee && inputs.tenant_id) {
+      const fdRow = await client.query<{ id: string; flex_deposit_enabled: boolean; first_amount: string | null }>(
+        `SELECT sd.id, sd.flex_deposit_enabled,
+                (SELECT amount::text FROM flex_deposit_installments
+                  WHERE security_deposit_id = sd.id AND installment_number = 1) AS first_amount
+           FROM security_deposits sd
+          WHERE sd.tenant_id = $1 AND sd.lease_id = $2
+          LIMIT 1`,
+        [inputs.tenant_id, inputs.lease_id],
+      )
+      if (fdRow.rows[0]?.flex_deposit_enabled && fdRow.rows[0]?.first_amount) {
+        flexDepositActive = true
+        flexDepositSecurityDepositId = fdRow.rows[0].id
+        firstInstallmentAmount = Number(fdRow.rows[0].first_amount)
+        // Invoice deposit line disappears; landlord doesn't see
+        // anything deposit-related on this invoice.
+        depositAmountForInvoice = 0
+      }
+    }
+    const totalAmount = rentForMoveIn + feesTotal + depositAmountForInvoice + firstInstallmentAmount
 
     const invoiceRes = await client.query(
       `INSERT INTO invoices (
@@ -118,7 +170,7 @@ export async function generateMoveInInvoice(
         invoiceNumber, inputs.start_date,
         rentForMoveIn.toFixed(2),
         feesTotal.toFixed(2),
-        depositAmount.toFixed(2),
+        depositAmountForInvoice.toFixed(2),
         totalAmount.toFixed(2),
       ]
     )
@@ -144,16 +196,15 @@ export async function generateMoveInInvoice(
       `INSERT INTO payments (
          invoice_id, unit_id, lease_id, tenant_id, landlord_id,
          type, amount, status, due_date, entry_description
-       ) VALUES ($1, $2, $3, $4, $5, 'rent', $6, 'pending', $7, $8)`,
+       ) VALUES ($1, $2, $3, $4, $5, 'rent', $6, 'pending', $7, 'RENT')`,
       [
         invoiceId, inputs.unit_id, inputs.lease_id, inputs.tenant_id, inputs.landlord_id,
         rentForMoveIn.toFixed(2), inputs.start_date,
-        `Move-in rent ${inputs.start_date}`,
       ]
     )
 
     let moveInFeesInserted = 0
-    for (const fee of fees) {
+    for (const fee of nonDepositFees) {
       await client.query(
         `INSERT INTO payments (
            invoice_id, unit_id, lease_id, tenant_id, landlord_id,
@@ -162,7 +213,7 @@ export async function generateMoveInInvoice(
         [
           invoiceId, inputs.unit_id, inputs.lease_id, inputs.tenant_id, inputs.landlord_id,
           fee.amount, inputs.start_date,
-          `${fee.fee_type}${fee.description ? ' — ' + fee.description : ''} ${inputs.start_date}`,
+          entryDescriptionForFeeType(fee.fee_type),
           fee.id,
         ]
       )
@@ -170,22 +221,69 @@ export async function generateMoveInInvoice(
     }
 
     let depositInserted = false
-    if (depositAmount > 0) {
+    if (depositAmountForInvoice > 0) {
       await client.query(
         `INSERT INTO payments (
            invoice_id, unit_id, lease_id, tenant_id, landlord_id,
            type, amount, status, due_date, entry_description
-         ) VALUES ($1, $2, $3, $4, $5, 'deposit', $6, 'pending', $7, $8)`,
+         ) VALUES ($1, $2, $3, $4, $5, 'deposit', $6, 'pending', $7, 'DEPOSIT')`,
         [
           invoiceId, inputs.unit_id, inputs.lease_id, inputs.tenant_id, inputs.landlord_id,
-          depositAmount.toFixed(2), inputs.start_date,
-          `Security deposit ${inputs.start_date}`,
+          depositAmountForInvoice.toFixed(2), inputs.start_date,
         ]
       )
       depositInserted = true
     }
 
+    // S246: FlexDeposit installment 1 payment row. Tagged
+    // entry_description='DEPOSIT' so allocation + audit treats it
+    // consistently with the regular deposit. The payments row carries
+    // the installment-1 amount (full deposit minus GAM-fronted gap);
+    // landlord doesn't see this row tied to their dashboard because
+    // it's NOT linked to the invoice (invoice_id=NULL) — its
+    // visibility is tenant-side only.
+    let flexDepositInstallment1PaymentId: string | null = null
+    if (flexDepositActive && firstInstallmentAmount > 0) {
+      const inst1 = await client.query<{ id: string }>(
+        `INSERT INTO payments (
+           unit_id, lease_id, tenant_id, landlord_id,
+           type, amount, status, due_date, entry_description, notes
+         ) VALUES ($1, $2, $3, $4, 'deposit', $5, 'pending', $6, 'DEPOSIT', $7)
+         RETURNING id`,
+        [
+          inputs.unit_id, inputs.lease_id, inputs.tenant_id, inputs.landlord_id,
+          firstInstallmentAmount.toFixed(2), inputs.start_date,
+          `FlexDeposit installment 1 (deposit ${flexDepositSecurityDepositId})`,
+        ]
+      )
+      flexDepositInstallment1PaymentId = inst1.rows[0].id
+    }
+
     if (ownsTx) await client.query('COMMIT')
+
+    // S246: post-commit FlexDeposit settlement. Flips installment 1
+    // to settled + fires the GAM-gap Connect Transfer to landlord
+    // (outside the DB tx — network round-trip). Best-effort: if the
+    // Transfer fails, an admin notification + transfer_error row is
+    // recorded; the deposit row is still marked partial-funded and
+    // a retry path runs in the cron.
+    if (flexDepositActive && flexDepositSecurityDepositId && flexDepositInstallment1PaymentId && inputs.tenant_id) {
+      try {
+        const { settleFlexDepositMoveIn } = await import('../services/flexDeposit')
+        await settleFlexDepositMoveIn({
+          tenantId:           inputs.tenant_id,
+          securityDepositId:  flexDepositSecurityDepositId,
+          movInPaymentId:     flexDepositInstallment1PaymentId,
+        })
+      } catch (e) {
+        logger.error({ err: e, security_deposit_id: flexDepositSecurityDepositId }, '[moveIn][flex-deposit-settle]')
+        // Don't throw — invoice is created, tenant payment will
+        // succeed separately. S260: no Connect Transfer at move-in
+        // (all FlexDeposit deposits gam_escrow); the only inside-tx
+        // work here is flipping installment 1 status + deposit
+        // counters, no money movement.
+      }
+    }
 
     return {
       invoiceCreated: true,

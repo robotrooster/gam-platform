@@ -6,6 +6,8 @@ import { LEASE_COLUMNS, LEASE_COLUMN_LABEL, LEASE_COLUMN_INPUT } from '@gam/shar
 import { useAuth } from '../context/AuthContext'
 import { Plus, X, FileText, Send, Settings, Eye, Trash2, ChevronRight, Check, AlertCircle, Download, MoreVertical } from 'lucide-react'
 
+const API_URL = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
+
 const FIELD_TYPES = [
   { type:'signature', label:'Signature',  icon:'✍️', color:'#c9a227', w:200, h:60 },
   { type:'initials',  label:'Initials',   icon:'🔡', color:'#4a9eff', w:80,  h:50 },
@@ -362,7 +364,7 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
             {/* PDF background rendered with PDF.js */}
             {template.basePdfUrl ? (
               <PDFCanvas
-                url={`${template.basePdfUrl.startsWith('http') ? '' : 'http://localhost:4000'}${template.basePdfUrl}`}
+                url={`${template.basePdfUrl.startsWith('http') ? '' : API_URL}${template.basePdfUrl}`}
                 page={currentPage}
                 width={pdfW * scale}
                 height={pdfH * scale}
@@ -404,6 +406,14 @@ function SendDocumentModal({ onClose }) {
   const [sending, setSending] = useState(false)
   const [error, setError] = useState('')
   const [prefillValues, setPrefillValues] = useState<Record<string,string>>({})
+  // S235: witness signer fields. Only surfaced when the picked template
+  // has fields assigned to signerRole='witness'; otherwise hidden so the
+  // common no-witness leases stay one-click. Witnesses provision via the
+  // new /esign/witnesses/provision endpoint (no tenant record / no unit
+  // assignment, unlike the tenant invite path).
+  const [witnessFirst, setWitnessFirst] = useState('')
+  const [witnessLast,  setWitnessLast]  = useState('')
+  const [witnessEmail, setWitnessEmail] = useState('')
   const { data: templates = [] } = useQuery('esign-templates', () => apiGet('/esign/templates'))
   // Full template (with fields) — only fetched once a template is picked.
   const { data: fullTemplate } = useQuery<any>(
@@ -411,6 +421,8 @@ function SendDocumentModal({ onClose }) {
     () => apiGet(`/esign/templates/${templateId}`),
     { enabled: !!templateId }
   )
+  const templateNeedsWitness: boolean = !!((fullTemplate?.fields || []) as any[])
+    .some((f: any) => f.signerRole === 'witness')
   // Fields bound to a lease_column are the ones the landlord fills at send time.
   // De-dupe by leaseColumn so the same column on multiple signer roles appears once.
   const uniqueBoundFields: any[] = Array.from(
@@ -431,6 +443,14 @@ function SendDocumentModal({ onClose }) {
     if (!authUser) { setError('Not logged in'); return }
     const validEmails = tenantEmails.filter(e => e.trim())
     if (!validEmails.length) { setError('Please enter at least one tenant email'); return }
+    if (templateNeedsWitness) {
+      if (!witnessEmail.trim()) { setError('This template requires a witness — enter their email'); return }
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(witnessEmail.trim())) {
+        setError('Witness email is invalid')
+        return
+      }
+      if (!witnessFirst.trim()) { setError('Witness first name required'); return }
+    }
     // Pick unitId from first tenant (required by backend for original_lease to build lease)
     const firstTenant = existingTenants.find(t => t.email === validEmails[0].trim())
     setSending(true); setError('')
@@ -476,6 +496,29 @@ function SendDocumentModal({ onClose }) {
         orderIndex: 1,
         userId: authUser.id,
       })
+
+      // S235: append witness signer last (after all tenants). Only fires
+      // when the template has witness-role fields and the form has a
+      // valid email. Empty/skipped witness for a template that needs one
+      // is caught above as a validation error before we get here.
+      if (templateNeedsWitness && witnessEmail.trim()) {
+        const wEmail = witnessEmail.trim()
+        const wFirst = witnessFirst.trim() || wEmail.split('@')[0]
+        const wLast  = witnessLast.trim()
+        const provRes: any = await apiPost('/esign/witnesses/provision', {
+          email: wEmail, firstName: wFirst, lastName: wLast,
+        })
+        signers.push({
+          role: 'witness',
+          name: (wFirst + ' ' + wLast).trim() || wEmail,
+          email: wEmail,
+          phone: null,
+          orderIndex: order,
+          userId: provRes.data.userId,
+        })
+        order++
+      }
+
       const unitId = firstTenant ? firstTenant.unitId : null
       const title = selectedTemplate ? selectedTemplate.name + (firstTenant ? ' — Unit ' + firstTenant.unit : '') : 'Lease Agreement'
       const res = await apiPost('/esign/documents', { templateId, unitId, title, signers, prefillValues })
@@ -523,6 +566,19 @@ function SendDocumentModal({ onClose }) {
           })}
           <button className='btn btn-ghost btn-sm' onClick={() => { setTenantEmails(prev => [...prev,'']); setSearches(prev => [...prev,'']) }}><Plus size={12} /> Add another tenant</button>
         </div>
+        {templateNeedsWitness && (
+          <div style={{ marginBottom:16, padding:'12px 14px', background:'rgba(245,158,11,.08)', border:'1px solid rgba(245,158,11,.25)', borderRadius:10 }}>
+            <label style={{ fontSize:'.72rem', fontWeight:600, color:'var(--text-3)', textTransform:'uppercase', letterSpacing:'.06em', display:'block', marginBottom:6 }}>Witness *</label>
+            <div style={{ fontSize:'.72rem', color:'var(--text-3)', marginBottom:8, lineHeight:1.45 }}>
+              This template has fields assigned to a witness. They sign after all tenants and receive an email with the link.
+            </div>
+            <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:6, marginBottom:6 }}>
+              <input className='input' placeholder='First name' value={witnessFirst} onChange={e => setWitnessFirst(e.target.value)} />
+              <input className='input' placeholder='Last name (optional)' value={witnessLast} onChange={e => setWitnessLast(e.target.value)} />
+            </div>
+            <input className='input' style={{ width:'100%' }} placeholder='witness@email.com' type='email' value={witnessEmail} onChange={e => setWitnessEmail(e.target.value)} />
+          </div>
+        )}
         {uniqueBoundFields.length > 0 && (
           <div style={{ marginBottom:16 }}>
             <label style={{ fontSize:'.72rem', fontWeight:600, color:'var(--text-3)', textTransform:'uppercase', letterSpacing:'.06em', display:'block', marginBottom:6 }}>Document Values</label>
@@ -545,7 +601,11 @@ function SendDocumentModal({ onClose }) {
         {templateId && tenantEmails.some(e => e.trim()) && (
           <div style={{ padding:'10px 14px', background:'var(--bg-2)', border:'1px solid var(--border-0)', borderRadius:10, marginBottom:16, fontSize:'.75rem', color:'var(--text-2)', lineHeight:1.8 }}>
             <div><strong>Template:</strong> {selectedTemplate && selectedTemplate.name}</div>
-            <div><strong>Signing order:</strong> {['Landlord', ...tenantEmails.filter(e=>e).map((_,i) => i === 0 ? 'Primary tenant' : 'Co-tenant ' + i)].join(' → ')}</div>
+            <div><strong>Signing order:</strong> {[
+              'Landlord',
+              ...tenantEmails.filter(e=>e).map((_,i) => i === 0 ? 'Primary tenant' : 'Co-tenant ' + i),
+              ...(templateNeedsWitness && witnessEmail.trim() ? ['Witness'] : []),
+            ].join(' → ')}</div>
             <div style={{ marginTop:6, fontSize:'.68rem', color:'var(--text-3)' }}>Each signer receives a signing request + portal invite email.</div>
           </div>
         )}
@@ -727,7 +787,7 @@ export function ESignPage() {
                       const formData = new FormData()
                       formData.append('file', file)
                       const token = localStorage.getItem('gam_token')
-                      const res = await fetch('http://localhost:4000/api/esign/upload', {
+                      const res = await fetch(`${API_URL}/api/esign/upload`, {
                         method: 'POST', headers: { Authorization: `Bearer ${token}` }, body: formData
                       })
                       const data = await res.json()

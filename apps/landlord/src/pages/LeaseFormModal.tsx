@@ -1,9 +1,24 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { useMutation, useQuery, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
-import { LeaseType, LEASE_TYPE_LABEL, AutoRenewMode } from '@gam/shared'
+import { LeaseType, LEASE_TYPE_LABEL, AutoRenewMode, AUTO_RENEW_MODES, AUTO_RENEW_MODE_LABEL, LeaseStatus, ADDENDUM_DIFF_FIELD_LABEL, formatAddendumDiffValue } from '@gam/shared'
+const AUTO_RENEW_MODE_DESC: Record<AutoRenewMode, string> = {
+  extend_same_term:          'Add another term of the same length (e.g. a 12-month lease extends by 12 months)',
+  convert_to_month_to_month: 'Switch to month-to-month with no fixed end date',
+}
+
 import { X, Check, DollarSign, AlertTriangle } from 'lucide-react'
 
+// S225: this modal is currently invoked in EDIT MODE ONLY. The
+// landlord-portal "Add Lease" entry point was replaced with a
+// /tenant-onboarding link because POST /api/leases never existed
+// on the backend (e-sign, CSV import, and the lease parser are
+// the live creation paths). The create-mode branches below
+// (createMut, the !isEdit submit path, the `availableUnits`
+// no-active-lease filter, the preselected* props, the
+// seededForPropertyRef effect) are kept dormant — if a future
+// session adds POST /api/leases, the modal is one entry point
+// away from working again.
 interface Props {
   onClose: () => void
   leaseId?: string  // if provided, modal is in edit mode
@@ -59,12 +74,93 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
     autoRenewMode: 'extend_same_term' as AutoRenewMode,
     noticeDaysRequired: '30',
     expirationNoticeDays: '60',
+    lateFeeEnabled: true,
     lateFeeGraceDays: '5',
     lateFeeInitialAmount: '15.00',
-    status: 'pending' as 'pending' | 'active' | 'expired' | 'terminated',
+    lateFeeInitialType: 'flat' as 'flat' | 'percent_of_rent',
+    // S226: recurring accrual + cap. Toggles default off; when on,
+    // amount/type/period (or amount/type for cap) get sent as a group;
+    // when off, the columns get NULLed in PATCH.
+    lateFeeAccrualEnabled: false,
+    lateFeeAccrualAmount: '5.00',
+    lateFeeAccrualType: 'flat' as 'flat' | 'percent_of_rent',
+    lateFeeAccrualPeriod: 'daily' as 'daily' | 'weekly' | 'monthly',
+    lateFeeCapEnabled: false,
+    lateFeeCapAmount: '50.00',
+    lateFeeCapType: 'flat' as 'flat' | 'percent_of_rent',
+    status: 'pending' as LeaseStatus,
   })
   const [errors, setErrors] = useState<Record<string, string>>({})
   const [submitError, setSubmitError] = useState<string>('')
+
+  // S224: derive the selected unit's property id from the units list,
+  // then pull the property's late-fee defaults. Used for the "(from
+  // property)" hint on each late-fee input. In edit mode this is
+  // informational; in create mode it also seeds the form on unit pick.
+  const selectedUnit = (units as any[]).find(u => u.id === form.unitId)
+  const selectedPropertyId: string | undefined = selectedUnit?.propertyId
+  const { data: selectedProperty } = useQuery<any>(
+    ['property-late-fee', selectedPropertyId],
+    () => apiGet('/properties/' + selectedPropertyId),
+    { enabled: !!selectedPropertyId }
+  )
+
+  // S224: in create mode, seed the late-fee inputs from the property's
+  // defaults the first time a unit is selected for a given property.
+  // Edit mode skips this — the existing lease's saved values win, and
+  // the property hint is informational only.
+  const seededForPropertyRef = useRef<string | null>(null)
+  useEffect(() => {
+    if (isEdit) return
+    if (!selectedProperty || !selectedPropertyId) return
+    if (seededForPropertyRef.current === selectedPropertyId) return
+    seededForPropertyRef.current = selectedPropertyId
+    const propAccrualSet = selectedProperty.lateFeeAccrualAmount != null && selectedProperty.lateFeeAccrualType != null && selectedProperty.lateFeeAccrualPeriod != null
+    const propCapSet     = selectedProperty.lateFeeCapAmount != null && selectedProperty.lateFeeCapType != null
+    setForm(f => ({
+      ...f,
+      lateFeeEnabled: selectedProperty.lateFeeEnabled !== false,
+      lateFeeGraceDays: String(selectedProperty.lateFeeGraceDays ?? 5),
+      lateFeeInitialAmount: selectedProperty.lateFeeInitialAmount != null ? String(selectedProperty.lateFeeInitialAmount) : '15.00',
+      lateFeeInitialType: (selectedProperty.lateFeeInitialType === 'percent_of_rent' ? 'percent_of_rent' : 'flat'),
+      // S226: seed accrual + cap from property defaults too. Toggles
+      // light up only when the property has all required columns set.
+      lateFeeAccrualEnabled: propAccrualSet,
+      lateFeeAccrualAmount: propAccrualSet ? String(selectedProperty.lateFeeAccrualAmount) : f.lateFeeAccrualAmount,
+      lateFeeAccrualType:   propAccrualSet ? selectedProperty.lateFeeAccrualType : f.lateFeeAccrualType,
+      lateFeeAccrualPeriod: propAccrualSet ? selectedProperty.lateFeeAccrualPeriod : f.lateFeeAccrualPeriod,
+      lateFeeCapEnabled: propCapSet,
+      lateFeeCapAmount: propCapSet ? String(selectedProperty.lateFeeCapAmount) : f.lateFeeCapAmount,
+      lateFeeCapType:   propCapSet ? selectedProperty.lateFeeCapType : f.lateFeeCapType,
+    }))
+  }, [selectedProperty, selectedPropertyId, isEdit])
+
+  // S224: hint helpers — show "(from property)" next to each late-fee
+  // input whenever the form value matches the property default. The
+  // hint vanishes once the landlord overrides (Q2 = b in S224 scope).
+  const matchesPropertyEnabled = !!selectedProperty && form.lateFeeEnabled === (selectedProperty.lateFeeEnabled !== false)
+  const matchesPropertyGrace   = !!selectedProperty && Number(form.lateFeeGraceDays) === Number(selectedProperty.lateFeeGraceDays ?? 5)
+  const matchesPropertyAmount  = !!selectedProperty && Number(form.lateFeeInitialAmount) === Number(selectedProperty.lateFeeInitialAmount ?? 15)
+  const matchesPropertyType    = !!selectedProperty && form.lateFeeInitialType === ((selectedProperty.lateFeeInitialType === 'percent_of_rent') ? 'percent_of_rent' : 'flat')
+  // S226: hints for accrual + cap. Group-level: "(from property)"
+  // shows on the toggle if both the toggle state AND every sub-field
+  // matches the property; flips off the moment the landlord changes
+  // any one of them.
+  const propAccrualSet = !!selectedProperty && selectedProperty.lateFeeAccrualAmount != null && selectedProperty.lateFeeAccrualType != null && selectedProperty.lateFeeAccrualPeriod != null
+  const propCapSet     = !!selectedProperty && selectedProperty.lateFeeCapAmount != null && selectedProperty.lateFeeCapType != null
+  const matchesPropertyAccrual = !!selectedProperty &&
+    form.lateFeeAccrualEnabled === propAccrualSet &&
+    (!form.lateFeeAccrualEnabled || (
+      Number(form.lateFeeAccrualAmount) === Number(selectedProperty.lateFeeAccrualAmount) &&
+      form.lateFeeAccrualType === selectedProperty.lateFeeAccrualType &&
+      form.lateFeeAccrualPeriod === selectedProperty.lateFeeAccrualPeriod
+    ))
+  const matchesPropertyCap = !!selectedProperty &&
+    form.lateFeeCapEnabled === propCapSet &&
+    (!form.lateFeeCapEnabled || (
+      Number(form.lateFeeCapAmount) === Number(selectedProperty.lateFeeCapAmount) &&
+      form.lateFeeCapType === selectedProperty.lateFeeCapType
+    ))
 
   // Hydrate form when existing lease loads
   useEffect(() => {
@@ -81,8 +177,18 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
         autoRenewMode: existingLease.autoRenewMode || 'extend_same_term',
         noticeDaysRequired: String(existingLease.noticeDaysRequired ?? 30),
         expirationNoticeDays: String(existingLease.expirationNoticeDays ?? 60),
+        lateFeeEnabled: existingLease.lateFeeEnabled !== false,
         lateFeeGraceDays: String(existingLease.lateFeeGraceDays ?? 5),
         lateFeeInitialAmount: existingLease.lateFeeInitialAmount != null ? String(existingLease.lateFeeInitialAmount) : '15.00',
+        lateFeeInitialType: (existingLease.lateFeeInitialType === 'percent_of_rent' ? 'percent_of_rent' : 'flat'),
+        // S226: hydrate accrual + cap from the existing lease.
+        lateFeeAccrualEnabled: existingLease.lateFeeAccrualAmount != null && existingLease.lateFeeAccrualType != null && existingLease.lateFeeAccrualPeriod != null,
+        lateFeeAccrualAmount: existingLease.lateFeeAccrualAmount != null ? String(existingLease.lateFeeAccrualAmount) : '5.00',
+        lateFeeAccrualType:   (existingLease.lateFeeAccrualType === 'percent_of_rent' ? 'percent_of_rent' : 'flat'),
+        lateFeeAccrualPeriod: (['daily','weekly','monthly'].includes(existingLease.lateFeeAccrualPeriod) ? existingLease.lateFeeAccrualPeriod : 'daily'),
+        lateFeeCapEnabled: existingLease.lateFeeCapAmount != null && existingLease.lateFeeCapType != null,
+        lateFeeCapAmount: existingLease.lateFeeCapAmount != null ? String(existingLease.lateFeeCapAmount) : '50.00',
+        lateFeeCapType:   (existingLease.lateFeeCapType === 'percent_of_rent' ? 'percent_of_rent' : 'flat'),
         status: existingLease.status || 'pending',
       })
     }
@@ -115,6 +221,39 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
     }
   )
 
+  // S201: 409 from PATCH with material_change_requires_new_lease or
+  // addendum_confirmation_required. Surface lives in the modal below
+  // the form fields. State holds the change list returned by the
+  // server so the user sees exactly what they're confirming.
+  const [pendingConfirm, setPendingConfirm] = useState<{
+    kind: 'material' | 'addendum'
+    message: string
+    changes: Array<{ field: string; from: string; to: string }>
+    payload: any
+  } | null>(null)
+
+  // S202: humanize backend snake_case field names for the diff.
+  const FIELD_LABEL: Record<string, string> = {
+    rent_amount:            'Monthly rent',
+    start_date:             'Start date',
+    end_date:               'End date',
+    lease_type:             'Lease type',
+    auto_renew:             'Auto-renew',
+    auto_renew_mode:        'Auto-renew mode',
+    late_fee_grace_days:    'Late fee grace days',
+    late_fee_initial_amount:'Late fee amount',
+    late_fee_initial_type:  'Late fee type',
+    late_fee_enabled:       'Late fees enabled',
+    late_fee_accrual_amount:'Recurring accrual amount',
+    late_fee_accrual_type:  'Recurring accrual type',
+    late_fee_accrual_period:'Recurring accrual period',
+    late_fee_cap_amount:    'Maximum cap amount',
+    late_fee_cap_type:      'Maximum cap type',
+    notice_days_required:   'Notice days required',
+    expiration_notice_days: 'Expiration notice days',
+    security_deposit:       'Security deposit',
+  }
+
   const updateMut = useMutation(
     (data: any) => apiPatch('/leases/' + leaseId, data),
     {
@@ -122,10 +261,33 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
         qc.invalidateQueries('leases')
         qc.invalidateQueries(['lease', leaseId])
         qc.invalidateQueries('units')
+        setPendingConfirm(null)
         onClose()
       },
       onError: (err: any) => {
-        setSubmitError(err?.response?.data?.message || err?.message || 'Failed to update lease')
+        const data = err?.response?.data
+        if (data?.error === 'material_change_requires_new_lease') {
+          setPendingConfirm({
+            kind: 'material',
+            message: data.message,
+            changes: data.changes ?? [],
+            payload: null,
+          })
+          setSubmitError('')
+          return
+        }
+        if (data?.error === 'addendum_confirmation_required') {
+          setPendingConfirm({
+            kind: 'addendum',
+            message: data.message,
+            changes: data.changes ?? [],
+            // Stash the original payload so retry can re-send with confirmAddendum.
+            payload: err?.config?.data ? JSON.parse(err.config.data) : null,
+          })
+          setSubmitError('')
+          return
+        }
+        setSubmitError(data?.message || err?.message || 'Failed to update lease')
       }
     }
   )
@@ -164,8 +326,18 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
       autoRenewMode: form.autoRenew ? form.autoRenewMode : null,
       noticeDaysRequired: Number(form.noticeDaysRequired) || 30,
       expirationNoticeDays: Number(form.expirationNoticeDays) || 60,
+      lateFeeEnabled: form.lateFeeEnabled,
       lateFeeGraceDays: Number(form.lateFeeGraceDays) || 0,
       lateFeeInitialAmount: Number(form.lateFeeInitialAmount) || 0,
+      lateFeeInitialType: form.lateFeeInitialType,
+      // S226: accrual + cap. Toggle off → null the columns; toggle on
+      // → send the parsed group. Server-side cross-field validation
+      // also enforces all-or-nothing.
+      lateFeeAccrualAmount: form.lateFeeAccrualEnabled ? Number(form.lateFeeAccrualAmount) || 0 : null,
+      lateFeeAccrualType:   form.lateFeeAccrualEnabled ? form.lateFeeAccrualType   : null,
+      lateFeeAccrualPeriod: form.lateFeeAccrualEnabled ? form.lateFeeAccrualPeriod : null,
+      lateFeeCapAmount:     form.lateFeeCapEnabled     ? Number(form.lateFeeCapAmount) || 0 : null,
+      lateFeeCapType:       form.lateFeeCapEnabled     ? form.lateFeeCapType         : null,
     }
 
     if (isEdit) {
@@ -241,7 +413,7 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
             <select
               className="input"
               value={form.unitId}
-              onChange={e => set('unit_id', e.target.value)}
+              onChange={e => set('unitId', e.target.value)}
               disabled={isEdit}
               style={{ width: '100%' }}
             >
@@ -260,7 +432,7 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
             <select
               className="input"
               value={form.tenantId}
-              onChange={e => set('tenant_id', e.target.value)}
+              onChange={e => set('tenantId', e.target.value)}
               disabled={isEdit}
               style={{ width: '100%' }}
             >
@@ -282,7 +454,7 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
             <select
               className="input"
               value={form.leaseType}
-              onChange={e => set('lease_type', e.target.value)}
+              onChange={e => set('leaseType', e.target.value)}
               style={{ width: '100%' }}
             >
               {(Object.keys(LEASE_TYPE_LABEL) as LeaseType[]).map(k => (
@@ -298,7 +470,7 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
                 className="input"
                 type="date"
                 value={form.startDate}
-                onChange={e => set('start_date', e.target.value)}
+                onChange={e => set('startDate', e.target.value)}
                 style={{ width: '100%' }}
               />
               {errors.startDate && <div style={{ color: 'var(--red)', fontSize: '.72rem', marginTop: 4 }}>{errors.startDate}</div>}
@@ -311,7 +483,7 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
                 className="input"
                 type="date"
                 value={form.endDate}
-                onChange={e => set('end_date', e.target.value)}
+                onChange={e => set('endDate', e.target.value)}
                 disabled={form.leaseType === 'month_to_month'}
                 style={{ width: '100%' }}
                 placeholder={form.leaseType === 'month_to_month' ? 'N/A' : ''}
@@ -356,7 +528,7 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
                   step="0.01"
                   placeholder="0.00"
                   value={form.rentAmount}
-                  onChange={e => set('rent_amount', e.target.value)}
+                  onChange={e => set('rentAmount', e.target.value)}
                   style={{ width: '100%', paddingLeft: 30 }}
                 />
               </div>
@@ -372,7 +544,7 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
                   step="0.01"
                   placeholder="0.00"
                   value={form.securityDeposit}
-                  onChange={e => set('security_deposit', e.target.value)}
+                  onChange={e => set('securityDeposit', e.target.value)}
                   style={{ width: '100%', paddingLeft: 30 }}
                 />
               </div>
@@ -388,7 +560,7 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
               <input
                 type="checkbox"
                 checked={form.autoRenew}
-                onChange={e => set('auto_renew', e.target.checked)}
+                onChange={e => set('autoRenew', e.target.checked)}
                 style={{ width: 16, height: 16, cursor: 'pointer' }}
               />
               <span style={{ fontSize: '.82rem', color: 'var(--text-1)', fontWeight: 500 }}>Enable auto-renew</span>
@@ -403,12 +575,11 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
               <label style={LABEL_STYLE}>Auto-Renew Mode</label>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                 {[
-                  { value: 'extend_same_term', label: 'Extend same term', desc: 'Add another term of the same length (e.g. a 12-month lease extends by 12 months)' },
-                  { value: 'convert_to_month_to_month', label: 'Convert to month-to-month', desc: 'Switch to month-to-month with no fixed end date' },
+                  ...AUTO_RENEW_MODES.map(value => ({ value, label: AUTO_RENEW_MODE_LABEL[value], desc: AUTO_RENEW_MODE_DESC[value] })),
                 ].map(opt => (
                   <div
                     key={opt.value}
-                    onClick={() => set('auto_renew_mode', opt.value)}
+                    onClick={() => set('autoRenewMode', opt.value)}
                     style={{
                       padding: '10px 12px',
                       borderRadius: 8,
@@ -436,7 +607,7 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
                 type="number"
                 min="0"
                 value={form.noticeDaysRequired}
-                onChange={e => set('notice_days_required', e.target.value)}
+                onChange={e => set('noticeDaysRequired', e.target.value)}
                 style={{ width: '100%' }}
               />
               <div style={{ fontSize: '.65rem', color: 'var(--text-3)', marginTop: 3 }}>
@@ -450,7 +621,7 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
                 type="number"
                 min="0"
                 value={form.expirationNoticeDays}
-                onChange={e => set('expiration_notice_days', e.target.value)}
+                onChange={e => set('expirationNoticeDays', e.target.value)}
                 style={{ width: '100%' }}
               />
               <div style={{ fontSize: '.65rem', color: 'var(--text-3)', marginTop: 3 }}>
@@ -459,23 +630,54 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
             </div>
           </div>
 
-          {/* LATE FEES */}
+          {/* LATE FEES — S224: 4 fields (enabled + grace + amount + type),
+              with "(from property)" hints when value matches property default. */}
           <div style={SECTION_HEADER_STYLE}>Late Fees</div>
 
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 14 }}>
+          <div style={{ marginBottom: 12 }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer' }}>
+              <input
+                type="checkbox"
+                checked={form.lateFeeEnabled}
+                onChange={e => set('lateFeeEnabled', e.target.checked)}
+                style={{ width: 16, height: 16, cursor: 'pointer' }}
+              />
+              <span style={{ fontSize: '.82rem', color: 'var(--text-1)', fontWeight: 500 }}>Late fees enabled</span>
+              {matchesPropertyEnabled && (
+                <span style={{ fontSize: '.65rem', color: 'var(--text-3)', fontStyle: 'italic' }}>(from property)</span>
+              )}
+            </label>
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12, marginBottom: 14, opacity: form.lateFeeEnabled ? 1 : 0.5 }}>
             <div>
-              <label style={LABEL_STYLE}>Grace Period (Days)</label>
+              <label style={LABEL_STYLE}>
+                Grace Period (Days)
+                {matchesPropertyGrace && form.lateFeeEnabled && (
+                  <span style={{ marginLeft: 6, fontWeight: 400, textTransform: 'none', letterSpacing: 0, color: 'var(--text-3)', fontStyle: 'italic' }}>
+                    (from property)
+                  </span>
+                )}
+              </label>
               <input
                 className="input"
                 type="number"
                 min="0"
                 value={form.lateFeeGraceDays}
-                onChange={e => set('late_fee_grace_days', e.target.value)}
+                onChange={e => set('lateFeeGraceDays', e.target.value)}
+                disabled={!form.lateFeeEnabled}
                 style={{ width: '100%' }}
               />
             </div>
             <div>
-              <label style={LABEL_STYLE}>Late Fee Amount</label>
+              <label style={LABEL_STYLE}>
+                Late Fee Amount
+                {matchesPropertyAmount && form.lateFeeEnabled && (
+                  <span style={{ marginLeft: 6, fontWeight: 400, textTransform: 'none', letterSpacing: 0, color: 'var(--text-3)', fontStyle: 'italic' }}>
+                    (from property)
+                  </span>
+                )}
+              </label>
               <div style={{ position: 'relative' }}>
                 <DollarSign size={14} style={{ position: 'absolute', left: 11, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-3)' }} />
                 <input
@@ -483,11 +685,146 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
                   type="number"
                   step="0.01"
                   value={form.lateFeeInitialAmount}
-                  onChange={e => set('late_fee_initial_amount', e.target.value)}
+                  onChange={e => set('lateFeeInitialAmount', e.target.value)}
+                  disabled={!form.lateFeeEnabled}
                   style={{ width: '100%', paddingLeft: 30 }}
                 />
               </div>
             </div>
+            <div>
+              <label style={LABEL_STYLE}>
+                Fee Type
+                {matchesPropertyType && form.lateFeeEnabled && (
+                  <span style={{ marginLeft: 6, fontWeight: 400, textTransform: 'none', letterSpacing: 0, color: 'var(--text-3)', fontStyle: 'italic' }}>
+                    (from property)
+                  </span>
+                )}
+              </label>
+              <select
+                className="input"
+                value={form.lateFeeInitialType}
+                onChange={e => set('lateFeeInitialType', e.target.value as 'flat' | 'percent_of_rent')}
+                disabled={!form.lateFeeEnabled}
+                style={{ width: '100%' }}
+              >
+                <option value="flat">Flat $</option>
+                <option value="percent_of_rent">% of rent</option>
+              </select>
+            </div>
+          </div>
+
+          {/* S226: recurring accrual toggle + 3 inputs. Disabled when
+              parent late-fee toggle is off. */}
+          <div style={{ marginTop: 4, marginBottom: 12, opacity: form.lateFeeEnabled ? 1 : 0.4 }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: form.lateFeeEnabled ? 'pointer' : 'not-allowed' }}>
+              <input
+                type="checkbox"
+                checked={form.lateFeeAccrualEnabled}
+                disabled={!form.lateFeeEnabled}
+                onChange={e => set('lateFeeAccrualEnabled', e.target.checked)}
+                style={{ width: 16, height: 16, cursor: form.lateFeeEnabled ? 'pointer' : 'not-allowed' }}
+              />
+              <span style={{ fontSize: '.78rem', color: 'var(--text-1)', fontWeight: 600 }}>Recurring accrual</span>
+              <span style={{ fontSize: '.68rem', color: 'var(--text-3)' }}>(continues to add up after the initial fee)</span>
+              {matchesPropertyAccrual && (
+                <span style={{ fontSize: '.65rem', color: 'var(--text-3)', fontStyle: 'italic' }}>(from property)</span>
+              )}
+            </label>
+            {form.lateFeeAccrualEnabled && form.lateFeeEnabled && (
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12, marginTop: 8 }}>
+                <div>
+                  <label style={LABEL_STYLE}>Amount per period</label>
+                  <div style={{ position: 'relative' }}>
+                    <DollarSign size={14} style={{ position: 'absolute', left: 11, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-3)' }} />
+                    <input
+                      className="input"
+                      type="number"
+                      step="0.01"
+                      min="0"
+                      value={form.lateFeeAccrualAmount}
+                      onChange={e => set('lateFeeAccrualAmount', e.target.value)}
+                      style={{ width: '100%', paddingLeft: 30 }}
+                    />
+                  </div>
+                </div>
+                <div>
+                  <label style={LABEL_STYLE}>Type</label>
+                  <select
+                    className="input"
+                    value={form.lateFeeAccrualType}
+                    onChange={e => set('lateFeeAccrualType', e.target.value as 'flat' | 'percent_of_rent')}
+                    style={{ width: '100%' }}
+                  >
+                    <option value="flat">Flat $</option>
+                    <option value="percent_of_rent">% of rent</option>
+                  </select>
+                </div>
+                <div>
+                  <label style={LABEL_STYLE}>Period</label>
+                  <select
+                    className="input"
+                    value={form.lateFeeAccrualPeriod}
+                    onChange={e => set('lateFeeAccrualPeriod', e.target.value as 'daily' | 'weekly' | 'monthly')}
+                    style={{ width: '100%' }}
+                  >
+                    <option value="daily">Daily</option>
+                    <option value="weekly">Weekly</option>
+                    <option value="monthly">Monthly</option>
+                  </select>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* S226: maximum cap toggle + 2 inputs. Cap-edge writes a
+              partial row of exactly the remaining amount, then stops
+              (locked S26b decision). Independent of accrual. */}
+          <div style={{ marginBottom: 14, opacity: form.lateFeeEnabled ? 1 : 0.4 }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: form.lateFeeEnabled ? 'pointer' : 'not-allowed' }}>
+              <input
+                type="checkbox"
+                checked={form.lateFeeCapEnabled}
+                disabled={!form.lateFeeEnabled}
+                onChange={e => set('lateFeeCapEnabled', e.target.checked)}
+                style={{ width: 16, height: 16, cursor: form.lateFeeEnabled ? 'pointer' : 'not-allowed' }}
+              />
+              <span style={{ fontSize: '.78rem', color: 'var(--text-1)', fontWeight: 600 }}>Maximum cap</span>
+              <span style={{ fontSize: '.68rem', color: 'var(--text-3)' }}>(total late fees per invoice cannot exceed this)</span>
+              {matchesPropertyCap && (
+                <span style={{ fontSize: '.65rem', color: 'var(--text-3)', fontStyle: 'italic' }}>(from property)</span>
+              )}
+            </label>
+            {form.lateFeeCapEnabled && form.lateFeeEnabled && (
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginTop: 8 }}>
+                <div>
+                  <label style={LABEL_STYLE}>Cap amount</label>
+                  <div style={{ position: 'relative' }}>
+                    <DollarSign size={14} style={{ position: 'absolute', left: 11, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-3)' }} />
+                    <input
+                      className="input"
+                      type="number"
+                      step="0.01"
+                      min="0"
+                      value={form.lateFeeCapAmount}
+                      onChange={e => set('lateFeeCapAmount', e.target.value)}
+                      style={{ width: '100%', paddingLeft: 30 }}
+                    />
+                  </div>
+                </div>
+                <div>
+                  <label style={LABEL_STYLE}>Cap type</label>
+                  <select
+                    className="input"
+                    value={form.lateFeeCapType}
+                    onChange={e => set('lateFeeCapType', e.target.value as 'flat' | 'percent_of_rent')}
+                    style={{ width: '100%' }}
+                  >
+                    <option value="flat">Flat $</option>
+                    <option value="percent_of_rent">% of rent</option>
+                  </select>
+                </div>
+              </div>
+            )}
           </div>
 
           {/* DISCLAIMER */}
@@ -505,6 +842,14 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
             Legal notice requirements, auto-renewal rules, and late fee limits vary by jurisdiction. GAM does not provide legal advice — please check your local laws to ensure compliance.
           </div>
 
+          {/* S211: addendum history — landlord parity with the tenant
+              LeasePage section shipped S210. Surfaces past non-material
+              edits recorded against this lease. Edit-mode only; renders
+              nothing when no addendums exist. */}
+          {isEdit && leaseId && (
+            <AddendumHistorySection leaseId={leaseId} />
+          )}
+
           {submitError && (
             <div className="alert alert-danger" style={{ marginTop: 12, fontSize: '.78rem' }}>
               {submitError}
@@ -520,6 +865,180 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
           </button>
         </div>
       </div>
+
+      {/* S201: confirmation overlay for material vs non-material edits. */}
+      {pendingConfirm && (
+        <div
+          style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.7)', zIndex: 1100, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 }}
+          onClick={() => setPendingConfirm(null)}
+        >
+          <div className="card" style={{ width: 520, maxWidth: '92vw', padding: 20 }} onClick={e => e.stopPropagation()}>
+            <h3 style={{ marginBottom: 10 }}>
+              {pendingConfirm.kind === 'material' ? 'New lease required' : 'Addendum confirmation'}
+            </h3>
+            <div style={{ fontSize: '.85rem', color: 'var(--text-2)', marginBottom: 14, lineHeight: 1.55 }}>
+              {pendingConfirm.message}
+            </div>
+
+            <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-0)', borderRadius: 8, padding: 10, marginBottom: 14 }}>
+              <div style={{ fontSize: '.7rem', fontWeight: 700, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.05em', marginBottom: 6 }}>
+                Changes
+              </div>
+              {pendingConfirm.changes.map(c => (
+                <div key={c.field} style={{ display: 'flex', gap: 8, fontSize: '.8rem', padding: '3px 0', alignItems: 'baseline' }}>
+                  <span style={{ flex: '0 0 180px', color: 'var(--text-2)' }}>{FIELD_LABEL[c.field] ?? c.field}</span>
+                  <span style={{ color: 'var(--text-3)' }}>{c.from || '—'}</span>
+                  <span style={{ color: 'var(--text-3)' }}>→</span>
+                  <span style={{ color: 'var(--text-0)', fontWeight: 600 }}>{c.to || '—'}</span>
+                </div>
+              ))}
+            </div>
+
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+              <button className="btn btn-ghost" onClick={() => setPendingConfirm(null)}>Cancel</button>
+              {pendingConfirm.kind === 'addendum' ? (
+                <button
+                  className="btn btn-primary"
+                  onClick={() => {
+                    if (pendingConfirm.payload) {
+                      updateMut.mutate({ ...pendingConfirm.payload, confirmAddendum: true })
+                    }
+                  }}
+                  disabled={updateMut.isLoading}
+                >
+                  {updateMut.isLoading ? <span className="spinner" /> : 'Confirm — record addendum'}
+                </button>
+              ) : (
+                // Material — no in-place confirm path; landlord must use new-lease workflow.
+                <button className="btn btn-primary" disabled>
+                  Use Tenant Onboarding
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── ADDENDUM HISTORY (S211 — landlord-side parity with S210 tenant view) ──
+// S212: field-label + money-formatting moved to @gam/shared so the
+// API PDF generator + tenant surface read the same map.
+// S213: pdf_filename → "View PDF" link, served via
+// /api/leases/:id/addendum-pdf/:filename. Browser <a> can't carry
+// the Bearer token, so the click handler fetches with auth and
+// opens a blob URL in a new tab.
+type AddendumChange = { field: string; from: string; to: string }
+type AddendumEvent  = {
+  id:                  string
+  occurredAt:          string
+  changes:             AddendumChange[]
+  tenantIds:           string[]
+  tenantNames:         string[]
+  recordedByUserId:    string | null
+  recordedByName:      string
+  recordedByRole:      'owner' | 'gam_admin' | 'pm' | 'team' | 'unknown'
+  recordedByRoleLabel: string
+  pdfFilename:         string | null
+}
+
+const ADDENDUM_API_BASE = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
+
+async function openLandlordAddendumPdf(leaseId: string, filename: string) {
+  const token = localStorage.getItem('gam_token') || ''
+  const res = await fetch(`${ADDENDUM_API_BASE}/api/leases/${leaseId}/addendum-pdf/${filename}`, {
+    headers: { Authorization: 'Bearer ' + token },
+  })
+  if (!res.ok) {
+    alert('Could not load PDF (status ' + res.status + ')')
+    return
+  }
+  const blob = await res.blob()
+  window.open(URL.createObjectURL(blob), '_blank')
+}
+
+function AddendumHistorySection({ leaseId }: { leaseId: string }) {
+  const { data, isLoading } = useQuery(
+    ['lease-addendums', leaseId],
+    () => apiGet('/leases/' + leaseId + '/addendums')
+  )
+  const addendums: AddendumEvent[] = (data as AddendumEvent[] | undefined) ?? []
+
+  if (isLoading || addendums.length === 0) return null
+
+  return (
+    <div style={{
+      marginTop: 12,
+      padding: 14,
+      background: 'var(--bg-2)',
+      border: '1px solid var(--border-0)',
+      borderRadius: 8,
+    }}>
+      <div style={{
+        fontSize: '.7rem',
+        fontWeight: 700,
+        color: 'var(--text-3)',
+        textTransform: 'uppercase',
+        letterSpacing: '.07em',
+        marginBottom: 10,
+      }}>
+        Addendum History ({addendums.length})
+      </div>
+      <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginBottom: 12 }}>
+        Past non-material edits recorded against this lease. Each row is part of the tenants' tenancy record.
+      </div>
+      {addendums.map(a => (
+        <div key={a.id} style={{ padding: '8px 0', borderBottom: '1px solid var(--border-0)' }}>
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 4, flexWrap: 'wrap' }}>
+            <span style={{ fontSize: '.76rem', fontWeight: 600, color: 'var(--text-0)' }}>
+              {new Date(a.occurredAt).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })}
+            </span>
+            <span style={{ fontSize: '.65rem', color: 'var(--text-3)' }}>
+              {new Date(a.occurredAt).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })}
+            </span>
+            {a.pdfFilename && (
+              <button
+                onClick={() => openLandlordAddendumPdf(leaseId, a.pdfFilename!)}
+                style={{ marginLeft: 'auto', fontSize: '.66rem', padding: '2px 8px', background: 'transparent', border: '1px solid var(--gold)', color: 'var(--gold)', borderRadius: 4, cursor: 'pointer' }}>
+                View PDF
+              </button>
+            )}
+          </div>
+          <div style={{ fontSize: '.66rem', color: 'var(--text-3)', marginBottom: 6, display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+            <span>Recorded by <span style={{ color: 'var(--text-2)', fontWeight: 600 }}>{a.recordedByName}</span></span>
+            <span>· {a.recordedByRoleLabel}</span>
+            <span>· On record for {a.tenantNames.length > 0 ? a.tenantNames.join(', ') : '(no active tenants)'}</span>
+          </div>
+          <div style={{ display: 'grid', gap: 4 }}>
+            {(a.changes ?? []).map((c, i) => (
+              <div key={i} style={{
+                fontSize: '.72rem',
+                color: 'var(--text-2)',
+                display: 'flex',
+                flexWrap: 'wrap',
+                gap: 6,
+                alignItems: 'baseline',
+              }}>
+                <span style={{ fontWeight: 600, color: 'var(--text-1)' }}>
+                  {ADDENDUM_DIFF_FIELD_LABEL[c.field] ?? c.field}
+                </span>
+                <span style={{ color: 'var(--text-3)', fontFamily: 'var(--font-m, monospace)' }}>
+                  {formatAddendumDiffValue(c.field, c.from)}
+                </span>
+                <span style={{ color: 'var(--text-3)' }}>→</span>
+                <span style={{
+                  color: 'var(--gold)',
+                  fontFamily: 'var(--font-m, monospace)',
+                  fontWeight: 600,
+                }}>
+                  {formatAddendumDiffValue(c.field, c.to)}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
     </div>
   )
 }

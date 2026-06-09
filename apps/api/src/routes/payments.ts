@@ -1,9 +1,13 @@
 import { Router } from 'express'
 import { z } from 'zod'
 import { query, queryOne } from '../db'
-import { requireAuth, requireLandlord, requireAdmin } from '../middleware/auth'
+import { requireAuth, requireAdmin } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { AchReturnCode, ACH_RETURN_CONFIG, PLATFORM_FEES } from '@gam/shared'
+import { getStripe } from '../lib/stripe'
+import { computeApplicationFee, createRentDestinationCharge, createRentPlatformCharge } from '../services/stripeConnect'
+import { createAdminNotification } from '../services/adminNotifications'
+import { computeTenantGamOutstandingTotal } from '../services/supersedence'
 
 export const paymentsRouter = Router()
 paymentsRouter.use(requireAuth)
@@ -17,11 +21,30 @@ paymentsRouter.get('/', async (req, res, next) => {
     const params: any[] = []
     let pi = 1
 
-    if (req.user!.role === 'landlord') {
+    const role = req.user!.role
+    const isAdmin = role === 'admin' || role === 'super_admin'
+    const isTeamRole = role === 'property_manager' || role === 'onsite_manager' || role === 'maintenance'
+    if (role === 'landlord') {
       conditions.push(`p.landlord_id = $${pi++}`); params.push(req.user!.profileId)
-    } else if (req.user!.role === 'tenant') {
+    } else if (role === 'tenant') {
       conditions.push(`p.tenant_id = $${pi++}`); params.push(req.user!.profileId)
+    } else if (isTeamRole) {
+      // Team members scoped to their landlord; without a landlordId claim,
+      // return nothing rather than leak across landlords. S81: also gate
+      // on payments.view_all sub-perm — onsite/maintenance without explicit
+      // permission do not see the landlord's payments roster.
+      if (!req.user!.landlordId) {
+        return res.json({ success: true, data: [], total: 0, page: 1, totalPages: 0 })
+      }
+      if (req.user!.permissions?.['payments.view_all'] !== true) {
+        return res.json({ success: true, data: [], total: 0, page: 1, totalPages: 0 })
+      }
+      conditions.push(`p.landlord_id = $${pi++}`); params.push(req.user!.landlordId)
+    } else if (!isAdmin) {
+      // Unknown role with no scope — empty rather than leak.
+      return res.json({ success: true, data: [], total: 0, page: 1, totalPages: 0 })
     }
+    // admin/super_admin fall through with no role-based filter (full visibility).
     if (status)  { conditions.push(`p.status = $${pi++}`);       params.push(status) }
     if (type)    { conditions.push(`p.type = $${pi++}`);         params.push(type) }
     if (from)    { conditions.push(`p.due_date >= $${pi++}`);    params.push(from) }
@@ -56,11 +79,12 @@ paymentsRouter.post('/initiate-rent-collection', requireAdmin, async (req, res, 
       targetMonth: z.string().regex(/^\d{4}-\d{2}$/) // YYYY-MM
     }).parse(req.body)
 
-    // Get all active units with verified ACH
+    // Get all active units with verified ACH whose landlord has at least one
+    // active bank account in the user_bank_accounts catalog. Pre-S67 the
+    // gate was l.stripe_account_id (Connect-flavored, deleted in S67).
     const units = await query<any>(`
       SELECT u.*, t.stripe_customer_id, t.ach_verified, t.on_time_pay_enrolled,
-        t.float_fee_active, t.income_arrival_day, t.id AS tenant_profile_id,
-        l.stripe_account_id
+        t.float_fee_active, t.income_arrival_day, t.id AS tenant_profile_id
       FROM units u
       JOIN v_unit_occupancy vuo ON vuo.unit_id = u.id
       JOIN tenants t ON t.id = vuo.primary_tenant_id
@@ -68,7 +92,10 @@ paymentsRouter.post('/initiate-rent-collection', requireAdmin, async (req, res, 
       WHERE u.status = 'active'
         AND u.payment_block = FALSE
         AND t.ach_verified = TRUE
-        AND l.stripe_account_id IS NOT NULL
+        AND EXISTS (
+          SELECT 1 FROM user_bank_accounts ba
+           WHERE ba.user_id = l.user_id AND ba.status = 'active'
+        )
     `)
 
     const [year, month] = targetMonth.split('-').map(Number)
@@ -77,12 +104,36 @@ paymentsRouter.post('/initiate-rent-collection', requireAdmin, async (req, res, 
     let initiated = 0
     const errors: string[] = []
 
+    let skipped = 0
     for (const unit of units) {
       try {
         // Determine pull date based on On-Time Pay enrollment
         const pullDay = unit.on_time_pay_enrolled && unit.income_arrival_day
           ? unit.income_arrival_day  // SSI/SSDI: pull on income arrival day
           : 28                       // Standard: pull ~28th for 1st settlement
+
+        // S407 idempotency guard: pre-fix, calling this route twice for the
+        // same targetMonth created DUPLICATE rent payment rows for every
+        // unit (no UNIQUE constraint on payments(unit_id, type, due_date),
+        // and the route loop INSERT'd unconditionally). A scheduler
+        // misfire / admin double-click would double-bill every tenant.
+        // Skip silently when an active rent row already exists for this
+        // (unit, due_date). S414: the residual concurrent-write race is
+        // now also closed by the partial UNIQUE index
+        // ux_payments_unit_type_due_date_active.
+        // S414 status filter: only skip when an ACTIVE (non-failed,
+        // non-returned) row exists. Failed/returned rows are retry-
+        // eligible — the system should be able to re-bill that month.
+        const existing = await queryOne<{ id: string }>(
+          `SELECT id FROM payments
+            WHERE unit_id = $1
+              AND type = 'rent'
+              AND due_date = $2
+              AND status NOT IN ('failed', 'returned')
+            LIMIT 1`,
+          [unit.id, dueDate]
+        )
+        if (existing) { skipped++; continue }
 
         const [payment] = await query<any>(`
           INSERT INTO payments
@@ -110,62 +161,8 @@ paymentsRouter.post('/initiate-rent-collection', requireAdmin, async (req, res, 
 
     res.json({
       success: true,
-      data: { initiated, errors, targetMonth }
+      data: { initiated, skipped, errors, targetMonth }
     })
-  } catch (e) { next(e) }
-})
-
-// POST /api/payments/initiate-disbursements — On-Time Pay SLA
-// Disbursement SLA: initiated on or before 1st business day of month
-// Platform fulfills from operational reserve if tenant hasn't settled yet
-paymentsRouter.post('/initiate-disbursements', requireAdmin, async (req, res, next) => {
-  try {
-    const { targetDate } = z.object({
-      targetDate: z.string()
-    }).parse(req.body)
-
-    // Get all landlords with active units
-    const landlords = await query<any>(`
-      SELECT l.id, l.stripe_account_id,
-        SUM(u.rent_amount) AS total_rent,
-        COUNT(u.id)::int AS unit_count,
-        COALESCE(SUM(CASE WHEN p.status = 'settled' THEN p.amount ELSE 0 END), 0) AS collected,
-        COALESCE(SUM(CASE WHEN p.status != 'settled' THEN p.amount ELSE 0 END), 0) AS uncollected
-      FROM landlords l
-      JOIN units u ON u.landlord_id = l.id AND u.status = 'active' AND u.payment_block = FALSE
-      LEFT JOIN payments p ON p.landlord_id = l.id AND p.type = 'rent'
-        AND p.due_date = $1
-      WHERE l.stripe_account_id IS NOT NULL
-      GROUP BY l.id, l.stripe_account_id`,
-      [targetDate]
-    )
-
-    let disbursed = 0
-    for (const landlord of landlords) {
-      const fromReserve = landlord.uncollected > 0
-      const [disb] = await query<any>(`
-        INSERT INTO disbursements
-          (landlord_id, amount, unit_count, status, from_reserve, reserve_amount, target_date)
-        VALUES ($1,$2,$3,'pending',$4,$5,$6)
-        RETURNING id`,
-        [landlord.id, landlord.total_rent, landlord.unit_count,
-         fromReserve, fromReserve ? landlord.uncollected : 0, targetDate]
-      )
-      if (fromReserve) {
-        // Log reserve drawdown
-        await query(`
-          INSERT INTO reserve_fund_ledger (type, amount, balance_after, reference_id, notes)
-          SELECT 'disbursement_cover', -$1, balance - $1, $2, 'On-Time Pay SLA fulfillment'
-          FROM reserve_fund_state LIMIT 1`,
-          [landlord.uncollected, disb.id]
-        )
-        await query(`UPDATE reserve_fund_state SET balance = balance - $1`, [landlord.uncollected])
-      }
-      disbursed++
-    }
-
-    res.json({ success: true, data: { disbursed, targetDate,
-      message: 'Disbursements initiated per On-Time Pay SLA' } })
   } catch (e) { next(e) }
 })
 
@@ -214,5 +211,243 @@ paymentsRouter.post('/:id/handle-return', requireAdmin, async (req, res, next) =
       zeroTolerance: config.zeroTolerance,
       action: config.zeroTolerance ? 'Tenant ACH suspended — manual review required' : 'Return logged — retry eligible'
     }})
+  } catch (e) { next(e) }
+})
+
+// POST /api/payments/:id/pay — tenant initiates a destination charge for
+// a pending rent payment row. (S117 — Stripe Connect destination charge
+// model. Replaces the pre-Connect "tenant has no way to pay" gap.)
+//
+// Flow:
+//   1. Tenant POSTs with their saved Stripe payment_method_id +
+//      payment_method_type ('ach' or 'card')
+//   2. Backend validates the payment row belongs to this tenant
+//   3. Looks up the landlord's stripe_connect_account_id
+//   4. Computes application_fee_amount via computeApplicationFee
+//   5. Creates a destination charge — Stripe routes gross to landlord's
+//      Connect, application_fee_amount to GAM's platform balance
+//   6. Stamps stripe_payment_intent_id on the payment row, status →
+//      'processing'
+//   7. Webhook payment_intent.succeeded later flips to 'settled' and
+//      runs allocation engine for the audit trail
+paymentsRouter.post('/:id/pay', async (req: any, res, next) => {
+  try {
+    const body = z.object({
+      paymentMethodId:   z.string().min(1),
+      paymentMethodType: z.enum(['ach', 'card']),
+    }).parse(req.body)
+
+    if (req.user!.role !== 'tenant') {
+      throw new AppError(403, 'Only tenants can call this endpoint')
+    }
+
+    // Fetch payment + verify ownership + status. S160+ cached Connect
+    // readiness flags on users let us decide destination-vs-platform charge
+    // without a live Stripe round-trip.
+    const pmt = await queryOne<any>(
+      `SELECT p.id, p.tenant_id, p.landlord_id, p.amount, p.status, p.type,
+              p.entry_description, p.stripe_payment_intent_id, p.unit_id,
+              p.due_date::text AS due_date,
+              u.property_id,
+              t.stripe_customer_id,
+              l.user_id AS landlord_user_id,
+              lu.stripe_connect_account_id,
+              lu.connect_charges_enabled,
+              lu.connect_details_submitted
+         FROM payments p
+         JOIN units u ON u.id = p.unit_id
+         JOIN tenants t ON t.id = p.tenant_id
+         JOIN landlords l ON l.id = p.landlord_id
+         JOIN users lu ON lu.id = l.user_id
+        WHERE p.id = $1`,
+      [req.params.id]
+    )
+    if (!pmt) throw new AppError(404, 'Payment not found')
+    if (pmt.tenant_id !== req.user!.profileId) {
+      throw new AppError(403, 'Not your payment')
+    }
+    if (pmt.status === 'settled') {
+      throw new AppError(409, 'Payment already settled')
+    }
+    if (pmt.status === 'processing' && pmt.stripe_payment_intent_id) {
+      throw new AppError(409, 'Payment already in flight')
+    }
+    if (!pmt.stripe_customer_id) {
+      throw new AppError(409, 'Tenant has no Stripe customer — complete ACH setup first')
+    }
+
+    // S113-PhaseA: don't fail the tenant payment when the destination Connect
+    // isn't ready. Fall back to a standard charge (gross to GAM platform);
+    // mark the payment platform_held; reconciliation Transfer fires when the
+    // landlord eventually completes Connect onboarding. Otherwise tenants
+    // hit a wall and spend the rent before we can collect.
+    const landlordConnectReady =
+      !!pmt.stripe_connect_account_id &&
+      pmt.connect_charges_enabled === true &&
+      pmt.connect_details_submitted === true
+
+    const stripe = getStripe()
+
+    // Read card country if relevant for the surcharge calculation
+    let cardCountry: string | null = null
+    if (body.paymentMethodType === 'card') {
+      const pm = await stripe.paymentMethods.retrieve(body.paymentMethodId)
+      cardCountry = pm.card?.country ?? null
+    }
+
+    const amount = parseFloat(pmt.amount)
+    const baseApplicationFee = computeApplicationFee({
+      amount,
+      paymentMethod: body.paymentMethodType,
+      cardCountry,
+    })
+
+    // S121: tenant-payer platform fee passthrough. Look up any unpaid
+    // platform_fee_accruals on this property where payer='tenant'.
+    // Sum their total_amount and add to application_fee_amount so GAM
+    // collects the SaaS subscription fee on top of rent. Mark them paid
+    // post-charge (after Stripe succeeds, so a charge failure leaves them
+    // unclaimed for the next attempt).
+    const unpaidAccruals = await query<{ id: string; total_amount: string }>(
+      `SELECT id, total_amount FROM platform_fee_accruals
+        WHERE property_id = $1
+          AND payer = 'tenant'
+          AND tenant_charge_id IS NULL
+          AND total_amount > 0`,
+      [pmt.property_id]
+    )
+    const passthroughAmount = unpaidAccruals.reduce(
+      (sum, r) => sum + parseFloat(r.total_amount), 0
+    )
+
+    // S248: sublease markup detection. When this payment is for a unit
+    // with an active sublease where the payer is the sublessee, the
+    // landlord receives `master_share_amount` (not `sub_monthly_amount`).
+    // The difference (markup) stays on platform balance and credits the
+    // sublessor via subleaseAllocation on webhook success. Implementation:
+    // add the markup to application_fee_amount so Stripe routes only
+    // (gross - app_fee - markup) to landlord.
+    let subleaseMarkup = 0
+    if (pmt.type === 'rent') {
+      const sub = await queryOne<{ sub: string; master: string }>(
+        `SELECT s.sub_monthly_amount::text AS sub, s.master_share_amount::text AS master
+           FROM subleases s
+           JOIN leases l ON l.id = s.master_lease_id
+          WHERE l.unit_id = $1
+            AND s.sublessee_tenant_id = $2
+            AND s.status = 'active'
+            AND s.start_date <= $3::date
+            AND (s.end_date IS NULL OR s.end_date >= $3::date)
+          LIMIT 1`,
+        [pmt.unit_id, pmt.tenant_id, pmt.due_date ?? new Date().toISOString().slice(0, 10)],
+      )
+      if (sub) {
+        subleaseMarkup = Math.max(0, parseFloat(sub.sub) - parseFloat(sub.master))
+      }
+    }
+
+    // S261: GAM-supersedence boost. Compute the tenant's outstanding
+    // GAM-owed debt (FlexDeposit defaults + accelerated balance +
+    // FlexCharge balances + FlexPay fees + custody fees) and route as
+    // much of THIS rent payment as needed (oldest-first) into GAM's
+    // platform balance via additional application_fee_amount. The
+    // landlord receives gross - banking_fee - supersedence; the lease
+    // still shows the rent paid in full. On webhook settle,
+    // applyTenantSupersedence distributes the boost FIFO across the
+    // live debt list.
+    const gamSupersedenceAmount = pmt.tenant_id
+      ? Math.min(amount, await computeTenantGamOutstandingTotal(pmt.tenant_id))
+      : 0
+
+    const applicationFeeAmount = Math.round(
+      (baseApplicationFee + passthroughAmount + subleaseMarkup + gamSupersedenceAmount) * 100
+    ) / 100
+
+    const intent = landlordConnectReady
+      ? await createRentDestinationCharge({
+          amount,
+          stripeCustomerId:        pmt.stripe_customer_id,
+          paymentMethodId:         body.paymentMethodId,
+          paymentMethodTypes:      body.paymentMethodType === 'ach' ? ['us_bank_account'] : ['card'],
+          destinationConnectAccountId: pmt.stripe_connect_account_id,
+          applicationFeeAmount,
+          entryDescription:        pmt.entry_description,
+          metadata: {
+            gam_payment_id: pmt.id,
+            tenant_id:      pmt.tenant_id,
+            landlord_id:    pmt.landlord_id,
+          },
+        })
+      : await createRentPlatformCharge({
+          amount,
+          stripeCustomerId:        pmt.stripe_customer_id,
+          paymentMethodId:         body.paymentMethodId,
+          paymentMethodTypes:      body.paymentMethodType === 'ach' ? ['us_bank_account'] : ['card'],
+          entryDescription:        pmt.entry_description,
+          metadata: {
+            gam_payment_id: pmt.id,
+            tenant_id:      pmt.tenant_id,
+            landlord_id:    pmt.landlord_id,
+          },
+        })
+
+    if (!landlordConnectReady) {
+      // S113-PhaseA: notify admin that a payment landed on platform balance.
+      // Reconciliation will fire automatically when the landlord finishes
+      // Connect onboarding — but admin should see the case to nudge them.
+      await createAdminNotification({
+        severity: 'warn',
+        category: 'platform_held_rent_charge',
+        title:    `Rent collected to platform — landlord ${pmt.landlord_user_id} not Connect-ready`,
+        body:     `Payment ${pmt.id} for $${amount} collected to GAM platform balance. Will reconcile via Transfer once landlord completes Connect onboarding.`,
+        context: {
+          payment_id:        pmt.id,
+          landlord_id:       pmt.landlord_id,
+          landlord_user_id:  pmt.landlord_user_id,
+          amount,
+          stripe_payment_intent_id: intent.id,
+        },
+      })
+    }
+
+    await query(
+      `UPDATE payments
+          SET status = CASE
+                WHEN $1 = 'card' THEN 'settled'
+                ELSE 'processing'
+              END,
+              stripe_payment_intent_id = $2,
+              platform_held = $4,
+              gam_supersedence_amount = $5
+        WHERE id = $3`,
+      [body.paymentMethodType, intent.id, pmt.id, !landlordConnectReady, gamSupersedenceAmount.toFixed(2)]
+    )
+
+    // S121: claim the unpaid tenant-payer accruals atomically. The filter
+    // `AND tenant_charge_id IS NULL` defends against a concurrent rent-pay
+    // claiming the same rows — only one UPDATE wins. Loser rows already
+    // collected the surcharge from the tenant; over-collection scenario
+    // is flagged for the reconciliation job (future).
+    if (unpaidAccruals.length > 0) {
+      const accrualIds = unpaidAccruals.map(r => r.id)
+      await query(
+        `UPDATE platform_fee_accruals
+            SET tenant_charge_id = $1, updated_at = NOW()
+          WHERE id = ANY($2::uuid[])
+            AND tenant_charge_id IS NULL`,
+        [pmt.id, accrualIds]
+      )
+    }
+
+    res.json({
+      success: true,
+      data: {
+        paymentIntentId:       intent.id,
+        status:                intent.status,
+        applicationFeeAmount,
+        platformFeePassthrough: passthroughAmount,
+        accrualsClaimed:       unpaidAccruals.length,
+      },
+    })
   } catch (e) { next(e) }
 })

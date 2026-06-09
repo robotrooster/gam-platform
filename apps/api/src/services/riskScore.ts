@@ -1,4 +1,5 @@
 import { query, queryOne } from '../db'
+import { BackgroundRiskLevel } from '@gam/shared'
 
 const DISPOSABLE = ['mailinator.com','guerrillamail.com','tempmail.com','throwam.com','sharklasers.com','trashmail.com','yopmail.com','getairmail.com','fakeinbox.com','maildrop.cc','dispostable.com','spamgourmet.com']
 
@@ -20,7 +21,7 @@ function looksLikeName(n: string): boolean {
 
 export interface RiskResult {
   score: number
-  level: 'low'|'medium'|'high'|'very_high'
+  level: BackgroundRiskLevel
   flags: string[]
   categories: { identity: string[]; financial: string[]; behavioral: string[]; duplicate: string[] }
 }
@@ -31,11 +32,6 @@ export async function calculateRiskScore(data: {
   employmentStatus: string; monthlyIncome?: number|null
   timeToComplete?: number|null; ipAddress?: string; userAgent?: string
   landlordId: string; unitRent?: number|null
-  idVerification?: {
-    fullMatch?: boolean; closeMatch?: boolean
-    dobMatch?: boolean|null; dobMismatch?: boolean
-    expired?: boolean; addressMatch?: boolean|null
-  } | null
 }): Promise<RiskResult> {
   let score = 0
   const identity: string[] = []
@@ -73,16 +69,6 @@ export async function calculateRiskScore(data: {
   const age = Math.floor((Date.now()-new Date(data.dob).getTime())/(365.25*24*60*60*1000))
   if (age<18) { score+=50; identity.push('under_18') }
   if (age>100) { score+=30; identity.push('age_over_100') }
-
-  // ── ID DOCUMENT VERIFICATION ──────────────────────────────
-  if (data.idVerification) {
-    const idv = data.idVerification
-    if (idv.fullMatch === false && idv.closeMatch === false) { score += 40; identity.push('id_name_mismatch') }
-    else if (idv.fullMatch === false && idv.closeMatch === true) { score += 15; identity.push('id_name_close_mismatch') }
-    if (idv.dobMismatch === true) { score += 35; identity.push('id_dob_mismatch') }
-    if (idv.expired === true) { score += 50; identity.push('id_expired') }
-    if (idv.addressMatch === false) { score += 10; identity.push('id_address_mismatch') }
-  }
 
   // ── FINANCIAL ─────────────────────────────────────────────
   const income = data.monthlyIncome||0

@@ -1,8 +1,17 @@
+import { SentryErrorBoundary } from './lib/sentry'
 import React, { useState, useEffect } from 'react'
 import ReactDOM from 'react-dom/client'
 import axios from 'axios'
+import { applyCamelizeInterceptor } from '@gam/shared'
 
-const API = 'http://localhost:4000'
+const API = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
+const TENANT_URL = (import.meta as any).env?.VITE_TENANT_APP_URL || 'http://localhost:3002'
+
+// S312: snake_case → camelCase response transform. Listings makes
+// bare axios.get / axios.post calls without an instance, so the
+// transformer is registered on the global axios default instance.
+// See packages/shared/src/camelize.ts.
+applyCamelizeInterceptor(axios)
 
 const css = `
 @import url('https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;500&display=swap');
@@ -115,8 +124,8 @@ function App() {
 
   useEffect(() => {
     let f = listings
-    if (search.city) f = f.filter(l => l.city?.toLowerCase().includes(search.city.toLowerCase()) || l.property_name?.toLowerCase().includes(search.city.toLowerCase()))
-    if (search.maxRent) f = f.filter(l => +l.rent_amount <= +search.maxRent)
+    if (search.city) f = f.filter(l => l.city?.toLowerCase().includes(search.city.toLowerCase()) || l.propertyName?.toLowerCase().includes(search.city.toLowerCase()))
+    if (search.maxRent) f = f.filter(l => +l.rentAmount <= +search.maxRent)
     if (search.beds) f = f.filter(l => +l.bedrooms >= +search.beds)
     setFiltered(f)
   }, [search, listings])
@@ -132,12 +141,12 @@ function App() {
         password: form.password,
         phone: form.phone || null,
         unitId: applying?.general ? null : applying?.id || null,
-        landlordId: applying?.landlord_id || null,
+        landlordId: applying?.landlordId || null,
       })
       const { token } = res.data.data
       // Store token and redirect to tenant portal background check
       localStorage.setItem('gam_prospect_token', token)
-      window.location.href = `http://localhost:3002/accept-invite?token=${token}&unit=${applying?.id || ''}`
+      window.location.href = `${TENANT_URL}/accept-invite?token=${token}&unit=${applying?.id || ''}`
     } catch (ex: any) {
       setError(ex.response?.data?.error || 'Submission failed. Please try again.')
     } finally { setSubmitting(false) }
@@ -172,7 +181,7 @@ function App() {
       <div className="main">
         <div className="results-header">
           <h2>{filtered.length} {filtered.length === 1 ? 'property' : 'properties'} available</h2>
-          <button className="btn-secondary" onClick={() => { window.location.href = 'http://localhost:3002/background-check' }} style={{ fontSize: '.78rem', padding: '8px 16px' }}>
+          <button className="btn-secondary" onClick={() => { window.location.href = `${TENANT_URL}/background-check` }} style={{ fontSize: '.78rem', padding: '8px 16px' }}>
             📋 General Application
           </button>
         </div>
@@ -190,21 +199,21 @@ function App() {
             <div key={l.id} className="card" onClick={() => setSelected(l)}>
               <div className="card-photos">
                 {l.photos?.[0]
-                  ? <img src={`${API}${l.photos[0]}`} alt={l.unit_number} />
+                  ? <img src={`${API}${l.photos[0]}`} alt={l.unitNumber} />
                   : <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: 'var(--t3)', fontSize: '.82rem' }}>No photo</div>
                 }
-                {l.photo_count > 1 && <div className="card-photos-count">+{l.photo_count - 1} photos</div>}
+                {l.photoCount > 1 && <div className="card-photos-count">+{l.photoCount - 1} photos</div>}
               </div>
               <div className="card-body">
-                <div className="card-price">{formatCurrency(+l.rent_amount)}<span>/mo</span></div>
-                <div className="card-address">{l.property_name} · Unit {l.unit_number}<br />{l.street1}, {l.city}, {l.state} {l.zip}</div>
+                <div className="card-price">{formatCurrency(+l.rentAmount)}<span>/mo</span></div>
+                <div className="card-address">{l.propertyName} · Unit {l.unitNumber}<br />{l.street1}, {l.city}, {l.state} {l.zip}</div>
                 <div className="card-specs">
                   <span><strong>{l.bedrooms}</strong> bed</span>
                   <span><strong>{l.bathrooms}</strong> bath</span>
                   {l.sqft && <span><strong>{l.sqft?.toLocaleString()}</strong> sqft</span>}
                 </div>
-                {l.available_date && <div className="card-available">Available {new Date(l.available_date + 'T12:00:00').toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}</div>}
-                <button className="btn-apply" onClick={e => { e.stopPropagation(); window.location.href = `http://localhost:3002/background-check?unitId=${l.id}&landlordId=${l.landlord_id}` }}>Apply Now</button>
+                {l.availableDate && <div className="card-available">Available {new Date(l.availableDate + 'T12:00:00').toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}</div>}
+                <button className="btn-apply" onClick={e => { e.stopPropagation(); window.location.href = `${TENANT_URL}/background-check?unitId=${l.id}&landlordId=${l.landlordId}` }}>Apply Now</button>
               </div>
             </div>
           ))}
@@ -230,8 +239,8 @@ function App() {
             <div className="modal-body">
               <div className="modal-header">
                 <div>
-                  <div className="modal-price">{formatCurrency(+selected.rent_amount)}<span style={{ fontSize: '.9rem', fontWeight: 400, color: 'var(--t2)', fontFamily: 'var(--font-b)' }}>/mo</span></div>
-                  <div style={{ fontSize: '.82rem', color: 'var(--t2)', marginTop: 4 }}>{selected.property_name} · Unit {selected.unit_number} · {selected.street1}, {selected.city}, {selected.state} {selected.zip}</div>
+                  <div className="modal-price">{formatCurrency(+selected.rentAmount)}<span style={{ fontSize: '.9rem', fontWeight: 400, color: 'var(--t2)', fontFamily: 'var(--font-b)' }}>/mo</span></div>
+                  <div style={{ fontSize: '.82rem', color: 'var(--t2)', marginTop: 4 }}>{selected.propertyName} · Unit {selected.unitNumber} · {selected.street1}, {selected.city}, {selected.state} {selected.zip}</div>
                 </div>
                 <button className="modal-close" onClick={() => setSelected(null)}>✕</button>
               </div>
@@ -239,12 +248,12 @@ function App() {
                 <div className="modal-spec"><span className="modal-spec-val">{selected.bedrooms}</span><span className="modal-spec-lbl">Bedrooms</span></div>
                 <div className="modal-spec"><span className="modal-spec-val">{selected.bathrooms}</span><span className="modal-spec-lbl">Bathrooms</span></div>
                 {selected.sqft && <div className="modal-spec"><span className="modal-spec-val">{selected.sqft?.toLocaleString()}</span><span className="modal-spec-lbl">Sq Ft</span></div>}
-                <div className="modal-spec"><span className="modal-spec-val">{formatCurrency(+selected.security_deposit || 0)}</span><span className="modal-spec-lbl">Deposit</span></div>
-                {selected.available_date && <div className="modal-spec"><span className="modal-spec-val">{new Date(selected.available_date + 'T12:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</span><span className="modal-spec-lbl">Available</span></div>}
+                <div className="modal-spec"><span className="modal-spec-val">{formatCurrency(+selected.securityDeposit || 0)}</span><span className="modal-spec-lbl">Deposit</span></div>
+                {selected.availableDate && <div className="modal-spec"><span className="modal-spec-val">{new Date(selected.availableDate + 'T12:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</span><span className="modal-spec-lbl">Available</span></div>}
               </div>
-              {selected.listing_description && <div className="modal-desc">{selected.listing_description}</div>}
+              {selected.listingDescription && <div className="modal-desc">{selected.listingDescription}</div>}
               <div className="modal-footer">
-                <button className="btn-primary" onClick={() => { window.location.href = `http://localhost:3002/background-check?unitId=${selected.id}&landlordId=${selected.landlord_id}` }}>Apply for This Unit</button>
+                <button className="btn-primary" onClick={() => { window.location.href = `${TENANT_URL}/background-check?unitId=${selected.id}&landlordId=${selected.landlordId}` }}>Apply for This Unit</button>
                 <button className="btn-secondary" onClick={() => setSelected(null)}>Close</button>
               </div>
             </div>
@@ -256,8 +265,8 @@ function App() {
       {applying && (
         <div className="app-overlay" onClick={e => { if (e.target === e.currentTarget) { setApplying(null); setSubmitted(false); setForm({ firstName: '', lastName: '', email: '', phone: '', password: '', confirmPassword: '' }) } }}>
           <div className="app-modal">
-            <h2>{applying.general ? 'General Rental Application' : `Apply — Unit ${applying.unit_number}`}</h2>
-            <p>{applying.general ? 'No specific unit in mind? Submit a general application and a landlord will reach out.' : `${applying.property_name} · ${applying.street1}, ${applying.city} · ${formatCurrency(+applying.rent_amount)}/mo`}</p>
+            <h2>{applying.general ? 'General Rental Application' : `Apply — Unit ${applying.unitNumber}`}</h2>
+            <p>{applying.general ? 'No specific unit in mind? Submit a general application and a landlord will reach out.' : `${applying.propertyName} · ${applying.street1}, ${applying.city} · ${formatCurrency(+applying.rentAmount)}/mo`}</p>
 
             {submitted ? (
               <div>
@@ -296,4 +305,13 @@ function App() {
   )
 }
 
-ReactDOM.createRoot(document.getElementById('root')!).render(<React.StrictMode><App /></React.StrictMode>)
+ReactDOM.createRoot(document.getElementById('root')!).render(
+  <React.StrictMode>
+    <SentryErrorBoundary fallback={<div style={{ padding: 40, textAlign: 'center' }}>
+      <div style={{ fontSize: '1.1rem', fontWeight: 600, marginBottom: 8 }}>Something went wrong</div>
+      <button onClick={() => window.location.reload()}>Reload</button>
+    </div>}>
+      <App />
+    </SentryErrorBoundary>
+  </React.StrictMode>
+)

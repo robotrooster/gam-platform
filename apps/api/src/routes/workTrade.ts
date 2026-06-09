@@ -1,33 +1,35 @@
 import { Router } from 'express'
 import { z } from 'zod'
 import { query, queryOne } from '../db'
-import { requireAuth, requireLandlord } from '../middleware/auth'
+import { requireAuth, requirePerm } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
+import { resolveLandlordIdForUser } from '../lib/scope'
+import { canManageLandlordResource } from '../middleware/scope'
 
 export const workTradeRouter = Router()
 workTradeRouter.use(requireAuth)
 
 // ── HELPERS ──────────────────────────────────────────────────
 
-async function getAgreementForLandlord(agreementId: string, landlordProfileId: string) {
+// S130: resolve agreement and verify caller has landlord-scope authority
+// over it. Replaces the prior helper which compared agreement.landlord_id
+// to req.user.profileId (broke for team workers — their profileId is the
+// team_member.id, not the landlord.id) and the broken isAdmin check
+// (which queried users.role with a landlord.id, not a user.id).
+async function getAgreementForUser(agreementId: string, user: any) {
   const agreement = await queryOne<any>(
     'SELECT * FROM work_trade_agreements WHERE id=$1', [agreementId]
   )
   if (!agreement) throw new AppError(404, 'Agreement not found')
-  if (agreement.landlord_id !== landlordProfileId && !(await isAdmin(landlordProfileId))) {
+  if (!canManageLandlordResource(user, agreement.landlord_id, ['property_manager'])) {
     throw new AppError(403, 'Forbidden')
   }
   return agreement
 }
 
-async function isAdmin(userId: string) {
-  const u = await queryOne<any>('SELECT role FROM users WHERE id=$1', [userId])
-  return u?.role === 'admin'
-}
-
 // ── CREATE AGREEMENT ─────────────────────────────────────────
 
-workTradeRouter.post('/', requireLandlord, async (req, res, next) => {
+workTradeRouter.post('/', requirePerm('work_trade.manage'), async (req, res, next) => {
   try {
     const body = z.object({
       unitId:         z.string().uuid(),
@@ -43,9 +45,24 @@ workTradeRouter.post('/', requireLandlord, async (req, res, next) => {
       renewalTerms:   z.string().optional(),
     }).parse(req.body)
 
+    const landlordId = resolveLandlordIdForUser(req.user!)
+    if (!landlordId) throw new AppError(400, 'No landlord scope on this user')
+
     // Verify unit belongs to landlord
-    const unit = await queryOne<any>('SELECT * FROM units WHERE id=$1 AND landlord_id=$2', [body.unitId, req.user!.profileId])
+    const unit = await queryOne<any>('SELECT * FROM units WHERE id=$1 AND landlord_id=$2', [body.unitId, landlordId])
     if (!unit) throw new AppError(404, 'Unit not found or access denied')
+
+    // S397 fix: verify the tenant has a lease in caller's portfolio.
+    // Pre-fix, body.tenantId was inserted unvalidated — a landlord
+    // could create a work-trade agreement against ANY tenant id
+    // (including strangers') and the tenant's view via /work-trade
+    // would surface it. Cross-tenant assignment.
+    const tenantLease = await queryOne<{ id: string }>(
+      `SELECT l.id FROM leases l
+       JOIN lease_tenants lt ON lt.lease_id = l.id
+       WHERE lt.tenant_id = $1 AND l.landlord_id = $2 LIMIT 1`,
+      [body.tenantId, landlordId])
+    if (!tenantLease) throw new AppError(404, 'Tenant has no lease under this landlord')
 
     // Calculate max monthly credit
     const monthlyHours = body.weeklyHours * (52 / 12)
@@ -58,7 +75,7 @@ workTradeRouter.post('/', requireLandlord, async (req, res, next) => {
          market_rent, cash_rent, trade_credit_max, duties, start_date, end_date, renewal_terms)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
       RETURNING *`,
-      [body.unitId, body.tenantId, req.user!.profileId, body.tradeType,
+      [body.unitId, body.tenantId, landlordId, body.tradeType,
        body.hourlyRate, body.weeklyHours, body.marketRent, cashRent,
        tradeCreditMax, body.duties || null, body.startDate,
        body.endDate || null, body.renewalTerms || null]
@@ -83,6 +100,27 @@ workTradeRouter.post('/', requireLandlord, async (req, res, next) => {
 
 workTradeRouter.get('/unit/:unitId', async (req, res, next) => {
   try {
+    // S397 fix: validate caller can access the unit's landlord scope.
+    // Pre-fix, the SELECT had no landlord filter — any auth user could
+    // pass any unit's id and read its work-trade agreement (tenant
+    // name/email, hourly rate, weekly hours, market rent). Cross-tenant
+    // information disclosure.
+    const unit = await queryOne<{ landlord_id: string; tenant_id: string | null }>(
+      `SELECT u.landlord_id,
+              (SELECT lt.tenant_id FROM lease_tenants lt
+                JOIN leases l ON l.id = lt.lease_id
+               WHERE l.unit_id = u.id AND lt.status='active' LIMIT 1) AS tenant_id
+         FROM units u WHERE u.id=$1`,
+      [req.params.unitId])
+    if (!unit) throw new AppError(404, 'Unit not found')
+    const u = req.user!
+    const isAdmin = u.role === 'admin' || u.role === 'super_admin'
+    const isOwnerLandlord = u.role === 'landlord' && u.profileId === unit.landlord_id
+    const isTeam = !!u.landlordId && u.landlordId === unit.landlord_id
+    const isOwnTenant = u.role === 'tenant' && u.profileId === unit.tenant_id
+    if (!isAdmin && !isOwnerLandlord && !isTeam && !isOwnTenant) {
+      throw new AppError(403, 'Forbidden')
+    }
     const agreement = await queryOne<any>(`
       SELECT wta.*,
         u.first_name as tenant_first, u.last_name as tenant_last, u.email as tenant_email,
@@ -106,6 +144,17 @@ workTradeRouter.get('/:id', async (req, res, next) => {
   try {
     const agreement = await queryOne<any>('SELECT * FROM work_trade_agreements WHERE id=$1', [req.params.id])
     if (!agreement) throw new AppError(404, 'Not found')
+    // S397 fix: validate caller scope. Pre-fix, any auth user could
+    // pass any agreement UUID and read the full payload (agreement
+    // + logs + periods + stats). Cross-tenant information disclosure.
+    const u = req.user!
+    const isAdmin = u.role === 'admin' || u.role === 'super_admin'
+    const isOwnerLandlord = u.role === 'landlord' && u.profileId === agreement.landlord_id
+    const isTeam = !!u.landlordId && u.landlordId === agreement.landlord_id
+    const isOwnTenant = u.role === 'tenant' && u.profileId === agreement.tenant_id
+    if (!isAdmin && !isOwnerLandlord && !isTeam && !isOwnTenant) {
+      throw new AppError(403, 'Forbidden')
+    }
 
     const logs = await query<any>(`
       SELECT wtl.*, u.first_name, u.last_name,
@@ -165,8 +214,18 @@ workTradeRouter.post('/:id/logs', async (req, res, next) => {
     if (!agreement) throw new AppError(404, 'Agreement not found')
     if (agreement.status !== 'active') throw new AppError(400, 'Agreement is not active')
 
-    // Verify caller is the tenant on this agreement OR landlord
-    if (req.user!.role === 'tenant' && req.user!.profileId !== agreement.tenant_id) {
+    // S397 fix: caller-scope validation. Pre-fix the route only
+    // checked tenant-self-match; non-tenant roles (landlord,
+    // property_manager, onsite_manager) could post fake hours
+    // against ANY agreement (including strangers'). Cross-tenant
+    // write into work_trade_logs + later approval would bump
+    // ytd_value on the stranger landlord's agreement.
+    const u = req.user!
+    const isOwnTenant = u.role === 'tenant' && u.profileId === agreement.tenant_id
+    const isAdmin = u.role === 'admin' || u.role === 'super_admin'
+    const isOwnerLandlord = u.role === 'landlord' && u.profileId === agreement.landlord_id
+    const isTeam = !!u.landlordId && u.landlordId === agreement.landlord_id
+    if (!isOwnTenant && !isAdmin && !isOwnerLandlord && !isTeam) {
       throw new AppError(403, 'Forbidden')
     }
 
@@ -182,7 +241,7 @@ workTradeRouter.post('/:id/logs', async (req, res, next) => {
 
 // ── LANDLORD: APPROVE / REJECT LOG ───────────────────────────
 
-workTradeRouter.patch('/logs/:logId', requireLandlord, async (req, res, next) => {
+workTradeRouter.patch('/logs/:logId', requirePerm('work_trade.reconcile'), async (req, res, next) => {
   try {
     const { action, rejectionReason } = z.object({
       action:          z.enum(['approve','reject']),
@@ -194,7 +253,7 @@ workTradeRouter.patch('/logs/:logId', requireLandlord, async (req, res, next) =>
     )
     if (!log) throw new AppError(404, 'Log not found')
 
-    const agreement = await getAgreementForLandlord(log.agreement_id, req.user!.profileId)
+    const agreement = await getAgreementForUser(log.agreement_id, req.user!)
     const creditValue = action === 'approve' ? parseFloat(log.hours) * parseFloat(agreement.hourly_rate) : null
 
     const updated = await queryOne<any>(`
@@ -233,14 +292,14 @@ workTradeRouter.patch('/logs/:logId', requireLandlord, async (req, res, next) =>
 
 // ── LANDLORD: RECONCILE PERIOD ────────────────────────────────
 
-workTradeRouter.post('/:id/reconcile', requireLandlord, async (req, res, next) => {
+workTradeRouter.post('/:id/reconcile', requirePerm('work_trade.reconcile'), async (req, res, next) => {
   try {
     const { month, year } = z.object({
       month: z.number().int().min(1).max(12),
       year:  z.number().int().min(2020),
     }).parse(req.body)
 
-    const agreement = await getAgreementForLandlord(req.params.id, req.user!.profileId)
+    const agreement = await getAgreementForUser(req.params.id, req.user!)
 
     const period = await queryOne<any>(`
       SELECT * FROM work_trade_periods
@@ -280,8 +339,10 @@ workTradeRouter.post('/:id/reconcile', requireLandlord, async (req, res, next) =
 
 // ── GET ALL WORK TRADE FOR LANDLORD (dashboard) ───────────────
 
-workTradeRouter.get('/', requireLandlord, async (req, res, next) => {
+workTradeRouter.get('/', requirePerm('work_trade.view'), async (req, res, next) => {
   try {
+    const landlordId = resolveLandlordIdForUser(req.user!)
+    if (!landlordId) throw new AppError(400, 'No landlord scope on this user')
     const agreements = await query<any>(`
       SELECT wta.*,
         u.first_name as tenant_first, u.last_name as tenant_last,
@@ -294,7 +355,7 @@ workTradeRouter.get('/', requireLandlord, async (req, res, next) => {
       JOIN properties p ON p.id = un.property_id
       WHERE wta.landlord_id=$1
       ORDER BY wta.created_at DESC`,
-      [req.user!.profileId]
+      [landlordId]
     )
     res.json({ success: true, data: agreements })
   } catch (e) { next(e) }
@@ -302,14 +363,14 @@ workTradeRouter.get('/', requireLandlord, async (req, res, next) => {
 
 // ── UPDATE AGREEMENT STATUS ───────────────────────────────────
 
-workTradeRouter.patch('/:id', requireLandlord, async (req, res, next) => {
+workTradeRouter.patch('/:id', requirePerm('work_trade.manage'), async (req, res, next) => {
   try {
     const { status, endDate } = z.object({
       status:  z.enum(['active','paused','ended']).optional(),
       endDate: z.string().optional(),
     }).parse(req.body)
 
-    await getAgreementForLandlord(req.params.id, req.user!.profileId)
+    await getAgreementForUser(req.params.id, req.user!)
 
     const updated = await queryOne<any>(`
       UPDATE work_trade_agreements SET

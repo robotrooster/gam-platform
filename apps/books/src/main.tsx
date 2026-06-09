@@ -1,11 +1,13 @@
+import { SentryErrorBoundary } from './lib/sentry'
 import React, { createContext, useContext, useState } from 'react'
 import ReactDOM from 'react-dom/client'
 import { BrowserRouter, Routes, Route, Navigate, NavLink, Outlet, useNavigate } from 'react-router-dom'
-import { QueryClient, QueryClientProvider, useQuery, useMutation, useQueryClient } from 'react-query'
+import { QueryClient, QueryClientProvider, useQuery, useQueryClient } from 'react-query'
 import axios from 'axios'
-import { formatCurrency } from '@gam/shared'
+import { formatCurrency, applyCamelizeInterceptor } from '@gam/shared'
 
 const API = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
+const ADMIN_URL = (import.meta as any).env?.VITE_ADMIN_APP_URL || 'http://localhost:3003'
 const api = axios.create({ baseURL: `${API}/api` })
 const TOKEN_KEYS = ['gam_admin_token', 'gam_books_token']
 const getToken = () => TOKEN_KEYS.map(k => localStorage.getItem(k)).find(Boolean) || null
@@ -13,6 +15,8 @@ api.interceptors.request.use(c => { const t=getToken(); if(t) c.headers.Authoriz
 api.interceptors.response.use(r=>r, e=>{ if(e.response?.status===401&&!e.config.url.includes('/auth/')){ TOKEN_KEYS.forEach(k=>localStorage.removeItem(k)); window.location.href='/login' } return Promise.reject(e) })
 // Inject active client header for bookkeepers
 api.interceptors.request.use(c=>{ const cid=localStorage.getItem('gam_books_client'); if(cid) c.headers['X-Client-Id']=cid; return c })
+// S312: snake_case → camelCase response transform (see packages/shared/src/camelize.ts).
+applyCamelizeInterceptor(api)
 const get=<T,>(url:string)=>api.get<{success:boolean;data:T}>(url).then(r=>r.data.data)
 const post=<T,>(url:string,body?:any)=>api.post<{success:boolean;data:T;message?:string}>(url,body).then(r=>r.data)
 const patch=<T,>(url:string,body?:any)=>api.patch<{success:boolean;data:T}>(url,body).then(r=>r.data)
@@ -218,7 +222,7 @@ function Layout(){
             <div style={{fontWeight:600,color:'var(--t0)',fontSize:'.78rem'}}>{user?.firstName} {user?.lastName}</div>
             <div style={{marginTop:3}}><span className={`badge ${isAdmin?'br':'bgold'}`} style={{fontSize:'.6rem'}}>{isAdmin?'Admin':'Landlord'}</span></div>
           </div>
-          {isAdmin&&<a href="http://localhost:3003" className="ni" style={{color:'var(--t3)',fontSize:'.75rem'}}>← Admin Console</a>}
+          {isAdmin&&<a href={ADMIN_URL} className="ni" style={{color:'var(--t3)',fontSize:'.75rem'}}>← Admin Console</a>}
           <button className="ni" onClick={()=>{logout();navigate('/login')}} style={{color:'var(--red)'}}>🚪 Sign out</button>
         </div>
       </aside>
@@ -407,7 +411,7 @@ function Employees(){
   const[showAdd,setShowAdd]=useState(false)
   const[err,setErr]=useState('')
   const[saving,setSaving]=useState(false)
-  const initForm={firstName:'',lastName:'',email:'',phone:'',title:'',department:'',payType:'salary',payRate:'',payFrequency:'biweekly',filingStatus:'single',federalAllowances:'0',azWithholdingPct:'2.5',startDate:'',ssnLast4:''}
+  const initForm={firstName:'',lastName:'',email:'',phone:'',title:'',department:'',payType:'salary',payRate:'',payFrequency:'biweekly',filingStatus:'single',federalAllowances:'0',stateWithholdingPct:'0',startDate:'',ssnLast4:''}
   const[form,setForm]=useState(initForm)
   const f=(k:string)=>(e:React.ChangeEvent<HTMLInputElement|HTMLSelectElement>)=>setForm(p=>({...p,[k]:e.target.value}))
 
@@ -423,7 +427,7 @@ function Employees(){
   const addEmp=async(e:React.FormEvent)=>{
     e.preventDefault();setSaving(true);setErr('')
     try{
-      await post('/books/employees',{...form,payRate:+form.payRate,federalAllowances:+form.federalAllowances,azWithholdingPct:+form.azWithholdingPct})
+      await post('/books/employees',{...form,payRate:+form.payRate,federalAllowances:+form.federalAllowances,stateWithholdingPct:+form.stateWithholdingPct})
       qc.invalidateQueries('emp')
       setShowAdd(false);setForm(initForm)
     }catch(ex:any){setErr(ex.response?.data?.error||'Failed to save')}
@@ -446,7 +450,7 @@ function Employees(){
         <div className="kpi"><div className="kl">Active W-2</div><div className="kv b">{activeEmp.length}</div><div className="ks">Receiving payroll</div></div>
         <div className="kpi"><div className="kl">YTD Gross Pay</div><div className="kv gold">{formatCurrency(ytdGross)}</div><div className="ks">All employees</div></div>
         <div className="kpi"><div className="kl">YTD Federal W/H</div><div className="kv a">{formatCurrency((employees as any[]).reduce((s:number,e:any)=>s+(+e.ytdFederalTax||0),0))}</div><div className="ks">Withheld YTD</div></div>
-        <div className="kpi"><div className="kl">YTD AZ State W/H</div><div className="kv t">{formatCurrency((employees as any[]).reduce((s:number,e:any)=>s+(+e.ytdStateTax||0),0))}</div><div className="ks">AZ flat 2.5%</div></div>
+        <div className="kpi"><div className="kl">YTD State W/H</div><div className="kv t">{formatCurrency((employees as any[]).reduce((s:number,e:any)=>s+(+e.ytdStateTax||0),0))}</div><div className="ks">Per-employee flat %</div></div>
       </div>
 
       <div className="card" style={{padding:0}}>
@@ -512,7 +516,7 @@ function Employees(){
               </div>
             </div>
             <div className="frow2">
-              <div><label>AZ Withholding %</label><input type="number" min="0" max="10" step="0.1" value={form.azWithholdingPct} onChange={f('azWithholdingPct')}/></div>
+              <div><label>State Withholding %</label><input type="number" min="0" max="10" step="0.1" value={form.stateWithholdingPct} onChange={f('stateWithholdingPct')}/></div>
               <div><label>Start Date</label><input type="date" value={form.startDate} onChange={f('startDate')}/></div>
             </div>
             <div className="frow"><label>SSN Last 4 (optional)</label><input type="text" maxLength={4} value={form.ssnLast4} onChange={f('ssnLast4')} placeholder="For tax forms"/></div>
@@ -851,7 +855,7 @@ function RunPayroll(){
               <div className="ct">Deduction Summary (per paycheck)</div>
               <div className="dr"><span className="dk">Social Security</span><span className="dv mono">6.2% (up to $168,600/yr)</span></div>
               <div className="dr"><span className="dk">Medicare</span><span className="dv mono">1.45% (+0.9% over $200k)</span></div>
-              <div className="dr"><span className="dk">AZ State (flat)</span><span className="dv mono">2.5% per employee setting</span></div>
+              <div className="dr"><span className="dk">State (flat)</span><span className="dv mono">Per-employee setting</span></div>
               <div className="dr"><span className="dk">Federal W/H</span><span className="dv mono">Per filing status</span></div>
               <div style={{marginTop:10,fontSize:'.72rem',color:'var(--t3)'}}>Federal withholding uses simplified rate tables. Production should use IRS Publication 15-T bracket tables.</div>
             </div>
@@ -902,7 +906,7 @@ function RunPayroll(){
         <div>
           <div className="grid4" style={{marginBottom:16}}>
             <div className="kpi"><div className="kl">Total Gross Pay</div><div className="kv gold">{formatCurrency(draftRun.totalGross)}</div><div className="ks">{draftRun.employeeCount} employees · {fmtFreq(draftRun.payFrequency)}</div></div>
-            <div className="kpi"><div className="kl">Total Taxes</div><div className="kv r">{formatCurrency((+draftRun.totalFederalTax)+(+draftRun.totalStateTax)+(+draftRun.totalSs)+(+draftRun.totalMedicare))}</div><div className="ks">Fed + AZ + SS + Medicare</div></div>
+            <div className="kpi"><div className="kl">Total Taxes</div><div className="kv r">{formatCurrency((+draftRun.totalFederalTax)+(+draftRun.totalStateTax)+(+draftRun.totalSs)+(+draftRun.totalMedicare))}</div><div className="ks">Fed + State + SS + Medicare</div></div>
             <div className="kpi"><div className="kl">Total Net Pay</div><div className="kv g">{formatCurrency(draftRun.totalNet)}</div><div className="ks">Employee take-home</div></div>
             <div className="kpi"><div className="kl">Pay Date</div><div className="kv b" style={{fontSize:'1.1rem'}}>{new Date(draftRun.payDate+'T12:00:00').toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'})}</div><div className="ks">Period: {new Date(draftRun.periodStart+'T12:00:00').toLocaleDateString()} – {new Date(draftRun.periodEnd+'T12:00:00').toLocaleDateString()}</div></div>
           </div>
@@ -910,7 +914,7 @@ function RunPayroll(){
           <div className="card" style={{marginBottom:16,padding:0}}>
             <div style={{padding:'12px 16px',borderBottom:'1px solid var(--b1)'}}><div className="ct" style={{marginBottom:0}}>Pay Run Breakdown</div></div>
             <table className="tbl">
-              <thead><tr><th>Employee</th><th>Pay Type</th><th>Gross</th><th>Federal W/H</th><th>SS (6.2%)</th><th>Medicare</th><th>AZ State</th><th>Net Pay</th></tr></thead>
+              <thead><tr><th>Employee</th><th>Pay Type</th><th>Gross</th><th>Federal W/H</th><th>SS (6.2%)</th><th>Medicare</th><th>State</th><th>Net Pay</th></tr></thead>
               <tbody>
                 {draftRun.lines?.map((line:any)=>(
                   <tr key={line.id}>
@@ -1034,7 +1038,7 @@ function PayHistory(){
               <div className="dr"><span className="dk">Gross Pay</span><span className="dv mono" style={{color:'var(--gold)'}}>{formatCurrency(runDetail.totalGross)}</span></div>
               <div className="dr"><span className="dk">Federal W/H</span><span className="dv mono" style={{color:'var(--red)'}}>{formatCurrency(runDetail.totalFederalTax)}</span></div>
               <div className="dr"><span className="dk">SS + Medicare</span><span className="dv mono" style={{color:'var(--amber)'}}>{formatCurrency((+runDetail.totalSs)+(+runDetail.totalMedicare))}</span></div>
-              <div className="dr"><span className="dk">AZ State Tax</span><span className="dv mono" style={{color:'var(--amber)'}}>{formatCurrency(runDetail.totalStateTax)}</span></div>
+              <div className="dr"><span className="dk">State Tax</span><span className="dv mono" style={{color:'var(--amber)'}}>{formatCurrency(runDetail.totalStateTax)}</span></div>
               <div className="dr" style={{borderTop:'1px solid var(--b1)',paddingTop:8,marginTop:4}}><span className="dk" style={{fontWeight:700}}>Net Pay</span><span className="dv mono" style={{color:'var(--green)',fontWeight:700}}>{formatCurrency(runDetail.totalNet)}</span></div>
 
               <div style={{marginTop:16}}>
@@ -1716,7 +1720,7 @@ function TaxCenter(){
 
       <div className="grid4" style={{marginBottom:16}}>
         <div className="kpi"><div className="kl">YTD Gross Payroll</div><div className="kv gold">{formatCurrency(payroll.ytdGross||0)}</div><div className="ks">{payroll.runCount||0} approved runs</div></div>
-        <div className="kpi"><div className="kl">Employee Tax W/H</div><div className="kv r">{formatCurrency((+payroll.ytdFederal||0)+(+payroll.ytdState||0)+(+payroll.ytdSs||0)+(+payroll.ytdMedicare||0))}</div><div className="ks">Fed + AZ + SS + Medicare</div></div>
+        <div className="kpi"><div className="kl">Employee Tax W/H</div><div className="kv r">{formatCurrency((+payroll.ytdFederal||0)+(+payroll.ytdState||0)+(+payroll.ytdSs||0)+(+payroll.ytdMedicare||0))}</div><div className="ks">Fed + State + SS + Medicare</div></div>
         <div className="kpi"><div className="kl">Employer Tax Match</div><div className="kv a">{formatCurrency((+payroll.employerSs||0)+(+payroll.employerMedicare||0))}</div><div className="ks">SS + Medicare match</div></div>
         <div className="kpi"><div className="kl">Total Tax Liability</div><div className="kv r">{formatCurrency(payroll.totalTaxLiability||0)}</div><div className="ks">Employee + employer</div></div>
       </div>
@@ -1728,7 +1732,7 @@ function TaxCenter(){
             <div className="dr"><span className="dk">Federal Income W/H (employee)</span><span className="dv mono" style={{color:'var(--red)'}}>{formatCurrency(payroll.ytdFederal||0)}</span></div>
             <div className="dr"><span className="dk">Social Security (employee 6.2%)</span><span className="dv mono" style={{color:'var(--amber)'}}>{formatCurrency(payroll.ytdSs||0)}</span></div>
             <div className="dr"><span className="dk">Medicare (employee 1.45%)</span><span className="dv mono" style={{color:'var(--amber)'}}>{formatCurrency(payroll.ytdMedicare||0)}</span></div>
-            <div className="dr"><span className="dk">AZ State W/H (employee 2.5%)</span><span className="dv mono" style={{color:'var(--amber)'}}>{formatCurrency(payroll.ytdState||0)}</span></div>
+            <div className="dr"><span className="dk">State W/H (per-employee flat %)</span><span className="dv mono" style={{color:'var(--amber)'}}>{formatCurrency(payroll.ytdState||0)}</span></div>
             <div className="dr" style={{borderTop:'1px solid var(--b1)',paddingTop:6,marginTop:4}}><span className="dk">Employer SS match (6.2%)</span><span className="dv mono" style={{color:'var(--red)'}}>{formatCurrency(payroll.employerSs||0)}</span></div>
             <div className="dr"><span className="dk">Employer Medicare match (1.45%)</span><span className="dv mono" style={{color:'var(--red)'}}>{formatCurrency(payroll.employerMedicare||0)}</span></div>
             <div className="dr" style={{borderTop:'2px solid var(--b1)',paddingTop:8,marginTop:8}}>
@@ -1739,18 +1743,71 @@ function TaxCenter(){
 
           <div className="card">
             <div className="ct">Filing Deadlines</div>
-            {deadlines.map((d:any)=>(
-              <div key={d.form} style={{padding:'10px 0',borderBottom:'1px solid var(--b0)'}}>
-                <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:4}}>
-                  <span style={{fontFamily:'var(--font-m)',fontWeight:600,color:'var(--gold)',fontSize:'.82rem'}}>{d.form}</span>
-                  {d.due&&<span className="badge ba">{d.due}</span>}
+            {/* S203/S204: per-state catalog from services/taxForms.ts.
+                 Shape: { state_code, form_code, form_name, agency,
+                 agency_url, category, frequency, due_dates: [{label, due}],
+                 statute, notes, filing_method }
+                 S207: filing_method='online_portal' rows have no paper
+                 form code; form_code is a descriptive label, link wording
+                 says "Open portal" instead of "File online". */}
+            {deadlines.map((d:any,idx:number)=>{
+              const stateLabel = d.stateCode === 'US' ? 'Federal' : d.stateCode
+              const dues = Array.isArray(d.dueDates) ? d.dueDates : []
+              const isPortal = d.filingMethod === 'online_portal'
+              return (
+                <div key={d.stateCode+'-'+d.formCode+'-'+idx} style={{padding:'10px 0',borderBottom:'1px solid var(--b0)'}}>
+                  <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:4,gap:8}}>
+                    <div style={{display:'flex',alignItems:'baseline',gap:8,flexWrap:'wrap',flex:1,minWidth:0}}>
+                      <span style={{fontFamily:'var(--font-m)',fontWeight:600,color:'var(--gold)',fontSize:'.82rem'}}>
+                        {d.formCode}
+                      </span>
+                      <span className="badge bmu" style={{fontSize:'.62rem'}}>{stateLabel}</span>
+                      <span className="badge bmu" style={{fontSize:'.62rem',textTransform:'capitalize'}}>{d.category}</span>
+                      {isPortal && (
+                        <span className="badge ba" style={{fontSize:'.62rem'}}>Online portal</span>
+                      )}
+                    </div>
+                  </div>
+                  <div style={{fontSize:'.75rem',color:'var(--t2)',marginBottom:6}}>{d.formName}</div>
+                  {dues.length > 0 && (
+                    <div style={{display:'flex',gap:6,flexWrap:'wrap',marginBottom:6}}>
+                      {dues.map((row:any,i:number)=>(
+                        <span key={i} className="badge ba" style={{fontSize:'.62rem'}}>
+                          {row.label}: {row.due}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  <div style={{fontSize:'.7rem',color:'var(--t3)',display:'flex',gap:6,flexWrap:'wrap',alignItems:'center'}}>
+                    <span>{d.agency}</span>
+                    {d.agencyUrl && (
+                      <>
+                        <span>·</span>
+                        <a href={d.agencyUrl} target="_blank" rel="noopener noreferrer" style={{color:'var(--gold)',textDecoration:'none'}}>
+                          {isPortal ? 'Open portal ↗' : 'File online ↗'}
+                        </a>
+                      </>
+                    )}
+                    {d.statute && (
+                      <>
+                        <span>·</span>
+                        <span style={{fontStyle:'italic'}}>{d.statute}</span>
+                      </>
+                    )}
+                  </div>
+                  {d.notes && (
+                    <div style={{fontSize:'.7rem',color:'var(--t3)',marginTop:4,fontStyle:'italic'}}>
+                      {d.notes}
+                    </div>
+                  )}
                 </div>
-                <div style={{fontSize:'.75rem',color:'var(--t2)',marginBottom:d.q1?6:0}}>{d.description}</div>
-                {d.q1&&<div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
-                  {['Q1','Q2','Q3','Q4'].map((q,i)=><span key={q} className="badge bmu" style={{fontSize:'.62rem'}}>{q}: {[d.q1,d.q2,d.q3,d.q4][i]}</span>)}
-                </div>}
+              )
+            })}
+            {deadlines.length === 0 && (
+              <div style={{padding:'10px 0',fontSize:'.75rem',color:'var(--t3)'}}>
+                No filing deadlines apply to your current setup. Add employees, contractors, or properties to surface relevant forms.
               </div>
-            ))}
+            )}
           </div>
         </div>
       )}
@@ -1782,7 +1839,7 @@ function TaxCenter(){
         <div className="card">
           <div className="ct">W-2 Employee YTD Summary ({year})</div>
           <table className="tbl">
-            <thead><tr><th>Employee</th><th>YTD Gross</th><th>Federal W/H</th><th>AZ State</th><th>SS</th><th>Medicare</th><th>Net Pay</th></tr></thead>
+            <thead><tr><th>Employee</th><th>YTD Gross</th><th>Federal W/H</th><th>State</th><th>SS</th><th>Medicare</th><th>Net Pay</th></tr></thead>
             <tbody>
               {employees.map((e:any,i:number)=>(
                 <tr key={i}>
@@ -1857,7 +1914,7 @@ function ProfitLoss(){
   const now=new Date()
   const[startDate,setStartDate]=useState(`${now.getFullYear()}-01-01`)
   const[endDate,setEndDate]=useState(now.toISOString().split('T')[0])
-  const{data,isLoading,refetch}=useQuery(['pl',startDate,endDate],()=>get<any>(`/books/reports/pl?startDate=${startDate}&endDate=${endDate}`))
+  const{data,isLoading}=useQuery(['pl',startDate,endDate],()=>get<any>(`/books/reports/pl?startDate=${startDate}&endDate=${endDate}`))
 
   const income=(data as any)?.income||[]
   const expenses=(data as any)?.expenses||[]
@@ -2204,7 +2261,7 @@ function LoginPage(){
             </button>
           </form>
         </div>
-        <div style={{textAlign:'center',marginTop:20}}><a href="http://localhost:3003" style={{color:'var(--t3)',fontSize:'.75rem'}}>← Back to Admin Console</a></div>
+        <div style={{textAlign:'center',marginTop:20}}><a href={ADMIN_URL} style={{color:'var(--t3)',fontSize:'.75rem'}}>← Back to Admin Console</a></div>
       </div>
     </div>
   )
@@ -2227,7 +2284,7 @@ function App(){
         <Route path="payroll/vendors"    element={<Vendors/>}/>
         <Route path="payroll/runs"       element={<RunPayroll/>}/>
         <Route path="payroll/history"    element={<PayHistory/>}/>
-        <Route path="payroll/tax-forms"  element={<ComingSoon title="Tax Forms" icon="📋" description="W-2s, 1099-NECs, 940, 941, AZ state forms"/>}/>
+        <Route path="payroll/tax-forms"  element={<ComingSoon title="Tax Forms" icon="📋" description="W-2s, 1099-NECs, 940, 941, state-specific forms"/>}/>
         <Route path="books/accounts"     element={<ChartOfAccounts/>}/>
         <Route path="books/journal"      element={<JournalEntries/>}/>
         <Route path="books/transactions" element={<Transactions/>}/>
@@ -2259,4 +2316,14 @@ function Root(){
   )
 }
 
-ReactDOM.createRoot(document.getElementById('root')!).render(<React.StrictMode><Root/></React.StrictMode>)
+ReactDOM.createRoot(document.getElementById('root')!).render(
+  <React.StrictMode>
+    <SentryErrorBoundary fallback={<div style={{ padding: 40, textAlign: 'center', color: 'var(--text-0)' }}>
+      <div style={{ fontSize: '1.1rem', fontWeight: 600, marginBottom: 8 }}>Something went wrong</div>
+      <div style={{ fontSize: '.82rem', color: 'var(--text-3)', marginBottom: 16 }}>The error has been reported. Reload the page to try again.</div>
+      <button className="btn btn-primary" onClick={() => window.location.reload()}>Reload</button>
+    </div>}>
+      <Root />
+    </SentryErrorBoundary>
+  </React.StrictMode>
+)

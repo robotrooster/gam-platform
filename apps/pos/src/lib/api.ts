@@ -1,5 +1,6 @@
 /// <reference types="vite/client" />
 import axios from 'axios'
+import { applyCamelizeInterceptor } from '@gam/shared'
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:4000'
 
@@ -7,6 +8,9 @@ export const api = axios.create({
   baseURL: `${API_URL}/api`,
   headers: { 'Content-Type': 'application/json' },
 })
+
+// S312: snake_case → camelCase response transform (see packages/shared/src/camelize.ts).
+applyCamelizeInterceptor(api)
 
 // Attach JWT on every request
 api.interceptors.request.use((config) => {

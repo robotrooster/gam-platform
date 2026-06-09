@@ -5,7 +5,7 @@ interface AuthUser {
   id: string; email: string; role: string
   firstName: string; lastName: string; profileId: string
   onboardingComplete?: boolean
-  stripeBankVerified?: boolean
+  bankAccountReady?: boolean
 }
 
 interface AuthCtx {

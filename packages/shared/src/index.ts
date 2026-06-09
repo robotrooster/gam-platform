@@ -57,6 +57,146 @@ export const LANDLORD_ASSIGNABLE_ROLE_LABEL: Record<LandlordAssignableRole, stri
   bookkeeper:       'Bookkeeper',
 }
 
+// ---------- Sub-permission catalog (per role) ----------
+// S79: granular feature toggles WITHIN a role. Composes with the role's
+// scope row (property_manager_scopes etc.) which controls property/unit
+// binding. A new POS employee and a POS manager can both have the
+// onsite_manager role + same property scope, but different sub-permissions
+// (the manager has pos.refund / pos.void; the new employee does not).
+//
+// Storage: team_members.permissions jsonb. Shape: { "[permission_key]": true }.
+// Absent key = denied. Backfill / dual-write into team_members on
+// invitation accept is follow-up work — see DEFERRED.md item 8 sub-tasks.
+//
+// Route gating is NOT yet wired. Routes today gate on role only. Wiring
+// per-route checks against these keys is its own dedicated session — see
+// DEFERRED.md item 8 follow-up "Wire sub-permission gates into routes."
+//
+// Bookkeeper is intentionally absent: bookkeeper access is a single
+// access_level toggle (read_only | read_write) on bookkeeper_scopes —
+// see BOOKKEEPER_ACCESS_LEVELS. Bookkeepers operate at landlord scope
+// (or property level), not within a property, so per-feature subdivision
+// doesn't fit the role.
+//
+// This is a starter list. Add/edit on product walkthroughs.
+
+// S236: dropped 3 orphan perms (`properties.archive`, `units.set_rent`,
+// `payments.initiate_disbursement`) from the property_manager list.
+// All three were toggleable in the TeamPage UI but didn't gate any
+// backend route — the perm flipping ON had no effect, creating UX
+// confusion. Audit found via grep across routes/. Either re-introduce
+// (with their actual gating handler) or leave them out.
+//
+// Old jsonb scope rows that had any of these flags = TRUE keep the
+// keys harmlessly; the auth middleware checks via OR and ignores
+// keys not in the current shared list.
+export const PROPERTY_MANAGER_SUB_PERMISSIONS = [
+  'team.invite',
+  'team.manage_permissions',
+  'properties.create',
+  'properties.edit',
+  'units.create',
+  'units.edit',
+  'tenants.create',
+  'tenants.run_background_check',
+  'tenants.archive',
+  'leases.create',
+  'leases.sign',
+  'leases.terminate',
+  'payments.view_all',
+  'maintenance.approve_above_threshold',
+  'books.view',
+  'books.edit',
+  'notifications.send_bulk',
+  'bulletin.view',
+  'work_trade.view',
+  'work_trade.manage',
+  'work_trade.reconcile',
+] as const
+export type PropertyManagerSubPermission = typeof PROPERTY_MANAGER_SUB_PERMISSIONS[number]
+
+export const ONSITE_MANAGER_SUB_PERMISSIONS = [
+  'pos.ring_sale',
+  'pos.refund',
+  'pos.void',
+  'pos.discount',
+  'pos.end_of_day',
+  'pos.manage_inventory',
+  'guests.check_in',
+  'guests.check_out',
+  'units.view_status',
+  'bulletin.view',
+] as const
+export type OnsiteManagerSubPermission = typeof ONSITE_MANAGER_SUB_PERMISSIONS[number]
+
+export const MAINTENANCE_SUB_PERMISSIONS = [
+  'work_orders.create',
+  'work_orders.complete',
+  'work_orders.reassign',
+  'purchases.request',
+  'purchases.approve',
+  'unit_access.view',
+  'time.clock_in_out',
+] as const
+export type MaintenanceSubPermission = typeof MAINTENANCE_SUB_PERMISSIONS[number]
+
+export type AnySubPermission =
+  | PropertyManagerSubPermission
+  | OnsiteManagerSubPermission
+  | MaintenanceSubPermission
+
+export const SUB_PERMISSIONS_BY_ROLE: Record<
+  Exclude<LandlordAssignableRole, 'bookkeeper'>,
+  readonly string[]
+> = {
+  property_manager: PROPERTY_MANAGER_SUB_PERMISSIONS,
+  onsite_manager:   ONSITE_MANAGER_SUB_PERMISSIONS,
+  maintenance:      MAINTENANCE_SUB_PERMISSIONS,
+}
+
+export const SUB_PERMISSION_LABEL: Record<AnySubPermission, string> = {
+  // property_manager
+  'team.invite':                       'Invite team members',
+  'team.manage_permissions':           'Manage team permissions',
+  'properties.create':                 'Create properties',
+  'properties.edit':                   'Edit properties',
+  'units.create':                      'Create units',
+  'units.edit':                        'Edit units',
+  'tenants.create':                    'Create tenants',
+  'tenants.run_background_check':      'Run background checks',
+  'tenants.archive':                   'Archive tenants',
+  'leases.create':                     'Create leases',
+  'leases.sign':                       'Sign leases',
+  'leases.terminate':                  'Terminate leases',
+  'payments.view_all':                 'View all payments',
+  'maintenance.approve_above_threshold': 'Approve maintenance over threshold',
+  'books.view':                        'View books',
+  'books.edit':                        'Edit books',
+  'notifications.send_bulk':           'Send bulk notifications',
+  'bulletin.view':                     'View tenant bulletin board',
+  'work_trade.view':                   'View work-trade agreements',
+  'work_trade.manage':                 'Create / update work-trade agreements',
+  'work_trade.reconcile':              'Approve hours + reconcile periods',
+  // onsite_manager
+  'pos.ring_sale':                     'Ring sales',
+  'pos.refund':                        'Issue refunds',
+  'pos.void':                          'Void transactions',
+  'pos.discount':                      'Apply discounts',
+  'pos.end_of_day':                    'End-of-day close',
+  'pos.manage_inventory':              'Manage inventory',
+  'guests.check_in':                   'Check guests in',
+  'guests.check_out':                  'Check guests out',
+  'units.view_status':                 'View unit status',
+  // maintenance
+  'work_orders.create':                'Create work orders',
+  'work_orders.complete':              'Complete work orders',
+  'work_orders.reassign':              'Reassign work orders',
+  'purchases.request':                 'Request purchases',
+  'purchases.approve':                 'Approve purchases',
+  'unit_access.view':                  'View unit access codes',
+  'time.clock_in_out':                 'Clock in/out',
+}
+
 // ---------- Maintenance job categories ----------
 
 export const MAINTENANCE_JOB_CATEGORIES = [
@@ -321,13 +461,9 @@ export const LEASE_STATUS_LABEL: Record<LeaseStatus, string> = {
   terminated: 'Terminated',
 }
 
-export enum PaymentStatus {
-  PENDING    = 'pending',
-  PROCESSING = 'processing',
-  SETTLED    = 'settled',
-  FAILED     = 'failed',
-  RETURNED   = 'returned',
-}
+// S75: PaymentStatus moved to const+type pattern below alongside other
+// payment-flow enums (PAYMENT_STATUSES at the S26a Invoice block).
+// The pre-S75 TypeScript `enum PaymentStatus` had zero consumers.
 
 export enum AchReturnCode {
   R01 = 'R01', // Insufficient funds
@@ -357,6 +493,13 @@ export const MAINTENANCE_STATUS_LABEL: Record<MaintenanceStatus, string> = {
 // Single source of truth for maintenance_requests_priority_check (4 values).
 export const MAINTENANCE_PRIORITIES = ['emergency', 'high', 'normal', 'low'] as const
 export type MaintenancePriority = typeof MAINTENANCE_PRIORITIES[number]
+
+// S76: maintenance request category. Matches maintenance_requests_category_check.
+export const MAINTENANCE_CATEGORIES = [
+  'general', 'plumbing', 'electrical', 'hvac', 'appliance', 'landscape',
+  'pest', 'cleaning', 'roofing', 'structural', 'pool', 'locksmith',
+] as const
+export type MaintenanceCategory = typeof MAINTENANCE_CATEGORIES[number]
 export const MAINTENANCE_PRIORITY_LABEL: Record<MaintenancePriority, string> = {
   emergency: 'Emergency',
   high:      'High',
@@ -389,13 +532,65 @@ export const DOCUMENT_CATEGORY_LABEL: Record<DocumentCategory, string> = {
 
 // Lease document types on the `lease_documents` table (e-sign dispatcher).
 // Single source of truth for lease_documents.document_type CHECK constraint.
-export const LEASE_DOCUMENT_TYPES = ['original_lease', 'addendum_add', 'addendum_remove', 'addendum_terms'] as const
+export const LEASE_DOCUMENT_TYPES = ['original_lease', 'addendum_add', 'addendum_remove', 'addendum_terms', 'sublease_agreement'] as const
 export type LeaseDocumentType = typeof LEASE_DOCUMENT_TYPES[number]
 export const LEASE_DOCUMENT_TYPE_LABEL: Record<LeaseDocumentType, string> = {
-  original_lease:  'Original Lease',
-  addendum_add:    'Add Tenant',
-  addendum_remove: 'Remove Tenant',
-  addendum_terms:  'Change Lease Terms',
+  original_lease:     'Original Lease',
+  addendum_add:       'Add Tenant',
+  addendum_remove:    'Remove Tenant',
+  addendum_terms:     'Change Lease Terms',
+  sublease_agreement: 'Sublease Agreement',
+}
+
+// S212: addendum diff display constants — shared by tenant LeasePage
+// (S210), landlord LeaseFormModal (S211), and the API addendum PDF
+// generator (S212+). Keeps the field-label dictionary + money-field
+// set in one place as the non-material edit surface grows. Field
+// names mirror the snake_case columns the leases PATCH endpoint may
+// modify (see leases.ts ChangeRow type).
+export const ADDENDUM_DIFF_FIELD_LABEL: Record<string, string> = {
+  late_fee_grace_days:     'Late fee grace period (days)',
+  late_fee_initial_amount: 'Initial late fee',
+  late_fee_initial_type:   'Late fee type',
+  late_fee_enabled:        'Late fees enabled',
+  late_fee_accrual_amount: 'Recurring late-fee accrual',
+  late_fee_accrual_type:   'Recurring accrual type',
+  late_fee_accrual_period: 'Recurring accrual period',
+  late_fee_cap_amount:     'Maximum late-fee cap',
+  late_fee_cap_type:       'Maximum cap type',
+  notice_days_required:    'Notice required (days)',
+  expiration_notice_days:  'Expiration notice (days)',
+  security_deposit:        'Security deposit',
+}
+export const ADDENDUM_DIFF_MONEY_FIELDS: ReadonlySet<string> = new Set([
+  'late_fee_initial_amount',
+  'late_fee_accrual_amount',
+  'late_fee_cap_amount',
+  'security_deposit',
+])
+
+// S226: collapse all flat / percent_of_rent enum fields into one set
+// so we don't grow the formatter switch as more late-fee surfaces land.
+const LATE_FEE_TYPE_FIELDS: ReadonlySet<string> = new Set([
+  'late_fee_initial_type', 'late_fee_accrual_type', 'late_fee_cap_type',
+])
+
+export function formatAddendumDiffValue(field: string, raw: string | null | undefined): string {
+  if (raw === '' || raw == null) return '—'
+  if (ADDENDUM_DIFF_MONEY_FIELDS.has(field)) {
+    const n = Number(raw)
+    return Number.isFinite(n) ? `$${n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : raw
+  }
+  if (LATE_FEE_TYPE_FIELDS.has(field)) {
+    return raw === 'flat' ? 'Flat $' : raw === 'percent_of_rent' ? '% of rent' : raw
+  }
+  if (field === 'late_fee_accrual_period') {
+    return raw === 'daily' ? 'Daily' : raw === 'weekly' ? 'Weekly' : raw === 'monthly' ? 'Monthly' : raw
+  }
+  if (field === 'late_fee_enabled') {
+    return raw === 'true' ? 'Yes' : raw === 'false' ? 'No' : raw
+  }
+  return raw
 }
 
 // ============================================================================
@@ -475,7 +670,7 @@ export const LEASE_COLUMN_CATEGORY: Record<LeaseColumn, LeaseColumnCategory> = {
   rent_amount:            'writable',
   start_date:             'writable',
   end_date:               'writable',
-  security_deposit:       'writable',
+  security_deposit:       'fee_row',  // S196: deprecated as a leases column; now a lease_fees row
   rent_due_day:           'writable',
   lease_type:             'writable',
   auto_renew:             'writable',
@@ -725,7 +920,7 @@ export type WritableLeaseColumn =
   | 'rent_amount'
   | 'start_date'
   | 'end_date'
-  | 'security_deposit'
+  // S196: 'security_deposit' removed — now a fee_row, not a leases column.
   | 'rent_due_day'
   | 'lease_type'
   | 'auto_renew'
@@ -770,9 +965,8 @@ export const WRITABLE_LEASE_COLUMN_SPECS: Record<WritableLeaseColumn, WritableLe
   end_date: {
     parse: (v) => ({ end_date: v.end_date || null }),
   },
-  security_deposit: {
-    parse: (v) => ({ security_deposit: v.security_deposit || 0 }),
-  },
+  // S196: security_deposit removed from WRITABLE specs. The fee_row
+  // pipeline (FEE_ROW_SPECS) now handles it as a lease_fees row.
   rent_due_day: {
     parse: (v) => ({ rent_due_day: parseInt(v.rent_due_day || '1') }),
   },
@@ -859,6 +1053,7 @@ export const WRITABLE_LEASE_COLUMN_SPECS: Record<WritableLeaseColumn, WritableLe
 // ============================================================================
 
 export type FeeRowTag =
+  | 'security_deposit'  // S196: was a column on leases; now a lease_fees row like the other deposits
   | 'pet_deposit' | 'key_deposit' | 'cleaning_deposit'
   | 'move_in_fee' | 'cleaning_fee' | 'pet_fee' | 'application_fee'
   | 'amenity_fee' | 'hoa_transfer_fee' | 'lease_prep_fee'
@@ -868,6 +1063,7 @@ export type FeeRowTag =
 
 export type FeeType = FeeRowTag
 export const FEE_TYPES: readonly FeeType[] = [
+  'security_deposit',
   'pet_deposit', 'key_deposit', 'cleaning_deposit',
   'move_in_fee', 'cleaning_fee', 'pet_fee', 'application_fee',
   'amenity_fee', 'hoa_transfer_fee', 'lease_prep_fee',
@@ -886,6 +1082,7 @@ export interface FeeTypeMeta {
   dueTiming: FeeDueTiming
 }
 export const FEE_TYPE_META: Record<FeeType, FeeTypeMeta> = {
+  security_deposit:       { isRefundable: true,  dueTiming: 'move_in' },
   pet_deposit:            { isRefundable: true,  dueTiming: 'move_in' },
   key_deposit:            { isRefundable: true,  dueTiming: 'move_in' },
   cleaning_deposit:       { isRefundable: true,  dueTiming: 'move_in' },
@@ -936,6 +1133,7 @@ function makeFeeRowSpec(tag: FeeType): FeeRowSpec {
 }
 
 export const FEE_ROW_SPECS: Record<FeeRowTag, FeeRowSpec> = {
+  security_deposit:       makeFeeRowSpec('security_deposit'),
   pet_deposit:            makeFeeRowSpec('pet_deposit'),
   key_deposit:            makeFeeRowSpec('key_deposit'),
   cleaning_deposit:       makeFeeRowSpec('cleaning_deposit'),
@@ -1150,17 +1348,23 @@ export const LEASE_TENANT_REMOVED_REASON_LABEL: Record<LeaseTenantRemovedReason,
 // Single source of truth for lease_documents_status_check (5 values).
 //   pending     — created, not yet dispatched
 //   sent        — first signer invited
-//   in_progress — at least one signer signed, not all
-//   completed   — all signers signed, execute* ran successfully
-//   voided      — cancelled before completion (with void_reason)
-export const LEASE_DOCUMENT_STATUSES = ['pending', 'sent', 'in_progress', 'completed', 'voided'] as const
+//   in_progress      — at least one signer signed, not all
+//   completed        — all signers signed, execute* ran successfully
+//   voided           — cancelled before completion (with void_reason)
+//   execution_failed — all signed, but the post-sign execute step (lease
+//                      build / cascade / move-in invoice) raised — parked
+//                      for admin investigation. Cleared via void.
+// S74: 'execution_failed' added to match the DB CHECK; pre-S74 the
+// shared list was missing this value while esign.ts actively wrote it.
+export const LEASE_DOCUMENT_STATUSES = ['pending', 'sent', 'in_progress', 'completed', 'voided', 'execution_failed'] as const
 export type LeaseDocumentStatus = typeof LEASE_DOCUMENT_STATUSES[number]
 export const LEASE_DOCUMENT_STATUS_LABEL: Record<LeaseDocumentStatus, string> = {
-  pending:     'Pending',
-  sent:        'Sent',
-  in_progress: 'In Progress',
-  completed:   'Completed',
-  voided:      'Voided',
+  pending:           'Pending',
+  sent:              'Sent',
+  in_progress:       'In Progress',
+  completed:         'Completed',
+  voided:            'Voided',
+  execution_failed:  'Execution Failed',
 }
 
 // Per-signer status on a lease document. Drives the sequential signing flow:
@@ -1197,8 +1401,11 @@ export interface Landlord {
   user?: User
   businessName?: string
   ein?: string                   // Tax ID
-  stripeAccountId?: string       // Stripe Connect account
-  stripeBankVerified: boolean
+  // S67: bankAccountReady is server-derived from active user_bank_accounts.
+  // Replaces the pre-16a stripeAccountId / stripeBankVerified fields which
+  // were Stripe-Connect-specific and incorrect under the merchant-of-record
+  // model.
+  bankAccountReady?: boolean
   onboardingComplete: boolean
   units?: Unit[]
   createdAt: Date
@@ -1370,7 +1577,8 @@ export interface Contractor {
   businessName: string
   phone: string
   email: string
-  azrocLicense: string           // Required — AZ Registrar of Contractors
+  contractorLicenseNumber: string | null  // Optional — varies by state and trade
+  contractorLicenseState: string | null   // 2-letter state code of issuing regulator
   insuranceExpiry: Date
   insuranceVerified: boolean
   listingTier?: 'featured' | 'premium' | 'exclusive'
@@ -1407,7 +1615,7 @@ export interface UtilityBill {
   usageAmount: number
   ratePerUnit: number
   utilityCost: number
-  adminFee: number               // AZ: actual cost + admin fee ONLY
+  adminFee: number               // Landlord-configurable passthrough fee
   totalAmount: number
   status: PaymentStatus
   billedAt: Date
@@ -1483,24 +1691,55 @@ export const RESERVE_CONFIG = {
   DEFAULT_RATE:    0.03,
 } as const
 
+// FlexDeposit tier matrix (S246). Larger deposits get FEWER
+// installments to minimize GAM's outstanding float exposure — GAM
+// can't pursue tenants for damages, so the higher the dollar amount
+// fronted, the faster GAM wants it recovered.
+//   $0 – $1000     → 4 installments max
+//   $1001 – $2000  → 3 installments max
+//   $2001+         → 2 installments max
+// The risk_level from the Checkr BG report further constrains:
+//   low risk      → max for the band
+//   medium risk   → max − 1 (floor 2)
+//   high+         → 2 only
 export const FLEX_DEPOSIT_TIERS = [
-  { maxDeposit: 500,  installments: 2, maxMonthly: 250 },
-  { maxDeposit: 800,  installments: 3, maxMonthly: 267 },
-  { maxDeposit: 1050, installments: 4, maxMonthly: 263 },
-  { maxDeposit: 1400, installments: 5, maxMonthly: 280 },
-  { maxDeposit: 2100, installments: 6, maxMonthly: 350 },
+  { maxDeposit: 1000,    maxInstallments: 4 },
+  { maxDeposit: 2000,    maxInstallments: 3 },
+  { maxDeposit: Infinity, maxInstallments: 2 },
 ] as const
 
+export const FLEX_DEPOSIT_CUSTODY_FEE = 3       // $/month while on platform
+export const FLEX_DEPOSIT_NSF_COOLDOWN_DAYS = 60
+
+// FlexCharge (S252+). Consolidated POS charge-account with monthly
+// statement + 1.5% service fee on the cycle balance. No interest;
+// no revolving balance — keeps the product classed as deferred-debit,
+// not credit extension (out of payday-lending regulatory territory).
+export const FLEX_CHARGE_STATEMENT_FEE_PCT = 0.015
+export const FLEX_CHARGE_DEFAULT_CREDIT_LIMIT = 500
+export const FLEX_CHARGE_ACCOUNT_STATUSES = ['active', 'suspended', 'disqualified'] as const
+export type FlexChargeAccountStatus = typeof FLEX_CHARGE_ACCOUNT_STATUSES[number]
+export const FLEX_CHARGE_TRANSACTION_STATUSES = ['pending', 'billed', 'paid', 'disputed', 'refunded'] as const
+export type FlexChargeTransactionStatus = typeof FLEX_CHARGE_TRANSACTION_STATUSES[number]
+export const FLEX_CHARGE_STATEMENT_STATUSES = ['open', 'billed', 'paid', 'failed', 'voided'] as const
+export type FlexChargeStatementStatus = typeof FLEX_CHARGE_STATEMENT_STATUSES[number]
+
 // ACH return codes with zero-tolerance flag
-export const ACH_RETURN_CONFIG: Record<string, { zeroTolerance: boolean; description: string }> = {
-  R05: { zeroTolerance: true,  description: 'Unauthorized debit to consumer account' },
-  R07: { zeroTolerance: true,  description: 'Authorization revoked by customer' },
-  R10: { zeroTolerance: true,  description: 'Customer advises not authorized' },
-  R29: { zeroTolerance: true,  description: 'Corporate customer advises not authorized' },
-  R01: { zeroTolerance: false, description: 'Insufficient funds' },
-  R02: { zeroTolerance: false, description: 'Account closed' },
-  R03: { zeroTolerance: false, description: 'No account / unable to locate' },
-  R04: { zeroTolerance: false, description: 'Invalid account number' },
+// S124: extended ACH return code classification with NACHA-compliant
+// retryability. NACHA permits up to 2 retries per failed transaction, but
+// only on certain return codes — account-related failures (closed,
+// invalid, no account) are NOT retry-eligible because retrying won't
+// change the outcome. Zero-tolerance codes obviously can't retry.
+export const ACH_RETURN_CONFIG: Record<string, { zeroTolerance: boolean; retryEligible: boolean; description: string }> = {
+  R05: { zeroTolerance: true,  retryEligible: false, description: 'Unauthorized debit to consumer account' },
+  R07: { zeroTolerance: true,  retryEligible: false, description: 'Authorization revoked by customer' },
+  R10: { zeroTolerance: true,  retryEligible: false, description: 'Customer advises not authorized' },
+  R29: { zeroTolerance: true,  retryEligible: false, description: 'Corporate customer advises not authorized' },
+  R01: { zeroTolerance: false, retryEligible: true,  description: 'Insufficient funds' },
+  R09: { zeroTolerance: false, retryEligible: true,  description: 'Uncollected funds' },
+  R02: { zeroTolerance: false, retryEligible: false, description: 'Account closed' },
+  R03: { zeroTolerance: false, retryEligible: false, description: 'No account / unable to locate' },
+  R04: { zeroTolerance: false, retryEligible: false, description: 'Invalid account number' },
 }
 
 // ── UTILITY FUNCTIONS ──────────────────────────────────────
@@ -1526,9 +1765,32 @@ export function getReservePhase(occupiedUnits: number): { phase: 1|2|3; rate: nu
   return { phase: 3, rate: RESERVE_CONFIG.PHASE3_RATE }
 }
 
+/**
+ * S246: max installments allowed given a deposit amount and the
+ * tenant's Checkr BG risk_level. Returns NULL if the tenant has no
+ * BG result or risk_level is unknown — UI surfaces a "background
+ * check pending / required" state in that case. Tier floor is 2
+ * installments regardless of risk.
+ */
+export type FlexDepositRiskLevel = 'low' | 'medium' | 'high' | 'very_high'
+
+export function getFlexDepositMaxInstallments(
+  depositAmount: number,
+  riskLevel: FlexDepositRiskLevel | null | undefined,
+): number | null {
+  if (!riskLevel) return null
+  const band = FLEX_DEPOSIT_TIERS.find(t => depositAmount <= t.maxDeposit) ?? FLEX_DEPOSIT_TIERS[FLEX_DEPOSIT_TIERS.length - 1]
+  const downgrade = riskLevel === 'low' ? 0 : riskLevel === 'medium' ? 1 : 99
+  return Math.max(2, band.maxInstallments - downgrade)
+}
+
+/** Backwards-compatible shim — returns the band's max-installment
+ *  number assuming low-risk tenant. Used only by pre-S246 callers
+ *  that don't have a risk_level in hand. New code should call
+ *  getFlexDepositMaxInstallments instead. */
 export function getFlexDepositTier(depositAmount: number) {
-  return FLEX_DEPOSIT_TIERS.find(t => depositAmount <= t.maxDeposit)
-    ?? FLEX_DEPOSIT_TIERS[FLEX_DEPOSIT_TIERS.length - 1]
+  const band = FLEX_DEPOSIT_TIERS.find(t => depositAmount <= t.maxDeposit) ?? FLEX_DEPOSIT_TIERS[FLEX_DEPOSIT_TIERS.length - 1]
+  return { maxDeposit: band.maxDeposit, installments: band.maxInstallments }
 }
 
 export function formatCurrency(amount: number): string {
@@ -1540,6 +1802,7 @@ export function formatCurrency(amount: number): string {
 // === S25: businessDay + paymentAllocation re-exports ===
 export * from './businessDay'
 export * from './paymentAllocation'
+export * from './camelize'
 
 // ============================================================
 // S26a: Invoice types
@@ -1547,6 +1810,110 @@ export * from './paymentAllocation'
 
 export const INVOICE_STATUSES = ['pending', 'partial', 'settled', 'void'] as const
 export type InvoiceStatus = typeof INVOICE_STATUSES[number]
+
+// S75: payment-flow enums centralized for Item 18 Batch 4. Single source of
+// truth for payments.{status,type,entry_description}, disbursements.{status,
+// trigger_type}, and security_deposits.{held_by,status} CHECKs.
+
+// S180: 'paid_via_deposit' added for the move-out deposit sweep.
+// Distinct from 'settled' (real money in) and 'failed' (still owed).
+export const PAYMENT_STATUSES = ['pending', 'processing', 'settled', 'failed', 'returned', 'paid_via_deposit'] as const
+export type PaymentStatus = typeof PAYMENT_STATUSES[number]
+
+export const PAYMENT_TYPES = ['rent', 'fee', 'deposit', 'utility', 'float_fee', 'late_fee', 'platform_fee'] as const
+export type PaymentType = typeof PAYMENT_TYPES[number]
+
+// NACHA CCD/PPD entry description field — uppercase, max 10 chars per spec.
+export const PAYMENT_ENTRY_DESCRIPTIONS = ['RENT', 'SUBSCRIP', 'DEPOSIT', 'UTILITY', 'ONTIMEPAY', 'LATEFEE'] as const
+export type PaymentEntryDescription = typeof PAYMENT_ENTRY_DESCRIPTIONS[number]
+
+export const DISBURSEMENT_STATUSES = ['pending', 'processing', 'settled', 'failed'] as const
+export type DisbursementStatus = typeof DISBURSEMENT_STATUSES[number]
+
+// trigger_type is nullable in DB; null = legacy row pre-S64.
+// 'otp_legacy' is reserved for the pre-16a OTP cycle and isn't actively
+// written under the current model — kept in the union to match DB CHECK.
+export const DISBURSEMENT_TRIGGER_TYPES = ['auto_friday', 'manual_on_demand', 'otp_legacy'] as const
+export type DisbursementTriggerType = typeof DISBURSEMENT_TRIGGER_TYPES[number]
+
+// Note: distinct from properties.deposit_handling_mode (which uses
+// 'landlord_held'). security_deposits.held_by uses bare 'landlord'.
+// Both centralizations exist and are NOT interchangeable.
+export const SECURITY_DEPOSIT_HELD_BY_VALUES = ['gam_escrow', 'landlord'] as const
+export type SecurityDepositHeldBy = typeof SECURITY_DEPOSIT_HELD_BY_VALUES[number]
+
+export const SECURITY_DEPOSIT_STATUSES = ['pending', 'funded', 'partial', 'disbursed', 'claimed'] as const
+export type SecurityDepositStatus = typeof SECURITY_DEPOSIT_STATUSES[number]
+
+// ── PM (third-party property-management) companies — S108 ────────────────
+// Distinct from the OWNER's in-house property managers (those live in
+// property_manager_scopes). pm_companies are external orgs that contract
+// with owners, employ multiple staff, take a fee cut from rent collections,
+// and need their own dispatch + visibility surface.
+
+export const PM_COMPANY_STATUSES = ['active', 'inactive', 'suspended'] as const
+export type PmCompanyStatus = typeof PM_COMPANY_STATUSES[number]
+
+// Internal-to-the-PM-org role. Distinct from the platform-level user role
+// (which stays 'pm_staff' or whatever the auth role becomes — TBD product
+// call). 'owner' = founder/admin of the PM org, can manage staff + plans.
+// 'manager' = can assign properties + view all reports. 'staff' = view
+// limited to assigned properties; can act on maintenance, etc.
+export const PM_STAFF_ROLES = ['owner', 'manager', 'staff'] as const
+export type PmStaffRole = typeof PM_STAFF_ROLES[number]
+
+export const PM_STAFF_STATUSES = ['active', 'inactive', 'removed'] as const
+export type PmStaffStatus = typeof PM_STAFF_STATUSES[number]
+
+// Fee-cut taxonomy. Mirrors the per-property allocation rule shapes from
+// 16a (DEFERRED.md item 16a) so a pm_fee_plan composes cleanly with the
+// allocation engine when S109 wires the cut.
+//   percent_of_rent     — % of collected rent each month
+//   flat_monthly        — fixed dollar amount each month per property
+//   percent_with_floor  — % of rent, but never less than floor_amount
+//   percent_with_ceiling— % of rent, but never more than ceiling_amount
+//   per_unit            — fixed dollar amount per occupied unit per month
+//   leasing_fee         — one-time on new lease signed
+//   maintenance_markup_pct — % added on top of vendor invoices
+export const PM_FEE_TYPES = [
+  'percent_of_rent',
+  'flat_monthly',
+  'percent_with_floor',
+  'percent_with_ceiling',
+  'per_unit',
+  'leasing_fee',
+  'maintenance_markup_pct',
+] as const
+export type PmFeeType = typeof PM_FEE_TYPES[number]
+
+export const PM_FEE_PLAN_STATUSES = ['active', 'inactive', 'deprecated'] as const
+export type PmFeePlanStatus = typeof PM_FEE_PLAN_STATUSES[number]
+
+// S157: pm_property_invitations — bidirectional consent handshake before
+// a property's pm_company_id flips from null to a real assignment.
+//   owner_to_pm — owner offers a PM company management of property X
+//   pm_to_owner — PM company invites owner to view/connect property X
+export const PM_PROPERTY_INVITE_DIRECTIONS = ['owner_to_pm', 'pm_to_owner'] as const
+export type PmPropertyInviteDirection = typeof PM_PROPERTY_INVITE_DIRECTIONS[number]
+
+// pm_property_invitations.status flow:
+//   pending → accepted (recipient approves; properties.pm_company_id is set)
+//   pending → rejected (recipient declines with optional reason)
+//   pending → expired  (cron sweeps when expires_at passes)
+//   pending → revoked  (sender pulls back before action)
+export const PM_PROPERTY_INVITE_STATUSES = [
+  'pending', 'accepted', 'rejected', 'expired', 'revoked',
+] as const
+export type PmPropertyInviteStatus = typeof PM_PROPERTY_INVITE_STATUSES[number]
+
+// pm_property_invitations.proposed_scope — the rights the linkage grants
+// the PM company over the property.
+//   manage — full management; pm_company_id + pm_fee_plan_id wired into
+//     allocation, maintenance routing, owner views the cut
+//   view   — PM owner-relationship side of the handshake (PM was hired
+//     off-platform; owner is just exposing the property to GAM via the PM)
+export const PM_LINK_SCOPES = ['manage', 'view'] as const
+export type PmLinkScope = typeof PM_LINK_SCOPES[number]
 
 export interface Invoice {
   id: string
@@ -1581,3 +1948,770 @@ export function formatInvoiceNumber(year: number, sequence: number): string {
 }
 
 export * from './lateFees';
+
+// ============================================================================
+// Pending tenant intent parser types (S29c-2-A backend, S29c-2-B UI)
+//
+// Single source of truth for parser_status, parser flag categories, and
+// parser flag severities. DB CHECK constraints, API validators, and UI
+// rendering all import from here. Adding a value = edit one place.
+//
+// ParserOutput defines the shape the parser must produce. The parser plugs
+// in later (S29c-2-C+); this contract is locked now so UI can render against
+// it without waiting on the parser.
+// ============================================================================
+
+export const PARSER_STATUSES = [
+  'not_uploaded',
+  'parsing',
+  'parsed',
+  'mismatch',
+  'error',
+  'resolved',
+] as const
+export type ParserStatus = typeof PARSER_STATUSES[number]
+
+export const PARSER_STATUS_META: Record<ParserStatus, { label: string; tone: 'muted'|'amber'|'green'|'red'|'gold'; description: string }> = {
+  not_uploaded: { label: 'No document',     tone: 'muted', description: 'Lease PDF not yet uploaded.' },
+  parsing:      { label: 'Parsing',         tone: 'amber', description: 'Parser is reading the document.' },
+  parsed:       { label: 'Ready to review', tone: 'green', description: 'Parser finished cleanly. Confirm and build the lease.' },
+  mismatch:     { label: 'Needs attention', tone: 'amber', description: 'Parser flagged issues that require landlord review.' },
+  error:        { label: 'Parse failed',    tone: 'red',   description: 'Parser could not read the document. Re-upload or fix.' },
+  resolved:     { label: 'Onboarded',       tone: 'gold',  description: 'Lease created. This intent is closed.' },
+}
+
+export const PARSER_FLAG_CATEGORIES = [
+  'identity_mismatch',
+  'unit_not_found',
+  'field_missing',
+  'field_suspect',
+  'field_low_confidence',
+] as const
+export type ParserFlagCategory = typeof PARSER_FLAG_CATEGORIES[number]
+
+export const PARSER_FLAG_CATEGORY_META: Record<ParserFlagCategory, { label: string; description: string }> = {
+  identity_mismatch:    { label: 'Identity mismatch',    description: 'Tenant on the lease does not match the tenant landlord typed. Possible wrong file.' },
+  unit_not_found:       { label: 'Unit not found',       description: 'Unit named on the lease is not in this landlord\'s portfolio.' },
+  field_missing:        { label: 'Missing field',        description: 'Lease term could not be located in the document.' },
+  field_suspect:        { label: 'Suspect value',        description: 'Lease term was extracted but the value looks wrong (zero rent, dates far in future, etc.).' },
+  field_low_confidence: { label: 'Low confidence',       description: 'Parser is not confident in this extraction. Landlord should verify.' },
+}
+
+export const PARSER_FLAG_SEVERITIES = ['block', 'confirm'] as const
+export type ParserFlagSeverity = typeof PARSER_FLAG_SEVERITIES[number]
+
+// One extracted field: value plus parser's confidence and the raw text it saw.
+// Generic so number / string / boolean fields share the same shape.
+export type ParserExtractedField<T> = {
+  value: T            // non-null by contract; if extraction failed, the whole field is null
+  confidence: number   // 0..1; <0.7 typically triggers field_low_confidence
+  rawText?: string     // verbatim text the parser pulled (for landlord audit)
+}
+
+// Single tenant party on a lease as extracted by the parser.
+export type ParserExtractedTenant = {
+  firstName: ParserExtractedField<string>
+  lastName:  ParserExtractedField<string>
+  email:     ParserExtractedField<string>
+  phone:     ParserExtractedField<string>
+  dateOfBirth?:     ParserExtractedField<string>   // ISO date
+  mailingAddress?:  ParserExtractedField<string>
+  identifications?:    ParserExtractedIdentification[]
+  emergencyContacts?:  ParserExtractedEmergencyContact[]
+  isPrimary?: boolean
+}
+
+// Unit identifier as extracted by the parser. Matches the resolveUnitFromPrefill
+// strategy from S23c — propertyName + unitNumber, optionally a composed address.
+export type ParserExtractedUnit = {
+  propertyName:    ParserExtractedField<string>
+  unitNumber:      ParserExtractedField<string>
+  propertyAddress?: ParserExtractedField<string>
+  unitType?:        ParserExtractedField<string>   // UNIT_TYPES value (apartment/single_family/rv_spot/mobile_home/storage/commercial)
+}
+
+// Lease terms as extracted by the parser. Field names match the existing
+// CSV row shape so resolve-time mapping is trivial.
+export type ParserExtractedLease = {
+  leaseType:           ParserExtractedField<string>   // LEASE_TYPES value (month_to_month/fixed_term/nnn_commercial)
+  leaseStart:          ParserExtractedField<string>   // ISO date
+  leaseEnd:            ParserExtractedField<string>   // ISO date or null for m2m
+  monthlyRent:         ParserExtractedField<number>
+  securityDeposit:     ParserExtractedField<number>
+  lateFeeAmount:       ParserExtractedField<number>
+  lateFeeGraceDays:    ParserExtractedField<number>
+  autoRenew:           ParserExtractedField<boolean>
+  autoRenewMode:       ParserExtractedField<string>   // 'extend_same_term' | 'convert_to_month_to_month'
+  noticeDaysRequired:  ParserExtractedField<number>
+  subleasingAllowed?:  ParserExtractedField<string>   // SUBLEASING_POLICIES value
+}
+
+// Full parser output — written to pending_tenant_intents.parser_output (JSONB).
+// Stored as-is; resolve-time logic reads from this shape.
+export type ParserOutput = {
+  tenants: ParserExtractedTenant[]
+  unit:    ParserExtractedUnit
+  lease:   ParserExtractedLease
+  // Lease-attached entities. Each is optional — parser populates only
+  // what it finds in the document. Resolve-time logic translates these
+  // to rows in lease_vehicles / rvs / mobile_homes / lease_pets /
+  // lease_occupants / liability_insurance_policies / subleases.
+  vehicles?:            ParserExtractedVehicle[]
+  rvs?:                 ParserExtractedRv[]
+  mobileHome?:          ParserExtractedMobileHome
+  pets?:                ParserExtractedPet[]
+  additionalOccupants?: ParserExtractedOccupant[]
+  liabilityInsurance?:  ParserExtractedLiabilityInsurance
+  sublease?:            ParserExtractedSublease
+  // Catchall for fields the parser pulls out but we have not yet
+  // promoted to typed columns. Written to leases.extraction_extras
+  // (JSONB) at resolve time.
+  extractionExtras?:    Record<string, unknown>
+  parserVersion: string  // e.g. 'gam-parser-0.1.0' — pinned for audit
+  parsedAt: string       // ISO timestamp
+}
+
+// One flag emitted by the parser. Written to pending_tenant_intents.parser_flags
+// (JSONB array). UI groups by category, sorts by severity (block first).
+export type ParserFlag = {
+  category: ParserFlagCategory
+  severity: ParserFlagSeverity
+  field?: string         // dot-path into ParserOutput, e.g. 'lease.monthlyRent', 'tenants.0.email'
+  message: string        // human-readable, surfaced directly to landlord
+  expected?: string      // what landlord typed (for identity_mismatch / unit_not_found)
+  found?: string         // what parser saw
+}
+
+// Runtime guards — used by API validators and frontend before write.
+export const isParserStatus = (v: unknown): v is ParserStatus =>
+  typeof v === 'string' && (PARSER_STATUSES as readonly string[]).includes(v)
+export const isParserFlagCategory = (v: unknown): v is ParserFlagCategory =>
+  typeof v === 'string' && (PARSER_FLAG_CATEGORIES as readonly string[]).includes(v)
+export const isParserFlagSeverity = (v: unknown): v is ParserFlagSeverity =>
+  typeof v === 'string' && (PARSER_FLAG_SEVERITIES as readonly string[]).includes(v)
+
+// =====================================================================
+// S29c-2-C: Onboarding Entity Types (April 28, 2026)
+//
+// New ParserExtracted* types for entities the parser pulls out of lease
+// PDFs and writes to typed tables at resolve time. Const arrays mirror
+// the DB CHECK constraints so frontend dropdowns and parser validation
+// share one source of truth — drift = bug.
+// =====================================================================
+
+// Mirror of lease_vehicles.vehicle_type CHECK
+export const VEHICLE_TYPES = [
+  'car', 'truck', 'suv', 'van', 'motorcycle',
+  'scooter', 'utility_trailer', 'boat', 'other',
+] as const
+export type VehicleType = typeof VEHICLE_TYPES[number]
+
+// Mirror of lease_pets.species CHECK
+export const PET_SPECIES = [
+  'dog', 'cat', 'bird', 'reptile', 'fish',
+  'small_mammal', 'livestock', 'other',
+] as const
+export type PetSpecies = typeof PET_SPECIES[number]
+
+// Mirror of rvs.hookup_class CHECK
+export const RV_HOOKUP_CLASSES = ['20amp', '30amp', '50amp', 'shore_only', 'none'] as const
+export type RvHookupClass = typeof RV_HOOKUP_CLASSES[number]
+
+// Mirror of tenant_identifications.id_type CHECK
+export const ID_TYPES = [
+  'drivers_license', 'state_id', 'passport',
+  'military_id', 'tribal_id', 'permanent_resident_card', 'other',
+] as const
+export type IdType = typeof ID_TYPES[number]
+
+// Mirror of leases.subleasing_allowed CHECK
+export const SUBLEASING_POLICIES = ['prohibited', 'with_consent', 'allowed'] as const
+export type SubleasingPolicy = typeof SUBLEASING_POLICIES[number]
+
+// ---------------------------------------------------------------------
+// Per-entity extracted shapes. Every field uses ParserExtractedField<T>
+// so confidence and rawText are preserved per S29c-2-B contract.
+// ---------------------------------------------------------------------
+
+export type ParserExtractedVehicle = {
+  vehicleType:    ParserExtractedField<string>   // VEHICLE_TYPES value
+  year?:          ParserExtractedField<number>
+  make?:          ParserExtractedField<string>
+  model?:         ParserExtractedField<string>
+  color?:         ParserExtractedField<string>
+  licensePlate?:  ParserExtractedField<string>
+  plateState?:    ParserExtractedField<string>
+}
+
+export type ParserExtractedRv = {
+  year?:         ParserExtractedField<number>
+  make?:         ParserExtractedField<string>
+  model?:        ParserExtractedField<string>
+  vin?:          ParserExtractedField<string>
+  lengthFt?:     ParserExtractedField<number>
+  numSlides?:    ParserExtractedField<number>
+  hookupClass?:  ParserExtractedField<string>    // RV_HOOKUP_CLASSES value
+  licensePlate?: ParserExtractedField<string>
+  plateState?:   ParserExtractedField<string>
+}
+
+export type ParserExtractedMobileHome = {
+  year?:             ParserExtractedField<number>
+  make?:             ParserExtractedField<string>
+  model?:            ParserExtractedField<string>
+  serialNumber?:     ParserExtractedField<string>
+  hudLabelNumber?:   ParserExtractedField<string>
+  lengthFt?:         ParserExtractedField<number>
+  widthFt?:          ParserExtractedField<number>
+  manufacturedDate?: ParserExtractedField<string>  // ISO date
+}
+
+export type ParserExtractedPet = {
+  name?:               ParserExtractedField<string>
+  species:             ParserExtractedField<string>   // PET_SPECIES value
+  breed?:              ParserExtractedField<string>
+  color?:              ParserExtractedField<string>
+  ageYears?:           ParserExtractedField<number>
+  weightLbs?:          ParserExtractedField<number>
+  isServiceAnimal?:    ParserExtractedField<boolean>
+  isEmotionalSupport?: ParserExtractedField<boolean>
+}
+
+export type ParserExtractedOccupant = {
+  fullName:                     ParserExtractedField<string>
+  relationshipToPrimaryTenant?: ParserExtractedField<string>
+  dateOfBirth?:                 ParserExtractedField<string>   // ISO date
+  isMinor?:                     ParserExtractedField<boolean>
+}
+
+export type ParserExtractedIdentification = {
+  idType:          ParserExtractedField<string>   // ID_TYPES value
+  idNumber:        ParserExtractedField<string>
+  issuingState?:   ParserExtractedField<string>   // USPS code for US-issued
+  issuingCountry?: ParserExtractedField<string>   // defaults 'US' at write time
+  expiryDate?:     ParserExtractedField<string>   // ISO date
+}
+
+export type ParserExtractedEmergencyContact = {
+  name:          ParserExtractedField<string>
+  phone?:        ParserExtractedField<string>
+  email?:        ParserExtractedField<string>
+  relationship?: ParserExtractedField<string>     // free text
+}
+
+export type ParserExtractedLiabilityInsurance = {
+  carrierName?:  ParserExtractedField<string>
+  policyNumber?: ParserExtractedField<string>
+  expiryDate?:   ParserExtractedField<string>     // ISO date
+}
+
+// Sublease detection only — the full sublease subsystem (payment splitter,
+// sublessor portal, sublease document parsing) is deferred. When the parser
+// detects sublease language in the document, it sets `detected=true` and
+// writes any sub-rent / dates it can find. Resolve does NOT auto-create a
+// subleases row; landlord confirms before the sublease becomes real.
+export type ParserExtractedSublease = {
+  detected:           ParserExtractedField<boolean>
+  subMonthlyAmount?:  ParserExtractedField<number>
+  startDate?:         ParserExtractedField<string>  // ISO date
+  endDate?:           ParserExtractedField<string>  // ISO date
+}
+
+// Runtime guards for the new const arrays.
+export const isVehicleType = (v: unknown): v is VehicleType =>
+  typeof v === 'string' && (VEHICLE_TYPES as readonly string[]).includes(v)
+export const isPetSpecies = (v: unknown): v is PetSpecies =>
+  typeof v === 'string' && (PET_SPECIES as readonly string[]).includes(v)
+export const isRvHookupClass = (v: unknown): v is RvHookupClass =>
+  typeof v === 'string' && (RV_HOOKUP_CLASSES as readonly string[]).includes(v)
+export const isIdType = (v: unknown): v is IdType =>
+  typeof v === 'string' && (ID_TYPES as readonly string[]).includes(v)
+export const isSubleasingPolicy = (v: unknown): v is SubleasingPolicy =>
+  typeof v === 'string' && (SUBLEASING_POLICIES as readonly string[]).includes(v)
+
+// ── BACKGROUND CHECK SUBSYSTEM ────────────────────────────────
+// Source of truth for the four CHECK constraints in
+// 20260430204722_background_check_subsystem.sql. Any consumer that writes
+// status values must validate against these arrays — do NOT inline.
+
+export const BACKGROUND_CHECK_STATUSES = [
+  'pending',
+  'awaiting_applicant',
+  'submitted',
+  'processing',
+  'complete',
+  'failed',
+  'cancelled',
+  'approved',
+  'denied',
+  'expired',
+] as const
+export type BackgroundCheckStatus = typeof BACKGROUND_CHECK_STATUSES[number]
+export const isBackgroundCheckStatus = (v: unknown): v is BackgroundCheckStatus =>
+  typeof v === 'string' && (BACKGROUND_CHECK_STATUSES as readonly string[]).includes(v)
+
+export const TENANT_BACKGROUND_CHECK_STATUSES = [
+  'not_started',
+  'submitted',
+  'approved',
+  'denied',
+  'cancelled',
+  'expired',
+] as const
+export type TenantBackgroundCheckStatus = typeof TENANT_BACKGROUND_CHECK_STATUSES[number]
+export const isTenantBackgroundCheckStatus = (v: unknown): v is TenantBackgroundCheckStatus =>
+  typeof v === 'string' && (TENANT_BACKGROUND_CHECK_STATUSES as readonly string[]).includes(v)
+
+// S76: tenant onboarding provenance and platform-status enums.
+// onboarding_source: 'applied' = walked in via public listing application;
+//                    'onboarded' = added directly by landlord (CSV / invite).
+// platform_status: gates ACH pulls + portal access. 'blocked' is a hard
+// stop set by eviction-mode + return-code workflows.
+export const TENANT_ONBOARDING_SOURCES = ['applied', 'onboarded'] as const
+export type TenantOnboardingSource = typeof TENANT_ONBOARDING_SOURCES[number]
+
+export const TENANT_PLATFORM_STATUSES = ['active', 'suspended', 'blocked'] as const
+export type TenantPlatformStatus = typeof TENANT_PLATFORM_STATUSES[number]
+
+export const APPLICATION_POOL_STATUSES = [
+  'available',
+  'matched',
+  'inactive',
+  'expired',
+] as const
+export type ApplicationPoolStatus = typeof APPLICATION_POOL_STATUSES[number]
+export const isApplicationPoolStatus = (v: unknown): v is ApplicationPoolStatus =>
+  typeof v === 'string' && (APPLICATION_POOL_STATUSES as readonly string[]).includes(v)
+
+export const POOL_MATCH_STATUSES = [
+  'pending',
+  'interested',
+  'not_interested',
+  'report_purchased',
+  'expired',
+] as const
+export type PoolMatchStatus = typeof POOL_MATCH_STATUSES[number]
+export const isPoolMatchStatus = (v: unknown): v is PoolMatchStatus =>
+  typeof v === 'string' && (POOL_MATCH_STATUSES as readonly string[]).includes(v)
+
+export const BACKGROUND_RISK_LEVELS = ['low', 'medium', 'high', 'very_high'] as const
+export type BackgroundRiskLevel = typeof BACKGROUND_RISK_LEVELS[number]
+export const isBackgroundRiskLevel = (v: unknown): v is BackgroundRiskLevel =>
+  typeof v === 'string' && (BACKGROUND_RISK_LEVELS as readonly string[]).includes(v)
+
+
+// =============================================================================
+// 16a allocation rules (S64) — single source of truth for property allocation
+// =============================================================================
+
+// S116: generic FEE_PAYER_VALUES — used by all three independent toggles
+// (ach_fee_payer / card_fee_payer / platform_fee_payer) introduced at
+// S114. Single union retained for ease of validation; the prior
+// BANKING_FEE_PAYER_VALUES alias is kept for backward compat one cycle.
+export const FEE_PAYER_VALUES = ['landlord', 'tenant'] as const
+export type FeePayer = typeof FEE_PAYER_VALUES[number]
+
+/** @deprecated S116 — use FEE_PAYER_VALUES instead. Will be removed once
+ *  all callers update. */
+export const BANKING_FEE_PAYER_VALUES = FEE_PAYER_VALUES
+/** @deprecated S116 — use FeePayer instead. */
+export type BankingFeePayer = FeePayer
+
+export const PLACEMENT_FEE_TYPE_VALUES = ['flat', 'percent_of_first_month'] as const
+export type PlacementFeeType = typeof PLACEMENT_FEE_TYPE_VALUES[number]
+
+/**
+ * Required payload on POST /api/properties.
+ * banking_fee_payer is required; all PM fee fields optional (owner-self-managed
+ * properties send all fees null).
+ *
+ * owner_bank_account_id (S66): optional bank account routing target. Snapshotted
+ * onto each ledger row at allocation time. Multiple properties can share one
+ * bank account — they collapse into a single Friday disbursement. NULL = no
+ * routing yet; ledger rows still write but autoPayouts skips them.
+ */
+export interface AllocationRuleInput {
+  banking_fee_payer: BankingFeePayer
+  rent_percent?: number | null
+  rent_percent_floor?: number | null
+  rent_percent_ceiling?: number | null
+  flat_monthly_fee?: number | null
+  per_unit_fee?: number | null
+  placement_fee_type?: PlacementFeeType | null
+  placement_fee_value?: number | null
+  maintenance_markup_percent?: number | null
+  owner_bank_account_id?: string | null
+}
+
+
+// =============================================================================
+// User bank accounts (S66) — per-user catalog, per-property routing
+// =============================================================================
+
+// =============================================================================
+// Properties review status (S73) — admin moderation lifecycle
+// =============================================================================
+
+export const PROPERTY_REVIEW_STATUSES = ['active', 'pending_review', 'rejected'] as const
+export type PropertyReviewStatus = typeof PROPERTY_REVIEW_STATUSES[number]
+
+
+export const ACCOUNT_TYPE_VALUES = ['checking', 'savings'] as const
+export type AccountType = typeof ACCOUNT_TYPE_VALUES[number]
+
+export const ACCOUNT_HOLDER_TYPE_VALUES = ['individual', 'business'] as const
+export type AccountHolderType = typeof ACCOUNT_HOLDER_TYPE_VALUES[number]
+
+export const BANK_ACCOUNT_STATUS_VALUES = ['active', 'archived'] as const
+export type BankAccountStatus = typeof BANK_ACCOUNT_STATUS_VALUES[number]
+
+/**
+ * POST /api/bank-accounts payload. routing_number + account_number raw on
+ * the wire (TLS only); server encrypts at rest and only ever returns last4.
+ */
+export interface BankAccountInput {
+  nickname: string
+  account_holder_name: string
+  account_holder_type: AccountHolderType
+  account_type: AccountType
+  routing_number: string
+  account_number: string
+}
+
+/**
+ * Returned by GET /api/bank-accounts. account_number_last4 is the only
+ * representation of the account number ever sent to a client; full number
+ * is decrypted server-side at payout fire time, never UI-bound.
+ */
+export interface BankAccountSummary {
+  id: string
+  nickname: string
+  account_holder_name: string
+  account_holder_type: AccountHolderType
+  account_type: AccountType
+  routing_number: string
+  account_number_last4: string
+  status: BankAccountStatus
+  created_at: string
+  updated_at: string
+}
+
+// ============================================================
+// CREDIT LEDGER v1
+// Hash-chained, Merkle-anchored event ledger spanning tenants,
+// landlords, managers, and properties. Score is internal-only
+// (gated to GAM lending services). See CREDIT_LEDGER_V1.md.
+// ============================================================
+
+export const CREDIT_SUBJECT_TYPES = ['tenant', 'landlord', 'manager', 'property'] as const
+export type CreditSubjectType = typeof CREDIT_SUBJECT_TYPES[number]
+
+// CreditEventType is the full v1 catalog. Forward-compat life-event
+// types (utility_*, telecom_*, auto_loan_*, insurance_*, child_support_*,
+// medical_*, subscription_*, bill_pay_*) are listed here so scoring
+// values in the v1.0.0 formula seed have matching keys. They are not
+// emitted in v1 — integrations land in v1.5 (Plaid Liabilities) and
+// v2.0 (GAM bill-pay product).
+//
+// Inspection / entry-request / eviction event types are also listed:
+// inspection workflow does not yet exist (build deferred); entry-request
+// flow is being scoped; eviction events are landlord-self-attested
+// in v1 via manual UI.
+export const CREDIT_EVENT_TYPES = [
+  // Payment events (auto-attested via Stripe webhooks)
+  'payment_received_on_time',
+  'payment_received_late_grace',
+  'payment_received_late_minor',
+  'payment_received_late_major',
+  'payment_received_late_severe',
+  'payment_failed_nsf',
+  'payment_partial',
+  'payment_skipped',
+  'payment_refunded',
+
+  // Lease events (auto-attested via e-sign)
+  'lease_signed',
+  'lease_renewed',
+  'lease_modified',
+  'lease_assigned',
+  'lease_anniversary',
+  'lease_terminated_natural',
+  'lease_terminated_early_by_tenant',
+  'lease_terminated_early_by_landlord',
+  'lease_abandoned',
+  'proper_notice_given_for_move_out',
+
+  // Move-in / move-out (inspection workflow — deferred build)
+  'move_in_inspection_completed',
+  'move_out_inspection_completed',
+  'move_out_condition_matches_move_in',
+  'move_out_condition_damage_documented',
+  'move_in_photos_submitted',
+  'move_out_photos_submitted',
+  'deposit_returned_full',
+  'deposit_returned_partial',
+  'deposit_returned_zero',
+  'deposit_returned_within_state_window',
+  'deposit_returned_late',
+  'deposit_interest_paid',  // S193 — statutory interest settled at lease end
+  'deposit_dispute_opened',
+  'deposit_dispute_resolved_for_tenant',
+
+  // Sublease lifecycle (S199). Recorded against the sublessor.
+  // Sublessee gets their own scoring signal via the master payment
+  // events when they pay their portion; these events capture the
+  // sublessor's behavior in subletting.
+  'sublease_requested',
+  'sublease_approved',
+  'sublease_denied',
+  'sublease_completed_natural',     // ended at end_date as planned
+  'sublease_terminated_early',      // ended before end_date by any party
+
+  // S202: lease amendment via addendum (B1+B2 phase 2A). Recorded
+  // against the tenant subject. event_data carries the field-by-
+  // field diff so the tenant's lease history surfaces what changed.
+  // Not scored in v1.0.0 — informational audit trail only.
+  'lease_addendum_recorded',
+  'unit_ready_on_move_in_date',
+  'utilities_transferred_at_move_in',
+  'renters_insurance_verified',
+
+  // Maintenance + cooperation
+  'maintenance_request_submitted',
+  'maintenance_request_acknowledged',
+  'maintenance_request_resolved',
+  'maintenance_response_within_sla',
+  'maintenance_response_24h',
+  'maintenance_response_72h',
+  'maintenance_response_breach_sla',
+  'maintenance_resolution_confirmed',
+  'repair_quality_held_30d',
+  'recurring_repair_same_issue',
+  'entry_request_made',
+  'entry_request_granted_within_window',
+  'entry_request_denied',
+  'entry_compliance_breach',
+  'proper_entry_notice_given',
+  'habitability_complaint_unresolved_30d',
+
+  // Conduct (manual attestation, evidence required)
+  'noise_complaint_logged',
+  'lease_violation_notice_issued',
+  'lease_violation_cured',
+  'recurring_lease_violation',
+  'property_damage_event_documented',
+  'nuisance_event_documented',
+  'rent_increase_with_proper_notice',
+  'rent_increase_without_proper_notice',
+
+  // Eviction + balance (landlord-attested in v1 via manual UI)
+  'eviction_notice_filed',
+  'eviction_hearing_scheduled',
+  'eviction_hearing_continued',
+  'eviction_hearing_dismissed',
+  'eviction_hearing_judgment_issued',
+  'eviction_settled',
+  'eviction_withdrawn',
+  'tenant_moved_before_judgment',
+  'tenancy_ended_with_balance',
+  'balance_paid_post_move',
+  'balance_sent_to_collections',
+  'utility_balance_unpaid_at_move_out',
+
+  // Network signals (cross-landlord)
+  'multi_landlord_history_clean',
+
+  // Self-attested
+  'hardship_period_started',
+  'hardship_period_ended',
+  'hardship_context_added',
+  'subject_added_event_context',
+
+  // Dispute (system-recorded)
+  'dispute_opened',
+  'dispute_evidence_submitted',
+  'dispute_resolved_upheld',
+  'dispute_resolved_corrected',
+  'dispute_resolved_no_change',
+
+  // External life events — utility (v1.5+ Plaid/aggregator)
+  'utility_payment_on_time',
+  'utility_payment_late_grace',
+  'utility_payment_late',
+  'utility_payment_missed',
+  'utility_disconnect_for_nonpayment',
+
+  // External life events — telecom (v1.5+)
+  'telecom_payment_on_time',
+  'telecom_payment_missed',
+  'telecom_disconnect_for_nonpayment',
+
+  // External life events — auto loan (v1.5+)
+  'auto_loan_payment_on_time',
+  'auto_loan_payment_late_grace',
+  'auto_loan_payment_late',
+  'auto_loan_payment_missed',
+  'auto_loan_default',
+
+  // External life events — insurance (v1.5+)
+  'insurance_premium_on_time',
+  'insurance_lapsed_nonpayment',
+  'insurance_lapsed_voluntary',
+
+  // External life events — child support (v2+)
+  'child_support_paid_on_time',
+  'child_support_missed',
+  'child_support_arrears',
+
+  // External life events — medical (v1.5+)
+  'medical_payment_plan_on_time',
+  'medical_collections_event',
+
+  // External life events — subscription (v1.5+)
+  'subscription_payment_on_time',
+  'subscription_canceled_nonpayment',
+
+  // Bill-pay product (v2.0+)
+  'bill_pay_payment_initiated',
+  'bill_pay_payment_settled',
+  'bill_pay_payment_failed',
+  'bill_pay_account_linked',
+  'bill_pay_account_unlinked',
+
+  // External-account consent events (v1.5+ aggregator integrations)
+  'external_data_consent_granted',
+  'external_data_consent_revoked',
+
+  // Reserved for v2+ (in enum, not emitted in v1 — kept here so future
+  // event_data writers don't accidentally collide on a reserved name)
+  'court_ruling_received',
+  'police_report_filed',
+  'police_report_outcome',
+  'medical_event_attested',
+  'bond_posted',
+  'bond_released',
+  'score_disclosed_to_third_party',
+  'credential_shared_with_third_party',
+  'biometric_anchor_established',
+  'balance_settled_voluntarily',
+  'balance_settled_via_partner',
+  'balance_recovery_received',
+  'settlement_offer_made',
+  'settlement_offer_accepted',
+  'settlement_offer_declined',
+  'partial_payment_received_post_move',
+  'partner_legal_action_initiated',
+  'partner_judgment_obtained',
+] as const
+export type CreditEventType = typeof CREDIT_EVENT_TYPES[number]
+
+export const CREDIT_ATTESTATION_SOURCES = [
+  'gam_workflow_auto',
+  'stripe_attested',
+  'gam_bill_pay_attested',
+  'plaid_attested',
+  'aggregator_attested',
+  'carrier_attested',
+  'lender_attested',
+  'partner_cra',
+  'court_record',
+  'police_record',
+  'medical_record_self_attested',
+  'landlord_self_reported_with_evidence',
+  'tenant_self_reported_with_doc_verified',
+  'tenant_self_reported',
+  'system_derived',
+] as const
+export type CreditAttestationSource = typeof CREDIT_ATTESTATION_SOURCES[number]
+
+export const CREDIT_SCORE_DIMENSIONS = [
+  'payment_reliability',
+  'property_care',
+  'tenancy_stability',
+  'community_fit',
+  'cooperation',
+] as const
+export type CreditScoreDimension = typeof CREDIT_SCORE_DIMENSIONS[number]
+
+export const CREDIT_NETWORK_VISIBILITY = [
+  'private_to_subject',
+  'visible_to_current_landlord',
+  'visible_to_gam_network',
+] as const
+export type CreditNetworkVisibility = typeof CREDIT_NETWORK_VISIBILITY[number]
+
+export const CREDIT_DISCLOSURE_SCOPES = ['gam_internal_only'] as const
+export type CreditDisclosureScope = typeof CREDIT_DISCLOSURE_SCOPES[number]
+
+export const CREDIT_DISPUTE_STATUSES = [
+  'open',
+  'evidence_pending',
+  'resolved_upheld',
+  'resolved_corrected',
+  'resolved_no_change',
+] as const
+export type CreditDisputeStatus = typeof CREDIT_DISPUTE_STATUSES[number]
+
+export const CREDIT_DISPUTE_REASONS = [
+  'factual_inaccuracy',
+  'attestation_invalid',
+  'identity_mismatch',
+  'other',
+] as const
+export type CreditDisputeReason = typeof CREDIT_DISPUTE_REASONS[number]
+
+export const CREDIT_HARDSHIP_CATEGORIES = [
+  'medical',
+  'job_loss',
+  'family_death',
+  'natural_disaster',
+  'military_deployment',
+  'other',
+] as const
+export type CreditHardshipCategory = typeof CREDIT_HARDSHIP_CATEGORIES[number]
+
+export const CREDIT_SUPERSEDE_REASONS = [
+  'correction_after_dispute',
+  'data_entry_error_corrected',
+  'attestation_invalidated',
+] as const
+export type CreditSupersedeReason = typeof CREDIT_SUPERSEDE_REASONS[number]
+
+export const CREDIT_NETWORK_TIERS = ['tier_2_full'] as const
+export type CreditNetworkTier = typeof CREDIT_NETWORK_TIERS[number]
+
+export const EXTERNAL_ACCOUNT_CATEGORIES = [
+  'utility',
+  'telecom',
+  'auto_loan',
+  'insurance',
+  'child_support',
+  'medical',
+  'subscription',
+  'bank_account',
+  'credit_card',
+  'student_loan',
+  'mortgage',
+] as const
+export type ExternalAccountCategory = typeof EXTERNAL_ACCOUNT_CATEGORIES[number]
+
+export const EXTERNAL_ACCOUNT_PROVIDER_KINDS = [
+  'plaid',
+  'mx',
+  'finicity',
+  'carrier_direct',
+  'lender_direct',
+  'gam_bill_pay',
+  'manual_upload',
+] as const
+export type ExternalAccountProviderKind = typeof EXTERNAL_ACCOUNT_PROVIDER_KINDS[number]
+
+// S207: state_tax_forms.filing_method — distinguishes paper-form filings
+// (form_code is the official IRS/state code) from online-portal-only
+// filings (form_code is a descriptive label; landlord files via agency_url
+// portal, no paper form to look up). Conservative posture from S205/S206:
+// fabricating a paper form code for portal-only states (MN, SD, WY, AK)
+// would mislead landlords; this column lets us catalog those states
+// without that hazard.
+export const FILING_METHOD_VALUES = ['paper_form', 'online_portal'] as const
+export type FilingMethod = typeof FILING_METHOD_VALUES[number]

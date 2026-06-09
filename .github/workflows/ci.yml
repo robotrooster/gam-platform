@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: tsc + test
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        # Wait for the server to accept connections before letting the
+        # job's steps start running queries.
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      # apps/api db/index.ts + test globalSetup read these.
+      # apps/api's `npm test` script prepends DB_NAME=gam_test to the
+      # vitest invocation, which overrides DB_NAME here for the test
+      # process; this var only matters if a future job needs the dev
+      # db name.
+      DB_HOST: localhost
+      DB_PORT: 5432
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_NAME: postgres
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # packages/shared is a TS composite project consumed by apps/api
+      # and the frontend apps. Build it once up front so the
+      # downstream tsc runs can resolve `@gam/shared`.
+      - name: Build @gam/shared
+        run: npm run build --workspace=packages/shared
+
+      - name: Type-check apps/api
+        run: npx tsc -b
+        working-directory: apps/api
+
+      - name: Test apps/api
+        run: npm test
+        working-directory: apps/api
+
+      - name: Type-check apps/pos
+        run: npx tsc --noEmit
+        working-directory: apps/pos
+
+      - name: Test apps/pos
+        run: npm test
+        working-directory: apps/pos

@@ -24,6 +24,7 @@ import {
   type LateFeeAccrualPeriod,
 } from '@gam/shared'
 import { registerEngine } from './timezoneCronManager'
+import { logger } from '../lib/logger'
 
 interface QualifyingInvoice {
   invoice_id: number
@@ -112,7 +113,7 @@ export async function generateLateFeesForTimezone(
         await client.query('ROLLBACK').catch(() => {})
         const msg = e instanceof Error ? e.message : String(e)
         result.errors.push({ invoice_id: inv.invoice_id, error: msg })
-        console.error(`[LateFees][${tz}] Invoice ${inv.invoice_id} error:`, e)
+        logger.error({ err: e, tz, invoice_id: inv.invoice_id }, '[LateFees] invoice error')
       }
     }
   } finally {
@@ -268,11 +269,7 @@ export function registerLateFeeEngine(): void {
     handler: async (tz: string) => {
       const r = await generateLateFeesForTimezone(tz)
       if (r.invoicesScanned > 0 || r.errors.length > 0) {
-        console.log(
-          `[LateFees][${tz}] Scanned ${r.invoicesScanned}, ` +
-          `wrote ${r.rowsWritten}, caps hit: ${r.capsHit}, ` +
-          `errors: ${r.errors.length}`
-        )
+        logger.info({ tz, scanned: r.invoicesScanned, wrote: r.rowsWritten, caps_hit: r.capsHit, errors: r.errors.length }, '[LateFees] scan complete')
       }
     },
     label: 'Late fees',

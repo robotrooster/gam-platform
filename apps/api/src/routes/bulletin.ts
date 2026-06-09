@@ -1,8 +1,9 @@
 import { Router } from 'express'
 import { query, queryOne } from '../db'
-import { requireAuth, requireTenant, requireLandlord } from '../middleware/auth'
+import { requireAuth, requireTenant, requirePerm } from '../middleware/auth'
 import { db } from '../db'
 import { AppError } from '../middleware/errorHandler'
+import { resolveLandlordIdForUser } from '../lib/scope'
 
 export const bulletinRouter = Router()
 bulletinRouter.use(requireAuth)
@@ -138,8 +139,10 @@ bulletinRouter.post('/', requireTenant, async (req, res, next) => {
 // ── POST /api/bulletin/:id/vote ───────────────────────────────
 bulletinRouter.post('/:id/vote', requireTenant, async (req, res, next) => {
   try {
-    const { vote_type } = req.body // 'up' or 'flag'
-    if (!['up','flag'].includes(vote_type)) throw new AppError(400, 'Invalid vote type')
+    // S317: camelCase request-body convention. db column stays
+    // `vote_type` (snake_case); only the wire-level key was renamed.
+    const { voteType } = req.body as { voteType: string } // 'up' or 'flag'
+    if (!['up','flag'].includes(voteType)) throw new AppError(400, 'Invalid vote type')
 
     const tenant = await getTenantLocation(req.user!.userId)
     if (!tenant) throw new AppError(404, 'Tenant not found')
@@ -169,7 +172,7 @@ bulletinRouter.post('/:id/vote', requireTenant, async (req, res, next) => {
 
     await query(
       `INSERT INTO bulletin_votes (post_id, tenant_id, vote_type) VALUES ($1, $2, $3)`,
-      [req.params.id, tenant.id, vote_type]
+      [req.params.id, tenant.id, voteType]
     )
 
     // Recount and update pin status
@@ -194,7 +197,16 @@ bulletinRouter.post('/:id/vote', requireTenant, async (req, res, next) => {
 // ── GET /api/bulletin/:id/reveal — super_admin only ──────────
 bulletinRouter.get('/:id/reveal', async (req, res, next) => {
   try {
-    if (!req.user?.permissions?.super_admin) throw new AppError(403, 'Super admin access required')
+    // S401 fix: pre-fix checked `permissions.super_admin` which is never
+    // set in any JWT — getScopeForUser in auth.ts returns null for
+    // admin/super_admin roles, so login stamps `permissions: null` on
+    // their tokens. The route was completely unreachable. Bulletin
+    // moderation (revealing a poster's identity) was a dead admin
+    // surface. Role check is the right gate; same pattern as
+    // requireRole('super_admin') used throughout the codebase.
+    if (req.user?.role !== 'super_admin') {
+      throw new AppError(403, 'Super admin access required')
+    }
 
     const post = await queryOne<any>(
       `SELECT bp.id, bp.alias, bp.content, bp.created_at, bp.scope,
@@ -222,10 +234,12 @@ bulletinRouter.get('/:id/reveal', async (req, res, next) => {
 })
 
 // ── GET /api/bulletin/landlord — read-only view for landlords ──
-bulletinRouter.get('/landlord', requireLandlord, async (req, res, next) => {
+// S129: opened to property_manager + onsite_manager via bulletin.view.
+bulletinRouter.get('/landlord', requirePerm('bulletin.view'), async (req, res, next) => {
   try {
     const { date, search } = req.query
-    const landlordId = req.user!.profileId
+    const landlordId = resolveLandlordIdForUser(req.user!)
+    if (!landlordId) throw new AppError(400, 'No landlord scope on this user')
 
     // Get all property_ids for this landlord
     const { rows: properties } = await db.query(
@@ -233,22 +247,44 @@ bulletinRouter.get('/landlord', requireLandlord, async (req, res, next) => {
     )
     if (!properties.length) return res.json({ success: true, data: [] })
 
-    const propertyIds = properties.map((p: any) => p.id)
-    const placeholders = propertyIds.map((_: any, i: number) => `$${i + 1}`).join(',')
+    // S401 fix: pre-fix interpolated `date` and `search` directly into
+    // SQL strings. The `date` interpolation had NO escaping (raw SQL
+    // injection on an authenticated landlord/PM surface). The `search`
+    // escaping ("''") was a hand-rolled half-defense that left edge
+    // cases like backslashes / LIKE metachars unhandled. Both now go
+    // through parameterized $N binds.
+    const params: any[] = [...properties.map((p: any) => p.id)]
+    const placeholders = params.map((_: any, i: number) => `$${i + 1}`).join(',')
 
-    const dateFilter = date ? `AND DATE(created_at) = '${date}'` : `AND DATE(created_at) = CURRENT_DATE`
-    const searchFilter = search ? `AND content ILIKE '%' || '${(search as string).replace(/'/g,"''")}' || '%'` : ''
+    let dateClause: string
+    if (date) {
+      // ISO YYYY-MM-DD only; reject anything else to prevent injection
+      // via a parameter that postgres still casts to text first.
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(String(date))) {
+        throw new AppError(400, 'date must be YYYY-MM-DD')
+      }
+      params.push(date)
+      dateClause = `AND DATE(created_at) = $${params.length}::date`
+    } else {
+      dateClause = `AND DATE(created_at) = CURRENT_DATE`
+    }
+
+    let searchClause = ''
+    if (search) {
+      params.push(search)
+      searchClause = `AND content ILIKE '%' || $${params.length} || '%'`
+    }
 
     const { rows: posts } = await db.query(
       `SELECT id, scope, alias, content, upvote_count, flag_count, total_votes, pinned, created_at, property_id, city, state
        FROM bulletin_posts
        WHERE property_id IN (${placeholders})
          AND (is_removed IS NULL OR is_removed = FALSE)
-         ${dateFilter}
-         ${searchFilter}
+         ${dateClause}
+         ${searchClause}
        ORDER BY pinned DESC, created_at DESC
        LIMIT 500`,
-      propertyIds
+      params
     )
 
     res.json({ success: true, data: posts })

@@ -10,9 +10,9 @@ export function InventoryPage() {
       <div className="page-header">
         <div><h1 className="page-title">Inventory</h1><p className="page-subtitle">Supplies and resale items</p></div>
       </div>
-      <div className="card" style={{padding:0}}>
+      <div className="card" style={{padding:0,overflowX:'auto'}}>
         {isLoading ? <div style={{padding:32,color:'var(--text-3)',textAlign:'center'}}>Loading…</div> : (
-          <table className="data-table">
+          <table className="data-table" style={{minWidth:820}}>
             <thead><tr><th>Item</th><th>SKU</th><th>Category</th><th>Qty</th><th>Unit Price</th><th>Total Value</th><th>Status</th></tr></thead>
             <tbody>
               {items.length ? items.map((item: any) => (

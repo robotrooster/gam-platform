@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useQuery } from 'react-query'
 import { apiGet } from '../lib/api'
-import { Users, Plus, UserPlus } from 'lucide-react'
+import { Plus, UserPlus } from 'lucide-react'
 import { InviteTenantModal } from './InviteTenantModal'
 
 export function TenantsPage() {
@@ -25,8 +25,8 @@ export function TenantsPage() {
         </div>
       </div>
       {isLoading ? <div style={{color:'var(--text-3)',padding:32}}>Loading…</div> : (
-        <div className="card" style={{padding:0}}>
-          <table className="data-table">
+        <div className="card" style={{padding:0,overflowX:'auto'}}>
+          <table className="data-table" style={{minWidth:880}}>
             <thead><tr><th>Tenant</th><th>Unit</th><th>Property</th><th>Rent</th><th>ACH</th><th>On-Time Pay</th><th>SSI/SSDI</th></tr></thead>
             <tbody>
               {tenants.length ? tenants.map((u: any) => (

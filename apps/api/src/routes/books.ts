@@ -1,25 +1,66 @@
-import { Router } from 'express'
+import { Router, Request, Response, NextFunction } from 'express'
+import { z } from 'zod'
 import { db, queryOne } from '../db'
-import { requireAuth, requireLandlord } from '../middleware/auth'
+import { requireAuth, requireLandlord, requireBooksRead, requireBooksWrite } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
+import { isDisposableEmail } from '../lib/email'
 
 export const booksRouter = Router()
 booksRouter.use(requireAuth)
 
 // ── Scope helper — admin sees all, landlord sees own, bookkeeper uses active client ──
+// Bookkeeper activeClientId is set by the middleware below from the
+// X-Client-Id header. The middleware throws 400 if the header is missing
+// and 403 if the claimed client isn't an assigned scope, so by the time
+// we reach this helper, activeClientId is either a validated landlord_id
+// or the caller is not a bookkeeper.
 function landlordScope(user: any) {
   if (user.role === 'admin' || user.role === 'super_admin') return null
-  if (user.role === 'bookkeeper') return user.activeClientId || null // set via X-Client-Id header
+  if (user.role === 'bookkeeper') return user.activeClientId
   return user.landlordId || user.profileId
 }
 
-// Middleware to inject activeClientId for bookkeepers from X-Client-Id header
-import { Request, Response, NextFunction } from 'express'
-booksRouter.use((req: Request, _res: Response, next: NextFunction) => {
-  if (req.user?.role === 'bookkeeper') {
-    (req.user as any).activeClientId = req.headers['x-client-id'] || null
-  }
-  next()
+// S383 fix — bookkeeper client-scope validation middleware. Pre-fix bug:
+// the middleware blindly accepted the X-Client-Id header without
+// verifying the bookkeeper had a bookkeeper_scopes row for that
+// landlord, AND treated a missing header as activeClientId=null. Both
+// paths flowed into landlordScope returning null, which made every
+// route's `WHERE landlord_id=$1 OR $1 IS NULL` guard match every row
+// across every landlord — a critical cross-tenant privilege escalation.
+// Now: missing header → 400; unrecognized client id → 403; the
+// access_level is re-read from the live scope row and re-stamped onto
+// req.user.permissions so a revoked / downgraded scope takes effect
+// immediately instead of being stuck on the JWT's stale value.
+//
+// Routes that don't require an active client scope (e.g.
+// GET /bookkeeper/clients, the discovery endpoint) live above
+// requireBooksRead/Write and bypass this gate by virtue of the route's
+// own authz check.
+booksRouter.use(async (req: Request, _res: Response, next: NextFunction) => {
+  try {
+    if (req.user?.role !== 'bookkeeper') return next()
+    // Discovery + invite routes don't need a scoped client — they ARE
+    // how a bookkeeper finds out which clients they're assigned to.
+    if (req.path === '/bookkeeper/clients') return next()
+    const headerVal = req.headers['x-client-id']
+    const clientId = Array.isArray(headerVal) ? headerVal[0] : headerVal
+    if (!clientId) {
+      throw new AppError(400, 'X-Client-Id header required for bookkeeper requests')
+    }
+    const scope = await queryOne<{ access_level: string }>(
+      `SELECT access_level FROM bookkeeper_scopes WHERE user_id=$1 AND landlord_id=$2`,
+      [req.user.userId, clientId]
+    )
+    if (!scope) {
+      throw new AppError(403, 'You are not assigned to this client')
+    }
+    ;(req.user as any).activeClientId = clientId
+    ;(req.user as any).permissions = {
+      ...(req.user.permissions || {}),
+      access_level: scope.access_level,
+    }
+    next()
+  } catch (e) { next(e) }
 })
 
 // ════════════════════════════════════════
@@ -27,7 +68,7 @@ booksRouter.use((req: Request, _res: Response, next: NextFunction) => {
 // ════════════════════════════════════════
 
 // GET /api/books/accounts
-booksRouter.get('/accounts', async (req, res, next) => {
+booksRouter.get('/accounts', requireBooksRead, async (req, res, next) => {
   try {
     const lid = landlordScope(req.user)
     const { rows } = await db.query(
@@ -42,7 +83,7 @@ booksRouter.get('/accounts', async (req, res, next) => {
 })
 
 // POST /api/books/accounts
-booksRouter.post('/accounts', async (req, res, next) => {
+booksRouter.post('/accounts', requireBooksWrite, async (req, res, next) => {
   try {
     const lid = landlordScope(req.user)
     const { code, name, type, subtype, description } = req.body
@@ -62,7 +103,7 @@ booksRouter.post('/accounts', async (req, res, next) => {
 })
 
 // PATCH /api/books/accounts/:id
-booksRouter.patch('/accounts/:id', async (req, res, next) => {
+booksRouter.patch('/accounts/:id', requireBooksWrite, async (req, res, next) => {
   try {
     const lid = landlordScope(req.user)
     const { name, subtype, description, active } = req.body
@@ -80,7 +121,7 @@ booksRouter.patch('/accounts/:id', async (req, res, next) => {
 })
 
 // DELETE /api/books/accounts/:id
-booksRouter.delete('/accounts/:id', async (req, res, next) => {
+booksRouter.delete('/accounts/:id', requireBooksWrite, async (req, res, next) => {
   try {
     const lid = landlordScope(req.user)
     await db.query(
@@ -93,7 +134,7 @@ booksRouter.delete('/accounts/:id', async (req, res, next) => {
 })
 
 // POST /api/books/accounts/seed — seed standard property mgmt COA
-booksRouter.post('/accounts/seed', async (req, res, next) => {
+booksRouter.post('/accounts/seed', requireBooksWrite, async (req, res, next) => {
   try {
     const lid = landlordScope(req.user)
     const standardAccounts = [
@@ -167,7 +208,7 @@ booksRouter.post('/accounts/seed', async (req, res, next) => {
 // EMPLOYEES
 // ════════════════════════════════════════
 
-booksRouter.get('/employees', async (req, res, next) => {
+booksRouter.get('/employees', requireBooksRead, async (req, res, next) => {
   try {
     const lid = landlordScope(req.user)
     const { rows } = await db.query(
@@ -178,29 +219,61 @@ booksRouter.get('/employees', async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
-booksRouter.post('/employees', async (req, res, next) => {
+// S416 (S412 fan-out): strict zod validation on POST /employees.
+// Same posture as the S384 contractors decision: "all fields required"
+// by default. Pre-fix only firstName/lastName/payType/payRate were
+// hand-checked; everything else passed through as null.
+//
+// S91 back-compat: stateWithholdingPct is the new generic name; the
+// legacy azWithholdingPct is still accepted for callers that haven't
+// updated. Either satisfies the required gate.
+const employeeBaseSchema = z.object({
+  firstName:           z.string().trim().min(1),
+  lastName:            z.string().trim().min(1),
+  email:               z.string().trim().email('valid email required'),
+  phone:               z.string().trim().min(7),
+  address:             z.string().trim().min(1),
+  ssnLast4:            z.string().trim().regex(/^\d{4}$/, 'ssnLast4 must be 4 digits'),
+  payType:             z.enum(['hourly', 'salary']),
+  payRate:             z.number().positive(),
+  payFrequency:        z.enum(['weekly', 'biweekly', 'semimonthly', 'monthly']),
+  filingStatus:        z.enum(['single', 'married', 'head_of_household']),
+  federalAllowances:   z.number().int().min(0),
+  // Either the new name OR the legacy az* name; at least one required.
+  stateWithholdingPct: z.number().min(0).max(100).optional(),
+  azWithholdingPct:    z.number().min(0).max(100).optional(),
+  title:               z.string().trim().min(1),
+  department:          z.string().trim().min(1),
+  startDate:           z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'startDate must be YYYY-MM-DD'),
+}).refine(
+  (v) => v.stateWithholdingPct !== undefined || v.azWithholdingPct !== undefined,
+  { message: 'stateWithholdingPct (or legacy azWithholdingPct) required',
+    path: ['stateWithholdingPct'] },
+)
+booksRouter.post('/employees', requireBooksWrite, async (req, res, next) => {
   try {
     const lid = landlordScope(req.user)
-    const { firstName, lastName, email, phone, address, ssnLast4, payType, payRate,
-            payFrequency, filingStatus, federalAllowances, azWithholdingPct,
-            title, department, startDate } = req.body
-    if (!firstName || !lastName || !payType || payRate === undefined)
-      throw new AppError(400, 'firstName, lastName, payType, payRate required')
+    const body = employeeBaseSchema.parse(req.body)
+    // S417: disposable-domain block (same Set as tenant /profile).
+    if (isDisposableEmail(body.email)) {
+      throw new AppError(400, 'Disposable / temporary email addresses are not allowed')
+    }
+    const stateRate = body.stateWithholdingPct ?? body.azWithholdingPct ?? 0
     const { rows: [emp] } = await db.query(
       `INSERT INTO books_employees
          (landlord_id, first_name, last_name, email, phone, address, ssn_last4,
           pay_type, pay_rate, pay_frequency, filing_status, federal_allowances,
-          az_withholding_pct, title, department, start_date)
+          state_withholding_pct, title, department, start_date)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`,
-      [lid, firstName, lastName, email||null, phone||null, address||null, ssnLast4||null,
-       payType, payRate, payFrequency||'biweekly', filingStatus||'single',
-       federalAllowances||0, azWithholdingPct||2.5, title||null, department||null, startDate||null]
+      [lid, body.firstName, body.lastName, body.email, body.phone, body.address, body.ssnLast4,
+       body.payType, body.payRate, body.payFrequency, body.filingStatus,
+       body.federalAllowances, stateRate, body.title, body.department, body.startDate]
     )
     res.status(201).json({ success: true, data: emp })
   } catch (e) { next(e) }
 })
 
-booksRouter.patch('/employees/:id', async (req, res, next) => {
+booksRouter.patch('/employees/:id', requireBooksWrite, async (req, res, next) => {
   try {
     const lid = landlordScope(req.user)
     const f = req.body
@@ -225,7 +298,7 @@ booksRouter.patch('/employees/:id', async (req, res, next) => {
 // CONTRACTORS
 // ════════════════════════════════════════
 
-booksRouter.get('/contractors', async (req, res, next) => {
+booksRouter.get('/contractors', requireBooksRead, async (req, res, next) => {
   try {
     const lid = landlordScope(req.user)
     const { rows } = await db.query(
@@ -236,25 +309,66 @@ booksRouter.get('/contractors', async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
-booksRouter.post('/contractors', async (req, res, next) => {
+// S412 (S398 S384 Nic-locked decision): "all fields required" on
+// POST /contractors. The memory note adds: "If a specific field
+// turns out to make individual-contractor (no EIN) or
+// no-SSN-on-file cases impossible, flag back to Nic before relaxing —
+// don't quietly skip fields."
+//
+// Implementation call: EIN is required only for entityType='business'
+// and SSN is required only for entityType='individual' (the two cases
+// the memory explicitly anticipated). Every other field is strictly
+// required. This conditional IS a relaxation of the literal directive
+// — flagged in the S412 handoff for Nic confirmation. If Nic wants
+// the strictest possible "both EIN AND SSN required regardless of
+// entity_type," revert to the all-required version and the route
+// becomes effectively unusable for real-world contractors (which is
+// presumably not the intent).
+const contractorBaseSchema = z.object({
+  firstName:    z.string().trim().min(1, 'firstName required'),
+  lastName:     z.string().trim().min(1, 'lastName required'),
+  businessName: z.string().trim().min(1, 'businessName required'),
+  email:        z.string().trim().email('valid email required'),
+  phone:        z.string().trim().min(7, 'phone required (min 7 digits)'),
+  address:      z.string().trim().min(1, 'address required'),
+  entityType:   z.enum(['individual', 'business']),
+  trade:        z.string().trim().min(1, 'trade required'),
+  payRate:      z.number().positive('payRate required (positive)'),
+  payUnit:      z.enum(['hour', 'project', 'sqft', 'day']),
+  w9OnFile:     z.boolean(),
+  ein:          z.string().trim().regex(/^\d{2}-?\d{7}$/, 'ein must be 9 digits (XX-XXXXXXX or XXXXXXXXX)').optional(),
+  ssnLast4:     z.string().trim().regex(/^\d{4}$/, 'ssnLast4 must be 4 digits').optional(),
+}).refine(
+  (v) => v.entityType !== 'business'   || !!v.ein,
+  { message: 'ein required for entityType=business', path: ['ein'] },
+).refine(
+  (v) => v.entityType !== 'individual' || !!v.ssnLast4,
+  { message: 'ssnLast4 required for entityType=individual', path: ['ssnLast4'] },
+)
+
+booksRouter.post('/contractors', requireBooksWrite, async (req, res, next) => {
   try {
     const lid = landlordScope(req.user)
-    const { firstName, lastName, businessName, email, phone, address, ein, ssnLast4,
-            entityType, trade, payRate, payUnit, w9OnFile } = req.body
+    const body = contractorBaseSchema.parse(req.body)
+    // S417: block disposable email domains (mailinator, yopmail, etc.)
+    // for parity with the tenant /profile route. Same Set in lib/email.
+    if (isDisposableEmail(body.email)) {
+      throw new AppError(400, 'Disposable / temporary email addresses are not allowed')
+    }
     const { rows: [con] } = await db.query(
       `INSERT INTO books_contractors
          (landlord_id, first_name, last_name, business_name, email, phone, address,
           ein, ssn_last4, entity_type, trade, pay_rate, pay_unit, w9_on_file)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *`,
-      [lid, firstName||null, lastName||null, businessName||null, email||null,
-       phone||null, address||null, ein||null, ssnLast4||null,
-       entityType||'individual', trade||null, payRate||null, payUnit||'project', w9OnFile||false]
+      [lid, body.firstName, body.lastName, body.businessName, body.email,
+       body.phone, body.address, body.ein ?? null, body.ssnLast4 ?? null,
+       body.entityType, body.trade, body.payRate, body.payUnit, body.w9OnFile]
     )
     res.status(201).json({ success: true, data: con })
   } catch (e) { next(e) }
 })
 
-booksRouter.patch('/contractors/:id', async (req, res, next) => {
+booksRouter.patch('/contractors/:id', requireBooksWrite, async (req, res, next) => {
   try {
     const lid = landlordScope(req.user)
     const f = req.body
@@ -278,7 +392,7 @@ booksRouter.patch('/contractors/:id', async (req, res, next) => {
 // VENDORS
 // ════════════════════════════════════════
 
-booksRouter.get('/vendors', async (req, res, next) => {
+booksRouter.get('/vendors', requireBooksRead, async (req, res, next) => {
   try {
     const lid = landlordScope(req.user)
     const { rows } = await db.query(
@@ -289,23 +403,50 @@ booksRouter.get('/vendors', async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
-booksRouter.post('/vendors', async (req, res, next) => {
+// S416 (S412 fan-out): strict zod validation on POST /vendors. Same
+// posture as the S384 contractors decision. Pre-fix only `name` was
+// required; everything else passed through as null, creating
+// unidentifiable vendor rows.
+//
+// Two intentional relaxations (flagged for Nic confirmation in the
+// S416 handoff — same pattern as S412's EIN/SSN conditional):
+//   - accountNumber: optional. Many small vendors don't issue
+//     customer-specific account numbers.
+//   - notes: optional. Free-text supplemental field.
+const vendorBaseSchema = z.object({
+  name:          z.string().trim().min(1),
+  contactName:   z.string().trim().min(1),
+  email:         z.string().trim().email('valid email required'),
+  phone:         z.string().trim().min(7),
+  address:       z.string().trim().min(1),
+  category:      z.string().trim().min(1),
+  paymentTerms:  z.enum(['net15', 'net30', 'net45', 'net60', 'due_on_receipt', 'cod']),
+  taxId:         z.string().trim().regex(/^\d{2}-?\d{7}$|^\d{3}-?\d{2}-?\d{4}$/,
+                   'taxId must be EIN (XX-XXXXXXX) or SSN (XXX-XX-XXXX)'),
+  accountNumber: z.string().trim().min(1).optional(),
+  notes:         z.string().trim().optional(),
+})
+booksRouter.post('/vendors', requireBooksWrite, async (req, res, next) => {
   try {
     const lid = landlordScope(req.user)
-    const { name, contactName, email, phone, address, category, paymentTerms, accountNumber, taxId, notes } = req.body
-    if (!name) throw new AppError(400, 'name is required')
+    const body = vendorBaseSchema.parse(req.body)
+    // S417: disposable-domain block.
+    if (isDisposableEmail(body.email)) {
+      throw new AppError(400, 'Disposable / temporary email addresses are not allowed')
+    }
     const { rows: [v] } = await db.query(
       `INSERT INTO books_vendors
          (landlord_id, name, contact_name, email, phone, address, category, payment_terms, account_number, tax_id, notes)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
-      [lid, name, contactName||null, email||null, phone||null, address||null,
-       category||null, paymentTerms||'net30', accountNumber||null, taxId||null, notes||null]
+      [lid, body.name, body.contactName, body.email, body.phone, body.address,
+       body.category, body.paymentTerms, body.accountNumber ?? null, body.taxId,
+       body.notes ?? null]
     )
     res.status(201).json({ success: true, data: v })
   } catch (e) { next(e) }
 })
 
-booksRouter.patch('/vendors/:id', async (req, res, next) => {
+booksRouter.patch('/vendors/:id', requireBooksWrite, async (req, res, next) => {
   try {
     const lid = landlordScope(req.user)
     const f = req.body
@@ -329,8 +470,15 @@ booksRouter.patch('/vendors/:id', async (req, res, next) => {
 // PAYROLL RUNS
 // ════════════════════════════════════════
 
-// Tax calculation helper
-function calcTaxes(grossPay: number, filingStatus: string, azPct: number, ytdGross: number) {
+// Tax calculation helper.
+// statePct is read off the employee's state_withholding_pct column;
+// the math here treats it as a flat percent, which works for any
+// state with a flat rate (or as an approximation for tiered states
+// at the per-payroll level — landlord configures the rate on the
+// employee row). State-specific quarterly forms (CA DE-9, NY NYS-45,
+// AZ A1-QRT, etc.) are NOT generated here — they live in the
+// landlord-configurable tax-form catalog (S91).
+function calcTaxes(grossPay: number, filingStatus: string, statePct: number, ytdGross: number) {
   // Federal withholding — simplified % by filing status (production would use IRS tables)
   const fedRates: Record<string, number> = {
     single: 0.12, married: 0.10, married_higher: 0.12, head_of_household: 0.10
@@ -346,8 +494,8 @@ function calcTaxes(grossPay: number, filingStatus: string, azPct: number, ytdGro
   // Medicare: 1.45% (+ 0.9% over $200k)
   const medicareTax = grossPay * 0.0145 + (ytdGross + grossPay > 200000 ? grossPay * 0.009 : 0)
 
-  // AZ state flat rate
-  const stateTax = grossPay * (azPct / 100)
+  // State withholding — flat-percent applied to gross
+  const stateTax = grossPay * (statePct / 100)
 
   const netPay = grossPay - federalTax - ssTax - medicareTax - stateTax
 
@@ -361,7 +509,7 @@ function calcTaxes(grossPay: number, filingStatus: string, azPct: number, ytdGro
 }
 
 // GET /api/books/payroll/runs
-booksRouter.get('/payroll/runs', async (req, res, next) => {
+booksRouter.get('/payroll/runs', requireBooksRead, async (req, res, next) => {
   try {
     const lid = landlordScope(req.user)
     const { rows } = await db.query(
@@ -378,7 +526,7 @@ booksRouter.get('/payroll/runs', async (req, res, next) => {
 })
 
 // GET /api/books/payroll/runs/:id
-booksRouter.get('/payroll/runs/:id', async (req, res, next) => {
+booksRouter.get('/payroll/runs/:id', requireBooksRead, async (req, res, next) => {
   try {
     const lid = landlordScope(req.user)
     const run = await queryOne<any>(
@@ -399,7 +547,7 @@ booksRouter.get('/payroll/runs/:id', async (req, res, next) => {
 })
 
 // POST /api/books/payroll/runs — calculate draft run
-booksRouter.post('/payroll/runs', async (req, res, next) => {
+booksRouter.post('/payroll/runs', requireBooksWrite, async (req, res, next) => {
   try {
     const lid = landlordScope(req.user)
     const { periodStart, periodEnd, payDate, payFrequency, employeeIds, hoursMap = {} } = req.body
@@ -441,7 +589,7 @@ booksRouter.post('/payroll/runs', async (req, res, next) => {
         }
         grossPay = +grossPay.toFixed(2)
 
-        const taxes = calcTaxes(grossPay, emp.filing_status || 'single', +emp.az_withholding_pct || 2.5, +emp.ytd_gross || 0)
+        const taxes = calcTaxes(grossPay, emp.filing_status || 'single', +emp.state_withholding_pct || 0, +emp.ytd_gross || 0)
 
         await client.query(
           `INSERT INTO payroll_run_lines
@@ -479,7 +627,7 @@ booksRouter.post('/payroll/runs', async (req, res, next) => {
 })
 
 // POST /api/books/payroll/runs/:id/approve
-booksRouter.post('/payroll/runs/:id/approve', async (req, res, next) => {
+booksRouter.post('/payroll/runs/:id/approve', requireBooksWrite, async (req, res, next) => {
   try {
     const lid = landlordScope(req.user)
     const run = await queryOne<any>(
@@ -524,7 +672,7 @@ booksRouter.post('/payroll/runs/:id/approve', async (req, res, next) => {
 })
 
 // POST /api/books/payroll/runs/:id/void
-booksRouter.post('/payroll/runs/:id/void', async (req, res, next) => {
+booksRouter.post('/payroll/runs/:id/void', requireBooksWrite, async (req, res, next) => {
   try {
     const lid = landlordScope(req.user)
     const run = await queryOne<any>(
@@ -570,8 +718,27 @@ booksRouter.post('/payroll/runs/:id/void', async (req, res, next) => {
 // ════════════════════════════════════════
 // BOOKKEEPER MANAGEMENT
 // ════════════════════════════════════════
+// S91: All five endpoints below were rewritten against bookkeeper_scopes
+// (the consolidated team-permission table from S80). Pre-S91 they
+// referenced phantom `books_access` and threw at runtime. The canonical
+// invitation flow (with email + token + accept page) now lives at
+// POST /api/scopes/:roleType/invite — these endpoints stay as a
+// books-portal convenience for direct create/list/revoke without the
+// invitation round-trip.
+//
+// Schema bridge: the old books_access carried a `permissions jsonb`
+// per-client. bookkeeper_scopes has `access_level` (read_only |
+// read_write). Callers that depended on the legacy `permissions` shape
+// should migrate; we expose access_level under both keys for
+// backward-compat reads.
 
 // GET /api/books/bookkeeper/clients — list all clients for logged-in bookkeeper
+// S131 bug fix: was gated by requireLandlord (admin/super_admin/landlord
+// only), which blocked the bookkeeper-self-fetch path the inner role
+// check was clearly trying to support. Bug pre-existed S131; visible
+// once you read both gates together. Fix: drop the requireLandlord
+// outer gate and rely on the inner role check (which already lists
+// bookkeeper / admin / super_admin).
 booksRouter.get('/bookkeeper/clients', async (req, res, next) => {
   try {
     if (req.user?.role !== 'bookkeeper' && req.user?.role !== 'admin' && req.user?.role !== 'super_admin')
@@ -581,17 +748,20 @@ booksRouter.get('/bookkeeper/clients', async (req, res, next) => {
 
     const { rows } = await db.query(
       `SELECT
-          ba.id AS access_id, ba.permissions, ba.status, ba.created_at AS access_since,
+          bs.id AS access_id,
+          bs.access_level,
+          jsonb_build_object('access_level', bs.access_level) AS permissions,
+          'active'::text AS status,
+          bs.created_at AS access_since,
           l.id AS landlord_id, l.business_name, l.volume_tier,
           u.first_name, u.last_name, u.email,
           (SELECT COUNT(*) FROM books_employees WHERE landlord_id = l.id AND status='active') AS employee_count,
           (SELECT COUNT(*) FROM books_contractors WHERE landlord_id = l.id AND status='active') AS contractor_count,
           (SELECT COUNT(*) FROM payroll_runs WHERE landlord_id = l.id AND status='approved') AS payroll_run_count
-        FROM books_access ba
-        JOIN landlords l ON l.id = ba.landlord_id
+        FROM bookkeeper_scopes bs
+        JOIN landlords l ON l.id = bs.landlord_id
         JOIN users u ON u.id = l.user_id
-        WHERE ($1::uuid IS NULL OR ba.bookkeeper_user_id = $1)
-        AND ba.status = 'active'
+        WHERE ($1::uuid IS NULL OR bs.user_id = $1)
         ORDER BY l.business_name ASC`,
       [userId]
     )
@@ -600,15 +770,18 @@ booksRouter.get('/bookkeeper/clients', async (req, res, next) => {
 })
 
 // GET /api/books/bookkeeper/all — admin: list all bookkeepers
-booksRouter.get('/bookkeeper/all', async (req, res, next) => {
+// S131: stays requireLandlord. Inner check restricts further to
+// admin/super_admin only; the outer gate is correct (admin owns this
+// platform-wide view, no team-worker delegation).
+booksRouter.get('/bookkeeper/all', requireLandlord, async (req, res, next) => {
   try {
     if (req.user?.role !== 'admin' && req.user?.role !== 'super_admin')
       throw new AppError(403, 'Admin required')
     const { rows } = await db.query(
       `SELECT u.id, u.email, u.first_name, u.last_name, u.created_at,
-          COUNT(ba.id) AS client_count
+          COUNT(bs.id) AS client_count
         FROM users u
-        LEFT JOIN books_access ba ON ba.bookkeeper_user_id = u.id AND ba.status = 'active'
+        LEFT JOIN bookkeeper_scopes bs ON bs.user_id = u.id
         WHERE u.role = 'bookkeeper'
         GROUP BY u.id ORDER BY u.last_name`
     )
@@ -616,22 +789,41 @@ booksRouter.get('/bookkeeper/all', async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
-// POST /api/books/bookkeeper/invite — admin: create bookkeeper user + assign clients
-booksRouter.post('/bookkeeper/invite', async (req, res, next) => {
+// POST /api/books/bookkeeper/invite — admin/landlord: create bookkeeper user + scope rows
+// Direct-create variant (sets a password rather than emailing an invite).
+// Use POST /api/scopes/bookkeeper/invite for the standard invitation
+// token flow with email delivery.
+// S131: stays requireLandlord. Granting bookkeeper access is the
+// landlord's call, not delegable to a PM (today). If a landlord wants
+// the PM to onboard their bookkeeper, that's a future product call.
+booksRouter.post('/bookkeeper/invite', requireLandlord, async (req, res, next) => {
   try {
     if (req.user?.role !== 'admin' && req.user?.role !== 'super_admin' && req.user?.role !== 'landlord')
       throw new AppError(403, 'Admin or Landlord required')
 
-    const { email, firstName, lastName, password, landlordIds } = req.body
+    const { email, firstName, lastName, password, landlordIds, accessLevel } = req.body
     if (!email || !firstName || !lastName || !password)
       throw new AppError(400, 'email, firstName, lastName, password required')
+
+    // S385 fix: cross-landlord scope-grant blocker. Pre-fix, a landlord
+    // could pass landlordIds = [<other-landlord-id>] and create a
+    // bookkeeper_scopes row granting a proxy bookkeeper access to a
+    // landlord they don't own. Admins retain cross-landlord authority.
+    if (req.user.role === 'landlord') {
+      const ownId = req.user.profileId
+      const ids = Array.isArray(landlordIds) ? landlordIds : []
+      if (ids.some(id => id !== ownId)) {
+        throw new AppError(403, 'Landlords can only assign bookkeepers to their own books')
+      }
+    }
+
+    const level = (accessLevel === 'read_write' ? 'read_write' : 'read_only') as 'read_only' | 'read_write'
 
     const bcrypt = require('bcryptjs')
     const hash = await bcrypt.hash(password, 12)
     const client = await db.connect()
     try {
       await client.query('BEGIN')
-      // Create or update user with bookkeeper role
       const { rows: [user] } = await client.query(
         `INSERT INTO users (email, password_hash, role, first_name, last_name)
          VALUES ($1,$2,'bookkeeper',$3,$4)
@@ -639,13 +831,13 @@ booksRouter.post('/bookkeeper/invite', async (req, res, next) => {
          RETURNING id, email, first_name, last_name, role`,
         [email, hash, firstName, lastName]
       )
-      // Assign clients
-      const assigned = []
+      const assigned: string[] = []
       for (const lid of (landlordIds || [])) {
         await client.query(
-          `INSERT INTO books_access (bookkeeper_user_id, landlord_id, invited_by)
-           VALUES ($1,$2,$3) ON CONFLICT (bookkeeper_user_id, landlord_id) DO UPDATE SET status='active'`,
-          [user.id, lid, req.user.userId]
+          `INSERT INTO bookkeeper_scopes (user_id, landlord_id, access_level)
+           VALUES ($1,$2,$3)
+           ON CONFLICT (user_id, landlord_id) DO UPDATE SET access_level=EXCLUDED.access_level, updated_at=NOW()`,
+          [user.id, lid, level]
         )
         assigned.push(lid)
       }
@@ -657,32 +849,52 @@ booksRouter.post('/bookkeeper/invite', async (req, res, next) => {
 })
 
 // POST /api/books/bookkeeper/assign — assign existing bookkeeper to a landlord
-booksRouter.post('/bookkeeper/assign', async (req, res, next) => {
+// S131: stays requireLandlord. Same posture as /bookkeeper/invite —
+// granting access is owner authority.
+booksRouter.post('/bookkeeper/assign', requireLandlord, async (req, res, next) => {
   try {
     if (req.user?.role !== 'admin' && req.user?.role !== 'super_admin' && req.user?.role !== 'landlord')
       throw new AppError(403, 'Admin or Landlord required')
-    const { bookkeeperUserId, landlordId, permissions } = req.body
+    const { bookkeeperUserId, landlordId, accessLevel } = req.body
     if (!bookkeeperUserId || !landlordId) throw new AppError(400, 'bookkeeperUserId and landlordId required')
+    // S385 fix: landlord callers can only assign bookkeepers to their own
+    // books. Pre-fix this was unguarded — any landlord could create a
+    // bookkeeper_scopes row pointing at any other landlord.
+    if (req.user.role === 'landlord' && landlordId !== req.user.profileId) {
+      throw new AppError(403, 'Landlords can only assign bookkeepers to their own books')
+    }
+    const level = (accessLevel === 'read_write' ? 'read_write' : 'read_only')
     const { rows: [access] } = await db.query(
-      `INSERT INTO books_access (bookkeeper_user_id, landlord_id, permissions, invited_by)
-       VALUES ($1,$2,$3,$4)
-       ON CONFLICT (bookkeeper_user_id, landlord_id) DO UPDATE SET status='active', permissions=COALESCE($3,books_access.permissions)
+      `INSERT INTO bookkeeper_scopes (user_id, landlord_id, access_level)
+       VALUES ($1,$2,$3)
+       ON CONFLICT (user_id, landlord_id) DO UPDATE SET access_level=EXCLUDED.access_level, updated_at=NOW()
        RETURNING *`,
-      [bookkeeperUserId, landlordId, permissions ? JSON.stringify(permissions) : null, req.user.userId]
+      [bookkeeperUserId, landlordId, level]
     )
     res.json({ success: true, data: access })
   } catch (e) { next(e) }
 })
 
 // DELETE /api/books/bookkeeper/revoke — remove bookkeeper from a client
-booksRouter.delete('/bookkeeper/revoke', async (req, res, next) => {
+// Hard delete on bookkeeper_scopes (S80 model has no soft-delete column).
+// Re-assign creates a fresh row.
+// S131: stays requireLandlord. Revoking bookkeeper access is the
+// inverse of grant — same owner-authority posture.
+booksRouter.delete('/bookkeeper/revoke', requireLandlord, async (req, res, next) => {
   try {
     if (req.user?.role !== 'admin' && req.user?.role !== 'super_admin' && req.user?.role !== 'landlord')
       throw new AppError(403, 'Admin or Landlord required')
     const { bookkeeperUserId, landlordId } = req.body
+    if (!bookkeeperUserId || !landlordId) throw new AppError(400, 'bookkeeperUserId and landlordId required')
+    // S385 fix: landlord callers can only revoke bookkeepers from their
+    // own books. Pre-fix any landlord could DELETE any other landlord's
+    // bookkeeper scope row — denial-of-service against another landlord's
+    // books access.
+    if (req.user.role === 'landlord' && landlordId !== req.user.profileId) {
+      throw new AppError(403, 'Landlords can only revoke bookkeepers from their own books')
+    }
     await db.query(
-      `UPDATE books_access SET status='revoked', updated_at=NOW()
-       WHERE bookkeeper_user_id=$1 AND landlord_id=$2`,
+      `DELETE FROM bookkeeper_scopes WHERE user_id=$1 AND landlord_id=$2`,
       [bookkeeperUserId, landlordId]
     )
     res.json({ success: true })
@@ -694,7 +906,7 @@ booksRouter.delete('/bookkeeper/revoke', async (req, res, next) => {
 // JOURNAL ENTRIES
 // ════════════════════════════════════════
 
-booksRouter.get('/journal', async (req, res, next) => {
+booksRouter.get('/journal', requireBooksRead, async (req, res, next) => {
   try {
     const lid = landlordScope(req.user)
     const { limit = 50, offset = 0 } = req.query
@@ -712,7 +924,7 @@ booksRouter.get('/journal', async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
-booksRouter.get('/journal/:id', async (req, res, next) => {
+booksRouter.get('/journal/:id', requireBooksRead, async (req, res, next) => {
   try {
     const lid = landlordScope(req.user)
     const entry = await queryOne<any>(
@@ -731,7 +943,7 @@ booksRouter.get('/journal/:id', async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
-booksRouter.post('/journal', async (req, res, next) => {
+booksRouter.post('/journal', requireBooksWrite, async (req, res, next) => {
   try {
     const lid = landlordScope(req.user)
     const { date, description, reference, type = 'manual', lines } = req.body
@@ -746,6 +958,29 @@ booksRouter.post('/journal', async (req, res, next) => {
     if (totalDebits === 0)
       throw new AppError(400, 'Entry must have at least one debit and one credit')
 
+    // S386 fix — accountId scope validation. Pre-fix, the per-line
+    // INSERT + balance UPDATE blindly trusted the accountId from the
+    // body. A landlord could pass an accountId belonging to another
+    // landlord and the UPDATE balance=balance+$1 WHERE id=$2 would
+    // mutate that other landlord's financial state. Cross-tenant
+    // financial corruption — HIGH severity.
+    const accountIds = (lines as any[]).map(l => l.accountId).filter(Boolean)
+    if (accountIds.length !== lines.length) {
+      throw new AppError(400, 'Each line requires accountId')
+    }
+    if (lid !== null) {
+      // Non-admin caller: every accountId must belong to caller's landlord.
+      const validation = await db.query<{ id: string }>(
+        `SELECT id FROM books_accounts WHERE id = ANY($1::uuid[]) AND landlord_id = $2`,
+        [accountIds, lid]
+      )
+      const validIds = new Set(validation.rows.map(r => r.id))
+      const unauthorized = accountIds.filter(id => !validIds.has(id))
+      if (unauthorized.length) {
+        throw new AppError(403, 'One or more accounts are not in your chart of accounts')
+      }
+    }
+
     const client = await db.connect()
     try {
       await client.query('BEGIN')
@@ -755,7 +990,7 @@ booksRouter.post('/journal', async (req, res, next) => {
         [lid, date, description, reference || null, type, totalDebits.toFixed(2), totalCredits.toFixed(2), req.user!.userId]
       )
       for (const line of lines) {
-        if (!line.accountId) throw new AppError(400, 'Each line requires accountId')
+        // accountId presence + scope already validated above (S386).
         await client.query(
           `INSERT INTO journal_entry_lines (entry_id, account_id, description, debit, credit)
            VALUES ($1,$2,$3,$4,$5)`,
@@ -782,7 +1017,7 @@ booksRouter.post('/journal', async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
-booksRouter.post('/journal/:id/void', async (req, res, next) => {
+booksRouter.post('/journal/:id/void', requireBooksWrite, async (req, res, next) => {
   try {
     const lid = landlordScope(req.user)
     const entry = await queryOne<any>(
@@ -814,7 +1049,7 @@ booksRouter.post('/journal/:id/void', async (req, res, next) => {
 // TRANSACTIONS
 // ════════════════════════════════════════
 
-booksRouter.get('/transactions', async (req, res, next) => {
+booksRouter.get('/transactions', requireBooksRead, async (req, res, next) => {
   try {
     const lid = landlordScope(req.user)
     const { type, reconciled, limit = 100, offset = 0 } = req.query
@@ -836,12 +1071,22 @@ booksRouter.get('/transactions', async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
-booksRouter.post('/transactions', async (req, res, next) => {
+booksRouter.post('/transactions', requireBooksWrite, async (req, res, next) => {
   try {
     const lid = landlordScope(req.user)
     const { date, description, amount, type, category, accountId, reference } = req.body
     if (!date || !description || amount === undefined || !type)
       throw new AppError(400, 'date, description, amount, type required')
+    // S386 fix — accountId scope validation. Pre-fix, a landlord could
+    // attach a transaction to another landlord's account_id; the LEFT
+    // JOIN on GET would silently surface the wrong account_name.
+    if (accountId && lid !== null) {
+      const ok = await queryOne<{ id: string }>(
+        `SELECT id FROM books_accounts WHERE id=$1 AND landlord_id=$2`,
+        [accountId, lid]
+      )
+      if (!ok) throw new AppError(403, 'Account is not in your chart of accounts')
+    }
     const { rows: [tx] } = await db.query(
       `INSERT INTO books_transactions (landlord_id, date, description, amount, type, category, account_id, reference)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
@@ -851,7 +1096,7 @@ booksRouter.post('/transactions', async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
-booksRouter.patch('/transactions/:id/reconcile', async (req, res, next) => {
+booksRouter.patch('/transactions/:id/reconcile', requireBooksWrite, async (req, res, next) => {
   try {
     const lid = landlordScope(req.user)
     const { rows: [tx] } = await db.query(
@@ -868,7 +1113,7 @@ booksRouter.patch('/transactions/:id/reconcile', async (req, res, next) => {
 // REPORTS
 // ════════════════════════════════════════
 
-booksRouter.get('/reports/pl', async (req, res, next) => {
+booksRouter.get('/reports/pl', requireBooksRead, async (req, res, next) => {
   try {
     const lid = landlordScope(req.user)
     const { startDate, endDate } = req.query
@@ -906,14 +1151,19 @@ booksRouter.get('/reports/pl', async (req, res, next) => {
       [lid, start, end]
     )
 
-    // Pull rent income from GAM payments if synced
+    // Pull rent income from GAM payments if synced. S387 fix: was
+    // subquerying landlords WHERE user_id=$1 with req.user.userId —
+    // worked by coincidence for landlord callers but returned 0 for
+    // admin and bookkeeper callers (their user_id doesn't match any
+    // landlord's user_id). Use lid directly — it IS the landlord_id
+    // (or NULL for admin = all).
     const { rows: rentIncome } = await db.query(
       `SELECT COALESCE(SUM(amount), 0) AS total
        FROM payments
-       WHERE landlord_id IN (SELECT id FROM landlords WHERE (user_id=$1 OR $1 IS NULL))
+       WHERE (landlord_id=$1 OR $1 IS NULL)
          AND status = 'settled'
          AND due_date BETWEEN $2 AND $3`,
-      [req.user!.userId, start, end]
+      [lid, start, end]
     ).catch(() => ({ rows: [{ total: 0 }] }))
 
     const totalIncome = income.reduce((s: number, a: any) => s + (+a.period_amount || 0), 0)
@@ -934,7 +1184,7 @@ booksRouter.get('/reports/pl', async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
-booksRouter.get('/reports/balance-sheet', async (req, res, next) => {
+booksRouter.get('/reports/balance-sheet', requireBooksRead, async (req, res, next) => {
   try {
     const lid = landlordScope(req.user)
     const getAccounts = (type: string) => db.query(
@@ -966,7 +1216,7 @@ booksRouter.get('/reports/balance-sheet', async (req, res, next) => {
 // BILLS & AP
 // ════════════════════════════════════════
 
-booksRouter.get('/bills', async (req, res, next) => {
+booksRouter.get('/bills', requireBooksRead, async (req, res, next) => {
   try {
     const lid = landlordScope(req.user)
     const { rows } = await db.query(
@@ -981,12 +1231,29 @@ booksRouter.get('/bills', async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
-booksRouter.post('/bills', async (req, res, next) => {
+booksRouter.post('/bills', requireBooksWrite, async (req, res, next) => {
   try {
     const lid = landlordScope(req.user)
     const { vendorId, billNumber, date, dueDate, description, amount, category, accountId, notes } = req.body
     if (!date || !description || amount === undefined)
       throw new AppError(400, 'date, description, amount required')
+    // S386 fix — vendorId + accountId scope validation. Pre-fix, the
+    // route blindly trusted vendorId and would UPDATE another
+    // landlord's books_vendors.ap_balance.
+    if (vendorId && lid !== null) {
+      const ok = await queryOne<{ id: string }>(
+        `SELECT id FROM books_vendors WHERE id=$1 AND landlord_id=$2`,
+        [vendorId, lid]
+      )
+      if (!ok) throw new AppError(403, 'Vendor is not in your books')
+    }
+    if (accountId && lid !== null) {
+      const ok = await queryOne<{ id: string }>(
+        `SELECT id FROM books_accounts WHERE id=$1 AND landlord_id=$2`,
+        [accountId, lid]
+      )
+      if (!ok) throw new AppError(403, 'Account is not in your chart of accounts')
+    }
     const { rows: [bill] } = await db.query(
       `INSERT INTO books_bills
          (landlord_id, vendor_id, bill_number, date, due_date, description, amount, category, account_id, notes)
@@ -1004,7 +1271,7 @@ booksRouter.post('/bills', async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
-booksRouter.post('/bills/:id/pay', async (req, res, next) => {
+booksRouter.post('/bills/:id/pay', requireBooksWrite, async (req, res, next) => {
   try {
     const lid = landlordScope(req.user)
     const bill = await queryOne<any>(
@@ -1013,28 +1280,70 @@ booksRouter.post('/bills/:id/pay', async (req, res, next) => {
     )
     if (!bill) throw new AppError(404, 'Bill not found')
     if (bill.status === 'paid') throw new AppError(400, 'Bill already paid')
-    const payAmount = req.body.amount || (+bill.amount - +bill.amount_paid)
-    const newPaid = +bill.amount_paid + +payAmount
+    const payAmount = +(req.body.amount || (+bill.amount - +bill.amount_paid))
+    const billRemaining = +bill.amount - +bill.amount_paid
+
+    // S413 (S386 Nic-locked decision): two-phase overpayment confirmation.
+    // Pre-fix any amount was accepted; an overpayment silently:
+    //   - stored amount_paid > amount on the bill
+    //   - updated vendor.ytd_paid by the full payAmount
+    //   - clamped ap_balance to 0 via GREATEST() — losing the excess
+    //     from the vendor accounting picture entirely.
+    // Now: detect the excess and require an explicit
+    // acceptOverpayment=true second-request confirmation. On confirm,
+    // bill closes at exactly amount_paid=amount, and the excess
+    // accrues to books_vendors.credit_balance for future application.
+    const overpayment = payAmount - billRemaining
+    if (overpayment > 0.01 && req.body.acceptOverpayment !== true) {
+      return res.status(409).json({
+        success: false,
+        error: 'Payment exceeds bill remaining; confirmation required',
+        requiresOverpaymentConfirm: true,
+        billRemaining: +billRemaining.toFixed(2),
+        overpaymentAmount: +overpayment.toFixed(2),
+        vendorId: bill.vendor_id,
+      })
+    }
+
+    // When confirmed, cap the bill at amount; route the excess to the
+    // vendor credit balance below.
+    const cappedPayAmount = overpayment > 0 ? billRemaining : payAmount
+    const newPaid = +bill.amount_paid + cappedPayAmount
     const newStatus = newPaid >= +bill.amount ? 'paid' : 'partial'
+    // S386: paid_at computed in JS to avoid reusing $2 in two type
+    // contexts. Pre-fix used $2 for both column-assign (varchar) and
+    // literal compare inside CASE; Postgres couldn't deduce a single
+    // type and the route returned 500 on every /pay call.
+    const paidAtClause = newStatus === 'paid' ? 'NOW()' : 'paid_at'
     const { rows: [updated] } = await db.query(
       `UPDATE books_bills SET
          amount_paid=$1, status=$2,
-         paid_at=CASE WHEN $2='paid' THEN NOW() ELSE paid_at END,
+         paid_at=${paidAtClause},
          updated_at=NOW()
        WHERE id=$3 RETURNING *`,
       [newPaid.toFixed(2), newStatus, req.params.id]
     )
     if (bill.vendor_id) {
+      // Vendor accounting: ap_balance / ytd_paid reflect ONLY the
+      // bill-applied portion (cappedPayAmount). The excess flows to
+      // credit_balance separately so consumers can distinguish
+      // "vendor has been paid for THIS bill" from "vendor has a
+      // pre-payment credit on file."
       await db.query(
         `UPDATE books_vendors SET
-           ap_balance = GREATEST(0, COALESCE(ap_balance,0) - $1),
-           ytd_paid   = COALESCE(ytd_paid,0) + $1,
-           updated_at = NOW()
-         WHERE id=$2`,
-        [payAmount, bill.vendor_id]
+           ap_balance     = GREATEST(0, COALESCE(ap_balance,0) - $1),
+           ytd_paid       = COALESCE(ytd_paid,0) + $1,
+           credit_balance = COALESCE(credit_balance,0) + $2,
+           updated_at     = NOW()
+         WHERE id=$3`,
+        [cappedPayAmount, overpayment > 0 ? overpayment : 0, bill.vendor_id]
       )
     }
-    res.json({ success: true, data: updated })
+    res.json({
+      success: true,
+      data: updated,
+      overpaymentCreditRecorded: overpayment > 0 ? +overpayment.toFixed(2) : 0,
+    })
   } catch (e) { next(e) }
 })
 
@@ -1042,7 +1351,7 @@ booksRouter.post('/bills/:id/pay', async (req, res, next) => {
 // CASH FLOW REPORT
 // ════════════════════════════════════════
 
-booksRouter.get('/reports/cash-flow', async (req, res, next) => {
+booksRouter.get('/reports/cash-flow', requireBooksRead, async (req, res, next) => {
   try {
     const lid = landlordScope(req.user)
     const { startDate, endDate } = req.query
@@ -1114,7 +1423,7 @@ booksRouter.get('/reports/cash-flow', async (req, res, next) => {
 // OWNER STATEMENTS REPORT
 // ════════════════════════════════════════
 
-booksRouter.get('/reports/owner-statements', async (req, res, next) => {
+booksRouter.get('/reports/owner-statements', requireBooksRead, async (req, res, next) => {
   try {
     const lid = landlordScope(req.user)
     const { startDate, endDate } = req.query
@@ -1170,7 +1479,7 @@ booksRouter.get('/reports/owner-statements', async (req, res, next) => {
 // TAX SUMMARY
 // ════════════════════════════════════════
 
-booksRouter.get('/tax/summary', async (req, res, next) => {
+booksRouter.get('/tax/summary', requireBooksRead, async (req, res, next) => {
   try {
     const lid  = landlordScope(req.user)
     const year = req.query.year || new Date().getFullYear()
@@ -1213,14 +1522,13 @@ booksRouter.get('/tax/summary', async (req, res, next) => {
     const employerMedicare = +p.ytd_medicare
     const totalTaxLiability = +p.ytd_federal + +p.ytd_state + +p.ytd_ss * 2 + +p.ytd_medicare * 2
 
-    const filingDeadlines = [
-      { form: 'Form 941', description: "Employer's Quarterly Federal Tax Return", q1: 'Apr 30', q2: 'Jul 31', q3: 'Oct 31', q4: 'Jan 31' },
-      { form: 'Form 940', description: 'Annual Federal Unemployment (FUTA) Tax Return', due: `Jan 31, ${+year+1}` },
-      { form: 'W-2 / W-3', description: 'Wage and Tax Statements to employees and SSA', due: `Jan 31, ${+year+1}` },
-      { form: '1099-NEC', description: 'Nonemployee Compensation (contractors paid $600+)', due: `Jan 31, ${+year+1}` },
-      { form: 'AZ A1-QRT', description: 'Arizona Quarterly Withholding Tax Return', q1: 'Apr 30', q2: 'Jul 31', q3: 'Oct 31', q4: 'Jan 31' },
-      { form: 'AZ A1-R', description: 'Arizona Annual Withholding Reconciliation', due: `Feb 28, ${+year+1}` },
-    ]
+    // S203: per-state tax form catalog (federal + state forms keyed
+    // to property states + employee/contractor presence). Replaces
+    // the S91 federal-only hardcoded list. Catalog is annual-refresh
+    // hardcoded per CLAUDE.md S177 carve-out — see
+    // services/taxForms.ts and migrations/*_state_tax_forms.sql.
+    const { getApplicableTaxForms } = await import('../services/taxForms')
+    const filingDeadlines = await getApplicableTaxForms(lid, +year)
 
     res.json({
       success: true,
@@ -1236,12 +1544,18 @@ booksRouter.get('/tax/summary', async (req, res, next) => {
 })
 
 // Rent roll — sync from GAM
-booksRouter.get('/rent-roll', async (req, res, next) => {
+booksRouter.get('/rent-roll', requireBooksRead, async (req, res, next) => {
   try {
-    const userId = req.user!.userId
-    const role = req.user!.role
     const lid = landlordScope(req.user)
 
+    // S387 fix: pre-fix had an extra `AND ($2::boolean OR l.user_id =
+    // $3::uuid)` clause that filtered by the caller's user_id. Admin
+    // bypassed via $2, landlords coincidentally worked (their user_id
+    // matches), but bookkeepers got an empty rent roll because their
+    // user_id doesn't match any landlord. The lid scope (set by
+    // landlordScope → enforced by the X-Client-Id middleware for
+    // bookkeepers) already provides the right tenant-trust boundary;
+    // the extra user_id filter was redundant and buggy.
     const { rows } = await db.query(
       `SELECT
           u.unit_number, u.rent_amount, u.status, u.on_time_pay_active,
@@ -1260,9 +1574,8 @@ booksRouter.get('/rent-roll', async (req, res, next) => {
         LEFT JOIN v_unit_occupancy vuo ON vuo.unit_id = u.id
         LEFT JOIN tenants ten ON ten.id = vuo.primary_tenant_id
         WHERE ($1::uuid IS NULL OR l.id = $1::uuid)
-          AND ($2::boolean OR l.user_id = $3::uuid)
         ORDER BY p.name, u.unit_number`,
-      [lid, role === 'admin' || role === 'super_admin', userId]
+      [lid]
     )
 
     const totalExpected = rows.reduce((s: number, r: any) => s + (r.status !== 'vacant' ? +r.rent_amount : 0), 0)

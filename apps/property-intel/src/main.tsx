@@ -1,17 +1,22 @@
+import { SentryErrorBoundary } from './lib/sentry'
 import React, { createContext, useContext, useState, useCallback } from 'react'
 import ReactDOM from 'react-dom/client'
 import { BrowserRouter, Routes, Route, Navigate, NavLink, Link, Outlet, useNavigate, useSearchParams } from 'react-router-dom'
 import { QueryClient, QueryClientProvider, useQuery } from 'react-query'
 import axios from 'axios'
+import { applyCamelizeInterceptor } from '@gam/shared'
 
-const PROP_API = 'http://localhost:4001'
-const GAM_API  = 'http://localhost:4000'
+const PROP_API = (import.meta as any).env?.VITE_PROPERTY_INTEL_API_URL || 'http://localhost:4001'
+const GAM_API  = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
+const ADMIN_URL = (import.meta as any).env?.VITE_ADMIN_APP_URL || 'http://localhost:3003'
 const TOKEN_KEYS = ['gam_admin_token', 'gam_prop_token']
 const getToken = () => TOKEN_KEYS.map(k => localStorage.getItem(k)).find(Boolean) || null
 
 const api = axios.create({ baseURL: PROP_API })
 api.interceptors.request.use(c => { const t=getToken(); if(t) c.headers.Authorization=`Bearer ${t}`; return c })
 api.interceptors.response.use(r=>r, e=>{ if(e.response?.status===401){ TOKEN_KEYS.forEach(k=>localStorage.removeItem(k)); window.location.href='/login' } return Promise.reject(e) })
+// S312: snake_case → camelCase response transform (see packages/shared/src/camelize.ts).
+applyCamelizeInterceptor(api)
 
 const get = <T,>(url: string, params?: any) => api.get<T>(url, { params }).then(r => r.data)
 
@@ -37,7 +42,7 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
       .then(res => {
         const u = res.data.data
         if (!u || !ALLOWED.includes(u.role)) { logout(); return }
-        setUser({ id:u.id, email:u.email, role:u.role, firstName:u.first_name||u.firstName||'', lastName:u.last_name||u.lastName||'' })
+        setUser({ id:u.id, email:u.email, role:u.role, firstName:u.firstName||u.firstName||'', lastName:u.lastName||u.lastName||'' })
       }).catch(logout).finally(() => setLoading(false))
   }, [logout])
 
@@ -47,7 +52,7 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
     if (!u || !ALLOWED.includes(u.role)) throw new Error('Admin or Landlord access required')
     localStorage.setItem('gam_prop_token', tk)
     api.defaults.headers.common['Authorization'] = 'Bearer ' + tk
-    setUser({ id:u.id, email:u.email, role:u.role, firstName:u.firstName||u.first_name||'', lastName:u.last_name||u.lastName||'' })
+    setUser({ id:u.id, email:u.email, role:u.role, firstName:u.firstName||u.firstName||'', lastName:u.lastName||u.lastName||'' })
   }
 
   return <Ctx.Provider value={{ user, loading, login, logout }}>{children}</Ctx.Provider>
@@ -171,7 +176,7 @@ function Layout() {
             <div style={{fontWeight:600,color:'var(--t0)',fontSize:'.78rem'}}>{user?.firstName} {user?.lastName}</div>
             <div style={{marginTop:3}}><span className="badge bteal" style={{fontSize:'.6rem'}}>{user?.role}</span></div>
           </div>
-          {isAdmin && <a href="http://localhost:3003" className="ni" style={{color:'var(--t3)',fontSize:'.75rem'}}>← Admin Console</a>}
+          {isAdmin && <a href={ADMIN_URL} className="ni" style={{color:'var(--t3)',fontSize:'.75rem'}}>← Admin Console</a>}
           <button className="ni" onClick={()=>{logout();navigate('/login')}} style={{color:'var(--red)'}}>🚪 Sign out</button>
         </div>
       </aside>
@@ -215,7 +220,7 @@ function ParcelDrawer({ apn, onClose }: { apn: string; onClose: () => void }) {
         <div className="drawer-h">
           <div>
             <div style={{fontFamily:'var(--font-d)',fontWeight:800,fontSize:'1.1rem',color:'var(--t0)',marginBottom:4}}>
-              {isLoading ? 'Loading…' : parcel?.situs_address || apn}
+              {isLoading ? 'Loading…' : parcel?.situsAddress || apn}
             </div>
             <div style={{fontSize:'.72rem',color:'var(--t3)'}}>APN: {apn}</div>
           </div>
@@ -226,26 +231,26 @@ function ParcelDrawer({ apn, onClose }: { apn: string; onClose: () => void }) {
           : parcel && <>
             <div className="card">
               <div className="ct">Property Details</div>
-              <div className="dr"><span className="dk">Address</span><span className="dv" style={{textAlign:'right',maxWidth:260}}>{parcel.situs_address}, {parcel.situs_city} {parcel.situs_zip}</span></div>
-              <div className="dr"><span className="dk">Property Type</span><span className="dv">{parcel.property_type_std||parcel.property_type_raw||'—'}</span></div>
-              <div className="dr"><span className="dk">Year Built</span><span className="dv mono">{parcel.year_built||'—'}</span></div>
-              <div className="dr"><span className="dk">Lot Size</span><span className="dv mono">{fmtSqft(parcel.lot_size_sqft)}</span></div>
-              <div className="dr"><span className="dk">Units</span><span className="dv mono">{parcel.unit_count||'—'}</span></div>
+              <div className="dr"><span className="dk">Address</span><span className="dv" style={{textAlign:'right',maxWidth:260}}>{parcel.situsAddress}, {parcel.situsCity} {parcel.situsZip}</span></div>
+              <div className="dr"><span className="dk">Property Type</span><span className="dv">{parcel.propertyTypeStd||parcel.propertyTypeRaw||'—'}</span></div>
+              <div className="dr"><span className="dk">Year Built</span><span className="dv mono">{parcel.yearBuilt||'—'}</span></div>
+              <div className="dr"><span className="dk">Lot Size</span><span className="dv mono">{fmtSqft(parcel.lotSizeSqft)}</span></div>
+              <div className="dr"><span className="dk">Units</span><span className="dv mono">{parcel.unitCount||'—'}</span></div>
             </div>
             <div className="card">
               <div className="ct">Valuation & Sale</div>
-              <div className="dr"><span className="dk">Assessed Value</span><span className="dv mono" style={{color:'var(--teal)'}}>{fmtCurrency(parcel.assessed_value)}</span></div>
-              <div className="dr"><span className="dk">Full Cash Value</span><span className="dv mono">{fmtCurrency(parcel.full_cash_value)}</span></div>
-              <div className="dr"><span className="dk">Last Sale Price</span><span className="dv mono" style={{color:'var(--gold)'}}>{fmtCurrency(parcel.last_sale_price)}</span></div>
-              <div className="dr"><span className="dk">Last Sale Date</span><span className="dv mono">{fmtDate(parcel.last_sale_date)}</span></div>
-              {parcel.portfolio_sale_flag && <div className="dr"><span className="dk">Portfolio Sale</span><span className="badge bpurple">Portfolio</span></div>}
+              <div className="dr"><span className="dk">Assessed Value</span><span className="dv mono" style={{color:'var(--teal)'}}>{fmtCurrency(parcel.assessedValue)}</span></div>
+              <div className="dr"><span className="dk">Full Cash Value</span><span className="dv mono">{fmtCurrency(parcel.fullCashValue)}</span></div>
+              <div className="dr"><span className="dk">Last Sale Price</span><span className="dv mono" style={{color:'var(--gold)'}}>{fmtCurrency(parcel.lastSalePrice)}</span></div>
+              <div className="dr"><span className="dk">Last Sale Date</span><span className="dv mono">{fmtDate(parcel.lastSaleDate)}</span></div>
+              {parcel.portfolioSaleFlag && <div className="dr"><span className="dk">Portfolio Sale</span><span className="badge bpurple">Portfolio</span></div>}
             </div>
             <div className="card">
               <div className="ct">Owner</div>
-              <div className="dr"><span className="dk">Owner</span><span className="dv" style={{textAlign:'right',maxWidth:260}}>{parcel.owner_name_parsed||parcel.owner_name_raw||'—'}</span></div>
-              <div className="dr"><span className="dk">Type</span><span className="dv"><span className={`badge ${parcel.owner_type==='corporate'?'bb':'bg2'}`}>{parcel.owner_type||'—'}</span></span></div>
-              <div className="dr"><span className="dk">Mailing</span><span className="dv" style={{textAlign:'right',fontSize:'.72rem',maxWidth:260}}>{parcel.owner_mailing_address?`${parcel.owner_mailing_address}, ${parcel.owner_mailing_city} ${parcel.owner_mailing_state}`:'—'}</span></div>
-              <div className="dr"><span className="dk">Portfolio Size</span>{parcel.parcel_count > 1 ? <Link to={`/owners?q=${encodeURIComponent(parcel.owner_name_parsed||parcel.owner_name_raw||'')}`} className="dv mono" style={{color:'var(--gold)',textDecoration:'underline',cursor:'pointer'}} onClick={()=>onClose()}>{fmt(parcel.parcel_count)} parcels →</Link> : <span className="dv mono">{parcel.parcel_count ? fmt(parcel.parcel_count)+' parcels' : '—'}</span>}</div>
+              <div className="dr"><span className="dk">Owner</span><span className="dv" style={{textAlign:'right',maxWidth:260}}>{parcel.ownerNameParsed||parcel.ownerNameRaw||'—'}</span></div>
+              <div className="dr"><span className="dk">Type</span><span className="dv"><span className={`badge ${parcel.ownerType==='corporate'?'bb':'bg2'}`}>{parcel.ownerType||'—'}</span></span></div>
+              <div className="dr"><span className="dk">Mailing</span><span className="dv" style={{textAlign:'right',fontSize:'.72rem',maxWidth:260}}>{parcel.ownerMailingAddress?`${parcel.ownerMailingAddress}, ${parcel.ownerMailingCity} ${parcel.ownerMailingState}`:'—'}</span></div>
+              <div className="dr"><span className="dk">Portfolio Size</span>{parcel.parcelCount > 1 ? <Link to={`/owners?q=${encodeURIComponent(parcel.ownerNameParsed||parcel.ownerNameRaw||'')}`} className="dv mono" style={{color:'var(--gold)',textDecoration:'underline',cursor:'pointer'}} onClick={()=>onClose()}>{fmt(parcel.parcelCount)} parcels →</Link> : <span className="dv mono">{parcel.parcelCount ? fmt(parcel.parcelCount)+' parcels' : '—'}</span>}</div>
             </div>
             {parcel.lat && parcel.lon && (
               <div className="card">
@@ -258,9 +263,9 @@ function ParcelDrawer({ apn, onClose }: { apn: string; onClose: () => void }) {
               <div className="card">
                 <div className="ct">Businesses ({bizData.count})</div>
                 {bizData.results.slice(0,5).map((b: any) => (
-                  <div key={b.account_number} style={{padding:'8px 0',borderBottom:'1px solid var(--b0)'}}>
-                    <div style={{fontWeight:600,color:'var(--t0)',fontSize:'.82rem'}}>{b.business_name}</div>
-                    <div style={{fontSize:'.72rem',color:'var(--t2)',marginTop:2}}>Value: {fmtCurrency(b.full_cash_value)}</div>
+                  <div key={b.accountNumber} style={{padding:'8px 0',borderBottom:'1px solid var(--b0)'}}>
+                    <div style={{fontWeight:600,color:'var(--t0)',fontSize:'.82rem'}}>{b.businessName}</div>
+                    <div style={{fontSize:'.72rem',color:'var(--t2)',marginTop:2}}>Value: {fmtCurrency(b.fullCashValue)}</div>
                   </div>
                 ))}
               </div>
@@ -347,14 +352,14 @@ function ParcelSearch() {
                   <tbody>
                     {results.length ? results.map((r: any) => (
                       <tr key={r.apn} className="click" onClick={()=>setSelectedApn(r.apn)}>
-                        <td><div style={{fontWeight:600,color:'var(--t0)',fontSize:'.78rem'}}>{r.situs_address}</div><div style={{fontSize:'.65rem',color:'var(--t3)'}}>{r.situs_city} · {r.apn}</div></td>
-                        <td><div style={{fontSize:'.75rem',maxWidth:160,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{r.owner_name_parsed||r.owner_name_raw||'—'}</div><span className={`badge ${r.owner_type==='corporate'?'bb':'bg2'}`} style={{fontSize:'.58rem'}}>{r.owner_type||'—'}</span></td>
-                        <td style={{fontSize:'.72rem',color:'var(--t2)'}}>{r.property_type_std||'—'}</td>
-                        <td className="mono">{r.unit_count||'—'}</td>
-                        <td className="mono" style={{color:'var(--teal)'}}>{fmtCurrency(r.assessed_value)}</td>
-                        <td className="mono" style={{color:'var(--gold)'}}>{fmtCurrency(r.last_sale_price)}</td>
-                        <td className="mono" style={{fontSize:'.7rem',color:'var(--t3)'}}>{fmtDate(r.last_sale_date)}</td>
-                        <td>{r.portfolio_sale_flag&&<span className="badge bpurple" style={{fontSize:'.58rem'}}>Portfolio</span>}</td>
+                        <td><div style={{fontWeight:600,color:'var(--t0)',fontSize:'.78rem'}}>{r.situsAddress}</div><div style={{fontSize:'.65rem',color:'var(--t3)'}}>{r.situsCity} · {r.apn}</div></td>
+                        <td><div style={{fontSize:'.75rem',maxWidth:160,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{r.ownerNameParsed||r.ownerNameRaw||'—'}</div><span className={`badge ${r.ownerType==='corporate'?'bb':'bg2'}`} style={{fontSize:'.58rem'}}>{r.ownerType||'—'}</span></td>
+                        <td style={{fontSize:'.72rem',color:'var(--t2)'}}>{r.propertyTypeStd||'—'}</td>
+                        <td className="mono">{r.unitCount||'—'}</td>
+                        <td className="mono" style={{color:'var(--teal)'}}>{fmtCurrency(r.assessedValue)}</td>
+                        <td className="mono" style={{color:'var(--gold)'}}>{fmtCurrency(r.lastSalePrice)}</td>
+                        <td className="mono" style={{fontSize:'.7rem',color:'var(--t3)'}}>{fmtDate(r.lastSaleDate)}</td>
+                        <td>{r.portfolioSaleFlag&&<span className="badge bpurple" style={{fontSize:'.58rem'}}>Portfolio</span>}</td>
                       </tr>
                     )) : <tr><td colSpan={8}><div className="empty">No results found.</div></td></tr>}
                   </tbody>
@@ -405,13 +410,13 @@ function RVParks() {
                   <tbody>
                     {results.length ? results.map((r: any, i: number) => (
                       <tr key={i} className="click" onClick={()=>r.apn&&setSelectedApn(r.apn)}>
-                        <td><div style={{fontWeight:600,color:'var(--teal)',fontSize:'.82rem'}}>{r.business_name}</div>{r.dba_name&&<div style={{fontSize:'.65rem',color:'var(--t3)'}}>DBA: {r.dba_name}</div>}</td>
-                        <td style={{fontSize:'.75rem'}}>{r.situs_address}<div style={{fontSize:'.65rem',color:'var(--t3)'}}>{r.situs_zip}</div></td>
-                        <td style={{fontSize:'.75rem',maxWidth:140}}><div style={{overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{r.owner_name_parsed||'—'}</div>{r.owner_type&&<span className={`badge ${r.owner_type==='corporate'?'bb':'bg2'}`} style={{fontSize:'.58rem'}}>{r.owner_type}</span>}</td>
-                        <td className="mono" style={{color:'var(--teal)'}}>{fmtCurrency(r.full_cash_value||r.parcel_fcv)}</td>
-                        <td className="mono">{fmtSqft(r.lot_size_sqft)}</td>
-                        <td><div className="mono" style={{fontSize:'.72rem',color:'var(--gold)'}}>{fmtCurrency(r.last_sale_price)}</div><div style={{fontSize:'.65rem',color:'var(--t3)'}}>{fmtDate(r.last_sale_date)}</div></td>
-                        <td style={{fontSize:'.7rem',color:'var(--t3)'}}>{r.owner_mailing_address?`${r.owner_mailing_address}, ${r.owner_mailing_city} ${r.owner_mailing_state}`:'—'}</td>
+                        <td><div style={{fontWeight:600,color:'var(--teal)',fontSize:'.82rem'}}>{r.businessName}</div>{r.dbaName&&<div style={{fontSize:'.65rem',color:'var(--t3)'}}>DBA: {r.dbaName}</div>}</td>
+                        <td style={{fontSize:'.75rem'}}>{r.situsAddress}<div style={{fontSize:'.65rem',color:'var(--t3)'}}>{r.situsZip}</div></td>
+                        <td style={{fontSize:'.75rem',maxWidth:140}}><div style={{overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{r.ownerNameParsed||'—'}</div>{r.ownerType&&<span className={`badge ${r.ownerType==='corporate'?'bb':'bg2'}`} style={{fontSize:'.58rem'}}>{r.ownerType}</span>}</td>
+                        <td className="mono" style={{color:'var(--teal)'}}>{fmtCurrency(r.fullCashValue||r.parcelFcv)}</td>
+                        <td className="mono">{fmtSqft(r.lotSizeSqft)}</td>
+                        <td><div className="mono" style={{fontSize:'.72rem',color:'var(--gold)'}}>{fmtCurrency(r.lastSalePrice)}</div><div style={{fontSize:'.65rem',color:'var(--t3)'}}>{fmtDate(r.lastSaleDate)}</div></td>
+                        <td style={{fontSize:'.7rem',color:'var(--t3)'}}>{r.ownerMailingAddress?`${r.ownerMailingAddress}, ${r.ownerMailingCity} ${r.ownerMailingState}`:'—'}</td>
                       </tr>
                     )) : <tr><td colSpan={7}><div className="empty">No parks found.</div></td></tr>}
                   </tbody>
@@ -462,13 +467,13 @@ function PortfolioSales() {
                   <tbody>
                     {results.length ? results.map((r: any) => (
                       <tr key={r.apn} className="click" onClick={()=>setSelectedApn(r.apn)}>
-                        <td><div style={{fontWeight:600,color:'var(--t0)',fontSize:'.78rem'}}>{r.situs_address}</div><div style={{fontSize:'.65rem',color:'var(--t3)'}}>{r.situs_city} · {r.apn}</div></td>
-                        <td style={{fontSize:'.75rem',maxWidth:160,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{r.owner_name_parsed||r.owner_name_raw||'—'}</td>
-                        <td style={{fontSize:'.72rem',color:'var(--t2)'}}>{r.property_type_std||'—'}</td>
-                        <td className="mono" style={{color:'var(--gold)',fontWeight:600}}>{fmtCurrency(r.last_sale_price)}</td>
-                        <td className="mono" style={{fontSize:'.72rem'}}>{fmtDate(r.last_sale_date)}</td>
-                        <td className="mono" style={{color:'var(--teal)'}}>{fmtCurrency(r.assessed_value)}</td>
-                        <td><span className="badge bpurple" style={{fontSize:'.6rem',fontFamily:'var(--font-m)'}}>{r.portfolio_sale_id?.slice(0,8)||'—'}</span></td>
+                        <td><div style={{fontWeight:600,color:'var(--t0)',fontSize:'.78rem'}}>{r.situsAddress}</div><div style={{fontSize:'.65rem',color:'var(--t3)'}}>{r.situsCity} · {r.apn}</div></td>
+                        <td style={{fontSize:'.75rem',maxWidth:160,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{r.ownerNameParsed||r.ownerNameRaw||'—'}</td>
+                        <td style={{fontSize:'.72rem',color:'var(--t2)'}}>{r.propertyTypeStd||'—'}</td>
+                        <td className="mono" style={{color:'var(--gold)',fontWeight:600}}>{fmtCurrency(r.lastSalePrice)}</td>
+                        <td className="mono" style={{fontSize:'.72rem'}}>{fmtDate(r.lastSaleDate)}</td>
+                        <td className="mono" style={{color:'var(--teal)'}}>{fmtCurrency(r.assessedValue)}</td>
+                        <td><span className="badge bpurple" style={{fontSize:'.6rem',fontFamily:'var(--font-m)'}}>{r.portfolioSaleId?.slice(0,8)||'—'}</span></td>
                       </tr>
                     )) : <tr><td colSpan={7}><div className="empty">No portfolio sales found.</div></td></tr>}
                   </tbody>
@@ -519,13 +524,13 @@ function Multifamily() {
                   <tbody>
                     {results.length ? results.map((r: any) => (
                       <tr key={r.apn} className="click" onClick={()=>setSelectedApn(r.apn)}>
-                        <td><div style={{fontWeight:600,color:'var(--t0)',fontSize:'.78rem'}}>{r.situs_address}</div><div style={{fontSize:'.65rem',color:'var(--t3)'}}>{r.situs_city} · {r.apn}</div></td>
-                        <td style={{fontSize:'.75rem',maxWidth:140,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{r.owner_name_parsed||r.owner_name_raw||'—'}</td>
-                        <td><span className="badge bteal" style={{fontFamily:'var(--font-m)'}}>{fmt(r.unit_count)}</span></td>
-                        <td style={{fontSize:'.72rem',color:'var(--t2)'}}>{r.property_type_std||'—'}</td>
-                        <td className="mono" style={{color:'var(--teal)'}}>{fmtCurrency(r.assessed_value)}</td>
-                        <td className="mono" style={{color:'var(--gold)'}}>{fmtCurrency(r.last_sale_price)}</td>
-                        <td className="mono" style={{color:'var(--t3)'}}>{r.year_built||'—'}</td>
+                        <td><div style={{fontWeight:600,color:'var(--t0)',fontSize:'.78rem'}}>{r.situsAddress}</div><div style={{fontSize:'.65rem',color:'var(--t3)'}}>{r.situsCity} · {r.apn}</div></td>
+                        <td style={{fontSize:'.75rem',maxWidth:140,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{r.ownerNameParsed||r.ownerNameRaw||'—'}</td>
+                        <td><span className="badge bteal" style={{fontFamily:'var(--font-m)'}}>{fmt(r.unitCount)}</span></td>
+                        <td style={{fontSize:'.72rem',color:'var(--t2)'}}>{r.propertyTypeStd||'—'}</td>
+                        <td className="mono" style={{color:'var(--teal)'}}>{fmtCurrency(r.assessedValue)}</td>
+                        <td className="mono" style={{color:'var(--gold)'}}>{fmtCurrency(r.lastSalePrice)}</td>
+                        <td className="mono" style={{color:'var(--t3)'}}>{r.yearBuilt||'—'}</td>
                       </tr>
                     )) : <tr><td colSpan={7}><div className="empty">No results.</div></td></tr>}
                   </tbody>
@@ -571,9 +576,9 @@ function OwnerLookup() {
             {results.length > 0 && (
               <div className="grid4" style={{marginBottom:16}}>
                 <div className="kpi"><div className="kl">Parcels Found</div><div className="kv t">{fmt(total)}</div></div>
-                <div className="kpi"><div className="kl">Total Assessed</div><div className="kv gold">{fmtCurrency(results.reduce((s:number,r:any)=>s+(+r.assessed_value||0),0))}</div></div>
-                <div className="kpi"><div className="kl">Total Sale Value</div><div className="kv g">{fmtCurrency(results.reduce((s:number,r:any)=>s+(+r.last_sale_price||0),0))}</div></div>
-                <div className="kpi"><div className="kl">Total Units</div><div className="kv b">{fmt(results.reduce((s:number,r:any)=>s+(+r.unit_count||0),0))}</div></div>
+                <div className="kpi"><div className="kl">Total Assessed</div><div className="kv gold">{fmtCurrency(results.reduce((s:number,r:any)=>s+(+r.assessedValue||0),0))}</div></div>
+                <div className="kpi"><div className="kl">Total Sale Value</div><div className="kv g">{fmtCurrency(results.reduce((s:number,r:any)=>s+(+r.lastSalePrice||0),0))}</div></div>
+                <div className="kpi"><div className="kl">Total Units</div><div className="kv b">{fmt(results.reduce((s:number,r:any)=>s+(+r.unitCount||0),0))}</div></div>
               </div>
             )}
             <div className="card" style={{padding:0}}>
@@ -584,12 +589,12 @@ function OwnerLookup() {
                     <tbody>
                       {results.length ? results.map((r:any)=>(
                         <tr key={r.apn} className="click" onClick={()=>setSelectedApn(r.apn)}>
-                          <td><div style={{fontWeight:600,color:'var(--t0)',fontSize:'.78rem'}}>{r.situs_address}</div><div style={{fontSize:'.65rem',color:'var(--t3)'}}>{r.situs_city} · {r.apn}</div></td>
-                          <td style={{fontSize:'.72rem',maxWidth:160,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{r.owner_name_parsed||r.owner_name_raw||'—'}</td>
-                          <td style={{fontSize:'.72rem',color:'var(--t2)'}}>{r.property_type_std||'—'}</td>
-                          <td className="mono">{r.unit_count||'—'}</td>
-                          <td className="mono" style={{color:'var(--teal)'}}>{fmtCurrency(r.assessed_value)}</td>
-                          <td className="mono" style={{color:'var(--gold)'}}>{fmtCurrency(r.last_sale_price)}</td>
+                          <td><div style={{fontWeight:600,color:'var(--t0)',fontSize:'.78rem'}}>{r.situsAddress}</div><div style={{fontSize:'.65rem',color:'var(--t3)'}}>{r.situsCity} · {r.apn}</div></td>
+                          <td style={{fontSize:'.72rem',maxWidth:160,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{r.ownerNameParsed||r.ownerNameRaw||'—'}</td>
+                          <td style={{fontSize:'.72rem',color:'var(--t2)'}}>{r.propertyTypeStd||'—'}</td>
+                          <td className="mono">{r.unitCount||'—'}</td>
+                          <td className="mono" style={{color:'var(--teal)'}}>{fmtCurrency(r.assessedValue)}</td>
+                          <td className="mono" style={{color:'var(--gold)'}}>{fmtCurrency(r.lastSalePrice)}</td>
                         </tr>
                       )) : <tr><td colSpan={6}><div className="empty">No results for "{query}"</div></td></tr>}
                     </tbody>
@@ -696,7 +701,7 @@ function LoginPage() {
           </form>
         </div>
         <div style={{textAlign:'center',marginTop:20}}>
-          <a href="http://localhost:3003" style={{color:'var(--t3)',fontSize:'.75rem'}}>← Back to Admin Console</a>
+          <a href={ADMIN_URL} style={{color:'var(--t3)',fontSize:'.75rem'}}>← Back to Admin Console</a>
         </div>
       </div>
     </div>
@@ -735,4 +740,14 @@ function Root() {
   )
 }
 
-ReactDOM.createRoot(document.getElementById('root')!).render(<React.StrictMode><Root/></React.StrictMode>)
+ReactDOM.createRoot(document.getElementById('root')!).render(
+  <React.StrictMode>
+    <SentryErrorBoundary fallback={<div style={{ padding: 40, textAlign: 'center', color: 'var(--text-0)' }}>
+      <div style={{ fontSize: '1.1rem', fontWeight: 600, marginBottom: 8 }}>Something went wrong</div>
+      <div style={{ fontSize: '.82rem', color: 'var(--text-3)', marginBottom: 16 }}>The error has been reported. Reload the page to try again.</div>
+      <button className="btn btn-primary" onClick={() => window.location.reload()}>Reload</button>
+    </div>}>
+      <Root />
+    </SentryErrorBoundary>
+  </React.StrictMode>
+)
