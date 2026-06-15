@@ -2,17 +2,18 @@ import { Outlet, NavLink, useNavigate } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
 import {
   LayoutDashboard, Building2, Users, Banknote,
-  HeartHandshake, Receipt, LogOut, Settings,
+  HeartHandshake, Receipt, LogOut, Settings, Bot,
 } from 'lucide-react'
 
 const NAV: Array<{ to: string; icon: any; label: string; section: string | null }> = [
-  { to: '/dashboard',     icon: LayoutDashboard, label: 'Dashboard',         section: 'Overview' },
-  { to: '/properties',    icon: Building2,        label: 'Properties',         section: 'Portfolio' },
-  { to: '/invitations',   icon: HeartHandshake,   label: 'Property Invites',   section: null },
-  { to: '/fee-plans',     icon: Receipt,          label: 'Fee Plans',          section: 'Company' },
-  { to: '/staff',         icon: Users,            label: 'Staff',              section: null },
-  { to: '/banking',       icon: Banknote,         label: 'Banking & Payouts',  section: null },
-  { to: '/settings',      icon: Settings,         label: 'Settings',           section: 'Admin' },
+  { to: '/dashboard',      icon: LayoutDashboard, label: 'Dashboard',         section: 'Overview' },
+  { to: '/agent-activity', icon: Bot,             label: 'Agent Activity',    section: null },
+  { to: '/properties',     icon: Building2,        label: 'Properties',         section: 'Portfolio' },
+  { to: '/invitations',    icon: HeartHandshake,   label: 'Property Invites',   section: null },
+  { to: '/fee-plans',      icon: Receipt,          label: 'Fee Plans',          section: 'Company' },
+  { to: '/staff',          icon: Users,            label: 'Staff',              section: null },
+  { to: '/banking',        icon: Banknote,         label: 'Banking & Payouts',  section: null },
+  { to: '/settings',       icon: Settings,         label: 'Settings',           section: 'Admin' },
 ]
 
 export function Layout() {

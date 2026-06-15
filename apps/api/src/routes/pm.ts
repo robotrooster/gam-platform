@@ -47,6 +47,7 @@ import {
   ensureConnectAccount, createOnboardingSession, fetchAccountStatus,
 } from '../services/stripeConnect'
 import { logger } from '../lib/logger'
+import { checkLeaseAgainstStateLaw, type LawFlag } from '../services/stateLaw'
 
 export const pmRouter = Router()
 
@@ -79,7 +80,7 @@ function buildPmAcceptUrl(token: string): string {
 // 'inactive' status does NOT lock out — it's the soft self-pause
 // state for companies that aren't currently operating but retain
 // self-service control.
-async function assertPmStaffRole(
+export async function assertPmStaffRole(
   userId: string,
   pmCompanyId: string,
   allowedRoles: PmStaffRole[]
@@ -666,6 +667,7 @@ pmRouter.get('/companies/:id/properties/:propertyId/drilldown', async (req: any,
     const property = await queryOne<any>(
       `SELECT p.id, p.name, p.street1, p.city, p.state, p.zip, p.type,
               p.pm_company_id, p.pm_fee_plan_id,
+              p.late_fee_initial_amount, p.late_fee_initial_type, p.late_fee_grace_days,
               fp.name      AS pm_fee_plan_name,
               fp.fee_type  AS pm_fee_type,
               fp.percent   AS pm_fee_percent,
@@ -681,6 +683,26 @@ pmRouter.get('/companies/:id/properties/:propertyId/drilldown', async (req: any,
       throw new AppError(404, 'Property not found or not managed by this PM company')
     }
 
+    // S487: recompute state-law warnings against the persisted property
+    // defaults so PM staff see the same hedged factual notices the
+    // landlord sees on their portal (S486). Late-fee config flows into
+    // new leases via the LeaseFormModal default-pull; surfacing here
+    // keeps the PM-staff oversight surface aligned with the landlord-
+    // facing one. Best-effort.
+    let stateLawWarnings: LawFlag[] = []
+    try {
+      stateLawWarnings = await checkLeaseAgainstStateLaw({
+        stateCode:            property.state,
+        rentAmount:           null,
+        lateFeeInitialAmount: property.late_fee_initial_amount != null ? Number(property.late_fee_initial_amount) : null,
+        lateFeeInitialType:   property.late_fee_initial_type,
+        lateFeeGraceDays:     property.late_fee_grace_days != null ? Number(property.late_fee_grace_days) : null,
+      })
+    } catch (e) {
+      logger.error({ err: e, property_id: property.id }, '[stateLaw] PM drilldown checks failed')
+    }
+    property.state_law_warnings = stateLawWarnings
+
     const units = await query<any>(
       `SELECT u.id, u.unit_number, u.status, u.rent_amount,
               vuo.primary_first_name AS tenant_first,
@@ -693,9 +715,12 @@ pmRouter.get('/companies/:id/properties/:propertyId/drilldown', async (req: any,
       [req.params.propertyId]
     )
 
+    // S488: column on leases is `rent_amount`, not `monthly_rent` —
+    // pre-S488 this endpoint 500'd on any happy-path GET. Caught by
+    // the drilldown test backfill (fix-it-right).
     const activeLeases = await query<any>(
       `SELECT l.id, l.unit_id, u.unit_number,
-              l.start_date, l.end_date, l.monthly_rent, l.status,
+              l.start_date, l.end_date, l.rent_amount AS monthly_rent, l.status,
               tu.first_name AS tenant_first, tu.last_name AS tenant_last
          FROM leases l
          JOIN units u ON u.id = l.unit_id

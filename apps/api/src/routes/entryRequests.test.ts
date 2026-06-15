@@ -209,6 +209,153 @@ describe('POST /api/entry-requests — create', () => {
     expect(res.status).toBe(400)
     expect(res.body.error).toMatch(/window end must be after/)
   })
+
+  // ───────────────────────────────────────────────────────────────
+  //  S475: outside-typical-hours flag (no state-specific advice)
+  // ───────────────────────────────────────────────────────────────
+
+  it('S475: normal-hours start (10am Phoenix) → outside_typical_hours=false', async () => {
+    const f = await seedERFixture()
+    // seedProperty defaults timezone to America/Phoenix (no DST), so
+    // 17:00 UTC = 10:00 Phoenix.
+    const res = await createRequest(f, f.landlordToken, {
+      windowStartIso: '2026-07-01T17:00:00Z',
+      windowEndIso:   '2026-07-01T18:00:00Z',
+    })
+    expect(res.status).toBe(200)
+    expect(res.body.data.outside_typical_hours).toBe(false)
+    expect(res.body.data.typical_hours_warning).toBeNull()
+  })
+
+  it('S475: pre-8am start (5am Phoenix) → outside_typical_hours=true + hedged warning', async () => {
+    const f = await seedERFixture()
+    // 12:00 UTC = 05:00 Phoenix (UTC-7, no DST).
+    const res = await createRequest(f, f.landlordToken, {
+      windowStartIso: '2026-07-01T12:00:00Z',
+      windowEndIso:   '2026-07-01T13:00:00Z',
+    })
+    expect(res.status).toBe(200)
+    expect(res.body.data.outside_typical_hours).toBe(true)
+    expect(res.body.data.typical_hours_warning).toMatch(/typical daytime/i)
+    expect(res.body.data.typical_hours_warning).toMatch(/check your local law/i)
+  })
+
+  it('S475: post-8pm start (9pm Phoenix) → outside_typical_hours=true', async () => {
+    const f = await seedERFixture()
+    // 04:00 UTC next day = 21:00 Phoenix prior day.
+    const res = await createRequest(f, f.landlordToken, {
+      windowStartIso: '2026-07-02T04:00:00Z',
+      windowEndIso:   '2026-07-02T05:00:00Z',
+    })
+    expect(res.status).toBe(200)
+    expect(res.body.data.outside_typical_hours).toBe(true)
+  })
+
+  it('S475: exact-8am edge → false (>= 8 only flips at < 8)', async () => {
+    const f = await seedERFixture()
+    // 15:00 UTC = 08:00 Phoenix.
+    const res = await createRequest(f, f.landlordToken, {
+      windowStartIso: '2026-07-01T15:00:00Z',
+      windowEndIso:   '2026-07-01T16:00:00Z',
+    })
+    expect(res.status).toBe(200)
+    expect(res.body.data.outside_typical_hours).toBe(false)
+  })
+
+  it('S475: exact-8pm edge → true (>= 20)', async () => {
+    const f = await seedERFixture()
+    // 03:00 UTC next day = 20:00 Phoenix prior day.
+    const res = await createRequest(f, f.landlordToken, {
+      windowStartIso: '2026-07-02T03:00:00Z',
+      windowEndIso:   '2026-07-02T04:00:00Z',
+    })
+    expect(res.status).toBe(200)
+    expect(res.body.data.outside_typical_hours).toBe(true)
+  })
+
+  // ───────────────────────────────────────────────────────────────
+  //  S476: state-law mismatch flag (entry_notice_hours)
+  // ───────────────────────────────────────────────────────────────
+
+  // schema.sql is schema-only — the state_law seed migrations
+  // INSERT data, not picked up by the snapshot. Seed inline.
+  async function seedAzEntryNoticeStatute(): Promise<void> {
+    const { rows: [a] } = await db.query<{ id: string }>(
+      `INSERT INTO state_landlord_tenant_acts
+         (state_code, act_key, act_name, unit_types, source_date, effective_year)
+       VALUES ('AZ', 'residential', 'AZ Residential Landlord-Tenant Act',
+               ARRAY['apartment','single_family']::text[], '2026-06-09', 2026)
+       ON CONFLICT DO NOTHING
+       RETURNING id`)
+    const actId = a?.id ?? (await db.query<{ id: string }>(
+      `SELECT id FROM state_landlord_tenant_acts WHERE state_code='AZ' AND act_key='residential' AND effective_year=2026 LIMIT 1`)).rows[0].id
+    await db.query(
+      `INSERT INTO state_law_provisions
+         (act_id, state_code, topic, rule_kind, threshold_numeric, threshold_unit,
+          summary, statute_citation, source_url, source_date, effective_year)
+       VALUES ($1, 'AZ', 'entry_notice_hours', 'min', 48, 'hours',
+               'Landlord must give at least two days notice before entry',
+               'A.R.S. § 33-1343', 'https://www.azleg.gov/ars/33/01343.htm',
+               '2026-06-09', 2026)
+       ON CONFLICT DO NOTHING`, [actId])
+  }
+
+  it('S476: AZ residential 30h notice (below 48h statute) → state_law_warnings nonempty', async () => {
+    const f = await seedERFixture()
+    await seedAzEntryNoticeStatute()
+    // 30h notice = below AZ § 33-1343's 48h minimum.
+    const futureStart = new Date(Date.now() + 30 * 3_600_000).toISOString()
+    const futureEnd   = new Date(Date.now() + 31 * 3_600_000).toISOString()
+    const res = await createRequest(f, f.landlordToken,
+      { windowStartIso: futureStart, windowEndIso: futureEnd })
+    expect(res.status).toBe(200)
+    expect(Array.isArray(res.body.data.state_law_warnings)).toBe(true)
+    expect(res.body.data.state_law_warnings.length).toBe(1)
+    const flag = res.body.data.state_law_warnings[0]
+    expect(flag.topic).toBe('entry_notice_hours')
+    expect(flag.message).toMatch(/below the 48/)
+    expect(flag.message).toMatch(/AZ/)
+    expect(flag.disclaimer).toMatch(/may be out of date/i)
+  })
+
+  it('S476: AZ residential 60h notice (above 48h statute) → state_law_warnings empty', async () => {
+    const f = await seedERFixture()
+    await seedAzEntryNoticeStatute()
+    const futureStart = new Date(Date.now() + 60 * 3_600_000).toISOString()
+    const futureEnd   = new Date(Date.now() + 61 * 3_600_000).toISOString()
+    const res = await createRequest(f, f.landlordToken,
+      { windowStartIso: futureStart, windowEndIso: futureEnd })
+    expect(res.status).toBe(200)
+    expect(res.body.data.state_law_warnings).toEqual([])
+  })
+
+  it('S476: uncatalogued state → state_law_warnings empty (no false alarm)', async () => {
+    const f = await seedERFixture()
+    // Move the property to a fake state with no provisions seeded.
+    await db.query(`UPDATE properties SET state = 'XX' WHERE id = $1`, [f.propertyId])
+    const futureStart = new Date(Date.now() + 30 * 3_600_000).toISOString()
+    const futureEnd   = new Date(Date.now() + 31 * 3_600_000).toISOString()
+    const res = await createRequest(f, f.landlordToken,
+      { windowStartIso: futureStart, windowEndIso: futureEnd })
+    expect(res.status).toBe(200)
+    expect(res.body.data.state_law_warnings).toEqual([])
+  })
+
+  it('S475: property timezone respected (Eastern 9pm = same UTC as Pacific 6pm)', async () => {
+    const f = await seedERFixture()
+    // Move the property to America/New_York. 01:00 UTC = 21:00 ET
+    // (during EDT) — outside hours. Same UTC time in America/Los_Angeles
+    // would be 18:00 PT — inside hours.
+    await db.query(
+      `UPDATE properties SET timezone = 'America/New_York' WHERE id = $1`,
+      [f.propertyId])
+    const res = await createRequest(f, f.landlordToken, {
+      windowStartIso: '2026-07-02T01:00:00Z',
+      windowEndIso:   '2026-07-02T02:00:00Z',
+    })
+    expect(res.status).toBe(200)
+    expect(res.body.data.outside_typical_hours).toBe(true)
+  })
 })
 
 describe('POST /api/entry-requests/:id/respond', () => {
@@ -401,5 +548,77 @@ describe('loadRequest scope guard (via GET /:id)', () => {
       .get(`/api/entry-requests/${reqId}`)
       .set('Authorization', `Bearer ${b.landlordToken}`)
     expect(res.status).toBe(403)
+  })
+
+  // ─────────────────────────────────────────────────────────────
+  //  S478: GET /:id recomputes warnings against the persisted row
+  // ─────────────────────────────────────────────────────────────
+
+  // Reuse the seed pattern from POST tests so the GET path has
+  // catalogued AZ statute data to compare against.
+  async function seedAzEntryNoticeStatute(): Promise<void> {
+    const { rows: [a] } = await db.query<{ id: string }>(
+      `INSERT INTO state_landlord_tenant_acts
+         (state_code, act_key, act_name, unit_types, source_date, effective_year)
+       VALUES ('AZ', 'residential', 'AZ Residential Landlord-Tenant Act',
+               ARRAY['apartment','single_family']::text[], '2026-06-09', 2026)
+       ON CONFLICT DO NOTHING
+       RETURNING id`)
+    const actId = a?.id ?? (await db.query<{ id: string }>(
+      `SELECT id FROM state_landlord_tenant_acts WHERE state_code='AZ' AND act_key='residential' AND effective_year=2026 LIMIT 1`)).rows[0].id
+    await db.query(
+      `INSERT INTO state_law_provisions
+         (act_id, state_code, topic, rule_kind, threshold_numeric, threshold_unit,
+          summary, statute_citation, source_url, source_date, effective_year)
+       VALUES ($1, 'AZ', 'entry_notice_hours', 'min', 48, 'hours',
+               'Landlord must give at least two days notice before entry',
+               'A.R.S. § 33-1343', 'https://www.azleg.gov/ars/33/01343.htm',
+               '2026-06-09', 2026)
+       ON CONFLICT DO NOTHING`, [actId])
+  }
+
+  it('S478: tenant GETs own request → sees outside_typical_hours + state_law_warnings', async () => {
+    const f = await seedERFixture()
+    await seedAzEntryNoticeStatute()
+    // 30h notice + 5 AM Phoenix = both flags fire.
+    // 12:00 UTC = 05:00 Phoenix.
+    const futureStart = new Date(Date.now() + 30 * 3_600_000)
+    futureStart.setUTCHours(12, 0, 0, 0)
+    const futureEnd = new Date(futureStart.getTime() + 60 * 60 * 1000)
+    const c = await createRequest(f, f.landlordToken, {
+      windowStartIso: futureStart.toISOString(),
+      windowEndIso:   futureEnd.toISOString(),
+    })
+    const reqId = c.body.data.id
+
+    const res = await request(buildApp())
+      .get(`/api/entry-requests/${reqId}`)
+      .set('Authorization', `Bearer ${f.tenantToken}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.outside_typical_hours).toBe(true)
+    expect(res.body.data.typical_hours_warning).toMatch(/typical daytime/i)
+    expect(res.body.data.state_law_warnings.length).toBe(1)
+    expect(res.body.data.state_law_warnings[0].topic).toBe('entry_notice_hours')
+  })
+
+  it('S478: GET on a within-range request → outside_typical_hours=false + empty state_law_warnings', async () => {
+    const f = await seedERFixture()
+    await seedAzEntryNoticeStatute()
+    // 60h notice + 10am Phoenix (17:00 UTC) — both checks pass.
+    const futureStart = new Date(Date.now() + 60 * 3_600_000)
+    futureStart.setUTCHours(17, 0, 0, 0)
+    const futureEnd = new Date(futureStart.getTime() + 60 * 60 * 1000)
+    const c = await createRequest(f, f.landlordToken, {
+      windowStartIso: futureStart.toISOString(),
+      windowEndIso:   futureEnd.toISOString(),
+    })
+    const reqId = c.body.data.id
+
+    const res = await request(buildApp())
+      .get(`/api/entry-requests/${reqId}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.outside_typical_hours).toBe(false)
+    expect(res.body.data.state_law_warnings).toEqual([])
   })
 })

@@ -30,7 +30,7 @@ Core rules you must always follow:
 - Hard stops — you must NOT attempt these yourself. The moment the customer raises one, immediately CALL your escalation tool — do not try to handle it and do not just acknowledge it in words:
   • moving, refunding, or adjusting money in any way
   • changing anyone's permissions, access, or account-security settings
-- Landlord/tenant LAW: GAM gives legal INFORMATION, not legal advice or interpretation. Use your law tools — search_state_law for the actual statute text, get_applicable_laws for which acts govern a unit, and check_against_law to compare a specific number or timeline (a late fee, a deposit amount, an entry-notice or notice-to-vacate period) to the statutory figure. You MAY point out an OBJECTIVE, factual mismatch a tool returns — e.g. "the $100/day late fee is above the $5/day figure in A.R.S. § 33-2105" — stated factually and hedged ("the law may have changed; check the current version"). You may NOT go beyond objective figures: never interpret a statute, judge whether a clause is enforceable, declare someone "in violation," or tell them what to do. NEVER cite a statute from memory — only what the tools return. Always tell them to check for a newer version and consult a licensed attorney in their state; GAM is not their lawyer. If GAM has no statute on file for that state, say so and point them to the state's official legislature site.
+- Landlord/tenant LAW: GAM gives legal INFORMATION, not legal advice or interpretation. Use your law tools — search_state_law for the actual landlord/tenant statute text, get_applicable_laws for which acts govern a unit, and check_against_law to compare a specific number or timeline (a late fee, a deposit amount, an entry-notice or notice-to-vacate period) to the statutory figure. For real-estate questions BEYOND the landlord/tenant relationship, use search_real_estate_law (property tax, deeds/recording & conveyancing, condos/co-ops, broker licensing, mortgages/liens/foreclosure) and get_property_tax_facts (crisp property-tax figures — exemptions, assessment-appeal deadline, redemption period; note that many are set locally within a state framework). You MAY point out an OBJECTIVE, factual mismatch a tool returns — e.g. "the $100/day late fee is above the $5/day figure in A.R.S. § 33-2105" — stated factually and hedged ("the law may have changed; check the current version"). You may NOT go beyond objective figures: never interpret a statute, judge whether a clause is enforceable, declare someone "in violation," or tell them what to do. NEVER cite a statute from memory — only what the tools return. Always tell them to check for a newer version and consult a licensed attorney in their state; GAM is not their lawyer. If GAM has no statute on file for that state, say so and point them to the state's official legislature site.
 - Stay within your scope. If something is outside what you can see or do, hand it up rather than improvising.
 - ACTIONS REQUIRE TOOL CALLS. To escalate, to look something up, or to take any other action, you must CALL the matching tool. Saying "I'll escalate this" or "I'll take care of that" WITHOUT calling the tool does nothing and strands the customer. Call the tool first; describe it afterward.
 - USE TOOLS FOR THEIR OWN DATA. When the person asks about their specific account — their balance, what they owe, their lease, their payments, their maintenance requests, their deposit, their payouts, who's behind on rent, etc. — CALL the matching tool to fetch their real answer. Do NOT answer generally or just point them to the portal: the knowledge base explains how things work in general, but tools give THIS person's actual numbers. "What do I owe?" → call the balance tool, don't describe where to look.
@@ -66,8 +66,8 @@ const TENANT_ENTRY: AgentProfile = {
   toolNames: [
     'file_maintenance_request', 'add_maintenance_comment', 'cancel_maintenance_request', 'get_my_maintenance_requests', 'get_my_lease',
     'get_my_payment_status', 'get_my_documents', 'get_my_inspections', 'get_my_entry_requests',
-    'get_my_payment_methods', 'get_my_deposit', 'get_my_invoices', 'get_my_bookings', 'get_my_contacts', 'get_my_landlord_patterns',
-    'get_applicable_laws', 'search_state_law', 'check_against_law', 'get_my_notifications', 'mark_notifications_read', 'update_notification_preference', 'escalate',
+    'get_my_payment_methods', 'get_my_deposit', 'get_my_invoices', 'get_my_bookings', 'get_my_contacts', 'get_my_landlord_patterns', 'get_my_landlord_renewal_tendency',
+    'get_applicable_laws', 'search_state_law', 'search_real_estate_law', 'get_property_tax_facts', 'check_against_law', 'get_my_notifications', 'mark_notifications_read', 'update_notification_preference', 'escalate',
   ],
   name: 'Ava',
   label: 'Tenant — Entry',
@@ -94,8 +94,8 @@ const TENANT_ESCALATION: AgentProfile = {
   toolNames: [
     'file_maintenance_request', 'add_maintenance_comment', 'cancel_maintenance_request', 'get_my_maintenance_requests', 'get_my_lease',
     'get_my_payment_status', 'get_my_documents', 'get_my_inspections', 'get_my_entry_requests',
-    'get_my_payment_methods', 'get_my_deposit', 'get_my_invoices', 'get_my_bookings', 'get_my_contacts', 'get_my_landlord_patterns',
-    'get_applicable_laws', 'search_state_law', 'check_against_law', 'get_my_notifications', 'mark_notifications_read', 'update_notification_preference', 'escalate_to_human',
+    'get_my_payment_methods', 'get_my_deposit', 'get_my_invoices', 'get_my_bookings', 'get_my_contacts', 'get_my_landlord_patterns', 'get_my_landlord_renewal_tendency',
+    'get_applicable_laws', 'search_state_law', 'search_real_estate_law', 'get_property_tax_facts', 'check_against_law', 'get_my_notifications', 'mark_notifications_read', 'update_notification_preference', 'escalate_to_human',
   ],
   name: 'Samantha',
   label: 'Tenant — Escalation',
@@ -122,9 +122,9 @@ const LANDLORD_ENTRY: AgentProfile = {
   toolNames: [
     'get_landlord_portfolio', 'get_property_rent_roll', 'get_setup_progress', 'get_pending_maintenance', 'lookup_tenant_payment_status',
     'get_delinquent_tenants', 'get_vacant_units', 'get_lease_expirations',
-    'get_pending_applications', 'get_my_payouts', 'get_background_check_status', 'get_maintenance_team', 'get_books_summary', 'get_tenant_contact', 'get_team',
+    'get_pending_applications', 'get_my_payouts', 'get_background_check_status', 'get_maintenance_team', 'get_books_summary', 'get_tenant_contact', 'get_team', 'search_parcels', 'get_market_rent',
     'approve_maintenance_request', 'assign_maintenance_request', 'reject_maintenance_request', 'schedule_maintenance', 'message_tenant', 'send_bulk_message',
-    'get_applicable_laws', 'search_state_law', 'check_against_law', 'get_my_notifications', 'mark_notifications_read', 'update_notification_preference', 'escalate',
+    'get_applicable_laws', 'search_state_law', 'search_real_estate_law', 'get_property_tax_facts', 'check_against_law', 'get_my_notifications', 'mark_notifications_read', 'update_notification_preference', 'escalate',
   ],
   name: 'David',
   label: 'Landlord — Entry',
@@ -149,9 +149,9 @@ const LANDLORD_ESCALATION: AgentProfile = {
   toolNames: [
     'get_landlord_portfolio', 'get_property_rent_roll', 'get_setup_progress', 'get_pending_maintenance', 'lookup_tenant_payment_status',
     'get_delinquent_tenants', 'get_vacant_units', 'get_lease_expirations',
-    'get_pending_applications', 'get_my_payouts', 'get_background_check_status', 'get_maintenance_team', 'get_books_summary', 'get_tenant_contact', 'get_team',
+    'get_pending_applications', 'get_my_payouts', 'get_background_check_status', 'get_maintenance_team', 'get_books_summary', 'get_tenant_contact', 'get_team', 'search_parcels', 'get_market_rent',
     'approve_maintenance_request', 'assign_maintenance_request', 'reject_maintenance_request', 'schedule_maintenance', 'message_tenant', 'send_bulk_message',
-    'get_applicable_laws', 'search_state_law', 'check_against_law', 'get_my_notifications', 'mark_notifications_read', 'update_notification_preference', 'escalate_to_human',
+    'get_applicable_laws', 'search_state_law', 'search_real_estate_law', 'get_property_tax_facts', 'check_against_law', 'get_my_notifications', 'mark_notifications_read', 'update_notification_preference', 'escalate_to_human',
   ],
   name: 'Sonny',
   label: 'Landlord — Escalation',

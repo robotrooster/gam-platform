@@ -14,6 +14,61 @@ import {
   notifyEntryRecorded,
 } from '../services/notifications'
 import { logger } from '../lib/logger'
+import { checkAgainstStatute, type LawFlag } from '../services/stateLaw'
+
+/**
+ * S478: shared warning compute used by POST (at create time) and GET
+ * (at read time, recomputed against the persisted row). Single source
+ * of truth so the tenant and landlord see the same hedged factual
+ * notices. Best-effort; returns safe defaults on any DB or engine
+ * failure. NEVER throws.
+ */
+async function computeEntryRequestWarnings(args: {
+  unitId: string
+  startIso: string
+  noticeWindowHours: number
+}): Promise<{
+  outsideTypicalHours: boolean
+  typicalHoursWarning: string | null
+  stateLawWarnings: LawFlag[]
+}> {
+  const fallback = {
+    outsideTypicalHours: false,
+    typicalHoursWarning: null,
+    stateLawWarnings: [],
+  }
+  try {
+    const tzRow = await queryOne<{ local_hour: number; timezone: string; state: string | null }>(
+      `SELECT
+         COALESCE(p.timezone, 'America/Phoenix') AS timezone,
+         EXTRACT(HOUR FROM ($1::timestamptz AT TIME ZONE
+           COALESCE(p.timezone, 'America/Phoenix')))::int AS local_hour,
+         p.state
+       FROM units u
+       JOIN properties p ON p.id = u.property_id
+      WHERE u.id = $2`,
+      [args.startIso, args.unitId])
+    if (!tzRow) return fallback
+    const localHour = tzRow.local_hour
+    const outsideTypicalHours = localHour < 8 || localHour >= 20
+    const typicalHoursWarning = outsideTypicalHours
+      ? 'Outside typical daytime hours (8 AM–8 PM). Entry laws commonly require "reasonable times" — check your local law.'
+      : null
+    const stateLawWarnings: LawFlag[] = []
+    if (tzRow.state) {
+      try {
+        const flag = await checkAgainstStatute(tzRow.state, 'entry_notice_hours', args.noticeWindowHours)
+        if (flag) stateLawWarnings.push(flag)
+      } catch (e) {
+        logger.error({ err: e, state: tzRow.state }, '[stateLaw] entry_notice_hours check failed')
+      }
+    }
+    return { outsideTypicalHours, typicalHoursWarning, stateLawWarnings }
+  } catch (e) {
+    logger.error({ err: e, unit_id: args.unitId }, '[entry-request-warnings] compute failed')
+    return fallback
+  }
+}
 
 // ============================================================
 // /api/entry-requests — landlord-initiated unit entry workflow.
@@ -91,6 +146,14 @@ entryRequestsRouter.post('/', async (req, res, next) => {
     }
     const noticeWindowHours = Math.round((start.getTime() - Date.now()) / 3_600_000)
 
+    // S475 + S476: outside-hours flag + state-law mismatch, all computed
+    // by the shared helper so POST and GET return identical shapes.
+    const warnings = await computeEntryRequestWarnings({
+      unitId:            body.unitId,
+      startIso:          start.toISOString(),
+      noticeWindowHours,
+    })
+
     const inserted = await queryOne<{ id: string }>(
       `INSERT INTO unit_entry_requests (
          unit_id, lease_id, tenant_id, landlord_id,
@@ -146,6 +209,9 @@ entryRequestsRouter.post('/', async (req, res, next) => {
         id: inserted!.id,
         notice_window_hours: noticeWindowHours,
         notice_window_meets_default: noticeWindowHours >= defaultNoticeHours,
+        outside_typical_hours: warnings.outsideTypicalHours,
+        typical_hours_warning: warnings.typicalHoursWarning,
+        state_law_warnings: warnings.stateLawWarnings,
       },
     })
   } catch (e) {
@@ -162,7 +228,26 @@ entryRequestsRouter.get('/:id', async (req, res, next) => {
         WHERE request_id = $1`,
       [r.id],
     )
-    res.json({ success: true, data: { ...r, response: resp ?? null } })
+    // S478: recompute warnings against the persisted row so the tenant
+    // (and any future re-read by the landlord) sees the same hedged
+    // factual notices that were returned at create time. Persisting
+    // the warnings would freeze them at create-time; recomputing keeps
+    // them current as the law catalog refreshes.
+    const warnings = await computeEntryRequestWarnings({
+      unitId:            r.unit_id,
+      startIso:          new Date(r.proposed_entry_window_start).toISOString(),
+      noticeWindowHours: r.notice_window_hours,
+    })
+    res.json({
+      success: true,
+      data: {
+        ...r,
+        response: resp ?? null,
+        outside_typical_hours: warnings.outsideTypicalHours,
+        typical_hours_warning: warnings.typicalHoursWarning,
+        state_law_warnings: warnings.stateLawWarnings,
+      },
+    })
   } catch (e) {
     next(e)
   }

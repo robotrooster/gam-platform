@@ -599,6 +599,46 @@ export function schedulerInit() {
     }
   }, { timezone: 'America/Phoenix' })
 
+  // S473: stale-route cleanup (service-business / Phase 1a.3). Daily
+  // at 1:45am Phoenix — sits between the materializer (1:15am) and
+  // the platform-fee accrual (1:30am 1st-only) / lease-end-processor
+  // (2:00am). Hard-deletes generated_routes rows created for a date
+  // more than 7 days ago and never moved past status='generated'.
+  // Routes that started or completed are never touched. FK cascade
+  // pulls the route_stops along with them.
+  cron.schedule('45 1 * * *', async () => {
+    try {
+      const { processRouteCleanup } = await import('./routeCleanup')
+      const result = await processRouteCleanup()
+      if (result.routes_deleted > 0) {
+        logger.info(result, '[route-cleanup]')
+      }
+    } catch (e) {
+      logger.error({ err: e }, '[route-cleanup] fatal')
+    }
+  }, { timezone: 'America/Phoenix' })
+
+  // S468: recurring-schedule materializer (service-business / Phase 1a.2).
+  // Daily at 1:15am Phoenix — sits between manager-fee accrual (1am 1st)
+  // and platform-fee accrual (1:30am 1st); on non-monthly days it has the
+  // window to itself. Walks every active recurring_schedules row and
+  // inserts the next 60 days of appointments. Idempotent via partial
+  // UNIQUE (recurring_schedule_id, scheduled_for) WHERE recurring_schedule_id
+  // IS NOT NULL — re-runs are no-ops. Owners can also trigger materialization
+  // on-demand via POST /api/recurring-schedules/:id/materialize (S461) for
+  // immediate visibility after editing a schedule.
+  cron.schedule('15 1 * * *', async () => {
+    try {
+      const { materializeAllSchedules } = await import('../services/recurringScheduleMaterializer')
+      const result = await materializeAllSchedules()
+      if (result.schedules_scanned > 0 || result.errors > 0) {
+        logger.info(result, '[recurring-schedule-materializer]')
+      }
+    } catch (e) {
+      logger.error({ err: e }, '[recurring-schedule-materializer] fatal')
+    }
+  }, { timezone: 'America/Phoenix' })
+
   // S69: monthly manager-fee accrual. Fires 1st of each month at 1am Phoenix.
   // Posts allocation_manager_fee ledger entries for properties with
   // flat_monthly_fee or per_unit_fee configured. Idempotent per (property, month).
@@ -675,6 +715,25 @@ export function schedulerInit() {
       logger.info(result, '[compliance-archive]')
     } catch (e) {
       logger.error({ err: e }, '[compliance-archive] fatal')
+    }
+  }, { timezone: 'America/Phoenix' })
+
+  // S479: state-law KB refresh-burden surfacer. Weekly on Sundays at
+  // 5am Phoenix — right after the credit Merkle anchor (4am Sun) in
+  // the low-contention Sunday morning window. Walks the LATEST
+  // provision per (state, topic), surfaces an admin notification when
+  // any row's source_date is older than 90 days. Idempotent via the
+  // existing-unack check inside the job (no double-firing while the
+  // refresh burden hasn't been touched).
+  cron.schedule('0 5 * * 0', async () => {
+    try {
+      const { processStateLawRefreshCheck } = await import('./stateLawRefreshCheck')
+      const result = await processStateLawRefreshCheck()
+      if (result.stale_provision_count > 0) {
+        logger.info(result, '[state-law-refresh-check]')
+      }
+    } catch (e) {
+      logger.error({ err: e }, '[state-law-refresh-check] fatal')
     }
   }, { timezone: 'America/Phoenix' })
 
@@ -1198,6 +1257,9 @@ export function schedulerInit() {
     }
   }).catch((e: unknown) => logger.error({ err: e }, '[Scheduler] Initial tz cron refresh error'))
 
+    logger.info('   ✓ Recurring materializer: Daily 1:15am Phoenix (service-business / Phase 1a)')
+    logger.info('   ✓ Route cleanup:        Daily 1:45am Phoenix (stale unstarted routes, 7-day retention)')
+    logger.info('   ✓ State-law refresh:    Weekly Sun 5am Phoenix (admin notif when source_date > 90 days)')
     logger.info('   ✓ Lease expiry notices: Daily 8am (per lease expiration_notice_days)')
   logger.info('   ✓ Lease end processor:  Daily 2am (auto-renew or expire)')
   logger.info('   ✓ Low stock check:      Daily 9am')
@@ -1206,7 +1268,25 @@ export function schedulerInit() {
   logger.info('   ✓ NACHA monitoring:     Daily 8am')
   logger.info('   ✓ Unit activations:     Hourly at :05')
   logger.info('   ✓ Invitation expiry:    Hourly at :10')
-  logger.info('   ✓ Tz refresh:           Daily 3am UTC\n')
+  logger.info('   ✓ Tz refresh:           Daily 3am UTC')
+  logger.info('   ✓ Recurring invoices:   Daily 9:30am Phoenix\n')
+
+  // S505: business-portal recurring invoice generation. Daily at
+  // 9:30am Phoenix (after the auto-payouts cron at 9am to avoid CPU
+  // contention with the heavier payout sweep). Sweeps active
+  // schedules whose next_due_date has arrived and generates one
+  // invoice each; auto-send flag is honored per-schedule.
+  cron.schedule('30 9 * * *', async () => {
+    try {
+      const { generateAllDueRecurringInvoices } = await import('../services/recurringInvoiceGeneration')
+      const r = await generateAllDueRecurringInvoices()
+      if (r.processed > 0 || r.failed > 0) {
+        logger.info(`[recurring] processed=${r.processed} failed=${r.failed}`)
+      }
+    } catch (e) {
+      logger.error({ err: e }, '[recurring-cron] sweep crashed')
+    }
+  })
 }
 
 

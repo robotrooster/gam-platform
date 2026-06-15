@@ -161,6 +161,94 @@ describe('GET /api/properties/:id', () => {
       .set('Authorization', `Bearer ${a.landlordToken}`)
     expect(res.status).toBe(403)
   })
+
+  // ─────────────────────────────────────────────────────────────
+  //  S486: state-law warnings on GET /:id recomputed against
+  //  persisted property defaults.
+  // ─────────────────────────────────────────────────────────────
+
+  async function seedNvLateFeeCap(): Promise<void> {
+    const { rows: [a] } = await db.query<{ id: string }>(
+      `INSERT INTO state_landlord_tenant_acts
+         (state_code, act_key, act_name, unit_types, source_date, effective_year)
+       VALUES ('NV', 'residential', 'NV Residential Landlord-Tenant Act',
+               ARRAY['apartment','single_family']::text[], '2026-06-11', 2026)
+       ON CONFLICT DO NOTHING
+       RETURNING id`)
+    const actId = a?.id ?? (await db.query<{ id: string }>(
+      `SELECT id FROM state_landlord_tenant_acts WHERE state_code='NV' AND act_key='residential' AND effective_year=2026 LIMIT 1`)).rows[0].id
+    await db.query(
+      `INSERT INTO state_law_provisions
+         (act_id, state_code, topic, rule_kind, threshold_numeric, threshold_unit,
+          summary, statute_citation, source_url, source_date, effective_year)
+       VALUES ($1, 'NV', 'late_fee_max_pct', 'max', 5, '% of rent',
+               'Late fee may not exceed 5% of monthly rent',
+               'NRS 118A.210', 'https://www.leg.state.nv.us/nrs/NRS-118A.html',
+               '2026-06-11', 2026)
+       ON CONFLICT DO NOTHING`, [actId])
+  }
+
+  async function createNvProperty(f: PropsFixture) {
+    return request(buildApp())
+      .post('/api/properties').set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({
+        name: 'NV Prop', street1: '1 main st', city: 'Las Vegas', state: 'NV', zip: '89101',
+        type: 'residential',
+        allocationRule: {
+          bankingFeePayer: 'landlord',
+          platformFeePayer: 'landlord',
+          rentPercent: 5,
+        },
+      })
+  }
+
+  it('S486: NV property with 10% percent-of-rent default → state_law_warnings flag', async () => {
+    const f = await seedPropsFixture()
+    await seedNvLateFeeCap()
+    const prop = await createNvProperty(f)
+    // Patch to set the late-fee config above the NV cap.
+    await request(buildApp())
+      .patch(`/api/properties/${prop.body.data.id}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ lateFeeInitialAmount: 10, lateFeeInitialType: 'percent_of_rent' })
+    // GET should recompute and surface the warning.
+    const res = await request(buildApp())
+      .get(`/api/properties/${prop.body.data.id}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(res.status).toBe(200)
+    expect(Array.isArray(res.body.data.state_law_warnings)).toBe(true)
+    expect(res.body.data.state_law_warnings.length).toBe(1)
+    expect(res.body.data.state_law_warnings[0].topic).toBe('late_fee_max_pct')
+  })
+
+  it('S486: AZ property with 10% percent-of-rent → empty (no late_fee_max_pct seeded)', async () => {
+    const f = await seedPropsFixture()
+    const prop = await createProperty(f)  // default AZ
+    await request(buildApp())
+      .patch(`/api/properties/${prop.body.data.id}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ lateFeeInitialAmount: 10, lateFeeInitialType: 'percent_of_rent' })
+    const res = await request(buildApp())
+      .get(`/api/properties/${prop.body.data.id}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.state_law_warnings).toEqual([])
+  })
+
+  it('S486: flat-dollar late fee → empty (no percent check fires)', async () => {
+    const f = await seedPropsFixture()
+    await seedNvLateFeeCap()
+    const prop = await createNvProperty(f)
+    await request(buildApp())
+      .patch(`/api/properties/${prop.body.data.id}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ lateFeeInitialAmount: 100, lateFeeInitialType: 'flat' })
+    const res = await request(buildApp())
+      .get(`/api/properties/${prop.body.data.id}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.state_law_warnings).toEqual([])
+  })
 })
 
 describe('POST /api/properties/:id/fee-schedule', () => {
@@ -230,6 +318,111 @@ describe('PATCH /api/properties/:id — late-fee accrual all-or-nothing', () => 
     expect(Number(res.body.data.late_fee_accrual_amount)).toBe(5)
     expect(res.body.data.late_fee_accrual_type).toBe('flat')
     expect(res.body.data.late_fee_accrual_period).toBe('daily')
+  })
+
+  // ─────────────────────────────────────────────────────────────
+  //  S481: state-law warnings on property defaults PATCH
+  // ─────────────────────────────────────────────────────────────
+
+  async function seedNvLateFeeCap(): Promise<void> {
+    // NV has late_fee_max_pct=5% (NRS 118A.210). Seed inline since
+    // schema.sql is schema-only.
+    const { rows: [a] } = await db.query<{ id: string }>(
+      `INSERT INTO state_landlord_tenant_acts
+         (state_code, act_key, act_name, unit_types, source_date, effective_year)
+       VALUES ('NV', 'residential', 'NV Residential Landlord-Tenant Act',
+               ARRAY['apartment','single_family']::text[], '2026-06-11', 2026)
+       ON CONFLICT DO NOTHING
+       RETURNING id`)
+    const actId = a?.id ?? (await db.query<{ id: string }>(
+      `SELECT id FROM state_landlord_tenant_acts WHERE state_code='NV' AND act_key='residential' AND effective_year=2026 LIMIT 1`)).rows[0].id
+    await db.query(
+      `INSERT INTO state_law_provisions
+         (act_id, state_code, topic, rule_kind, threshold_numeric, threshold_unit,
+          summary, statute_citation, source_url, source_date, effective_year)
+       VALUES ($1, 'NV', 'late_fee_max_pct', 'max', 5, '% of rent',
+               'Late fee may not exceed 5% of monthly rent',
+               'NRS 118A.210', 'https://www.leg.state.nv.us/nrs/NRS-118A.html',
+               '2026-06-11', 2026)
+       ON CONFLICT DO NOTHING`, [actId])
+  }
+
+  async function createNvProperty(f: PropsFixture) {
+    return request(buildApp())
+      .post('/api/properties').set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({
+        name: 'NV Prop', street1: '1 main st', city: 'Las Vegas', state: 'NV', zip: '89101',
+        type: 'residential',
+        allocationRule: {
+          bankingFeePayer: 'landlord',
+          platformFeePayer: 'landlord',
+          rentPercent: 5,
+        },
+      })
+  }
+
+  it('S481: NV late fee 10% (above 5% cap) → state_law_warnings flag', async () => {
+    const f = await seedPropsFixture()
+    await seedNvLateFeeCap()
+    const prop = await createNvProperty(f)
+    const res = await request(buildApp())
+      .patch(`/api/properties/${prop.body.data.id}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ lateFeeInitialAmount: 10, lateFeeInitialType: 'percent_of_rent' })
+    expect(res.status).toBe(200)
+    expect(Array.isArray(res.body.data.state_law_warnings)).toBe(true)
+    expect(res.body.data.state_law_warnings.length).toBe(1)
+    const flag = res.body.data.state_law_warnings[0]
+    expect(flag.topic).toBe('late_fee_max_pct')
+    expect(flag.message).toMatch(/above the 5/)
+    expect(flag.message).toMatch(/NV/)
+  })
+
+  it('S481: NV late fee 4% (within 5% cap) → state_law_warnings empty', async () => {
+    const f = await seedPropsFixture()
+    await seedNvLateFeeCap()
+    const prop = await createNvProperty(f)
+    const res = await request(buildApp())
+      .patch(`/api/properties/${prop.body.data.id}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ lateFeeInitialAmount: 4, lateFeeInitialType: 'percent_of_rent' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.state_law_warnings).toEqual([])
+  })
+
+  it('S481: AZ residential 10% late fee → empty (AZ has no late_fee_max_pct provision)', async () => {
+    const f = await seedPropsFixture()
+    const prop = await createProperty(f)  // default state AZ
+    const res = await request(buildApp())
+      .patch(`/api/properties/${prop.body.data.id}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ lateFeeInitialAmount: 10, lateFeeInitialType: 'percent_of_rent' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.state_law_warnings).toEqual([])
+  })
+
+  it('S481: PATCH that does not touch fee fields → empty state_law_warnings', async () => {
+    const f = await seedPropsFixture()
+    await seedNvLateFeeCap()
+    const prop = await createNvProperty(f)
+    const res = await request(buildApp())
+      .patch(`/api/properties/${prop.body.data.id}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ name: 'Renamed' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.state_law_warnings).toEqual([])
+  })
+
+  it('S481: flat-dollar late fee → no late_fee_max_pct check fires (apples vs oranges)', async () => {
+    const f = await seedPropsFixture()
+    await seedNvLateFeeCap()
+    const prop = await createNvProperty(f)
+    const res = await request(buildApp())
+      .patch(`/api/properties/${prop.body.data.id}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ lateFeeInitialAmount: 100, lateFeeInitialType: 'flat' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.state_law_warnings).toEqual([])
   })
 })
 

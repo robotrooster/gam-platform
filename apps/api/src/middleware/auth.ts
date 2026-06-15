@@ -8,6 +8,14 @@ export interface AuthPayload {
   email:       string
   profileId:   string
   landlordId?: string | null
+  // S453: business-side scope. Set for business_owner (resolved at
+  // login from businesses.owner_user_id) and for business_staff
+  // (resolved from business_users at login via getScopeForUser).
+  // Null for any non-business role. staffRole carries the per-business
+  // position so the business portal can gate driver-only vs
+  // dispatcher-only screens without a DB hit on every request.
+  businessId?: string | null
+  staffRole?:  string | null
   // S81: heterogeneous shape — sub-permission keys are boolean,
   // bookkeeper's access_level is 'read_only' | 'read_write'. Widened
   // from Record<string, boolean> so requireBooksRead/Write can read

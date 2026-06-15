@@ -592,3 +592,98 @@ describe('POST /maintenance/:id/comments', () => {
     expect(res.status).toBe(400)
   })
 })
+
+// ─── GET /stats/summary — backfilled S490 ──────────────────────────
+//
+// Coverage backfill for the maintenance stats summary endpoint —
+// follows the same pattern that caught the S488 drilldown bug.
+// Exercises the FILTER aggregates against real column names; any
+// schema mismatch would 500 on the first GET.
+
+describe('GET /maintenance/stats/summary', () => {
+  async function seedReq(args: {
+    landlordId: string; unitId: string; tenantId: string;
+    status?: string; priority?: string;
+    actualCost?: number | null; platformFee?: number | null;
+  }): Promise<void> {
+    await db.query(
+      `INSERT INTO maintenance_requests
+         (unit_id, tenant_id, landlord_id, title, description, priority, status,
+          actual_cost, platform_fee)
+       VALUES ($1, $2, $3, 'Test', 'desc', $4, $5, $6, $7)`,
+      [args.unitId, args.tenantId, args.landlordId,
+       args.priority ?? 'normal',
+       args.status ?? 'open',
+       args.actualCost ?? null,
+       args.platformFee ?? null])
+  }
+
+  it('landlord: counts per status + sums platform fee + total cost', async () => {
+    const f = await seedFixture()
+    // Mix: 2 open, 1 assigned, 1 in_progress, 2 completed (with cost+fee),
+    // 1 emergency-open (counted by emergency_count).
+    await seedReq({ landlordId: f.landlordId, unitId: f.unitId, tenantId: f.tenantId, status: 'open' })
+    await seedReq({ landlordId: f.landlordId, unitId: f.unitId, tenantId: f.tenantId, status: 'open' })
+    await seedReq({ landlordId: f.landlordId, unitId: f.unitId, tenantId: f.tenantId, status: 'assigned' })
+    await seedReq({ landlordId: f.landlordId, unitId: f.unitId, tenantId: f.tenantId, status: 'in_progress' })
+    await seedReq({
+      landlordId: f.landlordId, unitId: f.unitId, tenantId: f.tenantId,
+      status: 'completed', actualCost: 200, platformFee: 16,
+    })
+    await seedReq({
+      landlordId: f.landlordId, unitId: f.unitId, tenantId: f.tenantId,
+      status: 'completed', actualCost: 350, platformFee: 28,
+    })
+    await seedReq({
+      landlordId: f.landlordId, unitId: f.unitId, tenantId: f.tenantId,
+      status: 'open', priority: 'emergency',
+    })
+
+    const res = await request(buildApp())
+      .get('/api/maintenance/stats/summary')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(res.status).toBe(200)
+    expect(Number(res.body.data.open_count)).toBe(3)  // 2 normal + 1 emergency
+    expect(Number(res.body.data.assigned_count)).toBe(1)
+    expect(Number(res.body.data.in_progress_count)).toBe(1)
+    expect(Number(res.body.data.completed_count)).toBe(2)
+    expect(Number(res.body.data.emergency_count)).toBe(1)
+    expect(Number(res.body.data.total_cost)).toBe(550)
+    expect(Number(res.body.data.total_fees)).toBe(44)
+  })
+
+  it('cross-landlord rows excluded', async () => {
+    const a = await seedFixture()
+    const b = await seedFixture()
+    await seedReq({ landlordId: a.landlordId, unitId: a.unitId, tenantId: a.tenantId, status: 'open' })
+    await seedReq({ landlordId: b.landlordId, unitId: b.unitId, tenantId: b.tenantId, status: 'open' })
+    await seedReq({ landlordId: b.landlordId, unitId: b.unitId, tenantId: b.tenantId, status: 'completed' })
+    const res = await request(buildApp())
+      .get('/api/maintenance/stats/summary')
+      .set('Authorization', `Bearer ${a.landlordToken}`)
+    expect(Number(res.body.data.open_count)).toBe(1)
+    expect(Number(res.body.data.completed_count)).toBe(0)
+  })
+
+  it('empty: landlord with no requests → zero counters', async () => {
+    const f = await seedFixture()
+    const res = await request(buildApp())
+      .get('/api/maintenance/stats/summary')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(res.status).toBe(200)
+    expect(Number(res.body.data.open_count)).toBe(0)
+    expect(Number(res.body.data.total_cost)).toBe(0)
+    expect(Number(res.body.data.total_fees)).toBe(0)
+  })
+
+  it('tenant role → empty data response (route short-circuits)', async () => {
+    const f = await seedFixture()
+    await seedReq({ landlordId: f.landlordId, unitId: f.unitId, tenantId: f.tenantId, status: 'open' })
+    const res = await request(buildApp())
+      .get('/api/maintenance/stats/summary')
+      .set('Authorization', `Bearer ${f.tenantToken}`)
+    // Tenant role doesn't match any branch → requirePerm denies (403)
+    // before the early-return paths fire.
+    expect(res.status).toBe(403)
+  })
+})

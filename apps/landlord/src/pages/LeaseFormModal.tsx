@@ -8,6 +8,7 @@ const AUTO_RENEW_MODE_DESC: Record<AutoRenewMode, string> = {
 }
 
 import { X, Check, DollarSign, AlertTriangle } from 'lucide-react'
+import { LawWarningBanner, type LawFlag } from '../components/LawWarningBanner'
 
 // S225: this modal is currently invoked in EDIT MODE ONLY. The
 // landlord-portal "Add Lease" entry point was replaced with a
@@ -254,15 +255,29 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
     security_deposit:       'Security deposit',
   }
 
+  // S477: state-law warnings from the lease PATCH response. Empty on
+  // close-immediately path; populated when the save succeeded but the
+  // backend surfaced a hedged law mismatch (the modal stays open with
+  // the banner shown).
+  const [stateLawWarnings, setStateLawWarnings] = useState<LawFlag[]>([])
+
   const updateMut = useMutation(
-    (data: any) => apiPatch('/leases/' + leaseId, data),
+    (data: any) => apiPatch<any>('/leases/' + leaseId, data),
     {
-      onSuccess: () => {
+      onSuccess: (result: any) => {
         qc.invalidateQueries('leases')
         qc.invalidateQueries(['lease', leaseId])
         qc.invalidateQueries('units')
         setPendingConfirm(null)
-        onClose()
+        const warnings: LawFlag[] = result?.state_law_warnings ?? []
+        if (warnings.length > 0) {
+          // Keep the modal open so the landlord can read the hedged
+          // notice. Save is already committed; banner just informs.
+          setStateLawWarnings(warnings)
+        } else {
+          setStateLawWarnings([])
+          onClose()
+        }
       },
       onError: (err: any) => {
         const data = err?.response?.data
@@ -855,14 +870,38 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
               {submitError}
             </div>
           )}
+
+          {/* S477: state-law warning banner — shown after a successful
+              save that surfaced a hedged factual mismatch. The save
+              already committed; the modal stays open so the landlord
+              can read the notice before closing. */}
+          {stateLawWarnings.length > 0 && (
+            <div style={{ marginTop: 12 }}>
+              <LawWarningBanner warnings={stateLawWarnings} />
+              <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 4 }}>
+                Your changes were saved. The note above is informational —
+                no action required.
+              </div>
+            </div>
+          )}
         </div>
 
         {/* Footer */}
         <div className="modal-footer" style={{ marginTop: 16, flexShrink: 0 }}>
-          <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
-          <button className="btn btn-primary" onClick={submit} disabled={isLoading}>
-            {isLoading ? <span className="spinner" /> : <><Check size={14} /> {isEdit ? 'Save Changes' : 'Create Lease'}</>}
-          </button>
+          {stateLawWarnings.length > 0 ? (
+            // Post-warning state: save is already done; offer a single
+            // close action.
+            <button className="btn btn-primary" onClick={onClose}>
+              <Check size={14} /> Got it, close
+            </button>
+          ) : (
+            <>
+              <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+              <button className="btn btn-primary" onClick={submit} disabled={isLoading}>
+                {isLoading ? <span className="spinner" /> : <><Check size={14} /> {isEdit ? 'Save Changes' : 'Create Lease'}</>}
+              </button>
+            </>
+          )}
         </div>
       </div>
 

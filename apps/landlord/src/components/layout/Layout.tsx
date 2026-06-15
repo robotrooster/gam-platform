@@ -10,7 +10,7 @@ import {
   ArrowDownToLine, Wrench, FileText, LogOut, Settings,
   ShoppingCart, Shield, Package, BarChart2, ScrollText,
   UserSearch, ClipboardList, HeartHandshake, PenTool, UserPlus,
-  Landmark, ClipboardCheck, Gavel, MessageCircle
+  Landmark, ClipboardCheck, Gavel, MessageCircle, Bot
 } from 'lucide-react'
 
 // S82: each nav item has a `roles` admission list (which roles MAY see
@@ -51,6 +51,7 @@ const NAV_ITEMS: Array<{
   { to: '/banking',       icon: Landmark,         label: 'Banking',          section: null,          roles: ['landlord','property_manager'] },
   { to: '/payments',      icon: CreditCard,       label: 'Payments',         section: null,          roles: ['landlord','property_manager'], perm: ['payments.view_all'] },
   { to: '/reports',       icon: BarChart2,        label: 'Reports',          section: null,          roles: ['landlord'] },
+  { to: '/agent-activity',icon: Bot,              label: 'Agent Activity',   section: null,          roles: ['landlord'] },
   // Operations
   { to: '/maintenance',   icon: Wrench,           label: 'Maintenance',      section: 'Operations',  roles: ['landlord','property_manager','onsite_manager','maintenance'], perm: ['work_orders.create','work_orders.complete','work_orders.reassign','maintenance.approve_above_threshold'] },
   { to: '/inspections',   icon: ClipboardCheck,   label: 'Inspections',      section: null,          roles: ['landlord','property_manager','onsite_manager'] },

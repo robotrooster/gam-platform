@@ -50,6 +50,11 @@ import { markNotificationsRead } from './markNotificationsRead'
 import { updateNotificationPreference } from './updateNotificationPreference'
 import { getApplicableLaws } from './getApplicableLaws'
 import { searchStateLaw } from './searchStateLaw'
+import { searchRealEstateLaw } from './searchRealEstateLaw'
+import { getPropertyTaxFacts } from './getPropertyTaxFacts'
+import { searchParcelsTool } from './searchParcels'
+import { getMarketRentTool } from './getMarketRent'
+import { getMyLandlordRenewalTendency } from './getMyLandlordRenewalTendency'
 import { checkAgainstLaw } from './checkAgainstLaw'
 import { escalate, escalateToHuman } from './escalation'
 import type { AgentTool } from './types'
@@ -73,6 +78,7 @@ export const ALL_TOOLS: readonly AgentTool[] = [
   getMyBookings,
   getMyContacts,
   getMyLandlordPatterns,
+  getMyLandlordRenewalTendency,
   // landlord reads
   getLandlordPortfolio,
   getPropertyRentRoll,
@@ -101,6 +107,10 @@ export const ALL_TOOLS: readonly AgentTool[] = [
   // both
   getApplicableLaws,
   searchStateLaw,
+  searchRealEstateLaw,
+  getPropertyTaxFacts,
+  searchParcelsTool,
+  getMarketRentTool,
   checkAgainstLaw,
   getMyNotifications,
   markNotificationsRead,

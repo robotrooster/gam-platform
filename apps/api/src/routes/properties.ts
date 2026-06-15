@@ -15,6 +15,7 @@ import {
   PropertyReviewStatus,
 } from '@gam/shared'
 import { logger } from '../lib/logger'
+import { checkAgainstStatute, checkLeaseAgainstStateLaw, type LawFlag } from '../services/stateLaw'
 
 export const propertiesRouter = Router()
 export const publicPropertiesRouter = Router()
@@ -227,7 +228,29 @@ propertiesRouter.get('/:id', async (req, res, next) => {
     const p = await queryOne<any>(`SELECT * FROM properties WHERE id=$1`,[req.params.id])
     if (!p) throw new AppError(404,'Property not found')
     if (!canAccessLandlordResource(req.user, p.landlord_id)) throw new AppError(403, 'Forbidden')
-    res.json({ success: true, data: p })
+
+    // S486: recompute state-law warnings against the persisted
+    // property defaults so the detail page surfaces current-state
+    // mismatches without waiting for a PATCH. Deposit check skips
+    // automatically (no rentAmount at property level); only the
+    // late-fee checks fire. Best-effort; errors logged.
+    let stateLawWarnings: LawFlag[] = []
+    try {
+      stateLawWarnings = await checkLeaseAgainstStateLaw({
+        stateCode:            p.state,
+        rentAmount:           null,  // no per-property rent figure
+        lateFeeInitialAmount: p.late_fee_initial_amount != null ? Number(p.late_fee_initial_amount) : null,
+        lateFeeInitialType:   p.late_fee_initial_type,
+        lateFeeGraceDays:     p.late_fee_grace_days != null ? Number(p.late_fee_grace_days) : null,
+      })
+    } catch (e) {
+      logger.error({ err: e, property_id: p.id }, '[stateLaw] property GET checks failed')
+    }
+
+    res.json({
+      success: true,
+      data: { ...p, state_law_warnings: stateLawWarnings },
+    })
   } catch (e) { next(e) }
 })
 
@@ -467,7 +490,38 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
         lfValues,
       )
     }
-    res.json({ success: true, data: updated })
+
+    // S481: state-law mismatches against the property state's
+    // catalogued figures. Mirrors the S476 lease PATCH posture —
+    // only checks fields TOUCHED in this PATCH so the warning fires
+    // when the landlord acts, not on unrelated edits. The default
+    // late-fee config here flows into NEW leases at this property
+    // via the LeaseFormModal default-pull, so surfacing the hedged
+    // factual notice now beats waiting for per-lease re-flagging
+    // later.
+    const stateLawWarnings: LawFlag[] = []
+    try {
+      const stateCode = updated?.state
+      if (stateCode) {
+        if (lateFeeInitialAmount !== undefined && lateFeeInitialType === 'percent_of_rent') {
+          const flag = await checkAgainstStatute(
+            stateCode, 'late_fee_max_pct', Number(lateFeeInitialAmount))
+          if (flag) stateLawWarnings.push(flag)
+        }
+        if (lateFeeGraceDays !== undefined) {
+          const flag = await checkAgainstStatute(
+            stateCode, 'late_fee_grace_days', Number(lateFeeGraceDays))
+          if (flag) stateLawWarnings.push(flag)
+        }
+      }
+    } catch (e) {
+      logger.error({ err: e, property_id: prop.id }, '[stateLaw] property PATCH checks failed')
+    }
+
+    res.json({
+      success: true,
+      data: { ...updated, state_law_warnings: stateLawWarnings },
+    })
   } catch (e) { next(e) }
 })
 

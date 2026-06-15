@@ -1,8 +1,18 @@
 import { useState } from 'react'
 import { useQuery, useMutation } from 'react-query'
 import { useNavigate } from 'react-router-dom'
-import { DoorOpen, ArrowLeft, AlertTriangle } from 'lucide-react'
+import { DoorOpen, ArrowLeft, AlertTriangle, Check } from 'lucide-react'
 import { apiGet, apiPost } from '../lib/api'
+import { LawWarningBanner, type LawFlag } from '../components/LawWarningBanner'
+
+interface CreateResponseData {
+  id: string
+  notice_window_hours: number
+  notice_window_meets_default: boolean
+  outside_typical_hours: boolean
+  typical_hours_warning: string | null
+  state_law_warnings: LawFlag[]
+}
 
 export function NewEntryRequestPage() {
   const navigate = useNavigate()
@@ -13,15 +23,26 @@ export function NewEntryRequestPage() {
   const [windowStart, setWindowStart] = useState('')
   const [windowEnd, setWindowEnd] = useState('')
   const [error, setError] = useState<string | null>(null)
+  // S477: post-create result. Held in state when the backend surfaces
+  // warnings (state-law mismatch or outside-typical-hours flag) so the
+  // landlord can read them before navigating to the request detail.
+  const [submittedResult, setSubmittedResult] = useState<CreateResponseData | null>(null)
 
   const { data: units = [] } = useQuery<any[]>('units', () => apiGet<any[]>('/units'))
   const { data: tenants = [] } = useQuery<any[]>('tenants', () => apiGet<any[]>('/tenants'))
 
   const createMut = useMutation(
-    (body: any) => apiPost<{ id: string; notice_window_hours: number; notice_window_meets_default: boolean }>('/entry-requests', body),
+    (body: any) => apiPost<CreateResponseData>('/entry-requests', body),
     {
       onSuccess: (res: any) => {
-        navigate(`/entry-requests/${res.data.id}`)
+        const data: CreateResponseData = res.data
+        const hasWarnings = data.outside_typical_hours
+          || (data.state_law_warnings && data.state_law_warnings.length > 0)
+        if (hasWarnings) {
+          setSubmittedResult(data)
+        } else {
+          navigate(`/entry-requests/${data.id}`)
+        }
       },
       onError: (e: any) => setError(e?.response?.data?.error || 'Failed'),
     },
@@ -61,6 +82,55 @@ export function NewEntryRequestPage() {
           </h1>
         </div>
       </div>
+
+      {submittedResult ? (
+        <div className="card" style={{ padding: 24 }}>
+          <div style={{
+            display: 'flex', alignItems: 'center', gap: 8,
+            color: 'var(--green)', fontWeight: 600, fontSize: '.95rem',
+            marginBottom: 16,
+          }}>
+            <Check size={18} /> Entry request sent.
+          </div>
+
+          {submittedResult.outside_typical_hours && submittedResult.typical_hours_warning && (
+            <div style={{
+              background: 'rgba(245, 158, 11, 0.08)',
+              border: '1px solid rgba(245, 158, 11, 0.4)',
+              borderRadius: 8, padding: '12px 14px', marginBottom: 12,
+              display: 'flex', gap: 10, alignItems: 'flex-start',
+            }}>
+              <AlertTriangle size={16} style={{ color: 'var(--amber, #f59e0b)', flexShrink: 0, marginTop: 2 }} />
+              <div style={{ fontSize: 13, lineHeight: 1.5, color: 'var(--text-0)' }}>
+                <div style={{
+                  fontWeight: 700, color: 'var(--amber, #f59e0b)',
+                  fontSize: 12, textTransform: 'uppercase',
+                  letterSpacing: 0.5, marginBottom: 6,
+                }}>
+                  Outside typical hours
+                </div>
+                {submittedResult.typical_hours_warning}
+              </div>
+            </div>
+          )}
+
+          <LawWarningBanner warnings={submittedResult.state_law_warnings} />
+
+          <div style={{ fontSize: 12, color: 'var(--text-2)', marginTop: 8 }}>
+            Your notice was sent to the tenant. The note(s) above are
+            informational — no action required.
+          </div>
+
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 20 }}>
+            <button className="btn btn-ghost" onClick={() => navigate('/entry-requests')}>
+              Back to list
+            </button>
+            <button className="btn btn-primary" onClick={() => navigate(`/entry-requests/${submittedResult.id}`)}>
+              View request
+            </button>
+          </div>
+        </div>
+      ) : (
 
       <form onSubmit={onSubmit} className="card" style={{ padding: 24 }}>
         {error && (
@@ -157,6 +227,7 @@ export function NewEntryRequestPage() {
           </button>
         </div>
       </form>
+      )}
     </div>
   )
 }

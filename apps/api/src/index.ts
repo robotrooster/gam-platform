@@ -24,6 +24,31 @@ import { camelCaseKeys } from './lib/caseConversion'
 import { authRouter }         from './routes/auth'
 import { totpRouter }         from './routes/totp'
 import { landlordsRouter }    from './routes/landlords'
+import { landlordAgentActivityRouter } from './routes/landlordAgentActivity'
+import { pmAgentActivityRouter } from './routes/pmAgentActivity'
+import { businessesRouter }   from './routes/businesses'
+import { businessUsersRouter } from './routes/businessUsers'
+import { businessCustomersRouter } from './routes/businessCustomers'
+import { businessInvoicesRouter } from './routes/businessInvoices'
+import { businessInventoryRouter } from './routes/businessInventory'
+import { businessPosRouter } from './routes/businessPos'
+import { businessVehiclesRouter } from './routes/businessVehicles'
+import { businessWorkOrdersRouter } from './routes/businessWorkOrders'
+import { businessDashboardRouter } from './routes/businessDashboard'
+import { businessQuotesRouter } from './routes/businessQuotes'
+import { businessReportsRouter } from './routes/businessReports'
+import { businessRecurringInvoicesRouter } from './routes/businessRecurringInvoices'
+import { businessBookableServicesRouter } from './routes/businessBookableServices'
+import { publicBookingRouter } from './routes/publicBooking'
+import { businessAttachmentsRouter } from './routes/businessAttachments'
+import { publicCardUpdateRouter } from './routes/publicCardUpdate'
+import { businessSearchRouter } from './routes/businessSearch'
+import { appointmentsRouter } from './routes/appointments'
+import { recurringSchedulesRouter } from './routes/recurringSchedules'
+import { routesRouter } from './routes/routes'
+import { depotsRouter } from './routes/depots'
+import { vehiclesRouter } from './routes/vehicles'
+import { dumpLocationsRouter } from './routes/dumpLocations'
 import { tenantsRouter }      from './routes/tenants'
 import { propertiesRouter, publicPropertiesRouter } from './routes/properties'
 import { unitsRouter }        from './routes/units'
@@ -46,6 +71,8 @@ import { maintenancePortalRouter } from './routes/maintenance-portal'
 import { esignRouter }        from './routes/esign'
 import { backgroundRouter }   from './routes/background'
 import { announcementsRouter }  from './routes/announcements'
+import { propertyTaxRouter } from './routes/propertyTax'
+import { realEstateLawRouter } from './routes/realEstateLaw'
 import { booksRouter } from './routes/books'
 import { scopesRouter, invitationsRouter } from './routes/scopes'
 import { pmRouter } from './routes/pm'
@@ -152,6 +179,30 @@ app.get('/health', (_req, res) => res.json({ status: 'ok', ts: new Date() }))
 app.use('/api/auth',          authRouter)
 app.use('/api/auth/totp',     totpRouter)
 app.use('/api/landlords',     landlordsRouter)
+app.use('/api/landlord/agent-activity', landlordAgentActivityRouter)
+app.use('/api/businesses',    businessesRouter)
+app.use('/api/business-users', businessUsersRouter)
+app.use('/api/business-customers', businessCustomersRouter)
+app.use('/api/business-invoices',  businessInvoicesRouter)
+app.use('/api/business-inventory', businessInventoryRouter)
+app.use('/api/business-pos', businessPosRouter)
+app.use('/api/business-vehicles', businessVehiclesRouter)
+app.use('/api/business-work-orders', businessWorkOrdersRouter)
+app.use('/api/business-dashboard', businessDashboardRouter)
+app.use('/api/business-quotes', businessQuotesRouter)
+app.use('/api/business-reports', businessReportsRouter)
+app.use('/api/business-recurring-invoices', businessRecurringInvoicesRouter)
+app.use('/api/business-bookable-services', businessBookableServicesRouter)
+app.use('/api/public', publicBookingRouter)
+app.use('/api/business-attachments', businessAttachmentsRouter)
+app.use('/api/business-search', businessSearchRouter)
+app.use('/api/public', publicCardUpdateRouter)
+app.use('/api/appointments',  appointmentsRouter)
+app.use('/api/recurring-schedules', recurringSchedulesRouter)
+app.use('/api/routes',        routesRouter)
+app.use('/api/depots',         depotsRouter)
+app.use('/api/vehicles',       vehiclesRouter)
+app.use('/api/dump-locations', dumpLocationsRouter)
 app.use('/api/tenants',       tenantsRouter)
 app.use('/api/properties',    propertiesRouter)
 app.use('/api/public/properties', publicPropertiesRouter)
@@ -185,6 +236,8 @@ app.use('/api/background/id-files', (req, res, next) => {
 app.use('/api/maint-portal', maintenancePortalRouter)
 app.use('/api/esign',         esignRouter)
 app.use('/api/announcements',  announcementsRouter)
+app.use('/api/property-tax',   propertyTaxRouter)
+app.use('/api/real-estate-law', realEstateLawRouter)
 app.use('/api/bulletin',       bulletinRouter)
   app.use('/api/background',    backgroundRouter)
 app.use('/api/fitness',        fitnessRouter)
@@ -197,6 +250,7 @@ app.use('/api/books',          booksRouter)
 app.use('/api/scopes',         scopesRouter)
 app.use('/api/invitations',    invitationsRouter)
 app.use('/api/pm',             pmRouter)
+app.use('/api/pm/:pmCompanyId/agent-activity', pmAgentActivityRouter)
 app.use('/api/credit',         creditRouter)
 app.use('/api/bookings',       bookingsRouter)
 app.use('/api/inspections',    inspectionsRouter)

@@ -27,6 +27,7 @@ import { TenantOnboardingPage } from './pages/TenantOnboardingPage'
 import { PropertyOnboardingPage } from './pages/PropertyOnboardingPage'
 import { PaymentHistoryOnboardingPage } from './pages/PaymentHistoryOnboardingPage'
 import { ReportsPage } from './pages/ReportsPage'
+import { AgentActivityPage } from './pages/AgentActivityPage'
 import { ESignPage } from './pages/ESignPage'
 import { BackgroundChecksPage } from './pages/BackgroundChecksPage'
 import { SignPage } from './pages/SignPage'
@@ -128,6 +129,7 @@ export default function App() {
               <Route path="maintenance"    element={<MaintenancePage />} />
               <Route path="support"        element={<SupportPage />} />
               <Route path="reports"        element={<ReportsPage />} />
+              <Route path="agent-activity" element={<AgentActivityPage />} />
               <Route path="team"           element={<TeamPage />} />
               <Route path="work-trade"     element={<WorkTradePage />} />
               <Route path="pos"            element={<POSPage />} />

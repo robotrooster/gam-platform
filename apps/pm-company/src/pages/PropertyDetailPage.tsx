@@ -13,6 +13,15 @@ const fmt = (n: any) => n != null
   ? `$${Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
   : '—'
 
+interface LawFlag {
+  topic: string
+  message: string
+  citation: string | null
+  sourceUrl: string | null
+  sourceDate: string
+  disclaimer: string
+}
+
 interface Drilldown {
   property: {
     id: string
@@ -28,6 +37,7 @@ interface Drilldown {
     pmFeeFlatAmount: string | null
     totalUnits: number
     occupiedUnits: number
+    stateLawWarnings?: LawFlag[]
   }
   units: Array<{
     id: string
@@ -102,6 +112,54 @@ export function PropertyDetailPage() {
           {[d.property.street1, d.property.city, d.property.state, d.property.zip].filter(Boolean).join(', ') || '—'}
         </div>
       </div>
+
+      {/* S487: hedged factual state-law mismatch warnings against the
+          persisted property defaults. Same posture as the landlord
+          portal PropertyDetailPage (S486) — never advisory, never
+          blocking. Auto-hides when empty. */}
+      {Array.isArray(d.property.stateLawWarnings) && d.property.stateLawWarnings.length > 0 && (
+        <div style={{
+          background: 'rgba(245,158,11,.08)',
+          border: '1px solid rgba(245,158,11,.4)',
+          borderRadius: 8,
+          padding: '12px 14px',
+          marginBottom: 18,
+        }}>
+          <div style={{
+            fontSize: '.7rem', fontWeight: 700,
+            color: 'var(--amber)', textTransform: 'uppercase',
+            letterSpacing: '.06em', marginBottom: 8,
+          }}>
+            ⚠ Heads up — state-law check
+          </div>
+          {d.property.stateLawWarnings.map((w, i) => (
+            <div key={i} style={{
+              marginBottom: i < (d.property.stateLawWarnings?.length ?? 0) - 1 ? 12 : 0,
+            }}>
+              <div style={{ fontSize: '.85rem', color: 'var(--text-0)', lineHeight: 1.5, marginBottom: 4 }}>
+                {w.message}
+              </div>
+              <div style={{
+                fontSize: '.7rem', color: 'var(--text-3)',
+                display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 4,
+              }}>
+                {w.citation && <span>{w.citation}</span>}
+                {w.sourceUrl && (
+                  <a href={w.sourceUrl} target="_blank" rel="noreferrer"
+                    style={{ color: 'var(--amber)', textDecoration: 'none' }}>source ↗</a>
+                )}
+                {w.sourceDate && <span>as of {String(w.sourceDate).slice(0, 10)}</span>}
+              </div>
+              {w.disclaimer && (
+                <div style={{
+                  fontSize: '.66rem', color: 'var(--text-3)',
+                  fontStyle: 'italic', marginTop: 4, lineHeight: 1.45,
+                }}>{w.disclaimer}</div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12, marginBottom: 24 }}>
         <Kpi label="Units" value={`${d.property.occupiedUnits} / ${d.property.totalUnits}`} sub="occupied" />

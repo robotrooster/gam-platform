@@ -399,6 +399,51 @@ export async function emailPmInvitation(
   )
 }
 
+// ── BUSINESS STAFF INVITATION (S456) ──────────────────────────
+// Service-business owners invite staff (manager / dispatcher / driver /
+// office) by email. Distinct from emailInvitation (landlord in-house
+// worker) and emailPmInvitation (third-party PM company staff) — service
+// businesses live in a separate `businesses` entity tree with its own
+// portal at apps/business. Accept endpoint:
+// POST /api/business-users/invitations/:token/accept.
+const BUSINESS_STAFF_ROLE_LABEL_MAP: Record<string, string> = {
+  manager:    'Manager',
+  dispatcher: 'Dispatcher',
+  driver:     'Driver',
+  office:     'Office',
+}
+export async function emailBusinessInvitation(
+  to: string,
+  inviterName: string,
+  businessName: string,
+  staffRole: 'manager' | 'dispatcher' | 'driver' | 'office',
+  acceptUrl: string,
+  ctx?: { businessId?: string; invitationId?: string }
+) {
+  const roleLabel = BUSINESS_STAFF_ROLE_LABEL_MAP[staffRole] ?? staffRole
+  await send(to, `${inviterName} invited you to join ${businessName} on GAM`,
+    base(
+      h(`You've been invited to ${businessName}`) +
+      p(`<strong style="color:#eef1f8">${inviterName}</strong> has invited you to join <strong style="color:#eef1f8">${businessName}</strong> as a <strong style="color:#eef1f8">${roleLabel}</strong>.`) +
+      p(`${businessName} uses GAM (Gold Asset Management) to run their operations. As ${roleLabel.toLowerCase()}, you'll have access to your assigned screens in the business portal.`) +
+      p('Click below to accept and set up your account. This invitation expires in 24 hours.') +
+      btn('Accept Invitation', acceptUrl) +
+      `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">If you were not expecting this invitation, you can safely ignore this email.</div>`
+    ),
+    {
+      category: 'business_invitation',
+      // landlordId intentionally null — business invitations scope to a
+      // business, not a landlord. relatedEntity attribution + metadata
+      // carry business + invitation context.
+      landlordId: null,
+      relatedEntityType: ctx?.invitationId ? 'business_user_invitation' : null,
+      relatedEntityId: ctx?.invitationId ?? null,
+      metadata: { staff_role: staffRole, business_id: ctx?.businessId, business_name: businessName },
+    },
+    'support',
+  )
+}
+
 // ── S157: pm_property_invitations email (mutual property-link handshake) ──
 //
 // Two directions:
@@ -850,5 +895,245 @@ export async function emailFlexsuiteEnrollment(args: {
     },
     'noreply',
     [{ filename, content: args.pdfBuffer }],
+  )
+}
+
+// ── S500: BUSINESS PORTAL — customer-facing emails ────────────
+//
+// Send-best-effort: every caller passes try/catch and never lets a
+// failed email block the underlying mutation (invoice send, appointment
+// create). Status lands in email_send_log either way for the failure
+// dashboard.
+
+/**
+ * Sent when a business owner marks an invoice as `sent` and there's a
+ * hosted Stripe Checkout pay link to share. If `payUrl` is null the
+ * email still goes out — invoice + amount + due date — but without a
+ * pay-now button (operator collects via cash/check/external rails).
+ */
+export async function emailBusinessInvoiceSent(args: {
+  to: string
+  businessName: string
+  invoiceNumber: string
+  totalAmount: number
+  dueDate: string                // YYYY-MM-DD
+  payUrl: string | null
+  ctx?: { businessId?: string; invoiceId?: string }
+}) {
+  const formattedAmount = `$${args.totalAmount.toLocaleString('en-US', {
+    minimumFractionDigits: 2, maximumFractionDigits: 2,
+  })}`
+  const formattedDue = new Date(args.dueDate + 'T12:00:00').toLocaleDateString([], {
+    month: 'long', day: 'numeric', year: 'numeric',
+  })
+  const payBlock = args.payUrl
+    ? p('Tap the button to pay online.') + btn('Pay invoice', args.payUrl)
+    : p(`Reply to this email or contact ${args.businessName} for payment instructions.`)
+
+  await send(args.to,
+    `Invoice ${args.invoiceNumber} from ${args.businessName} — ${formattedAmount}`,
+    base(
+      h(`Invoice from ${args.businessName}`) +
+      p(`<strong style="color:#eef1f8">${args.businessName}</strong> sent you invoice <strong style="color:#eef1f8">${args.invoiceNumber}</strong>.`) +
+      p(`<strong style="color:#eef1f8">Amount due:</strong> ${formattedAmount}<br>` +
+        `<strong style="color:#eef1f8">Due:</strong> ${formattedDue}`) +
+      payBlock
+    ),
+    {
+      category: 'business_invoice_sent',
+      landlordId: null,
+      relatedEntityType: 'business_invoice',
+      relatedEntityId: args.ctx?.invoiceId ?? null,
+      metadata: { business_id: args.ctx?.businessId, invoice_number: args.invoiceNumber },
+    },
+    'support',
+  )
+}
+
+/**
+ * Sent on appointment creation so the customer has a record of the
+ * date/time + service. No reschedule link yet — that lands when a
+ * customer-side portal exists; for now they reply or call.
+ */
+export async function emailBusinessAppointmentConfirmed(args: {
+  to: string
+  customerName: string | null
+  businessName: string
+  serviceType: string
+  scheduledFor: Date              // converted to local-string in body
+  durationMinutes: number
+  notes: string | null
+  ctx?: { businessId?: string; appointmentId?: string }
+}) {
+  const when = args.scheduledFor.toLocaleString([], {
+    weekday: 'long', month: 'long', day: 'numeric',
+    hour: 'numeric', minute: '2-digit',
+  })
+  const greet = args.customerName ? p(`Hi <strong style="color:#eef1f8">${args.customerName}</strong>,`) : ''
+  const notesBlock = args.notes
+    ? p(`<strong style="color:#eef1f8">Notes:</strong> ${args.notes}`)
+    : ''
+
+  await send(args.to,
+    `Appointment confirmed with ${args.businessName} — ${when}`,
+    base(
+      h('Appointment confirmed') +
+      greet +
+      p(`Your appointment with <strong style="color:#eef1f8">${args.businessName}</strong> is scheduled.`) +
+      p(`<strong style="color:#eef1f8">When:</strong> ${when}<br>` +
+        `<strong style="color:#eef1f8">Service:</strong> ${args.serviceType}<br>` +
+        `<strong style="color:#eef1f8">Duration:</strong> ${args.durationMinutes} minutes`) +
+      notesBlock +
+      p(`Need to reschedule? Reply to this email or contact ${args.businessName} directly.`)
+    ),
+    {
+      category: 'business_appointment_confirmed',
+      landlordId: null,
+      relatedEntityType: 'appointment',
+      relatedEntityId: args.ctx?.appointmentId ?? null,
+      metadata: { business_id: args.ctx?.businessId, service_type: args.serviceType },
+    },
+    'support',
+  )
+}
+
+/**
+ * Sent when a business owner sends a quote / estimate to a customer.
+ * Renders the line items inline so the customer can review without
+ * needing a portal account (no customer-side acceptance page in v1 —
+ * they reply, call, or text to accept/decline; owner marks the
+ * outcome in the portal).
+ */
+export async function emailBusinessQuoteSent(args: {
+  to: string
+  customerName: string | null
+  businessName: string
+  quoteNumber: string
+  lines: Array<{ description: string; quantity: number; unitPrice: number; lineTotal: number }>
+  subtotal: number
+  taxAmount: number
+  totalAmount: number
+  expiresAt: Date | null
+  notes: string | null
+  ctx?: { businessId?: string; quoteId?: string }
+}) {
+  const fmt = (n: number) => `$${n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+  const greet = args.customerName
+    ? p(`Hi <strong style="color:#eef1f8">${args.customerName}</strong>,`)
+    : ''
+
+  const linesHtml = `<table style="width:100%;border-collapse:collapse;margin:8px 0 20px 0;color:#b8c4d8;font-size:.85rem">
+    <thead>
+      <tr style="border-bottom:1px solid #1e2530">
+        <th style="text-align:left;padding:6px 8px;color:#4a5568;font-weight:600;font-size:.7rem;text-transform:uppercase;letter-spacing:.05em">Item</th>
+        <th style="text-align:right;padding:6px 8px;color:#4a5568;font-weight:600;font-size:.7rem;text-transform:uppercase;letter-spacing:.05em">Qty</th>
+        <th style="text-align:right;padding:6px 8px;color:#4a5568;font-weight:600;font-size:.7rem;text-transform:uppercase;letter-spacing:.05em">Price</th>
+        <th style="text-align:right;padding:6px 8px;color:#4a5568;font-weight:600;font-size:.7rem;text-transform:uppercase;letter-spacing:.05em">Total</th>
+      </tr>
+    </thead>
+    <tbody>
+      ${args.lines.map(l => `<tr style="border-bottom:1px solid #1e2530">
+        <td style="padding:8px;color:#eef1f8">${l.description}</td>
+        <td style="padding:8px;text-align:right">${l.quantity}</td>
+        <td style="padding:8px;text-align:right">${fmt(l.unitPrice)}</td>
+        <td style="padding:8px;text-align:right;font-weight:600">${fmt(l.lineTotal)}</td>
+      </tr>`).join('')}
+    </tbody>
+  </table>`
+
+  const totalsHtml = `<div style="padding:12px;background:#0a0f14;border-radius:8px;font-size:.85rem">
+    <div style="display:flex;justify-content:space-between;padding:2px 0;color:#b8c4d8">
+      <span>Subtotal</span><span>${fmt(args.subtotal)}</span>
+    </div>
+    <div style="display:flex;justify-content:space-between;padding:2px 0;color:#b8c4d8">
+      <span>Tax</span><span>${fmt(args.taxAmount)}</span>
+    </div>
+    <div style="display:flex;justify-content:space-between;padding:6px 0 2px 0;font-weight:700;color:#c9a227;font-size:1rem;border-top:1px solid #1e2530;margin-top:6px">
+      <span>Total</span><span>${fmt(args.totalAmount)}</span>
+    </div>
+  </div>`
+
+  const expiresBlock = args.expiresAt
+    ? p(`This estimate is valid through <strong style="color:#eef1f8">${args.expiresAt.toLocaleDateString([], { month: 'long', day: 'numeric', year: 'numeric' })}</strong>.`)
+    : ''
+
+  const notesBlock = args.notes
+    ? p(`<strong style="color:#eef1f8">Notes:</strong> ${args.notes}`)
+    : ''
+
+  await send(args.to,
+    `Estimate ${args.quoteNumber} from ${args.businessName} — ${fmt(args.totalAmount)}`,
+    base(
+      h(`Estimate from ${args.businessName}`) +
+      greet +
+      p(`Here's the estimate you requested. Reply to this email or contact ${args.businessName} to accept or ask questions.`) +
+      `<div style="margin:18px 0;padding:14px;border:1px solid #1e2530;border-radius:8px">
+        <div style="font-size:.7rem;color:#4a5568;text-transform:uppercase;letter-spacing:.05em">Estimate</div>
+        <div style="font-family:'SF Mono',Menlo,monospace;color:#eef1f8;font-size:1rem">${args.quoteNumber}</div>
+      </div>` +
+      linesHtml +
+      totalsHtml +
+      notesBlock +
+      expiresBlock
+    ),
+    {
+      category: 'business_quote_sent',
+      landlordId: null,
+      relatedEntityType: 'business_quote',
+      relatedEntityId: args.ctx?.quoteId ?? null,
+      metadata: { business_id: args.ctx?.businessId, quote_number: args.quoteNumber },
+    },
+    'support',
+  )
+}
+
+/**
+ * S510 — sent when a customer's saved payment method needs to be
+ * replaced (auto-charge failed, expired, or owner-initiated). The
+ * link is single-use and expires in 7 days.
+ */
+export async function emailBusinessCardUpdateRequest(args: {
+  to: string
+  customerName: string | null
+  businessName: string
+  updateUrl: string
+  expiresAt: Date
+  reasonHint: 'auto_charge_failed' | 'expired' | 'manual'
+  ctx?: { businessId?: string; customerId?: string; invoiceId?: string | null }
+}) {
+  const greet = args.customerName
+    ? p(`Hi <strong style="color:#eef1f8">${args.customerName}</strong>,`)
+    : ''
+  const reason = args.reasonHint === 'auto_charge_failed'
+    ? `We weren't able to charge the card on file with <strong style="color:#eef1f8">${args.businessName}</strong>. Most often this is an expired card or a temporary bank issue.`
+    : args.reasonHint === 'expired'
+    ? `The card on file with <strong style="color:#eef1f8">${args.businessName}</strong> has expired.`
+    : `<strong style="color:#eef1f8">${args.businessName}</strong> asked us to send you a secure link to update your payment method.`
+  const exp = args.expiresAt.toLocaleDateString([], {
+    month: 'long', day: 'numeric', year: 'numeric',
+  })
+
+  await send(args.to,
+    `Update your payment method for ${args.businessName}`,
+    base(
+      h('Update payment method') +
+      greet +
+      p(reason) +
+      p('Use the secure link below to enter a new card. Takes about 30 seconds.') +
+      btn('Update payment method', args.updateUrl) +
+      p(`<span style="color:#4a5568;font-size:.78rem">Link expires ${exp}. If you didn't expect this email, you can safely ignore it.</span>`)
+    ),
+    {
+      category: 'business_card_update_request',
+      landlordId: null,
+      relatedEntityType: 'business_customer',
+      relatedEntityId: args.ctx?.customerId ?? null,
+      metadata: {
+        business_id: args.ctx?.businessId,
+        invoice_id: args.ctx?.invoiceId,
+        reason: args.reasonHint,
+      },
+    },
+    'support',
   )
 }

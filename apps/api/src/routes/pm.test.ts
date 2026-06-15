@@ -509,3 +509,282 @@ describe('POST /api/pm/invitations/accept', () => {
     expect(inv.rows[0].status).toBe('expired')
   })
 })
+
+// ═══════════════════════════════════════════════════════════════
+//  GET /api/pm/companies/:id/properties/:propertyId/drilldown
+//  S488: backfill coverage for the property drilldown endpoint.
+//  Pre-S488 this endpoint had no dedicated coverage — only the
+//  state-law check shape was indirectly verified via the helper.
+// ═══════════════════════════════════════════════════════════════
+
+async function seedPmManagedProperty(opts: {
+  ownerToken: string  // PM-company owner JWT
+  cId: string          // PM company id
+  state?: string       // property state (default AZ)
+}): Promise<{
+  landlordId: string
+  propertyId: string
+}> {
+  // Distinct landlord whose property gets assigned to this PM company.
+  const landlordUserEmail = `ll-${randomUUID()}@test.dev`
+  const llUser = await db.query<{ id: string }>(
+    `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+     VALUES ($1, 'x', 'landlord', 'LL', 'User', TRUE) RETURNING id`,
+    [landlordUserEmail])
+  const llRec = await db.query<{ id: string }>(
+    `INSERT INTO landlords (user_id) VALUES ($1) RETURNING id`,
+    [llUser.rows[0].id])
+  const landlordId = llRec.rows[0].id
+  const prop = await db.query<{ id: string }>(
+    `INSERT INTO properties
+       (landlord_id, name, street1, city, state, zip,
+        owner_user_id, managed_by_user_id, pm_company_id)
+     VALUES ($1, 'Test Drilldown Prop', '1 Main', 'Phoenix', $2, '85001',
+             $3, $3, $4)
+     RETURNING id`,
+    [landlordId, opts.state ?? 'AZ', llUser.rows[0].id, opts.cId])
+  return { landlordId, propertyId: prop.rows[0].id }
+}
+
+async function seedNvLateFeeCap(): Promise<void> {
+  const { rows: [a] } = await db.query<{ id: string }>(
+    `INSERT INTO state_landlord_tenant_acts
+       (state_code, act_key, act_name, unit_types, source_date, effective_year)
+     VALUES ('NV', 'residential', 'NV Residential Landlord-Tenant Act',
+             ARRAY['apartment','single_family']::text[], '2026-06-11', 2026)
+     ON CONFLICT DO NOTHING
+     RETURNING id`)
+  const actId = a?.id ?? (await db.query<{ id: string }>(
+    `SELECT id FROM state_landlord_tenant_acts WHERE state_code='NV' AND act_key='residential' AND effective_year=2026 LIMIT 1`)).rows[0].id
+  await db.query(
+    `INSERT INTO state_law_provisions
+       (act_id, state_code, topic, rule_kind, threshold_numeric, threshold_unit,
+        summary, statute_citation, source_url, source_date, effective_year)
+     VALUES ($1, 'NV', 'late_fee_max_pct', 'max', 5, '% of rent',
+             'Late fee may not exceed 5% of monthly rent',
+             'NRS 118A.210', 'https://www.leg.state.nv.us/nrs/NRS-118A.html',
+             '2026-06-11', 2026)
+     ON CONFLICT DO NOTHING`, [actId])
+}
+
+describe('GET /api/pm/companies/:id/properties/:propertyId/drilldown', () => {
+  it('happy path: returns property + units + leases + maintenance + fee impact shape', async () => {
+    const owner = await seedUser()
+    const cId = await createCompany(owner.token)
+    const { propertyId } = await seedPmManagedProperty({ ownerToken: owner.token, cId })
+
+    const res = await request(buildApp())
+      .get(`/api/pm/companies/${cId}/properties/${propertyId}/drilldown`)
+      .set('Authorization', `Bearer ${owner.token}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.property.id).toBe(propertyId)
+    expect(res.body.data.property.pm_company_id).toBe(cId)
+    // Empty subcollections still present.
+    expect(Array.isArray(res.body.data.units)).toBe(true)
+    expect(Array.isArray(res.body.data.active_leases)).toBe(true)
+    expect(Array.isArray(res.body.data.recent_maintenance)).toBe(true)
+    expect(res.body.data.mtd_fee_impact).toBeDefined()
+    // S487 state-law block always present (empty when within range).
+    expect(Array.isArray(res.body.data.property.state_law_warnings)).toBe(true)
+  })
+
+  it('cross-pm-company: company A staff cannot view company B\'s property → 404', async () => {
+    const ownerA = await seedUser()
+    const ownerB = await seedUser()
+    const cA = await createCompany(ownerA.token, 'PM A')
+    const cB = await createCompany(ownerB.token, 'PM B')
+    const { propertyId } = await seedPmManagedProperty({ ownerToken: ownerB.token, cId: cB })
+
+    const res = await request(buildApp())
+      .get(`/api/pm/companies/${cA}/properties/${propertyId}/drilldown`)
+      .set('Authorization', `Bearer ${ownerA.token}`)
+    expect(res.status).toBe(404)
+    expect(res.body.error).toMatch(/not managed by this PM company/i)
+  })
+
+  it('suspended PM company: staff blocked even on managed property → 403', async () => {
+    const owner = await seedUser()
+    const cId = await createCompany(owner.token)
+    const { propertyId } = await seedPmManagedProperty({ ownerToken: owner.token, cId })
+    await db.query(
+      `UPDATE pm_companies SET status='suspended' WHERE id=$1`, [cId])
+
+    const res = await request(buildApp())
+      .get(`/api/pm/companies/${cId}/properties/${propertyId}/drilldown`)
+      .set('Authorization', `Bearer ${owner.token}`)
+    expect(res.status).toBe(403)
+    expect(res.body.error).toMatch(/suspended/i)
+  })
+
+  it('S487: NV property with 10% percent-of-rent above cap → state_law_warnings populated', async () => {
+    const owner = await seedUser()
+    const cId = await createCompany(owner.token)
+    const { propertyId } = await seedPmManagedProperty({
+      ownerToken: owner.token, cId, state: 'NV',
+    })
+    await seedNvLateFeeCap()
+    // Set the late-fee config above the NV cap.
+    await db.query(
+      `UPDATE properties
+          SET late_fee_initial_amount = 10,
+              late_fee_initial_type   = 'percent_of_rent'
+        WHERE id = $1`, [propertyId])
+
+    const res = await request(buildApp())
+      .get(`/api/pm/companies/${cId}/properties/${propertyId}/drilldown`)
+      .set('Authorization', `Bearer ${owner.token}`)
+    expect(res.status).toBe(200)
+    const warnings = res.body.data.property.state_law_warnings
+    expect(warnings.length).toBe(1)
+    expect(warnings[0].topic).toBe('late_fee_max_pct')
+    expect(warnings[0].message).toMatch(/above the 5/)
+    expect(warnings[0].message).toMatch(/NV/)
+  })
+})
+
+// ═══════════════════════════════════════════════════════════════
+//  S489: backfill for the remaining untested read endpoints.
+//  Same pattern that caught S488's prod bug — happy-path GET
+//  exercises every column referenced in the SELECT, catching any
+//  schema mismatch silently sitting in production.
+// ═══════════════════════════════════════════════════════════════
+
+describe('GET /api/pm/companies/:id/staff', () => {
+  it('returns the auto-created owner row + invited members', async () => {
+    const owner = await seedUser()
+    const cId = await createCompany(owner.token)
+    const res = await request(buildApp())
+      .get(`/api/pm/companies/${cId}/staff`)
+      .set('Authorization', `Bearer ${owner.token}`)
+    expect(res.status).toBe(200)
+    expect(Array.isArray(res.body.data)).toBe(true)
+    // createCompany auto-inserts the owner row.
+    expect(res.body.data.length).toBe(1)
+    expect(res.body.data[0].role).toBe('owner')
+    expect(res.body.data[0].status).toBe('active')
+    expect(res.body.data[0].user_id).toBe(owner.userId)
+  })
+
+  it('non-staff caller → 403', async () => {
+    const owner = await seedUser()
+    const cId = await createCompany(owner.token)
+    const outsider = await seedUser()
+    const res = await request(buildApp())
+      .get(`/api/pm/companies/${cId}/staff`)
+      .set('Authorization', `Bearer ${outsider.token}`)
+    expect(res.status).toBe(403)
+  })
+})
+
+describe('GET /api/pm/companies/:id/fee-plans', () => {
+  it('happy path: returns empty array on a fresh company', async () => {
+    const owner = await seedUser()
+    const cId = await createCompany(owner.token)
+    const res = await request(buildApp())
+      .get(`/api/pm/companies/${cId}/fee-plans`)
+      .set('Authorization', `Bearer ${owner.token}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data).toEqual([])
+  })
+
+  it('returns fee plans after one is created', async () => {
+    const owner = await seedUser()
+    const cId = await createCompany(owner.token)
+    const create = await request(buildApp())
+      .post(`/api/pm/companies/${cId}/fee-plans`)
+      .set('Authorization', `Bearer ${owner.token}`)
+      .send({ name: 'Standard', feeType: 'percent_of_rent', percent: 8 })
+    expect(create.status).toBe(201)
+    const res = await request(buildApp())
+      .get(`/api/pm/companies/${cId}/fee-plans`)
+      .set('Authorization', `Bearer ${owner.token}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.length).toBe(1)
+    expect(res.body.data[0].name).toBe('Standard')
+  })
+})
+
+describe('GET /api/pm/companies/:id/invitations', () => {
+  it('happy path: returns empty array on a fresh company', async () => {
+    const owner = await seedUser()
+    const cId = await createCompany(owner.token)
+    const res = await request(buildApp())
+      .get(`/api/pm/companies/${cId}/invitations`)
+      .set('Authorization', `Bearer ${owner.token}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data).toEqual([])
+  })
+
+  it('returns invitations after sending one', async () => {
+    const owner = await seedUser()
+    const cId = await createCompany(owner.token)
+    await request(buildApp())
+      .post(`/api/pm/companies/${cId}/invitations`)
+      .set('Authorization', `Bearer ${owner.token}`)
+      .send({ email: 'newhire@test.dev', role: 'staff' })
+    const res = await request(buildApp())
+      .get(`/api/pm/companies/${cId}/invitations`)
+      .set('Authorization', `Bearer ${owner.token}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.length).toBe(1)
+    expect(res.body.data[0].email).toBe('newhire@test.dev')
+    expect(res.body.data[0].status).toBe('pending')
+  })
+})
+
+describe('GET /api/pm/companies/:id/payouts', () => {
+  it('happy path: empty array for a company with no payouts', async () => {
+    const owner = await seedUser()
+    const cId = await createCompany(owner.token)
+    const res = await request(buildApp())
+      .get(`/api/pm/companies/${cId}/payouts`)
+      .set('Authorization', `Bearer ${owner.token}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data).toEqual([])
+  })
+
+  it('non-staff → 403', async () => {
+    const owner = await seedUser()
+    const cId = await createCompany(owner.token)
+    const outsider = await seedUser()
+    const res = await request(buildApp())
+      .get(`/api/pm/companies/${cId}/payouts`)
+      .set('Authorization', `Bearer ${outsider.token}`)
+    expect(res.status).toBe(403)
+  })
+})
+
+describe('GET /api/pm/companies/:id/property-invitations', () => {
+  it('happy path: empty array for a company with no property invites', async () => {
+    const owner = await seedUser()
+    const cId = await createCompany(owner.token)
+    const res = await request(buildApp())
+      .get(`/api/pm/companies/${cId}/property-invitations`)
+      .set('Authorization', `Bearer ${owner.token}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data).toEqual([])
+  })
+
+  it('cross-pm-company isolation: company A staff sees only company A invites', async () => {
+    const ownerA = await seedUser()
+    const ownerB = await seedUser()
+    const cA = await createCompany(ownerA.token, 'PM A')
+    const cB = await createCompany(ownerB.token, 'PM B')
+    // Seed a property under B and an inbound owner_to_pm invitation
+    // pointing at it.
+    const { propertyId } = await seedPmManagedProperty({ ownerToken: ownerB.token, cId: cB })
+    await db.query(
+      `INSERT INTO pm_property_invitations
+         (pm_company_id, direction, property_id, landlord_id,
+          invited_email, invited_by_user_id, token, status, expires_at)
+       SELECT $1, 'owner_to_pm', $2, p.landlord_id,
+              'somebody@test.dev', $3, $4, 'pending', NOW() + INTERVAL '7 days'
+         FROM properties p WHERE p.id = $2`,
+      [cB, propertyId, ownerB.userId, randomUUID()])
+    const res = await request(buildApp())
+      .get(`/api/pm/companies/${cA}/property-invitations`)
+      .set('Authorization', `Bearer ${ownerA.token}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data).toEqual([])
+  })
+})

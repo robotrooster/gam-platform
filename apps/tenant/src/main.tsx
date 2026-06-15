@@ -2428,6 +2428,67 @@ function TenantEntryRequestDetailPage() {
         </div>
       </div>
 
+      {/* S478: hedged factual warnings (outside-hours + state-law)
+          recomputed server-side on every GET. Tenant-protective; the
+          landlord saw the same on submit, this closes the both-party
+          transparency loop. */}
+      {r.outsideTypicalHours && r.typicalHoursWarning && (
+        <div className="card" style={{
+          padding: 14, marginBottom: 12,
+          background: 'rgba(245,158,11,.08)',
+          border: '1px solid rgba(245,158,11,.4)',
+          display: 'flex', gap: 10, alignItems: 'flex-start',
+        }}>
+          <div style={{ fontSize: 18, lineHeight: 1, color: 'var(--amber)' }}>⚠</div>
+          <div style={{ fontSize: '.85rem', lineHeight: 1.5, color: 'var(--t0)' }}>
+            <div style={{
+              fontSize: '.7rem', fontWeight: 700,
+              color: 'var(--amber)', textTransform: 'uppercase',
+              letterSpacing: '.05em', marginBottom: 6,
+            }}>Outside typical hours</div>
+            {r.typicalHoursWarning}
+          </div>
+        </div>
+      )}
+
+      {Array.isArray(r.stateLawWarnings) && r.stateLawWarnings.length > 0 && (
+        <div className="card" style={{
+          padding: 14, marginBottom: 12,
+          background: 'rgba(245,158,11,.08)',
+          border: '1px solid rgba(245,158,11,.4)',
+        }}>
+          <div style={{
+            fontSize: '.7rem', fontWeight: 700,
+            color: 'var(--amber)', textTransform: 'uppercase',
+            letterSpacing: '.05em', marginBottom: 8,
+          }}>Heads up — state-law check</div>
+          {r.stateLawWarnings.map((w: any, i: number) => (
+            <div key={i} style={{ marginBottom: i < r.stateLawWarnings.length - 1 ? 12 : 0 }}>
+              <div style={{ fontSize: '.85rem', color: 'var(--t0)', lineHeight: 1.5, marginBottom: 4 }}>
+                {w.message}
+              </div>
+              <div style={{
+                fontSize: '.7rem', color: 'var(--t3)',
+                display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 4,
+              }}>
+                {w.citation && <span>{w.citation}</span>}
+                {w.sourceUrl && (
+                  <a href={w.sourceUrl} target="_blank" rel="noreferrer"
+                    style={{ color: 'var(--amber)', textDecoration: 'none' }}>source ↗</a>
+                )}
+                {w.sourceDate && <span>as of {String(w.sourceDate).slice(0, 10)}</span>}
+              </div>
+              {w.disclaimer && (
+                <div style={{
+                  fontSize: '.65rem', color: 'var(--t3)',
+                  fontStyle: 'italic', marginTop: 4, lineHeight: 1.4,
+                }}>{w.disclaimer}</div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
       {r.status === 'pending' && (
         <div className="card" style={{ padding: 16, background: 'rgba(201,162,39,.05)', border: '1px solid rgba(201,162,39,.25)' }}>
           <strong style={{ color: 'var(--gold)', display: 'block', marginBottom: 8 }}>Your response</strong>

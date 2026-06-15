@@ -18,10 +18,22 @@ function RequestDetailModal({ request: r, onClose }: { request: any; onClose: ()
   const [isInternal, setIsInternal] = useState(false)
   const [editCost, setEditCost] = useState('')
   const [editSchedule, setEditSchedule] = useState('')
+  // S475: pending worker-assignment selection.
+  const [editAssignee, setEditAssignee] = useState<string>('')
 
   const { data, isLoading } = useQuery(
     ['maint-detail', r.id],
     () => apiGet<any>(`/maintenance/${r.id}`)
+  )
+
+  // S475: maintenance team roster — landlord owner sees full list;
+  // worker roles get filtered to roleType==='maintenance' anyway.
+  const { data: teamData } = useQuery(
+    ['team-maintenance'],
+    () => apiGet<any>('/scopes/team'),
+  )
+  const maintenanceWorkers = (teamData?.members ?? []).filter(
+    (m: any) => m.role === 'maintenance',
   )
 
   const updateMut = useMutation(
@@ -166,13 +178,48 @@ function RequestDetailModal({ request: r, onClose }: { request: any; onClose: ()
               )}
             </div>
 
-            {/* Assign */}
+            {/* Assign — S475: editable dropdown over the team roster */}
             <div style={{ marginBottom: 10 }}>
               <label style={{ fontSize: '.68rem', color: 'var(--text-3)', display: 'block', marginBottom: 3 }}>Assigned To</label>
-              <div style={{ fontSize: '.78rem', color: req.assignedFirst ? 'var(--text-0)' : 'var(--text-3)', padding: '6px 0' }}>
-                {req.assignedFirst ? `${req.assignedFirst} ${req.assignedLast}` : 'Unassigned'}
-                {req.assignedAt && <span style={{ fontSize: '.65rem', color: 'var(--text-3)', marginLeft: 6 }}>{new Date(req.assignedAt).toLocaleDateString()}</span>}
-              </div>
+              {req.assignedFirst && (
+                <div style={{ fontSize: '.72rem', color: 'var(--text-2)', padding: '3px 0' }}>
+                  Currently: {req.assignedFirst} {req.assignedLast}
+                  {req.assignedAt && (
+                    <span style={{ fontSize: '.65rem', color: 'var(--text-3)', marginLeft: 6 }}>
+                      {new Date(req.assignedAt).toLocaleDateString()}
+                    </span>
+                  )}
+                </div>
+              )}
+              {maintenanceWorkers.length === 0 ? (
+                <div style={{ fontSize: '.72rem', color: 'var(--text-3)', padding: '6px 0' }}>
+                  No maintenance team members yet — invite one on the Team page.
+                </div>
+              ) : (
+                <div style={{ display: 'flex', gap: 6 }}>
+                  <select
+                    className="input"
+                    value={editAssignee || req.contractorId || ''}
+                    onChange={e => setEditAssignee(e.target.value)}
+                    style={{ flex: 1, fontSize: '.78rem' }}
+                  >
+                    <option value="">— Unassigned —</option>
+                    {maintenanceWorkers.map((w: any) => (
+                      <option key={w.userId} value={w.userId}>
+                        {w.firstName} {w.lastName}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    className="btn btn-ghost btn-sm"
+                    onClick={() => updateMut.mutate({
+                      assignedTo: editAssignee || null,
+                    })}
+                    disabled={editAssignee === (req.contractorId || '')}
+                    title="Save assignment"
+                  ><Check size={12} /></button>
+                </div>
+              )}
             </div>
 
             {/* Quick status buttons */}

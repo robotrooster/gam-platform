@@ -471,6 +471,105 @@ describe('PATCH /leases/:id — auth + validation', () => {
     expect(res.status).toBe(200)
     expect(syncSecurityDepositLeaseFeeMock).toHaveBeenCalledWith(f.leaseId, 1800)
   })
+
+  // ─────────────────────────────────────────────────────────────
+  //  S476: state-law warning surfacing on PATCH response
+  // ─────────────────────────────────────────────────────────────
+
+  // schema.sql is schema-only — state_law seed migrations INSERT data
+  // (skipped by the snapshot). Seed AZ residential deposit_max_months
+  // inline.
+  async function seedAzDepositCap(): Promise<void> {
+    const { rows: [a] } = await db.query<{ id: string }>(
+      `INSERT INTO state_landlord_tenant_acts
+         (state_code, act_key, act_name, unit_types, source_date, effective_year)
+       VALUES ('AZ', 'residential', 'AZ Residential Landlord-Tenant Act',
+               ARRAY['apartment','single_family']::text[], '2026-06-09', 2026)
+       ON CONFLICT DO NOTHING
+       RETURNING id`)
+    const actId = a?.id ?? (await db.query<{ id: string }>(
+      `SELECT id FROM state_landlord_tenant_acts WHERE state_code='AZ' AND act_key='residential' AND effective_year=2026 LIMIT 1`)).rows[0].id
+    await db.query(
+      `INSERT INTO state_law_provisions
+         (act_id, state_code, topic, rule_kind, threshold_numeric, threshold_unit,
+          summary, statute_citation, source_url, source_date, effective_year)
+       VALUES ($1, 'AZ', 'deposit_max_months', 'max', 1.5, 'months of rent',
+               'Security deposit may not exceed 1.5 months of rent',
+               'A.R.S. § 33-1321', 'https://www.azleg.gov/ars/33/01321.htm',
+               '2026-06-09', 2026)
+       ON CONFLICT DO NOTHING`, [actId])
+  }
+
+  it('S476: AZ deposit 2.0× rent (above 1.5mo cap) → state_law_warnings has flag', async () => {
+    const f = await seedFixture({ leaseStatus: 'pending', rentAmount: 1500 })
+    await seedAzDepositCap()
+    const res = await request(buildApp())
+      .patch(`/api/leases/${f.leaseId}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ securityDeposit: 3000 })  // 2.0 months of 1500 rent
+    expect(res.status).toBe(200)
+    expect(Array.isArray(res.body.data.state_law_warnings)).toBe(true)
+    expect(res.body.data.state_law_warnings.length).toBe(1)
+    const flag = res.body.data.state_law_warnings[0]
+    expect(flag.topic).toBe('deposit_max_months')
+    expect(flag.message).toMatch(/above the 1\.5/)
+    expect(flag.message).toMatch(/AZ/)
+  })
+
+  it('S476: AZ deposit 1.0× rent (within 1.5mo cap) → state_law_warnings empty', async () => {
+    const f = await seedFixture({ leaseStatus: 'pending', rentAmount: 1500 })
+    await seedAzDepositCap()
+    const res = await request(buildApp())
+      .patch(`/api/leases/${f.leaseId}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ securityDeposit: 1500 })
+    expect(res.status).toBe(200)
+    expect(res.body.data.state_law_warnings).toEqual([])
+  })
+
+  it('S476: PATCH that does NOT touch deposit → no deposit check fires', async () => {
+    const f = await seedFixture({ leaseStatus: 'pending', rentAmount: 1500 })
+    const res = await request(buildApp())
+      .patch(`/api/leases/${f.leaseId}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ needsReview: true })
+    expect(res.status).toBe(200)
+    expect(res.body.data.state_law_warnings).toEqual([])
+  })
+
+  it('S476: uncatalogued state → state_law_warnings empty', async () => {
+    const f = await seedFixture({ leaseStatus: 'pending', rentAmount: 1500 })
+    await db.query(`UPDATE properties SET state = 'XX' WHERE id = $1`, [f.propertyId])
+    const res = await request(buildApp())
+      .patch(`/api/leases/${f.leaseId}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ securityDeposit: 5000 })  // would flag in catalogued state
+    expect(res.status).toBe(200)
+    expect(res.body.data.state_law_warnings).toEqual([])
+  })
+
+  it('S476: lateFeeInitial percent of 10% > AZ catalog (no late_fee_max_pct on AZ residential) → empty', async () => {
+    // AZ does NOT have a late_fee_max_pct provision; checkAgainstStatute
+    // returns null when the topic is uncatalogued. Confirms no false
+    // alarm on a topic that doesn't have a state figure.
+    const f = await seedFixture({ leaseStatus: 'pending', rentAmount: 1500 })
+    const res = await request(buildApp())
+      .patch(`/api/leases/${f.leaseId}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ lateFeeInitialAmount: 10, lateFeeInitialType: 'percent_of_rent' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.state_law_warnings).toEqual([])
+  })
+
+  it('S476: lateFeeInitial flat-dollar type (not percent) → no late_fee check fires', async () => {
+    const f = await seedFixture({ leaseStatus: 'pending', rentAmount: 1500 })
+    const res = await request(buildApp())
+      .patch(`/api/leases/${f.leaseId}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ lateFeeInitialAmount: 75, lateFeeInitialType: 'flat' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.state_law_warnings).toEqual([])
+  })
 })
 
 // ─── PATCH /leases/:id/fees/:feeId ─────────────────────────────

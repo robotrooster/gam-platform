@@ -27,7 +27,7 @@ import { AppError } from '../middleware/errorHandler'
 import { createAdminNotification } from './adminNotifications'
 import { logger } from '../lib/logger'
 
-export type ConnectEntity = 'user' | 'pm_company'
+export type ConnectEntity = 'user' | 'pm_company' | 'business'
 
 interface CreateConnectAccountOpts {
   entity: ConnectEntity
@@ -767,6 +767,105 @@ export async function recordAccountUpdated(account: Stripe.Account): Promise<voi
   }
 }
 
+// ── BUSINESS INVOICE CHECKOUT (S494) ──────────────────────────────────────
+//
+// Customers paying a business invoice don't have GAM accounts (per the
+// S491 product call — customer-side portal deferred). We use Stripe
+// Checkout Sessions hosted on Stripe's domain. The customer follows a
+// link in their email, lands on Stripe's checkout page, pays card/ACH,
+// and Stripe routes the gross to the business's Connect account.
+//
+// Application fee (GAM platform cut) is set to 0 for now; the business
+// pays Stripe's processing fee (Stripe deducts before transfer). Per-
+// invoice fee tuning can dial this in later via a settings field.
+
+interface CreateInvoiceCheckoutOpts {
+  amountCents:                 number
+  businessConnectAccountId:    string
+  invoiceNumber:                string
+  customerEmail?:               string | null
+  successUrl:                   string
+  cancelUrl:                    string
+  applicationFeeCents?:         number
+  metadata?:                    Record<string, string>
+  // S508: when set, ask Stripe to create a Customer + save the card
+  // for off-session charges (recurring cycles). The webhook persists
+  // the resulting customer + payment method to business_customers.
+  saveForFutureUse?:            boolean
+  // Reuse an existing platform-side Stripe Customer so the same card
+  // can serve multiple businesses paid by the same end-user.
+  existingStripeCustomerId?:    string | null
+}
+
+export interface InvoiceCheckoutResult {
+  sessionId:   string
+  hostedUrl:   string
+}
+
+/**
+ * Create a Stripe Checkout Session for a business invoice. Returns the
+ * hosted URL the customer follows. Webhook handler matches on
+ * session.id at `checkout.session.completed` to mark the invoice paid.
+ */
+export async function createInvoiceCheckoutSession(
+  opts: CreateInvoiceCheckoutOpts,
+): Promise<InvoiceCheckoutResult> {
+  const stripe = getStripe()
+
+  // S508: when saveForFutureUse, ask Stripe to create a Customer (or
+  // reuse an existing one) and stamp setup_future_usage='off_session'
+  // on the PaymentIntent so the resulting PM can be charged later by
+  // the recurring cycle without re-prompting the customer.
+  const sessionParams: any = {
+    mode: 'payment',
+    payment_method_types: ['card', 'us_bank_account'],
+    line_items: [{
+      quantity: 1,
+      price_data: {
+        currency: 'usd',
+        unit_amount: opts.amountCents,
+        product_data: {
+          name: `Invoice ${opts.invoiceNumber}`,
+        },
+      },
+    }],
+    payment_intent_data: {
+      transfer_data: {
+        destination: opts.businessConnectAccountId,
+      },
+      application_fee_amount: opts.applicationFeeCents ?? 0,
+      metadata: {
+        gam_purpose: 'business_invoice',
+        ...(opts.metadata ?? {}),
+      },
+    },
+    metadata: {
+      gam_purpose: 'business_invoice',
+      ...(opts.metadata ?? {}),
+    },
+    success_url: opts.successUrl,
+    cancel_url:  opts.cancelUrl,
+  }
+
+  if (opts.saveForFutureUse) {
+    sessionParams.payment_intent_data.setup_future_usage = 'off_session'
+    if (opts.existingStripeCustomerId) {
+      sessionParams.customer = opts.existingStripeCustomerId
+    } else {
+      sessionParams.customer_creation = 'always'
+      sessionParams.customer_email = opts.customerEmail ?? undefined
+    }
+  } else {
+    sessionParams.customer_email = opts.customerEmail ?? undefined
+  }
+
+  const session = await stripe.checkout.sessions.create(sessionParams)
+  if (!session.url) {
+    throw new AppError(500, 'Stripe returned a Checkout Session with no URL')
+  }
+  return { sessionId: session.id, hostedUrl: session.url }
+}
+
 // ── Internal helpers ──────────────────────────────────────────────────────
 
 async function fetchExistingConnectId(entity: ConnectEntity, entityId: string): Promise<string | null> {
@@ -775,6 +874,14 @@ async function fetchExistingConnectId(entity: ConnectEntity, entityId: string): 
       `SELECT stripe_connect_account_id FROM users WHERE id = $1`, [entityId]
     )
     if (!row) throw new AppError(404, 'User not found')
+    return row.stripe_connect_account_id
+  }
+  if (entity === 'business') {
+    // S494: businesses table has its own connect_account_id column.
+    const row = await queryOne<{ stripe_connect_account_id: string | null }>(
+      `SELECT stripe_connect_account_id FROM businesses WHERE id = $1`, [entityId]
+    )
+    if (!row) throw new AppError(404, 'Business not found')
     return row.stripe_connect_account_id
   }
   // pm_company
@@ -789,6 +896,14 @@ async function persistConnectId(entity: ConnectEntity, entityId: string, connect
   if (entity === 'user') {
     await query(
       `UPDATE users SET stripe_connect_account_id = $1 WHERE id = $2 AND stripe_connect_account_id IS NULL`,
+      [connectId, entityId]
+    )
+    return
+  }
+  if (entity === 'business') {
+    // S494
+    await query(
+      `UPDATE businesses SET stripe_connect_account_id = $1 WHERE id = $2 AND stripe_connect_account_id IS NULL`,
       [connectId, entityId]
     )
     return

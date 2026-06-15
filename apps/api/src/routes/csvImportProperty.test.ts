@@ -383,3 +383,122 @@ describe('POST /api/landlords/me/onboard-properties-csv/commit', () => {
     expect(res.status).toBe(400)
   })
 })
+
+// ─────────────────────────────────────────────────────────────────────
+//  S491: state-law warnings on CSV property validate
+//  Recompute-on-validate posture mirrors S483 (tenant GET /lease) and
+//  S486 (property GET /:id) — landlord sees a hedged factual notice
+//  during the import preview, before commit, so they can correct or
+//  acknowledge before shipping the data.
+// ─────────────────────────────────────────────────────────────────────
+
+async function seedAzDepositCap(): Promise<void> {
+  const { rows: [a] } = await db.query<{ id: string }>(
+    `INSERT INTO state_landlord_tenant_acts
+       (state_code, act_key, act_name, unit_types, source_date, effective_year)
+     VALUES ('AZ', 'residential', 'AZ Residential Landlord-Tenant Act',
+             ARRAY['apartment','single_family']::text[], '2026-06-09', 2026)
+     ON CONFLICT DO NOTHING
+     RETURNING id`)
+  const actId = a?.id ?? (await db.query<{ id: string }>(
+    `SELECT id FROM state_landlord_tenant_acts WHERE state_code='AZ' AND act_key='residential' AND effective_year=2026 LIMIT 1`)).rows[0].id
+  await db.query(
+    `INSERT INTO state_law_provisions
+       (act_id, state_code, topic, rule_kind, threshold_numeric, threshold_unit,
+        summary, statute_citation, source_url, source_date, effective_year)
+     VALUES ($1, 'AZ', 'deposit_max_months', 'max', 1.5, 'months of rent',
+             'Security deposit may not exceed 1.5 months of rent',
+             'A.R.S. § 33-1321', 'https://www.azleg.gov/ars/33/01321.htm',
+             '2026-06-09', 2026)
+     ON CONFLICT DO NOTHING`, [actId])
+}
+
+describe('S491: state-law warnings on CSV property validate', () => {
+  it('AZ row with deposit 2.0× rent → warn issue surfaced', async () => {
+    const { token } = await seedLandlordWithToken()
+    await seedAzDepositCap()
+    const csv = [
+      'property_name,street1,city,state,zip,unit_number,rent_amount,security_deposit',
+      'Sunset,100 Main St,Phoenix,AZ,85001,4B,1500,3000',
+    ].join('\n')
+    const res = await request(buildApp())
+      .post('/api/landlords/me/onboard-properties-csv/validate')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ csv, source: 'generic' })
+    expect(res.status).toBe(200)
+    const warns = res.body.data.rows[0].issues.filter((i: any) => i.severity === 'warn' && i.field === 'security_deposit')
+    expect(warns.length).toBe(1)
+    expect(warns[0].message).toMatch(/above the 1\.5/)
+    expect(warns[0].message).toMatch(/AZ/)
+    expect(res.body.data.summary.warnings).toBeGreaterThanOrEqual(1)
+    // Row still ships as ready — warnings don't block commit.
+    expect(res.body.data.summary.blockers).toBe(0)
+    expect(res.body.data.summary.ready).toBe(1)
+  })
+
+  it('AZ row with deposit 1.0× rent → no state-law warn', async () => {
+    const { token } = await seedLandlordWithToken()
+    await seedAzDepositCap()
+    const csv = [
+      'property_name,street1,city,state,zip,unit_number,rent_amount,security_deposit',
+      'Sunset,100 Main St,Phoenix,AZ,85001,4B,1500,1500',
+    ].join('\n')
+    const res = await request(buildApp())
+      .post('/api/landlords/me/onboard-properties-csv/validate')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ csv, source: 'generic' })
+    expect(res.status).toBe(200)
+    const warns = res.body.data.rows[0].issues.filter((i: any) => i.field === 'security_deposit')
+    expect(warns.length).toBe(0)
+  })
+
+  it('Uncatalogued state ("XX") → no state-law warn even if deposit is huge', async () => {
+    const { token } = await seedLandlordWithToken()
+    const csv = [
+      'property_name,street1,city,state,zip,unit_number,rent_amount,security_deposit',
+      'Sunset,100 Main St,Anywhere,XX,12345,4B,1500,5000',
+    ].join('\n')
+    const res = await request(buildApp())
+      .post('/api/landlords/me/onboard-properties-csv/validate')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ csv, source: 'generic' })
+    expect(res.status).toBe(200)
+    const warns = res.body.data.rows[0].issues.filter((i: any) => i.field === 'security_deposit')
+    expect(warns.length).toBe(0)
+  })
+
+  it('Missing deposit → no state-law check fires', async () => {
+    const { token } = await seedLandlordWithToken()
+    await seedAzDepositCap()
+    const csv = [
+      'property_name,street1,city,state,zip,unit_number,rent_amount,security_deposit',
+      'Sunset,100 Main St,Phoenix,AZ,85001,4B,1500,',  // empty deposit
+    ].join('\n')
+    const res = await request(buildApp())
+      .post('/api/landlords/me/onboard-properties-csv/validate')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ csv, source: 'generic' })
+    expect(res.status).toBe(200)
+    const warns = res.body.data.rows[0].issues.filter((i: any) => i.field === 'security_deposit')
+    expect(warns.length).toBe(0)
+  })
+
+  it('Mixed batch: 1 AZ above-cap row + 1 AZ within-range row → only one warn', async () => {
+    const { token } = await seedLandlordWithToken()
+    await seedAzDepositCap()
+    const csv = [
+      'property_name,street1,city,state,zip,unit_number,rent_amount,security_deposit',
+      'Sunset,100 Main St,Phoenix,AZ,85001,4B,1500,3000',  // above
+      'Sunset,100 Main St,Phoenix,AZ,85001,4C,1500,1500',  // within
+    ].join('\n')
+    const res = await request(buildApp())
+      .post('/api/landlords/me/onboard-properties-csv/validate')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ csv, source: 'generic' })
+    expect(res.status).toBe(200)
+    const totalWarns = res.body.data.rows.flatMap((r: any) =>
+      r.issues.filter((i: any) => i.severity === 'warn' && i.field === 'security_deposit'),
+    )
+    expect(totalWarns.length).toBe(1)
+  })
+})

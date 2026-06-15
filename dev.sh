@@ -2,7 +2,7 @@
 set -e
 
 echo "Killing existing processes on all GAM ports..."
-for port in 3001 3002 3003 3004 3005 3006 3007 3008 3009 3011 4000 4001; do
+for port in 3001 3002 3003 3004 3005 3006 3007 3008 3009 3011 3012 4000 4001; do
   pid=$(lsof -ti tcp:$port 2>/dev/null)
   [ -n "$pid" ] && kill -9 $pid 2>/dev/null && echo "  Killed :$port (pid $pid)"
 done
@@ -51,6 +51,7 @@ nohup npm run dev --workspace=apps/books      > /tmp/gam-books.log      2>&1 & e
 nohup npm run dev --workspace=apps/listings   > /tmp/gam-listings.log   2>&1 & echo "  Listings  → :3008"
 nohup npm run dev --workspace=apps/admin-ops  > /tmp/gam-admin-ops.log  2>&1 & echo "  AdminOps  → :3009"
 nohup npm run dev --workspace=apps/pm-company > /tmp/gam-pm-company.log 2>&1 & echo "  PM Portal → :3011"
+nohup npm run dev --workspace=apps/business   > /tmp/gam-business.log   2>&1 & echo "  Business  → :3012"
 sleep 4
 
 echo ""
@@ -68,9 +69,10 @@ echo "  Books     http://localhost:3006"
 echo "  Listings  http://localhost:3008"
 echo "  AdminOps  http://localhost:3009"
 echo "  PM Portal http://localhost:3011"
+echo "  Business  http://localhost:3012"
 echo "═══════════════════════════════════"
 
 # Verify all ports are actually listening
 echo ""
 echo "Listening ports:"
-lsof -i tcp:3001,3002,3003,3004,3005,3006,3008,3009,3011,4000 2>/dev/null | grep LISTEN | awk '{print "  " $9}' | sort
+lsof -i tcp:3001,3002,3003,3004,3005,3006,3008,3009,3011,3012,4000 2>/dev/null | grep LISTEN | awk '{print "  " $9}' | sort

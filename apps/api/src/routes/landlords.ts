@@ -26,6 +26,7 @@ import {
   rejectPropertyInvitation, revokePropertyInvitation,
 } from '../services/pm'
 import { logger } from '../lib/logger'
+import { checkAgainstStatute } from '../services/stateLaw'
 import {
   recordValidateAttempt,
   recordCommitAttempt,
@@ -1928,6 +1929,31 @@ landlordsRouter.post('/me/onboard-properties-csv/validate', requirePerm('propert
       }
 
       rows.push(row)
+    }
+
+    // S491: state-law mismatch check. Run after the per-row validation
+    // so blocker issues stay leading. Fires only on rows that already
+    // have both a parseable rent + deposit + state — uncatalogued or
+    // missing-data rows return no flag. Best-effort: one failed
+    // checkAgainstStatute call doesn't suppress the others.
+    for (const row of rows) {
+      const rent = parseFloat(row.rentAmount)
+      const dep  = parseFloat(row.securityDeposit)
+      if (!row.state || !Number.isFinite(rent) || rent <= 0 || !Number.isFinite(dep) || dep < 0) continue
+      try {
+        const months = dep / rent
+        const flag = await checkAgainstStatute(row.state, 'deposit_max_months', months)
+        if (flag) {
+          row.issues.push({
+            severity: 'warn',
+            field:    'security_deposit',
+            message:  flag.message,
+          })
+        }
+      } catch (e) {
+        logger.error({ err: e, state: row.state, row_index: row.rowIndex },
+          '[stateLaw] property CSV deposit check failed')
+      }
     }
 
     const blockers = rows.reduce((n, r) => n + r.issues.filter(i => i.severity === 'block').length, 0)

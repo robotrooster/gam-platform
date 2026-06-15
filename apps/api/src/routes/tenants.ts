@@ -11,6 +11,7 @@ import { AppError } from '../middleware/errorHandler'
 import { emailLandlordBankingNudge } from '../services/email'
 import { isDisposableEmail } from '../lib/email'
 import { logger } from '../lib/logger'
+import { checkLeaseAgainstStateLaw, type LawFlag } from '../services/stateLaw'
 
 export const tenantsRouter = Router()
 
@@ -1336,8 +1337,17 @@ tenantsRouter.get('/lease', requireAuth, async (req, res, next) => {
       JOIN lease_tenants lt ON lt.lease_id = l.id AND lt.tenant_id = $1 AND lt.status = 'active'
       LIMIT 1`, [tenant.id])
     if (!unit) throw new AppError(404, 'No active unit')
+    // S483: extended SELECT pulls property state + security_deposit
+    // (from lease_fees post-S196) so the state-law compute below has
+    // all the inputs it needs without a second round-trip.
     const lease = await queryOne<any>(`
-      SELECT l.*, p.name as property_name, u.unit_number,
+      SELECT l.*, p.name as property_name, p.state as property_state,
+        u.unit_number,
+        (SELECT amount FROM lease_fees lf
+          WHERE lf.lease_id = l.id
+            AND lf.fee_type = 'security_deposit'
+            AND lf.due_timing = 'move_in'
+          LIMIT 1) AS security_deposit,
         lu.first_name || ' ' || lu.last_name as landlord_name,
         COALESCE(vuo.primary_first_name || ' ' || vuo.primary_last_name, '') as tenant_name
       FROM leases l
@@ -1348,7 +1358,31 @@ tenantsRouter.get('/lease', requireAuth, async (req, res, next) => {
       LEFT JOIN v_unit_occupancy vuo ON vuo.unit_id = u.id
       WHERE l.unit_id = $1 AND l.status IN ('pending','active')
       ORDER BY l.created_at DESC LIMIT 1`, [unit.id])
-    res.json({ success: true, data: lease })
+
+    // S483: state-law warnings recomputed against the persisted lease.
+    // The tenant sees the same hedged factual notice the landlord saw
+    // at PATCH time — completes the both-party transparency loop for
+    // lease terms (S478 closed it for entry requests). Best-effort.
+    let stateLawWarnings: LawFlag[] = []
+    if (lease) {
+      try {
+        stateLawWarnings = await checkLeaseAgainstStateLaw({
+          stateCode:             lease.property_state,
+          rentAmount:            Number(lease.rent_amount),
+          securityDepositAmount: lease.security_deposit != null ? Number(lease.security_deposit) : null,
+          lateFeeInitialAmount:  lease.late_fee_initial_amount != null ? Number(lease.late_fee_initial_amount) : null,
+          lateFeeInitialType:    lease.late_fee_initial_type,
+          lateFeeGraceDays:      lease.late_fee_grace_days != null ? Number(lease.late_fee_grace_days) : null,
+        })
+      } catch (e) {
+        logger.error({ err: e, lease_id: lease.id }, '[stateLaw] tenant lease GET checks failed')
+      }
+    }
+
+    res.json({
+      success: true,
+      data: lease ? { ...lease, state_law_warnings: stateLawWarnings } : lease,
+    })
   } catch (e) { next(e) }
 })
 

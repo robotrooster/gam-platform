@@ -14,6 +14,12 @@ export const USER_ROLES = [
   'property_manager',
   'onsite_manager',
   'maintenance',
+  // S453: service-business operator roles. business_owner = signs up
+  // a new business + owns the portal; business_staff = scoped staff
+  // member working under a business (scope row in business_users).
+  // See `BUSINESS_*` exports below for the per-business enums.
+  'business_owner',
+  'business_staff',
 ] as const
 
 export type UserRole = typeof USER_ROLES[number]
@@ -56,6 +62,377 @@ export const LANDLORD_ASSIGNABLE_ROLE_LABEL: Record<LandlordAssignableRole, stri
   maintenance:      'Maintenance',
   bookkeeper:       'Bookkeeper',
 }
+
+// ---------- Service-business operator roles (S453) ----------
+// Distinct from landlord-side roles. Service businesses (trash hauling,
+// maintenance crews, mobile rentals, equipment rentals) live in the
+// `businesses` table and run their own portal at apps/business.
+//   business_owner — top of the business, like landlord is to property
+//   business_staff — scoped staff resolved via business_users at login
+
+export const BUSINESS_ROLES = ['business_owner'] as const
+export type BusinessRole = typeof BUSINESS_ROLES[number]
+export const BUSINESS_ROLE_LABEL: Record<BusinessRole, string> = {
+  business_owner: 'Business Owner',
+}
+
+// Per-business staff positions. Single source of truth for the
+// business_users.staff_role CHECK constraint (S453 migration).
+export const BUSINESS_STAFF_ROLES = [
+  'manager',     // full operational scope, no ownership transfer
+  'dispatcher',  // route/appointment planning, customer management
+  'driver',      // driver-facing — assigned routes, complete stops only
+  'office',      // billing/invoicing, no driver/route ops
+] as const
+export type BusinessStaffRole = typeof BUSINESS_STAFF_ROLES[number]
+export const BUSINESS_STAFF_ROLE_LABEL: Record<BusinessStaffRole, string> = {
+  manager:    'Manager',
+  dispatcher: 'Dispatcher',
+  driver:     'Driver',
+  office:     'Office',
+}
+
+// businesses.business_type CHECK enum.
+export const BUSINESS_TYPES = [
+  'trash_hauling',
+  'maintenance_crew',
+  'mobile_rental',
+  'equipment_rental',
+  'mini_market',
+  'mechanic_stationary',
+  'mechanic_mobile',
+  'other',
+] as const
+export type BusinessType = typeof BUSINESS_TYPES[number]
+export const BUSINESS_TYPE_LABEL: Record<BusinessType, string> = {
+  trash_hauling:       'Trash / Waste Hauling',
+  maintenance_crew:    'Maintenance Crew',
+  mobile_rental:       'Mobile Rental (delivery-route)',
+  equipment_rental:    'Equipment Rental (fixed-location)',
+  mini_market:         'Mini Market / Retail',
+  mechanic_stationary: 'Mechanic (Stationary Shop)',
+  mechanic_mobile:     'Mechanic (Mobile)',
+  other:               'Other',
+}
+
+// S492: businesses.enabled_features CHECK catalog. Single source of
+// truth for the set of features a business can toggle. The CHECK
+// constraint on `businesses.enabled_features` mirrors this list — to
+// add a feature, append here AND cut a migration that ALTERs the
+// CHECK (per CLAUDE.md "Single source of truth for enums and CHECK
+// constraints" rule).
+export const BUSINESS_FEATURES = [
+  'customers',
+  'staff',
+  'recurring_schedules',
+  'appointments',
+  'routing',
+  'pos',
+  'inventory',
+  'work_orders',
+  'customer_vehicles',
+  'invoicing',
+  'payments',
+  'quotes',
+] as const
+export type BusinessFeature = typeof BUSINESS_FEATURES[number]
+
+export const BUSINESS_FEATURE_LABEL: Record<BusinessFeature, string> = {
+  customers:           'Customers',
+  staff:               'Staff',
+  recurring_schedules: 'Recurring Schedules',
+  appointments:        'Appointments',
+  routing:             'Routes & Fleet',
+  pos:                 'Point of Sale',
+  inventory:           'Inventory',
+  work_orders:         'Work Orders',
+  customer_vehicles:   'Customer Vehicles',
+  invoicing:           'Invoicing',
+  payments:            'Payments',
+  quotes:              'Quotes & Estimates',
+}
+
+export const BUSINESS_FEATURE_DESCRIPTION: Record<BusinessFeature, string> = {
+  customers:           'Track who you serve. Always on.',
+  staff:               'Team members with role-based access. Always on.',
+  recurring_schedules: 'Repeating services on a calendar (weekly, monthly). Powers Routes when fleet is on.',
+  appointments:        'Timed visits — book and confirm individual customer slots.',
+  routing:             'Daily route optimization for fleet-based services: depots, vehicles, dump locations, generated routes, driver execution.',
+  pos:                 'In-store register for retail sales. Inventory-aware.',
+  inventory:           'Stock tracking. Pairs with POS for retail and with Work Orders for parts.',
+  work_orders:         'Service jobs with diagnosis, labor, parts, and per-job invoicing. Attaches to a customer or a customer vehicle.',
+  customer_vehicles:   'Track customer-owned vehicles by VIN. Pairs with Work Orders. Cross-business history layer designed for future.',
+  invoicing:           'Send invoices (recurring or per-service). Tracks paid / unpaid.',
+  payments:            'Collect customer payments via Stripe Connect. Pairs with Invoicing.',
+  quotes:              'Price proposals before work begins. Customer reviews, you mark accepted, then convert to an invoice or work order.',
+}
+
+// Features that are universal and cannot be toggled off. Locked-on
+// because every business needs them.
+export const BUSINESS_FEATURE_ALWAYS_ON: BusinessFeature[] = [
+  'customers',
+  'staff',
+]
+
+// Default feature set per business_type. Drives the at-signup
+// pre-fill; owner can edit anytime in Settings → Features.
+export const BUSINESS_TYPE_DEFAULT_FEATURES: Record<BusinessType, BusinessFeature[]> = {
+  trash_hauling: [
+    'customers', 'staff', 'recurring_schedules', 'routing',
+    'invoicing', 'payments',
+  ],
+  maintenance_crew: [
+    'customers', 'staff', 'appointments', 'work_orders',
+    'inventory', 'invoicing', 'payments', 'quotes',
+  ],
+  mobile_rental: [
+    'customers', 'staff', 'appointments', 'routing',
+    'invoicing', 'payments',
+  ],
+  equipment_rental: [
+    'customers', 'staff', 'appointments', 'inventory',
+    'invoicing', 'payments',
+  ],
+  mini_market: [
+    'customers', 'staff', 'pos', 'inventory',
+    'invoicing', 'payments',
+  ],
+  mechanic_stationary: [
+    'customers', 'staff', 'appointments', 'work_orders',
+    'customer_vehicles', 'inventory', 'invoicing', 'payments',
+    'quotes',
+  ],
+  mechanic_mobile: [
+    'customers', 'staff', 'appointments', 'routing',
+    'work_orders', 'customer_vehicles', 'inventory',
+    'invoicing', 'payments', 'quotes',
+  ],
+  other: [
+    'customers', 'staff', 'invoicing', 'payments',
+  ],
+}
+
+// ── S502: business_users.permissions catalog ──────────────────
+//
+// Single source of truth for the per-staff permission text[] column.
+// Owners always have full access (no row in business_users); staff are
+// gated to the subset they were granted. Each permission is a
+// `feature.action` pair so the access-helper can also enforce the
+// feature toggle from the same string (e.g. 'invoices.write' requires
+// the 'invoicing' feature enabled).
+//
+// The same list appears in the businesses_users CHECK constraint
+// (S502 migration). Adding a new permission requires:
+//   - append to this array
+//   - migration to ALTER the CHECK
+//   - update PERMISSION_BY_ROLE defaults if appropriate
+//   - if it gates a new endpoint, add the requireBusinessAccess() call
+export const BUSINESS_STAFF_PERMISSIONS = [
+  // Dashboard
+  'dashboard.view',
+  // Customers
+  'customers.read',
+  'customers.write',
+  // Appointments
+  'appointments.read',
+  'appointments.write',
+  // Invoices
+  'invoices.read',
+  'invoices.write',
+  'invoices.send',
+  // Quotes
+  'quotes.read',
+  'quotes.write',
+  'quotes.send',
+  // POS
+  'pos.use',
+  'pos.refund',
+  // Inventory
+  'inventory.read',
+  'inventory.write',
+  'inventory.adjust',
+  // Work orders
+  'work_orders.read',
+  'work_orders.write',
+  'work_orders.complete',
+  // Customer vehicles
+  'vehicles.read',
+  'vehicles.write',
+  // Routes (fleet)
+  'routes.read',
+  'routes.write',
+  'routes.drive',
+  // Reports / analytics (owner-level data view)
+  'reports.view',
+] as const
+export type BusinessStaffPermission = typeof BUSINESS_STAFF_PERMISSIONS[number]
+
+// UI-grouped labels for the permission editor on Staff page.
+export const BUSINESS_STAFF_PERMISSION_GROUP: Record<BusinessStaffPermission, string> = {
+  'dashboard.view':      'Overview',
+  'customers.read':      'Customers',
+  'customers.write':     'Customers',
+  'appointments.read':   'Appointments',
+  'appointments.write':  'Appointments',
+  'invoices.read':       'Invoices',
+  'invoices.write':      'Invoices',
+  'invoices.send':       'Invoices',
+  'quotes.read':         'Quotes',
+  'quotes.write':        'Quotes',
+  'quotes.send':         'Quotes',
+  'pos.use':             'POS',
+  'pos.refund':          'POS',
+  'inventory.read':      'Inventory',
+  'inventory.write':     'Inventory',
+  'inventory.adjust':    'Inventory',
+  'work_orders.read':    'Work Orders',
+  'work_orders.write':   'Work Orders',
+  'work_orders.complete':'Work Orders',
+  'vehicles.read':       'Customer Vehicles',
+  'vehicles.write':      'Customer Vehicles',
+  'routes.read':         'Routes',
+  'routes.write':        'Routes',
+  'routes.drive':        'Routes',
+  'reports.view':        'Reports',
+}
+
+export const BUSINESS_STAFF_PERMISSION_LABEL: Record<BusinessStaffPermission, string> = {
+  'dashboard.view':      'View dashboard',
+  'customers.read':      'View customers',
+  'customers.write':     'Create + edit customers',
+  'appointments.read':   'View appointments',
+  'appointments.write':  'Create + edit appointments',
+  'invoices.read':       'View invoices',
+  'invoices.write':      'Create + edit invoices',
+  'invoices.send':       'Send invoices + record payments',
+  'quotes.read':         'View quotes',
+  'quotes.write':        'Create + edit quotes',
+  'quotes.send':         'Send quotes + mark accept/decline + convert',
+  'pos.use':             'Use the POS register',
+  'pos.refund':          'Refund POS sales',
+  'inventory.read':      'View inventory',
+  'inventory.write':     'Create + edit inventory items',
+  'inventory.adjust':    'Adjust stock counts',
+  'work_orders.read':    'View work orders',
+  'work_orders.write':   'Create + edit work orders + add lines',
+  'work_orders.complete':'Complete + cancel work orders',
+  'vehicles.read':       'View customer vehicles',
+  'vehicles.write':      'Create + edit customer vehicles',
+  'routes.read':         'View routes',
+  'routes.write':        'Generate + edit routes',
+  'routes.drive':        'Drive routes (mobile UI)',
+  'reports.view':        'View reports + analytics',
+}
+
+// Defaults applied to a new staff member based on their staff_role at
+// invite time. Owner can override per-staff after they accept.
+//
+// Manager: full operational scope (no settings / no staff management).
+// Dispatcher: customer-facing ops + routes/appointments/quotes (no POS, no inventory write).
+// Driver: drive-only + read appointments + read customers + read routes.
+// Office: customer-facing billing — invoices/quotes/payments + customers + appointments + POS register.
+export const BUSINESS_STAFF_PERMISSIONS_BY_ROLE: Record<BusinessStaffRole, BusinessStaffPermission[]> = {
+  manager: [
+    'dashboard.view',
+    'customers.read', 'customers.write',
+    'appointments.read', 'appointments.write',
+    'invoices.read', 'invoices.write', 'invoices.send',
+    'quotes.read', 'quotes.write', 'quotes.send',
+    'pos.use', 'pos.refund',
+    'inventory.read', 'inventory.write', 'inventory.adjust',
+    'work_orders.read', 'work_orders.write', 'work_orders.complete',
+    'vehicles.read', 'vehicles.write',
+    'routes.read', 'routes.write',
+    'reports.view',
+  ],
+  dispatcher: [
+    'dashboard.view',
+    'customers.read', 'customers.write',
+    'appointments.read', 'appointments.write',
+    'invoices.read',
+    'quotes.read', 'quotes.write',
+    'work_orders.read',
+    'vehicles.read', 'vehicles.write',
+    'routes.read', 'routes.write',
+  ],
+  driver: [
+    'appointments.read',
+    'customers.read',
+    'routes.read', 'routes.drive',
+  ],
+  office: [
+    'dashboard.view',
+    'customers.read', 'customers.write',
+    'appointments.read', 'appointments.write',
+    'invoices.read', 'invoices.write', 'invoices.send',
+    'quotes.read', 'quotes.write', 'quotes.send',
+    'pos.use',
+    'reports.view',
+  ],
+}
+
+// businesses.status CHECK enum.
+export const BUSINESS_STATUSES = ['active', 'suspended', 'archived'] as const
+export type BusinessStatus = typeof BUSINESS_STATUSES[number]
+
+// business_users.status CHECK enum.
+export const BUSINESS_USER_STATUSES = ['active', 'invited', 'revoked'] as const
+export type BusinessUserStatus = typeof BUSINESS_USER_STATUSES[number]
+
+// business_customers.customer_type CHECK enum.
+export const BUSINESS_CUSTOMER_TYPES = ['individual', 'business'] as const
+export type BusinessCustomerType = typeof BUSINESS_CUSTOMER_TYPES[number]
+export const BUSINESS_CUSTOMER_TYPE_LABEL: Record<BusinessCustomerType, string> = {
+  individual: 'Individual',
+  business:   'Business',
+}
+
+// business_customers.status CHECK enum.
+export const BUSINESS_CUSTOMER_STATUSES = ['active', 'archived'] as const
+export type BusinessCustomerStatus = typeof BUSINESS_CUSTOMER_STATUSES[number]
+
+// appointments.status CHECK enum (S459 / Phase 1a.2).
+export const APPOINTMENT_STATUSES = [
+  'scheduled',
+  'completed',
+  'cancelled',
+  'no_show',
+] as const
+export type AppointmentStatus = typeof APPOINTMENT_STATUSES[number]
+export const APPOINTMENT_STATUS_LABEL: Record<AppointmentStatus, string> = {
+  scheduled: 'Scheduled',
+  completed: 'Completed',
+  cancelled: 'Cancelled',
+  no_show:   'No-show',
+}
+
+// recurring_schedules.status CHECK enum (S460 / Phase 1a.2).
+export const RECURRING_SCHEDULE_STATUSES = [
+  'active',
+  'paused',
+  'ended',
+] as const
+export type RecurringScheduleStatus = typeof RECURRING_SCHEDULE_STATUSES[number]
+export const RECURRING_SCHEDULE_STATUS_LABEL: Record<RecurringScheduleStatus, string> = {
+  active: 'Active',
+  paused: 'Paused',
+  ended:  'Ended',
+}
+
+// generated_routes.status enum (S462 / Phase 1a.3).
+export const GENERATED_ROUTE_STATUSES = [
+  'generated',
+  'in_progress',
+  'completed',
+] as const
+export type GeneratedRouteStatus = typeof GENERATED_ROUTE_STATUSES[number]
+
+// route_stops.kind + .status (S462 / Phase 1a.3).
+export const ROUTE_STOP_KINDS = ['customer', 'dump', 'depot_return'] as const
+export type RouteStopKind = typeof ROUTE_STOP_KINDS[number]
+
+export const ROUTE_STOP_STATUSES = ['planned', 'completed', 'skipped'] as const
+export type RouteStopStatus = typeof ROUTE_STOP_STATUSES[number]
 
 // ---------- Sub-permission catalog (per role) ----------
 // S79: granular feature toggles WITHIN a role. Composes with the role's
@@ -2715,3 +3092,92 @@ export type ExternalAccountProviderKind = typeof EXTERNAL_ACCOUNT_PROVIDER_KINDS
 // without that hazard.
 export const FILING_METHOD_VALUES = ['paper_form', 'online_portal'] as const
 export type FilingMethod = typeof FILING_METHOD_VALUES[number]
+
+// state_law_section_texts.law_category — the broad real-estate-law area a
+// statute section belongs to. GAM's full-text statute corpus started as
+// landlord/tenant-only (the live agent surface), but the product needs ALL
+// real-estate law over time (for fix-and-flip investors, commercial operators,
+// agents). This column keeps the broader corpus in one table while letting the
+// landlord/tenant agent retrieval filter to `landlord_tenant` so its answers
+// stay clean. Single source of truth — the migration CHECK lists the same
+// values; ingesters import from here. Still the sanctioned retrieve+cite+date
+// carve-out (never advice). Add a value here AND in a fix-forward migration.
+export const LAW_CATEGORY_VALUES = [
+  'landlord_tenant', // residential/commercial tenancy, eviction, MH/RV parks (the live agent domain)
+  'conveyancing_title', // deeds, conveyances, recording, title, escrow
+  'condo_coop', // condominium + cooperative ownership
+  'broker_licensing', // real estate brokers, salespersons, appraisers
+  'mortgage_lien_foreclosure', // mortgages, mechanic's/other liens, foreclosure, partition
+  'property_tax', // real property assessment + taxation
+  'land_use_zoning', // zoning, subdivision, planning, building/housing codes
+  'environmental_disclosure', // property-condition + environmental disclosure duties
+  'general_real_property', // catch-all real property statutes not in the above
+] as const
+export type LawCategory = typeof LAW_CATEGORY_VALUES[number]
+
+// state_property_tax_provisions — STRUCTURED per-state property-tax facts (powers
+// a near-term GAM property-tax feature; sits beside the verbatim property_tax
+// statute text in state_law_section_texts). Single source of truth: the
+// migration CHECKs list the same topic + jurisdiction sets. Sourced + dated +
+// factual (the sanctioned no-state-legal carve-out), annual-refresh.
+export const PROPERTY_TAX_TOPIC_VALUES = [
+  'exemption', // a tax-relief program (homestead, senior, veteran, disability, ag, school relief…)
+  'assessment', // how property is assessed (ratio/level, reassessment cycle, valuation standard)
+  'assessment_appeal', // grievance/protest/appeal — deadline + review body
+  'payment', // when tax is due (installments, grace)
+  'delinquency_redemption', // late penalty/interest, tax-lien/deed sale, redemption period
+] as const
+export type PropertyTaxTopic = typeof PROPERTY_TAX_TOPIC_VALUES[number]
+
+export const PROPERTY_TAX_JURISDICTION_LEVELS = ['state', 'county', 'municipal'] as const
+export type PropertyTaxJurisdictionLevel = typeof PROPERTY_TAX_JURISDICTION_LEVELS[number]
+
+// Documented shapes for the `params` jsonb, by topic. Property tax is largely
+// LOCAL: state statute often sets a framework/ceiling that localities vary —
+// set `locally_variable: true` so the feature can say so honestly rather than
+// implying a single statewide number.
+export interface PropertyTaxExemptionParams {
+  age_min?: number
+  income_max?: number
+  income_unit?: 'usd_per_year'
+  ownership_required?: boolean
+  primary_residence_required?: boolean
+  benefit_kind?: 'fixed_amount' | 'pct_reduction' | 'assessment_freeze' | 'exempt_value_cap'
+  benefit_value?: number
+  benefit_unit?: 'usd' | 'pct'
+  locally_variable?: boolean
+  notes?: string
+}
+export interface PropertyTaxAssessmentParams {
+  assessment_ratio_pct?: number
+  market_value_standard?: boolean
+  reassessment_cycle_years?: number
+  locally_variable?: boolean
+}
+export interface PropertyTaxAppealParams {
+  deadline_kind?: 'fixed_date' | 'relative_to_roll' | 'window'
+  deadline_month?: number // 1-12
+  deadline_day?: number
+  deadline_desc?: string // e.g. "fourth Tuesday in May"
+  review_body?: string // e.g. "Board of Assessment Review", "Appraisal Review Board"
+  locally_variable?: boolean
+}
+export interface PropertyTaxPaymentParams {
+  installments?: { label?: string; due_month?: number; due_day?: number }[]
+  delinquent_after_desc?: string
+  grace_days?: number
+  locally_variable?: boolean
+}
+export interface PropertyTaxDelinquencyParams {
+  late_penalty_pct?: number
+  late_interest_pct_per_year?: number
+  redemption_period_months?: number
+  tax_sale_kind?: 'tax_lien' | 'tax_deed' | 'hybrid' | 'other'
+  locally_variable?: boolean
+}
+export type PropertyTaxProvisionParams =
+  | PropertyTaxExemptionParams
+  | PropertyTaxAssessmentParams
+  | PropertyTaxAppealParams
+  | PropertyTaxPaymentParams
+  | PropertyTaxDelinquencyParams

@@ -21,7 +21,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict P8lsRG5ev0VJk65MBOr7BiC5ccQRLTsKmMfT7PHUhiuFDPr0Cvmq7i29cCSMpQv
+\restrict rwZk6CNhw2PwEjUJqOeEl1xPOQaqi67uYFZxL13vUXhq9J2PPee3aWMyl5y21ZI
 
 -- Dumped from database version 16.13 (Homebrew)
 -- Dumped by pg_dump version 16.13 (Homebrew)
@@ -490,6 +490,33 @@ CREATE TABLE public.application_pool (
 
 
 --
+-- Name: appointments; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.appointments (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    business_id uuid NOT NULL,
+    customer_id uuid NOT NULL,
+    created_by_user_id uuid,
+    service_type text NOT NULL,
+    scheduled_for timestamp with time zone NOT NULL,
+    duration_minutes integer DEFAULT 30 NOT NULL,
+    status text DEFAULT 'scheduled'::text NOT NULL,
+    notes text,
+    completed_at timestamp with time zone,
+    cancelled_at timestamp with time zone,
+    cancelled_reason text,
+    recurring_schedule_id uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT appointments_cancelled_audit CHECK (((status <> 'cancelled'::text) OR (cancelled_at IS NOT NULL))),
+    CONSTRAINT appointments_completed_audit CHECK (((status <> 'completed'::text) OR (completed_at IS NOT NULL))),
+    CONSTRAINT appointments_duration_positive CHECK ((duration_minutes > 0)),
+    CONSTRAINT appointments_status_check CHECK ((status = ANY (ARRAY['scheduled'::text, 'completed'::text, 'cancelled'::text, 'no_show'::text])))
+);
+
+
+--
 -- Name: audit_log; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -847,6 +874,802 @@ CREATE TABLE public.bulletin_votes (
 
 
 --
+-- Name: business_attachments; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.business_attachments (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    business_id uuid NOT NULL,
+    entity_type text NOT NULL,
+    entity_id uuid NOT NULL,
+    file_name text NOT NULL,
+    file_size_bytes integer NOT NULL,
+    mime_type text NOT NULL,
+    stored_filename text NOT NULL,
+    description text,
+    is_internal boolean DEFAULT false NOT NULL,
+    uploaded_by_user_id uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT business_attachments_entity_type_check CHECK ((entity_type = ANY (ARRAY['work_order'::text, 'customer'::text, 'quote'::text, 'invoice'::text, 'inventory_item'::text]))),
+    CONSTRAINT business_attachments_filename_nonempty CHECK (((length(file_name) > 0) AND (length(stored_filename) > 0))),
+    CONSTRAINT business_attachments_mime_nonempty CHECK ((length(mime_type) > 0)),
+    CONSTRAINT business_attachments_size_positive CHECK (((file_size_bytes > 0) AND (file_size_bytes <= 20971520)))
+);
+
+
+--
+-- Name: TABLE business_attachments; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.business_attachments IS 'S509 polymorphic file attachments. entity_type/entity_id soft-link to a parent row (work_order, customer, quote, invoice, inventory_item). Files on disk under uploads/business-attachments/<businessId>/<stored_filename>.';
+
+
+--
+-- Name: business_bookable_services; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.business_bookable_services (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    business_id uuid NOT NULL,
+    name text NOT NULL,
+    description text,
+    duration_minutes integer NOT NULL,
+    price numeric(10,2),
+    is_active boolean DEFAULT true NOT NULL,
+    sort_order integer DEFAULT 0 NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT business_bookable_services_duration_positive CHECK (((duration_minutes > 0) AND (duration_minutes <= (24 * 60)))),
+    CONSTRAINT business_bookable_services_price_nonneg CHECK (((price IS NULL) OR (price >= (0)::numeric)))
+);
+
+
+--
+-- Name: TABLE business_bookable_services; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.business_bookable_services IS 'S507 catalog of services offered for public booking. Each service has a duration + optional price; the booking page lets customers pick one.';
+
+
+--
+-- Name: business_customer_payment_update_tokens; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.business_customer_payment_update_tokens (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    token text NOT NULL,
+    business_id uuid NOT NULL,
+    customer_id uuid NOT NULL,
+    triggered_by_invoice_id uuid,
+    expires_at timestamp with time zone NOT NULL,
+    used_at timestamp with time zone,
+    created_by_user_id uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: TABLE business_customer_payment_update_tokens; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.business_customer_payment_update_tokens IS 'S510 single-use 7-day tokens granting a customer (no login) the ability to replace their saved Stripe payment method on the marketing site.';
+
+
+--
+-- Name: business_customer_vehicles; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.business_customer_vehicles (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    business_id uuid NOT NULL,
+    customer_id uuid NOT NULL,
+    vin text,
+    license_plate text,
+    license_plate_state text,
+    year integer,
+    make text,
+    model text,
+    color text,
+    current_mileage integer,
+    notes text,
+    is_active boolean DEFAULT true NOT NULL,
+    archived_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT business_customer_vehicles_mileage_nonneg CHECK (((current_mileage IS NULL) OR (current_mileage >= 0))),
+    CONSTRAINT business_customer_vehicles_year_range CHECK (((year IS NULL) OR ((year >= 1900) AND (year <= 2200))))
+);
+
+
+--
+-- Name: TABLE business_customer_vehicles; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.business_customer_vehicles IS 'S498 per-business vehicle records keyed by VIN. Linked to a business_customers row. Cross-business shared-history surface is a future feature gated on customer-side portal.';
+
+
+--
+-- Name: business_customers; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.business_customers (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    business_id uuid NOT NULL,
+    customer_type text NOT NULL,
+    company_name text,
+    first_name text NOT NULL,
+    last_name text NOT NULL,
+    email text,
+    phone text,
+    street1 text NOT NULL,
+    street2 text,
+    city text NOT NULL,
+    state text NOT NULL,
+    zip text NOT NULL,
+    lat numeric(10,7),
+    lon numeric(10,7),
+    notes text,
+    status text DEFAULT 'active'::text NOT NULL,
+    user_id uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    archived_at timestamp with time zone,
+    tax_exempt boolean DEFAULT false NOT NULL,
+    tax_exempt_reason text,
+    stripe_customer_id text,
+    default_payment_method_id text,
+    payment_method_brand text,
+    payment_method_last4 text,
+    payment_method_exp_month integer,
+    payment_method_exp_year integer,
+    CONSTRAINT business_customers_business_name_required CHECK (((customer_type = 'individual'::text) OR ((customer_type = 'business'::text) AND (company_name IS NOT NULL) AND (length(company_name) > 0)))),
+    CONSTRAINT business_customers_customer_type_check CHECK ((customer_type = ANY (ARRAY['individual'::text, 'business'::text]))),
+    CONSTRAINT business_customers_payment_method_exp_month_range CHECK (((payment_method_exp_month IS NULL) OR ((payment_method_exp_month >= 1) AND (payment_method_exp_month <= 12)))),
+    CONSTRAINT business_customers_payment_method_exp_year_range CHECK (((payment_method_exp_year IS NULL) OR ((payment_method_exp_year >= 2024) AND (payment_method_exp_year <= 2100)))),
+    CONSTRAINT business_customers_status_check CHECK ((status = ANY (ARRAY['active'::text, 'archived'::text])))
+);
+
+
+--
+-- Name: COLUMN business_customers.tax_exempt; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.business_customers.tax_exempt IS 'S506 customer-level exemption (resale certificate, nonprofit, government). When TRUE, every invoice / quote / POS sale tax_amount is forced to 0.';
+
+
+--
+-- Name: COLUMN business_customers.stripe_customer_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.business_customers.stripe_customer_id IS 'S508 platform-side Stripe Customer (cus_xxx). Created on first Checkout payment with save-card. Recurring cycles auto-charge against the saved PM here.';
+
+
+--
+-- Name: business_inventory_adjustments; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.business_inventory_adjustments (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    business_id uuid NOT NULL,
+    item_id uuid NOT NULL,
+    adjustment_type text NOT NULL,
+    quantity_delta integer NOT NULL,
+    stock_qty_after integer NOT NULL,
+    notes text,
+    actor_user_id uuid,
+    reference_type text,
+    reference_id uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT business_inventory_adjustments_stock_after_nonneg CHECK ((stock_qty_after >= 0)),
+    CONSTRAINT business_inventory_adjustments_type_check CHECK ((adjustment_type = ANY (ARRAY['received'::text, 'sold'::text, 'used'::text, 'shrinkage'::text, 'count'::text, 'manual'::text])))
+);
+
+
+--
+-- Name: TABLE business_inventory_adjustments; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.business_inventory_adjustments IS 'S496 append-only audit trail for inventory stock changes. Every stock_qty mutation writes a row here.';
+
+
+--
+-- Name: business_inventory_categories; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.business_inventory_categories (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    business_id uuid NOT NULL,
+    name text NOT NULL,
+    sort_order integer DEFAULT 0 NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: business_inventory_items; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.business_inventory_items (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    business_id uuid NOT NULL,
+    category_id uuid,
+    name text NOT NULL,
+    sku text,
+    description text,
+    cost_price numeric(10,2) DEFAULT 0 NOT NULL,
+    sell_price numeric(10,2) DEFAULT 0 NOT NULL,
+    tax_rate numeric(5,4) DEFAULT 0 NOT NULL,
+    stock_qty integer DEFAULT 0 NOT NULL,
+    stock_min integer DEFAULT 0 NOT NULL,
+    stock_max integer DEFAULT 0 NOT NULL,
+    is_active boolean DEFAULT true NOT NULL,
+    archived_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT business_inventory_items_cost_nonneg CHECK ((cost_price >= (0)::numeric)),
+    CONSTRAINT business_inventory_items_sell_nonneg CHECK ((sell_price >= (0)::numeric)),
+    CONSTRAINT business_inventory_items_stock_max_nonneg CHECK ((stock_max >= 0)),
+    CONSTRAINT business_inventory_items_stock_min_nonneg CHECK ((stock_min >= 0)),
+    CONSTRAINT business_inventory_items_stock_qty_nonneg CHECK ((stock_qty >= 0)),
+    CONSTRAINT business_inventory_items_tax_range CHECK (((tax_rate >= (0)::numeric) AND (tax_rate < (1)::numeric)))
+);
+
+
+--
+-- Name: TABLE business_inventory_items; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.business_inventory_items IS 'S496 business-portal inventory items. Per-business SKUs with stock levels + pricing. Pairs with POS (retail sales) and Work Orders (parts consumed on service jobs).';
+
+
+--
+-- Name: business_invoice_lines; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.business_invoice_lines (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    invoice_id uuid NOT NULL,
+    sort_order integer DEFAULT 0 NOT NULL,
+    description text NOT NULL,
+    quantity numeric(10,2) DEFAULT 1 NOT NULL,
+    unit_price numeric(12,2) NOT NULL,
+    line_total numeric(12,2) NOT NULL,
+    service_key text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT business_invoice_lines_price_nn CHECK ((unit_price >= (0)::numeric)),
+    CONSTRAINT business_invoice_lines_qty_positive CHECK ((quantity > (0)::numeric)),
+    CONSTRAINT business_invoice_lines_total_nn CHECK ((line_total >= (0)::numeric))
+);
+
+
+--
+-- Name: TABLE business_invoice_lines; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.business_invoice_lines IS 'S493 business-invoice line items. ON DELETE CASCADE from the invoice. line_total = quantity * unit_price computed at write time.';
+
+
+--
+-- Name: business_invoice_sequences; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.business_invoice_sequences (
+    business_id uuid NOT NULL,
+    next_number integer DEFAULT 1 NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT bis_next_number_positive CHECK ((next_number >= 1))
+);
+
+
+--
+-- Name: TABLE business_invoice_sequences; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.business_invoice_sequences IS 'S493 per-business invoice number counter. nextval-style: each invoice create reads + bumps in one transaction.';
+
+
+--
+-- Name: business_invoices; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.business_invoices (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    business_id uuid NOT NULL,
+    customer_id uuid NOT NULL,
+    invoice_number text NOT NULL,
+    status text DEFAULT 'draft'::text NOT NULL,
+    issue_date date NOT NULL,
+    due_date date NOT NULL,
+    subtotal numeric(12,2) DEFAULT 0 NOT NULL,
+    tax_amount numeric(12,2) DEFAULT 0 NOT NULL,
+    total_amount numeric(12,2) DEFAULT 0 NOT NULL,
+    amount_paid numeric(12,2) DEFAULT 0 NOT NULL,
+    sent_at timestamp with time zone,
+    paid_at timestamp with time zone,
+    voided_at timestamp with time zone,
+    void_reason text,
+    payment_method text,
+    stripe_payment_intent_id text,
+    notes text,
+    internal_notes text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    stripe_checkout_session_id text,
+    hosted_pay_url text,
+    source_work_order_id uuid,
+    source_quote_id uuid,
+    source_recurring_schedule_id uuid,
+    auto_charge_attempted_at timestamp with time zone,
+    auto_charge_last_error text,
+    CONSTRAINT business_invoices_paid_audit CHECK ((((status = 'paid'::text) AND (paid_at IS NOT NULL)) OR (status <> 'paid'::text))),
+    CONSTRAINT business_invoices_paid_nn CHECK ((amount_paid >= (0)::numeric)),
+    CONSTRAINT business_invoices_sent_audit CHECK ((((status = ANY (ARRAY['sent'::text, 'paid'::text])) AND (sent_at IS NOT NULL)) OR (status <> ALL (ARRAY['sent'::text, 'paid'::text])))),
+    CONSTRAINT business_invoices_status_check CHECK ((status = ANY (ARRAY['draft'::text, 'sent'::text, 'paid'::text, 'void'::text]))),
+    CONSTRAINT business_invoices_subtotal_nn CHECK ((subtotal >= (0)::numeric)),
+    CONSTRAINT business_invoices_tax_nn CHECK ((tax_amount >= (0)::numeric)),
+    CONSTRAINT business_invoices_total_nn CHECK ((total_amount >= (0)::numeric)),
+    CONSTRAINT business_invoices_void_audit CHECK ((((status = 'void'::text) AND (voided_at IS NOT NULL)) OR (status <> 'void'::text)))
+);
+
+
+--
+-- Name: TABLE business_invoices; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.business_invoices IS 'S493 business-portal invoicing. Per-business per-customer invoices with free-form line items. Distinct from real-estate invoices (which are lease-coupled). Status: draft → sent → paid (or void from any).';
+
+
+--
+-- Name: COLUMN business_invoices.auto_charge_attempted_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.business_invoices.auto_charge_attempted_at IS 'S508 set when a recurring cycle attempted an off-session charge. If auto_charge_last_error is also set, the charge failed and the invoice remains in draft for owner follow-up.';
+
+
+--
+-- Name: business_pos_sequences; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.business_pos_sequences (
+    business_id uuid NOT NULL,
+    next_number integer DEFAULT 1 NOT NULL,
+    CONSTRAINT business_pos_sequences_next_positive CHECK ((next_number > 0))
+);
+
+
+--
+-- Name: business_pos_transaction_lines; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.business_pos_transaction_lines (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    transaction_id uuid NOT NULL,
+    item_id uuid NOT NULL,
+    name_snapshot text NOT NULL,
+    sku_snapshot text,
+    quantity integer NOT NULL,
+    unit_price numeric(10,2) NOT NULL,
+    tax_rate numeric(5,4) NOT NULL,
+    line_subtotal numeric(10,2) NOT NULL,
+    line_tax numeric(10,2) NOT NULL,
+    line_total numeric(10,2) NOT NULL,
+    sort_order integer DEFAULT 0 NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT business_pos_transaction_lines_price_nonneg CHECK ((unit_price >= (0)::numeric)),
+    CONSTRAINT business_pos_transaction_lines_qty_positive CHECK ((quantity > 0)),
+    CONSTRAINT business_pos_transaction_lines_tax_range CHECK (((tax_rate >= (0)::numeric) AND (tax_rate < (1)::numeric)))
+);
+
+
+--
+-- Name: TABLE business_pos_transaction_lines; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.business_pos_transaction_lines IS 'S497 POS sale lines. Snapshots unit_price, tax_rate, name, sku at sale time so receipts render historically.';
+
+
+--
+-- Name: business_pos_transactions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.business_pos_transactions (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    business_id uuid NOT NULL,
+    receipt_number text NOT NULL,
+    customer_id uuid,
+    status text DEFAULT 'completed'::text NOT NULL,
+    subtotal numeric(10,2) DEFAULT 0 NOT NULL,
+    tax_amount numeric(10,2) DEFAULT 0 NOT NULL,
+    total_amount numeric(10,2) DEFAULT 0 NOT NULL,
+    payment_method text NOT NULL,
+    amount_tendered numeric(10,2),
+    change_due numeric(10,2),
+    notes text,
+    refunded_at timestamp with time zone,
+    refund_reason text,
+    cashier_user_id uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT business_pos_transactions_payment_method_check CHECK ((payment_method = ANY (ARRAY['cash'::text, 'card_recorded'::text, 'stripe_terminal'::text, 'stripe_checkout'::text]))),
+    CONSTRAINT business_pos_transactions_refund_consistency CHECK ((((status = 'refunded'::text) AND (refunded_at IS NOT NULL)) OR ((status <> 'refunded'::text) AND (refunded_at IS NULL)))),
+    CONSTRAINT business_pos_transactions_status_check CHECK ((status = ANY (ARRAY['completed'::text, 'refunded'::text, 'void'::text]))),
+    CONSTRAINT business_pos_transactions_subtotal_nonneg CHECK ((subtotal >= (0)::numeric)),
+    CONSTRAINT business_pos_transactions_tax_nonneg CHECK ((tax_amount >= (0)::numeric)),
+    CONSTRAINT business_pos_transactions_total_nonneg CHECK ((total_amount >= (0)::numeric))
+);
+
+
+--
+-- Name: TABLE business_pos_transactions; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.business_pos_transactions IS 'S497 business-portal POS sales. One row per completed register transaction. Atomically decrements business_inventory_items.stock_qty + writes a sold adjustment per line.';
+
+
+--
+-- Name: COLUMN business_pos_transactions.payment_method; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.business_pos_transactions.payment_method IS 'cash | card_recorded (v1). stripe_terminal + stripe_checkout reserved for future hardware/QR integrations.';
+
+
+--
+-- Name: business_quote_lines; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.business_quote_lines (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    quote_id uuid NOT NULL,
+    line_type text NOT NULL,
+    item_id uuid,
+    description text NOT NULL,
+    quantity numeric(10,2) NOT NULL,
+    unit_price numeric(10,2) NOT NULL,
+    tax_rate numeric(5,4) DEFAULT 0 NOT NULL,
+    line_subtotal numeric(10,2) NOT NULL,
+    line_tax numeric(10,2) DEFAULT 0 NOT NULL,
+    line_total numeric(10,2) NOT NULL,
+    sort_order integer DEFAULT 0 NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT business_quote_lines_price_nonneg CHECK ((unit_price >= (0)::numeric)),
+    CONSTRAINT business_quote_lines_qty_positive CHECK ((quantity > (0)::numeric)),
+    CONSTRAINT business_quote_lines_tax_range CHECK (((tax_rate >= (0)::numeric) AND (tax_rate < (1)::numeric))),
+    CONSTRAINT business_quote_lines_type_check CHECK ((line_type = ANY (ARRAY['labor'::text, 'part'::text, 'fee'::text, 'generic'::text])))
+);
+
+
+--
+-- Name: TABLE business_quote_lines; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.business_quote_lines IS 'S501 quote line items. line_type labor (hours × rate) | part (snapshots inventory item but does NOT decrement stock) | fee | generic.';
+
+
+--
+-- Name: business_quote_sequences; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.business_quote_sequences (
+    business_id uuid NOT NULL,
+    next_number integer DEFAULT 1 NOT NULL,
+    CONSTRAINT business_quote_sequences_next_positive CHECK ((next_number > 0))
+);
+
+
+--
+-- Name: business_quotes; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.business_quotes (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    business_id uuid NOT NULL,
+    quote_number text NOT NULL,
+    customer_id uuid NOT NULL,
+    vehicle_id uuid,
+    status text DEFAULT 'draft'::text NOT NULL,
+    subtotal numeric(10,2) DEFAULT 0 NOT NULL,
+    tax_amount numeric(10,2) DEFAULT 0 NOT NULL,
+    total_amount numeric(10,2) DEFAULT 0 NOT NULL,
+    expires_at timestamp with time zone,
+    notes text,
+    internal_notes text,
+    intake_description text,
+    sent_at timestamp with time zone,
+    accepted_at timestamp with time zone,
+    declined_at timestamp with time zone,
+    decline_reason text,
+    invoice_id uuid,
+    work_order_id uuid,
+    created_by_user_id uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT business_quotes_accepted_audit CHECK ((((status = 'accepted'::text) AND (accepted_at IS NOT NULL)) OR ((status <> 'accepted'::text) AND (accepted_at IS NULL)))),
+    CONSTRAINT business_quotes_declined_audit CHECK ((((status = 'declined'::text) AND (declined_at IS NOT NULL) AND (decline_reason IS NOT NULL)) OR ((status <> 'declined'::text) AND (declined_at IS NULL)))),
+    CONSTRAINT business_quotes_money_nonneg CHECK (((subtotal >= (0)::numeric) AND (tax_amount >= (0)::numeric) AND (total_amount >= (0)::numeric))),
+    CONSTRAINT business_quotes_sent_audit CHECK ((((status = ANY (ARRAY['sent'::text, 'accepted'::text, 'declined'::text, 'expired'::text])) AND (sent_at IS NOT NULL)) OR ((status = 'draft'::text) AND (sent_at IS NULL)))),
+    CONSTRAINT business_quotes_status_check CHECK ((status = ANY (ARRAY['draft'::text, 'sent'::text, 'accepted'::text, 'declined'::text, 'expired'::text])))
+);
+
+
+--
+-- Name: TABLE business_quotes; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.business_quotes IS 'S501 business-portal quotes / estimates. Pre-work price proposal sent to a customer. On accepted, owner converts to a draft invoice or open work order via the convert endpoints; downstream linkage flows both ways.';
+
+
+--
+-- Name: business_recurring_invoice_lines; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.business_recurring_invoice_lines (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    schedule_id uuid NOT NULL,
+    description text NOT NULL,
+    quantity numeric(10,2) DEFAULT 1 NOT NULL,
+    unit_price numeric(10,2) NOT NULL,
+    sort_order integer DEFAULT 0 NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT business_recurring_invoice_lines_price_nonneg CHECK ((unit_price >= (0)::numeric)),
+    CONSTRAINT business_recurring_invoice_lines_qty_positive CHECK ((quantity > (0)::numeric))
+);
+
+
+--
+-- Name: TABLE business_recurring_invoice_lines; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.business_recurring_invoice_lines IS 'S505 line item template for a recurring invoice schedule. Cloned into business_invoice_lines on each cycle.';
+
+
+--
+-- Name: business_recurring_invoice_schedules; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.business_recurring_invoice_schedules (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    business_id uuid NOT NULL,
+    customer_id uuid NOT NULL,
+    name text NOT NULL,
+    frequency text NOT NULL,
+    day_of_month integer,
+    day_of_week integer,
+    start_date date NOT NULL,
+    end_date date,
+    next_due_date date NOT NULL,
+    auto_send boolean DEFAULT true NOT NULL,
+    payment_terms_days integer DEFAULT 30 NOT NULL,
+    status text DEFAULT 'active'::text NOT NULL,
+    notes text,
+    internal_notes text,
+    created_invoice_count integer DEFAULT 0 NOT NULL,
+    last_invoice_id uuid,
+    last_generated_at timestamp with time zone,
+    created_by_user_id uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT business_recurring_invoice_schedules_cadence_check CHECK ((((frequency = 'monthly'::text) AND (day_of_month IS NOT NULL) AND (day_of_week IS NULL)) OR ((frequency = 'weekly'::text) AND (day_of_week IS NOT NULL) AND (day_of_month IS NULL)))),
+    CONSTRAINT business_recurring_invoice_schedules_count_nonneg CHECK ((created_invoice_count >= 0)),
+    CONSTRAINT business_recurring_invoice_schedules_dom_range CHECK (((day_of_month IS NULL) OR ((day_of_month >= 1) AND (day_of_month <= 28)))),
+    CONSTRAINT business_recurring_invoice_schedules_dow_range CHECK (((day_of_week IS NULL) OR ((day_of_week >= 0) AND (day_of_week <= 6)))),
+    CONSTRAINT business_recurring_invoice_schedules_end_after_start CHECK (((end_date IS NULL) OR (end_date >= start_date))),
+    CONSTRAINT business_recurring_invoice_schedules_frequency_check CHECK ((frequency = ANY (ARRAY['weekly'::text, 'monthly'::text]))),
+    CONSTRAINT business_recurring_invoice_schedules_status_check CHECK ((status = ANY (ARRAY['active'::text, 'paused'::text, 'ended'::text]))),
+    CONSTRAINT business_recurring_invoice_schedules_terms_positive CHECK ((payment_terms_days > 0))
+);
+
+
+--
+-- Name: TABLE business_recurring_invoice_schedules; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.business_recurring_invoice_schedules IS 'S505 recurring invoice schedules. Cron generates a draft (or auto-sent) invoice each cycle by copying the lines template.';
+
+
+--
+-- Name: business_user_invitations; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.business_user_invitations (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    business_id uuid NOT NULL,
+    invited_by_user_id uuid NOT NULL,
+    token text NOT NULL,
+    email text NOT NULL,
+    staff_role text NOT NULL,
+    permissions jsonb DEFAULT '{}'::jsonb NOT NULL,
+    status text DEFAULT 'sent'::text NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    accepted_user_id uuid,
+    accepted_at timestamp with time zone,
+    cancelled_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT business_user_invitations_accepted_audit CHECK (((status <> 'accepted'::text) OR ((accepted_user_id IS NOT NULL) AND (accepted_at IS NOT NULL)))),
+    CONSTRAINT business_user_invitations_staff_role_check CHECK ((staff_role = ANY (ARRAY['manager'::text, 'dispatcher'::text, 'driver'::text, 'office'::text]))),
+    CONSTRAINT business_user_invitations_status_check CHECK ((status = ANY (ARRAY['sent'::text, 'accepted'::text, 'expired'::text, 'cancelled'::text])))
+);
+
+
+--
+-- Name: business_users; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.business_users (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    business_id uuid NOT NULL,
+    user_id uuid NOT NULL,
+    staff_role text NOT NULL,
+    permissions jsonb DEFAULT '{}'::jsonb NOT NULL,
+    status text DEFAULT 'active'::text NOT NULL,
+    invited_at timestamp with time zone,
+    accepted_at timestamp with time zone,
+    revoked_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT business_users_staff_role_check CHECK ((staff_role = ANY (ARRAY['manager'::text, 'dispatcher'::text, 'driver'::text, 'office'::text]))),
+    CONSTRAINT business_users_status_check CHECK ((status = ANY (ARRAY['active'::text, 'invited'::text, 'revoked'::text])))
+);
+
+
+--
+-- Name: COLUMN business_users.permissions; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.business_users.permissions IS 'S502 shape: JSON array of granted permission keys. Catalog + role-defaults live in packages/shared (BUSINESS_STAFF_PERMISSIONS / BUSINESS_STAFF_PERMISSIONS_BY_ROLE). API layer validates contents on PATCH against the catalog; no DB CHECK by design.';
+
+
+--
+-- Name: business_work_order_lines; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.business_work_order_lines (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    work_order_id uuid NOT NULL,
+    line_type text NOT NULL,
+    item_id uuid,
+    description text NOT NULL,
+    quantity numeric(10,2) NOT NULL,
+    unit_price numeric(10,2) NOT NULL,
+    tax_rate numeric(5,4) DEFAULT 0 NOT NULL,
+    line_subtotal numeric(10,2) NOT NULL,
+    line_tax numeric(10,2) DEFAULT 0 NOT NULL,
+    line_total numeric(10,2) NOT NULL,
+    sort_order integer DEFAULT 0 NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT business_work_order_lines_part_has_item CHECK ((((line_type = 'part'::text) AND (item_id IS NOT NULL)) OR ((line_type <> 'part'::text) AND (item_id IS NULL)))),
+    CONSTRAINT business_work_order_lines_price_nonneg CHECK ((unit_price >= (0)::numeric)),
+    CONSTRAINT business_work_order_lines_qty_positive CHECK ((quantity > (0)::numeric)),
+    CONSTRAINT business_work_order_lines_tax_range CHECK (((tax_rate >= (0)::numeric) AND (tax_rate < (1)::numeric))),
+    CONSTRAINT business_work_order_lines_type_check CHECK ((line_type = ANY (ARRAY['labor'::text, 'part'::text, 'fee'::text])))
+);
+
+
+--
+-- Name: TABLE business_work_order_lines; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.business_work_order_lines IS 'S498 work-order line items. line_type labor (hours × rate) | part (links to inventory + decrements stock on add) | fee (flat).';
+
+
+--
+-- Name: business_work_order_sequences; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.business_work_order_sequences (
+    business_id uuid NOT NULL,
+    next_number integer DEFAULT 1 NOT NULL,
+    CONSTRAINT business_work_order_sequences_next_positive CHECK ((next_number > 0))
+);
+
+
+--
+-- Name: business_work_orders; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.business_work_orders (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    business_id uuid NOT NULL,
+    wo_number text NOT NULL,
+    customer_id uuid NOT NULL,
+    vehicle_id uuid,
+    appointment_id uuid,
+    status text DEFAULT 'open'::text NOT NULL,
+    intake_mileage integer,
+    complaint text,
+    assigned_to_user_id uuid,
+    labor_subtotal numeric(10,2) DEFAULT 0 NOT NULL,
+    parts_subtotal numeric(10,2) DEFAULT 0 NOT NULL,
+    tax_amount numeric(10,2) DEFAULT 0 NOT NULL,
+    total_amount numeric(10,2) DEFAULT 0 NOT NULL,
+    completed_at timestamp with time zone,
+    closeout_mileage integer,
+    closeout_notes text,
+    cancelled_at timestamp with time zone,
+    cancel_reason text,
+    invoice_id uuid,
+    created_by_user_id uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    source_quote_id uuid,
+    CONSTRAINT business_work_orders_cancelled_consistency CHECK ((((status = 'cancelled'::text) AND (cancelled_at IS NOT NULL)) OR ((status <> 'cancelled'::text) AND (cancelled_at IS NULL)))),
+    CONSTRAINT business_work_orders_completed_consistency CHECK ((((status = 'completed'::text) AND (completed_at IS NOT NULL)) OR ((status <> 'completed'::text) AND (completed_at IS NULL)))),
+    CONSTRAINT business_work_orders_mileage_closeout_nonneg CHECK (((closeout_mileage IS NULL) OR (closeout_mileage >= 0))),
+    CONSTRAINT business_work_orders_mileage_intake_nonneg CHECK (((intake_mileage IS NULL) OR (intake_mileage >= 0))),
+    CONSTRAINT business_work_orders_money_nonneg CHECK (((labor_subtotal >= (0)::numeric) AND (parts_subtotal >= (0)::numeric) AND (tax_amount >= (0)::numeric) AND (total_amount >= (0)::numeric))),
+    CONSTRAINT business_work_orders_status_check CHECK ((status = ANY (ARRAY['open'::text, 'in_progress'::text, 'awaiting_parts'::text, 'completed'::text, 'cancelled'::text])))
+);
+
+
+--
+-- Name: TABLE business_work_orders; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.business_work_orders IS 'S498 mechanic-vertical work-order header. Customer + optional vehicle + status workflow. Convert-to-invoice creates a business_invoices row linked via invoice_id (and reverse via business_invoices.source_work_order_id).';
+
+
+--
+-- Name: businesses; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.businesses (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    owner_user_id uuid NOT NULL,
+    name text NOT NULL,
+    business_type text NOT NULL,
+    email text NOT NULL,
+    phone text,
+    street1 text,
+    street2 text,
+    city text,
+    state text,
+    zip text,
+    ein text,
+    stripe_connect_account_id text,
+    connect_payouts_enabled boolean DEFAULT false NOT NULL,
+    connect_details_submitted boolean DEFAULT false NOT NULL,
+    status text DEFAULT 'active'::text NOT NULL,
+    notes text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    enabled_features text[] DEFAULT '{}'::text[] NOT NULL,
+    default_tax_rate numeric(5,4) DEFAULT 0 NOT NULL,
+    tax_label text DEFAULT 'Sales Tax'::text NOT NULL,
+    public_booking_enabled boolean DEFAULT false NOT NULL,
+    public_booking_slug text,
+    public_booking_intro text,
+    business_hours jsonb DEFAULT '{}'::jsonb NOT NULL,
+    CONSTRAINT businesses_business_type_check CHECK ((business_type = ANY (ARRAY['trash_hauling'::text, 'maintenance_crew'::text, 'mobile_rental'::text, 'equipment_rental'::text, 'mini_market'::text, 'mechanic_stationary'::text, 'mechanic_mobile'::text, 'other'::text]))),
+    CONSTRAINT businesses_default_tax_rate_range CHECK (((default_tax_rate >= (0)::numeric) AND (default_tax_rate < (1)::numeric))),
+    CONSTRAINT businesses_enabled_features_check CHECK ((enabled_features <@ ARRAY['customers'::text, 'staff'::text, 'recurring_schedules'::text, 'appointments'::text, 'routing'::text, 'pos'::text, 'inventory'::text, 'work_orders'::text, 'customer_vehicles'::text, 'invoicing'::text, 'payments'::text, 'quotes'::text])),
+    CONSTRAINT businesses_public_booking_enabled_needs_slug CHECK (((public_booking_enabled = false) OR (public_booking_slug IS NOT NULL))),
+    CONSTRAINT businesses_public_booking_slug_format CHECK (((public_booking_slug IS NULL) OR ((public_booking_slug ~ '^[a-z0-9][a-z0-9-]{1,60}$'::text) AND (public_booking_slug !~ '--'::text)))),
+    CONSTRAINT businesses_status_check CHECK ((status = ANY (ARRAY['active'::text, 'suspended'::text, 'archived'::text])))
+);
+
+
+--
+-- Name: COLUMN businesses.default_tax_rate; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.businesses.default_tax_rate IS 'S506 default sales-tax rate applied to invoices + quotes + POS unless the customer is tax_exempt or the line has its own rate. Numeric 5,4 — store 0.0875 for 8.75%.';
+
+
+--
+-- Name: COLUMN businesses.public_booking_slug; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.businesses.public_booking_slug IS 'S507 URL-safe identifier used in /book/:slug. Lowercase a-z, digits, single hyphens; 2-61 chars; no leading hyphen, no consecutive hyphens.';
+
+
+--
+-- Name: COLUMN businesses.business_hours; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.businesses.business_hours IS 'S507 weekly hours map. Keys "0"-"6" (Sun-Sat) → {open, close} as HH:MM strings, or null for closed.';
+
+
+--
 -- Name: connect_disputes; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -1147,6 +1970,29 @@ COMMENT ON COLUMN public.deposit_returns.unpaid_balance_amount IS 'Sum of the au
 
 
 --
+-- Name: depots; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.depots (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    business_id uuid NOT NULL,
+    name text NOT NULL,
+    street1 text NOT NULL,
+    street2 text,
+    city text NOT NULL,
+    state text NOT NULL,
+    zip text NOT NULL,
+    lat numeric(10,7) NOT NULL,
+    lon numeric(10,7) NOT NULL,
+    notes text,
+    status text DEFAULT 'active'::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT depots_status_check CHECK ((status = ANY (ARRAY['active'::text, 'archived'::text])))
+);
+
+
+--
 -- Name: disbursements; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -1213,6 +2059,32 @@ CREATE TABLE public.documents (
     signed_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now(),
     CONSTRAINT documents_type_check CHECK ((type = ANY (ARRAY['lease'::text, 'addendum'::text, 'move_in_checklist'::text, 'move_out_checklist'::text, 'notice'::text, 'other'::text])))
+);
+
+
+--
+-- Name: dump_locations; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.dump_locations (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    business_id uuid NOT NULL,
+    name text NOT NULL,
+    street1 text NOT NULL,
+    street2 text,
+    city text NOT NULL,
+    state text NOT NULL,
+    zip text NOT NULL,
+    lat numeric(10,7) NOT NULL,
+    lon numeric(10,7) NOT NULL,
+    typical_dump_minutes integer DEFAULT 15 NOT NULL,
+    operating_hours text,
+    notes text,
+    status text DEFAULT 'active'::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT dump_locations_dump_minutes_positive CHECK ((typical_dump_minutes > 0)),
+    CONSTRAINT dump_locations_status_check CHECK ((status = ANY (ARRAY['active'::text, 'archived'::text])))
 );
 
 
@@ -1656,6 +2528,35 @@ CREATE TABLE public.float_account_state (
     apy numeric(5,4) DEFAULT 0.045 NOT NULL,
     monthly_interest numeric(10,2) DEFAULT 0,
     updated_at timestamp with time zone DEFAULT now()
+);
+
+
+--
+-- Name: generated_routes; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.generated_routes (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    business_id uuid NOT NULL,
+    vehicle_id uuid NOT NULL,
+    depot_id uuid NOT NULL,
+    generated_for_date date NOT NULL,
+    start_at_planned timestamp with time zone NOT NULL,
+    generated_by_user_id uuid,
+    status text DEFAULT 'generated'::text NOT NULL,
+    started_at timestamp with time zone,
+    completed_at timestamp with time zone,
+    total_miles numeric(10,2) NOT NULL,
+    total_minutes numeric(10,2) NOT NULL,
+    stop_count integer NOT NULL,
+    dump_count integer NOT NULL,
+    skipped_ungeocoded_count integer DEFAULT 0 NOT NULL,
+    notes text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT generated_routes_completed_audit CHECK (((status <> 'completed'::text) OR (completed_at IS NOT NULL))),
+    CONSTRAINT generated_routes_started_audit CHECK (((status = 'generated'::text) OR (started_at IS NOT NULL))),
+    CONSTRAINT generated_routes_status_check CHECK ((status = ANY (ARRAY['generated'::text, 'in_progress'::text, 'completed'::text])))
 );
 
 
@@ -3594,6 +4495,36 @@ CREATE TABLE public.purchase_requests (
 
 
 --
+-- Name: recurring_schedules; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.recurring_schedules (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    business_id uuid NOT NULL,
+    customer_id uuid NOT NULL,
+    created_by_user_id uuid,
+    service_type text NOT NULL,
+    rrule text NOT NULL,
+    time_of_day text NOT NULL,
+    start_date date NOT NULL,
+    end_date date,
+    default_duration_minutes integer DEFAULT 30 NOT NULL,
+    default_notes text,
+    status text DEFAULT 'active'::text NOT NULL,
+    paused_at timestamp with time zone,
+    paused_reason text,
+    last_materialized_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT recurring_schedules_duration_positive CHECK ((default_duration_minutes > 0)),
+    CONSTRAINT recurring_schedules_end_after_start CHECK (((end_date IS NULL) OR (end_date >= start_date))),
+    CONSTRAINT recurring_schedules_paused_audit CHECK (((status <> 'paused'::text) OR (paused_at IS NOT NULL))),
+    CONSTRAINT recurring_schedules_status_check CHECK ((status = ANY (ARRAY['active'::text, 'paused'::text, 'ended'::text]))),
+    CONSTRAINT recurring_schedules_time_of_day_format CHECK ((time_of_day ~ '^[0-2][0-9]:[0-5][0-9]$'::text))
+);
+
+
+--
 -- Name: reserve_fund_ledger; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -3622,6 +4553,33 @@ CREATE TABLE public.reserve_fund_state (
     monthly_contribution numeric(10,2) DEFAULT 0,
     updated_at timestamp with time zone DEFAULT now(),
     CONSTRAINT reserve_fund_state_phase_check CHECK ((phase = ANY (ARRAY[1, 2, 3])))
+);
+
+
+--
+-- Name: route_stops; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.route_stops (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    route_id uuid NOT NULL,
+    sequence_order integer NOT NULL,
+    stop_kind text NOT NULL,
+    appointment_id uuid,
+    dump_location_id uuid,
+    estimated_arrival timestamp with time zone NOT NULL,
+    estimated_departure timestamp with time zone,
+    actual_arrival timestamp with time zone,
+    actual_departure timestamp with time zone,
+    status text DEFAULT 'planned'::text NOT NULL,
+    driver_notes text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT route_stops_customer_ref CHECK (((stop_kind <> 'customer'::text) OR ((appointment_id IS NOT NULL) AND (dump_location_id IS NULL)))),
+    CONSTRAINT route_stops_depot_ref CHECK (((stop_kind <> 'depot_return'::text) OR ((appointment_id IS NULL) AND (dump_location_id IS NULL)))),
+    CONSTRAINT route_stops_dump_ref CHECK (((stop_kind <> 'dump'::text) OR ((dump_location_id IS NOT NULL) AND (appointment_id IS NULL)))),
+    CONSTRAINT route_stops_kind_check CHECK ((stop_kind = ANY (ARRAY['customer'::text, 'dump'::text, 'depot_return'::text]))),
+    CONSTRAINT route_stops_status_check CHECK ((status = ANY (ARRAY['planned'::text, 'completed'::text, 'skipped'::text])))
 );
 
 
@@ -3915,8 +4873,34 @@ CREATE TABLE public.state_law_section_texts (
     effective_year integer NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     search_tsv tsvector GENERATED ALWAYS AS (to_tsvector('english'::regconfig, ((COALESCE(section_title, ''::text) || ' '::text) || COALESCE(full_text, ''::text)))) STORED,
+    law_category text DEFAULT 'landlord_tenant'::text NOT NULL,
+    CONSTRAINT slst_law_category_check CHECK ((law_category = ANY (ARRAY['landlord_tenant'::text, 'conveyancing_title'::text, 'condo_coop'::text, 'broker_licensing'::text, 'mortgage_lien_foreclosure'::text, 'property_tax'::text, 'land_use_zoning'::text, 'environmental_disclosure'::text, 'general_real_property'::text]))),
     CONSTRAINT slst_state_check CHECK (((state_code = upper(state_code)) AND (length(state_code) = 2))),
     CONSTRAINT slst_year_check CHECK (((effective_year >= 2020) AND (effective_year <= 2100)))
+);
+
+
+--
+-- Name: state_property_tax_provisions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.state_property_tax_provisions (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    state_code text NOT NULL,
+    jurisdiction_level text DEFAULT 'state'::text NOT NULL,
+    topic text NOT NULL,
+    subtype text,
+    summary text NOT NULL,
+    params jsonb DEFAULT '{}'::jsonb NOT NULL,
+    statute_citation text,
+    source_url text,
+    source_date date NOT NULL,
+    effective_year integer NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT sptp_level_check CHECK ((jurisdiction_level = ANY (ARRAY['state'::text, 'county'::text, 'municipal'::text]))),
+    CONSTRAINT sptp_state_check CHECK (((state_code = upper(state_code)) AND (length(state_code) = 2))),
+    CONSTRAINT sptp_topic_check CHECK ((topic = ANY (ARRAY['exemption'::text, 'assessment'::text, 'assessment_appeal'::text, 'payment'::text, 'delinquency_redemption'::text]))),
+    CONSTRAINT sptp_year_check CHECK (((effective_year >= 2020) AND (effective_year <= 2100)))
 );
 
 
@@ -4475,7 +5459,7 @@ CREATE TABLE public.users (
     landlord_invite_token text,
     landlord_invite_expires_at timestamp with time zone,
     email_verify_token_expires_at timestamp with time zone,
-    CONSTRAINT users_role_check CHECK ((role = ANY (ARRAY['admin'::text, 'super_admin'::text, 'landlord'::text, 'tenant'::text, 'bookkeeper'::text, 'property_manager'::text, 'onsite_manager'::text, 'maintenance'::text])))
+    CONSTRAINT users_role_check CHECK ((role = ANY (ARRAY['admin'::text, 'super_admin'::text, 'landlord'::text, 'tenant'::text, 'bookkeeper'::text, 'property_manager'::text, 'onsite_manager'::text, 'maintenance'::text, 'business_owner'::text, 'business_staff'::text])))
 );
 
 
@@ -4606,6 +5590,43 @@ CREATE TABLE public.utility_meters (
 
 
 --
+-- Name: v_landlord_agent_interactions; Type: VIEW; Schema: public; Owner: -
+--
+
+CREATE VIEW public.v_landlord_agent_interactions AS
+ SELECT id,
+    conversation_id,
+    turn_index,
+    agent_type,
+    audience,
+    agent_name,
+    handled_by_tier,
+    outcome,
+    property_id,
+    landlord_id,
+    actor_user_id,
+    actor_role,
+    escalation_count,
+    escalated_to_human,
+    tool_invocation_count,
+    tool_names,
+    latency_ms,
+    prompt_tokens,
+    completion_tokens,
+    model,
+    grounded,
+    created_at
+   FROM public.agent_interaction_logs;
+
+
+--
+-- Name: VIEW v_landlord_agent_interactions; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON VIEW public.v_landlord_agent_interactions IS 'S480 landlord-facing agent_interaction_logs metadata-only view. Omits verbatim user_message / agent_reply / tool_invocations / human_handoff / error_detail / knowledge_chunk_ids / metadata / profile_id / actor_subject_id. Route-layer scoping must add landlord_id = actor.profileId.';
+
+
+--
 -- Name: v_lease_active_tenants; Type: VIEW; Schema: public; Owner: -
 --
 
@@ -4659,6 +5680,30 @@ CREATE VIEW public.v_unit_occupancy AS
            FROM (public.leases l
              JOIN public.lease_tenants lt ON ((lt.lease_id = l.id)))
           WHERE ((l.unit_id = u.id) AND (l.status = 'active'::text) AND (lt.status = 'active'::text))) counts ON (true));
+
+
+--
+-- Name: vehicles; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vehicles (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    business_id uuid NOT NULL,
+    home_depot_id uuid NOT NULL,
+    name text NOT NULL,
+    plate_or_id text,
+    stops_per_dump integer DEFAULT 50 NOT NULL,
+    avg_speed_mph integer DEFAULT 25 NOT NULL,
+    avg_service_minutes integer DEFAULT 3 NOT NULL,
+    status text DEFAULT 'active'::text NOT NULL,
+    notes text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT vehicles_service_minutes_positive CHECK ((avg_service_minutes > 0)),
+    CONSTRAINT vehicles_speed_positive CHECK ((avg_speed_mph > 0)),
+    CONSTRAINT vehicles_status_check CHECK ((status = ANY (ARRAY['active'::text, 'inactive'::text, 'archived'::text]))),
+    CONSTRAINT vehicles_stops_per_dump_positive CHECK ((stops_per_dump > 0))
+);
 
 
 --
@@ -4808,6 +5853,14 @@ ALTER TABLE ONLY public.application_pool
 
 
 --
+-- Name: appointments appointments_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.appointments
+    ADD CONSTRAINT appointments_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: audit_log audit_log_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -4925,6 +5978,286 @@ ALTER TABLE ONLY public.bulletin_votes
 
 ALTER TABLE ONLY public.bulletin_votes
     ADD CONSTRAINT bulletin_votes_post_id_tenant_id_key UNIQUE (post_id, tenant_id);
+
+
+--
+-- Name: business_attachments business_attachments_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_attachments
+    ADD CONSTRAINT business_attachments_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: business_bookable_services business_bookable_services_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_bookable_services
+    ADD CONSTRAINT business_bookable_services_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: business_customer_payment_update_tokens business_customer_payment_update_tokens_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_customer_payment_update_tokens
+    ADD CONSTRAINT business_customer_payment_update_tokens_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: business_customer_payment_update_tokens business_customer_payment_update_tokens_token_unique; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_customer_payment_update_tokens
+    ADD CONSTRAINT business_customer_payment_update_tokens_token_unique UNIQUE (token);
+
+
+--
+-- Name: business_customer_vehicles business_customer_vehicles_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_customer_vehicles
+    ADD CONSTRAINT business_customer_vehicles_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: business_customer_vehicles business_customer_vehicles_unique_vin; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_customer_vehicles
+    ADD CONSTRAINT business_customer_vehicles_unique_vin UNIQUE (business_id, vin);
+
+
+--
+-- Name: business_customers business_customers_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_customers
+    ADD CONSTRAINT business_customers_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: business_inventory_adjustments business_inventory_adjustments_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_inventory_adjustments
+    ADD CONSTRAINT business_inventory_adjustments_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: business_inventory_categories business_inventory_categories_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_inventory_categories
+    ADD CONSTRAINT business_inventory_categories_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: business_inventory_categories business_inventory_categories_unique_name; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_inventory_categories
+    ADD CONSTRAINT business_inventory_categories_unique_name UNIQUE (business_id, name);
+
+
+--
+-- Name: business_inventory_items business_inventory_items_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_inventory_items
+    ADD CONSTRAINT business_inventory_items_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: business_inventory_items business_inventory_items_unique_sku; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_inventory_items
+    ADD CONSTRAINT business_inventory_items_unique_sku UNIQUE (business_id, sku);
+
+
+--
+-- Name: business_invoice_lines business_invoice_lines_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_invoice_lines
+    ADD CONSTRAINT business_invoice_lines_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: business_invoice_sequences business_invoice_sequences_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_invoice_sequences
+    ADD CONSTRAINT business_invoice_sequences_pkey PRIMARY KEY (business_id);
+
+
+--
+-- Name: business_invoices business_invoices_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_invoices
+    ADD CONSTRAINT business_invoices_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: business_invoices business_invoices_unique_number; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_invoices
+    ADD CONSTRAINT business_invoices_unique_number UNIQUE (business_id, invoice_number);
+
+
+--
+-- Name: business_pos_sequences business_pos_sequences_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_pos_sequences
+    ADD CONSTRAINT business_pos_sequences_pkey PRIMARY KEY (business_id);
+
+
+--
+-- Name: business_pos_transaction_lines business_pos_transaction_lines_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_pos_transaction_lines
+    ADD CONSTRAINT business_pos_transaction_lines_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: business_pos_transactions business_pos_transactions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_pos_transactions
+    ADD CONSTRAINT business_pos_transactions_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: business_pos_transactions business_pos_transactions_unique_receipt; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_pos_transactions
+    ADD CONSTRAINT business_pos_transactions_unique_receipt UNIQUE (business_id, receipt_number);
+
+
+--
+-- Name: business_quote_lines business_quote_lines_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_quote_lines
+    ADD CONSTRAINT business_quote_lines_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: business_quote_sequences business_quote_sequences_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_quote_sequences
+    ADD CONSTRAINT business_quote_sequences_pkey PRIMARY KEY (business_id);
+
+
+--
+-- Name: business_quotes business_quotes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_quotes
+    ADD CONSTRAINT business_quotes_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: business_quotes business_quotes_unique_number; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_quotes
+    ADD CONSTRAINT business_quotes_unique_number UNIQUE (business_id, quote_number);
+
+
+--
+-- Name: business_recurring_invoice_lines business_recurring_invoice_lines_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_recurring_invoice_lines
+    ADD CONSTRAINT business_recurring_invoice_lines_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: business_recurring_invoice_schedules business_recurring_invoice_schedules_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_recurring_invoice_schedules
+    ADD CONSTRAINT business_recurring_invoice_schedules_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: business_user_invitations business_user_invitations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_user_invitations
+    ADD CONSTRAINT business_user_invitations_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: business_user_invitations business_user_invitations_token_unique; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_user_invitations
+    ADD CONSTRAINT business_user_invitations_token_unique UNIQUE (token);
+
+
+--
+-- Name: business_users business_users_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_users
+    ADD CONSTRAINT business_users_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: business_users business_users_unique_user_per_business; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_users
+    ADD CONSTRAINT business_users_unique_user_per_business UNIQUE (business_id, user_id);
+
+
+--
+-- Name: business_work_order_lines business_work_order_lines_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_work_order_lines
+    ADD CONSTRAINT business_work_order_lines_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: business_work_order_sequences business_work_order_sequences_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_work_order_sequences
+    ADD CONSTRAINT business_work_order_sequences_pkey PRIMARY KEY (business_id);
+
+
+--
+-- Name: business_work_orders business_work_orders_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_work_orders
+    ADD CONSTRAINT business_work_orders_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: business_work_orders business_work_orders_unique_number; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_work_orders
+    ADD CONSTRAINT business_work_orders_unique_number UNIQUE (business_id, wo_number);
+
+
+--
+-- Name: businesses businesses_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.businesses
+    ADD CONSTRAINT businesses_pkey PRIMARY KEY (id);
 
 
 --
@@ -5080,6 +6413,14 @@ ALTER TABLE ONLY public.deposit_returns
 
 
 --
+-- Name: depots depots_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.depots
+    ADD CONSTRAINT depots_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: disbursements disbursements_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -5101,6 +6442,14 @@ ALTER TABLE ONLY public.document_batches
 
 ALTER TABLE ONLY public.documents
     ADD CONSTRAINT documents_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: dump_locations dump_locations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.dump_locations
+    ADD CONSTRAINT dump_locations_pkey PRIMARY KEY (id);
 
 
 --
@@ -5309,6 +6658,14 @@ ALTER TABLE ONLY public.flexsuite_enrollment_acceptances
 
 ALTER TABLE ONLY public.float_account_state
     ADD CONSTRAINT float_account_state_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: generated_routes generated_routes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.generated_routes
+    ADD CONSTRAINT generated_routes_pkey PRIMARY KEY (id);
 
 
 --
@@ -6064,6 +7421,14 @@ ALTER TABLE ONLY public.purchase_requests
 
 
 --
+-- Name: recurring_schedules recurring_schedules_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.recurring_schedules
+    ADD CONSTRAINT recurring_schedules_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: reserve_fund_ledger reserve_fund_ledger_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -6077,6 +7442,22 @@ ALTER TABLE ONLY public.reserve_fund_ledger
 
 ALTER TABLE ONLY public.reserve_fund_state
     ADD CONSTRAINT reserve_fund_state_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: route_stops route_stops_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.route_stops
+    ADD CONSTRAINT route_stops_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: route_stops route_stops_unique_sequence; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.route_stops
+    ADD CONSTRAINT route_stops_unique_sequence UNIQUE (route_id, sequence_order);
 
 
 --
@@ -6189,6 +7570,14 @@ ALTER TABLE ONLY public.state_landlord_tenant_acts
 
 ALTER TABLE ONLY public.state_deposit_interest_rates
     ADD CONSTRAINT state_deposit_interest_rates_pkey PRIMARY KEY (state_code, effective_year);
+
+
+--
+-- Name: state_property_tax_provisions state_property_tax_provisions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.state_property_tax_provisions
+    ADD CONSTRAINT state_property_tax_provisions_pkey PRIMARY KEY (id);
 
 
 --
@@ -6480,6 +7869,14 @@ ALTER TABLE ONLY public.utility_meters
 
 
 --
+-- Name: vehicles vehicles_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vehicles
+    ADD CONSTRAINT vehicles_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: work_trade_agreements work_trade_agreements_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -6687,10 +8084,45 @@ CREATE INDEX idx_app_pool_user ON public.application_pool USING btree (user_id);
 
 
 --
+-- Name: idx_appointments_business_day; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_appointments_business_day ON public.appointments USING btree (business_id, scheduled_for) WHERE (status = 'scheduled'::text);
+
+
+--
+-- Name: idx_appointments_customer; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_appointments_customer ON public.appointments USING btree (customer_id, scheduled_for DESC);
+
+
+--
+-- Name: idx_appointments_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_appointments_status ON public.appointments USING btree (business_id, status, scheduled_for DESC);
+
+
+--
 -- Name: idx_audit_entity; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_audit_entity ON public.audit_log USING btree (entity_type, entity_id);
+
+
+--
+-- Name: idx_bcput_active_lookup; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_bcput_active_lookup ON public.business_customer_payment_update_tokens USING btree (token) WHERE (used_at IS NULL);
+
+
+--
+-- Name: idx_bcput_customer; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_bcput_customer ON public.business_customer_payment_update_tokens USING btree (customer_id, created_at DESC);
 
 
 --
@@ -6775,6 +8207,384 @@ CREATE INDEX idx_bp_created ON public.bulletin_posts USING btree (created_at);
 --
 
 CREATE INDEX idx_bp_property ON public.bulletin_posts USING btree (property_id);
+
+
+--
+-- Name: idx_brilines_schedule; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_brilines_schedule ON public.business_recurring_invoice_lines USING btree (schedule_id, sort_order);
+
+
+--
+-- Name: idx_brisched_business; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_brisched_business ON public.business_recurring_invoice_schedules USING btree (business_id, status, next_due_date);
+
+
+--
+-- Name: idx_brisched_cron_due; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_brisched_cron_due ON public.business_recurring_invoice_schedules USING btree (next_due_date) WHERE (status = 'active'::text);
+
+
+--
+-- Name: idx_brisched_customer; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_brisched_customer ON public.business_recurring_invoice_schedules USING btree (customer_id);
+
+
+--
+-- Name: idx_business_attachments_business; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_attachments_business ON public.business_attachments USING btree (business_id, created_at DESC);
+
+
+--
+-- Name: idx_business_attachments_entity; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_attachments_entity ON public.business_attachments USING btree (entity_type, entity_id, created_at DESC);
+
+
+--
+-- Name: idx_business_bookable_services_business; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_bookable_services_business ON public.business_bookable_services USING btree (business_id, is_active, sort_order);
+
+
+--
+-- Name: idx_business_customer_vehicles_business; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_customer_vehicles_business ON public.business_customer_vehicles USING btree (business_id, is_active);
+
+
+--
+-- Name: idx_business_customer_vehicles_customer; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_customer_vehicles_customer ON public.business_customer_vehicles USING btree (customer_id);
+
+
+--
+-- Name: idx_business_customer_vehicles_vin; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_customer_vehicles_vin ON public.business_customer_vehicles USING btree (vin) WHERE (vin IS NOT NULL);
+
+
+--
+-- Name: idx_business_customers_business; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_customers_business ON public.business_customers USING btree (business_id) WHERE (status = 'active'::text);
+
+
+--
+-- Name: idx_business_customers_email; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_customers_email ON public.business_customers USING btree (business_id, lower(email)) WHERE (email IS NOT NULL);
+
+
+--
+-- Name: idx_business_customers_geocoded; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_customers_geocoded ON public.business_customers USING btree (business_id) WHERE ((status = 'active'::text) AND (lat IS NOT NULL) AND (lon IS NOT NULL));
+
+
+--
+-- Name: idx_business_customers_stripe_customer_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_customers_stripe_customer_id ON public.business_customers USING btree (stripe_customer_id) WHERE (stripe_customer_id IS NOT NULL);
+
+
+--
+-- Name: idx_business_inventory_adjustments_business; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_inventory_adjustments_business ON public.business_inventory_adjustments USING btree (business_id, created_at DESC);
+
+
+--
+-- Name: idx_business_inventory_adjustments_item; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_inventory_adjustments_item ON public.business_inventory_adjustments USING btree (item_id, created_at DESC);
+
+
+--
+-- Name: idx_business_inventory_categories_business; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_inventory_categories_business ON public.business_inventory_categories USING btree (business_id, sort_order);
+
+
+--
+-- Name: idx_business_inventory_items_business; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_inventory_items_business ON public.business_inventory_items USING btree (business_id, is_active, name);
+
+
+--
+-- Name: idx_business_inventory_items_category; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_inventory_items_category ON public.business_inventory_items USING btree (category_id);
+
+
+--
+-- Name: idx_business_inventory_items_low_stock; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_inventory_items_low_stock ON public.business_inventory_items USING btree (business_id) WHERE ((is_active = true) AND (stock_qty <= stock_min) AND (stock_min > 0));
+
+
+--
+-- Name: idx_business_invoice_lines_invoice; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_invoice_lines_invoice ON public.business_invoice_lines USING btree (invoice_id, sort_order);
+
+
+--
+-- Name: idx_business_invoices_business; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_invoices_business ON public.business_invoices USING btree (business_id, created_at DESC);
+
+
+--
+-- Name: idx_business_invoices_customer; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_invoices_customer ON public.business_invoices USING btree (customer_id, created_at DESC);
+
+
+--
+-- Name: idx_business_invoices_source_quote; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_invoices_source_quote ON public.business_invoices USING btree (source_quote_id) WHERE (source_quote_id IS NOT NULL);
+
+
+--
+-- Name: idx_business_invoices_source_recurring; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_invoices_source_recurring ON public.business_invoices USING btree (source_recurring_schedule_id) WHERE (source_recurring_schedule_id IS NOT NULL);
+
+
+--
+-- Name: idx_business_invoices_source_wo; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_invoices_source_wo ON public.business_invoices USING btree (source_work_order_id) WHERE (source_work_order_id IS NOT NULL);
+
+
+--
+-- Name: idx_business_invoices_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_invoices_status ON public.business_invoices USING btree (business_id, status, due_date) WHERE (status = ANY (ARRAY['sent'::text, 'draft'::text]));
+
+
+--
+-- Name: idx_business_pos_transaction_lines_item; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_pos_transaction_lines_item ON public.business_pos_transaction_lines USING btree (item_id);
+
+
+--
+-- Name: idx_business_pos_transaction_lines_txn; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_pos_transaction_lines_txn ON public.business_pos_transaction_lines USING btree (transaction_id, sort_order);
+
+
+--
+-- Name: idx_business_pos_transactions_business; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_pos_transactions_business ON public.business_pos_transactions USING btree (business_id, created_at DESC);
+
+
+--
+-- Name: idx_business_pos_transactions_customer; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_pos_transactions_customer ON public.business_pos_transactions USING btree (customer_id) WHERE (customer_id IS NOT NULL);
+
+
+--
+-- Name: idx_business_quote_lines_quote; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_quote_lines_quote ON public.business_quote_lines USING btree (quote_id, sort_order);
+
+
+--
+-- Name: idx_business_quotes_business; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_quotes_business ON public.business_quotes USING btree (business_id, status, created_at DESC);
+
+
+--
+-- Name: idx_business_quotes_customer; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_quotes_customer ON public.business_quotes USING btree (customer_id);
+
+
+--
+-- Name: idx_business_quotes_expiring; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_quotes_expiring ON public.business_quotes USING btree (expires_at) WHERE ((status = 'sent'::text) AND (expires_at IS NOT NULL));
+
+
+--
+-- Name: idx_business_quotes_invoice; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_quotes_invoice ON public.business_quotes USING btree (invoice_id) WHERE (invoice_id IS NOT NULL);
+
+
+--
+-- Name: idx_business_quotes_vehicle; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_quotes_vehicle ON public.business_quotes USING btree (vehicle_id) WHERE (vehicle_id IS NOT NULL);
+
+
+--
+-- Name: idx_business_quotes_work_order; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_quotes_work_order ON public.business_quotes USING btree (work_order_id) WHERE (work_order_id IS NOT NULL);
+
+
+--
+-- Name: idx_business_user_invitations_business; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_user_invitations_business ON public.business_user_invitations USING btree (business_id, status) WHERE (status = 'sent'::text);
+
+
+--
+-- Name: idx_business_user_invitations_token; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_user_invitations_token ON public.business_user_invitations USING btree (token);
+
+
+--
+-- Name: idx_business_users_business; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_users_business ON public.business_users USING btree (business_id, staff_role) WHERE (status = 'active'::text);
+
+
+--
+-- Name: idx_business_users_user; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_users_user ON public.business_users USING btree (user_id) WHERE (status = 'active'::text);
+
+
+--
+-- Name: idx_business_work_order_lines_item; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_work_order_lines_item ON public.business_work_order_lines USING btree (item_id) WHERE (item_id IS NOT NULL);
+
+
+--
+-- Name: idx_business_work_order_lines_wo; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_work_order_lines_wo ON public.business_work_order_lines USING btree (work_order_id, sort_order);
+
+
+--
+-- Name: idx_business_work_orders_appointment; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_work_orders_appointment ON public.business_work_orders USING btree (appointment_id) WHERE (appointment_id IS NOT NULL);
+
+
+--
+-- Name: idx_business_work_orders_assigned; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_work_orders_assigned ON public.business_work_orders USING btree (assigned_to_user_id) WHERE (assigned_to_user_id IS NOT NULL);
+
+
+--
+-- Name: idx_business_work_orders_business; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_work_orders_business ON public.business_work_orders USING btree (business_id, status, created_at DESC);
+
+
+--
+-- Name: idx_business_work_orders_customer; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_work_orders_customer ON public.business_work_orders USING btree (customer_id);
+
+
+--
+-- Name: idx_business_work_orders_invoice; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_work_orders_invoice ON public.business_work_orders USING btree (invoice_id) WHERE (invoice_id IS NOT NULL);
+
+
+--
+-- Name: idx_business_work_orders_source_quote; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_work_orders_source_quote ON public.business_work_orders USING btree (source_quote_id) WHERE (source_quote_id IS NOT NULL);
+
+
+--
+-- Name: idx_business_work_orders_vehicle; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_work_orders_vehicle ON public.business_work_orders USING btree (vehicle_id) WHERE (vehicle_id IS NOT NULL);
+
+
+--
+-- Name: idx_businesses_owner; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_businesses_owner ON public.businesses USING btree (owner_user_id);
+
+
+--
+-- Name: idx_businesses_public_booking_slug; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX idx_businesses_public_booking_slug ON public.businesses USING btree (public_booking_slug) WHERE (public_booking_slug IS NOT NULL);
+
+
+--
+-- Name: idx_businesses_type; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_businesses_type ON public.businesses USING btree (business_type) WHERE (status = 'active'::text);
 
 
 --
@@ -6953,6 +8763,13 @@ CREATE INDEX idx_deposit_returns_tenant ON public.deposit_returns USING btree (t
 
 
 --
+-- Name: idx_depots_business; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_depots_business ON public.depots USING btree (business_id) WHERE (status = 'active'::text);
+
+
+--
 -- Name: idx_disbursements_bank_account; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -6985,6 +8802,13 @@ CREATE INDEX idx_disbursements_user ON public.disbursements USING btree (user_id
 --
 
 CREATE INDEX idx_document_batches_landlord ON public.document_batches USING btree (landlord_id);
+
+
+--
+-- Name: idx_dump_locations_business; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_dump_locations_business ON public.dump_locations USING btree (business_id) WHERE (status = 'active'::text);
 
 
 --
@@ -7265,6 +9089,27 @@ CREATE INDEX idx_flexpay_advances_tenant ON public.flexpay_advances USING btree 
 --
 
 CREATE INDEX idx_flexsuite_enrollment_acceptances_tenant ON public.flexsuite_enrollment_acceptances USING btree (tenant_id, product_type, accepted_at DESC);
+
+
+--
+-- Name: idx_generated_routes_business_date; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_generated_routes_business_date ON public.generated_routes USING btree (business_id, generated_for_date DESC);
+
+
+--
+-- Name: idx_generated_routes_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_generated_routes_status ON public.generated_routes USING btree (business_id, status) WHERE (status <> 'completed'::text);
+
+
+--
+-- Name: idx_generated_routes_vehicle_date; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_generated_routes_vehicle_date ON public.generated_routes USING btree (vehicle_id, generated_for_date DESC);
 
 
 --
@@ -8262,6 +10107,41 @@ CREATE INDEX idx_purchase_requests_work_order ON public.purchase_requests USING 
 
 
 --
+-- Name: idx_recurring_schedules_active; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_recurring_schedules_active ON public.recurring_schedules USING btree (id) WHERE (status = 'active'::text);
+
+
+--
+-- Name: idx_recurring_schedules_business; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_recurring_schedules_business ON public.recurring_schedules USING btree (business_id, status);
+
+
+--
+-- Name: idx_recurring_schedules_customer; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_recurring_schedules_customer ON public.recurring_schedules USING btree (customer_id, status);
+
+
+--
+-- Name: idx_route_stops_appointment; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_route_stops_appointment ON public.route_stops USING btree (appointment_id) WHERE (appointment_id IS NOT NULL);
+
+
+--
+-- Name: idx_route_stops_route; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_route_stops_route ON public.route_stops USING btree (route_id, sequence_order);
+
+
+--
 -- Name: idx_rvs_owner; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -8339,10 +10219,24 @@ CREATE INDEX idx_slst_search ON public.state_law_section_texts USING gin (search
 
 
 --
+-- Name: idx_slst_state_category; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_slst_state_category ON public.state_law_section_texts USING btree (state_code, law_category);
+
+
+--
 -- Name: idx_slta_lookup; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_slta_lookup ON public.state_landlord_tenant_acts USING btree (state_code, effective_year);
+
+
+--
+-- Name: idx_sptp_lookup; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_sptp_lookup ON public.state_property_tax_provisions USING btree (state_code, topic);
 
 
 --
@@ -8759,6 +10653,13 @@ CREATE INDEX idx_utility_meters_property_id ON public.utility_meters USING btree
 
 
 --
+-- Name: idx_vehicles_business; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_vehicles_business ON public.vehicles USING btree (business_id) WHERE (status = 'active'::text);
+
+
+--
 -- Name: idx_work_trade_agreements_landlord; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -8955,6 +10856,27 @@ CREATE UNIQUE INDEX shifts_one_open_per_user ON public.shifts USING btree (user_
 
 
 --
+-- Name: sptp_unique; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX sptp_unique ON public.state_property_tax_provisions USING btree (state_code, jurisdiction_level, topic, COALESCE(subtype, ''::text), effective_year);
+
+
+--
+-- Name: uniq_appointments_recurring_occurrence; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uniq_appointments_recurring_occurrence ON public.appointments USING btree (recurring_schedule_id, scheduled_for) WHERE (recurring_schedule_id IS NOT NULL);
+
+
+--
+-- Name: uniq_business_invoices_checkout_session; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uniq_business_invoices_checkout_session ON public.business_invoices USING btree (stripe_checkout_session_id) WHERE (stripe_checkout_session_id IS NOT NULL);
+
+
+--
 -- Name: ux_invoices_landlord_number; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -9067,10 +10989,101 @@ CREATE TRIGGER trg_application_pool_updated_at BEFORE UPDATE ON public.applicati
 
 
 --
+-- Name: appointments trg_appointments_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_appointments_updated_at BEFORE UPDATE ON public.appointments FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
 -- Name: background_checks trg_background_checks_updated_at; Type: TRIGGER; Schema: public; Owner: -
 --
 
 CREATE TRIGGER trg_background_checks_updated_at BEFORE UPDATE ON public.background_checks FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: business_recurring_invoice_schedules trg_brisched_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_brisched_updated_at BEFORE UPDATE ON public.business_recurring_invoice_schedules FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: business_bookable_services trg_business_bookable_services_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_business_bookable_services_updated_at BEFORE UPDATE ON public.business_bookable_services FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: business_customer_vehicles trg_business_customer_vehicles_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_business_customer_vehicles_updated_at BEFORE UPDATE ON public.business_customer_vehicles FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: business_customers trg_business_customers_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_business_customers_updated_at BEFORE UPDATE ON public.business_customers FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: business_inventory_items trg_business_inventory_items_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_business_inventory_items_updated_at BEFORE UPDATE ON public.business_inventory_items FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: business_invoices trg_business_invoices_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_business_invoices_updated_at BEFORE UPDATE ON public.business_invoices FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: business_pos_transactions trg_business_pos_transactions_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_business_pos_transactions_updated_at BEFORE UPDATE ON public.business_pos_transactions FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: business_quotes trg_business_quotes_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_business_quotes_updated_at BEFORE UPDATE ON public.business_quotes FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: business_user_invitations trg_business_user_invitations_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_business_user_invitations_updated_at BEFORE UPDATE ON public.business_user_invitations FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: business_users trg_business_users_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_business_users_updated_at BEFORE UPDATE ON public.business_users FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: business_work_orders trg_business_work_orders_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_business_work_orders_updated_at BEFORE UPDATE ON public.business_work_orders FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: businesses trg_businesses_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_businesses_updated_at BEFORE UPDATE ON public.businesses FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
 
 
 --
@@ -9081,10 +11094,31 @@ CREATE TRIGGER trg_deposits_updated_at BEFORE UPDATE ON public.security_deposits
 
 
 --
+-- Name: depots trg_depots_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_depots_updated_at BEFORE UPDATE ON public.depots FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: dump_locations trg_dump_locations_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_dump_locations_updated_at BEFORE UPDATE ON public.dump_locations FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
 -- Name: emergency_contacts trg_emergency_contacts_updated_at; Type: TRIGGER; Schema: public; Owner: -
 --
 
 CREATE TRIGGER trg_emergency_contacts_updated_at BEFORE UPDATE ON public.emergency_contacts FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: generated_routes trg_generated_routes_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_generated_routes_updated_at BEFORE UPDATE ON public.generated_routes FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
 
 
 --
@@ -9200,6 +11234,20 @@ CREATE TRIGGER trg_property_allocation_rules_updated_at BEFORE UPDATE ON public.
 
 
 --
+-- Name: recurring_schedules trg_recurring_schedules_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_recurring_schedules_updated_at BEFORE UPDATE ON public.recurring_schedules FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: route_stops trg_route_stops_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_route_stops_updated_at BEFORE UPDATE ON public.route_stops FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
 -- Name: rvs trg_rvs_updated_at; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -9246,6 +11294,13 @@ CREATE TRIGGER trg_user_bank_accounts_updated_at BEFORE UPDATE ON public.user_ba
 --
 
 CREATE TRIGGER trg_users_updated_at BEFORE UPDATE ON public.users FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: vehicles trg_vehicles_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_vehicles_updated_at BEFORE UPDATE ON public.vehicles FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
 
 
 --
@@ -9342,6 +11397,38 @@ ALTER TABLE ONLY public.application_pool
 
 ALTER TABLE ONLY public.application_pool
     ADD CONSTRAINT application_pool_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: appointments appointments_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.appointments
+    ADD CONSTRAINT appointments_business_id_fkey FOREIGN KEY (business_id) REFERENCES public.businesses(id) ON DELETE CASCADE;
+
+
+--
+-- Name: appointments appointments_created_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.appointments
+    ADD CONSTRAINT appointments_created_by_user_id_fkey FOREIGN KEY (created_by_user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: appointments appointments_customer_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.appointments
+    ADD CONSTRAINT appointments_customer_id_fkey FOREIGN KEY (customer_id) REFERENCES public.business_customers(id);
+
+
+--
+-- Name: appointments appointments_recurring_schedule_fk; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.appointments
+    ADD CONSTRAINT appointments_recurring_schedule_fk FOREIGN KEY (recurring_schedule_id) REFERENCES public.recurring_schedules(id) ON DELETE SET NULL;
 
 
 --
@@ -9542,6 +11629,494 @@ ALTER TABLE ONLY public.bulletin_votes
 
 ALTER TABLE ONLY public.bulletin_votes
     ADD CONSTRAINT bulletin_votes_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id) ON DELETE CASCADE;
+
+
+--
+-- Name: business_attachments business_attachments_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_attachments
+    ADD CONSTRAINT business_attachments_business_id_fkey FOREIGN KEY (business_id) REFERENCES public.businesses(id) ON DELETE CASCADE;
+
+
+--
+-- Name: business_attachments business_attachments_uploaded_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_attachments
+    ADD CONSTRAINT business_attachments_uploaded_by_user_id_fkey FOREIGN KEY (uploaded_by_user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: business_bookable_services business_bookable_services_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_bookable_services
+    ADD CONSTRAINT business_bookable_services_business_id_fkey FOREIGN KEY (business_id) REFERENCES public.businesses(id) ON DELETE CASCADE;
+
+
+--
+-- Name: business_customer_payment_update_tokens business_customer_payment_update_t_triggered_by_invoice_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_customer_payment_update_tokens
+    ADD CONSTRAINT business_customer_payment_update_t_triggered_by_invoice_id_fkey FOREIGN KEY (triggered_by_invoice_id) REFERENCES public.business_invoices(id) ON DELETE SET NULL;
+
+
+--
+-- Name: business_customer_payment_update_tokens business_customer_payment_update_tokens_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_customer_payment_update_tokens
+    ADD CONSTRAINT business_customer_payment_update_tokens_business_id_fkey FOREIGN KEY (business_id) REFERENCES public.businesses(id) ON DELETE CASCADE;
+
+
+--
+-- Name: business_customer_payment_update_tokens business_customer_payment_update_tokens_created_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_customer_payment_update_tokens
+    ADD CONSTRAINT business_customer_payment_update_tokens_created_by_user_id_fkey FOREIGN KEY (created_by_user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: business_customer_payment_update_tokens business_customer_payment_update_tokens_customer_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_customer_payment_update_tokens
+    ADD CONSTRAINT business_customer_payment_update_tokens_customer_id_fkey FOREIGN KEY (customer_id) REFERENCES public.business_customers(id) ON DELETE CASCADE;
+
+
+--
+-- Name: business_customer_vehicles business_customer_vehicles_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_customer_vehicles
+    ADD CONSTRAINT business_customer_vehicles_business_id_fkey FOREIGN KEY (business_id) REFERENCES public.businesses(id) ON DELETE CASCADE;
+
+
+--
+-- Name: business_customer_vehicles business_customer_vehicles_customer_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_customer_vehicles
+    ADD CONSTRAINT business_customer_vehicles_customer_id_fkey FOREIGN KEY (customer_id) REFERENCES public.business_customers(id) ON DELETE CASCADE;
+
+
+--
+-- Name: business_customers business_customers_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_customers
+    ADD CONSTRAINT business_customers_business_id_fkey FOREIGN KEY (business_id) REFERENCES public.businesses(id) ON DELETE CASCADE;
+
+
+--
+-- Name: business_customers business_customers_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_customers
+    ADD CONSTRAINT business_customers_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: business_inventory_adjustments business_inventory_adjustments_actor_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_inventory_adjustments
+    ADD CONSTRAINT business_inventory_adjustments_actor_user_id_fkey FOREIGN KEY (actor_user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: business_inventory_adjustments business_inventory_adjustments_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_inventory_adjustments
+    ADD CONSTRAINT business_inventory_adjustments_business_id_fkey FOREIGN KEY (business_id) REFERENCES public.businesses(id) ON DELETE CASCADE;
+
+
+--
+-- Name: business_inventory_adjustments business_inventory_adjustments_item_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_inventory_adjustments
+    ADD CONSTRAINT business_inventory_adjustments_item_id_fkey FOREIGN KEY (item_id) REFERENCES public.business_inventory_items(id) ON DELETE CASCADE;
+
+
+--
+-- Name: business_inventory_categories business_inventory_categories_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_inventory_categories
+    ADD CONSTRAINT business_inventory_categories_business_id_fkey FOREIGN KEY (business_id) REFERENCES public.businesses(id) ON DELETE CASCADE;
+
+
+--
+-- Name: business_inventory_items business_inventory_items_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_inventory_items
+    ADD CONSTRAINT business_inventory_items_business_id_fkey FOREIGN KEY (business_id) REFERENCES public.businesses(id) ON DELETE CASCADE;
+
+
+--
+-- Name: business_inventory_items business_inventory_items_category_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_inventory_items
+    ADD CONSTRAINT business_inventory_items_category_id_fkey FOREIGN KEY (category_id) REFERENCES public.business_inventory_categories(id) ON DELETE SET NULL;
+
+
+--
+-- Name: business_invoice_lines business_invoice_lines_invoice_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_invoice_lines
+    ADD CONSTRAINT business_invoice_lines_invoice_id_fkey FOREIGN KEY (invoice_id) REFERENCES public.business_invoices(id) ON DELETE CASCADE;
+
+
+--
+-- Name: business_invoice_sequences business_invoice_sequences_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_invoice_sequences
+    ADD CONSTRAINT business_invoice_sequences_business_id_fkey FOREIGN KEY (business_id) REFERENCES public.businesses(id) ON DELETE CASCADE;
+
+
+--
+-- Name: business_invoices business_invoices_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_invoices
+    ADD CONSTRAINT business_invoices_business_id_fkey FOREIGN KEY (business_id) REFERENCES public.businesses(id) ON DELETE CASCADE;
+
+
+--
+-- Name: business_invoices business_invoices_customer_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_invoices
+    ADD CONSTRAINT business_invoices_customer_id_fkey FOREIGN KEY (customer_id) REFERENCES public.business_customers(id);
+
+
+--
+-- Name: business_invoices business_invoices_source_quote_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_invoices
+    ADD CONSTRAINT business_invoices_source_quote_id_fkey FOREIGN KEY (source_quote_id) REFERENCES public.business_quotes(id) ON DELETE SET NULL;
+
+
+--
+-- Name: business_invoices business_invoices_source_recurring_schedule_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_invoices
+    ADD CONSTRAINT business_invoices_source_recurring_schedule_id_fkey FOREIGN KEY (source_recurring_schedule_id) REFERENCES public.business_recurring_invoice_schedules(id) ON DELETE SET NULL;
+
+
+--
+-- Name: business_invoices business_invoices_source_work_order_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_invoices
+    ADD CONSTRAINT business_invoices_source_work_order_id_fkey FOREIGN KEY (source_work_order_id) REFERENCES public.business_work_orders(id) ON DELETE SET NULL;
+
+
+--
+-- Name: business_pos_sequences business_pos_sequences_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_pos_sequences
+    ADD CONSTRAINT business_pos_sequences_business_id_fkey FOREIGN KEY (business_id) REFERENCES public.businesses(id) ON DELETE CASCADE;
+
+
+--
+-- Name: business_pos_transaction_lines business_pos_transaction_lines_item_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_pos_transaction_lines
+    ADD CONSTRAINT business_pos_transaction_lines_item_id_fkey FOREIGN KEY (item_id) REFERENCES public.business_inventory_items(id) ON DELETE CASCADE;
+
+
+--
+-- Name: business_pos_transaction_lines business_pos_transaction_lines_transaction_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_pos_transaction_lines
+    ADD CONSTRAINT business_pos_transaction_lines_transaction_id_fkey FOREIGN KEY (transaction_id) REFERENCES public.business_pos_transactions(id) ON DELETE CASCADE;
+
+
+--
+-- Name: business_pos_transactions business_pos_transactions_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_pos_transactions
+    ADD CONSTRAINT business_pos_transactions_business_id_fkey FOREIGN KEY (business_id) REFERENCES public.businesses(id) ON DELETE CASCADE;
+
+
+--
+-- Name: business_pos_transactions business_pos_transactions_cashier_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_pos_transactions
+    ADD CONSTRAINT business_pos_transactions_cashier_user_id_fkey FOREIGN KEY (cashier_user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: business_pos_transactions business_pos_transactions_customer_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_pos_transactions
+    ADD CONSTRAINT business_pos_transactions_customer_id_fkey FOREIGN KEY (customer_id) REFERENCES public.business_customers(id) ON DELETE SET NULL;
+
+
+--
+-- Name: business_quote_lines business_quote_lines_item_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_quote_lines
+    ADD CONSTRAINT business_quote_lines_item_id_fkey FOREIGN KEY (item_id) REFERENCES public.business_inventory_items(id) ON DELETE SET NULL;
+
+
+--
+-- Name: business_quote_lines business_quote_lines_quote_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_quote_lines
+    ADD CONSTRAINT business_quote_lines_quote_id_fkey FOREIGN KEY (quote_id) REFERENCES public.business_quotes(id) ON DELETE CASCADE;
+
+
+--
+-- Name: business_quote_sequences business_quote_sequences_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_quote_sequences
+    ADD CONSTRAINT business_quote_sequences_business_id_fkey FOREIGN KEY (business_id) REFERENCES public.businesses(id) ON DELETE CASCADE;
+
+
+--
+-- Name: business_quotes business_quotes_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_quotes
+    ADD CONSTRAINT business_quotes_business_id_fkey FOREIGN KEY (business_id) REFERENCES public.businesses(id) ON DELETE CASCADE;
+
+
+--
+-- Name: business_quotes business_quotes_created_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_quotes
+    ADD CONSTRAINT business_quotes_created_by_user_id_fkey FOREIGN KEY (created_by_user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: business_quotes business_quotes_customer_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_quotes
+    ADD CONSTRAINT business_quotes_customer_id_fkey FOREIGN KEY (customer_id) REFERENCES public.business_customers(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: business_quotes business_quotes_invoice_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_quotes
+    ADD CONSTRAINT business_quotes_invoice_id_fkey FOREIGN KEY (invoice_id) REFERENCES public.business_invoices(id) ON DELETE SET NULL;
+
+
+--
+-- Name: business_quotes business_quotes_vehicle_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_quotes
+    ADD CONSTRAINT business_quotes_vehicle_id_fkey FOREIGN KEY (vehicle_id) REFERENCES public.business_customer_vehicles(id) ON DELETE SET NULL;
+
+
+--
+-- Name: business_quotes business_quotes_work_order_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_quotes
+    ADD CONSTRAINT business_quotes_work_order_id_fkey FOREIGN KEY (work_order_id) REFERENCES public.business_work_orders(id) ON DELETE SET NULL;
+
+
+--
+-- Name: business_recurring_invoice_lines business_recurring_invoice_lines_schedule_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_recurring_invoice_lines
+    ADD CONSTRAINT business_recurring_invoice_lines_schedule_id_fkey FOREIGN KEY (schedule_id) REFERENCES public.business_recurring_invoice_schedules(id) ON DELETE CASCADE;
+
+
+--
+-- Name: business_recurring_invoice_schedules business_recurring_invoice_schedules_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_recurring_invoice_schedules
+    ADD CONSTRAINT business_recurring_invoice_schedules_business_id_fkey FOREIGN KEY (business_id) REFERENCES public.businesses(id) ON DELETE CASCADE;
+
+
+--
+-- Name: business_recurring_invoice_schedules business_recurring_invoice_schedules_created_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_recurring_invoice_schedules
+    ADD CONSTRAINT business_recurring_invoice_schedules_created_by_user_id_fkey FOREIGN KEY (created_by_user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: business_recurring_invoice_schedules business_recurring_invoice_schedules_customer_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_recurring_invoice_schedules
+    ADD CONSTRAINT business_recurring_invoice_schedules_customer_id_fkey FOREIGN KEY (customer_id) REFERENCES public.business_customers(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: business_recurring_invoice_schedules business_recurring_invoice_schedules_last_invoice_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_recurring_invoice_schedules
+    ADD CONSTRAINT business_recurring_invoice_schedules_last_invoice_id_fkey FOREIGN KEY (last_invoice_id) REFERENCES public.business_invoices(id) ON DELETE SET NULL;
+
+
+--
+-- Name: business_user_invitations business_user_invitations_accepted_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_user_invitations
+    ADD CONSTRAINT business_user_invitations_accepted_user_id_fkey FOREIGN KEY (accepted_user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: business_user_invitations business_user_invitations_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_user_invitations
+    ADD CONSTRAINT business_user_invitations_business_id_fkey FOREIGN KEY (business_id) REFERENCES public.businesses(id) ON DELETE CASCADE;
+
+
+--
+-- Name: business_user_invitations business_user_invitations_invited_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_user_invitations
+    ADD CONSTRAINT business_user_invitations_invited_by_user_id_fkey FOREIGN KEY (invited_by_user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: business_users business_users_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_users
+    ADD CONSTRAINT business_users_business_id_fkey FOREIGN KEY (business_id) REFERENCES public.businesses(id) ON DELETE CASCADE;
+
+
+--
+-- Name: business_users business_users_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_users
+    ADD CONSTRAINT business_users_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: business_work_order_lines business_work_order_lines_item_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_work_order_lines
+    ADD CONSTRAINT business_work_order_lines_item_id_fkey FOREIGN KEY (item_id) REFERENCES public.business_inventory_items(id) ON DELETE CASCADE;
+
+
+--
+-- Name: business_work_order_lines business_work_order_lines_work_order_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_work_order_lines
+    ADD CONSTRAINT business_work_order_lines_work_order_id_fkey FOREIGN KEY (work_order_id) REFERENCES public.business_work_orders(id) ON DELETE CASCADE;
+
+
+--
+-- Name: business_work_order_sequences business_work_order_sequences_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_work_order_sequences
+    ADD CONSTRAINT business_work_order_sequences_business_id_fkey FOREIGN KEY (business_id) REFERENCES public.businesses(id) ON DELETE CASCADE;
+
+
+--
+-- Name: business_work_orders business_work_orders_appointment_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_work_orders
+    ADD CONSTRAINT business_work_orders_appointment_id_fkey FOREIGN KEY (appointment_id) REFERENCES public.appointments(id) ON DELETE SET NULL;
+
+
+--
+-- Name: business_work_orders business_work_orders_assigned_to_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_work_orders
+    ADD CONSTRAINT business_work_orders_assigned_to_user_id_fkey FOREIGN KEY (assigned_to_user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: business_work_orders business_work_orders_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_work_orders
+    ADD CONSTRAINT business_work_orders_business_id_fkey FOREIGN KEY (business_id) REFERENCES public.businesses(id) ON DELETE CASCADE;
+
+
+--
+-- Name: business_work_orders business_work_orders_created_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_work_orders
+    ADD CONSTRAINT business_work_orders_created_by_user_id_fkey FOREIGN KEY (created_by_user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: business_work_orders business_work_orders_customer_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_work_orders
+    ADD CONSTRAINT business_work_orders_customer_id_fkey FOREIGN KEY (customer_id) REFERENCES public.business_customers(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: business_work_orders business_work_orders_invoice_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_work_orders
+    ADD CONSTRAINT business_work_orders_invoice_id_fkey FOREIGN KEY (invoice_id) REFERENCES public.business_invoices(id) ON DELETE SET NULL;
+
+
+--
+-- Name: business_work_orders business_work_orders_source_quote_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_work_orders
+    ADD CONSTRAINT business_work_orders_source_quote_id_fkey FOREIGN KEY (source_quote_id) REFERENCES public.business_quotes(id) ON DELETE SET NULL;
+
+
+--
+-- Name: business_work_orders business_work_orders_vehicle_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_work_orders
+    ADD CONSTRAINT business_work_orders_vehicle_id_fkey FOREIGN KEY (vehicle_id) REFERENCES public.business_customer_vehicles(id) ON DELETE SET NULL;
+
+
+--
+-- Name: businesses businesses_owner_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.businesses
+    ADD CONSTRAINT businesses_owner_user_id_fkey FOREIGN KEY (owner_user_id) REFERENCES public.users(id);
 
 
 --
@@ -9777,6 +12352,14 @@ ALTER TABLE ONLY public.deposit_returns
 
 
 --
+-- Name: depots depots_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.depots
+    ADD CONSTRAINT depots_business_id_fkey FOREIGN KEY (business_id) REFERENCES public.businesses(id) ON DELETE CASCADE;
+
+
+--
 -- Name: disbursements disbursements_bank_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -9854,6 +12437,14 @@ ALTER TABLE ONLY public.documents
 
 ALTER TABLE ONLY public.documents
     ADD CONSTRAINT documents_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id);
+
+
+--
+-- Name: dump_locations dump_locations_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.dump_locations
+    ADD CONSTRAINT dump_locations_business_id_fkey FOREIGN KEY (business_id) REFERENCES public.businesses(id) ON DELETE CASCADE;
 
 
 --
@@ -10150,6 +12741,38 @@ ALTER TABLE ONLY public.flexsuite_enrollment_acceptances
 
 ALTER TABLE ONLY public.flexsuite_enrollment_acceptances
     ADD CONSTRAINT flexsuite_enrollment_acceptances_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: generated_routes generated_routes_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.generated_routes
+    ADD CONSTRAINT generated_routes_business_id_fkey FOREIGN KEY (business_id) REFERENCES public.businesses(id) ON DELETE CASCADE;
+
+
+--
+-- Name: generated_routes generated_routes_depot_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.generated_routes
+    ADD CONSTRAINT generated_routes_depot_id_fkey FOREIGN KEY (depot_id) REFERENCES public.depots(id);
+
+
+--
+-- Name: generated_routes generated_routes_generated_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.generated_routes
+    ADD CONSTRAINT generated_routes_generated_by_user_id_fkey FOREIGN KEY (generated_by_user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: generated_routes generated_routes_vehicle_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.generated_routes
+    ADD CONSTRAINT generated_routes_vehicle_id_fkey FOREIGN KEY (vehicle_id) REFERENCES public.vehicles(id);
 
 
 --
@@ -11657,6 +14280,54 @@ ALTER TABLE ONLY public.purchase_requests
 
 
 --
+-- Name: recurring_schedules recurring_schedules_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.recurring_schedules
+    ADD CONSTRAINT recurring_schedules_business_id_fkey FOREIGN KEY (business_id) REFERENCES public.businesses(id) ON DELETE CASCADE;
+
+
+--
+-- Name: recurring_schedules recurring_schedules_created_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.recurring_schedules
+    ADD CONSTRAINT recurring_schedules_created_by_user_id_fkey FOREIGN KEY (created_by_user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: recurring_schedules recurring_schedules_customer_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.recurring_schedules
+    ADD CONSTRAINT recurring_schedules_customer_id_fkey FOREIGN KEY (customer_id) REFERENCES public.business_customers(id);
+
+
+--
+-- Name: route_stops route_stops_appointment_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.route_stops
+    ADD CONSTRAINT route_stops_appointment_id_fkey FOREIGN KEY (appointment_id) REFERENCES public.appointments(id);
+
+
+--
+-- Name: route_stops route_stops_dump_location_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.route_stops
+    ADD CONSTRAINT route_stops_dump_location_id_fkey FOREIGN KEY (dump_location_id) REFERENCES public.dump_locations(id);
+
+
+--
+-- Name: route_stops route_stops_route_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.route_stops
+    ADD CONSTRAINT route_stops_route_id_fkey FOREIGN KEY (route_id) REFERENCES public.generated_routes(id) ON DELETE CASCADE;
+
+
+--
 -- Name: rvs rvs_current_owner_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -12297,6 +14968,22 @@ ALTER TABLE ONLY public.utility_meters
 
 
 --
+-- Name: vehicles vehicles_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vehicles
+    ADD CONSTRAINT vehicles_business_id_fkey FOREIGN KEY (business_id) REFERENCES public.businesses(id) ON DELETE CASCADE;
+
+
+--
+-- Name: vehicles vehicles_home_depot_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vehicles
+    ADD CONSTRAINT vehicles_home_depot_id_fkey FOREIGN KEY (home_depot_id) REFERENCES public.depots(id);
+
+
+--
 -- Name: work_trade_agreements work_trade_agreements_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -12364,5 +15051,5 @@ ALTER TABLE ONLY public.work_trade_periods
 -- PostgreSQL database dump complete
 --
 
-\unrestrict P8lsRG5ev0VJk65MBOr7BiC5ccQRLTsKmMfT7PHUhiuFDPr0Cvmq7i29cCSMpQv
+\unrestrict rwZk6CNhw2PwEjUJqOeEl1xPOQaqi67uYFZxL13vUXhq9J2PPee3aWMyl5y21ZI
 

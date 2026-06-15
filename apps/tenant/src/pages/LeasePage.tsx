@@ -267,6 +267,60 @@ export function LeasePage() {
         </div>
       )}
 
+      {/* S483: state-law warnings on lease terms. Tenant sees the same
+          hedged factual notices the landlord saw at PATCH time;
+          completes the both-party transparency loop for lease terms
+          (S478 closed entry-requests). Recomputed server-side per
+          GET so they stay current as the catalog refreshes. */}
+      {Array.isArray(lease.stateLawWarnings) && lease.stateLawWarnings.length > 0 && (
+        <div style={{
+          background: 'rgba(245,158,11,.08)',
+          border: '1px solid rgba(245,158,11,.4)',
+          borderRadius: 10,
+          padding: '14px 18px',
+          marginBottom: 20,
+        }}>
+          <div style={{
+            display: 'flex', alignItems: 'center', gap: 8,
+            fontSize: '.7rem', fontWeight: 700,
+            color: 'var(--amber, #f59e0b)', textTransform: 'uppercase',
+            letterSpacing: '.06em', marginBottom: 10,
+          }}>
+            ⚠ Heads up — state-law check
+          </div>
+          {lease.stateLawWarnings.map((w: any, i: number) => (
+            <div key={i} style={{
+              marginBottom: i < lease.stateLawWarnings.length - 1 ? 14 : 0,
+            }}>
+              <div style={{ fontSize: '.85rem', color: 'var(--text-0)', lineHeight: 1.55, marginBottom: 6 }}>
+                {w.message}
+              </div>
+              <div style={{
+                fontSize: '.7rem', color: 'var(--text-3)',
+                display: 'flex', flexWrap: 'wrap', gap: 10,
+              }}>
+                {w.citation && <span>{w.citation}</span>}
+                {w.sourceUrl && (
+                  <a href={w.sourceUrl} target="_blank" rel="noreferrer"
+                    style={{ color: 'var(--amber, #f59e0b)', textDecoration: 'none' }}>
+                    source ↗
+                  </a>
+                )}
+                {w.sourceDate && <span>as of {String(w.sourceDate).slice(0, 10)}</span>}
+              </div>
+              {w.disclaimer && (
+                <div style={{
+                  fontSize: '.66rem', color: 'var(--text-3)',
+                  fontStyle: 'italic', marginTop: 6, lineHeight: 1.45,
+                }}>
+                  {w.disclaimer}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
       {/* Status banner */}
       {fullyExecuted ? (
         <div style={{ display:'flex', alignItems:'center', gap:10, padding:'12px 16px', background:'rgba(30,219,122,.08)', border:'1px solid rgba(30,219,122,.25)', borderRadius:10, marginBottom:20 }}>

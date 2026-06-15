@@ -4,6 +4,7 @@ import { Link, useNavigate } from 'react-router-dom'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
 import { Building2, Plus, MapPin, DoorOpen, Users, DollarSign, X, Check, Edit2, Landmark } from 'lucide-react'
 import { AddUnitModal } from './AddUnitModal'
+import { LawWarningBanner, type LawFlag } from '../components/LawWarningBanner'
 import { UNIT_TYPES, UNIT_TYPE_LABEL, UNIT_TYPE_PREFIX, UNIT_TYPE_ICON, UNIT_TYPE_HAS_BEDROOMS, UnitType, FEE_PAYER_VALUES, type FeePayer } from '@gam/shared'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
@@ -234,11 +235,16 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
   )
   const activeBankAccounts = bankAccounts.filter(b => b.status === 'active')
 
+  // S481: state-law warnings from property PATCH response. Empty on
+  // close-immediately path; populated when the backend surfaced a
+  // hedged factual mismatch (modal stays open with banner).
+  const [stateLawWarnings, setStateLawWarnings] = useState<LawFlag[]>([])
+
   const propMut = useMutation(
     async (data: any) => {
       if (isEdit) {
         // Property core fields PATCH
-        const propRes = await apiPatch(`/properties/${property.id}`, data)
+        const propRes = await apiPatch<any>(`/properties/${property.id}`, data)
         // S66 + S172: allocation-rule PATCH carries the editable fee_payer
         // toggles + payout bank account. Build a delta of just what
         // changed since unchanged values would no-op anyway.
@@ -266,7 +272,19 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
     {
       onSuccess: (res: any) => {
         qc.invalidateQueries('properties')
-        if (isEdit) { onClose(); return }
+        if (isEdit) {
+          // S481: hold modal open when the backend surfaced state-law
+          // warnings; save was committed regardless. apiPatch unwraps
+          // to r.data.data, so warnings sit at res.state_law_warnings.
+          const warnings: LawFlag[] = res?.state_law_warnings ?? []
+          if (warnings.length > 0) {
+            setStateLawWarnings(warnings)
+          } else {
+            setStateLawWarnings([])
+            onClose()
+          }
+          return
+        }
         const pid = res?.data?.id || res?.id
         if (pid && form.unitTypes.length > 0) {
           setCreatedPropId(pid)
@@ -901,11 +919,33 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
             </div>
           )}
 
+          {/* S481: state-law warning banner after successful save when
+              the backend flagged a hedged factual mismatch. The save
+              already committed; the modal stays open so the landlord
+              can read the notice before closing. */}
+          {stateLawWarnings.length > 0 && (
+            <div style={{ marginTop: 8 }}>
+              <LawWarningBanner warnings={stateLawWarnings} />
+              <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: -4, marginBottom: 8 }}>
+                Your changes were saved. The note above is informational —
+                no action required.
+              </div>
+            </div>
+          )}
+
           <div className="modal-footer">
-            <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
-            <button className="btn btn-primary" onClick={submitStep1} disabled={propMut.isLoading}>
-              {propMut.isLoading ? <span className="spinner" /> : <><Check size={14} /> {isEdit ? 'Save Changes' : form.unitTypes.length > 0 ? 'Next: Create Units →' : 'Add Property'}</>}
-            </button>
+            {stateLawWarnings.length > 0 ? (
+              <button className="btn btn-primary" onClick={onClose}>
+                <Check size={14} /> Got it, close
+              </button>
+            ) : (
+              <>
+                <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+                <button className="btn btn-primary" onClick={submitStep1} disabled={propMut.isLoading}>
+                  {propMut.isLoading ? <span className="spinner" /> : <><Check size={14} /> {isEdit ? 'Save Changes' : form.unitTypes.length > 0 ? 'Next: Create Units →' : 'Add Property'}</>}
+                </button>
+              </>
+            )}
           </div>
         </>}
 

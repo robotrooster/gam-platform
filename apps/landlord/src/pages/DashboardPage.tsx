@@ -3,7 +3,7 @@ import { useQuery } from 'react-query'
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
 import { apiGet } from '../lib/api'
 import { useNavigate } from 'react-router-dom'
-import { AlertTriangle, CheckCircle, TrendingUp, ArrowDownToLine, Clock, FileText, CreditCard, Wrench, ChevronRight } from 'lucide-react'
+import { AlertTriangle, CheckCircle, TrendingUp, ArrowDownToLine, Clock, FileText, CreditCard, Wrench, ChevronRight, Bot } from 'lucide-react'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
 interface DashStats {
@@ -262,8 +262,103 @@ export function DashboardPage() {
         </div>
       )}
 
+      {/* Agent Activity preview */}
+      <AgentActivityCard />
+
       {/* Bulletin Board */}
       <BulletinBoard />
+    </div>
+  )
+}
+
+// S482: agent-activity preview card. Reuses /api/landlord/agent-activity
+// (S480) for the 30-day rollup. Renders a 3-tile mini-summary +
+// "View all" deep link to the full AgentActivityPage. Hides itself
+// when the landlord has no agent traffic yet (pre-launch state).
+function AgentActivityCard() {
+  const navigate = useNavigate()
+  const { data, isLoading } = useQuery<{
+    days: number
+    totals: {
+      total: number
+      tenant_count: number
+      landlord_count: number
+      escalated_count: number
+      avg_latency_ms: number | null
+    }
+    by_agent: Array<{ agent_name: string; count: number }>
+  }>(
+    'dash-agent-activity',
+    () => apiGet('/landlord/agent-activity?days=30'),
+    { retry: false },
+  )
+
+  if (isLoading || !data) return null
+  if (data.totals.total === 0) return null
+
+  return (
+    <div className="card mt-16">
+      <div className="card-header" style={{ display: 'flex', justifyContent: 'space-between' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <Bot size={16} style={{ color: 'var(--gold)' }} />
+          <span className="card-title">Agent Activity</span>
+          <span style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>last 30 days</span>
+        </div>
+        <button
+          onClick={() => navigate('/agent-activity')}
+          className="btn btn-ghost btn-sm"
+          style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}
+        >
+          View all <ChevronRight size={12} />
+        </button>
+      </div>
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: 'repeat(3, 1fr)',
+        gap: 12,
+        padding: '8px 0',
+      }}>
+        <div>
+          <div style={{ fontSize: '.7rem', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 4 }}>
+            Conversations
+          </div>
+          <div style={{ fontSize: '1.5rem', fontWeight: 700, color: 'var(--gold)' }}>
+            {data.totals.total}
+          </div>
+          <div style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>
+            {data.totals.tenant_count} tenant · {data.totals.landlord_count} you
+          </div>
+        </div>
+        <div>
+          <div style={{ fontSize: '.7rem', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 4 }}>
+            Escalated
+          </div>
+          <div style={{
+            fontSize: '1.5rem', fontWeight: 700,
+            color: data.totals.escalated_count > 0 ? 'var(--amber)' : 'var(--text-1)',
+          }}>
+            {data.totals.escalated_count}
+          </div>
+          <div style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>
+            {data.totals.total > 0
+              ? `${Math.round((data.totals.escalated_count / data.totals.total) * 100)}% of total`
+              : '—'}
+          </div>
+        </div>
+        <div>
+          <div style={{ fontSize: '.7rem', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 4 }}>
+            Top agent
+          </div>
+          <div style={{ fontSize: '1.5rem', fontWeight: 700, color: 'var(--text-0)' }}>
+            {data.by_agent[0]?.agent_name ?? '—'}
+          </div>
+          <div style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>
+            {data.by_agent[0]
+              ? `${data.by_agent[0].count} conversation${data.by_agent[0].count === 1 ? '' : 's'}`
+              : 'no agent traffic yet'}
+          </div>
+        </div>
+      </div>
     </div>
   )
 }

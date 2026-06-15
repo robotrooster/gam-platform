@@ -2187,8 +2187,12 @@ describe('POST /sign/:documentId — sublease_agreement completion', () => {
     expect(sub.rows[0].status).toBe('active')
     expect(sub.rows[0].sublease_document_url).toBe('/api/esign/files/sublease-base.pdf')
     expect(sub.rows[0].landlord_consent_date).toBeTruthy()
-    // landlord_consent_date is set via CURRENT_DATE → today
-    const today = new Date().toISOString().slice(0, 10)
+    // landlord_consent_date is set via CURRENT_DATE — pull "today"
+    // from the DB so the assertion uses the same timezone the column
+    // was stamped in (avoids a UTC-vs-local boundary flake when the
+    // local clock straddles UTC midnight; pre-S454 used `new Date()`).
+    const { rows: [{ today }] } = await db.query<{ today: string }>(
+      `SELECT CURRENT_DATE::text AS today`)
     expect(new Date(sub.rows[0].landlord_consent_date!).toISOString().slice(0, 10)).toBe(today)
 
     // Doc flips completed

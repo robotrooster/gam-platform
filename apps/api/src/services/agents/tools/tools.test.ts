@@ -7,6 +7,7 @@
 import { vi, describe, it, expect, beforeEach } from 'vitest'
 
 vi.mock('../../../db', () => ({ query: vi.fn(), queryOne: vi.fn() }))
+vi.mock('../../../db/propertiesDb', () => ({ queryProperties: vi.fn() }))
 vi.mock('../../maintenanceRequests', () => ({ createMaintenanceRequest: vi.fn() }))
 vi.mock('../../notifications', () => ({ createNotification: vi.fn(), notifyMaintenanceUpdated: vi.fn() }))
 
@@ -40,6 +41,12 @@ import { getMyEntryRequests } from './getMyEntryRequests'
 import { getMyLandlordPatterns } from './getMyLandlordPatterns'
 import { getApplicableLaws } from './getApplicableLaws'
 import { searchStateLaw } from './searchStateLaw'
+import { searchRealEstateLaw } from './searchRealEstateLaw'
+import { getPropertyTaxFacts } from './getPropertyTaxFacts'
+import { searchParcelsTool } from './searchParcels'
+import { getMarketRentTool } from './getMarketRent'
+import { getMyLandlordRenewalTendency } from './getMyLandlordRenewalTendency'
+import { queryProperties } from '../../../db/propertiesDb'
 import { checkAgainstLaw } from './checkAgainstLaw'
 import { messageTenant } from './messageTenant'
 import { getMyDeposit } from './getMyDeposit'
@@ -805,7 +812,7 @@ describe('search_state_law (full-text statute search, both audiences)', () => {
     ])
     const res: any = await searchStateLaw.execute({ query: 'what happens to abandoned property' }, TENANT_ACTOR)
     expect(mockQueryOne.mock.calls[0][1]).toEqual(['t1']) // lease scoped to tenant
-    expect((query as any).mock.calls[0][1]).toEqual(['AZ', 'what happens to abandoned property', 4]) // FTS scoped to state
+    expect((query as any).mock.calls[0][1]).toEqual(['AZ', 'what happens to abandoned property', 4, 'landlord_tenant']) // FTS scoped to state + category
     expect(res.results[0]).toMatchObject({ citation: 'A.R.S. § 33-1370', section: '33-1370' })
     expect(res.disclaimer).toMatch(/not legal advice/i)
   })
@@ -825,6 +832,142 @@ describe('search_state_law (full-text statute search, both audiences)', () => {
     expect(res.ok).toBe(true)
     expect(res.results).toEqual([])
     expect(res.note).toMatch(/couldn’t find/i)
+  })
+})
+
+describe('search_real_estate_law (broad real-estate corpus, both audiences)', () => {
+  beforeEach(() => { vi.clearAllMocks() })
+
+  it('landlord: cross-category search labels each hit with its area', async () => {
+    ;(query as any).mockResolvedValueOnce([
+      { law_category: 'conveyancing_title', act_key: 'conveyancing_title', section_number: '1058.5', section_title: 'Recording', full_text: 'A deed may be recorded...', source_url: 'u', source_date: '2026-06-14', rank: 0.6 },
+      { law_category: 'property_tax', act_key: 'property_tax', section_number: '3708.1', section_title: 'Tax deed', full_text: 'text', source_url: 'u', source_date: '2026-06-14', rank: 0.3 },
+    ])
+    const res: any = await searchRealEstateLaw.execute({ query: 'how do I record a deed', state: 'ca' }, LANDLORD_ACTOR)
+    expect((query as any).mock.calls[0][1][0]).toBe('CA') // uppercased
+    expect(res.results).toHaveLength(2)
+    expect(res.results[0]).toMatchObject({ area: 'deeds & conveyancing', section: '1058.5' })
+    expect(res.results[1].area).toBe('property tax')
+    expect(res.disclaimer).toMatch(/not legal advice/i)
+  })
+
+  it('defers on a stubbed area (zoning) without searching', async () => {
+    const res: any = await searchRealEstateLaw.execute({ query: 'zoning variance setback', state: 'OH' }, LANDLORD_ACTOR)
+    expect(res.results).toEqual([])
+    expect(res.note).toMatch(/zoning & land-use/i)
+    expect(query as any).not.toHaveBeenCalled()
+  })
+})
+
+describe('get_property_tax_facts (structured figures, both audiences)', () => {
+  beforeEach(() => { vi.clearAllMocks() })
+
+  it('landlord: returns structured facts with citation + locally_set flag', async () => {
+    ;(query as any).mockResolvedValueOnce([
+      { topic: 'exemption', subtype: 'senior', summary: 'Owners 65+ may get up to 50% off', params: { age_min: 65, locally_variable: true }, statute_citation: 'N.Y. Real Prop. Tax Law § 467', source_url: 'u', source_date: '2026-06-14', effective_year: 2026 },
+      { topic: 'assessment_appeal', subtype: null, summary: 'Grievance day is 4th Tue in May', params: { deadline_desc: 'fourth Tuesday in May', locally_variable: true }, statute_citation: 'N.Y. Real Prop. Tax Law § 512', source_url: 'u', source_date: '2026-06-14', effective_year: 2026 },
+    ])
+    const res: any = await getPropertyTaxFacts.execute({ state: 'ny' }, LANDLORD_ACTOR)
+    expect((query as any).mock.calls[0][1]).toEqual(['NY'])
+    expect(res.facts).toHaveLength(2)
+    expect(res.facts[0]).toMatchObject({ area: 'exemption', subtype: 'senior', locally_set: true, citation: 'N.Y. Real Prop. Tax Law § 467' })
+    expect(res.facts[1].area).toBe('assessment appeal / grievance')
+    expect(res.disclaimer).toMatch(/not legal advice/i)
+  })
+
+  it('clean note when the state has no property-tax facts on file', async () => {
+    ;(query as any).mockResolvedValueOnce([])
+    const res: any = await getPropertyTaxFacts.execute({ state: 'ZZ' }, LANDLORD_ACTOR)
+    expect(res.facts).toEqual([])
+    expect(res.note).toMatch(/doesn’t have structured property-tax facts/i)
+  })
+})
+
+describe('search_parcels (county parcel records, landlord audience)', () => {
+  beforeEach(() => { vi.clearAllMocks() })
+
+  it('landlord: text search returns parcel summaries with the public-record note', async () => {
+    ;(queryProperties as any).mockResolvedValueOnce([
+      { apn: '11221014D', county: 'Maricopa', state: 'AZ', situs_address: '100 W WASHINGTON ST', situs_city: 'PHOENIX', owner_name: 'PHOENIX CITY OF', assessed_value: 53332121 },
+    ])
+    const res: any = await searchParcelsTool.execute({ query: '100 W Washington', state: 'az' }, LANDLORD_ACTOR)
+    expect((queryProperties as any).mock.calls[0][1]).toContain('AZ') // state uppercased + passed
+    expect(res.results).toHaveLength(1)
+    expect(res.results[0]).toMatchObject({ apn: '11221014D', owner_name: 'PHOENIX CITY OF' })
+    expect(res.note).toMatch(/public county-assessor records/i)
+  })
+
+  it('clean note when no parcel matches', async () => {
+    ;(queryProperties as any).mockResolvedValueOnce([])
+    const res: any = await searchParcelsTool.execute({ query: 'zzz nowhere' }, LANDLORD_ACTOR)
+    expect(res.results).toEqual([])
+    expect(res.note).toMatch(/no parcel on file/i)
+  })
+
+  it('is landlord-only (not on tenant profiles)', () => {
+    const ll = getToolsForProfile(requireProfile('landlord_entry')).map((x) => x.name)
+    const tn = getToolsForProfile(requireProfile('tenant_entry')).map((x) => x.name)
+    expect(ll).toContain('search_parcels')
+    expect(tn).not.toContain('search_parcels')
+  })
+})
+
+describe('get_market_rent (anonymized aggregate, landlord audience)', () => {
+  beforeEach(() => { vi.clearAllMocks() })
+
+  it('landlord: returns the market band + position, excluding self from the aggregate', async () => {
+    ;(query as any).mockResolvedValueOnce([
+      { unit_type: 'apartment', city: 'Phoenix', state: 'AZ', n_leases: '40', n_landlords: '9', median_rent: '1500', p25_rent: '1350', p75_rent: '1700' },
+    ])
+    const res: any = await getMarketRentTool.execute({ unit_type: 'apartment', city: 'Phoenix', state: 'az', your_rent: 1250 }, LANDLORD_ACTOR)
+    // exclude-self: the asking landlord id is passed as the 4th query param
+    expect((query as any).mock.calls[0][1][3]).toBe('L1')
+    expect(res.market).toMatchObject({ median_rent: 1500, typical_range: { low: 1350, high: 1700 } })
+    expect(res.position).toBe('below')
+    expect(res.note).toMatch(/anonymized aggregate/i)
+  })
+
+  it('too-thin market (below the k-anonymity threshold) → no figure', async () => {
+    ;(query as any).mockResolvedValueOnce([]) // HAVING COUNT(DISTINCT landlord) >= k filtered it out
+    const res: any = await getMarketRentTool.execute({ unit_type: 'mobile_home', city: 'Tinytown', state: 'AZ' }, LANDLORD_ACTOR)
+    expect(res.market).toBeNull()
+    expect(res.note).toMatch(/enough .* rent data/i)
+  })
+
+  it('is landlord-only', () => {
+    expect(getToolsForProfile(requireProfile('landlord_entry')).map((x) => x.name)).toContain('get_market_rent')
+    expect(getToolsForProfile(requireProfile('tenant_entry')).map((x) => x.name)).not.toContain('get_market_rent')
+  })
+})
+
+describe('get_my_landlord_renewal_tendency (tenant transparency)', () => {
+  beforeEach(() => { vi.clearAllMocks() })
+
+  it('tenant: returns the landlord renewal pattern (aggregate) when enough history', async () => {
+    mockQueryOne.mockResolvedValueOnce({ landlord_id: 'LL9' }) // resolved from tenant's lease
+    ;(query as any).mockResolvedValueOnce([
+      { renewal_count: '5', median_increase_pct: '8.0', avg_increase_pct: '9.2', ended_count: '4', not_renewed_count: '1' },
+    ])
+    const res: any = await getMyLandlordRenewalTendency.execute({}, TENANT_ACTOR)
+    expect(mockQueryOne.mock.calls[0][1]).toEqual(['t1']) // scoped to the tenant
+    expect((query as any).mock.calls[0][1]).toEqual(['LL9']) // aggregate scoped to their landlord
+    expect(res.renewal_tendency).toMatchObject({ typical_increase_pct: 8, based_on_renewals: 5, non_renewal_rate_pct: 25 })
+    expect(res.note).toMatch(/doesn’t identify any other tenant/i)
+  })
+
+  it('min-count gate: too little history → no figure', async () => {
+    mockQueryOne.mockResolvedValueOnce({ landlord_id: 'LL9' })
+    ;(query as any).mockResolvedValueOnce([
+      { renewal_count: '1', median_increase_pct: '10', avg_increase_pct: '10', ended_count: '1', not_renewed_count: '0' },
+    ])
+    const res: any = await getMyLandlordRenewalTendency.execute({}, TENANT_ACTOR)
+    expect(res.renewal_tendency).toBeNull()
+    expect(res.note).toMatch(/enough renewal history/i)
+  })
+
+  it('is tenant-only', () => {
+    expect(getToolsForProfile(requireProfile('tenant_entry')).map((x) => x.name)).toContain('get_my_landlord_renewal_tendency')
+    expect(getToolsForProfile(requireProfile('landlord_entry')).map((x) => x.name)).not.toContain('get_my_landlord_renewal_tendency')
   })
 })
 

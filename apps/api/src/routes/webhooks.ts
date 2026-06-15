@@ -735,6 +735,92 @@ webhooksRouter.post('/stripe', async (req, res) => {
       }
       break
     }
+
+    // S494: business-invoice customer-pay completion. Stripe Checkout
+    // Sessions fire this when the customer finishes the hosted-pay
+    // flow. We match on the session id we stored at send time, mark
+    // the invoice paid, and stamp the PaymentIntent id for audit.
+    case 'checkout.session.completed': {
+      const session = event.data.object as Stripe.Checkout.Session
+      if (session.metadata?.gam_purpose !== 'business_invoice') {
+        // Not ours — fall through silently.
+        break
+      }
+      const piId = typeof session.payment_intent === 'string'
+        ? session.payment_intent
+        : session.payment_intent?.id ?? null
+      const amountPaid = Number(session.amount_total ?? 0) / 100
+      try {
+        const r = await query<{ id: string; customer_id: string }>(
+          `UPDATE business_invoices
+              SET status                    = 'paid',
+                  paid_at                   = NOW(),
+                  sent_at                   = COALESCE(sent_at, NOW()),
+                  amount_paid               = $3,
+                  payment_method            = 'card',
+                  stripe_payment_intent_id  = $2
+            WHERE stripe_checkout_session_id = $1
+              AND status IN ('draft', 'sent')
+            RETURNING id, customer_id`,
+          [session.id, piId, amountPaid],
+        )
+        if (r.length === 0) {
+          logger.warn({ session_id: session.id },
+            '[webhook] checkout.session.completed: no matching draft/sent business_invoice')
+          break
+        }
+
+        // S508: persist saved card to the customer row if Stripe attached
+        // a Customer + saved a PM. Pull PM details (brand, last4, expiry)
+        // for the UI indicator.
+        const stripeCustomerId = typeof session.customer === 'string'
+          ? session.customer
+          : session.customer?.id ?? null
+        if (stripeCustomerId && piId) {
+          try {
+            const pi = await stripe.paymentIntents.retrieve(piId)
+            const pmId = typeof pi.payment_method === 'string'
+              ? pi.payment_method
+              : pi.payment_method?.id ?? null
+            if (pmId) {
+              const pm = await stripe.paymentMethods.retrieve(pmId)
+              const card = pm.card
+              await query(
+                `UPDATE business_customers
+                    SET stripe_customer_id        = $1,
+                        default_payment_method_id = $2,
+                        payment_method_brand      = $3,
+                        payment_method_last4      = $4,
+                        payment_method_exp_month  = $5,
+                        payment_method_exp_year   = $6
+                  WHERE id = $7`,
+                [stripeCustomerId, pmId,
+                 card?.brand ?? null,
+                 card?.last4 ?? null,
+                 card?.exp_month ?? null,
+                 card?.exp_year ?? null,
+                 r[0]!.customer_id])
+              logger.info({
+                customer_id: r[0]!.customer_id,
+                stripe_customer_id: stripeCustomerId,
+                pm_brand: card?.brand,
+              }, '[S508] saved payment method on business_customer')
+            }
+          } catch (e) {
+            // Don't fail the webhook — the invoice is already marked
+            // paid. Just log and the saved-PM slot stays empty until
+            // the next payment.
+            logger.error({ err: e, session_id: session.id },
+              '[S508] saved-PM persist failed')
+          }
+        }
+      } catch (e) {
+        logger.error({ err: e, session_id: session.id },
+          'webhook checkout.session.completed (business invoice) failed')
+        return res.status(500).json({ error: 'webhook handler failed' })
+      }
+      break
+    }
   }
 
   res.json({ received: true })

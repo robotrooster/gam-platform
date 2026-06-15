@@ -9,6 +9,7 @@ import { canAccessLandlordResource, canManageLandlordResource } from '../middlew
 import { AppError } from '../middleware/errorHandler'
 import { resolveUploadPath } from '../lib/uploadPaths'
 import { logger } from '../lib/logger'
+import { checkLeaseAgainstStateLaw, type LawFlag } from '../services/stateLaw'
 
 export const leasesRouter = Router()
 leasesRouter.use(requireAuth)
@@ -689,7 +690,37 @@ leasesRouter.patch('/:id', requirePerm('leases.create', 'leases.terminate'), asy
     if (updated) {
       updated.tenants = await fetchLeaseTenants(updated.id)
     }
-    res.json({ success: true, data: updated })
+
+    // S476 + S483: state-law mismatches against the property state.
+    // Only fields TOUCHED in this PATCH get checked — landlord sees a
+    // hedged factual notice when they ACT, not on every read. Returns
+    // empty array when within range, uncatalogued, or non-directional.
+    // Shared helper with tenant GET /lease (S483) so both surfaces
+    // render identical warnings.
+    let stateLawWarnings: LawFlag[] = []
+    try {
+      const propState = await queryOne<{ state: string | null }>(
+        `SELECT p.state FROM units u JOIN properties p ON p.id = u.property_id WHERE u.id = $1`,
+        [lease.unit_id])
+      stateLawWarnings = await checkLeaseAgainstStateLaw({
+        stateCode:             propState?.state,
+        rentAmount:            body.rentAmount ?? Number(lease.rent_amount),
+        securityDepositAmount: body.securityDeposit,
+        lateFeeInitialAmount:  body.lateFeeInitialAmount,
+        lateFeeInitialType:    body.lateFeeInitialType,
+        lateFeeGraceDays:      body.lateFeeGraceDays,
+      })
+    } catch (e) {
+      logger.error({ err: e, lease_id: lease.id }, '[stateLaw] lease PATCH checks failed')
+    }
+
+    // S476: attach state-law warnings ONTO data — apiPatch on the
+    // landlord portal unwraps `r.data.data`, so a top-level field
+    // would be silently dropped on the client.
+    res.json({
+      success: true,
+      data: { ...updated, state_law_warnings: stateLawWarnings },
+    })
   } catch (e) { next(e) }
 })
 

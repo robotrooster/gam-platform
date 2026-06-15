@@ -5,6 +5,7 @@ import { apiGet, apiPatch } from '../lib/api'
 import { ArrowLeft, Plus, DoorOpen, DollarSign, Building2, MapPin, UserCheck } from 'lucide-react'
 import { AddUnitModal } from './AddUnitModal'
 import { PropertyFeeScheduleSection } from './PropertyFeeScheduleSection'
+import { LawWarningBanner } from '../components/LawWarningBanner'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
 const STATUS_COLORS: Record<string,string> = {
@@ -55,6 +56,13 @@ export function PropertyDetailPage() {
           <Plus size={15} /> Add Unit
         </button>
       </div>
+
+      {/* S486: state-law warnings recomputed against the persisted
+          property defaults. Late-fee config flows into new leases at
+          this property via the LeaseFormModal default-pull, so a
+          hedged factual notice here catches the landlord before the
+          value propagates to new leases. Auto-hides when empty. */}
+      <LawWarningBanner warnings={property.stateLawWarnings} />
 
       {/* Stats */}
       <div style={{ display:'grid', gridTemplateColumns:'repeat(5,1fr)', gap:12, marginBottom:24 }}>

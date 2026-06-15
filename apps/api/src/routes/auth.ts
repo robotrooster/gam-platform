@@ -23,8 +23,27 @@ async function getScopeForUser(userId: string, role: string):
     /** S168: per-manager Connect opt-in toggle. Property_manager only;
      *  null for other worker roles since they have no rent-share path. */
     directDepositEnabled?: boolean
+    /** S453: business-side scope. Set for business_staff (resolved from
+     *  business_users). landlordId stays null — business_staff lives
+     *  in a parallel scope tree, not the landlord one. */
+    businessId?: string | null
+    staffRole?:  string | null
   } | null>
 {
+  if (role === 'business_staff') {
+    const r = await queryOne<any>(
+      `SELECT business_id, staff_role, permissions
+         FROM business_users
+        WHERE user_id = $1 AND status = 'active'
+        LIMIT 1`,
+      [userId])
+    return r ? {
+      landlordId: null,
+      businessId: r.business_id,
+      staffRole:  r.staff_role,
+      permissions: r.permissions || {},
+    } : null
+  }
   if (role === 'property_manager') {
     const r = await queryOne<any>(
       `SELECT landlord_id, permissions, direct_deposit_enabled
@@ -156,10 +175,16 @@ authRouter.post('/login', async (req, res, next) => {
   try {
     const { email, password } = loginSchema.parse(req.body)
     const user = await queryOne<any>(
-      `SELECT u.*, COALESCE(l.id, t.id) AS profile_id
+      `SELECT u.*,
+              COALESCE(l.id, t.id, b.id) AS profile_id,
+              b.id                       AS business_id
        FROM users u
-       LEFT JOIN landlords l ON l.user_id = u.id
-       LEFT JOIN tenants   t ON t.user_id = u.id
+       LEFT JOIN landlords  l ON l.user_id = u.id
+       LEFT JOIN tenants    t ON t.user_id = u.id
+       -- S453: business_owner login also resolves business_id directly.
+       -- business_staff users go through getScopeForUser instead because
+       -- their business_id lives in the scope row.
+       LEFT JOIN businesses b ON b.owner_user_id = u.id AND b.status = 'active'
        WHERE u.email = $1`, [email]
     )
     if (!user) throw new AppError(401, 'Invalid credentials')
@@ -219,16 +244,31 @@ authRouter.post('/login', async (req, res, next) => {
       )
     }
 
-    // For landlord-assignable roles, look up the scope row to pull
-    // landlordId + permissions for the JWT claim. Absence of a scope
-    // row for a worker role means the user was scoped at some point but
-    // their scope was revoked — block login per pre-S80 behavior.
-    const isWorkerRole = ['property_manager','onsite_manager','maintenance','bookkeeper'].includes(user.role)
+    // For landlord-assignable roles + business_staff, look up the scope
+    // row to pull (landlordId | businessId) + permissions for the JWT
+    // claim. Absence of a scope row for a worker role means the user was
+    // scoped at some point but their scope was revoked — block login.
+    // S453: business_staff joins the worker list and goes through the
+    // same gate. business_owner is NOT a worker — its business_id comes
+    // off the JOIN's `business_id` column directly.
+    const isWorkerRole = ['property_manager','onsite_manager','maintenance','bookkeeper','business_staff'].includes(user.role)
     const scope = isWorkerRole ? await getScopeForUser(user.id, user.role) : null
     if (isWorkerRole && !scope) {
-      throw new AppError(403, 'Your account has been deactivated. Contact your landlord.')
+      const msg = user.role === 'business_staff'
+        ? 'Your account has been deactivated. Contact your business owner.'
+        : 'Your account has been deactivated. Contact your landlord.'
+      throw new AppError(403, msg)
     }
-    const profileId = user.profile_id || scope?.landlordId || null
+    const profileId = user.profile_id || scope?.landlordId || scope?.businessId || null
+    // S453: businessId carries either the owner's business (from JOIN) or
+    // the staff member's scoped business (from getScopeForUser). null for
+    // any non-business role.
+    const businessId = user.role === 'business_owner'
+      ? (user.business_id || null)
+      : (scope?.businessId || null)
+    const staffRole = user.role === 'business_staff'
+      ? (scope?.staffRole || null)
+      : null
 
     // S288: TOTP gate. If the user has 2FA enabled, don't issue the
     // full session JWT yet — mint a short-lived totp_session that
@@ -253,6 +293,8 @@ authRouter.post('/login', async (req, res, next) => {
       userId: user.id, role: user.role, email: user.email,
       profileId,
       landlordId: scope?.landlordId || null,
+      businessId,
+      staffRole,
       permissions: scope?.permissions || null,
     })
     res.json({
@@ -262,6 +304,8 @@ authRouter.post('/login', async (req, res, next) => {
         firstName: user.first_name, lastName: user.last_name,
         profileId,
         landlordId: scope?.landlordId || null,
+        businessId,
+        staffRole,
         permissions: scope?.permissions || null,
         directDepositEnabled: scope?.directDepositEnabled ?? false,
         // S288: forces enrollment-flow on first login post-rollout for
@@ -286,22 +330,35 @@ authRouter.get('/me', requireAuth, async (req, res, next) => {
     const user = await queryOne<any>(
       `SELECT u.id, u.email, u.role, u.first_name, u.last_name, u.phone,
          u.totp_enabled,
-         COALESCE(l.id, t.id) AS profile_id,
+         COALESCE(l.id, t.id, b.id) AS profile_id,
          l.business_name, l.onboarding_complete,
+         b.id   AS business_id,
+         b.name AS business_name_b,
+         b.business_type,
          EXISTS (
            SELECT 1 FROM user_bank_accounts ba
             WHERE ba.user_id = u.id AND ba.status = 'active'
          ) AS bank_account_ready,
          t.ach_verified, t.on_time_pay_enrolled, t.credit_reporting_enrolled
        FROM users u
-       LEFT JOIN landlords l ON l.user_id = u.id
-       LEFT JOIN tenants   t ON t.user_id = u.id
+       LEFT JOIN landlords  l ON l.user_id = u.id
+       LEFT JOIN tenants    t ON t.user_id = u.id
+       LEFT JOIN businesses b ON b.owner_user_id = u.id AND b.status = 'active'
        WHERE u.id = $1`, [req.user!.userId]
     )
     if (!user) throw new AppError(404, 'User not found')
 
-    const isWorkerRole = ['property_manager','onsite_manager','maintenance','bookkeeper'].includes(user.role)
+    const isWorkerRole = ['property_manager','onsite_manager','maintenance','bookkeeper','business_staff'].includes(user.role)
     const scope = isWorkerRole ? await getScopeForUser(user.id, user.role) : null
+    // S453: business_owner has business_id directly from the JOIN; staff
+    // resolves through scope. Mirrored both ways so frontend can read
+    // either naming.
+    const businessId = user.role === 'business_owner'
+      ? (user.business_id || null)
+      : (scope?.businessId || null)
+    const staffRole = user.role === 'business_staff'
+      ? (scope?.staffRole || null)
+      : null
 
     // Emit both snake_case (for any legacy consumer) and camelCase
     // (what AuthContext.AuthUser expects) for the new fields.
@@ -309,6 +366,10 @@ authRouter.get('/me', requireAuth, async (req, res, next) => {
       ...user,
       landlord_id: scope?.landlordId || null,
       landlordId:  scope?.landlordId || null,
+      business_id: businessId,
+      businessId,
+      staff_role:  staffRole,
+      staffRole,
       permissions: scope?.permissions || null,
       // S168: surfaces the per-manager Connect opt-in toggle so the
       // landlord-portal nav can gate the /banking entry for managers

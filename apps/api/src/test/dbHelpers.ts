@@ -243,6 +243,38 @@ export async function cleanupAllSchema(): Promise<void> {
   // and S446 flex_charge cleanup additions. stripeConnectWebhooks.test.ts
   // pre-cleaned this manually; that workaround is now obsolete.
   await db.query(`DELETE FROM disbursements`)
+  // S453: businesses chain — businesses.owner_user_id FKs users,
+  // business_users.user_id FKs users (both no ON DELETE), so leaving
+  // any business row in place traps the users DELETE. business_users +
+  // business_customers CASCADE on businesses delete, so the parent
+  // wipe transitively clears them.
+  // S456: business_user_invitations also CASCADEs on businesses, but
+  // invited_by_user_id + accepted_user_id FK users directly (no ON
+  // DELETE), so clear the chain explicitly before users DELETE.
+  await db.query(`DELETE FROM business_user_invitations`)
+  // S459: appointments CASCADE on businesses but their created_by_user_id
+  // FKs users with no ON DELETE; clearing transitively via businesses
+  // wipe is fine for the FK direction, but explicit DELETE makes the
+  // chain readable.
+  // S460: recurring_schedules CASCADE on businesses too. Order is
+  // important — appointments has an FK back to recurring_schedules
+  // (ON DELETE SET NULL), so dropping appointments first is fine,
+  // but the FK gets exercised on the schedules-delete pass.
+  // S463: route_stops + generated_routes CASCADE on businesses, but
+  // route_stops.appointment_id FKs appointments (no ON DELETE) so
+  // they must be cleared BEFORE the appointments DELETE below.
+  await db.query(`DELETE FROM route_stops`)
+  await db.query(`DELETE FROM generated_routes`)
+  await db.query(`DELETE FROM appointments`)
+  await db.query(`DELETE FROM recurring_schedules`)
+  // S462: route infrastructure tables. vehicles.home_depot_id FKs
+  // depots so trucks must be cleared first; depots / dump_locations
+  // are sibling-CASCADE on businesses but explicit clear keeps order
+  // readable.
+  await db.query(`DELETE FROM vehicles`)
+  await db.query(`DELETE FROM depots`)
+  await db.query(`DELETE FROM dump_locations`)
+  await db.query(`DELETE FROM businesses`)
   await db.query(`DELETE FROM landlords`)
   await db.query(`DELETE FROM tenants`)
   await db.query(`DELETE FROM users`)

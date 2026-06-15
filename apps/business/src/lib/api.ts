@@ -1,0 +1,56 @@
+/// <reference types="vite/client" />
+import axios from 'axios'
+import { applyCamelizeInterceptor } from '@gam/shared'
+
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:4000'
+
+export const api = axios.create({
+  baseURL: `${API_URL}/api`,
+  headers: { 'Content-Type': 'application/json' },
+})
+
+// S312: snake_case → camelCase response transform. Registered
+// BEFORE the auth interceptor so the camelize step runs on the
+// success path; the 401 redirect path doesn't touch r.data. See
+// packages/shared/src/camelize.ts for the passthrough rules
+// protecting JSONB blob columns.
+applyCamelizeInterceptor(api)
+
+// Attach JWT on every request
+api.interceptors.request.use((config) => {
+  const token = localStorage.getItem('gam_business_token')
+  if (token) config.headers.Authorization = `Bearer ${token}`
+  return config
+})
+
+// Auto-logout on 401
+api.interceptors.response.use(
+  (res) => res,
+  (err) => {
+    if (err.response?.status === 401) {
+      localStorage.removeItem('gam_business_token')
+      window.location.href = '/login'
+    }
+    return Promise.reject(err)
+  }
+)
+
+export const apiGet  = <T = any>(url: string) => api.get<{ success: boolean; data: T }>(url).then(r => r.data.data)
+export const apiPost = <T = any>(url: string, body?: any) => api.post<{ success: boolean; data: T; message?: string }>(url, body).then(r => r.data)
+export const apiPatch = <T = any>(url: string, body?: any) => api.patch<{ success: boolean; data: T }>(url, body).then(r => r.data.data)
+export const apiDel  = (url: string) => api.delete(url).then(r => r.data)
+
+export const apiPut = <T = any>(url: string, body?: any) => api.put<{ success: boolean; data: T }>(url, body).then(r => r.data.data)
+export const apiDelete = <T = any>(url: string) => api.delete<{ success: boolean; data: T }>(url).then(r => r.data)
+
+// S504: PDF endpoints return binary; fetch with auth and open in a new
+// tab via blob URL. Auth interceptor runs on the axios call so the
+// existing Bearer token is included.
+export async function openPdfInNewTab(url: string): Promise<void> {
+  const r = await api.get(url, { responseType: 'blob' })
+  const blobUrl = URL.createObjectURL(r.data as Blob)
+  window.open(blobUrl, '_blank', 'noopener,noreferrer')
+  // Best-effort cleanup — the tab keeps its own ref so revoke after a
+  // minute is safe.
+  setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000)
+}

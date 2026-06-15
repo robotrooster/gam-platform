@@ -12,7 +12,13 @@
  */
 
 import { queryOne } from '../../../db'
-import { searchStateLawText, buildDisclaimer } from '../../stateLaw'
+import {
+  searchStateLawText,
+  buildDisclaimer,
+  citationFor,
+  detectStubbedCategory,
+  STUBBED_CATEGORY_LABELS,
+} from '../../stateLaw'
 import type { AgentTool, AgentActor } from './types'
 
 const MAX_EXCERPT = 2000 // bound each section's text in the tool result
@@ -58,6 +64,24 @@ export const searchStateLaw: AgentTool = {
       return { ok: false, error: 'Which state? Give me the two-letter code (e.g. "AZ") and I’ll search its statutes.' }
     }
 
+    // Broader real-estate areas GAM hasn't deeply ingested yet (property tax,
+    // zoning/land-use, environmental/condition disclosure) — defer gracefully
+    // instead of guessing. Classify the QUESTION itself (not the search hits):
+    // the corpus's one huge section, NY §233, satisfies almost any full-term
+    // match, so a results-based gate is unreliable. Patterns are conservative
+    // enough not to hijack genuine landlord/tenant questions.
+    const stub = detectStubbedCategory(q)
+    if (stub) {
+      return {
+        ok: true,
+        state,
+        query: q,
+        results: [],
+        note: `GAM is still working on getting the latest ${STUBBED_CATEGORY_LABELS[stub]} law for ${state} and doesn’t have it on file yet. For this kind of question, please consult a licensed attorney in ${state}. (This isn’t legal advice.)`,
+        disclaimer: buildDisclaimer(null),
+      }
+    }
+
     const hits = await searchStateLawText(state, q, 4)
     if (hits.length === 0) {
       return {
@@ -65,7 +89,7 @@ export const searchStateLaw: AgentTool = {
         state,
         query: q,
         results: [],
-        note: `I couldn’t find a matching statute section for ${state} on file. ${state === 'AZ' ? '' : 'GAM may not have ' + state + '’s statutes loaded yet. '}Check the state’s official site or a local attorney.`,
+        note: `I couldn’t find a matching statute section for ${state} in what GAM has on file. Try rephrasing the question, or check ${state}’s official statute site or a local attorney.`,
         disclaimer: buildDisclaimer(null),
       }
     }
@@ -76,9 +100,9 @@ export const searchStateLaw: AgentTool = {
       state,
       query: q,
       results: hits.map((h) => ({
-        // AZ statutes cite as "A.R.S. §"; keep other states generic until their
-        // citation prefix is added.
-        citation: state === 'AZ' ? `A.R.S. § ${h.section_number}` : `${state} § ${h.section_number}`,
+        // Proper per-state citation (A.R.S. § / NRS / Cal. Civ. Code § / Fla.
+        // Stat. § / generic fallback) — single source in stateLaw.citationFor.
+        citation: citationFor(state, h.section_number),
         section: h.section_number,
         title: h.section_title,
         text: h.full_text.length > MAX_EXCERPT ? h.full_text.slice(0, MAX_EXCERPT) + '… [truncated — see source]' : h.full_text,

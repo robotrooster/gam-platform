@@ -202,8 +202,12 @@ describe('Tenant CSV — opening-balance invoice (commit)', () => {
     expect(parseFloat(inv.rows[0].total_amount)).toBe(1234.56)
     expect(inv.rows[0].unit_id).toBe(unitId)
     expect(inv.rows[0].notes).toMatch(/Imported opening balance/i)
-    // due_date is CURRENT_DATE
-    const today = new Date().toISOString().slice(0, 10)
+    // due_date is CURRENT_DATE — pull "today" from the DB so the
+    // assertion uses the same timezone the column was stamped in
+    // (avoids a UTC-vs-local boundary flake when the local clock
+    // straddles UTC midnight; pre-S454 used `new Date()...slice(0,10)`).
+    const { rows: [{ today }] } = await db.query<{ today: string }>(
+      `SELECT CURRENT_DATE::text AS today`)
     expect(inv.rows[0].due_date_str).toBe(today)
   })
 

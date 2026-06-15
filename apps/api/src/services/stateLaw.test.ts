@@ -8,7 +8,7 @@ import { vi, describe, it, expect, beforeEach } from 'vitest'
 vi.mock('../db', () => ({ query: vi.fn() }))
 
 import { query } from '../db'
-import { getApplicableActs, checkAgainstStatute, buildDisclaimer } from './stateLaw'
+import { getApplicableActs, checkAgainstStatute, buildDisclaimer, detectStubbedCategory } from './stateLaw'
 
 const mockQuery = query as unknown as ReturnType<typeof vi.fn>
 
@@ -26,6 +26,24 @@ describe('getApplicableActs', () => {
     expect(await getApplicableActs('Arizona', 'rv_spot')).toEqual([])
     expect(await getApplicableActs('AZ', '')).toEqual([])
     expect(mockQuery).not.toHaveBeenCalled()
+  })
+})
+
+describe('detectStubbedCategory (broad real-estate areas not yet ingested)', () => {
+  it('flags clearly zoning / sale-disclosure questions', () => {
+    expect(detectStubbedCategory('what is the setback for a zoning variance')).toBe('land_use_zoning')
+    expect(detectStubbedCategory('property condition disclosure when selling')).toBe('environmental_disclosure')
+  })
+  it('does NOT stub property tax (it is being ingested for a near-term feature)', () => {
+    expect(detectStubbedCategory('how do I grieve my property tax assessment')).toBeNull()
+    expect(detectStubbedCategory('property tax exemption for seniors')).toBeNull()
+  })
+  it('does NOT hijack genuine landlord/tenant questions', () => {
+    expect(detectStubbedCategory('warranty of habitability')).toBeNull()
+    expect(detectStubbedCategory('can my landlord keep my security deposit')).toBeNull()
+    expect(detectStubbedCategory('evicting a tenant for non-payment of rent')).toBeNull()
+    // lead paint as a habitability issue (no "disclosure") stays L/T
+    expect(detectStubbedCategory('there is lead paint in my apartment')).toBeNull()
   })
 })
 
