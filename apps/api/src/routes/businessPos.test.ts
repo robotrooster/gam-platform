@@ -361,6 +361,154 @@ describe('Tax exemption (S506)', () => {
 })
 
 // ═══════════════════════════════════════════════════════════════
+//  S512 — POS tips
+// ═══════════════════════════════════════════════════════════════
+
+describe('Tips (S512)', () => {
+  it('card sale with tip: tip stored separately, total_amount stays sale-only', async () => {
+    const f = await seedFixture({ itemAPrice: 10.00, itemATax: 0 })
+    const res = await request(buildApp())
+      .post('/api/business-pos/transactions')
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send({
+        paymentMethod: 'card_recorded',
+        tipAmount: 2.50,
+        lines: [{ itemId: f.itemA, quantity: 1 }],  // sale = 10.00
+      })
+    expect(res.status).toBe(201)
+    expect(Number(res.body.data.subtotal)).toBeCloseTo(10.00)
+    expect(Number(res.body.data.tip_amount)).toBeCloseTo(2.50)
+    // total_amount is the SALE only — tip is not folded in.
+    expect(Number(res.body.data.total_amount)).toBeCloseTo(10.00)
+  })
+
+  it('cash sale with tip: change computed against grand total (sale + tip)', async () => {
+    const f = await seedFixture({ itemAPrice: 10.00, itemATax: 0 })
+    const res = await request(buildApp())
+      .post('/api/business-pos/transactions')
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send({
+        paymentMethod: 'cash',
+        tipAmount: 3.00,
+        amountTendered: 20.00,   // grand total = 13.00 → change 7.00
+        lines: [{ itemId: f.itemA, quantity: 1 }],
+      })
+    expect(res.status).toBe(201)
+    expect(Number(res.body.data.tip_amount)).toBeCloseTo(3.00)
+    expect(Number(res.body.data.change_due)).toBeCloseTo(7.00)
+  })
+
+  it('cash sale: tendered covers sale but not the tip → 400', async () => {
+    const f = await seedFixture({ itemAPrice: 10.00, itemATax: 0 })
+    const res = await request(buildApp())
+      .post('/api/business-pos/transactions')
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send({
+        paymentMethod: 'cash',
+        tipAmount: 5.00,
+        amountTendered: 12.00,   // covers 10 sale but not 15 grand total
+        lines: [{ itemId: f.itemA, quantity: 1 }],
+      })
+    expect(res.status).toBe(400)
+    expect(res.body.error).toMatch(/less than total/i)
+  })
+
+  it('no tip → tip_amount defaults to 0', async () => {
+    const f = await seedFixture()
+    const res = await request(buildApp())
+      .post('/api/business-pos/transactions')
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send({ paymentMethod: 'card_recorded',
+              lines: [{ itemId: f.itemA, quantity: 1 }] })
+    expect(res.status).toBe(201)
+    expect(Number(res.body.data.tip_amount)).toBe(0)
+  })
+
+  it('negative tip rejected by zod', async () => {
+    const f = await seedFixture()
+    const res = await request(buildApp())
+      .post('/api/business-pos/transactions')
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send({ paymentMethod: 'card_recorded', tipAmount: -1,
+              lines: [{ itemId: f.itemA, quantity: 1 }] })
+    expect(res.status).toBe(400)
+  })
+})
+
+// ═══════════════════════════════════════════════════════════════
+//  S513 — POS discount codes
+// ═══════════════════════════════════════════════════════════════
+
+describe('Discounts (S513)', () => {
+  async function makeCode(businessId: string, type: 'percent' | 'fixed', value: number,
+    opts: { code?: string; max?: number | null } = {}) {
+    const { rows: [r] } = await db.query<{ id: string; code: string; redemption_count: number }>(
+      `INSERT INTO business_discount_codes
+         (business_id, code, discount_type, discount_value, max_redemptions)
+       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+      [businessId, opts.code ?? 'SAVE', type, value, opts.max ?? null])
+    return r
+  }
+
+  it('percent discount: reduces total, scales tax, consumes a redemption', async () => {
+    const f = await seedFixture({ itemAPrice: 10.00, itemATax: 0.10 })  // sub 10, tax 1
+    const code = await makeCode(f.businessId, 'percent', 20)            // 20% off
+    const res = await request(buildApp())
+      .post('/api/business-pos/transactions')
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send({ paymentMethod: 'card_recorded', discountCode: 'save',
+              lines: [{ itemId: f.itemA, quantity: 1 }] })
+    expect(res.status).toBe(201)
+    expect(Number(res.body.data.subtotal)).toBeCloseTo(10.00)       // full price
+    expect(Number(res.body.data.discount_amount)).toBeCloseTo(2.00) // 20% of 10
+    expect(Number(res.body.data.tax_amount)).toBeCloseTo(0.80)      // 1.00 * (8/10)
+    expect(Number(res.body.data.total_amount)).toBeCloseTo(8.80)    // 8 + 0.80
+
+    const { rows: [after] } = await db.query<{ redemption_count: number }>(
+      `SELECT redemption_count FROM business_discount_codes WHERE id = $1`, [code.id])
+    expect(after.redemption_count).toBe(1)
+  })
+
+  it('fixed discount clamps to subtotal', async () => {
+    const f = await seedFixture({ itemAPrice: 10.00, itemATax: 0 })
+    await makeCode(f.businessId, 'fixed', 100, { code: 'BIG' })  // more than the sale
+    const res = await request(buildApp())
+      .post('/api/business-pos/transactions')
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send({ paymentMethod: 'card_recorded', discountCode: 'BIG',
+              lines: [{ itemId: f.itemA, quantity: 1 }] })
+    expect(res.status).toBe(201)
+    expect(Number(res.body.data.discount_amount)).toBeCloseTo(10.00)
+    expect(Number(res.body.data.total_amount)).toBeCloseTo(0)
+  })
+
+  it('unknown code → 404 and no sale row written', async () => {
+    const f = await seedFixture()
+    const res = await request(buildApp())
+      .post('/api/business-pos/transactions')
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send({ paymentMethod: 'card_recorded', discountCode: 'NOPE',
+              lines: [{ itemId: f.itemA, quantity: 1 }] })
+    expect(res.status).toBe(404)
+    const { rows } = await db.query(
+      `SELECT id FROM business_pos_transactions WHERE business_id = $1`, [f.businessId])
+    expect(rows.length).toBe(0)
+  })
+
+  it('redemption cap blocks the sale → 409', async () => {
+    const f = await seedFixture()
+    const code = await makeCode(f.businessId, 'fixed', 1, { code: 'ONCE', max: 1 })
+    await db.query(`UPDATE business_discount_codes SET redemption_count = 1 WHERE id = $1`, [code.id])
+    const res = await request(buildApp())
+      .post('/api/business-pos/transactions')
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send({ paymentMethod: 'card_recorded', discountCode: 'ONCE',
+              lines: [{ itemId: f.itemA, quantity: 1 }] })
+    expect(res.status).toBe(409)
+  })
+})
+
+// ═══════════════════════════════════════════════════════════════
 //  GET /transactions
 // ═══════════════════════════════════════════════════════════════
 
@@ -445,6 +593,81 @@ describe('POST /:id/refund', () => {
         WHERE item_id = $1 AND adjustment_type = 'received'`,
       [f.itemA])
     expect(rec.length).toBe(1)
+  })
+
+  it('partial line refund → partially_refunded, restores only that qty', async () => {
+    const f = await seedFixture({ itemAStock: 10, itemAPrice: 10, itemATax: 0 })
+    const sale = await request(buildApp())
+      .post('/api/business-pos/transactions')
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send({ paymentMethod: 'card_recorded',
+              lines: [{ itemId: f.itemA, quantity: 4 }] })  // stock 10→6, total 40
+    const lineId = sale.body.data.lines[0].id
+    const res = await request(buildApp())
+      .post(`/api/business-pos/transactions/${sale.body.data.id}/refund`)
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send({ reason: 'returned 1', lines: [{ lineId, quantity: 1 }] })
+    expect(res.status).toBe(200)
+    expect(res.body.data.status).toBe('partially_refunded')
+    expect(Number(res.body.data.refunded_amount)).toBeCloseTo(10)   // 1 of 4 @ $40 total
+    expect(res.body.data.lines[0].refunded_qty).toBe(1)
+
+    const { rows: [after] } = await db.query<{ stock_qty: number }>(
+      `SELECT stock_qty FROM business_inventory_items WHERE id = $1`, [f.itemA])
+    expect(after.stock_qty).toBe(7)  // 6 + 1 back
+  })
+
+  it('refunding the remaining qty flips it to refunded', async () => {
+    const f = await seedFixture({ itemAStock: 10, itemAPrice: 10, itemATax: 0 })
+    const sale = await request(buildApp())
+      .post('/api/business-pos/transactions')
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send({ paymentMethod: 'card_recorded', lines: [{ itemId: f.itemA, quantity: 4 }] })
+    const lineId = sale.body.data.lines[0].id
+    await request(buildApp())
+      .post(`/api/business-pos/transactions/${sale.body.data.id}/refund`)
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send({ reason: 'r1', lines: [{ lineId, quantity: 1 }] })
+    const res = await request(buildApp())
+      .post(`/api/business-pos/transactions/${sale.body.data.id}/refund`)
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send({ reason: 'r2', lines: [{ lineId, quantity: 3 }] })
+    expect(res.status).toBe(200)
+    expect(res.body.data.status).toBe('refunded')
+    expect(Number(res.body.data.refunded_amount)).toBeCloseTo(40)
+  })
+
+  it('refunding more than remains → 400', async () => {
+    const f = await seedFixture({ itemAPrice: 10, itemATax: 0 })
+    const sale = await request(buildApp())
+      .post('/api/business-pos/transactions')
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send({ paymentMethod: 'card_recorded', lines: [{ itemId: f.itemA, quantity: 2 }] })
+    const lineId = sale.body.data.lines[0].id
+    const res = await request(buildApp())
+      .post(`/api/business-pos/transactions/${sale.body.data.id}/refund`)
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send({ reason: 'too much', lines: [{ lineId, quantity: 5 }] })
+    expect(res.status).toBe(400)
+  })
+
+  it('discounted sale: full refund returns the discounted total, not list price', async () => {
+    const f = await seedFixture({ itemAPrice: 10, itemATax: 0 })
+    await db.query(
+      `INSERT INTO business_discount_codes (business_id, code, discount_type, discount_value)
+       VALUES ($1, 'HALF', 'percent', 50)`, [f.businessId])
+    const sale = await request(buildApp())
+      .post('/api/business-pos/transactions')
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send({ paymentMethod: 'card_recorded', discountCode: 'HALF',
+              lines: [{ itemId: f.itemA, quantity: 2 }] })  // list 20, discounted total 10
+    expect(Number(sale.body.data.total_amount)).toBeCloseTo(10)
+    const res = await request(buildApp())
+      .post(`/api/business-pos/transactions/${sale.body.data.id}/refund`)
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send({ reason: 'full' })
+    expect(res.body.data.status).toBe('refunded')
+    expect(Number(res.body.data.refunded_amount)).toBeCloseTo(10)  // discounted, not 20
   })
 
   it('cannot double-refund', async () => {

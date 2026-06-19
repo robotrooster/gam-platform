@@ -32,6 +32,7 @@ import { businessCustomersRouter } from './routes/businessCustomers'
 import { businessInvoicesRouter } from './routes/businessInvoices'
 import { businessInventoryRouter } from './routes/businessInventory'
 import { businessPosRouter } from './routes/businessPos'
+import { businessDiscountsRouter } from './routes/businessDiscounts'
 import { businessVehiclesRouter } from './routes/businessVehicles'
 import { businessWorkOrdersRouter } from './routes/businessWorkOrders'
 import { businessDashboardRouter } from './routes/businessDashboard'
@@ -42,6 +43,7 @@ import { businessBookableServicesRouter } from './routes/businessBookableService
 import { publicBookingRouter } from './routes/publicBooking'
 import { businessAttachmentsRouter } from './routes/businessAttachments'
 import { publicCardUpdateRouter } from './routes/publicCardUpdate'
+import { publicCustomerPortalRouter } from './routes/publicCustomerPortal'
 import { businessSearchRouter } from './routes/businessSearch'
 import { appointmentsRouter } from './routes/appointments'
 import { recurringSchedulesRouter } from './routes/recurringSchedules'
@@ -79,7 +81,7 @@ import { pmRouter } from './routes/pm'
 import { creditRouter }       from './routes/credit'
 import { bookingsRouter }     from './routes/bookings'
 import { inspectionsRouter }  from './routes/inspections'
-import { agentRouter, salesAgentRouter } from './routes/agent'
+import { agentRouter, salesAgentRouter, guestAgentRouter } from './routes/agent'
 import { entryRequestsRouter } from './routes/entryRequests'
 import { bulletinRouter }      from './routes/bulletin'
 import { notificationsRouter } from './routes/notifications'
@@ -186,6 +188,7 @@ app.use('/api/business-customers', businessCustomersRouter)
 app.use('/api/business-invoices',  businessInvoicesRouter)
 app.use('/api/business-inventory', businessInventoryRouter)
 app.use('/api/business-pos', businessPosRouter)
+app.use('/api/business-discounts', businessDiscountsRouter)
 app.use('/api/business-vehicles', businessVehiclesRouter)
 app.use('/api/business-work-orders', businessWorkOrdersRouter)
 app.use('/api/business-dashboard', businessDashboardRouter)
@@ -197,6 +200,7 @@ app.use('/api/public', publicBookingRouter)
 app.use('/api/business-attachments', businessAttachmentsRouter)
 app.use('/api/business-search', businessSearchRouter)
 app.use('/api/public', publicCardUpdateRouter)
+app.use('/api/public', publicCustomerPortalRouter)
 app.use('/api/appointments',  appointmentsRouter)
 app.use('/api/recurring-schedules', recurringSchedulesRouter)
 app.use('/api/routes',        routesRouter)
@@ -256,6 +260,7 @@ app.use('/api/bookings',       bookingsRouter)
 app.use('/api/inspections',    inspectionsRouter)
 app.use('/api/agent',          agentRouter)
 app.use('/api/sales',          salesAgentRouter)
+app.use('/api/guest',          guestAgentRouter)
 app.use('/api/entry-requests', entryRequestsRouter)
 app.use('/webhooks',          webhooksRouter)
 

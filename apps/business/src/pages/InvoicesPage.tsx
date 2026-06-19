@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { apiGet, apiPost, openPdfInNewTab } from '../lib/api'
+import { useAuth } from '../context/AuthContext'
 import { Modal } from '../components/Modal'
 import { Plus, Trash, ChevronRight, ArrowLeft, Check, X, Printer } from 'lucide-react'
 
@@ -13,7 +14,7 @@ interface CustomerLite {
 interface InvoiceRow {
   id: string
   invoiceNumber: string
-  status: 'draft' | 'sent' | 'paid' | 'void'
+  status: 'draft' | 'sent' | 'paid' | 'partially_refunded' | 'refunded' | 'void'
   issueDate: string
   dueDate: string
   subtotal: string
@@ -40,6 +41,9 @@ interface InvoiceLine {
 
 interface InvoiceDetail extends InvoiceRow {
   customerEmail: string | null
+  discountAmount: string
+  refundedAmount: string
+  refundReason: string | null
   notes: string | null
   internalNotes: string | null
   paymentMethod: string | null
@@ -57,6 +61,8 @@ const STATUS_TONE: Record<InvoiceRow['status'], { bg: string; color: string; lab
   draft: { bg: 'var(--bg-2)',   color: 'var(--text-2)', label: 'Draft' },
   sent:  { bg: 'rgba(245,158,11,.1)', color: 'var(--amber)', label: 'Sent' },
   paid:  { bg: 'rgba(34,197,94,.1)',  color: 'var(--green, #22c55e)', label: 'Paid' },
+  partially_refunded: { bg: 'rgba(245,158,11,.1)', color: 'var(--amber)', label: 'Partial refund' },
+  refunded: { bg: 'rgba(245,158,11,.1)', color: 'var(--amber)', label: 'Refunded' },
   void:  { bg: 'var(--bg-2)',   color: 'var(--text-3)', label: 'Void' },
 }
 
@@ -221,6 +227,7 @@ function InvoiceDetailView({
   const [actioning, setActioning] = useState(false)
   const [showMarkPaid, setShowMarkPaid] = useState(false)
   const [showVoid, setShowVoid] = useState(false)
+  const [showRefund, setShowRefund] = useState(false)
 
   const reload = async () => {
     try {
@@ -366,11 +373,13 @@ function InvoiceDetailView({
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 24, fontSize: 14 }}>
           <div style={{ textAlign: 'right' as const }}>
             <div style={{ color: 'var(--text-3)', marginBottom: 4 }}>Subtotal</div>
+            {Number(inv.discountAmount) > 0 && <div style={{ color: 'var(--text-3)', marginBottom: 4 }}>Discount</div>}
             <div style={{ color: 'var(--text-3)', marginBottom: 4 }}>Tax</div>
             <div style={{ color: 'var(--text-0)', fontWeight: 700 }}>Total</div>
           </div>
           <div style={{ textAlign: 'right' as const, fontFamily: 'var(--font-mono)' }}>
             <div style={{ marginBottom: 4 }}>{fmtMoney(inv.subtotal)}</div>
+            {Number(inv.discountAmount) > 0 && <div style={{ marginBottom: 4 }}>-{fmtMoney(inv.discountAmount)}</div>}
             <div style={{ marginBottom: 4 }}>{fmtMoney(inv.taxAmount)}</div>
             <div style={{ color: 'var(--gold)', fontWeight: 700 }}>{fmtMoney(inv.totalAmount)}</div>
           </div>
@@ -419,6 +428,11 @@ function InvoiceDetailView({
               <Trash size={14} /> Void
             </button>
           )}
+          {(inv.status === 'paid' || inv.status === 'partially_refunded') && (
+            <button onClick={() => setShowRefund(true)} style={ghostActionBtnStyle}>
+              Refund
+            </button>
+          )}
         </div>
       </div>
 
@@ -433,6 +447,12 @@ function InvoiceDetailView({
           onClose={() => setShowVoid(false)}
           onSuccess={() => { setShowVoid(false); reload(); onChange() }} />
       )}
+      {showRefund && (
+        <RefundInvoiceModal invoiceId={id}
+          refundable={Number(inv.amountPaid) - Number(inv.refundedAmount)}
+          onClose={() => setShowRefund(false)}
+          onSuccess={() => { setShowRefund(false); reload(); onChange() }} />
+      )}
     </div>
   )
 }
@@ -440,6 +460,28 @@ function InvoiceDetailView({
 // ─────────────────────────────────────────────────────────────────
 //  Create modal
 // ─────────────────────────────────────────────────────────────────
+
+// Draft line in the create form. discountType 'none' means no per-line
+// discount; percent/fixed mirror the backend lineSchema (S504).
+interface FormLine {
+  description: string
+  quantity: string
+  unitPrice: string
+  discountType: 'none' | 'percent' | 'fixed'
+  discountValue: string
+}
+const blankLine = (): FormLine => ({
+  description: '', quantity: '1', unitPrice: '', discountType: 'none', discountValue: '',
+})
+// Net of a draft line after its per-line discount, clamped to >= 0.
+const lineNet = (l: FormLine): number => {
+  const gross = (parseFloat(l.quantity) || 0) * (parseFloat(l.unitPrice) || 0)
+  const v = Number(l.discountValue) || 0
+  const d = l.discountType === 'percent' ? gross * v / 100
+    : l.discountType === 'fixed' ? Math.min(v, gross)
+    : 0
+  return Math.max(0, Math.round((gross - d) * 100) / 100)
+}
 
 function CreateInvoiceModal({
   customers, onClose, onCreated,
@@ -456,27 +498,45 @@ function CreateInvoiceModal({
     dueDate: dueDefault,
     taxAmount: '0',
     notes: '',
-    lines: [{ description: '', quantity: '1', unitPrice: '' }],
+    lines: [blankLine()],
   })
   const [saving, setSaving] = useState(false)
   const [err, setErr] = useState<string | null>(null)
 
-  const subtotal = form.lines.reduce((acc, l) => {
-    const q = parseFloat(l.quantity) || 0
-    const p = parseFloat(l.unitPrice) || 0
-    return acc + (q * p)
-  }, 0)
-  const tax = parseFloat(form.taxAmount) || 0
-  const total = subtotal + tax
+  const { business } = useAuth()
+  const discountsEnabled = (business?.enabledFeatures ?? []).includes('discounts')
+  // S513: discount code, previewed against the current subtotal.
+  const [discountInput, setDiscountInput] = useState('')
+  const [applied, setApplied] = useState<{ code: string; discountAmount: number } | null>(null)
+  const [discountErr, setDiscountErr] = useState<string | null>(null)
 
-  const updLine = (i: number, key: 'description' | 'quantity' | 'unitPrice', val: string) => {
+  const subtotal = form.lines.reduce((acc, l) => acc + lineNet(l), 0)
+  const tax = parseFloat(form.taxAmount) || 0
+  const discount = applied?.discountAmount ?? 0
+  const total = Math.max(0, Math.round((subtotal - discount + tax) * 100) / 100)
+
+  const applyCode = async () => {
+    setDiscountErr(null)
+    if (!discountInput.trim()) return
+    try {
+      const r = await apiPost<{ code: string; discountAmount: number }>(
+        '/business-discounts/preview', { code: discountInput.trim(), subtotal })
+      setApplied(r.data)
+    } catch (e: any) {
+      setApplied(null)
+      setDiscountErr(e?.response?.data?.error || 'Invalid code')
+    }
+  }
+  const clearCode = () => { setApplied(null); setDiscountInput(''); setDiscountErr(null) }
+
+  const updLine = (i: number, key: keyof FormLine, val: string) => {
     const next = [...form.lines]
-    next[i] = { ...next[i], [key]: val }
+    next[i] = { ...next[i], [key]: val } as FormLine
     setForm({ ...form, lines: next })
   }
 
   const addLine = () => {
-    setForm({ ...form, lines: [...form.lines, { description: '', quantity: '1', unitPrice: '' }] })
+    setForm({ ...form, lines: [...form.lines, blankLine()] })
   }
   const rmLine = (i: number) => {
     if (form.lines.length === 1) return
@@ -491,9 +551,14 @@ function CreateInvoiceModal({
         description: l.description.trim(),
         quantity: parseFloat(l.quantity),
         unitPrice: parseFloat(l.unitPrice),
+        ...(l.discountType !== 'none' && Number(l.discountValue) > 0
+          ? { discountType: l.discountType, discountValue: Number(l.discountValue) }
+          : {}),
       }))
       .filter(l => l.description && Number.isFinite(l.quantity) && Number.isFinite(l.unitPrice))
     if (cleanLines.length === 0) { setErr('Add at least one line item'); return }
+    const badPct = form.lines.some(l => l.discountType === 'percent' && Number(l.discountValue) > 100)
+    if (badPct) { setErr('A line percent discount cannot exceed 100'); return }
 
     setSaving(true)
     try {
@@ -502,6 +567,7 @@ function CreateInvoiceModal({
         issueDate: form.issueDate,
         dueDate:   form.dueDate,
         taxAmount: tax,
+        discountCode: applied?.code,
         notes:     form.notes || undefined,
         lines:     cleanLines,
       })
@@ -557,38 +623,58 @@ function CreateInvoiceModal({
       <label style={labelStyle}>Line items</label>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
         {form.lines.map((l, i) => (
-          <div key={i} style={{
-            display: 'grid', gridTemplateColumns: '2fr 80px 110px 120px 32px',
-            gap: 6, alignItems: 'center',
-          }}>
-            <input placeholder="Description"
-              value={l.description}
-              onChange={e => updLine(i, 'description', e.target.value)}
-              style={inputStyle} />
-            <input placeholder="Qty"
-              value={l.quantity}
-              onChange={e => updLine(i, 'quantity', e.target.value)}
-              type="number" step="0.5" min="0"
-              style={inputStyle} />
-            <input placeholder="Unit price"
-              value={l.unitPrice}
-              onChange={e => updLine(i, 'unitPrice', e.target.value)}
-              type="number" step="0.01" min="0"
-              style={inputStyle} />
+          <div key={i} style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
             <div style={{
-              padding: '10px 8px', fontSize: 13, fontFamily: 'var(--font-mono)',
-              color: 'var(--text-1)', textAlign: 'right' as const,
+              display: 'grid', gridTemplateColumns: '2fr 80px 110px 120px 32px',
+              gap: 6, alignItems: 'center',
             }}>
-              {fmtMoney((parseFloat(l.quantity) || 0) * (parseFloat(l.unitPrice) || 0))}
-            </div>
-            <button onClick={() => rmLine(i)}
-              disabled={form.lines.length === 1}
-              style={{
-                background: 'transparent', border: 'none', cursor: 'pointer',
-                color: 'var(--text-3)', padding: 4,
+              <input placeholder="Description"
+                value={l.description}
+                onChange={e => updLine(i, 'description', e.target.value)}
+                style={inputStyle} />
+              <input placeholder="Qty"
+                value={l.quantity}
+                onChange={e => updLine(i, 'quantity', e.target.value)}
+                type="number" step="0.5" min="0"
+                style={inputStyle} />
+              <input placeholder="Unit price"
+                value={l.unitPrice}
+                onChange={e => updLine(i, 'unitPrice', e.target.value)}
+                type="number" step="0.01" min="0"
+                style={inputStyle} />
+              <div style={{
+                padding: '10px 8px', fontSize: 13, fontFamily: 'var(--font-mono)',
+                color: 'var(--text-1)', textAlign: 'right' as const,
               }}>
-              <X size={14} />
-            </button>
+                {fmtMoney(lineNet(l))}
+              </div>
+              <button onClick={() => rmLine(i)}
+                disabled={form.lines.length === 1}
+                style={{
+                  background: 'transparent', border: 'none', cursor: 'pointer',
+                  color: 'var(--text-3)', padding: 4,
+                }}>
+                <X size={14} />
+              </button>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, paddingLeft: 2 }}>
+              <span style={{ fontSize: 11, color: 'var(--text-3)' }}>Line discount</span>
+              <select value={l.discountType}
+                onChange={e => updLine(i, 'discountType', e.target.value)}
+                style={{ ...inputStyle, marginTop: 0, maxWidth: 120 }}>
+                <option value="none">None</option>
+                <option value="percent">% off</option>
+                <option value="fixed">$ off</option>
+              </select>
+              {l.discountType !== 'none' && (
+                <input type="number" step="0.01" min="0"
+                  max={l.discountType === 'percent' ? 100 : undefined}
+                  value={l.discountValue}
+                  onChange={e => updLine(i, 'discountValue', e.target.value)}
+                  placeholder={l.discountType === 'percent' ? '10' : '25.00'}
+                  style={{ ...inputStyle, marginTop: 0, maxWidth: 100 }} />
+              )}
+            </div>
           </div>
         ))}
         <button type="button" onClick={addLine} style={{
@@ -597,6 +683,34 @@ function CreateInvoiceModal({
           <Plus size={12} /> Add line
         </button>
       </div>
+
+      {discountsEnabled && (
+        <div style={{ marginTop: 12 }}>
+          <label style={labelStyle}>Discount code (optional)</label>
+          {applied ? (
+            <div style={{
+              display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+              padding: '10px 12px', background: 'rgba(34,197,94,.08)',
+              border: '1px solid var(--green, #22c55e)', borderRadius: 8,
+            }}>
+              <span style={{ fontSize: 13, color: 'var(--text-1)' }}>
+                <strong style={{ fontFamily: 'var(--font-mono)' as const }}>{applied.code}</strong> — {fmtMoney(applied.discountAmount)} off
+              </span>
+              <button onClick={clearCode} style={{ ...ghostBtn, padding: '4px 10px' }}>Remove</button>
+            </div>
+          ) : (
+            <div style={{ display: 'flex', gap: 8 }}>
+              <input value={discountInput}
+                onChange={e => setDiscountInput(e.target.value.toUpperCase())}
+                onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); applyCode() } }}
+                placeholder="SUMMER20"
+                style={{ ...inputStyle, fontFamily: 'var(--font-mono)' as const }} />
+              <button onClick={applyCode} disabled={!discountInput.trim()} style={ghostBtn}>Apply</button>
+            </div>
+          )}
+          {discountErr && <div style={{ fontSize: 12, color: 'var(--red, #ef4444)', marginTop: 6 }}>{discountErr}</div>}
+        </div>
+      )}
 
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginTop: 12 }}>
         <div>
@@ -607,7 +721,7 @@ function CreateInvoiceModal({
             style={inputStyle} />
         </div>
         <div>
-          <label style={labelStyle}>Total</label>
+          <label style={labelStyle}>Total{discount > 0 ? ` (−${fmtMoney(discount)})` : ''}</label>
           <div style={{
             padding: '10px 12px',
             background: 'var(--bg-2)',
@@ -737,6 +851,80 @@ function VoidModal({
       <input value={reason}
         onChange={e => setReason(e.target.value)}
         placeholder="Wrong customer / duplicate / etc."
+        style={inputStyle} />
+    </Modal>
+  )
+}
+
+function RefundInvoiceModal({
+  invoiceId, refundable, onClose, onSuccess,
+}: {
+  invoiceId: string
+  refundable: number
+  onClose: () => void
+  onSuccess: () => void
+}) {
+  const [mode, setMode] = useState<'full' | 'amount'>('full')
+  const [amount, setAmount] = useState('')
+  const [reason, setReason] = useState('')
+  const [saving, setSaving] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+
+  const submit = async () => {
+    setErr(null)
+    if (!reason.trim()) { setErr('Reason required'); return }
+    const payload: any = { reason: reason.trim() }
+    if (mode === 'amount') {
+      const a = parseFloat(amount)
+      if (isNaN(a) || a <= 0) { setErr('Enter an amount'); return }
+      if (a > refundable + 0.005) { setErr(`Max refundable is ${fmtMoney(refundable)}`); return }
+      payload.amount = a
+    }
+    setSaving(true)
+    try {
+      await apiPost(`/business-invoices/${invoiceId}/refund`, payload)
+      onSuccess()
+    } catch (e: any) {
+      setErr(e?.response?.data?.error || 'Refund failed')
+    } finally { setSaving(false) }
+  }
+
+  return (
+    <Modal title="Refund invoice" onClose={onClose}
+      footer={
+        <>
+          <button onClick={onClose} style={ghostBtn}>Cancel</button>
+          <button onClick={submit} disabled={saving} style={primaryBtnStyle}>
+            {saving ? 'Refunding…' : 'Refund'}
+          </button>
+        </>
+      }>
+      {err && <div style={errStyle}>{err}</div>}
+      <div style={{ fontSize: 13, color: 'var(--text-2)', marginBottom: 12 }}>
+        If this invoice was paid through Stripe, the refund is sent back to the customer
+        automatically. Cash or terminal payments are recorded here for your books — refund those
+        on your device. Refundable: <strong style={{ color: 'var(--gold)' }}>{fmtMoney(refundable)}</strong>.
+      </div>
+      <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
+        {(['full', 'amount'] as const).map(m => (
+          <button key={m} onClick={() => setMode(m)} style={{
+            flex: 1, padding: 10,
+            background: mode === m ? 'rgba(212,175,55,.12)' : 'var(--bg-2)',
+            border: `1px solid ${mode === m ? 'var(--gold)' : 'var(--border-1)'}`,
+            borderRadius: 8, color: mode === m ? 'var(--gold)' : 'var(--text-1)',
+            fontSize: 13, fontWeight: 600, cursor: 'pointer',
+          }}>{m === 'full' ? 'Full remaining' : 'Specific amount'}</button>
+        ))}
+      </div>
+      {mode === 'amount' && (
+        <input type="number" step="0.01" min={0} max={refundable} value={amount}
+          onChange={e => setAmount(e.target.value)} placeholder="0.00"
+          style={{ ...inputStyle, fontFamily: 'var(--font-mono)' as const }} />
+      )}
+      <label style={labelStyle}>Reason</label>
+      <input value={reason}
+        onChange={e => setReason(e.target.value)}
+        placeholder="Customer canceled / overcharge / etc."
         style={inputStyle} />
     </Modal>
   )

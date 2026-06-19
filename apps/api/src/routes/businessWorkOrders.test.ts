@@ -591,3 +591,109 @@ describe('Cross-business isolation', () => {
     expect(detail.status).toBe(404)
   })
 })
+
+// ═══════════════════════════════════════════════════════════════
+//  S514 — work-order time tracking
+// ═══════════════════════════════════════════════════════════════
+
+describe('Time tracking (S514)', () => {
+  const post = (token: string, url: string, body?: any) =>
+    request(buildApp()).post(url).set('Authorization', `Bearer ${token}`).send(body ?? {})
+
+  it('start creates a running entry; double-start → 409', async () => {
+    const f = await seedFixture()
+    const woId = await newWo(f.ownerToken, f.customerId)
+    const r1 = await post(f.ownerToken, `/api/business-work-orders/${woId}/time/start`)
+    expect(r1.status).toBe(201)
+    expect(r1.body.data.ended_at).toBeNull()
+    expect(r1.body.data.duration_minutes).toBeNull()
+    const r2 = await post(f.ownerToken, `/api/business-work-orders/${woId}/time/start`)
+    expect(r2.status).toBe(409)
+  })
+
+  it('stop closes the running entry with a duration', async () => {
+    const f = await seedFixture()
+    const woId = await newWo(f.ownerToken, f.customerId)
+    await post(f.ownerToken, `/api/business-work-orders/${woId}/time/start`)
+    const res = await post(f.ownerToken, `/api/business-work-orders/${woId}/time/stop`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.ended_at).not.toBeNull()
+    expect(res.body.data.duration_minutes).toBeGreaterThanOrEqual(0)
+  })
+
+  it('stop with no running timer → 404', async () => {
+    const f = await seedFixture()
+    const woId = await newWo(f.ownerToken, f.customerId)
+    const res = await post(f.ownerToken, `/api/business-work-orders/${woId}/time/stop`)
+    expect(res.status).toBe(404)
+  })
+
+  it('manual entry records the given duration', async () => {
+    const f = await seedFixture()
+    const woId = await newWo(f.ownerToken, f.customerId)
+    const res = await post(f.ownerToken, `/api/business-work-orders/${woId}/time/manual`, { minutes: 90, note: 'forgot to clock' })
+    expect(res.status).toBe(201)
+    expect(res.body.data.duration_minutes).toBe(90)
+    expect(res.body.data.ended_at).not.toBeNull()
+  })
+
+  it('bill rolls unbilled time into a labor line + updates header totals', async () => {
+    const f = await seedFixture()
+    const woId = await newWo(f.ownerToken, f.customerId)
+    await post(f.ownerToken, `/api/business-work-orders/${woId}/time/manual`, { minutes: 90 })  // 1.5h
+    const res = await post(f.ownerToken, `/api/business-work-orders/${woId}/time/bill`, { hourlyRate: 100 })
+    expect(res.status).toBe(201)
+    expect(res.body.data.hours).toBeCloseTo(1.5)
+    expect(Number(res.body.data.line.quantity)).toBeCloseTo(1.5)
+    expect(Number(res.body.data.line.line_subtotal)).toBeCloseTo(150)
+
+    const detail = await request(buildApp())
+      .get(`/api/business-work-orders/${woId}`)
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+    expect(Number(detail.body.data.labor_subtotal)).toBeCloseTo(150)
+    expect(Number(detail.body.data.total_amount)).toBeCloseTo(150)
+    expect(detail.body.data.timeEntries.length).toBe(1)
+    expect(detail.body.data.timeEntries[0].billed_at).not.toBeNull()
+  })
+
+  it('cannot bill the same time twice (marked billed) → 409', async () => {
+    const f = await seedFixture()
+    const woId = await newWo(f.ownerToken, f.customerId)
+    await post(f.ownerToken, `/api/business-work-orders/${woId}/time/manual`, { minutes: 60 })
+    await post(f.ownerToken, `/api/business-work-orders/${woId}/time/bill`, { hourlyRate: 50 })
+    const second = await post(f.ownerToken, `/api/business-work-orders/${woId}/time/bill`, { hourlyRate: 50 })
+    expect(second.status).toBe(409)
+  })
+
+  it('bill with nothing tracked → 409', async () => {
+    const f = await seedFixture()
+    const woId = await newWo(f.ownerToken, f.customerId)
+    const res = await post(f.ownerToken, `/api/business-work-orders/${woId}/time/bill`, { hourlyRate: 100 })
+    expect(res.status).toBe(409)
+  })
+
+  it('delete unbilled ok; delete billed → 409', async () => {
+    const f = await seedFixture()
+    const woId = await newWo(f.ownerToken, f.customerId)
+    const m = await post(f.ownerToken, `/api/business-work-orders/${woId}/time/manual`, { minutes: 30 })
+    const del = await request(buildApp())
+      .delete(`/api/business-work-orders/${woId}/time/${m.body.data.id}`)
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+    expect(del.status).toBe(200)
+    // Now a billed one
+    const m2 = await post(f.ownerToken, `/api/business-work-orders/${woId}/time/manual`, { minutes: 30 })
+    await post(f.ownerToken, `/api/business-work-orders/${woId}/time/bill`, { hourlyRate: 80 })
+    const del2 = await request(buildApp())
+      .delete(`/api/business-work-orders/${woId}/time/${m2.body.data.id}`)
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+    expect(del2.status).toBe(409)
+  })
+
+  it('cannot start time on a completed work order → 409', async () => {
+    const f = await seedFixture()
+    const woId = await newWo(f.ownerToken, f.customerId)
+    await db.query(`UPDATE business_work_orders SET status = 'completed', completed_at = NOW() WHERE id = $1`, [woId])
+    const res = await post(f.ownerToken, `/api/business-work-orders/${woId}/time/start`)
+    expect(res.status).toBe(409)
+  })
+})

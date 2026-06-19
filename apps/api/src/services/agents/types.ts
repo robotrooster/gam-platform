@@ -31,14 +31,16 @@ import type { SamplerSettings } from './config'
  */
 
 /** What kind of work the agent does. */
-export const AGENT_TYPES = ['customer_service', 'sales'] as const
-// 'booking' joins here when the RV/STR/storage booking agent ships (deferred).
+export const AGENT_TYPES = ['customer_service', 'sales', 'booking'] as const
+// 'booking' = the no-account booking-guest agent (RV/STR/storage); like
+// 'sales' it carries its own prompt, NOT the CS guardrails.
 export type AgentType = (typeof AGENT_TYPES)[number]
 
 /** Who the agent talks to. 'prospect' is an unauthenticated marketing-site
  *  visitor (no GAM account) the sales agent talks to. */
-export const AGENT_AUDIENCES = ['tenant', 'landlord', 'prospect'] as const
-// 'guest' joins here for booking-facing agents (deferred).
+export const AGENT_AUDIENCES = ['tenant', 'landlord', 'prospect', 'guest'] as const
+// 'guest' = a no-account booking guest (RV/STR/extended-stay) talking to the
+// booking agent, identified by a per-booking access token rather than a JWT.
 export type AgentAudience = (typeof AGENT_AUDIENCES)[number]
 
 /** Where the agent sits in the escalation ladder. 'human' is the

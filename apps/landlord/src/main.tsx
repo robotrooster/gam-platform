@@ -45,6 +45,7 @@ import { ShelfLabelPage } from './pages/ShelfLabelPage'
 import { InspectionsPage } from './pages/InspectionsPage'
 import { NewInspectionPage } from './pages/NewInspectionPage'
 import { InspectionDetailPage } from './pages/InspectionDetailPage'
+import { UnitLifecyclePage } from './pages/UnitLifecyclePage'
 import { EntryRequestsPage } from './pages/EntryRequestsPage'
 import { NewEntryRequestPage } from './pages/NewEntryRequestPage'
 import { EntryRequestDetailPage } from './pages/EntryRequestDetailPage'
@@ -137,6 +138,7 @@ export default function App() {
               <Route path="schedule"       element={<SchedulePage />} />
               <Route path="inspections"      element={<InspectionsPage />} />
               <Route path="inspections/new"  element={<NewInspectionPage />} />
+              <Route path="inspections/unit/:unitId/lifecycle" element={<UnitLifecyclePage />} />
               <Route path="inspections/:id"  element={<InspectionDetailPage />} />
               <Route path="entry-requests"     element={<EntryRequestsPage />} />
               <Route path="entry-requests/new" element={<NewEntryRequestPage />} />

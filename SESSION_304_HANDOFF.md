@@ -120,7 +120,7 @@ Rewrote the "Flex Suite product line" section with:
 
 ### Cross-session memory persisted
 
-`/Users/gold/.claude/projects/-Users-gold-Downloads-gam/memory/`:
+`/Users/nicholasrhoades/.claude/projects/-Users-gold-Downloads-gam/memory/`:
 
 - **New:** `project_sla_not_loan_principle.md` — full
   description of the SLA-not-loan principle + per-product

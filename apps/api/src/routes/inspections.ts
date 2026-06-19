@@ -15,6 +15,7 @@ import {
   notifyInspectionFinalized,
 } from '../services/notifications'
 import { logger } from '../lib/logger'
+import { buildInspectionChecklist, INSPECTION_TYPES } from '@gam/shared'
 
 // ============================================================
 // /api/inspections — move-in / move-out / periodic inspection
@@ -57,6 +58,24 @@ const photoUpload = multer({
   },
 })
 
+// ── walkthrough video upload (GAM in-house storage) ────────────
+const inspectionVideoDir = path.join(process.cwd(), 'uploads', 'inspection-videos')
+if (!fs.existsSync(inspectionVideoDir)) fs.mkdirSync(inspectionVideoDir, { recursive: true })
+
+const videoStorage = multer.diskStorage({
+  destination: inspectionVideoDir,
+  filename: (_req: any, file: any, cb: any) =>
+    cb(null, Date.now() + '-' + crypto.randomBytes(8).toString('hex') + path.extname(file.originalname)),
+})
+const videoUpload = multer({
+  storage: videoStorage,
+  limits: { fileSize: 500 * 1024 * 1024 }, // 500MB — phone walkthrough clips
+  fileFilter: (_req: any, file: any, cb: any) => {
+    if (['video/mp4', 'video/quicktime', 'video/webm'].includes(file.mimetype)) cb(null, true)
+    else cb(new Error('MP4 MOV WEBM only'))
+  },
+})
+
 // ── POST /api/inspections — create ──────────────────────────────
 // S318: wire-format convention — camelCase request bodies. DB column
 // names remain snake_case.
@@ -64,24 +83,29 @@ const createSchema = z.object({
   unitId: z.string().uuid(),
   leaseId: z.string().uuid().optional(),
   tenantId: z.string().uuid().optional(),
-  inspectionType: z.enum(['move_in', 'move_out', 'periodic']),
+  inspectionType: z.enum(INSPECTION_TYPES),
   comparisonInspectionId: z.string().uuid().optional(),
   scheduledFor: z.string().optional(),
   notes: z.string().optional(),
 })
 
 inspectionsRouter.post('/', async (req, res, next) => {
+  const client = await getClient()
   try {
     const body = createSchema.parse(req.body)
-    const unit = await queryOne<{ id: string; landlord_id: string }>(
-      `SELECT id, landlord_id FROM units WHERE id=$1`,
+    // unit_type + bedrooms drive the standard walkthrough checklist (single
+    // source: buildInspectionChecklist) seeded below.
+    const unit = await queryOne<{ id: string; landlord_id: string; bedrooms: number | null; unit_type: string | null }>(
+      `SELECT id, landlord_id, bedrooms, unit_type FROM units WHERE id=$1`,
       [body.unitId],
     )
     if (!unit) throw new AppError(404, 'Unit not found')
     if (!canManageLandlordResource(req.user, unit.landlord_id)) {
       throw new AppError(403, 'Forbidden')
     }
-    const inserted = await queryOne<{ id: string }>(
+
+    await client.query('BEGIN')
+    const inserted = (await client.query(
       `INSERT INTO unit_inspections (
          unit_id, lease_id, tenant_id, landlord_id,
          inspection_type, comparison_inspection_id,
@@ -98,10 +122,37 @@ inspectionsRouter.post('/', async (req, res, next) => {
         body.scheduledFor ?? null,
         body.notes ?? null,
       ],
-    )
-    res.json({ success: true, data: { id: inserted!.id } })
+    )).rows[0] as { id: string }
+
+    // Seed the standard area checklist as 'na' items so the agent-guided
+    // walkthrough and per-area photo progress have real rows to attach to.
+    // Sized to the unit (only its real bedrooms). ON CONFLICT keeps this
+    // idempotent against the (inspection_id, area, item_label) unique key.
+    const checklist = buildInspectionChecklist({ unitType: unit.unit_type, bedrooms: unit.bedrooms })
+    const seedRows: string[] = []
+    const seedParams: any[] = [inserted.id]
+    for (const areaDef of checklist) {
+      for (const label of areaDef.items) {
+        const areaIdx = seedParams.push(areaDef.area)
+        const labelIdx = seedParams.push(label)
+        seedRows.push(`($1, $${areaIdx}, $${labelIdx}, 'na')`)
+      }
+    }
+    if (seedRows.length) {
+      await client.query(
+        `INSERT INTO unit_inspection_items (inspection_id, area, item_label, condition)
+         VALUES ${seedRows.join(', ')}
+         ON CONFLICT (inspection_id, area, item_label) DO NOTHING`,
+        seedParams,
+      )
+    }
+    await client.query('COMMIT')
+    res.json({ success: true, data: { id: inserted.id, seededItems: seedRows.length } })
   } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
     next(e)
+  } finally {
+    client.release()
   }
 })
 
@@ -254,14 +305,15 @@ inspectionsRouter.post('/:id/photos', photoUpload.single('file'), async (req: an
     const photoUrl = '/api/inspections/photo-files/' + req.file.filename
     const r = await queryOne<{ id: string }>(
       `INSERT INTO unit_inspection_photos (
-         inspection_id, item_id, photo_url, caption, uploaded_by
-       ) VALUES ($1, $2, $3, $4, $5)
+         inspection_id, item_id, photo_url, caption, captured_live, uploaded_by
+       ) VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING id`,
       [
         req.params.id,
         req.body.itemId || null,
         photoUrl,
         req.body.caption || null,
+        req.body.capturedLive === 'true' || req.body.capturedLive === true,
         req.user!.userId,
       ],
     )
@@ -276,6 +328,163 @@ inspectionsRouter.get('/photo-files/:filename', async (req, res, next) => {
     const fp = path.join(inspectionPhotoDir, req.params.filename)
     if (!fs.existsSync(fp)) throw new AppError(404, 'Not found')
     res.sendFile(fp)
+  } catch (e) {
+    next(e)
+  }
+})
+
+// ── Walkthrough videos (GAM in-house "mini-YouTube") ────────────────────
+// Visibility model (Nic 2026-06-18):
+//  - Landlords see ALL video of THEIR units (per-inspection list + the
+//    per-unit lifecycle). These reject the tenant role (denyTenant).
+//  - Tenants may UPLOAD on their own inspection, and see ONLY the videos
+//    THEY uploaded, across every unit, over the years (GET /videos/mine).
+//  - Video files are served with per-row authorization (landlord of the
+//    unit OR the uploader), never blanket-open.
+// Videos are immutable — there is intentionally NO delete route (the DB
+// also hard-blocks deletion; see migration 20260618140000).
+function denyTenant(req: import('express').Request) {
+  if (req.user!.role === 'tenant') throw new AppError(403, 'Forbidden')
+}
+
+// POST /api/inspections/:id/videos — multipart upload of one walkthrough clip.
+// Tenant may upload on THEIR OWN inspection (loadInspectionRow scopes it).
+inspectionsRouter.post('/:id/videos', videoUpload.single('file'), async (req: any, res, next) => {
+  try {
+    if (!req.file) throw new AppError(400, 'No file')
+    const insp = await loadInspectionRow(req.params.id, req)
+    if (insp.status === 'finalized' || insp.status === 'cancelled') {
+      throw new AppError(409, `cannot add videos in status ${insp.status}`)
+    }
+    const videoUrl = '/api/inspections/video-files/' + req.file.filename
+    const durationRaw = Number(req.body.durationSeconds)
+    const r = await queryOne<{ id: string }>(
+      `INSERT INTO unit_inspection_videos (
+         inspection_id, title, video_url, duration_seconds, file_size, mime_type, captured_live, uploaded_by
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING id`,
+      [
+        req.params.id,
+        req.body.title || null,
+        videoUrl,
+        Number.isFinite(durationRaw) ? Math.trunc(durationRaw) : null,
+        req.file.size ?? null,
+        req.file.mimetype ?? null,
+        req.body.capturedLive === 'true' || req.body.capturedLive === true,
+        req.user!.userId,
+      ],
+    )
+    res.json({ success: true, data: { id: r!.id, url: videoUrl } })
+  } catch (e) {
+    next(e)
+  }
+})
+
+// GET /api/inspections/:id/videos — list this inspection's videos
+inspectionsRouter.get('/:id/videos', async (req, res, next) => {
+  try {
+    denyTenant(req)
+    await loadInspectionRow(req.params.id, req) // scope check
+    const videos = await query<any>(
+      `SELECT id, title, video_url, thumbnail_url, duration_seconds, mime_type,
+              captured_live, uploaded_by, uploaded_at
+         FROM unit_inspection_videos WHERE inspection_id = $1
+        ORDER BY uploaded_at ASC`,
+      [req.params.id],
+    )
+    res.json({ success: true, data: videos })
+  } catch (e) {
+    next(e)
+  }
+})
+
+// GET /api/inspections/videos/mine — every video the caller uploaded, across
+// all units, over the years, with unit/inspection context. Self-scoped by
+// uploaded_by, so it's safe for tenants (their own contributions only).
+// (2-segment path — no collision with GET /:id.)
+inspectionsRouter.get('/videos/mine', async (req, res, next) => {
+  try {
+    const videos = await query<any>(
+      `SELECT v.id, v.title, v.video_url, v.thumbnail_url, v.duration_seconds,
+              v.captured_live, v.uploaded_at,
+              i.id AS inspection_id, i.inspection_type,
+              u.id AS unit_id, u.unit_number, p.name AS property_name
+         FROM unit_inspection_videos v
+         JOIN unit_inspections i ON i.id = v.inspection_id
+         JOIN units u ON u.id = i.unit_id
+         JOIN properties p ON p.id = u.property_id
+        WHERE v.uploaded_by = $1
+        ORDER BY v.uploaded_at DESC`,
+      [req.user!.userId],
+    )
+    res.json({ success: true, data: videos })
+  } catch (e) {
+    next(e)
+  }
+})
+
+// GET /api/inspections/video-files/:filename — stream a video. Authorized
+// per-row: admin, the landlord of the unit, or the original uploader.
+inspectionsRouter.get('/video-files/:filename', async (req, res, next) => {
+  try {
+    const videoUrl = '/api/inspections/video-files/' + req.params.filename
+    const v = await queryOne<{ uploaded_by: string; landlord_id: string }>(
+      `SELECT v.uploaded_by, i.landlord_id
+         FROM unit_inspection_videos v
+         JOIN unit_inspections i ON i.id = v.inspection_id
+        WHERE v.video_url = $1`,
+      [videoUrl],
+    )
+    if (!v) throw new AppError(404, 'Not found')
+    const u = req.user!
+    const allowed =
+      u.role === 'admin' ||
+      u.role === 'super_admin' ||
+      v.uploaded_by === u.userId ||
+      canAccessLandlordResource(u, v.landlord_id)
+    if (!allowed) throw new AppError(403, 'Forbidden')
+
+    const fp = path.join(inspectionVideoDir, req.params.filename)
+    if (!fs.existsSync(fp)) throw new AppError(404, 'Not found')
+    res.sendFile(fp)
+  } catch (e) {
+    next(e)
+  }
+})
+
+// GET /api/inspections/unit/:unitId/lifecycle — the unit's video story:
+// every inspection for the unit, oldest first, each with its videos.
+// (3-segment path — no collision with GET /:id.)
+inspectionsRouter.get('/unit/:unitId/lifecycle', async (req, res, next) => {
+  try {
+    denyTenant(req)
+    const unit = await queryOne<{ id: string; landlord_id: string; unit_number: string | null }>(
+      `SELECT id, landlord_id, unit_number FROM units WHERE id = $1`,
+      [req.params.unitId],
+    )
+    if (!unit) throw new AppError(404, 'Unit not found')
+    if (!canAccessLandlordResource(req.user, unit.landlord_id)) throw new AppError(403, 'Forbidden')
+
+    const stages = await query<any>(
+      `SELECT i.id, i.inspection_type, i.status, i.scheduled_for, i.conducted_at,
+              i.finalized_at, i.created_at,
+              COALESCE(
+                json_agg(
+                  json_build_object(
+                    'id', v.id, 'title', v.title, 'url', v.video_url,
+                    'thumbnailUrl', v.thumbnail_url, 'durationSeconds', v.duration_seconds,
+                    'capturedLive', v.captured_live, 'uploadedAt', v.uploaded_at
+                  ) ORDER BY v.uploaded_at
+                ) FILTER (WHERE v.id IS NOT NULL), '[]'
+              ) AS videos
+         FROM unit_inspections i
+         LEFT JOIN unit_inspection_videos v ON v.inspection_id = i.id
+        WHERE i.unit_id = $1
+        GROUP BY i.id
+        ORDER BY COALESCE(i.conducted_at, i.scheduled_for, i.created_at) ASC`,
+      [req.params.unitId],
+    )
+    res.json({ success: true, data: { unit: { id: unit.id, unitNumber: unit.unit_number }, stages } })
   } catch (e) {
     next(e)
   }
@@ -598,7 +807,7 @@ async function loadInspection(
     [id],
   )
   const photos = await query<any>(
-    `SELECT id, item_id, photo_url, caption, uploaded_by, uploaded_at
+    `SELECT id, item_id, photo_url, caption, captured_live, uploaded_by, uploaded_at
        FROM unit_inspection_photos
       WHERE inspection_id = $1
       ORDER BY uploaded_at`,

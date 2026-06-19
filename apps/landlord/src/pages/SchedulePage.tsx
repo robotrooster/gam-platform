@@ -51,6 +51,12 @@ export function SchedulePage() {
   const [typeForm, setTypeForm] = useState<any>({})
   const [unitPickerOpen, setUnitPickerOpen] = useState(false)
   const [selectedCell, setSelectedCell] = useState<{unitId:string; date:string}|null>(null)
+  // Booking-guest access: the QR/link a no-account guest uses to reach their
+  // stay assistant. Generated on demand per booking.
+  const [guestAccess, setGuestAccess] = useState<{
+    show:boolean; booking:any; loading:boolean; error:string|null;
+    data:{url:string; qrDataUrl:string; expiresAt:string; emailed?:boolean}|null; emailing:boolean
+  }>({show:false, booking:null, loading:false, error:null, data:null, emailing:false})
   const scrollContainerRef = useRef<HTMLDivElement>(null)
   const theadRef = useRef<HTMLTableSectionElement>(null)
   const legendRef = useRef<HTMLDivElement>(null)
@@ -132,6 +138,29 @@ export function SchedulePage() {
       onError: () => { alert('Cannot move booking — date conflict on that unit.') }
     }
   )
+
+  const openGuestAccess = async (b: any) => {
+    setGuestAccess({show:true, booking:b, loading:true, error:null, data:null, emailing:false})
+    try {
+      const resp = await apiPost<{url:string; qrDataUrl:string; expiresAt:string; emailed?:boolean}>(
+        `/units/${b.unitId}/bookings/${b.id}/guest-access`, { delivery:'qr' })
+      setGuestAccess(s => ({...s, loading:false, data: resp.data}))
+    } catch (e:any) {
+      setGuestAccess(s => ({...s, loading:false, error: e?.message || 'Could not generate the guest link.'}))
+    }
+  }
+  const emailGuestAccess = async () => {
+    const b = guestAccess.booking
+    if (!b) return
+    setGuestAccess(s => ({...s, emailing:true, error:null}))
+    try {
+      const resp = await apiPost<{url:string; qrDataUrl:string; expiresAt:string; emailed?:boolean}>(
+        `/units/${b.unitId}/bookings/${b.id}/guest-access`, { delivery:'email', sendEmail:true })
+      setGuestAccess(s => ({...s, emailing:false, data: resp.data}))
+    } catch (e:any) {
+      setGuestAccess(s => ({...s, emailing:false, error: e?.message || 'Could not email the guest link.'}))
+    }
+  }
 
   const getBookingForDate = (unitId: string, date: string) => {
     return bookings.find(b => b.unitId === unitId && date >= b.checkIn && date < b.checkOut) ||
@@ -498,9 +527,15 @@ export function SchedulePage() {
                 </div>
                 {b.guestEmail && <div style={{fontSize:'.75rem',color:'var(--text-3)'}}>{b.guestEmail} · {b.guestPhone||''}</div>}
               </div>
-              <div style={{textAlign:'right'}}>
-                <div style={{fontWeight:700,color:'var(--gold)'}}>{fmt(b.totalAmount)}</div>
-                <div style={{fontSize:'.72rem',color:'var(--text-3)'}}>Fee: {fmt(b.platformFee)}</div>
+              <div style={{textAlign:'right',display:'flex',flexDirection:'column',alignItems:'flex-end',gap:6}}>
+                <div>
+                  <div style={{fontWeight:700,color:'var(--gold)'}}>{fmt(b.totalAmount)}</div>
+                  <div style={{fontSize:'.72rem',color:'var(--text-3)'}}>Fee: {fmt(b.platformFee)}</div>
+                </div>
+                {!['cancelled','checked_out','no_show'].includes(b.status) && (
+                  <button className="btn btn-ghost btn-sm" style={{fontSize:'.68rem',padding:'3px 8px',whiteSpace:'nowrap'}}
+                    onClick={()=>openGuestAccess(b)}>Guest link</button>
+                )}
               </div>
             </div>
           ))}
@@ -662,6 +697,48 @@ export function SchedulePage() {
               <button className="btn btn-primary" onClick={()=>createBookingMut.mutate()} disabled={!newBooking.checkIn||!newBooking.checkOut||createBookingMut.isLoading}>
                 {createBookingMut.isLoading?'Creating...':'Create Booking'}
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Guest access — QR + link the guest scans/opens to reach their stay assistant */}
+      {guestAccess.show && (
+        <div className="modal-overlay" onClick={()=>setGuestAccess(s=>({...s,show:false}))}>
+          <div className="modal" style={{maxWidth:420}} onClick={e=>e.stopPropagation()}>
+            <div className="modal-header">
+              <span className="modal-title">Guest stay assistant</span>
+              <button className="btn btn-ghost btn-sm" onClick={()=>setGuestAccess(s=>({...s,show:false}))}>✕</button>
+            </div>
+            <div style={{padding:16}}>
+              <div style={{fontSize:'.8rem',color:'var(--text-3)',marginBottom:12}}>
+                {guestAccess.booking?.guestName||'Your guest'} can scan this code or open the link to ask about their stay and request things like a late checkout. No account needed — it works through checkout.
+              </div>
+              {guestAccess.loading && <div style={{textAlign:'center',padding:24,color:'var(--text-3)'}}>Generating…</div>}
+              {guestAccess.error && <div style={{color:'var(--red)',fontSize:'.82rem',padding:'8px 0'}}>{guestAccess.error}</div>}
+              {guestAccess.data && (
+                <>
+                  <div style={{display:'flex',justifyContent:'center',marginBottom:12}}>
+                    <img src={guestAccess.data.qrDataUrl} alt="Guest access QR" width={200} height={200}
+                      style={{borderRadius:8,background:'#fff',padding:8}} />
+                  </div>
+                  <div style={{display:'flex',gap:8,alignItems:'center',marginBottom:10}}>
+                    <input readOnly value={guestAccess.data.url}
+                      style={{flex:1,fontSize:'.72rem',padding:'6px 8px',background:'var(--bg-1)',border:'1px solid var(--border-1)',borderRadius:6,color:'var(--text-2)'}}
+                      onFocus={e=>e.currentTarget.select()} />
+                    <button className="btn btn-ghost btn-sm" onClick={()=>navigator.clipboard?.writeText(guestAccess.data!.url)}>Copy</button>
+                  </div>
+                  <div style={{fontSize:'.7rem',color:'var(--text-3)',marginBottom:12}}>
+                    Link expires {new Date(guestAccess.data.expiresAt).toLocaleDateString()}. Keep it private — anyone with it can see this booking.
+                  </div>
+                  {guestAccess.booking?.guestEmail && (
+                    guestAccess.data.emailed
+                      ? <div style={{fontSize:'.78rem',color:'var(--green)'}}>✓ Emailed to {guestAccess.booking.guestEmail}</div>
+                      : <button className="btn btn-secondary btn-sm" style={{width:'100%'}} disabled={guestAccess.emailing}
+                          onClick={emailGuestAccess}>{guestAccess.emailing?'Sending…':`Email link to ${guestAccess.booking.guestEmail}`}</button>
+                  )}
+                </>
+              )}
             </div>
           </div>
         </div>

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { apiGet, apiPost, openPdfInNewTab } from '../lib/api'
+import { useAuth } from '../context/AuthContext'
 import { Modal } from '../components/Modal'
 import {
   Search, Plus, Minus, X, ShoppingCart, Receipt, ArrowLeft,
@@ -36,9 +37,10 @@ interface CartLine {
 interface TransactionSummary {
   id: string
   receiptNumber: string
-  status: 'completed' | 'refunded' | 'void'
+  status: 'completed' | 'partially_refunded' | 'refunded' | 'void'
   subtotal: string
   taxAmount: string
+  tipAmount: string
   totalAmount: string
   paymentMethod: 'cash' | 'card_recorded' | 'stripe_terminal' | 'stripe_checkout'
   refundedAt: string | null
@@ -54,6 +56,7 @@ interface TransactionLine {
   nameSnapshot: string
   skuSnapshot: string | null
   quantity: number
+  refundedQty: number
   unitPrice: string
   taxRate: string
   lineSubtotal: string
@@ -64,6 +67,8 @@ interface TransactionLine {
 interface TransactionDetail extends TransactionSummary {
   amountTendered: string | null
   changeDue: string | null
+  discountAmount: string
+  refundedAmount: string
   notes: string | null
   refundReason: string | null
   customerEmail: string | null
@@ -413,18 +418,61 @@ function CheckoutModal({
   onClose: () => void
   onSold: (txn: TransactionDetail) => void
 }) {
+  const { business } = useAuth()
+  const discountsEnabled = (business?.enabledFeatures ?? []).includes('discounts')
+
   const [method, setMethod] = useState<'cash' | 'card_recorded'>('cash')
+  // S512: tip is added on top of the sale. Presets compute off the
+  // pre-tax subtotal (US convention); custom is a flat dollar amount.
+  const [tipPreset, setTipPreset] = useState<number | 'custom' | null>(null)
+  const [customTip, setCustomTip] = useState('')
+  const round2 = (n: number) => Math.round(n * 100) / 100
+
+  // S513: optional discount code, previewed against the subtotal. The
+  // discount is pre-tax, so the line tax scales down with it.
+  const [discountInput, setDiscountInput] = useState('')
+  const [applied, setApplied] = useState<{ code: string; discountAmount: number } | null>(null)
+  const [discountErr, setDiscountErr] = useState<string | null>(null)
+  const [applying, setApplying] = useState(false)
+  const applyCode = async () => {
+    setDiscountErr(null)
+    if (!discountInput.trim()) return
+    setApplying(true)
+    try {
+      const r = await apiPost<{ code: string; discountAmount: number }>(
+        '/business-discounts/preview', { code: discountInput.trim(), subtotal })
+      setApplied(r.data)
+    } catch (e: any) {
+      setApplied(null)
+      setDiscountErr(e?.response?.data?.error || 'Invalid code')
+    } finally { setApplying(false) }
+  }
+  const clearCode = () => { setApplied(null); setDiscountInput(''); setDiscountErr(null) }
+
+  const discount = applied?.discountAmount ?? 0
+  const discountedSubtotal = round2(subtotal - discount)
+  const scaledTax = subtotal > 0 ? round2(tax * (discountedSubtotal / subtotal)) : tax
+  const saleTotal = round2(discountedSubtotal + scaledTax)
+
+  const tip = tipPreset === 'custom'
+    ? Math.max(0, round2(Number(customTip) || 0))
+    : tipPreset != null ? round2(subtotal * tipPreset) : 0
+  const grandTotal = round2(saleTotal + tip)
+
   const [tendered, setTendered] = useState(String(total.toFixed(2)))
+  const [tenderedTouched, setTenderedTouched] = useState(false)
   const [notes, setNotes] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [err, setErr] = useState<string | null>(null)
 
-  const change = method === 'cash' ? Math.max(0, Number(tendered) - total) : 0
+  // Keep tendered tracking the grand total until the cashier edits it.
+  const tenderedNum = tenderedTouched ? Number(tendered) : grandTotal
+  const change = method === 'cash' ? Math.max(0, tenderedNum - grandTotal) : 0
 
   const submit = async () => {
     setErr(null)
-    if (method === 'cash' && Number(tendered) < total) {
-      setErr(`Tendered must be at least ${fmtMoney(total)}`)
+    if (method === 'cash' && tenderedNum < grandTotal) {
+      setErr(`Tendered must be at least ${fmtMoney(grandTotal)}`)
       return
     }
     setSubmitting(true)
@@ -435,7 +483,9 @@ function CheckoutModal({
         lines: cart.map(c => ({ itemId: c.itemId, quantity: c.qty })),
       }
       if (customerId) payload.customerId = customerId
-      if (method === 'cash') payload.amountTendered = Number(tendered)
+      if (tip > 0) payload.tipAmount = tip
+      if (applied) payload.discountCode = applied.code
+      if (method === 'cash') payload.amountTendered = tenderedNum
       const r = await apiPost<TransactionDetail>('/business-pos/transactions', payload)
       onSold(r.data)
     } catch (e: any) {
@@ -449,7 +499,7 @@ function CheckoutModal({
         <>
           <button onClick={onClose} style={ghostBtn}>Cancel</button>
           <button onClick={submit} disabled={submitting} style={primaryBtnStyle}>
-            {submitting ? 'Recording…' : `Complete sale — ${fmtMoney(total)}`}
+            {submitting ? 'Recording…' : `Complete sale — ${fmtMoney(grandTotal)}`}
           </button>
         </>
       }>
@@ -457,9 +507,72 @@ function CheckoutModal({
 
       <div style={{ padding: 14, background: 'var(--bg-2)', borderRadius: 8, marginBottom: 16 }}>
         <Row label="Subtotal" value={fmtMoney(subtotal)} />
-        <Row label="Tax"      value={fmtMoney(tax)} />
-        <Row label="Total"    value={fmtMoney(total)} big />
+        {discount > 0 && <Row label={`Discount${applied ? ` (${applied.code})` : ''}`} value={`-${fmtMoney(discount)}`} />}
+        <Row label="Tax"      value={fmtMoney(scaledTax)} />
+        {tip > 0 && <Row label="Tip" value={fmtMoney(tip)} />}
+        <Row label="Total"    value={fmtMoney(grandTotal)} big />
       </div>
+
+      {discountsEnabled && (
+        <>
+          <label style={labelStyle}>Discount code (optional)</label>
+          {applied ? (
+            <div style={{
+              display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+              padding: '10px 12px', background: 'rgba(34,197,94,.08)',
+              border: '1px solid var(--green, #22c55e)', borderRadius: 8,
+            }}>
+              <span style={{ fontSize: 13, color: 'var(--text-1)' }}>
+                <strong style={{ fontFamily: 'var(--font-mono)' as const }}>{applied.code}</strong> — {fmtMoney(applied.discountAmount)} off
+              </span>
+              <button onClick={clearCode} style={{ ...ghostBtn, padding: '4px 10px' }}>Remove</button>
+            </div>
+          ) : (
+            <div style={{ display: 'flex', gap: 8 }}>
+              <input
+                value={discountInput}
+                onChange={e => setDiscountInput(e.target.value.toUpperCase())}
+                onKeyDown={e => { if (e.key === 'Enter') applyCode() }}
+                placeholder="SUMMER20"
+                style={{ ...inputStyle, marginTop: 0, fontFamily: 'var(--font-mono)' as const }} />
+              <button onClick={applyCode} disabled={applying || !discountInput.trim()} style={ghostBtn}>
+                {applying ? '…' : 'Apply'}
+              </button>
+            </div>
+          )}
+          {discountErr && <div style={{ fontSize: 12, color: 'var(--red, #ef4444)', marginTop: 6 }}>{discountErr}</div>}
+        </>
+      )}
+
+      <label style={labelStyle}>Tip (optional)</label>
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' as const }}>
+        {([['None', null], ['15%', 0.15], ['18%', 0.18], ['20%', 0.20], ['Custom', 'custom']] as const).map(([lbl, val]) => {
+          const active = tipPreset === val
+          return (
+            <button key={lbl}
+              onClick={() => { setTipPreset(val); if (val !== 'custom') setCustomTip('') }}
+              style={{
+                flex: '1 1 0', minWidth: 56, padding: '8px 4px',
+                background: active ? 'rgba(212,175,55,.12)' : 'var(--bg-2)',
+                border: `1px solid ${active ? 'var(--gold)' : 'var(--border-1)'}`,
+                borderRadius: 8,
+                color: active ? 'var(--gold)' : 'var(--text-1)',
+                fontSize: 13, fontWeight: 600, cursor: 'pointer',
+              }}>
+              {lbl}
+            </button>
+          )
+        })}
+      </div>
+      {tipPreset === 'custom' && (
+        <input
+          type="number" step="0.01" min={0}
+          value={customTip}
+          onChange={e => setCustomTip(e.target.value)}
+          placeholder="Tip amount"
+          style={{ ...inputStyle, marginTop: 8, fontFamily: 'var(--font-mono)' as const }}
+          autoFocus />
+      )}
 
       <label style={labelStyle}>Payment method</label>
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
@@ -485,9 +598,9 @@ function CheckoutModal({
         <>
           <label style={labelStyle}>Amount tendered</label>
           <input
-            type="number" step="0.01" min={total}
-            value={tendered}
-            onChange={e => setTendered(e.target.value)}
+            type="number" step="0.01" min={grandTotal}
+            value={tenderedTouched ? tendered : grandTotal.toFixed(2)}
+            onChange={e => { setTenderedTouched(true); setTendered(e.target.value) }}
             style={{ ...inputStyle, fontSize: 20, fontFamily: 'var(--font-mono)' as const }} />
           <div style={{
             marginTop: 12, padding: 12,
@@ -559,8 +672,10 @@ function ReceiptView({ txn, onDone }: { txn: TransactionDetail; onDone: () => vo
         ))}
         <div style={{ borderTop: '1px solid var(--border-1)', marginTop: 12, paddingTop: 12 }}>
           <Row label="Subtotal" value={fmtMoney(txn.subtotal)} />
+          {Number(txn.discountAmount) > 0 && <Row label="Discount" value={`-${fmtMoney(txn.discountAmount)}`} />}
           <Row label="Tax"      value={fmtMoney(txn.taxAmount)} />
-          <Row label="Total"    value={fmtMoney(txn.totalAmount)} big />
+          {Number(txn.tipAmount) > 0 && <Row label="Tip" value={fmtMoney(txn.tipAmount)} />}
+          <Row label="Total"    value={fmtMoney(Number(txn.totalAmount) + Number(txn.tipAmount ?? 0))} big />
         </div>
         {txn.paymentMethod === 'cash' && txn.changeDue !== null && (
           <div style={{
@@ -651,7 +766,7 @@ function HistoryTab() {
                   : t.paymentMethod}
                 </td>
                 <td style={{ ...tdStyle, fontFamily: 'var(--font-mono)' as const, fontWeight: 600 }}>
-                  {fmtMoney(t.totalAmount)}
+                  {fmtMoney(Number(t.totalAmount) + Number(t.tipAmount ?? 0))}
                 </td>
                 <td style={tdStyle}>
                   <StatusBadge status={t.status} />
@@ -715,7 +830,7 @@ function HistoryDetail({ id, onBack }: { id: string; onBack: () => void }) {
               style={ghostBtn}>
               <Printer size={12} /> Print
             </button>
-            {txn.status === 'completed' && (
+            {(txn.status === 'completed' || txn.status === 'partially_refunded') && (
               <button onClick={() => setShowRefund(true)} style={ghostBtn}>
                 <RotateCcw size={12} /> Refund
               </button>
@@ -723,16 +838,16 @@ function HistoryDetail({ id, onBack }: { id: string; onBack: () => void }) {
           </div>
         </div>
 
-        {txn.status === 'refunded' && txn.refundReason && (
+        {(txn.status === 'refunded' || txn.status === 'partially_refunded') && txn.refundReason && (
           <div style={{
             padding: 12, marginBottom: 16,
             background: 'rgba(245,158,11,.06)',
             border: '1px solid rgba(245,158,11,.4)',
             borderRadius: 8, fontSize: 13, color: 'var(--text-1)',
           }}>
-            <strong>Refund reason:</strong> {txn.refundReason}
+            <strong>{txn.status === 'partially_refunded' ? 'Partial refund' : 'Refunded'} — {fmtMoney(txn.refundedAmount)}:</strong> {txn.refundReason}
             <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 4 }}>
-              Refunded {fmtDate(txn.refundedAt)}
+              {fmtDate(txn.refundedAt)}
             </div>
           </div>
         )}
@@ -771,8 +886,10 @@ function HistoryDetail({ id, onBack }: { id: string; onBack: () => void }) {
 
         <div style={{ padding: 14, background: 'var(--bg-2)', borderRadius: 8 }}>
           <Row label="Subtotal" value={fmtMoney(txn.subtotal)} />
+          {Number(txn.discountAmount) > 0 && <Row label="Discount" value={`-${fmtMoney(txn.discountAmount)}`} />}
           <Row label="Tax"      value={fmtMoney(txn.taxAmount)} />
-          <Row label="Total"    value={fmtMoney(txn.totalAmount)} big />
+          {Number(txn.tipAmount) > 0 && <Row label="Tip" value={fmtMoney(txn.tipAmount)} />}
+          <Row label="Total"    value={fmtMoney(Number(txn.totalAmount) + Number(txn.tipAmount ?? 0))} big />
           {txn.paymentMethod === 'cash' && txn.amountTendered !== null && (
             <>
               <Row label="Tendered" value={fmtMoney(txn.amountTendered)} />
@@ -808,15 +925,33 @@ function RefundModal({
   onDone: () => void
 }) {
   const [reason, setReason] = useState('')
+  const [mode, setMode] = useState<'full' | 'lines'>('full')
+  // Per-line refund quantities, keyed by line id. Default 0.
+  const [qtys, setQtys] = useState<Record<string, number>>({})
   const [submitting, setSubmitting] = useState(false)
   const [err, setErr] = useState<string | null>(null)
+
+  const remainingOf = (l: TransactionLine) => l.quantity - l.refundedQty
+  const refundableLines = txn.lines.filter(l => remainingOf(l) > 0)
+  const setQty = (id: string, max: number, v: string) => {
+    const n = Math.max(0, Math.min(max, Math.floor(Number(v) || 0)))
+    setQtys(prev => ({ ...prev, [id]: n }))
+  }
 
   const submit = async () => {
     setErr(null)
     if (!reason.trim()) { setErr('Reason required'); return }
+    const payload: any = { reason: reason.trim() }
+    if (mode === 'lines') {
+      const lines = refundableLines
+        .map(l => ({ lineId: l.id, quantity: qtys[l.id] ?? 0 }))
+        .filter(l => l.quantity > 0)
+      if (lines.length === 0) { setErr('Pick at least one item to refund'); return }
+      payload.lines = lines
+    }
     setSubmitting(true)
     try {
-      await apiPost(`/business-pos/transactions/${txn.id}/refund`, { reason: reason.trim() })
+      await apiPost(`/business-pos/transactions/${txn.id}/refund`, payload)
       onDone()
     } catch (e: any) {
       setErr(e?.response?.data?.error || 'Refund failed')
@@ -829,7 +964,7 @@ function RefundModal({
         <>
           <button onClick={onClose} style={ghostBtn}>Cancel</button>
           <button onClick={submit} disabled={submitting} style={primaryBtnStyle}>
-            {submitting ? 'Refunding…' : `Refund ${fmtMoney(txn.totalAmount)}`}
+            {submitting ? 'Refunding…' : 'Record refund'}
           </button>
         </>
       }>
@@ -843,31 +978,66 @@ function RefundModal({
       }}>
         <AlertTriangle size={14} style={{ color: 'var(--amber)', flexShrink: 0, marginTop: 2 }} />
         <span>
-          This is a full refund. Items go back into inventory at their original quantities.
-          Run the actual refund on your card terminal separately — GAM only records the bookkeeping.
+          Refunded items go back into inventory. Run the actual refund on your card terminal
+          separately — GAM only records the bookkeeping.
         </span>
       </div>
+
+      <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
+        {(['full', 'lines'] as const).map(m => (
+          <button key={m} onClick={() => setMode(m)} style={{
+            flex: 1, padding: 10,
+            background: mode === m ? 'rgba(212,175,55,.12)' : 'var(--bg-2)',
+            border: `1px solid ${mode === m ? 'var(--gold)' : 'var(--border-1)'}`,
+            borderRadius: 8, color: mode === m ? 'var(--gold)' : 'var(--text-1)',
+            fontSize: 13, fontWeight: 600, cursor: 'pointer',
+          }}>{m === 'full' ? 'Everything remaining' : 'Pick items'}</button>
+        ))}
+      </div>
+
+      {mode === 'lines' && (
+        <div style={{ marginBottom: 12 }}>
+          {refundableLines.map(l => {
+            const max = remainingOf(l)
+            return (
+              <div key={l.id} style={{
+                display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                padding: '8px 0', borderBottom: '1px solid var(--border-0)',
+              }}>
+                <div style={{ fontSize: 13, color: 'var(--text-1)' }}>
+                  {l.nameSnapshot}
+                  <span style={{ color: 'var(--text-3)', fontSize: 11, marginLeft: 6 }}>
+                    {max} of {l.quantity} refundable
+                  </span>
+                </div>
+                <input type="number" min={0} max={max} value={qtys[l.id] ?? 0}
+                  onChange={e => setQty(l.id, max, e.target.value)}
+                  style={{ ...inputStyle, width: 70, marginTop: 0, textAlign: 'center' as const }} />
+              </div>
+            )
+          })}
+        </div>
+      )}
 
       <label style={labelStyle}>Reason</label>
       <input value={reason}
         onChange={e => setReason(e.target.value)}
         placeholder="Customer returned item / wrong charge / etc."
-        style={inputStyle}
-        autoFocus />
+        style={inputStyle} />
     </Modal>
   )
 }
 
-function StatusBadge({ status }: { status: 'completed' | 'refunded' | 'void' }) {
+function StatusBadge({ status }: { status: 'completed' | 'partially_refunded' | 'refunded' | 'void' }) {
   const color = status === 'completed' ? 'var(--green, #22c55e)'
-              : status === 'refunded'  ? 'var(--amber)'
+              : status === 'refunded' || status === 'partially_refunded' ? 'var(--amber)'
               : 'var(--text-3)'
   return (
     <span style={{
       padding: '3px 8px', fontSize: 11, fontWeight: 700,
       textTransform: 'uppercase' as const, letterSpacing: 0.5,
       border: `1px solid ${color}`, color, borderRadius: 4,
-    }}>{status}</span>
+    }}>{status.replace('_', ' ')}</span>
   )
 }
 

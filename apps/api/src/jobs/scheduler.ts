@@ -639,6 +639,18 @@ export function schedulerInit() {
     }
   }, { timezone: 'America/Phoenix' })
 
+  // S518: business appointment reminders. Hourly — emails the customer
+  // once when their appointment enters the next-24h window (reminder_sent_at
+  // one-shot guard). Cuts no-shows for appointment-based businesses.
+  cron.schedule('5 * * * *', async () => {
+    try {
+      const { sendAppointmentReminders } = await import('../services/appointmentReminders')
+      await sendAppointmentReminders()
+    } catch (e) {
+      logger.error({ err: e }, '[appointment-reminders] fatal')
+    }
+  }, { timezone: 'America/Phoenix' })
+
   // S69: monthly manager-fee accrual. Fires 1st of each month at 1am Phoenix.
   // Posts allocation_manager_fee ledger entries for properties with
   // flat_monthly_fee or per_unit_fee configured. Idempotent per (property, month).

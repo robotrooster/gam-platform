@@ -1,0 +1,11 @@
+-- Live Stripe refunds for business invoices (S502).
+--
+-- The S519 invoice refund was bookkeeping-only (operator ran the money refund
+-- on Stripe by hand). Now the refund route fires the real Stripe refund for
+-- invoices that were paid through Stripe (stripe_payment_intent_id present).
+-- Capture the Stripe refund id for traceability (most-recent refund; the
+-- accumulated dollar total still lives in refunded_amount).
+--
+-- No backfill needed — new nullable column; manually/terminal-paid invoices
+-- (no payment_intent) keep the bookkeeping-only path and leave this NULL.
+ALTER TABLE business_invoices ADD COLUMN IF NOT EXISTS stripe_refund_id text;

@@ -150,7 +150,64 @@ export function SettingsPage() {
       {biz && <StripeConnectSection biz={biz} />}
       {biz && <TaxSection biz={biz} setBiz={setBiz} />}
       {biz && <PublicBookingSection biz={biz} setBiz={setBiz} />}
+      {biz && ((biz.enabledFeatures ?? biz.enabled_features ?? []) as string[]).includes('appointments') &&
+        <AppointmentRemindersSection biz={biz} setBiz={setBiz} />}
       {biz && <FeaturesSection biz={biz} setBiz={setBiz} />}
+    </div>
+  )
+}
+
+// S502: automated appointment reminders opt-out. Only shown when the
+// 'appointments' feature is on. Default ON; turning it off stops the 24h-
+// before reminder emails to this business's customers.
+function AppointmentRemindersSection({ biz, setBiz }: { biz: any; setBiz: (b: any) => void }) {
+  const current = biz.appointmentRemindersEnabled ?? biz.appointment_reminders_enabled ?? true
+  const [enabled, setEnabled] = useState<boolean>(!!current)
+  const [saving, setSaving] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+
+  const onToggle = async () => {
+    const next = !enabled
+    setEnabled(next); setErr(null); setSaving(true)
+    try {
+      const updated = await apiPatch<any>('/businesses/me', { appointmentRemindersEnabled: next })
+      setBiz(updated)
+    } catch (e: any) {
+      setEnabled(!next) // revert on failure
+      setErr(e?.response?.data?.error || 'Save failed')
+    } finally { setSaving(false) }
+  }
+
+  return (
+    <div style={{
+      marginTop: 24, padding: 24,
+      background: 'var(--bg-1)', border: '1px solid var(--border-0)',
+      borderRadius: 12, maxWidth: 640,
+    }}>
+      <h2 style={{ fontFamily: 'var(--font-display)', fontSize: 18, marginTop: 0 }}>
+        Appointment reminders
+      </h2>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 16 }}>
+        <div style={{ fontSize: 13, color: 'var(--text-2)', maxWidth: 460 }}>
+          Automatically email customers a reminder about 24 hours before their appointment.
+          Turn this off if you’d rather remind them yourself.
+        </div>
+        <button
+          type="button" role="switch" aria-checked={enabled} aria-label="Appointment reminders"
+          disabled={saving} onClick={onToggle}
+          style={{
+            flexShrink: 0, width: 44, height: 24, borderRadius: 999, border: 'none',
+            cursor: saving ? 'default' : 'pointer', position: 'relative',
+            background: enabled ? 'var(--gold)' : 'var(--border-1)',
+            transition: 'background .15s', opacity: saving ? 0.6 : 1,
+          }}>
+          <span style={{
+            position: 'absolute', top: 2, left: enabled ? 22 : 2, width: 20, height: 20,
+            borderRadius: '50%', background: '#fff', transition: 'left .15s',
+          }} />
+        </button>
+      </div>
+      {err && <div style={{ marginTop: 10, color: 'var(--red)', fontSize: 12 }}>{err}</div>}
     </div>
   )
 }

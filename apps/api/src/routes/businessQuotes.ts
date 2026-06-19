@@ -28,6 +28,11 @@ import { z } from 'zod'
 import { db, query, queryOne } from '../db'
 import { requireAuth } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
+import {
+  applyDiscount,
+  resolveDiscountCode,
+  computeDiscountAmount,
+} from '../services/businessDiscounts'
 
 export const businessQuotesRouter = Router()
 
@@ -49,22 +54,52 @@ function dec(n: string | number | null | undefined): number {
   return Math.round(Number(n ?? 0) * 100) / 100
 }
 
+// S503: discount-aware totals. subtotal stays GROSS (sum of line
+// subtotals); any attached discount code is re-derived against the fresh
+// gross subtotal — so a percent code stays correct as lines change and a
+// fixed code clamps to the new subtotal. The discount is a PREVIEW: no
+// redemption is consumed here (that happens at convert-to-invoice). Tax is
+// per-line, so we scale it by (subtotal - discount)/subtotal to keep the
+// taxable base consistent with the post-discount amount. A code that was
+// deleted out from under the quote drops to a 0 discount + null link.
 async function recomputeTotals(client: any, quoteId: string): Promise<void> {
   const { rows: lines } = (await client.query(
     `SELECT line_subtotal, line_tax FROM business_quote_lines WHERE quote_id = $1`,
     [quoteId])) as { rows: Array<{ line_subtotal: string; line_tax: string }> }
-  let subtotal = 0, tax = 0
+  let grossSubtotal = 0, grossTax = 0
   for (const l of lines) {
-    subtotal += Number(l.line_subtotal)
-    tax += Number(l.line_tax)
+    grossSubtotal += Number(l.line_subtotal)
+    grossTax += Number(l.line_tax)
   }
-  subtotal = dec(subtotal); tax = dec(tax)
-  const total = dec(subtotal + tax)
+  grossSubtotal = dec(grossSubtotal); grossTax = dec(grossTax)
+
+  const { rows: [q] } = await client.query(
+    `SELECT discount_code_id FROM business_quotes WHERE id = $1`, [quoteId])
+  let discount = 0
+  let discountCodeId: string | null = q?.discount_code_id ?? null
+  if (discountCodeId) {
+    const { rows: [dc] } = await client.query(
+      `SELECT discount_type, discount_value
+         FROM business_discount_codes WHERE id = $1`, [discountCodeId])
+    if (dc) {
+      discount = computeDiscountAmount(
+        dc.discount_type, Number(dc.discount_value), grossSubtotal)
+    } else {
+      discountCodeId = null
+    }
+  }
+
+  const taxableFactor = grossSubtotal > 0
+    ? (grossSubtotal - discount) / grossSubtotal
+    : 0
+  const tax = dec(grossTax * taxableFactor)
+  const total = dec(grossSubtotal - discount + tax)
   await client.query(
     `UPDATE business_quotes
-        SET subtotal = $1, tax_amount = $2, total_amount = $3
-      WHERE id = $4`,
-    [subtotal, tax, total, quoteId])
+        SET subtotal = $1, tax_amount = $2, total_amount = $3,
+            discount_amount = $4, discount_code_id = $5
+      WHERE id = $6`,
+    [grossSubtotal, tax, total, discount, discountCodeId, quoteId])
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -164,7 +199,7 @@ businessQuotesRouter.get('/', requireAuth, async (req, res, next) => {
     params.push(q.limit ?? 100)
     const rows = await query<any>(
       `SELECT q.id, q.quote_number, q.status,
-              q.subtotal, q.tax_amount, q.total_amount,
+              q.subtotal, q.discount_amount, q.tax_amount, q.total_amount,
               q.expires_at, q.sent_at, q.accepted_at, q.declined_at,
               q.invoice_id, q.work_order_id,
               q.customer_id, q.vehicle_id,
@@ -190,6 +225,7 @@ businessQuotesRouter.get('/:id', requireAuth, async (req, res, next) => {
     const businessId = await requireRead(req)
     const q = await queryOne<any>(
       `SELECT q.*,
+              dc.code AS discount_code,
               c.first_name AS customer_first_name,
               c.last_name  AS customer_last_name,
               c.company_name AS customer_company_name,
@@ -201,6 +237,7 @@ businessQuotesRouter.get('/:id', requireAuth, async (req, res, next) => {
               v.vin    AS vehicle_vin
          FROM business_quotes q
          JOIN business_customers c ON c.id = q.customer_id
+         LEFT JOIN business_discount_codes dc ON dc.id = q.discount_code_id
          LEFT JOIN business_customer_vehicles v ON v.id = q.vehicle_id
         WHERE q.id = $1 AND q.business_id = $2`,
       [req.params.id, businessId])
@@ -238,7 +275,7 @@ businessQuotesRouter.get('/:id/pdf', requireAuth, async (req, res, next) => {
       [req.params.id, businessId])
     if (!q) throw new AppError(404, 'Quote not found')
     const lines = await query<any>(
-      `SELECT description, quantity, unit_price, line_total
+      `SELECT description, quantity, unit_price, line_total, discount_amount
          FROM business_quote_lines WHERE quote_id = $1 ORDER BY sort_order ASC`, [q.id])
 
     const { renderQuotePdf } = await import('../services/businessPdf')
@@ -266,8 +303,10 @@ businessQuotesRouter.get('/:id/pdf', requireAuth, async (req, res, next) => {
         quantity:    Number(l.quantity),
         unitPrice:   Number(l.unit_price),
         lineTotal:   Number(l.line_total),
+        discountAmount: Number(l.discount_amount),
       })),
       subtotal:    Number(q.subtotal),
+      discountAmount: Number(q.discount_amount),
       taxAmount:   Number(q.tax_amount),
       totalAmount: Number(q.total_amount),
     })
@@ -336,9 +375,76 @@ businessQuotesRouter.patch('/:id', requireAuth, async (req, res, next) => {
 })
 
 // ═══════════════════════════════════════════════════════════════
+//  PATCH /:id/discount — attach / clear a discount code (draft only)
+// ═══════════════════════════════════════════════════════════════
+//
+// S503: applying a code here is a PREVIEW — it's validated (exists, active,
+// in-window, under its redemption cap) and recorded on the quote, but no
+// redemption is consumed. The dollar amount is recomputed in
+// recomputeTotals so it tracks line changes. The redemption is consumed
+// only at convert-to-invoice. Pass { code: null } to clear.
+
+const discountSchema = z.object({
+  code: z.string().min(1).max(40).nullable(),
+}).strict()
+
+businessQuotesRouter.patch('/:id/discount', requireAuth, async (req, res, next) => {
+  try {
+    const businessId = await requireWrite(req)
+    const body = discountSchema.parse(req.body)
+
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+
+      const { rows: [q] } = await client.query<{ id: string; status: string }>(
+        `SELECT id, status FROM business_quotes
+          WHERE id = $1 AND business_id = $2
+          FOR UPDATE`,
+        [req.params.id, businessId])
+      if (!q) {
+        await client.query('ROLLBACK')
+        throw new AppError(404, 'Quote not found')
+      }
+      if (q.status !== 'draft') {
+        await client.query('ROLLBACK')
+        throw new AppError(409, `Cannot change the discount on a ${q.status} quote`)
+      }
+
+      let codeId: string | null = null
+      if (body.code !== null) {
+        // Validate without consuming a redemption (preview).
+        const dc = await resolveDiscountCode(client, businessId, body.code)
+        codeId = dc.id
+      }
+      await client.query(
+        `UPDATE business_quotes SET discount_code_id = $1 WHERE id = $2`,
+        [codeId, q.id])
+      await recomputeTotals(client, q.id)
+
+      const { rows: [updated] } = await client.query<any>(
+        `SELECT * FROM business_quotes WHERE id = $1`, [q.id])
+      await client.query('COMMIT')
+      res.json({ success: true, data: updated })
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {})
+      throw e
+    } finally {
+      client.release()
+    }
+  } catch (e) { next(e) }
+})
+
+// ═══════════════════════════════════════════════════════════════
 //  POST /:id/lines — add a line (draft only)
 // ═══════════════════════════════════════════════════════════════
 
+// S504: every line variant can carry an optional per-line discount
+// (percent | fixed), resolved against the line's gross.
+const lineDiscountFields = {
+  discountType:  z.enum(['percent', 'fixed']).optional(),
+  discountValue: z.number().min(0).max(1_000_000).optional(),
+}
 const addLineSchema = z.discriminatedUnion('lineType', [
   z.object({
     lineType:    z.literal('labor'),
@@ -346,18 +452,21 @@ const addLineSchema = z.discriminatedUnion('lineType', [
     hours:       z.number().positive().max(10000),
     hourlyRate:  z.number().min(0).max(10000),
     taxRate:     z.number().min(0).max(0.9999).optional(),
+    ...lineDiscountFields,
   }),
   z.object({
     lineType:    z.literal('part'),
     itemId:      z.string().uuid(),
     quantity:    z.number().positive().max(10000),
     unitPrice:   z.number().min(0).optional(),
+    ...lineDiscountFields,
   }),
   z.object({
     lineType:    z.literal('fee'),
     description: z.string().min(1).max(500),
     amount:      z.number().min(0).max(1_000_000),
     taxRate:     z.number().min(0).max(0.9999).optional(),
+    ...lineDiscountFields,
   }),
   z.object({
     lineType:    z.literal('generic'),
@@ -365,8 +474,16 @@ const addLineSchema = z.discriminatedUnion('lineType', [
     quantity:    z.number().positive().max(10000),
     unitPrice:   z.number().min(0).max(1_000_000),
     taxRate:     z.number().min(0).max(0.9999).optional(),
+    ...lineDiscountFields,
   }),
-])
+]).superRefine((l, ctx) => {
+  if (l.discountType && (l.discountValue === undefined || l.discountValue <= 0)) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'discountValue required when discountType is set', path: ['discountValue'] })
+  }
+  if (l.discountType === 'percent' && (l.discountValue ?? 0) > 100) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'percent discount cannot exceed 100', path: ['discountValue'] })
+  }
+})
 
 businessQuotesRouter.post('/:id/lines', requireAuth, async (req, res, next) => {
   try {
@@ -411,50 +528,70 @@ businessQuotesRouter.post('/:id/lines', requireAuth, async (req, res, next) => {
         [q.id])
       const sortOrder = (maxRow?.max ?? -1) + 1
 
+      // S504: resolve the per-line discount against the line's gross, then
+      // derive line_subtotal/line_tax/line_total NET of it. recomputeTotals
+      // sums line_subtotal (now post-line-discount) so a whole-order code
+      // stacks line-first.
+      const resolveLine = (gross: number, taxRate: number) => {
+        const g = dec(gross)
+        const discountAmount = body.discountType
+          ? computeDiscountAmount(body.discountType, body.discountValue ?? 0, g)
+          : 0
+        const net = dec(g - discountAmount)
+        const lineTax = dec(net * taxRate)
+        const lineTotal = dec(net + lineTax)
+        return {
+          net, lineTax, lineTotal,
+          discountType: body.discountType ?? null,
+          discountValue: body.discountValue ?? 0,
+          discountAmount,
+        }
+      }
+
       let line: any
       if (body.lineType === 'labor') {
-        const subtotal = dec(body.hours * body.hourlyRate)
         const taxRate = body.taxRate ?? defaultTaxRate
-        const lineTax = dec(subtotal * taxRate)
-        const total = dec(subtotal + lineTax)
+        const r = resolveLine(body.hours * body.hourlyRate, taxRate)
         const { rows: [created] } = await client.query<any>(
           `INSERT INTO business_quote_lines
              (quote_id, line_type, description, quantity, unit_price,
-              tax_rate, line_subtotal, line_tax, line_total, sort_order)
-           VALUES ($1, 'labor', $2, $3, $4, $5, $6, $7, $8, $9)
+              tax_rate, line_subtotal, line_tax, line_total, sort_order,
+              discount_type, discount_value, discount_amount)
+           VALUES ($1, 'labor', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
            RETURNING *`,
           [q.id, body.description.trim(), body.hours, body.hourlyRate,
-           taxRate, subtotal, lineTax, total, sortOrder])
+           taxRate, r.net, r.lineTax, r.lineTotal, sortOrder,
+           r.discountType, r.discountValue, r.discountAmount])
         line = created
 
       } else if (body.lineType === 'fee') {
-        const subtotal = dec(body.amount)
         const taxRate = body.taxRate ?? defaultTaxRate
-        const lineTax = dec(subtotal * taxRate)
-        const total = dec(subtotal + lineTax)
+        const r = resolveLine(body.amount, taxRate)
         const { rows: [created] } = await client.query<any>(
           `INSERT INTO business_quote_lines
              (quote_id, line_type, description, quantity, unit_price,
-              tax_rate, line_subtotal, line_tax, line_total, sort_order)
-           VALUES ($1, 'fee', $2, 1, $3, $4, $5, $6, $7, $8)
+              tax_rate, line_subtotal, line_tax, line_total, sort_order,
+              discount_type, discount_value, discount_amount)
+           VALUES ($1, 'fee', $2, 1, $3, $4, $5, $6, $7, $8, $9, $10, $11)
            RETURNING *`,
-          [q.id, body.description.trim(), subtotal,
-           taxRate, subtotal, lineTax, total, sortOrder])
+          [q.id, body.description.trim(), dec(body.amount),
+           taxRate, r.net, r.lineTax, r.lineTotal, sortOrder,
+           r.discountType, r.discountValue, r.discountAmount])
         line = created
 
       } else if (body.lineType === 'generic') {
-        const subtotal = dec(body.quantity * body.unitPrice)
         const taxRate = body.taxRate ?? defaultTaxRate
-        const lineTax = dec(subtotal * taxRate)
-        const total = dec(subtotal + lineTax)
+        const r = resolveLine(body.quantity * body.unitPrice, taxRate)
         const { rows: [created] } = await client.query<any>(
           `INSERT INTO business_quote_lines
              (quote_id, line_type, description, quantity, unit_price,
-              tax_rate, line_subtotal, line_tax, line_total, sort_order)
-           VALUES ($1, 'generic', $2, $3, $4, $5, $6, $7, $8, $9)
+              tax_rate, line_subtotal, line_tax, line_total, sort_order,
+              discount_type, discount_value, discount_amount)
+           VALUES ($1, 'generic', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
            RETURNING *`,
           [q.id, body.description.trim(), body.quantity, body.unitPrice,
-           taxRate, subtotal, lineTax, total, sortOrder])
+           taxRate, r.net, r.lineTax, r.lineTotal, sortOrder,
+           r.discountType, r.discountValue, r.discountAmount])
         line = created
 
       } else {
@@ -477,17 +614,17 @@ businessQuotesRouter.post('/:id/lines', requireAuth, async (req, res, next) => {
         const unitPrice = body.unitPrice !== undefined ? dec(body.unitPrice) : dec(item.sell_price)
         // S506: exempt customer zeros out the item's snapshot tax rate.
         const taxRate = cust?.tax_exempt ? 0 : dec(item.tax_rate)
-        const subtotal = dec(unitPrice * body.quantity)
-        const lineTax = dec(subtotal * taxRate)
-        const total = dec(subtotal + lineTax)
+        const r = resolveLine(unitPrice * body.quantity, taxRate)
         const { rows: [created] } = await client.query<any>(
           `INSERT INTO business_quote_lines
              (quote_id, line_type, item_id, description, quantity, unit_price,
-              tax_rate, line_subtotal, line_tax, line_total, sort_order)
-           VALUES ($1, 'part', $2, $3, $4, $5, $6, $7, $8, $9, $10)
+              tax_rate, line_subtotal, line_tax, line_total, sort_order,
+              discount_type, discount_value, discount_amount)
+           VALUES ($1, 'part', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
            RETURNING *`,
           [q.id, item.id, item.name, body.quantity, unitPrice,
-           taxRate, subtotal, lineTax, total, sortOrder])
+           taxRate, r.net, r.lineTax, r.lineTotal, sortOrder,
+           r.discountType, r.discountValue, r.discountAmount])
         line = created
       }
 
@@ -562,12 +699,13 @@ businessQuotesRouter.post('/:id/send', requireAuth, async (req, res, next) => {
 
     const q = await queryOne<{
       id: string; status: string; quote_number: string;
-      subtotal: string; tax_amount: string; total_amount: string;
+      subtotal: string; discount_amount: string;
+      tax_amount: string; total_amount: string;
       notes: string | null; expires_at: string | null;
       customer_id: string;
     }>(
       `SELECT id, status, quote_number,
-              subtotal, tax_amount, total_amount,
+              subtotal, discount_amount, tax_amount, total_amount,
               notes, expires_at, customer_id
          FROM business_quotes
         WHERE id = $1 AND business_id = $2 AND status = 'draft'`,
@@ -630,6 +768,7 @@ businessQuotesRouter.post('/:id/send', requireAuth, async (req, res, next) => {
             lineTotal: Number(l.line_total),
           })),
           subtotal: Number(q.subtotal),
+          discountAmount: Number(q.discount_amount),
           taxAmount: Number(q.tax_amount),
           totalAmount: Number(q.total_amount),
           expiresAt: new Date(expiresAtIso),
@@ -731,12 +870,50 @@ businessQuotesRouter.post('/:id/convert-to-invoice', requireAuth, async (req, re
 
       const { rows: lines } = await client.query<{
         description: string; quantity: string;
-        unit_price: string; line_subtotal: string; sort_order: number;
+        unit_price: string; line_subtotal: string; line_tax: string;
+        sort_order: number;
+        discount_type: string | null; discount_value: string; discount_amount: string;
       }>(
-        `SELECT description, quantity, unit_price, line_subtotal, sort_order
+        `SELECT description, quantity, unit_price, line_subtotal, line_tax, sort_order,
+                discount_type, discount_value, discount_amount
            FROM business_quote_lines
           WHERE quote_id = $1
           ORDER BY sort_order ASC`, [q.id])
+
+      // S503: recompute totals authoritatively from the lines and consume the
+      // discount redemption now (not at quote time). If the quote carried a
+      // code preview, re-run applyDiscount exactly as a fresh invoice would —
+      // it locks the code, re-checks the cap, bumps the count, and returns the
+      // dollar amount against the gross subtotal. If the code has since lapsed
+      // (expired / exhausted / inactive / deleted), the convert proceeds with
+      // no discount rather than blocking the conversion.
+      let grossSubtotal = 0, grossTax = 0
+      for (const ln of lines) {
+        grossSubtotal += Number(ln.line_subtotal)
+        grossTax += Number(ln.line_tax)
+      }
+      grossSubtotal = dec(grossSubtotal); grossTax = dec(grossTax)
+
+      let discountCodeId: string | null = null
+      let discountAmount = 0
+      if (q.discount_code_id) {
+        const { rows: [dc] } = await client.query<{ code: string }>(
+          `SELECT code FROM business_discount_codes WHERE id = $1 AND business_id = $2`,
+          [q.discount_code_id, businessId])
+        if (dc) {
+          try {
+            const applied = await applyDiscount(client, businessId, dc.code, grossSubtotal)
+            discountCodeId = applied.discountCodeId
+            discountAmount = applied.discountAmount
+          } catch { /* code lapsed — convert without a discount */ }
+        }
+      }
+      const taxableFactor = grossSubtotal > 0
+        ? (grossSubtotal - discountAmount) / grossSubtotal
+        : 0
+      const invSubtotal = grossSubtotal
+      const invTax = dec(grossTax * taxableFactor)
+      const invTotal = dec(invSubtotal - discountAmount + invTax)
 
       const { rows: [seq] } = await client.query<{ next_number: number }>(
         `INSERT INTO business_invoice_sequences (business_id, next_number)
@@ -752,25 +929,29 @@ businessQuotesRouter.post('/:id/convert-to-invoice', requireAuth, async (req, re
         `INSERT INTO business_invoices
            (business_id, invoice_number, customer_id,
             issue_date, due_date, status,
-            subtotal, tax_amount, total_amount,
+            subtotal, discount_code_id, discount_amount, tax_amount, total_amount,
             notes, source_quote_id)
          VALUES ($1, $2, $3, $4, $5, 'draft',
-                 $6, $7, $8, $9, $10)
+                 $6, $7, $8, $9, $10, $11, $12)
          RETURNING *`,
         [businessId, invoiceNumber, q.customer_id,
          body.issueDate, body.dueDate,
-         dec(q.subtotal), dec(q.tax_amount), dec(q.total_amount),
+         invSubtotal, discountCodeId, discountAmount, invTax, invTotal,
          q.notes, q.id])
 
       for (let i = 0; i < lines.length; i++) {
         const ln = lines[i]!
+        // S504: line_subtotal is already NET of any per-line discount; carry
+        // the per-line discount fields so the invoice shows the same breakdown.
         await client.query(
           `INSERT INTO business_invoice_lines
-             (invoice_id, description, quantity, unit_price, line_total, sort_order)
-           VALUES ($1, $2, $3, $4, $5, $6)`,
+             (invoice_id, description, quantity, unit_price, line_total, sort_order,
+              discount_type, discount_value, discount_amount)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
           [inv.id, ln.description,
            Number(ln.quantity), Number(ln.unit_price),
-           Number(ln.line_subtotal), i])
+           Number(ln.line_subtotal), i,
+           ln.discount_type, Number(ln.discount_value), Number(ln.discount_amount)])
       }
 
       await client.query(

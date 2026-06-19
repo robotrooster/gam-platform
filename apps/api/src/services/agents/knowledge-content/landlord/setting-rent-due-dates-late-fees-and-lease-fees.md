@@ -4,7 +4,7 @@ title: Setting rent, due dates, late fees, and lease fees
 ---
 You're in control of the money side of every lease. GAM doesn't set rent or decide what to charge — you do, per lease. Here's what you can configure.
 
-Rent and due date. Set the monthly rent amount and the due date on the lease. GAM bills the tenant on that schedule. Payments are electronic only — tenants pay by ACH (1.0%, capped at $6) or card (3.25%; Canadian cards paying in USD add 1.5%). A per-property setting decides whether the tenant or you cover that processing fee — GAM never absorbs it.
+Rent and due date. Set the monthly rent amount and the due date on the lease. GAM bills the tenant on that schedule. Payments are electronic only — tenants pay by ACH (1.0%, capped at $6) or card (3.25%; Canadian cards paying in USD add 1.5%). Per-property settings decide whether the tenant or you cover that processing fee, with separate toggles for ACH and card — GAM never absorbs it.
 
 Late fees. Late fees are fully optional and tunable per lease. You set:
 

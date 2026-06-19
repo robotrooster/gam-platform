@@ -194,6 +194,22 @@ describe('POST /inspections', () => {
     expect(row.rows[0].status).toBe('draft')
   })
 
+  it('seeds the standard walkthrough checklist as na items on create', async () => {
+    const f = await seedFixture()
+    const res = await request(buildApp())
+      .post('/api/inspections')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ unitId: f.unitId, leaseId: f.leaseId, tenantId: f.tenantId, inspectionType: 'move_in' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.seededItems).toBeGreaterThan(0)
+    const items = await db.query<{ area: string; condition: string }>(
+      `SELECT area, condition FROM unit_inspection_items WHERE inspection_id = $1`, [res.body.data.id],
+    )
+    expect(items.rows.length).toBe(res.body.data.seededItems)
+    expect(items.rows.every((r) => r.condition === 'na')).toBe(true)
+    expect(items.rows.map((r) => r.area)).toContain('Kitchen')
+  })
+
   it('tenant denied (only landlord-side can create)', async () => {
     const f = await seedFixture()
     const res = await request(buildApp())
@@ -772,5 +788,127 @@ describe('POST /inspections/:id/finalize', () => {
     expect(ctx.photoCount).toBe(1)
     expect(ctx.inspectionType).toBe('move_in')
     expect(ctx.leaseStartDate).toBeInstanceOf(Date)
+  })
+})
+
+describe('walkthrough videos + unit lifecycle (landlord/internal)', () => {
+  it('accepts the turnover inspection type and seeds its checklist', async () => {
+    const f = await seedFixture()
+    const res = await request(buildApp())
+      .post('/api/inspections')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ unitId: f.unitId, inspectionType: 'turnover' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.seededItems).toBeGreaterThan(0)
+    const row = await db.query<{ inspection_type: string }>(
+      `SELECT inspection_type FROM unit_inspections WHERE id = $1`, [res.body.data.id],
+    )
+    expect(row.rows[0].inspection_type).toBe('turnover')
+  })
+
+  it('uploads a video, lists it, and denies the tenant', async () => {
+    const f = await seedFixture()
+    const inspId = await createInspection(f, { inspectionType: 'move_in' })
+    const up = await request(buildApp())
+      .post(`/api/inspections/${inspId}/videos`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .field('title', 'Move-in walkthrough')
+      .attach('file', Buffer.from('fakemp4data'), { filename: 'clip.mp4', contentType: 'video/mp4' })
+    expect(up.status).toBe(200)
+    expect(up.body.data.url).toMatch(/\/api\/inspections\/video-files\//)
+
+    const list = await request(buildApp())
+      .get(`/api/inspections/${inspId}/videos`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(list.body.data).toHaveLength(1)
+    expect(list.body.data[0].title).toBe('Move-in walkthrough')
+
+    const denied = await request(buildApp())
+      .get(`/api/inspections/${inspId}/videos`)
+      .set('Authorization', `Bearer ${f.tenantToken}`)
+    expect(denied.status).toBe(403)
+  })
+
+  it('returns the unit lifecycle oldest-first with each stage’s videos; tenant denied', async () => {
+    const f = await seedFixture()
+    const moveIn = await createInspection(f, { inspectionType: 'move_in' })
+    await db.query(
+      `INSERT INTO unit_inspection_videos (inspection_id, title, video_url, uploaded_by)
+       VALUES ($1, $2, $3, $4)`,
+      [moveIn, 'mi clip', '/api/inspections/video-files/x.mp4', f.landlordUserId],
+    )
+    const res = await request(buildApp())
+      .get(`/api/inspections/unit/${f.unitId}/lifecycle`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(res.status).toBe(200)
+    const stage = res.body.data.stages.find((s: any) => s.id === moveIn)
+    expect(stage.videos).toHaveLength(1)
+    expect(stage.videos[0].title).toBe('mi clip')
+
+    const denied = await request(buildApp())
+      .get(`/api/inspections/unit/${f.unitId}/lifecycle`)
+      .set('Authorization', `Bearer ${f.tenantToken}`)
+    expect(denied.status).toBe(403)
+  })
+})
+
+describe('video immutability + tenant uploads & visibility', () => {
+  it('blocks deleting a video and repointing its url (DB-enforced immutability)', async () => {
+    const f = await seedFixture()
+    const inspId = await createInspection(f, { inspectionType: 'move_in' })
+    const url = '/api/inspections/video-files/imm-' + Math.floor(performance.now()) + '.mp4'
+    await db.query(
+      `INSERT INTO unit_inspection_videos (inspection_id, title, video_url, uploaded_by)
+       VALUES ($1, 'keep', $2, $3)`, [inspId, url, f.landlordUserId],
+    )
+    const vid = (await db.query<{ id: string }>(
+      `SELECT id FROM unit_inspection_videos WHERE video_url = $1`, [url])).rows[0].id
+
+    await expect(db.query(`DELETE FROM unit_inspection_videos WHERE id = $1`, [vid])).rejects.toThrow(/immutable/i)
+    await expect(db.query(`UPDATE unit_inspection_videos SET video_url = '/x' WHERE id = $1`, [vid])).rejects.toThrow(/immutable/i)
+    // deleting the parent inspection is blocked too (FK RESTRICT) — videos survive
+    await expect(db.query(`DELETE FROM unit_inspections WHERE id = $1`, [inspId])).rejects.toThrow()
+    // metadata (thumbnail) stays editable
+    await db.query(`UPDATE unit_inspection_videos SET thumbnail_url = '/t.jpg' WHERE id = $1`, [vid])
+    const still = await db.query(`SELECT id FROM unit_inspection_videos WHERE id = $1`, [vid])
+    expect(still.rows).toHaveLength(1)
+  })
+
+  it('lets a tenant upload to their own inspection and see it under /videos/mine', async () => {
+    const f = await seedFixture()
+    const inspId = await createInspection(f, { inspectionType: 'move_in', tenantId: f.tenantId })
+    const up = await request(buildApp())
+      .post(`/api/inspections/${inspId}/videos`)
+      .set('Authorization', `Bearer ${f.tenantToken}`)
+      .field('title', 'My move-in clip')
+      .attach('file', Buffer.from('tenantclip'), { filename: 't.mp4', contentType: 'video/mp4' })
+    expect(up.status).toBe(200)
+
+    const mine = await request(buildApp())
+      .get('/api/inspections/videos/mine')
+      .set('Authorization', `Bearer ${f.tenantToken}`)
+    expect(mine.status).toBe(200)
+    const found = mine.body.data.find((v: any) => v.title === 'My move-in clip')
+    expect(found).toBeTruthy()
+    expect(found.unit_number).toBeTruthy()
+  })
+
+  it('serves a video to its uploader and the unit landlord, but not a stranger', async () => {
+    const f = await seedFixture()
+    const inspId = await createInspection(f, { inspectionType: 'move_in', tenantId: f.tenantId })
+    const up = await request(buildApp())
+      .post(`/api/inspections/${inspId}/videos`)
+      .set('Authorization', `Bearer ${f.tenantToken}`)
+      .attach('file', Buffer.from('clipdata'), { filename: 'c.mp4', contentType: 'video/mp4' })
+    const fileUrl = up.body.data.url
+
+    const asUploader = await request(buildApp()).get(fileUrl).set('Authorization', `Bearer ${f.tenantToken}`)
+    expect(asUploader.status).toBe(200)
+    const asLandlord = await request(buildApp()).get(fileUrl).set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(asLandlord.status).toBe(200)
+
+    const stranger = await seedFixture() // different tenant + landlord
+    const asStranger = await request(buildApp()).get(fileUrl).set('Authorization', `Bearer ${stranger.tenantToken}`)
+    expect(asStranger.status).toBe(403)
   })
 })

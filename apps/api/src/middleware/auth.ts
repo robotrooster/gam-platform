@@ -112,6 +112,10 @@ export function requirePerm(...keys: string[]) {
 export function requireBooksRead(req: Request, res: Response, next: NextFunction) {
   if (!req.user) return res.status(401).json({ success: false, error: 'Unauthenticated' })
   if (OWNER_ROLES.includes(req.user.role)) return next()
+  // S459: a business_owner has full authority over their own company's
+  // books (the GAM Books engine is reused by business customers, scoped
+  // by business_id). Must carry a businessId to be scoped.
+  if (req.user.role === 'business_owner' && req.user.businessId) return next()
   const perms = req.user.permissions || {}
   if (req.user.role === 'bookkeeper') {
     if (perms.access_level === 'read_only' || perms.access_level === 'read_write') return next()
@@ -123,6 +127,7 @@ export function requireBooksRead(req: Request, res: Response, next: NextFunction
 export function requireBooksWrite(req: Request, res: Response, next: NextFunction) {
   if (!req.user) return res.status(401).json({ success: false, error: 'Unauthenticated' })
   if (OWNER_ROLES.includes(req.user.role)) return next()
+  if (req.user.role === 'business_owner' && req.user.businessId) return next()
   const perms = req.user.permissions || {}
   if (req.user.role === 'bookkeeper' && perms.access_level === 'read_write') return next()
   if (req.user.role === 'property_manager' && perms['books.edit'] === true) return next()

@@ -19,12 +19,15 @@ import { InvoicesPage } from './pages/InvoicesPage'
 import { AppointmentsPage } from './pages/AppointmentsPage'
 import { InventoryPage } from './pages/InventoryPage'
 import { POSPage } from './pages/POSPage'
+import { DiscountsPage } from './pages/DiscountsPage'
+import { PayoutsPage } from './pages/PayoutsPage'
 import { WorkOrdersPage } from './pages/WorkOrdersPage'
 import { CustomerVehiclesPage } from './pages/CustomerVehiclesPage'
 import { QuotesPage } from './pages/QuotesPage'
 import { ReportsPage } from './pages/ReportsPage'
 import { RecurringInvoicesPage } from './pages/RecurringInvoicesPage'
 import { BookableServicesPage } from './pages/BookableServicesPage'
+import { BookkeepingPage } from './pages/BookkeepingPage'
 import './styles/globals.css'
 
 function Protected({ children }: { children: React.ReactNode }) {
@@ -50,10 +53,13 @@ function App() {
             <Route path="/appointments" element={<AppointmentsPage />} />
             <Route path="/inventory"    element={<InventoryPage />} />
             <Route path="/pos"          element={<POSPage />} />
+            <Route path="/discounts"    element={<DiscountsPage />} />
+            <Route path="/payouts"      element={<PayoutsPage />} />
             <Route path="/work-orders"  element={<WorkOrdersPage />} />
             <Route path="/customer-vehicles" element={<CustomerVehiclesPage />} />
             <Route path="/quotes"       element={<QuotesPage />} />
             <Route path="/reports"      element={<ReportsPage />} />
+            <Route path="/bookkeeping"  element={<BookkeepingPage />} />
             <Route path="/recurring-invoices" element={<RecurringInvoicesPage />} />
             <Route path="/bookable-services"  element={<BookableServicesPage />} />
             <Route path="/schedules" element={<SchedulesPage />} />

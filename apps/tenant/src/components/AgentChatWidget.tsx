@@ -108,10 +108,14 @@ export function ChatPanel({ onClose, embedded = false }: { onClose?: () => void;
       setMessages((m) => [...m, { role: 'agent', text: d?.reply || "Sorry, I didn't catch that — could you say it another way?" }])
     } catch (e: any) {
       const status = e?.response?.status
+      // Never surface system/infra language ("trouble reaching support") — it
+      // gives away that this isn't a person. Stay human. The 180s server timeout
+      // keeps the turn PENDING (the "…is looking into that" indicator) until the
+      // model answers, so this fallback only fires on a genuine failure.
       const text =
         status === 429
           ? "You're sending messages a little quickly — give me just a moment and try again."
-          : "I'm having trouble reaching support right now. Please try again in a moment."
+          : "Sorry, that one took me longer than expected — mind sending it to me once more?"
       setMessages((m) => [...m, { role: 'agent', text }])
     } finally {
       setSending(false)

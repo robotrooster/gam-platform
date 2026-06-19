@@ -49,6 +49,32 @@ export async function loadConversationHistory(
   return history
 }
 
+/**
+ * Guest variant of loadConversationHistory. A booking guest has no GAM user,
+ * so actor_user_id is NULL on their rows — ownership keys on actor_profile_id,
+ * which holds the booking id. Otherwise identical: last N turns, oldest first.
+ */
+export async function loadGuestConversationHistory(
+  conversationId: string,
+  bookingId: string,
+  limit = historyTurns()
+): Promise<ChatMessage[]> {
+  const rows = await query<{ user_message: string; agent_reply: string }>(
+    `SELECT user_message, agent_reply
+       FROM agent_interaction_logs
+      WHERE conversation_id = $1 AND actor_profile_id = $2 AND audience = 'guest'
+      ORDER BY turn_index DESC
+      LIMIT $3`,
+    [conversationId, bookingId, limit]
+  )
+  const history: ChatMessage[] = []
+  for (const r of rows.reverse()) {
+    history.push({ role: 'user', content: r.user_message })
+    if (r.agent_reply) history.push({ role: 'assistant', content: r.agent_reply })
+  }
+  return history
+}
+
 function userContextItems(): number {
   const n = Number(process.env.AGENT_USER_CONTEXT_ITEMS)
   return Number.isFinite(n) && n > 0 ? Math.trunc(n) : 5

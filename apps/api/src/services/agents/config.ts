@@ -55,8 +55,10 @@ export function getLlmConfig(): LlmConfig {
   const model = process.env.LLM_MODEL
   if (!model) throw new Error('LLM_MODEL not set')
 
+  // 180s default: a 36B at 6-bit can take >60s on a long generation (e.g. a full
+  // portal walkthrough), which previously timed out and surfaced an error.
   const rawTimeout = Number(process.env.LLM_TIMEOUT_MS)
-  const timeoutMs = Number.isFinite(rawTimeout) && rawTimeout > 0 ? rawTimeout : 60_000
+  const timeoutMs = Number.isFinite(rawTimeout) && rawTimeout > 0 ? rawTimeout : 180_000
 
   const rawMaxTokens = Number(process.env.LLM_MAX_TOKENS)
   const maxTokens = Number.isFinite(rawMaxTokens) && rawMaxTokens > 0 ? rawMaxTokens : 1024

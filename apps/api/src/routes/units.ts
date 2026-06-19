@@ -6,6 +6,13 @@ import { canAccessLandlordResource, canManageLandlordResource, canViewLandlordFi
 import { AppError } from '../middleware/errorHandler'
 import { UnitStatus, calcNetPerUnit, getReservePhase, PLATFORM_FEES, UNIT_STATUSES } from '@gam/shared'
 import { formatUnitNumber } from '../lib/format'
+import { logger } from '../lib/logger'
+import {
+  sendBookingGuestAccessEmail,
+  issueBookingGuestToken,
+  bookingGuestQrDataUrl,
+  revokeBookingGuestTokens,
+} from '../services/bookingGuestTokens'
 
 export const unitsRouter = Router()
 unitsRouter.use(requireAuth)
@@ -318,7 +325,96 @@ unitsRouter.post('/:id/bookings', requirePerm('guests.check_in', 'units.edit'), 
        body.nightlyRate ?? unit.nightly_rate ?? null, body.weeklyRate ?? unit.weekly_rate ?? null,
        body.totalAmount ?? 0, platformFee, body.notes ?? null, body.source ?? 'direct'])
 
+    // Booking guests with no GAM account get a stay-assistant link by email
+    // (a host can also issue a QR from the booking). Best-effort — a missing
+    // or failed token must never fail the booking itself.
+    if (booking.guest_email) {
+      sendBookingGuestAccessEmail({
+        bookingId: booking.id,
+        landlordId: unit.landlord_id,
+        createdByUserId: req.user!.userId,
+      }).catch((err) => logger.error({ err, bookingId: booking.id }, '[booking] guest access email failed'))
+    }
+
     res.status(201).json({ success: true, data: booking })
+  } catch (e) { next(e) }
+})
+
+// POST /api/units/:id/bookings/:bookingId/guest-access — issue (or re-issue)
+// the guest's stay-assistant token and return the link + a QR for the host to
+// show/print on-site. Optionally also emails the link to the guest. This is
+// the QR/email delivery surface for the booking-guest agent.
+unitsRouter.post('/:id/bookings/:bookingId/guest-access', requirePerm('guests.check_in', 'units.edit'), async (req, res, next) => {
+  try {
+    const body = z.object({
+      delivery: z.enum(['email', 'qr']).optional(),
+      sendEmail: z.boolean().optional(),
+    }).parse(req.body ?? {})
+
+    const booking = await queryOne<any>(
+      `SELECT b.id, b.landlord_id, b.guest_email
+         FROM unit_bookings b WHERE b.id = $1 AND b.unit_id = $2`,
+      [req.params.bookingId, req.params.id])
+    if (!booking) throw new AppError(404, 'Booking not found')
+    if (!canManageLandlordResource(req.user, booking.landlord_id)) throw new AppError(403, 'Forbidden')
+
+    const issued = await issueBookingGuestToken({
+      bookingId: booking.id,
+      landlordId: booking.landlord_id,
+      delivery: body.delivery ?? 'qr',
+      createdByUserId: req.user!.userId,
+    })
+    const qrDataUrl = await bookingGuestQrDataUrl(issued.token)
+
+    let emailed = false
+    if (body.sendEmail && booking.guest_email) {
+      const { emailBookingGuestAccess } = await import('../services/email')
+      const ctx = await queryOne<any>(
+        `SELECT b.guest_name, b.check_in, b.check_out, p.name AS property_name, u.unit_number
+           FROM unit_bookings b
+           LEFT JOIN units u ON u.id = b.unit_id
+           LEFT JOIN properties p ON p.id = u.property_id
+          WHERE b.id = $1`, [booking.id])
+      await emailBookingGuestAccess({
+        to: booking.guest_email,
+        guestName: ctx?.guest_name ?? null,
+        propertyName: ctx?.property_name ?? null,
+        unitNumber: ctx?.unit_number ?? null,
+        checkIn: ctx?.check_in,
+        checkOut: ctx?.check_out,
+        stayUrl: issued.url,
+        expiresAt: issued.expiresAt,
+        ctx: { landlordId: booking.landlord_id, bookingId: booking.id },
+      })
+      emailed = true
+    }
+
+    res.json({
+      success: true,
+      data: { url: issued.url, qrDataUrl, expiresAt: issued.expiresAt, emailed },
+    })
+  } catch (e) { next(e) }
+})
+
+// DELETE /api/units/:id/bookings/:bookingId/guest-access — revoke the guest's
+// stay-assistant access. Kills EVERY outstanding link for the booking (each
+// issue mints a fresh token without retiring the last), so this is the host's
+// single kill switch. Same auth as issue. Idempotent: re-revoking returns 0.
+unitsRouter.delete('/:id/bookings/:bookingId/guest-access', requirePerm('guests.check_in', 'units.edit'), async (req, res, next) => {
+  try {
+    const booking = await queryOne<any>(
+      `SELECT b.id, b.landlord_id
+         FROM unit_bookings b WHERE b.id = $1 AND b.unit_id = $2`,
+      [req.params.bookingId, req.params.id])
+    if (!booking) throw new AppError(404, 'Booking not found')
+    if (!canManageLandlordResource(req.user, booking.landlord_id)) throw new AppError(403, 'Forbidden')
+
+    const { revoked } = await revokeBookingGuestTokens({
+      bookingId: booking.id,
+      landlordId: booking.landlord_id,
+    })
+
+    res.json({ success: true, data: { revoked } })
   } catch (e) { next(e) }
 })
 

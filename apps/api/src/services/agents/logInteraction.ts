@@ -45,6 +45,20 @@ export async function resolveInteractionProperty(
     // Portfolio-wide: no single property; the landlord IS the subject.
     return { propertyId: null, landlordId: actor.profileId }
   }
+  if (actor.role === 'guest') {
+    // Booking guest: attribute to the booking's landlord (+ its property).
+    if (!actor.bookingId) return { propertyId: null, landlordId: null }
+    const rows = await query<{ property_id: string | null; landlord_id: string }>(
+      `SELECT u.property_id, b.landlord_id
+         FROM unit_bookings b
+         LEFT JOIN units u ON u.id = b.unit_id
+        WHERE b.id = $1`,
+      [actor.bookingId]
+    )
+    return rows[0]
+      ? { propertyId: rows[0].property_id, landlordId: rows[0].landlord_id }
+      : { propertyId: null, landlordId: null }
+  }
   if (actor.role !== 'tenant') {
     return { propertyId: null, landlordId: null }
   }
@@ -95,6 +109,17 @@ export async function logInteraction(
     const outcome = deriveOutcome(result, ctx.outcomeError)
     const escalatedToHuman = result.humanHandoff != null || result.handledBy.tier === 'human'
 
+    // turn_index must be a TRUE monotonic counter per conversation. Deriving it
+    // from the (bounded) loaded-history length saturates once a chat passes the
+    // history window (every later turn gets the same value), which ties the rows
+    // and breaks loadConversationHistory's `ORDER BY turn_index DESC` — the agent
+    // then re-reads stale turns and loops. Compute the real next index instead.
+    const convId = ctx.conversationId ?? randomUUID()
+    const nextTurn = await query<{ n: number }>(
+      `SELECT COALESCE(MAX(turn_index), -1) + 1 AS n FROM agent_interaction_logs WHERE conversation_id = $1`,
+      [convId]
+    ).then((r) => Number(r[0]?.n ?? 0)).catch(() => input.history?.length ?? 0)
+
     const rows = await query<{ id: string }>(
       `INSERT INTO agent_interaction_logs (
          conversation_id, turn_index,
@@ -116,8 +141,8 @@ export async function logInteraction(
          $26, $27, $28::jsonb, $29, $30::jsonb
        ) RETURNING id`,
       [
-        ctx.conversationId ?? randomUUID(),
-        input.history?.length ?? 0,
+        convId,
+        nextTurn,
         ctx.agentType ?? 'customer_service',
         input.audience,
         ctx.finalProfileId,
@@ -126,8 +151,9 @@ export async function logInteraction(
         outcome,
         propertyId,
         landlordId,
-        // Prospects are anonymous (no GAM user) — actor_user_id FK must be NULL.
-        input.audience === 'prospect' ? null : actor.userId,
+        // Prospects and booking guests are anonymous (no GAM user) — the
+        // actor_user_id FK must be NULL for them.
+        input.audience === 'prospect' || input.audience === 'guest' ? null : actor.userId,
         actor.role,
         actor.profileId,
         result.escalations.length,

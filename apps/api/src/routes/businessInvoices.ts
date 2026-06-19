@@ -31,6 +31,8 @@ import { z } from 'zod'
 import { db, query, queryOne } from '../db'
 import { requireAuth } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
+import { refundBusinessInvoicePayment } from '../services/stripeConnect'
+import { logger } from '../lib/logger'
 
 export const businessInvoicesRouter = Router()
 
@@ -40,6 +42,7 @@ export const businessInvoicesRouter = Router()
 // terse. Read endpoints take 'invoices.read'; write CRUD takes
 // 'invoices.write'; send / mark-paid / void take 'invoices.send'.
 import { requireBusinessAccess } from '../middleware/businessAccess'
+import { applyDiscount, computeDiscountAmount } from '../services/businessDiscounts'
 
 const requireRead  = async (req: any) => (await requireBusinessAccess(req, { permission: 'invoices.read',  feature: 'invoicing' })).businessId
 const requireWrite = async (req: any) => (await requireBusinessAccess(req, { permission: 'invoices.write', feature: 'invoicing' })).businessId
@@ -54,6 +57,17 @@ const lineSchema = z.object({
   quantity:    z.number().positive(),
   unitPrice:   z.number().min(0),
   serviceKey:  z.string().max(120).optional(),
+  // S504: optional per-line discount. percent → value is % off this line;
+  // fixed → value is $ off this line. Resolved against the line's gross.
+  discountType:  z.enum(['percent', 'fixed']).optional(),
+  discountValue: z.number().min(0).optional(),
+}).superRefine((l, ctx) => {
+  if (l.discountType && (l.discountValue === undefined || l.discountValue <= 0)) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'discountValue required when discountType is set', path: ['discountValue'] })
+  }
+  if (l.discountType === 'percent' && (l.discountValue ?? 0) > 100) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'percent discount cannot exceed 100', path: ['discountValue'] })
+  }
 })
 
 const createSchema = z.object({
@@ -61,6 +75,8 @@ const createSchema = z.object({
   issueDate:     z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   dueDate:       z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   taxAmount:     z.number().min(0).optional(),
+  // S513: optional discount code, applied pre-tax to the subtotal.
+  discountCode:  z.string().min(1).max(40).optional(),
   notes:         z.string().max(2000).nullable().optional(),
   internalNotes: z.string().max(2000).nullable().optional(),
   lines:         z.array(lineSchema).min(1).max(200),
@@ -82,28 +98,47 @@ businessInvoicesRouter.post('/', requireAuth, async (req, res, next) => {
       throw new AppError(400, 'due_date must be >= issue_date')
     }
 
-    const subtotal = body.lines.reduce(
-      (acc, l) => acc + (l.quantity * l.unitPrice), 0,
-    )
-    // S506: auto-tax if owner didn't override AND customer not exempt.
-    // Rate comes from businesses.default_tax_rate; 0 → no tax even if
-    // not exempt. Owner can always force a value via body.taxAmount.
-    let tax: number
-    if (body.taxAmount !== undefined) {
-      tax = body.taxAmount
-    } else if (c.tax_exempt) {
-      tax = 0
-    } else {
+    const round2 = (n: number) => Math.round(n * 100) / 100
+    // S504: resolve each line's per-line discount up front. line net =
+    // gross - line discount; the order subtotal is the sum of net line
+    // amounts (post-line-discount), so a whole-order code stacks line-first.
+    const lineCalcs = body.lines.map(l => {
+      const gross = round2(l.quantity * l.unitPrice)
+      const discountAmount = l.discountType
+        ? computeDiscountAmount(l.discountType, l.discountValue ?? 0, gross)
+        : 0
+      return { ...l, gross, discountAmount, net: round2(gross - discountAmount) }
+    })
+    const subtotal = round2(lineCalcs.reduce((acc, l) => acc + l.net, 0))
+    // S506: auto-tax basis decided up front; the actual tax is computed
+    // inside the txn against the POST-discount subtotal (S513). Rate comes
+    // from businesses.default_tax_rate; 0 → no tax even if not exempt.
+    // Owner can always force a value via body.taxAmount.
+    let rate = 0
+    if (body.taxAmount === undefined && !c.tax_exempt) {
       const biz = await queryOne<{ default_tax_rate: string }>(
         `SELECT default_tax_rate FROM businesses WHERE id = $1`, [businessId])
-      const rate = Number(biz?.default_tax_rate ?? 0)
-      tax = Math.round(subtotal * rate * 100) / 100
+      rate = Number(biz?.default_tax_rate ?? 0)
     }
-    const total = subtotal + tax
 
     const client = await db.connect()
     try {
       await client.query('BEGIN')
+
+      // S513: apply a discount code (pre-tax) inside the txn — consumes a
+      // redemption under a row lock. Discount reduces the taxable base.
+      let discountAmount = 0
+      let discountCodeId: string | null = null
+      if (body.discountCode) {
+        const applied = await applyDiscount(client, businessId, body.discountCode, subtotal)
+        discountCodeId = applied.discountCodeId
+        discountAmount = applied.discountAmount
+      }
+      const discountedSubtotal = round2(subtotal - discountAmount)
+      const tax = body.taxAmount !== undefined
+        ? body.taxAmount
+        : round2(discountedSubtotal * rate)
+      const total = round2(discountedSubtotal + tax)
 
       // Reserve next invoice number for this business. INSERT...ON
       // CONFLICT lets us seed the sequence row on first use.
@@ -125,24 +160,27 @@ businessInvoicesRouter.post('/', requireAuth, async (req, res, next) => {
            (business_id, customer_id, invoice_number,
             status, issue_date, due_date,
             subtotal, tax_amount, total_amount,
+            discount_code_id, discount_amount,
             notes, internal_notes)
-         VALUES ($1, $2, $3, 'draft', $4, $5, $6, $7, $8, $9, $10)
+         VALUES ($1, $2, $3, 'draft', $4, $5, $6, $7, $8, $9, $10, $11, $12)
          RETURNING id`,
         [businessId, body.customerId, invoiceNumber,
          body.issueDate, body.dueDate,
          subtotal, tax, total,
+         discountCodeId, discountAmount,
          body.notes ?? null, body.internalNotes ?? null])
 
       // Insert lines in order.
-      for (let i = 0; i < body.lines.length; i++) {
-        const l = body.lines[i]
-        const lineTotal = l.quantity * l.unitPrice
+      for (let i = 0; i < lineCalcs.length; i++) {
+        const l = lineCalcs[i]
         await client.query(
           `INSERT INTO business_invoice_lines
              (invoice_id, sort_order, description,
-              quantity, unit_price, line_total, service_key)
-           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-          [inv.id, i, l.description, l.quantity, l.unitPrice, lineTotal, l.serviceKey ?? null])
+              quantity, unit_price, line_total, service_key,
+              discount_type, discount_value, discount_amount)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+          [inv.id, i, l.description, l.quantity, l.unitPrice, l.net, l.serviceKey ?? null,
+           l.discountType ?? null, l.discountValue ?? 0, l.discountAmount])
       }
 
       await client.query('COMMIT')
@@ -254,7 +292,7 @@ businessInvoicesRouter.get('/:id/pdf', requireAuth, async (req, res, next) => {
       [req.params.id, businessId])
     if (!inv) throw new AppError(404, 'Invoice not found')
     const lines = await query<any>(
-      `SELECT description, quantity, unit_price, line_total
+      `SELECT description, quantity, unit_price, line_total, discount_amount
          FROM business_invoice_lines WHERE invoice_id = $1 ORDER BY sort_order ASC`,
       [inv.id])
 
@@ -281,11 +319,13 @@ businessInvoicesRouter.get('/:id/pdf', requireAuth, async (req, res, next) => {
         quantity:    Number(l.quantity),
         unitPrice:   Number(l.unit_price),
         lineTotal:   Number(l.line_total),
+        discountAmount: Number(l.discount_amount),
       })),
-      subtotal:     Number(inv.subtotal),
-      taxAmount:    Number(inv.tax_amount),
-      totalAmount:  Number(inv.total_amount),
-      amountPaid:   Number(inv.amount_paid),
+      subtotal:       Number(inv.subtotal),
+      discountAmount: Number(inv.discount_amount),
+      taxAmount:      Number(inv.tax_amount),
+      totalAmount:    Number(inv.total_amount),
+      amountPaid:     Number(inv.amount_paid),
       notes:        inv.notes,
       hostedPayUrl: inv.hosted_pay_url,
     })
@@ -468,5 +508,96 @@ businessInvoicesRouter.post('/:id/void', requireAuth, async (req, res, next) => 
       [body.reason, req.params.id, businessId])
     if (r.length === 0) throw new AppError(404, 'Invoice not found or already paid/voided')
     res.json({ success: true, data: r[0] })
+  } catch (e) { next(e) }
+})
+
+// ═══════════════════════════════════════════════════════════════
+//  S519 / S502 — POST /:id/refund : refund a paid invoice
+// ═══════════════════════════════════════════════════════════════
+//
+// When the invoice was paid through Stripe (stripe_payment_intent_id
+// present), this fires the REAL Stripe refund — a reverse_transfer refund
+// on the Connect destination charge, so the money comes back out of the
+// business's Connect balance (GAM keeps its platform fee, per S502). When
+// there's no payment_intent (manual / terminal / cash), it stays
+// bookkeeping-only — the operator runs the money refund themselves.
+//
+// Full or partial; the invoice flips to 'partially_refunded' until the whole
+// paid amount is returned, then 'refunded'. The Stripe refund fires BEFORE
+// the bookkeeping write — if Stripe rejects it, nothing is recorded.
+
+const refundInvoiceSchema = z.object({
+  reason: z.string().min(1).max(500),
+  amount: z.number().positive().optional(),  // omit = refund the full remaining
+})
+
+businessInvoicesRouter.post('/:id/refund', requireAuth, async (req, res, next) => {
+  try {
+    const businessId = await requireSend(req)
+    const body = refundInvoiceSchema.parse(req.body)
+
+    const inv = await queryOne<{
+      id: string; status: string; amount_paid: string; refunded_amount: string;
+      stripe_payment_intent_id: string | null;
+    }>(
+      `SELECT id, status, amount_paid, refunded_amount, stripe_payment_intent_id
+         FROM business_invoices
+        WHERE id = $1 AND business_id = $2`,
+      [req.params.id, businessId])
+    if (!inv) throw new AppError(404, 'Invoice not found')
+    if (inv.status !== 'paid' && inv.status !== 'partially_refunded') {
+      throw new AppError(409, `Only a paid invoice can be refunded (this one is ${inv.status})`)
+    }
+
+    const round2 = (n: number) => Math.round(n * 100) / 100
+    const paid = Number(inv.amount_paid)
+    const alreadyRefunded = Number(inv.refunded_amount)
+    const refundable = round2(paid - alreadyRefunded)
+    if (refundable <= 0) throw new AppError(409, 'This invoice is already fully refunded')
+
+    const amount = body.amount ?? refundable
+    if (amount > refundable + 0.005) {
+      throw new AppError(400, `Refund $${amount.toFixed(2)} exceeds the refundable $${refundable.toFixed(2)}`)
+    }
+
+    const newRefunded = round2(alreadyRefunded + amount)
+    const newStatus = newRefunded >= paid - 0.005 ? 'refunded' : 'partially_refunded'
+    const isFullRemaining = round2(amount) >= refundable - 0.005
+
+    // Stripe-paid → fire the real refund first. The idempotency key is keyed
+    // on the cumulative refunded total, so a retry of THIS refund is a no-op
+    // while a later partial refund (different cumulative) is allowed through.
+    let stripeRefundId: string | null = null
+    if (inv.stripe_payment_intent_id) {
+      try {
+        const refund = await refundBusinessInvoicePayment({
+          paymentIntentId: inv.stripe_payment_intent_id,
+          // Full remaining → omit amount so Stripe refunds the exact remainder
+          // (avoids cent drift); otherwise refund this partial amount.
+          amountCents: isFullRemaining ? undefined : Math.round(amount * 100),
+          reason: body.reason.trim(),
+          idempotencyKey: `biz-inv-refund:${inv.id}:${newRefunded.toFixed(2)}`,
+          metadata: { business_invoice_id: inv.id, business_id: businessId },
+        })
+        stripeRefundId = refund.refundId
+      } catch (e: any) {
+        logger.error({ err: e, invoiceId: inv.id }, '[business-invoice] Stripe refund failed')
+        throw new AppError(502, `Stripe could not process the refund: ${e?.message ?? 'unknown error'}. Nothing was changed.`)
+      }
+    }
+
+    const r = await query<any>(
+      `UPDATE business_invoices
+          SET status          = $1,
+              refunded_amount = $2,
+              refunded_at     = COALESCE(refunded_at, NOW()),
+              refund_reason   = $3,
+              stripe_refund_id = COALESCE($4, stripe_refund_id)
+        WHERE id = $5 AND business_id = $6
+          AND status IN ('paid', 'partially_refunded')
+        RETURNING id, status, refunded_amount, refunded_at, stripe_refund_id`,
+      [newStatus, newRefunded, body.reason.trim(), stripeRefundId, req.params.id, businessId])
+    if (r.length === 0) throw new AppError(404, 'Invoice not found or not refundable')
+    res.json({ success: true, data: { ...r[0], stripeRefunded: stripeRefundId != null } })
   } catch (e) { next(e) }
 })

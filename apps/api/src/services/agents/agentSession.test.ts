@@ -84,19 +84,25 @@ describe('runAgentSession', () => {
 
     expect(res.handledBy).toEqual({ name: 'GAM Support', tier: 'human' })
     expect(res.escalations.map((e) => e.to)).toEqual(['Samantha', 'GAM Support'])
-    expect(res.reply).toMatch(/specialist/i)
+    expect(res.reply).toMatch(/senior agent/i)
     expect(res.humanHandoff).toMatchObject({ reason: 'money movement: refund' })
     expect(res.humanHandoff!.transcript.at(-1)).toEqual({ role: 'user', content: 'I want my money back' })
   })
 
-  it('serves a curated FAQ answer instantly — no model, no gate', async () => {
-    matchCuratedFaqMock.mockResolvedValueOnce('Your rent due date is in your lease.')
-    const res = await runAgentSession({ audience: 'tenant', actor: ACTOR, message: 'when is rent due?' })
+  it('serves a curated FAQ answer instantly — no model, no gate (when enabled)', async () => {
+    // Curated FAQ is flag-gated (default OFF since S498); enable it for this path.
+    process.env.AGENT_CURATED_FAQ = '1'
+    try {
+      matchCuratedFaqMock.mockResolvedValueOnce('Your rent due date is in your lease.')
+      const res = await runAgentSession({ audience: 'tenant', actor: ACTOR, message: 'when is rent due?' })
 
-    expect(res.curated).toBe(true)
-    expect(res.reply).toBe('Your rent due date is in your lease.')
-    expect(mockRun).not.toHaveBeenCalled() // never touched the model
-    expect(getTurnGateMock).not.toHaveBeenCalled() // never took a gate slot
+      expect(res.curated).toBe(true)
+      expect(res.reply).toBe('Your rent due date is in your lease.')
+      expect(mockRun).not.toHaveBeenCalled() // never touched the model
+      expect(getTurnGateMock).not.toHaveBeenCalled() // never took a gate slot
+    } finally {
+      delete process.env.AGENT_CURATED_FAQ
+    }
   })
 
   it('injects cross-session memory into the model context on a fresh conversation', async () => {

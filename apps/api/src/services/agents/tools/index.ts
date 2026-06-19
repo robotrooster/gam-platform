@@ -57,6 +57,15 @@ import { getMarketRentTool } from './getMarketRent'
 import { getMyLandlordRenewalTendency } from './getMyLandlordRenewalTendency'
 import { checkAgainstLaw } from './checkAgainstLaw'
 import { escalate, escalateToHuman } from './escalation'
+import { setAgentPermission, getAgentPermissions } from './agentPermissionTools'
+import { requestLeaseRenewal } from './requestLeaseRenewal'
+import { billFee } from './billFee'
+import { flagApplicantDecision } from './flagApplicantDecision'
+import { draftTenantNotice } from './draftTenantNotice'
+import { getInspectionChecklist } from './getInspectionChecklist'
+import { getInspectionProgress } from './getInspectionProgress'
+import { getGuestBooking } from './getGuestBooking'
+import { requestBookingChange } from './requestBookingChange'
 import type { AgentTool } from './types'
 import type { AgentProfile } from '../types'
 import type { ToolSchema } from '../engine'
@@ -79,6 +88,8 @@ export const ALL_TOOLS: readonly AgentTool[] = [
   getMyContacts,
   getMyLandlordPatterns,
   getMyLandlordRenewalTendency,
+  requestLeaseRenewal,
+  getInspectionChecklist,
   // landlord reads
   getLandlordPortfolio,
   getPropertyRentRoll,
@@ -95,6 +106,7 @@ export const ALL_TOOLS: readonly AgentTool[] = [
   getBooksSummary,
   getTenantContact,
   getTeam,
+  getInspectionProgress,
   // landlord actions
   approveMaintenanceRequest,
   assignMaintenanceRequest,
@@ -102,8 +114,16 @@ export const ALL_TOOLS: readonly AgentTool[] = [
   scheduleMaintenance,
   messageTenant,
   sendBulkMessage,
+  getAgentPermissions,
+  setAgentPermission,
+  billFee,
+  flagApplicantDecision,
+  draftTenantNotice,
   // sales (prospect)
   captureLead,
+  // booking guest (token-scoped)
+  getGuestBooking,
+  requestBookingChange,
   // both
   getApplicableLaws,
   searchStateLaw,

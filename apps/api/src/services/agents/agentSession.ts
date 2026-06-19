@@ -81,10 +81,13 @@ function buildHandoffNote(from: AgentProfile, to: AgentProfile, h: HandoffSignal
   )
 }
 
+// No live human agents staff the chat. When something reaches the human tier we
+// commit to an ASYNC follow-up: a senior agent reviews it and emails the customer
+// within 24 hours. The reply must NOT imply a real-time transfer / someone waiting.
 const HUMAN_HANDOFF_REPLY =
-  `I'm bringing in a GAM support specialist to take this from here. ` +
-  `I've passed along everything we discussed, so you won't need to repeat yourself — ` +
-  `someone will follow up with you.`
+  `I've escalated this to a senior agent on our support team. They'll personally review ` +
+  `everything we've covered and email you a response within 24 hours — so you won't have to ` +
+  `repeat yourself. Is there anything else I can help you with in the meantime?`
 
 // Distinct from the human-handoff copy on purpose: a capacity shed must NOT
 // imply a specialist will follow up (no false promise).
@@ -102,7 +105,10 @@ export async function runAgentSession(input: AgentSessionInput): Promise<AgentSe
   // `audience`, while every tool's data scope binds to `actor`. They must
   // agree, or a misconfigured caller could surface one audience's tools
   // against the other's identity. Fail fast on a mismatch.
-  if ((actor.role === 'tenant' || actor.role === 'landlord') && actor.role !== audience) {
+  if (
+    (actor.role === 'tenant' || actor.role === 'landlord' || actor.role === 'guest') &&
+    actor.role !== audience
+  ) {
     throw new Error(`agent session: audience '${audience}' does not match actor.role '${actor.role}'`)
   }
 
@@ -170,7 +176,12 @@ export async function runAgentSession(input: AgentSessionInput): Promise<AgentSe
   // Curated FAQ fast-path: an approved answer to a top general question,
   // served instantly — no gate, no model. First-turn only (a follow-up
   // depends on conversation context, so a canned answer wouldn't fit).
-  if (baseHistory.length === 0) {
+  //
+  // DISABLED by default: the canned copy broke the "real person" feel (e.g.
+  // deflecting "see my lease details" to "it's in Documents" instead of calling
+  // get_my_lease). Every message now goes through the agent + tools. Re-enable
+  // with AGENT_CURATED_FAQ=1 if a vetted instant-answer path is wanted again.
+  if (process.env.AGENT_CURATED_FAQ === '1' && baseHistory.length === 0) {
     const faq = await matchCuratedFaq(audience, message).catch(() => null)
     if (faq) {
       return await finalize(
@@ -224,7 +235,14 @@ export async function runAgentSession(input: AgentSessionInput): Promise<AgentSe
         )
       }
 
-      if (res.handoff.kind === 'human') {
+      // Routing rule (locked, Nic): ALL escalation runs through the senior agent,
+      // and ONLY the senior (tier 'escalation') can escalate to the real-person /
+      // email tier. An entry agent can never reach a human directly — downgrade any
+      // 'human' signal it produces to a hand-up to the senior.
+      const handoffKind: typeof res.handoff.kind =
+        res.handoff.kind === 'human' && profile.tier !== 'escalation' ? 'tier' : res.handoff.kind
+
+      if (handoffKind === 'human') {
         escalations.push({ from: profile.name, to: 'GAM Support', reason: res.handoff.reason })
         return await finalize(humanHandoffResult(res.handoff.reason, res.handoff.summary), profile.id)
       }

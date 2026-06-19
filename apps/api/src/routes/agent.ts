@@ -20,7 +20,8 @@ import rateLimit from 'express-rate-limit'
 import { requireAuth } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { runAgentSession } from '../services/agents/agentSession'
-import { loadConversationHistory } from '../services/agents/conversationHistory'
+import { loadConversationHistory, loadGuestConversationHistory } from '../services/agents/conversationHistory'
+import { resolveBookingGuestToken } from '../services/bookingGuestTokens'
 import type { AgentAudience, ChatMessage } from '../services/agents/types'
 
 export const agentRouter = Router()
@@ -150,6 +151,83 @@ salesAgentRouter.post('/chat', async (req, res, next) => {
       message: body.message,
       conversationId,
       history: body.history,
+    })
+
+    res.json({
+      success: true,
+      data: {
+        reply: result.reply,
+        conversationId,
+        ...(result.shed ? { shed: true } : {}),
+      },
+    })
+  } catch (e) {
+    next(e)
+  }
+})
+
+// ── Booking-guest agent (NO login — bearer token) ─────────────────────
+// A no-account booking guest reaches their stay assistant via a per-booking
+// access token (delivered by email-link or on-site QR). The token IS the
+// identity: it resolves to exactly one booking, and the guest actor is
+// scoped to it server-side — the model never chooses the booking. Rate-
+// limited by token so one stay can't saturate the fleet.
+export const guestAgentRouter = Router()
+
+const guestLimiter = rateLimit({
+  windowMs: Number(process.env.GUEST_AGENT_RATE_WINDOW_MS) || 60_000,
+  max: () => Number(process.env.GUEST_AGENT_RATE_MAX) || 20,
+  keyGenerator: (req) => (typeof req.body?.token === 'string' ? req.body.token : req.ip) ?? 'anonymous',
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, error: "You're sending messages too quickly — please wait a moment." },
+})
+guestAgentRouter.use(guestLimiter)
+
+const guestChatSchema = z.object({
+  token: z.string().min(16).max(128),
+  message: z.string().trim().min(1).max(4000),
+  conversationId: z.string().uuid().optional(),
+  history: z
+    .array(z.object({ role: z.enum(['user', 'assistant']), content: z.string().min(1).max(8000) }))
+    .max(40)
+    .optional(),
+})
+
+// POST /api/guest/chat — one stay-assistant turn (token-authenticated).
+guestAgentRouter.post('/chat', async (req, res, next) => {
+  try {
+    const body = guestChatSchema.parse(req.body)
+    const guest = await resolveBookingGuestToken(body.token)
+    if (!guest) {
+      throw new AppError(401, 'This stay link is invalid or has expired. Ask your host for a new one.')
+    }
+
+    // The guest actor is bound entirely to the token's booking. profileId and
+    // bookingId are the booking id; userId carries the token id (no GAM user).
+    const actor = {
+      userId: guest.tokenId,
+      role: 'guest',
+      profileId: guest.bookingId,
+      bookingId: guest.bookingId,
+    }
+
+    // Server-owned history, same posture as the authenticated door: continue a
+    // thread by id (ownership = the token's booking), else mint a new id.
+    let conversationId = body.conversationId
+    let history: ChatMessage[] | undefined = body.history
+    if (conversationId) {
+      history = await loadGuestConversationHistory(conversationId, guest.bookingId)
+    } else {
+      conversationId = randomUUID()
+    }
+
+    const result = await runAgentSession({
+      audience: 'guest',
+      actor,
+      message: body.message,
+      conversationId,
+      history,
     })
 
     res.json({

@@ -2,7 +2,7 @@
 scope: landlord
 title: Tenant payment fees and the pass-through toggle
 ---
-Every electronic rent payment carries a small processing fee. GAM lets you decide, per property, whether your tenant or you cover it. GAM never absorbs the fee itself, so one side or the other always pays it.
+Every electronic rent payment carries a small processing fee. GAM lets you decide, per property, whether your tenant or you cover it — with **separate toggles for ACH and for card**. GAM never absorbs the fee itself, so one side or the other always pays it.
 
 Here are the standard processing rates:
 
@@ -10,12 +10,12 @@ Here are the standard processing rates:
 - Card: 3.25%
 - Canadian cards paid in USD: an extra 1.5% on top
 
-The per-property pass-through toggle controls who pays:
+Each property has two pass-through toggles — one for ACH, one for card — and each controls who pays that fee:
 
 - Tenant pays: the fee is added on top of the rent at checkout, so the tenant sees the rent plus the processing fee. You receive the full rent amount.
 - Landlord pays: the tenant pays exactly the rent, and the fee is netted out of what you receive.
 
-Because the setting lives at the property level, you can run different properties differently. A good way to think about it: "tenant pays" keeps your payout clean and predictable, while "landlord pays" makes the tenant's total simpler at the cost of a deduction on your side.
+Because the toggles are independent and live at the property level, you can run different properties differently — and even pass card fees through while absorbing ACH yourself. A good way to think about it: "tenant pays" keeps your payout clean and predictable, while "landlord pays" makes the tenant's total simpler at the cost of a deduction on your side.
 
 This processing fee is completely separate from the monthly platform fee ($2 per occupied unit, $10 per-property minimum). One is per-payment, the other is monthly.
 

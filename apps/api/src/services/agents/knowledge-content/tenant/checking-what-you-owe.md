@@ -9,14 +9,15 @@ Your GAM portal shows what you currently owe and the status of payments you've m
 Sign in to your tenant portal and open your payments area. There you can see:
 
 - Amounts currently due and their due dates
-- Payments that are pending, completed, or failed
+- Payments that are pending, processing, settled, failed, or returned
 - A history of past payments
 
 ## Understanding payment statuses
 
-- **Pending:** The payment has been submitted and funds are still clearing. Bank (ACH) payments can take a few days to fully clear.
-- **Completed:** The payment has cleared.
-- **Failed:** The payment didn't go through — for example, a card was declined or a bank transfer was returned. A failed payment leaves the balance still owing, so you'll want to try again or use another payment method.
+- **Pending:** The payment hasn't been submitted yet, or has just been started.
+- **Processing:** The payment has been submitted and funds are still clearing. Bank (ACH) payments sit here for a few days; card payments usually skip straight to settled.
+- **Settled:** The payment has cleared. This is the "done, paid" state.
+- **Failed / Returned:** The payment didn't go through — for example, a card was declined or a bank transfer was returned. This leaves the balance still owing, so you'll want to try again or use another payment method.
 
 ## A note on cash payments
 

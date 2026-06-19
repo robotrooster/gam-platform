@@ -32,6 +32,46 @@ function asHandoff(result: unknown): HandoffSignal | undefined {
   return undefined
 }
 
+/**
+ * Safety net for control-tool unreliability. This model class will sometimes
+ * NARRATE an escalation in plain prose ("I'll connect you with a senior agent —
+ * please hold") instead of CALLING the escalate tool, which silently strands the
+ * customer on a hard stop. When the agent's OWN reply promises a handoff but no
+ * escalation tool fired, we make the handoff real. This keys off the AGENT's
+ * stated intent — NOT the user's words — a deliberate, non-brittle choice.
+ */
+const HANDOFF_VERB =
+  /\b(transfer(?:ring)?\s+you|connect(?:ing)?\s+you\s+with|put\s+you\s+through|hand(?:ing)?\s+(?:this|you|it)\s+(?:off|up|over)|pass(?:ing)?\s+(?:this|you|it)\s+(?:on|up|along)|bring(?:ing)?\s+in|loop(?:ing)?\s+(?:you\s+)?in|hold\s+(?:on\s+)?(?:tight\s+)?while\s+i)\b/i
+const SUPPORT_TARGET =
+  /\b(senior|supervisor|specialist|a\s+human|(?:real|live)\s+person|gam\s+support|support\s+(?:team|specialist|agent|representative)|(?:right|appropriate)\s+(?:team|department|person)|someone\s+(?:who|that)\s+can)\b/i
+
+/**
+ * True when the agent's prose promises an escalation to a higher SUPPORT tier.
+ * Requires a handoff verb AND a support-tier target (or an explicit "escalate"),
+ * so routing the tenant to their LANDLORD ("I'll connect you with your landlord")
+ * is NOT mistaken for a support escalation.
+ */
+function promisesHandoff(content: string): boolean {
+  if (!content) return false
+  if (/\bescalat\w+/i.test(content)) return true
+  return HANDOFF_VERB.test(content) && SUPPORT_TARGET.test(content)
+}
+
+function synthesizeHandoff(profile: AgentProfile, content: string): HandoffSignal | undefined {
+  if (!promisesHandoff(content)) return undefined
+  const allow = profile.toolNames ?? []
+  if (!allow.includes('escalate') && !allow.includes('escalate_to_human')) return undefined
+  // Routing rule (locked): ALL escalation runs through the senior agent, and ONLY
+  // the senior (tier 'escalation') reaches the real-person/email tier. So a senior
+  // hands to 'human'; every other tier hands UP to the senior ('tier').
+  const kind: HandoffSignal['kind'] = profile.tier === 'escalation' ? 'human' : 'tier'
+  return {
+    kind,
+    reason: 'Agent indicated a handoff was needed but did not call the escalation tool.',
+    summary: content.replace(/\s+/g, ' ').trim().slice(0, 400),
+  }
+}
+
 export interface RunWithToolsInput {
   profile: AgentProfile
   actor: AgentActor
@@ -108,6 +148,11 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
     addUsage(out.usage)
 
     if (out.toolCalls.length === 0) {
+      const synth = synthesizeHandoff(profile, out.content)
+      if (synth) {
+        logger.warn({ profile: profile.id }, 'agent runner: model promised a handoff in prose without calling escalate — synthesizing the escalation (safety net)')
+        return { reply: out.content, model, retrieved, grounded, toolInvocations, usage, handoff: synth }
+      }
       return { reply: out.content, model, retrieved, grounded, toolInvocations, usage }
     }
 
@@ -143,6 +188,10 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
   // The no-tools call can still come back empty (model emits a stray
   // tool_call -> content forced to ''). Never return an empty reply.
   const reply = final.content || STEP_CEILING_FALLBACK
+  const ceilingHandoff = synthesizeHandoff(profile, reply)
+  if (ceilingHandoff) {
+    return { reply, model: model || final.model, retrieved, grounded, toolInvocations, usage, handoff: ceilingHandoff }
+  }
   return { reply, model: model || final.model, retrieved, grounded, toolInvocations, usage }
 }
 

@@ -80,6 +80,7 @@ describe('logInteraction', () => {
   it('inserts one row and returns its id', async () => {
     mockQuery
       .mockResolvedValueOnce([{ property_id: 'p1', landlord_id: 'L9' }]) // property resolve
+      .mockResolvedValueOnce([{ n: 0 }]) // turn_index = MAX(turn_index)+1
       .mockResolvedValueOnce([{ id: 'log-1' }]) // insert
     const input: AgentSessionInput = { audience: 'tenant', actor: TENANT, message: 'hi' }
     const id = await logInteraction(input, result({ toolInvocations: [{ name: 'get_my_lease', args: {}, result: {} }] }), {
@@ -93,7 +94,7 @@ describe('logInteraction', () => {
     })
 
     expect(id).toBe('log-1')
-    const params = mockQuery.mock.calls[1][1]
+    const params = mockQuery.mock.calls[2][1] // [0] property, [1] turn_index, [2] insert
     // spot-check the shaped row
     expect(params).toContain('tenant_entry') // profile_id
     expect(params).toContain('action_taken') // derived outcome (tool ran)

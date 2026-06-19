@@ -824,36 +824,26 @@ leasesRouter.post('/:id/bill-fee', requirePerm('properties.edit'), async (req, r
     }
 
     const body = billFeeSchema.parse(req.body)
-    const dueDate = body.dueDate ?? new Date().toISOString().slice(0, 10)
-    const description = body.description ??
-      (body.feeType === 'early_termination_fee'
-        ? 'Early termination fee'
-        : 'Landlord-billed fee')
-
-    const inserted = await queryOne<{ id: string }>(
-      `INSERT INTO payments (
-         landlord_id, tenant_id, lease_id, unit_id,
-         type, amount, status, entry_description, due_date, notes
-       ) VALUES ($1, $2, $3, $4, 'fee', $5, 'pending', 'SUBSCRIP', $6, $7)
-       RETURNING id`,
-      [
-        lease.landlord_id,
-        lease.tenant_id,
-        lease.id,
-        lease.unit_id,
-        body.amount,
-        dueDate,
-        `S180-A2 admin-billed: ${body.feeType} — ${description}`,
-      ],
-    )
+    const { createLeaseFeePayment } = await import('../services/leaseFees')
+    const result = await createLeaseFeePayment({
+      landlordId:  lease.landlord_id,
+      tenantId:    lease.tenant_id,
+      leaseId:     lease.id,
+      unitId:      lease.unit_id,
+      feeType:     body.feeType,
+      amount:      body.amount,
+      description: body.description,
+      dueDate:     body.dueDate,
+      source:      'admin',
+    })
     res.status(201).json({
       success: true,
       data: {
-        payment_id:  inserted!.id,
+        payment_id:  result.paymentId,
         fee_type:    body.feeType,
         amount:      body.amount,
-        due_date:    dueDate,
-        description,
+        due_date:    result.dueDate,
+        description: result.description,
       },
     })
   } catch (e) { next(e) }

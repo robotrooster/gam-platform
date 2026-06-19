@@ -33,6 +33,7 @@ export const businessPosRouter = Router()
 // pos.use; refunds gated by pos.refund (separate so cashiers can ring
 // up sales without being able to refund).
 import { requireBusinessAccess } from '../middleware/businessAccess'
+import { applyDiscount } from '../services/businessDiscounts'
 
 const requireUse    = async (req: any) => (await requireBusinessAccess(req, { permission: 'pos.use',    feature: 'pos' })).businessId
 const requireRefund = async (req: any) => (await requireBusinessAccess(req, { permission: 'pos.refund', feature: 'pos' })).businessId
@@ -54,6 +55,10 @@ const createSchema = z.object({
   customerId: z.string().uuid().nullable().optional(),
   paymentMethod: z.enum(['cash', 'card_recorded']),
   amountTendered: z.number().min(0).optional(),
+  // S512: optional customer gratuity, tracked separately from the sale.
+  tipAmount: z.number().min(0).max(100000).optional(),
+  // S513: optional discount code, applied pre-tax to the subtotal.
+  discountCode: z.string().min(1).max(40).optional(),
   notes: z.string().max(1000).nullable().optional(),
   lines: z.array(z.object({
     itemId:   z.string().uuid(),
@@ -139,19 +144,41 @@ businessPosRouter.post('/transactions', requireAuth, async (req, res, next) => {
           newStockQty: it.stock_qty - l.quantity,
         })
       }
-      const totalAmount = dec(subtotal + taxAmount)
+      // S513: apply a discount code (pre-tax) inside the txn — this
+      // consumes a redemption under a row lock. The discount reduces the
+      // taxable base, so we scale the accumulated per-line tax by
+      // (discountedSubtotal / subtotal) — identical to a proportional
+      // per-line discount, but without rewriting the stored line rows
+      // (lines stay full-price; the discount shows as a transaction line).
+      let discountAmount = 0
+      let discountCodeId: string | null = null
+      if (body.discountCode) {
+        const applied = await applyDiscount(client, businessId, body.discountCode, subtotal)
+        discountCodeId = applied.discountCodeId
+        discountAmount = applied.discountAmount
+        if (discountAmount > 0 && subtotal > 0) {
+          const factor = (subtotal - discountAmount) / subtotal
+          taxAmount = dec(taxAmount * factor)
+        }
+      }
 
-      // Cash sale: change calc.
+      const totalAmount = dec(subtotal - discountAmount + taxAmount)
+      // S512: tip is tracked apart from the sale. The customer pays the
+      // grand total (sale + tip); cash tendered must cover it.
+      const tipAmount = dec(body.tipAmount ?? 0)
+      const grandTotal = dec(totalAmount + tipAmount)
+
+      // Cash sale: change calc against the grand total (incl. tip).
       let changeDue: number | null = null
       if (body.paymentMethod === 'cash') {
         if (body.amountTendered === undefined) {
           throw new AppError(400, 'amountTendered required for cash sale')
         }
-        if (body.amountTendered < totalAmount) {
+        if (body.amountTendered < grandTotal) {
           throw new AppError(400,
-            `Tendered amount $${body.amountTendered.toFixed(2)} less than total $${totalAmount.toFixed(2)}`)
+            `Tendered amount $${body.amountTendered.toFixed(2)} less than total $${grandTotal.toFixed(2)}`)
         }
-        changeDue = dec(body.amountTendered - totalAmount)
+        changeDue = dec(body.amountTendered - grandTotal)
       }
 
       // Bump receipt sequence (UPSERT pattern from S493).
@@ -172,13 +199,15 @@ businessPosRouter.post('/transactions', requireAuth, async (req, res, next) => {
       const { rows: [txn] } = await client.query<any>(
         `INSERT INTO business_pos_transactions
            (business_id, receipt_number, customer_id,
-            subtotal, tax_amount, total_amount,
+            subtotal, tax_amount, tip_amount, total_amount,
+            discount_code_id, discount_amount,
             payment_method, amount_tendered, change_due,
             notes, cashier_user_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
          RETURNING *`,
         [businessId, receiptNumber, body.customerId ?? null,
-         subtotal, taxAmount, totalAmount,
+         subtotal, taxAmount, tipAmount, totalAmount,
+         discountCodeId, discountAmount,
          body.paymentMethod,
          body.amountTendered ?? null,
          changeDue,
@@ -254,7 +283,7 @@ businessPosRouter.get('/transactions', requireAuth, async (req, res, next) => {
     params.push(q.limit ?? 100)
     const rows = await query<any>(
       `SELECT t.id, t.receipt_number, t.status,
-              t.subtotal, t.tax_amount, t.total_amount,
+              t.subtotal, t.tax_amount, t.tip_amount, t.total_amount,
               t.payment_method, t.refunded_at,
               t.customer_id,
               c.first_name AS customer_first_name,
@@ -352,9 +381,11 @@ businessPosRouter.get('/transactions/:id/pdf', requireAuth, async (req, res, nex
         unitPrice:   Number(l.unit_price),
         lineTotal:   Number(l.line_total),
       })),
-      subtotal:    Number(txn.subtotal),
-      taxAmount:   Number(txn.tax_amount),
-      totalAmount: Number(txn.total_amount),
+      subtotal:       Number(txn.subtotal),
+      discountAmount: Number(txn.discount_amount),
+      taxAmount:      Number(txn.tax_amount),
+      tipAmount:      Number(txn.tip_amount),
+      totalAmount:    Number(txn.total_amount),
     })
 
     res.setHeader('Content-Type', 'application/pdf')
@@ -364,11 +395,27 @@ businessPosRouter.get('/transactions/:id/pdf', requireAuth, async (req, res, nex
 })
 
 // ═══════════════════════════════════════════════════════════════
-//  POST /transactions/:id/refund — full refund, restore stock
+//  POST /transactions/:id/refund — full OR partial (line-level) refund
 // ═══════════════════════════════════════════════════════════════
+//
+// Body: { reason, lines?: [{ lineId, quantity }] }
+//   - omit `lines` → refund everything still outstanding (full refund of
+//     the remaining quantity on every line).
+//   - provide `lines` → refund just those quantities (must be ≤ what's
+//     left on each line). The sale flips to 'partially_refunded' until
+//     every line is fully returned, then 'refunded'.
+//
+// Refund dollars are proportional to the ACTUAL charged total, so a
+// discounted sale refunds the discounted amount:
+//   line refund = unit_price * qty / subtotal * total_amount.
+// Restores stock + writes a 'received' adjustment per refunded line.
 
 const refundSchema = z.object({
   reason: z.string().min(1).max(500),
+  lines:  z.array(z.object({
+    lineId:   z.string().uuid(),
+    quantity: z.number().int().positive(),
+  })).min(1).optional(),
 })
 
 businessPosRouter.post('/transactions/:id/refund', requireAuth, async (req, res, next) => {
@@ -382,8 +429,9 @@ businessPosRouter.post('/transactions/:id/refund', requireAuth, async (req, res,
 
       const { rows: [txn] } = await client.query<{
         id: string; receipt_number: string; status: string;
+        subtotal: string; total_amount: string; refunded_amount: string;
       }>(
-        `SELECT id, receipt_number, status
+        `SELECT id, receipt_number, status, subtotal, total_amount, refunded_amount
            FROM business_pos_transactions
           WHERE id = $1 AND business_id = $2
           FOR UPDATE`,
@@ -392,52 +440,105 @@ businessPosRouter.post('/transactions/:id/refund', requireAuth, async (req, res,
         await client.query('ROLLBACK')
         throw new AppError(404, 'Transaction not found')
       }
-      if (txn.status !== 'completed') {
+      // Can refund a completed sale or keep refunding a partially-refunded one.
+      if (txn.status !== 'completed' && txn.status !== 'partially_refunded') {
         await client.query('ROLLBACK')
         throw new AppError(409, `Cannot refund a ${txn.status} sale`)
       }
 
-      // Walk lines + restore stock.
       const { rows: lines } = await client.query<{
-        item_id: string; quantity: number;
+        id: string; item_id: string; quantity: number;
+        refunded_qty: number; unit_price: string;
       }>(
-        `SELECT item_id, quantity
+        `SELECT id, item_id, quantity, refunded_qty, unit_price
            FROM business_pos_transaction_lines
           WHERE transaction_id = $1
           ORDER BY item_id`,
         [txn.id])
+      const lineById = new Map(lines.map(l => [l.id, l]))
 
-      for (const ln of lines) {
-        // Lock item row, restore stock, write audit.
+      // Build the list of (line, refundQty) to process.
+      let toRefund: Array<{ line: typeof lines[number]; qty: number }>
+      if (body.lines) {
+        toRefund = body.lines.map(req => {
+          const line = lineById.get(req.lineId)
+          if (!line) throw new AppError(404, `Line ${req.lineId} not found on this sale`)
+          const remaining = line.quantity - line.refunded_qty
+          if (req.quantity > remaining) {
+            throw new AppError(400,
+              `Cannot refund ${req.quantity} of "${line.item_id}" — only ${remaining} left to refund`)
+          }
+          return { line, qty: req.quantity }
+        })
+      } else {
+        // Full refund of whatever remains.
+        toRefund = lines
+          .map(line => ({ line, qty: line.quantity - line.refunded_qty }))
+          .filter(x => x.qty > 0)
+      }
+      if (toRefund.length === 0) {
+        await client.query('ROLLBACK')
+        throw new AppError(409, 'Nothing left to refund on this sale')
+      }
+
+      const subtotal = dec(txn.subtotal)
+      const totalAmount = dec(txn.total_amount)
+      let refundSum = 0
+
+      for (const { line, qty } of toRefund) {
+        // Restore stock + audit.
         const { rows: [item] } = await client.query<{ stock_qty: number }>(
-          `SELECT stock_qty FROM business_inventory_items
-            WHERE id = $1 FOR UPDATE`, [ln.item_id])
-        const newQty = (item?.stock_qty ?? 0) + ln.quantity
+          `SELECT stock_qty FROM business_inventory_items WHERE id = $1 FOR UPDATE`,
+          [line.item_id])
+        const newQty = (item?.stock_qty ?? 0) + qty
         await client.query(
           `UPDATE business_inventory_items SET stock_qty = $1 WHERE id = $2`,
-          [newQty, ln.item_id])
+          [newQty, line.item_id])
         await client.query(
           `INSERT INTO business_inventory_adjustments
              (business_id, item_id, adjustment_type,
               quantity_delta, stock_qty_after, notes,
               actor_user_id, reference_type, reference_id)
            VALUES ($1, $2, 'received', $3, $4, $5, $6, 'pos_transaction', $7)`,
-          [businessId, ln.item_id, ln.quantity, newQty,
+          [businessId, line.item_id, qty, newQty,
            `Refund of ${txn.receipt_number}`,
            req.user!.userId, txn.id])
+        // Bump refunded_qty on the line.
+        await client.query(
+          `UPDATE business_pos_transaction_lines
+              SET refunded_qty = refunded_qty + $1 WHERE id = $2`,
+          [qty, line.id])
+        // Proportional refund dollars vs the actual charged total.
+        const share = subtotal > 0
+          ? dec((dec(Number(line.unit_price) * qty) / subtotal) * totalAmount)
+          : 0
+        refundSum = dec(refundSum + share)
       }
+
+      // Fully refunded when nothing remains across all lines.
+      const { rows: [{ remaining }] } = await client.query<{ remaining: number }>(
+        `SELECT COALESCE(SUM(quantity - refunded_qty), 0)::int AS remaining
+           FROM business_pos_transaction_lines WHERE transaction_id = $1`,
+        [txn.id])
+      const newStatus = remaining === 0 ? 'refunded' : 'partially_refunded'
+      const newRefundedAmount = dec(Number(txn.refunded_amount) + refundSum)
 
       const { rows: [updated] } = await client.query<any>(
         `UPDATE business_pos_transactions
-            SET status = 'refunded',
-                refunded_at = NOW(),
-                refund_reason = $1
-          WHERE id = $2
+            SET status = $1,
+                refunded_at = COALESCE(refunded_at, NOW()),
+                refunded_amount = $2,
+                refund_reason = $3
+          WHERE id = $4
           RETURNING *`,
-        [body.reason.trim(), txn.id])
+        [newStatus, newRefundedAmount, body.reason.trim(), txn.id])
+
+      const { rows: updatedLines } = await client.query<any>(
+        `SELECT * FROM business_pos_transaction_lines
+          WHERE transaction_id = $1 ORDER BY sort_order ASC`, [txn.id])
 
       await client.query('COMMIT')
-      res.json({ success: true, data: updated })
+      res.json({ success: true, data: { ...updated, lines: updatedLines, refundedThisTime: refundSum } })
     } catch (e) {
       await client.query('ROLLBACK').catch(() => {})
       throw e

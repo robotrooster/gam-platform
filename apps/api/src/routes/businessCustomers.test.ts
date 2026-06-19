@@ -22,6 +22,10 @@ import { db } from '../db'
 import { businessCustomersRouter } from './businessCustomers'
 import { errorHandler } from '../middleware/errorHandler'
 import { cleanupAllSchema } from '../test/dbHelpers'
+import {
+  getOrCreateCustomerPortalToken,
+  resolveCustomerPortalToken,
+} from '../services/customerPortalTokens'
 
 function buildApp() {
   const app = express()
@@ -488,6 +492,110 @@ describe('POST /api/business-customers/:id/archive', () => {
     const res = await request(buildApp())
       .post(`/api/business-customers/${c.body.data.id}/archive`)
       .set('Authorization', `Bearer ${a.token}`)
+    expect(res.status).toBe(404)
+  })
+})
+
+// ═══════════════════════════════════════════════════════════════
+//  S515 (D) — POST /import : bulk CSV import
+// ═══════════════════════════════════════════════════════════════
+
+describe('POST /api/business-customers/import', () => {
+  it('imports valid rows, reports invalid ones', async () => {
+    const o = await seedOwner()
+    const res = await request(buildApp())
+      .post('/api/business-customers/import')
+      .set('Authorization', `Bearer ${o.token}`)
+      .send({ customers: [
+        { firstName: 'Jane', lastName: 'Doe', street1: '1 Elm', city: 'Phoenix', state: 'AZ', zip: '85001', email: 'jane@x.com' },
+        { firstName: 'Acme', lastName: 'Inc', companyName: 'Acme Inc', street1: '2 Oak', city: 'Mesa', state: 'AZ', zip: '85201' },
+        { firstName: '', lastName: 'NoFirst', street1: '3 Pine', city: 'Tempe', state: 'AZ', zip: '85281' }, // invalid
+        { firstName: 'NoAddr', lastName: 'X' }, // missing street/city/state/zip → invalid
+      ] })
+    expect(res.status).toBe(201)
+    expect(res.body.data.created).toBe(2)
+    expect(res.body.data.skipped).toBe(2)
+    expect(res.body.data.total).toBe(4)
+    expect(res.body.data.errors.length).toBe(2)
+
+    // The business row was inferred from companyName.
+    const { rows } = await db.query<{ customer_type: string }>(
+      `SELECT customer_type FROM business_customers WHERE business_id = $1 AND company_name = 'Acme Inc'`,
+      [o.businessId])
+    expect(rows[0]?.customer_type).toBe('business')
+  })
+
+  it('empty email string is stored as null', async () => {
+    const o = await seedOwner()
+    await request(buildApp())
+      .post('/api/business-customers/import')
+      .set('Authorization', `Bearer ${o.token}`)
+      .send({ customers: [
+        { firstName: 'No', lastName: 'Email', email: '', street1: '1 Elm', city: 'Phoenix', state: 'AZ', zip: '85001' },
+      ] })
+    const { rows } = await db.query<{ email: string | null }>(
+      `SELECT email FROM business_customers WHERE business_id = $1`, [o.businessId])
+    expect(rows[0]?.email).toBeNull()
+  })
+
+  it('rejects an empty array', async () => {
+    const o = await seedOwner()
+    const res = await request(buildApp())
+      .post('/api/business-customers/import')
+      .set('Authorization', `Bearer ${o.token}`)
+      .send({ customers: [] })
+    expect(res.status).toBe(400)
+  })
+})
+
+// ═══════════════════════════════════════════════════════════════
+//  POST /api/business-customers/:id/revoke-portal-access
+// ═══════════════════════════════════════════════════════════════
+
+describe('POST /api/business-customers/:id/revoke-portal-access', () => {
+  async function makeCustomer(o: { token: string }): Promise<string> {
+    const res = await request(buildApp())
+      .post('/api/business-customers').set('Authorization', `Bearer ${o.token}`)
+      .send(validCustomer())
+    return res.body.data.id
+  }
+
+  it('revokes a live link and the token then fails to resolve', async () => {
+    const o = await seedOwner()
+    const customerId = await makeCustomer(o)
+    const { token } = await getOrCreateCustomerPortalToken({
+      businessId: o.businessId, customerId })
+    // Live before revoke.
+    expect(await resolveCustomerPortalToken(token)).not.toBeNull()
+
+    const res = await request(buildApp())
+      .post(`/api/business-customers/${customerId}/revoke-portal-access`)
+      .set('Authorization', `Bearer ${o.token}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.revoked).toBe(1)
+    // Dead after revoke (fails closed).
+    expect(await resolveCustomerPortalToken(token)).toBeNull()
+  })
+
+  it('is idempotent — revoking with no live link returns revoked:0', async () => {
+    const o = await seedOwner()
+    const customerId = await makeCustomer(o)
+    const res = await request(buildApp())
+      .post(`/api/business-customers/${customerId}/revoke-portal-access`)
+      .set('Authorization', `Bearer ${o.token}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.revoked).toBe(0)
+  })
+
+  it("404s for another business's customer (no cross-tenant revoke)", async () => {
+    const a = await seedOwner()
+    const b = await seedOwner()
+    const customerId = await makeCustomer(a)
+    await getOrCreateCustomerPortalToken({ businessId: a.businessId, customerId })
+
+    const res = await request(buildApp())
+      .post(`/api/business-customers/${customerId}/revoke-portal-access`)
+      .set('Authorization', `Bearer ${b.token}`)
     expect(res.status).toBe(404)
   })
 })

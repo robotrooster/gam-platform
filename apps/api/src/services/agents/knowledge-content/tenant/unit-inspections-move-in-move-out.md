@@ -2,7 +2,7 @@
 scope: tenant
 title: Unit inspections: move-in, move-out, and what your signature means
 ---
-GAM gives your landlord a structured way to document the condition of your unit, and gives you a clear record of what was found. There are three kinds of inspection: move-in (done around the start of your tenancy), move-out (done when you leave), and periodic (a routine check during your stay).
+GAM gives your landlord a structured way to document the condition of your unit, and gives you a clear record of what was found. The inspections you'll take part in are move-in (done around the start of your tenancy), move-out (done when you leave), and periodic (a routine check during your stay). (Your landlord may also run an internal turnover check between tenancies — that one isn't something you sign.)
 
 Your landlord schedules the inspection and walks through the unit area by area. Each item, like a wall, an appliance, or flooring, gets a condition: good, fair, damaged, missing, or not applicable. They can attach photos and notes to back up what they recorded. When the documentation is ready, you'll get a notification asking you to review and sign.
 

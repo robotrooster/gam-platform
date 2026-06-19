@@ -6,7 +6,7 @@ Your rent amount, your due date, any grace period, and any late fees are all set
 
 ## Where these terms live
 
-You'll find your due date, grace period, and late-fee terms in your lease, which you can view in the **Documents** section of your tenant portal. Your payments area shows upcoming amounts and their due dates so you know what's coming.
+You'll find your due date, grace period, and late-fee terms in your lease, which you can view in the **Lease** section of your tenant portal. Your payments area shows upcoming amounts and their due dates so you know what's coming.
 
 ## How late fees work
 

@@ -185,12 +185,15 @@ businessReportsRouter.get('/overview', requireAuth, async (req, res, next) => {
       const { rows: [salesAgg] } = await db.query<{
         total_sales: string; sale_count: number;
         refund_count: number; refund_amount: string;
+        total_tips: string;
       }>(
         `SELECT
            COALESCE(SUM(CASE WHEN status = 'completed' THEN total_amount ELSE 0 END), 0) AS total_sales,
            SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END)::int AS sale_count,
            SUM(CASE WHEN status = 'refunded'  THEN 1 ELSE 0 END)::int AS refund_count,
-           COALESCE(SUM(CASE WHEN status = 'refunded' THEN total_amount ELSE 0 END), 0) AS refund_amount
+           COALESCE(SUM(CASE WHEN status = 'refunded' THEN total_amount ELSE 0 END), 0) AS refund_amount,
+           -- S512: tips collected on completed sales, tracked apart from sales revenue.
+           COALESCE(SUM(CASE WHEN status = 'completed' THEN tip_amount ELSE 0 END), 0) AS total_tips
          FROM business_pos_transactions
          WHERE business_id = $1
            AND created_at::date >= CURRENT_DATE - ($2::int - 1)`,
@@ -202,6 +205,7 @@ businessReportsRouter.get('/overview', requireAuth, async (req, res, next) => {
         sale_count: salesAgg.sale_count,
         refund_count: salesAgg.refund_count,
         refund_amount: salesAgg.refund_amount,
+        total_tips: salesAgg.total_tips,
       }
     }
 
@@ -346,6 +350,163 @@ businessReportsRouter.get('/overview', requireAuth, async (req, res, next) => {
       }
     }
 
+    // ─── Sales tax collected (S517) ─────────────────────────────
+    // Tax the operator collected and will owe on a return. Sourced from
+    // completed POS sales + issued invoices (sent/paid), bucketed by
+    // month. Amounts are post-discount (tax_amount is already net of any
+    // discount on both tables). Computed whenever POS or invoicing is on.
+    let salesTax: any = null
+    if (features.has('pos') || features.has('invoicing')) {
+      const { rows: monthly } = await db.query<{
+        month: string; tax_collected: string; pos_tax: string; invoice_tax: string;
+        taxable_sales: string;
+      }>(
+        `WITH tax_rows AS (
+           SELECT date_trunc('month', created_at) AS month,
+                  tax_amount AS tax, subtotal AS net, 'pos' AS source
+             FROM business_pos_transactions
+            WHERE business_id = $1 AND status = 'completed'
+              AND created_at::date >= CURRENT_DATE - ($2::int - 1)
+           UNION ALL
+           SELECT date_trunc('month', issue_date::timestamptz) AS month,
+                  tax_amount AS tax, (subtotal - discount_amount) AS net, 'invoice' AS source
+             FROM business_invoices
+            WHERE business_id = $1 AND status IN ('sent', 'paid')
+              AND issue_date >= CURRENT_DATE - ($2::int - 1)
+         )
+         SELECT to_char(month, 'YYYY-MM') AS month,
+                COALESCE(SUM(tax), 0) AS tax_collected,
+                COALESCE(SUM(CASE WHEN source = 'pos'     THEN tax ELSE 0 END), 0) AS pos_tax,
+                COALESCE(SUM(CASE WHEN source = 'invoice' THEN tax ELSE 0 END), 0) AS invoice_tax,
+                COALESCE(SUM(net), 0) AS taxable_sales
+           FROM tax_rows
+          GROUP BY month
+          ORDER BY month ASC`,
+        [businessId, days])
+
+      const total = monthly.reduce((a, m) => a + Number(m.tax_collected), 0)
+      salesTax = {
+        total_collected: Math.round(total * 100) / 100,
+        monthly,
+      }
+    }
+
+    // ─── A/R aging (S502) ───────────────────────────────────────
+    // A point-in-time snapshot of OUTSTANDING receivables — every 'sent'
+    // invoice with a remaining balance, bucketed by how far past its due
+    // date it is TODAY. Unlike the other sections this ignores `range`:
+    // a 120-day-overdue invoice matters no matter the chart window.
+    // Computed whenever invoicing is on.
+    let arAging: any = null
+    if (features.has('invoicing')) {
+      const { rows: open } = await db.query<{
+        customer_id: string; company_name: string | null;
+        first_name: string | null; last_name: string | null;
+        due: string; days_overdue: number;
+      }>(
+        `SELECT bi.customer_id,
+                c.company_name, c.first_name, c.last_name,
+                (bi.total_amount - bi.amount_paid) AS due,
+                (CURRENT_DATE - bi.due_date) AS days_overdue
+           FROM business_invoices bi
+           JOIN business_customers c ON c.id = bi.customer_id
+          WHERE bi.business_id = $1 AND bi.status = 'sent'
+            AND (bi.total_amount - bi.amount_paid) > 0`,
+        [businessId])
+
+      // Keys are deliberately underscore-free so the snake→camel response
+      // transform leaves them untouched (numeric-underscore keys camelize
+      // unpredictably).
+      const emptyBuckets = () => ({ current: 0, d1to30: 0, d31to60: 0, d61to90: 0, d90plus: 0, total: 0 })
+      const bucketOf = (overdue: number) =>
+        overdue <= 0 ? 'current' : overdue <= 30 ? 'd1to30' : overdue <= 60 ? 'd31to60' : overdue <= 90 ? 'd61to90' : 'd90plus'
+
+      const totals = emptyBuckets()
+      const byCustomer = new Map<string, any>()
+      for (const r of open) {
+        const due = Number(r.due)
+        const b = bucketOf(Number(r.days_overdue))
+        totals[b] += due; totals.total += due
+        let cust = byCustomer.get(r.customer_id)
+        if (!cust) {
+          cust = {
+            customer_id: r.customer_id,
+            name: r.company_name || `${r.first_name ?? ''} ${r.last_name ?? ''}`.trim() || 'Customer',
+            ...emptyBuckets(),
+          }
+          byCustomer.set(r.customer_id, cust)
+        }
+        cust[b] += due; cust.total += due
+      }
+      const round2 = (n: number) => Math.round(n * 100) / 100
+      const roundBuckets = (o: any) => {
+        for (const k of ['current', 'd1to30', 'd31to60', 'd61to90', 'd90plus', 'total']) o[k] = round2(o[k])
+        return o
+      }
+      arAging = {
+        totals: roundBuckets(totals),
+        customers: Array.from(byCustomer.values()).map(roundBuckets).sort((a, b) => b.total - a.total),
+      }
+    }
+
+    // ─── Discount usage (S503) ──────────────────────────────────
+    // Where the operator's discount codes actually got used over the
+    // range: dollars given away + redemption count, per code, across
+    // issued invoices (sent/paid — quote-converted discounts land here
+    // too) and completed POS sales. Computed whenever the Discounts
+    // feature is on. A code with rows on either table appears even if
+    // it's since been deactivated, so historical giveaway stays visible.
+    let discounts: any = null
+    if (features.has('discounts')) {
+      const { rows: byCode } = await db.query<{
+        discount_code_id: string; code: string | null;
+        discount_type: string | null; is_active: boolean | null;
+        redemptions: string; amount: string;
+        invoice_amount: string; pos_amount: string;
+      }>(
+        `WITH used AS (
+           SELECT discount_code_id, discount_amount AS amt, 'invoice' AS source
+             FROM business_invoices
+            WHERE business_id = $1 AND status IN ('sent', 'paid')
+              AND discount_code_id IS NOT NULL AND discount_amount > 0
+              AND issue_date >= CURRENT_DATE - ($2::int - 1)
+           UNION ALL
+           SELECT discount_code_id, discount_amount AS amt, 'pos' AS source
+             FROM business_pos_transactions
+            WHERE business_id = $1 AND status = 'completed'
+              AND discount_code_id IS NOT NULL AND discount_amount > 0
+              AND created_at::date >= CURRENT_DATE - ($2::int - 1)
+         )
+         SELECT u.discount_code_id,
+                dc.code, dc.discount_type, dc.is_active,
+                COUNT(*) AS redemptions,
+                COALESCE(SUM(u.amt), 0) AS amount,
+                COALESCE(SUM(CASE WHEN u.source = 'invoice' THEN u.amt ELSE 0 END), 0) AS invoice_amount,
+                COALESCE(SUM(CASE WHEN u.source = 'pos'     THEN u.amt ELSE 0 END), 0) AS pos_amount
+           FROM used u
+           LEFT JOIN business_discount_codes dc ON dc.id = u.discount_code_id
+          GROUP BY u.discount_code_id, dc.code, dc.discount_type, dc.is_active
+          ORDER BY amount DESC`,
+        [businessId, days])
+
+      const round2d = (n: number) => Math.round(n * 100) / 100
+      const codes = byCode.map(r => ({
+        discount_code_id: r.discount_code_id,
+        code: r.code ?? '(deleted code)',
+        discount_type: r.discount_type,
+        is_active: r.is_active ?? false,
+        redemptions: Number(r.redemptions),
+        amount: round2d(Number(r.amount)),
+        invoice_amount: round2d(Number(r.invoice_amount)),
+        pos_amount: round2d(Number(r.pos_amount)),
+      }))
+      discounts = {
+        total_discounted: round2d(codes.reduce((a, c) => a + c.amount, 0)),
+        total_redemptions: codes.reduce((a, c) => a + c.redemptions, 0),
+        codes,
+      }
+    }
+
     res.json({
       success: true,
       data: {
@@ -358,6 +519,9 @@ businessReportsRouter.get('/overview', requireAuth, async (req, res, next) => {
         inventory,
         work_orders: workOrders,
         quotes,
+        sales_tax: salesTax,
+        ar_aging: arAging,
+        discounts,
       },
     })
   } catch (e) { next(e) }

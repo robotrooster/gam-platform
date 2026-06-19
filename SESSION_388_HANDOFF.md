@@ -73,7 +73,7 @@ The audit doc has the full per-file breakdown.
 ## Items shipped
 
 ```
-/Users/gold/Downloads/gam/
+/Users/nicholasrhoades/Downloads/gam/
   SCOPE_BYPASS_AUDIT_S388.md   (NEW — ~290 lines)
 ```
 

@@ -5,6 +5,7 @@ import { apiGet, apiPatch } from '../lib/api'
 import { ArrowLeft, Plus, DoorOpen, DollarSign, Building2, MapPin, UserCheck } from 'lucide-react'
 import { AddUnitModal } from './AddUnitModal'
 import { PropertyFeeScheduleSection } from './PropertyFeeScheduleSection'
+import { PropertyAgentPermissionsSection } from './PropertyAgentPermissionsSection'
 import { LawWarningBanner } from '../components/LawWarningBanner'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
@@ -267,6 +268,8 @@ function PropertyFinances({ propertyId }: { propertyId: string }) {
       )}
 
       <PropertyFeeScheduleSection propertyId={data.id} />
+
+      <PropertyAgentPermissionsSection propertyId={data.id} />
     </div>
   )
 }

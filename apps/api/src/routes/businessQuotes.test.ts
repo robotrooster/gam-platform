@@ -187,6 +187,53 @@ describe('POST /:id/lines', () => {
     expect(Number(res.body.data.line_subtotal)).toBeCloseTo(150)
   })
 
+  // S504 — per-line discounts on quote lines. line_subtotal/tax/total are
+  // stored NET of the line discount; header recomputes from the nets.
+  it('per-line percent discount: line + header net of the discount', async () => {
+    const f = await seedFixture()
+    const id = await newQuote(f.ownerToken, f.customerId)
+    const res = await request(buildApp())
+      .post(`/api/business-quotes/${id}/lines`)
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      // gross 200, 15% off → discount 30 → net 170
+      .send({ lineType: 'labor', description: 'Brake job', hours: 2, hourlyRate: 100, taxRate: 0,
+              discountType: 'percent', discountValue: 15 })
+    expect(res.status).toBe(201)
+    expect(Number(res.body.data.discount_amount)).toBeCloseTo(30)
+    expect(Number(res.body.data.line_subtotal)).toBeCloseTo(170)
+    expect(Number(res.body.data.line_total)).toBeCloseTo(170)
+    const detail = await request(buildApp())
+      .get(`/api/business-quotes/${id}`).set('Authorization', `Bearer ${f.ownerToken}`)
+    expect(Number(detail.body.data.subtotal)).toBeCloseTo(170)
+  })
+
+  it('per-line fixed discount with tax: tax computed on the net base', async () => {
+    const f = await seedFixture()
+    const id = await newQuote(f.ownerToken, f.customerId)
+    const res = await request(buildApp())
+      .post(`/api/business-quotes/${id}/lines`)
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      // gross 100, $10 off → net 90, 10% tax → tax 9, total 99
+      .send({ lineType: 'generic', description: 'Part', quantity: 1, unitPrice: 100, taxRate: 0.10,
+              discountType: 'fixed', discountValue: 10 })
+    expect(res.status).toBe(201)
+    expect(Number(res.body.data.discount_amount)).toBeCloseTo(10)
+    expect(Number(res.body.data.line_subtotal)).toBeCloseTo(90)
+    expect(Number(res.body.data.line_tax)).toBeCloseTo(9)
+    expect(Number(res.body.data.line_total)).toBeCloseTo(99)
+  })
+
+  it('per-line percent discount > 100 → 400', async () => {
+    const f = await seedFixture()
+    const id = await newQuote(f.ownerToken, f.customerId)
+    const res = await request(buildApp())
+      .post(`/api/business-quotes/${id}/lines`)
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send({ lineType: 'generic', description: 'X', quantity: 1, unitPrice: 100, taxRate: 0,
+              discountType: 'percent', discountValue: 150 })
+    expect(res.status).toBe(400)
+  })
+
   it('cannot add lines to a sent quote', async () => {
     const f = await seedFixture()
     const id = await newQuote(f.ownerToken, f.customerId)
@@ -464,6 +511,174 @@ describe('Convert to invoice', () => {
       .set('Authorization', `Bearer ${f.ownerToken}`)
       .send({ issueDate: '2026-06-14', dueDate: '2026-07-14' })
     expect(res.status).toBe(409)
+  })
+})
+
+// ═══════════════════════════════════════════════════════════════
+//  Discount codes on quotes (S503)
+// ═══════════════════════════════════════════════════════════════
+
+async function newDiscountCode(
+  businessId: string,
+  opts: { code: string; type: 'percent' | 'fixed'; value: number; maxRedemptions?: number },
+): Promise<string> {
+  const { rows: [d] } = await db.query<{ id: string }>(
+    `INSERT INTO business_discount_codes
+       (business_id, code, discount_type, discount_value, max_redemptions)
+     VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+    [businessId, opts.code.toUpperCase(), opts.type, opts.value, opts.maxRedemptions ?? null])
+  return d.id
+}
+
+async function addLabor(token: string, quoteId: string, hours: number, rate: number, taxRate = 0) {
+  return request(buildApp())
+    .post(`/api/business-quotes/${quoteId}/lines`)
+    .set('Authorization', `Bearer ${token}`)
+    .send({ lineType: 'labor', description: 'Work', hours, hourlyRate: rate, taxRate })
+}
+
+describe('Discount codes on quotes (S503)', () => {
+  it('percent code: previews discount + scales tax, consumes NO redemption', async () => {
+    const f = await seedFixture()
+    await newDiscountCode(f.businessId, { code: 'SAVE10', type: 'percent', value: 10 })
+    const id = await newQuote(f.ownerToken, f.customerId)
+    await addLabor(f.ownerToken, id, 1, 100, 0.10)   // 100 + $10 tax
+
+    const res = await request(buildApp())
+      .patch(`/api/business-quotes/${id}/discount`)
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send({ code: 'SAVE10' })
+    expect(res.status).toBe(200)
+    // subtotal stays gross 100; discount $10; tax scaled 10 → 9; total 99
+    expect(Number(res.body.data.subtotal)).toBeCloseTo(100)
+    expect(Number(res.body.data.discount_amount)).toBeCloseTo(10)
+    expect(Number(res.body.data.tax_amount)).toBeCloseTo(9)
+    expect(Number(res.body.data.total_amount)).toBeCloseTo(99)
+    // No redemption burned at quote time.
+    const { rows: [dc] } = await db.query<{ redemption_count: number }>(
+      `SELECT redemption_count FROM business_discount_codes WHERE business_id = $1`, [f.businessId])
+    expect(dc.redemption_count).toBe(0)
+  })
+
+  it('percent discount re-derives when a line is added afterward', async () => {
+    const f = await seedFixture()
+    await newDiscountCode(f.businessId, { code: 'TEN', type: 'percent', value: 10 })
+    const id = await newQuote(f.ownerToken, f.customerId)
+    await addLabor(f.ownerToken, id, 1, 100, 0)
+    await request(buildApp())
+      .patch(`/api/business-quotes/${id}/discount`)
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send({ code: 'TEN' })
+    // Add a second $100 line — discount should grow from $10 to $20.
+    await addLabor(f.ownerToken, id, 1, 100, 0)
+    const detail = await request(buildApp())
+      .get(`/api/business-quotes/${id}`)
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+    expect(Number(detail.body.data.subtotal)).toBeCloseTo(200)
+    expect(Number(detail.body.data.discount_amount)).toBeCloseTo(20)
+    expect(Number(detail.body.data.total_amount)).toBeCloseTo(180)
+    expect(detail.body.data.discount_code).toBe('TEN')
+  })
+
+  it('clearing the discount restores full totals', async () => {
+    const f = await seedFixture()
+    await newDiscountCode(f.businessId, { code: 'FIVE', type: 'fixed', value: 5 })
+    const id = await newQuote(f.ownerToken, f.customerId)
+    await addLabor(f.ownerToken, id, 1, 100, 0)
+    await request(buildApp())
+      .patch(`/api/business-quotes/${id}/discount`)
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send({ code: 'FIVE' })
+    const cleared = await request(buildApp())
+      .patch(`/api/business-quotes/${id}/discount`)
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send({ code: null })
+    expect(cleared.status).toBe(200)
+    expect(Number(cleared.body.data.discount_amount)).toBeCloseTo(0)
+    expect(cleared.body.data.discount_code_id).toBeNull()
+    expect(Number(cleared.body.data.total_amount)).toBeCloseTo(100)
+  })
+
+  it('unknown code → 404; no redemption consumed', async () => {
+    const f = await seedFixture()
+    const id = await newQuote(f.ownerToken, f.customerId)
+    await addLabor(f.ownerToken, id, 1, 100, 0)
+    const res = await request(buildApp())
+      .patch(`/api/business-quotes/${id}/discount`)
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send({ code: 'NOPE' })
+    expect(res.status).toBe(404)
+  })
+
+  it('cannot change discount on a non-draft quote', async () => {
+    const f = await seedFixture()
+    await newDiscountCode(f.businessId, { code: 'X', type: 'fixed', value: 5 })
+    const id = await newQuote(f.ownerToken, f.customerId)
+    await addLabor(f.ownerToken, id, 1, 100, 0)
+    await request(buildApp())
+      .post(`/api/business-quotes/${id}/send`)
+      .set('Authorization', `Bearer ${f.ownerToken}`).send({})
+    const res = await request(buildApp())
+      .patch(`/api/business-quotes/${id}/discount`)
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send({ code: 'X' })
+    expect(res.status).toBe(409)
+  })
+
+  it('convert-to-invoice consumes the redemption + carries the discount', async () => {
+    const f = await seedFixture()
+    await newDiscountCode(f.businessId, { code: 'SAVE10', type: 'percent', value: 10, maxRedemptions: 5 })
+    const id = await newQuote(f.ownerToken, f.customerId)
+    await addLabor(f.ownerToken, id, 1, 100, 0.10)
+    await request(buildApp())
+      .patch(`/api/business-quotes/${id}/discount`)
+      .set('Authorization', `Bearer ${f.ownerToken}`).send({ code: 'SAVE10' })
+    await request(buildApp())
+      .post(`/api/business-quotes/${id}/send`)
+      .set('Authorization', `Bearer ${f.ownerToken}`).send({})
+    await request(buildApp())
+      .post(`/api/business-quotes/${id}/accept`)
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+    const conv = await request(buildApp())
+      .post(`/api/business-quotes/${id}/convert-to-invoice`)
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send({ issueDate: '2026-06-14', dueDate: '2026-07-14' })
+    expect(conv.status).toBe(201)
+    expect(Number(conv.body.data.subtotal)).toBeCloseTo(100)
+    expect(Number(conv.body.data.discount_amount)).toBeCloseTo(10)
+    expect(Number(conv.body.data.tax_amount)).toBeCloseTo(9)
+    expect(Number(conv.body.data.total_amount)).toBeCloseTo(99)
+    // Redemption consumed exactly once at convert (not at quote apply).
+    const { rows: [dc] } = await db.query<{ redemption_count: number }>(
+      `SELECT redemption_count FROM business_discount_codes WHERE business_id = $1`, [f.businessId])
+    expect(dc.redemption_count).toBe(1)
+  })
+
+  it('convert proceeds without discount if the code lapsed (exhausted)', async () => {
+    const f = await seedFixture()
+    const codeId = await newDiscountCode(f.businessId, { code: 'ONCE', type: 'fixed', value: 10, maxRedemptions: 1 })
+    const id = await newQuote(f.ownerToken, f.customerId)
+    await addLabor(f.ownerToken, id, 1, 100, 0)
+    await request(buildApp())
+      .patch(`/api/business-quotes/${id}/discount`)
+      .set('Authorization', `Bearer ${f.ownerToken}`).send({ code: 'ONCE' })
+    await request(buildApp())
+      .post(`/api/business-quotes/${id}/send`)
+      .set('Authorization', `Bearer ${f.ownerToken}`).send({})
+    await request(buildApp())
+      .post(`/api/business-quotes/${id}/accept`)
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+    // Exhaust the one redemption out-of-band before convert.
+    await db.query(
+      `UPDATE business_discount_codes SET redemption_count = 1 WHERE id = $1`, [codeId])
+    const conv = await request(buildApp())
+      .post(`/api/business-quotes/${id}/convert-to-invoice`)
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send({ issueDate: '2026-06-14', dueDate: '2026-07-14' })
+    expect(conv.status).toBe(201)
+    expect(Number(conv.body.data.discount_amount)).toBeCloseTo(0)
+    expect(conv.body.data.discount_code_id).toBeNull()
+    expect(Number(conv.body.data.total_amount)).toBeCloseTo(100)
   })
 })
 

@@ -22,6 +22,7 @@ import { readdirSync, readFileSync, statSync } from 'fs'
 import { join, relative } from 'path'
 import { ingestArticle } from './knowledgeIngest'
 import { KNOWLEDGE_SCOPES, type KnowledgeScope } from './types'
+import { query } from '../../db'
 
 process.env.EMBEDDINGS_ENDPOINT ||= 'http://localhost:8081/v1'
 process.env.EMBEDDINGS_MODEL ||= 'bge-large-en-v1.5'
@@ -63,8 +64,14 @@ async function main() {
   const files = walk(CONTENT_ROOT)
   console.log(`[ingest] ${files.length} article(s) under ${CONTENT_ROOT}\n`)
   let totalChunks = 0
+  // Every on-disk source seen this run. Anything in the store NOT in this set
+  // is an article that was deleted from the content dir — prune its chunks so
+  // a removed article stops being retrieved (the per-source replace alone
+  // can't do this; it only touches sources it re-ingests).
+  const seen: string[] = []
   for (const file of files) {
     const source = relative(CONTENT_ROOT, file)
+    seen.push(source)
     try {
       const { scope, title, body } = parseArticle(readFileSync(file, 'utf8'))
       const res = await ingestArticle({ scope, source, title, body })
@@ -75,6 +82,21 @@ async function main() {
       process.exitCode = 1
     }
   }
+
+  // Prune orphaned chunks whose source file no longer exists on disk. Sources
+  // are kept in `seen` from before parse, so a file that failed to parse this
+  // run still counts as present and keeps its last-good chunks.
+  const pruned = await query<{ source: string }>(
+    `DELETE FROM agent_knowledge_chunks
+      WHERE source IS NOT NULL AND source <> ALL($1::text[])
+      RETURNING source`,
+    [seen]
+  )
+  if (pruned.length) {
+    const sources = [...new Set(pruned.map((r) => r.source))]
+    console.log(`\n[ingest] pruned ${pruned.length} orphaned chunk(s) from ${sources.length} removed article(s): ${sources.join(', ')}`)
+  }
+
   console.log(`\n[ingest] done — ${totalChunks} chunks across ${files.length} articles`)
 }
 

@@ -17,8 +17,8 @@ Connect onboarding flow.
 This rebuild supersedes the S78 "Stripe inbound only / no Treasury /
 TBD bank rail" decision. Stripe Connect Express + destination charges
 is the rail in BOTH directions. See:
-- `/Users/gold/.claude/projects/-Users-gold-Downloads-gam/memory/project_stripe_connect_rail.md`
-- `/Users/gold/.claude/projects/-Users-gold-Downloads-gam/memory/project_gam_pricing_model.md`
+- `/Users/nicholasrhoades/.claude/projects/-Users-gold-Downloads-gam/memory/project_stripe_connect_rail.md`
+- `/Users/nicholasrhoades/.claude/projects/-Users-gold-Downloads-gam/memory/project_gam_pricing_model.md`
 - CLAUDE.md "Stripe Connect Express + destination charges" section
 
 Multi-session rebuild plan (S114 → S120):

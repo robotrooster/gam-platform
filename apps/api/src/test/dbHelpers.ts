@@ -129,6 +129,12 @@ export async function cleanupAllSchema(): Promise<void> {
   await db.query(`UPDATE sublessee_invitations SET sublease_id = NULL`)
   await db.query(`DELETE FROM subleases`)
   await db.query(`DELETE FROM sublessee_invitations`)
+  // unit_inspection_videos are immutable in prod (a BEFORE DELETE trigger
+  // blocks row deletes and the inspection FK is ON DELETE RESTRICT). For test
+  // cleanup we TRUNCATE them — TRUNCATE does not fire the row-level delete
+  // trigger and clears the FK refs so the unit_inspections DELETE below can
+  // proceed. This is test-infra only; no app path can remove a video.
+  await db.query(`TRUNCATE unit_inspection_videos`)
   // unit_inspections FKs leases.id (children — items / photos /
   // signatures — cascade on parent delete per schema FKs).
   await db.query(`DELETE FROM unit_inspections`)

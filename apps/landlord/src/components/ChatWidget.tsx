@@ -100,10 +100,13 @@ export function ChatPanel({ onClose, embedded = false }: { onClose?: () => void;
       setMessages((m) => [...m, { role: 'agent', text: d?.reply || "Sorry, I didn't catch that — could you say it another way?" }])
     } catch (e: any) {
       const status = e?.response?.status
+      // No system/infra language — it gives away that this isn't a person. The
+      // 180s server timeout keeps the turn pending until the model answers, so
+      // this only fires on a genuine failure.
       const msg =
         status === 429
           ? "You're sending messages a little quickly — give me just a moment and try again."
-          : "I'm having trouble reaching support right now. Please try again in a moment."
+          : "Sorry, that one took me longer than expected — mind sending it to me once more?"
       setMessages((m) => [...m, { role: 'agent', text: msg }])
     } finally {
       setSending(false)

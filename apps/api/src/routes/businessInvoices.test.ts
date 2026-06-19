@@ -18,6 +18,20 @@ vi.mock('../services/email', async (importOriginal) => {
   return { ...actual, emailBusinessInvoiceSent: emailBusinessInvoiceSentMock }
 })
 
+// S502: stub the live Stripe refund so the refund route can be exercised
+// without hitting Stripe. Default returns a fake refund id; a test can
+// override mockRejectedValueOnce to assert the failure path.
+const { refundBusinessInvoicePaymentMock } = vi.hoisted(() => ({
+  refundBusinessInvoicePaymentMock: vi.fn(
+    async (_args: { paymentIntentId: string; amountCents?: number; reason?: string; idempotencyKey?: string; metadata?: Record<string, string> }) =>
+      ({ refundId: 're_test_1', status: 'succeeded' }),
+  ),
+}))
+vi.mock('../services/stripeConnect', async (importOriginal) => {
+  const actual = await importOriginal<Record<string, unknown>>()
+  return { ...actual, refundBusinessInvoicePayment: refundBusinessInvoicePaymentMock }
+})
+
 import { db } from '../db'
 import { cleanupAllSchema } from '../test/dbHelpers'
 import { businessInvoicesRouter } from './businessInvoices'
@@ -35,6 +49,8 @@ beforeEach(async () => {
   await cleanupAllSchema()
   emailBusinessInvoiceSentMock.mockClear()
   emailBusinessInvoiceSentMock.mockImplementation(async () => undefined)
+  refundBusinessInvoicePaymentMock.mockClear()
+  refundBusinessInvoicePaymentMock.mockResolvedValue({ refundId: 're_test_1', status: 'succeeded' })
   process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_jwt_secret_s493'
 })
 
@@ -163,6 +179,117 @@ describe('POST /api/business-invoices', () => {
     expect(Number(res.body.data.subtotal)).toBe(150)
     expect(Number(res.body.data.tax_amount)).toBe(12.50)
     expect(Number(res.body.data.total_amount)).toBe(162.50)
+  })
+
+  // S513 — discount codes on invoices
+  it('discount code reduces subtotal pre-tax; tax recomputed on discounted base', async () => {
+    const f = await seedFixture()
+    // 10% business tax + a $50-off code; subtotal 150 → discounted 100 → tax 10.
+    await db.query(`UPDATE businesses SET default_tax_rate = 0.10 WHERE id = $1`, [f.businessId])
+    await db.query(
+      `INSERT INTO business_discount_codes (business_id, code, discount_type, discount_value)
+       VALUES ($1, 'FIFTY', 'fixed', 50)`, [f.businessId])
+    const res = await request(buildApp())
+      .post('/api/business-invoices')
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send(validCreate(f.customerId, { taxAmount: undefined, discountCode: 'fifty' }))
+    expect(res.status).toBe(201)
+    expect(Number(res.body.data.subtotal)).toBe(150)
+    expect(Number(res.body.data.discount_amount)).toBe(50)
+    expect(Number(res.body.data.tax_amount)).toBeCloseTo(10)   // 100 * 0.10
+    expect(Number(res.body.data.total_amount)).toBeCloseTo(110)
+    const { rows: [code] } = await db.query<{ redemption_count: number }>(
+      `SELECT redemption_count FROM business_discount_codes WHERE business_id = $1`, [f.businessId])
+    expect(code.redemption_count).toBe(1)
+  })
+
+  it('unknown discount code → 404, no invoice created', async () => {
+    const f = await seedFixture()
+    const res = await request(buildApp())
+      .post('/api/business-invoices')
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send(validCreate(f.customerId, { discountCode: 'GHOST' }))
+    expect(res.status).toBe(404)
+    const { rows } = await db.query(
+      `SELECT id FROM business_invoices WHERE business_id = $1`, [f.businessId])
+    expect(rows.length).toBe(0)
+  })
+
+  // S504 — per-line discounts (percent / fixed). Line net = gross − line
+  // discount; subtotal = sum of nets; a whole-order code (if any) stacks
+  // line-first.
+  it('per-line percent discount: line net + subtotal reflect the discount', async () => {
+    const f = await seedFixture()
+    const res = await request(buildApp())
+      .post('/api/business-invoices')
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send(validCreate(f.customerId, {
+        taxAmount: 0,
+        lines: [
+          // gross 100, 10% off → net 90
+          { description: 'Job A', quantity: 1, unitPrice: 100, discountType: 'percent', discountValue: 10 },
+          // gross 50, no discount
+          { description: 'Job B', quantity: 1, unitPrice: 50 },
+        ],
+      }))
+    expect(res.status).toBe(201)
+    expect(Number(res.body.data.subtotal)).toBe(140) // 90 + 50
+    const lineA = res.body.data.lines.find((l: any) => l.description === 'Job A')
+    expect(Number(lineA.discount_amount)).toBe(10)
+    expect(Number(lineA.line_total)).toBe(90)
+  })
+
+  it('per-line fixed discount clamps to the line gross (never negative)', async () => {
+    const f = await seedFixture()
+    const res = await request(buildApp())
+      .post('/api/business-invoices')
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send(validCreate(f.customerId, {
+        taxAmount: 0,
+        lines: [
+          // gross 40, $100 off → clamps to 40 → net 0
+          { description: 'Comp', quantity: 1, unitPrice: 40, discountType: 'fixed', discountValue: 100 },
+        ],
+      }))
+    expect(res.status).toBe(201)
+    expect(Number(res.body.data.subtotal)).toBe(0)
+    expect(Number(res.body.data.lines[0].discount_amount)).toBe(40)
+  })
+
+  it('per-line discount + whole-order code stack line-first, tax on the net base', async () => {
+    const f = await seedFixture()
+    // 10% business tax + a $20-off code.
+    await db.query(
+      `INSERT INTO business_discount_codes (business_id, code, discount_type, discount_value)
+       VALUES ($1, 'TWENTY', 'fixed', 20)`, [f.businessId])
+    await db.query(`UPDATE businesses SET default_tax_rate = 0.10 WHERE id = $1`, [f.businessId])
+    const res = await request(buildApp())
+      .post('/api/business-invoices')
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send(validCreate(f.customerId, {
+        taxAmount: undefined, discountCode: 'twenty',
+        lines: [
+          // gross 100, 10% off → net 90
+          { description: 'Job', quantity: 1, unitPrice: 100, discountType: 'percent', discountValue: 10 },
+        ],
+      }))
+    expect(res.status).toBe(201)
+    expect(Number(res.body.data.subtotal)).toBe(90)        // line net
+    expect(Number(res.body.data.discount_amount)).toBe(20) // whole-order code
+    // taxable base = 90 − 20 = 70 → tax 7 → total 77
+    expect(Number(res.body.data.tax_amount)).toBe(7)
+    expect(Number(res.body.data.total_amount)).toBe(77)
+  })
+
+  it('per-line percent discount > 100 → 400', async () => {
+    const f = await seedFixture()
+    const res = await request(buildApp())
+      .post('/api/business-invoices')
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send(validCreate(f.customerId, {
+        lines: [{ description: 'X', quantity: 1, unitPrice: 100, discountType: 'percent', discountValue: 150 }],
+      }))
+    expect(res.status).toBe(400)
   })
 })
 
@@ -591,5 +718,140 @@ describe('POST /:id/send — customer email (S500)', () => {
       .set('Authorization', `Bearer ${f.ownerToken}`)
     expect(res.status).toBe(200)
     expect(res.body.data.status).toBe('sent')
+  })
+})
+
+// ═══════════════════════════════════════════════════════════════
+//  S519 — POST /:id/refund
+// ═══════════════════════════════════════════════════════════════
+
+describe('POST /api/business-invoices/:id/refund', () => {
+  async function paidInvoice(f: Fixture, amount?: number) {
+    const c = await request(buildApp())
+      .post('/api/business-invoices')
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send(validCreate(f.customerId, { taxAmount: 0 }))  // subtotal 150
+    await request(buildApp())
+      .post(`/api/business-invoices/${c.body.data.id}/mark-paid`)
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send({ paymentMethod: 'cash', ...(amount !== undefined ? { amount } : {}) })
+    return c.body.data.id
+  }
+
+  it('full refund of a paid invoice → refunded', async () => {
+    const f = await seedFixture()
+    const id = await paidInvoice(f)
+    const res = await request(buildApp())
+      .post(`/api/business-invoices/${id}/refund`)
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send({ reason: 'customer canceled' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.status).toBe('refunded')
+    expect(Number(res.body.data.refunded_amount)).toBeCloseTo(150)
+  })
+
+  it('partial then remainder → partially_refunded then refunded', async () => {
+    const f = await seedFixture()
+    const id = await paidInvoice(f)
+    const r1 = await request(buildApp())
+      .post(`/api/business-invoices/${id}/refund`)
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send({ reason: 'partial', amount: 50 })
+    expect(r1.body.data.status).toBe('partially_refunded')
+    expect(Number(r1.body.data.refunded_amount)).toBeCloseTo(50)
+    const r2 = await request(buildApp())
+      .post(`/api/business-invoices/${id}/refund`)
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send({ reason: 'rest' })
+    expect(r2.body.data.status).toBe('refunded')
+    expect(Number(r2.body.data.refunded_amount)).toBeCloseTo(150)
+  })
+
+  it('refund above the paid amount → 400', async () => {
+    const f = await seedFixture()
+    const id = await paidInvoice(f)
+    const res = await request(buildApp())
+      .post(`/api/business-invoices/${id}/refund`)
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send({ reason: 'too much', amount: 999 })
+    expect(res.status).toBe(400)
+  })
+
+  it('cannot refund a draft/sent invoice → 409', async () => {
+    const f = await seedFixture()
+    const c = await request(buildApp())
+      .post('/api/business-invoices')
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send(validCreate(f.customerId, { taxAmount: 0 }))
+    const res = await request(buildApp())
+      .post(`/api/business-invoices/${c.body.data.id}/refund`)
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send({ reason: 'nope' })
+    expect(res.status).toBe(409)
+  })
+
+  // ── S502: live Stripe refund when the invoice was paid through Stripe ──
+  // A cash/manual mark-paid leaves stripe_payment_intent_id NULL (bookkeeping
+  // only); a Stripe payment stamps it. Simulate the latter by setting it.
+  async function stripePaidInvoice(f: Fixture) {
+    const id = await paidInvoice(f)
+    await db.query(`UPDATE business_invoices SET stripe_payment_intent_id = $1 WHERE id = $2`, ['pi_test_x', id])
+    return id
+  }
+
+  it('cash/manual refund does NOT call Stripe (bookkeeping only)', async () => {
+    const f = await seedFixture()
+    const id = await paidInvoice(f)
+    const res = await request(buildApp())
+      .post(`/api/business-invoices/${id}/refund`)
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send({ reason: 'cash refund' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.stripeRefunded).toBe(false)
+    expect(refundBusinessInvoicePaymentMock).not.toHaveBeenCalled()
+  })
+
+  it('Stripe-paid full refund fires the real refund (full remaining → no amount)', async () => {
+    const f = await seedFixture()
+    const id = await stripePaidInvoice(f)
+    const res = await request(buildApp())
+      .post(`/api/business-invoices/${id}/refund`)
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send({ reason: 'customer canceled' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.status).toBe('refunded')
+    expect(res.body.data.stripeRefunded).toBe(true)
+    expect(res.body.data.stripe_refund_id).toBe('re_test_1')
+    expect(refundBusinessInvoicePaymentMock).toHaveBeenCalledTimes(1)
+    const arg = refundBusinessInvoicePaymentMock.mock.calls[0][0]
+    expect(arg.paymentIntentId).toBe('pi_test_x')
+    expect(arg.amountCents).toBeUndefined() // full remaining → exact remainder
+  })
+
+  it('Stripe-paid partial refund passes amountCents', async () => {
+    const f = await seedFixture()
+    const id = await stripePaidInvoice(f)
+    const res = await request(buildApp())
+      .post(`/api/business-invoices/${id}/refund`)
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send({ reason: 'partial', amount: 50 })
+    expect(res.status).toBe(200)
+    expect(res.body.data.status).toBe('partially_refunded')
+    expect(refundBusinessInvoicePaymentMock.mock.calls[0][0].amountCents).toBe(5000)
+  })
+
+  it('Stripe refund failure → 502 and NOTHING recorded', async () => {
+    const f = await seedFixture()
+    const id = await stripePaidInvoice(f)
+    refundBusinessInvoicePaymentMock.mockRejectedValueOnce(new Error('card_declined'))
+    const res = await request(buildApp())
+      .post(`/api/business-invoices/${id}/refund`)
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send({ reason: 'will fail' })
+    expect(res.status).toBe(502)
+    // bookkeeping untouched — still paid, nothing refunded
+    const row = await db.query(`SELECT status, refunded_amount FROM business_invoices WHERE id = $1`, [id])
+    expect(row.rows[0].status).toBe('paid')
+    expect(Number(row.rows[0].refunded_amount)).toBe(0)
   })
 })

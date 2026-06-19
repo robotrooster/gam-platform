@@ -27,6 +27,6 @@ Once a check is **complete**, the report summary opens right inside the applicat
 
 ## What the report is not
 
-The risk score shown on the application is a fraud-screening signal, separate from the provider's report. Neither one decides anything for you. Whether a particular result clears your bar is your call, guided by your own criteria and what your local laws allow.
+The provider's report doesn't decide anything for you — and neither does the application's fraud-screening risk score. Whether a particular result clears your bar is your call, guided by your own criteria and what your local laws allow.
 
 When the report is complete and you are ready to act, see approving or declining an applicant.

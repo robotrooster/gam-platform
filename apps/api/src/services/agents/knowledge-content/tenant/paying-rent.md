@@ -23,6 +23,10 @@ Because ACH is capped at $6.00, paying from a bank account is usually the lowest
 
 Whether you or your landlord covers this processing fee is set per property. Your payment screen shows any fee before you confirm, so you'll always see the total before you pay.
 
+## How to pay
+
+When a payment row shows as due, open it, pick your saved bank account or card, review the total (rent plus any fee that applies to you), and confirm. That's it.
+
 A note on roles: GAM is the platform that moves your payment — it is not your landlord and does not set your rent. The rent amount, due date, and any late fees come from your lease with your landlord.
 
 Have a question about a specific charge or a payment that didn't go through? We can help, and anything involving moving or refunding money is handed to a human GAM specialist.

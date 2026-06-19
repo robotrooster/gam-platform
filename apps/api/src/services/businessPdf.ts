@@ -67,10 +67,11 @@ export interface CustomerInfo {
 }
 
 interface LineRow {
-  description: string
-  quantity:    number
-  unitPrice:   number
-  lineTotal:   number
+  description:     string
+  quantity:       number
+  unitPrice:      number
+  lineTotal:      number
+  discountAmount?: number   // S504 — per-line discount $ off (line_total is already net)
 }
 
 // ── Internal helpers ──────────────────────────────────────────
@@ -287,9 +288,13 @@ function drawLineTable(doc: Doc, lines: LineRow[]) {
         color: ROW_ALT,
       })
     }
-    // Description (wraps if needed)
+    // Description (wraps if needed). S504: a per-line discount appends a
+    // compact "(−$X.XX off)" marker so the net line total is explained.
     const descMaxW = colQtyX - colDescX - 12
-    const truncated = truncToWidth(ln.description, doc.font, FONT_SIZE_BODY, descMaxW)
+    const desc = (ln.discountAmount ?? 0) > 0
+      ? `${ln.description}  (−${fmtMoney(ln.discountAmount!)} off)`
+      : ln.description
+    const truncated = truncToWidth(desc, doc.font, FONT_SIZE_BODY, descMaxW)
     text(doc, truncated, colDescX, doc.cursorY + 4, {})
     text(doc, String(ln.quantity), colQtyX + 35, doc.cursorY + 4, {
       mono: true, align: 'right',
@@ -371,6 +376,7 @@ export interface InvoicePdfInput {
   dueDate:        Date | string
   lines:          LineRow[]
   subtotal:       number
+  discountAmount?: number   // S513 — pre-tax discount
   taxAmount:      number
   totalAmount:    number
   amountPaid:     number
@@ -395,11 +401,13 @@ export async function renderInvoicePdf(args: InvoicePdfInput): Promise<Buffer> {
   drawLineTable(doc, args.lines)
 
   const balance = args.totalAmount - args.amountPaid
+  const discount = args.discountAmount ?? 0
   const totals: Array<{ label: string; value: string; big?: boolean }> = [
     { label: 'Subtotal', value: fmtMoney(args.subtotal) },
-    { label: 'Tax',      value: fmtMoney(args.taxAmount) },
-    { label: 'Total',    value: fmtMoney(args.totalAmount), big: true },
   ]
+  if (discount > 0) totals.push({ label: 'Discount', value: `-${fmtMoney(discount)}` })
+  totals.push({ label: 'Tax',   value: fmtMoney(args.taxAmount) })
+  totals.push({ label: 'Total', value: fmtMoney(args.totalAmount), big: true })
   if (args.amountPaid > 0) {
     totals.push({ label: 'Paid',         value: fmtMoney(args.amountPaid) })
     totals.push({ label: 'Balance due',  value: fmtMoney(balance), big: true })
@@ -554,6 +562,7 @@ export interface QuotePdfInput {
   notes:              string | null
   lines:              LineRow[]
   subtotal:           number
+  discountAmount?:    number   // S503 — pre-tax discount
   taxAmount:          number
   totalAmount:        number
 }
@@ -586,11 +595,16 @@ export async function renderQuotePdf(args: QuotePdfInput): Promise<Buffer> {
 
   drawLineTable(doc, args.lines)
 
-  drawTotals(doc, [
+  const quoteDiscount = args.discountAmount ?? 0
+  const quoteTotals: Array<{ label: string; value: string; big?: boolean }> = [
     { label: 'Subtotal', value: fmtMoney(args.subtotal) },
-    { label: 'Tax',      value: fmtMoney(args.taxAmount) },
-    { label: 'Total',    value: fmtMoney(args.totalAmount), big: true },
-  ])
+  ]
+  if (quoteDiscount > 0) {
+    quoteTotals.push({ label: 'Discount', value: `-${fmtMoney(quoteDiscount)}` })
+  }
+  quoteTotals.push({ label: 'Tax', value: fmtMoney(args.taxAmount) })
+  quoteTotals.push({ label: 'Total', value: fmtMoney(args.totalAmount), big: true })
+  drawTotals(doc, quoteTotals)
 
   const footerLines: string[] = []
   if (args.notes) footerLines.push(args.notes)
@@ -616,7 +630,9 @@ export interface PosReceiptPdfInput {
   refundReason:    string | null
   lines:           LineRow[]
   subtotal:        number
+  discountAmount?: number   // S513 — pre-tax discount
   taxAmount:       number
+  tipAmount?:      number   // S512 — gratuity, separate from the sale
   totalAmount:     number
 }
 
@@ -641,11 +657,18 @@ export async function renderPosReceiptPdf(args: PosReceiptPdfInput): Promise<Buf
 
   drawLineTable(doc, args.lines)
 
+  // S512: total_amount is sale-only (subtotal + tax). The grand total the
+  // customer paid adds the tip, shown as the bold "Total" line.
+  const tip = args.tipAmount ?? 0
+  const discount = args.discountAmount ?? 0
+  const grandTotal = args.totalAmount + tip
   const totals: Array<{ label: string; value: string; big?: boolean }> = [
     { label: 'Subtotal', value: fmtMoney(args.subtotal) },
-    { label: 'Tax',      value: fmtMoney(args.taxAmount) },
-    { label: 'Total',    value: fmtMoney(args.totalAmount), big: true },
   ]
+  if (discount > 0) totals.push({ label: 'Discount', value: `-${fmtMoney(discount)}` })
+  totals.push({ label: 'Tax', value: fmtMoney(args.taxAmount) })
+  if (tip > 0) totals.push({ label: 'Tip', value: fmtMoney(tip) })
+  totals.push({ label: 'Total', value: fmtMoney(grandTotal), big: true })
   if (args.paymentMethod === 'cash' && args.amountTendered !== null) {
     totals.push({ label: 'Tendered', value: fmtMoney(args.amountTendered) })
     totals.push({ label: 'Change',   value: fmtMoney(args.changeDue ?? 0) })

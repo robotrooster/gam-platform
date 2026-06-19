@@ -269,6 +269,20 @@ http.createServer((req, res) => {
   const updateMatch = url.match(/^\/update-payment\/([a-f0-9]{64})$/)
   if (updateMatch) return send(renderCardUpdateShell(updateMatch[1]))
 
+  // S502: customer self-service portal. /account/:token. Token is validated
+  // server-side by /api/public/customer/:token; this shell lists the
+  // customer's invoices + balance and pays open ones via the hosted link.
+  const acctMatch = url.match(/^\/account\/([a-f0-9]{64})$/)
+  if (acctMatch) return send(renderCustomerPortalShell(acctMatch[1]))
+
+  // S505: guest stay assistant. /stay/:token. The token is a reusable
+  // booking-guest access token (32-byte hex, minted in bookingGuestTokens).
+  // This shell is purely a chat widget that talks to /api/guest/chat — the
+  // token authenticates each turn server-side and scopes the agent to one
+  // booking. No SSR of booking data; the agent surfaces it on request.
+  const stayMatch = url.match(/^\/stay\/([a-f0-9]{64})$/)
+  if (stayMatch) return send(renderStayShell(stayMatch[1]))
+
   // Default: the marketing landing page
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
   res.end(HTML)
@@ -886,6 +900,286 @@ function render() {
 }
 
 load();
+</script>
+</body>
+</html>`
+}
+
+// S502: customer self-service portal shell. /account/:token. Lists the
+// customer's invoices + balance and pays open ones via the hosted Stripe link.
+function renderCustomerPortalShell(token) {
+  const apiBase = process.env.API_URL || 'http://localhost:4000'
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Your account — Gold Asset Management</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&family=DM+Sans:ital,wght@0,300;0,400;0,500;0,600&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#080a0c;--bg2:#0d1014;--bg3:#141820;--border:#1e2435;
+  --text:#f0f2f7;--muted:#8a96b0;--dim:#475060;
+  --gold:#c9a227;--gold-dim:rgba(201,162,39,.12);--green:#22c55e;--red:#ef4444;--amber:#f59e0b;
+  --fd:'Syne',sans-serif;--fb:'DM Sans',sans-serif;--fm:'DM Mono',monospace;
+}
+body{font-family:var(--fb);background:var(--bg);color:var(--text);line-height:1.6;font-size:.95rem;min-height:100vh}
+.shell{max-width:560px;margin:0 auto;padding:48px 24px 120px}
+.eyebrow{font-family:var(--fm);font-size:.7rem;color:var(--gold);letter-spacing:.16em;text-transform:uppercase;margin-bottom:14px}
+h1{font-family:var(--fd);font-size:clamp(1.6rem,3vw,2rem);font-weight:800;letter-spacing:-.02em;margin-bottom:4px}
+.muted{color:var(--muted)}
+.balance{background:var(--bg2);border:1px solid var(--border);border-radius:14px;padding:24px;margin:20px 0}
+.balance-label{font-family:var(--fm);font-size:.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px}
+.balance-amt{font-family:var(--fd);font-size:2rem;font-weight:800}
+.balance-amt.owed{color:var(--gold)}
+.balance-amt.clear{color:var(--green)}
+.inv{background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:16px 18px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center;gap:12px}
+.inv-num{font-weight:600}
+.inv-meta{font-size:.78rem;color:var(--muted);margin-top:2px}
+.inv-right{text-align:right;flex-shrink:0}
+.inv-amt{font-family:var(--fm);font-weight:600}
+.badge{display:inline-block;font-size:.66rem;font-family:var(--fm);text-transform:uppercase;letter-spacing:.06em;padding:2px 8px;border-radius:999px;margin-top:4px}
+.badge.sent{background:var(--gold-dim);color:var(--gold)}
+.badge.paid{background:rgba(34,197,94,.12);color:var(--green)}
+.badge.refunded{background:rgba(245,158,11,.12);color:var(--amber)}
+.btn{display:inline-block;padding:10px 18px;background:var(--gold);color:var(--bg);border:none;border-radius:9px;font-weight:700;font-size:.85rem;cursor:pointer;font-family:inherit}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.alert{padding:12px 14px;border-radius:8px;font-size:.85rem;margin-bottom:14px}
+.alert.err{background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.4);color:var(--red)}
+.empty{text-align:center;color:var(--muted);padding:32px}
+.footer{text-align:center;color:var(--dim);font-size:.75rem;margin-top:48px}
+.footer a{color:var(--muted);text-decoration:none}
+</style>
+</head>
+<body>
+<div class="shell">
+  <div id="root"><div class="muted" style="text-align:center;padding:48px">Loading…</div></div>
+  <div class="footer">Powered by <a href="/">GAM</a></div>
+</div>
+<script>
+const TOKEN = ${JSON.stringify(token)};
+const API = ${JSON.stringify(apiBase)};
+const ROOT = document.getElementById('root');
+let DATA = null, PAYING = null, ERR = null;
+
+function esc(s){if(s==null)return '';return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function money(n){return '$'+Number(n).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});}
+function fmtDate(d){try{return new Date(d+'T12:00:00').toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'});}catch(e){return d;}}
+
+function badge(inv){
+  if(inv.status==='paid')return '<span class="badge paid">Paid</span>';
+  if(inv.status==='refunded'||inv.status==='partially_refunded')return '<span class="badge refunded">Refunded</span>';
+  if(inv.status==='sent')return '<span class="badge sent">Due '+esc(fmtDate(inv.dueDate))+'</span>';
+  return '';
+}
+
+function render(){
+  if(ERR){ROOT.innerHTML='<div class="alert err">'+esc(ERR)+'</div>';return;}
+  if(!DATA){ROOT.innerHTML='<div class="muted" style="text-align:center;padding:48px">Loading…</div>';return;}
+  const owed = DATA.outstanding>0.005;
+  let h='';
+  h+='<div class="eyebrow">'+esc(DATA.business.name)+'</div>';
+  h+='<h1>Hi '+esc(DATA.customer.name)+'</h1>';
+  h+='<div class="muted">Your invoices and balance with '+esc(DATA.business.name)+'.</div>';
+  h+='<div class="balance"><div class="balance-label">Balance due</div>'+
+     '<div class="balance-amt '+(owed?'owed':'clear')+'">'+money(DATA.outstanding)+'</div>'+
+     (owed?'':'<div class="muted" style="font-size:.82rem;margin-top:4px">You\\'re all caught up — thank you!</div>')+'</div>';
+  if(!DATA.invoices.length){
+    h+='<div class="empty">No invoices yet.</div>';
+  }else{
+    for(const inv of DATA.invoices){
+      h+='<div class="inv"><div><div class="inv-num">'+esc(inv.number)+'</div>'+
+         '<div class="inv-meta">'+badge(inv)+'</div></div>'+
+         '<div class="inv-right"><div class="inv-amt">'+money(inv.payable?inv.amountDue:inv.total)+'</div>'+
+         (inv.payable?'<button class="btn" data-pay="'+esc(inv.id)+'" '+(PAYING===inv.id?'disabled':'')+' style="margin-top:8px">'+(PAYING===inv.id?'Opening…':'Pay now')+'</button>':'')+
+         '</div></div>';
+    }
+  }
+  ROOT.innerHTML=h;
+  ROOT.querySelectorAll('[data-pay]').forEach(b=>b.addEventListener('click',()=>pay(b.getAttribute('data-pay'))));
+}
+
+async function load(){
+  try{
+    const r=await fetch(API+'/api/public/customer/'+TOKEN);
+    const j=await r.json().catch(()=>({error:'Could not load your account.'}));
+    if(!r.ok)throw new Error(j.error||'Could not load your account.');
+    DATA=j.data;ERR=null;render();
+  }catch(e){ERR=e.message;render();}
+}
+
+async function pay(invoiceId){
+  PAYING=invoiceId;render();
+  try{
+    const r=await fetch(API+'/api/public/customer/'+TOKEN+'/invoices/'+invoiceId+'/pay',{method:'POST'});
+    const j=await r.json().catch(()=>({error:'Could not start payment.'}));
+    if(!r.ok)throw new Error(j.error||'Could not start payment.');
+    window.location.href=j.data.hostedUrl;
+  }catch(e){PAYING=null;ERR=e.message;render();}
+}
+
+load();
+</script>
+</body>
+</html>`
+}
+
+// S505: guest stay assistant shell. A chat widget bound to one booking-guest
+// token. Every turn POSTs {token, message, conversationId?} to
+// /api/guest/chat; the server resolves the token → guest actor and returns
+// {reply, conversationId}. Conversation threading is server-owned; the client
+// just echoes conversationId back. An invalid/expired token surfaces the API's
+// 401 message and locks the composer.
+function renderStayShell(token) {
+  const apiBase = process.env.API_URL || 'http://localhost:4000'
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Your stay — Gold Asset Management</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&family=DM+Sans:ital,wght@0,300;0,400;0,500;0,600&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#080a0c;--bg2:#0d1014;--bg3:#141820;--border:#1e2435;
+  --text:#f0f2f7;--muted:#8a96b0;--dim:#475060;
+  --gold:#c9a227;--gold-dim:rgba(201,162,39,.12);--green:#22c55e;--red:#ef4444;
+  --fd:'Syne',sans-serif;--fb:'DM Sans',sans-serif;--fm:'DM Mono',monospace;
+}
+html,body{height:100%}
+body{font-family:var(--fb);background:var(--bg);color:var(--text);line-height:1.6;font-size:.95rem;display:flex;flex-direction:column;min-height:100dvh}
+.head{max-width:640px;width:100%;margin:0 auto;padding:32px 24px 16px;flex-shrink:0}
+.eyebrow{font-family:var(--fm);font-size:.7rem;color:var(--gold);letter-spacing:.16em;text-transform:uppercase;margin-bottom:12px}
+h1{font-family:var(--fd);font-size:clamp(1.5rem,3vw,1.9rem);font-weight:800;letter-spacing:-.02em;margin-bottom:4px}
+.sub{color:var(--muted);font-size:.85rem}
+.chat{flex:1;width:100%;max-width:640px;margin:0 auto;padding:8px 24px;overflow-y:auto;display:flex;flex-direction:column;gap:14px}
+.msg{max-width:85%;padding:11px 15px;border-radius:14px;white-space:pre-wrap;word-wrap:break-word}
+.msg.bot{align-self:flex-start;background:var(--bg2);border:1px solid var(--border);border-bottom-left-radius:4px}
+.msg.me{align-self:flex-end;background:var(--gold-dim);border:1px solid rgba(201,162,39,.35);border-bottom-right-radius:4px}
+.msg.typing{align-self:flex-start;color:var(--muted);font-size:.85rem;display:flex;gap:5px;align-items:center}
+.dot{width:6px;height:6px;border-radius:50%;background:var(--muted);animation:pulse 1.2s infinite ease-in-out}
+.dot:nth-child(2){animation-delay:.2s}.dot:nth-child(3){animation-delay:.4s}
+@keyframes pulse{0%,60%,100%{opacity:.3}30%{opacity:1}}
+.alert{max-width:640px;width:100%;margin:0 auto;padding:0 24px}
+.alert .box{background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.4);color:var(--red);padding:12px 14px;border-radius:8px;font-size:.85rem;margin-bottom:8px}
+.composer{flex-shrink:0;position:sticky;bottom:0;background:linear-gradient(to top,var(--bg) 70%,transparent);padding:14px 24px 22px}
+.composer-inner{max-width:640px;margin:0 auto;display:flex;gap:10px;align-items:flex-end}
+textarea{flex:1;resize:none;background:var(--bg2);border:1px solid var(--border);border-radius:12px;color:var(--text);font-family:inherit;font-size:.95rem;padding:12px 14px;line-height:1.4;max-height:140px}
+textarea:focus{outline:none;border-color:var(--gold)}
+textarea:disabled{opacity:.5}
+.send{flex-shrink:0;width:44px;height:44px;border:none;border-radius:11px;background:var(--gold);color:var(--bg);font-size:1.2rem;cursor:pointer;display:flex;align-items:center;justify-content:center}
+.send:disabled{opacity:.4;cursor:not-allowed}
+.footer{text-align:center;color:var(--dim);font-size:.72rem;padding:0 24px 16px}
+.footer a{color:var(--muted);text-decoration:none}
+</style>
+</head>
+<body>
+<div class="head">
+  <div class="eyebrow">Your stay</div>
+  <h1>Stay assistant</h1>
+  <div class="sub">Ask about your booking, check-in, the property, or request a change — your host gets the final say on any changes.</div>
+</div>
+<div class="alert" id="alert"></div>
+<div class="chat" id="chat"></div>
+<div class="composer">
+  <div class="composer-inner">
+    <textarea id="input" rows="1" placeholder="Type a message…" autocomplete="off"></textarea>
+    <button class="send" id="send" aria-label="Send">&#8593;</button>
+  </div>
+</div>
+<div class="footer">Powered by <a href="/">GAM</a></div>
+<script>
+const TOKEN = ${JSON.stringify(token)};
+const API = ${JSON.stringify(apiBase)};
+const CHAT = document.getElementById('chat');
+const ALERT = document.getElementById('alert');
+const INPUT = document.getElementById('input');
+const SEND = document.getElementById('send');
+let conversationId = null, sending = false, locked = false;
+
+function esc(s){if(s==null)return '';return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function scrollDown(){CHAT.scrollTop = CHAT.scrollHeight;}
+
+function addMsg(role, text){
+  const d = document.createElement('div');
+  d.className = 'msg ' + (role === 'me' ? 'me' : 'bot');
+  d.textContent = text;
+  CHAT.appendChild(d);
+  scrollDown();
+  return d;
+}
+function showTyping(){
+  const d = document.createElement('div');
+  d.className = 'msg typing';
+  d.innerHTML = '<span class="dot"></span><span class="dot"></span><span class="dot"></span>';
+  CHAT.appendChild(d);
+  scrollDown();
+  return d;
+}
+function setError(msg){
+  ALERT.innerHTML = msg ? '<div class="box">' + esc(msg) + '</div>' : '';
+}
+function lock(msg){
+  locked = true;
+  INPUT.disabled = true;
+  SEND.disabled = true;
+  INPUT.placeholder = msg || 'This link is no longer active.';
+}
+
+function autosize(){
+  INPUT.style.height = 'auto';
+  INPUT.style.height = Math.min(INPUT.scrollHeight, 140) + 'px';
+}
+
+async function send(){
+  if(sending || locked) return;
+  const text = INPUT.value.trim();
+  if(!text) return;
+  setError('');
+  INPUT.value = '';
+  autosize();
+  addMsg('me', text);
+  sending = true; SEND.disabled = true;
+  const typing = showTyping();
+  try{
+    const r = await fetch(API + '/api/guest/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: TOKEN, message: text, conversationId: conversationId || undefined }),
+    });
+    const j = await r.json().catch(() => ({ error: 'Something went wrong. Please try again.' }));
+    typing.remove();
+    if(r.status === 401){
+      lock();
+      setError(j.error || 'This stay link is invalid or has expired. Ask your host for a new one.');
+      return;
+    }
+    if(!r.ok || !j.success){
+      throw new Error(j.error || 'Something went wrong. Please try again.');
+    }
+    conversationId = j.data.conversationId || conversationId;
+    addMsg('bot', j.data.reply);
+  }catch(e){
+    typing.remove();
+    setError(e.message || 'Network error — please try again.');
+  }finally{
+    sending = false;
+    if(!locked){ SEND.disabled = false; INPUT.focus(); }
+  }
+}
+
+SEND.addEventListener('click', send);
+INPUT.addEventListener('input', autosize);
+INPUT.addEventListener('keydown', (e) => {
+  if(e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); send(); }
+});
+
+addMsg('bot', "Hi! I'm Skye, your stay assistant. I can help with your booking details, check-in, the property, and requests like a late checkout. What can I do for you?");
+INPUT.focus();
 </script>
 </body>
 </html>`

@@ -12,12 +12,18 @@
 import type { AgentAudience } from '../types'
 
 export interface AgentActor {
-  /** users.id of the logged-in caller */
+  /** users.id of the logged-in caller. For a token-scoped booking guest
+   *  (role='guest') there is no GAM account — this carries the access-token
+   *  id instead, and no users-table row is implied. */
   userId: string
-  /** caller role, e.g. 'tenant' | 'landlord' */
+  /** caller role, e.g. 'tenant' | 'landlord' | 'guest' */
   role: string
-  /** profile id: tenant uuid when role='tenant', landlord id when 'landlord' */
+  /** profile id: tenant uuid when role='tenant', landlord id when 'landlord',
+   *  booking id when role='guest'. */
   profileId: string
+  /** the unit_bookings.id a guest actor is scoped to. Set ONLY for
+   *  role='guest'; guest tools read/write only this one booking. */
+  bookingId?: string
 }
 
 export interface AgentTool {

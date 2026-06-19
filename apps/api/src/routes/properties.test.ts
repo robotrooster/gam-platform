@@ -536,3 +536,67 @@ describe('PATCH /api/properties/:id/manager — PM conflict guard', () => {
     expect(res.body.error).toMatch(/not a property_manager scope holder/)
   })
 })
+
+describe('agent-permissions (per-property revenue opt-in)', () => {
+  it('GET defaults every capability to false when no rows exist', async () => {
+    const f = await seedPropsFixture()
+    const prop = await createProperty(f)
+    const res = await request(buildApp())
+      .get(`/api/properties/${prop.body.data.id}/agent-permissions`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data).toEqual({ take_payment: false, lease_renewal: false, bill_fee: false })
+  })
+
+  it('PATCH enables a capability and GET reflects it', async () => {
+    const f = await seedPropsFixture()
+    const prop = await createProperty(f)
+    const propId = prop.body.data.id
+
+    const patch = await request(buildApp())
+      .patch(`/api/properties/${propId}/agent-permissions`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ capability: 'bill_fee', enabled: true })
+    expect(patch.status).toBe(200)
+    expect(patch.body.data).toEqual({ capability: 'bill_fee', enabled: true })
+
+    const get = await request(buildApp())
+      .get(`/api/properties/${propId}/agent-permissions`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(get.body.data.bill_fee).toBe(true)
+    expect(get.body.data.lease_renewal).toBe(false)
+  })
+
+  it('PATCH toggling back to false persists off', async () => {
+    const f = await seedPropsFixture()
+    const prop = await createProperty(f)
+    const propId = prop.body.data.id
+    const buildAppOnce = buildApp()
+    await request(buildAppOnce).patch(`/api/properties/${propId}/agent-permissions`)
+      .set('Authorization', `Bearer ${f.landlordToken}`).send({ capability: 'lease_renewal', enabled: true })
+    const off = await request(buildApp()).patch(`/api/properties/${propId}/agent-permissions`)
+      .set('Authorization', `Bearer ${f.landlordToken}`).send({ capability: 'lease_renewal', enabled: false })
+    expect(off.body.data.enabled).toBe(false)
+  })
+
+  it('rejects an unknown capability (zod enum)', async () => {
+    const f = await seedPropsFixture()
+    const prop = await createProperty(f)
+    const res = await request(buildApp())
+      .patch(`/api/properties/${prop.body.data.id}/agent-permissions`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ capability: 'evict_tenant', enabled: true })
+    expect(res.status).toBe(400)
+  })
+
+  it('cross-landlord property → 403 on PATCH', async () => {
+    const a = await seedPropsFixture()
+    const b = await seedPropsFixture()
+    const bProp = await createProperty(b, 'B Prop')
+    const res = await request(buildApp())
+      .patch(`/api/properties/${bProp.body.data.id}/agent-permissions`)
+      .set('Authorization', `Bearer ${a.landlordToken}`)
+      .send({ capability: 'bill_fee', enabled: true })
+    expect(res.status).toBe(403)
+  })
+})

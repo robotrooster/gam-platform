@@ -4,7 +4,7 @@ title: How to file a maintenance request
 ---
 When something in your home needs attention — a leaky faucet, a broken appliance, a heating issue — you can file a maintenance request right from your GAM account. Here's how it works.
 
-Go to the Maintenance section, choose your unit, and create a new request. You'll fill in:
+Go to the Maintenance section and create a new request — it's automatically filed against your unit, so there's nothing to select. You'll fill in:
 
 - A short title (for example, "Kitchen sink dripping")
 - A description with as much detail as you can give — what's wrong, when it started, anything you've already tried

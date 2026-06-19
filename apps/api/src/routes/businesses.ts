@@ -173,6 +173,8 @@ businessesRouter.get('/me', requireAuth, async (req, res, next) => {
               default_tax_rate, tax_label,
               public_booking_enabled, public_booking_slug,
               public_booking_intro, business_hours,
+              appointment_reminders_enabled,
+              onboarding_completed_at,
               created_at, updated_at
          FROM businesses
         WHERE owner_user_id = $1
@@ -182,6 +184,75 @@ businessesRouter.get('/me', requireAuth, async (req, res, next) => {
       [req.user!.userId])
     if (!biz) throw new AppError(404, 'No active business found for this owner')
     res.json({ success: true, data: biz })
+  } catch (e) { next(e) }
+})
+
+// ═══════════════════════════════════════════════════════════════
+//  S515 (D) — onboarding wizard status + completion
+// ═══════════════════════════════════════════════════════════════
+
+// GET /api/businesses/me/onboarding — derived step status for the
+// post-signup checklist. Steps are computed from real data so the
+// checklist self-updates as the owner completes each one elsewhere.
+businessesRouter.get('/me/onboarding', requireAuth, async (req, res, next) => {
+  try {
+    if (req.user!.role !== 'business_owner') {
+      throw new AppError(403, 'Only business owners can read onboarding')
+    }
+    const biz = await queryOne<{
+      id: string; street1: string | null; city: string | null;
+      state: string | null; zip: string | null;
+      stripe_connect_account_id: string | null;
+      connect_payouts_enabled: boolean;
+      enabled_features: string[];
+      default_tax_rate: string | null;
+      onboarding_completed_at: string | null;
+    }>(
+      `SELECT id, street1, city, state, zip,
+              stripe_connect_account_id, connect_payouts_enabled,
+              enabled_features, default_tax_rate, onboarding_completed_at
+         FROM businesses
+        WHERE owner_user_id = $1 AND status IN ('active', 'suspended')
+        ORDER BY created_at DESC LIMIT 1`,
+      [req.user!.userId])
+    if (!biz) throw new AppError(404, 'No active business found for this owner')
+
+    const [{ count }] = await query<{ count: string }>(
+      `SELECT COUNT(*)::int AS count FROM business_customers
+        WHERE business_id = $1 AND status = 'active'`, [biz.id])
+    const customerCount = Number(count)
+
+    res.json({ success: true, data: {
+      completedAt: biz.onboarding_completed_at,
+      steps: {
+        profile:   !!(biz.street1 && biz.city && biz.state && biz.zip),
+        features:  (biz.enabled_features ?? []).length > 0,
+        stripe:    !!biz.stripe_connect_account_id && biz.connect_payouts_enabled === true,
+        stripeStarted: !!biz.stripe_connect_account_id,
+        tax:       biz.default_tax_rate !== null,
+        customers: customerCount > 0,
+      },
+      customerCount,
+      defaultTaxRate: biz.default_tax_rate !== null ? Number(biz.default_tax_rate) : null,
+    } })
+  } catch (e) { next(e) }
+})
+
+// POST /api/businesses/me/onboarding/complete — finish or dismiss the
+// wizard. Idempotent: re-calling keeps the original timestamp.
+businessesRouter.post('/me/onboarding/complete', requireAuth, async (req, res, next) => {
+  try {
+    if (req.user!.role !== 'business_owner') {
+      throw new AppError(403, 'Only business owners can complete onboarding')
+    }
+    const r = await query<{ id: string; onboarding_completed_at: string }>(
+      `UPDATE businesses
+          SET onboarding_completed_at = COALESCE(onboarding_completed_at, NOW())
+        WHERE owner_user_id = $1 AND status IN ('active', 'suspended')
+        RETURNING id, onboarding_completed_at`,
+      [req.user!.userId])
+    if (r.length === 0) throw new AppError(404, 'No active business found for this owner')
+    res.json({ success: true, data: r[0] })
   } catch (e) { next(e) }
 })
 
@@ -245,6 +316,8 @@ const patchMeSchema = z.object({
       close: z.string().regex(/^\d{2}:\d{2}$/),
     }),
   ])).optional(),
+  // S502 — opt out of automated 24h appointment reminders.
+  appointmentRemindersEnabled: z.boolean().optional(),
 }).strict()  // refuses unknown keys (status flip is the admin route)
 
 // PATCH /api/businesses/me — update mutable fields for the owner's business
@@ -282,7 +355,8 @@ businessesRouter.patch('/me', requireAuth, async (req, res, next) => {
               public_booking_enabled = COALESCE($15, public_booking_enabled),
               public_booking_slug    = COALESCE($16, public_booking_slug),
               public_booking_intro   = COALESCE($17, public_booking_intro),
-              business_hours         = COALESCE($18, business_hours)
+              business_hours         = COALESCE($18, business_hours),
+              appointment_reminders_enabled = COALESCE($19, appointment_reminders_enabled)
         WHERE owner_user_id = $12
           AND status IN ('active', 'suspended')`,
       [
@@ -304,6 +378,7 @@ businessesRouter.patch('/me', requireAuth, async (req, res, next) => {
         patch.publicBookingSlug === undefined ? null : patch.publicBookingSlug,
         patch.publicBookingIntro === undefined ? null : (patch.publicBookingIntro?.trim() ?? null),
         patch.businessHours ? JSON.stringify(patch.businessHours) : null,
+        patch.appointmentRemindersEnabled ?? null,
       ])
     const biz = await queryOne<any>(
       `SELECT id, name, business_type, email, phone,
@@ -311,7 +386,8 @@ businessesRouter.patch('/me', requireAuth, async (req, res, next) => {
               status, updated_at,
               default_tax_rate, tax_label,
               public_booking_enabled, public_booking_slug,
-              public_booking_intro, business_hours
+              public_booking_intro, business_hours,
+              appointment_reminders_enabled
          FROM businesses
         WHERE owner_user_id = $1
           AND status IN ('active', 'suspended')
@@ -448,5 +524,108 @@ businessesRouter.get('/me/connect/account-status', requireAuth, async (req, res,
       success: true,
       data: { accountId: biz.stripe_connect_account_id, ...status },
     })
+  } catch (e) { next(e) }
+})
+
+// ═══════════════════════════════════════════════════════════════
+//  S516 — money visibility: balance, payout history, manual payout
+// ═══════════════════════════════════════════════════════════════
+
+// Resolve the owner's business + its Connect account, or throw a clean
+// 4xx the UI can render.
+async function requireConnectedBusiness(req: any): Promise<{ id: string; accountId: string }> {
+  if (req.user!.role !== 'business_owner') {
+    throw new AppError(403, 'Only business owners can view payouts')
+  }
+  const biz = await queryOne<{ id: string; stripe_connect_account_id: string | null }>(
+    `SELECT id, stripe_connect_account_id
+       FROM businesses
+      WHERE owner_user_id = $1 AND status IN ('active', 'suspended')
+      ORDER BY created_at DESC LIMIT 1`,
+    [req.user!.userId])
+  if (!biz) throw new AppError(404, 'No active business for this owner')
+  if (!biz.stripe_connect_account_id) {
+    throw new AppError(409, 'Connect your account in Settings before viewing payouts')
+  }
+  return { id: biz.id, accountId: biz.stripe_connect_account_id }
+}
+
+// GET /me/connect/balance — live Stripe balance (available + pending).
+businessesRouter.get('/me/connect/balance', requireAuth, async (req, res, next) => {
+  try {
+    const { accountId } = await requireConnectedBusiness(req)
+    const { getConnectBalance } = await import('../services/connectPayouts')
+    const bal = await getConnectBalance(accountId)
+    const usd = (arr: { currency: string; amount: number }[]) =>
+      arr.find(b => b.currency === 'usd')?.amount ?? 0
+    res.json({ success: true, data: {
+      availableUsd:        usd(bal.available),
+      pendingUsd:          usd(bal.pending),
+      instantAvailableUsd: usd(bal.instant_available),
+    } })
+  } catch (e) { next(e) }
+})
+
+// GET /me/connect/payouts — recorded payout history (from the webhook-fed
+// connect_payouts table; no live Stripe round-trip).
+businessesRouter.get('/me/connect/payouts', requireAuth, async (req, res, next) => {
+  try {
+    const { accountId } = await requireConnectedBusiness(req)
+    const rows = await query<any>(
+      `SELECT id, stripe_payout_id, amount, currency, status,
+              destination_bank_last4, arrival_date,
+              failure_code, failure_message, created_at
+         FROM connect_payouts
+        WHERE stripe_account_id = $1
+        ORDER BY created_at DESC
+        LIMIT 100`, [accountId])
+    res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
+// POST /me/connect/payouts — trigger a manual payout of the available
+// balance (or a specified amount) to the attached bank.
+const payoutSchema = z.object({
+  amount: z.number().positive().max(1_000_000).optional(),  // omit = entire available USD
+})
+businessesRouter.post('/me/connect/payouts', requireAuth, async (req, res, next) => {
+  try {
+    const { id: businessId, accountId } = await requireConnectedBusiness(req)
+    const body = payoutSchema.parse(req.body)
+
+    const { fetchAccountStatus } = await import('../services/stripeConnect')
+    const status = await fetchAccountStatus(accountId)
+    if (!status.payouts_enabled) {
+      throw new AppError(409, 'Payouts are not enabled yet — finish verification in Settings')
+    }
+
+    const { getAvailableUsdBalance, firePayoutForConnectAccount } = await import('../services/connectPayouts')
+    const available = await getAvailableUsdBalance(accountId)
+    const amount = body.amount ?? available
+    if (!(amount > 0)) {
+      throw new AppError(409, 'No balance available to pay out')
+    }
+    if (amount > available + 0.005) {
+      throw new AppError(409, `Requested $${amount.toFixed(2)} exceeds available $${available.toFixed(2)}`)
+    }
+
+    // Deterministic-ish idempotency key: business + cents + minute bucket so
+    // a double-click within the same minute can't fire two payouts, but a
+    // deliberate later payout can.
+    const minuteBucket = new Date().toISOString().slice(0, 16)
+    const idempotencyKey = `biz-payout-${businessId}-${Math.round(amount * 100)}-${minuteBucket}`
+    const payout = await firePayoutForConnectAccount({
+      connectAccountId: accountId,
+      amount,
+      idempotencyKey,
+      description: 'GAM business payout',
+      metadata: { gam_entity: 'business', gam_entity_id: businessId },
+    })
+    res.status(201).json({ success: true, data: {
+      stripePayoutId: payout.id,
+      amount,
+      status: payout.status,
+      arrivalDate: payout.arrival_date,
+    } })
   } catch (e) { next(e) }
 })

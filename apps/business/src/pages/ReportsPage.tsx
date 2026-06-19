@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { apiGet } from '../lib/api'
 import {
   TrendingUp, TrendingDown, Users, ShoppingCart, Package,
-  Wrench, FileText,
+  Wrench, FileText, Receipt, Clock, Download, Tag,
 } from 'lucide-react'
 
 type RangeKey = '30d' | '90d' | '365d'
@@ -87,6 +87,44 @@ interface QuotesSection {
   acceptanceRate: number | null
 }
 
+interface SalesTaxMonth {
+  month: string
+  taxCollected: string
+  posTax: string
+  invoiceTax: string
+  taxableSales: string
+}
+interface SalesTaxSection {
+  totalCollected: number
+  monthly: SalesTaxMonth[]
+}
+interface ArAgingBuckets {
+  current: number; d1to30: number; d31to60: number; d61to90: number; d90plus: number; total: number
+}
+interface ArAgingCustomer extends ArAgingBuckets {
+  customerId: string
+  name: string
+}
+interface DiscountCodeUsage {
+  discountCodeId: string
+  code: string
+  discountType: string | null
+  isActive: boolean
+  redemptions: number
+  amount: number
+  invoiceAmount: number
+  posAmount: number
+}
+interface DiscountsSection {
+  totalDiscounted: number
+  totalRedemptions: number
+  codes: DiscountCodeUsage[]
+}
+interface ArAgingSection {
+  totals: ArAgingBuckets
+  customers: ArAgingCustomer[]
+}
+
 interface Overview {
   range: RangeKey
   days: number
@@ -97,6 +135,9 @@ interface Overview {
   inventory: InventorySection | null
   workOrders: WorkOrdersSection | null
   quotes: QuotesSection | null
+  salesTax: SalesTaxSection | null
+  arAging: ArAgingSection | null
+  discounts: DiscountsSection | null
 }
 
 function fmtMoney(n: string | number | null | undefined): string {
@@ -133,7 +174,7 @@ function pctDelta(cur: number, prior: number): { pct: number | null; up: boolean
 //  Page
 // ─────────────────────────────────────────────────────────────────
 
-type TabKey = 'revenue' | 'customers' | 'pos' | 'inventory' | 'work_orders' | 'quotes'
+type TabKey = 'revenue' | 'customers' | 'pos' | 'inventory' | 'work_orders' | 'quotes' | 'sales_tax' | 'ar_aging' | 'discounts'
 
 export function ReportsPage() {
   const [range, setRange] = useState<RangeKey>('30d')
@@ -159,6 +200,9 @@ export function ReportsPage() {
     if (tab === 'inventory'  && !data.inventory) setTab('revenue')
     if (tab === 'work_orders'&& !data.workOrders) setTab('revenue')
     if (tab === 'quotes'     && !data.quotes) setTab('revenue')
+    if (tab === 'sales_tax'  && !data.salesTax) setTab('revenue')
+    if (tab === 'ar_aging'   && !data.arAging) setTab('revenue')
+    if (tab === 'discounts'  && !data.discounts) setTab('revenue')
   }, [data, tab])
 
   const tabs: Array<{ key: TabKey; label: string; icon: any; gated?: boolean }> = useMemo(() => [
@@ -168,6 +212,9 @@ export function ReportsPage() {
     { key: 'inventory',   label: 'Inventory',   icon: Package,       gated: data ? !data.inventory  : false },
     { key: 'work_orders', label: 'Work orders', icon: Wrench,        gated: data ? !data.workOrders : false },
     { key: 'quotes',      label: 'Quotes',      icon: FileText,      gated: data ? !data.quotes     : false },
+    { key: 'sales_tax',   label: 'Sales tax',   icon: Receipt,       gated: data ? !data.salesTax   : false },
+    { key: 'ar_aging',    label: 'A/R aging',   icon: Clock,         gated: data ? !data.arAging    : false },
+    { key: 'discounts',   label: 'Discounts',   icon: Tag,           gated: data ? !data.discounts  : false },
   ], [data])
 
   return (
@@ -229,6 +276,9 @@ export function ReportsPage() {
           {tab === 'inventory'   && data.inventory  && <InventoryTab d={data.inventory} />}
           {tab === 'work_orders' && data.workOrders && <WorkOrdersTab d={data.workOrders} />}
           {tab === 'quotes'      && data.quotes     && <QuotesTab    d={data.quotes} />}
+          {tab === 'sales_tax'   && data.salesTax   && <SalesTaxTab  d={data.salesTax} />}
+          {tab === 'ar_aging'    && data.arAging    && <ArAgingTab   d={data.arAging} />}
+          {tab === 'discounts'   && data.discounts  && <DiscountsTab d={data.discounts} />}
         </>
       )}
     </div>
@@ -608,6 +658,225 @@ function QuotesTab({ d }: { d: QuotesSection }) {
         </div>
         <div style={{ marginTop: 12, fontSize: 11, color: 'var(--text-3)' }}>
           Acceptance rate = accepted ÷ (accepted + declined). Pending and expired quotes are excluded.
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function SalesTaxTab({ d }: { d: SalesTaxSection }) {
+  const fmtMonth = (m: string) => {
+    const [y, mo] = m.split('-')
+    const date = new Date(Number(y), Number(mo) - 1, 1)
+    return date.toLocaleDateString([], { month: 'short', year: 'numeric' })
+  }
+  return (
+    <div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12, marginBottom: 24 }}>
+        <BigStat label="Tax collected (period)" value={fmtMoney(d.totalCollected)} accent />
+        <BigStat label="From POS"      value={fmtMoney(d.monthly.reduce((a, m) => a + Number(m.posTax), 0))} />
+        <BigStat label="From invoices" value={fmtMoney(d.monthly.reduce((a, m) => a + Number(m.invoiceTax), 0))} />
+      </div>
+
+      <div style={cardStyle}>
+        <h2 style={h2Style}>By month</h2>
+        {d.monthly.length === 0 ? (
+          <div style={{ color: 'var(--text-2)', fontSize: 14 }}>No taxable sales in this range.</div>
+        ) : (
+          <table style={tableStyle}>
+            <thead>
+              <tr style={{ borderBottom: '1px solid var(--border-1)' }}>
+                <th style={thStyle}>Month</th>
+                <th style={thStyle}>Taxable sales</th>
+                <th style={thStyle}>POS tax</th>
+                <th style={thStyle}>Invoice tax</th>
+                <th style={thStyle}>Total tax</th>
+              </tr>
+            </thead>
+            <tbody>
+              {d.monthly.map(m => (
+                <tr key={m.month} style={{ borderBottom: '1px solid var(--border-0)' }}>
+                  <td style={tdStyle}>{fmtMonth(m.month)}</td>
+                  <td style={tdStyle}>{fmtMoney(m.taxableSales)}</td>
+                  <td style={tdStyle}>{fmtMoney(m.posTax)}</td>
+                  <td style={tdStyle}>{fmtMoney(m.invoiceTax)}</td>
+                  <td style={{ ...tdStyle, fontWeight: 700, fontFamily: 'var(--font-mono)' as const, color: 'var(--gold)' }}>
+                    {fmtMoney(m.taxCollected)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+        <div style={{ marginTop: 12, fontSize: 11, color: 'var(--text-3)' }}>
+          Tax on completed POS sales + issued invoices (sent/paid), net of discounts. Use this to prepare your sales-tax return. GAM does not file on your behalf.
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function downloadCsv(filename: string, headers: string[], rows: (string | number)[][]) {
+  const esc = (v: string | number) => {
+    const s = String(v)
+    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
+  }
+  const csv = [headers, ...rows].map(r => r.map(esc).join(',')).join('\n')
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url; a.download = filename
+  document.body.appendChild(a); a.click(); document.body.removeChild(a)
+  URL.revokeObjectURL(url)
+}
+
+function ArAgingTab({ d }: { d: ArAgingSection }) {
+  const t = d.totals
+  const exportCsv = () => {
+    downloadCsv(
+      'ar-aging.csv',
+      ['Customer', 'Current', '1-30', '31-60', '61-90', '90+', 'Total'],
+      d.customers.map(c => [c.name, c.current, c.d1to30, c.d31to60, c.d61to90, c.d90plus, c.total]),
+    )
+  }
+  return (
+    <div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12, marginBottom: 24 }}>
+        <BigStat label="Total outstanding" value={fmtMoney(t.total)} accent />
+        <BigStat label="Current (not due)" value={fmtMoney(t.current)} />
+        <BigStat label="1–30 days" value={fmtMoney(t.d1to30)} />
+        <BigStat label="31–60 days" value={fmtMoney(t.d31to60)} />
+        <BigStat label="61–90 days" value={fmtMoney(t.d61to90)} />
+        <BigStat label="90+ days" value={fmtMoney(t.d90plus)} warn />
+      </div>
+
+      <div style={cardStyle}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+          <h2 style={h2Style}>By customer</h2>
+          {d.customers.length > 0 && (
+            <button onClick={exportCsv} style={{
+              display: 'flex', alignItems: 'center', gap: 6, padding: '6px 12px',
+              background: 'var(--bg-2)', border: '1px solid var(--border-1)', borderRadius: 8,
+              color: 'var(--text-1)', fontSize: 12, fontWeight: 600, cursor: 'pointer',
+            }}>
+              <Download size={13} /> Export CSV
+            </button>
+          )}
+        </div>
+        {d.customers.length === 0 ? (
+          <div style={{ color: 'var(--text-2)', fontSize: 14, marginTop: 8 }}>
+            No outstanding invoices — every sent invoice is paid. 🎉
+          </div>
+        ) : (
+          <table style={tableStyle}>
+            <thead>
+              <tr style={{ borderBottom: '1px solid var(--border-1)' }}>
+                <th style={thStyle}>Customer</th>
+                <th style={thStyle}>Current</th>
+                <th style={thStyle}>1–30</th>
+                <th style={thStyle}>31–60</th>
+                <th style={thStyle}>61–90</th>
+                <th style={thStyle}>90+</th>
+                <th style={thStyle}>Total</th>
+              </tr>
+            </thead>
+            <tbody>
+              {d.customers.map(c => (
+                <tr key={c.customerId} style={{ borderBottom: '1px solid var(--border-0)' }}>
+                  <td style={tdStyle}>{c.name}</td>
+                  <td style={tdStyle}>{fmtMoney(c.current)}</td>
+                  <td style={tdStyle}>{fmtMoney(c.d1to30)}</td>
+                  <td style={tdStyle}>{fmtMoney(c.d31to60)}</td>
+                  <td style={tdStyle}>{fmtMoney(c.d61to90)}</td>
+                  <td style={{ ...tdStyle, color: c.d90plus > 0 ? 'var(--red)' : undefined }}>{fmtMoney(c.d90plus)}</td>
+                  <td style={{ ...tdStyle, fontWeight: 700, fontFamily: 'var(--font-mono)' as const, color: 'var(--gold)' }}>
+                    {fmtMoney(c.total)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+        <div style={{ marginTop: 12, fontSize: 11, color: 'var(--text-3)' }}>
+          Outstanding balance on sent invoices, bucketed by days past the due date as of today. Paid, draft, and void invoices are excluded.
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function DiscountsTab({ d }: { d: DiscountsSection }) {
+  const exportCsv = () => {
+    downloadCsv(
+      'discount-usage.csv',
+      ['Code', 'Type', 'Active', 'Redemptions', 'Total discounted', 'From invoices', 'From POS'],
+      d.codes.map(c => [
+        c.code, c.discountType ?? '', c.isActive ? 'yes' : 'no',
+        c.redemptions, c.amount, c.invoiceAmount, c.posAmount,
+      ]),
+    )
+  }
+  return (
+    <div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 12, marginBottom: 24 }}>
+        <BigStat label="Total discounted" value={fmtMoney(d.totalDiscounted)} accent />
+        <BigStat label="Redemptions" value={String(d.totalRedemptions)} />
+      </div>
+
+      <div style={cardStyle}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+          <h2 style={h2Style}>By code</h2>
+          {d.codes.length > 0 && (
+            <button onClick={exportCsv} style={{
+              display: 'flex', alignItems: 'center', gap: 6, padding: '6px 12px',
+              background: 'var(--bg-2)', border: '1px solid var(--border-1)', borderRadius: 8,
+              color: 'var(--text-1)', fontSize: 12, fontWeight: 600, cursor: 'pointer',
+            }}>
+              <Download size={13} /> Export CSV
+            </button>
+          )}
+        </div>
+        {d.codes.length === 0 ? (
+          <div style={{ color: 'var(--text-2)', fontSize: 14, marginTop: 8 }}>
+            No discount codes were redeemed in this range.
+          </div>
+        ) : (
+          <table style={tableStyle}>
+            <thead>
+              <tr style={{ borderBottom: '1px solid var(--border-1)' }}>
+                <th style={thStyle}>Code</th>
+                <th style={thStyle}>Type</th>
+                <th style={thStyle}>Redemptions</th>
+                <th style={thStyle}>From invoices</th>
+                <th style={thStyle}>From POS</th>
+                <th style={thStyle}>Total discounted</th>
+              </tr>
+            </thead>
+            <tbody>
+              {d.codes.map(c => (
+                <tr key={c.discountCodeId} style={{ borderBottom: '1px solid var(--border-0)' }}>
+                  <td style={tdStyle}>
+                    {c.code}
+                    {!c.isActive && (
+                      <span style={{ marginLeft: 6, fontSize: 10, color: 'var(--text-3)', textTransform: 'uppercase' as const }}>
+                        inactive
+                      </span>
+                    )}
+                  </td>
+                  <td style={{ ...tdStyle, textTransform: 'capitalize' as const }}>{c.discountType ?? '—'}</td>
+                  <td style={tdStyle}>{c.redemptions}</td>
+                  <td style={tdStyle}>{fmtMoney(c.invoiceAmount)}</td>
+                  <td style={tdStyle}>{fmtMoney(c.posAmount)}</td>
+                  <td style={{ ...tdStyle, fontWeight: 700, fontFamily: 'var(--font-mono)' as const, color: 'var(--gold)' }}>
+                    {fmtMoney(c.amount)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+        <div style={{ marginTop: 12, fontSize: 11, color: 'var(--text-3)' }}>
+          Discount dollars given away across issued invoices (sent/paid — including quote conversions) and completed POS sales in this range.
         </div>
       </div>
     </div>

@@ -1,8 +1,9 @@
 import { useMemo, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useNavigate } from 'react-router-dom'
-import { CalendarRange, Search, ArrowRight, FileSignature, CheckCircle2, AlertTriangle } from 'lucide-react'
-import { apiGet, apiPatch } from '../lib/api'
+import { CalendarRange, Search, ArrowRight, FileSignature, CheckCircle2, AlertTriangle, MessageSquare, Check, X, QrCode, Copy, Mail, Ban } from 'lucide-react'
+import { apiGet, apiPatch, apiPost, apiDelete } from '../lib/api'
+import { BOOKING_CHANGE_REQUEST_TYPE_LABEL, type BookingChangeRequestType } from '@gam/shared'
 
 type Booking = {
   id: string
@@ -27,6 +28,20 @@ type Booking = {
   createdAt: string
 }
 
+type ChangeRequest = {
+  id: string
+  bookingId: string
+  requestType: BookingChangeRequestType
+  details: string | null
+  status: string
+  guestName: string | null
+  checkIn: string
+  checkOut: string
+  unitNumber: string | null
+  propertyName: string | null
+  createdAt: string
+}
+
 const STATUS_BADGE: Record<string, string> = {
   confirmed: 'badge-blue',
   checked_in: 'badge-green',
@@ -41,9 +56,136 @@ const fmt = (v: string | number | null | undefined) => {
   return `$${n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
 }
 
+// Date-only strings render at noon to dodge TZ off-by-one.
+const fmtDate = (d: string | null | undefined) => {
+  if (!d) return '—'
+  try { return new Date(`${d.slice(0, 10)}T12:00:00`).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) }
+  catch { return d }
+}
+
+// Guest stay-assistant access (S501 track). Shows the per-booking stay link +
+// QR the host displays/prints on-site, can re-email it to the guest, and can
+// revoke all access. Issuing mints a fresh reusable token bound to this one
+// booking; revoke kills every outstanding link for it.
+type IssuedAccess = { url: string; qrDataUrl: string; expiresAt: string; emailed: boolean }
+
+function GuestAccessModal({ booking, onClose }: { booking: Booking; onClose: () => void }) {
+  const base = `/units/${booking.unitId}/bookings/${booking.id}/guest-access`
+  const [issued, setIssued] = useState<IssuedAccess | null>(null)
+  const [copied, setCopied] = useState(false)
+  const [revoked, setRevoked] = useState<number | null>(null)
+
+  // Issue (or re-issue) the link + QR. sendEmail re-issues and emails the guest.
+  const issueMut = useMutation(
+    (sendEmail: boolean) => apiPost<IssuedAccess>(base, { sendEmail }),
+    {
+      onSuccess: (res) => {
+        setIssued(res.data)
+        setRevoked(null)
+        setCopied(false)
+      },
+    },
+  )
+
+  const revokeMut = useMutation(
+    () => apiDelete<{ revoked: number }>(base),
+    {
+      onSuccess: (res) => {
+        setRevoked(res.data.revoked)
+        setIssued(null)
+      },
+    },
+  )
+
+  const copyLink = () => {
+    if (!issued) return
+    navigator.clipboard?.writeText(issued.url).then(() => {
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1800)
+    }).catch(() => {})
+  }
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" style={{ maxWidth: 440, width: '95vw' }} onClick={e => e.stopPropagation()}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+          <div className="modal-title" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <QrCode size={18} style={{ color: 'var(--gold)' }} /> Stay link
+          </div>
+          <button className="btn btn-ghost btn-sm" onClick={onClose} aria-label="Close"><X size={16} /></button>
+        </div>
+        <div style={{ fontSize: '.8rem', color: 'var(--text-3)', marginBottom: 16 }}>
+          {booking.guestName || 'Guest'} · {booking.propertyName} Unit {booking.unitNumber} · {fmtDate(booking.checkIn)}–{fmtDate(booking.checkOut)}
+        </div>
+
+        {!issued && revoked == null && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+            <p style={{ fontSize: '.84rem', color: 'var(--text-1)' }}>
+              Generate the guest's stay-assistant link and a QR code to show or print on-site.
+              The guest chats with no account; the link works for the whole stay.
+            </p>
+            <button className="btn" disabled={issueMut.isLoading} onClick={() => issueMut.mutate(false)}>
+              {issueMut.isLoading ? 'Generating…' : 'Generate stay link'}
+            </button>
+          </div>
+        )}
+
+        {issued && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+            <div style={{ display: 'flex', justifyContent: 'center' }}>
+              <img src={issued.qrDataUrl} alt="Stay link QR code" width={200} height={200} style={{ borderRadius: 10, background: '#fff', padding: 8 }} />
+            </div>
+            <div>
+              <label style={{ display: 'block', fontSize: '.7rem', color: 'var(--text-3)', marginBottom: 4 }}>Link</label>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <input className="input" readOnly value={issued.url} onFocus={e => e.currentTarget.select()} style={{ fontSize: '.78rem' }} />
+                <button className="btn btn-ghost btn-sm" onClick={copyLink} title="Copy link" style={{ flexShrink: 0 }}>
+                  {copied ? <Check size={14} /> : <Copy size={14} />}
+                </button>
+              </div>
+            </div>
+            <div style={{ fontSize: '.74rem', color: 'var(--text-3)' }}>
+              Expires {new Date(issued.expiresAt).toLocaleDateString()}{issued.emailed ? ' · emailed to guest' : ''}
+            </div>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+              {booking.guestEmail && (
+                <button className="btn btn-ghost btn-sm" disabled={issueMut.isLoading} onClick={() => issueMut.mutate(true)}>
+                  <Mail size={13} /> Email to guest
+                </button>
+              )}
+              <button
+                className="btn btn-ghost btn-sm"
+                disabled={revokeMut.isLoading}
+                onClick={() => revokeMut.mutate()}
+                style={{ color: 'var(--red)', marginLeft: 'auto' }}
+              >
+                <Ban size={13} /> Revoke access
+              </button>
+            </div>
+          </div>
+        )}
+
+        {revoked != null && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            <p style={{ fontSize: '.84rem', color: 'var(--text-1)' }}>
+              {revoked > 0
+                ? `Access revoked. ${revoked} link${revoked === 1 ? '' : 's'} no longer work.`
+                : 'No active links to revoke.'}
+            </p>
+            <button className="btn btn-ghost btn-sm" disabled={issueMut.isLoading} onClick={() => issueMut.mutate(false)} style={{ alignSelf: 'flex-start' }}>
+              Generate a new link
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
 export function BookingsPage() {
   const navigate = useNavigate()
   const qc = useQueryClient()
+  const [linkBooking, setLinkBooking] = useState<Booking | null>(null)
   const [search, setSearch] = useState('')
   const [status, setStatus] = useState('')
   const [source, setSource] = useState('')
@@ -57,6 +199,20 @@ export function BookingsPage() {
     {
       onSuccess: () => qc.invalidateQueries(['bookings']),
     },
+  )
+
+  // Guest-agent change requests (S501 track): open stay-change asks recorded
+  // by the guest agent. The host approves/declines here; approving is an
+  // acknowledgment, not an automatic booking edit.
+  const { data: changeRequests = [] } = useQuery<ChangeRequest[]>(
+    ['booking-change-requests'],
+    () => apiGet<ChangeRequest[]>('/bookings/change-requests'),
+    { staleTime: 30000 },
+  )
+  const resolveMut = useMutation(
+    ({ id, status }: { id: string; status: 'approved' | 'declined' }) =>
+      apiPatch(`/bookings/change-requests/${id}`, { status }),
+    { onSuccess: () => qc.invalidateQueries(['booking-change-requests']) },
   )
 
   const queryString = useMemo(() => {
@@ -107,6 +263,59 @@ export function BookingsPage() {
           </div>
         </div>
       </div>
+
+      {changeRequests.length > 0 && (
+        <div className="card" style={{ padding: 16, marginBottom: 16 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+            <MessageSquare size={16} style={{ color: 'var(--gold)' }} />
+            <strong style={{ fontSize: '.9rem' }}>Guest requests</strong>
+            <span className="badge badge-blue" style={{ marginLeft: 2 }}>{changeRequests.length}</span>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+            {changeRequests.map(cr => (
+              <div
+                key={cr.id}
+                style={{
+                  display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                  gap: 12, flexWrap: 'wrap',
+                  padding: '12px 14px', border: '1px solid var(--border)', borderRadius: 8,
+                  background: 'var(--bg-1)',
+                }}
+              >
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                    <span className="badge badge-blue">{BOOKING_CHANGE_REQUEST_TYPE_LABEL[cr.requestType]}</span>
+                    <strong style={{ fontSize: '.88rem' }}>{cr.guestName || 'Guest'}</strong>
+                    <span style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>
+                      {cr.propertyName || '—'}{cr.unitNumber ? ` · Unit ${cr.unitNumber}` : ''}
+                      {' · '}{fmtDate(cr.checkIn)}–{fmtDate(cr.checkOut)}
+                    </span>
+                  </div>
+                  {cr.details && (
+                    <div style={{ fontSize: '.82rem', color: 'var(--text-1)', marginTop: 4 }}>{cr.details}</div>
+                  )}
+                </div>
+                <div style={{ display: 'flex', gap: 8, flexShrink: 0 }}>
+                  <button
+                    className="btn btn-sm"
+                    disabled={resolveMut.isLoading}
+                    onClick={() => resolveMut.mutate({ id: cr.id, status: 'approved' })}
+                  >
+                    <Check size={13} /> Approve
+                  </button>
+                  <button
+                    className="btn btn-ghost btn-sm"
+                    disabled={resolveMut.isLoading}
+                    onClick={() => resolveMut.mutate({ id: cr.id, status: 'declined' })}
+                  >
+                    <X size={13} /> Decline
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       <div className="card" style={{ padding: 16, marginBottom: 16 }}>
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12 }}>
@@ -197,6 +406,7 @@ export function BookingsPage() {
                 <th>Total</th>
                 <th>Source</th>
                 <th>Ack</th>
+                <th>Stay link</th>
               </tr>
             </thead>
             <tbody>
@@ -247,12 +457,26 @@ export function BookingsPage() {
                       <span style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>n/a</span>
                     )}
                   </td>
+                  <td>
+                    <button
+                      className="btn btn-ghost btn-sm"
+                      onClick={() => setLinkBooking(b)}
+                      style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}
+                      title="Show the guest stay-assistant link and QR, or revoke access"
+                    >
+                      <QrCode size={12} /> Stay link
+                    </button>
+                  </td>
                 </tr>
               ))}
             </tbody>
           </table>
         )}
       </div>
+
+      {linkBooking && (
+        <GuestAccessModal booking={linkBooking} onClose={() => setLinkBooking(null)} />
+      )}
     </div>
   )
 }

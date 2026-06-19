@@ -1,10 +1,11 @@
 import { useEffect, useState } from 'react'
 import { apiGet, apiPost, apiDelete, openPdfInNewTab } from '../lib/api'
+import { useAuth } from '../context/AuthContext'
 import { AttachmentList } from '../components/AttachmentList'
 import { Modal } from '../components/Modal'
 import {
   Plus, ChevronRight, ArrowLeft, Search, Wrench, Trash2,
-  Receipt, AlertTriangle, Car, Printer,
+  Receipt, AlertTriangle, Car, Printer, Play, Square, Clock,
 } from 'lucide-react'
 
 type WorkOrderStatus = 'open' | 'in_progress' | 'awaiting_parts' | 'completed' | 'cancelled'
@@ -47,6 +48,18 @@ interface WorkOrderLine {
   sortOrder: number
 }
 
+interface TimeEntry {
+  id: string
+  userId: string
+  techFirstName: string | null
+  techLastName: string | null
+  startedAt: string
+  endedAt: string | null
+  durationMinutes: number | null
+  note: string | null
+  billedAt: string | null
+}
+
 interface WorkOrderDetail extends WorkOrderSummary {
   intakeMileage: number | null
   closeoutMileage: number | null
@@ -58,6 +71,7 @@ interface WorkOrderDetail extends WorkOrderSummary {
   appointmentId: string | null
   assignedToUserId: string | null
   lines: WorkOrderLine[]
+  timeEntries: TimeEntry[]
 }
 
 interface Customer {
@@ -367,12 +381,14 @@ function Detail({
   id: string
   onBack: () => void
 }) {
+  const { user } = useAuth()
   const [wo, setWo] = useState<WorkOrderDetail | null>(null)
   const [err, setErr] = useState<string | null>(null)
   const [showAddLine, setShowAddLine] = useState(false)
   const [showCancel,  setShowCancel]  = useState(false)
   const [showComplete, setShowComplete] = useState(false)
   const [showConvert, setShowConvert] = useState(false)
+  const [showBillTime, setShowBillTime] = useState(false)
 
   const reload = async () => {
     setErr(null)
@@ -403,6 +419,26 @@ function Detail({
       reload()
     } catch (e: any) {
       setErr(e?.response?.data?.error || 'Remove failed')
+    }
+  }
+
+  // S514: time tracking.
+  const timeAction = async (path: string) => {
+    setErr(null)
+    try {
+      await apiPost(`/business-work-orders/${id}/time/${path}`)
+      reload()
+    } catch (e: any) {
+      setErr(e?.response?.data?.error || 'Time action failed')
+    }
+  }
+  const deleteTimeEntry = async (entryId: string) => {
+    setErr(null)
+    try {
+      await apiDelete(`/business-work-orders/${id}/time/${entryId}`)
+      reload()
+    } catch (e: any) {
+      setErr(e?.response?.data?.error || 'Failed to delete entry')
     }
   }
 
@@ -614,6 +650,16 @@ function Detail({
           <Row label="Total"  value={fmtMoney(wo.totalAmount)} big />
         </div>
 
+        {/* S514: time tracking */}
+        <TimeSection
+          wo={wo}
+          currentUserId={user?.id ?? null}
+          isEditable={isEditable}
+          onStart={() => timeAction('start')}
+          onStop={() => timeAction('stop')}
+          onDelete={deleteTimeEntry}
+          onBill={() => setShowBillTime(true)} />
+
         {/* S509: attachments */}
         <div style={{ marginTop: 24 }}>
           <AttachmentList entityType="work_order" entityId={id} canEdit={isEditable} />
@@ -641,7 +687,185 @@ function Detail({
           onClose={() => setShowConvert(false)}
           onDone={() => { setShowConvert(false); reload() }} />
       )}
+      {showBillTime && (
+        <BillTimeModal workOrderId={id}
+          unbilledMinutes={wo.timeEntries
+            .filter(t => t.endedAt && !t.billedAt)
+            .reduce((a, t) => a + (t.durationMinutes ?? 0), 0)}
+          onClose={() => setShowBillTime(false)}
+          onDone={() => { setShowBillTime(false); reload() }} />
+      )}
     </div>
+  )
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  S514 — time-tracking section + bill modal
+// ─────────────────────────────────────────────────────────────────
+
+function fmtHrs(minutes: number): string {
+  const h = minutes / 60
+  return `${h.toFixed(2)} hr${h === 1 ? '' : 's'}`
+}
+
+function TimeSection({
+  wo, currentUserId, isEditable, onStart, onStop, onDelete, onBill,
+}: {
+  wo: WorkOrderDetail
+  currentUserId: string | null
+  isEditable: boolean
+  onStart: () => void
+  onStop: () => void
+  onDelete: (entryId: string) => void
+  onBill: () => void
+}) {
+  const myRunning = wo.timeEntries.find(t => t.userId === currentUserId && !t.endedAt) ?? null
+  const unbilledMinutes = wo.timeEntries
+    .filter(t => t.endedAt && !t.billedAt)
+    .reduce((a, t) => a + (t.durationMinutes ?? 0), 0)
+
+  return (
+    <div style={{ marginTop: 24 }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
+        <h2 style={{ margin: 0, fontSize: 16, color: 'var(--text-0)', display: 'flex', alignItems: 'center', gap: 6 }}>
+          <Clock size={15} color="var(--gold)" /> Time tracking
+        </h2>
+        {isEditable && (
+          myRunning ? (
+            <button onClick={onStop} style={{ ...primaryBtnStyle, background: 'var(--red, #ef4444)', color: '#fff' }}>
+              <Square size={12} /> Clock out
+            </button>
+          ) : (
+            <button onClick={onStart} style={primaryBtnStyle}>
+              <Play size={12} /> Clock in
+            </button>
+          )
+        )}
+      </div>
+
+      {wo.timeEntries.length === 0 ? (
+        <div style={{ ...emptyStyle, marginBottom: 0 }}>No time tracked yet. Clock in to start the labor timer.</div>
+      ) : (
+        <>
+          <table style={tableStyle}>
+            <thead>
+              <tr style={{ borderBottom: '1px solid var(--border-1)' }}>
+                <th style={thStyle}>Tech</th>
+                <th style={thStyle}>Started</th>
+                <th style={thStyle}>Duration</th>
+                <th style={thStyle}>Status</th>
+                <th style={thStyle}></th>
+              </tr>
+            </thead>
+            <tbody>
+              {wo.timeEntries.map(t => {
+                const running = !t.endedAt
+                return (
+                  <tr key={t.id} style={{ borderBottom: '1px solid var(--border-0)' }}>
+                    <td style={tdStyle}>{`${t.techFirstName ?? ''} ${t.techLastName ?? ''}`.trim() || '—'}</td>
+                    <td style={tdStyle}>{fmtDate(t.startedAt)}</td>
+                    <td style={tdStyle}>{running ? '—' : fmtHrs(t.durationMinutes ?? 0)}</td>
+                    <td style={tdStyle}>
+                      {running ? (
+                        <span style={{ color: 'var(--gold)', fontWeight: 600 }}>Running…</span>
+                      ) : t.billedAt ? (
+                        <span style={{ color: 'var(--text-3)' }}>Billed</span>
+                      ) : (
+                        <span style={{ color: 'var(--green, #22c55e)' }}>Unbilled</span>
+                      )}
+                    </td>
+                    <td style={{ ...tdStyle, textAlign: 'right' as const }}>
+                      {isEditable && !t.billedAt && !running && (
+                        <button onClick={() => onDelete(t.id)}
+                          style={{ background: 'transparent', border: 'none', color: 'var(--text-3)', cursor: 'pointer', padding: 2 }}>
+                          <Trash2 size={12} />
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+
+          {isEditable && unbilledMinutes > 0 && (
+            <div style={{
+              marginTop: 10, display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+              padding: 12, background: 'var(--bg-2)', borderRadius: 8,
+            }}>
+              <span style={{ fontSize: 13, color: 'var(--text-1)' }}>
+                <strong>{fmtHrs(unbilledMinutes)}</strong> tracked and not yet billed
+              </span>
+              <button onClick={onBill} style={primaryBtnStyle}>Bill as labor →</button>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  )
+}
+
+function BillTimeModal({
+  workOrderId, unbilledMinutes, onClose, onDone,
+}: {
+  workOrderId: string
+  unbilledMinutes: number
+  onClose: () => void
+  onDone: () => void
+}) {
+  const [hourlyRate, setHourlyRate] = useState('')
+  const [description, setDescription] = useState('')
+  const [taxRate, setTaxRate] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+
+  const hours = unbilledMinutes / 60
+  const preview = hours * (parseFloat(hourlyRate) || 0)
+
+  const submit = async () => {
+    setErr(null)
+    const rate = parseFloat(hourlyRate)
+    if (isNaN(rate) || rate < 0) { setErr('Enter an hourly rate'); return }
+    setSubmitting(true)
+    try {
+      const payload: any = { hourlyRate: rate }
+      if (description.trim()) payload.description = description.trim()
+      if (taxRate.trim()) payload.taxRate = (parseFloat(taxRate) || 0) / 100
+      await apiPost(`/business-work-orders/${workOrderId}/time/bill`, payload)
+      onDone()
+    } catch (e: any) {
+      setErr(e?.response?.data?.error || 'Failed to bill time')
+    } finally { setSubmitting(false) }
+  }
+
+  return (
+    <Modal title="Bill tracked time" onClose={onClose}
+      footer={
+        <>
+          <button onClick={onClose} style={ghostBtn}>Cancel</button>
+          <button onClick={submit} disabled={submitting} style={primaryBtnStyle}>
+            {submitting ? 'Billing…' : `Add labor line — ${fmtMoney(preview)}`}
+          </button>
+        </>
+      }>
+      {err && <div style={errStyle}>{err}</div>}
+      <div style={{ padding: 12, background: 'var(--bg-2)', borderRadius: 8, marginBottom: 12, fontSize: 13, color: 'var(--text-1)' }}>
+        Rolling <strong>{fmtHrs(unbilledMinutes)}</strong> of tracked time into a single labor line.
+      </div>
+
+      <label style={labelStyle}>Hourly rate</label>
+      <input type="number" step="0.01" min={0} value={hourlyRate}
+        onChange={e => setHourlyRate(e.target.value)} placeholder="100.00"
+        style={{ ...inputStyle, fontFamily: 'var(--font-mono)' as const }} autoFocus />
+
+      <label style={labelStyle}>Description (optional)</label>
+      <input value={description} onChange={e => setDescription(e.target.value)}
+        placeholder={`Labor — ${hours.toFixed(2)} hrs (tracked)`} style={inputStyle} />
+
+      <label style={labelStyle}>Tax rate % (optional)</label>
+      <input type="number" step="0.01" min={0} value={taxRate}
+        onChange={e => setTaxRate(e.target.value)} placeholder="0" style={inputStyle} />
+    </Modal>
   )
 }
 

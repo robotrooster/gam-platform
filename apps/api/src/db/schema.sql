@@ -21,10 +21,10 @@
 -- PostgreSQL database dump
 --
 
-\restrict rwZk6CNhw2PwEjUJqOeEl1xPOQaqi67uYFZxL13vUXhq9J2PPee3aWMyl5y21ZI
+\restrict ot6S9pC7LNDLpQFGUYYFEhxqokOtDmekGGoM6xKqVcnOLIoIWPMMRYbh9xTmVWj
 
--- Dumped from database version 16.13 (Homebrew)
--- Dumped by pg_dump version 16.13 (Homebrew)
+-- Dumped from database version 16.14 (Homebrew)
+-- Dumped by pg_dump version 16.14 (Homebrew)
 
 SET statement_timeout = 0;
 SET lock_timeout = 0;
@@ -252,6 +252,35 @@ $$;
 
 
 --
+-- Name: unit_inspection_videos_no_delete(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.unit_inspection_videos_no_delete() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  RAISE EXCEPTION 'unit_inspection_videos are immutable: a walkthrough video cannot be deleted';
+END;
+$$;
+
+
+--
+-- Name: unit_inspection_videos_protect_url(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.unit_inspection_videos_protect_url() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  IF NEW.video_url IS DISTINCT FROM OLD.video_url THEN
+    RAISE EXCEPTION 'unit_inspection_videos.video_url is immutable and cannot be changed';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: update_updated_at(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -439,8 +468,8 @@ CREATE TABLE public.agent_interaction_logs (
     error_detail text,
     metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT agent_interaction_logs_agent_type_check CHECK ((agent_type = ANY (ARRAY['customer_service'::text, 'sales'::text]))),
-    CONSTRAINT agent_interaction_logs_audience_check CHECK ((audience = ANY (ARRAY['tenant'::text, 'landlord'::text, 'prospect'::text]))),
+    CONSTRAINT agent_interaction_logs_agent_type_check CHECK ((agent_type = ANY (ARRAY['customer_service'::text, 'sales'::text, 'booking'::text]))),
+    CONSTRAINT agent_interaction_logs_audience_check CHECK ((audience = ANY (ARRAY['tenant'::text, 'landlord'::text, 'prospect'::text, 'guest'::text]))),
     CONSTRAINT agent_interaction_logs_handled_by_tier_check CHECK ((handled_by_tier = ANY (ARRAY['entry'::text, 'escalation'::text, 'human'::text]))),
     CONSTRAINT agent_interaction_logs_outcome_check CHECK ((outcome = ANY (ARRAY['answered_entry'::text, 'answered_escalation'::text, 'action_taken'::text, 'escalated_to_senior'::text, 'escalated_to_human'::text, 'abandoned'::text, 'error'::text])))
 );
@@ -509,11 +538,19 @@ CREATE TABLE public.appointments (
     recurring_schedule_id uuid,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    reminder_sent_at timestamp with time zone,
     CONSTRAINT appointments_cancelled_audit CHECK (((status <> 'cancelled'::text) OR (cancelled_at IS NOT NULL))),
     CONSTRAINT appointments_completed_audit CHECK (((status <> 'completed'::text) OR (completed_at IS NOT NULL))),
     CONSTRAINT appointments_duration_positive CHECK ((duration_minutes > 0)),
     CONSTRAINT appointments_status_check CHECK ((status = ANY (ARRAY['scheduled'::text, 'completed'::text, 'cancelled'::text, 'no_show'::text])))
 );
+
+
+--
+-- Name: COLUMN appointments.reminder_sent_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.appointments.reminder_sent_at IS 'S518 set when the 24h reminder email fires. One-shot idempotency guard for the reminder cron.';
 
 
 --
@@ -629,7 +666,47 @@ CREATE TABLE public.bank_reconciliations (
     difference numeric(12,2) GENERATED ALWAYS AS ((statement_balance - book_balance)) STORED,
     status character varying(20) DEFAULT 'open'::character varying,
     completed_at timestamp with time zone,
-    created_at timestamp with time zone DEFAULT now()
+    created_at timestamp with time zone DEFAULT now(),
+    business_id uuid,
+    CONSTRAINT bank_reconciliations_one_owner CHECK ((num_nonnulls(landlord_id, business_id) <= 1))
+);
+
+
+--
+-- Name: booking_change_requests; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.booking_change_requests (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    booking_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    request_type text NOT NULL,
+    details text,
+    status text DEFAULT 'requested'::text NOT NULL,
+    resolved_at timestamp with time zone,
+    resolved_by_user_id uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT booking_change_requests_status_check CHECK ((status = ANY (ARRAY['requested'::text, 'approved'::text, 'declined'::text, 'cancelled'::text]))),
+    CONSTRAINT booking_change_requests_type_check CHECK ((request_type = ANY (ARRAY['late_checkout'::text, 'early_checkin'::text, 'extra_night'::text, 'other'::text])))
+);
+
+
+--
+-- Name: booking_guest_access_tokens; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.booking_guest_access_tokens (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    token text NOT NULL,
+    booking_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    delivery_method text DEFAULT 'email'::text NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    revoked_at timestamp with time zone,
+    last_used_at timestamp with time zone,
+    created_by_user_id uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT booking_guest_access_tokens_delivery_check CHECK ((delivery_method = ANY (ARRAY['email'::text, 'qr'::text])))
 );
 
 
@@ -664,7 +741,9 @@ CREATE TABLE public.books_accounts (
     balance numeric(12,2) DEFAULT 0,
     active boolean DEFAULT true,
     created_at timestamp with time zone DEFAULT now(),
-    updated_at timestamp with time zone DEFAULT now()
+    updated_at timestamp with time zone DEFAULT now(),
+    business_id uuid,
+    CONSTRAINT books_accounts_one_owner CHECK ((num_nonnulls(landlord_id, business_id) <= 1))
 );
 
 
@@ -688,7 +767,9 @@ CREATE TABLE public.books_bills (
     notes text,
     paid_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now(),
-    updated_at timestamp with time zone DEFAULT now()
+    updated_at timestamp with time zone DEFAULT now(),
+    business_id uuid,
+    CONSTRAINT books_bills_one_owner CHECK ((num_nonnulls(landlord_id, business_id) <= 1))
 );
 
 
@@ -715,7 +796,9 @@ CREATE TABLE public.books_contractors (
     ytd_paid numeric(12,2) DEFAULT 0,
     w9_on_file boolean DEFAULT false,
     created_at timestamp with time zone DEFAULT now(),
-    updated_at timestamp with time zone DEFAULT now()
+    updated_at timestamp with time zone DEFAULT now(),
+    business_id uuid,
+    CONSTRAINT books_contractors_one_owner CHECK ((num_nonnulls(landlord_id, business_id) <= 1))
 );
 
 
@@ -750,7 +833,9 @@ CREATE TABLE public.books_employees (
     ytd_medicare numeric(12,2) DEFAULT 0,
     ytd_net numeric(12,2) DEFAULT 0,
     created_at timestamp with time zone DEFAULT now(),
-    updated_at timestamp with time zone DEFAULT now()
+    updated_at timestamp with time zone DEFAULT now(),
+    business_id uuid,
+    CONSTRAINT books_employees_one_owner CHECK ((num_nonnulls(landlord_id, business_id) <= 1))
 );
 
 
@@ -772,7 +857,9 @@ CREATE TABLE public.books_transactions (
     reconciled_at timestamp with time zone,
     source character varying(30) DEFAULT 'manual'::character varying,
     created_at timestamp with time zone DEFAULT now(),
-    updated_at timestamp with time zone DEFAULT now()
+    updated_at timestamp with time zone DEFAULT now(),
+    business_id uuid,
+    CONSTRAINT books_transactions_one_owner CHECK ((num_nonnulls(landlord_id, business_id) <= 1))
 );
 
 
@@ -798,7 +885,9 @@ CREATE TABLE public.books_vendors (
     notes text,
     created_at timestamp with time zone DEFAULT now(),
     updated_at timestamp with time zone DEFAULT now(),
-    credit_balance numeric(12,2) DEFAULT 0
+    credit_balance numeric(12,2) DEFAULT 0,
+    business_id uuid,
+    CONSTRAINT books_vendors_one_owner CHECK ((num_nonnulls(landlord_id, business_id) <= 1))
 );
 
 
@@ -956,6 +1045,23 @@ COMMENT ON TABLE public.business_customer_payment_update_tokens IS 'S510 single-
 
 
 --
+-- Name: business_customer_portal_tokens; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.business_customer_portal_tokens (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    token text NOT NULL,
+    business_id uuid NOT NULL,
+    customer_id uuid NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    revoked_at timestamp with time zone,
+    last_used_at timestamp with time zone,
+    created_by_user_id uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
 -- Name: business_customer_vehicles; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -1042,6 +1148,41 @@ COMMENT ON COLUMN public.business_customers.tax_exempt IS 'S506 customer-level e
 --
 
 COMMENT ON COLUMN public.business_customers.stripe_customer_id IS 'S508 platform-side Stripe Customer (cus_xxx). Created on first Checkout payment with save-card. Recurring cycles auto-charge against the saved PM here.';
+
+
+--
+-- Name: business_discount_codes; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.business_discount_codes (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    business_id uuid NOT NULL,
+    code text NOT NULL,
+    description text,
+    discount_type text NOT NULL,
+    discount_value numeric(10,2) NOT NULL,
+    is_active boolean DEFAULT true NOT NULL,
+    starts_at timestamp with time zone,
+    expires_at timestamp with time zone,
+    max_redemptions integer,
+    redemption_count integer DEFAULT 0 NOT NULL,
+    created_by uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT business_discount_codes_max_redemptions_positive CHECK (((max_redemptions IS NULL) OR (max_redemptions > 0))),
+    CONSTRAINT business_discount_codes_percent_range CHECK (((discount_type <> 'percent'::text) OR (discount_value <= (100)::numeric))),
+    CONSTRAINT business_discount_codes_redemptions_nonneg CHECK ((redemption_count >= 0)),
+    CONSTRAINT business_discount_codes_type_check CHECK ((discount_type = ANY (ARRAY['percent'::text, 'fixed'::text]))),
+    CONSTRAINT business_discount_codes_value_nonneg CHECK ((discount_value >= (0)::numeric)),
+    CONSTRAINT business_discount_codes_window CHECK (((starts_at IS NULL) OR (expires_at IS NULL) OR (expires_at > starts_at)))
+);
+
+
+--
+-- Name: TABLE business_discount_codes; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.business_discount_codes IS 'S513 owner-created discount codes (percent | fixed) applied to POS sales + invoices. redemption_count is bumped at apply time inside the sale/invoice transaction.';
 
 
 --
@@ -1136,6 +1277,13 @@ CREATE TABLE public.business_invoice_lines (
     line_total numeric(12,2) NOT NULL,
     service_key text,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
+    discount_type text,
+    discount_value numeric(10,2) DEFAULT 0 NOT NULL,
+    discount_amount numeric(10,2) DEFAULT 0 NOT NULL,
+    CONSTRAINT business_invoice_lines_discount_amount_nonneg CHECK ((discount_amount >= (0)::numeric)),
+    CONSTRAINT business_invoice_lines_discount_pct_range CHECK (((discount_type <> 'percent'::text) OR (discount_value <= (100)::numeric))),
+    CONSTRAINT business_invoice_lines_discount_type_check CHECK (((discount_type IS NULL) OR (discount_type = ANY (ARRAY['percent'::text, 'fixed'::text])))),
+    CONSTRAINT business_invoice_lines_discount_value_nonneg CHECK ((discount_value >= (0)::numeric)),
     CONSTRAINT business_invoice_lines_price_nn CHECK ((unit_price >= (0)::numeric)),
     CONSTRAINT business_invoice_lines_qty_positive CHECK ((quantity > (0)::numeric)),
     CONSTRAINT business_invoice_lines_total_nn CHECK ((line_total >= (0)::numeric))
@@ -1147,6 +1295,13 @@ CREATE TABLE public.business_invoice_lines (
 --
 
 COMMENT ON TABLE public.business_invoice_lines IS 'S493 business-invoice line items. ON DELETE CASCADE from the invoice. line_total = quantity * unit_price computed at write time.';
+
+
+--
+-- Name: COLUMN business_invoice_lines.discount_amount; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.business_invoice_lines.discount_amount IS 'S504 per-line discount $ off (resolved from discount_type/value against gross = quantity*unit_price). line_total is stored NET of this. Whole-order discount_code on business_invoices stacks on top, line-first.';
 
 
 --
@@ -1201,10 +1356,18 @@ CREATE TABLE public.business_invoices (
     source_recurring_schedule_id uuid,
     auto_charge_attempted_at timestamp with time zone,
     auto_charge_last_error text,
+    discount_code_id uuid,
+    discount_amount numeric(10,2) DEFAULT 0 NOT NULL,
+    refunded_amount numeric(12,2) DEFAULT 0 NOT NULL,
+    refunded_at timestamp with time zone,
+    refund_reason text,
+    stripe_refund_id text,
+    CONSTRAINT business_invoices_discount_nonneg CHECK ((discount_amount >= (0)::numeric)),
     CONSTRAINT business_invoices_paid_audit CHECK ((((status = 'paid'::text) AND (paid_at IS NOT NULL)) OR (status <> 'paid'::text))),
     CONSTRAINT business_invoices_paid_nn CHECK ((amount_paid >= (0)::numeric)),
+    CONSTRAINT business_invoices_refunded_amount_nonneg CHECK ((refunded_amount >= (0)::numeric)),
     CONSTRAINT business_invoices_sent_audit CHECK ((((status = ANY (ARRAY['sent'::text, 'paid'::text])) AND (sent_at IS NOT NULL)) OR (status <> ALL (ARRAY['sent'::text, 'paid'::text])))),
-    CONSTRAINT business_invoices_status_check CHECK ((status = ANY (ARRAY['draft'::text, 'sent'::text, 'paid'::text, 'void'::text]))),
+    CONSTRAINT business_invoices_status_check CHECK ((status = ANY (ARRAY['draft'::text, 'sent'::text, 'paid'::text, 'partially_refunded'::text, 'refunded'::text, 'void'::text]))),
     CONSTRAINT business_invoices_subtotal_nn CHECK ((subtotal >= (0)::numeric)),
     CONSTRAINT business_invoices_tax_nn CHECK ((tax_amount >= (0)::numeric)),
     CONSTRAINT business_invoices_total_nn CHECK ((total_amount >= (0)::numeric)),
@@ -1224,6 +1387,20 @@ COMMENT ON TABLE public.business_invoices IS 'S493 business-portal invoicing. Pe
 --
 
 COMMENT ON COLUMN public.business_invoices.auto_charge_attempted_at IS 'S508 set when a recurring cycle attempted an off-session charge. If auto_charge_last_error is also set, the charge failed and the invoice remains in draft for owner follow-up.';
+
+
+--
+-- Name: COLUMN business_invoices.discount_amount; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.business_invoices.discount_amount IS 'S513 pre-tax discount applied via discount_code_id. total_amount = (subtotal - discount_amount) + tax_amount.';
+
+
+--
+-- Name: COLUMN business_invoices.refunded_amount; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.business_invoices.refunded_amount IS 'S519 amount refunded against a paid invoice (bookkeeping). Operator runs the actual money refund on Stripe/terminal; GAM records it.';
 
 
 --
@@ -1255,8 +1432,10 @@ CREATE TABLE public.business_pos_transaction_lines (
     line_total numeric(10,2) NOT NULL,
     sort_order integer DEFAULT 0 NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
+    refunded_qty integer DEFAULT 0 NOT NULL,
     CONSTRAINT business_pos_transaction_lines_price_nonneg CHECK ((unit_price >= (0)::numeric)),
     CONSTRAINT business_pos_transaction_lines_qty_positive CHECK ((quantity > 0)),
+    CONSTRAINT business_pos_transaction_lines_refunded_qty_range CHECK (((refunded_qty >= 0) AND (refunded_qty <= quantity))),
     CONSTRAINT business_pos_transaction_lines_tax_range CHECK (((tax_rate >= (0)::numeric) AND (tax_rate < (1)::numeric)))
 );
 
@@ -1290,11 +1469,18 @@ CREATE TABLE public.business_pos_transactions (
     cashier_user_id uuid,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    tip_amount numeric(10,2) DEFAULT 0 NOT NULL,
+    discount_code_id uuid,
+    discount_amount numeric(10,2) DEFAULT 0 NOT NULL,
+    refunded_amount numeric(10,2) DEFAULT 0 NOT NULL,
+    CONSTRAINT business_pos_transactions_discount_nonneg CHECK ((discount_amount >= (0)::numeric)),
     CONSTRAINT business_pos_transactions_payment_method_check CHECK ((payment_method = ANY (ARRAY['cash'::text, 'card_recorded'::text, 'stripe_terminal'::text, 'stripe_checkout'::text]))),
-    CONSTRAINT business_pos_transactions_refund_consistency CHECK ((((status = 'refunded'::text) AND (refunded_at IS NOT NULL)) OR ((status <> 'refunded'::text) AND (refunded_at IS NULL)))),
-    CONSTRAINT business_pos_transactions_status_check CHECK ((status = ANY (ARRAY['completed'::text, 'refunded'::text, 'void'::text]))),
+    CONSTRAINT business_pos_transactions_refund_consistency CHECK ((((status = ANY (ARRAY['refunded'::text, 'partially_refunded'::text])) AND (refunded_at IS NOT NULL)) OR ((status <> ALL (ARRAY['refunded'::text, 'partially_refunded'::text])) AND (refunded_at IS NULL)))),
+    CONSTRAINT business_pos_transactions_refunded_amount_nonneg CHECK ((refunded_amount >= (0)::numeric)),
+    CONSTRAINT business_pos_transactions_status_check CHECK ((status = ANY (ARRAY['completed'::text, 'partially_refunded'::text, 'refunded'::text, 'void'::text]))),
     CONSTRAINT business_pos_transactions_subtotal_nonneg CHECK ((subtotal >= (0)::numeric)),
     CONSTRAINT business_pos_transactions_tax_nonneg CHECK ((tax_amount >= (0)::numeric)),
+    CONSTRAINT business_pos_transactions_tip_nonneg CHECK ((tip_amount >= (0)::numeric)),
     CONSTRAINT business_pos_transactions_total_nonneg CHECK ((total_amount >= (0)::numeric))
 );
 
@@ -1311,6 +1497,27 @@ COMMENT ON TABLE public.business_pos_transactions IS 'S497 business-portal POS s
 --
 
 COMMENT ON COLUMN public.business_pos_transactions.payment_method IS 'cash | card_recorded (v1). stripe_terminal + stripe_checkout reserved for future hardware/QR integrations.';
+
+
+--
+-- Name: COLUMN business_pos_transactions.tip_amount; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.business_pos_transactions.tip_amount IS 'S512 customer gratuity, tracked separately from total_amount (which stays sale-only). Grand total charged = total_amount + tip_amount.';
+
+
+--
+-- Name: COLUMN business_pos_transactions.discount_amount; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.business_pos_transactions.discount_amount IS 'S513 pre-tax discount applied via discount_code_id. subtotal is full price; total_amount = (subtotal - discount_amount) + (scaled) tax_amount.';
+
+
+--
+-- Name: COLUMN business_pos_transactions.refunded_amount; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.business_pos_transactions.refunded_amount IS 'S519 running total refunded (partial or full). status = partially_refunded until refunded_qty hits quantity on every line.';
 
 
 --
@@ -1331,6 +1538,13 @@ CREATE TABLE public.business_quote_lines (
     line_total numeric(10,2) NOT NULL,
     sort_order integer DEFAULT 0 NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
+    discount_type text,
+    discount_value numeric(10,2) DEFAULT 0 NOT NULL,
+    discount_amount numeric(10,2) DEFAULT 0 NOT NULL,
+    CONSTRAINT business_quote_lines_discount_amount_nonneg CHECK ((discount_amount >= (0)::numeric)),
+    CONSTRAINT business_quote_lines_discount_pct_range CHECK (((discount_type <> 'percent'::text) OR (discount_value <= (100)::numeric))),
+    CONSTRAINT business_quote_lines_discount_type_check CHECK (((discount_type IS NULL) OR (discount_type = ANY (ARRAY['percent'::text, 'fixed'::text])))),
+    CONSTRAINT business_quote_lines_discount_value_nonneg CHECK ((discount_value >= (0)::numeric)),
     CONSTRAINT business_quote_lines_price_nonneg CHECK ((unit_price >= (0)::numeric)),
     CONSTRAINT business_quote_lines_qty_positive CHECK ((quantity > (0)::numeric)),
     CONSTRAINT business_quote_lines_tax_range CHECK (((tax_rate >= (0)::numeric) AND (tax_rate < (1)::numeric))),
@@ -1343,6 +1557,13 @@ CREATE TABLE public.business_quote_lines (
 --
 
 COMMENT ON TABLE public.business_quote_lines IS 'S501 quote line items. line_type labor (hours × rate) | part (snapshots inventory item but does NOT decrement stock) | fee | generic.';
+
+
+--
+-- Name: COLUMN business_quote_lines.discount_amount; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.business_quote_lines.discount_amount IS 'S504 per-line discount $ off (resolved from discount_type/value against gross = quantity*unit_price). line_subtotal/line_tax/line_total are stored NET of this. Whole-order code stacks on top, line-first.';
 
 
 --
@@ -1383,8 +1604,11 @@ CREATE TABLE public.business_quotes (
     created_by_user_id uuid,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    discount_code_id uuid,
+    discount_amount numeric(10,2) DEFAULT 0 NOT NULL,
     CONSTRAINT business_quotes_accepted_audit CHECK ((((status = 'accepted'::text) AND (accepted_at IS NOT NULL)) OR ((status <> 'accepted'::text) AND (accepted_at IS NULL)))),
     CONSTRAINT business_quotes_declined_audit CHECK ((((status = 'declined'::text) AND (declined_at IS NOT NULL) AND (decline_reason IS NOT NULL)) OR ((status <> 'declined'::text) AND (declined_at IS NULL)))),
+    CONSTRAINT business_quotes_discount_nonneg CHECK ((discount_amount >= (0)::numeric)),
     CONSTRAINT business_quotes_money_nonneg CHECK (((subtotal >= (0)::numeric) AND (tax_amount >= (0)::numeric) AND (total_amount >= (0)::numeric))),
     CONSTRAINT business_quotes_sent_audit CHECK ((((status = ANY (ARRAY['sent'::text, 'accepted'::text, 'declined'::text, 'expired'::text])) AND (sent_at IS NOT NULL)) OR ((status = 'draft'::text) AND (sent_at IS NULL)))),
     CONSTRAINT business_quotes_status_check CHECK ((status = ANY (ARRAY['draft'::text, 'sent'::text, 'accepted'::text, 'declined'::text, 'expired'::text])))
@@ -1396,6 +1620,13 @@ CREATE TABLE public.business_quotes (
 --
 
 COMMENT ON TABLE public.business_quotes IS 'S501 business-portal quotes / estimates. Pre-work price proposal sent to a customer. On accepted, owner converts to a draft invoice or open work order via the convert endpoints; downstream linkage flows both ways.';
+
+
+--
+-- Name: COLUMN business_quotes.discount_amount; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.business_quotes.discount_amount IS 'S503 pre-tax discount applied via discount_code_id (preview, recomputed from the code on every line change). NO redemption consumed at quote level — consumed at convert-to-invoice. total_amount = (subtotal - discount_amount) + scaled tax_amount.';
 
 
 --
@@ -1564,6 +1795,36 @@ CREATE TABLE public.business_work_order_sequences (
 
 
 --
+-- Name: business_work_order_time_entries; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.business_work_order_time_entries (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    business_id uuid NOT NULL,
+    work_order_id uuid NOT NULL,
+    user_id uuid NOT NULL,
+    started_at timestamp with time zone NOT NULL,
+    ended_at timestamp with time zone,
+    duration_minutes integer,
+    note text,
+    billed_at timestamp with time zone,
+    billed_line_id uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT business_wo_time_entries_duration_nonneg CHECK (((duration_minutes IS NULL) OR (duration_minutes >= 0))),
+    CONSTRAINT business_wo_time_entries_running_consistency CHECK ((((ended_at IS NULL) AND (duration_minutes IS NULL)) OR ((ended_at IS NOT NULL) AND (duration_minutes IS NOT NULL)))),
+    CONSTRAINT business_wo_time_entries_span CHECK (((ended_at IS NULL) OR (ended_at >= started_at)))
+);
+
+
+--
+-- Name: TABLE business_work_order_time_entries; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.business_work_order_time_entries IS 'S514 work-order labor time tracking. Tech clock-in/out spans; unbilled stopped spans roll into a labor line via the /time/bill endpoint.';
+
+
+--
 -- Name: business_work_orders; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -1639,9 +1900,11 @@ CREATE TABLE public.businesses (
     public_booking_slug text,
     public_booking_intro text,
     business_hours jsonb DEFAULT '{}'::jsonb NOT NULL,
+    onboarding_completed_at timestamp with time zone,
+    appointment_reminders_enabled boolean DEFAULT true NOT NULL,
     CONSTRAINT businesses_business_type_check CHECK ((business_type = ANY (ARRAY['trash_hauling'::text, 'maintenance_crew'::text, 'mobile_rental'::text, 'equipment_rental'::text, 'mini_market'::text, 'mechanic_stationary'::text, 'mechanic_mobile'::text, 'other'::text]))),
     CONSTRAINT businesses_default_tax_rate_range CHECK (((default_tax_rate >= (0)::numeric) AND (default_tax_rate < (1)::numeric))),
-    CONSTRAINT businesses_enabled_features_check CHECK ((enabled_features <@ ARRAY['customers'::text, 'staff'::text, 'recurring_schedules'::text, 'appointments'::text, 'routing'::text, 'pos'::text, 'inventory'::text, 'work_orders'::text, 'customer_vehicles'::text, 'invoicing'::text, 'payments'::text, 'quotes'::text])),
+    CONSTRAINT businesses_enabled_features_check CHECK ((enabled_features <@ ARRAY['customers'::text, 'staff'::text, 'recurring_schedules'::text, 'appointments'::text, 'routing'::text, 'pos'::text, 'inventory'::text, 'work_orders'::text, 'customer_vehicles'::text, 'invoicing'::text, 'payments'::text, 'quotes'::text, 'discounts'::text, 'bookkeeping'::text])),
     CONSTRAINT businesses_public_booking_enabled_needs_slug CHECK (((public_booking_enabled = false) OR (public_booking_slug IS NOT NULL))),
     CONSTRAINT businesses_public_booking_slug_format CHECK (((public_booking_slug IS NULL) OR ((public_booking_slug ~ '^[a-z0-9][a-z0-9-]{1,60}$'::text) AND (public_booking_slug !~ '--'::text)))),
     CONSTRAINT businesses_status_check CHECK ((status = ANY (ARRAY['active'::text, 'suspended'::text, 'archived'::text])))
@@ -1667,6 +1930,13 @@ COMMENT ON COLUMN public.businesses.public_booking_slug IS 'S507 URL-safe identi
 --
 
 COMMENT ON COLUMN public.businesses.business_hours IS 'S507 weekly hours map. Keys "0"-"6" (Sun-Sat) → {open, close} as HH:MM strings, or null for closed.';
+
+
+--
+-- Name: COLUMN businesses.onboarding_completed_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.businesses.onboarding_completed_at IS 'S515 set when the owner finishes or dismisses the onboarding wizard. NULL = wizard still surfaces.';
 
 
 --
@@ -2647,7 +2917,9 @@ CREATE TABLE public.journal_entries (
     total_credits numeric(12,2) DEFAULT 0,
     created_by uuid,
     created_at timestamp with time zone DEFAULT now(),
-    updated_at timestamp with time zone DEFAULT now()
+    updated_at timestamp with time zone DEFAULT now(),
+    business_id uuid,
+    CONSTRAINT journal_entries_one_owner CHECK ((num_nonnulls(landlord_id, business_id) <= 1))
 );
 
 
@@ -2938,6 +3210,34 @@ CREATE TABLE public.lease_pets (
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT lease_pets_species_check CHECK ((species = ANY (ARRAY['dog'::text, 'cat'::text, 'bird'::text, 'reptile'::text, 'fish'::text, 'small_mammal'::text, 'livestock'::text, 'other'::text])))
 );
+
+
+--
+-- Name: lease_renewal_requests; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.lease_renewal_requests (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    lease_id uuid NOT NULL,
+    tenant_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    requested_by_user_id uuid NOT NULL,
+    preferred_term text,
+    notes text,
+    status text DEFAULT 'requested'::text NOT NULL,
+    requested_at timestamp with time zone DEFAULT now() NOT NULL,
+    resolved_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT lease_renewal_requests_status_check CHECK ((status = ANY (ARRAY['requested'::text, 'approved'::text, 'declined'::text, 'cancelled'::text, 'completed'::text])))
+);
+
+
+--
+-- Name: TABLE lease_renewal_requests; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.lease_renewal_requests IS 'Tenant intent-to-renew, captured (often by the agent, gated by the lease_renewal property permission). Landlord finalizes the actual lease. Status mirrors LEASE_RENEWAL_REQUEST_STATUSES in packages/shared.';
 
 
 --
@@ -3506,7 +3806,9 @@ CREATE TABLE public.payroll_runs (
     approved_by uuid,
     voided_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now(),
-    updated_at timestamp with time zone DEFAULT now()
+    updated_at timestamp with time zone DEFAULT now(),
+    business_id uuid,
+    CONSTRAINT payroll_runs_one_owner CHECK ((num_nonnulls(landlord_id, business_id) <= 1))
 );
 
 
@@ -4386,6 +4688,29 @@ COMMENT ON COLUMN public.properties.flexcharge_enabled IS 'S309: per-Location Fl
 
 
 --
+-- Name: property_agent_permissions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.property_agent_permissions (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    property_id uuid NOT NULL,
+    capability text NOT NULL,
+    enabled boolean DEFAULT false NOT NULL,
+    updated_by uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT property_agent_permissions_capability_check CHECK ((capability = ANY (ARRAY['take_payment'::text, 'lease_renewal'::text, 'bill_fee'::text])))
+);
+
+
+--
+-- Name: TABLE property_agent_permissions; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.property_agent_permissions IS 'Per-property landlord opt-in for revenue-affecting agent actions. No row OR enabled=false => the agent may NOT take that action on that property. Capability set mirrors AGENT_REVENUE_CAPABILITIES in packages/shared.';
+
+
+--
 -- Name: property_allocation_rules; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -5258,7 +5583,8 @@ CREATE TABLE public.unit_inspection_photos (
     photo_url text NOT NULL,
     caption text,
     uploaded_by uuid NOT NULL,
-    uploaded_at timestamp with time zone DEFAULT now() NOT NULL
+    uploaded_at timestamp with time zone DEFAULT now() NOT NULL,
+    captured_live boolean DEFAULT false NOT NULL
 );
 
 
@@ -5274,6 +5600,25 @@ CREATE TABLE public.unit_inspection_signatures (
     signed_at timestamp with time zone DEFAULT now() NOT NULL,
     signature_evidence jsonb DEFAULT '{}'::jsonb NOT NULL,
     CONSTRAINT unit_inspection_signatures_signer_role_check CHECK ((signer_role = ANY (ARRAY['tenant'::text, 'landlord'::text, 'inspector'::text])))
+);
+
+
+--
+-- Name: unit_inspection_videos; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.unit_inspection_videos (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    inspection_id uuid NOT NULL,
+    title text,
+    video_url text NOT NULL,
+    thumbnail_url text,
+    duration_seconds integer,
+    file_size bigint,
+    mime_type text,
+    captured_live boolean DEFAULT false NOT NULL,
+    uploaded_by uuid NOT NULL,
+    uploaded_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
 
@@ -5298,7 +5643,7 @@ CREATE TABLE public.unit_inspections (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     reminder_sent_at timestamp with time zone,
-    CONSTRAINT unit_inspections_inspection_type_check CHECK ((inspection_type = ANY (ARRAY['move_in'::text, 'move_out'::text, 'periodic'::text]))),
+    CONSTRAINT unit_inspections_inspection_type_check CHECK ((inspection_type = ANY (ARRAY['move_in'::text, 'move_out'::text, 'periodic'::text, 'turnover'::text]))),
     CONSTRAINT unit_inspections_status_check CHECK ((status = ANY (ARRAY['draft'::text, 'tenant_signed'::text, 'landlord_signed'::text, 'finalized'::text, 'disputed'::text, 'cancelled'::text])))
 );
 
@@ -5885,6 +6230,30 @@ ALTER TABLE ONLY public.bank_reconciliations
 
 
 --
+-- Name: booking_change_requests booking_change_requests_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.booking_change_requests
+    ADD CONSTRAINT booking_change_requests_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: booking_guest_access_tokens booking_guest_access_tokens_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.booking_guest_access_tokens
+    ADD CONSTRAINT booking_guest_access_tokens_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: booking_guest_access_tokens booking_guest_access_tokens_token_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.booking_guest_access_tokens
+    ADD CONSTRAINT booking_guest_access_tokens_token_key UNIQUE (token);
+
+
+--
 -- Name: bookkeeper_scopes bookkeeper_scopes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -6013,6 +6382,22 @@ ALTER TABLE ONLY public.business_customer_payment_update_tokens
 
 
 --
+-- Name: business_customer_portal_tokens business_customer_portal_tokens_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_customer_portal_tokens
+    ADD CONSTRAINT business_customer_portal_tokens_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: business_customer_portal_tokens business_customer_portal_tokens_token_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_customer_portal_tokens
+    ADD CONSTRAINT business_customer_portal_tokens_token_key UNIQUE (token);
+
+
+--
 -- Name: business_customer_vehicles business_customer_vehicles_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -6034,6 +6419,22 @@ ALTER TABLE ONLY public.business_customer_vehicles
 
 ALTER TABLE ONLY public.business_customers
     ADD CONSTRAINT business_customers_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: business_discount_codes business_discount_codes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_discount_codes
+    ADD CONSTRAINT business_discount_codes_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: business_discount_codes business_discount_codes_unique_code; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_discount_codes
+    ADD CONSTRAINT business_discount_codes_unique_code UNIQUE (business_id, code);
 
 
 --
@@ -6218,6 +6619,14 @@ ALTER TABLE ONLY public.business_users
 
 ALTER TABLE ONLY public.business_users
     ADD CONSTRAINT business_users_unique_user_per_business UNIQUE (business_id, user_id);
+
+
+--
+-- Name: business_work_order_time_entries business_wo_time_entries_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_work_order_time_entries
+    ADD CONSTRAINT business_wo_time_entries_pkey PRIMARY KEY (id);
 
 
 --
@@ -6805,6 +7214,14 @@ ALTER TABLE ONLY public.lease_pets
 
 
 --
+-- Name: lease_renewal_requests lease_renewal_requests_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_renewal_requests
+    ADD CONSTRAINT lease_renewal_requests_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: lease_template_fields lease_template_fields_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -7365,6 +7782,22 @@ ALTER TABLE ONLY public.properties
 
 
 --
+-- Name: property_agent_permissions property_agent_permissions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_agent_permissions
+    ADD CONSTRAINT property_agent_permissions_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: property_agent_permissions property_agent_permissions_property_id_capability_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_agent_permissions
+    ADD CONSTRAINT property_agent_permissions_property_id_capability_key UNIQUE (property_id, capability);
+
+
+--
 -- Name: property_allocation_rules property_allocation_rules_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -7749,6 +8182,14 @@ ALTER TABLE ONLY public.unit_inspection_signatures
 
 
 --
+-- Name: unit_inspection_videos unit_inspection_videos_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_inspection_videos
+    ADD CONSTRAINT unit_inspection_videos_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: unit_inspections unit_inspections_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -8112,6 +8553,13 @@ CREATE INDEX idx_audit_entity ON public.audit_log USING btree (entity_type, enti
 
 
 --
+-- Name: idx_bank_reconciliations_business; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_bank_reconciliations_business ON public.bank_reconciliations USING btree (business_id) WHERE (business_id IS NOT NULL);
+
+
+--
 -- Name: idx_bcput_active_lookup; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -8182,6 +8630,27 @@ CREATE INDEX idx_bgc_user_id ON public.background_checks USING btree (user_id);
 
 
 --
+-- Name: idx_booking_change_requests_booking; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_booking_change_requests_booking ON public.booking_change_requests USING btree (booking_id);
+
+
+--
+-- Name: idx_booking_change_requests_landlord_open; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_booking_change_requests_landlord_open ON public.booking_change_requests USING btree (landlord_id) WHERE (status = 'requested'::text);
+
+
+--
+-- Name: idx_booking_guest_tokens_booking; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_booking_guest_tokens_booking ON public.booking_guest_access_tokens USING btree (booking_id);
+
+
+--
 -- Name: idx_bookkeeper_scopes_landlord; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -8193,6 +8662,48 @@ CREATE INDEX idx_bookkeeper_scopes_landlord ON public.bookkeeper_scopes USING bt
 --
 
 CREATE INDEX idx_bookkeeper_scopes_user ON public.bookkeeper_scopes USING btree (user_id);
+
+
+--
+-- Name: idx_books_accounts_business; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_books_accounts_business ON public.books_accounts USING btree (business_id) WHERE (business_id IS NOT NULL);
+
+
+--
+-- Name: idx_books_bills_business; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_books_bills_business ON public.books_bills USING btree (business_id) WHERE (business_id IS NOT NULL);
+
+
+--
+-- Name: idx_books_contractors_business; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_books_contractors_business ON public.books_contractors USING btree (business_id) WHERE (business_id IS NOT NULL);
+
+
+--
+-- Name: idx_books_employees_business; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_books_employees_business ON public.books_employees USING btree (business_id) WHERE (business_id IS NOT NULL);
+
+
+--
+-- Name: idx_books_transactions_business; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_books_transactions_business ON public.books_transactions USING btree (business_id) WHERE (business_id IS NOT NULL);
+
+
+--
+-- Name: idx_books_vendors_business; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_books_vendors_business ON public.books_vendors USING btree (business_id) WHERE (business_id IS NOT NULL);
 
 
 --
@@ -8259,6 +8770,20 @@ CREATE INDEX idx_business_bookable_services_business ON public.business_bookable
 
 
 --
+-- Name: idx_business_customer_portal_tokens_business; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_customer_portal_tokens_business ON public.business_customer_portal_tokens USING btree (business_id);
+
+
+--
+-- Name: idx_business_customer_portal_tokens_customer; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_customer_portal_tokens_customer ON public.business_customer_portal_tokens USING btree (customer_id);
+
+
+--
 -- Name: idx_business_customer_vehicles_business; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -8305,6 +8830,13 @@ CREATE INDEX idx_business_customers_geocoded ON public.business_customers USING 
 --
 
 CREATE INDEX idx_business_customers_stripe_customer_id ON public.business_customers USING btree (stripe_customer_id) WHERE (stripe_customer_id IS NOT NULL);
+
+
+--
+-- Name: idx_business_discount_codes_business; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_discount_codes_business ON public.business_discount_codes USING btree (business_id, is_active);
 
 
 --
@@ -8501,6 +9033,20 @@ CREATE INDEX idx_business_users_business ON public.business_users USING btree (b
 --
 
 CREATE INDEX idx_business_users_user ON public.business_users USING btree (user_id) WHERE (status = 'active'::text);
+
+
+--
+-- Name: idx_business_wo_time_entries_business; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_wo_time_entries_business ON public.business_work_order_time_entries USING btree (business_id);
+
+
+--
+-- Name: idx_business_wo_time_entries_wo; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_wo_time_entries_wo ON public.business_work_order_time_entries USING btree (work_order_id, started_at);
 
 
 --
@@ -9183,6 +9729,13 @@ CREATE INDEX idx_invoices_unit ON public.invoices USING btree (unit_id);
 
 
 --
+-- Name: idx_journal_entries_business; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_journal_entries_business ON public.journal_entries USING btree (business_id) WHERE (business_id IS NOT NULL);
+
+
+--
 -- Name: idx_landlord_pfo_landlord; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -9306,6 +9859,20 @@ CREATE INDEX idx_lease_occupants_lease ON public.lease_occupants USING btree (le
 --
 
 CREATE INDEX idx_lease_pets_lease ON public.lease_pets USING btree (lease_id);
+
+
+--
+-- Name: idx_lease_renewal_requests_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_lease_renewal_requests_landlord ON public.lease_renewal_requests USING btree (landlord_id);
+
+
+--
+-- Name: idx_lease_renewal_requests_lease; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_lease_renewal_requests_lease ON public.lease_renewal_requests USING btree (lease_id);
 
 
 --
@@ -9579,6 +10146,13 @@ CREATE INDEX idx_payments_tenant ON public.payments USING btree (tenant_id);
 --
 
 CREATE INDEX idx_payments_unit ON public.payments USING btree (unit_id);
+
+
+--
+-- Name: idx_payroll_runs_business; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_payroll_runs_business ON public.payroll_runs USING btree (business_id) WHERE (business_id IS NOT NULL);
 
 
 --
@@ -10079,6 +10653,13 @@ CREATE INDEX idx_properties_pm_company ON public.properties USING btree (pm_comp
 
 
 --
+-- Name: idx_property_agent_permissions_property; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_property_agent_permissions_property ON public.property_agent_permissions USING btree (property_id);
+
+
+--
 -- Name: idx_property_allocation_rules_bank_account; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -10454,6 +11035,13 @@ CREATE INDEX idx_unit_inspection_photos_item ON public.unit_inspection_photos US
 --
 
 CREATE INDEX idx_unit_inspection_signatures_inspection ON public.unit_inspection_signatures USING btree (inspection_id);
+
+
+--
+-- Name: idx_unit_inspection_videos_inspection; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_unit_inspection_videos_inspection ON public.unit_inspection_videos USING btree (inspection_id);
 
 
 --
@@ -10877,6 +11465,20 @@ CREATE UNIQUE INDEX uniq_business_invoices_checkout_session ON public.business_i
 
 
 --
+-- Name: uniq_open_renewal_request_per_lease; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uniq_open_renewal_request_per_lease ON public.lease_renewal_requests USING btree (lease_id) WHERE (status = 'requested'::text);
+
+
+--
+-- Name: uq_business_wo_time_entries_one_running; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_business_wo_time_entries_one_running ON public.business_work_order_time_entries USING btree (work_order_id, user_id) WHERE (ended_at IS NULL);
+
+
+--
 -- Name: ux_invoices_landlord_number; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -11031,6 +11633,13 @@ CREATE TRIGGER trg_business_customers_updated_at BEFORE UPDATE ON public.busines
 
 
 --
+-- Name: business_discount_codes trg_business_discount_codes_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_business_discount_codes_updated_at BEFORE UPDATE ON public.business_discount_codes FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
 -- Name: business_inventory_items trg_business_inventory_items_updated_at; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -11070,6 +11679,13 @@ CREATE TRIGGER trg_business_user_invitations_updated_at BEFORE UPDATE ON public.
 --
 
 CREATE TRIGGER trg_business_users_updated_at BEFORE UPDATE ON public.business_users FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: business_work_order_time_entries trg_business_wo_time_entries_updated_at; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_business_wo_time_entries_updated_at BEFORE UPDATE ON public.business_work_order_time_entries FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
 
 
 --
@@ -11273,6 +11889,20 @@ CREATE TRIGGER trg_tenant_identifications_updated_at BEFORE UPDATE ON public.ten
 --
 
 CREATE TRIGGER trg_tenants_updated_at BEFORE UPDATE ON public.tenants FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
+
+
+--
+-- Name: unit_inspection_videos trg_unit_inspection_videos_no_delete; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_unit_inspection_videos_no_delete BEFORE DELETE ON public.unit_inspection_videos FOR EACH ROW EXECUTE FUNCTION public.unit_inspection_videos_no_delete();
+
+
+--
+-- Name: unit_inspection_videos trg_unit_inspection_videos_protect_url; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_unit_inspection_videos_protect_url BEFORE UPDATE ON public.unit_inspection_videos FOR EACH ROW EXECUTE FUNCTION public.unit_inspection_videos_protect_url();
 
 
 --
@@ -11496,11 +12126,35 @@ ALTER TABLE ONLY public.bank_reconciliations
 
 
 --
+-- Name: bank_reconciliations bank_reconciliations_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bank_reconciliations
+    ADD CONSTRAINT bank_reconciliations_business_id_fkey FOREIGN KEY (business_id) REFERENCES public.businesses(id) ON DELETE CASCADE;
+
+
+--
 -- Name: bank_reconciliations bank_reconciliations_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.bank_reconciliations
     ADD CONSTRAINT bank_reconciliations_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: booking_change_requests booking_change_requests_booking_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.booking_change_requests
+    ADD CONSTRAINT booking_change_requests_booking_id_fkey FOREIGN KEY (booking_id) REFERENCES public.unit_bookings(id) ON DELETE CASCADE;
+
+
+--
+-- Name: booking_guest_access_tokens booking_guest_access_tokens_booking_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.booking_guest_access_tokens
+    ADD CONSTRAINT booking_guest_access_tokens_booking_id_fkey FOREIGN KEY (booking_id) REFERENCES public.unit_bookings(id) ON DELETE CASCADE;
 
 
 --
@@ -11520,6 +12174,14 @@ ALTER TABLE ONLY public.bookkeeper_scopes
 
 
 --
+-- Name: books_accounts books_accounts_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.books_accounts
+    ADD CONSTRAINT books_accounts_business_id_fkey FOREIGN KEY (business_id) REFERENCES public.businesses(id) ON DELETE CASCADE;
+
+
+--
 -- Name: books_accounts books_accounts_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -11533,6 +12195,14 @@ ALTER TABLE ONLY public.books_accounts
 
 ALTER TABLE ONLY public.books_bills
     ADD CONSTRAINT books_bills_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.books_accounts(id);
+
+
+--
+-- Name: books_bills books_bills_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.books_bills
+    ADD CONSTRAINT books_bills_business_id_fkey FOREIGN KEY (business_id) REFERENCES public.businesses(id) ON DELETE CASCADE;
 
 
 --
@@ -11552,11 +12222,27 @@ ALTER TABLE ONLY public.books_bills
 
 
 --
+-- Name: books_contractors books_contractors_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.books_contractors
+    ADD CONSTRAINT books_contractors_business_id_fkey FOREIGN KEY (business_id) REFERENCES public.businesses(id) ON DELETE CASCADE;
+
+
+--
 -- Name: books_contractors books_contractors_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.books_contractors
     ADD CONSTRAINT books_contractors_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: books_employees books_employees_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.books_employees
+    ADD CONSTRAINT books_employees_business_id_fkey FOREIGN KEY (business_id) REFERENCES public.businesses(id) ON DELETE CASCADE;
 
 
 --
@@ -11576,11 +12262,27 @@ ALTER TABLE ONLY public.books_transactions
 
 
 --
+-- Name: books_transactions books_transactions_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.books_transactions
+    ADD CONSTRAINT books_transactions_business_id_fkey FOREIGN KEY (business_id) REFERENCES public.businesses(id) ON DELETE CASCADE;
+
+
+--
 -- Name: books_transactions books_transactions_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.books_transactions
     ADD CONSTRAINT books_transactions_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: books_vendors books_vendors_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.books_vendors
+    ADD CONSTRAINT books_vendors_business_id_fkey FOREIGN KEY (business_id) REFERENCES public.businesses(id) ON DELETE CASCADE;
 
 
 --
@@ -11688,6 +12390,14 @@ ALTER TABLE ONLY public.business_customer_payment_update_tokens
 
 
 --
+-- Name: business_customer_portal_tokens business_customer_portal_tokens_customer_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_customer_portal_tokens
+    ADD CONSTRAINT business_customer_portal_tokens_customer_id_fkey FOREIGN KEY (customer_id) REFERENCES public.business_customers(id) ON DELETE CASCADE;
+
+
+--
 -- Name: business_customer_vehicles business_customer_vehicles_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -11717,6 +12427,22 @@ ALTER TABLE ONLY public.business_customers
 
 ALTER TABLE ONLY public.business_customers
     ADD CONSTRAINT business_customers_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: business_discount_codes business_discount_codes_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_discount_codes
+    ADD CONSTRAINT business_discount_codes_business_id_fkey FOREIGN KEY (business_id) REFERENCES public.businesses(id) ON DELETE CASCADE;
+
+
+--
+-- Name: business_discount_codes business_discount_codes_created_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_discount_codes
+    ADD CONSTRAINT business_discount_codes_created_by_fkey FOREIGN KEY (created_by) REFERENCES public.users(id);
 
 
 --
@@ -11800,6 +12526,14 @@ ALTER TABLE ONLY public.business_invoices
 
 
 --
+-- Name: business_invoices business_invoices_discount_code_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_invoices
+    ADD CONSTRAINT business_invoices_discount_code_id_fkey FOREIGN KEY (discount_code_id) REFERENCES public.business_discount_codes(id) ON DELETE SET NULL;
+
+
+--
 -- Name: business_invoices business_invoices_source_quote_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -11872,6 +12606,14 @@ ALTER TABLE ONLY public.business_pos_transactions
 
 
 --
+-- Name: business_pos_transactions business_pos_transactions_discount_code_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_pos_transactions
+    ADD CONSTRAINT business_pos_transactions_discount_code_id_fkey FOREIGN KEY (discount_code_id) REFERENCES public.business_discount_codes(id) ON DELETE SET NULL;
+
+
+--
 -- Name: business_quote_lines business_quote_lines_item_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -11917,6 +12659,14 @@ ALTER TABLE ONLY public.business_quotes
 
 ALTER TABLE ONLY public.business_quotes
     ADD CONSTRAINT business_quotes_customer_id_fkey FOREIGN KEY (customer_id) REFERENCES public.business_customers(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: business_quotes business_quotes_discount_code_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_quotes
+    ADD CONSTRAINT business_quotes_discount_code_id_fkey FOREIGN KEY (discount_code_id) REFERENCES public.business_discount_codes(id) ON DELETE SET NULL;
 
 
 --
@@ -12045,6 +12795,38 @@ ALTER TABLE ONLY public.business_work_order_lines
 
 ALTER TABLE ONLY public.business_work_order_sequences
     ADD CONSTRAINT business_work_order_sequences_business_id_fkey FOREIGN KEY (business_id) REFERENCES public.businesses(id) ON DELETE CASCADE;
+
+
+--
+-- Name: business_work_order_time_entries business_work_order_time_entries_billed_line_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_work_order_time_entries
+    ADD CONSTRAINT business_work_order_time_entries_billed_line_id_fkey FOREIGN KEY (billed_line_id) REFERENCES public.business_work_order_lines(id) ON DELETE SET NULL;
+
+
+--
+-- Name: business_work_order_time_entries business_work_order_time_entries_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_work_order_time_entries
+    ADD CONSTRAINT business_work_order_time_entries_business_id_fkey FOREIGN KEY (business_id) REFERENCES public.businesses(id) ON DELETE CASCADE;
+
+
+--
+-- Name: business_work_order_time_entries business_work_order_time_entries_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_work_order_time_entries
+    ADD CONSTRAINT business_work_order_time_entries_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: business_work_order_time_entries business_work_order_time_entries_work_order_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_work_order_time_entries
+    ADD CONSTRAINT business_work_order_time_entries_work_order_id_fkey FOREIGN KEY (work_order_id) REFERENCES public.business_work_orders(id) ON DELETE CASCADE;
 
 
 --
@@ -12848,6 +13630,14 @@ ALTER TABLE ONLY public.invoices
 
 
 --
+-- Name: journal_entries journal_entries_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.journal_entries
+    ADD CONSTRAINT journal_entries_business_id_fkey FOREIGN KEY (business_id) REFERENCES public.businesses(id) ON DELETE CASCADE;
+
+
+--
 -- Name: journal_entries journal_entries_created_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -13045,6 +13835,38 @@ ALTER TABLE ONLY public.lease_occupants
 
 ALTER TABLE ONLY public.lease_pets
     ADD CONSTRAINT lease_pets_lease_id_fkey FOREIGN KEY (lease_id) REFERENCES public.leases(id) ON DELETE CASCADE;
+
+
+--
+-- Name: lease_renewal_requests lease_renewal_requests_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_renewal_requests
+    ADD CONSTRAINT lease_renewal_requests_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id);
+
+
+--
+-- Name: lease_renewal_requests lease_renewal_requests_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_renewal_requests
+    ADD CONSTRAINT lease_renewal_requests_lease_id_fkey FOREIGN KEY (lease_id) REFERENCES public.leases(id) ON DELETE CASCADE;
+
+
+--
+-- Name: lease_renewal_requests lease_renewal_requests_requested_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_renewal_requests
+    ADD CONSTRAINT lease_renewal_requests_requested_by_user_id_fkey FOREIGN KEY (requested_by_user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: lease_renewal_requests lease_renewal_requests_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_renewal_requests
+    ADD CONSTRAINT lease_renewal_requests_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id);
 
 
 --
@@ -13501,6 +14323,14 @@ ALTER TABLE ONLY public.payroll_run_lines
 
 ALTER TABLE ONLY public.payroll_runs
     ADD CONSTRAINT payroll_runs_approved_by_fkey FOREIGN KEY (approved_by) REFERENCES public.users(id);
+
+
+--
+-- Name: payroll_runs payroll_runs_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payroll_runs
+    ADD CONSTRAINT payroll_runs_business_id_fkey FOREIGN KEY (business_id) REFERENCES public.businesses(id) ON DELETE CASCADE;
 
 
 --
@@ -14184,6 +15014,22 @@ ALTER TABLE ONLY public.properties
 
 
 --
+-- Name: property_agent_permissions property_agent_permissions_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_agent_permissions
+    ADD CONSTRAINT property_agent_permissions_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE CASCADE;
+
+
+--
+-- Name: property_agent_permissions property_agent_permissions_updated_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_agent_permissions
+    ADD CONSTRAINT property_agent_permissions_updated_by_fkey FOREIGN KEY (updated_by) REFERENCES public.users(id);
+
+
+--
 -- Name: property_allocation_rules property_allocation_rules_owner_bank_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -14736,6 +15582,14 @@ ALTER TABLE ONLY public.unit_inspection_signatures
 
 
 --
+-- Name: unit_inspection_videos unit_inspection_videos_inspection_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_inspection_videos
+    ADD CONSTRAINT unit_inspection_videos_inspection_id_fkey FOREIGN KEY (inspection_id) REFERENCES public.unit_inspections(id) ON DELETE RESTRICT;
+
+
+--
 -- Name: unit_inspections unit_inspections_comparison_inspection_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -15051,5 +15905,5 @@ ALTER TABLE ONLY public.work_trade_periods
 -- PostgreSQL database dump complete
 --
 
-\unrestrict rwZk6CNhw2PwEjUJqOeEl1xPOQaqi67uYFZxL13vUXhq9J2PPee3aWMyl5y21ZI
+\unrestrict ot6S9pC7LNDLpQFGUYYFEhxqokOtDmekGGoM6xKqVcnOLIoIWPMMRYbh9xTmVWj
 

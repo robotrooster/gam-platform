@@ -10,4 +10,4 @@ A few things worth knowing about who controls what. Your rent amount, your due d
 
 Rent is paid electronically through GAM, by bank transfer (ACH) or card. A small processing fee may apply, and a per-property setting decides whether you or your landlord covers it; if it's on you, you'll see it clearly before you confirm a payment.
 
-If you ever spot something that doesn't match what you agreed to, reach out to your landlord through your portal. Anything tied to your rights, deposit, or local requirements depends on your lease and the laws where you live, so check those alongside your written agreement.
+If you can't find your lease under the Leases section, or a document looks out of date, let us know and we'll help you locate the right version or reach your landlord. And if you ever spot something that doesn't match what you agreed to, reach out to your landlord through your portal. Anything tied to your rights, deposit, or local requirements depends on your lease and the laws where you live, so check those alongside your written agreement.

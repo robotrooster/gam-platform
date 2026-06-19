@@ -56,19 +56,27 @@ import { getMyPayouts } from './getMyPayouts'
 import { markNotificationsRead } from './markNotificationsRead'
 import { sendBulkMessage } from './sendBulkMessage'
 import { getBackgroundCheckStatus } from './getBackgroundCheckStatus'
+import { flagApplicantDecision } from './flagApplicantDecision'
+import { draftTenantNotice } from './draftTenantNotice'
+import { getInspectionChecklist } from './getInspectionChecklist'
+import { getInspectionProgress } from './getInspectionProgress'
 import { getMyBookings } from './getMyBookings'
 import { getPropertyRentRoll } from './getPropertyRentRoll'
 import { getSetupProgress } from './getSetupProgress'
+import { getGuestBooking } from './getGuestBooking'
+import { requestBookingChange } from './requestBookingChange'
 import { queryOne } from '../../../db'
 import { createNotification } from '../../notifications'
 import { requireProfile } from '../profiles'
 import type { AgentActor } from './types'
 
+const mockQuery = query as unknown as ReturnType<typeof vi.fn>
 const mockQueryOne = queryOne as unknown as ReturnType<typeof vi.fn>
 const mockCreateNotification = createNotification as unknown as ReturnType<typeof vi.fn>
 
 const TENANT_ACTOR: AgentActor = { userId: 'u1', role: 'tenant', profileId: 't1' }
 const LANDLORD_ACTOR: AgentActor = { userId: 'u2', role: 'landlord', profileId: 'L1' }
+const GUEST_ACTOR: AgentActor = { userId: 'tok1', role: 'guest', profileId: 'bk1', bookingId: 'bk1' }
 
 describe('tool allowlist', () => {
   it('gives tenant profiles the tenant tools, landlord profiles the landlord tools', () => {
@@ -101,6 +109,80 @@ describe('tool allowlist', () => {
   it('getTool resolves by name', () => {
     expect(getTool('file_maintenance_request')).toBe(fileMaintenanceRequest)
     expect(getTool('nope')).toBeUndefined()
+  })
+
+  it('guest profile gets ONLY the two booking-guest tools', () => {
+    const g = getToolsForProfile(requireProfile('guest_entry')).map((x) => x.name)
+    expect(g.sort()).toEqual(['get_guest_booking', 'request_booking_change'])
+    // and those guest tools never leak to tenant/landlord profiles
+    const t = getToolsForProfile(requireProfile('tenant_entry')).map((x) => x.name)
+    const l = getToolsForProfile(requireProfile('landlord_entry')).map((x) => x.name)
+    for (const name of ['get_guest_booking', 'request_booking_change']) {
+      expect(t).not.toContain(name)
+      expect(l).not.toContain(name)
+    }
+  })
+})
+
+describe('guest tools scope to the actor.bookingId', () => {
+  beforeEach(() => {
+    mockQuery.mockReset(); mockQueryOne.mockReset()
+    mockCreateNotification.mockReset(); mockCreateNotification.mockResolvedValue(undefined)
+  })
+
+  it('get_guest_booking reads exactly the booking the token grants', async () => {
+    mockQueryOne.mockResolvedValueOnce({
+      booking_id: 'bk1', guest_name: 'Sam Rivera', check_in: '2026-07-01', check_out: '2026-07-05',
+      nights: 4, status: 'confirmed', lease_type: 'nightly', total_amount: '480.00', notes: 'Gate code 4412',
+      landlord_id: 'L1', landlord_user_id: 'u-host', property_name: 'Pinecrest RV', property_city: 'Flagstaff',
+      property_state: 'AZ', unit_number: 'A3',
+    })
+    const r: any = await getGuestBooking.execute({}, GUEST_ACTOR)
+    expect(mockQueryOne).toHaveBeenCalledWith(expect.any(String), ['bk1'])
+    expect(r.ok).toBe(true)
+    expect(r.property).toBe('Pinecrest RV')
+    expect(r.location).toBe('Flagstaff, AZ')
+    expect(r.total).toBe(480)
+    expect(r.hostNote).toBe('Gate code 4412')
+  })
+
+  it('get_guest_booking refuses when no booking is bound to the session', async () => {
+    const r: any = await getGuestBooking.execute({}, { userId: 'tok1', role: 'guest', profileId: 'bk1' })
+    expect(r.ok).toBe(false)
+  })
+
+  it('request_booking_change records a request + notifies the host', async () => {
+    mockQueryOne.mockResolvedValueOnce({
+      booking_id: 'bk1', guest_name: 'Sam Rivera', status: 'confirmed',
+      landlord_id: 'L1', landlord_user_id: 'u-host', property_name: 'Pinecrest RV', unit_number: 'A3',
+    })
+    mockQuery
+      .mockResolvedValueOnce([])                 // no existing open request
+      .mockResolvedValueOnce([{ id: 'cr1' }])    // insert returning id
+    const r: any = await requestBookingChange.execute(
+      { request_type: 'late checkout', details: 'checkout at 2pm' }, GUEST_ACTOR)
+    expect(r.ok).toBe(true)
+    expect(r.requestType).toBe('late_checkout') // normalized "late checkout" → enum
+    expect(r.requestId).toBe('cr1')
+    expect(mockCreateNotification).toHaveBeenCalledTimes(1)
+    expect(mockCreateNotification.mock.calls[0][0].userId).toBe('u-host')
+  })
+
+  it('request_booking_change dedups an already-open request of the same kind', async () => {
+    mockQueryOne.mockResolvedValueOnce({
+      booking_id: 'bk1', guest_name: 'Sam', status: 'confirmed',
+      landlord_id: 'L1', landlord_user_id: 'u-host', property_name: 'P', unit_number: 'A3',
+    })
+    mockQuery.mockResolvedValueOnce([{ id: 'existing' }]) // open request already there
+    const r: any = await requestBookingChange.execute({ request_type: 'extra_night' }, GUEST_ACTOR)
+    expect(r.alreadyRequested).toBe(true)
+    expect(mockCreateNotification).not.toHaveBeenCalled()
+  })
+
+  it('request_booking_change rejects an unknown request type', async () => {
+    const r: any = await requestBookingChange.execute({ request_type: 'free upgrade' }, GUEST_ACTOR)
+    expect(r.ok).toBe(false)
+    expect(mockQueryOne).not.toHaveBeenCalled()
   })
 })
 
@@ -467,6 +549,103 @@ describe('read tools scope to the actor', () => {
       expect((query as any).mock.calls[0][1][0]).toBe('L1')
       expect(sql).not.toMatch(/ssn|date_of_birth|monthly_income|employer/i)
       expect(res.checks[0]).toMatchObject({ applicant: 'Sam Lee', status: 'complete', reportLink: 'https://portal/report/1' })
+    })
+
+    it('flag_applicant_decision records intent (decline) without deciding — notifies, never touches background_checks', async () => {
+      ;(query as any).mockResolvedValueOnce([{ id: 'bc1', first_name: 'Jane', last_name: 'Doe', status: 'complete', created_at: 'd' }])
+      const res: any = await flagApplicantDecision.execute({ applicant: 'Jane Doe', decision: 'decline' }, LANDLORD_ACTOR)
+      // lookup scoped to the landlord, NOT a decision write
+      expect((query as any).mock.calls[0][1][0]).toBe('L1')
+      expect((query as any).mock.calls[0][0]).not.toMatch(/UPDATE background_checks|decided_at|decision_notes/i)
+      // intent captured as a durable notification for THIS landlord
+      expect(mockCreateNotification).toHaveBeenCalledWith(expect.objectContaining({
+        landlordId: 'L1', type: 'applicant_decision',
+        data: expect.objectContaining({ checkId: 'bc1', decision: 'decline', source: 'agent' }),
+      }))
+      expect(res.ok).toBe(true)
+      expect(res.recorded).toBe(true)
+      expect(res.portalPath).toBe('/screening')
+      // a decline must remind the landlord the official notice fires in the portal, not here
+      expect(res.message).toMatch(/notice/i)
+    })
+
+    it('flag_applicant_decision refuses an undecidable check (e.g. still pending) — no intent recorded', async () => {
+      ;(query as any).mockResolvedValueOnce([{ id: 'bc1', first_name: 'Jane', last_name: 'Doe', status: 'pending', created_at: 'd' }])
+      const res: any = await flagApplicantDecision.execute({ applicant: 'Jane Doe', decision: 'approve' }, LANDLORD_ACTOR)
+      expect(res.ok).toBe(false)
+      expect(mockCreateNotification).not.toHaveBeenCalled()
+    })
+
+    it('flag_applicant_decision refuses when no screening check matches, pointing to the portal', async () => {
+      ;(query as any).mockResolvedValueOnce([])
+      const res: any = await flagApplicantDecision.execute({ applicant: 'Nobody', decision: 'approve' }, LANDLORD_ACTOR)
+      expect(res.ok).toBe(false)
+      expect(res.portalPath).toBe('/screening')
+      expect(mockCreateNotification).not.toHaveBeenCalled()
+    })
+
+    it('flag_applicant_decision asks which one when the name matches several checks', async () => {
+      ;(query as any).mockResolvedValueOnce([
+        { id: 'bc1', first_name: 'Jane', last_name: 'Doe', status: 'complete', created_at: 'd1' },
+        { id: 'bc2', first_name: 'Jane', last_name: 'Doerr', status: 'processing', created_at: 'd2' },
+      ])
+      const res: any = await flagApplicantDecision.execute({ applicant: 'Jane', decision: 'approve' }, LANDLORD_ACTOR)
+      expect(res.needsDisambiguation).toBe(true)
+      expect(res.candidates).toHaveLength(2)
+      expect(mockCreateNotification).not.toHaveBeenCalled()
+    })
+
+    it('flag_applicant_decision by checkId scopes the lookup to the landlord', async () => {
+      ;(mockQueryOne as any).mockResolvedValueOnce({ id: 'bc9', first_name: 'Sam', last_name: 'Lee', status: 'submitted', created_at: 'd' })
+      const res: any = await flagApplicantDecision.execute({ checkId: 'bc9', decision: 'approve' }, LANDLORD_ACTOR)
+      expect((mockQueryOne as any).mock.calls[0][1]).toEqual(['bc9', 'L1'])
+      expect(res.ok).toBe(true)
+    })
+
+    it('flag_applicant_decision rejects an unrecognized decision verb', async () => {
+      const res: any = await flagApplicantDecision.execute({ applicant: 'Jane Doe', decision: 'maybe' }, LANDLORD_ACTOR)
+      expect(res.ok).toBe(false)
+      expect(mockCreateNotification).not.toHaveBeenCalled()
+    })
+
+    it('draft_tenant_notice returns a draft WITHOUT sending until approved', async () => {
+      ;(query as any).mockResolvedValueOnce([{ user_id: 'tenantUser', first_name: 'Jane', last_name: 'Doe', email: 'j@x.dev' }])
+      const res: any = await draftTenantNotice.execute({ tenant: 'Jane', subject: 'Rent Increase', notice: 'Your rent will increase by $50 starting Aug 1.' }, LANDLORD_ACTOR)
+      // tenant lookup scoped to the landlord
+      expect((query as any).mock.calls[0][1][0]).toBe('L1')
+      expect(res.needsApproval).toBe(true)
+      expect(res.draft).toMatchObject({ to: 'Jane Doe', subject: 'Rent Increase' })
+      // nothing delivered in the draft phase
+      expect(mockCreateNotification).not.toHaveBeenCalled()
+    })
+
+    it('draft_tenant_notice delivers to the tenant only when confirmed', async () => {
+      ;(query as any).mockResolvedValueOnce([{ user_id: 'tenantUser', first_name: 'Jane', last_name: 'Doe', email: 'j@x.dev' }])
+      const res: any = await draftTenantNotice.execute({ tenant: 'Jane', subject: 'Lease Violation', notice: 'Please remove the trailer from the common lot.', confirmed: true }, LANDLORD_ACTOR)
+      expect(mockCreateNotification).toHaveBeenCalledWith(expect.objectContaining({
+        userId: 'tenantUser', landlordId: 'L1', type: 'landlord_notice', title: 'Lease Violation',
+        data: expect.objectContaining({ kind: 'landlord_notice', source: 'agent' }),
+      }))
+      expect(res.ok).toBe(true)
+      expect(res.sent).toBe(true)
+    })
+
+    it('draft_tenant_notice refuses when no owned tenant matches (even if confirmed)', async () => {
+      ;(query as any).mockResolvedValueOnce([])
+      const res: any = await draftTenantNotice.execute({ tenant: 'Nobody', notice: 'hello', confirmed: true }, LANDLORD_ACTOR)
+      expect(res.ok).toBe(false)
+      expect(mockCreateNotification).not.toHaveBeenCalled()
+    })
+
+    it('draft_tenant_notice asks which one when several tenants match', async () => {
+      ;(query as any).mockResolvedValueOnce([
+        { user_id: 'u_a', first_name: 'Jane', last_name: 'Doe', email: 'a@x.dev' },
+        { user_id: 'u_b', first_name: 'Jane', last_name: 'Doerr', email: 'b@x.dev' },
+      ])
+      const res: any = await draftTenantNotice.execute({ tenant: 'Jane', notice: 'hi', confirmed: true }, LANDLORD_ACTOR)
+      expect(res.needsDisambiguation).toBe(true)
+      expect(res.matches).toHaveLength(2)
+      expect(mockCreateNotification).not.toHaveBeenCalled()
     })
   })
 })
@@ -1002,5 +1181,96 @@ describe('check_against_law (objective numeric/timeline mismatch, both audiences
     expect(res.ok).toBe(true)
     expect(res.matched).toBe(false)
     expect(res.note).toMatch(/doesn’t have/i)
+  })
+})
+
+describe('get_inspection_checklist (tenant, agent-guided walkthrough)', () => {
+  beforeEach(() => { vi.clearAllMocks() })
+
+  it('sizes the checklist to the unit — only the bedrooms it actually has', async () => {
+    ;(mockQueryOne as any).mockResolvedValueOnce({ id: 'i1', inspection_type: 'move_in', status: 'draft', unit_number: '101', bedrooms: 2, unit_type: 'apartment' })
+    ;(query as any).mockResolvedValueOnce([]) // no photos yet
+    const res: any = await getInspectionChecklist.execute({}, TENANT_ACTOR)
+    // inspection lookup scoped to the tenant
+    expect((mockQueryOne as any).mock.calls[0][1]).toContain('t1')
+    const areaNames = res.areas.map((a: any) => a.area)
+    expect(areaNames).toContain('Bedroom 1')
+    expect(areaNames).toContain('Bedroom 2')
+    expect(areaNames).not.toContain('Bedroom 3')
+    expect(areaNames).toContain('Kitchen')
+    expect(res.ok).toBe(true)
+    expect(res.remainingAreas).toContain('Kitchen') // nothing photographed yet
+  })
+
+  it('flags an area as photographed (case-insensitive) and drops it from remaining', async () => {
+    ;(mockQueryOne as any).mockResolvedValueOnce({ id: 'i1', inspection_type: 'move_in', status: 'draft', unit_number: '101', bedrooms: 1, unit_type: 'apartment' })
+    ;(query as any).mockResolvedValueOnce([{ area: 'kitchen' }]) // lowercase ad-hoc item
+    const res: any = await getInspectionChecklist.execute({}, TENANT_ACTOR)
+    const kitchen = res.areas.find((a: any) => a.area === 'Kitchen')
+    expect(kitchen.photographed).toBe(true)
+    expect(res.remainingAreas).not.toContain('Kitchen')
+  })
+
+  it('uses the RV site checklist (no bedrooms) for an rv_spot unit', async () => {
+    ;(mockQueryOne as any).mockResolvedValueOnce({ id: 'i2', inspection_type: 'move_out', status: 'draft', unit_number: 'A7', bedrooms: 0, unit_type: 'rv_spot' })
+    ;(query as any).mockResolvedValueOnce([])
+    const res: any = await getInspectionChecklist.execute({}, TENANT_ACTOR)
+    const areaNames = res.areas.map((a: any) => a.area)
+    expect(areaNames).toContain('Hookups')
+    expect(areaNames.some((n: string) => n.startsWith('Bedroom'))).toBe(false)
+  })
+
+  it('marks a finalized inspection closed and tells the agent not to prompt', async () => {
+    ;(mockQueryOne as any).mockResolvedValueOnce({ id: 'i3', inspection_type: 'move_out', status: 'finalized', unit_number: '101', bedrooms: 1, unit_type: 'apartment' })
+    ;(query as any).mockResolvedValueOnce([])
+    const res: any = await getInspectionChecklist.execute({ inspectionId: 'i3' }, TENANT_ACTOR)
+    expect(res.closed).toBe(true)
+    expect(res.note).toMatch(/closed/i)
+  })
+
+  it('returns ok:false when the tenant has no inspection', async () => {
+    ;(mockQueryOne as any).mockResolvedValueOnce(null)
+    const res: any = await getInspectionChecklist.execute({}, TENANT_ACTOR)
+    expect(res.ok).toBe(false)
+  })
+})
+
+describe('get_inspection_progress (landlord-run walkthrough)', () => {
+  beforeEach(() => { vi.clearAllMocks() })
+
+  it('resolves a unit-sized checklist by inspectionId, scoped to the landlord', async () => {
+    ;(mockQueryOne as any).mockResolvedValueOnce({ id: 'i1', inspection_type: 'move_in', status: 'draft', unit_number: '4', bedrooms: 2, unit_type: 'apartment' })
+    ;(query as any).mockResolvedValueOnce([]) // photographed areas
+    const res: any = await getInspectionProgress.execute({ inspectionId: 'i1' }, LANDLORD_ACTOR)
+    expect((mockQueryOne as any).mock.calls[0][1]).toEqual(['i1', 'L1'])
+    const names = res.areas.map((a: any) => a.area)
+    expect(names).toContain('Bedroom 1')
+    expect(names).toContain('Bedroom 2')
+    expect(names).not.toContain('Bedroom 3')
+    expect(res.ok).toBe(true)
+    expect(res.remainingAreas).toContain('Kitchen')
+  })
+
+  it('resolves by unit number (scoped to the landlord) and uses the RV checklist', async () => {
+    ;(mockQueryOne as any).mockResolvedValueOnce({ id: 'i2', inspection_type: 'turnover', status: 'draft', unit_number: '12', bedrooms: 0, unit_type: 'rv_spot' })
+    ;(query as any).mockResolvedValueOnce([])
+    const res: any = await getInspectionProgress.execute({ unit: '12' }, LANDLORD_ACTOR)
+    expect((mockQueryOne as any).mock.calls[0][1][0]).toBe('L1')
+    expect(res.ok).toBe(true)
+    expect(res.areas.map((a: any) => a.area)).toContain('Hookups')
+  })
+
+  it('lists open inspections when no selector is given', async () => {
+    ;(query as any).mockResolvedValueOnce([{ id: 'i9', inspection_type: 'move_out', status: 'draft', unit_number: '7', property_name: 'Maple' }])
+    const res: any = await getInspectionProgress.execute({}, LANDLORD_ACTOR)
+    expect(res.ok).toBe(false)
+    expect(res.needsSelection).toBe(true)
+    expect(res.openInspections).toHaveLength(1)
+  })
+
+  it('refuses an inspection not owned by the landlord', async () => {
+    ;(mockQueryOne as any).mockResolvedValueOnce(null)
+    const res: any = await getInspectionProgress.execute({ inspectionId: 'x' }, LANDLORD_ACTOR)
+    expect(res.ok).toBe(false)
   })
 })

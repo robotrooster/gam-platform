@@ -866,6 +866,41 @@ export async function createInvoiceCheckoutSession(
   return { sessionId: session.id, hostedUrl: session.url }
 }
 
+/**
+ * Refund a business-invoice PaymentIntent (a Connect destination charge).
+ *
+ * `reverse_transfer: true` is REQUIRED: the gross landed in the business's
+ * Connect balance, so the refund must pull the money back from there — never
+ * from GAM's platform balance. `refund_application_fee` is intentionally
+ * OMITTED (Nic, S502): GAM keeps its platform fee on a refund, so the business
+ * bears GAM's cut on the refunded amount.
+ *
+ * `amountCents` omitted = full remaining refund. Returns the Stripe refund id.
+ * `idempotencyKey` makes a retried request safe (no double refund).
+ */
+export async function refundBusinessInvoicePayment(opts: {
+  paymentIntentId: string
+  amountCents?: number
+  reason?: string
+  idempotencyKey?: string
+  metadata?: Record<string, string>
+}): Promise<{ refundId: string; status: string | null }> {
+  const stripe = getStripe()
+  const params: Stripe.RefundCreateParams = {
+    payment_intent: opts.paymentIntentId,
+    reverse_transfer: true,
+    metadata: { gam_purpose: 'business_invoice_refund', ...(opts.metadata ?? {}) },
+  }
+  if (opts.amountCents != null) params.amount = opts.amountCents
+  // Stripe only accepts its own enum reasons; a free-text operator reason is
+  // kept in metadata, not the Stripe `reason` field.
+  const refund = await stripe.refunds.create(
+    params,
+    opts.idempotencyKey ? { idempotencyKey: opts.idempotencyKey } : undefined,
+  )
+  return { refundId: refund.id, status: refund.status }
+}
+
 // ── Internal helpers ──────────────────────────────────────────────────────
 
 async function fetchExistingConnectId(entity: ConnectEntity, entityId: string): Promise<string | null> {

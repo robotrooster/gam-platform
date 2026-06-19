@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
-import { MapPin, Pencil, Archive, CreditCard } from 'lucide-react'
+import { MapPin, Pencil, Archive, CreditCard, Link2, Upload, Link2Off } from 'lucide-react'
 import { Modal } from '../components/Modal'
+import { parseCustomerCsv, type CustomerImportResult } from '../lib/customerCsv'
 
 /** Days-since-last-service summary. Tinted amber after 14 days
  *  (loose "is this customer stale?" heuristic). */
@@ -67,6 +68,10 @@ export function CustomersPage() {
   })
   const [editSaving, setEditSaving] = useState(false)
   const [archiving, setArchiving] = useState<string | null>(null)
+  const [revoking, setRevoking] = useState<string | null>(null)
+  const [importing, setImporting] = useState(false)
+  const [importResult, setImportResult] = useState<CustomerImportResult | null>(null)
+  const [importErr, setImportErr] = useState<string | null>(null)
 
   const reload = async () => {
     try {
@@ -78,6 +83,21 @@ export function CustomersPage() {
   }
 
   useEffect(() => { reload() }, [])
+
+  // Bulk CSV import — same parser + endpoint as the onboarding wizard.
+  const onImportFile = async (file: File) => {
+    setImportErr(null); setImportResult(null); setImporting(true)
+    try {
+      const text = await file.text()
+      const customers = parseCustomerCsv(text)
+      if (customers.length === 0) { setImportErr('No rows found in the file'); return }
+      const r = await apiPost<CustomerImportResult>('/business-customers/import', { customers })
+      setImportResult(r.data)
+      await reload()
+    } catch (e: any) {
+      setImportErr(e?.response?.data?.error || 'Import failed')
+    } finally { setImporting(false) }
+  }
 
   const onSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -186,6 +206,42 @@ export function CustomersPage() {
     }
   }
 
+  const onAccountLink = async (r: CustomerRow) => {
+    const label = r.companyName || `${r.firstName} ${r.lastName}`
+    setErr(null)
+    try {
+      const resp = await apiPost<{ url: string }>(`/business-customers/${r.id}/portal-link`, {})
+      const url = resp.data.url
+      try { await navigator.clipboard?.writeText(url) } catch { /* clipboard may be blocked */ }
+      const emailToo = r.email && window.confirm(
+        `Account link copied to clipboard:\n${url}\n\nAlso email it to ${r.email}?`)
+      if (emailToo) {
+        await apiPost(`/business-customers/${r.id}/portal-link`, { sendEmail: true })
+        window.alert(`Account link emailed to ${r.email}.`)
+      } else {
+        window.alert(`Account link for ${label} copied to clipboard.`)
+      }
+    } catch (e: any) {
+      setErr(e?.response?.data?.error || 'Could not create the account link')
+    }
+  }
+
+  const onRevokePortal = async (r: CustomerRow) => {
+    const label = r.companyName || `${r.firstName} ${r.lastName}`
+    if (!window.confirm(
+      `Revoke ${label}'s portal access? Their current link stops working immediately. ` +
+      `You can issue a fresh link anytime with "Account link".`)) return
+    setErr(null); setRevoking(r.id)
+    try {
+      const resp = await apiPost<{ revoked: number }>(`/business-customers/${r.id}/revoke-portal-access`, {})
+      window.alert(resp.data.revoked > 0
+        ? `Portal access revoked for ${label}.`
+        : `${label} had no active portal link.`)
+    } catch (e: any) {
+      setErr(e?.response?.data?.error || 'Could not revoke portal access')
+    } finally { setRevoking(null) }
+  }
+
   const onGeocode = async (id: string) => {
     setErr(null); setGeocoding(id)
     try {
@@ -200,9 +256,21 @@ export function CustomersPage() {
 
   return (
     <div>
-      <h1 style={{ fontFamily: 'var(--font-display)', fontSize: 28, marginTop: 0 }}>
-        Customers
-      </h1>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+        <h1 style={{ fontFamily: 'var(--font-display)', fontSize: 28, marginTop: 0 }}>
+          Customers
+        </h1>
+        <label style={{
+          display: 'inline-flex', alignItems: 'center', gap: 6, cursor: importing ? 'default' : 'pointer',
+          padding: '8px 14px', background: 'transparent', color: 'var(--text-1)',
+          border: '1px solid var(--border-1)', borderRadius: 8, fontSize: 13, fontWeight: 500,
+          opacity: importing ? 0.6 : 1,
+        }}>
+          <Upload size={14} /> {importing ? 'Importing…' : 'Import CSV'}
+          <input type="file" accept=".csv,text/csv" style={{ display: 'none' }} disabled={importing}
+            onChange={e => { const f = e.target.files?.[0]; if (f) onImportFile(f); e.target.value = '' }} />
+        </label>
+      </div>
       <div style={{ color: 'var(--text-2)', fontSize: 14, marginBottom: 24 }}>
         Your service roster. New customers are auto-geocoded on create;
         if the address can't be resolved, you'll see a "Geocode" button
@@ -300,6 +368,18 @@ export function CustomersPage() {
                             {r.hasSavedCard ? 'Update card' : 'Add card'}
                           </button>
                         )}
+                        <button onClick={() => onAccountLink(r)}
+                          style={iconBtnStyle('default', false)}
+                          title="Copy or email this customer a link to view & pay their invoices">
+                          <Link2 size={12} /> Account link
+                        </button>
+                        <button onClick={() => onRevokePortal(r)}
+                          disabled={revoking === r.id}
+                          style={iconBtnStyle('amber', revoking === r.id)}
+                          title="Immediately disable this customer's portal link (e.g. if it leaked or the relationship ended)">
+                          <Link2Off size={12} />
+                          {revoking === r.id ? 'Revoking…' : 'Revoke link'}
+                        </button>
                         <button onClick={() => onArchive(r)}
                           disabled={archiving === r.id}
                           style={iconBtnStyle('amber', archiving === r.id)}>
@@ -518,6 +598,33 @@ export function CustomersPage() {
               )}
             </div>
           </form>
+        </Modal>
+      )}
+
+      {(importResult || importErr) && (
+        <Modal title="Customer import"
+          onClose={() => { setImportResult(null); setImportErr(null) }}>
+          {importErr ? (
+            <div style={errStyle}>{importErr}</div>
+          ) : importResult && (
+            <div style={{ fontSize: 13, color: 'var(--text-1)' }}>
+              Imported <strong style={{ color: 'var(--green, #22c55e)' }}>{importResult.created}</strong>
+              {' '}of {importResult.total}.
+              {importResult.skipped > 0 && (
+                <div style={{ marginTop: 8, color: 'var(--text-2)' }}>
+                  {importResult.skipped} skipped:
+                  <ul style={{ margin: '4px 0 0', paddingLeft: 18 }}>
+                    {importResult.errors.slice(0, 10).map((e, i) => (
+                      <li key={i}>Row {e.row}: {e.reason}</li>
+                    ))}
+                    {importResult.errors.length > 10 && (
+                      <li>…and {importResult.errors.length - 10} more</li>
+                    )}
+                  </ul>
+                </div>
+              )}
+            </div>
+          )}
         </Modal>
       )}
     </div>

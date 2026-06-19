@@ -10,7 +10,7 @@ GAM charges a platform fee for the service of managing your properties, tenants,
 - **Vacant units are never charged.** If a unit has no tenant, it doesn't count toward the fee.
 - **$10 per property, per month minimum.** Each property has a floor of $10/month, even if it has few occupied units.
 
-For example, a property with one occupied unit still meets the $10/property minimum, while a larger property is billed at $2 per occupied unit once that exceeds the minimum.
+GAM compares your occupied-unit total against the $10 minimum for each property and bills whichever is higher — never both. For example: a property with 3 occupied units calculates to $6 ($2 × 3), so the $10 minimum applies instead; a property with 8 occupied units calculates to $16, which is above the floor, so you're billed $16.
 
 ## Stripe Connect account fee
 

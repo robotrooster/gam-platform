@@ -5,7 +5,7 @@ import {
   LayoutDashboard, Users, UserCog, Settings, LogOut,
   Building2, Truck, Trash2, CalendarClock, Route as RouteIcon,
   Receipt, CalendarDays, Package, ShoppingCart, Wrench, Car, FileText,
-  BarChart3, Repeat,
+  BarChart3, Repeat, Tag, Banknote, BookOpen,
 } from 'lucide-react'
 
 // S466 + S492: section-grouped nav with feature-gating.
@@ -48,6 +48,9 @@ const NAV_ITEMS: Array<{
   { to: '/pos',           icon: ShoppingCart,    label: 'POS',
     roles: ['business_owner', 'business_staff'],
     feature: 'pos' },
+  { to: '/discounts',     icon: Tag,             label: 'Discounts',
+    roles: ['business_owner'],
+    feature: 'discounts' },
   { to: '/work-orders',   icon: Wrench,          label: 'Work orders',
     roles: ['business_owner', 'business_staff'],
     feature: 'work_orders' },
@@ -85,6 +88,12 @@ const NAV_ITEMS: Array<{
   { to: '/reports',       icon: BarChart3,       label: 'Reports',
     section: 'Insights',
     roles: ['business_owner', 'business_staff'] },
+  { to: '/bookkeeping',   icon: BookOpen,        label: 'Bookkeeping',
+    roles: ['business_owner'],
+    feature: 'bookkeeping' },
+  { to: '/payouts',       icon: Banknote,        label: 'Payouts',
+    roles: ['business_owner'],
+    feature: 'payments' },
   // Settings
   { to: '/settings',      icon: Settings,        label: 'Settings',
     section: 'Settings',

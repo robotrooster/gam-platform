@@ -233,7 +233,14 @@ businessWorkOrdersRouter.get('/:id', requireAuth, async (req, res, next) => {
       `SELECT * FROM business_work_order_lines
         WHERE work_order_id = $1
         ORDER BY sort_order ASC, created_at ASC`, [wo.id])
-    res.json({ success: true, data: { ...wo, lines } })
+    // S514: time-tracking spans + the tech's name, newest-first.
+    const timeEntries = await query<any>(
+      `SELECT t.*, u.first_name AS tech_first_name, u.last_name AS tech_last_name
+         FROM business_work_order_time_entries t
+         JOIN users u ON u.id = t.user_id
+        WHERE t.work_order_id = $1
+        ORDER BY t.started_at DESC`, [wo.id])
+    res.json({ success: true, data: { ...wo, lines, timeEntries } })
   } catch (e) { next(e) }
 })
 
@@ -792,6 +799,193 @@ businessWorkOrdersRouter.post('/:id/convert-to-invoice', requireAuth, async (req
 
       await client.query('COMMIT')
       res.status(201).json({ success: true, data: inv })
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {})
+      throw e
+    } finally {
+      client.release()
+    }
+  } catch (e) { next(e) }
+})
+
+// ═══════════════════════════════════════════════════════════════
+//  S514 — work-order time tracking
+// ═══════════════════════════════════════════════════════════════
+
+// Guard: the WO exists for this business + isn't terminal. Returns it.
+async function loadOpenWo(businessId: string, woId: string) {
+  const wo = await queryOne<{ id: string; status: string }>(
+    `SELECT id, status FROM business_work_orders WHERE id = $1 AND business_id = $2`,
+    [woId, businessId])
+  if (!wo) throw new AppError(404, 'Work order not found')
+  if (wo.status === 'completed' || wo.status === 'cancelled') {
+    throw new AppError(409, `Cannot track time on a ${wo.status} work order`)
+  }
+  return wo
+}
+
+// POST /:id/time/start — clock the current user in.
+businessWorkOrdersRouter.post('/:id/time/start', requireAuth, async (req, res, next) => {
+  try {
+    const businessId = await requireWrite(req)
+    await loadOpenWo(businessId, req.params.id)
+    try {
+      const row = await queryOne<any>(
+        `INSERT INTO business_work_order_time_entries
+           (business_id, work_order_id, user_id, started_at)
+         VALUES ($1, $2, $3, NOW())
+         RETURNING *`,
+        [businessId, req.params.id, req.user!.userId])
+      res.status(201).json({ success: true, data: row })
+    } catch (e: any) {
+      // partial unique index → a timer is already running for this tech.
+      if (e?.code === '23505') {
+        throw new AppError(409, 'A timer is already running for you on this work order')
+      }
+      throw e
+    }
+  } catch (e) { next(e) }
+})
+
+// POST /:id/time/stop — clock the current user out (computes duration).
+businessWorkOrdersRouter.post('/:id/time/stop', requireAuth, async (req, res, next) => {
+  try {
+    const businessId = await requireWrite(req)
+    // No terminal-status guard: a running clock can always be stopped.
+    const running = await queryOne<{ id: string }>(
+      `SELECT t.id
+         FROM business_work_order_time_entries t
+         JOIN business_work_orders w ON w.id = t.work_order_id
+        WHERE t.work_order_id = $1 AND w.business_id = $2
+          AND t.user_id = $3 AND t.ended_at IS NULL`,
+      [req.params.id, businessId, req.user!.userId])
+    if (!running) throw new AppError(404, 'No running timer for you on this work order')
+    const row = await queryOne<any>(
+      `UPDATE business_work_order_time_entries
+          SET ended_at = NOW(),
+              duration_minutes = GREATEST(0, ROUND(EXTRACT(EPOCH FROM (NOW() - started_at)) / 60))::int
+        WHERE id = $1
+        RETURNING *`,
+      [running.id])
+    res.json({ success: true, data: row })
+  } catch (e) { next(e) }
+})
+
+// POST /:id/time/manual — add an already-stopped span (tech forgot to clock).
+const manualTimeSchema = z.object({
+  minutes:   z.number().int().positive().max(100000),
+  startedAt: z.string().datetime().optional(),
+  note:      z.string().max(500).nullable().optional(),
+})
+businessWorkOrdersRouter.post('/:id/time/manual', requireAuth, async (req, res, next) => {
+  try {
+    const businessId = await requireWrite(req)
+    const body = manualTimeSchema.parse(req.body)
+    await loadOpenWo(businessId, req.params.id)
+    const row = await queryOne<any>(
+      `WITH s AS (
+         SELECT COALESCE($4::timestamptz, NOW() - ($5 * interval '1 minute')) AS started
+       )
+       INSERT INTO business_work_order_time_entries
+         (business_id, work_order_id, user_id, started_at, ended_at, duration_minutes, note)
+       SELECT $1, $2, $3, s.started, s.started + ($5 * interval '1 minute'), $5, $6
+         FROM s
+       RETURNING *`,
+      [businessId, req.params.id, req.user!.userId,
+       body.startedAt ?? null, body.minutes, body.note ?? null])
+    res.status(201).json({ success: true, data: row })
+  } catch (e) { next(e) }
+})
+
+// DELETE /:id/time/:entryId — remove an unbilled entry.
+businessWorkOrdersRouter.delete('/:id/time/:entryId', requireAuth, async (req, res, next) => {
+  try {
+    const businessId = await requireWrite(req)
+    const entry = await queryOne<{ id: string; billed_at: string | null; ended_at: string | null }>(
+      `SELECT t.id, t.billed_at, t.ended_at
+         FROM business_work_order_time_entries t
+         JOIN business_work_orders w ON w.id = t.work_order_id
+        WHERE t.id = $1 AND t.work_order_id = $2 AND w.business_id = $3`,
+      [req.params.entryId, req.params.id, businessId])
+    if (!entry) throw new AppError(404, 'Time entry not found')
+    if (entry.billed_at) throw new AppError(409, 'Cannot delete a billed time entry')
+    await query(`DELETE FROM business_work_order_time_entries WHERE id = $1`, [entry.id])
+    res.json({ success: true })
+  } catch (e) { next(e) }
+})
+
+// POST /:id/time/bill — roll all unbilled stopped spans into one labor line.
+const billTimeSchema = z.object({
+  hourlyRate:  z.number().min(0).max(10000),
+  description: z.string().min(1).max(500).optional(),
+  taxRate:     z.number().min(0).max(0.9999).optional(),
+})
+businessWorkOrdersRouter.post('/:id/time/bill', requireAuth, async (req, res, next) => {
+  try {
+    const businessId = await requireWrite(req)
+    const body = billTimeSchema.parse(req.body)
+
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+
+      const { rows: [wo] } = await client.query<{ id: string; status: string }>(
+        `SELECT id, status FROM business_work_orders
+          WHERE id = $1 AND business_id = $2 FOR UPDATE`,
+        [req.params.id, businessId])
+      if (!wo) { await client.query('ROLLBACK'); throw new AppError(404, 'Work order not found') }
+      if (wo.status === 'completed' || wo.status === 'cancelled') {
+        await client.query('ROLLBACK')
+        throw new AppError(409, `Cannot bill time on a ${wo.status} work order`)
+      }
+
+      // Lock the unbilled, stopped spans.
+      const { rows: entries } = await client.query<{ id: string; duration_minutes: number }>(
+        `SELECT id, duration_minutes
+           FROM business_work_order_time_entries
+          WHERE work_order_id = $1 AND ended_at IS NOT NULL AND billed_at IS NULL
+          FOR UPDATE`,
+        [wo.id])
+      if (entries.length === 0) {
+        await client.query('ROLLBACK')
+        throw new AppError(409, 'No unbilled tracked time to bill')
+      }
+      const totalMinutes = entries.reduce((a, e) => a + Number(e.duration_minutes), 0)
+      const hours = dec(totalMinutes / 60)
+      if (hours <= 0) {
+        await client.query('ROLLBACK')
+        throw new AppError(409, 'Tracked time rounds to zero hours')
+      }
+
+      const lineSubtotal = dec(hours * body.hourlyRate)
+      const taxRate = body.taxRate ?? 0
+      const lineTax = dec(lineSubtotal * taxRate)
+      const lineTotal = dec(lineSubtotal + lineTax)
+      const description = body.description?.trim() || `Labor — ${hours} hrs (tracked)`
+
+      const { rows: [maxRow] } = await client.query<{ max: number | null }>(
+        `SELECT MAX(sort_order) AS max FROM business_work_order_lines WHERE work_order_id = $1`, [wo.id])
+      const sortOrder = (maxRow?.max ?? -1) + 1
+
+      const { rows: [line] } = await client.query<any>(
+        `INSERT INTO business_work_order_lines
+           (work_order_id, line_type, description, quantity, unit_price,
+            tax_rate, line_subtotal, line_tax, line_total, sort_order)
+         VALUES ($1, 'labor', $2, $3, $4, $5, $6, $7, $8, $9)
+         RETURNING *`,
+        [wo.id, description, hours, body.hourlyRate,
+         taxRate, lineSubtotal, lineTax, lineTotal, sortOrder])
+
+      await client.query(
+        `UPDATE business_work_order_time_entries
+            SET billed_at = NOW(), billed_line_id = $1
+          WHERE id = ANY($2::uuid[])`,
+        [line.id, entries.map(e => e.id)])
+
+      await recomputeTotals(client, wo.id)
+
+      await client.query('COMMIT')
+      res.status(201).json({ success: true, data: { line, billedMinutes: totalMinutes, hours } })
     } catch (e) {
       await client.query('ROLLBACK').catch(() => {})
       throw e

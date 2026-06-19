@@ -30,6 +30,7 @@ import { useForm } from 'react-hook-form'
 import axios from 'axios'
 import { formatCurrency, applyCamelizeInterceptor } from '@gam/shared'
 import { AgentChatWidget, SupportPage } from './components/AgentChatWidget'
+import { CameraCapture } from './components/CameraCapture'
 
 // ── API ──────────────────────────────────────────────────────
 const API_URL = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
@@ -232,6 +233,7 @@ function Layout() {
             <NavLink to="/maintenance" className={({isActive})=>`ni${isActive?' active':''}`}>🔧 Maintenance</NavLink>
             <NavLink to="/support" className={({isActive})=>`ni${isActive?' active':''}`}>💬 Support</NavLink>
             <NavLink to="/inspections" className={({isActive})=>`ni${isActive?' active':''}`}>📋 Inspections</NavLink>
+            <NavLink to="/walkthroughs" className={({isActive})=>`ni${isActive?' active':''}`}>🎥 My walkthroughs</NavLink>
             <NavLink to="/entry-requests" className={({isActive})=>`ni${isActive?' active':''}`}>🚪 Entry Requests</NavLink>
             <NavLink to="/credit" className={({isActive})=>`ni${isActive?' active':''}`}>📊 My Record</NavLink>
             <NavLink to="/my-disputes" className={({isActive})=>`ni${isActive?' active':''}`}>⚖️ My Disputes</NavLink>
@@ -1642,6 +1644,22 @@ function TenantInspectionDetailPage() {
       onError: (e: any) => setError(e?.response?.data?.error || 'Sign failed'),
     },
   )
+  const [camera, setCamera] = useState<null | 'photo' | 'video'>(null)
+  const [videoSaved, setVideoSaved] = useState(false)
+  const photoMut = useMutation(
+    ({ file, live }: { file: File; live?: boolean }) => {
+      const fd = new FormData(); fd.append('file', file); if (live) fd.append('capturedLive', 'true')
+      return api.post(`/inspections/${id}/photos`, fd, { headers: { 'Content-Type': 'multipart/form-data' } }).then(r => r.data)
+    },
+    { onSuccess: () => qc.invalidateQueries(['tenant-inspection', id]), onError: (e: any) => setError(e?.response?.data?.error || 'Upload failed') },
+  )
+  const videoMut = useMutation(
+    ({ file, live }: { file: File; live?: boolean }) => {
+      const fd = new FormData(); fd.append('file', file); if (live) fd.append('capturedLive', 'true')
+      return api.post(`/inspections/${id}/videos`, fd, { headers: { 'Content-Type': 'multipart/form-data' } }).then(r => r.data)
+    },
+    { onSuccess: () => setVideoSaved(true), onError: (e: any) => setError(e?.response?.data?.error || 'Video upload failed') },
+  )
 
   if (isLoading || !data) return <div style={{ padding: 32, color: 'var(--t3)' }}>Loading…</div>
   const insp = data as any
@@ -1649,6 +1667,8 @@ function TenantInspectionDetailPage() {
   const photos = (insp.photos || []) as any[]
   const signatures = (insp.signatures || []) as any[]
   const tenantSigned = signatures.some(s => s.signerRole === 'tenant')
+  const editable = insp.status !== 'finalized' && insp.status !== 'cancelled'
+  const API = (import.meta as any).env.VITE_API_URL
 
   return (
     <div>
@@ -1691,17 +1711,39 @@ function TenantInspectionDetailPage() {
         )}
       </div>
 
-      {photos.length > 0 && (
+      {(editable || photos.length > 0) && (
         <div className="card" style={{ padding: 16, marginBottom: 16 }}>
-          <strong style={{ color: 'var(--t0)', display: 'block', marginBottom: 12 }}>Photos ({photos.length})</strong>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(120px, 1fr))', gap: 8 }}>
-            {photos.map(p => (
-              <a key={p.id} href={(import.meta as any).env.VITE_API_URL + p.photoUrl} target="_blank" rel="noreferrer"
-                 style={{ display: 'block', aspectRatio: '1/1', borderRadius: 8, overflow: 'hidden', background: 'var(--bg3)' }}>
-                <img src={(import.meta as any).env.VITE_API_URL + p.photoUrl} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
-              </a>
-            ))}
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+            <strong style={{ color: 'var(--t0)' }}>Photos ({photos.length})</strong>
+            {editable && (
+              <div style={{ display: 'flex', gap: 8 }}>
+                <button className="btn btn-p btn-sm" onClick={() => setCamera('photo')} disabled={photoMut.isLoading}>📷 Take photo</button>
+                <button className="btn btn-p btn-sm" onClick={() => setCamera('video')} disabled={videoMut.isLoading}>🎥 Record video</button>
+              </div>
+            )}
           </div>
+          {videoSaved && (
+            <div className="alert" style={{ background: 'rgba(34,197,94,.08)', color: 'var(--green)', marginBottom: 12, fontSize: '.82rem', padding: 10, borderRadius: 8 }}>
+              Video saved. Review your walkthroughs anytime under <a href="/walkthroughs" style={{ color: 'var(--gold)' }}>My walkthroughs</a>.
+            </div>
+          )}
+          {photos.length === 0 ? (
+            <div style={{ color: 'var(--t3)', fontSize: '.85rem' }}>
+              No photos yet.{editable ? ' Use “Take photo” to capture each area fresh from your camera.' : ''}
+            </div>
+          ) : (
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(120px, 1fr))', gap: 8 }}>
+              {photos.map(p => (
+                <div key={p.id} style={{ position: 'relative' }}>
+                  <a href={API + p.photoUrl} target="_blank" rel="noreferrer"
+                     style={{ display: 'block', aspectRatio: '1/1', borderRadius: 8, overflow: 'hidden', background: 'var(--bg3)' }}>
+                    <img src={API + p.photoUrl} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                  </a>
+                  {p.capturedLive && <span className="badge b-green" style={{ position: 'absolute', top: 6, left: 6 }}>live</span>}
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
 
@@ -1727,7 +1769,56 @@ function TenantInspectionDetailPage() {
         </div>
       )}
 
+      {camera && (
+        <CameraCapture
+          mode={camera}
+          onClose={() => setCamera(null)}
+          onCapture={(file) => (camera === 'photo' ? photoMut : videoMut).mutate({ file, live: true })}
+        />
+      )}
+
       {!user && null}
+    </div>
+  )
+}
+
+// ── MY WALKTHROUGHS ──────────────────────────────────────────
+// Every walkthrough video the tenant has recorded, across all their units
+// over the years (self-scoped via GET /inspections/videos/mine).
+function TenantMyWalkthroughsPage() {
+  const { data = [], isLoading } = useQuery<any[]>('tenant-my-walkthroughs', () =>
+    get<any[]>('/inspections/videos/mine'),
+  )
+  const API = (import.meta as any).env.VITE_API_URL
+  if (isLoading) return <div style={{ padding: 32, color: 'var(--t3)' }}>Loading…</div>
+  return (
+    <div>
+      <div className="ph">
+        <div>
+          <h1 className="pt">My walkthroughs</h1>
+          <p className="ps">Every walkthrough video you’ve recorded, across your units.</p>
+        </div>
+      </div>
+      {data.length === 0 ? (
+        <div className="card" style={{ padding: 24, textAlign: 'center', color: 'var(--t3)' }}>
+          No walkthrough videos yet. When you record one during an inspection, it shows up here.
+        </div>
+      ) : (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: 16 }}>
+          {data.map(v => (
+            <div key={v.id} className="card" style={{ padding: 12 }}>
+              <video controls preload="metadata" src={API + v.videoUrl}
+                     style={{ width: '100%', borderRadius: 8, background: '#000', aspectRatio: '16/9' }} />
+              <div style={{ marginTop: 8, fontSize: '.82rem', color: 'var(--t0)' }}>
+                {labelType(v.inspectionType)} · Unit {v.unitNumber || '—'}
+              </div>
+              <div style={{ fontSize: '.75rem', color: 'var(--t3)' }}>
+                {v.propertyName} · {new Date(v.uploadedAt).toLocaleDateString()}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   )
 }
@@ -2643,6 +2734,7 @@ function App() {
           <Route path="utilities"        element={<UtilitiesPage />} />
           <Route path="inspections"      element={<TenantInspectionsPage />} />
           <Route path="inspections/:id"  element={<TenantInspectionDetailPage />} />
+          <Route path="walkthroughs"     element={<TenantMyWalkthroughsPage />} />
           <Route path="entry-requests"      element={<TenantEntryRequestsPage />} />
           <Route path="entry-requests/:id"  element={<TenantEntryRequestDetailPage />} />
           <Route path="credit"              element={<CreditPage />} />

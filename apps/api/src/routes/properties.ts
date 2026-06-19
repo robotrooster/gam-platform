@@ -13,7 +13,9 @@ import {
   FEE_PAYER_VALUES,
   PLACEMENT_FEE_TYPE_VALUES,
   PropertyReviewStatus,
+  AGENT_REVENUE_CAPABILITIES,
 } from '@gam/shared'
+import { listAgentPermissions, setAgentCapability } from '../services/agentPermissions'
 import { logger } from '../lib/logger'
 import { checkAgainstStatute, checkLeaseAgainstStateLaw, type LawFlag } from '../services/stateLaw'
 
@@ -332,6 +334,41 @@ propertiesRouter.delete('/:id/fee-schedule/:rowId', requirePerm('properties.edit
     if (!canManageLandlordResource(req.user, p.landlord_id)) throw new AppError(403, 'Forbidden')
     await query(`DELETE FROM property_fee_schedules WHERE id=$1 AND property_id=$2`, [req.params.rowId, req.params.id])
     res.json({ success: true })
+  } catch (e) { next(e) }
+})
+
+// ─────────────────────────────────────────────────────────────
+// AGENT REVENUE PERMISSIONS (S498 foundation → S501 settings UI)
+// Per-property opt-in for revenue-affecting agent actions. Default
+// OFF; absence of a row means OFF. The same gate the in-chat
+// set_agent_permission tool writes — this is the property-settings
+// surface so a landlord can manage it outside of chat.
+// ─────────────────────────────────────────────────────────────
+
+// GET /api/properties/:id/agent-permissions — full capability map (every capability, default false)
+propertiesRouter.get('/:id/agent-permissions', async (req, res, next) => {
+  try {
+    const p = await queryOne<any>(`SELECT id, landlord_id FROM properties WHERE id=$1`, [req.params.id])
+    if (!p) throw new AppError(404, 'Property not found')
+    if (!canAccessLandlordResource(req.user, p.landlord_id)) throw new AppError(403, 'Forbidden')
+    const map = await listAgentPermissions(req.params.id)
+    res.json({ success: true, data: map })
+  } catch (e) { next(e) }
+})
+
+// PATCH /api/properties/:id/agent-permissions — toggle one capability
+const agentPermSchema = z.object({
+  capability: z.enum(AGENT_REVENUE_CAPABILITIES),
+  enabled: z.boolean(),
+})
+propertiesRouter.patch('/:id/agent-permissions', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const p = await queryOne<any>(`SELECT id, landlord_id FROM properties WHERE id=$1`, [req.params.id])
+    if (!p) throw new AppError(404, 'Property not found')
+    if (!canManageLandlordResource(req.user, p.landlord_id)) throw new AppError(403, 'Forbidden')
+    const body = agentPermSchema.parse(req.body)
+    const enabled = await setAgentCapability(req.params.id, body.capability, body.enabled, req.user!.userId)
+    res.json({ success: true, data: { capability: body.capability, enabled } })
   } catch (e) { next(e) }
 })
 

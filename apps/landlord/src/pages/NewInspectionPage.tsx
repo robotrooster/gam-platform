@@ -13,7 +13,7 @@ export function NewInspectionPage() {
   const [unitId, setUnitId] = useState('')
   const [tenantId, setTenantId] = useState('')
   const [leaseId, setLeaseId] = useState('')
-  const [type, setType] = useState<'move_in' | 'move_out' | 'periodic'>('move_in')
+  const [type, setType] = useState<'move_in' | 'move_out' | 'periodic' | 'turnover'>('move_in')
   const [comparisonId, setComparisonId] = useState('')
   const [scheduledFor, setScheduledFor] = useState('')
   const [notes, setNotes] = useState('')
@@ -87,6 +87,7 @@ export function NewInspectionPage() {
           <select value={type} onChange={e => setType(e.target.value as any)} className="input" required>
             <option value="move_in">Move-in</option>
             <option value="move_out">Move-out</option>
+            <option value="turnover">Turnover (clean/repair between tenancies)</option>
             <option value="periodic">Periodic</option>
           </select>
         </Field>

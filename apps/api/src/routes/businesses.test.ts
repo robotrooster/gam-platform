@@ -457,14 +457,14 @@ describe('S492 — POST signup applies BUSINESS_TYPE_DEFAULT_FEATURES', () => {
     ].sort())
   })
 
-  it('mini_market → seeds {customers, staff, pos, inventory, invoicing, payments}', async () => {
+  it('mini_market → seeds {customers, staff, pos, inventory, invoicing, payments, discounts}', async () => {
     const body = validSignup({ businessType: 'mini_market' })
     const res = await request(buildApp())
       .post('/api/businesses').send(body)
     expect(res.status).toBe(201)
     const features: string[] = res.body.data.business.enabledFeatures
     expect(features.sort()).toEqual([
-      'customers', 'inventory', 'invoicing',
+      'customers', 'discounts', 'inventory', 'invoicing',
       'payments', 'pos', 'staff',
     ].sort())
   })
@@ -554,5 +554,54 @@ describe('S492 — PATCH /api/businesses/me/features', () => {
       expect(res.status).toBe(201)
       expect(res.body.data.business.businessType).toBe(bt)
     }
+  })
+})
+
+// ═══════════════════════════════════════════════════════════════
+//  S515 (D) — onboarding wizard status + completion
+// ═══════════════════════════════════════════════════════════════
+
+describe('GET /api/businesses/me/onboarding', () => {
+  it('derives step status from real data', async () => {
+    const o = await seedOwner({ businessType: 'mini_market' })
+    const res = await request(buildApp())
+      .get('/api/businesses/me/onboarding')
+      .set('Authorization', `Bearer ${o.token}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.completedAt).toBeNull()
+    expect(res.body.data.steps.features).toBe(true)   // mini_market has defaults
+    expect(res.body.data.steps.stripe).toBe(false)    // no Connect account
+    expect(res.body.data.steps.customers).toBe(false) // none yet
+    expect(res.body.data.customerCount).toBe(0)
+  })
+
+  it('customers step flips true after a customer exists', async () => {
+    const o = await seedOwner()
+    await db.query(
+      `INSERT INTO business_customers
+         (business_id, customer_type, first_name, last_name, street1, city, state, zip)
+       VALUES ($1, 'individual', 'A', 'B', '1 St', 'Phoenix', 'AZ', '85001')`,
+      [o.businessId])
+    const res = await request(buildApp())
+      .get('/api/businesses/me/onboarding')
+      .set('Authorization', `Bearer ${o.token}`)
+    expect(res.body.data.steps.customers).toBe(true)
+    expect(res.body.data.customerCount).toBe(1)
+  })
+})
+
+describe('POST /api/businesses/me/onboarding/complete', () => {
+  it('sets completedAt and is idempotent', async () => {
+    const o = await seedOwner()
+    const r1 = await request(buildApp())
+      .post('/api/businesses/me/onboarding/complete')
+      .set('Authorization', `Bearer ${o.token}`)
+    expect(r1.status).toBe(200)
+    expect(r1.body.data.onboarding_completed_at).not.toBeNull()
+    const firstStamp = r1.body.data.onboarding_completed_at
+    const r2 = await request(buildApp())
+      .post('/api/businesses/me/onboarding/complete')
+      .set('Authorization', `Bearer ${o.token}`)
+    expect(r2.body.data.onboarding_completed_at).toBe(firstStamp)  // unchanged
   })
 })

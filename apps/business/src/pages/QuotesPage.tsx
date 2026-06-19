@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
-import { apiGet, apiPost, apiDelete, openPdfInNewTab } from '../lib/api'
+import { apiGet, apiPost, apiPatch, apiDelete, openPdfInNewTab } from '../lib/api'
+import { useAuth } from '../context/AuthContext'
 import { Modal } from '../components/Modal'
 import {
   Plus, ChevronRight, ArrowLeft, Send, Check, X as XIcon,
@@ -13,6 +14,7 @@ interface QuoteSummary {
   quoteNumber: string
   status: QuoteStatus
   subtotal: string
+  discountAmount: string
   taxAmount: string
   totalAmount: string
   expiresAt: string | null
@@ -54,6 +56,7 @@ interface QuoteDetail extends QuoteSummary {
   vehicleMake: string | null
   vehicleModel: string | null
   vehicleVin: string | null
+  discountCode: string | null
   lines: QuoteLine[]
 }
 
@@ -346,8 +349,12 @@ function CreateModal({
 // ─────────────────────────────────────────────────────────────────
 
 function Detail({ id, onBack }: { id: string; onBack: () => void }) {
+  const { business } = useAuth()
+  const discountsEnabled = (business?.enabledFeatures ?? []).includes('discounts')
   const [q, setQ] = useState<QuoteDetail | null>(null)
   const [err, setErr] = useState<string | null>(null)
+  const [discountInput, setDiscountInput] = useState('')
+  const [discountBusy, setDiscountBusy] = useState(false)
   const [showAddLine, setShowAddLine] = useState(false)
   const [showSend, setShowSend] = useState(false)
   const [showDecline, setShowDecline] = useState(false)
@@ -382,6 +389,19 @@ function Detail({ id, onBack }: { id: string; onBack: () => void }) {
       reload()
     } catch (e: any) {
       setErr(e?.response?.data?.error || 'Remove failed')
+    }
+  }
+  const applyDiscount = async (code: string | null) => {
+    setErr(null)
+    setDiscountBusy(true)
+    try {
+      await apiPatch(`/business-quotes/${id}/discount`, { code })
+      setDiscountInput('')
+      reload()
+    } catch (e: any) {
+      setErr(e?.response?.data?.error || 'Could not apply discount')
+    } finally {
+      setDiscountBusy(false)
     }
   }
 
@@ -568,9 +588,52 @@ function Detail({ id, onBack }: { id: string; onBack: () => void }) {
         {/* Totals */}
         <div style={{ padding: 14, background: 'var(--bg-2)', borderRadius: 8 }}>
           <Row label="Subtotal" value={fmtMoney(q.subtotal)} />
+          {Number(q.discountAmount) > 0 && (
+            <Row
+              label={q.discountCode ? `Discount (${q.discountCode})` : 'Discount'}
+              value={`-${fmtMoney(q.discountAmount)}`}
+            />
+          )}
           <Row label="Tax"      value={fmtMoney(q.taxAmount)} />
           <Row label="Total"    value={fmtMoney(q.totalAmount)} big />
         </div>
+
+        {/* Discount code control — draft only, when the Discounts feature is on */}
+        {isDraft && discountsEnabled && (
+          <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' as const }}>
+            {Number(q.discountAmount) > 0 ? (
+              <>
+                <span style={{ fontSize: 13, color: 'var(--text-2)' }}>
+                  Discount code <strong style={{ color: 'var(--text-1)' }}>{q.discountCode}</strong> applied
+                </span>
+                <button
+                  onClick={() => applyDiscount(null)}
+                  disabled={discountBusy}
+                  style={ghostBtn}
+                >
+                  Remove
+                </button>
+              </>
+            ) : (
+              <>
+                <input
+                  value={discountInput}
+                  onChange={e => setDiscountInput(e.target.value.toUpperCase())}
+                  placeholder="Discount code"
+                  style={{ ...inputStyle, maxWidth: 200, margin: 0 }}
+                  onKeyDown={e => { if (e.key === 'Enter' && discountInput.trim()) applyDiscount(discountInput.trim()) }}
+                />
+                <button
+                  onClick={() => applyDiscount(discountInput.trim())}
+                  disabled={discountBusy || !discountInput.trim()}
+                  style={{ ...ghostBtn, opacity: discountBusy || !discountInput.trim() ? 0.5 : 1 }}
+                >
+                  Apply
+                </button>
+              </>
+            )}
+          </div>
+        )}
 
         {q.internalNotes && (
           <div style={{
@@ -660,9 +723,20 @@ function AddLineModal({
   const [genericQty, setGenericQty] = useState('1')
   const [genericPrice, setGenericPrice] = useState('0')
   const [genericTax, setGenericTax] = useState('0')
+  // S504: shared per-line discount, applies to whichever line type is active.
+  const [discType, setDiscType] = useState<'none' | 'percent' | 'fixed'>('none')
+  const [discValue, setDiscValue] = useState('')
 
   const [err, setErr] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+
+  const withLineDiscount = (payload: any) => {
+    if (discType !== 'none' && Number(discValue) > 0) {
+      payload.discountType = discType
+      payload.discountValue = Number(discValue)
+    }
+    return payload
+  }
 
   useEffect(() => {
     if (type !== 'part') return
@@ -701,6 +775,9 @@ function AddLineModal({
       payload = { lineType: 'part', itemId, quantity: Number(qty) || 0 }
       if (overridePrice.trim()) payload.unitPrice = Number(overridePrice)
     }
+    if (discType !== 'none' && !(Number(discValue) > 0)) { setErr('Enter a discount amount or set discount to None'); return }
+    if (discType === 'percent' && Number(discValue) > 100) { setErr('Percent discount cannot exceed 100'); return }
+    withLineDiscount(payload)
     setBusy(true)
     try {
       await apiPost(`/business-quotes/${quoteId}/lines`, payload)
@@ -873,6 +950,30 @@ function AddLineModal({
           </div>
         </>
       )}
+
+      <div style={{ borderTop: '1px solid var(--border-1)', marginTop: 16, paddingTop: 12 }}>
+        <label style={labelStyle}>Line discount (optional)</label>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+          <select value={discType}
+            onChange={e => setDiscType(e.target.value as 'none' | 'percent' | 'fixed')}
+            style={inputStyle}>
+            <option value="none">No discount</option>
+            <option value="percent">Percent off (%)</option>
+            <option value="fixed">Amount off ($)</option>
+          </select>
+          {discType !== 'none' && (
+            <input type="number" step="0.01" min="0"
+              max={discType === 'percent' ? 100 : undefined}
+              value={discValue} onChange={e => setDiscValue(e.target.value)}
+              placeholder={discType === 'percent' ? '10' : '25.00'}
+              style={inputStyle} />
+          )}
+        </div>
+        <div style={{ marginTop: 6, fontSize: 11, color: 'var(--text-3)' }}>
+          Discounts this line off its gross (qty × price), pre-tax. A whole-quote
+          discount code, if any, stacks on top.
+        </div>
+      </div>
     </Modal>
   )
 }

@@ -117,7 +117,7 @@ Per S268 list, remaining items in roughly leverage order:
 
 ### Possible follow-ups discovered this session
 
-- `apps/api/src/db/index.ts` has a hardcoded `/Users/gold/...`
+- `apps/api/src/db/index.ts` has a hardcoded `/Users/nicholasrhoades/...`
   path on its `dotenv.config()` call. Works in CI (silent
   no-op) and works in dev (loads the local .env). Production
   will set env vars at the orchestrator level, so the hardcode

@@ -2,11 +2,11 @@
 scope: sales
 title: Why landlords choose GAM
 ---
-GAM is an all-in-one property-management platform built to take the busywork out of being a landlord — so rent, leases, maintenance, and screening all live in one place instead of scattered across spreadsheets, email, and a half-dozen apps.
+GAM is the only property-management platform with a **rent guarantee**: your rent hits your bank account on the **first business day of every month — regardless of when your tenants actually pay**. That's the headline reason landlords choose GAM, and no other platform offers it. Everything else — rent, leases, maintenance, and screening — lives in one place instead of scattered across spreadsheets, email, and a half-dozen apps.
 
 Here's what landlords get:
 
-- **Get paid, automatically.** Tenants pay rent electronically by bank transfer (ACH) or card, and payouts land in your connected bank account on a regular schedule through Stripe. No chasing checks.
+- **Rent on the 1st, guaranteed.** You get paid on the first business day of every month even if a tenant pays late. Tenants pay electronically by bank transfer (ACH) or card; payouts reach your connected bank through Stripe. No chasing checks, no waiting on slow payers.
 - **Leases and e-signing built in.** Create a lease, send it for signature, and keep the signed copy on file — all in the portal.
 - **Maintenance that routes itself.** Tenants file requests right in their portal; they come straight to you, with an approval step for bigger jobs so nothing happens without your sign-off.
 - **Tenant screening.** Run applications and background checks on prospective tenants without leaving the platform.

@@ -8,7 +8,7 @@ GAM is a property-rental software platform used by tenants and landlords to mana
 
 GAM is the **platform**, not your landlord. GAM does not own properties, set rent, write lease terms, perform repairs, or make decisions about your unit. Those choices belong to your landlord and are governed by your lease and your local laws. GAM provides the tools you both use to handle rent, documents, maintenance requests, and communication in one place.
 
-For example, your rent amount, due date, grace period, and late fees are set by your landlord in your lease — you can view your lease anytime in the portal under **Documents**. Maintenance and repair decisions are your landlord's responsibility; you start that process by filing a maintenance request, which GAM routes to your landlord.
+For example, your rent amount, due date, grace period, and late fees are set by your landlord in your lease — you can view your lease anytime in the portal under the **Lease** section. Maintenance and repair decisions are your landlord's responsibility; you start that process by filing a maintenance request, which GAM routes to your landlord.
 
 ## Getting help
 

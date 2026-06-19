@@ -2,10 +2,11 @@ import { useState, useRef } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useParams, useNavigate } from 'react-router-dom'
 import {
-  ClipboardCheck, ArrowLeft, Plus, Camera,
+  ClipboardCheck, ArrowLeft, Plus, Camera, Video, Film,
   CheckCircle2, FileSignature, Calendar,
 } from 'lucide-react'
 import { api, apiGet, apiPatch, apiPost } from '../lib/api'
+import { CameraCapture } from '../components/CameraCapture'
 
 type Item = {
   id: string
@@ -20,17 +21,27 @@ type Photo = {
   itemId: string | null
   photoUrl: string
   caption: string | null
+  capturedLive: boolean
   uploadedBy: string
   uploadedAt: string
 }
 type Sig = { signerUserId: string; signerRole: string; signedAt: string }
+type Vid = {
+  id: string
+  title: string | null
+  videoUrl: string
+  thumbnailUrl: string | null
+  durationSeconds: number | null
+  capturedLive: boolean
+  uploadedAt: string
+}
 type Detail = {
   id: string
   unitId: string
   leaseId: string | null
   tenantId: string | null
   landlordId: string
-  inspectionType: 'move_in' | 'move_out' | 'periodic'
+  inspectionType: 'move_in' | 'move_out' | 'periodic' | 'turnover'
   status: string
   comparisonInspectionId: string | null
   scheduledFor: string | null
@@ -63,14 +74,22 @@ export function InspectionDetailPage() {
   const navigate = useNavigate()
   const qc = useQueryClient()
   const fileRef = useRef<HTMLInputElement>(null)
+  const videoRef = useRef<HTMLInputElement>(null)
   const [newItem, setNewItem] = useState({ area: '', itemLabel: '', condition: 'good' as Item['condition'], notes: '' })
   const [error, setError] = useState<string | null>(null)
   const [finalizeResult, setFinalizeResult] = useState<any>(null)
   const [showReschedule, setShowReschedule] = useState(false)
+  const [camera, setCamera] = useState<null | 'photo' | 'video'>(null)
 
   const { data, isLoading } = useQuery<Detail>(
     ['inspection', id],
     () => apiGet<Detail>(`/inspections/${id}`),
+  )
+
+  // Walkthrough videos live on a separate endpoint (not in the detail payload).
+  const { data: videos } = useQuery<Vid[]>(
+    ['inspection-videos', id],
+    () => apiGet<Vid[]>(`/inspections/${id}/videos`),
   )
 
   const addItemMut = useMutation(
@@ -85,9 +104,10 @@ export function InspectionDetailPage() {
   )
 
   const photoMut = useMutation(
-    (file: File) => {
+    ({ file, live }: { file: File; live?: boolean }) => {
       const fd = new FormData()
       fd.append('file', file)
+      if (live) fd.append('capturedLive', 'true')
       return api.post(`/inspections/${id}/photos`, fd, {
         headers: { 'Content-Type': 'multipart/form-data' },
       }).then(r => r.data)
@@ -95,6 +115,21 @@ export function InspectionDetailPage() {
     {
       onSuccess: () => qc.invalidateQueries(['inspection', id]),
       onError: (e: any) => setError(e?.response?.data?.error || 'Upload failed'),
+    },
+  )
+
+  const videoMut = useMutation(
+    ({ file, live }: { file: File; live?: boolean }) => {
+      const fd = new FormData()
+      fd.append('file', file)
+      if (live) fd.append('capturedLive', 'true')
+      return api.post(`/inspections/${id}/videos`, fd, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      }).then(r => r.data)
+    },
+    {
+      onSuccess: () => qc.invalidateQueries(['inspection-videos', id]),
+      onError: (e: any) => setError(e?.response?.data?.error || 'Video upload failed'),
     },
   )
 
@@ -155,6 +190,13 @@ export function InspectionDetailPage() {
             {insp.tenantId && <> · Tenant {insp.tenantId.slice(0, 8)}…</>}
             {insp.comparisonInspectionId && <> · Comparing against {insp.comparisonInspectionId.slice(0, 8)}…</>}
           </div>
+          <button
+            className="btn btn-ghost btn-sm"
+            onClick={() => navigate(`/inspections/unit/${insp.unitId}/lifecycle`)}
+            style={{ marginTop: 8 }}
+          >
+            <Film size={14} /> Unit video history
+          </button>
           {insp.status !== 'finalized' && insp.status !== 'cancelled' && (
             <div style={{ marginTop: 8, display: 'flex', alignItems: 'center', gap: 8, fontSize: '.85rem' }}>
               <Calendar size={14} style={{ color: 'var(--text-3)' }} />
@@ -177,6 +219,14 @@ export function InspectionDetailPage() {
           onClose={() => setShowReschedule(false)}
           onSave={(v) => rescheduleMut.mutate(v)}
           saving={rescheduleMut.isLoading}
+        />
+      )}
+
+      {camera && (
+        <CameraCapture
+          mode={camera}
+          onClose={() => setCamera(null)}
+          onCapture={(file) => (camera === 'photo' ? photoMut : videoMut).mutate({ file, live: true })}
         />
       )}
 
@@ -289,7 +339,7 @@ export function InspectionDetailPage() {
         <div style={{ padding: 16, borderBottom: '1px solid var(--border-0)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
           <strong>Photos ({insp.photos.length})</strong>
           {insp.status !== 'finalized' && insp.status !== 'cancelled' && (
-            <>
+            <div style={{ display: 'flex', gap: 8 }}>
               <input
                 ref={fileRef}
                 type="file"
@@ -297,14 +347,17 @@ export function InspectionDetailPage() {
                 style={{ display: 'none' }}
                 onChange={e => {
                   const f = e.target.files?.[0]
-                  if (f) photoMut.mutate(f)
+                  if (f) photoMut.mutate({ file: f })
                   e.target.value = ''
                 }}
               />
-              <button className="btn btn-ghost btn-sm" onClick={() => fileRef.current?.click()} disabled={photoMut.isLoading}>
-                <Camera size={14} /> {photoMut.isLoading ? 'Uploading…' : 'Upload photo'}
+              <button className="btn btn-primary btn-sm" onClick={() => setCamera('photo')} disabled={photoMut.isLoading}>
+                <Camera size={14} /> Take photo
               </button>
-            </>
+              <button className="btn btn-ghost btn-sm" onClick={() => fileRef.current?.click()} disabled={photoMut.isLoading}>
+                {photoMut.isLoading ? 'Uploading…' : 'Upload'}
+              </button>
+            </div>
           )}
         </div>
         {insp.photos.length === 0 ? (
@@ -312,11 +365,64 @@ export function InspectionDetailPage() {
         ) : (
           <div style={{ padding: 16, display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(150px, 1fr))', gap: 12 }}>
             {insp.photos.map(p => (
-              <a key={p.id} href={(import.meta as any).env.VITE_API_URL + p.photoUrl} target="_blank" rel="noreferrer"
-                 style={{ display: 'block', aspectRatio: '1/1', borderRadius: 8, overflow: 'hidden', background: 'var(--bg-3)' }}>
-                <img src={(import.meta as any).env.VITE_API_URL + p.photoUrl} alt={p.caption || ''}
-                     style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
-              </a>
+              <div key={p.id} style={{ position: 'relative' }}>
+                <a href={(import.meta as any).env.VITE_API_URL + p.photoUrl} target="_blank" rel="noreferrer"
+                   style={{ display: 'block', aspectRatio: '1/1', borderRadius: 8, overflow: 'hidden', background: 'var(--bg-3)' }}>
+                  <img src={(import.meta as any).env.VITE_API_URL + p.photoUrl} alt={p.caption || ''}
+                       style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                </a>
+                {p.capturedLive && (
+                  <span className="badge badge-green" style={{ position: 'absolute', top: 6, left: 6 }}>live</span>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* VIDEOS — in-house walkthrough clips (the unit's "mini-YouTube") */}
+      <div className="card" style={{ padding: 0, marginBottom: 16 }}>
+        <div style={{ padding: 16, borderBottom: '1px solid var(--border-0)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <strong>Walkthrough videos ({videos?.length ?? 0})</strong>
+          {insp.status !== 'finalized' && insp.status !== 'cancelled' && (
+            <div style={{ display: 'flex', gap: 8 }}>
+              <input
+                ref={videoRef}
+                type="file"
+                accept="video/mp4,video/quicktime,video/webm"
+                style={{ display: 'none' }}
+                onChange={e => {
+                  const f = e.target.files?.[0]
+                  if (f) videoMut.mutate({ file: f })
+                  e.target.value = ''
+                }}
+              />
+              <button className="btn btn-primary btn-sm" onClick={() => setCamera('video')} disabled={videoMut.isLoading}>
+                <Video size={14} /> Record video
+              </button>
+              <button className="btn btn-ghost btn-sm" onClick={() => videoRef.current?.click()} disabled={videoMut.isLoading}>
+                {videoMut.isLoading ? 'Uploading…' : 'Upload'}
+              </button>
+            </div>
+          )}
+        </div>
+        {!videos || videos.length === 0 ? (
+          <div style={{ padding: 24, textAlign: 'center', color: 'var(--text-3)' }}>No videos yet. Walkthrough clips are kept permanently — they can’t be deleted once added.</div>
+        ) : (
+          <div style={{ padding: 16, display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: 16 }}>
+            {videos.map(v => (
+              <div key={v.id}>
+                <video
+                  controls
+                  preload="metadata"
+                  src={(import.meta as any).env.VITE_API_URL + v.videoUrl}
+                  style={{ width: '100%', borderRadius: 8, background: '#000', aspectRatio: '16/9' }}
+                />
+                <div style={{ marginTop: 6, fontSize: '.78rem', color: 'var(--text-2)', display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <span>{v.title || new Date(v.uploadedAt).toLocaleDateString()}</span>
+                  {v.capturedLive && <span className="badge badge-green">live capture</span>}
+                </div>
+              </div>
             ))}
           </div>
         )}
@@ -388,7 +494,10 @@ export function InspectionDetailPage() {
 }
 
 function labelType(t: string) {
-  return t === 'move_in' ? 'Move-in' : t === 'move_out' ? 'Move-out' : 'Periodic'
+  return t === 'move_in' ? 'Move-in'
+    : t === 'move_out' ? 'Move-out'
+    : t === 'turnover' ? 'Turnover'
+    : 'Periodic'
 }
 
 function RescheduleModal({

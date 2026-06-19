@@ -123,6 +123,82 @@ businessCustomersRouter.post('/', requireAuth, async (req, res, next) => {
 })
 
 // ═══════════════════════════════════════════════════════════════
+//  S515 (D) — POST /import : bulk CSV customer import
+// ═══════════════════════════════════════════════════════════════
+//
+// The frontend parses the CSV and posts a JSON array of rows. We validate
+// each row independently and insert the valid ones, returning a per-row
+// error report so the operator can fix and re-import the rejects. Geocode
+// is skipped on bulk import (kept fast); lat/lon backfills later via
+// POST /:id/geocode, same as any address edit.
+
+const importRowSchema = z.object({
+  customerType: z.enum(BUSINESS_CUSTOMER_TYPES).optional(),
+  companyName:  z.string().optional(),
+  firstName:    z.string().min(1),
+  lastName:     z.string().min(1),
+  email:        z.string().email().optional().or(z.literal('')),
+  phone:        z.string().optional(),
+  street1:      z.string().min(1),
+  street2:      z.string().optional(),
+  city:         z.string().min(1),
+  state:        z.string().min(1),
+  zip:          z.string().min(1),
+  notes:        z.string().optional(),
+})
+
+const importSchema = z.object({
+  customers: z.array(z.any()).min(1).max(1000),
+})
+
+businessCustomersRouter.post('/import', requireAuth, async (req, res, next) => {
+  try {
+    const businessId = await requireOwnerBusinessId(req)
+    const { customers } = importSchema.parse(req.body)
+
+    let created = 0
+    const errors: Array<{ row: number; reason: string }> = []
+
+    for (let i = 0; i < customers.length; i++) {
+      const parsed = importRowSchema.safeParse(customers[i])
+      if (!parsed.success) {
+        const issue = parsed.error.issues[0]
+        errors.push({ row: i + 1, reason: issue ? `${issue.path.join('.')}: ${issue.message}` : 'invalid row' })
+        continue
+      }
+      const r = parsed.data
+      const type = r.customerType ?? (r.companyName?.trim() ? 'business' : 'individual')
+      if (type === 'business' && !r.companyName?.trim()) {
+        errors.push({ row: i + 1, reason: 'companyName required for a business customer' })
+        continue
+      }
+      const email = r.email && r.email.trim() ? r.email.trim() : null
+      try {
+        await query(
+          `INSERT INTO business_customers
+             (business_id, customer_type, company_name,
+              first_name, last_name, email, phone,
+              street1, street2, city, state, zip, notes)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+          [businessId, type,
+           type === 'business' ? r.companyName?.trim() : null,
+           r.firstName, r.lastName, email, r.phone ?? null,
+           r.street1, r.street2 ?? null, r.city, r.state, r.zip,
+           r.notes ?? null])
+        created++
+      } catch (e) {
+        logger.error({ err: e, row: i + 1 }, '[customer-import] row insert failed')
+        errors.push({ row: i + 1, reason: 'database insert failed' })
+      }
+    }
+
+    res.status(201).json({ success: true, data: {
+      created, skipped: errors.length, total: customers.length, errors,
+    } })
+  } catch (e) { next(e) }
+})
+
+// ═══════════════════════════════════════════════════════════════
 //  POST /:id/geocode  — backfill coords for an existing customer
 // ═══════════════════════════════════════════════════════════════
 
@@ -292,6 +368,60 @@ businessCustomersRouter.post('/:id/send-card-update-link', requireAuth, async (r
       throw new AppError(400, 'Customer has no email on file — add one first.')
     }
     res.json({ success: true, data: { ok: true } })
+  } catch (e) { next(e) }
+})
+
+// S502 — get (or create) the customer's self-service portal link. Reuses a
+// live token so the customer's existing link keeps working. The owner copies
+// the URL or has it emailed to the customer.
+businessCustomersRouter.post('/:id/portal-link', requireAuth, async (req, res, next) => {
+  try {
+    const businessId = await requireOwnerBusinessId(req)
+    const customer = await queryOne<{ id: string; email: string | null }>(
+      `SELECT id, email FROM business_customers WHERE id = $1 AND business_id = $2`,
+      [req.params.id, businessId])
+    if (!customer) throw new AppError(404, 'Customer not found')
+
+    const { getOrCreateCustomerPortalToken } = await import('../services/customerPortalTokens')
+    const link = await getOrCreateCustomerPortalToken({
+      businessId, customerId: customer.id, createdByUserId: req.user!.userId,
+    })
+
+    // Optionally email the link to the customer (when they have an email).
+    let emailed = false
+    if (req.body?.sendEmail === true && customer.email) {
+      const [{ emailBusinessCustomerPortalLink }, biz] = await Promise.all([
+        import('../services/email'),
+        queryOne<{ name: string }>(`SELECT name FROM businesses WHERE id = $1`, [businessId]),
+      ])
+      await emailBusinessCustomerPortalLink({
+        to: customer.email,
+        businessName: biz?.name ?? 'your service provider',
+        portalUrl: link.url,
+        ctx: { businessId, customerId: customer.id },
+      })
+      emailed = true
+    }
+
+    res.json({ success: true, data: { url: link.url, expiresAt: link.expiresAt, emailed } })
+  } catch (e) { next(e) }
+})
+
+// Revoke a customer's portal access — the off-switch for a leaked or stale
+// self-service link. Kills every live token; the next portal-link issue mints
+// a fresh one. Owner-only, scoped to the owner's business.
+businessCustomersRouter.post('/:id/revoke-portal-access', requireAuth, async (req, res, next) => {
+  try {
+    const businessId = await requireOwnerBusinessId(req)
+    const customer = await queryOne<{ id: string }>(
+      `SELECT id FROM business_customers WHERE id = $1 AND business_id = $2`,
+      [req.params.id, businessId])
+    if (!customer) throw new AppError(404, 'Customer not found')
+
+    const { revokeCustomerPortalTokens } = await import('../services/customerPortalTokens')
+    const { revoked } = await revokeCustomerPortalTokens({ businessId, customerId: customer.id })
+
+    res.json({ success: true, data: { revoked } })
   } catch (e) { next(e) }
 })
 

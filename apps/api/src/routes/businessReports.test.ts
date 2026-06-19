@@ -370,3 +370,204 @@ describe('Cross-business isolation', () => {
     expect(Number(res.body.data.revenue.period_totals.pos)).toBe(0)
   })
 })
+
+// ═══════════════════════════════════════════════════════════════
+//  S517 — sales tax collected
+// ═══════════════════════════════════════════════════════════════
+
+describe('Sales tax section', () => {
+  it('sums POS + invoice tax into total + monthly buckets', async () => {
+    const f = await seedFixture()
+    await db.query(
+      `INSERT INTO business_pos_transactions
+         (business_id, receipt_number, status, subtotal, tax_amount, total_amount, payment_method)
+       VALUES ($1, 'TXN-T1', 'completed', 100, 8.75, 108.75, 'cash')`,
+      [f.businessId])
+    await db.query(
+      `INSERT INTO business_invoices
+         (business_id, customer_id, invoice_number, status, issue_date, due_date,
+          subtotal, tax_amount, total_amount, amount_paid, sent_at)
+       VALUES ($1, $2, 'INV-T1', 'sent', CURRENT_DATE, CURRENT_DATE + 30, 200, 17.50, 217.50, 0, NOW())`,
+      [f.businessId, f.customerId])
+
+    const res = await request(buildApp())
+      .get('/api/business-reports/overview')
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.sales_tax).not.toBeNull()
+    expect(Number(res.body.data.sales_tax.total_collected)).toBeCloseTo(26.25)  // 8.75 + 17.50
+    expect(res.body.data.sales_tax.monthly.length).toBeGreaterThanOrEqual(1)
+    const thisMonth = res.body.data.sales_tax.monthly.at(-1)
+    expect(Number(thisMonth.pos_tax)).toBeCloseTo(8.75)
+    expect(Number(thisMonth.invoice_tax)).toBeCloseTo(17.50)
+  })
+
+  it('draft invoices + refunded POS excluded from tax', async () => {
+    const f = await seedFixture()
+    await db.query(
+      `INSERT INTO business_pos_transactions
+         (business_id, receipt_number, status, subtotal, tax_amount, total_amount, payment_method, refunded_at, refund_reason)
+       VALUES ($1, 'TXN-R', 'refunded', 100, 8.75, 108.75, 'cash', NOW(), 'test')`,
+      [f.businessId])
+    await db.query(
+      `INSERT INTO business_invoices
+         (business_id, customer_id, invoice_number, status, issue_date, due_date,
+          subtotal, tax_amount, total_amount, amount_paid)
+       VALUES ($1, $2, 'INV-D', 'draft', CURRENT_DATE, CURRENT_DATE + 30, 200, 17.50, 217.50, 0)`,
+      [f.businessId, f.customerId])
+    const res = await request(buildApp())
+      .get('/api/business-reports/overview')
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+    expect(Number(res.body.data.sales_tax.total_collected)).toBe(0)
+  })
+})
+
+// ═══════════════════════════════════════════════════════════════
+//  A/R aging (S502)
+// ═══════════════════════════════════════════════════════════════
+
+describe('A/R aging', () => {
+  // dueOffset: + = due in the future (current), - = days past due.
+  async function sentInvoice(f: Fixture, num: string, total: number, dueOffset: number, paid = 0, customerId?: string) {
+    await db.query(
+      `INSERT INTO business_invoices
+         (business_id, customer_id, invoice_number, status, issue_date, due_date,
+          subtotal, tax_amount, total_amount, amount_paid, sent_at)
+       VALUES ($1, $2, $3, 'sent', CURRENT_DATE - 100, CURRENT_DATE + $4::int,
+          $5, 0, $5, $6, now())`,
+      [f.businessId, customerId ?? f.customerId, num, dueOffset, total, paid])
+  }
+  async function get(f: Fixture) {
+    const res = await request(buildApp())
+      .get('/api/business-reports/overview')
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+    return res.body.data.ar_aging
+  }
+
+  it('is null when invoicing is off', async () => {
+    const f = await seedFixture({ features: ['customers', 'staff'] })
+    expect(await get(f)).toBeNull()
+  })
+
+  it('buckets outstanding invoices by days past due', async () => {
+    const f = await seedFixture()
+    await sentInvoice(f, 'INV-CUR', 100, 5)     // due in 5 days → current
+    await sentInvoice(f, 'INV-A', 50, -10)      // 10 days late → 1-30
+    await sentInvoice(f, 'INV-B', 70, -45)      // 45 days late → 31-60
+    await sentInvoice(f, 'INV-C', 30, -80)      // 80 days late → 61-90
+    await sentInvoice(f, 'INV-D', 200, -200)    // 200 days late → 90+
+    const ar = await get(f)
+    expect(ar.totals.current).toBeCloseTo(100)
+    expect(ar.totals.d1to30).toBeCloseTo(50)
+    expect(ar.totals.d31to60).toBeCloseTo(70)
+    expect(ar.totals.d61to90).toBeCloseTo(30)
+    expect(ar.totals.d90plus).toBeCloseTo(200)
+    expect(ar.totals.total).toBeCloseTo(450)
+  })
+
+  it('counts only the unpaid remainder and excludes draft/paid/void', async () => {
+    const f = await seedFixture()
+    await sentInvoice(f, 'INV-PART', 100, -10, 40)  // $60 remaining → 1-30
+    // paid + draft + void must NOT appear
+    await db.query(
+      `INSERT INTO business_invoices (business_id, customer_id, invoice_number, status, issue_date, due_date, subtotal, tax_amount, total_amount, amount_paid, sent_at, paid_at)
+       VALUES ($1,$2,'INV-PAID','paid',CURRENT_DATE-50,CURRENT_DATE-20,500,0,500,500,now(),now())`,
+      [f.businessId, f.customerId])
+    await db.query(
+      `INSERT INTO business_invoices (business_id, customer_id, invoice_number, status, issue_date, due_date, subtotal, tax_amount, total_amount, amount_paid)
+       VALUES ($1,$2,'INV-DRAFT','draft',CURRENT_DATE,CURRENT_DATE+30,999,0,999,0)`,
+      [f.businessId, f.customerId])
+    const ar = await get(f)
+    expect(ar.totals.total).toBeCloseTo(60)
+    expect(ar.totals.d1to30).toBeCloseTo(60)
+  })
+
+  it('breaks down per customer, sorted by total desc', async () => {
+    const f = await seedFixture()
+    const { rows: [c2] } = await db.query<{ id: string }>(
+      `INSERT INTO business_customers (business_id, customer_type, first_name, last_name, street1, city, state, zip)
+       VALUES ($1,'individual','Big','Spender','2 Oak','Phoenix','AZ','85001') RETURNING id`,
+      [f.businessId])
+    await sentInvoice(f, 'INV-SMALL', 40, -5)                    // default customer
+    await sentInvoice(f, 'INV-BIG', 300, -5, 0, c2.id)          // c2
+    const ar = await get(f)
+    expect(ar.customers).toHaveLength(2)
+    expect(ar.customers[0].name).toBe('Big Spender')           // sorted desc
+    expect(ar.customers[0].total).toBeCloseTo(300)
+    expect(ar.customers[1].total).toBeCloseTo(40)
+  })
+})
+
+// ═══════════════════════════════════════════════════════════════
+//  Discount usage (S503)
+// ═══════════════════════════════════════════════════════════════
+
+describe('Discount usage', () => {
+  async function get(f: Fixture) {
+    const res = await request(buildApp())
+      .get('/api/business-reports/overview')
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+    return res.body.data.discounts
+  }
+
+  it('is null when the Discounts feature is off', async () => {
+    const f = await seedFixture()   // default features have no 'discounts'
+    expect(await get(f)).toBeNull()
+  })
+
+  it('aggregates discount dollars across invoices + POS, per code', async () => {
+    const f = await seedFixture({
+      features: ['customers', 'staff', 'pos', 'invoicing', 'discounts'],
+    })
+    const { rows: [code] } = await db.query<{ id: string }>(
+      `INSERT INTO business_discount_codes (business_id, code, discount_type, discount_value)
+       VALUES ($1, 'SAVE10', 'percent', 10) RETURNING id`, [f.businessId])
+    // Two issued invoices using the code ($10 + $5 discount).
+    await db.query(
+      `INSERT INTO business_invoices
+         (business_id, customer_id, invoice_number, status, issue_date, due_date,
+          subtotal, discount_code_id, discount_amount, tax_amount, total_amount, sent_at)
+       VALUES ($1,$2,'INV-1','sent',CURRENT_DATE,CURRENT_DATE+30,100,$3,10,0,90,now()),
+              ($1,$2,'INV-2','sent',CURRENT_DATE,CURRENT_DATE+30,50,$3,5,0,45,now())`,
+      [f.businessId, f.customerId, code.id])
+    // One completed POS sale using the code ($8 discount).
+    await db.query(
+      `INSERT INTO business_pos_transactions
+         (business_id, receipt_number, status, subtotal, discount_code_id, discount_amount,
+          tax_amount, total_amount, payment_method)
+       VALUES ($1,'TXN-1','completed',80,$2,8,0,72,'cash')`,
+      [f.businessId, code.id])
+
+    const d = await get(f)
+    expect(d.total_discounted).toBeCloseTo(23)
+    expect(d.total_redemptions).toBe(3)
+    expect(d.codes).toHaveLength(1)
+    expect(d.codes[0].code).toBe('SAVE10')
+    expect(d.codes[0].invoice_amount).toBeCloseTo(15)
+    expect(d.codes[0].pos_amount).toBeCloseTo(8)
+  })
+
+  it('excludes draft invoices and non-completed POS sales', async () => {
+    const f = await seedFixture({
+      features: ['customers', 'staff', 'pos', 'invoicing', 'discounts'],
+    })
+    const { rows: [code] } = await db.query<{ id: string }>(
+      `INSERT INTO business_discount_codes (business_id, code, discount_type, discount_value)
+       VALUES ($1, 'X', 'fixed', 5) RETURNING id`, [f.businessId])
+    await db.query(
+      `INSERT INTO business_invoices
+         (business_id, customer_id, invoice_number, status, issue_date, due_date,
+          subtotal, discount_code_id, discount_amount, tax_amount, total_amount)
+       VALUES ($1,$2,'INV-DRAFT','draft',CURRENT_DATE,CURRENT_DATE+30,100,$3,5,0,95)`,
+      [f.businessId, f.customerId, code.id])
+    await db.query(
+      `INSERT INTO business_pos_transactions
+         (business_id, receipt_number, status, subtotal, discount_code_id, discount_amount,
+          tax_amount, total_amount, payment_method)
+       VALUES ($1,'TXN-VOID','void',80,$2,5,0,75,'cash')`,
+      [f.businessId, code.id])
+    const d = await get(f)
+    expect(d.total_discounted).toBeCloseTo(0)
+    expect(d.codes).toHaveLength(0)
+  })
+})

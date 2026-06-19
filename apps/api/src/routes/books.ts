@@ -20,6 +20,37 @@ function landlordScope(user: any) {
   return user.landlordId || user.profileId
 }
 
+// S459 — owner generalization. GAM Books is reused by BOTH landlords and
+// business customers (apps/business). Every owner-scoped Books table now
+// carries landlord_id XOR business_id (migration 20260619120000). This
+// resolves which owner column + id applies to the caller. For landlord /
+// admin / bookkeeper callers it returns { col:'landlord_id', id:<same as
+// landlordScope> } — so `${col}` interpolation produces byte-identical SQL
+// and landlord behavior is unchanged. For a business_owner it returns
+// { col:'business_id', id:<businessId> }. business_owner always has a
+// concrete businessId, so the `$1 IS NULL` admin-sees-all branch never
+// fires for them (no cross-tenant leak).
+//
+// The column name is from this fixed two-value allowlist, never user input,
+// so interpolating it into SQL is injection-safe.
+type OwnerCol = 'landlord_id' | 'business_id'
+function ownerScope(user: any): { col: OwnerCol; id: string | null } {
+  if (user.role === 'business_owner') return { col: 'business_id', id: user.businessId }
+  return { col: 'landlord_id', id: landlordScope(user) }
+}
+
+// S459: landlord-only Books surfaces — owner statements, rent roll, and the
+// tax summary — are built on landlord rent concepts (properties / units /
+// payments / disbursements / per-property state tax forms) that have no
+// business-customer analog. business_owner is admitted to the rest of the
+// engine but blocked here; these endpoints keep using landlordScope.
+function blockBusinessOwner(req: Request, _res: Response, next: NextFunction) {
+  if (req.user?.role === 'business_owner') {
+    return next(new AppError(403, 'Not available for business accounts'))
+  }
+  next()
+}
+
 // S383 fix — bookkeeper client-scope validation middleware. Pre-fix bug:
 // the middleware blindly accepted the X-Client-Id header without
 // verifying the bookkeeper had a bookkeeper_scopes row for that
@@ -70,10 +101,10 @@ booksRouter.use(async (req: Request, _res: Response, next: NextFunction) => {
 // GET /api/books/accounts
 booksRouter.get('/accounts', requireBooksRead, async (req, res, next) => {
   try {
-    const lid = landlordScope(req.user)
+    const { col, id: lid } = ownerScope(req.user)
     const { rows } = await db.query(
       `SELECT * FROM books_accounts
-       WHERE (landlord_id = $1 OR $1 IS NULL)
+       WHERE (${col} = $1 OR $1 IS NULL)
        AND active = TRUE
        ORDER BY code ASC`,
       [lid]
@@ -85,16 +116,16 @@ booksRouter.get('/accounts', requireBooksRead, async (req, res, next) => {
 // POST /api/books/accounts
 booksRouter.post('/accounts', requireBooksWrite, async (req, res, next) => {
   try {
-    const lid = landlordScope(req.user)
+    const { col, id: lid } = ownerScope(req.user)
     const { code, name, type, subtype, description } = req.body
     if (!code || !name || !type) throw new AppError(400, 'code, name, and type are required')
     const exists = await queryOne(
-      'SELECT id FROM books_accounts WHERE code=$1 AND (landlord_id=$2 OR landlord_id IS NULL)',
+      `SELECT id FROM books_accounts WHERE code=$1 AND (${col}=$2 OR ${col} IS NULL)`,
       [code, lid]
     )
     if (exists) throw new AppError(409, `Account code ${code} already exists`)
     const { rows: [acct] } = await db.query(
-      `INSERT INTO books_accounts (landlord_id, code, name, type, subtype, description)
+      `INSERT INTO books_accounts (${col}, code, name, type, subtype, description)
        VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
       [lid, code, name, type, subtype || null, description || null]
     )
@@ -105,14 +136,14 @@ booksRouter.post('/accounts', requireBooksWrite, async (req, res, next) => {
 // PATCH /api/books/accounts/:id
 booksRouter.patch('/accounts/:id', requireBooksWrite, async (req, res, next) => {
   try {
-    const lid = landlordScope(req.user)
+    const { col, id: lid } = ownerScope(req.user)
     const { name, subtype, description, active } = req.body
     const { rows: [acct] } = await db.query(
       `UPDATE books_accounts SET
          name=COALESCE($1,name), subtype=COALESCE($2,subtype),
          description=COALESCE($3,description), active=COALESCE($4,active),
          updated_at=NOW()
-       WHERE id=$5 AND (landlord_id=$6 OR $6 IS NULL) RETURNING *`,
+       WHERE id=$5 AND (${col}=$6 OR $6 IS NULL) RETURNING *`,
       [name||null, subtype||null, description||null, active??null, req.params.id, lid]
     )
     if (!acct) throw new AppError(404, 'Account not found')
@@ -123,77 +154,119 @@ booksRouter.patch('/accounts/:id', requireBooksWrite, async (req, res, next) => 
 // DELETE /api/books/accounts/:id
 booksRouter.delete('/accounts/:id', requireBooksWrite, async (req, res, next) => {
   try {
-    const lid = landlordScope(req.user)
+    const { col, id: lid } = ownerScope(req.user)
     await db.query(
       `UPDATE books_accounts SET active=FALSE, updated_at=NOW()
-       WHERE id=$1 AND (landlord_id=$2 OR $2 IS NULL)`,
+       WHERE id=$1 AND (${col}=$2 OR $2 IS NULL)`,
       [req.params.id, lid]
     )
     res.json({ success: true })
   } catch (e) { next(e) }
 })
 
-// POST /api/books/accounts/seed — seed standard property mgmt COA
+// Landlord (property-management) default chart of accounts.
+const LANDLORD_COA = [
+  // Assets
+  { code:'1010', name:'Checking Account',           type:'asset',     subtype:'bank' },
+  { code:'1020', name:'Savings / Reserve Account',  type:'asset',     subtype:'bank' },
+  { code:'1030', name:'Security Deposits Held',     type:'asset',     subtype:'current' },
+  { code:'1100', name:'Accounts Receivable',        type:'asset',     subtype:'current' },
+  { code:'1200', name:'Prepaid Expenses',           type:'asset',     subtype:'current' },
+  { code:'1500', name:'Rental Property',            type:'asset',     subtype:'fixed' },
+  { code:'1510', name:'Accumulated Depreciation',   type:'asset',     subtype:'fixed' },
+  // Liabilities
+  { code:'2010', name:'Accounts Payable',           type:'liability', subtype:'current' },
+  { code:'2020', name:'Security Deposits Payable',  type:'liability', subtype:'current' },
+  { code:'2030', name:'Payroll Liabilities',        type:'liability', subtype:'current' },
+  { code:'2040', name:'Sales Tax Payable',          type:'liability', subtype:'current' },
+  { code:'2100', name:'Mortgage Payable',           type:'liability', subtype:'longterm' },
+  // Equity
+  { code:'3010', name:'Owner Equity',               type:'equity',    subtype:null },
+  { code:'3020', name:'Owner Draws',                type:'equity',    subtype:null },
+  { code:'3030', name:'Retained Earnings',          type:'equity',    subtype:null },
+  // Income
+  { code:'4010', name:'Rental Income',              type:'income',    subtype:'operating' },
+  { code:'4020', name:'Late Fee Income',            type:'income',    subtype:'operating' },
+  { code:'4030', name:'Application Fee Income',     type:'income',    subtype:'operating' },
+  { code:'4040', name:'Pet Fee Income',             type:'income',    subtype:'operating' },
+  { code:'4050', name:'Laundry / Vending Income',   type:'income',    subtype:'operating' },
+  { code:'4060', name:'Storage Fee Income',         type:'income',    subtype:'operating' },
+  { code:'4070', name:'Utility Reimbursements',     type:'income',    subtype:'operating' },
+  { code:'4900', name:'Other Income',               type:'income',    subtype:'other' },
+  // Expenses
+  { code:'5010', name:'Mortgage / Loan Interest',   type:'expense',   subtype:'operating' },
+  { code:'5020', name:'Property Taxes',             type:'expense',   subtype:'operating' },
+  { code:'5030', name:'Property Insurance',         type:'expense',   subtype:'operating' },
+  { code:'5040', name:'Repairs & Maintenance',      type:'expense',   subtype:'operating' },
+  { code:'5050', name:'Utilities',                  type:'expense',   subtype:'operating' },
+  { code:'5060', name:'Landscaping',                type:'expense',   subtype:'operating' },
+  { code:'5070', name:'Pest Control',               type:'expense',   subtype:'operating' },
+  { code:'5080', name:'Property Management Fees',   type:'expense',   subtype:'operating' },
+  { code:'5090', name:'Advertising & Marketing',    type:'expense',   subtype:'operating' },
+  { code:'5100', name:'Legal & Professional Fees',  type:'expense',   subtype:'operating' },
+  { code:'5110', name:'Accounting & Bookkeeping',   type:'expense',   subtype:'operating' },
+  { code:'5120', name:'Payroll Expenses',           type:'expense',   subtype:'operating' },
+  { code:'5130', name:'Contractor Payments',        type:'expense',   subtype:'operating' },
+  { code:'5140', name:'Office Supplies',            type:'expense',   subtype:'operating' },
+  { code:'5150', name:'Software & Subscriptions',   type:'expense',   subtype:'operating' },
+  { code:'5160', name:'Vehicle & Travel',           type:'expense',   subtype:'operating' },
+  { code:'5170', name:'Depreciation Expense',       type:'expense',   subtype:'operating' },
+  { code:'5900', name:'Other Expenses',             type:'expense',   subtype:'other' },
+]
+
+// S459: service/retail business default chart of accounts. Generic across
+// the GAM business types (trash hauling, mechanic, mini-market, equipment
+// rental) — no property-management concepts.
+const BUSINESS_COA = [
+  // Assets
+  { code:'1010', name:'Checking Account',           type:'asset',     subtype:'bank' },
+  { code:'1020', name:'Savings Account',            type:'asset',     subtype:'bank' },
+  { code:'1100', name:'Accounts Receivable',        type:'asset',     subtype:'current' },
+  { code:'1200', name:'Inventory',                  type:'asset',     subtype:'current' },
+  { code:'1500', name:'Equipment & Vehicles',       type:'asset',     subtype:'fixed' },
+  // Liabilities
+  { code:'2010', name:'Accounts Payable',           type:'liability', subtype:'current' },
+  { code:'2030', name:'Payroll Liabilities',        type:'liability', subtype:'current' },
+  { code:'2040', name:'Sales Tax Payable',          type:'liability', subtype:'current' },
+  // Equity
+  { code:'3010', name:'Owner Equity',               type:'equity',    subtype:null },
+  { code:'3020', name:'Owner Draws',                type:'equity',    subtype:null },
+  { code:'3030', name:'Retained Earnings',          type:'equity',    subtype:null },
+  // Income
+  { code:'4010', name:'Service Revenue',            type:'income',    subtype:'operating' },
+  { code:'4020', name:'Product Sales',              type:'income',    subtype:'operating' },
+  { code:'4030', name:'Rental Income',              type:'income',    subtype:'operating' },
+  { code:'4900', name:'Other Income',               type:'income',    subtype:'other' },
+  // Expenses
+  { code:'5010', name:'Cost of Goods Sold',         type:'expense',   subtype:'operating' },
+  { code:'5020', name:'Wages & Payroll',            type:'expense',   subtype:'operating' },
+  { code:'5030', name:'Fuel & Vehicle',             type:'expense',   subtype:'operating' },
+  { code:'5040', name:'Equipment & Supplies',       type:'expense',   subtype:'operating' },
+  { code:'5050', name:'Rent & Utilities',           type:'expense',   subtype:'operating' },
+  { code:'5060', name:'Insurance',                  type:'expense',   subtype:'operating' },
+  { code:'5070', name:'Repairs & Maintenance',      type:'expense',   subtype:'operating' },
+  { code:'5080', name:'Advertising & Marketing',    type:'expense',   subtype:'operating' },
+  { code:'5090', name:'Office & Software',          type:'expense',   subtype:'operating' },
+  { code:'5100', name:'Legal & Professional',       type:'expense',   subtype:'operating' },
+  { code:'5110', name:'Bank & Processing Fees',     type:'expense',   subtype:'operating' },
+  { code:'5900', name:'Other Expenses',             type:'expense',   subtype:'other' },
+]
+
+// POST /api/books/accounts/seed — seed a standard chart of accounts
+// appropriate to the owner type (landlord PM vs service/retail business).
 booksRouter.post('/accounts/seed', requireBooksWrite, async (req, res, next) => {
   try {
-    const lid = landlordScope(req.user)
-    const standardAccounts = [
-      // Assets
-      { code:'1010', name:'Checking Account',           type:'asset',     subtype:'bank' },
-      { code:'1020', name:'Savings / Reserve Account',  type:'asset',     subtype:'bank' },
-      { code:'1030', name:'Security Deposits Held',     type:'asset',     subtype:'current' },
-      { code:'1100', name:'Accounts Receivable',        type:'asset',     subtype:'current' },
-      { code:'1200', name:'Prepaid Expenses',           type:'asset',     subtype:'current' },
-      { code:'1500', name:'Rental Property',            type:'asset',     subtype:'fixed' },
-      { code:'1510', name:'Accumulated Depreciation',   type:'asset',     subtype:'fixed' },
-      // Liabilities
-      { code:'2010', name:'Accounts Payable',           type:'liability', subtype:'current' },
-      { code:'2020', name:'Security Deposits Payable',  type:'liability', subtype:'current' },
-      { code:'2030', name:'Payroll Liabilities',        type:'liability', subtype:'current' },
-      { code:'2040', name:'Sales Tax Payable',          type:'liability', subtype:'current' },
-      { code:'2100', name:'Mortgage Payable',           type:'liability', subtype:'longterm' },
-      // Equity
-      { code:'3010', name:'Owner Equity',               type:'equity',    subtype:null },
-      { code:'3020', name:'Owner Draws',                type:'equity',    subtype:null },
-      { code:'3030', name:'Retained Earnings',          type:'equity',    subtype:null },
-      // Income
-      { code:'4010', name:'Rental Income',              type:'income',    subtype:'operating' },
-      { code:'4020', name:'Late Fee Income',            type:'income',    subtype:'operating' },
-      { code:'4030', name:'Application Fee Income',     type:'income',    subtype:'operating' },
-      { code:'4040', name:'Pet Fee Income',             type:'income',    subtype:'operating' },
-      { code:'4050', name:'Laundry / Vending Income',   type:'income',    subtype:'operating' },
-      { code:'4060', name:'Storage Fee Income',         type:'income',    subtype:'operating' },
-      { code:'4070', name:'Utility Reimbursements',     type:'income',    subtype:'operating' },
-      { code:'4900', name:'Other Income',               type:'income',    subtype:'other' },
-      // Expenses
-      { code:'5010', name:'Mortgage / Loan Interest',   type:'expense',   subtype:'operating' },
-      { code:'5020', name:'Property Taxes',             type:'expense',   subtype:'operating' },
-      { code:'5030', name:'Property Insurance',         type:'expense',   subtype:'operating' },
-      { code:'5040', name:'Repairs & Maintenance',      type:'expense',   subtype:'operating' },
-      { code:'5050', name:'Utilities',                  type:'expense',   subtype:'operating' },
-      { code:'5060', name:'Landscaping',                type:'expense',   subtype:'operating' },
-      { code:'5070', name:'Pest Control',               type:'expense',   subtype:'operating' },
-      { code:'5080', name:'Property Management Fees',   type:'expense',   subtype:'operating' },
-      { code:'5090', name:'Advertising & Marketing',    type:'expense',   subtype:'operating' },
-      { code:'5100', name:'Legal & Professional Fees',  type:'expense',   subtype:'operating' },
-      { code:'5110', name:'Accounting & Bookkeeping',   type:'expense',   subtype:'operating' },
-      { code:'5120', name:'Payroll Expenses',           type:'expense',   subtype:'operating' },
-      { code:'5130', name:'Contractor Payments',        type:'expense',   subtype:'operating' },
-      { code:'5140', name:'Office Supplies',            type:'expense',   subtype:'operating' },
-      { code:'5150', name:'Software & Subscriptions',   type:'expense',   subtype:'operating' },
-      { code:'5160', name:'Vehicle & Travel',           type:'expense',   subtype:'operating' },
-      { code:'5170', name:'Depreciation Expense',       type:'expense',   subtype:'operating' },
-      { code:'5900', name:'Other Expenses',             type:'expense',   subtype:'other' },
-    ]
+    const { col, id: lid } = ownerScope(req.user)
+    const standardAccounts = col === 'business_id' ? BUSINESS_COA : LANDLORD_COA
     let inserted = 0
     for (const a of standardAccounts) {
       const exists = await queryOne(
-        'SELECT id FROM books_accounts WHERE code=$1 AND (landlord_id=$2 OR landlord_id IS NULL)',
+        `SELECT id FROM books_accounts WHERE code=$1 AND (${col}=$2 OR ${col} IS NULL)`,
         [a.code, lid]
       )
       if (!exists) {
         await db.query(
-          `INSERT INTO books_accounts (landlord_id, code, name, type, subtype, is_system)
+          `INSERT INTO books_accounts (${col}, code, name, type, subtype, is_system)
            VALUES ($1,$2,$3,$4,$5,TRUE)`,
           [lid, a.code, a.name, a.type, a.subtype]
         )
@@ -210,9 +283,9 @@ booksRouter.post('/accounts/seed', requireBooksWrite, async (req, res, next) => 
 
 booksRouter.get('/employees', requireBooksRead, async (req, res, next) => {
   try {
-    const lid = landlordScope(req.user)
+    const { col, id: lid } = ownerScope(req.user)
     const { rows } = await db.query(
-      `SELECT * FROM books_employees WHERE (landlord_id=$1 OR $1 IS NULL) ORDER BY last_name,first_name`,
+      `SELECT * FROM books_employees WHERE (${col}=$1 OR $1 IS NULL) ORDER BY last_name,first_name`,
       [lid]
     )
     res.json({ success: true, data: rows })
@@ -252,7 +325,7 @@ const employeeBaseSchema = z.object({
 )
 booksRouter.post('/employees', requireBooksWrite, async (req, res, next) => {
   try {
-    const lid = landlordScope(req.user)
+    const { col, id: lid } = ownerScope(req.user)
     const body = employeeBaseSchema.parse(req.body)
     // S417: disposable-domain block (same Set as tenant /profile).
     if (isDisposableEmail(body.email)) {
@@ -261,7 +334,7 @@ booksRouter.post('/employees', requireBooksWrite, async (req, res, next) => {
     const stateRate = body.stateWithholdingPct ?? body.azWithholdingPct ?? 0
     const { rows: [emp] } = await db.query(
       `INSERT INTO books_employees
-         (landlord_id, first_name, last_name, email, phone, address, ssn_last4,
+         (${col}, first_name, last_name, email, phone, address, ssn_last4,
           pay_type, pay_rate, pay_frequency, filing_status, federal_allowances,
           state_withholding_pct, title, department, start_date)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`,
@@ -275,7 +348,7 @@ booksRouter.post('/employees', requireBooksWrite, async (req, res, next) => {
 
 booksRouter.patch('/employees/:id', requireBooksWrite, async (req, res, next) => {
   try {
-    const lid = landlordScope(req.user)
+    const { col, id: lid } = ownerScope(req.user)
     const f = req.body
     const { rows: [emp] } = await db.query(
       `UPDATE books_employees SET
@@ -284,7 +357,7 @@ booksRouter.patch('/employees/:id', requireBooksWrite, async (req, res, next) =>
          department=COALESCE($6,department), pay_type=COALESCE($7,pay_type),
          pay_rate=COALESCE($8,pay_rate), pay_frequency=COALESCE($9,pay_frequency),
          status=COALESCE($10,status), updated_at=NOW()
-       WHERE id=$11 AND (landlord_id=$12 OR $12 IS NULL) RETURNING *`,
+       WHERE id=$11 AND (${col}=$12 OR $12 IS NULL) RETURNING *`,
       [f.firstName||null, f.lastName||null, f.email||null, f.phone||null,
        f.title||null, f.department||null, f.payType||null, f.payRate||null,
        f.payFrequency||null, f.status||null, req.params.id, lid]
@@ -300,9 +373,9 @@ booksRouter.patch('/employees/:id', requireBooksWrite, async (req, res, next) =>
 
 booksRouter.get('/contractors', requireBooksRead, async (req, res, next) => {
   try {
-    const lid = landlordScope(req.user)
+    const { col, id: lid } = ownerScope(req.user)
     const { rows } = await db.query(
-      `SELECT * FROM books_contractors WHERE (landlord_id=$1 OR $1 IS NULL) ORDER BY created_at DESC`,
+      `SELECT * FROM books_contractors WHERE (${col}=$1 OR $1 IS NULL) ORDER BY created_at DESC`,
       [lid]
     )
     res.json({ success: true, data: rows })
@@ -348,7 +421,7 @@ const contractorBaseSchema = z.object({
 
 booksRouter.post('/contractors', requireBooksWrite, async (req, res, next) => {
   try {
-    const lid = landlordScope(req.user)
+    const { col, id: lid } = ownerScope(req.user)
     const body = contractorBaseSchema.parse(req.body)
     // S417: block disposable email domains (mailinator, yopmail, etc.)
     // for parity with the tenant /profile route. Same Set in lib/email.
@@ -357,7 +430,7 @@ booksRouter.post('/contractors', requireBooksWrite, async (req, res, next) => {
     }
     const { rows: [con] } = await db.query(
       `INSERT INTO books_contractors
-         (landlord_id, first_name, last_name, business_name, email, phone, address,
+         (${col}, first_name, last_name, business_name, email, phone, address,
           ein, ssn_last4, entity_type, trade, pay_rate, pay_unit, w9_on_file)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *`,
       [lid, body.firstName, body.lastName, body.businessName, body.email,
@@ -370,7 +443,7 @@ booksRouter.post('/contractors', requireBooksWrite, async (req, res, next) => {
 
 booksRouter.patch('/contractors/:id', requireBooksWrite, async (req, res, next) => {
   try {
-    const lid = landlordScope(req.user)
+    const { col, id: lid } = ownerScope(req.user)
     const f = req.body
     const { rows: [con] } = await db.query(
       `UPDATE books_contractors SET
@@ -378,7 +451,7 @@ booksRouter.patch('/contractors/:id', requireBooksWrite, async (req, res, next) 
          business_name=COALESCE($3,business_name), email=COALESCE($4,email),
          trade=COALESCE($5,trade), pay_rate=COALESCE($6,pay_rate),
          status=COALESCE($7,status), w9_on_file=COALESCE($8,w9_on_file), updated_at=NOW()
-       WHERE id=$9 AND (landlord_id=$10 OR $10 IS NULL) RETURNING *`,
+       WHERE id=$9 AND (${col}=$10 OR $10 IS NULL) RETURNING *`,
       [f.firstName||null, f.lastName||null, f.businessName||null, f.email||null,
        f.trade||null, f.payRate||null, f.status||null, f.w9OnFile??null,
        req.params.id, lid]
@@ -394,9 +467,9 @@ booksRouter.patch('/contractors/:id', requireBooksWrite, async (req, res, next) 
 
 booksRouter.get('/vendors', requireBooksRead, async (req, res, next) => {
   try {
-    const lid = landlordScope(req.user)
+    const { col, id: lid } = ownerScope(req.user)
     const { rows } = await db.query(
-      `SELECT * FROM books_vendors WHERE (landlord_id=$1 OR $1 IS NULL) AND status='active' ORDER BY name`,
+      `SELECT * FROM books_vendors WHERE (${col}=$1 OR $1 IS NULL) AND status='active' ORDER BY name`,
       [lid]
     )
     res.json({ success: true, data: rows })
@@ -428,7 +501,7 @@ const vendorBaseSchema = z.object({
 })
 booksRouter.post('/vendors', requireBooksWrite, async (req, res, next) => {
   try {
-    const lid = landlordScope(req.user)
+    const { col, id: lid } = ownerScope(req.user)
     const body = vendorBaseSchema.parse(req.body)
     // S417: disposable-domain block.
     if (isDisposableEmail(body.email)) {
@@ -436,7 +509,7 @@ booksRouter.post('/vendors', requireBooksWrite, async (req, res, next) => {
     }
     const { rows: [v] } = await db.query(
       `INSERT INTO books_vendors
-         (landlord_id, name, contact_name, email, phone, address, category, payment_terms, account_number, tax_id, notes)
+         (${col}, name, contact_name, email, phone, address, category, payment_terms, account_number, tax_id, notes)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
       [lid, body.name, body.contactName, body.email, body.phone, body.address,
        body.category, body.paymentTerms, body.accountNumber ?? null, body.taxId,
@@ -448,7 +521,7 @@ booksRouter.post('/vendors', requireBooksWrite, async (req, res, next) => {
 
 booksRouter.patch('/vendors/:id', requireBooksWrite, async (req, res, next) => {
   try {
-    const lid = landlordScope(req.user)
+    const { col, id: lid } = ownerScope(req.user)
     const f = req.body
     const { rows: [v] } = await db.query(
       `UPDATE books_vendors SET
@@ -456,7 +529,7 @@ booksRouter.patch('/vendors/:id', requireBooksWrite, async (req, res, next) => {
          email=COALESCE($3,email), phone=COALESCE($4,phone),
          category=COALESCE($5,category), payment_terms=COALESCE($6,payment_terms),
          status=COALESCE($7,status), notes=COALESCE($8,notes), updated_at=NOW()
-       WHERE id=$9 AND (landlord_id=$10 OR $10 IS NULL) RETURNING *`,
+       WHERE id=$9 AND (${col}=$10 OR $10 IS NULL) RETURNING *`,
       [f.name||null, f.contactName||null, f.email||null, f.phone||null,
        f.category||null, f.paymentTerms||null, f.status||null, f.notes||null,
        req.params.id, lid]
@@ -511,12 +584,12 @@ function calcTaxes(grossPay: number, filingStatus: string, statePct: number, ytd
 // GET /api/books/payroll/runs
 booksRouter.get('/payroll/runs', requireBooksRead, async (req, res, next) => {
   try {
-    const lid = landlordScope(req.user)
+    const { col, id: lid } = ownerScope(req.user)
     const { rows } = await db.query(
       `SELECT pr.*, COUNT(prl.id) as line_count
        FROM payroll_runs pr
        LEFT JOIN payroll_run_lines prl ON prl.run_id = pr.id
-       WHERE (pr.landlord_id = $1 OR $1 IS NULL)
+       WHERE (pr.${col} = $1 OR $1 IS NULL)
        GROUP BY pr.id
        ORDER BY pr.pay_date DESC`,
       [lid]
@@ -528,9 +601,9 @@ booksRouter.get('/payroll/runs', requireBooksRead, async (req, res, next) => {
 // GET /api/books/payroll/runs/:id
 booksRouter.get('/payroll/runs/:id', requireBooksRead, async (req, res, next) => {
   try {
-    const lid = landlordScope(req.user)
+    const { col, id: lid } = ownerScope(req.user)
     const run = await queryOne<any>(
-      'SELECT * FROM payroll_runs WHERE id=$1 AND (landlord_id=$2 OR $2 IS NULL)',
+      `SELECT * FROM payroll_runs WHERE id=$1 AND (${col}=$2 OR $2 IS NULL)`,
       [req.params.id, lid]
     )
     if (!run) throw new AppError(404, 'Run not found')
@@ -549,7 +622,7 @@ booksRouter.get('/payroll/runs/:id', requireBooksRead, async (req, res, next) =>
 // POST /api/books/payroll/runs — calculate draft run
 booksRouter.post('/payroll/runs', requireBooksWrite, async (req, res, next) => {
   try {
-    const lid = landlordScope(req.user)
+    const { col, id: lid } = ownerScope(req.user)
     const { periodStart, periodEnd, payDate, payFrequency, employeeIds, hoursMap = {} } = req.body
     if (!periodStart || !periodEnd || !payDate || !payFrequency || !employeeIds?.length)
       throw new AppError(400, 'periodStart, periodEnd, payDate, payFrequency, employeeIds required')
@@ -557,7 +630,7 @@ booksRouter.post('/payroll/runs', requireBooksWrite, async (req, res, next) => {
     // Fetch selected employees
     const placeholders = employeeIds.map((_: any, i: number) => `$${i + 2}`).join(',')
     const { rows: employees } = await db.query(
-      `SELECT * FROM books_employees WHERE id IN (${placeholders}) AND (landlord_id=$1 OR $1 IS NULL) AND status='active'`,
+      `SELECT * FROM books_employees WHERE id IN (${placeholders}) AND (${col}=$1 OR $1 IS NULL) AND status='active'`,
       [lid, ...employeeIds]
     )
     if (!employees.length) throw new AppError(400, 'No active employees found')
@@ -570,7 +643,7 @@ booksRouter.post('/payroll/runs', requireBooksWrite, async (req, res, next) => {
     try {
       await client.query('BEGIN')
       const { rows: [run] } = await client.query(
-        `INSERT INTO payroll_runs (landlord_id, period_start, period_end, pay_date, pay_frequency, status)
+        `INSERT INTO payroll_runs (${col}, period_start, period_end, pay_date, pay_frequency, status)
          VALUES ($1,$2,$3,$4,$5,'draft') RETURNING *`,
         [lid, periodStart, periodEnd, payDate, payFrequency]
       )
@@ -629,9 +702,9 @@ booksRouter.post('/payroll/runs', requireBooksWrite, async (req, res, next) => {
 // POST /api/books/payroll/runs/:id/approve
 booksRouter.post('/payroll/runs/:id/approve', requireBooksWrite, async (req, res, next) => {
   try {
-    const lid = landlordScope(req.user)
+    const { col, id: lid } = ownerScope(req.user)
     const run = await queryOne<any>(
-      'SELECT * FROM payroll_runs WHERE id=$1 AND (landlord_id=$2 OR $2 IS NULL)',
+      `SELECT * FROM payroll_runs WHERE id=$1 AND (${col}=$2 OR $2 IS NULL)`,
       [req.params.id, lid]
     )
     if (!run) throw new AppError(404, 'Run not found')
@@ -674,9 +747,9 @@ booksRouter.post('/payroll/runs/:id/approve', requireBooksWrite, async (req, res
 // POST /api/books/payroll/runs/:id/void
 booksRouter.post('/payroll/runs/:id/void', requireBooksWrite, async (req, res, next) => {
   try {
-    const lid = landlordScope(req.user)
+    const { col, id: lid } = ownerScope(req.user)
     const run = await queryOne<any>(
-      'SELECT * FROM payroll_runs WHERE id=$1 AND (landlord_id=$2 OR $2 IS NULL)',
+      `SELECT * FROM payroll_runs WHERE id=$1 AND (${col}=$2 OR $2 IS NULL)`,
       [req.params.id, lid]
     )
     if (!run) throw new AppError(404, 'Run not found')
@@ -908,13 +981,13 @@ booksRouter.delete('/bookkeeper/revoke', requireLandlord, async (req, res, next)
 
 booksRouter.get('/journal', requireBooksRead, async (req, res, next) => {
   try {
-    const lid = landlordScope(req.user)
+    const { col, id: lid } = ownerScope(req.user)
     const { limit = 50, offset = 0 } = req.query
     const { rows } = await db.query(
       `SELECT je.*, COUNT(jel.id) as line_count
        FROM journal_entries je
        LEFT JOIN journal_entry_lines jel ON jel.entry_id = je.id
-       WHERE (je.landlord_id = $1 OR $1 IS NULL)
+       WHERE (je.${col} = $1 OR $1 IS NULL)
        GROUP BY je.id
        ORDER BY je.date DESC, je.created_at DESC
        LIMIT $2 OFFSET $3`,
@@ -926,9 +999,9 @@ booksRouter.get('/journal', requireBooksRead, async (req, res, next) => {
 
 booksRouter.get('/journal/:id', requireBooksRead, async (req, res, next) => {
   try {
-    const lid = landlordScope(req.user)
+    const { col, id: lid } = ownerScope(req.user)
     const entry = await queryOne<any>(
-      'SELECT * FROM journal_entries WHERE id=$1 AND (landlord_id=$2 OR $2 IS NULL)',
+      `SELECT * FROM journal_entries WHERE id=$1 AND (${col}=$2 OR $2 IS NULL)`,
       [req.params.id, lid]
     )
     if (!entry) throw new AppError(404, 'Entry not found')
@@ -945,7 +1018,7 @@ booksRouter.get('/journal/:id', requireBooksRead, async (req, res, next) => {
 
 booksRouter.post('/journal', requireBooksWrite, async (req, res, next) => {
   try {
-    const lid = landlordScope(req.user)
+    const { col, id: lid } = ownerScope(req.user)
     const { date, description, reference, type = 'manual', lines } = req.body
     if (!date || !description || !lines?.length)
       throw new AppError(400, 'date, description, and lines required')
@@ -971,7 +1044,7 @@ booksRouter.post('/journal', requireBooksWrite, async (req, res, next) => {
     if (lid !== null) {
       // Non-admin caller: every accountId must belong to caller's landlord.
       const validation = await db.query<{ id: string }>(
-        `SELECT id FROM books_accounts WHERE id = ANY($1::uuid[]) AND landlord_id = $2`,
+        `SELECT id FROM books_accounts WHERE id = ANY($1::uuid[]) AND ${col} = $2`,
         [accountIds, lid]
       )
       const validIds = new Set(validation.rows.map(r => r.id))
@@ -985,7 +1058,7 @@ booksRouter.post('/journal', requireBooksWrite, async (req, res, next) => {
     try {
       await client.query('BEGIN')
       const { rows: [entry] } = await client.query(
-        `INSERT INTO journal_entries (landlord_id, date, description, reference, type, total_debits, total_credits, created_by)
+        `INSERT INTO journal_entries (${col}, date, description, reference, type, total_debits, total_credits, created_by)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
         [lid, date, description, reference || null, type, totalDebits.toFixed(2), totalCredits.toFixed(2), req.user!.userId]
       )
@@ -1019,9 +1092,9 @@ booksRouter.post('/journal', requireBooksWrite, async (req, res, next) => {
 
 booksRouter.post('/journal/:id/void', requireBooksWrite, async (req, res, next) => {
   try {
-    const lid = landlordScope(req.user)
+    const { col, id: lid } = ownerScope(req.user)
     const entry = await queryOne<any>(
-      'SELECT * FROM journal_entries WHERE id=$1 AND (landlord_id=$2 OR $2 IS NULL)',
+      `SELECT * FROM journal_entries WHERE id=$1 AND (${col}=$2 OR $2 IS NULL)`,
       [req.params.id, lid]
     )
     if (!entry) throw new AppError(404, 'Entry not found')
@@ -1051,9 +1124,9 @@ booksRouter.post('/journal/:id/void', requireBooksWrite, async (req, res, next) 
 
 booksRouter.get('/transactions', requireBooksRead, async (req, res, next) => {
   try {
-    const lid = landlordScope(req.user)
+    const { col, id: lid } = ownerScope(req.user)
     const { type, reconciled, limit = 100, offset = 0 } = req.query
-    const conditions = ['(bt.landlord_id = $1 OR $1 IS NULL)']
+    const conditions = [`(bt.${col} = $1 OR $1 IS NULL)`]
     const params: any[] = [lid]
     if (type) { params.push(type); conditions.push(`bt.type = $${params.length}`) }
     if (reconciled !== undefined) { params.push(reconciled === 'true'); conditions.push(`bt.reconciled = $${params.length}`) }
@@ -1073,7 +1146,7 @@ booksRouter.get('/transactions', requireBooksRead, async (req, res, next) => {
 
 booksRouter.post('/transactions', requireBooksWrite, async (req, res, next) => {
   try {
-    const lid = landlordScope(req.user)
+    const { col, id: lid } = ownerScope(req.user)
     const { date, description, amount, type, category, accountId, reference } = req.body
     if (!date || !description || amount === undefined || !type)
       throw new AppError(400, 'date, description, amount, type required')
@@ -1082,13 +1155,13 @@ booksRouter.post('/transactions', requireBooksWrite, async (req, res, next) => {
     // JOIN on GET would silently surface the wrong account_name.
     if (accountId && lid !== null) {
       const ok = await queryOne<{ id: string }>(
-        `SELECT id FROM books_accounts WHERE id=$1 AND landlord_id=$2`,
+        `SELECT id FROM books_accounts WHERE id=$1 AND ${col}=$2`,
         [accountId, lid]
       )
       if (!ok) throw new AppError(403, 'Account is not in your chart of accounts')
     }
     const { rows: [tx] } = await db.query(
-      `INSERT INTO books_transactions (landlord_id, date, description, amount, type, category, account_id, reference)
+      `INSERT INTO books_transactions (${col}, date, description, amount, type, category, account_id, reference)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
       [lid, date, description, amount, type, category || null, accountId || null, reference || null]
     )
@@ -1098,14 +1171,61 @@ booksRouter.post('/transactions', requireBooksWrite, async (req, res, next) => {
 
 booksRouter.patch('/transactions/:id/reconcile', requireBooksWrite, async (req, res, next) => {
   try {
-    const lid = landlordScope(req.user)
+    const { col, id: lid } = ownerScope(req.user)
     const { rows: [tx] } = await db.query(
       `UPDATE books_transactions SET reconciled=TRUE, reconciled_at=NOW(), updated_at=NOW()
-       WHERE id=$1 AND (landlord_id=$2 OR $2 IS NULL) RETURNING *`,
+       WHERE id=$1 AND (${col}=$2 OR $2 IS NULL) RETURNING *`,
       [req.params.id, lid]
     )
     if (!tx) throw new AppError(404, 'Transaction not found')
     res.json({ success: true, data: tx })
+  } catch (e) { next(e) }
+})
+
+// PATCH /api/books/transactions/:id — edit a cash transaction (fix a typo'd
+// expense, recategorize, reassign account). books_transactions are plain
+// ledger rows with NO account-balance side effect (unlike journal entries),
+// so an in-place edit is safe — no balance reversal needed. Owner-scoped.
+booksRouter.patch('/transactions/:id', requireBooksWrite, async (req, res, next) => {
+  try {
+    const { col, id: lid } = ownerScope(req.user)
+    const { date, description, amount, type, category, accountId, reference } = req.body
+    // accountId scope validation (S386 parity): a reassigned account must
+    // belong to the caller's own books.
+    if (accountId && lid !== null) {
+      const ok = await queryOne<{ id: string }>(
+        `SELECT id FROM books_accounts WHERE id=$1 AND ${col}=$2`,
+        [accountId, lid]
+      )
+      if (!ok) throw new AppError(403, 'Account is not in your chart of accounts')
+    }
+    const { rows: [tx] } = await db.query(
+      `UPDATE books_transactions SET
+         date=COALESCE($1,date), description=COALESCE($2,description),
+         amount=COALESCE($3,amount), type=COALESCE($4,type),
+         category=$5, account_id=$6, reference=$7, updated_at=NOW()
+       WHERE id=$8 AND (${col}=$9 OR $9 IS NULL) RETURNING *`,
+      [date ?? null, description ?? null, amount ?? null, type ?? null,
+       category ?? null, accountId ?? null, reference ?? null, req.params.id, lid]
+    )
+    if (!tx) throw new AppError(404, 'Transaction not found')
+    res.json({ success: true, data: tx })
+  } catch (e) { next(e) }
+})
+
+// DELETE /api/books/transactions/:id — remove a cash transaction. No balance
+// side effect to reverse (see PATCH note). Owner-scoped; 404 if not the
+// caller's row.
+booksRouter.delete('/transactions/:id', requireBooksWrite, async (req, res, next) => {
+  try {
+    const { col, id: lid } = ownerScope(req.user)
+    const { rows: [tx] } = await db.query(
+      `DELETE FROM books_transactions
+       WHERE id=$1 AND (${col}=$2 OR $2 IS NULL) RETURNING id`,
+      [req.params.id, lid]
+    )
+    if (!tx) throw new AppError(404, 'Transaction not found')
+    res.json({ success: true })
   } catch (e) { next(e) }
 })
 
@@ -1115,7 +1235,7 @@ booksRouter.patch('/transactions/:id/reconcile', requireBooksWrite, async (req, 
 
 booksRouter.get('/reports/pl', requireBooksRead, async (req, res, next) => {
   try {
-    const lid = landlordScope(req.user)
+    const { col, id: lid } = ownerScope(req.user)
     const { startDate, endDate } = req.query
     const start = startDate || new Date(new Date().getFullYear(), 0, 1).toISOString().split('T')[0]
     const end = endDate || new Date().toISOString().split('T')[0]
@@ -1129,9 +1249,9 @@ booksRouter.get('/reports/pl', requireBooksRead, async (req, res, next) => {
         LEFT JOIN journal_entries je ON je.id = jel.entry_id
           AND je.date BETWEEN $2 AND $3
           AND je.status = 'posted'
-          AND (je.landlord_id = $1 OR $1 IS NULL)
+          AND (je.${col} = $1 OR $1 IS NULL)
         WHERE ba.type = 'income' AND ba.active = TRUE
-          AND (ba.landlord_id = $1 OR $1 IS NULL)
+          AND (ba.${col} = $1 OR $1 IS NULL)
         GROUP BY ba.id ORDER BY ba.code`,
       [lid, start, end]
     )
@@ -1144,9 +1264,9 @@ booksRouter.get('/reports/pl', requireBooksRead, async (req, res, next) => {
         LEFT JOIN journal_entries je ON je.id = jel.entry_id
           AND je.date BETWEEN $2 AND $3
           AND je.status = 'posted'
-          AND (je.landlord_id = $1 OR $1 IS NULL)
+          AND (je.${col} = $1 OR $1 IS NULL)
         WHERE ba.type = 'expense' AND ba.active = TRUE
-          AND (ba.landlord_id = $1 OR $1 IS NULL)
+          AND (ba.${col} = $1 OR $1 IS NULL)
         GROUP BY ba.id ORDER BY ba.code`,
       [lid, start, end]
     )
@@ -1155,7 +1275,7 @@ booksRouter.get('/reports/pl', requireBooksRead, async (req, res, next) => {
     // subquerying landlords WHERE user_id=$1 with req.user.userId —
     // worked by coincidence for landlord callers but returned 0 for
     // admin and bookkeeper callers (their user_id doesn't match any
-    // landlord's user_id). Use lid directly — it IS the landlord_id
+    // landlord's user_id). Use lid directly — it IS the ${col}
     // (or NULL for admin = all).
     const { rows: rentIncome } = await db.query(
       `SELECT COALESCE(SUM(amount), 0) AS total
@@ -1165,6 +1285,28 @@ booksRouter.get('/reports/pl', requireBooksRead, async (req, res, next) => {
          AND due_date BETWEEN $2 AND $3`,
       [lid, start, end]
     ).catch(() => ({ rows: [{ total: 0 }] }))
+
+    // S459: for a business owner, pull REAL collected revenue the platform
+    // already tracks — completed POS sales + collected invoices — so the P&L
+    // reflects actual sales, not only manually-booked ledger entries. Mirrors
+    // the landlord gamRentIncome pull and the businessReports revenue
+    // definition (status='completed' POS by date, status='paid' invoices by
+    // paid_at) so the two surfaces agree. Zero for non-business callers.
+    let gamBusinessRevenue = 0
+    if (col === 'business_id' && lid) {
+      const { rows: bizRev } = await db.query(
+        `SELECT
+           COALESCE((SELECT SUM(total_amount) FROM business_pos_transactions
+                      WHERE business_id=$1 AND status='completed'
+                        AND created_at::date BETWEEN $2 AND $3), 0)
+           +
+           COALESCE((SELECT SUM(amount_paid) FROM business_invoices
+                      WHERE business_id=$1 AND status='paid'
+                        AND paid_at::date BETWEEN $2 AND $3), 0) AS total`,
+        [lid, start, end]
+      ).catch(() => ({ rows: [{ total: 0 }] }))
+      gamBusinessRevenue = +bizRev[0]?.total || 0
+    }
 
     const totalIncome = income.reduce((s: number, a: any) => s + (+a.period_amount || 0), 0)
     const totalExpenses = expenses.reduce((s: number, a: any) => s + (+a.period_amount || 0), 0)
@@ -1179,6 +1321,10 @@ booksRouter.get('/reports/pl', requireBooksRead, async (req, res, next) => {
         totalExpenses,
         netIncome: totalIncome - totalExpenses,
         gamRentIncome: +rentIncome[0]?.total || 0,
+        // Auto-pulled real sales (POS + collected invoices). Surfaced
+        // separately so totalIncome/netIncome stay journal-only (no landlord
+        // behavior change); business P&L UI folds this into its net.
+        gamBusinessRevenue,
       }
     })
   } catch (e) { next(e) }
@@ -1186,10 +1332,10 @@ booksRouter.get('/reports/pl', requireBooksRead, async (req, res, next) => {
 
 booksRouter.get('/reports/balance-sheet', requireBooksRead, async (req, res, next) => {
   try {
-    const lid = landlordScope(req.user)
+    const { col, id: lid } = ownerScope(req.user)
     const getAccounts = (type: string) => db.query(
       `SELECT code, name, balance FROM books_accounts
-       WHERE type=$1 AND active=TRUE AND (landlord_id=$2 OR $2 IS NULL) ORDER BY code`,
+       WHERE type=$1 AND active=TRUE AND (${col}=$2 OR $2 IS NULL) ORDER BY code`,
       [type, lid]
     )
     const [assets, liabilities, equity] = await Promise.all([
@@ -1218,12 +1364,12 @@ booksRouter.get('/reports/balance-sheet', requireBooksRead, async (req, res, nex
 
 booksRouter.get('/bills', requireBooksRead, async (req, res, next) => {
   try {
-    const lid = landlordScope(req.user)
+    const { col, id: lid } = ownerScope(req.user)
     const { rows } = await db.query(
       `SELECT bb.*, bv.name AS vendor_name
        FROM books_bills bb
        LEFT JOIN books_vendors bv ON bv.id = bb.vendor_id
-       WHERE (bb.landlord_id = $1 OR $1 IS NULL)
+       WHERE (bb.${col} = $1 OR $1 IS NULL)
        ORDER BY bb.date DESC`,
       [lid]
     )
@@ -1233,7 +1379,7 @@ booksRouter.get('/bills', requireBooksRead, async (req, res, next) => {
 
 booksRouter.post('/bills', requireBooksWrite, async (req, res, next) => {
   try {
-    const lid = landlordScope(req.user)
+    const { col, id: lid } = ownerScope(req.user)
     const { vendorId, billNumber, date, dueDate, description, amount, category, accountId, notes } = req.body
     if (!date || !description || amount === undefined)
       throw new AppError(400, 'date, description, amount required')
@@ -1242,21 +1388,21 @@ booksRouter.post('/bills', requireBooksWrite, async (req, res, next) => {
     // landlord's books_vendors.ap_balance.
     if (vendorId && lid !== null) {
       const ok = await queryOne<{ id: string }>(
-        `SELECT id FROM books_vendors WHERE id=$1 AND landlord_id=$2`,
+        `SELECT id FROM books_vendors WHERE id=$1 AND ${col}=$2`,
         [vendorId, lid]
       )
       if (!ok) throw new AppError(403, 'Vendor is not in your books')
     }
     if (accountId && lid !== null) {
       const ok = await queryOne<{ id: string }>(
-        `SELECT id FROM books_accounts WHERE id=$1 AND landlord_id=$2`,
+        `SELECT id FROM books_accounts WHERE id=$1 AND ${col}=$2`,
         [accountId, lid]
       )
       if (!ok) throw new AppError(403, 'Account is not in your chart of accounts')
     }
     const { rows: [bill] } = await db.query(
       `INSERT INTO books_bills
-         (landlord_id, vendor_id, bill_number, date, due_date, description, amount, category, account_id, notes)
+         (${col}, vendor_id, bill_number, date, due_date, description, amount, category, account_id, notes)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
       [lid, vendorId||null, billNumber||null, date, dueDate||null,
        description, amount, category||null, accountId||null, notes||null]
@@ -1273,9 +1419,9 @@ booksRouter.post('/bills', requireBooksWrite, async (req, res, next) => {
 
 booksRouter.post('/bills/:id/pay', requireBooksWrite, async (req, res, next) => {
   try {
-    const lid = landlordScope(req.user)
+    const { col, id: lid } = ownerScope(req.user)
     const bill = await queryOne<any>(
-      'SELECT * FROM books_bills WHERE id=$1 AND (landlord_id=$2 OR $2 IS NULL)',
+      `SELECT * FROM books_bills WHERE id=$1 AND (${col}=$2 OR $2 IS NULL)`,
       [req.params.id, lid]
     )
     if (!bill) throw new AppError(404, 'Bill not found')
@@ -1353,7 +1499,7 @@ booksRouter.post('/bills/:id/pay', requireBooksWrite, async (req, res, next) => 
 
 booksRouter.get('/reports/cash-flow', requireBooksRead, async (req, res, next) => {
   try {
-    const lid = landlordScope(req.user)
+    const { col, id: lid } = ownerScope(req.user)
     const { startDate, endDate } = req.query
     const start = (startDate as string) || new Date(new Date().getFullYear(), 0, 1).toISOString().split('T')[0]
     const end   = (endDate   as string) || new Date().toISOString().split('T')[0]
@@ -1367,22 +1513,22 @@ booksRouter.get('/reports/cash-flow', requireBooksRead, async (req, res, next) =
       ).catch(() => ({ rows: [{ total: 0 }] })),
       db.query(
         `SELECT COALESCE(SUM(amount),0) AS total FROM books_transactions
-         WHERE (landlord_id=$1 OR $1 IS NULL) AND type='income' AND date BETWEEN $2 AND $3`,
+         WHERE (${col}=$1 OR $1 IS NULL) AND type='income' AND date BETWEEN $2 AND $3`,
         [lid, start, end]
       ),
       db.query(
         `SELECT COALESCE(SUM(amount),0) AS total FROM books_transactions
-         WHERE (landlord_id=$1 OR $1 IS NULL) AND type='expense' AND date BETWEEN $2 AND $3`,
+         WHERE (${col}=$1 OR $1 IS NULL) AND type='expense' AND date BETWEEN $2 AND $3`,
         [lid, start, end]
       ),
       db.query(
         `SELECT COALESCE(SUM(total_net),0) AS total FROM payroll_runs
-         WHERE (landlord_id=$1 OR $1 IS NULL) AND status='approved' AND pay_date BETWEEN $2 AND $3`,
+         WHERE (${col}=$1 OR $1 IS NULL) AND status='approved' AND pay_date BETWEEN $2 AND $3`,
         [lid, start, end]
       ),
       db.query(
         `SELECT COALESCE(SUM(amount_paid),0) AS total FROM books_bills
-         WHERE (landlord_id=$1 OR $1 IS NULL) AND status IN ('paid','partial') AND paid_at BETWEEN $2 AND $3`,
+         WHERE (${col}=$1 OR $1 IS NULL) AND status IN ('paid','partial') AND paid_at BETWEEN $2 AND $3`,
         [lid, start, end]
       ),
       db.query(
@@ -1423,7 +1569,7 @@ booksRouter.get('/reports/cash-flow', requireBooksRead, async (req, res, next) =
 // OWNER STATEMENTS REPORT
 // ════════════════════════════════════════
 
-booksRouter.get('/reports/owner-statements', requireBooksRead, async (req, res, next) => {
+booksRouter.get('/reports/owner-statements', requireBooksRead, blockBusinessOwner, async (req, res, next) => {
   try {
     const lid = landlordScope(req.user)
     const { startDate, endDate } = req.query
@@ -1479,7 +1625,7 @@ booksRouter.get('/reports/owner-statements', requireBooksRead, async (req, res, 
 // TAX SUMMARY
 // ════════════════════════════════════════
 
-booksRouter.get('/tax/summary', requireBooksRead, async (req, res, next) => {
+booksRouter.get('/tax/summary', requireBooksRead, blockBusinessOwner, async (req, res, next) => {
   try {
     const lid  = landlordScope(req.user)
     const year = req.query.year || new Date().getFullYear()
@@ -1544,7 +1690,7 @@ booksRouter.get('/tax/summary', requireBooksRead, async (req, res, next) => {
 })
 
 // Rent roll — sync from GAM
-booksRouter.get('/rent-roll', requireBooksRead, async (req, res, next) => {
+booksRouter.get('/rent-roll', requireBooksRead, blockBusinessOwner, async (req, res, next) => {
   try {
     const lid = landlordScope(req.user)
 

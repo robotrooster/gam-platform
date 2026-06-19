@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { apiGet } from '../lib/api'
 import { useAuth } from '../context/AuthContext'
+import { OnboardingWizard } from '../components/OnboardingWizard'
 import {
   DollarSign, AlertTriangle, Calendar, Wrench, Package,
   CreditCard, ArrowRight, Car, ChevronRight,
@@ -121,6 +122,9 @@ export function DashboardPage() {
       <div style={{ color: 'var(--text-2)', fontSize: 14, marginBottom: 24 }}>
         Welcome back, {user?.firstName}.
       </div>
+
+      {/* S515: post-signup activation checklist (self-hides when done) */}
+      <OnboardingWizard />
 
       {err && <div style={errStyle}>{err}</div>}
 

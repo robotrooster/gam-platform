@@ -124,7 +124,7 @@ entire codebase, not just one route file:
 ## Files touched
 
 ```
-/Users/gold/Downloads/gam/
+/Users/nicholasrhoades/Downloads/gam/
   COVERAGE_AUDIT_S382.md         (NEW — 339 lines, the
                                   prioritized worklist)
   COVERAGE_AUDIT_S382_FULL.md    (NEW — 374 lines, the raw

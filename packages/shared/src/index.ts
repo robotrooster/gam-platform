@@ -76,6 +76,113 @@ export const BUSINESS_ROLE_LABEL: Record<BusinessRole, string> = {
   business_owner: 'Business Owner',
 }
 
+// Agent revenue capabilities — per-property, landlord opt-in. The CS agent may
+// only take these revenue-affecting actions on a property where the landlord has
+// explicitly enabled the capability (default OFF). Single source of truth for the
+// property_agent_permissions.capability CHECK constraint. NOTE: accepting a
+// notice-to-vacate and changing lease terms are intentionally NOT here — the agent
+// never performs those, with or without a toggle.
+export const AGENT_REVENUE_CAPABILITIES = [
+  'take_payment',   // take/retry a tenant payment or set up autopay
+  'lease_renewal',  // process a lease renewal
+  'bill_fee',       // bill a fee against a tenant/lease
+] as const
+export type AgentRevenueCapability = typeof AGENT_REVENUE_CAPABILITIES[number]
+export const AGENT_REVENUE_CAPABILITY_LABEL: Record<AgentRevenueCapability, string> = {
+  take_payment: 'Take a payment',
+  lease_renewal: 'Process a renewal',
+  bill_fee: 'Bill a fee',
+}
+
+// Lease renewal request lifecycle. A tenant (often via the agent) expresses
+// intent to renew; the LANDLORD finalizes the actual lease — the agent never
+// changes lease terms. Single source of truth for the
+// lease_renewal_requests.status CHECK.
+export const LEASE_RENEWAL_REQUEST_STATUSES = ['requested', 'approved', 'declined', 'cancelled', 'completed'] as const
+export type LeaseRenewalRequestStatus = typeof LEASE_RENEWAL_REQUEST_STATUSES[number]
+
+// Booking-guest change requests. A no-account booking guest (RV/STR/extended-
+// stay) asks the guest agent for a stay change; the HOST finalizes it — the
+// agent only records the request (draft-with-approval, never auto-committed).
+// Single source for the booking_change_requests.{request_type,status} CHECKs.
+export const BOOKING_CHANGE_REQUEST_TYPES = ['late_checkout', 'early_checkin', 'extra_night', 'other'] as const
+export type BookingChangeRequestType = typeof BOOKING_CHANGE_REQUEST_TYPES[number]
+export const BOOKING_CHANGE_REQUEST_TYPE_LABEL: Record<BookingChangeRequestType, string> = {
+  late_checkout: 'Late checkout',
+  early_checkin: 'Early check-in',
+  extra_night: 'Extra night',
+  other: 'Other request',
+}
+export const BOOKING_CHANGE_REQUEST_STATUSES = ['requested', 'approved', 'declined', 'cancelled'] as const
+export type BookingChangeRequestStatus = typeof BOOKING_CHANGE_REQUEST_STATUSES[number]
+
+// Inspection lifecycle stages. Single source for the
+// unit_inspections.inspection_type CHECK. 'turnover' = the landlord's
+// clean/repair of an empty unit between tenancies — a first-class stage so
+// the unit video lifecycle (move-in → move-out → turnover → next move-in)
+// has a record for the turn.
+export const INSPECTION_TYPES = ['move_in', 'move_out', 'periodic', 'turnover'] as const
+export type InspectionType = typeof INSPECTION_TYPES[number]
+
+// ── Standard inspection walkthrough checklist (single source) ──────────
+// The areas the agent walks a tenant/landlord through on a move-in / move-out
+// / periodic inspection. Each area expects at least one fresh camera photo;
+// any item rated 'damaged' or 'missing' forces its own close-up (the agent's
+// per-area minimum rule, Nic 2026-06-17). Bedroom areas are generated up to
+// the UNIT's bedroom count (capped at 4) so the agent never prompts for a
+// bedroom that does not exist. `buildInspectionChecklist` is the single entry
+// point consumers (agent tools, inspection UI) call with the unit's facts.
+export interface InspectionChecklistArea {
+  area: string
+  items: readonly string[]
+}
+
+export const MAX_INSPECTION_BEDROOMS = 4
+
+const BEDROOM_ITEMS = ['Walls', 'Flooring', 'Closet', 'Window', 'Lighting'] as const
+
+// Residential base, MINUS bedrooms — bedrooms are spliced in after
+// 'Living / common' by the builder, sized to the unit.
+const RESIDENTIAL_INSPECTION_AREAS_BASE: readonly InspectionChecklistArea[] = [
+  { area: 'Kitchen', items: ['Countertops & cabinets', 'Sink & faucet', 'Stove/oven', 'Refrigerator', 'Dishwasher/microwave', 'Floor'] },
+  { area: 'Bathroom', items: ['Toilet', 'Sink & vanity', 'Tub/shower', 'Tile & grout', 'Exhaust fan', 'Floor'] },
+  { area: 'Living / common', items: ['Walls', 'Flooring', 'Ceiling', 'Windows & blinds', 'Doors', 'Lighting & outlets'] },
+  { area: 'Systems & safety', items: ['HVAC/thermostat', 'Water heater', 'Smoke & CO detectors', 'Breaker panel'] },
+  { area: 'Laundry', items: ['Washer/dryer or hookups'] },
+  { area: 'Exterior / entry', items: ['Entry door & locks', 'Patio/balcony', 'Exterior walls/screens'] },
+  { area: 'Handover', items: ['Keys/remotes/access devices', 'Utility meter readings'] },
+]
+
+const RV_SITE_INSPECTION_AREAS: readonly InspectionChecklistArea[] = [
+  { area: 'Pad & site', items: ['Pad surface', 'Leveling', 'Picnic table', 'Fire ring/grill'] },
+  { area: 'Hookups', items: ['Electric pedestal', 'Water connection', 'Sewer connection'] },
+  { area: 'Cleanliness', items: ['Trash removed', 'Site cleared'] },
+  { area: 'Surroundings', items: ['Landscaping/clearance', 'Site markers/signage'] },
+  { area: 'Handover', items: ['Gate/access code', 'Meter reading (if metered)'] },
+]
+
+// Dwelling unit types that get bedroom areas. rv_spot uses the site list;
+// storage/commercial get the residential base WITHOUT bedrooms.
+const BEDROOM_UNIT_TYPES = ['apartment', 'single_family', 'mobile_home']
+
+export function buildInspectionChecklist(input: { unitType?: string | null; bedrooms?: number | null }): InspectionChecklistArea[] {
+  if (input.unitType === 'rv_spot') return RV_SITE_INSPECTION_AREAS.map((a) => ({ ...a }))
+
+  const base = RESIDENTIAL_INSPECTION_AREAS_BASE
+  if (!BEDROOM_UNIT_TYPES.includes(input.unitType ?? 'apartment')) {
+    return base.map((a) => ({ ...a }))
+  }
+
+  const n = Math.trunc(Number(input.bedrooms ?? 1))
+  const bedroomCount = Math.min(Math.max(Number.isFinite(n) ? n : 1, 0), MAX_INSPECTION_BEDROOMS)
+  const bedrooms: InspectionChecklistArea[] = Array.from({ length: bedroomCount }, (_, i) => ({
+    area: `Bedroom ${i + 1}`,
+    items: [...BEDROOM_ITEMS],
+  }))
+  const idx = base.findIndex((a) => a.area === 'Living / common')
+  return [...base.slice(0, idx + 1), ...bedrooms, ...base.slice(idx + 1)].map((a) => ({ ...a }))
+}
+
 // Per-business staff positions. Single source of truth for the
 // business_users.staff_role CHECK constraint (S453 migration).
 export const BUSINESS_STAFF_ROLES = [
@@ -134,8 +241,16 @@ export const BUSINESS_FEATURES = [
   'invoicing',
   'payments',
   'quotes',
+  'discounts',
+  'bookkeeping',
 ] as const
 export type BusinessFeature = typeof BUSINESS_FEATURES[number]
+
+// S513 (J): discount code value types. percent → discount_value is a
+// percentage (15.00 = 15% off); fixed → discount_value is a flat dollar
+// amount off the pre-tax subtotal.
+export const BUSINESS_DISCOUNT_TYPES = ['percent', 'fixed'] as const
+export type BusinessDiscountType = typeof BUSINESS_DISCOUNT_TYPES[number]
 
 export const BUSINESS_FEATURE_LABEL: Record<BusinessFeature, string> = {
   customers:           'Customers',
@@ -150,6 +265,8 @@ export const BUSINESS_FEATURE_LABEL: Record<BusinessFeature, string> = {
   invoicing:           'Invoicing',
   payments:            'Payments',
   quotes:              'Quotes & Estimates',
+  discounts:           'Discounts & Coupons',
+  bookkeeping:         'Bookkeeping',
 }
 
 export const BUSINESS_FEATURE_DESCRIPTION: Record<BusinessFeature, string> = {
@@ -165,6 +282,8 @@ export const BUSINESS_FEATURE_DESCRIPTION: Record<BusinessFeature, string> = {
   invoicing:           'Send invoices (recurring or per-service). Tracks paid / unpaid.',
   payments:            'Collect customer payments via Stripe Connect. Pairs with Invoicing.',
   quotes:              'Price proposals before work begins. Customer reviews, you mark accepted, then convert to an invoice or work order.',
+  discounts:           'Owner-created discount codes (percent or flat amount) applied at the register or on an invoice. Optional usage limits + expiry.',
+  bookkeeping:         'Track expenses and run a profit & loss report. Chart of accounts, expense/income transactions, and P&L over any date range.',
 }
 
 // Features that are universal and cannot be toggled off. Locked-on
@@ -183,7 +302,7 @@ export const BUSINESS_TYPE_DEFAULT_FEATURES: Record<BusinessType, BusinessFeatur
   ],
   maintenance_crew: [
     'customers', 'staff', 'appointments', 'work_orders',
-    'inventory', 'invoicing', 'payments', 'quotes',
+    'inventory', 'invoicing', 'payments', 'quotes', 'discounts',
   ],
   mobile_rental: [
     'customers', 'staff', 'appointments', 'routing',
@@ -195,17 +314,17 @@ export const BUSINESS_TYPE_DEFAULT_FEATURES: Record<BusinessType, BusinessFeatur
   ],
   mini_market: [
     'customers', 'staff', 'pos', 'inventory',
-    'invoicing', 'payments',
+    'invoicing', 'payments', 'discounts',
   ],
   mechanic_stationary: [
     'customers', 'staff', 'appointments', 'work_orders',
     'customer_vehicles', 'inventory', 'invoicing', 'payments',
-    'quotes',
+    'quotes', 'discounts',
   ],
   mechanic_mobile: [
     'customers', 'staff', 'appointments', 'routing',
     'work_orders', 'customer_vehicles', 'inventory',
-    'invoicing', 'payments', 'quotes',
+    'invoicing', 'payments', 'quotes', 'discounts',
   ],
   other: [
     'customers', 'staff', 'invoicing', 'payments',
@@ -262,6 +381,9 @@ export const BUSINESS_STAFF_PERMISSIONS = [
   'routes.read',
   'routes.write',
   'routes.drive',
+  // Discounts / coupons
+  'discounts.read',
+  'discounts.write',
   // Reports / analytics (owner-level data view)
   'reports.view',
 ] as const
@@ -293,6 +415,8 @@ export const BUSINESS_STAFF_PERMISSION_GROUP: Record<BusinessStaffPermission, st
   'routes.read':         'Routes',
   'routes.write':        'Routes',
   'routes.drive':        'Routes',
+  'discounts.read':      'Discounts',
+  'discounts.write':     'Discounts',
   'reports.view':        'Reports',
 }
 
@@ -321,6 +445,8 @@ export const BUSINESS_STAFF_PERMISSION_LABEL: Record<BusinessStaffPermission, st
   'routes.read':         'View routes',
   'routes.write':        'Generate + edit routes',
   'routes.drive':        'Drive routes (mobile UI)',
+  'discounts.read':      'View discount codes',
+  'discounts.write':     'Create + edit discount codes',
   'reports.view':        'View reports + analytics',
 }
 
@@ -343,6 +469,7 @@ export const BUSINESS_STAFF_PERMISSIONS_BY_ROLE: Record<BusinessStaffRole, Busin
     'work_orders.read', 'work_orders.write', 'work_orders.complete',
     'vehicles.read', 'vehicles.write',
     'routes.read', 'routes.write',
+    'discounts.read', 'discounts.write',
     'reports.view',
   ],
   dispatcher: [
@@ -367,6 +494,7 @@ export const BUSINESS_STAFF_PERMISSIONS_BY_ROLE: Record<BusinessStaffRole, Busin
     'invoices.read', 'invoices.write', 'invoices.send',
     'quotes.read', 'quotes.write', 'quotes.send',
     'pos.use',
+    'discounts.read', 'discounts.write',
     'reports.view',
   ],
 }

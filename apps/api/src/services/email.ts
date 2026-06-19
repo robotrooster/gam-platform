@@ -998,6 +998,47 @@ export async function emailBusinessAppointmentConfirmed(args: {
 }
 
 /**
+ * S518: one-shot appointment reminder, sent ~24h before the scheduled
+ * time by the reminder cron. Mirrors the confirmation but framed as a
+ * "coming up" nudge to cut no-shows.
+ */
+export async function emailBusinessAppointmentReminder(args: {
+  to: string
+  customerName: string | null
+  businessName: string
+  serviceType: string
+  scheduledFor: Date
+  durationMinutes: number
+  ctx?: { businessId?: string; appointmentId?: string }
+}) {
+  const when = args.scheduledFor.toLocaleString([], {
+    weekday: 'long', month: 'long', day: 'numeric',
+    hour: 'numeric', minute: '2-digit',
+  })
+  const greet = args.customerName ? p(`Hi <strong style="color:#eef1f8">${args.customerName}</strong>,`) : ''
+  await send(args.to,
+    `Reminder: your appointment with ${args.businessName} — ${when}`,
+    base(
+      h('Appointment reminder') +
+      greet +
+      p(`This is a reminder that your appointment with <strong style="color:#eef1f8">${args.businessName}</strong> is coming up.`) +
+      p(`<strong style="color:#eef1f8">When:</strong> ${when}<br>` +
+        `<strong style="color:#eef1f8">Service:</strong> ${args.serviceType}<br>` +
+        `<strong style="color:#eef1f8">Duration:</strong> ${args.durationMinutes} minutes`) +
+      p(`Need to reschedule? Reply to this email or contact ${args.businessName} directly.`)
+    ),
+    {
+      category: 'business_appointment_reminder',
+      landlordId: null,
+      relatedEntityType: 'appointment',
+      relatedEntityId: args.ctx?.appointmentId ?? null,
+      metadata: { business_id: args.ctx?.businessId, service_type: args.serviceType },
+    },
+    'support',
+  )
+}
+
+/**
  * Sent when a business owner sends a quote / estimate to a customer.
  * Renders the line items inline so the customer can review without
  * needing a portal account (no customer-side acceptance page in v1 —
@@ -1011,6 +1052,7 @@ export async function emailBusinessQuoteSent(args: {
   quoteNumber: string
   lines: Array<{ description: string; quantity: number; unitPrice: number; lineTotal: number }>
   subtotal: number
+  discountAmount?: number
   taxAmount: number
   totalAmount: number
   expiresAt: Date | null
@@ -1041,10 +1083,17 @@ export async function emailBusinessQuoteSent(args: {
     </tbody>
   </table>`
 
+  const quoteDiscount = args.discountAmount ?? 0
+  const discountRow = quoteDiscount > 0
+    ? `<div style="display:flex;justify-content:space-between;padding:2px 0;color:#b8c4d8">
+      <span>Discount</span><span>-${fmt(quoteDiscount)}</span>
+    </div>`
+    : ''
   const totalsHtml = `<div style="padding:12px;background:#0a0f14;border-radius:8px;font-size:.85rem">
     <div style="display:flex;justify-content:space-between;padding:2px 0;color:#b8c4d8">
       <span>Subtotal</span><span>${fmt(args.subtotal)}</span>
     </div>
+    ${discountRow}
     <div style="display:flex;justify-content:space-between;padding:2px 0;color:#b8c4d8">
       <span>Tax</span><span>${fmt(args.taxAmount)}</span>
     </div>
@@ -1133,6 +1182,80 @@ export async function emailBusinessCardUpdateRequest(args: {
         invoice_id: args.ctx?.invoiceId,
         reason: args.reasonHint,
       },
+    },
+    'support',
+  )
+}
+
+// Customer self-service portal — a no-login business customer gets a reusable
+// link to view their invoices + balance and pay anything open. Sent by the
+// business owner on demand.
+export async function emailBusinessCustomerPortalLink(args: {
+  to: string
+  businessName: string
+  portalUrl: string
+  ctx?: { businessId?: string; customerId?: string }
+}) {
+  await send(args.to,
+    `Your account with ${args.businessName}`,
+    base(
+      h('Your account') +
+      p(`<strong style="color:#eef1f8">${args.businessName}</strong> set up a secure page where you can see your invoices and balance, and pay anything that's open — no account or password needed.`) +
+      btn('View your account', args.portalUrl) +
+      p(`<span style="color:#4a5568;font-size:.78rem">Keep this link private — anyone with it can see your account. Bookmark it to come back anytime.</span>`)
+    ),
+    {
+      category: 'business_customer_portal_link',
+      landlordId: null,
+      relatedEntityType: 'business_customer',
+      relatedEntityId: args.ctx?.customerId ?? null,
+      metadata: { business_id: args.ctx?.businessId },
+    },
+    'support',
+  )
+}
+
+// Booking-guest stay assistant — a no-account guest gets a reusable link to
+// their stay's AI assistant (questions about check-in, the unit, balance;
+// requesting late checkout / extra nights). Delivered at booking time.
+export async function emailBookingGuestAccess(args: {
+  to: string
+  guestName: string | null
+  propertyName: string | null
+  unitNumber: string | null
+  checkIn: string
+  checkOut: string
+  stayUrl: string
+  expiresAt: Date
+  ctx?: { landlordId?: string; bookingId?: string }
+}) {
+  const greet = args.guestName
+    ? p(`Hi <strong style="color:#eef1f8">${args.guestName}</strong>,`)
+    : ''
+  const where = args.propertyName
+    ? `${args.propertyName}${args.unitNumber ? ` · Unit ${args.unitNumber}` : ''}`
+    : (args.unitNumber ? `Unit ${args.unitNumber}` : 'your stay')
+  const fmtDate = (d: string) =>
+    new Date(d).toLocaleDateString([], { weekday: 'short', month: 'long', day: 'numeric' })
+
+  await send(args.to,
+    `Your stay assistant${args.propertyName ? ` — ${args.propertyName}` : ''}`,
+    base(
+      h('Your stay assistant') +
+      greet +
+      p('Your booking is confirmed. Use the secure link below any time during your stay to ask questions — check-in details, the unit, your balance — or to request things like a late checkout. No account or password needed.') +
+      `<div style="margin:12px 0;padding:12px 16px;background:#0a0f14;border-radius:8px;border-left:3px solid #c9a227">
+        <div style="font-weight:700;color:#eef1f8;margin-bottom:2px">${where}</div>
+        <div style="font-size:.82rem;color:#b8c4d8">${fmtDate(args.checkIn)} → ${fmtDate(args.checkOut)}</div>
+      </div>` +
+      btn('Open your stay assistant', args.stayUrl) +
+      p(`<span style="color:#4a5568;font-size:.78rem">This link is just for your stay and stops working shortly after checkout. Keep it private — anyone with the link can see your booking.</span>`)
+    ),
+    {
+      category: 'booking_guest_access',
+      landlordId: args.ctx?.landlordId ?? null,
+      relatedEntityType: args.ctx?.bookingId ? 'unit_booking' : null,
+      relatedEntityId: args.ctx?.bookingId ?? null,
     },
     'support',
   )
