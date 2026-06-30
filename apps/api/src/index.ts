@@ -115,23 +115,40 @@ const PORT = process.env.PORT || 4000
 
 // ── MIDDLEWARE ──────────────────────────────────────────────
 app.use(helmet())
+// Explicit allow-list: per-portal env override falling back to the local
+// dev origin, plus the ArcGIS embed. In production the portals live on
+// *.goldassetmanagement.com (landlord/tenant/admin/ops/pos) with marketing
+// on the apex + www — those are matched by suffix below rather than
+// enumerated here, so a new subdomain doesn't need an env var or redeploy.
+const STATIC_ALLOWED_ORIGINS = [
+  process.env.LANDLORD_APP_URL       || 'http://localhost:3001',
+  process.env.TENANT_APP_URL         || 'http://localhost:3002',
+  process.env.ADMIN_APP_URL          || 'http://localhost:3003',
+  process.env.MARKETING_URL          || 'http://localhost:3004',
+  process.env.POS_APP_URL            || 'http://localhost:3005',
+  process.env.BOOKS_APP_URL          || 'http://localhost:3006',
+  process.env.PROPERTY_INTEL_APP_URL || 'http://localhost:3007',
+  process.env.LISTINGS_APP_URL       || 'http://localhost:3008',
+  process.env.ADMIN_OPS_APP_URL      || 'http://localhost:3009',
+  process.env.PM_COMPANY_APP_URL     || 'http://localhost:3011',
+  process.env.BUSINESS_APP_URL       || 'http://localhost:3012',
+  process.env.FITNESS_APP_URL        || 'http://localhost:3013',
+  process.env.CUSTOMER_PORTAL_URL    || 'http://localhost:3014',
+  'https://experience.arcgis.com',
+]
+// Any GAM production origin: apex marketing + www + every portal subdomain.
+const PROD_HOST = 'goldassetmanagement.com'
 app.use(cors({
-  origin: [
-    process.env.LANDLORD_APP_URL       || 'http://localhost:3001',
-    process.env.TENANT_APP_URL         || 'http://localhost:3002',
-    process.env.ADMIN_APP_URL          || 'http://localhost:3003',
-    process.env.MARKETING_URL          || 'http://localhost:3004',
-    process.env.POS_APP_URL            || 'http://localhost:3005',
-    process.env.BOOKS_APP_URL          || 'http://localhost:3006',
-    process.env.PROPERTY_INTEL_APP_URL || 'http://localhost:3007',
-    process.env.LISTINGS_APP_URL       || 'http://localhost:3008',
-    process.env.ADMIN_OPS_APP_URL      || 'http://localhost:3009',
-    process.env.PM_COMPANY_APP_URL     || 'http://localhost:3011',
-    process.env.BUSINESS_APP_URL       || 'http://localhost:3012',
-    process.env.FITNESS_APP_URL        || 'http://localhost:3013',
-    process.env.CUSTOMER_PORTAL_URL    || 'http://localhost:3014',
-    'https://experience.arcgis.com',
-  ],
+  origin: (origin, cb) => {
+    // Non-browser / same-origin / curl requests have no Origin header.
+    if (!origin) return cb(null, true)
+    if (STATIC_ALLOWED_ORIGINS.includes(origin)) return cb(null, true)
+    try {
+      const host = new URL(origin).hostname
+      if (host === PROD_HOST || host.endsWith('.' + PROD_HOST)) return cb(null, true)
+    } catch { /* malformed origin → reject below */ }
+    return cb(new Error('Not allowed by CORS'))
+  },
   credentials: true,
 }))
 

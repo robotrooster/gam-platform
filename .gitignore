@@ -2,6 +2,7 @@ node_modules/
 dist/
 .env
 *.env
+.env.*
 uploads/
 *.log
 .DS_Store
@@ -16,3 +17,4 @@ CLAUDE.md
 # Compiled vite configs (artifacts of tsc; source of truth is vite.config.ts)
 apps/*/vite.config.js
 apps/*/vite.config.d.ts
+.vercel

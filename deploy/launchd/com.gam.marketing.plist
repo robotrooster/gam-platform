@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.gam.marketing</string>
+  <!-- Public marketing site (apps/marketing/server.js). Unlike the other 5
+       portals (static, on Vercel), marketing is a dynamic Node server (legal
+       docs, booking/payment/customer token shells) so it's hosted on the Mac
+       behind the Cloudflare tunnel: apex goldassetmanagement.com -> :3004.
+       API_URL is injected into the client HTML, so it must point at the prod
+       API, not localhost. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/opt/node@22/bin/node</string>
+    <string>/Users/nicholasrhoades/gam/apps/marketing/server.js</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/nicholasrhoades/gam/apps/marketing</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/opt/node@22/bin:/usr/bin:/bin</string>
+    <key>NODE_ENV</key>
+    <string>production</string>
+    <key>API_URL</key>
+    <string>https://api.goldassetmanagement.com</string>
+  </dict>
+  <key>KeepAlive</key>
+  <true/>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>/tmp/gam-marketing.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/gam-marketing.log</string>
+</dict>
+</plist>
