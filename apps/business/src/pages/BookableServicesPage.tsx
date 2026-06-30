@@ -2,6 +2,12 @@ import { useEffect, useState } from 'react'
 import { apiGet, apiPost, apiPatch, apiDelete } from '../lib/api'
 import { Modal } from '../components/Modal'
 import { Plus, Pencil, Trash2, Eye, EyeOff } from 'lucide-react'
+import {
+  type BookableServiceRecurrence,
+  BOOKABLE_SERVICE_RECURRENCES,
+  BOOKABLE_SERVICE_RECURRENCE_LABEL,
+  WEEKDAY_LABEL,
+} from '@gam/shared'
 
 interface Service {
   id: string
@@ -11,6 +17,8 @@ interface Service {
   price: string | null
   isActive: boolean
   sortOrder: number
+  recurrence: BookableServiceRecurrence
+  recurrenceDayOfWeek: number | null
 }
 
 function fmtPrice(p: string | null): string {
@@ -159,6 +167,8 @@ function ServiceFormModal({
   const [durationMinutes, setDurationMinutes] = useState(String(service?.durationMinutes ?? 60))
   const [price, setPrice] = useState(service?.price ?? '')
   const [sortOrder, setSortOrder] = useState(String(service?.sortOrder ?? 0))
+  const [recurrence, setRecurrence] = useState<BookableServiceRecurrence>(service?.recurrence ?? 'one_time')
+  const [recurrenceDayOfWeek, setRecurrenceDayOfWeek] = useState(String(service?.recurrenceDayOfWeek ?? 1))
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
 
@@ -175,6 +185,8 @@ function ServiceFormModal({
         durationMinutes: dur,
         price: price.trim() ? Number(price) : null,
         sortOrder: parseInt(sortOrder, 10) || 0,
+        recurrence,
+        recurrenceDayOfWeek: recurrence === 'one_time' ? null : parseInt(recurrenceDayOfWeek, 10),
       }
       if (service) {
         await apiPatch(`/business-bookable-services/${service.id}`, body)
@@ -231,6 +243,34 @@ function ServiceFormModal({
             onChange={e => setSortOrder(e.target.value)} style={inputStyle} />
         </div>
       </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginTop: 12 }}>
+        <div>
+          <label style={labelStyle}>Cadence</label>
+          <select value={recurrence}
+            onChange={e => setRecurrence(e.target.value as BookableServiceRecurrence)}
+            style={inputStyle}>
+            {BOOKABLE_SERVICE_RECURRENCES.map(r => (
+              <option key={r} value={r}>{BOOKABLE_SERVICE_RECURRENCE_LABEL[r]}</option>
+            ))}
+          </select>
+        </div>
+        {recurrence !== 'one_time' && (
+          <div>
+            <label style={labelStyle}>Repeats on</label>
+            <select value={recurrenceDayOfWeek}
+              onChange={e => setRecurrenceDayOfWeek(e.target.value)}
+              style={inputStyle}>
+              {WEEKDAY_LABEL.map((d, i) => <option key={i} value={i}>{d}</option>)}
+            </select>
+          </div>
+        )}
+      </div>
+      {recurrence !== 'one_time' && (
+        <div style={{ fontSize: 12, color: 'var(--text-3)', marginTop: 6 }}>
+          Customers who book this enroll in a {BOOKABLE_SERVICE_RECURRENCE_LABEL[recurrence].toLowerCase()} schedule on {WEEKDAY_LABEL[parseInt(recurrenceDayOfWeek, 10)]}s — the route sets the time.
+        </div>
+      )}
     </Modal>
   )
 }

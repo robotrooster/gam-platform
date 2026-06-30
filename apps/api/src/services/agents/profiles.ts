@@ -56,7 +56,8 @@ GAM handles the platform: the tenant's account, payments, and lease records. Any
  * checklist and prompting one area at a time.
  */
 const TENANT_INSPECTION_ROUTING = `
-If the tenant is doing a move-in or move-out inspection (or asks for help with one), you can WALK THEM THROUGH it: call get_inspection_checklist to see the areas to photograph for their specific unit, then guide them one area at a time — "take a fresh photo of the kitchen", then the next area — and remind them of anything still missing. Tell them to use the camera for a fresh photo (not an old one from their gallery), and that any item that's damaged or missing should get its own close-up. You only guide and track progress; the tenant takes the photos in the app, and signing the inspection is theirs to do.`
+If the tenant is doing a move-in or move-out inspection (or asks for help with one), you can WALK THEM THROUGH it: call get_inspection_checklist to see the areas to photograph for their specific unit, then guide them one area at a time — "take a fresh photo of the kitchen", then the next area — and remind them of anything still missing. Tell them to use the camera for a fresh photo (not an old one from their gallery), and that any item that's damaged or missing should get its own close-up. You only guide and track progress; the tenant takes the photos in the app, and signing the inspection is theirs to do.
+Offer the guided walkthrough AT MOST ONCE. If the tenant declines (no thanks, they'll do it themselves, not now), call decline_guided_inspection so you remember — then DON'T bring it up again. If get_inspection_checklist comes back with guidedWalkthroughDeclined: true, they've already passed; do not re-offer — only help if they ask for it.`
 
 /** Tenant routing blocks appended after the role block. */
 const TENANT_ROUTING = `${TENANT_PROPERTY_ROUTING}\n\n${TENANT_INSPECTION_ROUTING}`
@@ -79,8 +80,23 @@ Approving or declining an applicant is the LANDLORD's decision, not yours. When 
 const LANDLORD_NOTICE_ROUTING = `
 When the landlord wants to send a formal notice to a tenant (rent increase, lease violation, entry notice, or any one-way notice), use draft_tenant_notice. DRAFT the wording, call the tool WITHOUT confirmed to get the draft, then read the exact draft back to the landlord and get their explicit yes. Only after they approve do you send it (call again with confirmed: true). Never send a notice on your own initiative, and never use a notice to change lease terms or to handle a notice to vacate — a notice only delivers text, it changes nothing.`
 
+/**
+ * Landlord-side inspection walkthrough. The agent can run a hands-off
+ * walkthrough: create the inspection, then record each item's condition as
+ * the landlord (or whoever is on-site) reports it. Signing and finalizing
+ * stay with the people involved — the agent never signs or finalizes.
+ */
+const LANDLORD_INSPECTION_ROUTING = `
+When the landlord wants to inspect a unit (move-in, move-out, periodic, or turnover), you RUN it for them — you create the inspection AND record every condition yourself. Recording conditions is YOUR job through the tools; never hand it back to them to "do in the app."
+
+1. Call create_inspection with the unit number and type to start a draft and seed its checklist (for move-in/move-out the current tenant and lease link automatically; a move-out auto-compares against the unit's last finalized move-in). Keep the inspectionId it returns — pass that exact id to every set_inspection_item_condition call.
+2. The moment the landlord names a condition for an item — even in the SAME message that asked you to start the inspection — call set_inspection_item_condition right away with that inspectionId, the area, the item, and the condition (good/fair/damaged/missing/na), plus a note and an estimated repair cost for anything damaged or missing. Map their words to the closest checklist area + item (e.g. "bathroom sink" → area "Bathroom", item "Sink & vanity"; "kitchen counters" → area "Kitchen", item "Countertops & cabinets"). Record each item as they mention it — do not defer it, summarize it, or tell them to enter it themselves.
+3. Then walk them through the rest of the unit area by area, recording as you go. Use get_inspection_progress to see what's left and which areas still need a photo, and nudge them. Photos are captured in the app — a fresh camera shot per area, not an old gallery photo.
+
+You CREATE the inspection and RECORD conditions; you NEVER sign or finalize — the landlord signs, the tenant signs their own attestation, and finalizing is theirs to do in the app.`
+
 /** The landlord routing blocks, appended after the role block. */
-const LANDLORD_ROUTING = `${LANDLORD_APPLICANT_ROUTING}\n\n${LANDLORD_NOTICE_ROUTING}`
+const LANDLORD_ROUTING = `${LANDLORD_APPLICANT_ROUTING}\n\n${LANDLORD_NOTICE_ROUTING}\n\n${LANDLORD_INSPECTION_ROUTING}`
 
 /**
  * Persona/scope/escalation block, an optional middle block (e.g. the
@@ -100,7 +116,7 @@ const TENANT_ENTRY: AgentProfile = {
   toolNames: [
     'file_maintenance_request', 'add_maintenance_comment', 'cancel_maintenance_request', 'get_my_maintenance_requests', 'get_my_lease',
     'get_my_payment_status', 'get_my_documents', 'get_my_inspections', 'get_my_entry_requests',
-    'get_my_payment_methods', 'get_my_deposit', 'get_my_invoices', 'get_my_bookings', 'get_my_contacts', 'get_my_landlord_patterns', 'get_my_landlord_renewal_tendency', 'request_lease_renewal', 'get_inspection_checklist',
+    'get_my_payment_methods', 'get_my_deposit', 'get_my_invoices', 'get_my_bookings', 'get_my_contacts', 'get_my_landlord_patterns', 'get_my_landlord_renewal_tendency', 'request_lease_renewal', 'get_inspection_checklist', 'decline_guided_inspection',
     'get_applicable_laws', 'search_state_law', 'search_real_estate_law', 'get_property_tax_facts', 'check_against_law', 'get_my_notifications', 'mark_notifications_read', 'update_notification_preference', 'escalate',
   ],
   name: 'Ava',
@@ -128,7 +144,7 @@ const TENANT_ESCALATION: AgentProfile = {
   toolNames: [
     'file_maintenance_request', 'add_maintenance_comment', 'cancel_maintenance_request', 'get_my_maintenance_requests', 'get_my_lease',
     'get_my_payment_status', 'get_my_documents', 'get_my_inspections', 'get_my_entry_requests',
-    'get_my_payment_methods', 'get_my_deposit', 'get_my_invoices', 'get_my_bookings', 'get_my_contacts', 'get_my_landlord_patterns', 'get_my_landlord_renewal_tendency', 'request_lease_renewal', 'get_inspection_checklist',
+    'get_my_payment_methods', 'get_my_deposit', 'get_my_invoices', 'get_my_bookings', 'get_my_contacts', 'get_my_landlord_patterns', 'get_my_landlord_renewal_tendency', 'request_lease_renewal', 'get_inspection_checklist', 'decline_guided_inspection',
     'get_applicable_laws', 'search_state_law', 'search_real_estate_law', 'get_property_tax_facts', 'check_against_law', 'get_my_notifications', 'mark_notifications_read', 'update_notification_preference', 'escalate_to_human',
   ],
   name: 'Samantha',
@@ -157,7 +173,7 @@ const LANDLORD_ENTRY: AgentProfile = {
     'get_landlord_portfolio', 'get_property_rent_roll', 'get_setup_progress', 'get_pending_maintenance', 'lookup_tenant_payment_status',
     'get_delinquent_tenants', 'get_vacant_units', 'get_lease_expirations',
     'get_pending_applications', 'get_my_payouts', 'get_background_check_status', 'get_maintenance_team', 'get_books_summary', 'get_tenant_contact', 'get_team', 'search_parcels', 'get_market_rent',
-    'approve_maintenance_request', 'assign_maintenance_request', 'reject_maintenance_request', 'schedule_maintenance', 'message_tenant', 'send_bulk_message', 'get_agent_permissions', 'set_agent_permission', 'bill_fee', 'flag_applicant_decision', 'draft_tenant_notice', 'get_inspection_progress',
+    'approve_maintenance_request', 'assign_maintenance_request', 'reject_maintenance_request', 'schedule_maintenance', 'message_tenant', 'send_bulk_message', 'get_agent_permissions', 'set_agent_permission', 'bill_fee', 'flag_applicant_decision', 'draft_tenant_notice', 'get_inspection_progress', 'create_inspection', 'set_inspection_item_condition',
     'get_applicable_laws', 'search_state_law', 'search_real_estate_law', 'get_property_tax_facts', 'check_against_law', 'get_my_notifications', 'mark_notifications_read', 'update_notification_preference', 'escalate',
   ],
   name: 'David',
@@ -184,7 +200,7 @@ const LANDLORD_ESCALATION: AgentProfile = {
     'get_landlord_portfolio', 'get_property_rent_roll', 'get_setup_progress', 'get_pending_maintenance', 'lookup_tenant_payment_status',
     'get_delinquent_tenants', 'get_vacant_units', 'get_lease_expirations',
     'get_pending_applications', 'get_my_payouts', 'get_background_check_status', 'get_maintenance_team', 'get_books_summary', 'get_tenant_contact', 'get_team', 'search_parcels', 'get_market_rent',
-    'approve_maintenance_request', 'assign_maintenance_request', 'reject_maintenance_request', 'schedule_maintenance', 'message_tenant', 'send_bulk_message', 'get_agent_permissions', 'set_agent_permission', 'bill_fee', 'flag_applicant_decision', 'draft_tenant_notice', 'get_inspection_progress',
+    'approve_maintenance_request', 'assign_maintenance_request', 'reject_maintenance_request', 'schedule_maintenance', 'message_tenant', 'send_bulk_message', 'get_agent_permissions', 'set_agent_permission', 'bill_fee', 'flag_applicant_decision', 'draft_tenant_notice', 'get_inspection_progress', 'create_inspection', 'set_inspection_item_condition',
     'get_applicable_laws', 'search_state_law', 'search_real_estate_law', 'get_property_tax_facts', 'check_against_law', 'get_my_notifications', 'mark_notifications_read', 'update_notification_preference', 'escalate_to_human',
   ],
   name: 'Sonny',
@@ -216,10 +232,10 @@ const SALES_ENTRY: AgentProfile = {
   tier: 'entry',
   knowledgeScopes: ['sales', 'shared'],
   toolNames: ['capture_lead'],
-  name: 'Jordan',
+  name: 'Lucy',
   label: 'Sales — Prospect',
   systemPrompt: `
-You are Jordan, a friendly product specialist for GAM, a property-management platform for landlords. You talk with prospective landlords on the GAM website to help them understand whether GAM is a good fit, and to connect interested ones with the team.
+You are Lucy, a friendly product specialist for GAM, a property-management platform for landlords. You talk with prospective landlords on the GAM website to help them understand whether GAM is a good fit, and to connect interested ones with the team.
 
 Your goal: genuinely help, build real interest, and — when they're engaged — offer to connect them with the team for a closer look or demo. You are NOT pushy; you lead with being useful.
 

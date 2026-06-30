@@ -43,13 +43,16 @@ export async function generateRoute(args: GenerateRouteArgs): Promise<GenerateRo
   const vehicle = await queryOne<{
     id: string; business_id: string; home_depot_id: string
     stops_per_dump: number; avg_speed_mph: number; avg_service_minutes: number
+    service_seconds_per_unit: number
     depot_lat: string; depot_lon: string
   }>(
     `SELECT v.id, v.business_id, v.home_depot_id,
             v.stops_per_dump, v.avg_speed_mph, v.avg_service_minutes,
+            b.service_seconds_per_unit,
             d.lat::text AS depot_lat, d.lon::text AS depot_lon
        FROM vehicles v
-       JOIN depots d ON d.id = v.home_depot_id
+       JOIN depots d     ON d.id = v.home_depot_id
+       JOIN businesses b ON b.id = v.business_id
       WHERE v.id = $1 AND v.business_id = $2
         AND v.status = 'active' AND d.status = 'active'`,
     [args.vehicleId, args.businessId])
@@ -60,12 +63,12 @@ export async function generateRoute(args: GenerateRouteArgs): Promise<GenerateRo
   //    don't belong on today's route.
   const appointments = await query<{
     id: string; lat: string | null; lon: string | null
-    duration_minutes: number
+    unit_count: number
   }>(
     `SELECT a.id,
             c.lat::text AS lat,
             c.lon::text AS lon,
-            a.duration_minutes
+            c.unit_count
        FROM appointments a
        JOIN business_customers c ON c.id = a.customer_id
       WHERE a.business_id = $1
@@ -74,7 +77,11 @@ export async function generateRoute(args: GenerateRouteArgs): Promise<GenerateRo
         AND a.scheduled_for <  ($2::date + INTERVAL '1 day')`,
     [args.businessId, args.date])
 
-  // Split into geocoded + un-geocoded buckets.
+  // Split into geocoded + un-geocoded buckets. Service time per stop =
+  // owner rate × the customer's unit count (Nic's "1 min per can");
+  // expected_seconds is snapshotted onto each stop for efficiency.
+  const ratePerUnit = vehicle.service_seconds_per_unit
+  const expectedById = new Map<string, number>()
   const optimizerStops: OptimizerStop[] = []
   let skippedUngeocodedCount = 0
   for (const a of appointments) {
@@ -82,11 +89,13 @@ export async function generateRoute(args: GenerateRouteArgs): Promise<GenerateRo
       skippedUngeocodedCount += 1
       continue
     }
+    const expectedSeconds = ratePerUnit * (a.unit_count ?? 1)
+    expectedById.set(a.id, expectedSeconds)
     optimizerStops.push({
       id: a.id,
       lat: Number(a.lat),
       lon: Number(a.lon),
-      serviceMinutes: a.duration_minutes,
+      serviceMinutes: expectedSeconds / 60,
     })
   }
 
@@ -142,9 +151,9 @@ export async function generateRoute(args: GenerateRouteArgs): Promise<GenerateRo
         await client.query(
           `INSERT INTO route_stops
              (route_id, sequence_order, stop_kind, appointment_id,
-              estimated_arrival, estimated_departure)
-           VALUES ($1, $2, 'customer', $3, $4, $5)`,
-          [routeId, seq, leg.stopId, leg.arriveAt, leg.departAt])
+              estimated_arrival, estimated_departure, expected_seconds)
+           VALUES ($1, $2, 'customer', $3, $4, $5, $6)`,
+          [routeId, seq, leg.stopId, leg.arriveAt, leg.departAt, expectedById.get(leg.stopId) ?? null])
       } else if (leg.kind === 'dump') {
         await client.query(
           `INSERT INTO route_stops

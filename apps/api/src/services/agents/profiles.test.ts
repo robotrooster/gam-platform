@@ -100,7 +100,7 @@ describe('agent profile registry', () => {
     expect(sales.agentType).toBe('sales')
     expect(sales.audience).toBe('prospect')
     expect(sales.toolNames).toEqual(['capture_lead'])
-    expect(sales.systemPrompt).toContain('Jordan')
+    expect(sales.systemPrompt).toContain('Lucy')
     // sales does NOT carry the CS guardrails (its own prompt)
     expect(sales.systemPrompt).not.toContain('Hard stops')
   })

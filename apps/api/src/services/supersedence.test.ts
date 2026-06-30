@@ -73,6 +73,8 @@ async function seedCtx(): Promise<Ctx> {
   finally { c.release() }
 }
 
+// A 'missed' installment (both scheduled pulls failed) is the then-due,
+// unfunded portion of the deposit picked up by GAM-first routing (S514).
 async function seedDefaultedInstallment(ctx: Ctx, opts: {
   amount: number; defaultedAt: string; installmentNumber?: number
 }): Promise<string> {
@@ -80,23 +82,11 @@ async function seedDefaultedInstallment(ctx: Ctx, opts: {
     `INSERT INTO flex_deposit_installments
        (security_deposit_id, tenant_id, installment_number,
         installment_count, amount, due_date, status, defaulted_at)
-     VALUES ($1, $2, $3, 4, $4, $5::date, 'defaulted', $6::timestamptz)
+     VALUES ($1, $2, $3, 4, $4, $5::date, 'missed', $6::timestamptz)
      RETURNING id`,
     [ctx.depositId, ctx.tenantId, opts.installmentNumber ?? 1,
      opts.amount, opts.defaultedAt.slice(0, 10), opts.defaultedAt])
   return id
-}
-
-async function setDepositAccelerated(ctx: Ctx, opts: {
-  balanceDue: number; balanceDueFullAt: string
-}): Promise<void> {
-  await db.query(
-    `UPDATE security_deposits
-        SET flex_deposit_plan_status = 'accelerated',
-            balance_due_total        = $1,
-            balance_due_full_at      = $2::timestamptz
-      WHERE id = $3`,
-    [opts.balanceDue, opts.balanceDueFullAt, ctx.depositId])
 }
 
 async function seedFlexChargeStatement(ctx: Ctx, opts: {
@@ -180,17 +170,6 @@ describe('computeTenantGamOutstanding', () => {
       source: 'flexdeposit_installment',
       ref_id: refId,
       amount: 83.33,
-    })
-  })
-
-  it('accelerated deposit → 1 acceleration item; per-installment row not double-counted', async () => {
-    const ctx = await seedCtx()
-    await setDepositAccelerated(ctx,
-      { balanceDue: 750, balanceDueFullAt: '2026-05-01T00:00:00Z' })
-    const list = await computeTenantGamOutstanding(ctx.tenantId)
-    expect(list).toHaveLength(1)
-    expect(list[0]).toMatchObject({
-      source: 'flexdeposit_acceleration', amount: 750,
     })
   })
 
@@ -363,7 +342,7 @@ describe('applyTenantSupersedence', () => {
     // Row NOT flipped — boost was too small.
     const { rows: [row] } = await db.query<any>(
       `SELECT status FROM flex_deposit_installments WHERE id=$1`, [refId])
-    expect(row.status).toBe('defaulted')
+    expect(row.status).toBe('missed')
     // Breakdown captures the partial as residual=true.
     const { rows: [pay] } = await db.query<any>(
       `SELECT gam_supersedence_breakdown FROM payments WHERE id=$1`, [paymentId])

@@ -95,13 +95,14 @@ describe('POST /api/properties — create', () => {
          FROM property_allocation_rules WHERE property_id=$1`,
       [res.body.data.id])
     expect(ar.rows.length).toBe(1)
-    // bankingFeePayer mirrored into ach + card per S116 back-compat
+    // bankingFeePayer ('landlord') mirrors into ACH. card is hard-locked to
+    // 'tenant' (S513 #2) regardless of the legacy banking value.
     expect(ar.rows[0].ach_fee_payer).toBe('landlord')
-    expect(ar.rows[0].card_fee_payer).toBe('landlord')
+    expect(ar.rows[0].card_fee_payer).toBe('tenant')
     expect(ar.rows[0].platform_fee_payer).toBe('landlord')
   })
 
-  it('allocationRule missing both ach/card + bankingFeePayer → 400', async () => {
+  it('allocationRule with no fee payers → 201; ACH inherits landlord default, card locked tenant (S513 #2)', async () => {
     const f = await seedPropsFixture()
     const res = await request(buildApp())
       .post('/api/properties')
@@ -110,9 +111,28 @@ describe('POST /api/properties — create', () => {
         name: 'No Rule Prop',
         street1: '1 Main', city: 'Phoenix', state: 'AZ', zip: '85001',
         type: 'residential',
-        allocationRule: { platformFeePayer: 'landlord' },  // missing fee payers
+        allocationRule: { platformFeePayer: 'landlord' },  // no explicit fee payers
       })
-    expect(res.status).toBe(400)
+    expect(res.status).toBe(201)
+    const ar = await db.query<{ ach_fee_payer: string; card_fee_payer: string }>(
+      `SELECT ach_fee_payer, card_fee_payer FROM property_allocation_rules WHERE property_id=$1`,
+      [res.body.data.id])
+    // A freshly-seeded landlord has default_ach_fee_payer 'tenant' (column default).
+    expect(ar.rows[0].ach_fee_payer).toBe('tenant')
+    expect(ar.rows[0].card_fee_payer).toBe('tenant')
+  })
+
+  it('allocationRule entirely omitted → 201 (fixes onboarding step-1; S513 #2)', async () => {
+    const f = await seedPropsFixture()
+    const res = await request(buildApp())
+      .post('/api/properties')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({
+        name: 'Onboarding Prop',
+        street1: '2 Main', city: 'Phoenix', state: 'AZ', zip: '85002',
+        type: 'residential',
+      })
+    expect(res.status).toBe(201)
   })
 
   it('duplicate address from same landlord → flags review_status', async () => {

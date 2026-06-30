@@ -830,3 +830,120 @@ describe('POST /leases/:id/waive-early-termination', () => {
     expect(res.status).toBe(403)
   })
 })
+
+// ─── GET /leases/:id/move-in-photos — S512 #15 ──────────────────
+
+/** Insert a move-in inspection (optionally lease-linked) + N photos. */
+async function seedMoveInInspection(opts: {
+  unitId: string
+  landlordId: string
+  uploadedBy: string
+  leaseId?: string | null
+  inspectionType?: 'move_in' | 'move_out'
+  status?: string
+  captions?: Array<string | null>
+}): Promise<string> {
+  const client = await db.connect()
+  try {
+    const insp = await client.query<{ id: string }>(
+      `INSERT INTO unit_inspections (unit_id, lease_id, landlord_id, inspection_type, status)
+       VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+      [opts.unitId, opts.leaseId ?? null, opts.landlordId,
+       opts.inspectionType ?? 'move_in', opts.status ?? 'finalized'],
+    )
+    const inspectionId = insp.rows[0].id
+    for (const caption of opts.captions ?? []) {
+      await client.query(
+        `INSERT INTO unit_inspection_photos (inspection_id, photo_url, caption, uploaded_by)
+         VALUES ($1, $2, $3, $4)`,
+        [inspectionId, '/api/inspections/photo-files/' + randomUUID() + '.jpg', caption, opts.uploadedBy],
+      )
+    }
+    return inspectionId
+  } finally { client.release() }
+}
+
+describe('GET /leases/:id/move-in-photos', () => {
+  it('returns the move-in inspection photos for the landlord', async () => {
+    const f = await seedFixture()
+    const inspectionId = await seedMoveInInspection({
+      unitId: f.unitId, landlordId: f.landlordId, uploadedBy: f.landlordUserId,
+      leaseId: f.leaseId, captions: ['Kitchen', 'Bath'],
+    })
+    const res = await request(buildApp())
+      .get(`/api/leases/${f.leaseId}/move-in-photos`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.inspectionId).toBe(inspectionId)
+    expect(res.body.data.photos).toHaveLength(2)
+    expect(res.body.data.photos[0].photoUrl).toMatch(/^\/api\/inspections\/photo-files\//)
+    expect(res.body.data.photos.map((p: any) => p.caption)).toEqual(['Kitchen', 'Bath'])
+  })
+
+  it('tenant on the lease can read move-in photos', async () => {
+    const f = await seedFixture()
+    await seedMoveInInspection({
+      unitId: f.unitId, landlordId: f.landlordId, uploadedBy: f.landlordUserId,
+      leaseId: f.leaseId, captions: ['Living room'],
+    })
+    const res = await request(buildApp())
+      .get(`/api/leases/${f.leaseId}/move-in-photos`)
+      .set('Authorization', `Bearer ${f.tenantToken}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.photos).toHaveLength(1)
+  })
+
+  it('returns empty photos when no move-in inspection exists', async () => {
+    const f = await seedFixture()
+    const res = await request(buildApp())
+      .get(`/api/leases/${f.leaseId}/move-in-photos`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.inspectionId).toBeNull()
+    expect(res.body.data.photos).toEqual([])
+  })
+
+  it('ignores move-out inspections', async () => {
+    const f = await seedFixture()
+    await seedMoveInInspection({
+      unitId: f.unitId, landlordId: f.landlordId, uploadedBy: f.landlordUserId,
+      leaseId: f.leaseId, inspectionType: 'move_out', captions: ['Damage'],
+    })
+    const res = await request(buildApp())
+      .get(`/api/leases/${f.leaseId}/move-in-photos`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.inspectionId).toBeNull()
+    expect(res.body.data.photos).toEqual([])
+  })
+
+  it('falls back to the unit move-in inspection when not lease-linked', async () => {
+    const f = await seedFixture()
+    const inspectionId = await seedMoveInInspection({
+      unitId: f.unitId, landlordId: f.landlordId, uploadedBy: f.landlordUserId,
+      leaseId: null, captions: ['Entry'],
+    })
+    const res = await request(buildApp())
+      .get(`/api/leases/${f.leaseId}/move-in-photos`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.inspectionId).toBe(inspectionId)
+    expect(res.body.data.photos).toHaveLength(1)
+  })
+
+  it('unrelated landlord is forbidden', async () => {
+    const f = await seedFixture()
+    await seedMoveInInspection({
+      unitId: f.unitId, landlordId: f.landlordId, uploadedBy: f.landlordUserId,
+      leaseId: f.leaseId, captions: ['Kitchen'],
+    })
+    const otherToken = jwt.sign(
+      { userId: randomUUID(), role: 'landlord', email: 'o@test.dev', profileId: randomUUID(), permissions: {} },
+      process.env.JWT_SECRET!, { expiresIn: '1h' },
+    )
+    const res = await request(buildApp())
+      .get(`/api/leases/${f.leaseId}/move-in-photos`)
+      .set('Authorization', `Bearer ${otherToken}`)
+    expect(res.status).toBe(403)
+  })
+})

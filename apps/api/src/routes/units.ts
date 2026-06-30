@@ -4,9 +4,11 @@ import { query, queryOne } from '../db'
 import { requireAuth, requireLandlord, requirePerm } from '../middleware/auth'
 import { canAccessLandlordResource, canManageLandlordResource, canViewLandlordFinances } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
-import { UnitStatus, calcNetPerUnit, getReservePhase, PLATFORM_FEES, UNIT_STATUSES } from '@gam/shared'
+import { UnitStatus, calcNetPerUnit, getReservePhase, LAUNCH_PLATFORM_FEE, UNIT_STATUSES, computeStayPrice, RV_SITE_LAYOUTS, RV_AMP_SERVICES } from '@gam/shared'
 import { formatUnitNumber } from '../lib/format'
 import { logger } from '../lib/logger'
+import { promoteNextWaitlister } from '../services/propertyBooking'
+import { recordBookingEvent, recordBookingChange } from '../services/bookingEvents'
 import {
   sendBookingGuestAccessEmail,
   issueBookingGuestToken,
@@ -188,7 +190,12 @@ unitsRouter.get('/:id/economics', async (req, res, next) => {
     const [{ count }] = await query('SELECT COUNT(*)::int AS count FROM units WHERE landlord_id = $1 AND status = $2', [unit.landlord_id, 'active'])
     const { rate } = getReservePhase(count)
     const econ = calcNetPerUnit(unit.rent_amount, rate)
-    const fee = unit.status === 'active' ? PLATFORM_FEES.ACTIVE_UNIT : unit.status === 'direct_pay' ? PLATFORM_FEES.DIRECT_PAY_UNIT : 0
+    // Launch fee model (walkthrough #34): flat $2 per OCCUPIED unit (active or
+    // direct_pay), vacant $0 — retires the old $15/$5 OTP/direct tiers. The
+    // $10/property minimum is a per-property accrual floor, not attributable to
+    // a single unit, so the per-unit lifetime fee is just $2 × occupied months.
+    const fee = (unit.status === 'active' || unit.status === 'direct_pay')
+      ? LAUNCH_PLATFORM_FEE.PER_OCCUPIED_UNIT : 0
     const feeNum = Number(fee)
     const ps = await queryOne("SELECT COALESCE(SUM(amount) FILTER (WHERE status = 'settled'), 0) as total_collected, COALESCE(SUM(amount) FILTER (WHERE status = 'settled' AND due_date >= date_trunc('month', NOW())), 0) as this_month, COALESCE(SUM(amount) FILTER (WHERE status = 'settled' AND due_date >= date_trunc('year', NOW())), 0) as this_year, COUNT(*) FILTER (WHERE status = 'settled') as settled_count, COUNT(*) FILTER (WHERE status = 'failed') as failed_count, MIN(due_date) as first_payment FROM payments WHERE unit_id = $1", [req.params.id])
     const ms = await queryOne("SELECT COALESCE(SUM(actual_cost), 0) as total_cost, COALESCE(SUM(actual_cost) FILTER (WHERE created_at >= date_trunc('month', NOW())), 0) as this_month_cost, COUNT(*) as total_requests FROM maintenance_requests WHERE unit_id = $1", [req.params.id])
@@ -214,7 +221,14 @@ const LEASE_TYPE_MATRIX: Record<string, string[]> = {
 unitsRouter.patch('/:id/type', requirePerm('units.edit'), async (req, res, next) => {
   try {
     const { unitType, nightlyRate, weeklyRate, monthlyRate, minStayNights, maxStayNights,
-            checkInTime, checkOutTime, amenities, unitDescription, isBookable } = req.body
+            checkInTime, checkOutTime, amenities, unitDescription, isBookable, rvSiteLayout, rvAmpService } = req.body
+
+    if (rvSiteLayout != null && !RV_SITE_LAYOUTS.includes(rvSiteLayout)) {
+      throw new AppError(400, `Invalid rvSiteLayout '${rvSiteLayout}'`)
+    }
+    if (rvAmpService != null && !RV_AMP_SERVICES.includes(rvAmpService)) {
+      throw new AppError(400, `Invalid rvAmpService '${rvAmpService}'`)
+    }
 
     const unit = await queryOne<any>('SELECT * FROM units WHERE id=$1', [req.params.id])
     if (!unit) throw new AppError(404, 'Unit not found')
@@ -227,12 +241,14 @@ unitsRouter.patch('/:id/type', requirePerm('units.edit'), async (req, res, next)
     const updated = await queryOne<any>(`UPDATE units SET
       unit_type=$1, lease_types_allowed=$2, nightly_rate=$3, weekly_rate=$4, monthly_rate=$5,
       min_stay_nights=$6, max_stay_nights=$7, check_in_time=$8, check_out_time=$9,
-      amenities=$10, unit_description=$11, is_bookable=$12, updated_at=NOW()
+      amenities=$10, unit_description=$11, is_bookable=$12,
+      rv_site_layout=COALESCE($14,rv_site_layout),
+      rv_amp_service=COALESCE($15,rv_amp_service), updated_at=NOW()
       WHERE id=$13 RETURNING *`,
       [unitType||'residential', leaseTypesAllowed, nightlyRate||null, weeklyRate||null,
        monthlyRate||null, minStayNights||1, maxStayNights||null,
        checkInTime||'15:00', checkOutTime||'11:00',
-       amenities||[], unitDescription||null, isBookable??false, unit.id])
+       amenities||[], unitDescription||null, isBookable??false, unit.id, rvSiteLayout ?? null, rvAmpService ?? null])
 
     res.json({ success: true, data: updated })
   } catch (e) { next(e) }
@@ -283,6 +299,8 @@ unitsRouter.post('/:id/bookings', requirePerm('guests.check_in', 'units.edit'), 
       totalAmount: z.number().min(0).nullish(),
       notes:       z.string().nullish(),
       source:      z.string().nullish(),
+      requiredSiteLayout: z.enum(RV_SITE_LAYOUTS as unknown as [string, ...string[]]).nullish(),
+      requiredAmpService: z.enum(RV_AMP_SERVICES as unknown as [string, ...string[]]).nullish(),
     }).parse(req.body)
 
     const checkInD  = new Date(body.checkIn)
@@ -299,8 +317,10 @@ unitsRouter.post('/:id/bookings', requirePerm('guests.check_in', 'units.edit'), 
       throw new AppError(403, 'Forbidden')
     }
 
-    // Check allowed lease types
-    if (unit.lease_types_allowed && !unit.lease_types_allowed.includes(body.leaseType)) {
+    // Check allowed lease types. An EMPTY list means unrestricted (a manual
+    // staff reservation can book any unit) — only enforce when the unit has an
+    // explicit allow-list configured.
+    if (unit.lease_types_allowed?.length && !unit.lease_types_allowed.includes(body.leaseType)) {
       throw new AppError(400, `Lease type '${body.leaseType}' not allowed for ${unit.unit_type} units`)
     }
 
@@ -313,17 +333,40 @@ unitsRouter.post('/:id/bookings', requirePerm('guests.check_in', 'units.edit'), 
     if (conflict) throw new AppError(409, 'Unit is already booked for those dates')
 
     const nights = Math.ceil((checkOutD.getTime() - checkInD.getTime()) / (1000*60*60*24))
-    const platformFee = (body.totalAmount || 0) * 0.05 // 5% platform fee on short-term
+    // Price authoritatively from the UNIT's stay rates, falling back to the
+    // PROPERTY default per rate when the unit hasn't been configured separately
+    // (Nic: rates are uniform by default — RV spots/storage share a price — but
+    // a landlord can override a specific unit, e.g. pull-through vs back-in RV
+    // sites). Tier by length, prorated, short-term tax (tax stays property-level).
+    // Falls back to a client-supplied total only when no rate is set at all.
+    const prop = await queryOne<any>(
+      'SELECT nightly_rate, weekly_rate, monthly_rate, short_term_tax_rate FROM properties WHERE id=$1',
+      [unit.property_id])
+    const price = computeStayPrice(
+      { nightly: unit.nightly_rate ?? prop?.nightly_rate,
+        weekly:  unit.weekly_rate  ?? prop?.weekly_rate,
+        monthly: unit.monthly_rate ?? prop?.monthly_rate },
+      Number(prop?.short_term_tax_rate || 0), nights)
+    const total = price.total > 0 ? price.total : (body.totalAmount || 0)
+    const platformFee = total * 0.05 // 5% platform fee on short-term
 
     const booking = await queryOne<any>(`INSERT INTO unit_bookings
       (unit_id, landlord_id, tenant_id, guest_name, guest_email, guest_phone,
        lease_type, check_in, check_out, nights, nightly_rate, weekly_rate,
-       total_amount, platform_fee, notes, source)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`,
+       total_amount, platform_fee, notes, source, required_site_layout, required_amp_service)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING *`,
       [unit.id, unit.landlord_id, body.tenantId ?? null, body.guestName ?? null, body.guestEmail ?? null,
        body.guestPhone ?? null, body.leaseType, body.checkIn, body.checkOut, nights,
        body.nightlyRate ?? unit.nightly_rate ?? null, body.weeklyRate ?? unit.weekly_rate ?? null,
-       body.totalAmount ?? 0, platformFee, body.notes ?? null, body.source ?? 'direct'])
+       total, platformFee, body.notes ?? null, body.source ?? 'direct', body.requiredSiteLayout ?? 'none', body.requiredAmpService ?? 'none'])
+
+    // S517: change-history (Master Schedule). Best-effort — never fail the booking.
+    recordBookingEvent({
+      bookingId: booking.id, unitId: unit.id, landlordId: unit.landlord_id,
+      eventType: 'created', actorUserId: req.user!.userId,
+      summary: `Reservation created for ${booking.guest_name || 'Guest'} (${body.checkIn}→${body.checkOut})`,
+      detail: { check_in: body.checkIn, check_out: body.checkOut, lease_type: body.leaseType, source: body.source ?? 'direct' },
+    }).catch((err) => logger.error({ err, bookingId: booking.id }, '[booking] event record failed'))
 
     // Booking guests with no GAM account get a stay-assistant link by email
     // (a host can also issue a QR from the booking). Best-effort — a missing
@@ -448,7 +491,13 @@ unitsRouter.get('/:id/bookings', requirePerm('guests.check_in', 'guests.check_ou
 // PATCH /api/units/:id/bookings/:bookingId — update booking (status, move dates, swap unit)
 unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('guests.check_in', 'guests.check_out', 'units.edit'), async (req, res, next) => {
   try {
-    const { status, notes, checkIn, checkOut, unitId } = req.body
+    const { status, notes, checkIn, checkOut, unitId, guestName, guestEmail, guestPhone, requiredSiteLayout, requiredAmpService } = req.body
+    if (requiredSiteLayout != null && !RV_SITE_LAYOUTS.includes(requiredSiteLayout)) {
+      throw new AppError(400, `Invalid requiredSiteLayout '${requiredSiteLayout}'`)
+    }
+    if (requiredAmpService != null && !RV_AMP_SERVICES.includes(requiredAmpService)) {
+      throw new AppError(400, `Invalid requiredAmpService '${requiredAmpService}'`)
+    }
     const booking = await queryOne<any>('SELECT * FROM unit_bookings WHERE id=$1', [req.params.bookingId])
     if (!booking) throw new AppError(404, 'Booking not found')
     if (!canManageLandlordResource(req.user, booking.landlord_id)) {
@@ -458,11 +507,13 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('guests.check_in', 'gu
     const newUnitId = unitId || booking.unit_id
     const newCheckIn = checkIn || booking.check_in
     const newCheckOut = checkOut || booking.check_out
+    const datesOrUnitChanged = !!(checkIn || checkOut || unitId)
 
     // If dates or unit changed, verify target unit exists, belongs to the
-    // same landlord, and check for conflicts.
-    if (checkIn || checkOut || unitId) {
-      const targetUnit = await queryOne<any>('SELECT * FROM units WHERE id=$1 AND landlord_id=$2', [newUnitId, booking.landlord_id])
+    // same landlord, and check for conflicts. Repricing below reads its rates.
+    let targetUnit: any = null
+    if (datesOrUnitChanged) {
+      targetUnit = await queryOne<any>('SELECT * FROM units WHERE id=$1 AND landlord_id=$2', [newUnitId, booking.landlord_id])
       if (!targetUnit) throw new AppError(404, 'Target unit not found')
 
       const conflict = await queryOne<any>(`
@@ -475,12 +526,50 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('guests.check_in', 'gu
 
     const nights = Math.ceil((new Date(newCheckOut).getTime() - new Date(newCheckIn).getTime()) / (1000*60*60*24))
 
+    // Reprice when dates or the unit change — the stored total must never drift
+    // from the new stay. Same unit-rate-then-property-default rule as create.
+    // A pure status/notes/guest edit keeps the existing total.
+    let newTotal: number | null = null
+    if (datesOrUnitChanged) {
+      const prop = await queryOne<any>(
+        'SELECT nightly_rate, weekly_rate, monthly_rate, short_term_tax_rate FROM properties WHERE id=$1',
+        [targetUnit.property_id])
+      const price = computeStayPrice(
+        { nightly: targetUnit.nightly_rate ?? prop?.nightly_rate,
+          weekly:  targetUnit.weekly_rate  ?? prop?.weekly_rate,
+          monthly: targetUnit.monthly_rate ?? prop?.monthly_rate },
+        Number(prop?.short_term_tax_rate || 0), nights)
+      if (price.total > 0) newTotal = price.total
+    }
+
     const updated = await queryOne<any>(`
       UPDATE unit_bookings
       SET status=COALESCE($1,status), notes=COALESCE($2,notes),
-          unit_id=$3, check_in=$4, check_out=$5, nights=$6, updated_at=NOW()
+          unit_id=$3, check_in=$4, check_out=$5, nights=$6,
+          guest_name=COALESCE($8,guest_name),
+          guest_email=COALESCE($9,guest_email),
+          guest_phone=COALESCE($10,guest_phone),
+          total_amount=COALESCE($11,total_amount),
+          platform_fee=COALESCE($12,platform_fee),
+          required_site_layout=COALESCE($13,required_site_layout),
+          required_amp_service=COALESCE($14,required_amp_service),
+          updated_at=NOW()
       WHERE id=$7 RETURNING *`,
-      [status||null, notes||null, newUnitId, newCheckIn, newCheckOut, nights, booking.id])
+      [status||null, notes||null, newUnitId, newCheckIn, newCheckOut, nights, booking.id,
+       guestName ?? null, guestEmail ?? null, guestPhone ?? null,
+       newTotal, newTotal != null ? newTotal * 0.05 : null, requiredSiteLayout ?? null, requiredAmpService ?? null])
+
+    // S517: append the change-history events (moved / dates_changed / cancelled
+    // / status_changed) by diffing old → new. Best-effort.
+    recordBookingChange(booking, updated, req.user!.userId).catch(err =>
+      logger.error({ err, bookingId: booking.id }, '[booking] change event record failed'))
+
+    // S517: a cancellation frees the dates — promote the next waitlister
+    // (best-effort; mints a 1-hour claim link + emails them).
+    if (status === 'cancelled' && booking.status !== 'cancelled') {
+      promoteNextWaitlister(booking.unit_id).catch(err =>
+        logger.error({ err, unit_id: booking.unit_id }, '[booking] waitlist promote on cancel failed'))
+    }
     res.json({ success: true, data: updated })
   } catch (e) { next(e) }
 })
@@ -531,9 +620,12 @@ unitsRouter.get('/schedule/master', requirePerm('guests.check_in', 'units.view_s
 
     const units = await query<any>(`
       SELECT u.id, u.unit_number, u.unit_type, u.status, u.rent_amount,
-        u.nightly_rate, u.weekly_rate, u.is_bookable, u.lease_types_allowed,
+        u.nightly_rate, u.weekly_rate, u.monthly_rate, u.is_bookable, u.lease_types_allowed,
+        u.rv_site_layout, u.rv_amp_service,
         u.check_in_time, u.check_out_time, u.amenities, u.unit_description,
-        p.name as property_name,
+        p.id as property_id, p.name as property_name,
+        p.nightly_rate as property_nightly_rate, p.weekly_rate as property_weekly_rate,
+        p.monthly_rate as property_monthly_rate, p.short_term_tax_rate as property_tax_rate,
         vuo.primary_first_name as tenant_first,
         vuo.primary_last_name as tenant_last
       FROM units u
@@ -575,6 +667,27 @@ unitsRouter.get('/schedule/master', requirePerm('guests.check_in', 'units.view_s
       ORDER BY l.start_date`, [callerLandlordId, fromDate, toDate])
 
     res.json({ success: true, data: { units, bookings, leases, range: { from: fromDate, to: toDate } } })
+  } catch (e) { next(e) }
+})
+
+// GET /api/units/schedule/history — S517 / #10. Master-schedule change log:
+// every reservation create / move / date-change / cancel, newest first.
+unitsRouter.get('/schedule/history', requirePerm('guests.check_in', 'units.view_status', 'units.edit'), async (req, res, next) => {
+  try {
+    const callerLandlordId = req.user!.role === 'landlord' ? req.user!.profileId : req.user!.landlordId
+    const limit = Math.min(200, Math.max(1, parseInt(String(req.query.limit ?? '100')) || 100))
+    const events = await query<any>(`
+      SELECT e.id, e.event_type, e.summary, e.detail, e.created_at,
+             u.unit_number, p.name AS property_name,
+             a.first_name AS actor_first, a.last_name AS actor_last
+        FROM unit_booking_events e
+        JOIN units u ON u.id = e.unit_id
+        JOIN properties p ON p.id = u.property_id
+        LEFT JOIN users a ON a.id = e.actor_user_id
+       WHERE e.landlord_id = $1
+       ORDER BY e.created_at DESC
+       LIMIT $2`, [callerLandlordId, limit])
+    res.json({ success: true, data: events })
   } catch (e) { next(e) }
 })
 

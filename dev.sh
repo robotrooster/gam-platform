@@ -2,9 +2,9 @@
 set -e
 
 echo "Killing existing processes on all GAM ports..."
-for port in 3001 3002 3003 3004 3005 3006 3007 3008 3009 3011 3012 4000 4001; do
-  pid=$(lsof -ti tcp:$port 2>/dev/null)
-  [ -n "$pid" ] && kill -9 $pid 2>/dev/null && echo "  Killed :$port (pid $pid)"
+for port in 3001 3002 3003 3004 3005 3006 3007 3008 3009 3011 3012 3013 3014 4000 4001; do
+  pid=$(lsof -ti tcp:$port 2>/dev/null) || true
+  [ -n "$pid" ] && kill -9 $pid 2>/dev/null && echo "  Killed :$port (pid $pid)" || true
 done
 sleep 2
 
@@ -41,6 +41,7 @@ echo "Starting servers..."
 nohup npm run build:watch --workspace=packages/shared > /tmp/gam-shared.log 2>&1 & echo "  Shared    → tsc --watch"
 sleep 2  # let shared do its first compile so api boots against fresh dist
 nohup npm run dev --workspace=apps/api        > /tmp/gam-api.log        2>&1 & echo "  API       → :4000"
+nohup npm run dev --workspace=apps/property-api > /tmp/gam-property-api.log 2>&1 & echo "  PropAPI   → :4001 (gam_properties)"
 sleep 3
 nohup npm run dev --workspace=apps/landlord   > /tmp/gam-landlord.log   2>&1 & echo "  Landlord  → :3001"
 nohup npm run dev --workspace=apps/tenant     > /tmp/gam-tenant.log     2>&1 & echo "  Tenant    → :3002"
@@ -48,10 +49,13 @@ nohup npm run dev --workspace=apps/admin      > /tmp/gam-admin.log      2>&1 & e
 nohup npm run dev --workspace=apps/marketing  > /tmp/gam-marketing.log  2>&1 & echo "  Marketing → :3004"
 nohup npm run dev --workspace=apps/pos        > /tmp/gam-pos.log        2>&1 & echo "  POS       → :3005"
 nohup npm run dev --workspace=apps/books      > /tmp/gam-books.log      2>&1 & echo "  Books     → :3006"
+nohup npm run dev --workspace=apps/property-intel > /tmp/gam-property-intel.log 2>&1 & echo "  PropIntel → :3007"
 nohup npm run dev --workspace=apps/listings   > /tmp/gam-listings.log   2>&1 & echo "  Listings  → :3008"
 nohup npm run dev --workspace=apps/admin-ops  > /tmp/gam-admin-ops.log  2>&1 & echo "  AdminOps  → :3009"
 nohup npm run dev --workspace=apps/pm-company > /tmp/gam-pm-company.log 2>&1 & echo "  PM Portal → :3011"
 nohup npm run dev --workspace=apps/business   > /tmp/gam-business.log   2>&1 & echo "  Business  → :3012"
+nohup npm run dev --workspace=apps/fitness    > /tmp/gam-fitness.log    2>&1 & echo "  Fitness   → :3013"
+nohup npm run dev --workspace=apps/customer   > /tmp/gam-customer.log   2>&1 & echo "  Customer  → :3014"
 sleep 4
 
 echo ""
@@ -60,19 +64,23 @@ echo "  GAM Platform — Port Map"
 echo "═══════════════════════════════════"
 echo "  Shared    tsc -b --watch (no port, logs in /tmp/gam-shared.log)"
 echo "  API       http://localhost:4000"
+echo "  PropAPI   http://localhost:4001  (gam_properties — powers Property Intelligence)"
 echo "  Landlord  http://localhost:3001"
 echo "  Tenant    http://localhost:3002"
 echo "  Admin     http://localhost:3003"
 echo "  Marketing http://localhost:3004"
 echo "  POS       http://localhost:3005"
 echo "  Books     http://localhost:3006"
+echo "  PropIntel http://localhost:3007"
 echo "  Listings  http://localhost:3008"
 echo "  AdminOps  http://localhost:3009"
 echo "  PM Portal http://localhost:3011"
 echo "  Business  http://localhost:3012"
+echo "  Fitness   http://localhost:3013"
+echo "  Customer  http://localhost:3014  (public service-status + invoice portal)"
 echo "═══════════════════════════════════"
 
 # Verify all ports are actually listening
 echo ""
 echo "Listening ports:"
-lsof -i tcp:3001,3002,3003,3004,3005,3006,3008,3009,3011,3012,4000 2>/dev/null | grep LISTEN | awk '{print "  " $9}' | sort
+lsof -i tcp:3001,3002,3003,3004,3005,3006,3007,3008,3009,3011,3012,3013,3014,4000,4001 2>/dev/null | grep LISTEN | awk '{print "  " $9}' | sort

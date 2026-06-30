@@ -350,8 +350,7 @@ maintenanceRouter.get('/stats/summary', requirePerm('work_orders.complete', 'wor
         COUNT(*) FILTER (WHERE status = 'in_progress') as in_progress_count,
         COUNT(*) FILTER (WHERE status = 'completed') as completed_count,
         COUNT(*) FILTER (WHERE priority = 'emergency' AND status != 'completed') as emergency_count,
-        COALESCE(SUM(actual_cost) FILTER (WHERE status = 'completed'), 0) as total_cost,
-        COALESCE(SUM(platform_fee) FILTER (WHERE status = 'completed'), 0) as total_fees
+        COALESCE(SUM(actual_cost) FILTER (WHERE status = 'completed'), 0) as total_cost
       FROM maintenance_requests ${where}`, params)
     res.json({ success: true, data: stats })
   } catch (e) { next(e) }

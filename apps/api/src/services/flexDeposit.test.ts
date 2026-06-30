@@ -1,21 +1,24 @@
 /**
- * FlexDeposit eligibility checks — S330 + pre-existing blockers.
+ * FlexDeposit eligibility checks — custody model (S514) + S330 blockers.
  *
  * Read-only path through getFlexDepositEligibility — tests use
  * withRollback for isolation. The function reads tenants /
  * security_deposits / background_checks / credit_events.
  *
- * The eligibility rule set (S330):
+ * The eligibility rule set:
+ *   - not_ssi_ssdi (S514)               : tenants.ssi_ssdi = FALSE
  *   - ach_unverified                    : tenants.ach_verified = FALSE
  *   - no_bg_result / bg_not_approved    : background_check_status != 'approved'
  *   - risk_level_missing                : BG row missing risk_level
- *   - tenant_suspended_nsf              : flex_deposit_disqualified_until in future
  *   - no_deposit_row / already_funded   : security_deposits state
  *   - insufficient_platform_tenure (S330): tenants.created_at < 30d ago
- *   - prior_flexdeposit_default (S330)  : any prior plan in_default
  *   - insufficient_on_time_payment_history (S330):
  *       has prior lease AND < 1 payment_received_on_time event in 90d
  *       (first-lease-ever tenants are exempt)
+ *
+ * S514 removed the advance/default model: there is no NSF cooldown
+ * (tenant_suspended_nsf) and no permanent prior-default block
+ * (prior_flexdeposit_default) — a missed installment is not a default.
  */
 
 import { describe, it, expect, beforeEach } from 'vitest'
@@ -32,15 +35,15 @@ import type { PoolClient } from 'pg'
 async function buildEligibilityStack(
   client: PoolClient,
   opts: {
+    ssiSsdi?:                            boolean
     achVerified?:                        boolean
     bgStatus?:                           string | null
     riskLevel?:                          'low' | 'medium' | 'high' | 'very_high' | null
-    flexDepositDisqualifiedUntil?:       string | null
     tenantCreatedAt?:                    string  // ISO; defaults to NOW()
     skipDeposit?:                        boolean
     depositStatus?:                      'pending' | 'partial' | 'funded'
     seedPriorLease?:                     boolean
-    seedPriorDefault?:                   boolean
+    seedPriorPlan?:                      boolean
   } = {},
 ): Promise<{ tenantId: string; landlordId: string }> {
   const { userId: ownerUserId, landlordId } = await seedLandlord(client)
@@ -68,21 +71,22 @@ async function buildEligibilityStack(
 
   // tenants.background_check_status has a NOT NULL constraint with
   // default 'not_started'. We update it only when a status is given;
-  // when null is passed, we leave the default in place.
+  // when null is passed, we leave the default in place. ssi_ssdi
+  // defaults TRUE (FlexDeposit is SSDI/SSI-only — S514).
   await client.query(
     `UPDATE tenants
-        SET ach_verified                = $2,
-            background_check_status     = COALESCE($3::text, background_check_status),
-            background_check_id         = $4,
-            flex_deposit_disqualified_until = $5,
+        SET ssi_ssdi                    = $2,
+            ach_verified                = $3,
+            background_check_status     = COALESCE($4::text, background_check_status),
+            background_check_id         = $5,
             created_at                  = COALESCE($6::timestamptz, created_at)
       WHERE id = $1`,
     [
       tenantId,
+      opts.ssiSsdi ?? true,
       opts.achVerified ?? true,
       opts.bgStatus ?? null,
       bgId,
-      opts.flexDepositDisqualifiedUntil ?? null,
       opts.tenantCreatedAt ?? null,
     ],
   )
@@ -117,7 +121,9 @@ async function buildEligibilityStack(
     await seedLeaseTenant(client, { leaseId: priorLeaseId, tenantId, role: 'primary' })
   }
 
-  if (opts.seedPriorDefault) {
+  if (opts.seedPriorPlan) {
+    // A prior FlexDeposit plan on an expired lease. Under the custody
+    // model this never blocks a future enrollment (no permanent default).
     const otherUnitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 900 })
     const otherLeaseId = await seedLease(client, {
       unitId: otherUnitId, landlordId, rentAmount: 900, status: 'expired',
@@ -126,7 +132,7 @@ async function buildEligibilityStack(
       `INSERT INTO security_deposits
          (unit_id, lease_id, tenant_id, total_amount, status, held_by,
           flex_deposit_enabled, flex_deposit_plan_status)
-       VALUES ($1, $2, $3, 400, 'funded', 'gam_escrow', TRUE, 'in_default')`,
+       VALUES ($1, $2, $3, 400, 'funded', 'gam_escrow', TRUE, 'completed')`,
       [otherUnitId, otherLeaseId, tenantId],
     )
   }
@@ -249,25 +255,22 @@ describe('getFlexDepositEligibility — pre-existing blockers', () => {
     expect(r.blockers).toContain('risk_level_missing')
   })
 
-  it('blocks tenant_suspended_nsf when flex_deposit_disqualified_until in future', async () => {
-    const future = new Date(Date.now() + 30 * 86400_000).toISOString()
+  it('blocks not_ssi_ssdi when tenant is not an SSDI/SSI recipient (S514)', async () => {
     const client = await db.connect()
     let tenantId: string
     try {
       await client.query('BEGIN')
       const stack = await buildEligibilityStack(client, {
+        ssiSsdi: false,
         achVerified: true, bgStatus: 'approved', riskLevel: 'low',
-        flexDepositDisqualifiedUntil: future,
         tenantCreatedAt: '2020-01-01T00:00:00Z',
       })
       tenantId = stack.tenantId
       await client.query('COMMIT')
     } finally { client.release() }
     const r = await getFlexDepositEligibility(tenantId)
-    expect(r.blockers).toContain('tenant_suspended_nsf')
-    // Compare via Date.parse — pg driver returns timestamps as Date
-    // objects, while `future` here is the ISO string we sent in.
-    expect(new Date(r.suspended_until!).toISOString()).toBe(future)
+    expect(r.eligible).toBe(false)
+    expect(r.blockers).toContain('not_ssi_ssdi')
   })
 
   it('blocks no_deposit_row when no security_deposits row for tenant', async () => {
@@ -324,8 +327,8 @@ describe('getFlexDepositEligibility — S330 platform tenure', () => {
   })
 })
 
-describe('getFlexDepositEligibility — S330 prior FlexDeposit default', () => {
-  it('blocks permanently when any prior plan landed in_default', async () => {
+describe('getFlexDepositEligibility — S514 prior plan does not block', () => {
+  it('does NOT block when a prior FlexDeposit plan exists (no permanent default)', async () => {
     const client = await db.connect()
     let tenantId: string
     try {
@@ -333,13 +336,15 @@ describe('getFlexDepositEligibility — S330 prior FlexDeposit default', () => {
       const stack = await buildEligibilityStack(client, {
         achVerified: true, bgStatus: 'approved', riskLevel: 'low',
         tenantCreatedAt: '2020-01-01T00:00:00Z',
-        seedPriorDefault: true,
+        seedPriorPlan: true,
       })
       tenantId = stack.tenantId
       await client.query('COMMIT')
     } finally { client.release() }
     const r = await getFlexDepositEligibility(tenantId)
-    expect(r.blockers).toContain('prior_flexdeposit_default')
+    expect(r.blockers).not.toContain('not_ssi_ssdi')
+    // The prior plan never adds a blocker — eligibility is unaffected.
+    expect(r.eligible).toBe(true)
   })
 })
 

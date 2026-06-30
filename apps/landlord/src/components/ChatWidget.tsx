@@ -61,12 +61,15 @@ function Avatar({ name, size = 36 }: { name: string; size?: number }) {
   )
 }
 
-export function ChatPanel({ onClose, embedded = false }: { onClose?: () => void; embedded?: boolean }) {
+export function ChatPanel({ onClose, embedded = false, initialInput }: { onClose?: () => void; embedded?: boolean; initialInput?: string }) {
   const [agent, setAgent] = useState(DEFAULT_AGENT)
   const [messages, setMessages] = useState<Msg[]>([])
   const [conversationId, setConversationId] = useState<string | undefined>()
   const [input, setInput] = useState('')
   const [sending, setSending] = useState(false)
+  // Prefill (never auto-send) when opened from a "Start walkthrough"-style CTA;
+  // the landlord reviews the suggested message and sends it themselves.
+  useEffect(() => { if (initialInput) setInput(initialInput) }, [initialInput])
   const scrollRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -189,8 +192,20 @@ function Working({ agent }: { agent: string }) {
   )
 }
 
+// Open the assistant (optionally prefilled) from anywhere in the app, e.g. a
+// "Start guided walkthrough" CTA. The ChatWidget listens for this event.
+export function openAssistant(prefill?: string) {
+  window.dispatchEvent(new CustomEvent('gam:open-assistant', { detail: { prefill } }))
+}
+
 export function ChatWidget() {
   const [open, setOpen] = useState(false)
+  const [prefill, setPrefill] = useState<string | undefined>()
+  useEffect(() => {
+    const handler = (e: Event) => { setPrefill((e as CustomEvent).detail?.prefill); setOpen(true) }
+    window.addEventListener('gam:open-assistant', handler)
+    return () => window.removeEventListener('gam:open-assistant', handler)
+  }, [])
   return (
     <>
       <style>{DOT_CSS}</style>
@@ -201,7 +216,7 @@ export function ChatWidget() {
           borderRadius: 16, overflow: 'hidden', border: '1px solid var(--border-2)',
           boxShadow: '0 18px 50px rgba(0,0,0,.5)',
         }}>
-          <ChatPanel onClose={() => setOpen(false)} />
+          <ChatPanel onClose={() => setOpen(false)} initialInput={prefill} />
         </div>
       )}
       <button

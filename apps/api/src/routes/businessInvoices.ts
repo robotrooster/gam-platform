@@ -43,6 +43,7 @@ export const businessInvoicesRouter = Router()
 // 'invoices.write'; send / mark-paid / void take 'invoices.send'.
 import { requireBusinessAccess } from '../middleware/businessAccess'
 import { applyDiscount, computeDiscountAmount } from '../services/businessDiscounts'
+import { BUSINESS_DEPOSIT_TYPES, computeInvoiceDue } from '@gam/shared'
 
 const requireRead  = async (req: any) => (await requireBusinessAccess(req, { permission: 'invoices.read',  feature: 'invoicing' })).businessId
 const requireWrite = async (req: any) => (await requireBusinessAccess(req, { permission: 'invoices.write', feature: 'invoicing' })).businessId
@@ -79,7 +80,19 @@ const createSchema = z.object({
   discountCode:  z.string().min(1).max(40).optional(),
   notes:         z.string().max(2000).nullable().optional(),
   internalNotes: z.string().max(2000).nullable().optional(),
+  // S511: optional upfront deposit (Business #9). Tagged service|materials.
+  // Must be paired (amount>0 ⇔ type set) and ≤ total (total checked post-calc).
+  depositAmount: z.number().min(0).optional(),
+  depositType:   z.enum(BUSINESS_DEPOSIT_TYPES).optional(),
   lines:         z.array(lineSchema).min(1).max(200),
+}).superRefine((b, ctx) => {
+  const amt = b.depositAmount ?? 0
+  if (amt > 0 && !b.depositType) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'depositType is required when a deposit is set', path: ['depositType'] })
+  }
+  if (b.depositType && amt <= 0) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'depositAmount must be > 0 when depositType is set', path: ['depositAmount'] })
+  }
 })
 
 businessInvoicesRouter.post('/', requireAuth, async (req, res, next) => {
@@ -140,6 +153,14 @@ businessInvoicesRouter.post('/', requireAuth, async (req, res, next) => {
         : round2(discountedSubtotal * rate)
       const total = round2(discountedSubtotal + tax)
 
+      // S511: deposit must fit inside the (now-known) total.
+      const depositAmount = round2(body.depositAmount ?? 0)
+      if (depositAmount > total + 0.005) {
+        await client.query('ROLLBACK')
+        throw new AppError(400, 'Deposit cannot exceed the invoice total')
+      }
+      const depositType = depositAmount > 0 ? (body.depositType ?? null) : null
+
       // Reserve next invoice number for this business. INSERT...ON
       // CONFLICT lets us seed the sequence row on first use.
       const { rows: [seq] } = await client.query<{ next_number: number }>(
@@ -161,13 +182,15 @@ businessInvoicesRouter.post('/', requireAuth, async (req, res, next) => {
             status, issue_date, due_date,
             subtotal, tax_amount, total_amount,
             discount_code_id, discount_amount,
+            deposit_amount, deposit_type,
             notes, internal_notes)
-         VALUES ($1, $2, $3, 'draft', $4, $5, $6, $7, $8, $9, $10, $11, $12)
+         VALUES ($1, $2, $3, 'draft', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
          RETURNING id`,
         [businessId, body.customerId, invoiceNumber,
          body.issueDate, body.dueDate,
          subtotal, tax, total,
          discountCodeId, discountAmount,
+         depositAmount, depositType,
          body.notes ?? null, body.internalNotes ?? null])
 
       // Insert lines in order.
@@ -352,12 +375,21 @@ businessInvoicesRouter.post('/:id/send', requireAuth, async (req, res, next) => 
       invoice_number: string;
       customer_id: string;
       due_date: string;
+      deposit_amount: string;
     }>(
-      `SELECT id, status, total_amount, invoice_number, customer_id, due_date
+      `SELECT id, status, total_amount, invoice_number, customer_id, due_date, deposit_amount
          FROM business_invoices
         WHERE id = $1 AND business_id = $2 AND status = 'draft'`,
       [req.params.id, businessId])
     if (!inv) throw new AppError(404, 'Invoice not found or not in draft')
+
+    // S511: the first pay link covers the amount due now — the deposit when
+    // one is set (balance link is minted later by the portal), else the total.
+    const due = computeInvoiceDue({
+      totalAmount:   Number(inv.total_amount),
+      amountPaid:    0,
+      depositAmount: Number(inv.deposit_amount),
+    })
 
     const biz = await queryOne<{
       name: string;
@@ -383,7 +415,7 @@ businessInvoicesRouter.post('/:id/send', requireAuth, async (req, res, next) => 
         const { createInvoiceCheckoutSession } = await import('../services/stripeConnect')
         const appBase = process.env.MARKETING_URL || 'http://localhost:3004'
         const session = await createInvoiceCheckoutSession({
-          amountCents:              Math.round(Number(inv.total_amount) * 100),
+          amountCents:              Math.round(due.amountDueNow * 100),
           businessConnectAccountId: biz.stripe_connect_account_id,
           invoiceNumber:            inv.invoice_number,
           customerEmail:            customer?.email ?? null,
@@ -392,6 +424,7 @@ businessInvoicesRouter.post('/:id/send', requireAuth, async (req, res, next) => 
           metadata: {
             business_invoice_id: inv.id,
             business_id:         businessId,
+            payment_kind:        due.nextPaymentKind, // 'deposit' | 'balance'
           },
         })
         sessionId = session.sessionId

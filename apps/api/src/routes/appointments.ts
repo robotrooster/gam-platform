@@ -186,6 +186,53 @@ appointmentsRouter.get('/', requireAuth, async (req, res, next) => {
 })
 
 // ═══════════════════════════════════════════════════════════════
+//  Calendar sync — ICS subscribe feed (S511, walkthrough Business #7)
+//
+//  GET  /api/appointments/calendar-feed         → { token, url, webcalUrl }
+//  POST /api/appointments/calendar-feed/rotate   → new token (revokes old sub)
+//
+//  Registered BEFORE GET /:id so the literal paths don't get swallowed by the
+//  :id param. The owner subscribes to `url` (or `webcalUrl`) in their calendar
+//  app; the token is the only credential on the public endpoint.
+// ═══════════════════════════════════════════════════════════════
+
+function feedUrls(token: string): { url: string; webcalUrl: string } {
+  const base = (process.env.API_PUBLIC_URL || 'http://localhost:4000').replace(/\/$/, '')
+  const url = `${base}/api/public/business-calendar/${token}.ics`
+  // webcal:// makes calendar apps add it as a live subscription on click.
+  const webcalUrl = url.replace(/^https?:\/\//, 'webcal://')
+  return { url, webcalUrl }
+}
+
+appointmentsRouter.get('/calendar-feed', requireAuth, async (req, res, next) => {
+  try {
+    const businessId = await requireBusinessId(req)
+    // Lazily mint the token on first view; keep an existing one stable.
+    const row = await queryOne<{ calendar_feed_token: string }>(
+      `UPDATE businesses
+          SET calendar_feed_token = COALESCE(calendar_feed_token, gen_random_uuid())
+        WHERE id = $1
+      RETURNING calendar_feed_token`,
+      [businessId])
+    const token = row!.calendar_feed_token
+    res.json({ success: true, data: { token, ...feedUrls(token) } })
+  } catch (e) { next(e) }
+})
+
+appointmentsRouter.post('/calendar-feed/rotate', requireAuth, async (req, res, next) => {
+  try {
+    const businessId = await requireBusinessId(req)
+    const row = await queryOne<{ calendar_feed_token: string }>(
+      `UPDATE businesses SET calendar_feed_token = gen_random_uuid()
+        WHERE id = $1
+      RETURNING calendar_feed_token`,
+      [businessId])
+    const token = row!.calendar_feed_token
+    res.json({ success: true, data: { token, ...feedUrls(token) } })
+  } catch (e) { next(e) }
+})
+
+// ═══════════════════════════════════════════════════════════════
 //  GET /:id  — read one
 // ═══════════════════════════════════════════════════════════════
 

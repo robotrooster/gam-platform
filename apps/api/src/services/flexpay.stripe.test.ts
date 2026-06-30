@@ -26,7 +26,7 @@
  *     filter (only 'pulled' → 'reconciled'), idempotent re-run.
  *   handleFlexPayPaymentNsf — entry_description gate, retry_count<1
  *     short-circuit (ACH retry still in flight), retry_count>=1 +
- *     match → defaulted + 60-day tenant suspension + alert.
+ *     match → defaulted + 90-day tenant suspension + alert.
  */
 
 import { vi, describe, it, expect, beforeEach } from 'vitest'
@@ -38,16 +38,17 @@ vi.mock('stripe', () => {
     invoice_settings: { default_payment_method: 'pm_default' },
     default_source: null,
   }))
+  const paymentIntentsUpdate = vi.fn(async () => ({ id: 'pi_flexpay_mock' }))
   function FakeStripe(this: any) {
     this.transfers = { create: transfersCreate }
     this.customers = { retrieve: customersRetrieve, create: vi.fn() }
     this.accounts = { create: vi.fn(), retrieve: vi.fn() }
     this.accountSessions = { create: vi.fn() }
     this.setupIntents = { create: vi.fn() }
-    this.paymentIntents = { create: vi.fn(), retrieve: vi.fn() }
+    this.paymentIntents = { create: vi.fn(), retrieve: vi.fn(), update: paymentIntentsUpdate }
     this.payouts = { list: vi.fn(), retrieve: vi.fn(), create: vi.fn() }
   }
-  ;(FakeStripe as any).__mocks = { transfersCreate, customersRetrieve }
+  ;(FakeStripe as any).__mocks = { transfersCreate, customersRetrieve, paymentIntentsUpdate }
   return { default: FakeStripe }
 })
 
@@ -73,7 +74,11 @@ import {
   processFlexPayPullDay,
   reconcileSettledFlexPayPayment,
   handleFlexPayPaymentNsf,
+  repriceFlexPayRetryPayment,
+  calculateFlexPayFee,
   FLEXPAY_NSF_COOLDOWN_DAYS,
+  FLEXPAY_ACH_RETURN_FEE,
+  FLEXPAY_MAX_PULL_DAY,
 } from './flexpay'
 import {
   cleanupAllSchema,
@@ -82,8 +87,9 @@ import {
 } from '../test/dbHelpers'
 
 const stripeMocks: {
-  transfersCreate:    ReturnType<typeof vi.fn>
-  customersRetrieve:  ReturnType<typeof vi.fn>
+  transfersCreate:      ReturnType<typeof vi.fn>
+  customersRetrieve:    ReturnType<typeof vi.fn>
+  paymentIntentsUpdate: ReturnType<typeof vi.fn>
 } = (Stripe as any).__mocks
 
 const createRentPlatformChargeMock =
@@ -103,6 +109,8 @@ beforeEach(async () => {
   createRentPlatformChargeMock.mockResolvedValue({
     id: 'pi_flexpay_mock', status: 'processing',
   })
+  stripeMocks.paymentIntentsUpdate.mockReset()
+  stripeMocks.paymentIntentsUpdate.mockResolvedValue({ id: 'pi_flexpay_mock' } as any)
   process.env.STRIPE_SECRET_KEY = 'sk_test_mocked'
 })
 
@@ -824,7 +832,7 @@ describe('handleFlexPayPaymentNsf', () => {
     finally { c.release() }
   }
 
-  it('FLEXPAY + retry_count=1 + matching pulled advance → defaulted + 60-day suspension + alert', async () => {
+  it('FLEXPAY + retry_count=1 + matching pulled advance → defaulted + 90-day suspension + alert', async () => {
     const seed = await seedFailedPullPayment()
     await handleFlexPayPaymentNsf(seed.paymentId)
 
@@ -890,5 +898,68 @@ describe('handleFlexPayPaymentNsf', () => {
     await expect(handleFlexPayPaymentNsf(
       '00000000-0000-0000-0000-000000000000'
     )).resolves.toBeUndefined()
+  })
+})
+
+// ─── repriceFlexPayRetryPayment (ToS § 4.1/4.2 re-priced retry) ───
+describe('repriceFlexPayRetryPayment', () => {
+  async function seedFailedFlexPayPull(): Promise<{ paymentId: string; advanceId: string; tenantId: string }> {
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const { userId, landlordId } = await seedLandlord(c)
+      const propertyId = await seedProperty(c, { landlordId, ownerUserId: userId, managedByUserId: userId })
+      const unitId = await seedUnit(c, { propertyId, landlordId })
+      const tenantId = await seedTenant(c)
+      const leaseId = await seedLease(c, { unitId, landlordId })
+      await seedLeaseTenant(c, { leaseId, tenantId, role: 'primary' })
+      // Original pull: rent 1000 + fee 16 (enrolled pull_day 11), now failed.
+      const { rows: [p] } = await c.query<{ id: string }>(
+        `INSERT INTO payments
+           (landlord_id, tenant_id, lease_id, unit_id, type, amount, status,
+            entry_description, due_date, stripe_payment_intent_id, retry_count)
+         VALUES ($1,$2,$3,$4,'rent',1016,'failed','FLEXPAY','2026-06-01','pi_repx',1)
+         RETURNING id`,
+        [landlordId, tenantId, leaseId, unitId])
+      const { rows: [a] } = await c.query<{ id: string }>(
+        `INSERT INTO flexpay_advances
+           (cycle_month, tenant_id, landlord_id, unit_id, lease_id,
+            rent_amount, tenant_fee_amount, pull_day, status, rent_payment_id)
+         VALUES ('2026-06-01',$1,$2,$3,$4, 1000, 16, 11, 'pulled', $5)
+         RETURNING id`,
+        [tenantId, landlordId, unitId, leaseId, p.id])
+      await c.query('COMMIT')
+      return { paymentId: p.id, advanceId: a.id, tenantId }
+    } catch (e) { await c.query('ROLLBACK'); throw e }
+    finally { c.release() }
+  }
+
+  it('recomputes fee to the retry day + passes through the ACH-return fee; updates PI + advance + payment', async () => {
+    const seed = await seedFailedFlexPayPull()
+    const retryDay = Math.min(Math.max(new Date().getUTCDate(), 1), FLEXPAY_MAX_PULL_DAY)
+    const newFee = calculateFlexPayFee(retryDay)
+    const expectedTotal = 1000 + newFee + FLEXPAY_ACH_RETURN_FEE  // boost 0 (no outstanding GAM balances)
+
+    await repriceFlexPayRetryPayment(seed.paymentId)
+
+    // PI amount updated to the re-priced total (in cents).
+    expect(stripeMocks.paymentIntentsUpdate).toHaveBeenCalledTimes(1)
+    const [piId, args] = stripeMocks.paymentIntentsUpdate.mock.calls[0]
+    expect(piId).toBe('pi_repx')
+    expect(args.amount).toBe(Math.round(expectedTotal * 100))
+    expect(args.metadata.gam_fee).toBe(String(newFee))
+
+    // Advance fee re-stamped.
+    const { rows: [adv] } = await db.query<any>(`SELECT tenant_fee_amount FROM flexpay_advances WHERE id=$1`, [seed.advanceId])
+    expect(Number(adv.tenant_fee_amount)).toBe(newFee)
+
+    // Payment amount re-priced.
+    const { rows: [pay] } = await db.query<any>(`SELECT amount FROM payments WHERE id=$1`, [seed.paymentId])
+    expect(Number(pay.amount)).toBe(expectedTotal)
+  })
+
+  it('no-op when the payment is not a FlexPay PI', async () => {
+    await repriceFlexPayRetryPayment('00000000-0000-0000-0000-000000000000')
+    expect(stripeMocks.paymentIntentsUpdate).not.toHaveBeenCalled()
   })
 })

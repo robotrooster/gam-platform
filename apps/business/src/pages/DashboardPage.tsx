@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom'
 import { apiGet } from '../lib/api'
 import { useAuth } from '../context/AuthContext'
 import { OnboardingWizard } from '../components/OnboardingWizard'
+import { ErrorBoundary } from '../components/ErrorBoundary'
 import {
   DollarSign, AlertTriangle, Calendar, Wrench, Package,
   CreditCard, ArrowRight, Car, ChevronRight,
@@ -10,11 +11,13 @@ import {
 
 interface AgingBucket { count: number; amount: string }
 interface ArAging {
+  // Camelize-safe keys (no underscore-before-digit), matching the Reports
+  // page's A/R-aging scheme. The route emits these names verbatim.
   current: AgingBucket
-  d1_30:   AgingBucket
-  d31_60:  AgingBucket
-  d61_90:  AgingBucket
-  over90:  AgingBucket
+  d1to30:  AgingBucket
+  d31to60: AgingBucket
+  d61to90: AgingBucket
+  d90plus: AgingBucket
 }
 
 interface AppointmentRow {
@@ -177,19 +180,20 @@ export function DashboardPage() {
               hidden={!data.enabledFeatures.includes('invoicing')} />
           </div>
 
-          {/* Two-column tile grid */}
+          {/* Two-column tile grid — each tile wrapped so one failing tile
+              can't blank the whole dashboard (S508). */}
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
             {data.todayAppointments !== null && (
-              <TodayAppointmentsTile rows={data.todayAppointments} />
+              <ErrorBoundary label="tile:appointments"><TodayAppointmentsTile rows={data.todayAppointments} /></ErrorBoundary>
             )}
             {data.openWorkOrders !== null && data.openWorkOrderStats && (
-              <OpenWorkOrdersTile rows={data.openWorkOrders} stats={data.openWorkOrderStats} />
+              <ErrorBoundary label="tile:work-orders"><OpenWorkOrdersTile rows={data.openWorkOrders} stats={data.openWorkOrderStats} /></ErrorBoundary>
             )}
             {data.arAging && (
-              <ArAgingTile aging={data.arAging} />
+              <ErrorBoundary label="tile:ar-aging"><ArAgingTile aging={data.arAging} /></ErrorBoundary>
             )}
             {data.lowStock !== null && (
-              <LowStockTile rows={data.lowStock} totalCount={data.lowStockCount} />
+              <ErrorBoundary label="tile:low-stock"><LowStockTile rows={data.lowStock} totalCount={data.lowStockCount} /></ErrorBoundary>
             )}
           </div>
         </>
@@ -311,12 +315,12 @@ function OpenWorkOrdersTile({
 function ArAgingTile({ aging }: { aging: ArAging }) {
   const buckets: Array<[string, AgingBucket, string]> = [
     ['Current',  aging.current, 'var(--text-1)'],
-    ['1–30d',    aging.d1_30,   'var(--text-1)'],
-    ['31–60d',   aging.d31_60,  'var(--amber)'],
-    ['61–90d',   aging.d61_90,  'var(--amber)'],
-    ['90d+',     aging.over90,  'var(--red, #ef4444)'],
+    ['1–30d',    aging.d1to30,  'var(--text-1)'],
+    ['31–60d',   aging.d31to60, 'var(--amber)'],
+    ['61–90d',   aging.d61to90, 'var(--amber)'],
+    ['90d+',     aging.d90plus, 'var(--red, #ef4444)'],
   ]
-  const total = buckets.reduce((s, [, b]) => s + Number(b.amount), 0)
+  const total = buckets.reduce((s, [, b]) => s + Number(b?.amount ?? 0), 0)
   return (
     <div style={cardStyle}>
       <TileHeader icon={<DollarSign size={14} />} label="Open invoices" link="/invoices" />
@@ -330,7 +334,7 @@ function ArAgingTile({ aging }: { aging: ArAging }) {
         <div style={emptyTile}>No outstanding invoices.</div>
       ) : (
         <div style={{ display: 'flex', flexDirection: 'column' as const, gap: 6 }}>
-          {buckets.filter(([, b]) => b.count > 0).map(([label, b, color]) => (
+          {buckets.filter(([, b]) => b && b.count > 0).map(([label, b, color]) => (
             <div key={label} style={{
               display: 'flex' as const, justifyContent: 'space-between',
               padding: '6px 0', fontSize: 12,

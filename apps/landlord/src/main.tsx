@@ -4,8 +4,7 @@ import ReactDOM from 'react-dom/client'
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from 'react-query'
 import { AuthProvider, useAuth } from './context/AuthContext'
-import { Layout } from './components/layout/Layout'
-import { SupportPage } from './components/ChatWidget'
+import { Layout, LAUNCH_HIDDEN } from './components/layout/Layout'
 import { LoginPage }       from './pages/LoginPage'
 import { RegisterPage }    from './pages/RegisterPage'
 import { DashboardPage }   from './pages/DashboardPage'
@@ -27,12 +26,12 @@ import { TenantOnboardingPage } from './pages/TenantOnboardingPage'
 import { PropertyOnboardingPage } from './pages/PropertyOnboardingPage'
 import { PaymentHistoryOnboardingPage } from './pages/PaymentHistoryOnboardingPage'
 import { ReportsPage } from './pages/ReportsPage'
-import { AgentActivityPage } from './pages/AgentActivityPage'
 import { ESignPage } from './pages/ESignPage'
 import { BackgroundChecksPage } from './pages/BackgroundChecksPage'
 import { SignPage } from './pages/SignPage'
 import { MaintenancePortalPage } from './pages/MaintenancePortalPage'
 import { SettingsPage } from './pages/SettingsPage'
+import { TotpEnrollPage } from './pages/TotpEnrollPage'
 import { ApplicantPoolPage } from './pages/ApplicantPoolPage'
 import { LeasesPage } from "./pages/LeasesPage"
 import { SubleasesPage } from "./pages/SubleasesPage"
@@ -43,6 +42,7 @@ import { InventoryPage } from './pages/InventoryPage'
 import { SchedulePage } from './pages/SchedulePage'
 import { ShelfLabelPage } from './pages/ShelfLabelPage'
 import { InspectionsPage } from './pages/InspectionsPage'
+import { AmenitiesPage } from './pages/AmenitiesPage'
 import { NewInspectionPage } from './pages/NewInspectionPage'
 import { InspectionDetailPage } from './pages/InspectionDetailPage'
 import { UnitLifecyclePage } from './pages/UnitLifecyclePage'
@@ -51,12 +51,11 @@ import { NewEntryRequestPage } from './pages/NewEntryRequestPage'
 import { EntryRequestDetailPage } from './pages/EntryRequestDetailPage'
 import { TenantScreeningPage } from './pages/TenantScreeningPage'
 import { NotificationPrefsPage } from './pages/NotificationPrefsPage'
-import { RecordEventPage } from './pages/RecordEventPage'
 import { BookingsPage } from './pages/BookingsPage'
+import { BookingSitesPage } from './pages/BookingSitesPage'
 import { NotificationsPage } from './pages/NotificationsPage'
 import { DepositReturnPage } from './pages/DepositReturnPage'
 import { LeaseTerminationPage } from './pages/LeaseTerminationPage'
-import { OtpPage } from './pages/OtpPage'
 import { FlexChargePage } from './pages/FlexChargePage'
 import './styles/globals.css'
 
@@ -108,7 +107,7 @@ export default function App() {
               <Route path="properties/:id"  element={<PropertyDetailPage />} />
               <Route path="property-onboarding" element={<PropertyOnboardingPage />} />
               <Route path="payment-history-onboarding" element={<PaymentHistoryOnboardingPage />} />
-              <Route path="pm-invitations"  element={<PmInvitationsPage />} />
+              <Route path="pm-invitations"  element={LAUNCH_HIDDEN.has('/pm-invitations') ? <Navigate to="/dashboard" replace /> : <PmInvitationsPage />} />
               <Route path="units"          element={<UnitsPage />} />
               <Route path="units/:id"      element={<UnitDetailPage />} />
               <Route path="tenants"        element={<TenantsPage />} />
@@ -117,26 +116,26 @@ export default function App() {
               <Route path="tenant-onboarding/pending" element={<PendingTenantsPage />} />
               <Route path="documents"      element={<DocumentsPage />} />
               <Route path="leases"         element={<LeasesPage />} />
-              <Route path="subleases"       element={<SubleasesPage />} />
+              <Route path="subleases"       element={LAUNCH_HIDDEN.has('/subleases') ? <Navigate to="/dashboard" replace /> : <SubleasesPage />} />
               <Route path="esign"          element={<ESignPage />} />
               <Route path="background"     element={<BackgroundChecksPage />} />
               <Route path="pool"            element={<ApplicantPoolPage />} />
               <Route path="settings"         element={<SettingsPage />} />
+              <Route path="totp/enroll"      element={<TotpEnrollPage />} />
               <Route path="maint-portal"    element={<MaintenancePortalPage />} />
               <Route path="sign/:token"    element={<SignPage />} />
               <Route path="payments"       element={<PaymentsPage />} />
               <Route path="disbursements"  element={<DisbursementsPage />} />
               <Route path="banking"        element={<BankingPage />} />
               <Route path="maintenance"    element={<MaintenancePage />} />
-              <Route path="support"        element={<SupportPage />} />
               <Route path="reports"        element={<ReportsPage />} />
-              <Route path="agent-activity" element={<AgentActivityPage />} />
               <Route path="team"           element={<TeamPage />} />
-              <Route path="work-trade"     element={<WorkTradePage />} />
+              <Route path="work-trade"     element={LAUNCH_HIDDEN.has('/work-trade') ? <Navigate to="/dashboard" replace /> : <WorkTradePage />} />
               <Route path="pos"            element={<POSPage />} />
               <Route path="inventory"       element={<InventoryPage />} />
               <Route path="schedule"       element={<SchedulePage />} />
               <Route path="inspections"      element={<InspectionsPage />} />
+              <Route path="amenities"        element={<AmenitiesPage />} />
               <Route path="inspections/new"  element={<NewInspectionPage />} />
               <Route path="inspections/unit/:unitId/lifecycle" element={<UnitLifecyclePage />} />
               <Route path="inspections/:id"  element={<InspectionDetailPage />} />
@@ -145,13 +144,12 @@ export default function App() {
               <Route path="entry-requests/:id" element={<EntryRequestDetailPage />} />
               <Route path="screening"          element={<TenantScreeningPage />} />
               <Route path="notification-prefs" element={<NotificationPrefsPage />} />
-              <Route path="record-event"       element={<RecordEventPage />} />
               <Route path="bookings"           element={<BookingsPage />} />
+              <Route path="booking-sites"      element={<BookingSitesPage />} />
               <Route path="notifications"     element={<NotificationsPage />} />
               <Route path="leases/:id/deposit-return" element={<DepositReturnPage />} />
               <Route path="leases/:id/termination"   element={<LeaseTerminationPage />} />
-              <Route path="otp"                       element={<OtpPage />} />
-              <Route path="flex-charge"               element={<FlexChargePage />} />
+              <Route path="flex-charge"               element={LAUNCH_HIDDEN.has('/flex-charge') ? <Navigate to="/dashboard" replace /> : <FlexChargePage />} />
             </Route>
           </Routes>
         </BrowserRouter>

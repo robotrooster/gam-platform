@@ -1,8 +1,9 @@
 import { useState, useEffect } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useAuth } from '../context/AuthContext'
-import { apiGet, apiPatch } from '../lib/api'
-import { Pencil, Save, X } from 'lucide-react'
+import { apiGet, apiPatch, apiPost } from '../lib/api'
+import { Pencil, Save, X, ShieldCheck } from 'lucide-react'
 
 interface PmCompany {
   id: string
@@ -63,7 +64,7 @@ export function SettingsPage() {
     }),
     {
       onSuccess: () => { qc.invalidateQueries(['pm-company', cid]); setEditing(false); setErr(null) },
-      onError:   (e: any) => setErr(e?.response?.data?.error?.message || 'Save failed.'),
+      onError:   (e: any) => setErr(e?.response?.data?.error || 'Save failed.'),
     },
   )
 
@@ -142,6 +143,111 @@ export function SettingsPage() {
           </div>
         )}
       </div>
+
+      <SecuritySection />
+    </div>
+  )
+}
+
+// 2FA surface — enable (navigate to enroll flow) / disable (password
+// re-confirm). PM-company users are not in MANDATORY_TOTP_ROLES, so 2FA
+// is optional; this is the opt-in/opt-out control.
+function SecuritySection() {
+  const { user, refresh } = useAuth()
+  const navigate = useNavigate()
+  const [showConfirm, setShowConfirm] = useState(false)
+  const [password, setPassword] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+  const [err, setErr] = useState('')
+  const [success, setSuccess] = useState('')
+
+  const onDisable = async (e: React.FormEvent) => {
+    e.preventDefault(); setSubmitting(true); setErr('')
+    try {
+      await apiPost('/auth/totp/disable', { password })
+      await refresh()
+      setShowConfirm(false); setPassword('')
+      setSuccess('Two-factor authentication disabled.')
+    } catch (ex: any) {
+      setErr(ex?.response?.data?.error || 'Could not disable 2FA. Check your password.')
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <div className="card" style={{ padding: 16, maxWidth: 620 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 14 }}>
+        <ShieldCheck size={16} style={{ color: 'var(--gold)' }} />
+        <div style={{ fontWeight: 600, color: 'var(--text-0)' }}>Two-factor authentication</div>
+      </div>
+
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 14 }}>
+        <div style={{
+          width: 36, height: 36, borderRadius: 8,
+          background: user?.totpEnabled ? 'var(--green-bg)' : 'var(--amber-bg)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '1.2rem',
+        }}>
+          {user?.totpEnabled ? '✅' : '⚠️'}
+        </div>
+        <div>
+          <div style={{ fontWeight: 700, color: 'var(--text-0)', fontSize: '.95rem' }}>
+            {user?.totpEnabled ? 'Enabled' : 'Not enrolled'}
+          </div>
+          <div style={{ fontSize: '.78rem', color: 'var(--text-2)' }}>
+            {user?.totpEnabled
+              ? 'You will be prompted for a 6-digit code on every sign-in.'
+              : 'Add a second factor to protect your account. Optional, but recommended.'}
+          </div>
+        </div>
+      </div>
+
+      {success && (
+        <div className="alert alert-success" style={{ marginBottom: 12 }}>{success}</div>
+      )}
+
+      {!user?.totpEnabled && (
+        <button className="btn btn-primary" onClick={() => navigate('/totp/enroll')}>
+          Enable two-factor
+        </button>
+      )}
+
+      {user?.totpEnabled && !showConfirm && (
+        <button className="btn btn-danger" onClick={() => { setShowConfirm(true); setSuccess('') }}>
+          Disable two-factor
+        </button>
+      )}
+
+      {user?.totpEnabled && showConfirm && (
+        <form onSubmit={onDisable} style={{ marginTop: 8, padding: 14, background: 'var(--bg-1)', border: '1px solid var(--border-1)', borderRadius: 8 }}>
+          <div style={{ fontSize: '.82rem', color: 'var(--text-1)', marginBottom: 10, lineHeight: 1.5 }}>
+            Confirm your password to disable 2FA. After disable, any saved recovery codes are invalidated.
+          </div>
+          <div style={{ marginBottom: 10 }}>
+            <label style={{ display: 'block', fontSize: '.7rem', fontWeight: 600, color: 'var(--text-3)', marginBottom: 4, textTransform: 'uppercase', letterSpacing: '.06em' }}>Password</label>
+            <input
+              type="password"
+              className="input"
+              value={password}
+              onChange={e => setPassword(e.target.value)}
+              autoFocus
+              required
+              style={{ width: '100%' }}
+            />
+          </div>
+          {err && (
+            <div style={{ marginBottom: 10, padding: 8, background: 'rgba(220,76,76,.1)', borderRadius: 6, fontSize: '.74rem', color: 'var(--red, #dc4c4c)' }}>{err}</div>
+          )}
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button type="submit" className="btn btn-danger" disabled={submitting || !password}>
+              {submitting ? 'Disabling…' : 'Disable two-factor'}
+            </button>
+            <button type="button" className="btn btn-ghost" onClick={() => { setShowConfirm(false); setPassword(''); setErr('') }} disabled={submitting}>
+              Cancel
+            </button>
+          </div>
+        </form>
+      )}
     </div>
   )
 }

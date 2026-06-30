@@ -1,8 +1,10 @@
 import { useEffect, useState } from 'react'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
 import { Modal } from '../components/Modal'
+import { humanizeServiceType as humanizeService } from '@gam/shared'
 import {
   Plus, Calendar, ChevronRight, ArrowLeft, Check, X, Clock,
+  List, CalendarDays, ChevronLeft, Copy, RefreshCw,
 } from 'lucide-react'
 
 interface CustomerLite {
@@ -76,6 +78,8 @@ export function AppointmentsPage() {
   const [statusFilter, setStatusFilter] = useState<AppointmentStatus | ''>('')
   const [showCreate, setShowCreate] = useState(false)
   const [selectedId, setSelectedId] = useState<string | null>(null)
+  const [view, setView] = useState<'list' | 'calendar'>('list')
+  const [showSync, setShowSync] = useState(false)
 
   const reload = async () => {
     setErr(null)
@@ -127,11 +131,31 @@ export function AppointmentsPage() {
             cancel if it doesn't happen.
           </div>
         </div>
-        <button onClick={() => setShowCreate(true)}
-          disabled={customers.length === 0}
-          style={primaryBtnStyle}>
-          <Plus size={14} /> New appointment
-        </button>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          <div style={{ display: 'flex', border: '1px solid var(--border-1)', borderRadius: 6, overflow: 'hidden' }}>
+            {(['list', 'calendar'] as const).map(v => (
+              <button key={v} onClick={() => setView(v)}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 6,
+                  padding: '6px 12px', fontSize: 12, cursor: 'pointer',
+                  border: 'none',
+                  background: view === v ? 'var(--gold-bg)' : 'var(--bg-2)',
+                  color: view === v ? 'var(--gold)' : 'var(--text-1)',
+                  textTransform: 'capitalize' as const,
+                }}>
+                {v === 'list' ? <List size={13} /> : <CalendarDays size={13} />}{v}
+              </button>
+            ))}
+          </div>
+          <button onClick={() => setShowSync(true)} style={ghostBtn}>
+            <CalendarDays size={14} /> Sync to calendar
+          </button>
+          <button onClick={() => setShowCreate(true)}
+            disabled={customers.length === 0}
+            style={primaryBtnStyle}>
+            <Plus size={14} /> New appointment
+          </button>
+        </div>
       </div>
 
       {err && <div style={errStyle}>{err}</div>}
@@ -143,26 +167,30 @@ export function AppointmentsPage() {
         </div>
       )}
 
-      <div style={{ display: 'flex', gap: 8, marginBottom: 16, alignItems: 'center' }}>
-        <span style={{ fontSize: 12, color: 'var(--text-2)' }}>Filter</span>
-        {(['', 'scheduled', 'completed', 'cancelled', 'no_show'] as const).map(s => (
-          <button key={s || 'all'} onClick={() => setStatusFilter(s)}
-            style={{
-              padding: '6px 12px',
-              background: statusFilter === s ? 'var(--gold-bg)' : 'var(--bg-2)',
-              color: statusFilter === s ? 'var(--gold)' : 'var(--text-1)',
-              border: `1px solid ${statusFilter === s ? 'var(--gold)' : 'var(--border-1)'}`,
-              borderRadius: 6,
-              fontSize: 12,
-              cursor: 'pointer',
-              textTransform: 'capitalize' as const,
-            }}>
-            {s ? s.replace('_', ' ') : 'all'}
-          </button>
-        ))}
-      </div>
+      {view === 'list' && (
+        <div style={{ display: 'flex', gap: 8, marginBottom: 16, alignItems: 'center' }}>
+          <span style={{ fontSize: 12, color: 'var(--text-2)' }}>Filter</span>
+          {(['', 'scheduled', 'completed', 'cancelled', 'no_show'] as const).map(s => (
+            <button key={s || 'all'} onClick={() => setStatusFilter(s)}
+              style={{
+                padding: '6px 12px',
+                background: statusFilter === s ? 'var(--gold-bg)' : 'var(--bg-2)',
+                color: statusFilter === s ? 'var(--gold)' : 'var(--text-1)',
+                border: `1px solid ${statusFilter === s ? 'var(--gold)' : 'var(--border-1)'}`,
+                borderRadius: 6,
+                fontSize: 12,
+                cursor: 'pointer',
+                textTransform: 'capitalize' as const,
+              }}>
+              {s ? s.replace('_', ' ') : 'all'}
+            </button>
+          ))}
+        </div>
+      )}
 
-      {loading ? (
+      {view === 'calendar' ? (
+        <CalendarMonth onSelect={setSelectedId} />
+      ) : loading ? (
         <div style={{ color: 'var(--text-2)' }}>Loading…</div>
       ) : rows.length === 0 ? (
         <div style={emptyStyle}>
@@ -188,6 +216,7 @@ export function AppointmentsPage() {
           onClose={() => setShowCreate(false)}
           onCreated={() => { setShowCreate(false); reload() }} />
       )}
+      {showSync && <CalendarSyncModal onClose={() => setShowSync(false)} />}
     </div>
   )
 }
@@ -234,7 +263,7 @@ function Section({ title, rows, onSelect }: {
                 )}
               </td>
               <td style={tdStyle}>{fmtCustomer(r)}</td>
-              <td style={tdStyle}>{r.serviceType}</td>
+              <td style={tdStyle}>{humanizeService(r.serviceType)}</td>
               <td style={tdStyle}>{fmtDuration(r.durationMinutes)}</td>
               <td style={tdStyle}>
                 <span style={{
@@ -250,6 +279,190 @@ function Section({ title, rows, onSelect }: {
         </tbody>
       </table>
     </div>
+  )
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Calendar month view (S511)
+// ─────────────────────────────────────────────────────────────────
+
+const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+
+function localDateKey(d: Date): string {
+  return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`
+}
+
+function CalendarMonth({ onSelect }: { onSelect: (id: string) => void }) {
+  // Anchored to the first of the displayed month.
+  const [anchor, setAnchor] = useState(() => {
+    const n = new Date()
+    return new Date(n.getFullYear(), n.getMonth(), 1)
+  })
+  const [rows, setRows] = useState<AppointmentRow[]>([])
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    setLoading(true)
+    const from = new Date(anchor.getFullYear(), anchor.getMonth(), 1, 0, 0, 0)
+    const to = new Date(anchor.getFullYear(), anchor.getMonth() + 1, 0, 23, 59, 59)
+    apiGet<AppointmentRow[]>(
+      `/appointments?from=${encodeURIComponent(from.toISOString())}&to=${encodeURIComponent(to.toISOString())}&limit=500`)
+      .then(setRows)
+      .catch(() => setRows([]))
+      .finally(() => setLoading(false))
+  }, [anchor])
+
+  // Bucket appointments by local day.
+  const byDay = new Map<string, AppointmentRow[]>()
+  for (const r of rows) {
+    const k = localDateKey(new Date(r.scheduledFor))
+    const arr = byDay.get(k) ?? []
+    arr.push(r)
+    byDay.set(k, arr)
+  }
+
+  const daysInMonth = new Date(anchor.getFullYear(), anchor.getMonth() + 1, 0).getDate()
+  const leading = new Date(anchor.getFullYear(), anchor.getMonth(), 1).getDay()
+  const cells: (Date | null)[] = []
+  for (let i = 0; i < leading; i++) cells.push(null)
+  for (let d = 1; d <= daysInMonth; d++) cells.push(new Date(anchor.getFullYear(), anchor.getMonth(), d))
+  while (cells.length % 7 !== 0) cells.push(null)
+
+  const todayKey = localDateKey(new Date())
+  const monthLabel = anchor.toLocaleDateString([], { month: 'long', year: 'numeric' })
+  const shift = (n: number) => setAnchor(new Date(anchor.getFullYear(), anchor.getMonth() + n, 1))
+  const goToday = () => { const n = new Date(); setAnchor(new Date(n.getFullYear(), n.getMonth(), 1)) }
+
+  return (
+    <div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
+        <button onClick={() => shift(-1)} style={navBtn} aria-label="Previous month"><ChevronLeft size={16} /></button>
+        <div style={{ fontFamily: 'var(--font-display)', fontSize: 18, minWidth: 160 }}>{monthLabel}</div>
+        <button onClick={() => shift(1)} style={navBtn} aria-label="Next month"><ChevronRight size={16} /></button>
+        <button onClick={goToday} style={{ ...ghostBtn, padding: '4px 10px', fontSize: 12 }}>Today</button>
+        {loading && <span style={{ fontSize: 12, color: 'var(--text-3)' }}>Loading…</span>}
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7, 1fr)', gap: 1, background: 'var(--border-0)', border: '1px solid var(--border-0)', borderRadius: 8, overflow: 'hidden' }}>
+        {WEEKDAYS.map(w => (
+          <div key={w} style={{ background: 'var(--bg-2)', padding: '6px 8px', fontSize: 11, fontWeight: 700, letterSpacing: 0.5, color: 'var(--text-3)', textTransform: 'uppercase' as const }}>{w}</div>
+        ))}
+        {cells.map((cell, i) => {
+          if (!cell) return <div key={`b${i}`} style={{ background: 'var(--bg-1)', minHeight: 96 }} />
+          const k = localDateKey(cell)
+          const dayRows = (byDay.get(k) ?? []).sort((a, b) => a.scheduledFor.localeCompare(b.scheduledFor))
+          const isToday = k === todayKey
+          return (
+            <div key={k} style={{ background: 'var(--bg-1)', minHeight: 96, padding: 6, display: 'flex', flexDirection: 'column' as const, gap: 3 }}>
+              <div style={{
+                fontSize: 12, fontWeight: isToday ? 700 : 500, marginBottom: 2,
+                color: isToday ? 'var(--gold)' : 'var(--text-2)',
+              }}>{cell.getDate()}</div>
+              {dayRows.slice(0, 3).map(r => (
+                <button key={r.id} onClick={() => onSelect(r.id)} title={`${fmtCustomer(r)} · ${humanizeService(r.serviceType)}`}
+                  style={{
+                    display: 'block', width: '100%', textAlign: 'left' as const,
+                    border: 'none', borderRadius: 4, cursor: 'pointer',
+                    padding: '2px 6px', fontSize: 11, lineHeight: 1.3,
+                    background: STATUS_TONE[r.status].bg, color: STATUS_TONE[r.status].color,
+                    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' as const,
+                  }}>
+                  {new Date(r.scheduledFor).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })} {humanizeService(r.serviceType)}
+                </button>
+              ))}
+              {dayRows.length > 3 && (
+                <div style={{ fontSize: 10, color: 'var(--text-3)', paddingLeft: 4 }}>+{dayRows.length - 3} more</div>
+              )}
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Calendar sync modal — ICS subscribe feed (S511)
+// ─────────────────────────────────────────────────────────────────
+
+interface FeedInfo { token: string; url: string; webcalUrl: string }
+
+function CalendarSyncModal({ onClose }: { onClose: () => void }) {
+  const [feed, setFeed] = useState<FeedInfo | null>(null)
+  const [err, setErr] = useState<string | null>(null)
+  const [copied, setCopied] = useState(false)
+  const [rotating, setRotating] = useState(false)
+
+  useEffect(() => {
+    apiGet<FeedInfo>('/appointments/calendar-feed')
+      .then(setFeed)
+      .catch((e: any) => setErr(e?.response?.data?.error || 'Could not load the feed link'))
+  }, [])
+
+  const copy = async () => {
+    if (!feed) return
+    try {
+      await navigator.clipboard.writeText(feed.url)
+      setCopied(true); setTimeout(() => setCopied(false), 1500)
+    } catch { /* clipboard blocked — the field is selectable */ }
+  }
+
+  const rotate = async () => {
+    setRotating(true)
+    try {
+      const r = await apiPost<FeedInfo>('/appointments/calendar-feed/rotate', {})
+      setFeed(r.data)
+    } catch (e: any) {
+      setErr(e?.response?.data?.error || 'Could not reset the link')
+    } finally { setRotating(false) }
+  }
+
+  return (
+    <Modal title="Sync to your calendar" onClose={onClose}
+      footer={<button onClick={onClose} style={primaryBtnStyle}>Done</button>}>
+      {err && <div style={errStyle}>{err}</div>}
+      <p style={{ fontSize: 13, color: 'var(--text-1)', marginTop: 0 }}>
+        Subscribe once and your appointments stay up to date in Google, Apple, or
+        Outlook calendars. This is a private, read-only link — anyone with it can
+        see your schedule, so keep it to yourself.
+      </p>
+
+      {!feed ? (
+        <div style={{ color: 'var(--text-2)', fontSize: 13 }}>Loading link…</div>
+      ) : (
+        <>
+          <label style={labelStyle}>Your calendar feed link</label>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <input readOnly value={feed.url} onFocus={e => e.currentTarget.select()}
+              style={{ ...inputStyle, marginTop: 0, fontFamily: 'var(--font-mono)' as const, fontSize: 12 }} />
+            <button onClick={copy} style={{ ...ghostBtn, whiteSpace: 'nowrap' as const }}>
+              <Copy size={13} /> {copied ? 'Copied' : 'Copy'}
+            </button>
+          </div>
+
+          <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
+            <a href={feed.webcalUrl} style={{ ...primaryBtnStyle, textDecoration: 'none' }}>
+              <CalendarDays size={14} /> Add to calendar
+            </a>
+            <button onClick={rotate} disabled={rotating} style={ghostBtn}>
+              <RefreshCw size={13} /> {rotating ? 'Resetting…' : 'Reset link'}
+            </button>
+          </div>
+
+          <div style={{ marginTop: 16, padding: 12, background: 'var(--bg-2)', borderRadius: 8, fontSize: 12.5, color: 'var(--text-2)', lineHeight: 1.6 }}>
+            <strong style={{ color: 'var(--text-1)' }}>How to subscribe</strong>
+            <ul style={{ margin: '6px 0 0 0', paddingLeft: 18 }}>
+              <li><strong>Apple Calendar:</strong> “Add to calendar” above, or File → New Calendar Subscription, paste the link.</li>
+              <li><strong>Google Calendar:</strong> Other calendars → + → From URL, paste the link.</li>
+              <li><strong>Outlook:</strong> Add calendar → Subscribe from web, paste the link.</li>
+            </ul>
+            <div style={{ marginTop: 8, color: 'var(--text-3)' }}>
+              “Reset link” immediately disables any calendar already subscribed to the old link.
+            </div>
+          </div>
+        </>
+      )}
+    </Modal>
   )
 }
 
@@ -323,7 +536,7 @@ function AppointmentDetailView({
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'start', marginBottom: 20 }}>
           <div>
             <h1 style={{ fontFamily: 'var(--font-display)', fontSize: 22, margin: 0 }}>
-              {appt.serviceType}
+              {humanizeService(appt.serviceType)}
             </h1>
             <div style={{ display: 'flex', gap: 12, marginTop: 6, color: 'var(--text-2)', fontSize: 14 }}>
               <span style={{ display: 'inline-flex' as const, alignItems: 'center', gap: 4 }}>
@@ -726,6 +939,11 @@ const ghostBtn: React.CSSProperties = {
   border: '1px solid var(--border-1)', borderRadius: 8,
   fontSize: 13, fontWeight: 500, cursor: 'pointer',
   display: 'inline-flex' as const, alignItems: 'center', gap: 6,
+}
+const navBtn: React.CSSProperties = {
+  padding: 6, background: 'var(--bg-2)', color: 'var(--text-1)',
+  border: '1px solid var(--border-1)', borderRadius: 6, cursor: 'pointer',
+  display: 'inline-flex' as const, alignItems: 'center',
 }
 const errStyle: React.CSSProperties = {
   marginBottom: 12, padding: '10px 12px',

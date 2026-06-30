@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { NotificationBell } from '../NotificationBell'
 import { ChatWidget } from '../ChatWidget'
 import { apiGet } from '../../lib/api'
-import { Outlet, NavLink, useNavigate } from 'react-router-dom'
+import { Outlet, NavLink, useNavigate, useLocation } from 'react-router-dom'
 import { useQuery } from 'react-query'
 import { useAuth } from '../../context/AuthContext'
 import {
@@ -10,7 +10,7 @@ import {
   ArrowDownToLine, Wrench, FileText, LogOut, Settings,
   ShoppingCart, Shield, Package, BarChart2, ScrollText,
   UserSearch, ClipboardList, HeartHandshake, PenTool, UserPlus,
-  Landmark, ClipboardCheck, Gavel, MessageCircle, Bot
+  Landmark, ClipboardCheck, CalendarClock
 } from 'lucide-react'
 
 // S82: each nav item has a `roles` admission list (which roles MAY see
@@ -31,12 +31,13 @@ const NAV_ITEMS: Array<{
 }> = [
   // Overview
   { to: '/dashboard',     icon: LayoutDashboard, label: 'Dashboard',        section: 'Overview',    roles: ['landlord','property_manager'] },
-  { to: '/support',       icon: MessageCircle,   label: 'Support',          section: null,          roles: ['landlord','property_manager','onsite_manager','maintenance'] },
+  { to: '/pos',           icon: ShoppingCart,     label: 'Point of Sale',    section: null,          roles: ['landlord','property_manager','onsite_manager'], perm: ['pos.ring_sale','pos.refund','pos.void','pos.discount','pos.end_of_day','pos.manage_inventory'] },
   // Portfolio
   { to: '/properties',    icon: Building2,        label: 'Properties',       section: 'Portfolio',   roles: ['landlord','property_manager'], perm: ['properties.create','properties.edit'] },
   { to: '/units',         icon: DoorOpen,         label: 'Unit Overview',    section: null,          roles: ['landlord','property_manager','onsite_manager'], perm: ['units.create','units.edit','units.view_status'] },
   { to: '/schedule',      icon: DoorOpen,         label: 'Master Schedule',  section: null,          roles: ['landlord','property_manager','onsite_manager'], perm: ['units.view_status','units.edit','guests.check_in','guests.check_out'] },
   { to: '/bookings',      icon: DoorOpen,         label: 'Bookings',         section: null,          roles: ['landlord','property_manager','onsite_manager'], perm: ['units.view_status','units.edit','guests.check_in','guests.check_out'] },
+  { to: '/booking-sites', icon: Building2,        label: 'Booking Sites',    section: null,          roles: ['landlord','property_manager'], perm: ['properties.edit'] },
   { to: '/tenants',       icon: Users,            label: 'Tenants',          section: null,          roles: ['landlord','property_manager'], perm: ['tenants.create','tenants.archive','tenants.run_background_check'] },
   { to: '/tenant-onboarding', icon: UserPlus,    label: 'Tenant Onboarding',section: null,          roles: ['landlord','property_manager'], perm: ['tenants.create'] },
   { to: '/leases',        icon: ScrollText,       label: 'Leases',           section: null,          roles: ['landlord','property_manager'], perm: ['leases.create','leases.sign','leases.terminate'] },
@@ -51,20 +52,17 @@ const NAV_ITEMS: Array<{
   { to: '/banking',       icon: Landmark,         label: 'Banking',          section: null,          roles: ['landlord','property_manager'] },
   { to: '/payments',      icon: CreditCard,       label: 'Payments',         section: null,          roles: ['landlord','property_manager'], perm: ['payments.view_all'] },
   { to: '/reports',       icon: BarChart2,        label: 'Reports',          section: null,          roles: ['landlord'] },
-  { to: '/agent-activity',icon: Bot,              label: 'Agent Activity',   section: null,          roles: ['landlord'] },
   // Operations
   { to: '/maintenance',   icon: Wrench,           label: 'Maintenance',      section: 'Operations',  roles: ['landlord','property_manager','onsite_manager','maintenance'], perm: ['work_orders.create','work_orders.complete','work_orders.reassign','maintenance.approve_above_threshold'] },
   { to: '/inspections',   icon: ClipboardCheck,   label: 'Inspections',      section: null,          roles: ['landlord','property_manager','onsite_manager'] },
-  { to: '/entry-requests',icon: DoorOpen,         label: 'Entry Requests',   section: null,          roles: ['landlord','property_manager','onsite_manager'] },
+  { to: '/amenities',     icon: CalendarClock,    label: 'Amenities',        section: null,          roles: ['landlord','property_manager','onsite_manager'] },
   { to: '/documents',     icon: FileText,         label: 'Documents',        section: null,          roles: ['landlord','property_manager'], perm: ['leases.create','leases.sign','leases.terminate'] },
-  { to: '/pos',           icon: ShoppingCart,     label: 'Point of Sale',    section: null,          roles: ['landlord','property_manager','onsite_manager'], perm: ['pos.ring_sale','pos.refund','pos.void','pos.discount','pos.end_of_day','pos.manage_inventory'] },
   { to: '/inventory',     icon: Package,          label: 'Inventory',        section: null,          roles: ['landlord','property_manager','onsite_manager'], perm: ['pos.manage_inventory'] },
   { to: '/work-trade',    icon: HeartHandshake,   label: 'Work Trade',       section: null,          roles: ['landlord'] },
   // Screening
   { to: '/pool',          icon: UserSearch,       label: 'Applicant Pool',   section: 'Screening',   roles: ['landlord','property_manager'], perm: ['tenants.run_background_check'] },
   { to: '/background',    icon: ClipboardList,    label: 'Background Checks',section: null,          roles: ['landlord','property_manager'], perm: ['tenants.run_background_check'] },
-  { to: '/screening',     icon: UserSearch,       label: 'Tenant Record',    section: null,          roles: ['landlord','property_manager'] },
-  { to: '/record-event',  icon: Gavel,            label: 'Record Event',     section: null,          roles: ['landlord','property_manager'] },
+  { to: '/screening',     icon: ScrollText,       label: 'Rental History',   section: null,          roles: ['landlord','property_manager'], perm: ['tenants.run_background_check'] },
   // Admin
   { to: '/team',          icon: Shield,           label: 'Team',             section: 'Admin',       roles: ['landlord','property_manager'], perm: ['team.invite','team.manage_permissions'] },
   { to: '/pm-invitations', icon: HeartHandshake,  label: 'PM Invitations',   section: null,          roles: ['landlord'] },
@@ -73,6 +71,22 @@ const NAV_ITEMS: Array<{
 ]
 
 const OWNER_ROLES = new Set(['admin','super_admin','landlord'])
+
+// S512 LAUNCH: features hidden from the UI for the initial launch. Nav
+// entries are filtered out and their routes redirect (see main.tsx). The
+// pages + backend stay intact — unhide post-launch by emptying this set.
+//   /flex-charge    — Flex Suite hidden at launch (LAUNCH_DECISIONS #7)
+//   /subleases      — unfinished (#16), no seed data
+//   /work-trade     — auto-billing unbuilt (#29)
+//   /pm-invitations — PM-company portal not launching with the trio
+// Fitness (external SSO link, no route) is hidden via LAUNCH_HIDE_FITNESS.
+export const LAUNCH_HIDDEN = new Set<string>([
+  '/flex-charge',
+  '/subleases',
+  '/work-trade',
+  '/pm-invitations',
+])
+export const LAUNCH_HIDE_FITNESS = true
 
 const LL_FONTS: Record<string, { imp: string; family: string; display: string }> = {
   default:     { imp: '', family: "'DM Sans',sans-serif", display: "'Syne',sans-serif" },
@@ -143,10 +157,52 @@ function AnnouncementBar() {
   )
 }
 
+// Soft, dismissible nudge to enable 2FA. The landlord role is not in
+// MANDATORY_TOTP_ROLES, so this never blocks — it just reminds. Dismissal
+// persists per-account in localStorage; enabling 2FA clears it implicitly
+// (the banner stops rendering once totpEnabled is true).
+function TotpNudge() {
+  const { user } = useAuth()
+  const navigate = useNavigate()
+  const location = useLocation()
+  const dismissKey = user ? `gam_ll_totp_nudge_dismissed_${user.id}` : ''
+  const [dismissed, setDismissed] = useState(() => {
+    try { return !!dismissKey && localStorage.getItem(dismissKey) === '1' } catch { return false }
+  })
+
+  if (!user) return null
+  if ((user as any).totpEnabled) return null
+  if (dismissed) return null
+  // Don't nag while they're already on the enroll/settings flow.
+  if (location.pathname === '/totp/enroll' || location.pathname === '/settings') return null
+
+  const dismiss = () => {
+    try { localStorage.setItem(dismissKey, '1') } catch {}
+    setDismissed(true)
+  }
+
+  return (
+    <div style={{ background:'var(--gold-bg)', border:'1px solid rgba(201,162,39,.3)', borderRadius:10, padding:'12px 16px', marginBottom:16, display:'flex', alignItems:'center', justifyContent:'space-between', gap:12 }}>
+      <div>
+        <div style={{ fontWeight:700, color:'var(--gold)', fontSize:'.88rem' }}>🔐 Secure your account with two-factor authentication</div>
+        <div style={{ fontSize:'.75rem', color:'var(--text-2)', marginTop:2 }}>Add an authenticator-app code at sign-in so a stolen password isn't enough.</div>
+      </div>
+      <div style={{ display:'flex', alignItems:'center', gap:8, flexShrink:0 }}>
+        <button className="btn btn-primary btn-sm" onClick={() => navigate('/totp/enroll')}>Enable</button>
+        <button className="btn btn-ghost btn-sm" onClick={dismiss}>Dismiss</button>
+      </div>
+    </div>
+  )
+}
+
 export function Layout() {
   const { user, logout } = useAuth()
   const navigate = useNavigate()
+  const layoutLocation = useLocation()
   const role = user?.role || 'landlord'
+  // The Master Schedule timeline wants the full monitor width; other pages keep
+  // the readable 1400px cap.
+  const fullBleed = layoutLocation.pathname === '/schedule'
 
   const cachedTheme = (() => { try { return JSON.parse(localStorage.getItem('gam_landlord_theme') || '{}') } catch { return {} } })()
   const { data: themeData } = useQuery(
@@ -171,15 +227,6 @@ export function Layout() {
 
   const handleLogout = () => { logout(); navigate('/login') }
 
-  // OTP visibility — hidden by default. Both system_features.otp_rollout_visible
-  // AND landlords.otp_rollout_enabled must be TRUE for the link to render.
-  const { data: otpVis } = useQuery<{ visible: boolean }>(
-    'otp-visibility',
-    () => apiGet('/landlords/me/otp/visibility'),
-    { staleTime: 5 * 60 * 1000, enabled: role === 'landlord' || role === 'property_manager' },
-  )
-  const showOtp = (otpVis as any)?.visible === true
-
   // Visibility: role admission first; then for worker roles, gate by perm.
   // Owner roles bypass perm. Item with no perm = role-only (used for
   // landlord-self pages like /reports, /banking, /settings).
@@ -187,6 +234,7 @@ export function Layout() {
   const isOwner = OWNER_ROLES.has(role)
   const directDepositEnabled = (user as any)?.directDepositEnabled === true
   const visibleItems = NAV_ITEMS.filter(item => {
+    if (LAUNCH_HIDDEN.has(item.to)) return false  // S512 launch hide
     if (!item.roles.includes(role)) return false
     // S168: /banking for property_manager — only visible when their
     // landlord has flipped the direct-deposit toggle on. Without this
@@ -229,14 +277,27 @@ export function Layout() {
               </div>
             )
           })}
-          {showOtp && (
-            <NavLink to="/otp" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
-              📈 On-Time Pay
+          {!LAUNCH_HIDDEN.has('/flex-charge') && (
+            <NavLink to="/flex-charge" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
+              💳 FlexCharge
             </NavLink>
           )}
-          <NavLink to="/flex-charge" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
-            💳 FlexCharge
-          </NavLink>
+          {/* GAM Fitness — standalone app (:3013). Hand off the portal's JWT
+              via ?sso= so the landlord lands signed-in without re-auth. */}
+          {!LAUNCH_HIDE_FITNESS && (
+            <a
+              className="nav-item"
+              href="#"
+              onClick={e => {
+                e.preventDefault()
+                const t = localStorage.getItem('gam_token') || ''
+                const base = (import.meta as any).env?.VITE_FITNESS_URL || 'http://localhost:3013'
+                window.open(`${base}/?sso=${encodeURIComponent(t)}`, '_blank')
+              }}
+            >
+              🏋️ Fitness
+            </a>
+          )}
         </nav>
 
         <div className="sidebar-footer">
@@ -267,7 +328,8 @@ export function Layout() {
             <Settings size={16} style={{ cursor:'pointer' }} onClick={() => window.location.href='/settings'} />
           </button>
         </header>
-        <div className="page-content">
+        <div className={"page-content" + (fullBleed ? " page-content-wide" : "")}>
+          <TotpNudge />
           <Outlet />
         </div>
       </div>

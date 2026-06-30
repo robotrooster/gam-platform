@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.gam.backup</string>
+  <!-- NOTE: the script runs from ~/gam-services (NOT the repo). launchd agents
+       are denied access to ~/Downloads by macOS TCC ("Operation not permitted"),
+       so install-services.sh copies backup-db.sh out to this launchd-safe dir.
+       The backup only needs pg_dump + ~/gam-backups, neither of which is in the repo. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/nicholasrhoades/gam-services/backup-db.sh</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>3</integer>
+    <key>Minute</key><integer>30</integer>
+  </dict>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>StandardOutPath</key>
+  <string>/tmp/gam-backup.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/gam-backup.log</string>
+</dict>
+</plist>

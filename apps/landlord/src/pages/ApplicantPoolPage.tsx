@@ -25,7 +25,17 @@ interface PoolEntry {
   riskLevel:         string | null
   riskScore:         number | null
   createdAt:         string
+  proximityRank:     number | null
   alreadyContacted:  boolean
+}
+
+// S512 #30: how close the candidate is to one of the landlord's
+// properties. Lower rank = closer. Rank 4 (elsewhere) gets no badge.
+const PROXIMITY: Record<number, { label: string; cls: string }> = {
+  0: { label: 'Same ZIP',    cls: 'badge-green' },
+  1: { label: 'Your city',   cls: 'badge-green' },
+  2: { label: 'Same region', cls: 'badge-blue' },
+  3: { label: 'Same state',  cls: 'badge-amber' },
 }
 
 interface MatchRequest {
@@ -88,21 +98,11 @@ const STATUS_LABEL: Record<MatchRequest['status'], string> = {
 }
 
 export function ApplicantPoolPage() {
-  const [filters, setFilters] = useState({
-    minIncome: '',
-    maxIncome: '',
-    state:     '',
-    riskLevel: '',
-  })
   const [reachOutFor, setReachOutFor] = useState<PoolEntry | null>(null)
 
-  const queryStr = new URLSearchParams(
-    Object.entries(filters).filter(([, v]) => v !== '')
-  ).toString()
-
   const { data: pool = [], isLoading: poolLoading } = useQuery<PoolEntry[]>(
-    ['pool-search', queryStr],
-    () => apiGet<PoolEntry[]>(`/background/pool/search${queryStr ? `?${queryStr}` : ''}`),
+    'pool-search',
+    () => apiGet<PoolEntry[]>('/background/pool/search'),
   )
 
   const { data: matches = [], isLoading: matchesLoading } = useQuery<MatchRequest[]>(
@@ -116,17 +116,16 @@ export function ApplicantPoolPage() {
         <div>
           <h1 className="page-title">Applicant Pool</h1>
           <p className="page-subtitle">
-            Pre-screened tenants opted in to GAM's pool. Reach out is free —
-            the tenant chooses whether to share their full info. Unlock the
-            full report ($1) only after they confirm interest.
+            Pre-screened tenants opted in to GAM's pool, closest to your
+            properties first. Reach out is free — the tenant chooses whether
+            to share their full info. Unlock the full report ($1) only after
+            they confirm interest.
           </p>
         </div>
       </div>
 
-      <FilterBar filters={filters} onChange={setFilters} />
-
       <div style={{ marginBottom: 8, fontSize: '.78rem', color: 'var(--text-3)' }}>
-        {poolLoading ? 'Searching…' : `${pool.length} candidate${pool.length === 1 ? '' : 's'} in the pool`}
+        {poolLoading ? 'Loading…' : `${pool.length} candidate${pool.length === 1 ? '' : 's'} in the pool · sorted by proximity to your properties`}
       </div>
 
       <div className="card" style={{ padding: 0, marginBottom: 28, overflowX: 'auto' }}>
@@ -151,8 +150,13 @@ export function ApplicantPoolPage() {
             ) : pool.map(c => (
               <tr key={c.id}>
                 <td>
-                  <div style={{ fontWeight: 500 }}>
+                  <div style={{ fontWeight: 500, display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
                     {c.city || '—'}{c.state ? `, ${c.state}` : ''}
+                    {c.proximityRank != null && PROXIMITY[c.proximityRank] && (
+                      <span className={`badge ${PROXIMITY[c.proximityRank].cls}`} style={{ fontSize: '.62rem' }}>
+                        {PROXIMITY[c.proximityRank].label}
+                      </span>
+                    )}
                   </div>
                   <div style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>{c.zip || ''}</div>
                 </td>
@@ -271,85 +275,6 @@ export function ApplicantPoolPage() {
           onClose={() => setReachOutFor(null)}
         />
       )}
-    </div>
-  )
-}
-
-function FilterBar({
-  filters, onChange,
-}: {
-  filters:  { minIncome: string; maxIncome: string; state: string; riskLevel: string }
-  onChange: (next: typeof filters) => void
-}) {
-  const setField = (key: keyof typeof filters) => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) =>
-    onChange({ ...filters, [key]: e.target.value })
-
-  const cleared = filters.minIncome === '' && filters.maxIncome === '' && filters.state === '' && filters.riskLevel === ''
-
-  return (
-    <div className="card" style={{ padding: 14, marginBottom: 16, display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr)) auto', gap: 10, alignItems: 'end' }}>
-      <Field label="Min income/mo">
-        <input
-          type="number" min="0" step="50"
-          value={filters.minIncome}
-          onChange={setField('minIncome')}
-          placeholder="3000"
-          className="input"
-          style={{ width: '100%' }}
-        />
-      </Field>
-      <Field label="Max income/mo">
-        <input
-          type="number" min="0" step="50"
-          value={filters.maxIncome}
-          onChange={setField('maxIncome')}
-          placeholder="any"
-          className="input"
-          style={{ width: '100%' }}
-        />
-      </Field>
-      <Field label="State">
-        <input
-          type="text" maxLength={2}
-          value={filters.state}
-          onChange={e => onChange({ ...filters, state: e.target.value.toUpperCase() })}
-          placeholder="AZ"
-          className="input"
-          style={{ width: '100%', textTransform: 'uppercase' }}
-        />
-      </Field>
-      <Field label="Risk level">
-        <select
-          value={filters.riskLevel}
-          onChange={setField('riskLevel')}
-          className="input"
-          style={{ width: '100%' }}
-        >
-          <option value="">Any</option>
-          <option value="low">Low</option>
-          <option value="moderate">Moderate</option>
-          <option value="high">High</option>
-        </select>
-      </Field>
-      <button
-        type="button"
-        className="btn btn-ghost btn-sm"
-        disabled={cleared}
-        onClick={() => onChange({ minIncome: '', maxIncome: '', state: '', riskLevel: '' })}
-      >
-        Clear
-      </button>
-    </div>
-  )
-}
-
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
-  return (
-    <div>
-      <div style={{ fontSize: '.7rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.05em', marginBottom: 4 }}>
-        {label}
-      </div>
-      {children}
     </div>
   )
 }

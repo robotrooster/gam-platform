@@ -15,7 +15,7 @@ import { FeePlansPage } from './pages/FeePlansPage'
 import { StaffPage } from './pages/StaffPage'
 import { BankingPage } from './pages/BankingPage'
 import { SettingsPage } from './pages/SettingsPage'
-import { AgentActivityPage } from './pages/AgentActivityPage'
+import { TotpEnrollPage } from './pages/TotpEnrollPage'
 import './styles/globals.css'
 
 const qc = new QueryClient({
@@ -47,7 +47,6 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
             <Route path="/" element={<PrivateRoute><Layout /></PrivateRoute>}>
               <Route index             element={<Navigate to="/dashboard" replace />} />
               <Route path="dashboard"      element={<DashboardPage />} />
-              <Route path="agent-activity" element={<AgentActivityPage />} />
               <Route path="properties"      element={<PropertiesPage />} />
               <Route path="properties/:id"  element={<PropertyDetailPage />} />
               <Route path="invitations" element={<InvitationsPage />} />
@@ -55,6 +54,7 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
               <Route path="staff"      element={<StaffPage />} />
               <Route path="banking"    element={<BankingPage />} />
               <Route path="settings"   element={<SettingsPage />} />
+              <Route path="totp/enroll" element={<TotpEnrollPage />} />
             </Route>
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>

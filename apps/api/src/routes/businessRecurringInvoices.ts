@@ -22,6 +22,10 @@ import { db, query, queryOne } from '../db'
 import { requireAuth } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { requireBusinessAccess } from '../middleware/businessAccess'
+import {
+  type RecurringInvoiceFrequency,
+  isMonthlyRecurrence,
+} from '@gam/shared'
 
 export const businessRecurringInvoicesRouter = Router()
 
@@ -38,14 +42,17 @@ function todayIso(): string {
 // Compute the first next_due_date >= start_date that matches the
 // cadence. Used at create time.
 function computeInitialNextDue(
-  freq: 'weekly' | 'monthly',
+  freq: RecurringInvoiceFrequency,
   dayOfMonth: number | null,
   dayOfWeek: number | null,
   startDateIso: string
 ): string {
   const d = new Date(`${startDateIso}T12:00:00Z`)
-  if (freq === 'monthly') {
-    if (dayOfMonth === null) throw new Error('day_of_month required for monthly')
+  if (isMonthlyRecurrence(freq)) {
+    // All month-based cadences (monthly/quarterly/semiannual/annual) seed their
+    // first due on the first occurrence of day_of_month on or after start_date;
+    // the per-cycle month step only affects subsequent advances (generator).
+    if (dayOfMonth === null) throw new Error(`day_of_month required for ${freq}`)
     // If current month's day_of_month >= start_date's day, use this month;
     // otherwise advance to next month.
     const cand = new Date(d.getTime())
@@ -74,11 +81,20 @@ const lineSchema = z.object({
   unitPrice:   z.number().min(0),
 })
 
-const createSchema = z.discriminatedUnion('frequency', [
+// Month-based cadences share one shape (anchor day_of_month 1..28); weekly
+// anchors day_of_week 0..6. Kept as a discriminated union so zod rejects a
+// weekly body carrying dayOfMonth and vice-versa.
+const monthlyVariant = (freq: 'monthly' | 'quarterly' | 'semiannual' | 'annual') =>
   z.object({
-    frequency:    z.literal('monthly'),
-    dayOfMonth:   z.number().int().min(1).max(28),
-  }),
+    frequency:  z.literal(freq),
+    dayOfMonth: z.number().int().min(1).max(28),
+  })
+
+const createSchema = z.discriminatedUnion('frequency', [
+  monthlyVariant('monthly'),
+  monthlyVariant('quarterly'),
+  monthlyVariant('semiannual'),
+  monthlyVariant('annual'),
   z.object({
     frequency:    z.literal('weekly'),
     dayOfWeek:    z.number().int().min(0).max(6),
@@ -113,8 +129,8 @@ businessRecurringInvoicesRouter.post('/', requireAuth, async (req, res, next) =>
 
     const initialNextDue = computeInitialNextDue(
       body.frequency,
-      body.frequency === 'monthly' ? body.dayOfMonth : null,
-      body.frequency === 'weekly' ? body.dayOfWeek : null,
+      'dayOfMonth' in body ? body.dayOfMonth : null,
+      'dayOfWeek'  in body ? body.dayOfWeek  : null,
       body.startDate)
 
     const client = await db.connect()
@@ -131,8 +147,8 @@ businessRecurringInvoicesRouter.post('/', requireAuth, async (req, res, next) =>
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
          RETURNING *`,
         [businessId, body.customerId, body.name.trim(), body.frequency,
-         body.frequency === 'monthly' ? body.dayOfMonth : null,
-         body.frequency === 'weekly' ? body.dayOfWeek : null,
+         'dayOfMonth' in body ? body.dayOfMonth : null,
+         'dayOfWeek'  in body ? body.dayOfWeek  : null,
          body.startDate, body.endDate ?? null, initialNextDue,
          body.autoSend ?? true,
          body.paymentTermsDays ?? 30,

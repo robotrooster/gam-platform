@@ -129,16 +129,18 @@ function PaymentDetailModal({ payment: p, onClose }: { payment: any; onClose: ()
 
           {/* Unit & Tenant */}
           <div style={{ fontSize: '.72rem', fontWeight: 700, color: 'var(--gold)', textTransform: 'uppercase', letterSpacing: '.08em', margin: '16px 0 4px 0' }}>
-            Unit
+            Unit & Tenant
           </div>
+          {row(p.status === 'failed' ? 'Attempted by' : 'Paid by',
+            (p.tenantFirst || p.tenantLast) ? `${p.tenantFirst ?? ''} ${p.tenantLast ?? ''}`.trim() : null)}
           {row('Unit', p.unitNumber, { mono: true })}
           {row('Property', p.propertyName)}
 
-          {/* Stripe & ACH refs */}
+          {/* Payment processor & ACH refs */}
           <div style={{ fontSize: '.72rem', fontWeight: 700, color: 'var(--gold)', textTransform: 'uppercase', letterSpacing: '.08em', margin: '16px 0 4px 0' }}>
-            Stripe & ACH
+            Payment & ACH
           </div>
-          {row('Payment Intent ID', p.stripePaymentIntentId, { mono: true })}
+          {row('Payment ID', p.stripePaymentIntentId, { mono: true })}
           {row('Charge ID', p.stripeChargeId, { mono: true })}
           {row('ACH Trace Number', p.achTraceNumber, { mono: true })}
 
@@ -217,6 +219,7 @@ export function PaymentsPage() {
               <tr>
                 <th>Due</th>
                 <th>Unit</th>
+                <th>Tenant</th>
                 <th>Type</th>
                 <th>Amount</th>
                 <th>Status</th>
@@ -236,6 +239,7 @@ export function PaymentsPage() {
                 >
                   <td className="mono">{p.dueDate ? new Date(p.dueDate).toLocaleDateString() : '—'}</td>
                   <td className="mono">{p.unitNumber || '—'}</td>
+                  <td style={{ fontSize: '.8rem' }}>{(p.tenantFirst || p.tenantLast) ? `${p.tenantFirst ?? ''} ${p.tenantLast ?? ''}`.trim() : '—'}</td>
                   <td><span className="badge badge-muted">{p.type}</span></td>
                   <td className="mono" style={{ color: 'var(--text-0)' }}>
                     {/* S262: when supersedence diverted part of the gross,
@@ -266,7 +270,7 @@ export function PaymentsPage() {
                 </tr>
               )}) : (
                 <tr>
-                  <td colSpan={7} style={{ textAlign: 'center', color: 'var(--text-3)', padding: 32 }}>
+                  <td colSpan={8} style={{ textAlign: 'center', color: 'var(--text-3)', padding: 32 }}>
                     No payments yet.
                   </td>
                 </tr>

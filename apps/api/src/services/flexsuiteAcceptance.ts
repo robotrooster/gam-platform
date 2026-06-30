@@ -6,6 +6,7 @@ import { query, queryOne, getClient } from '../db'
 import { AppError } from '../middleware/errorHandler'
 import { renderAcceptancePdf } from './flexsuitePdf'
 import { emailFlexsuiteEnrollment } from './email'
+import { FLEX_DEPOSIT_CUSTODY_FEE } from '@gam/shared'
 import { logger } from '../lib/logger'
 
 // S314: FlexSuite enrollment acceptance — render + persist the
@@ -15,11 +16,17 @@ import { logger } from '../lib/logger'
 // defense. See migrations/20260518140000_flexsuite_enrollment_acceptances.sql.
 
 export const FLEXPAY_TEMPLATE_VERSION     = '1.0.0'
-export const FLEXDEPOSIT_TEMPLATE_VERSION = '1.0.0'
+// S514: bumped 1.0.0 → 2.0.0 with the custody-model rewrite. The new
+// template (FLEXDEPOSIT_CUSTODY_AGREEMENT.md) replaces the advance/SLA
+// model with the deposit-custody model of Consumer ToS § 9.1. Tenants on
+// the 1.0.0 acceptance are prompted to re-accept (informational; see the
+// re-acceptance flow below). The archived FLEXDEPOSIT_SLA_TEMPLATE.md
+// (advance model) is no longer loaded.
+export const FLEXDEPOSIT_TEMPLATE_VERSION = '2.0.0'
 
 const LEGAL_DIR = path.resolve(__dirname, '..', '..', '..', '..', 'legal')
 const FLEXPAY_TEMPLATE_PATH     = path.join(LEGAL_DIR, 'FLEXPAY_SUBSCRIPTION_TERMS.md')
-const FLEXDEPOSIT_TEMPLATE_PATH = path.join(LEGAL_DIR, 'FLEXDEPOSIT_SLA_TEMPLATE.md')
+const FLEXDEPOSIT_TEMPLATE_PATH = path.join(LEGAL_DIR, 'FLEXDEPOSIT_CUSTODY_AGREEMENT.md')
 
 type SubstitutionMap = Record<string, string>
 
@@ -99,8 +106,7 @@ export interface FlexDepositAcceptanceContext {
   depositId:          string
   installmentCount:   number
   installments:       FlexDepositInstallment[]
-  gamAdvanceAmount:   number  // dollars
-  totalInstallmentAmount: number  // dollars (sum of all installment amounts)
+  totalInstallmentAmount: number  // dollars (sum of all installment amounts = deposit total)
   moveInDate:         string  // YYYY-MM-DD
   ip:                 string | null
   userAgent:          string | null
@@ -164,7 +170,8 @@ export async function renderFlexDepositAcceptanceText(
     Move_In_Date:             ctx.moveInDate,
     Total_Installments:       String(ctx.installmentCount),
     Total_Installment_Amount: ctx.totalInstallmentAmount.toFixed(2),
-    Advance_Amount:           ctx.gamAdvanceAmount.toFixed(2),
+    Deposit_Total:            ctx.totalInstallmentAmount.toFixed(2),
+    Custody_Fee:              FLEX_DEPOSIT_CUSTODY_FEE.toFixed(2),
     Signature_Date:           isoDate(),
     Tenant_Signature:         '[Click-accepted electronically; see audit record]',
     Tenant_IP_Address:        ctx.ip || '[Not recorded]',
@@ -182,8 +189,8 @@ export async function renderFlexDepositAcceptanceText(
       depositId:              ctx.depositId,
       installmentCount:       ctx.installmentCount,
       installments:           ctx.installments,
-      gamAdvanceAmount:       ctx.gamAdvanceAmount,
       totalInstallmentAmount: ctx.totalInstallmentAmount,
+      custodyFeeMonthly:      FLEX_DEPOSIT_CUSTODY_FEE,
       moveInDate:             ctx.moveInDate,
       bankLast4:              t.bank_last4,
     },
@@ -404,17 +411,16 @@ export async function renderReAcceptanceTerms(args: {
   const dep = await queryOne<{
     id: string; total_amount: string; installment_count: number;
     lease_id: string; start_date: string; rent_due_day: number;
-    gam_advance_amount: string; installment_amount: string
+    installment_amount: string
   }>(
     `SELECT sd.id, sd.total_amount::text, sd.installment_count,
-            sd.lease_id, sd.gam_advance_amount::text,
-            sd.installment_amount::text,
+            sd.lease_id, sd.installment_amount::text,
             l.start_date::text, l.rent_due_day
        FROM security_deposits sd
        JOIN leases l ON l.id = sd.lease_id
       WHERE sd.tenant_id = $1
         AND sd.flex_deposit_enabled = TRUE
-        AND sd.flex_deposit_plan_status IN ('active','accelerated')
+        AND sd.flex_deposit_plan_status = 'active'
       ORDER BY sd.created_at DESC LIMIT 1`,
     [args.tenantId],
   )
@@ -446,7 +452,6 @@ export async function renderReAcceptanceTerms(args: {
     depositId:              dep.id,
     installmentCount:       dep.installment_count,
     installments,
-    gamAdvanceAmount:       Number(dep.gam_advance_amount),
     totalInstallmentAmount,
     moveInDate:             dep.start_date.slice(0, 10),
     ip:                     args.ip,

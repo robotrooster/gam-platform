@@ -1,3 +1,4 @@
+import type { PoolClient } from 'pg'
 import { query, queryOne, getClient } from '../db'
 import { isFeatureEnabled } from './systemFeatures'
 import { getStripe } from '../lib/stripe'
@@ -6,7 +7,6 @@ import { computeTenantGamOutstandingTotal } from './supersedence'
 import {
   getFlexDepositMaxInstallments,
   FLEX_DEPOSIT_CUSTODY_FEE,
-  FLEX_DEPOSIT_NSF_COOLDOWN_DAYS,
   type FlexDepositRiskLevel,
 } from '@gam/shared'
 import {
@@ -19,34 +19,41 @@ import {
 import { logger } from '../lib/logger'
 
 // ============================================================
-// FlexDeposit — tenant-paid deposit-installment product (S246).
+// FlexDeposit — deposit-custody installment product (S246; reworked
+// S514 to the S512 custody model, Consumer ToS § 9.1).
 //
-// Tenant picks 2-4 installments based on deposit amount × Checkr BG
-// risk_level. Installment 1 paid at move-in alongside rent + utilities
-// in a single combined ACH pull. GAM fronts the remaining (N-1) ×
-// installment_amount to landlord at move-in via Connect Transfer so
-// landlord sees the deposit funded in full from day 1. Tenant pays
-// installments 2..N to GAM over the next N-1 months. $3/mo custody
-// fee billed continuously while tenant is on the GAM platform.
+// CUSTODY MODEL (not an advance, not credit). The tenant funds their
+// OWN security deposit into GAM custody over 2–6 monthly installments.
+// GAM advances/floats NOTHING: the landlord's books reflect the deposit
+// in full at move-in, but the cash is held by GAM in custody
+// (held_by='gam_escrow'), never transferred to the landlord at move-in.
+// Installment 1 is paid at move-in alongside rent + utilities in a
+// single combined ACH pull; installments 2..N are pulled monthly.
+// A $3/mo custody fee (FLEX_DEPOSIT_CUSTODY_FEE) applies while GAM
+// holds the deposit. At lease-end the deposit-return flow settles
+// against collected_amount — i.e. only what the tenant actually funded
+// (see services/depositReturn.ts).
 //
-// Landlord NEVER sees FlexDeposit. Their move-in invoice excludes
-// the deposit line (covered by the GAM front); custody fees and
-// installment receipts are tenant↔GAM ledger entries only.
+// Eligibility is limited to SSDI/SSI recipients (income verified) per
+// ToS § 9.1.1 — a service-tier qualification, not a credit decision.
 //
-// Risk model: GAM eats the loss on default. Same posture as OTP /
-// FlexPay. Larger deposits get fewer allowed installments to cap
-// outstanding exposure (per S246 product spec).
+// Landlord NEVER sees FlexDeposit. Their move-in invoice excludes the
+// deposit line (held in custody); custody fees and installment receipts
+// are tenant↔GAM ledger entries only.
 //
-// Missed-installment legal remedy: TODO. S246 placeholder is
-// standard late_fee + admin alert + plan status='in_default'.
-// Stricter remedy (deposit-due-in-full, eviction-eligible, etc.)
-// pending Nic's legal review — surfaced as admin alert with the
-// hook at handleInstallmentNsf.
+// NO RECOURSE on a missed installment (ToS § 9.1.5). A missed
+// installment leaves the deposit "simply under-funded" — GAM does NOT
+// accelerate, demand a balance in full, sue, collect, furnish to a CRA,
+// or threaten any of the foregoing. The custody balance is funded by
+// the scheduled installment pulls plus GAM-First FIFO routing of any
+// platform payment (the funding mechanism, NOT debt collection — ToS
+// § 9.1.4). Re-enrollment restriction, if any, is "until current" — no
+// permanent block, no fixed cooldown.
 // ============================================================
 
 // S330: signal thresholds for the eligibility-check workflow promised
 // in Consumer Privacy Policy § 2.1. All rule-based — no scoring or
-// underwriting (preserves the SLA-not-loan structural defense).
+// underwriting (preserves the not-credit structural defense).
 export const FLEX_DEPOSIT_MIN_TENURE_DAYS = 30
 export const FLEX_DEPOSIT_MIN_RECENT_ON_TIME_PAYMENTS = 1
 export const FLEX_DEPOSIT_PAYMENT_LOOKBACK_DAYS = 90
@@ -59,17 +66,15 @@ export interface FlexDepositEligibility {
     | 'no_bg_result'
     | 'bg_not_approved'
     | 'risk_level_missing'
-    | 'tenant_suspended_nsf'
+    | 'not_ssi_ssdi'
     | 'already_funded'
     | 'tenant_not_found'
     | 'insufficient_platform_tenure'
     | 'insufficient_on_time_payment_history'
-    | 'prior_flexdeposit_default'
   >
   max_installments: number | null
   risk_level:       FlexDepositRiskLevel | null
   deposit_amount:   number | null
-  suspended_until:  string | null
 }
 
 export async function isFlexDepositVisible(): Promise<boolean> {
@@ -78,21 +83,26 @@ export async function isFlexDepositVisible(): Promise<boolean> {
 
 /**
  * Compute the tenant's FlexDeposit eligibility based on:
+ *  - SSDI/SSI recipient (tenants.ssi_ssdi) — ToS § 9.1.1 service-tier
+ *    qualification, income verified at onboarding (not a credit decision)
  *  - ach_verified
  *  - background_checks.status = 'approved' AND risk_level set
  *  - security_deposits exists for an upcoming/active lease
- *  - not in NSF cooldown
- * Returns max_installments (2-4) when eligible, null otherwise.
+ *  - platform tenure + on-time payment history (fraud defense)
+ * Returns max_installments (2-6) when eligible, null otherwise.
+ *
+ * No NSF cooldown / no permanent prior-default block (S514): under the
+ * custody model a missed installment is not a default and carries no
+ * lasting disqualification — restriction, if any, is "until current."
  */
 export async function getFlexDepositEligibility(tenantId: string): Promise<FlexDepositEligibility> {
   const t = await queryOne<{
     ach_verified: boolean
+    ssi_ssdi: boolean
     bg_status: string | null
-    flex_deposit_disqualified_until: string | null
     tenure_days: number
   }>(
-    `SELECT ach_verified, background_check_status AS bg_status,
-            flex_deposit_disqualified_until,
+    `SELECT ach_verified, ssi_ssdi, background_check_status AS bg_status,
             EXTRACT(EPOCH FROM (NOW() - created_at)) / 86400 AS tenure_days
        FROM tenants WHERE id = $1`,
     [tenantId],
@@ -100,22 +110,19 @@ export async function getFlexDepositEligibility(tenantId: string): Promise<FlexD
   if (!t) {
     return {
       eligible: false, blockers: ['tenant_not_found'],
-      max_installments: null, risk_level: null, deposit_amount: null, suspended_until: null,
+      max_installments: null, risk_level: null, deposit_amount: null,
     }
   }
 
   const blockers: FlexDepositEligibility['blockers'] = []
-  let suspendedUntil: string | null = null
+
+  // ToS § 9.1.1: FlexDeposit is limited to SSDI/SSI recipients. The flag is
+  // set + income-verified at tenant onboarding; this is a service-tier
+  // qualification, not a credit decision, and uses no consumer report.
+  if (!t.ssi_ssdi) blockers.push('not_ssi_ssdi')
 
   if (!t.ach_verified) blockers.push('ach_unverified')
   if (t.bg_status !== 'approved') blockers.push(t.bg_status ? 'bg_not_approved' : 'no_bg_result')
-  if (t.flex_deposit_disqualified_until) {
-    const until = new Date(t.flex_deposit_disqualified_until)
-    if (until.getTime() > Date.now()) {
-      blockers.push('tenant_suspended_nsf')
-      suspendedUntil = t.flex_deposit_disqualified_until
-    }
-  }
 
   // S330: platform-tenure gate. New-just-signed-up accounts can't
   // immediately get FlexDeposit — standard fraud defense. Per the
@@ -125,20 +132,9 @@ export async function getFlexDepositEligibility(tenantId: string): Promise<FlexD
     blockers.push('insufficient_platform_tenure')
   }
 
-  // S330: prior-default permanent block. Distinct from
-  // tenant_suspended_nsf (which is a temporary cooldown). Any prior
-  // FlexDeposit plan that landed in_default permanently disqualifies
-  // — re-enrollment after a default would undermine the SLA-not-loan
-  // service-tier consequences framing.
-  const priorDefault = await queryOne<{ exists: boolean }>(
-    `SELECT EXISTS (
-       SELECT 1 FROM security_deposits
-        WHERE tenant_id = $1
-          AND flex_deposit_plan_status = 'in_default'
-     ) AS exists`,
-    [tenantId],
-  )
-  if (priorDefault?.exists) blockers.push('prior_flexdeposit_default')
+  // S514: no permanent prior-default block. Under the custody model a
+  // missed installment is not a default and creates no debt (ToS § 9.1.5),
+  // so a prior under-funded plan does not bar a future enrollment.
 
   // S330: on-time payment history. Per Privacy Policy § 2.1 "payment
   // history on the Platform" signal. Tenants with at least one prior
@@ -210,7 +206,6 @@ export async function getFlexDepositEligibility(tenantId: string): Promise<FlexD
     max_installments: maxInstallments,
     risk_level: riskLevel,
     deposit_amount: depositAmount,
-    suspended_until: suspendedUntil,
   }
 }
 
@@ -236,7 +231,10 @@ export interface FlexDepositSchedule {
   installments:           FlexDepositInstallment[]
   installmentAmount:      number
   firstAmount:            number
-  gamAdvanceAmount:       number
+  // Balance not yet funded into custody at move-in (total − installment 1).
+  // This is NOT an advance — GAM floats nothing; it is simply the amount the
+  // tenant has yet to pay into their own custody balance.
+  uncollectedAtMoveIn:    number
   totalInstallmentAmount: number
   startDate:              string  // YYYY-MM-DD
   rentDueDay:             number
@@ -253,7 +251,7 @@ function computeFlexDepositSchedule(args: {
   // Rounding residue lives on installment 1 so the sum equals total.
   const residue = roundHalfEvenCents(total - installmentAmount * args.installmentCount)
   const firstAmount = roundHalfEvenCents(installmentAmount + residue)
-  const gamAdvanceAmount = roundHalfEvenCents(total - firstAmount)
+  const uncollectedAtMoveIn = roundHalfEvenCents(total - firstAmount)
 
   const installments: FlexDepositInstallment[] = []
   for (let i = 1; i <= args.installmentCount; i++) {
@@ -266,7 +264,7 @@ function computeFlexDepositSchedule(args: {
   const totalInstallmentAmount = installments.reduce((s, x) => s + x.amount, 0)
 
   return {
-    installments, installmentAmount, firstAmount, gamAdvanceAmount,
+    installments, installmentAmount, firstAmount, uncollectedAtMoveIn,
     totalInstallmentAmount, startDate: args.startDate, rentDueDay: args.rentDueDay,
   }
 }
@@ -303,8 +301,8 @@ export async function previewFlexDepositSchedule(args: {
   | { ok: true; schedule: FlexDepositSchedule; depositId: string }
   | { ok: false; reason: string }
 > {
-  if (!Number.isInteger(args.installmentCount) || args.installmentCount < 2 || args.installmentCount > 4) {
-    return { ok: false, reason: 'installmentCount must be 2, 3, or 4' }
+  if (!Number.isInteger(args.installmentCount) || args.installmentCount < 2 || args.installmentCount > 6) {
+    return { ok: false, reason: 'installmentCount must be between 2 and 6' }
   }
   const dep = await fetchUnfundedDeposit(args.tenantId)
   if (!dep) return { ok: false, reason: 'No unfunded deposit on file' }
@@ -341,8 +339,8 @@ export async function enrollFlexDeposit(args: {
   const elig = await getFlexDepositEligibility(args.tenantId)
   if (!elig.eligible) return { ok: false, reason: `Not eligible: ${elig.blockers.join(', ')}` }
 
-  if (!Number.isInteger(args.installmentCount) || args.installmentCount < 2 || args.installmentCount > 4) {
-    return { ok: false, reason: 'installmentCount must be 2, 3, or 4' }
+  if (!Number.isInteger(args.installmentCount) || args.installmentCount < 2 || args.installmentCount > 6) {
+    return { ok: false, reason: 'installmentCount must be between 2 and 6' }
   }
   if (elig.max_installments === null || args.installmentCount > elig.max_installments) {
     return { ok: false, reason: `Max allowed installments for this deposit and risk profile: ${elig.max_installments}` }
@@ -369,7 +367,6 @@ export async function enrollFlexDeposit(args: {
     depositId:              dep.id,
     installmentCount:       args.installmentCount,
     installments:           schedule.installments,
-    gamAdvanceAmount:       schedule.gamAdvanceAmount,
     totalInstallmentAmount: schedule.totalInstallmentAmount,
     moveInDate:             schedule.startDate,
     ip:                     args.ip,
@@ -413,11 +410,11 @@ export async function enrollFlexDeposit(args: {
       )
     }
 
-    // Flip the deposit row's FlexDeposit columns. S260: force
-    // held_by='gam_escrow' regardless of property default — GAM holds
-    // FlexDeposit funds throughout the lease (no move-in Connect
-    // Transfer; settle to landlord at lease-end with whatever was
-    // collected, GAM eats any gap).
+    // Flip the deposit row's FlexDeposit columns. Force held_by='gam_escrow'
+    // regardless of property default — GAM holds the deposit in custody
+    // throughout the lease (no move-in Connect Transfer; the deposit-return
+    // flow settles against collected_amount at lease-end). GAM advances
+    // nothing, so gam_advance_amount stays at its DEFAULT 0 (deprecated S514).
     await client.query(
       `UPDATE security_deposits
           SET flex_deposit_enabled    = TRUE,
@@ -428,14 +425,12 @@ export async function enrollFlexDeposit(args: {
               installments_paid        = 0,
               installments_remaining   = $1,
               next_installment_date    = $3,
-              gam_advance_amount       = $4,
               updated_at               = NOW()
-        WHERE id = $5`,
+        WHERE id = $4`,
       [
         args.installmentCount,
         schedule.installmentAmount.toFixed(2),
         addMonths(schedule.startDate, 1),
-        schedule.gamAdvanceAmount.toFixed(2),
         dep.id,
       ],
     )
@@ -477,13 +472,13 @@ export async function enrollFlexDeposit(args: {
       ok: true,
       acceptanceId,
       plan: {
-        deposit_id:         dep.id,
-        installment_count:  args.installmentCount,
-        installment_amount: schedule.installmentAmount,
-        first_amount:       schedule.firstAmount,
-        gam_advance:        schedule.gamAdvanceAmount,
-        first_due:          schedule.startDate,
-        next_due:           addMonths(schedule.startDate, 1),
+        deposit_id:          dep.id,
+        installment_count:   args.installmentCount,
+        installment_amount:  schedule.installmentAmount,
+        first_amount:        schedule.firstAmount,
+        uncollected_at_move_in: schedule.uncollectedAtMoveIn,
+        first_due:           schedule.startDate,
+        next_due:            addMonths(schedule.startDate, 1),
       },
     }
   } catch (e) {
@@ -536,7 +531,6 @@ export async function cancelFlexDeposit(tenantId: string): Promise<{ ok: true } 
               installments_paid          = 0,
               installments_remaining     = NULL,
               next_installment_date      = NULL,
-              gam_advance_amount         = 0,
               updated_at                 = NOW()
         WHERE id = $1`,
       [dep.rows[0].id],
@@ -562,20 +556,16 @@ export async function cancelFlexDeposit(tenantId: string): Promise<{ ok: true } 
  *   1. Mark installment 1 as 'settled' (paid as part of the move-in PI)
  *   2. Increment security_deposits.installments_paid + collected_amount
  *
- * S260 model change: NO landlord Connect Transfer at move-in. All
- * FlexDeposit deposits are held in gam_escrow throughout the lease
- * (forced at enrollment time). GAM holds the partial-collected funds,
- * marks the deposit 'funded' on the landlord-visible dashboard once
- * the total is collected, and settles to landlord at lease-end with
- * whatever's collected (GAM eats any gap then).
+ * Custody model: NO landlord Connect Transfer at move-in. The deposit is
+ * held in gam_escrow throughout the lease (forced at enrollment). GAM holds
+ * the partial-collected funds, marks the deposit 'funded' on the
+ * landlord-visible dashboard once the total is collected, and the
+ * deposit-return flow settles against collected_amount at lease-end —
+ * GAM advances nothing, so there is no gap for GAM to "eat": the amount
+ * available to landlord/tenant is exactly what the tenant funded into
+ * custody (ToS § 9.1.3 / § 9.1.5).
  *
- * Pre-S260 behavior: when `held_by='landlord'`, fired a Connect Transfer
- * for the (N-1)-installment gap to the landlord's Connect account so
- * the landlord saw deposit funded in full from day 1. Under S260 that
- * gap stays with GAM until lease-end; no transfer fires.
- *
- * Signature preserved (still accepts landlordConnectAccountId) for
- * backward call-site compat. Returns null stripeTransferId always.
+ * Returns null stripeTransferId always (no transfer fires under custody).
  */
 export async function settleFlexDepositMoveIn(args: {
   tenantId:                 string
@@ -641,21 +631,22 @@ export interface InstallmentDueResult {
 /**
  * Daily cron — walks pending installment rows ready for an ACH pull.
  *
- * S260 model: each installment has TWO pull attempts:
+ * Pull schedule: each installment has TWO pull attempts:
  *   - primary at rent_due_day − 5 (fires when attempt_count = 0)
  *   - retry   at rent_due_day − 1 (fires when attempt_count = 1
  *                                  AND primary failed; if primary
  *                                  succeeded, status flipped to
  *                                  'settled' and retry is skipped)
  *
- * On retry failure (attempt_count would become 2 after second pull
- * fires), the webhook NSF handler defaults the installment and
- * checks for 2 consecutive defaulted installments → fires plan
- * acceleration. See handleFlexDepositPaymentNsf.
+ * On retry failure (attempt_count = 2) the webhook NSF handler marks the
+ * installment 'missed'. There is NO acceleration and no plan-level default
+ * (ToS § 9.1.5): the deposit is simply under-funded by that installment,
+ * and the custody balance keeps funding from later installments + GAM-First
+ * routing. See handleFlexDepositPaymentNsf.
  *
  * One PaymentIntent per pull (platform charge, gross to GAM platform
- * balance — landlord deposit lives entirely in gam_escrow under S260,
- * no Connect Transfer happens until lease-end settlement).
+ * balance — the deposit lives entirely in gam_escrow; no Connect Transfer
+ * fires under the custody model).
  */
 export async function processFlexDepositInstallmentDue(now: Date = new Date()): Promise<InstallmentDueResult> {
   const out: InstallmentDueResult = { candidates_scanned: 0, pulls_initiated: 0, errors: 0 }
@@ -699,7 +690,7 @@ export async function processFlexDepositInstallmentDue(now: Date = new Date()): 
   for (const r of rows) {
     try {
       if (!r.stripe_customer_id) {
-        await markInstallmentDefaulted(r.installment_id, r.security_deposit_id, r.tenant_id, 'no_stripe_customer')
+        await markInstallmentMissed(r.installment_id, r.security_deposit_id, r.tenant_id, 'no_stripe_customer')
         out.errors += 1
         continue
       }
@@ -714,7 +705,7 @@ export async function processFlexDepositInstallmentDue(now: Date = new Date()): 
         }
       } catch {}
       if (!paymentMethodId) {
-        await markInstallmentDefaulted(r.installment_id, r.security_deposit_id, r.tenant_id, 'no_default_payment_method')
+        await markInstallmentMissed(r.installment_id, r.security_deposit_id, r.tenant_id, 'no_default_payment_method')
         out.errors += 1
         continue
       }
@@ -775,7 +766,11 @@ export async function processFlexDepositInstallmentDue(now: Date = new Date()): 
   return out
 }
 
-async function markInstallmentDefaulted(
+// Mark an installment 'missed'. Under the custody model (ToS § 9.1.5) this
+// is NOT a default and creates no debt: the plan stays 'active' and the
+// deposit is simply under-funded by this installment. No plan-level state
+// change, no acceleration, no recourse.
+async function markInstallmentMissed(
   installmentId: string,
   depositId: string,
   tenantId: string,
@@ -783,24 +778,18 @@ async function markInstallmentDefaulted(
 ) {
   await query(
     `UPDATE flex_deposit_installments
-        SET status = 'defaulted', defaulted_at = NOW(),
+        SET status = 'missed', defaulted_at = NOW(),
             default_reason = $1, updated_at = NOW()
       WHERE id = $2`,
     [reason, installmentId],
   )
-  await query(
-    `UPDATE security_deposits
-        SET flex_deposit_plan_status = 'in_default', updated_at = NOW()
-      WHERE id = $1`,
-    [depositId],
-  )
   try {
     const { createAdminNotification } = await import('./adminNotifications')
     await createAdminNotification({
-      severity: 'warn',
-      category: 'flexdeposit_installment_defaulted',
-      title:    `FlexDeposit installment defaulted`,
-      body:     `Installment ${installmentId} for tenant ${tenantId} flipped to defaulted: ${reason}. Plan flagged for legal-remedy review. TODO: legal remedy implementation pending Nic spec.`,
+      severity: 'info',
+      category: 'flexdeposit_installment_missed',
+      title:    `FlexDeposit installment missed`,
+      body:     `Installment ${installmentId} for tenant ${tenantId} did not fund: ${reason}. The deposit is under-funded by this installment; no acceleration or recourse (custody model). Funding continues from later installments + GAM-First routing.`,
       context: { installment_id: installmentId, deposit_id: depositId, tenant_id: tenantId, reason },
     })
   } catch (e) { logger.error({ err: e }, '[flexdeposit][alert]') }
@@ -847,6 +836,7 @@ export async function processFlexDepositCustodyFee(now: Date = new Date()): Prom
        JOIN leases l            ON l.id = sd.lease_id
       WHERE sd.flex_deposit_enabled = TRUE
         AND sd.flex_deposit_plan_status IN ('active', 'completed')
+        AND sd.custody_fee_active = TRUE
         AND l.status IN ('active', 'pending')`,
   )
   out.candidates_scanned = rows.length
@@ -947,13 +937,15 @@ export async function reconcileSettledFlexDepositPayment(
   )
   if (!p) return
 
-  // S260: acceleration-pull settlement. Routed by PI metadata stamp,
-  // not installment-row presence (no installment row exists for an
-  // acceleration pull — it's a single full-balance charge against
-  // remaining unpaid installments). Flips plan → 'completed' and
-  // mass-settles all unpaid installments.
-  if (piMetadata?.gam_purpose === 'flexdeposit_acceleration' && piMetadata.gam_deposit_id) {
-    await settleFlexDepositAcceleration(piMetadata.gam_deposit_id)
+  // S514: voluntary pay-ahead settlement. Routed by PI metadata stamp,
+  // not installment-row presence (no installment row exists for a
+  // pay-ahead pull — it's a single charge for the tenant's remaining
+  // unfunded installments, initiated by the tenant). Flips plan →
+  // 'completed' and mass-settles all unpaid installments. There is no
+  // failure-side terminal state: a failed pay-ahead simply leaves the
+  // plan 'active' and the scheduled installment pulls continue.
+  if (piMetadata?.gam_purpose === 'flexdeposit_payahead' && piMetadata.gam_deposit_id) {
+    await settleFlexDepositPayAhead(piMetadata.gam_deposit_id)
     return
   }
 
@@ -1020,9 +1012,9 @@ export async function reconcileSettledFlexDepositPayment(
 }
 
 /**
- * NSF handler (S260 rewrite).
+ * NSF handler (S514 custody rework).
  *
- * The S260 pull-schedule model has each installment fire TWO attempts:
+ * Each installment fires TWO pull attempts:
  *   - primary (attempt_count goes 0→1)
  *   - retry   (attempt_count goes 1→2)
  *
@@ -1030,17 +1022,17 @@ export async function reconcileSettledFlexDepositPayment(
  * payment with metadata.gam_purpose='flexdeposit_installment'.
  *
  * Behavior:
- *   - Primary attempt failed (installment.attempt_count = 1):
- *     installment stays 'pending'; the daily cron picks up the retry
- *     on retry_pull_date. No plan-level state change.
- *   - Retry attempt failed (installment.attempt_count = 2):
- *     installment flips to 'defaulted'. Then we count consecutive
- *     defaulted installments ending with this one. On 2 consecutive
- *     defaulted installments → fire plan acceleration.
+ *   - Primary attempt failed (attempt_count = 1): installment stays
+ *     'pending'; the daily cron picks up the retry on retry_pull_date.
+ *     No plan-level state change.
+ *   - Retry attempt failed (attempt_count = 2): installment flips to
+ *     'missed'. Per ToS § 9.1.5 that is the END of it — no acceleration,
+ *     no balance-due-in-full, no plan default, no recourse. The deposit
+ *     is simply under-funded by that installment; later installments and
+ *     GAM-First routing keep funding the custody balance.
  *
- * The S260 model does NOT use achRetry for FlexDeposit — retry timing
- * is locked to retry_pull_date. The webhook layer must NULL out
- * next_retry_at for FlexDeposit installment failures so achRetry
+ * Retry timing is locked to retry_pull_date, so the webhook layer must
+ * NULL out next_retry_at for FlexDeposit installment failures so achRetry
  * doesn't pick them up.
  */
 export async function handleFlexDepositPaymentNsf(paymentId: string): Promise<void> {
@@ -1065,263 +1057,70 @@ export async function handleFlexDepositPaymentNsf(paymentId: string): Promise<vo
   )
   if (!inst) return
 
-  // Primary attempt failed (count=1 after pull fired). Don't default
-  // yet — retry will fire on retry_pull_date.
+  // Primary attempt failed (count=1 after pull fired). Don't mark missed
+  // yet — the retry will fire on retry_pull_date.
   if (inst.attempt_count <= 1) {
     return
   }
 
-  // Retry attempt failed (count=2). Default this installment, then
-  // check for 2-strike acceleration.
-  const client = await getClient()
-  try {
-    await client.query('BEGIN')
-    await client.query(
-      `UPDATE flex_deposit_installments
-          SET status         = 'defaulted',
-              defaulted_at   = NOW(),
-              default_reason = 'tenant_nsf_both_attempts_failed',
-              updated_at     = NOW()
-        WHERE id = $1`,
-      [inst.id],
-    )
-    await client.query('COMMIT')
-  } catch (e) {
-    await client.query('ROLLBACK').catch(() => {})
-    throw e
-  } finally {
-    client.release()
-  }
-
-  // Strike check: 2 consecutive defaulted installments ending at the
-  // most recent → acceleration. "Consecutive" walks back from the
-  // highest installment_number with a settled-or-defaulted outcome,
-  // not skipping pending installments (which wouldn't exist between
-  // a defaulted one and another later one anyway under the
-  // chronological monthly schedule).
-  const consecutive = await queryOne<{ count: number }>(
-    `WITH recent AS (
-       SELECT status, installment_number
-         FROM flex_deposit_installments
-        WHERE security_deposit_id = $1
-          AND status IN ('settled', 'defaulted')
-        ORDER BY installment_number DESC
-        LIMIT 2
-     )
-     SELECT COUNT(*)::int AS count
-       FROM recent
-      WHERE status = 'defaulted'`,
-    [inst.security_deposit_id],
+  // Retry attempt failed (count=2). Mark this installment 'missed'. The
+  // plan stays 'active'; there is no acceleration or recourse (custody
+  // model). markInstallmentMissed emits the (info-level) admin alert.
+  await markInstallmentMissed(
+    inst.id,
+    inst.security_deposit_id,
+    p.tenant_id,
+    'tenant_nsf_both_attempts_failed',
   )
-  const consecCount = consecutive?.count ?? 0
-
-  if (consecCount >= 2) {
-    await accelerateFlexDepositPlan({
-      depositId: inst.security_deposit_id,
-      tenantId:  p.tenant_id,
-      reason:    'second_consecutive_installment_default',
-    })
-    return
-  }
-
-  // Single-strike state: don't accelerate yet. Log for visibility.
-  try {
-    const { createAdminNotification } = await import('./adminNotifications')
-    await createAdminNotification({
-      severity: 'info',
-      category: 'flexdeposit_installment_defaulted',
-      title:    `FlexDeposit installment defaulted (strike 1 of 2) — tenant ${p.tenant_id}`,
-      body:     `Installment ${inst.id} (deposit ${inst.security_deposit_id}) defaulted after both primary and retry pulls failed. One more consecutive default triggers plan acceleration.`,
-      context:  { installment_id: inst.id, deposit_id: inst.security_deposit_id, tenant_id: p.tenant_id, installment_number: inst.installment_number },
-    })
-  } catch (e) { logger.error({ err: e }, '[flexdeposit][nsf-alert]') }
 }
 
-/**
- * S260: plan acceleration. Triggered by 2 consecutive defaulted
- * installments OR via the webhook handler for the accelerated pull
- * itself when it fails.
- *
- * Steps:
- *   1. Compute remaining balance = sum of (pending + defaulted)
- *      installment amounts.
- *   2. Stamp security_deposits.balance_due_full_at + balance_due_total;
- *      flip flex_deposit_plan_status to 'accelerated'.
- *   3. Fire a single ACH pull at the full remaining balance. Metadata
- *      stamps this as a flexdeposit_acceleration_pull (separate from
- *      installment pulls).
- *   4. On webhook success: plan flips to 'completed', all unpaid
- *      installments flip to 'settled' (paid by acceleration).
- *   5. On webhook failure: plan flips to 'in_default' terminal. GAM
- *      eats the unpaid portion at lease-end settlement; tenant gets
- *      a 60-day cooldown on FlexDeposit re-enrollment.
- */
-export async function accelerateFlexDepositPlan(args: {
-  depositId: string
-  tenantId:  string
-  reason:    string
-}): Promise<{ accelerated: boolean; balance_due: number; payment_id: string | null }> {
-  const dep = await queryOne<{
-    id: string; lease_id: string; landlord_id: string; unit_id: string;
-    stripe_customer_id: string | null;
-  }>(
-    `SELECT sd.id, sd.lease_id, l.landlord_id, sd.unit_id,
-            t.stripe_customer_id
-       FROM security_deposits sd
-       JOIN leases   l ON l.id = sd.lease_id
-       JOIN tenants  t ON t.id = sd.tenant_id
-      WHERE sd.id = $1`,
-    [args.depositId],
-  )
-  if (!dep) {
-    return { accelerated: false, balance_due: 0, payment_id: null }
-  }
-
-  // Sum unpaid (pending + defaulted) installment amounts.
-  const balanceRow = await queryOne<{ remaining: string }>(
-    `SELECT COALESCE(SUM(amount), 0)::text AS remaining
-       FROM flex_deposit_installments
-      WHERE security_deposit_id = $1
-        AND status IN ('pending', 'defaulted')`,
-    [args.depositId],
-  )
-  const remaining = Number(balanceRow?.remaining ?? 0)
-  if (remaining <= 0) {
-    return { accelerated: false, balance_due: 0, payment_id: null }
-  }
-
-  // Stamp acceleration onto the deposit.
-  await query(
-    `UPDATE security_deposits
-        SET flex_deposit_plan_status = 'accelerated',
-            balance_due_full_at      = NOW(),
-            balance_due_total        = $1,
-            updated_at               = NOW()
-      WHERE id = $2`,
-    [remaining.toFixed(2), args.depositId],
-  )
-
-  // Notify admin (the only operator-visible signal — landlord never
-  // sees FlexDeposit state per F4).
-  try {
-    const { createAdminNotification } = await import('./adminNotifications')
-    await createAdminNotification({
-      severity: 'warn',
-      category: 'flexdeposit_plan_accelerated',
-      title:    `FlexDeposit plan accelerated — tenant ${args.tenantId}`,
-      body:     `2 consecutive installment defaults triggered acceleration on deposit ${args.depositId}. Full remaining balance of $${remaining.toFixed(2)} pulled in a single ACH attempt. Reason: ${args.reason}.`,
-      context:  { deposit_id: args.depositId, tenant_id: args.tenantId, balance_due_total: remaining, reason: args.reason },
-    })
-  } catch (e) { logger.error({ err: e }, '[flexdeposit][accelerate-alert]') }
-
-  // Fire the single full-balance ACH pull.
-  let paymentId: string | null = null
-  try {
-    if (!dep.stripe_customer_id) {
-      await markPlanInDefault(args.depositId, args.tenantId, 'no_stripe_customer')
-      return { accelerated: true, balance_due: remaining, payment_id: null }
-    }
-
-    const stripe = getStripe()
-    let paymentMethodId: string | null = null
-    try {
-      const cust = await stripe.customers.retrieve(dep.stripe_customer_id)
-      if (cust && !(cust as any).deleted) {
-        const c = cust as any
-        paymentMethodId = c.invoice_settings?.default_payment_method ?? c.default_source ?? null
-      }
-    } catch {}
-    if (!paymentMethodId) {
-      await markPlanInDefault(args.depositId, args.tenantId, 'no_default_payment_method')
-      return { accelerated: true, balance_due: remaining, payment_id: null }
-    }
-
-    // S261: supersedence boost on the acceleration pull. The
-    // accelerated balance for THIS deposit is excluded from the
-    // outstanding query for the duration of this transaction by the
-    // computeTenantGamOutstanding filter (it scans plan_status
-    // ='accelerated' only after balance_due_total is stamped — at this
-    // point in accelerateFlexDepositPlan the stamp has already
-    // happened, so we must subtract our own deposit row). Cheaper:
-    // compute total, subtract `remaining` for this deposit.
-    const rawBoost = await computeTenantGamOutstandingTotal(args.tenantId)
-    const boost = Math.max(0, Math.round((rawBoost - remaining) * 100) / 100)
-    const pullAmount = Math.round((remaining + boost) * 100) / 100
-
-    const intent = await createRentPlatformCharge({
-      amount:              pullAmount,
-      stripeCustomerId:    dep.stripe_customer_id,
-      paymentMethodId,
-      paymentMethodTypes:  ['us_bank_account'],
-      entryDescription:    'DEPOSIT',
-      metadata: {
-        gam_purpose:    'flexdeposit_acceleration',
-        gam_deposit_id: args.depositId,
-        gam_tenant_id:  args.tenantId,
-      },
-    })
-
-    const today = new Date().toISOString().slice(0, 10)
-    const pay = await queryOne<{ id: string }>(
-      `INSERT INTO payments (
-         landlord_id, tenant_id, lease_id, unit_id,
-         type, amount, status, entry_description,
-         due_date, stripe_payment_intent_id, notes,
-         gam_supersedence_amount
-       ) VALUES ($1, $2, $3, $4, 'deposit', $5, 'pending', 'DEPOSIT', $6, $7, $8, $9)
-       RETURNING id`,
-      [
-        dep.landlord_id, args.tenantId, dep.lease_id, dep.unit_id,
-        pullAmount.toFixed(2), today, intent.id,
-        `FlexDeposit acceleration — full balance due (deposit ${args.depositId})`,
-        boost.toFixed(2),
-      ],
-    )
-    paymentId = pay?.id ?? null
-  } catch (e) {
-    logger.error({ err: e, ctx: args.depositId }, '[flexdeposit][accelerate-pull]')
-    await markPlanInDefault(args.depositId, args.tenantId, 'acceleration_pull_create_failed')
-  }
-
-  return { accelerated: true, balance_due: remaining, payment_id: paymentId }
-}
+// ── Voluntary pay-ahead (replaces acceleration) ─────────────────
 
 /**
- * S262: tenant-initiated manual retry of an acceleration pull. Reaches
- * here only from the tenant LeasePage "Pay full balance now" button
- * when their plan is 'in_default' (the prior acceleration pull failed).
+ * S514: tenant-initiated voluntary pay-ahead. Replaces the removed
+ * acceleration mechanism. Reached from the tenant LeasePage "Fund
+ * remaining deposit now" button when the tenant chooses to top up their
+ * custody balance early. This is OPTIONAL and tenant-driven — it is not a
+ * demand, an acceleration, or a balance-due-in-full event.
  *
- * Flips plan_status back to 'accelerated', re-stamps balance_due_full_at,
- * and fires a fresh ACH pull at balance_due_total + supersedence boost.
- * Webhook routes settlement back through settleFlexDepositAcceleration
- * (success) or failFlexDepositAcceleration (back to 'in_default').
- *
- * The supersedence FIFO logic naturally excludes this deposit by the
- * existing self-subtract pattern (rawBoost - balance_due_total).
+ * Fires a single ACH pull for the sum of the tenant's unfunded (pending +
+ * missed) installments. On webhook success the remaining installments are
+ * marked 'settled' and the plan flips to 'completed' (see
+ * settleFlexDepositPayAhead). On failure, nothing terminal happens: the
+ * plan stays 'active' and the scheduled installment pulls keep running.
  */
-export async function retryFlexDepositAcceleration(args: {
+export async function payAheadFlexDeposit(args: {
   tenantId: string
-}): Promise<{ ok: boolean; reason?: string; balance_due?: number; payment_id?: string | null }> {
+}): Promise<{ ok: boolean; reason?: string; balance_remaining?: number; payment_id?: string | null }> {
   const dep = await queryOne<{
     id: string; lease_id: string; landlord_id: string; unit_id: string;
-    balance_due_total: string | null;
     stripe_customer_id: string | null;
   }>(
     `SELECT sd.id, sd.lease_id, l.landlord_id, sd.unit_id,
-            sd.balance_due_total::text AS balance_due_total,
             t.stripe_customer_id
        FROM security_deposits sd
        JOIN leases   l ON l.id = sd.lease_id
        JOIN tenants  t ON t.id = sd.tenant_id
       WHERE sd.tenant_id = $1
-        AND sd.flex_deposit_plan_status = 'in_default'
+        AND sd.flex_deposit_enabled = TRUE
+        AND sd.flex_deposit_plan_status = 'active'
+      ORDER BY sd.created_at DESC
       LIMIT 1`,
     [args.tenantId],
   )
-  if (!dep) return { ok: false, reason: 'No in_default FlexDeposit plan found for tenant' }
+  if (!dep) return { ok: false, reason: 'No active FlexDeposit plan found for tenant' }
 
-  const remaining = Number(dep.balance_due_total ?? 0)
-  if (remaining <= 0) return { ok: false, reason: 'No outstanding balance on this plan' }
+  // Sum unfunded (pending + missed) installments. This is the amount the
+  // tenant has yet to fund into their own custody balance — not a debt to GAM.
+  const balanceRow = await queryOne<{ remaining: string }>(
+    `SELECT COALESCE(SUM(amount), 0)::text AS remaining
+       FROM flex_deposit_installments
+      WHERE security_deposit_id = $1
+        AND status IN ('pending', 'missed')`,
+    [dep.id],
+  )
+  const remaining = Number(balanceRow?.remaining ?? 0)
+  if (remaining <= 0) return { ok: false, reason: 'Deposit is already fully funded' }
   if (!dep.stripe_customer_id) return { ok: false, reason: 'No Stripe customer on tenant' }
 
   const stripe = getStripe()
@@ -1335,38 +1134,18 @@ export async function retryFlexDepositAcceleration(args: {
   } catch {}
   if (!paymentMethodId) return { ok: false, reason: 'No default payment method on tenant' }
 
-  // Flip plan back to 'accelerated' and re-stamp the deadline.
-  await query(
-    `UPDATE security_deposits
-        SET flex_deposit_plan_status = 'accelerated',
-            balance_due_full_at      = NOW(),
-            updated_at               = NOW()
-      WHERE id = $1
-        AND flex_deposit_plan_status = 'in_default'`,
-    [dep.id],
-  )
-
-  // Supersedence boost — same self-subtract pattern as
-  // accelerateFlexDepositPlan. With plan_status now 'accelerated',
-  // the FIFO query would include this deposit's balance_due_total;
-  // subtract it to avoid double-counting.
-  const rawBoost = await computeTenantGamOutstandingTotal(args.tenantId)
-  const boost = Math.max(0, Math.round((rawBoost - remaining) * 100) / 100)
-  const pullAmount = Math.round((remaining + boost) * 100) / 100
-
   let paymentId: string | null = null
   try {
     const intent = await createRentPlatformCharge({
-      amount:              pullAmount,
+      amount:              remaining,
       stripeCustomerId:    dep.stripe_customer_id,
       paymentMethodId,
       paymentMethodTypes:  ['us_bank_account'],
       entryDescription:    'DEPOSIT',
       metadata: {
-        gam_purpose:    'flexdeposit_acceleration',
+        gam_purpose:    'flexdeposit_payahead',
         gam_deposit_id: dep.id,
         gam_tenant_id:  args.tenantId,
-        gam_retry:      'true',
       },
     })
 
@@ -1375,34 +1154,32 @@ export async function retryFlexDepositAcceleration(args: {
       `INSERT INTO payments (
          landlord_id, tenant_id, lease_id, unit_id,
          type, amount, status, entry_description,
-         due_date, stripe_payment_intent_id, notes,
-         gam_supersedence_amount
-       ) VALUES ($1, $2, $3, $4, 'deposit', $5, 'pending', 'DEPOSIT', $6, $7, $8, $9)
+         due_date, stripe_payment_intent_id, notes
+       ) VALUES ($1, $2, $3, $4, 'deposit', $5, 'pending', 'DEPOSIT', $6, $7, $8)
        RETURNING id`,
       [
         dep.landlord_id, args.tenantId, dep.lease_id, dep.unit_id,
-        pullAmount.toFixed(2), today, intent.id,
-        `FlexDeposit acceleration manual retry (deposit ${dep.id})`,
-        boost.toFixed(2),
+        remaining.toFixed(2), today, intent.id,
+        `FlexDeposit voluntary pay-ahead (deposit ${dep.id})`,
       ],
     )
     paymentId = pay?.id ?? null
   } catch (e) {
-    logger.error({ err: e, ctx: dep.id }, '[flexdeposit][retry-acceleration]')
-    await markPlanInDefault(dep.id, args.tenantId, 'retry_acceleration_pull_create_failed')
-    return { ok: false, reason: 'Pull creation failed; plan returned to in_default' }
+    logger.error({ err: e, ctx: dep.id }, '[flexdeposit][pay-ahead]')
+    // Benign failure: no terminal state, plan stays active, crons continue.
+    return { ok: false, reason: 'Pull creation failed; no change to plan' }
   }
 
-  return { ok: true, balance_due: remaining, payment_id: paymentId }
+  return { ok: true, balance_remaining: remaining, payment_id: paymentId }
 }
 
 /**
- * S260: acceleration-pull success handler. Called when the
- * accelerated full-balance ACH pull settles. Flips plan to 'completed'
- * and mass-settles all remaining unpaid (pending + defaulted)
- * installments — they're considered paid by the acceleration charge.
+ * S514: pay-ahead settlement handler. Called when the voluntary pay-ahead
+ * ACH pull settles. Flips the plan to 'completed' and marks all remaining
+ * unfunded (pending + missed) installments 'settled' — they are funded by
+ * the pay-ahead charge. Sets collected_amount = total_amount.
  */
-async function settleFlexDepositAcceleration(depositId: string): Promise<void> {
+async function settleFlexDepositPayAhead(depositId: string): Promise<void> {
   const client = await getClient()
   try {
     await client.query('BEGIN')
@@ -1410,9 +1187,11 @@ async function settleFlexDepositAcceleration(depositId: string): Promise<void> {
       `UPDATE flex_deposit_installments
           SET status = 'settled', settled_at = NOW(), updated_at = NOW()
         WHERE security_deposit_id = $1
-          AND status IN ('pending', 'defaulted')`,
+          AND status IN ('pending', 'missed')`,
       [depositId],
     )
+    // Paying the deposit off in full via pay-ahead also stops the custody
+    // fee (ToS § 9.1.6 "option 2" rule: lump-fund → fee dissolves).
     await client.query(
       `UPDATE security_deposits
           SET flex_deposit_plan_status = 'completed',
@@ -1421,6 +1200,7 @@ async function settleFlexDepositAcceleration(depositId: string): Promise<void> {
               collected_amount         = total_amount,
               status                   = 'funded',
               next_installment_date    = NULL,
+              custody_fee_active       = FALSE,
               updated_at               = NOW()
         WHERE id = $1`,
       [depositId],
@@ -1434,67 +1214,86 @@ async function settleFlexDepositAcceleration(depositId: string): Promise<void> {
   }
 }
 
-/**
- * S260: acceleration-pull failure handler. Called by the webhook
- * when the acceleration full-balance ACH pull fails. Terminal state:
- * plan flips to 'in_default'; tenant disqualified for the NSF
- * cooldown. GAM eats the unpaid portion at lease-end settlement.
- */
-export async function failFlexDepositAcceleration(
-  depositId: string,
-  tenantId: string | null,
-  reason: string,
-): Promise<void> {
-  let resolvedTenantId = tenantId
-  if (!resolvedTenantId) {
-    const row = await queryOne<{ tenant_id: string }>(
-      'SELECT tenant_id FROM security_deposits WHERE id = $1',
-      [depositId],
-    )
-    if (!row) return
-    resolvedTenantId = row.tenant_id
-  }
-  await markPlanInDefault(depositId, resolvedTenantId, `acceleration_pull_failed:${reason.slice(0, 80)}`)
-  try {
-    const { createAdminNotification } = await import('./adminNotifications')
-    await createAdminNotification({
-      severity: 'warn',
-      category: 'flexdeposit_acceleration_failed',
-      title:    `FlexDeposit acceleration pull failed (terminal) — tenant ${resolvedTenantId}`,
-      body:     `Acceleration ACH pull for deposit ${depositId} failed. Plan in_default; tenant cooldown engaged. GAM eats the unpaid portion at lease-end settlement. Reason: ${reason}.`,
-      context:  { deposit_id: depositId, tenant_id: resolvedTenantId, reason },
-    })
-  } catch (e) { logger.error({ err: e }, '[flexdeposit][accelerate-fail-alert]') }
-}
+// ── Cross-property top-up (S516) ─────────────────────────────────
 
-async function markPlanInDefault(
-  depositId: string,
-  tenantId: string,
-  reason: string,
-): Promise<void> {
-  const client = await getClient()
-  try {
-    await client.query('BEGIN')
+/**
+ * S516: generate top-up installments for a carried-forward FlexDeposit whose
+ * new property requires a LARGER deposit. The difference is spread into
+ * monthly installments (tiered on the top-up amount) that the existing
+ * installment cron collects — "option 1": the custody fee keeps running. The
+ * tenant may instead fund the whole remainder at once via payAheadFlexDeposit
+ * — "option 2": the custody fee stops. The option is expressed by tenant
+ * behavior; no upfront choice is required.
+ *
+ * Must run inside the caller's transaction (the forward execute). New rows are
+ * numbered AFTER the deposit's existing (now-settled) installments so the
+ * unique (deposit, number) constraint holds; each carries installment_count =
+ * the new grand total.
+ */
+export async function scheduleFlexDepositTopUp(
+  client: PoolClient,
+  args: { depositId: string; topUpAmount: number },
+): Promise<{ count: number }> {
+  if (args.topUpAmount <= 0) return { count: 0 }
+
+  const info = await client.query<{
+    tenant_id: string; rent_due_day: number;
+    risk_level: FlexDepositRiskLevel | null; max_num: number;
+  }>(
+    `SELECT sd.tenant_id, l.rent_due_day, bc.risk_level,
+            COALESCE((SELECT MAX(installment_number)
+                        FROM flex_deposit_installments
+                       WHERE security_deposit_id = sd.id), 0) AS max_num
+       FROM security_deposits sd
+       JOIN leases l ON l.id = sd.lease_id
+       LEFT JOIN tenants t ON t.id = sd.tenant_id
+       LEFT JOIN background_checks bc ON bc.id = t.background_check_id
+      WHERE sd.id = $1`,
+    [args.depositId],
+  ).then(r => r.rows[0])
+  if (!info) return { count: 0 }
+
+  const count = getFlexDepositMaxInstallments(args.topUpAmount, info.risk_level) ?? 2
+  // Anchor to next month so the first top-up pull is upcoming, not overdue.
+  const startDate = addMonths(firstOfMonth(new Date()), 1)
+  const schedule = computeFlexDepositSchedule({
+    depositTotal:     args.topUpAmount,
+    installmentCount: count,
+    startDate,
+    rentDueDay:       info.rent_due_day,
+  })
+  const maxNum = Number(info.max_num)
+  const grandTotal = maxNum + count
+
+  for (let i = 1; i <= count; i++) {
+    const inst = schedule.installments[i - 1]
+    const pulls = computeInstallmentPullDates(startDate, i, info.rent_due_day)
     await client.query(
-      `UPDATE security_deposits
-          SET flex_deposit_plan_status = 'in_default', updated_at = NOW()
-        WHERE id = $1`,
-      [depositId],
+      `INSERT INTO flex_deposit_installments
+         (security_deposit_id, tenant_id, installment_number, installment_count,
+          amount, due_date, primary_pull_date, retry_pull_date, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')`,
+      [
+        args.depositId, info.tenant_id, maxNum + i, grandTotal,
+        inst.amount.toFixed(2), inst.dueDate, pulls.primary, pulls.retry,
+      ],
     )
-    await client.query(
-      `UPDATE tenants
-          SET flex_deposit_disqualified_until  = NOW() + INTERVAL '${FLEX_DEPOSIT_NSF_COOLDOWN_DAYS} days',
-              flex_deposit_disqualified_reason = $2
-        WHERE id = $1`,
-      [tenantId, reason],
-    )
-    await client.query('COMMIT')
-  } catch (e) {
-    await client.query('ROLLBACK').catch(() => {})
-    throw e
-  } finally {
-    client.release()
   }
+
+  await client.query(
+    `UPDATE security_deposits
+        SET installment_count      = $2,
+            installment_amount     = $3,
+            installments_remaining = $4,
+            next_installment_date  = $5,
+            updated_at             = NOW()
+      WHERE id = $1`,
+    [
+      args.depositId, grandTotal, schedule.installmentAmount.toFixed(2),
+      count, schedule.installments[0].dueDate,
+    ],
+  )
+  return { count }
 }
 
 // ── helpers ─────────────────────────────────────────────────────

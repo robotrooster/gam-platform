@@ -79,10 +79,13 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
         placementFeeValue: z.number().nullable().optional(),
         maintenanceMarkupPercent: z.number().nullable().optional(),
         ownerBankAccountId: z.string().uuid().nullable().optional(),
-      }).refine(
-        ar => (ar.achFeePayer && ar.cardFeePayer) || ar.bankingFeePayer,
-        { message: 'Provide achFeePayer + cardFeePayer (or legacy bankingFeePayer)' }
-      ),
+      // S513 (#2): fee payers are no longer required on create. card_fee_payer
+      // is hard-locked to 'tenant' and ach_fee_payer inherits the landlord's
+      // onboarding election (landlords.default_ach_fee_payer) when omitted, so
+      // a caller need not supply either. allocationRule itself is optional —
+      // this also fixes onboarding step-1, which posts a property with no
+      // allocationRule and previously 400'd on the old required-payer refine.
+      }).default({}),
     }).parse(req.body)
     // Quiet formatter — clean up capitalization, state, zip before storage
     const body = {
@@ -137,10 +140,18 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
     }
 
     // Allocation rule INSERT — 1:1 with property.
-    // S116: three independent fee toggles. Legacy bankingFeePayer (if
-    // sent) mirrors into ach + card when those aren't supplied.
-    const achFeePayer       = ar.achFeePayer ?? ar.bankingFeePayer ?? 'landlord'
-    const cardFeePayer      = ar.cardFeePayer ?? ar.bankingFeePayer ?? 'landlord'
+    // S116: three independent fee toggles. S513 (walkthrough #2): card_fee_payer
+    // is hard-locked to 'tenant' — the landlord NEVER covers card (S512). ACH
+    // defaults to the landlord's onboarding election
+    // (landlords.default_ach_fee_payer), overridable per-property by an explicit
+    // achFeePayer in the request. Legacy bankingFeePayer still mirrors into ACH.
+    const dfltRes = await client.query<{ default_ach_fee_payer: string }>(
+      `SELECT default_ach_fee_payer FROM landlords WHERE id=$1`,
+      [req.user!.profileId]
+    )
+    const landlordAchDefault = dfltRes.rows[0]?.default_ach_fee_payer ?? 'tenant'
+    const achFeePayer       = ar.achFeePayer ?? ar.bankingFeePayer ?? landlordAchDefault
+    const cardFeePayer      = 'tenant'
     const platformFeePayer  = ar.platformFeePayer ?? 'landlord'
     await client.query(`
       INSERT INTO property_allocation_rules
@@ -620,7 +631,9 @@ propertiesRouter.patch('/:id/allocation-rule', requireLandlord, async (req, res,
       sets.push(`ach_fee_payer = $${params.length}`)
     }
     if (body.cardFeePayer !== undefined) {
-      params.push(body.cardFeePayer)
+      // S513 lock: card is always the tenant's — the landlord can never elect to
+      // cover card. Accept the field for backward compat but force 'tenant'.
+      params.push('tenant')
       sets.push(`card_fee_payer = $${params.length}`)
     }
     if (body.platformFeePayer !== undefined) {

@@ -2,8 +2,6 @@ import { useState, useEffect } from 'react'
 import { apiGet, apiPost } from '../lib/api'
 import { Clock, Check, X } from 'lucide-react'
 
-const fmt = (n: number) => n.toLocaleString('en-US', { style: 'currency', currency: 'USD' })
-
 export function WorkTradePage() {
   const [data, setData] = useState<any>(null)
   const [loading, setLoading] = useState(true)
@@ -72,12 +70,11 @@ export function WorkTradePage() {
   const logs = data.logs || []
   const stats = data.stats || {}
   const pending = logs.filter((l: any) => l.status === 'pending')
-  const monthlyCommit = parseFloat(agreement.weeklyHours) * (52 / 12)
-  const hoursLeft = Math.max(0, monthlyCommit - stats.hoursThisPeriod)
-  const progress = Math.min(100, (stats.hoursThisPeriod / monthlyCommit) * 100)
-
-  const typeColors: Record<string, string> = { full: '#1edb7a', partial: '#c9a227', credit: '#4a9eff' }
-  const typeColor = typeColors[agreement.tradeType] || '#c9a227'
+  const target = Number(stats.target || 0)
+  const hours = Number(stats.hoursApprovedThisMonth || 0)
+  const creditPct = Number(stats.creditPct || 0)
+  const progress = target > 0 ? Math.min(100, (hours / target) * 100) : 0
+  const hoursLeft = Math.max(0, target - hours)
 
   return (
     <div style={style.page}>
@@ -96,26 +93,21 @@ export function WorkTradePage() {
             <div style={{ fontSize: '1rem', fontWeight: 800, color: '#eef1f8' }}>Work Trade Agreement</div>
             <div style={{ fontSize: '.72rem', color: '#7a8aaa', marginTop: 2 }}>Unit {agreement.unitNumber} · {agreement.propertyName}</div>
           </div>
-          <span style={{ fontSize: '.65rem', padding: '3px 10px', borderRadius: 10, background: `${typeColor}18`, border: `1px solid ${typeColor}40`, color: typeColor, fontWeight: 700, textTransform: 'uppercase' as const }}>
-            {agreement.tradeType} trade
+          <span style={{ fontSize: '.65rem', padding: '3px 10px', borderRadius: 10, background: '#c9a22718', border: '1px solid #c9a22740', color: '#c9a227', fontWeight: 700, textTransform: 'uppercase' as const }}>
+            {agreement.status}
           </span>
         </div>
 
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 10, marginBottom: 14 }}>
-          {[
-            { label: 'Your Rate', val: `${fmt(agreement.hourlyRate)}/hr` },
-            { label: 'Weekly Hours', val: `${agreement.weeklyHours} hrs` },
-            { label: 'Cash Due', val: fmt(agreement.cashRent) },
-          ].map(s => (
-            <div key={s.label} style={{ background: '#0f1318', border: '1px solid #1e2530', borderRadius: 8, padding: '10px 12px' }}>
-              <div style={style.label}>{s.label}</div>
-              <div style={style.val}>{s.val}</div>
-            </div>
-          ))}
+        <div style={{ background: '#0f1318', border: '1px solid #1e2530', borderRadius: 8, padding: '10px 12px' }}>
+          <div style={style.label}>How it works</div>
+          <div style={{ fontSize: '.78rem', color: '#b8c4d8', lineHeight: 1.6 }}>
+            Each approved hour covers <b>1/{target}</b> of your monthly bill (rent + utilities + fees).
+            Work the full <b>{target} hours</b> in a month and next month is fully covered.
+          </div>
         </div>
 
         {agreement.duties && (
-          <div style={{ background: '#0f1318', border: '1px solid #1e2530', borderRadius: 8, padding: '10px 12px' }}>
+          <div style={{ background: '#0f1318', border: '1px solid #1e2530', borderRadius: 8, padding: '10px 12px', marginTop: 10 }}>
             <div style={style.label}>Your Duties</div>
             <div style={{ fontSize: '.78rem', color: '#b8c4d8', lineHeight: 1.6 }}>{agreement.duties}</div>
           </div>
@@ -126,15 +118,15 @@ export function WorkTradePage() {
       <div style={style.card}>
         <div style={{ fontSize: '.8rem', fontWeight: 700, color: '#eef1f8', marginBottom: 12 }}>This Month's Progress</div>
         <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '.78rem', marginBottom: 6 }}>
-          <span style={{ color: '#7a8aaa' }}>Hours worked</span>
-          <span style={{ fontFamily: 'monospace', color: '#eef1f8', fontWeight: 600 }}>{stats.hoursThisPeriod?.toFixed(1) || '0.0'} / {monthlyCommit.toFixed(1)} hrs</span>
+          <span style={{ color: '#7a8aaa' }}>Approved hours</span>
+          <span style={{ fontFamily: 'monospace', color: '#eef1f8', fontWeight: 600 }}>{hours.toFixed(1)} / {target} hrs</span>
         </div>
         <div style={{ height: 8, background: '#141920', borderRadius: 4, overflow: 'hidden', marginBottom: 8 }}>
           <div style={{ height: '100%', width: `${progress}%`, background: progress >= 100 ? '#1edb7a' : '#c9a227', borderRadius: 4, transition: 'width .3s' }} />
         </div>
         <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '.72rem', color: '#7a8aaa' }}>
-          <span>{hoursLeft > 0 ? `${hoursLeft.toFixed(1)} hrs remaining` : '✓ Commitment met!'}</span>
-          <span>{pending.length > 0 ? `${pending.length} pending approval` : ''}</span>
+          <span>≈ {creditPct}% of next month's bill covered</span>
+          <span>{pending.length > 0 ? `${pending.length} pending approval` : (hoursLeft > 0 ? `${hoursLeft.toFixed(1)} hrs to full` : '✓ Fully covered')}</span>
         </div>
       </div>
 
@@ -185,7 +177,6 @@ export function WorkTradePage() {
                   <div style={{ fontSize: '.78rem', color: '#eef1f8', fontWeight: 500 }}>{log.description}</div>
                   <div style={{ fontSize: '.68rem', color: '#7a8aaa', marginTop: 2 }}>
                     {new Date(log.workDate).toLocaleDateString()} · {log.hours}h
-                    {log.creditValue ? ` · ${fmt(log.creditValue)} credit` : ''}
                   </div>
                 </div>
                 <span style={{

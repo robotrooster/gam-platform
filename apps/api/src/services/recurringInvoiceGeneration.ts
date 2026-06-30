@@ -18,6 +18,11 @@
 import { db } from '../db'
 import { AppError } from '../middleware/errorHandler'
 import { logger } from '../lib/logger'
+import {
+  type RecurringInvoiceFrequency,
+  RECURRING_INVOICE_MONTH_STEP,
+  isMonthlyRecurrence,
+} from '@gam/shared'
 
 export interface GeneratedInvoice {
   id: string
@@ -31,7 +36,7 @@ interface ScheduleRow {
   business_id: string
   customer_id: string
   name: string
-  frequency: 'weekly' | 'monthly'
+  frequency: RecurringInvoiceFrequency
   day_of_month: number | null
   day_of_week: number | null
   start_date: string
@@ -43,16 +48,18 @@ interface ScheduleRow {
   notes: string | null
 }
 
-function advanceDueDate(current: Date, freq: 'weekly' | 'monthly',
+function advanceDueDate(current: Date, freq: RecurringInvoiceFrequency,
                        dayOfMonth: number | null, dayOfWeek: number | null): Date {
   const next = new Date(current.getTime())
-  if (freq === 'weekly') {
+  if (!isMonthlyRecurrence(freq)) {
+    // weekly — advance 7 days.
     next.setUTCDate(next.getUTCDate() + 7)
     return next
   }
-  // monthly — advance by 1 month, then snap to dayOfMonth (clamped to 28
-  // so Feb is always fine; the CHECK constraint also enforces 1..28).
-  next.setUTCMonth(next.getUTCMonth() + 1)
+  // Month-based — advance by the cadence's month step (monthly 1, quarterly 3,
+  // semiannual 6, annual 12), then snap to dayOfMonth (clamped to 28 so Feb is
+  // always fine; the CHECK constraint also enforces 1..28).
+  next.setUTCMonth(next.getUTCMonth() + RECURRING_INVOICE_MONTH_STEP[freq])
   if (dayOfMonth !== null) {
     next.setUTCDate(Math.min(dayOfMonth, 28))
   }

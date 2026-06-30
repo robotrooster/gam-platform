@@ -137,8 +137,8 @@ export async function generateMoveInInvoice(
     let flexDepositActive = false
     let flexDepositSecurityDepositId: string | null = null
     if (depositFee && inputs.tenant_id) {
-      const fdRow = await client.query<{ id: string; flex_deposit_enabled: boolean; first_amount: string | null }>(
-        `SELECT sd.id, sd.flex_deposit_enabled,
+      const fdRow = await client.query<{ id: string; flex_deposit_enabled: boolean; first_amount: string | null; portability_status: string }>(
+        `SELECT sd.id, sd.flex_deposit_enabled, sd.portability_status,
                 (SELECT amount::text FROM flex_deposit_installments
                   WHERE security_deposit_id = sd.id AND installment_number = 1) AS first_amount
            FROM security_deposits sd
@@ -146,7 +146,12 @@ export async function generateMoveInInvoice(
           LIMIT 1`,
         [inputs.tenant_id, inputs.lease_id],
       )
-      if (fdRow.rows[0]?.flex_deposit_enabled && fdRow.rows[0]?.first_amount) {
+      // S516: double-charge guard. A deposit carried forward from a prior
+      // GAM lease is already held in custody for this lease — never bill a
+      // fresh deposit at move-in.
+      if (fdRow.rows[0]?.portability_status === 'carried_forward') {
+        depositAmountForInvoice = 0
+      } else if (fdRow.rows[0]?.flex_deposit_enabled && fdRow.rows[0]?.first_amount) {
         flexDepositActive = true
         flexDepositSecurityDepositId = fdRow.rows[0].id
         firstInstallmentAmount = Number(fdRow.rows[0].first_amount)

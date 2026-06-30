@@ -1,7 +1,10 @@
 import { useState, useEffect } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
-import { apiGet, apiPatch, apiPut, apiDelete } from '../lib/api'
-import { Check, DollarSign, Trash2, X } from 'lucide-react'
+import { api, apiGet, apiPatch } from '../lib/api'
+import { Check, DollarSign, X, ShieldCheck } from 'lucide-react'
+import { LAUNCH_HIDDEN } from '../components/layout/Layout'
+import { useAuth } from '../context/AuthContext'
 
 interface LinkedPmCompany {
   id: string
@@ -20,24 +23,17 @@ export function SettingsPage() {
   const { data: me, isLoading } = useQuery<any>('landlord-me', () => apiGet('/landlords/me'))
 
   const [threshold, setThreshold] = useState<string>('')
-  const [earlyTermMonths, setEarlyTermMonths] = useState<string>('')
   const [saved, setSaved] = useState(false)
 
   useEffect(() => {
     if (me) {
       setThreshold(me.maintApprovalThreshold != null ? String(me.maintApprovalThreshold) : '500')
-      setEarlyTermMonths(
-        me.defaultEarlyTerminationMonthsRent != null
-          ? String(me.defaultEarlyTerminationMonthsRent)
-          : '',
-      )
     }
   }, [me])
 
   const saveMut = useMutation(
     () => apiPatch('/landlords/me', {
       maintApprovalThreshold: Number(threshold),
-      defaultEarlyTerminationMonthsRent: earlyTermMonths === '' ? null : Number(earlyTermMonths),
     }),
     {
       onSuccess: () => {
@@ -50,11 +46,8 @@ export function SettingsPage() {
 
   const thresholdNum = Number(threshold)
   const thresholdValid = !isNaN(thresholdNum) && thresholdNum >= 0
-  const earlyTermNum = earlyTermMonths === '' ? null : Number(earlyTermMonths)
-  const earlyTermValid = earlyTermMonths === '' || (!isNaN(Number(earlyTermMonths)) && Number(earlyTermMonths) >= 0)
   const thresholdChanged = me && (
-    Number(me.maintApprovalThreshold || 500) !== thresholdNum ||
-    (me.defaultEarlyTerminationMonthsRent ?? null) !== earlyTermNum
+    Number(me.maintApprovalThreshold || 500) !== thresholdNum
   )
 
   return (
@@ -94,13 +87,17 @@ export function SettingsPage() {
             </div>
           </div>
 
+          {/* Security / 2FA */}
+          <SecurityCard />
+
           {/* Billing */}
           <div className="card">
             <div className="card-header"><span className="card-title">Billing</span></div>
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginTop: 12 }}>
               <div>
-                <div style={{ fontSize: '.78rem', color: 'var(--text-3)', marginBottom: 4 }}>Volume Tier</div>
-                <div><span className="badge badge-green">{me?.volumeTier || 'standard'}</span></div>
+                <div style={{ fontSize: '.78rem', color: 'var(--text-3)', marginBottom: 4 }}>Platform Fee</div>
+                <div style={{ fontSize: '.88rem', color: 'var(--text-0)', fontWeight: 600 }}>$2 / occupied unit / mo</div>
+                <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 2 }}>Billed monthly · deducted from your payouts</div>
               </div>
               <div>
                 <div style={{ fontSize: '.78rem', color: 'var(--text-3)', marginBottom: 4 }}>Bank Account</div>
@@ -160,7 +157,7 @@ export function SettingsPage() {
                 <button
                   className="btn btn-primary"
                   onClick={() => saveMut.mutate()}
-                  disabled={!thresholdValid || !earlyTermValid || !thresholdChanged || saveMut.isLoading}
+                  disabled={!thresholdValid || !thresholdChanged || saveMut.isLoading}
                 >
                   {saveMut.isLoading ? <span className="spinner" /> : 'Save'}
                 </button>
@@ -178,55 +175,14 @@ export function SettingsPage() {
             </div>
           </div>
 
-          {/* Default Early-Termination Policy */}
-          <div className="card">
-            <div className="card-header"><span className="card-title">Default Early-Termination Policy</span></div>
-            <div style={{ marginTop: 12 }}>
-              <div style={{ fontSize: '.82rem', color: 'var(--text-2)', marginBottom: 12, lineHeight: 1.5 }}>
-                Default early-termination fee for leases that don't specify one in writing.
-                Expressed as a multiplier of monthly rent (e.g. 1.0 = one month's rent, 1.5 = one and a half months).
-                Lease-specific clauses always override this default. Leave blank for no default policy
-                (tenants will see "contact your landlord" if their lease has no clause).
-              </div>
-              <div style={{ maxWidth: 280 }}>
-                <label style={{
-                  fontSize: '.72rem',
-                  fontWeight: 600,
-                  color: 'var(--text-3)',
-                  textTransform: 'uppercase',
-                  letterSpacing: '.06em',
-                  display: 'block',
-                  marginBottom: 5
-                }}>
-                  Months of Rent
-                </label>
-                <input
-                  className="input"
-                  type="number"
-                  min="0"
-                  step="0.25"
-                  value={earlyTermMonths}
-                  onChange={e => setEarlyTermMonths(e.target.value)}
-                  placeholder="e.g. 1.0"
-                  style={{ width: '100%' }}
-                />
-                <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginTop: 6 }}>
-                  {earlyTermMonths
-                    ? `On a $1,500 rent: ${(Number(earlyTermMonths) * 1500).toFixed(2)} fee`
-                    : 'No default — tenants see "contact landlord" when no lease clause'}
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* Default PM Company (S157) */}
-          <DefaultPmCompanyCard
-            currentDefaultId={me?.defaultPmCompanyId ?? null}
-            onChange={() => qc.invalidateQueries('landlord-me')}
-          />
-
-          {/* Deposit Interest Overrides (S190) */}
-          <DepositInterestOverridesCard />
+          {/* Default PM Company (S157) — S512: hidden at launch with the
+              PM-company surface (PM Invitations not in the launch trio). */}
+          {!LAUNCH_HIDDEN.has('/pm-invitations') && (
+            <DefaultPmCompanyCard
+              currentDefaultId={me?.defaultPmCompanyId ?? null}
+              onChange={() => qc.invalidateQueries('landlord-me')}
+            />
+          )}
 
           {/* Notifications placeholder */}
           <div className="card">
@@ -237,6 +193,106 @@ export function SettingsPage() {
           </div>
         </div>
       )}
+    </div>
+  )
+}
+
+// Two-factor authentication surface. Optional-with-prompts for the
+// landlord role: enable routes to the full enrollment page; disable
+// posts the password to /auth/totp/disable.
+function SecurityCard() {
+  const { user, refresh } = useAuth()
+  const navigate = useNavigate()
+  const [showConfirm, setShowConfirm] = useState(false)
+  const [password, setPassword] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+  const [err, setErr] = useState('')
+  const [success, setSuccess] = useState('')
+
+  const enabled = !!user?.totpEnabled
+
+  const onDisable = async (e: React.FormEvent) => {
+    e.preventDefault(); setSubmitting(true); setErr('')
+    try {
+      await api.post('/auth/totp/disable', { password })
+      await refresh()
+      setShowConfirm(false); setPassword('')
+      setSuccess('Two-factor disabled.')
+    } catch (ex: any) {
+      setErr(ex.response?.data?.error || 'Could not disable 2FA. Check your password.')
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <div className="card">
+      <div className="card-header"><span className="card-title">Two-Factor Authentication</span></div>
+      <div style={{ marginTop: 12 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 14 }}>
+          <div style={{
+            width: 38, height: 38, borderRadius: 9,
+            background: enabled ? 'var(--green-bg)' : 'var(--amber-bg)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '1.2rem'
+          }}>
+            {enabled ? '✅' : '⚠️'}
+          </div>
+          <div>
+            <div style={{ fontWeight: 700, color: 'var(--text-0)', fontSize: '.95rem' }}>
+              {enabled ? 'Enabled' : 'Not enabled'}
+            </div>
+            <div style={{ fontSize: '.78rem', color: 'var(--text-2)' }}>
+              {enabled
+                ? 'You are prompted for a 6-digit code on every sign-in.'
+                : 'Protect your account with an authenticator-app code at sign-in.'}
+            </div>
+          </div>
+        </div>
+
+        {success && (
+          <div className="alert alert-success" style={{ marginBottom: 12 }}>{success}</div>
+        )}
+
+        {!enabled && (
+          <button className="btn btn-primary" onClick={() => navigate('/totp/enroll')}>
+            <ShieldCheck size={15} /> Enable two-factor
+          </button>
+        )}
+
+        {enabled && !showConfirm && (
+          <button className="btn btn-danger" onClick={() => { setShowConfirm(true); setSuccess('') }}>
+            Disable two-factor
+          </button>
+        )}
+
+        {enabled && showConfirm && (
+          <form onSubmit={onDisable} style={{ marginTop: 8, padding: 14, background: 'var(--bg-1)', border: '1px solid var(--border-1)', borderRadius: 8 }}>
+            <div style={{ fontSize: '.82rem', color: 'var(--text-1)', marginBottom: 10, lineHeight: 1.5 }}>
+              Confirm your password to disable 2FA. After disable, any saved recovery codes are invalidated.
+            </div>
+            <div className="form-group" style={{ maxWidth: 320 }}>
+              <label className="form-label">Password</label>
+              <input
+                className="form-input"
+                type="password"
+                value={password}
+                onChange={e => setPassword(e.target.value)}
+                autoFocus
+                required
+              />
+            </div>
+            {err && <div className="alert alert-danger" style={{ marginBottom: 10 }}>{err}</div>}
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button className="btn btn-danger" type="submit" disabled={submitting || !password}>
+                {submitting ? <span className="spinner" /> : 'Disable two-factor'}
+              </button>
+              <button className="btn btn-secondary" type="button" onClick={() => { setShowConfirm(false); setPassword(''); setErr('') }} disabled={submitting}>
+                Cancel
+              </button>
+            </div>
+          </form>
+        )}
+      </div>
     </div>
   )
 }
@@ -320,222 +376,3 @@ function DefaultPmCompanyCard({
   )
 }
 
-// S190: Deposit interest rate overrides for variable-rate states
-// (NY/NJ/CT/IL/PA/NH and others). Statutory hardcoded states (MA, MD,
-// MN as of S188) take precedence; this UI is for entering rates the
-// platform can't hardcode because they depend on the landlord's bank.
-type Override = {
-  stateCode:      string
-  effectiveYear:  number
-  annualRatePct: string
-  sourceNotes:    string | null
-  updatedAt:      string
-}
-
-const VARIABLE_STATE_HINTS: Record<string, string> = {
-  NY: 'NY: bank passbook rate (RPL § 7-103). Look up your escrow account’s current rate.',
-  NJ: 'NJ: bank rate minus 1% admin fee (NJSA § 46:8-19).',
-  CT: 'CT: state-published rate, updated annually by the Banking Commissioner.',
-  IL: 'IL: actual interest earned (or higher of statutory minimum if applicable).',
-  PA: 'PA: bank passbook rate, escrow account required for deposits ≥ $100.',
-  NH: 'NH: rate held in escrow (must equal at least bank-paid rate).',
-}
-
-function DepositInterestOverridesCard() {
-  const qc = useQueryClient()
-  const { data: rows = [], isLoading } = useQuery<Override[]>(
-    'deposit-interest-overrides',
-    () => apiGet<Override[]>('/landlords/me/deposit-interest-overrides'),
-  )
-
-  const [showAdd, setShowAdd] = useState(false)
-  const [stateCode, setStateCode] = useState('')
-  const [year, setYear] = useState(String(new Date().getFullYear()))
-  const [rate, setRate] = useState('')
-  const [notes, setNotes] = useState('')
-  const [error, setError] = useState<string | null>(null)
-
-  const upsertMut = useMutation(
-    (body: any) => apiPut('/landlords/me/deposit-interest-overrides', body),
-    {
-      onSuccess: () => {
-        qc.invalidateQueries('deposit-interest-overrides')
-        setShowAdd(false)
-        setStateCode(''); setRate(''); setNotes('')
-        setError(null)
-      },
-      onError: (e: any) => {
-        setError(e?.response?.data?.error?.message || 'Failed to save')
-      },
-    },
-  )
-
-  const deleteMut = useMutation(
-    ({ state, year }: { state: string; year: number }) =>
-      apiDelete(`/landlords/me/deposit-interest-overrides/${state}/${year}`),
-    {
-      onSuccess: () => qc.invalidateQueries('deposit-interest-overrides'),
-    },
-  )
-
-  const handleSubmit = () => {
-    setError(null)
-    const yr = parseInt(year, 10)
-    const rt = parseFloat(rate)
-    if (!stateCode || stateCode.length !== 2) {
-      setError('State code must be 2 letters')
-      return
-    }
-    if (isNaN(yr) || yr < 2020 || yr > 2100) {
-      setError('Year must be between 2020 and 2100')
-      return
-    }
-    if (isNaN(rt) || rt < 0 || rt > 100) {
-      setError('Rate must be between 0 and 100')
-      return
-    }
-    upsertMut.mutate({
-      stateCode: stateCode.toUpperCase(),
-      effectiveYear: yr,
-      annualRatePct: rt,
-      sourceNotes: notes.trim() || null,
-    })
-  }
-
-  return (
-    <div className="card">
-      <div className="card-header">
-        <span className="card-title">Deposit Interest — Bank Rates</span>
-      </div>
-      <div style={{ marginTop: 12 }}>
-        <div style={{ fontSize: '.82rem', color: 'var(--text-2)', marginBottom: 12, lineHeight: 1.5 }}>
-          For states where the deposit interest rate depends on your bank (NY, NJ, CT, IL, PA, NH and others),
-          enter the rate here. The platform applies it to deposits in escrow at properties in those states.
-          Statutory fixed-rate states (currently MA 5%, MD 1.5%, MN 1%) are hardcoded and don't need entry.
-        </div>
-
-        {isLoading ? (
-          <div style={{ color: 'var(--text-3)', fontSize: '.82rem' }}>Loading…</div>
-        ) : rows.length === 0 ? (
-          <div style={{ padding: 12, background: 'var(--bg-2)', borderRadius: 6, color: 'var(--text-3)', fontSize: '.82rem', marginBottom: 12 }}>
-            No overrides set. Add one if you have properties in a variable-rate state.
-          </div>
-        ) : (
-          <table className="data-table" style={{ width: '100%', marginBottom: 12 }}>
-            <thead>
-              <tr>
-                <th>State</th>
-                <th>Year</th>
-                <th>Rate</th>
-                <th>Notes</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((r) => (
-                <tr key={`${r.stateCode}-${r.effectiveYear}`}>
-                  <td className="mono"><strong>{r.stateCode}</strong></td>
-                  <td>{r.effectiveYear}</td>
-                  <td className="mono">{Number(r.annualRatePct).toFixed(4)}%</td>
-                  <td style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>
-                    {r.sourceNotes || '—'}
-                  </td>
-                  <td style={{ textAlign: 'right' }}>
-                    <button
-                      className="btn btn-ghost btn-sm"
-                      style={{ color: 'var(--red)' }}
-                      onClick={() => deleteMut.mutate({ state: r.stateCode, year: r.effectiveYear })}
-                      disabled={deleteMut.isLoading}
-                    >
-                      <Trash2 size={13} />
-                    </button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-
-        {!showAdd ? (
-          <button className="btn btn-ghost btn-sm" onClick={() => setShowAdd(true)}>
-            + Add override
-          </button>
-        ) : (
-          <div style={{ background: 'var(--bg-2)', padding: 14, borderRadius: 8, border: '1px solid var(--border-0)' }}>
-            <div style={{ display: 'grid', gridTemplateColumns: '90px 110px 130px 1fr', gap: 10, marginBottom: 10 }}>
-              <div>
-                <label style={{ fontSize: '.65rem', fontWeight: 700, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.05em', display: 'block', marginBottom: 4 }}>State</label>
-                <input
-                  className="input"
-                  type="text"
-                  maxLength={2}
-                  value={stateCode}
-                  onChange={(e) => setStateCode(e.target.value.toUpperCase())}
-                  placeholder="NY"
-                  style={{ textTransform: 'uppercase' }}
-                />
-              </div>
-              <div>
-                <label style={{ fontSize: '.65rem', fontWeight: 700, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.05em', display: 'block', marginBottom: 4 }}>Year</label>
-                <input
-                  className="input"
-                  type="number"
-                  min="2020"
-                  max="2100"
-                  value={year}
-                  onChange={(e) => setYear(e.target.value)}
-                />
-              </div>
-              <div>
-                <label style={{ fontSize: '.65rem', fontWeight: 700, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.05em', display: 'block', marginBottom: 4 }}>Rate (%)</label>
-                <input
-                  className="input"
-                  type="number"
-                  step="0.0001"
-                  min="0"
-                  max="100"
-                  value={rate}
-                  onChange={(e) => setRate(e.target.value)}
-                  placeholder="1.5"
-                />
-              </div>
-              <div>
-                <label style={{ fontSize: '.65rem', fontWeight: 700, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.05em', display: 'block', marginBottom: 4 }}>Notes (optional)</label>
-                <input
-                  className="input"
-                  type="text"
-                  value={notes}
-                  onChange={(e) => setNotes(e.target.value)}
-                  placeholder="e.g. Chase passbook rate as of Jan 2026"
-                />
-              </div>
-            </div>
-            {stateCode.length === 2 && VARIABLE_STATE_HINTS[stateCode] && (
-              <div style={{ fontSize: '.74rem', color: 'var(--text-3)', marginBottom: 10, padding: 8, background: 'var(--bg-1)', borderRadius: 4 }}>
-                {VARIABLE_STATE_HINTS[stateCode]}
-              </div>
-            )}
-            {error && (
-              <div style={{ color: 'var(--red)', fontSize: '.78rem', marginBottom: 10 }}>{error}</div>
-            )}
-            <div style={{ display: 'flex', gap: 8 }}>
-              <button
-                className="btn btn-primary btn-sm"
-                onClick={handleSubmit}
-                disabled={upsertMut.isLoading}
-              >
-                {upsertMut.isLoading ? '…' : 'Save'}
-              </button>
-              <button
-                className="btn btn-ghost btn-sm"
-                onClick={() => { setShowAdd(false); setError(null) }}
-              >
-                Cancel
-              </button>
-            </div>
-          </div>
-        )}
-      </div>
-    </div>
-  )
-}

@@ -9,7 +9,8 @@ const post = (p: string, b: any) => fetch(API+'/api'+p,{method:'POST',headers:{'
 
 export function TenantNotificationsPage() {
   const qc = useQueryClient()
-  const { data: notifs = [], isLoading } = useQuery('tenant-notifs', () => get('/background/notifications'))
+  const { data: notifs = [], isLoading } = useQuery('tenant-notifs', () =>
+    get('/background/notifications').then((r: any) => Array.isArray(r) ? r : []))
 
   const readMut = useMutation(
     (id: string) => patch('/background/notifications/'+id+'/read'),
@@ -42,7 +43,8 @@ export function TenantNotificationsPage() {
       ) : (
         <div style={{ display:'flex', flexDirection:'column', gap:10 }}>
           {(notifs as any[]).map((n: any) => {
-            const data = typeof n.data === 'string' ? JSON.parse(n.data||'{}') : n.data||{}
+            let data: any = {}
+            try { data = typeof n.data === 'string' ? JSON.parse(n.data||'{}') : n.data||{} } catch { data = {} }
             const isMatch = n.type === 'match_interest'
             return (
               <div key={n.id} onClick={()=>!n.read&&readMut.mutate(n.id)}

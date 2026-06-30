@@ -2,13 +2,25 @@ import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useSearchParams, useNavigate, Link } from 'react-router-dom'
 import { apiGet, apiPost } from '../lib/api'
-import { UserPlus, AlertTriangle, DollarSign, FileText, X } from 'lucide-react'
+import { UserPlus, AlertTriangle, DollarSign, FileText, Eye, X } from 'lucide-react'
 import { LEASE_TYPE_LABEL, LeaseStatus } from '@gam/shared'
 import { LeaseFormModal } from './LeaseFormModal'
 
 const fmt = (n: any) => n != null
   ? '$' + Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
   : '—'
+
+const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:4000'
+
+// Open the lease agreement PDF in a new tab. A plain <a download> can't carry
+// the Bearer token, so fetch with auth and open the blob.
+async function openLeasePdf(leaseId: string) {
+  const res = await fetch(`${API_BASE}/api/leases/${leaseId}/pdf`, {
+    headers: { Authorization: 'Bearer ' + (localStorage.getItem('gam_token') || '') },
+  })
+  if (!res.ok) { alert('Could not load lease PDF (status ' + res.status + ')'); return }
+  window.open(URL.createObjectURL(await res.blob()), '_blank')
+}
 
 const STATUS_MAP: Record<LeaseStatus, string> = {
   pending:    'badge-amber',
@@ -21,6 +33,9 @@ export function LeasesPage() {
   const { data: leases = [], isLoading } = useQuery<any[]>('leases', () => apiGet('/leases'))
   const [modalOpen, setModalOpen] = useState(false)
   const [editingLeaseId, setEditingLeaseId] = useState<string | undefined>(undefined)
+  // S511 #15: confirmed leases open read-only (terms locked once signed); only
+  // needs-review imports open editable so the owner can confirm defaults.
+  const [viewOnly, setViewOnly] = useState(false)
   // S181 / A2: bill-fee modal state. Holds the lease object to bill against,
   // or null when the modal is closed.
   const [billFeeLease, setBillFeeLease] = useState<any | null>(null)
@@ -36,13 +51,16 @@ export function LeasesPage() {
     }
   }, [searchParams])
 
-  const openEdit = (id: string) => {
-    setEditingLeaseId(id)
+  // Row click: needs-review → editable (confirm import); otherwise view-only.
+  const openLease = (l: any) => {
+    setViewOnly(!l.needsReview)
+    setEditingLeaseId(l.id)
     setModalOpen(true)
   }
   const closeModal = () => {
     setModalOpen(false)
     setEditingLeaseId(undefined)
+    setViewOnly(false)
     if (searchParams.get('open')) {
       searchParams.delete('open')
       setSearchParams(searchParams, { replace: true })
@@ -107,7 +125,7 @@ export function LeasesPage() {
                 return (
                   <tr
                     key={l.id}
-                    onClick={() => openEdit(l.id)}
+                    onClick={() => openLease(l)}
                     style={{ cursor: 'pointer' }}
                     className="row-clickable"
                   >
@@ -154,6 +172,14 @@ export function LeasesPage() {
                     </td>
                     <td onClick={e => e.stopPropagation()}>
                       <div style={{ display: 'flex', gap: 6 }}>
+                        <button
+                          className="btn btn-ghost btn-sm"
+                          title="View the lease agreement (PDF)"
+                          onClick={() => openLeasePdf(l.id)}
+                          style={{ padding: '3px 8px' }}
+                        >
+                          <Eye size={12} /> View
+                        </button>
                         {l.status === 'active' && (
                           <button
                             className="btn btn-ghost btn-sm"
@@ -194,6 +220,7 @@ export function LeasesPage() {
         <LeaseFormModal
           onClose={closeModal}
           leaseId={editingLeaseId}
+          readOnly={viewOnly}
         />
       )}
 

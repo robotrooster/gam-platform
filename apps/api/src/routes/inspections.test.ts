@@ -34,6 +34,8 @@ import {
   cleanupAllSchema,
   seedLandlord, seedTenant, seedProperty, seedUnit, seedLease, seedLeaseTenant,
 } from '../test/dbHelpers'
+import { createInspection as createInspectionTool } from '../services/agents/tools/createInspection'
+import { setInspectionItemCondition as setItemConditionTool } from '../services/agents/tools/setInspectionItemCondition'
 
 const {
   emitInspectionFinalizedEventsMock,
@@ -542,6 +544,19 @@ describe('POST /inspections/:id/sign — sign-off state machine', () => {
     expect(res.body.data.status).toBe('draft')
   })
 
+  it('landlord signs a tenant-less periodic (no tenant_id) → flips straight to landlord_signed', async () => {
+    const f = await seedFixture()
+    const id = await createInspection(f, { inspectionType: 'periodic', tenantId: null })
+    const res = await request(buildApp())
+      .post(`/api/inspections/${id}/sign`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.signed).toBe('landlord')
+    // No tenant exists to sign — the landlord's signature alone is sufficient,
+    // otherwise a landlord-initiated periodic could never be finalized.
+    expect(res.body.data.status).toBe('landlord_signed')
+  })
+
   it('cannot sign in finalized status', async () => {
     const f = await seedFixture()
     const id = await createInspection(f, { status: 'finalized' })
@@ -636,6 +651,22 @@ describe('POST /inspections/:id/finalize', () => {
     )
     expect(row.rows[0].status).toBe('finalized')
     expect(row.rows[0].finalized_at).not.toBeNull()
+  })
+
+  it('landlord-initiated periodic with no tenant: sign → finalize works end-to-end', async () => {
+    const f = await seedFixture()
+    const id = await createInspection(f, { inspectionType: 'periodic', tenantId: null })
+    // Landlord signs — tenant-less, so this alone reaches landlord_signed.
+    const signRes = await request(buildApp())
+      .post(`/api/inspections/${id}/sign`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(signRes.body.data.status).toBe('landlord_signed')
+    // …and finalize succeeds from there.
+    const finRes = await request(buildApp())
+      .post(`/api/inspections/${id}/finalize`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(finRes.status).toBe(200)
+    expect(finRes.body.data.status).toBe('finalized')
   })
 
   it('rejects from draft status', async () => {
@@ -910,5 +941,82 @@ describe('video immutability + tenant uploads & visibility', () => {
     const stranger = await seedFixture() // different tenant + landlord
     const asStranger = await request(buildApp()).get(fileUrl).set('Authorization', `Bearer ${stranger.tenantToken}`)
     expect(asStranger.status).toBe(403)
+  })
+})
+
+// ─── Agent inspection tools (create + write conditions) ───────────
+// The landlord agent can start an inspection and record item conditions;
+// signing/finalizing stay with the humans. These exercise the real tools
+// against the real DB via the seeded landlord fixture.
+describe('agent inspection tools', () => {
+  async function unitNumberOf(unitId: string): Promise<string> {
+    const r = await db.query<{ unit_number: string }>('SELECT unit_number FROM units WHERE id=$1', [unitId])
+    return r.rows[0].unit_number
+  }
+  const landlordActor = (f: SeedFixture) => ({ userId: f.landlordUserId, role: 'landlord', profileId: f.landlordId })
+
+  it('create_inspection: creates a draft + seeds the checklist for the landlord’s own unit', async () => {
+    const f = await seedFixture()
+    const unit = await unitNumberOf(f.unitId)
+    const res: any = await createInspectionTool.execute({ unit, inspectionType: 'periodic' }, landlordActor(f))
+    expect(res.ok).toBe(true)
+    expect(res.seededItems).toBeGreaterThan(0)
+    const insp = await db.query('SELECT inspection_type, status, landlord_id FROM unit_inspections WHERE id=$1', [res.inspectionId])
+    expect(insp.rows[0]).toMatchObject({ inspection_type: 'periodic', status: 'draft', landlord_id: f.landlordId })
+    const items = await db.query<{ n: number }>('SELECT COUNT(*)::int AS n FROM unit_inspection_items WHERE inspection_id=$1', [res.inspectionId])
+    expect(items.rows[0].n).toBe(res.seededItems)
+  })
+
+  it('create_inspection: refuses a unit the landlord does not own', async () => {
+    const f = await seedFixture()
+    const res: any = await createInspectionTool.execute({ unit: 'U-nope00', inspectionType: 'periodic' }, landlordActor(f))
+    expect(res.ok).toBe(false)
+  })
+
+  it('set_inspection_item_condition: upserts a condition on the landlord’s own draft (no duplicate row)', async () => {
+    const f = await seedFixture()
+    const unit = await unitNumberOf(f.unitId)
+    const created: any = await createInspectionTool.execute({ unit, inspectionType: 'periodic' }, landlordActor(f))
+    const res: any = await setItemConditionTool.execute(
+      { inspectionId: created.inspectionId, area: 'Kitchen', itemLabel: 'Sink', condition: 'damaged', notes: 'leak', estimatedRepairCost: 120 },
+      landlordActor(f),
+    )
+    expect(res.ok).toBe(true)
+    // Re-record the same area+item → updates in place, not a second row.
+    const res2: any = await setItemConditionTool.execute(
+      { inspectionId: created.inspectionId, area: 'Kitchen', itemLabel: 'Sink', condition: 'good' },
+      landlordActor(f),
+    )
+    expect(res2.ok).toBe(true)
+    const row = await db.query<{ n: number; c: string }>(
+      'SELECT COUNT(*)::int AS n, MAX(condition) AS c FROM unit_inspection_items WHERE inspection_id=$1 AND area=$2 AND item_label=$3',
+      [created.inspectionId, 'Kitchen', 'Sink'],
+    )
+    expect(row.rows[0].n).toBe(1)
+    expect(row.rows[0].c).toBe('good')
+  })
+
+  it('set_inspection_item_condition: rejects a cross-landlord inspection', async () => {
+    const f = await seedFixture()
+    const unit = await unitNumberOf(f.unitId)
+    const created: any = await createInspectionTool.execute({ unit, inspectionType: 'periodic' }, landlordActor(f))
+    const stranger = { userId: 'x', role: 'landlord', profileId: randomUUID() }
+    const res: any = await setItemConditionTool.execute(
+      { inspectionId: created.inspectionId, area: 'Kitchen', itemLabel: 'Sink', condition: 'good' },
+      stranger,
+    )
+    expect(res.ok).toBe(false)
+  })
+
+  it('set_inspection_item_condition: refuses once the inspection is no longer a draft', async () => {
+    const f = await seedFixture()
+    const unit = await unitNumberOf(f.unitId)
+    const created: any = await createInspectionTool.execute({ unit, inspectionType: 'periodic' }, landlordActor(f))
+    await db.query(`UPDATE unit_inspections SET status='landlord_signed' WHERE id=$1`, [created.inspectionId])
+    const res: any = await setItemConditionTool.execute(
+      { inspectionId: created.inspectionId, area: 'Kitchen', itemLabel: 'Sink', condition: 'good' },
+      landlordActor(f),
+    )
+    expect(res.ok).toBe(false)
   })
 })

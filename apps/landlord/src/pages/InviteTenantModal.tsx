@@ -268,7 +268,7 @@ export function InviteTenantModal({ onClose }: Props) {
                 { icon: '📧', text: 'Invite email sent to tenant' },
                 { icon: '🔐', text: 'Tenant sets password and verifies identity' },
                 { icon: '🏦', text: 'Tenant connects bank account for ACH' },
-                { icon: '✅', text: 'Unit goes active — On-Time Pay SLA begins' },
+                { icon: '✅', text: 'Unit goes active — rent collection begins' },
               ].map((item, i) => (
                 <div key={i} style={{ padding: '8px 16px', borderBottom: i < 3 ? '1px solid var(--border-0)' : 'none', display: 'flex', alignItems: 'center', gap: 10, fontSize: '.75rem', color: 'var(--text-3)' }}>
                   <span>{item.icon}</span> {item.text}

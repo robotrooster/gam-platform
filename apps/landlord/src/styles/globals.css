@@ -146,6 +146,11 @@ h4 { font-size: 1rem;   font-weight: 600; }
   overflow-x: hidden;
 }
 
+/* Full-bleed pages (e.g. the Master Schedule timeline) use the whole width. */
+.page-content-wide {
+  max-width: none;
+}
+
 /* ── SIDEBAR COMPONENTS ──────────────────────────────────── */
 .sidebar-logo {
   padding: 20px 20px 16px;

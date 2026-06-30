@@ -150,7 +150,7 @@ bookingsRouter.get('/change-requests', async (req, res, next) => {
               cr.resolved_at,
               cr.resolved_by_user_id,
               cr.created_at,
-              resolver.name AS resolved_by_name,
+              COALESCE(NULLIF(TRIM(resolver.first_name || ' ' || resolver.last_name), ''), resolver.email) AS resolved_by_name,
               b.unit_id,
               b.guest_name,
               b.guest_email,

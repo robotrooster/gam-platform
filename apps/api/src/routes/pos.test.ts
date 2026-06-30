@@ -1965,3 +1965,30 @@ describe('POST /api/pos/terminal/payment-intents/:id/cancel', () => {
   })
 })
 
+// POS #1: business-level default margin
+describe('GET/PATCH /api/pos/settings (default margin)', () => {
+  it('defaults to null, persists a set value, and rejects out-of-range', async () => {
+    const f = await seedPosFixture()
+    const app = buildApp()
+    const auth = { Authorization: `Bearer ${f.landlordToken}` }
+
+    const g0 = await request(app).get('/api/pos/settings').set(auth)
+    expect(g0.status).toBe(200)
+    expect(g0.body.data.defaultMarginPct).toBeNull()
+
+    const set = await request(app).patch('/api/pos/settings').set(auth).send({ defaultMarginPct: 40 })
+    expect(set.status).toBe(200)
+    expect(set.body.data.defaultMarginPct).toBe(40)
+
+    const g1 = await request(app).get('/api/pos/settings').set(auth)
+    expect(g1.body.data.defaultMarginPct).toBe(40)
+
+    const bad = await request(app).patch('/api/pos/settings').set(auth).send({ defaultMarginPct: 150 })
+    expect(bad.status).toBe(400)
+
+    const clear = await request(app).patch('/api/pos/settings').set(auth).send({ defaultMarginPct: null })
+    expect(clear.status).toBe(200)
+    expect(clear.body.data.defaultMarginPct).toBeNull()
+  })
+})
+

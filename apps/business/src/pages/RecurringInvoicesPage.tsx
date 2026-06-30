@@ -5,8 +5,14 @@ import {
   Plus, ChevronRight, ArrowLeft, Pause, Play, X as XIcon, Zap,
   Calendar, Repeat, Trash2,
 } from 'lucide-react'
+import {
+  type RecurringInvoiceFrequency,
+  RECURRING_INVOICE_FREQUENCIES,
+  RECURRING_INVOICE_FREQUENCY_LABEL,
+  isMonthlyRecurrence,
+} from '@gam/shared'
 
-type Frequency = 'weekly' | 'monthly'
+type Frequency = RecurringInvoiceFrequency
 type SchedStatus = 'active' | 'paused' | 'ended'
 
 interface ScheduleSummary {
@@ -76,8 +82,8 @@ function customerLabel(r: Pick<ScheduleSummary, 'customerCompanyName' | 'custome
 }
 
 function cadenceLabel(s: ScheduleSummary): string {
-  if (s.frequency === 'monthly') {
-    return `Monthly on the ${ordinal(s.dayOfMonth ?? 1)}`
+  if (isMonthlyRecurrence(s.frequency)) {
+    return `${RECURRING_INVOICE_FREQUENCY_LABEL[s.frequency]} on the ${ordinal(s.dayOfMonth ?? 1)}`
   }
   return `Weekly on ${DOW_LABEL[s.dayOfWeek ?? 0]}`
 }
@@ -287,8 +293,8 @@ function CreateModal({
           unitPrice: Number(l.unitPrice),
         })),
       }
-      if (form.frequency === 'monthly') payload.dayOfMonth = parseInt(form.dayOfMonth, 10)
-      else                              payload.dayOfWeek  = parseInt(form.dayOfWeek, 10)
+      if (isMonthlyRecurrence(form.frequency)) payload.dayOfMonth = parseInt(form.dayOfMonth, 10)
+      else                                     payload.dayOfWeek  = parseInt(form.dayOfWeek, 10)
       const r = await apiPost<{ id: string }>('/business-recurring-invoices', payload)
       onCreated(r.data.id)
     } catch (e: any) {
@@ -334,11 +340,12 @@ function CreateModal({
           <select value={form.frequency}
             onChange={e => setForm({ ...form, frequency: e.target.value as Frequency })}
             style={inputStyle}>
-            <option value="monthly">Monthly</option>
-            <option value="weekly">Weekly</option>
+            {RECURRING_INVOICE_FREQUENCIES.map(f => (
+              <option key={f} value={f}>{RECURRING_INVOICE_FREQUENCY_LABEL[f]}</option>
+            ))}
           </select>
         </div>
-        {form.frequency === 'monthly' ? (
+        {isMonthlyRecurrence(form.frequency) ? (
           <div>
             <label style={labelStyle}>Day of month (1–28)</label>
             <input type="number" min="1" max="28" value={form.dayOfMonth}
@@ -401,7 +408,7 @@ function CreateModal({
       <div style={{ display: 'flex', flexDirection: 'column' as const, gap: 8 }}>
         {lines.map((line, i) => (
           <div key={i} style={{
-            display: 'grid', gridTemplateColumns: '3fr 1fr 1fr auto', gap: 8,
+            display: 'grid', gridTemplateColumns: '3fr 1fr 1fr auto auto', gap: 8,
             alignItems: 'center',
           }}>
             <input value={line.description}
@@ -418,6 +425,12 @@ function CreateModal({
               onChange={e => updateLine(i, 'unitPrice', e.target.value)}
               placeholder="Unit price"
               style={{ ...inputStyle, marginTop: 0 }} />
+            <span style={{
+              minWidth: 72, textAlign: 'right' as const, fontSize: 13, fontWeight: 600,
+              fontFamily: 'var(--font-mono)' as const, color: 'var(--text-1)',
+            }} title="Quantity × unit price">
+              {fmtMoney((Number(line.quantity) || 0) * (Number(line.unitPrice) || 0))}
+            </span>
             <button onClick={() => removeLine(i)}
               disabled={lines.length === 1}
               style={{

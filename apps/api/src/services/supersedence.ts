@@ -12,12 +12,14 @@
 //     and distributes it FIFO across the live debts. Idempotent via
 //     gam_supersedence_applied_at.
 //
-// Sources (S261 v1):
-//   1. flex_deposit_installments status='defaulted' (plan active|in_default)
-//   2. security_deposits flex_deposit_plan_status='accelerated' (balance_due_total)
-//   3. flex_charge_statements status IN ('open','failed') AND due_date<=today
-//   4. flexpay_advances status='defaulted'
-//   5. flex_deposit_custody_charges status='failed'
+// Sources (S261 v1; FlexDeposit updated S514 to the custody model):
+//   1. flex_deposit_installments status='missed' (plan active) — a missed
+//      installment is the then-due, unfunded portion of the tenant's own
+//      deposit; routing it here is the funding mechanism, NOT debt
+//      collection (Consumer ToS § 9.1.4). No acceleration source exists.
+//   2. flex_charge_statements status IN ('open','failed') AND due_date<=today
+//   3. flexpay_advances status='defaulted'
+//   4. flex_deposit_custody_charges status='failed'
 //
 // FIFO order: oldest unpaid date ASC, deterministic ties by source then ref_id.
 //
@@ -31,7 +33,6 @@ import { query } from '../db'
 
 export type SupersedenceSource =
   | 'flexdeposit_installment'
-  | 'flexdeposit_acceleration'
   | 'flexcharge_statement'
   | 'flexpay_advance'
   | 'custody_charge'
@@ -79,6 +80,9 @@ export async function computeTenantGamOutstanding(
 
   const out: OutstandingItem[] = []
 
+  // A 'missed' installment (both scheduled pulls failed) is the then-due,
+  // unfunded portion of the tenant's own deposit. defaulted_at is the
+  // legacy column name for when the installment was marked missed.
   const installments = await exec<{
     id: string; amount: string; defaulted_at: string;
   }>(
@@ -86,8 +90,8 @@ export async function computeTenantGamOutstanding(
        FROM flex_deposit_installments i
        JOIN security_deposits d ON d.id = i.security_deposit_id
       WHERE i.tenant_id = $1
-        AND i.status = 'defaulted'
-        AND d.flex_deposit_plan_status IN ('active', 'in_default')`,
+        AND i.status = 'missed'
+        AND d.flex_deposit_plan_status = 'active'`,
     [tenantId],
   )
   for (const r of installments) {
@@ -96,25 +100,6 @@ export async function computeTenantGamOutstanding(
       ref_id:      r.id,
       amount:      Number(r.amount),
       unpaid_date: r.defaulted_at,
-    })
-  }
-
-  const accel = await exec<{
-    id: string; balance_due_total: string; balance_due_full_at: string;
-  }>(
-    `SELECT id, balance_due_total::text, balance_due_full_at::text
-       FROM security_deposits
-      WHERE tenant_id = $1
-        AND flex_deposit_plan_status = 'accelerated'
-        AND balance_due_total IS NOT NULL`,
-    [tenantId],
-  )
-  for (const r of accel) {
-    out.push({
-      source:      'flexdeposit_acceleration',
-      ref_id:      r.id,
-      amount:      Number(r.balance_due_total),
-      unpaid_date: r.balance_due_full_at,
     })
   }
 
@@ -251,9 +236,6 @@ export async function applyTenantSupersedence(
       case 'flexdeposit_installment':
         satisfied = await satisfyFlexDepositInstallment(client, item.ref_id, paymentId)
         break
-      case 'flexdeposit_acceleration':
-        satisfied = await satisfyFlexDepositAcceleration(client, item.ref_id, paymentId)
-        break
       case 'flexcharge_statement': {
         const r = await satisfyFlexChargeStatement(client, item.ref_id, paymentId)
         satisfied = r.satisfied
@@ -326,7 +308,7 @@ async function satisfyFlexDepositInstallment(
             settled_at = NOW(),
             payment_id = COALESCE(payment_id, $2),
             updated_at = NOW()
-      WHERE id = $1 AND status = 'defaulted'
+      WHERE id = $1 AND status = 'missed'
       RETURNING security_deposit_id, amount::text`,
     [installmentId, payerPaymentId],
   )
@@ -349,37 +331,6 @@ async function satisfyFlexDepositInstallment(
         AND installments_remaining = 0
         AND collected_amount >= total_amount`,
     [inst.security_deposit_id],
-  )
-  return true
-}
-
-async function satisfyFlexDepositAcceleration(
-  client: PoolClient,
-  depositId: string,
-  payerPaymentId: string,
-): Promise<boolean> {
-  const r = await client.query<{ total_amount: string }>(
-    `UPDATE security_deposits
-        SET flex_deposit_plan_status = 'completed',
-            status                   = 'funded',
-            installments_remaining   = 0,
-            collected_amount         = total_amount,
-            updated_at               = NOW()
-      WHERE id = $1
-        AND flex_deposit_plan_status = 'accelerated'
-      RETURNING total_amount::text`,
-    [depositId],
-  )
-  if (r.rows.length === 0) return false
-  await client.query(
-    `UPDATE flex_deposit_installments
-        SET status     = 'settled',
-            settled_at = NOW(),
-            payment_id = COALESCE(payment_id, $2),
-            updated_at = NOW()
-      WHERE security_deposit_id = $1
-        AND status IN ('pending', 'defaulted')`,
-    [depositId, payerPaymentId],
   )
   return true
 }

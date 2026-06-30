@@ -8,7 +8,7 @@ It tends to be a great fit if you:
 
 - **Own anywhere from a single unit to a large portfolio.** The platform scales with you, and you only pay for occupied units.
 - **Manage RV parks, extended-stay, or nightly/weekly stays.** GAM has first-class support for these — bookings, check-in/check-out, and flexible stay types — which most traditional tools treat as an afterthought.
-- **Want your rent guaranteed on the 1st.** GAM's signature promise: your rent hits your bank on the first business day of every month regardless of when tenants pay — no other platform offers this. Tenants pay electronically, so you're done chasing checks.
+- **Want to stop chasing checks.** Tenants pay electronically (ACH or card), and your payouts land in your connected bank through Stripe on a regular schedule as those payments clear — no mailed checks, no manual deposits.
 - **Operate across more than one location or state.** GAM is a nationwide platform.
 
 It may be less of a fit if you only ever deal in cash and don't want any electronic payments — GAM is electronic-only by design.

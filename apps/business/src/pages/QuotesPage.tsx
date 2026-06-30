@@ -246,9 +246,13 @@ function CreateModal({
   onClose: () => void
   onCreated: (id: string) => void
 }) {
+  const { business } = useAuth()
+  // Vehicles are an auto-shop feature. Generic service businesses (hauling,
+  // maintenance crews, rentals) quote against a customer + a description only —
+  // gate the whole vehicle UI on the feature instead of inferring it from a 403.
+  const hasVehicles = (business?.enabledFeatures ?? []).includes('customer_vehicles')
   const [customers, setCustomers] = useState<Customer[]>([])
   const [vehicles, setVehicles] = useState<Vehicle[]>([])
-  const [vehiclesAvailable, setVehiclesAvailable] = useState(true)
   const [form, setForm] = useState({
     customerId: '', vehicleId: '',
     intakeDescription: '', notes: '',
@@ -261,11 +265,11 @@ function CreateModal({
   }, [])
 
   useEffect(() => {
-    if (!form.customerId) { setVehicles([]); return }
+    if (!hasVehicles || !form.customerId) { setVehicles([]); return }
     apiGet<Vehicle[]>(`/business-vehicles?customerId=${form.customerId}`)
-      .then(rows => { setVehicles(rows); setVehiclesAvailable(true) })
-      .catch(() => { setVehicles([]); setVehiclesAvailable(false) })
-  }, [form.customerId])
+      .then(setVehicles)
+      .catch(() => setVehicles([]))
+  }, [hasVehicles, form.customerId])
 
   const submit = async () => {
     setErr(null)
@@ -309,7 +313,7 @@ function CreateModal({
         ))}
       </select>
 
-      {vehiclesAvailable && (
+      {hasVehicles && (
         <>
           <label style={labelStyle}>Vehicle (optional)</label>
           <select value={form.vehicleId}
@@ -351,6 +355,7 @@ function CreateModal({
 function Detail({ id, onBack }: { id: string; onBack: () => void }) {
   const { business } = useAuth()
   const discountsEnabled = (business?.enabledFeatures ?? []).includes('discounts')
+  const workOrdersEnabled = (business?.enabledFeatures ?? []).includes('work_orders')
   const [q, setQ] = useState<QuoteDetail | null>(null)
   const [err, setErr] = useState<string | null>(null)
   const [discountInput, setDiscountInput] = useState('')
@@ -471,7 +476,7 @@ function Detail({ id, onBack }: { id: string; onBack: () => void }) {
               <Receipt size={12} /> Convert to invoice
             </button>
           )}
-          {q.status === 'accepted' && !q.workOrderId && (
+          {q.status === 'accepted' && !q.workOrderId && workOrdersEnabled && (
             <button onClick={() => setShowConvWO(true)} style={ghostBtn}>
               <Wrench size={12} /> Convert to work order
             </button>

@@ -24,7 +24,7 @@ import { PayoutsPage } from './pages/PayoutsPage'
 import { PosCustomerOnboardingPage } from './pages/PosCustomerOnboardingPage'
 import React, { useContext, useState, useEffect, useCallback } from 'react'
 import ReactDOM from 'react-dom/client'
-import { BrowserRouter, Routes, Route, Navigate, NavLink, Outlet, useNavigate, useParams, Link } from 'react-router-dom'
+import { BrowserRouter, Routes, Route, Navigate, NavLink, Outlet, useNavigate, useParams, Link, useLocation } from 'react-router-dom'
 import { QueryClient, QueryClientProvider, useQuery, useMutation, useQueryClient } from 'react-query'
 import { useForm } from 'react-hook-form'
 import axios from 'axios'
@@ -35,6 +35,54 @@ import { CameraCapture } from './components/CameraCapture'
 // ── API ──────────────────────────────────────────────────────
 const API_URL = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
 const api = axios.create({ baseURL: `${API_URL}/api` })
+
+// ── Auth-gated media (S513) ───────────────────────────────────
+// Inspection photo/video file routes sit behind requireAuth, which
+// only honors an `Authorization: Bearer` header — a plain
+// <img src>/<video src> can't send it, so it 401s. Fetch the file
+// as a blob with the tenant token and render via an object URL,
+// revoking on unmount. Mirrors the landlord AuthedMedia helper.
+// Blob trade-off: video loses HTTP range/seek; fine for short
+// walkthrough clips.
+function useAuthedBlob(path: string): { src: string | null; failed: boolean } {
+  const [src, setSrc] = useState<string | null>(null)
+  const [failed, setFailed] = useState(false)
+  useEffect(() => {
+    let url: string | null = null
+    let cancelled = false
+    setSrc(null)
+    setFailed(false)
+    const token = localStorage.getItem('gam_tenant_token') || ''
+    fetch(`${API_URL}${path}`, { headers: { Authorization: 'Bearer ' + token } })
+      .then(r => (r.ok ? r.blob() : Promise.reject(new Error('status ' + r.status))))
+      .then(blob => { if (!cancelled) { url = URL.createObjectURL(blob); setSrc(url) } })
+      .catch(() => { if (!cancelled) setFailed(true) })
+    return () => { cancelled = true; if (url) URL.revokeObjectURL(url) }
+  }, [path])
+  return { src, failed }
+}
+
+function AuthedImg({ path, alt, style }: { path: string; alt: string; style?: React.CSSProperties }) {
+  const { src, failed } = useAuthedBlob(path)
+  if (failed) return <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--bg1)', color: 'var(--t3)', fontSize: '.62rem', width: '100%', height: '100%', ...style }}>unavailable</div>
+  if (!src) return <div style={{ background: 'var(--bg3)', width: '100%', height: '100%', ...style }} />
+  return <img src={src} alt={alt} style={style} />
+}
+
+function AuthedVideo({ path, style }: { path: string; style?: React.CSSProperties }) {
+  const { src, failed } = useAuthedBlob(path)
+  if (failed) return <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#000', color: 'var(--t3)', fontSize: '.7rem', aspectRatio: '16/9', ...style }}>video unavailable</div>
+  if (!src) return <div style={{ background: '#000', aspectRatio: '16/9', ...style }} />
+  return <video controls preload="metadata" src={src} style={style} />
+}
+
+// S512 LAUNCH: tenant features hidden for the initial launch — the Flex
+// Suite hub (/services) and the credit-ledger surfaces (/credit, /my-disputes,
+// which are the FlexCredit/internal-scoring tenant view). Nav links are
+// filtered and routes redirect to /home; the pages + backend stay intact.
+// Unhide post-launch by emptying this set.
+const LAUNCH_HIDDEN = new Set<string>(['/services', '/credit', '/my-disputes'])
+const LAUNCH_HIDE_FITNESS = true
 api.interceptors.request.use(c => { const t = localStorage.getItem('gam_tenant_token'); if(t) c.headers.Authorization=`Bearer ${t}`; return c })
 api.interceptors.response.use(r=>r, e => { if(e.response?.status===401){localStorage.removeItem('gam_tenant_token');window.location.href='/login'} return Promise.reject(e) })
 // S312: snake_case → camelCase response transform (see lib/api.ts comment + packages/shared/src/camelize.ts).
@@ -43,8 +91,15 @@ const get = <T,>(url: string) => api.get<{success:boolean;data:T}>(url).then(r=>
 const post = <T,>(url: string, body?: any) => api.post<{success:boolean;data:T;message?:string}>(url,body).then(r=>r.data)
 
 // ── AUTH ──────────────────────────────────────────────────────
-interface AuthUser { id:string;email:string;role:string;firstName:string;lastName:string;profileId:string }
-interface AuthCtx { user:AuthUser|null;token:string|null;loading:boolean;login:(e:string,p:string)=>Promise<void>;logout:()=>void }
+// S289: optional 2FA. Tenant is NOT in MANDATORY_TOTP_ROLES, so
+// mustEnrollTotp is always false here — no enrollment gate, no nag.
+// totpEnabled reflects whether the tenant opted in via the Security
+// page; when true, login gates on the TOTP second step.
+interface AuthUser { id:string;email:string;role:string;firstName:string;lastName:string;profileId:string;totpEnabled?:boolean;mustEnrollTotp?:boolean }
+// S289: login() returns a discriminated result so LoginPage can branch
+// into the TOTP second step when the backend gates on 2FA.
+type LoginResult = { kind:'success' } | { kind:'totp_required'; totpSession:string }
+interface AuthCtx { user:AuthUser|null;token:string|null;loading:boolean;login:(e:string,p:string)=>Promise<LoginResult>;loginWithTotp:(totpSession:string,code:string)=>Promise<void>;refresh:()=>Promise<void>;logout:()=>void }
 const Ctx = React.createContext<AuthCtx>(null!)
 const useAuth = () => useContext(Ctx)
 
@@ -53,15 +108,41 @@ function AuthProvider({children}:{children:React.ReactNode}) {
   const [token,setToken]=useState<string|null>(()=>localStorage.getItem('gam_tenant_token'))
   const [loading,setLoading]=useState(true)
   const logout = useCallback(()=>{localStorage.removeItem('gam_tenant_token');setToken(null);setUser(null)},[])
+  const refresh = useCallback(async()=>{
+    const t = localStorage.getItem('gam_tenant_token')
+    if(!t){setLoading(false);return}
+    try{ const u = await get<AuthUser>('/auth/me'); setUser(u) }
+    catch{ logout() }
+    finally{ setLoading(false) }
+  },[logout])
   useEffect(()=>{
     if(!token){setLoading(false);return}
     get<AuthUser>('/auth/me').then(u=>setUser(u)).catch(logout).finally(()=>setLoading(false))
   },[token,logout])
-  const login = async(email:string,password:string)=>{
-    const res=await post<{token:string;user:AuthUser}>('/auth/login',{email,password})
-    localStorage.setItem('gam_tenant_token',res.data!.token);setToken(res.data!.token);setUser(res.data!.user)
+  // S289: post-credentials login. Returns a discriminated result so
+  // LoginPage can pivot into the TOTP second step when 2FA is enabled
+  // on the account. Doesn't set user state until the full JWT lands —
+  // a totp_session JWT is not a valid auth token.
+  const login = async(email:string,password:string):Promise<LoginResult>=>{
+    const res=await post<any>('/auth/login',{email,password})
+    const data=res.data!
+    if(data.requiresTotp){ return { kind:'totp_required', totpSession:data.totpSession as string } }
+    const { token:tk, user:u } = data as { token:string; user:AuthUser }
+    localStorage.setItem('gam_tenant_token',tk);setToken(tk);setUser(u)
+    return { kind:'success' }
   }
-  return <Ctx.Provider value={{user,token,loading,login,logout}}>{children}</Ctx.Provider>
+  // S289: TOTP second-step exchange. Trades the short-lived totp_session
+  // JWT (from /login) plus a 6-digit token or recovery code for the full
+  // session JWT, then loads the user from /auth/me.
+  const loginWithTotp = async(totpSession:string,code:string):Promise<void>=>{
+    const res=await post<{token:string}>('/auth/totp/verify',{totpSession,code})
+    const tk=res.data!.token
+    localStorage.setItem('gam_tenant_token',tk)
+    api.defaults.headers.common['Authorization']='Bearer '+tk
+    const u=await get<AuthUser>('/auth/me')
+    setUser(u);setToken(tk)
+  }
+  return <Ctx.Provider value={{user,token,loading,login,loginWithTotp,refresh,logout}}>{children}</Ctx.Provider>
 }
 
 // ── STYLES ────────────────────────────────────────────────────
@@ -182,6 +263,36 @@ const FONT_IMPORTS: Record<string, string> = {
   teamfury: "@font-face{font-family:'TeamFury';src:url('/fonts/teamfury.ttf') format('truetype');}",
 }
 
+// Tenant #6: full-page lockout when the 48h move-in inspection deadline lapsed.
+// The ONLY action is to go complete the inspection (the /inspections route stays
+// reachable so this isn't a dead end).
+function MoveInLockout({ gate }: { gate: any }) {
+  const navigate = useNavigate()
+  const due = gate?.deadline ? new Date(gate.deadline).toLocaleString('en-US',
+    { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : null
+  return (
+    <div style={{ maxWidth: 560, margin: '40px auto' }}>
+      <div className="card" style={{ padding: 28, borderLeft: '4px solid var(--red,#e25555)' }}>
+        <h1 className="pt" style={{ fontSize: '1.4rem', marginBottom: 8 }}>⚠️ Move-in inspection overdue</h1>
+        <p className="ps" style={{ marginBottom: 14, lineHeight: 1.6 }}>
+          Your move-in inspection had to be completed within <b>48 hours of your lease start</b>
+          {due ? <> (the deadline was <b>{due}</b>)</> : null}. Because it wasn’t finished in time, the rest
+          of your portal is locked, and <b>you’ve assumed liability for any condition issues left
+          undocumented</b> in the unit.
+        </p>
+        <p className="ps" style={{ marginBottom: 20, lineHeight: 1.6 }}>
+          You can still complete the inspection now to document the unit’s condition and restore full
+          access. Finish every area, then sign it.
+        </p>
+        <button className="btn btn-g" onClick={() => navigate(
+          gate?.inspectionId ? `/inspections/${gate.inspectionId}` : '/inspections')}>
+          Complete my move-in inspection →
+        </button>
+      </div>
+    </div>
+  )
+}
+
 function Layout() {
   const { data: bgStatus } = useQuery('bg-status-nav', () =>
     fetch((import.meta as any).env?.VITE_API_URL + '/api/background/status', {
@@ -212,8 +323,24 @@ function Layout() {
   .logo-name { color: ${accent}; }
   `
   const bgApproved = bgStatus?.status === 'approved'
+  // S508 (#2): an existing tenant (has an active lease → unitId) is past the
+  // application stage — show them the full portal and never the Application tab,
+  // regardless of whether a GAM background check was ever run/approved.
+  const isExistingTenant = !!(tenantMe as any)?.unitId
+  const showFullNav = bgApproved || isExistingTenant
   const { user, logout } = useAuth()
   const navigate = useNavigate()
+  const location = useLocation()
+  // Tenant #6: 48h move-in-inspection deadline. Once overdue + still incomplete,
+  // the tenant is locked out of everything EXCEPT completing the inspection.
+  const { data: moveInGate } = useQuery('move-in-gate', () =>
+    fetch((import.meta as any).env?.VITE_API_URL + '/api/tenants/me/move-in-gate', {
+      headers: { Authorization: 'Bearer ' + localStorage.getItem('gam_tenant_token') }
+    }).then(r=>r.json()).then(r=>r.data),
+    { refetchInterval: 300000 }
+  )
+  const onInspectionRoute = location.pathname.startsWith('/inspections')
+  const moveInLocked = moveInGate?.gated === true && !onInspectionRoute
   return (
     <div className="shell">
       <style dangerouslySetInnerHTML={{__html: themeCss}} />
@@ -223,28 +350,35 @@ function Layout() {
           <div className="logo-sub">Gold Asset Management</div>
         </div>
         <nav className="nav">
-          {!bgApproved && (
+          {!showFullNav && (
             <NavLink to="/background-check" className={({isActive})=>`ni${isActive?' active':''}`}>🛡 Application</NavLink>
           )}
-          {bgApproved && <>
+          {showFullNav && <>
             <NavLink to="/home" className={({isActive})=>`ni${isActive?' active':''}`}>🏠 Home</NavLink>
-            <NavLink to="/services" className={({isActive})=>`ni${isActive?' active':''}`}>⭐ Flex Advantage</NavLink>
+            {!LAUNCH_HIDDEN.has('/services') && <NavLink to="/services" className={({isActive})=>`ni${isActive?' active':''}`}>⭐ Flex Advantage</NavLink>}
             <NavLink to="/payments" className={({isActive})=>`ni${isActive?' active':''}`}>💳 Payments</NavLink>
             <NavLink to="/maintenance" className={({isActive})=>`ni${isActive?' active':''}`}>🔧 Maintenance</NavLink>
             <NavLink to="/support" className={({isActive})=>`ni${isActive?' active':''}`}>💬 Support</NavLink>
             <NavLink to="/inspections" className={({isActive})=>`ni${isActive?' active':''}`}>📋 Inspections</NavLink>
             <NavLink to="/walkthroughs" className={({isActive})=>`ni${isActive?' active':''}`}>🎥 My walkthroughs</NavLink>
             <NavLink to="/entry-requests" className={({isActive})=>`ni${isActive?' active':''}`}>🚪 Entry Requests</NavLink>
-            <NavLink to="/credit" className={({isActive})=>`ni${isActive?' active':''}`}>📊 My Record</NavLink>
-            <NavLink to="/my-disputes" className={({isActive})=>`ni${isActive?' active':''}`}>⚖️ My Disputes</NavLink>
+            <NavLink to="/amenities" className={({isActive})=>`ni${isActive?' active':''}`}>🎉 Amenities</NavLink>
+            {!LAUNCH_HIDDEN.has('/credit') && <NavLink to="/credit" className={({isActive})=>`ni${isActive?' active':''}`}>📊 My Record</NavLink>}
+            {!LAUNCH_HIDDEN.has('/my-disputes') && <NavLink to="/my-disputes" className={({isActive})=>`ni${isActive?' active':''}`}>⚖️ My Disputes</NavLink>}
             <LeaseNavLink/>
           </>}
           <NavLink to="/notifications" className={({isActive})=>`ni${isActive?' active':''}`}>🔔 Notifications</NavLink>
           <NavLink to="/notification-prefs" className={({isActive})=>`ni${isActive?' active':''}`} style={{paddingLeft:24,fontSize:'.78rem'}}>· Preferences</NavLink>
-          {bgApproved && tenantMe?.stripeConnectAccountId && (
+          {showFullNav && tenantMe?.stripeConnectAccountId && (
             <NavLink to="/payouts" className={({isActive})=>`ni${isActive?' active':''}`}>🏦 Payouts</NavLink>
           )}
-          {bgApproved && <NavLink to="/profile" className={({isActive})=>`ni${isActive?' active':''}`}>👤 Profile</NavLink>}
+          {showFullNav && <NavLink to="/profile" className={({isActive})=>`ni${isActive?' active':''}`}>👤 Profile</NavLink>}
+          <NavLink to="/security" className={({isActive})=>`ni${isActive?' active':''}`}>🔐 Security</NavLink>
+          {/* GAM Fitness — standalone app (:3013). Hand off the portal's JWT
+              via ?sso= so the tenant lands signed-in without re-auth. */}
+          {!LAUNCH_HIDE_FITNESS && (
+          <a className="ni" href="#" onClick={e=>{e.preventDefault();const t=localStorage.getItem('gam_tenant_token')||'';const base=(import.meta as any).env?.VITE_FITNESS_URL||'http://localhost:3013';window.open(`${base}/?sso=${encodeURIComponent(t)}`,'_blank')}}>🏋️ Fitness</a>
+          )}
         </nav>
         <div className="footer">
           <div style={{padding:'8px 10px',marginBottom:4}}>
@@ -256,18 +390,51 @@ function Layout() {
       </aside>
       <div className="main">
         <header className="topbar" />
-        <div className="page"><Outlet /></div>
+        <div className="page">{moveInLocked ? <MoveInLockout gate={moveInGate} /> : <Outlet />}</div>
       </div>
-      {bgApproved && <FlexsuiteReAcceptanceGate />}
+      {showFullNav && <FlexsuiteReAcceptanceGate />}
       <AgentChatWidget />
     </div>
   )
 }
 
 // ── HOME PAGE ─────────────────────────────────────────────────
+// Live utility-outage notices affecting this resident (water/power/etc. down,
+// with expected-back time). Fed by GET /service-interruptions/mine.
+function ServiceOutageBanner() {
+  const { data: notices = [] } = useQuery<any[]>('service-interruptions-mine',
+    () => get<any[]>('/service-interruptions/mine'), { refetchInterval: 120000 })
+  if (!notices.length) return null
+  const utilLbl: Record<string, string> = {
+    water: 'Water', power: 'Power', gas: 'Gas', heat_ac: 'Heat / AC',
+    elevator: 'Elevator', internet: 'Internet', parking: 'Parking', other: 'Service',
+  }
+  const fmtW = (s: string | null) => s ? new Date(s).toLocaleString('en-US',
+    { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : null
+  return (
+    <div style={{ display: 'grid', gap: 8, marginBottom: 16 }}>
+      {notices.map(n => (
+        <div key={n.id} className="card" style={{
+          padding: 14, borderLeft: `4px solid ${n.isEmergency ? 'var(--red,#e25555)' : 'var(--amber,#e0a93b)'}`,
+        }}>
+          <div style={{ fontWeight: 700, color: 'var(--t0)' }}>
+            {n.isEmergency ? '🚨 ' : '🔧 '}{utilLbl[n.utilityType] ?? 'Service'} {n.isEmergency ? 'outage' : 'interruption'}
+            {n.title ? ` — ${n.title}` : ''}
+          </div>
+          {n.message && <div className="ps" style={{ marginTop: 3 }}>{n.message}</div>}
+          <div style={{ fontSize: '.78rem', color: 'var(--t2)', marginTop: 5 }}>
+            {fmtW(n.startsAt)}{n.expectedRestoreAt ? ` · expected back ${fmtW(n.expectedRestoreAt)}` : ' · until further notice'}
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
 function HomePage() {
   const { user } = useAuth()
   const { data: me } = useQuery('tenant-me', () => get<any>('/tenants/me'))
+  const { data: health } = useQuery<any>('tenant-payment-health', () => get<any>('/tenants/me/payment-health'))
   const [bulletinScope, setBulletinScope] = useState<'property'|'city'|'state'>('property')
   const [bulletinSort, setBulletinSort] = useState<'new'|'old'>('new')
   const [bulletinSearch, setBulletinSearch] = useState('')
@@ -304,6 +471,7 @@ function HomePage() {
         </div>
       </div>
 
+      <ServiceOutageBanner />
       <LandlordBankingBanner />
 
       {/* S311: removed the dashboard "On-Time Pay Qualification"
@@ -332,14 +500,53 @@ function HomePage() {
           </div>
           <div className="kpi-s">{me?.propertyName}</div>
         </div>
-        <a href="/services" style={{textDecoration:'none'}} className="kpi"
-          onMouseEnter={e=>(e.currentTarget as any).style.borderColor='var(--gold)'}
-          onMouseLeave={e=>(e.currentTarget as any).style.borderColor=''}>
-          <div className="kpi-l">Security Deposit</div>
-          <div className="kpi-v">{me?.depositTotal ? formatCurrency(me.depositTotal) : '—'}</div>
-          <div className="kpi-s">{me?.flexDepositEnrolled ? 'FlexDeposit installments' : 'Paid in full'} →</div>
-        </a>
+        {LAUNCH_HIDDEN.has('/services') ? (
+          // S512 launch: Flex Suite hidden — deposit KPI is informational
+          // only (no /services link, no FlexDeposit framing).
+          <div className="kpi">
+            <div className="kpi-l">Security Deposit</div>
+            <div className="kpi-v">{me?.depositTotal ? formatCurrency(me.depositTotal) : '—'}</div>
+            <div className="kpi-s">Held in custody</div>
+          </div>
+        ) : (
+          <a href="/services" style={{textDecoration:'none'}} className="kpi"
+            onMouseEnter={e=>(e.currentTarget as any).style.borderColor='var(--gold)'}
+            onMouseLeave={e=>(e.currentTarget as any).style.borderColor=''}>
+            <div className="kpi-l">Security Deposit</div>
+            <div className="kpi-v">{me?.depositTotal ? formatCurrency(me.depositTotal) : '—'}</div>
+            <div className="kpi-s">{me?.flexDepositEnrolled ? 'FlexDeposit installments' : 'Paid in full'} →</div>
+          </a>
+        )}
       </div>
+
+      {/* #12: Payment Health — the tenant's own view of the on-time-rate card
+          the landlord sees on TenantDetailPage. Only shown once there's a
+          payment history to summarize. */}
+      {health && health.totalPayments > 0 && (() => {
+        const rate = health.onTimeRate as number
+        const color = rate >= 90 ? 'var(--green,#2fbf71)' : rate >= 75 ? 'var(--amber,#e0a93b)' : 'var(--red,#e25555)'
+        const label = rate >= 90 ? 'Excellent' : rate >= 75 ? 'Good' : 'Needs attention'
+        return (
+          <a href="/payments" className="card" style={{ display: 'block', textDecoration: 'none', padding: 18, marginBottom: 24 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
+              <div>
+                <div style={{ fontWeight: 700, color: 'var(--t0)' }}>Payment Health</div>
+                <div className="ps" style={{ marginTop: 2 }}>
+                  {health.settledCount} of {health.totalPayments} payments settled
+                  {health.tenantMonths > 0 ? ` · ${health.tenantMonths} mo on platform` : ''}
+                </div>
+              </div>
+              <div style={{ textAlign: 'right' }}>
+                <div style={{ fontFamily: 'var(--font-mono,monospace)', fontSize: '1.6rem', fontWeight: 800, color }}>{rate}%</div>
+                <div style={{ fontSize: '.72rem', color }}>{label}</div>
+              </div>
+            </div>
+            <div style={{ marginTop: 12, height: 7, borderRadius: 4, background: 'var(--b1,#1e2530)', overflow: 'hidden' }}>
+              <div style={{ width: `${rate}%`, height: '100%', background: color }} />
+            </div>
+          </a>
+        )
+      })()}
 
       <div className="grid2">
         <a href="/lease" style={{textDecoration:'none'}} className="card"
@@ -355,6 +562,9 @@ function HomePage() {
           <div className="dr"><span className="dk">Rent</span><span className="dv mono">{me?.rentAmount ? formatCurrency(me.rentAmount) : '—'}/mo</span></div>
           <div className="dr"><span className="dk">ACH</span><span className={`badge ${me?.achVerified?'b-green':'b-amber'}`}>{me?.achVerified?'Verified':'Pending'}</span></div>
         </a>
+        {/* S512 launch: "Your Subscriptions" is the Flex Suite card — hidden
+            with the rest of the suite. */}
+        {!LAUNCH_HIDDEN.has('/services') && (
         <a href="/services" style={{textDecoration:'none'}} className="card"
           onMouseEnter={e=>(e.currentTarget as any).style.borderColor='var(--gold)'}
           onMouseLeave={e=>(e.currentTarget as any).style.borderColor=''}>
@@ -368,6 +578,7 @@ function HomePage() {
             <span className="btn btn-g btn-sm">Manage services →</span>
           </div>
         </a>
+        )}
       </div>
 
       {/* ── Community Bulletin Board ─────────────────────────── */}
@@ -724,7 +935,7 @@ function FlexsuiteReAcceptanceGate() {
   )
 
   if (!current) return null
-  const label = current.product === 'flexpay' ? 'FlexPay Subscription Terms' : 'FlexDeposit Service Agreement'
+  const label = current.product === 'flexpay' ? 'FlexPay Subscription Terms' : 'FlexDeposit Custody Agreement'
   const productNoun = current.product === 'flexpay' ? 'FlexPay' : 'FlexDeposit'
 
   return (
@@ -934,6 +1145,66 @@ function FlexPayModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: 
   )
 }
 
+// ── FLEXPAY CHANGE-PULL-DAY MODAL ─────────────────────────────────────────
+// Enrolled tenants can move their pull day; the change takes effect NEXT
+// cycle (the current cycle's pull is already scheduled). Fee recomputes to
+// $5 + the new day for future cycles.
+function FlexPayChangeDayModal({
+  currentDay, onClose, onSuccess,
+}: { currentDay: number; onClose: () => void; onSuccess: () => void }) {
+  const [pullDay, setPullDay] = useState(currentDay || 15)
+  const [error, setError] = useState('')
+  const fee = 5 + pullDay
+
+  const mut = useMutation(
+    () => fetch((import.meta as any).env?.VITE_API_URL + '/api/tenants/flexpay/pull-day', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + localStorage.getItem('gam_tenant_token') },
+      body: JSON.stringify({ pullDay }),
+    }).then(r => r.json()),
+    {
+      onSuccess: (data) => {
+        if (!data.success) { setError(data.error || 'Could not change your pull day'); return }
+        onSuccess()
+      },
+      onError: () => setError('Could not change your pull day. Please try again.'),
+    }
+  )
+
+  return (
+    <div className="modal-ov" onClick={onClose}>
+      <div className="modal" onClick={e=>e.stopPropagation()} style={{maxWidth:480}}>
+        <div className="modal-t">⚡ Change FlexPay pull day</div>
+        <p style={{fontSize:'.82rem',color:'var(--t2)',marginBottom:20}}>
+          Pick a new day of the month. This takes effect <strong>next billing cycle</strong> — your current cycle's pull is already scheduled. Your fee is $5 plus the day number.
+        </p>
+        <div className="fg">
+          <label className="fl">Pull day of month</label>
+          <div style={{display:'flex',alignItems:'center',gap:12}}>
+            <input type="range" min={1} max={28} value={pullDay} onChange={e=>setPullDay(parseInt(e.target.value))}
+              style={{flex:1,accentColor:'var(--gold)'}} />
+            <span style={{fontFamily:'var(--font-m)',fontSize:'1.2rem',fontWeight:800,color:'var(--t0)',minWidth:32,textAlign:'center'}}>{pullDay}</span>
+          </div>
+        </div>
+        <div style={{background:'var(--bg3)',borderRadius:10,padding:16,margin:'16px 0'}}>
+          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+            <span style={{fontWeight:700,color:'var(--t0)',fontSize:'.875rem'}}>New monthly fee (next cycle)</span>
+            <span style={{fontFamily:'var(--font-m)',fontSize:'1.4rem',fontWeight:800,color:'var(--gold)'}}>${fee}</span>
+          </div>
+          <div style={{fontSize:'.7rem',color:'var(--t3)',marginTop:6}}>$5 base + ${pullDay} (day number)</div>
+        </div>
+        {error && <div className="alert a-red" style={{marginBottom:12}}>{error}</div>}
+        <div style={{display:'flex',gap:8,justifyContent:'flex-end'}}>
+          <button className="btn btn-g btn-sm" onClick={onClose}>Cancel</button>
+          <button className="btn btn-p btn-sm" disabled={mut.isLoading || pullDay===currentDay} onClick={()=>{ setError(''); mut.mutate() }}>
+            {mut.isLoading ? <span className="spinner"/> : 'Save (next cycle)'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // ── FLEXDEPOSIT ENROLL MODAL (S246) ───────────────────────────────────────
 // Pre-move-in flow. Tenant picks 2..maxInstallments (max comes from
 // the eligibility payload — deposit amount × BG risk_level). The
@@ -1003,10 +1274,9 @@ function FlexDepositModal({
             {eligibility?.blockers?.includes('ach_unverified')    && 'You must verify your bank account before enrolling in FlexDeposit.'}
             {eligibility?.blockers?.includes('no_deposit_row')    && 'No upcoming deposit found. FlexDeposit must be enrolled before move-in.'}
             {eligibility?.blockers?.includes('already_funded')    && 'Your deposit is already fully funded. FlexDeposit can only be enrolled before paying the deposit.'}
-            {eligibility?.blockers?.includes('tenant_suspended_nsf') && `Suspended after NSF until ${eligibility?.suspendedUntil ? new Date(eligibility.suspendedUntil).toLocaleDateString() : 'soon'}.`}
+            {eligibility?.blockers?.includes('not_ssi_ssdi')      && 'FlexDeposit is currently available only to SSDI/SSI recipients with verified income.'}
             {eligibility?.blockers?.includes('insufficient_platform_tenure') && `FlexDeposit requires at least 30 days on the GAM platform. Check back closer to your move-in date.`}
             {eligibility?.blockers?.includes('insufficient_on_time_payment_history') && `FlexDeposit requires at least one on-time rent payment on a prior lease in the last 90 days.`}
-            {eligibility?.blockers?.includes('prior_flexdeposit_default') && `A prior FlexDeposit plan was marked in default. Re-enrollment is not available.`}
           </div>
           <div className="modal-f"><button className="btn btn-g" onClick={onClose}>Close</button></div>
         </div>
@@ -1061,15 +1331,15 @@ function FlexDepositModal({
 
         {/* S260: FlexDeposit Terms summary. S314: full populated SLA link + persisted acceptance. */}
         <div style={{background:'var(--bg3)',border:'1px solid var(--b1)',borderRadius:8,padding:14,marginBottom:14,fontSize:'.72rem',color:'var(--t2)',lineHeight:1.5}}>
-          <div style={{fontWeight:700,color:'var(--t0)',marginBottom:8,fontSize:'.78rem'}}>FlexDeposit Service Agreement — please review</div>
+          <div style={{fontWeight:700,color:'var(--t0)',marginBottom:8,fontSize:'.78rem'}}>FlexDeposit Custody Agreement — please review</div>
           <p style={{marginBottom:8}}>
-            <strong style={{color:'var(--t1)'}}>Service agreement, not a loan.</strong> GAM advances your security deposit to your landlord at move-in as a service-level accommodation. Your installments are service fees, not principal repayment. GAM is not your creditor; no debt is created by this agreement and GAM will not report to credit bureaus or pursue collections on this balance.
+            <strong style={{color:'var(--t1)'}}>Custody, not a loan.</strong> GAM does not advance or lend you any money and does not float any part of your deposit. Your landlord's books reflect your deposit at move-in, but GAM holds the funds in custody as you pay them in — released to your landlord if you default on your lease, or returned to you at move-out (subject to your lease), limited to the amount you have actually funded. Your installments fund your own deposit, not loan repayment. GAM is not your creditor; no debt is created and GAM will not report to credit bureaus or pursue collections on this balance.
           </p>
           <p style={{marginBottom:8}}>
             <strong style={{color:'var(--t1)'}}>ACH pull priority.</strong> Installments are pulled from your bank account on a schedule set at enrollment. These pulls may occur before any rent payment scheduled to the same bank account in the same cycle. You authorize GAM to attempt installment pulls regardless of your rent obligations to your landlord.
           </p>
           <p style={{marginBottom:8}}>
-            <strong style={{color:'var(--t1)'}}>Catch-up and acceleration.</strong> Each installment cycle has two pull attempts — a primary pull 5 days before your lease's rent due date and a retry 1 day before. If both attempts fail, the installment is in default. After two consecutive defaulted installments, your full remaining balance becomes immediately due and GAM will attempt a single ACH pull for the full amount.
+            <strong style={{color:'var(--t1)'}}>If an installment is missed.</strong> Each installment has two pull attempts — a primary pull 5 days before your lease's rent due date and a retry 1 day before. If both attempts fail, that installment simply doesn't fund your deposit that month: <em>nothing is accelerated, no balance becomes due in full, and GAM has no recourse against you.</em> Your deposit stays under-funded by that amount until a later installment, the GAM-first routing of any payment you make, or a voluntary catch-up funds it. If you never finish funding, your move-out refund and your landlord's deductions are simply calculated against what you actually paid into custody.
           </p>
           <p style={{marginBottom:0}}>
             <strong style={{color:'var(--t1)'}}>Separate parties.</strong> GAM and your landlord are separate parties. Missed installments do not relieve your rent obligations under your lease. Insufficient funds caused by GAM's installment pull may result in failed rent payments, which are governed by your lease, not by this agreement.
@@ -1084,7 +1354,7 @@ function FlexDepositModal({
                 color:'var(--gold)',textDecoration:'underline',cursor:'pointer',
                 fontSize:'.72rem',fontWeight:600,
               }}>
-              {loadingTerms ? 'Loading full agreement…' : 'Read full FlexDeposit Service Agreement →'}
+              {loadingTerms ? 'Loading full agreement…' : 'Read full FlexDeposit Custody Agreement →'}
             </button>
           </div>
           <label style={{display:'flex',alignItems:'flex-start',gap:8,marginTop:12,cursor:'pointer'}}>
@@ -1094,7 +1364,7 @@ function FlexDepositModal({
               onChange={e => setTosAck(e.target.checked)}
               style={{marginTop:2}}
             />
-            <span style={{color:'var(--t1)',fontWeight:600}}>I have read and agree to the FlexDeposit Service Agreement.</span>
+            <span style={{color:'var(--t1)',fontWeight:600}}>I have read and agree to the FlexDeposit Custody Agreement.</span>
           </label>
         </div>
 
@@ -1106,7 +1376,7 @@ function FlexDepositModal({
         </div>
         {showFullTerms && fullTermsText && (
           <TermsViewerModal
-            title="FlexDeposit Service Agreement"
+            title="FlexDeposit Custody Agreement"
             body={fullTermsText}
             onClose={() => setShowFullTerms(false)}
           />
@@ -1277,6 +1547,7 @@ function ServicesPage() {
   const qc2 = useQuery('tenant-me', () => get<any>('/tenants/me'))
   const me = qc2.data
   const [flexPayModal, setFlexPayModal] = useState(false)
+  const [flexPayChangeModal, setFlexPayChangeModal] = useState(false)
   const [flexDepositModal, setFlexDepositModal] = useState(false)
   const fd = useQuery('tenant-flexdeposit', () => get<any>('/tenants/flexdeposit'))
 
@@ -1350,7 +1621,10 @@ function ServicesPage() {
             <div className="dr" style={{border:'none',padding:0}}>
               <span className="price-tag">{s.price}</span>
               {s.enrolled
-                ? <span className="badge b-green">✓ Active</span>
+                ? <span style={{display:'flex',gap:8,alignItems:'center'}}>
+                    <span className="badge b-green">✓ Active</span>
+                    {s.id==='flexpay' && <button className="btn btn-g btn-sm" onClick={()=>setFlexPayChangeModal(true)}>Change day</button>}
+                  </span>
                 : (s as any).locked
                 ? <span className="badge b-muted">🔒 Locked</span>
                 : <button className="btn btn-p btn-sm" onClick={s.action} disabled={s.loading}>{s.loading?<span className="spinner"/>:'Enroll'}</button>}
@@ -1389,6 +1663,13 @@ function ServicesPage() {
         <FlexPayModal
           onClose={() => setFlexPayModal(false)}
           onSuccess={() => { qc2.refetch(); setFlexPayModal(false) }}
+        />
+      )}
+      {flexPayChangeModal && (
+        <FlexPayChangeDayModal
+          currentDay={me?.flexpayPullDay ?? 15}
+          onClose={() => setFlexPayChangeModal(false)}
+          onSuccess={() => { qc2.refetch(); setFlexPayChangeModal(false) }}
         />
       )}
       {flexDepositModal && (
@@ -1668,7 +1949,6 @@ function TenantInspectionDetailPage() {
   const signatures = (insp.signatures || []) as any[]
   const tenantSigned = signatures.some(s => s.signerRole === 'tenant')
   const editable = insp.status !== 'finalized' && insp.status !== 'cancelled'
-  const API = (import.meta as any).env.VITE_API_URL
 
   return (
     <div>
@@ -1735,10 +2015,9 @@ function TenantInspectionDetailPage() {
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(120px, 1fr))', gap: 8 }}>
               {photos.map(p => (
                 <div key={p.id} style={{ position: 'relative' }}>
-                  <a href={API + p.photoUrl} target="_blank" rel="noreferrer"
-                     style={{ display: 'block', aspectRatio: '1/1', borderRadius: 8, overflow: 'hidden', background: 'var(--bg3)' }}>
-                    <img src={API + p.photoUrl} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
-                  </a>
+                  <div style={{ aspectRatio: '1/1', borderRadius: 8, overflow: 'hidden', background: 'var(--bg3)' }}>
+                    <AuthedImg path={p.photoUrl} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                  </div>
                   {p.capturedLive && <span className="badge b-green" style={{ position: 'absolute', top: 6, left: 6 }}>live</span>}
                 </div>
               ))}
@@ -1789,7 +2068,6 @@ function TenantMyWalkthroughsPage() {
   const { data = [], isLoading } = useQuery<any[]>('tenant-my-walkthroughs', () =>
     get<any[]>('/inspections/videos/mine'),
   )
-  const API = (import.meta as any).env.VITE_API_URL
   if (isLoading) return <div style={{ padding: 32, color: 'var(--t3)' }}>Loading…</div>
   return (
     <div>
@@ -1807,7 +2085,7 @@ function TenantMyWalkthroughsPage() {
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: 16 }}>
           {data.map(v => (
             <div key={v.id} className="card" style={{ padding: 12 }}>
-              <video controls preload="metadata" src={API + v.videoUrl}
+              <AuthedVideo path={v.videoUrl}
                      style={{ width: '100%', borderRadius: 8, background: '#000', aspectRatio: '16/9' }} />
               <div style={{ marginTop: 8, fontSize: '.82rem', color: 'var(--t0)' }}>
                 {labelType(v.inspectionType)} · Unit {v.unitNumber || '—'}
@@ -2202,6 +2480,9 @@ const TENANT_NOTIFICATION_TYPES: { type: string; label: string }[] = [
   { type: 'entry_recorded',                  label: 'Entry recorded by landlord' },
   { type: 'dispute_resolved',                label: 'Dispute resolved' },
   { type: 'work_trade_reminder',             label: 'Work trade reminder' },
+  { type: 'amenity_unavailable',             label: 'Amenity unavailable / reserved' },
+  { type: 'reservation_decision',            label: 'Reservation approved / declined' },
+  { type: 'service_interruption',            label: 'Utility outage / service interruption' },
 ]
 
 function NotificationPrefsPage() {
@@ -2457,6 +2738,144 @@ function entryStatusBadge(s: string) {
   if (s === 'breached') return 'b-red'
   return 'b-muted'
 }
+
+// ── Amenities / common-area reservations (resident side) ──────────────
+// Responses arrive camelCased (applyCamelizeInterceptor).
+type AmenityArea = {
+  id: string; name: string; description: string | null
+  requiresApproval: boolean; capacity: number | null; reservationFee: string
+  openTime: string | null; closeTime: string | null
+  maxReservationHours: number | null; advanceBookingDays: number | null
+  upcoming: { title: string | null; kind: string; startsAt: string; endsAt: string }[]
+}
+type MyReservation = {
+  id: string; areaName: string; kind: string; title: string | null
+  status: 'pending' | 'approved' | 'rejected' | 'cancelled'
+  startsAt: string; endsAt: string; guestCount: number | null
+}
+function resvBadge(s: string) {
+  if (s === 'approved') return 'b-green'
+  if (s === 'pending') return 'b-amber'
+  return 'b-muted'
+}
+const fmtResv = (s: string) => new Date(s).toLocaleString('en-US',
+  { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
+
+function TenantAmenitiesPage() {
+  const qc = useQueryClient()
+  const { data: areas = [] } = useQuery<AmenityArea[]>('amenity-areas', () => get<AmenityArea[]>('/common-areas/mine'))
+  const { data: mine = [] } = useQuery<MyReservation[]>('my-reservations', () => get<MyReservation[]>('/common-areas/my-reservations'))
+  const [reqFor, setReqFor] = useState<AmenityArea | null>(null)
+  const cancel = useMutation((id: string) => post(`/common-areas/reservations/${id}/cancel`), {
+    onSuccess: () => { qc.invalidateQueries('my-reservations'); qc.invalidateQueries('amenity-areas') },
+  })
+
+  return (
+    <div>
+      <div className="ph">
+        <div>
+          <h1 className="pt">Amenities</h1>
+          <p className="ps">Reserve shared spaces — clubhouse, pool, pavilion — for private use.</p>
+        </div>
+      </div>
+
+      {areas.length === 0 && (
+        <div className="card" style={{ padding: 32, textAlign: 'center', color: 'var(--t3)' }}>
+          No reservable amenities at your property.
+        </div>
+      )}
+
+      <div style={{ display: 'grid', gap: 12 }}>
+        {areas.map(a => (
+          <div key={a.id} className="card" style={{ padding: 16 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 12 }}>
+              <div>
+                <div style={{ fontWeight: 700, fontSize: '1.05rem', color: 'var(--t0)' }}>{a.name}</div>
+                {a.description && <div className="ps" style={{ marginTop: 2 }}>{a.description}</div>}
+                <div style={{ fontSize: '.75rem', color: 'var(--t3)', marginTop: 6, display: 'flex', gap: 14, flexWrap: 'wrap' }}>
+                  {a.capacity != null && <span>Capacity {a.capacity}</span>}
+                  {Number(a.reservationFee) > 0 && <span>Fee ${Number(a.reservationFee).toFixed(2)}</span>}
+                  {a.openTime && a.closeTime && <span>Open {a.openTime.slice(0, 5)}–{a.closeTime.slice(0, 5)}</span>}
+                  {a.maxReservationHours && <span>Max {a.maxReservationHours}h</span>}
+                  <span>{a.requiresApproval ? 'Approval required' : 'Instant'}</span>
+                </div>
+                {a.upcoming.length > 0 && (
+                  <div style={{ fontSize: '.72rem', color: 'var(--amber)', marginTop: 8 }}>
+                    Unavailable: {a.upcoming.slice(0, 3).map(h => `${fmtResv(h.startsAt)}–${new Date(h.endsAt).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })}`).join(' · ')}
+                    {a.upcoming.length > 3 && ` +${a.upcoming.length - 3} more`}
+                  </div>
+                )}
+              </div>
+              <button className="btn btn-g btn-sm" style={{ flexShrink: 0 }} onClick={() => setReqFor(a)}>Reserve</button>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <h2 className="pt" style={{ fontSize: '1.05rem', margin: '22px 0 10px' }}>My reservations</h2>
+      <div className="card" style={{ padding: 0, overflowX: 'auto' }}>
+        {mine.length === 0 ? (
+          <div style={{ padding: 24, color: 'var(--t3)', textAlign: 'center' }}>No reservations yet.</div>
+        ) : (
+          <table className="tbl" style={{ minWidth: 600 }}>
+            <thead><tr><th>Area</th><th>When</th><th>Status</th><th></th></tr></thead>
+            <tbody>
+              {mine.map(r => (
+                <tr key={r.id}>
+                  <td style={{ color: 'var(--t0)' }}>{r.areaName}{r.title ? ` · ${r.title}` : ''}</td>
+                  <td className="mono" style={{ fontSize: '.78rem' }}>{fmtResv(r.startsAt)} → {fmtResv(r.endsAt)}</td>
+                  <td><span className={`badge ${resvBadge(r.status)}`}>{r.status}</span></td>
+                  <td>{(r.status === 'pending' || r.status === 'approved') &&
+                    <button className="btn btn-sm" disabled={cancel.isLoading} onClick={() => cancel.mutate(r.id)}>Cancel</button>}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      {reqFor && <ReserveModal area={reqFor} onClose={() => setReqFor(null)}
+        onDone={() => { setReqFor(null); qc.invalidateQueries('my-reservations'); qc.invalidateQueries('amenity-areas') }} />}
+    </div>
+  )
+}
+
+function ReserveModal({ area, onClose, onDone }: { area: AmenityArea; onClose: () => void; onDone: () => void }) {
+  const [f, setF] = useState({ title: '', startsAt: '', endsAt: '', guestCount: '', notes: '' })
+  const m = useMutation(
+    () => post(`/common-areas/${area.id}/request`, {
+      title: f.title || undefined,
+      startsAt: new Date(f.startsAt).toISOString(), endsAt: new Date(f.endsAt).toISOString(),
+      guestCount: f.guestCount ? Number(f.guestCount) : null, notes: f.notes || undefined,
+    }),
+    { onSuccess: onDone })
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.6)', display: 'grid', placeItems: 'center', zIndex: 60 }} onClick={onClose}>
+      <div className="card" style={{ width: 440, maxWidth: '92vw', padding: 20 }} onClick={e => e.stopPropagation()}>
+        <h2 className="pt" style={{ fontSize: '1.1rem', marginBottom: 4 }}>Reserve {area.name}</h2>
+        <p className="ps" style={{ marginBottom: 12 }}>
+          {area.requiresApproval ? 'Your request goes to management for approval.' : 'This area reserves instantly.'}
+        </p>
+        <label className="ps">What for? (optional)</label>
+        <input className="inp" value={f.title} onChange={e => setF({ ...f, title: e.target.value })} placeholder="Birthday party" style={{ marginBottom: 8 }} />
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+          <div><label className="ps">Starts</label><input className="inp" type="datetime-local" value={f.startsAt} onChange={e => setF({ ...f, startsAt: e.target.value })} /></div>
+          <div><label className="ps">Ends</label><input className="inp" type="datetime-local" value={f.endsAt} onChange={e => setF({ ...f, endsAt: e.target.value })} /></div>
+        </div>
+        <label className="ps" style={{ marginTop: 8, display: 'block' }}>Guests (optional)</label>
+        <input className="inp" type="number" value={f.guestCount} onChange={e => setF({ ...f, guestCount: e.target.value })} />
+        {m.isError && <div style={{ color: 'var(--red,#e25)', fontSize: '.8rem', marginTop: 8 }}>
+          {(m.error as any)?.response?.data?.error || 'Could not reserve (time taken or out of bounds).'}</div>}
+        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 14 }}>
+          <button className="btn btn-sm" onClick={onClose}>Cancel</button>
+          <button className="btn btn-g btn-sm" disabled={!f.startsAt || !f.endsAt || m.isLoading} onClick={() => m.mutate()}>
+            {area.requiresApproval ? 'Request' : 'Reserve'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
 function fmtEntryDateTime(ts: string | null | undefined) {
   if (!ts) return '—'
   return new Date(ts).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
@@ -2669,15 +3088,80 @@ function UtilitiesPage() {
 
 // ── LOGIN ─────────────────────────────────────────────────────
 function LoginPage() {
-  const { login } = useAuth(); const navigate = useNavigate()
+  const { login, loginWithTotp } = useAuth(); const navigate = useNavigate()
   const [err, setErr] = useState(''); const [loading, setLoading] = useState(false)
+  const [totpSession, setTotpSession] = useState<string|null>(null)
+  const [code, setCode] = useState('')
   const { register, handleSubmit } = useForm<{email:string;password:string}>()
   const onSubmit = async(d:{email:string;password:string})=>{
     setLoading(true);setErr('')
-    try{await login(d.email,d.password);navigate('/home')}
+    try{
+      const r = await login(d.email,d.password)
+      if(r.kind==='totp_required'){setTotpSession(r.totpSession);setCode('')}
+      else navigate('/home')
+    }
     catch(e:any){setErr(e.response?.data?.error||'Login failed')}
     finally{setLoading(false)}
   }
+  const onTotpSubmit = async(e:React.FormEvent)=>{
+    e.preventDefault();setLoading(true);setErr('')
+    try{ await loginWithTotp(totpSession!,code.trim()); navigate('/home') }
+    catch(ex:any){
+      const msg=ex.response?.data?.error||'Invalid code.'
+      setErr(msg)
+      // Session expired — drop back to the credentials step.
+      if(/session/i.test(msg)){setTotpSession(null);setCode('')}
+    }
+    finally{setLoading(false)}
+  }
+
+  // ── Step 2: TOTP code ─────────────────────────────────────────
+  if(totpSession){
+    return (
+      <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',background:'var(--bg0)',padding:20}}>
+        <div style={{width:'100%',maxWidth:400}}>
+          <div style={{textAlign:'center',marginBottom:40}}>
+            <div style={{fontFamily:'var(--font-d)',fontSize:'2rem',fontWeight:800,color:'var(--gold)',marginBottom:8}}>⚡ GAM</div>
+            <div style={{color:'var(--t2)',fontSize:'.875rem'}}>Two-factor authentication</div>
+          </div>
+          <div className="card" style={{padding:28}}>
+            <h2 style={{marginBottom:14}}>Enter your code</h2>
+            <div style={{fontSize:'.85rem',color:'var(--t1)',marginBottom:16,lineHeight:1.6}}>
+              Enter the 6-digit code from your authenticator app, or one of your recovery codes.
+            </div>
+            {err && <div className="alert a-warn" style={{marginBottom:16}}>{err}</div>}
+            <form onSubmit={onTotpSubmit}>
+              <div className="fg">
+                <label className="fl">Code</label>
+                <input
+                  className="fi"
+                  type="text"
+                  value={code}
+                  onChange={e=>setCode(e.target.value)}
+                  autoFocus
+                  required
+                  autoComplete="one-time-code"
+                  inputMode="text"
+                  placeholder="123 456 or xxxxx-xxxxx"
+                  style={{fontFamily:'var(--font-m)',letterSpacing:'.2em',textAlign:'center'}}
+                />
+              </div>
+              <button className="btn btn-p" type="submit" disabled={loading||!code.trim()} style={{width:'100%',justifyContent:'center',marginTop:8}}>
+                {loading?<span className="spinner"/>:'Verify'}
+              </button>
+            </form>
+            <div style={{marginTop:16,textAlign:'center'}}>
+              <button onClick={()=>{setTotpSession(null);setCode('');setErr('')}} style={{background:'none',border:'none',color:'var(--t2)',fontSize:'.85rem',cursor:'pointer',textDecoration:'underline'}}>
+                ← Back to sign in
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  // ── Step 1: credentials ───────────────────────────────────────
   return (
     <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',background:'var(--bg0)',padding:20}}>
       <div style={{width:'100%',maxWidth:400}}>
@@ -2706,6 +3190,251 @@ function LoginPage() {
   )
 }
 
+// ── TOTP ENROLLMENT ───────────────────────────────────────────
+// S289: opt-in 2FA enrollment for tenants. Reached from the Security
+// page only — tenants are NOT in MANDATORY_TOTP_ROLES, so there's no
+// gate forcing this. Three states:
+//   loading   — fetching the secret + QR + recovery codes
+//   showCodes — user scans the QR / saves recovery codes / enters the
+//               first 6-digit token to confirm enrollment
+//   done      — confirm succeeded; refresh() pulled totpEnabled; back
+//               to Security
+function TotpEnrollPage() {
+  const { refresh } = useAuth()
+  const navigate = useNavigate()
+  const [state, setState] = useState<'loading'|'showCodes'|'done'|'error'>('loading')
+  const [err, setErr] = useState('')
+  const [qrDataUri, setQrDataUri] = useState('')
+  const [otpauthUrl, setOtpauthUrl] = useState('')
+  const [recoveryCodes, setRecoveryCodes] = useState<string[]>([])
+  const [code, setCode] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+  const [savedAck, setSavedAck] = useState(false)
+
+  useEffect(()=>{
+    let cancelled=false
+    api.post('/auth/totp/enroll-start')
+      .then(r=>{
+        if(cancelled)return
+        const d=r.data.data
+        setQrDataUri(d.qrDataUri);setOtpauthUrl(d.otpauthUrl)
+        setRecoveryCodes(d.recoveryCodes||[])
+        setState('showCodes')
+      })
+      .catch((e:any)=>{
+        if(cancelled)return
+        // 409 if already enrolled — nothing to do, back to Security.
+        if(e.response?.status===409){navigate('/security',{replace:true});return}
+        setErr(e.response?.data?.error||'Could not start enrollment.')
+        setState('error')
+      })
+    return()=>{cancelled=true}
+  },[navigate])
+
+  const onConfirm=async(e:React.FormEvent)=>{
+    e.preventDefault();setSubmitting(true);setErr('')
+    try{
+      await api.post('/auth/totp/enroll-confirm',{token:code.trim()})
+      await refresh()
+      setState('done')
+      setTimeout(()=>navigate('/security',{replace:true}),700)
+    }catch(ex:any){
+      setErr(ex.response?.data?.error||'Verification failed. Try the current code from your app.')
+      setSubmitting(false)
+    }
+  }
+
+  if(state==='loading'){
+    return <div className="loading"><span className="spinner"/></div>
+  }
+  if(state==='error'){
+    return (
+      <div>
+        <div className="ph"><div><div className="pt">Set up two-factor</div></div></div>
+        <div className="card" style={{maxWidth:480}}>
+          <div style={{fontSize:32,marginBottom:12}}>⚠️</div>
+          <h3 style={{marginBottom:10}}>Couldn't start enrollment</h3>
+          <p style={{color:'var(--t2)',fontSize:'.85rem',lineHeight:1.6,marginBottom:16}}>{err}</p>
+          <button onClick={()=>navigate('/security')} className="btn btn-g">Back to Security</button>
+        </div>
+      </div>
+    )
+  }
+  if(state==='done'){
+    return (
+      <div>
+        <div className="card" style={{maxWidth:480,textAlign:'center',padding:28}}>
+          <div style={{fontSize:36,marginBottom:12}}>✅</div>
+          <h3 style={{marginBottom:10}}>Two-factor authentication enabled</h3>
+          <p style={{color:'var(--t2)',fontSize:'.85rem',lineHeight:1.6}}>Returning to Security…</p>
+        </div>
+      </div>
+    )
+  }
+
+  // Main enrollment screen
+  return (
+    <div>
+      <div className="ph">
+        <div><div className="pt">Set up two-factor authentication</div><div className="ps">Add an authenticator-app code to every sign-in</div></div>
+      </div>
+      <div className="card" style={{maxWidth:600}}>
+        <div style={{fontSize:'.85rem',color:'var(--t1)',marginBottom:16,lineHeight:1.6}}>
+          Two-factor authentication adds a one-time code to your sign-in, so a stolen password isn't enough to get into your account. This is optional.
+        </div>
+
+        <div style={{display:'grid',gridTemplateColumns:'auto 1fr',gap:16,alignItems:'start',marginBottom:18}}>
+          <div style={{padding:10,background:'#fff',borderRadius:8,lineHeight:0}}>
+            <img src={qrDataUri} alt="Scan this QR code with your authenticator app" style={{display:'block',width:180,height:180}}/>
+          </div>
+          <div style={{fontSize:'.85rem',color:'var(--t1)',lineHeight:1.6}}>
+            <div style={{fontWeight:700,color:'var(--t0)',marginBottom:6}}>1. Scan with your authenticator app</div>
+            <div style={{color:'var(--t2)',fontSize:'.8rem',marginBottom:10}}>Google Authenticator, Authy, 1Password, Bitwarden — any TOTP app works. Open the app, tap "Add account" or the + icon, then scan the QR code on the left.</div>
+            <div style={{fontSize:'.75rem',color:'var(--t3)'}}>Can't scan? <a href={otpauthUrl} style={{color:'var(--gold)',wordBreak:'break-all'}}>Tap to add manually →</a></div>
+          </div>
+        </div>
+
+        <div style={{marginBottom:18,padding:14,background:'rgba(245,158,11,.05)',border:'1px solid rgba(245,158,11,.2)',borderRadius:8}}>
+          <div style={{fontWeight:700,color:'var(--amber)',marginBottom:8,fontSize:'.88rem'}}>2. Save these recovery codes</div>
+          <div style={{fontSize:'.8rem',color:'var(--t2)',marginBottom:10,lineHeight:1.5}}>
+            If you ever lose access to your authenticator app, these one-time codes are the only way to get back in. Store them somewhere safe — a password manager works well.
+          </div>
+          <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:6,marginBottom:10}}>
+            {recoveryCodes.map(rc=>(
+              <div key={rc} style={{fontFamily:'var(--font-m)',fontSize:'.85rem',color:'var(--t0)',background:'var(--bg3)',padding:'5px 9px',borderRadius:5,letterSpacing:'.05em'}}>{rc}</div>
+            ))}
+          </div>
+          <label style={{display:'flex',alignItems:'center',gap:8,fontSize:'.8rem',color:'var(--t1)',cursor:'pointer'}}>
+            <input type="checkbox" checked={savedAck} onChange={e=>setSavedAck(e.target.checked)}/>
+            I've saved my recovery codes somewhere safe.
+          </label>
+        </div>
+
+        <form onSubmit={onConfirm}>
+          <div className="fg">
+            <label className="fl">3. Enter the 6-digit code from your app to confirm</label>
+            <input
+              className="fi"
+              type="text"
+              value={code}
+              onChange={e=>setCode(e.target.value)}
+              required
+              inputMode="numeric"
+              pattern="[0-9 ]*"
+              autoComplete="one-time-code"
+              placeholder="000000"
+              maxLength={7}
+              style={{fontFamily:'var(--font-m)',letterSpacing:'.2em',textAlign:'center'}}
+            />
+          </div>
+          {err && <div className="alert a-warn" style={{marginBottom:12}}>{err}</div>}
+          <div style={{display:'flex',gap:10}}>
+            <button className="btn btn-p" type="submit" disabled={submitting||!savedAck||code.trim().length<6} style={{justifyContent:'center'}}>
+              {submitting?<span className="spinner"/>:'Enable two-factor'}
+            </button>
+            <button type="button" className="btn btn-g" onClick={()=>navigate('/security')} disabled={submitting}>Cancel</button>
+          </div>
+          <div style={{marginTop:10,fontSize:'.75rem',color:'var(--t3)'}}>
+            Confirm the codes are saved before continuing — they're shown only once.
+          </div>
+        </form>
+      </div>
+    </div>
+  )
+}
+
+// ── SECURITY PAGE ─────────────────────────────────────────────
+// S289: tenant 2FA management. Opt-in enable (routes to /security/enroll)
+// and password-confirmed disable. Fully optional — no enrollment gate.
+function SecurityPage() {
+  const { user, refresh } = useAuth()
+  const navigate = useNavigate()
+  const [showConfirm, setShowConfirm] = useState(false)
+  const [password, setPassword] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+  const [err, setErr] = useState('')
+  const [success, setSuccess] = useState('')
+
+  const onDisable=async(e:React.FormEvent)=>{
+    e.preventDefault();setSubmitting(true);setErr('')
+    try{
+      await api.post('/auth/totp/disable',{password})
+      await refresh()
+      setShowConfirm(false);setPassword('')
+      setSuccess('Two-factor authentication disabled.')
+    }catch(ex:any){
+      setErr(ex.response?.data?.error||'Could not disable 2FA. Check your password.')
+    }finally{
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <div>
+      <div className="ph">
+        <div><div className="pt">Security</div><div className="ps">Manage two-factor authentication</div></div>
+      </div>
+      <div className="card" style={{maxWidth:600,marginBottom:16}}>
+        <div className="kpi-l" style={{marginBottom:14}}>Two-factor authentication</div>
+        <div style={{display:'flex',alignItems:'center',gap:12,marginBottom:14}}>
+          <div style={{width:36,height:36,borderRadius:8,background:user?.totpEnabled?'rgba(34,197,94,.1)':'rgba(138,150,176,.1)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'1.2rem'}}>
+            {user?.totpEnabled?'✅':'🔓'}
+          </div>
+          <div>
+            <div style={{fontWeight:700,color:'var(--t0)',fontSize:'.95rem'}}>
+              {user?.totpEnabled?'Enabled':'Not enabled'}
+            </div>
+            <div style={{fontSize:'.8rem',color:'var(--t2)'}}>
+              {user?.totpEnabled
+                ?'You will be prompted for a 6-digit code on every sign-in.'
+                :'Add an authenticator-app code to your sign-in for extra protection. Optional.'}
+            </div>
+          </div>
+        </div>
+
+        {success && <div className="alert a-green" style={{marginBottom:12}}>{success}</div>}
+
+        {!user?.totpEnabled && (
+          <button className="btn btn-p" onClick={()=>{setSuccess('');navigate('/security/enroll')}}>
+            Enable two-factor
+          </button>
+        )}
+
+        {user?.totpEnabled && !showConfirm && (
+          <button className="btn btn-d" onClick={()=>{setShowConfirm(true);setSuccess('')}}>
+            Disable two-factor
+          </button>
+        )}
+
+        {user?.totpEnabled && showConfirm && (
+          <form onSubmit={onDisable} style={{marginTop:8,padding:14,background:'var(--bg1)',border:'1px solid var(--b1)',borderRadius:8}}>
+            <div style={{fontSize:'.82rem',color:'var(--t1)',marginBottom:10,lineHeight:1.5}}>
+              Confirm your password to disable 2FA. After disable, any saved recovery codes are invalidated.
+            </div>
+            <div className="fg">
+              <label className="fl">Password</label>
+              <input className="fi" type="password" value={password} onChange={e=>setPassword(e.target.value)} autoFocus required />
+            </div>
+            {err && <div className="alert a-warn" style={{marginBottom:10}}>{err}</div>}
+            <div style={{display:'flex',gap:8}}>
+              <button type="submit" className="btn btn-d" disabled={submitting||!password} style={{justifyContent:'center'}}>
+                {submitting?<span className="spinner"/>:'Disable two-factor'}
+              </button>
+              <button type="button" className="btn btn-g" onClick={()=>{setShowConfirm(false);setPassword('');setErr('')}} disabled={submitting}>
+                Cancel
+              </button>
+            </div>
+          </form>
+        )}
+      </div>
+
+      <div style={{fontSize:'.75rem',color:'var(--t3)',maxWidth:600,lineHeight:1.5}}>
+        If you lose your authenticator app, use one of your saved recovery codes to sign in, then disable and re-enable 2FA with the new app.
+      </div>
+    </div>
+  )
+}
+
 // ── APP ───────────────────────────────────────────────────────
 function App() {
   const { token, loading } = useAuth()
@@ -2728,7 +3457,7 @@ function App() {
           <Route path="maintenance"      element={<MaintenancePage />} />
           <Route path="lease"            element={<LeasePage />} />
           <Route path="sign/:documentId" element={<SignPage />} />
-          <Route path="services"         element={<ServicesPage />} />
+          <Route path="services"         element={LAUNCH_HIDDEN.has('/services') ? <Navigate to="/home" replace /> : <ServicesPage />} />
           <Route path="documents"        element={<DocumentsPage />} />
           <Route path="support"          element={<SupportPage />} />
           <Route path="utilities"        element={<UtilitiesPage />} />
@@ -2736,11 +3465,14 @@ function App() {
           <Route path="inspections/:id"  element={<TenantInspectionDetailPage />} />
           <Route path="walkthroughs"     element={<TenantMyWalkthroughsPage />} />
           <Route path="entry-requests"      element={<TenantEntryRequestsPage />} />
+          <Route path="amenities"           element={<TenantAmenitiesPage />} />
           <Route path="entry-requests/:id"  element={<TenantEntryRequestDetailPage />} />
-          <Route path="credit"              element={<CreditPage />} />
-          <Route path="my-disputes"         element={<MyDisputesPage />} />
+          <Route path="credit"              element={LAUNCH_HIDDEN.has('/credit') ? <Navigate to="/home" replace /> : <CreditPage />} />
+          <Route path="my-disputes"         element={LAUNCH_HIDDEN.has('/my-disputes') ? <Navigate to="/home" replace /> : <MyDisputesPage />} />
           <Route path="notification-prefs"  element={<NotificationPrefsPage />} />
           <Route path="profile"          element={<ProfilePage />} />
+          <Route path="security"         element={<SecurityPage />} />
+          <Route path="security/enroll"  element={<TotpEnrollPage />} />
           <Route path="payouts"          element={<PayoutsPage />} />
         </Route>
       </Routes>

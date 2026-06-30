@@ -126,11 +126,19 @@ authRouter.post('/register', async (req, res, next) => {
     try {
       await client.query('BEGIN')
 
+      // Model C (PM-company self-register + all registrations): require
+      // email verification in production, auto-verify in local dev so
+      // testing doesn't need to click an email link. 'test' is excluded so
+      // the email-verification suites still exercise the real gate.
+      const env = process.env.NODE_ENV
+      const devAutoVerify = env !== 'production' && env !== 'test'
+
       const [user] = await client.query(
         `INSERT INTO users (email, password_hash, role, first_name, last_name, phone,
-                            accepted_tos_at, accepted_privacy_at)
-         VALUES ($1,$2,$3,$4,$5,$6, NOW(), NOW()) RETURNING id, email, role, first_name, last_name`,
-        [body.email, hash, body.role, body.firstName, body.lastName, body.phone ?? null]
+                            accepted_tos_at, accepted_privacy_at, email_verified, email_verified_at)
+         VALUES ($1,$2,$3,$4,$5,$6, NOW(), NOW(), $7, ${devAutoVerify ? 'NOW()' : 'NULL'})
+         RETURNING id, email, role, first_name, last_name`,
+        [body.email, hash, body.role, body.firstName, body.lastName, body.phone ?? null, devAutoVerify]
       ).then(r => r.rows)
 
       let profileId: string
@@ -150,8 +158,9 @@ authRouter.post('/register', async (req, res, next) => {
 
       // S281: mint + email verification token AFTER commit. Failure
       // here doesn't fail the registration — the user can request a
-      // resend via /api/auth/resend-verification.
-      void mintAndSendVerifyEmail(user.id, user.email, user.first_name)
+      // resend via /api/auth/resend-verification. Skipped in dev where
+      // the account is already auto-verified (model C).
+      if (!devAutoVerify) void mintAndSendVerifyEmail(user.id, user.email, user.first_name)
 
       const token = signToken({ userId: user.id, role: user.role, email: user.email, profileId })
       res.status(201).json({

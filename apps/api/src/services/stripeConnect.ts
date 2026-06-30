@@ -866,6 +866,51 @@ export async function createInvoiceCheckoutSession(
   return { sessionId: session.id, hostedUrl: session.url }
 }
 
+// ── Booking deposit checkout (S517 / public property booking) ──
+// A public stay-booking guest pays a deposit on Stripe's hosted Checkout;
+// the gross routes to the landlord's Connect account (destination charge),
+// GAM takes its platform cut as the application fee. The webhook confirms the
+// booking on checkout.session.completed (gam_purpose='booking_deposit').
+export interface CreateBookingDepositCheckoutOpts {
+  amountCents:                 number
+  landlordConnectAccountId:    string
+  unitLabel:                   string
+  guestEmail?:                 string | null
+  successUrl:                  string
+  cancelUrl:                   string
+  applicationFeeCents?:        number
+  metadata?:                   Record<string, string>
+}
+
+export async function createBookingDepositCheckoutSession(
+  opts: CreateBookingDepositCheckoutOpts,
+): Promise<InvoiceCheckoutResult> {
+  const stripe = getStripe()
+  const session = await stripe.checkout.sessions.create({
+    mode: 'payment',
+    payment_method_types: ['card', 'us_bank_account'],
+    line_items: [{
+      quantity: 1,
+      price_data: {
+        currency: 'usd',
+        unit_amount: opts.amountCents,
+        product_data: { name: `Stay deposit — ${opts.unitLabel}` },
+      },
+    }],
+    payment_intent_data: {
+      transfer_data: { destination: opts.landlordConnectAccountId },
+      application_fee_amount: opts.applicationFeeCents ?? 0,
+      metadata: { gam_purpose: 'booking_deposit', ...(opts.metadata ?? {}) },
+    },
+    metadata: { gam_purpose: 'booking_deposit', ...(opts.metadata ?? {}) },
+    customer_email: opts.guestEmail ?? undefined,
+    success_url: opts.successUrl,
+    cancel_url:  opts.cancelUrl,
+  })
+  if (!session.url) throw new AppError(500, 'Stripe returned a Checkout Session with no URL')
+  return { sessionId: session.id, hostedUrl: session.url }
+}
+
 /**
  * Refund a business-invoice PaymentIntent (a Connect destination charge).
  *

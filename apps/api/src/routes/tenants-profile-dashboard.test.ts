@@ -26,7 +26,7 @@ import { randomUUID } from 'crypto'
 import { db } from '../db'
 import {
   cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant,
-  seedLease, seedLeaseTenant, seedSecurityDeposit,
+  seedLease, seedLeaseTenant, seedSecurityDeposit, seedRentPayment,
 } from '../test/dbHelpers'
 
 const { emailLandlordBankingNudgeMock, getAccrualHistoryMock } = vi.hoisted(() => ({
@@ -198,6 +198,88 @@ describe('GET /api/tenants/me', () => {
     expect(res.body.data.unit_id).toBe(f.unitId)
     expect(Number(res.body.data.deposit_total)).toBe(1500)
     expect(res.body.data.deposit_fully_funded).toBe(true)
+  })
+})
+
+describe('GET /api/tenants/me/payment-health', () => {
+  it('computes on-time rate from the tenant\'s own payments', async () => {
+    const f = await seedTFixture()
+    const client = await db.connect()
+    try {
+      // 3 settled, 1 failed → 3/4 = 75%. One payment per unit to avoid the
+      // (unit_id, due_date) active-rent unique index (all share CURRENT_DATE).
+      const statuses: Array<'settled' | 'failed'> = ['settled', 'settled', 'settled', 'failed']
+      for (const status of statuses) {
+        const unitId = await seedUnit(client, { propertyId: f.propertyId, landlordId: f.landlordId })
+        await seedRentPayment(client, { unitId, tenantId: f.tenantId, landlordId: f.landlordId, amount: 1000, status })
+      }
+    } finally { client.release() }
+
+    const res = await request(buildApp())
+      .get('/api/tenants/me/payment-health')
+      .set('Authorization', `Bearer ${f.tenantToken}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.totalPayments).toBe(4)
+    expect(res.body.data.settledCount).toBe(3)
+    expect(res.body.data.failedCount).toBe(1)
+    expect(res.body.data.onTimeRate).toBe(75)
+  })
+
+  it('no payments → 0% rate, zero counts', async () => {
+    const f = await seedTFixture()
+    const res = await request(buildApp())
+      .get('/api/tenants/me/payment-health')
+      .set('Authorization', `Bearer ${f.tenantToken}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.totalPayments).toBe(0)
+    expect(res.body.data.onTimeRate).toBe(0)
+  })
+})
+
+describe('GET /api/tenants/me/move-in-gate (Tenant #6)', () => {
+  const insertMoveIn = (f: any, status: string) =>
+    db.query(`INSERT INTO unit_inspections (unit_id, lease_id, tenant_id, landlord_id, inspection_type, status)
+              VALUES ($1,$2,$3,$4,'move_in',$5)`, [f.unitId, f.leaseId, f.tenantId, f.landlordId, status])
+
+  it('overdue + still draft → gated, and stamps the liability moment', async () => {
+    const f = await seedTFixture()           // lease starts 2025-01-01 → well past 48h
+    await insertMoveIn(f, 'draft')
+    const res = await request(buildApp()).get('/api/tenants/me/move-in-gate')
+      .set('Authorization', `Bearer ${f.tenantToken}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.gated).toBe(true)
+    expect(res.body.data.completed).toBe(false)
+    expect(res.body.data.liabilityAssumedAt).toBeTruthy()
+    const row = await db.query<{ move_in_deadline_missed_at: string | null }>(
+      `SELECT move_in_deadline_missed_at FROM unit_inspections WHERE tenant_id=$1`, [f.tenantId])
+    expect(row.rows[0].move_in_deadline_missed_at).toBeTruthy()
+  })
+
+  it('completed (tenant_signed) → not gated', async () => {
+    const f = await seedTFixture()
+    await insertMoveIn(f, 'tenant_signed')
+    const res = await request(buildApp()).get('/api/tenants/me/move-in-gate')
+      .set('Authorization', `Bearer ${f.tenantToken}`)
+    expect(res.body.data.gated).toBe(false)
+    expect(res.body.data.completed).toBe(true)
+  })
+
+  it('no move-in inspection → not gated (never lock out for the landlord’s omission)', async () => {
+    const f = await seedTFixture()
+    const res = await request(buildApp()).get('/api/tenants/me/move-in-gate')
+      .set('Authorization', `Bearer ${f.tenantToken}`)
+    expect(res.body.data.gated).toBe(false)
+    expect(res.body.data.hasMoveIn).toBe(false)
+  })
+
+  it('within the 48h window → not gated yet', async () => {
+    const f = await seedTFixture()
+    await db.query(`UPDATE leases SET start_date = CURRENT_DATE WHERE id=$1`, [f.leaseId])
+    await insertMoveIn(f, 'draft')
+    const res = await request(buildApp()).get('/api/tenants/me/move-in-gate')
+      .set('Authorization', `Bearer ${f.tenantToken}`)
+    expect(res.body.data.gated).toBe(false)
+    expect(res.body.data.overdue).toBe(false)
   })
 })
 

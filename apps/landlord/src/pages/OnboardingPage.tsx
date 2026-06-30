@@ -31,6 +31,9 @@ export function OnboardingPage() {
   const agreementRef = useRef<HTMLDivElement>(null)
   const [scrolledAgreement, setScrolledAgreement] = useState(false)
   const [showAddBank, setShowAddBank] = useState(false)
+  // S513 (#2): landlord's onboarding ACH fee election. Default false = tenant
+  // pays ACH (the launch default). Card is always the tenant's — not a choice.
+  const [coverTenantAch, setCoverTenantAch] = useState(false)
 
   // Profile form
   const [profile, setProfile] = useState({ businessName: '', ein: '', phone: '', street1: '', city: '', state: '', zip: '' })
@@ -55,7 +58,7 @@ export function OnboardingPage() {
   )
 
   const completeMut = useMutation(
-    () => apiPost('/landlords/complete-onboarding', { signature, agreedAt: new Date().toISOString() }),
+    () => apiPost('/landlords/complete-onboarding', { signature, agreedAt: new Date().toISOString(), coverTenantAch }),
     { onSuccess: async () => {
       await refresh?.()
       navigate('/dashboard')
@@ -123,7 +126,7 @@ export function OnboardingPage() {
         {/* Left sidebar — steps */}
         <div style={{ width: 280, flexShrink: 0, background: 'var(--bg-1)', borderRight: '1px solid var(--border-0)', padding: '32px 24px', overflowY: 'auto' }}>
           <div style={{ fontSize: '.78rem', color: 'var(--text-3)', marginBottom: 20, lineHeight: 1.6 }}>
-            Complete all 4 steps to activate On-Time Pay for your portfolio.
+            Complete all 4 steps to activate your portfolio.
           </div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
             {STEPS.map((s, i) => {
@@ -162,11 +165,11 @@ export function OnboardingPage() {
             })}
           </div>
 
-          {/* SLA reminder */}
+          {/* Fee + payout reminder */}
           <div style={{ marginTop: 32, padding: '12px 14px', background: 'rgba(201,162,39,.06)', border: '1px solid rgba(201,162,39,.2)', borderRadius: 10 }}>
-            <div style={{ fontSize: '.68rem', fontWeight: 700, color: 'var(--gold)', marginBottom: 6 }}>ON-TIME PAY SLA</div>
+            <div style={{ fontSize: '.68rem', fontWeight: 700, color: 'var(--gold)', marginBottom: 6 }}>SIMPLE, FLAT PRICING</div>
             <div style={{ fontSize: '.7rem', color: 'var(--text-3)', lineHeight: 1.6 }}>
-              Rent initiated to your account on the 1st business day — every month — regardless of when your tenant pays.
+              $2 per occupied unit / month — vacant units are free. Rent is routed to your connected bank account as your tenants' payments settle.
             </div>
           </div>
         </div>
@@ -344,7 +347,7 @@ export function OnboardingPage() {
                       </div>
                       <div style={{ background: 'rgba(255,184,32,.06)', border: '1px solid rgba(255,184,32,.2)', borderRadius: 8, padding: '8px 12px', fontSize: '.72rem', color: 'var(--amber)', display: 'flex', alignItems: 'flex-start', gap: 8, marginBottom: 16 }}>
                         <AlertTriangle size={13} style={{ flexShrink: 0, marginTop: 1 }} />
-                        Test mode. No real money will move until attorney review is complete.
+                        Test mode. No real money will move until live payment processing is enabled.
                       </div>
                       <button className="btn btn-primary" style={{ width: '100%', justifyContent: 'center', padding: 13 }} onClick={() => setShowAddBank(true)}>
                         <Plus size={14} /> Add Bank Account
@@ -357,6 +360,36 @@ export function OnboardingPage() {
                     </div>
                   </div>
                 )}
+
+                {/* S513 (#2): ACH fee election. Card is always the tenant's. */}
+                <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-0)', borderRadius: 12, padding: 18, marginTop: 8 }}>
+                  <div style={{ fontSize: '.82rem', fontWeight: 700, color: 'var(--text-0)', marginBottom: 4 }}>Who pays the ACH processing fee?</div>
+                  <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginBottom: 14, lineHeight: 1.5 }}>
+                    ACH bank payments cost 1.0% (capped $6.00). By default your tenants pay this fee. You can
+                    choose to cover it for them — applied across your properties (change per-property later in Settings).
+                  </div>
+                  <div style={{ display: 'flex', gap: 10 }}>
+                    {[
+                      { v: false, title: 'Tenant pays ACH', sub: 'Standard — fee added on top of rent' },
+                      { v: true,  title: "I'll cover ACH",   sub: 'Deducted from your payouts' },
+                    ].map(opt => {
+                      const selected = coverTenantAch === opt.v
+                      return (
+                        <button key={String(opt.v)} type="button" onClick={() => setCoverTenantAch(opt.v)}
+                          style={{ flex: 1, textAlign: 'left', padding: '12px 14px', borderRadius: 10, cursor: 'pointer',
+                            background: selected ? 'rgba(201,162,39,.1)' : 'var(--bg-1)',
+                            border: selected ? '1.5px solid var(--gold)' : '1px solid var(--border-0)' }}>
+                          <div style={{ fontSize: '.82rem', fontWeight: 700, color: selected ? 'var(--gold)' : 'var(--text-0)' }}>{opt.title}</div>
+                          <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 2 }}>{opt.sub}</div>
+                        </button>
+                      )
+                    })}
+                  </div>
+                  <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 12, display: 'flex', alignItems: 'flex-start', gap: 6 }}>
+                    <CreditCard size={12} style={{ flexShrink: 0, marginTop: 2 }} />
+                    Card payments (3.25%) are always paid by the tenant — landlords never cover card fees.
+                  </div>
+                </div>
               </div>
             )}
 
@@ -377,14 +410,27 @@ export function OnboardingPage() {
                   </div>
 
                   {[
-                    { title: '1. On-Time Pay SLA', body: 'Platform initiates ACH disbursement to Landlord\'s connected bank account on or before the first business day of each calendar month ("Disbursement Date") regardless of whether Tenant has remitted rent payment. This constitutes a Service Level Agreement between Landlord and Platform. This is NOT an insurance policy, surety bond, financial guarantee, or indemnification. Platform acts as Landlord\'s authorized collection agent.' },
-                    { title: '2. Platform Fees', body: 'Active/Occupied Units: $15.00/unit/month — includes On-Time Pay SLA and full platform access. Direct Pay Units: $5.00/unit/month — dashboard access, no ACH processing. Vacant Units: $0.00/unit/month — auto-listed in vacancy marketplace at $1.00/unit/month listing fee. Fees are billed monthly and deducted from disbursements.' },
-                    { title: '3. Reserve Fund', body: 'Platform maintains an operational working capital reserve to fund disbursements pending tenant ACH settlement. This reserve constitutes Platform\'s operational capital — it is NOT an insurance reserve, trust account, or escrow. Landlord retains all legal rights against Tenant for unpaid rent. Platform\'s disbursement obligation is a service commitment funded by operational reserves, not Landlord\'s capital.' },
-                    { title: '4. Eviction Mode', body: 'In many jurisdictions, accepting any rent payment while pursuing eviction for that nonpayment may waive the right to proceed. Landlord is responsible for knowing and complying with their local eviction rules. Landlord must activate Eviction Mode before filing any eviction action. Activation hard-blocks all tenant ACH pulls from the affected unit. Landlord\'s On-Time Pay SLA is suspended for eviction-mode units. Platform is not liable for eviction complications arising from failure to activate Eviction Mode or from non-compliance with local laws.' },
-                    { title: '5. ACH Authorization', body: 'Landlord authorizes Platform to initiate ACH debit entries from Tenant\'s bank account and ACH credit entries to Landlord\'s connected bank account. Landlord authorizes Platform to reverse erroneous entries. Platform complies with NACHA Operating Rules and Guidelines. Landlord agrees to promptly notify Platform of any unauthorized transactions.' },
-                    { title: '6. Work Trade Arrangements', body: 'Where Landlord establishes Work Trade Agreements through the Platform, Landlord acknowledges that labor received in exchange for rent reduction may constitute taxable income to Tenant under IRS Publication 525. Landlord is responsible for issuing required 1099-NEC forms. Platform provides documentation tools only and does not provide tax advice.' },
-                    { title: '7. Governing Law', body: 'This Agreement is governed by the laws of the state where Platform is headquartered. If any provision is held unenforceable, the remaining provisions remain in full force.' },
-                    { title: '8. Pending Legal Review', body: 'This Agreement is pending review by licensed counsel. It does not constitute legal advice. Landlord is encouraged to have independent counsel review this Agreement before signing. Platform reserves the right to update this Agreement following attorney review, with 30 days notice to Landlord.' },
+                    { title: '1. Payment Processing & Payouts', body: 'Platform processes Tenant rent payments (ACH and card) and routes settled funds to Landlord\'s connected bank account via Stripe Connect. Platform does NOT advance funds — Landlord receives rent as Tenant payments settle, not before. Platform acts as Landlord\'s authorized payment processor and collection agent. This is NOT an insurance policy, surety bond, financial guarantee, or rent advance.' },
+                    { title: '2. Payment Routing Priority', body: 'When a Tenant makes a payment through the Platform, the payment is applied first to any outstanding balance the Tenant owes to Platform under any current or future Platform service, beginning with the oldest such balance (first-in, first-out); the remaining amount is then routed to Landlord. Landlord acknowledges that where a Tenant owes Platform, Landlord receives the residual amount after Platform\'s balance is satisfied, not the gross payment. This is an authorized routing of the Tenant\'s own funds — not a debt-collection action and not a reduction of any amount the Tenant owes Landlord. Landlord retains all rights and remedies against the Tenant for any rent or other amount that remains unpaid.' },
+                    { title: '3. Platform Fees', body: 'Occupied Units: $2.00 per occupied unit per month, subject to a $10.00 monthly minimum per connected payout account. A connected payout account corresponds to the legal entity or bank account that receives payouts; properties that share one connected account share a single minimum, while separate entities (for example, separate LLCs, each with its own connected account) each carry their own minimum. Vacant Units: $0.00 — vacant units are never charged. Card and ACH processing fees are paid by the Tenant and are never absorbed by Platform; at onboarding, Landlord may elect to cover its Tenants\' ACH fees, but card processing fees are always paid by the Tenant and are never covered by Landlord. Platform fees are billed monthly and deducted from Landlord payouts.' },
+                    { title: '4. Payment Reversals & Pass-Through Charges', body: 'Platform does not absorb banking, processing, or payment-network charges of any kind. All such charges — including card-processing fees, ACH fees, returned-payment fees, and chargeback or dispute fees — pass through to the responsible party as described in the Platform Fees section, and Platform absorbs none of them. Because Platform does not advance funds, a Tenant payment that fails, is returned, or is reversed before settlement is simply not paid out. If a payment is reversed, returned, or charged back after it has been routed to Landlord, Landlord authorizes Platform to recover the reversed amount and any associated charge from Landlord\'s balance or future payouts. Platform bears no liability for reversed, returned, or charged-back payments.' },
+                    { title: '5. Additional Services', body: 'Platform may make additional, optional services and products available to Landlord from time to time (for example, premium features, marketing or listing enhancements, tenant-screening packages, or other add-ons). Each such service is optional and is enrolled in separately. The scope and fees for any additional service are disclosed to Landlord at the point of enrollment, and upon enrollment that service is governed by this Agreement. Landlord authorizes Platform to bill the disclosed fees for any service Landlord enrolls in under the same terms as Platform Fees — billed monthly and deducted from Landlord payouts. Declining or not enrolling in an additional service does not affect Landlord\'s core platform access.' },
+                    { title: '6. Security Deposit Custody', body: 'Where Landlord uses Platform to collect or hold security deposits, Platform holds those funds as custodian. Where applicable law requires a security deposit to be held in a separate, escrow, or trust account, to be held in a particular form, or to accrue interest, Platform holds the deposit accordingly and pays any required interest at the applicable statutory rate. Where applicable law does not require segregation, Landlord authorizes Platform to hold deposit funds in its general account and to use such funds in the ordinary course of its business. In all cases, Platform remains obligated to keep the deposit available for return and disbursement in accordance with the lease and applicable law, and the manner in which deposit funds are held does not reduce or impair the deposit owed to the Tenant; Landlord remains responsible to the Tenant for the security deposit under the lease and applicable law. Landlord may transfer security deposits it currently holds into Platform custody, in which case those deposits are held under this Section and Landlord\'s platform fee is reduced as disclosed by Platform.' },
+                    { title: '7. Tenant Screening & FCRA', body: 'Where Landlord uses Platform\'s tenant-screening or background-check tools, Landlord is the user of the consumer report under the Fair Credit Reporting Act (FCRA) and applicable law. Landlord certifies that it will request and use reports only for a permissible purpose, obtain any required applicant authorization, and make its own screening decisions. When Landlord takes adverse action based in whole or in part on a report, Platform generates and sends the federal adverse-action notice on Landlord\'s behalf using the decision information Landlord provides; Landlord is responsible for the accuracy of that information and for any additional notice or disclosure its jurisdiction requires. Platform provides screening tools only — it is not the decision-maker and does not provide legal advice regarding screening.' },
+                    { title: '8. Eviction Mode', body: 'In many jurisdictions, accepting any rent payment while pursuing eviction for that nonpayment may waive the right to proceed. Landlord is responsible for knowing and complying with their local eviction rules. Landlord must activate Eviction Mode before filing any eviction action. While Eviction Mode is active, all Tenant payments routed to the Landlord for the affected unit are paused. Platform is not liable for eviction complications arising from failure to activate Eviction Mode or from non-compliance with local laws.' },
+                    { title: '9. ACH Authorization', body: 'Landlord authorizes Platform to initiate ACH debit entries from Tenant\'s bank account and ACH credit entries to Landlord\'s connected bank account. Landlord authorizes Platform to reverse erroneous entries. Platform complies with NACHA Operating Rules and Guidelines. Landlord agrees to promptly notify Platform of any unauthorized transactions.' },
+                    { title: '10. Tax Reporting', body: 'Landlord is solely responsible for its own tax obligations arising from its use of the Platform. Platform and its payment processor may issue tax forms (for example, IRS Form 1099-K) to Landlord and to taxing authorities as required by law. Platform does not provide tax advice.' },
+                    { title: '11. Landlord Compliance & Indemnification', body: 'Landlord is solely responsible for operating its rental business in compliance with all applicable laws, including fair-housing, landlord-tenant, consumer-protection, and privacy laws, and for the lawfulness of its lease terms, fees, and tenant communications. Platform\'s features are configurable tools that Landlord directs; Platform does not set, review, or warrant the legality of Landlord\'s decisions. Landlord will indemnify and hold harmless Platform from any claim, loss, or liability arising out of Landlord\'s acts or omissions, its violation of law, or its breach of this Agreement.' },
+                    { title: '12. Disclaimers & Limitation of Liability', body: 'The Platform is provided "as is" and "as available," without warranties of any kind, express or implied. Platform does not provide legal, tax, accounting, or financial advice, and nothing in the Platform constitutes such advice. To the maximum extent permitted by law, Platform is not liable for indirect, incidental, special, consequential, or punitive damages, and Platform\'s total liability for any claim arising out of or relating to this Agreement is limited to the total Platform Fees paid by Landlord in the twelve (12) months preceding the event giving rise to the claim.' },
+                    { title: '13. Automated Systems & AI Agents', body: 'Platform operates in part through automated systems and AI-assisted agents that may communicate with users, generate documents and notices, schedule and process activity, and perform routine actions within the Platform. Where an automated or AI agent presents an action for review, Landlord (or its operator) is responsible for confirming the action before it is taken, and is responsible for any action it confirms or directs the agent to take. These systems may occasionally make an error or take an incorrect action; Platform may review, correct, reverse, or adjust any erroneous action, entry, communication, or record produced by such systems, and Landlord authorizes Platform to make those corrections. Automated or AI-generated communications are operational tools — they are not legal, tax, or financial advice and do not replace Landlord\'s own judgment. Platform\'s responsibility for the actions of its automated systems is governed by the Disclaimers and Limitation of Liability section, and Landlord agrees to promptly notify Platform of any error it identifies so it can be corrected.' },
+                    { title: '14. Electronic Records & Signatures', body: 'Landlord consents to transact with Platform electronically. Landlord agrees that its electronic signature on this Agreement and on any document executed through the Platform is legally binding, and that Platform may deliver this Agreement, notices, disclosures, statements, and other communications electronically, consistent with the federal ESIGN Act and applicable state law. Landlord may request a paper copy of any record and may withdraw consent to electronic delivery as provided by law, which may limit Landlord\'s ability to use the Platform.' },
+                    { title: '15. Communications Consent', body: 'Landlord consents to receive communications from Platform — including account, billing, transaction, security, and service messages — by email, SMS/text, push notification, and telephone, including messages sent by automated systems, at the contact information Landlord provides. Message and data rates may apply. Landlord may opt out of non-essential marketing communications at any time; Landlord may not opt out of operational and transactional messages necessary to provide the service. Landlord is responsible for keeping its contact information current.' },
+                    { title: '16. Privacy & Data', body: 'Platform\'s collection and use of personal information is described in its Privacy Policy, which is incorporated into this Agreement by reference. Landlord represents that it has the authority and any required consents to provide tenant and applicant information to Platform and to direct Platform\'s processing of that information, and that it will handle personal information it receives through the Platform in compliance with applicable privacy laws. Each party will use reasonable measures to protect personal information.' },
+                    { title: '17. FlexCharge', body: 'FlexCharge is a product organized by GAM but operated by Landlord. It lets Landlord, acting as a Business Account Owner, offer a rolling charge account to its tenants or point-of-sale customers at a Location. Landlord — not GAM — is the creditor. Landlord sets all account terms (credit limit, any interest or finance charges, payment cadence, and default consequences) and is solely responsible for compliance with all laws applicable to extending and servicing such accounts, including the Truth in Lending Act, Equal Credit Opportunity Act, Fair Credit Billing Act, Fair Debt Collection Practices Act, and state lending, retail-installment, and usury laws. GAM provides the accounting software only, sets no rules on how Landlord operates its charge accounts, and advises Landlord to operate within its local laws. The three-party terms among the account holder, Landlord, and GAM are set out in the FlexCharge Business Account Agreement Landlord enters at enablement. FlexCharge is not a launch feature; these terms govern it if and when Landlord enables it.' },
+                    { title: '18. Termination', body: 'Landlord may stop using and leave the Platform at any time. Platform Fees are not prorated; no partial-month credit or refund is issued upon termination, and any outstanding Platform Fees or other amounts owed to Platform remain due and may be settled from Landlord\'s balance or payouts. Following termination, security deposits held by Platform in custody may be retained for up to ninety (90) days to wind down accounts and close any interest-bearing accounts, unless applicable law requires earlier return or disbursement; such deposits remain subject to the lease and applicable law. Final payouts settle through normal processing.' },
+                    { title: '19. Dispute Resolution & Arbitration', body: 'Most concerns can be resolved informally: before starting a formal proceeding, a party must send the other written notice describing the dispute and allow 30 days to resolve it. Any dispute not resolved that way will be settled by binding arbitration administered by the American Arbitration Association under its Commercial Arbitration Rules, before a single arbitrator, in the state where Platform is headquartered, and the Federal Arbitration Act governs this section. Disputes will be arbitrated only on an individual basis: Landlord and Platform each waive any right to bring or participate in a class, collective, consolidated, or representative action, and the arbitrator may not consolidate claims or preside over any form of representative proceeding. Notwithstanding the above, either party may bring an individual claim in small-claims court, and either party may seek injunctive or other equitable relief in court to protect its intellectual property or confidential information. If the class-action waiver in this section is found unenforceable as to a particular claim, that claim (and only that claim) will proceed in court rather than arbitration, and the remainder of this section stays in effect.' },
+                    { title: '20. Governing Law & Amendments', body: 'This Agreement is governed by the laws of the state where Platform is headquartered. If any provision is held unenforceable, the remaining provisions remain in full force. Platform may update this Agreement with 30 days\' written notice to Landlord.' },
+                    { title: '21. General Provisions', body: 'Landlord may not assign this Agreement without Platform\'s prior written consent; Platform may assign it to an affiliate or to a successor in connection with a merger, acquisition, or sale of assets. This Agreement, together with any terms presented at enrollment for a specific service, is the entire agreement between the parties on its subject matter and supersedes prior understandings. Platform may provide notices to Landlord electronically or through the Platform. Neither party is liable for failures or delays caused by events beyond its reasonable control. A failure to enforce any provision is not a waiver of it.' },
                   ].map(section => (
                     <div key={section.title} style={{ marginBottom: 16 }}>
                       <div style={{ fontWeight: 700, color: 'var(--text-0)', marginBottom: 4 }}>{section.title}</div>
@@ -392,8 +438,8 @@ export function OnboardingPage() {
                     </div>
                   ))}
 
-                  <div style={{ borderTop: '1px solid var(--border-0)', paddingTop: 12, marginTop: 8, color: 'var(--amber)', fontStyle: 'italic', fontSize: '.72rem' }}>
-                    This agreement is pending review by licensed counsel. Questions about this agreement should be directed to your own legal counsel.
+                  <div style={{ borderTop: '1px solid var(--border-0)', paddingTop: 12, marginTop: 8, color: 'var(--text-3)', fontSize: '.72rem' }}>
+                    Landlords are encouraged to consult their own advisor before signing.
                   </div>
                 </div>
 
@@ -407,7 +453,7 @@ export function OnboardingPage() {
                   <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, cursor: 'pointer' }}>
                     <input type="checkbox" checked={agreed} onChange={e => setAgreed(e.target.checked)} style={{ marginTop: 2 }} />
                     <div style={{ fontSize: '.78rem', color: 'var(--text-1)', lineHeight: 1.5 }}>
-                      I have read and understand the Landlord Platform Participation Agreement. I agree to the On-Time Pay SLA terms, platform fees, and all other provisions. I acknowledge this agreement is pending attorney review.
+                      I have read and understand the Landlord Platform Participation Agreement. I agree to the platform fees and all other provisions.
                     </div>
                   </label>
                   {errors.agreed && <div style={{ color: 'var(--red)', fontSize: '.7rem', marginTop: 6 }}>{errors.agreed}</div>}

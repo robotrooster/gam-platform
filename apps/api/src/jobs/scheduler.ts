@@ -618,6 +618,53 @@ export function schedulerInit() {
     }
   }, { timezone: 'America/Phoenix' })
 
+  // Route auto-advance (service-business). Every minute: walk every
+  // in_progress route and auto-complete stops whose timer has elapsed
+  // (planned drive leg + 1 min after the previous stop finalized).
+  // Drivers don't tap a per-stop button — this is what marks stops
+  // done; their only manual action is Skip. Idempotent; future stops
+  // wait. When a route's stops are all finalized, the route completes.
+  cron.schedule('* * * * *', async () => {
+    try {
+      const { processRouteAutoAdvance } = await import('./routeAutoAdvance')
+      const result = await processRouteAutoAdvance()
+      if (result.stops_completed > 0 || result.routes_completed > 0) {
+        logger.info(result, '[route-auto-advance]')
+      }
+    } catch (e) {
+      logger.error({ err: e }, '[route-auto-advance] fatal')
+    }
+  }, { timezone: 'America/Phoenix' })
+
+  // S517: public booking holds + waitlist claims. Every minute — expire
+  // abandoned tentative deposit holds (frees the calendar) + stale 1-hour
+  // waitlist claims, then promote the next eligible waitlister for any unit
+  // a cancellation/expiry just freed. Idempotent.
+  cron.schedule('* * * * *', async () => {
+    try {
+      const { sweepBookingHoldsAndClaims } = await import('../services/propertyBooking')
+      const r = await sweepBookingHoldsAndClaims()
+      if (r.holdsExpired > 0 || r.claimsExpired > 0 || r.promoted > 0) {
+        logger.info(r, '[booking-sweep]')
+      }
+    } catch (e) {
+      logger.error({ err: e }, '[booking-sweep] fatal')
+    }
+  })
+
+  // S517: flip scheduled service-interruption notices to 'active' once their
+  // start time arrives (every 5 min). Resolution stays manual — see
+  // services/serviceInterruptions.ts for why we don't auto-resolve.
+  cron.schedule('*/5 * * * *', async () => {
+    try {
+      const { activateDueServiceInterruptions } = await import('../services/serviceInterruptions')
+      const r = await activateDueServiceInterruptions()
+      if (r.activated > 0) logger.info(r, '[service-interruption-activate]')
+    } catch (e) {
+      logger.error({ err: e }, '[service-interruption-activate] fatal')
+    }
+  })
+
   // S468: recurring-schedule materializer (service-business / Phase 1a.2).
   // Daily at 1:15am Phoenix — sits between manager-fee accrual (1am 1st)
   // and platform-fee accrual (1:30am 1st); on non-monthly days it has the

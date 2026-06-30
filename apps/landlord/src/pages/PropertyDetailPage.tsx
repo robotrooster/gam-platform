@@ -7,6 +7,7 @@ import { AddUnitModal } from './AddUnitModal'
 import { PropertyFeeScheduleSection } from './PropertyFeeScheduleSection'
 import { PropertyAgentPermissionsSection } from './PropertyAgentPermissionsSection'
 import { LawWarningBanner } from '../components/LawWarningBanner'
+import { LAUNCH_HIDDEN } from '../components/layout/Layout'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
 const STATUS_COLORS: Record<string,string> = {
@@ -83,13 +84,15 @@ export function PropertyDetailPage() {
 
       {/* S159: PM Linkage section — visible whether or not a PM is set;
             CTA to /pm-invitations is the discoverability path for landlords
-            without a PM yet. */}
-      <PmLinkageCard
-        propertyId={property.id}
-        propertyName={property.name}
-        pmCompanyId={property.pmCompanyId ?? null}
-        pmFeePlanId={property.pmFeePlanId ?? null}
-      />
+            without a PM yet. S512: hidden at launch with the PM-company surface. */}
+      {!LAUNCH_HIDDEN.has('/pm-invitations') && (
+        <PmLinkageCard
+          propertyId={property.id}
+          propertyName={property.name}
+          pmCompanyId={property.pmCompanyId ?? null}
+          pmFeePlanId={property.pmFeePlanId ?? null}
+        />
+      )}
 
       {/* S184: individual day-to-day manager assignment. Hidden when a PM
             company is set — that takes priority in the responsible-party
@@ -135,7 +138,7 @@ export function PropertyDetailPage() {
             <thead>
               <tr>
                 <th>Unit</th><th>Tenant</th><th>Rent</th><th>Status</th>
-                <th>Bed/Bath</th><th>Sq Ft</th><th>On-Time Pay</th><th></th>
+                <th>Bed/Bath</th><th>Sq Ft</th><th></th>
               </tr>
             </thead>
             <tbody>
@@ -158,12 +161,6 @@ export function PropertyDetailPage() {
                   <td><span className={`badge ${STATUS_COLORS[u.status] || 'badge-muted'}`}>{u.status?.replace('_',' ')}</span></td>
                   <td style={{ fontSize:'.78rem' }}>{u.bedrooms}bd / {u.bathrooms}ba</td>
                   <td className="mono" style={{ fontSize:'.75rem' }}>{u.sqft ? u.sqft.toLocaleString() : '—'}</td>
-                  <td>
-                    {u.onTimePayActive
-                      ? <span className="badge badge-green">Active</span>
-                      : <span className="badge badge-muted">Inactive</span>
-                    }
-                  </td>
                   <td onClick={e => e.stopPropagation()}>
                     <button className="btn btn-ghost btn-sm" onClick={() => navigate(`/units/${u.id}`)}>View</button>
                   </td>
@@ -189,7 +186,7 @@ const LEDGER_TYPE_LABELS: Record<string, string> = {
   allocation_manager_fee: 'Manager fee',
   withdrawal_auto: 'Auto Friday payout',
   withdrawal_manual: 'Manual withdrawal',
-  withdrawal_otp: 'OTP withdrawal',
+  withdrawal_otp: 'Scheduled payout',
   reserve_fund_replenishment: 'Reserve fund',
   adjustment: 'Adjustment',
 }

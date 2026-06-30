@@ -18,6 +18,7 @@ export interface InspectionUnitRow {
   unit_number: string | null
   bedrooms: number | null
   unit_type: string | null
+  guided_walkthrough_declined?: boolean
 }
 
 export const CLOSED_INSPECTION_STATUSES = ['finalized', 'cancelled']

@@ -127,6 +127,25 @@ describe('POST /api/auth/register — verification email side effect', () => {
     expect(firstName).toBe('New')
     expect(url).toContain(`token=${token}`)
   })
+
+  // Model C: in local dev the account auto-verifies and no email is sent;
+  // 'production' and 'test' keep the real gate (asserted by the case above).
+  it('dev env: auto-verifies + sends no verification email', async () => {
+    const prev = process.env.NODE_ENV
+    process.env.NODE_ENV = 'development'
+    try {
+      const res = await request(buildApp())
+        .post('/api/auth/register')
+        .send({ email: 'devuser@test.dev', password: 'goodpass1234',
+          firstName: 'Dev', lastName: 'User', role: 'tenant', acceptedTerms: true })
+      expect(res.status).toBe(201)
+      const row = await db.query<{ email_verified: boolean; email_verify_token: string | null }>(
+        `SELECT email_verified, email_verify_token FROM users WHERE email='devuser@test.dev'`)
+      expect(row.rows[0].email_verified).toBe(true)
+      expect(row.rows[0].email_verify_token).toBeNull()
+      expect(sendVerifyMock).not.toHaveBeenCalled()
+    } finally { process.env.NODE_ENV = prev }
+  })
 })
 
 describe('POST /api/auth/verify-email', () => {

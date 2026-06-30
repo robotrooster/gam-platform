@@ -126,12 +126,25 @@ describe('OTP enrollment (deprecated S155)', () => {
   })
 })
 
-describe('Credit reporting enrollment', () => {
-  it('POST /enroll-credit-reporting flips column to TRUE; idempotent on re-call', async () => {
+describe('Credit reporting enrollment (FlexCredit)', () => {
+  it('flag OFF (default): does NOT flip the column, returns visible:false', async () => {
     const f = await seedFixture()
-    const pre = await db.query<{ credit_reporting_enrolled: boolean }>(
+    const r = await request(buildApp())
+      .post('/api/tenants/enroll-credit-reporting')
+      .set('Authorization', `Bearer ${f.token}`)
+    expect(r.status).toBe(200)
+    expect(r.body.data?.visible).toBe(false)
+    const row = await db.query<{ credit_reporting_enrolled: boolean }>(
       `SELECT credit_reporting_enrolled FROM tenants WHERE id=$1`, [f.tenantId])
-    expect(pre.rows[0].credit_reporting_enrolled).toBe(false)
+    expect(row.rows[0].credit_reporting_enrolled).toBe(false)  // NOT enrolled while hidden
+  })
+
+  it('flag ON: flips column to TRUE; idempotent on re-call', async () => {
+    const f = await seedFixture()
+    await db.query(
+      `INSERT INTO system_features (key, enabled, description)
+       VALUES ('flexcredit_rollout_visible', TRUE, 'test')
+       ON CONFLICT (key) DO UPDATE SET enabled = TRUE`)
 
     const r1 = await request(buildApp())
       .post('/api/tenants/enroll-credit-reporting')

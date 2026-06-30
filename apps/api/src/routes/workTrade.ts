@@ -5,6 +5,19 @@ import { requireAuth, requirePerm } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { resolveLandlordIdForUser } from '../lib/scope'
 import { canManageLandlordResource } from '../middleware/scope'
+import { workTradeFraction } from '../services/workTradeCredit'
+
+// ============================================================
+// S517 / Walkthrough Landlord #29 — work-trade routes, percent model.
+//
+// An agreement is just the enrollment (tenant + unit + duties + term). The
+// tenant logs hours (work_trade_logs); the landlord approves/rejects. There
+// are no dollar terms and no per-agreement reconciliation: at invoice
+// generation, approved hours from the prior month buy a percent of the
+// invoice total against the PROPERTY's monthly hours target
+// (properties.work_trade_hours_target). See services/workTradeCredit.ts +
+// jobs/invoiceGeneration.ts for the billing wire.
+// ============================================================
 
 export const workTradeRouter = Router()
 workTradeRouter.use(requireAuth)
@@ -12,10 +25,7 @@ workTradeRouter.use(requireAuth)
 // ── HELPERS ──────────────────────────────────────────────────
 
 // S130: resolve agreement and verify caller has landlord-scope authority
-// over it. Replaces the prior helper which compared agreement.landlord_id
-// to req.user.profileId (broke for team workers — their profileId is the
-// team_member.id, not the landlord.id) and the broken isAdmin check
-// (which queried users.role with a landlord.id, not a user.id).
+// over it (covers owner landlord + scoped team workers).
 async function getAgreementForUser(agreementId: string, user: any) {
   const agreement = await queryOne<any>(
     'SELECT * FROM work_trade_agreements WHERE id=$1', [agreementId]
@@ -27,22 +37,55 @@ async function getAgreementForUser(agreementId: string, user: any) {
   return agreement
 }
 
-// ── CREATE AGREEMENT ─────────────────────────────────────────
+// ── PROPERTY HOURS TARGET (the credit denominator) ───────────
+
+// Read a property's monthly work-trade hours target.
+workTradeRouter.get('/property/:propertyId/target', requirePerm('work_trade.view'), async (req, res, next) => {
+  try {
+    const prop = await queryOne<{ id: string; landlord_id: string; work_trade_hours_target: number }>(
+      'SELECT id, landlord_id, work_trade_hours_target FROM properties WHERE id=$1', [req.params.propertyId]
+    )
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canManageLandlordResource(req.user, prop.landlord_id, ['property_manager'])) {
+      throw new AppError(403, 'Forbidden')
+    }
+    res.json({ success: true, data: { propertyId: prop.id, target: prop.work_trade_hours_target } })
+  } catch (e) { next(e) }
+})
+
+// Set a property's monthly work-trade hours target. A full target month of
+// verified hours covers 100% of that month's invoice.
+workTradeRouter.patch('/property/:propertyId/target', requirePerm('work_trade.manage'), async (req, res, next) => {
+  try {
+    const { target } = z.object({
+      target: z.number().int().positive().max(744),   // 744 = 31×24, a hard sanity cap
+    }).parse(req.body)
+    const prop = await queryOne<{ id: string; landlord_id: string }>(
+      'SELECT id, landlord_id FROM properties WHERE id=$1', [req.params.propertyId]
+    )
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canManageLandlordResource(req.user, prop.landlord_id, ['property_manager'])) {
+      throw new AppError(403, 'Forbidden')
+    }
+    const updated = await queryOne<{ work_trade_hours_target: number }>(
+      'UPDATE properties SET work_trade_hours_target=$1, updated_at=NOW() WHERE id=$2 RETURNING work_trade_hours_target',
+      [target, prop.id]
+    )
+    res.json({ success: true, data: { propertyId: prop.id, target: updated!.work_trade_hours_target } })
+  } catch (e) { next(e) }
+})
+
+// ── CREATE AGREEMENT (enrollment only) ───────────────────────
 
 workTradeRouter.post('/', requirePerm('work_trade.manage'), async (req, res, next) => {
   try {
     const body = z.object({
-      unitId:         z.string().uuid(),
-      tenantId:       z.string().uuid(),
-      tradeType:      z.enum(['full','partial','credit']),
-      hourlyRate:     z.number().positive(),
-      weeklyHours:    z.number().positive(),
-      marketRent:     z.number().positive(),
-      cashRent:       z.number().min(0).default(0),
-      duties:         z.string().optional(),
-      startDate:      z.string(),
-      endDate:        z.string().optional(),
-      renewalTerms:   z.string().optional(),
+      unitId:       z.string().uuid(),
+      tenantId:     z.string().uuid(),
+      duties:       z.string().optional(),
+      startDate:    z.string(),
+      endDate:      z.string().optional(),
+      renewalTerms: z.string().optional(),
     }).parse(req.body)
 
     const landlordId = resolveLandlordIdForUser(req.user!)
@@ -52,11 +95,8 @@ workTradeRouter.post('/', requirePerm('work_trade.manage'), async (req, res, nex
     const unit = await queryOne<any>('SELECT * FROM units WHERE id=$1 AND landlord_id=$2', [body.unitId, landlordId])
     if (!unit) throw new AppError(404, 'Unit not found or access denied')
 
-    // S397 fix: verify the tenant has a lease in caller's portfolio.
-    // Pre-fix, body.tenantId was inserted unvalidated — a landlord
-    // could create a work-trade agreement against ANY tenant id
-    // (including strangers') and the tenant's view via /work-trade
-    // would surface it. Cross-tenant assignment.
+    // S397: verify the tenant has a lease in caller's portfolio (no
+    // cross-tenant assignment).
     const tenantLease = await queryOne<{ id: string }>(
       `SELECT l.id FROM leases l
        JOIN lease_tenants lt ON lt.lease_id = l.id
@@ -64,32 +104,13 @@ workTradeRouter.post('/', requirePerm('work_trade.manage'), async (req, res, nex
       [body.tenantId, landlordId])
     if (!tenantLease) throw new AppError(404, 'Tenant has no lease under this landlord')
 
-    // Calculate max monthly credit
-    const monthlyHours = body.weeklyHours * (52 / 12)
-    const tradeCreditMax = monthlyHours * body.hourlyRate
-    const cashRent = body.tradeType === 'full' ? 0 : body.cashRent
-
     const agreement = await queryOne<any>(`
       INSERT INTO work_trade_agreements
-        (unit_id, tenant_id, landlord_id, trade_type, hourly_rate, weekly_hours,
-         market_rent, cash_rent, trade_credit_max, duties, start_date, end_date, renewal_terms)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+        (unit_id, tenant_id, landlord_id, duties, start_date, end_date, renewal_terms)
+      VALUES ($1,$2,$3,$4,$5,$6,$7)
       RETURNING *`,
-      [body.unitId, body.tenantId, landlordId, body.tradeType,
-       body.hourlyRate, body.weeklyHours, body.marketRent, cashRent,
-       tradeCreditMax, body.duties || null, body.startDate,
-       body.endDate || null, body.renewalTerms || null]
-    )
-
-    // Create the first open period
-    const now = new Date()
-    const monthlyCommitHours = body.weeklyHours * (52 / 12)
-    await query(`
-      INSERT INTO work_trade_periods
-        (agreement_id, period_month, period_year, hours_committed, cash_due)
-      VALUES ($1,$2,$3,$4,$5)
-      ON CONFLICT DO NOTHING`,
-      [agreement!.id, now.getMonth() + 1, now.getFullYear(), monthlyCommitHours, cashRent]
+      [body.unitId, body.tenantId, landlordId, body.duties || null,
+       body.startDate, body.endDate || null, body.renewalTerms || null]
     )
 
     res.json({ success: true, data: agreement })
@@ -100,11 +121,8 @@ workTradeRouter.post('/', requirePerm('work_trade.manage'), async (req, res, nex
 
 workTradeRouter.get('/unit/:unitId', async (req, res, next) => {
   try {
-    // S397 fix: validate caller can access the unit's landlord scope.
-    // Pre-fix, the SELECT had no landlord filter — any auth user could
-    // pass any unit's id and read its work-trade agreement (tenant
-    // name/email, hourly rate, weekly hours, market rent). Cross-tenant
-    // information disclosure.
+    // S397: validate caller can access the unit's landlord scope OR is the
+    // tenant on the unit.
     const unit = await queryOne<{ landlord_id: string; tenant_id: string | null }>(
       `SELECT u.landlord_id,
               (SELECT lt.tenant_id FROM lease_tenants lt
@@ -124,7 +142,7 @@ workTradeRouter.get('/unit/:unitId', async (req, res, next) => {
     const agreement = await queryOne<any>(`
       SELECT wta.*,
         u.first_name as tenant_first, u.last_name as tenant_last, u.email as tenant_email,
-        un.unit_number, p.name as property_name
+        un.unit_number, p.name as property_name, p.work_trade_hours_target AS target
       FROM work_trade_agreements wta
       JOIN tenants t ON t.id = wta.tenant_id
       JOIN users u ON u.id = t.user_id
@@ -138,15 +156,19 @@ workTradeRouter.get('/unit/:unitId', async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
-// ── GET AGREEMENT WITH LOGS ───────────────────────────────────
+// ── GET AGREEMENT WITH LOGS + CURRENT-MONTH PROGRESS ──────────
 
 workTradeRouter.get('/:id', async (req, res, next) => {
   try {
-    const agreement = await queryOne<any>('SELECT * FROM work_trade_agreements WHERE id=$1', [req.params.id])
+    const agreement = await queryOne<any>(`
+      SELECT wta.*, p.work_trade_hours_target AS target,
+        un.unit_number, p.name as property_name
+      FROM work_trade_agreements wta
+      JOIN units un ON un.id = wta.unit_id
+      JOIN properties p ON p.id = un.property_id
+      WHERE wta.id=$1`, [req.params.id])
     if (!agreement) throw new AppError(404, 'Not found')
-    // S397 fix: validate caller scope. Pre-fix, any auth user could
-    // pass any agreement UUID and read the full payload (agreement
-    // + logs + periods + stats). Cross-tenant information disclosure.
+    // S397: validate caller scope (owner landlord / team / own tenant / admin).
     const u = req.user!
     const isAdmin = u.role === 'admin' || u.role === 'super_admin'
     const isOwnerLandlord = u.role === 'landlord' && u.profileId === agreement.landlord_id
@@ -165,35 +187,30 @@ workTradeRouter.get('/:id', async (req, res, next) => {
       WHERE wtl.agreement_id=$1
       ORDER BY wtl.work_date DESC`, [req.params.id])
 
-    const periods = await query<any>(
-      'SELECT * FROM work_trade_periods WHERE agreement_id=$1 ORDER BY period_year DESC, period_month DESC',
-      [req.params.id]
-    )
-
-    // Current period stats
+    // Current-month progress: approved hours logged THIS calendar month are
+    // what the tenant is earning toward NEXT month's invoice credit.
     const now = new Date()
-    const currentPeriod = periods.find(p =>
-      p.period_month === now.getMonth() + 1 && p.period_year === now.getFullYear()
-    )
+    const inThisMonth = (d: string) => {
+      const wd = new Date(d)
+      return wd.getMonth() === now.getMonth() && wd.getFullYear() === now.getFullYear()
+    }
+    const target = Number(agreement.target)
+    const approvedThisMonth = logs.filter(l => l.status === 'approved' && inThisMonth(l.work_date))
+    const hoursApprovedThisMonth = approvedThisMonth.reduce((s: number, l: any) => s + parseFloat(l.hours), 0)
     const pendingLogs = logs.filter(l => l.status === 'pending')
-    const approvedThisPeriod = logs.filter(l =>
-      l.status === 'approved' &&
-      new Date(l.work_date).getMonth() + 1 === now.getMonth() + 1 &&
-      new Date(l.work_date).getFullYear() === now.getFullYear()
-    )
-    const hoursApprovedThisPeriod = approvedThisPeriod.reduce((s: number, l: any) => s + parseFloat(l.hours), 0)
+    const fraction = workTradeFraction(hoursApprovedThisMonth, target)
 
     res.json({
       success: true,
       data: {
         agreement,
         logs,
-        periods,
-        currentPeriod,
         stats: {
+          target,
+          hoursApprovedThisMonth,
           pendingCount: pendingLogs.length,
-          hoursThisPeriod: hoursApprovedThisPeriod,
-          hoursCommitted: parseFloat(agreement.weekly_hours) * (52 / 12),
+          creditFraction: fraction,
+          creditPct: Math.round(fraction * 1000) / 10,   // e.g. 62.5
         }
       }
     })
@@ -214,12 +231,8 @@ workTradeRouter.post('/:id/logs', async (req, res, next) => {
     if (!agreement) throw new AppError(404, 'Agreement not found')
     if (agreement.status !== 'active') throw new AppError(400, 'Agreement is not active')
 
-    // S397 fix: caller-scope validation. Pre-fix the route only
-    // checked tenant-self-match; non-tenant roles (landlord,
-    // property_manager, onsite_manager) could post fake hours
-    // against ANY agreement (including strangers'). Cross-tenant
-    // write into work_trade_logs + later approval would bump
-    // ytd_value on the stranger landlord's agreement.
+    // S397: own-tenant OR own-landlord-scope may submit (landlord can log a
+    // substitute entry); strangers cannot.
     const u = req.user!
     const isOwnTenant = u.role === 'tenant' && u.profileId === agreement.tenant_id
     const isAdmin = u.role === 'admin' || u.role === 'super_admin'
@@ -253,84 +266,18 @@ workTradeRouter.patch('/logs/:logId', requirePerm('work_trade.reconcile'), async
     )
     if (!log) throw new AppError(404, 'Log not found')
 
-    const agreement = await getAgreementForUser(log.agreement_id, req.user!)
-    const creditValue = action === 'approve' ? parseFloat(log.hours) * parseFloat(agreement.hourly_rate) : null
+    // Scope check (also 404s a stranger's agreement before any write).
+    await getAgreementForUser(log.agreement_id, req.user!)
 
+    // No per-log dollar value in the percent model — approval simply makes
+    // the hours count toward the next invoice's credit.
     const updated = await queryOne<any>(`
       UPDATE work_trade_logs SET
         status=$1, reviewed_by=$2, reviewed_at=NOW(),
-        rejection_reason=$3, credit_value=$4
-      WHERE id=$5 RETURNING *`,
-      [action === 'approve' ? 'approved' : 'rejected',
-       req.user!.userId, rejectionReason || null, creditValue, log.id]
-    )
-
-    // Update period hours if approved
-    if (action === 'approve') {
-      const workDate = new Date(log.work_date)
-      await query(`
-        UPDATE work_trade_periods SET
-          hours_worked = hours_worked + $1,
-          credit_earned = credit_earned + $2
-        WHERE agreement_id=$3 AND period_month=$4 AND period_year=$5`,
-        [log.hours, creditValue, agreement.id,
-         workDate.getMonth() + 1, workDate.getFullYear()]
-      )
-
-      // Update YTD value and flag 1099 if over $600
-      await query(`
-        UPDATE work_trade_agreements SET
-          ytd_value = ytd_value + $1,
-          flag_1099 = CASE WHEN ytd_value + $1 >= 600 THEN TRUE ELSE flag_1099 END
-        WHERE id=$2`, [creditValue, agreement.id]
-      )
-    }
-
-    res.json({ success: true, data: updated })
-  } catch (e) { next(e) }
-})
-
-// ── LANDLORD: RECONCILE PERIOD ────────────────────────────────
-
-workTradeRouter.post('/:id/reconcile', requirePerm('work_trade.reconcile'), async (req, res, next) => {
-  try {
-    const { month, year } = z.object({
-      month: z.number().int().min(1).max(12),
-      year:  z.number().int().min(2020),
-    }).parse(req.body)
-
-    const agreement = await getAgreementForUser(req.params.id, req.user!)
-
-    const period = await queryOne<any>(`
-      SELECT * FROM work_trade_periods
-      WHERE agreement_id=$1 AND period_month=$2 AND period_year=$3`,
-      [agreement.id, month, year]
-    )
-    if (!period) throw new AppError(404, 'Period not found')
-    if (period.status === 'reconciled') throw new AppError(400, 'Already reconciled')
-
-    const hoursShort = Math.max(0, period.hours_committed - period.hours_worked)
-    const shortfallCharge = hoursShort * parseFloat(agreement.hourly_rate)
-    const cashDue = parseFloat(agreement.cash_rent) + shortfallCharge
-
-    const updated = await queryOne<any>(`
-      UPDATE work_trade_periods SET
-        hours_short=$1, shortfall_charge=$2, cash_due=$3,
-        status='reconciled', reconciled_at=NOW()
+        rejection_reason=$3
       WHERE id=$4 RETURNING *`,
-      [hoursShort, shortfallCharge, cashDue, period.id]
-    )
-
-    // Open next period
-    const nextMonth = month === 12 ? 1 : month + 1
-    const nextYear  = month === 12 ? year + 1 : year
-    const monthlyCommit = parseFloat(agreement.weekly_hours) * (52 / 12)
-    await query(`
-      INSERT INTO work_trade_periods
-        (agreement_id, period_month, period_year, hours_committed, cash_due)
-      VALUES ($1,$2,$3,$4,$5)
-      ON CONFLICT DO NOTHING`,
-      [agreement.id, nextMonth, nextYear, monthlyCommit, agreement.cash_rent]
+      [action === 'approve' ? 'approved' : 'rejected',
+       req.user!.userId, rejectionReason || null, log.id]
     )
 
     res.json({ success: true, data: updated })
@@ -346,8 +293,12 @@ workTradeRouter.get('/', requirePerm('work_trade.view'), async (req, res, next) 
     const agreements = await query<any>(`
       SELECT wta.*,
         u.first_name as tenant_first, u.last_name as tenant_last,
-        un.unit_number, p.name as property_name,
-        (SELECT COUNT(*) FROM work_trade_logs wtl WHERE wtl.agreement_id=wta.id AND wtl.status='pending') as pending_count
+        un.unit_number, p.id as property_id, p.name as property_name, p.work_trade_hours_target AS target,
+        (SELECT COUNT(*) FROM work_trade_logs wtl
+          WHERE wtl.agreement_id=wta.id AND wtl.status='pending') as pending_count,
+        (SELECT COALESCE(SUM(l.hours),0) FROM work_trade_logs l
+          WHERE l.agreement_id=wta.id AND l.status='approved'
+            AND date_trunc('month', l.work_date) = date_trunc('month', CURRENT_DATE)) as hours_this_month
       FROM work_trade_agreements wta
       JOIN tenants t ON t.id = wta.tenant_id
       JOIN users u ON u.id = t.user_id

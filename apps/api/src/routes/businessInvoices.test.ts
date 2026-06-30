@@ -170,6 +170,35 @@ describe('POST /api/business-invoices', () => {
     expect(res.status).toBe(400)
   })
 
+  it('S511: deposit persists with its type', async () => {
+    const f = await seedFixture()
+    const res = await request(buildApp())
+      .post('/api/business-invoices')
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send(validCreate(f.customerId, { depositAmount: 50, depositType: 'materials' }))
+    expect(res.status).toBe(201)
+    expect(Number(res.body.data.deposit_amount)).toBe(50)
+    expect(res.body.data.deposit_type).toBe('materials')
+  })
+
+  it('S511: deposit exceeding total → 400', async () => {
+    const f = await seedFixture()
+    const res = await request(buildApp())
+      .post('/api/business-invoices')
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send(validCreate(f.customerId, { depositAmount: 9999, depositType: 'service' }))
+    expect(res.status).toBe(400)
+  })
+
+  it('S511: deposit amount without a type → 400 (zod pairing)', async () => {
+    const f = await seedFixture()
+    const res = await request(buildApp())
+      .post('/api/business-invoices')
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send(validCreate(f.customerId, { depositAmount: 25 }))
+    expect(res.status).toBe(400)
+  })
+
   it('tax adds to total', async () => {
     const f = await seedFixture()
     const res = await request(buildApp())

@@ -106,6 +106,16 @@ async function seed() {
         $2, $2)
       RETURNING id`, [landlord2.id, lUser2.id])
 
+    // Backdate demo-property onboarding so the seeded P&L / platform-fee reports
+    // show a populated full year. Platform fee is charged per month a property
+    // has been ON THE PLATFORM (created_at), so without this the demo would only
+    // show fees from the seed date forward. REAL landlords keep their true
+    // onboarding date — a landlord who joins July 1 is charged July-forward only.
+    await client.query(
+      `UPDATE properties SET created_at = NOW() - INTERVAL '18 months'
+        WHERE id = ANY($1::uuid[])`,
+      [[prop1?.id, prop2?.id, prop3?.id].filter(Boolean)])
+
     console.log('  ✓ Properties:', [prop1?.id, prop2?.id, prop3?.id].filter(Boolean).length)
 
     // ── TENANTS ───────────────────────────────────────────

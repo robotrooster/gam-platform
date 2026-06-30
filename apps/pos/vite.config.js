@@ -1,9 +1,0 @@
-import { defineConfig } from 'vite';
-import react from '@vitejs/plugin-react';
-export default defineConfig({
-    plugins: [react()],
-    resolve: {
-        alias: { '@gam/shared': '/Users/nicholasrhoades/Downloads/gam/packages/shared/src/index.ts' }
-    },
-    server: { strictPort: true, port: 3005 }
-});

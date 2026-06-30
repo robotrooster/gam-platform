@@ -17,6 +17,7 @@ const LANDLORD_NOTIFICATION_TYPES: { type: string; label: string }[] = [
   { type: 'lease_expiring',                label: 'Lease expiring' },
   { type: 'low_stock',                     label: 'Low POS stock' },
   { type: 'tenant_invite_accepted',        label: 'Tenant accepted invite' },
+  { type: 'reservation_requested',         label: 'Amenity reservation request' },
 ]
 
 interface EmailFailureRow {

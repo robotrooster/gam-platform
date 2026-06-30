@@ -32,6 +32,7 @@ interface CustomerRow {
   street1: string; street2: string | null
   city: string; state: string; zip: string
   lat: string | null; lon: string | null
+  unitCount?: number
   status: string
   createdAt: string
   lastServicedAt: string | null
@@ -53,6 +54,7 @@ export function CustomersPage() {
     email: '', phone: '',
     street1: '', street2: '',
     city: '', state: '', zip: '',
+    unitCount: '1',
   })
   const [saving, setSaving] = useState(false)
   const [geocoding, setGeocoding] = useState<string | null>(null)
@@ -65,6 +67,7 @@ export function CustomersPage() {
     city: '', state: '', zip: '',
     lat: '', lon: '',
     taxExempt: false, taxExemptReason: '',
+    unitCount: '1',
   })
   const [editSaving, setEditSaving] = useState(false)
   const [archiving, setArchiving] = useState<string | null>(null)
@@ -112,12 +115,14 @@ export function CustomersPage() {
         phone: form.phone || undefined,
         street1: form.street1, street2: form.street2 || undefined,
         city: form.city, state: form.state, zip: form.zip,
+        unitCount: Math.max(0, Math.round(Number(form.unitCount) || 1)),
       })
       setForm({
         customerType: 'individual',
         companyName: '', firstName: '', lastName: '',
         email: '', phone: '',
         street1: '', street2: '', city: '', state: '', zip: '',
+        unitCount: '1',
       })
       await reload()
     } catch (e: any) {
@@ -137,6 +142,7 @@ export function CustomersPage() {
       lat: r.lat ?? '', lon: r.lon ?? '',
       taxExempt: (r as any).taxExempt ?? false,
       taxExemptReason: (r as any).taxExemptReason ?? '',
+      unitCount: String((r as any).unitCount ?? 1),
     })
   }
 
@@ -168,6 +174,7 @@ export function CustomersPage() {
         city: editForm.city, state: editForm.state, zip: editForm.zip,
         taxExempt: editForm.taxExempt,
         taxExemptReason: editForm.taxExempt ? (editForm.taxExemptReason.trim() || null) : null,
+        unitCount: Math.max(0, Math.round(Number(editForm.unitCount) || 1)),
         ...coordPatch,
       })
       setEditing(null)
@@ -468,6 +475,12 @@ export function CustomersPage() {
               </div>
             </div>
 
+            <div style={{ marginTop: 12, maxWidth: 200 }}>
+              <label style={labelStyle}>Units (e.g. # cans)</label>
+              <input value={form.unitCount} onChange={e => setForm({ ...form, unitCount: e.target.value })}
+                type="number" min="0" step="1" style={inputStyle} />
+            </div>
+
             <button type="submit" disabled={saving}
               style={{ ...btnStyle, opacity: saving ? 0.6 : 1 }}>
               {saving ? 'Saving…' : 'Add customer'}
@@ -554,6 +567,12 @@ export function CustomersPage() {
                   onChange={e => setEditForm({ ...editForm, zip: e.target.value })}
                   required style={inputStyle} />
               </div>
+            </div>
+            <div style={{ marginTop: 12, maxWidth: 200 }}>
+              <label style={labelStyle}>Units (e.g. # cans)</label>
+              <input value={editForm.unitCount}
+                onChange={e => setEditForm({ ...editForm, unitCount: e.target.value })}
+                type="number" min="0" step="1" style={inputStyle} />
             </div>
             <div style={{ marginTop: 16, padding: 12, background: 'var(--bg-2)', borderRadius: 8 }}>
               <div style={{ fontSize: 12, color: 'var(--text-2)', marginBottom: 8 }}>

@@ -56,6 +56,12 @@ export interface OptimizerRequest {
   /** Start time of the route, ISO. ETAs in the output are computed
    *  forward from this. */
   startAt:       Date
+  /** Where the truck physically starts this (re-)optimization. Defaults
+   *  to the depot for a fresh route. For a LIVE INSERT mid-route it's
+   *  the last finalized stop's location, so the remaining plan is
+   *  optimized from where the driver actually is. The depot is still
+   *  the return target regardless. */
+  startFrom?:    GeoPoint
 }
 
 export type RouteLeg =
@@ -139,7 +145,7 @@ export function optimizeRoute(req: OptimizerRequest): OptimizerResult {
 
   // Working state
   const remaining = [...req.stops]
-  let current: GeoPoint = req.depot
+  let current: GeoPoint = req.startFrom ?? req.depot
   let currentTime = new Date(req.startAt)
   let stopsSinceDump = 0
 

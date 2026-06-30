@@ -16,7 +16,6 @@ export function TenantDetailPage() {
   const { id } = useParams()
   const navigate = useNavigate()
   const [showTransfer, setShowTransfer] = useState(false)
-  const [tab, setTab] = useState('overview')
   // S252: per-tenant FlexCharge query removed alongside the legacy
   // panel. New flex_charge_accounts schema is (customer, property)
   // keyed; consult the FlexCharge dashboard (S254) for per-property
@@ -42,7 +41,6 @@ export function TenantDetailPage() {
               <p className="page-subtitle">
                 {currentUnit ? `Unit ${currentUnit.unitNumber} - ${currentUnit.propertyName}` : 'No current unit'}
                 {tenant.ssiSsdi && <span className="badge badge-gold" style={{ marginLeft: 8 }}>SSI/SSDI</span>}
-                {tenant.onTimePayEnrolled && <span className="badge badge-green" style={{ marginLeft: 6 }}>On-Time Pay</span>}
               </p>
             </div>
           </div>
@@ -50,27 +48,7 @@ export function TenantDetailPage() {
         {currentUnit && <button className="btn btn-primary" onClick={() => setShowTransfer(true)}>Transfer Unit</button>}
       </div>
 
-      <div style={{ display: 'flex', gap: 4, borderBottom: '1px solid var(--border-0)', marginBottom: 24 }}>
-        {[{ id: 'overview', label: 'Overview' }, { id: 'flexcharge', label: 'FlexCharge' }].map((t: any) => (
-          <button key={t.id} onClick={() => setTab(t.id)}
-            style={{ padding: '8px 16px', border: 'none', background: 'none', cursor: 'pointer', fontSize: '.82rem', fontWeight: 600, color: tab === t.id ? 'var(--gold)' : 'var(--text-3)', borderBottom: tab === t.id ? '2px solid var(--gold)' : '2px solid transparent', marginBottom: -1 }}>
-            {t.label}
-          </button>
-        ))}
-      </div>
-
-      {tab === 'flexcharge' && (
-        <div className="card" style={{ padding: 24, textAlign: 'center' }}>
-          <div style={{ fontWeight: 700, color: 'var(--text-0)', marginBottom: 8 }}>FlexCharge Account</div>
-          <div style={{ fontSize: '.82rem', color: 'var(--text-3)', lineHeight: 1.5, maxWidth: 480, margin: '0 auto' }}>
-            FlexCharge accounts are now scoped per-property (a tenant can hold separate tabs at different properties).
-            Manage from the dedicated FlexCharge dashboard — landing in a follow-up session. The per-tenant
-            single-account view here has been retired.
-          </div>
-        </div>
-      )}
-
-      {tab === 'overview' && (
+      {(
         <div>
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5,1fr)', gap: 12, marginBottom: 24 }}>
             {[

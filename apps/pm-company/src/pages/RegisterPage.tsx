@@ -59,7 +59,7 @@ export function RegisterPage() {
       await login(email, password)
       setStep('company')
     } catch (ex: any) {
-      setErr(ex?.response?.data?.error?.message || 'Account creation failed.')
+      setErr(ex?.response?.data?.error || 'Account creation failed.')
     } finally { setBusy(false) }
   }
 
@@ -76,7 +76,7 @@ export function RegisterPage() {
       await refresh()
       navigate('/')
     } catch (ex: any) {
-      setErr(ex?.response?.data?.error?.message || 'Company creation failed.')
+      setErr(ex?.response?.data?.error || 'Company creation failed.')
     } finally { setBusy(false) }
   }
 

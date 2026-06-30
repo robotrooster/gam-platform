@@ -45,7 +45,7 @@ import {
   FLEXPAY_FEE_BASE, FLEXPAY_MAX_PULL_DAY,
   calculateFlexPayFee, cycleMonthForDate,
   isFlexPayVisible, getFlexPayEligibility,
-  enrollFlexPay, cancelFlexPay,
+  enrollFlexPay, cancelFlexPay, changeFlexPayPullDay,
   autoDisenrollFlexPayOnAchUnverified,
 } from './flexpay'
 
@@ -130,6 +130,8 @@ describe('getFlexPayEligibility', () => {
       const tenantId = await seedTenant(c)
       const leaseId = await seedLease(c, { unitId, landlordId })
       await seedLeaseTenant(c, { leaseId, tenantId, role: 'primary' })
+      // FlexPay is SSDI/SSI-only (S512) — set the service-tier flag by default.
+      await c.query(`UPDATE tenants SET ssi_ssdi=TRUE WHERE id=$1`, [tenantId])
       if (opts.ach !== false) {
         await c.query(`UPDATE tenants SET ach_verified=TRUE WHERE id=$1`, [tenantId])
       }
@@ -190,6 +192,28 @@ describe('getFlexPayEligibility', () => {
     expect(r.blockers).toContain('no_active_lease')
   })
 
+  it('S512: not SSDI/SSI → not_ssi_ssdi', async () => {
+    const { tenantId } = await seedTenantWithLease()
+    await db.query(`UPDATE tenants SET ssi_ssdi=FALSE WHERE id=$1`, [tenantId])
+    const r = await getFlexPayEligibility(tenantId)
+    expect(r.blockers).toContain('not_ssi_ssdi')
+    expect(r.eligible).toBe(false)
+  })
+
+  it('existing off-platform deposit (unfunded row) does NOT block — only FlexDeposit gates', async () => {
+    // Landlords onboarding bring tenants with deposits paid off-platform; their
+    // imported security_deposits rows can read "unfunded" but must not block FlexPay.
+    const { tenantId, unitId, leaseId } = await seedTenantWithLease()
+    await db.query(
+      `INSERT INTO security_deposits
+         (unit_id, lease_id, tenant_id, total_amount, collected_amount, status, held_by)
+       VALUES ($1, $2, $3, 1000, 0, 'pending', 'landlord')`,
+      [unitId, leaseId, tenantId])
+    const r = await getFlexPayEligibility(tenantId)
+    expect(r.eligible).toBe(true)
+    expect(r.blockers).toEqual([])
+  })
+
   it('all baseline conditions met → eligible=true, no blockers', async () => {
     const { tenantId } = await seedTenantWithLease()
     const r = await getFlexPayEligibility(tenantId)
@@ -218,7 +242,7 @@ describe('enrollFlexPay', () => {
       const tenantId = await seedTenant(c)
       const leaseId = await seedLease(c, { unitId, landlordId })
       await seedLeaseTenant(c, { leaseId, tenantId, role: 'primary' })
-      await c.query(`UPDATE tenants SET ach_verified=TRUE WHERE id=$1`, [tenantId])
+      await c.query(`UPDATE tenants SET ach_verified=TRUE, ssi_ssdi=TRUE WHERE id=$1`, [tenantId])
       const { rows: [{ user_id }] } = await c.query<{ user_id: string }>(
         `SELECT user_id FROM tenants WHERE id=$1`, [tenantId])
       await c.query('COMMIT')
@@ -369,5 +393,77 @@ describe('autoDisenrollFlexPayOnAchUnverified', () => {
     const { rows: [t] } = await db.query<any>(
       `SELECT flexpay_enrolled FROM tenants WHERE id=$1`, [tenantId])
     expect(t.flexpay_enrolled).toBe(false)
+  })
+})
+
+// ─── changeFlexPayPullDay (next-cycle-effective) ─────────────────
+describe('changeFlexPayPullDay', () => {
+  async function seedEnrolled(pullDay = 10): Promise<string> {
+    await db.query(
+      `INSERT INTO system_features (key, enabled, description)
+       VALUES ('flexpay_rollout_visible', TRUE, 'test')
+       ON CONFLICT (key) DO UPDATE SET enabled=TRUE`)
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const { userId, landlordId } = await seedLandlord(c)
+      const propertyId = await seedProperty(c, { landlordId, ownerUserId: userId, managedByUserId: userId })
+      const unitId = await seedUnit(c, { propertyId, landlordId })
+      const tenantId = await seedTenant(c)
+      const leaseId = await seedLease(c, { unitId, landlordId })
+      await seedLeaseTenant(c, { leaseId, tenantId, role: 'primary' })
+      await c.query(
+        `UPDATE tenants SET ach_verified=TRUE, ssi_ssdi=TRUE,
+            flexpay_enrolled=TRUE, flexpay_pull_day=$2, flexpay_monthly_fee=$3 WHERE id=$1`,
+        [tenantId, pullDay, 5 + pullDay])
+      await c.query('COMMIT')
+      return tenantId
+    } catch (e) { await c.query('ROLLBACK'); throw e }
+    finally { c.release() }
+  }
+
+  it('happy: updates pull day + recomputes fee, effective next cycle', async () => {
+    const tenantId = await seedEnrolled(10)
+    const out = await changeFlexPayPullDay(tenantId, 20)
+    expect(out.ok).toBe(true)
+    expect(out.pullDay).toBe(20)
+    expect(out.fee).toBe(25)            // $5 + 20
+    expect(out.effective).toBe('next_cycle')
+    const { rows: [t] } = await db.query<any>(
+      `SELECT flexpay_pull_day, flexpay_monthly_fee FROM tenants WHERE id=$1`, [tenantId])
+    expect(t.flexpay_pull_day).toBe(20)
+    expect(Number(t.flexpay_monthly_fee)).toBe(25)
+  })
+
+  it('invalid pull day → rejected, no change', async () => {
+    const tenantId = await seedEnrolled(10)
+    const out = await changeFlexPayPullDay(tenantId, 31)
+    expect(out.ok).toBe(false)
+    const { rows: [t] } = await db.query<any>(`SELECT flexpay_pull_day FROM tenants WHERE id=$1`, [tenantId])
+    expect(t.flexpay_pull_day).toBe(10)   // unchanged
+  })
+
+  it('not enrolled → rejected', async () => {
+    await db.query(
+      `INSERT INTO system_features (key, enabled, description)
+       VALUES ('flexpay_rollout_visible', TRUE, 'test')
+       ON CONFLICT (key) DO UPDATE SET enabled=TRUE`)
+    const c = await db.connect()
+    let tenantId = ''
+    try {
+      await c.query('BEGIN')
+      tenantId = await seedTenant(c)
+      await c.query('COMMIT')
+    } finally { c.release() }
+    const out = await changeFlexPayPullDay(tenantId, 15)
+    expect(out.ok).toBe(false)
+    expect(out.reason).toMatch(/not enrolled/i)
+  })
+
+  it('flag off → rejected', async () => {
+    const tenantId = await seedEnrolled(10)
+    await db.query(`UPDATE system_features SET enabled=FALSE WHERE key='flexpay_rollout_visible'`)
+    const out = await changeFlexPayPullDay(tenantId, 20)
+    expect(out.ok).toBe(false)
   })
 })

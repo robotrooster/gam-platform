@@ -114,12 +114,16 @@ businessDashboardRouter.get('/overview', requireAuth, async (req, res, next) => 
               AND status = 'sent'
               AND total_amount > amount_paid
          ) s`, [biz.id])
+      // Wire keys are camelize-safe (no underscore-before-digit) and match the
+      // Reports page's A/R-aging scheme (businessReports.ts) — one convention
+      // across the business portal. The old d1_30/d31_60/d61_90 keys camelized
+      // lossily to d130/d3160/d6190, which is what black-screened this tile.
       arAging = {
         current: { count: a.current_count, amount: a.current_amount },
-        d1_30:   { count: a.d30_count,     amount: a.d30_amount },
-        d31_60:  { count: a.d60_count,     amount: a.d60_amount },
-        d61_90:  { count: a.d90_count,     amount: a.d90_amount },
-        over90:  { count: a.over90_count,  amount: a.over90_amount },
+        d1to30:  { count: a.d30_count,     amount: a.d30_amount },
+        d31to60: { count: a.d60_count,     amount: a.d60_amount },
+        d61to90: { count: a.d90_count,     amount: a.d90_amount },
+        d90plus: { count: a.over90_count,  amount: a.over90_amount },
       }
     }
 

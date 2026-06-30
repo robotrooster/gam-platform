@@ -3,6 +3,9 @@ import { formatInvoiceNumber } from '@gam/shared'
 import { getClient, query, queryOne } from '../db'
 import type { PoolClient } from 'pg'
 import { logger } from '../lib/logger'
+import {
+  loadWorkTradeCreditContext, workTradeFraction, distributeWorkTradeCredit, round2,
+} from '../services/workTradeCredit'
 
 // ============================================================
 // S26a: Invoice generator (replaces S25 rentGeneration)
@@ -245,28 +248,63 @@ async function runGeneration(
         const year = DateTime.fromISO(dueDate).year
         const invoiceNumber = await allocateInvoiceNumber(client, lease.landlord_id, year)
 
-        // Compute totals before insert
+        // Compute GROSS totals (the invoice subtotals stay gross for the record).
         const rentAmountNum = Number(effectiveRentAmount)
         const feesTotalNum = fees.reduce((s, f) => s + Number(f.amount), 0)
         const utilitiesTotalNum = utilityBills.reduce((s, b) => s + Number(b.charge_amount), 0)
-        const totalAmountNum = rentAmountNum + feesTotalNum + utilitiesTotalNum
+        const billableTotalNum = round2(rentAmountNum + feesTotalNum + utilitiesTotalNum)
         const subtotalFeesStr      = feesTotalNum.toFixed(2)
         const subtotalUtilitiesStr = utilitiesTotalNum.toFixed(2)
-        const totalAmountStr       = totalAmountNum.toFixed(2)
 
-        // Insert invoice — ON CONFLICT short-circuits whole cycle if already exists
+        // S517 — work-trade credit (Landlord #29). When the master tenant on
+        // this unit has an active work-trade agreement, verified hours from
+        // the prior calendar month buy a percent of THIS invoice's total
+        // (rent+utilities+fees), per the property's hours target. The credit
+        // reduces what the tenant is actually charged; subtotals stay gross.
+        // Skipped under an active sublease (the sublessee, not the work-
+        // trader, is the payer for that cycle).
+        const wt = (!sublease && lease.tenant_id)
+          ? await loadWorkTradeCreditContext(client, { unitId: lease.unit_id, tenantId: lease.tenant_id, dueDate })
+          : null
+        const wtFraction = wt ? workTradeFraction(wt.verifiedHours, wt.target) : 0
+        const wtCreditTarget = round2(wtFraction * billableTotalNum)
+        const dist = distributeWorkTradeCredit(
+          rentAmountNum,
+          utilityBills.map(b => Number(b.charge_amount)),
+          fees.map(f => Number(f.amount)),
+          wtCreditTarget,
+        )
+        const netTotalNum = round2(
+          dist.rentNet
+          + dist.utilityNets.reduce((s, u) => s + u, 0)
+          + dist.feeNets.reduce((s, f) => s + f, 0)
+        )
+        // A row fully covered by the trade is charged $0 and recorded as
+        // already-settled (covered by labor, not cash) only when work-trade
+        // actually applied — otherwise a legitimately $0 line keeps its prior
+        // 'pending' behavior.
+        const wtActive = !!wt && dist.creditApplied > 0
+        const WT_NOTE = 'Covered by work-trade credit'
+        const rowStatus = (net: number) => (wtActive && net === 0 ? 'settled' : 'pending')
+        const rowNote   = (net: number) => (wtActive && net === 0 ? WT_NOTE : null)
+
+        // Insert invoice — ON CONFLICT short-circuits whole cycle if already exists.
+        // total_amount is NET of the work-trade credit; the credit + driving
+        // agreement are stamped for audit + tenant/landlord display.
         const invoiceRes = await client.query(
           `INSERT INTO invoices (
              landlord_id, tenant_id, lease_id, unit_id,
              invoice_number, due_date,
-             subtotal_rent, subtotal_fees, subtotal_utilities, total_amount
-           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+             subtotal_rent, subtotal_fees, subtotal_utilities, total_amount,
+             work_trade_credit_amount, work_trade_credit_hours, work_trade_agreement_id
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
            ON CONFLICT (lease_id, due_date) DO NOTHING
            RETURNING id`,
           [
             lease.landlord_id, effectiveTenantId, lease.id, lease.unit_id,
             invoiceNumber, dueDate,
-            effectiveRentAmount, subtotalFeesStr, subtotalUtilitiesStr, totalAmountStr,
+            effectiveRentAmount, subtotalFeesStr, subtotalUtilitiesStr, netTotalNum.toFixed(2),
+            dist.creditApplied.toFixed(2), (wt ? wt.verifiedHours : 0).toFixed(2), wt ? wt.agreementId : null,
           ]
         )
 
@@ -278,57 +316,65 @@ async function runGeneration(
 
         const invoiceId = invoiceRes.rows[0].id as string
 
-        // Rent child row. entry_description is the NACHA-shaped categorical
-        // enum (CHECK on payments.entry_description); not a free-text label.
+        // Rent child row at the work-trade-NET amount. entry_description is the
+        // NACHA-shaped categorical enum (CHECK on payments.entry_description).
         await client.query(
           `INSERT INTO payments (
              invoice_id, unit_id, lease_id, tenant_id, landlord_id,
-             type, amount, status, due_date, entry_description
-           ) VALUES ($1, $2, $3, $4, $5, 'rent', $6, 'pending', $7, 'RENT')`,
+             type, amount, status, due_date, entry_description, notes,
+             settled_at
+           ) VALUES ($1, $2, $3, $4, $5, 'rent', $6, $8, $7, 'RENT', $9,
+             CASE WHEN $8 = 'settled' THEN NOW() ELSE NULL END)`,
           [
             invoiceId, lease.unit_id, lease.id, effectiveTenantId, lease.landlord_id,
-            effectiveRentAmount, dueDate,
+            dist.rentNet.toFixed(2), dueDate, rowStatus(dist.rentNet), rowNote(dist.rentNet),
           ]
         )
         rentsInserted++
 
-        // Monthly fee child rows. monthly_ongoing scope only — no
+        // Monthly fee child rows at NET. monthly_ongoing scope only — no
         // deposit-shape fee_types live under monthly_ongoing in the
         // CHECK enum, so SUBSCRIP is the right NACHA category here.
         // S247: fees route to sublessee when sublease is active (the
         // occupant is the one responsible for unit-period charges).
-        for (const fee of fees) {
+        for (let i = 0; i < fees.length; i++) {
+          const fee = fees[i]
+          const net = dist.feeNets[i]
           await client.query(
             `INSERT INTO payments (
                invoice_id, unit_id, lease_id, tenant_id, landlord_id,
-               type, amount, status, due_date, entry_description, lease_fee_id
-             ) VALUES ($1, $2, $3, $4, $5, 'fee', $6, 'pending', $7, 'SUBSCRIP', $8)`,
+               type, amount, status, due_date, entry_description, lease_fee_id, notes,
+               settled_at
+             ) VALUES ($1, $2, $3, $4, $5, 'fee', $6, $9, $7, 'SUBSCRIP', $8, $10,
+               CASE WHEN $9 = 'settled' THEN NOW() ELSE NULL END)`,
             [
               invoiceId, lease.unit_id, lease.id, effectiveTenantId, lease.landlord_id,
-              fee.amount, dueDate, fee.id,
+              net.toFixed(2), dueDate, fee.id, rowStatus(net), rowNote(net),
             ]
           )
           feesInserted++
         }
 
-        // S178: Utility child rows. Each utility_bill becomes a
+        // S178: Utility child rows at NET. Each utility_bill becomes a
         // payments.type='utility' row linked to the invoice, mirroring
         // the fee model. utility_bills.payment_id is stamped + status
         // flipped to 'billed' so subsequent invoice runs don't double-
-        // bill. Pre-S178 these were standalone payments rows with no
-        // invoice_id; the /api/utility/bills/:id/pay route created them
-        // ad-hoc on tenant pay attempt, which broke the "utilities are
-        // line items on the rent invoice" architecture from S90.
-        for (const ub of utilityBills) {
+        // bill — this link is made even when the trade fully covers the
+        // bill (the $0 settled row still owns the bill).
+        for (let i = 0; i < utilityBills.length; i++) {
+          const ub = utilityBills[i]
+          const net = dist.utilityNets[i]
           const utilityPayment = await client.query<{ id: string }>(
             `INSERT INTO payments (
                invoice_id, unit_id, lease_id, tenant_id, landlord_id,
-               type, amount, status, due_date, entry_description
-             ) VALUES ($1, $2, $3, $4, $5, 'utility', $6, 'pending', $7, 'UTILITY')
+               type, amount, status, due_date, entry_description, notes,
+               settled_at
+             ) VALUES ($1, $2, $3, $4, $5, 'utility', $6, $8, $7, 'UTILITY', $9,
+               CASE WHEN $8 = 'settled' THEN NOW() ELSE NULL END)
              RETURNING id`,
             [
               invoiceId, lease.unit_id, lease.id, effectiveTenantId, lease.landlord_id,
-              ub.charge_amount, dueDate,
+              net.toFixed(2), dueDate, rowStatus(net), rowNote(net),
             ]
           )
           await client.query(

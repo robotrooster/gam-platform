@@ -59,6 +59,7 @@ import { getBackgroundCheckStatus } from './getBackgroundCheckStatus'
 import { flagApplicantDecision } from './flagApplicantDecision'
 import { draftTenantNotice } from './draftTenantNotice'
 import { getInspectionChecklist } from './getInspectionChecklist'
+import { declineGuidedInspection } from './declineGuidedInspection'
 import { getInspectionProgress } from './getInspectionProgress'
 import { getMyBookings } from './getMyBookings'
 import { getPropertyRentRoll } from './getPropertyRentRoll'
@@ -87,6 +88,17 @@ describe('tool allowlist', () => {
     const l = getToolsForProfile(requireProfile('landlord_entry')).map((x) => x.name)
     for (const name of ['get_landlord_portfolio', 'get_property_rent_roll', 'get_setup_progress', 'get_delinquent_tenants', 'get_vacant_units', 'get_lease_expirations', 'get_pending_applications', 'get_my_payouts', 'get_background_check_status', 'get_maintenance_team', 'get_books_summary', 'get_tenant_contact', 'get_team', 'get_applicable_laws', 'check_against_law', 'approve_maintenance_request', 'assign_maintenance_request', 'reject_maintenance_request', 'schedule_maintenance', 'message_tenant', 'send_bulk_message', 'get_my_notifications', 'mark_notifications_read'])
       expect(l).toContain(name)
+  })
+
+  it('surfaces the agent inspection write-tools to landlord profiles (entry + escalation), never to tenants', () => {
+    for (const profileId of ['landlord_entry', 'landlord_escalation']) {
+      const names = getToolsForProfile(requireProfile(profileId)).map((x) => x.name)
+      expect(names).toContain('create_inspection')
+      expect(names).toContain('set_inspection_item_condition')
+    }
+    const t = getToolsForProfile(requireProfile('tenant_entry')).map((x) => x.name)
+    expect(t).not.toContain('create_inspection')
+    expect(t).not.toContain('set_inspection_item_condition')
   })
 
   it('never surfaces a tenant-only tool to a landlord profile (audience gate), and vice-versa', () => {
@@ -1231,6 +1243,37 @@ describe('get_inspection_checklist (tenant, agent-guided walkthrough)', () => {
   it('returns ok:false when the tenant has no inspection', async () => {
     ;(mockQueryOne as any).mockResolvedValueOnce(null)
     const res: any = await getInspectionChecklist.execute({}, TENANT_ACTOR)
+    expect(res.ok).toBe(false)
+  })
+
+  // #23: surface a prior decline so the agent stops offering.
+  it('surfaces guidedWalkthroughDeclined when the tenant previously declined', async () => {
+    ;(mockQueryOne as any).mockResolvedValueOnce({ id: 'i1', inspection_type: 'move_in', status: 'draft', unit_number: '101', bedrooms: 1, unit_type: 'apartment', guided_walkthrough_declined: true })
+    ;(query as any).mockResolvedValueOnce([])
+    const res: any = await getInspectionChecklist.execute({}, TENANT_ACTOR)
+    expect(res.guidedWalkthroughDeclined).toBe(true)
+  })
+})
+
+describe('decline_guided_inspection (#23 — ask once)', () => {
+  beforeEach(() => { vi.clearAllMocks() })
+
+  it('records the decline on the tenant’s open inspection, scoped to the tenant', async () => {
+    ;(mockQueryOne as any)
+      .mockResolvedValueOnce({ id: 'i1' })   // inspection lookup
+      .mockResolvedValueOnce({ id: 'i1' })    // UPDATE ... RETURNING
+    const res: any = await declineGuidedInspection.execute({}, TENANT_ACTOR)
+    expect(res.ok).toBe(true)
+    expect(res.declined).toBe(true)
+    expect(res.inspectionId).toBe('i1')
+    // both queries are scoped to the tenant (t1)
+    expect((mockQueryOne as any).mock.calls[0][1]).toContain('t1')
+    expect((mockQueryOne as any).mock.calls[1][1]).toContain('t1')
+  })
+
+  it('returns ok:false when the tenant has no inspection', async () => {
+    ;(mockQueryOne as any).mockResolvedValueOnce(null)
+    const res: any = await declineGuidedInspection.execute({}, TENANT_ACTOR)
     expect(res.ok).toBe(false)
   })
 })

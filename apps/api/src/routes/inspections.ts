@@ -15,7 +15,8 @@ import {
   notifyInspectionFinalized,
 } from '../services/notifications'
 import { logger } from '../lib/logger'
-import { buildInspectionChecklist, INSPECTION_TYPES } from '@gam/shared'
+import { insertInspectionWithChecklist } from '../services/inspections'
+import { INSPECTION_TYPES, INSPECTION_ITEM_CONDITIONS } from '@gam/shared'
 
 // ============================================================
 // /api/inspections — move-in / move-out / periodic inspection
@@ -105,49 +106,20 @@ inspectionsRouter.post('/', async (req, res, next) => {
     }
 
     await client.query('BEGIN')
-    const inserted = (await client.query(
-      `INSERT INTO unit_inspections (
-         unit_id, lease_id, tenant_id, landlord_id,
-         inspection_type, comparison_inspection_id,
-         scheduled_for, notes
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-       RETURNING id`,
-      [
-        body.unitId,
-        body.leaseId ?? null,
-        body.tenantId ?? null,
-        unit.landlord_id,
-        body.inspectionType,
-        body.comparisonInspectionId ?? null,
-        body.scheduledFor ?? null,
-        body.notes ?? null,
-      ],
-    )).rows[0] as { id: string }
-
-    // Seed the standard area checklist as 'na' items so the agent-guided
-    // walkthrough and per-area photo progress have real rows to attach to.
-    // Sized to the unit (only its real bedrooms). ON CONFLICT keeps this
-    // idempotent against the (inspection_id, area, item_label) unique key.
-    const checklist = buildInspectionChecklist({ unitType: unit.unit_type, bedrooms: unit.bedrooms })
-    const seedRows: string[] = []
-    const seedParams: any[] = [inserted.id]
-    for (const areaDef of checklist) {
-      for (const label of areaDef.items) {
-        const areaIdx = seedParams.push(areaDef.area)
-        const labelIdx = seedParams.push(label)
-        seedRows.push(`($1, $${areaIdx}, $${labelIdx}, 'na')`)
-      }
-    }
-    if (seedRows.length) {
-      await client.query(
-        `INSERT INTO unit_inspection_items (inspection_id, area, item_label, condition)
-         VALUES ${seedRows.join(', ')}
-         ON CONFLICT (inspection_id, area, item_label) DO NOTHING`,
-        seedParams,
-      )
-    }
+    const { id, seededItems } = await insertInspectionWithChecklist(client, {
+      unitId: body.unitId,
+      landlordId: unit.landlord_id,
+      unitType: unit.unit_type,
+      bedrooms: unit.bedrooms,
+      leaseId: body.leaseId ?? null,
+      tenantId: body.tenantId ?? null,
+      inspectionType: body.inspectionType,
+      comparisonInspectionId: body.comparisonInspectionId ?? null,
+      scheduledFor: body.scheduledFor ?? null,
+      notes: body.notes ?? null,
+    })
     await client.query('COMMIT')
-    res.json({ success: true, data: { id: inserted.id, seededItems: seedRows.length } })
+    res.json({ success: true, data: { id, seededItems } })
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {})
     next(e)
@@ -258,7 +230,7 @@ inspectionsRouter.patch('/:id', async (req, res, next) => {
 const itemSchema = z.object({
   area: z.string().min(1),
   itemLabel: z.string().min(1),
-  condition: z.enum(['good', 'fair', 'damaged', 'missing', 'na']),
+  condition: z.enum(INSPECTION_ITEM_CONDITIONS),
   notes: z.string().optional(),
   estimatedRepairCost: z.number().optional(),
 })
@@ -534,8 +506,14 @@ inspectionsRouter.post('/:id/sign', async (req, res, next) => {
     )
     const hasTenant = sigs.some((s) => s.signer_role === 'tenant')
     const hasLandlord = sigs.some((s) => s.signer_role === 'landlord' || s.signer_role === 'inspector')
+    // A tenant-less inspection (landlord-initiated periodic / turnover with no
+    // tenant_id) has no second party to sign, so the landlord's signature
+    // alone must be enough to reach landlord_signed — otherwise it could never
+    // be finalized. When a tenant IS on the inspection, both signatures are
+    // still required before finalize.
+    const tenantRequired = insp.tenant_id != null
     let newStatus = insp.status
-    if (hasTenant && hasLandlord) newStatus = 'landlord_signed'
+    if (hasLandlord && (hasTenant || !tenantRequired)) newStatus = 'landlord_signed'
     else if (hasTenant) newStatus = 'tenant_signed'
     if (newStatus !== insp.status) {
       await query(

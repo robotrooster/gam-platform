@@ -238,13 +238,12 @@ export function LeasePage() {
         )}
       </div>
 
-      {/* S262: FlexDeposit accelerated / in_default banner. Renders
-          when the tenant's deposit plan has triggered the 2-strike
-          acceleration. 'accelerated' = pull in flight (info only).
-          'in_default' = pull failed, manual retry available. Auto-
-          hides when neither state applies. */}
+      {/* S514: FlexDeposit voluntary pay-ahead banner. Offers an optional
+          early funding of the remaining deposit balance held in custody.
+          No acceleration / no balance-due-in-full. Auto-hides when the
+          plan is fully funded. */}
       {(lease.status === 'active' || lease.status === 'pending') && (
-        <FlexDepositAcceleratedBanner />
+        <FlexDepositPayAheadBanner />
       )}
 
       {/* S256: deposit portability — when this lease is ending and the
@@ -1433,16 +1432,18 @@ function SubleaseSection({ leaseId }: { leaseId: string }) {
   )
 }
 
-// ── S262: FlexDeposit accelerated / in_default banner ─────────────────────
-// Renders at the top of LeasePage when the tenant's FlexDeposit plan
-// has triggered the 2-strike acceleration. Two presentations:
-//   accelerated: info-only banner (pull is in flight; 1–3 business days)
-//   in_default:  warning banner with a manual "Pay full balance now" button
-// Auto-hides for plans in 'active'/'completed' states.
-function FlexDepositAcceleratedBanner() {
+// ── S514: FlexDeposit voluntary pay-ahead banner (custody model) ──────────
+// Renders at the top of LeasePage when the tenant has an active FlexDeposit
+// plan with a deposit balance not yet funded into custody. It is an OPTIONAL
+// convenience — there is no "balance due in full," no acceleration, and no
+// recourse (Consumer ToS § 9.1.5). The tenant may fund the remaining
+// installments early in a single ACH pull, or simply let the scheduled
+// installments + GAM-first routing finish funding the deposit.
+// Auto-hides for completed/fully-funded plans.
+function FlexDepositPayAheadBanner() {
   const qc = useQueryClient()
   const [error, setError] = useState<string | null>(null)
-  const [retryStarted, setRetryStarted] = useState(false)
+  const [started, setStarted] = useState(false)
 
   const { data } = useQuery<any>(
     'tenant-flexdeposit',
@@ -1450,65 +1451,46 @@ function FlexDepositAcceleratedBanner() {
   )
   const deposit = data?.deposit
   const status = deposit?.flexDepositPlanStatus as string | undefined
+  const unfunded = Number(deposit?.unfundedAmount ?? 0)
 
-  const retry = useMutation(
-    () => post('/tenants/flexdeposit/retry-acceleration', {}),
+  const payAhead = useMutation(
+    () => post('/tenants/flexdeposit/pay-ahead', {}),
     {
       onSuccess: (r: any) => {
-        if (r?.success === false) { setError(r?.error || 'Retry failed'); return }
+        if (r?.success === false) { setError(r?.error || 'Could not start the payment'); return }
         setError(null)
-        setRetryStarted(true)
+        setStarted(true)
         qc.invalidateQueries('tenant-flexdeposit')
       },
-      onError: (e: any) => setError(e?.message || 'Retry failed'),
+      onError: (e: any) => setError(e?.message || 'Could not start the payment'),
     },
   )
 
-  if (!deposit || (status !== 'accelerated' && status !== 'in_default')) return null
+  if (!deposit || status !== 'active' || unfunded <= 0) return null
 
-  const balance = Number(deposit.balanceDueTotal ?? 0)
-  const sinceAccel = deposit.balanceDueFullAt
-    ? Math.floor((Date.now() - new Date(deposit.balanceDueFullAt).getTime()) / 86400000)
-    : 0
-
-  if (status === 'accelerated') {
-    return (
-      <div style={{ padding:'14px 18px', background:'rgba(245,158,11,.06)', border:'1px solid rgba(245,158,11,.3)', borderRadius:12, marginBottom:20 }}>
-        <div style={{ fontSize:'.78rem', fontWeight:700, color:'var(--gold, #c9a227)', marginBottom:6 }}>
-          Deposit balance due in full — ${balance.toFixed(2)}
-        </div>
-        <div style={{ fontSize:'.78rem', color:'var(--text-2)' }}>
-          We're collecting the full remaining deposit balance via ACH. This typically completes in 1–3 business days.
-          {sinceAccel > 0 && ` Initiated ${sinceAccel} day${sinceAccel === 1 ? '' : 's'} ago.`}
-        </div>
-      </div>
-    )
-  }
-
-  // in_default — manual retry available
   return (
-    <div style={{ padding:'14px 18px', background:'rgba(239,68,68,.06)', border:'1px solid rgba(239,68,68,.3)', borderRadius:12, marginBottom:20 }}>
+    <div style={{ padding:'14px 18px', background:'rgba(245,158,11,.06)', border:'1px solid rgba(245,158,11,.3)', borderRadius:12, marginBottom:20 }}>
       <div style={{ display:'flex', alignItems:'flex-start', gap:14, flexWrap:'wrap' as const }}>
         <div style={{ flex:'1 1 280px' }}>
-          <div style={{ fontSize:'.82rem', fontWeight:700, color:'var(--red, #ef4444)', marginBottom:4 }}>
-            Deposit balance due in full — ${balance.toFixed(2)}
+          <div style={{ fontSize:'.82rem', fontWeight:700, color:'var(--gold, #c9a227)', marginBottom:4 }}>
+            Deposit remaining to fund — ${unfunded.toFixed(2)}
           </div>
           <div style={{ fontSize:'.76rem', color:'var(--text-2)' }}>
-            The previous collection attempt did not clear. Pay the full balance now to bring your deposit current.
+            Your remaining deposit is collected automatically on its monthly schedule. If you'd like, you can fund the rest now in a single payment — entirely optional.
           </div>
         </div>
         <button
-          onClick={() => retry.mutate()}
-          disabled={retry.isLoading || retryStarted}
+          onClick={() => payAhead.mutate()}
+          disabled={payAhead.isLoading || started}
           style={{
             padding:'10px 20px', borderRadius:8, border:'none',
-            background: retryStarted ? 'var(--bg-2)' : 'var(--gold, #c9a227)',
-            color: retryStarted ? 'var(--text-3)' : '#060809',
-            fontWeight:700, cursor: retryStarted ? 'default' : 'pointer',
+            background: started ? 'var(--bg-2)' : 'var(--gold, #c9a227)',
+            color: started ? 'var(--text-3)' : '#060809',
+            fontWeight:700, cursor: started ? 'default' : 'pointer',
             whiteSpace:'nowrap' as const,
           }}
         >
-          {retry.isLoading ? 'Starting…' : retryStarted ? 'ACH pull initiated' : 'Pay full balance now'}
+          {payAhead.isLoading ? 'Starting…' : started ? 'Payment initiated' : 'Fund remaining deposit now'}
         </button>
       </div>
       {error && (

@@ -103,7 +103,7 @@ function eventTone(eventType: string): 'positive' | 'negative' | 'neutral' {
 
 function attestationLabel(src: string): string {
   switch (src) {
-    case 'stripe_attested':       return 'Stripe (payment processor)'
+    case 'stripe_attested':       return 'Verified by payment processor'
     case 'gam_workflow_auto':     return 'GAM workflow'
     case 'gam_bill_pay_attested': return 'GAM bill-pay'
     case 'plaid_attested':        return 'Plaid'

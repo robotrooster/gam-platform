@@ -3,6 +3,7 @@ import { apiGet, apiPost, openPdfInNewTab } from '../lib/api'
 import { useAuth } from '../context/AuthContext'
 import { Modal } from '../components/Modal'
 import { Plus, Trash, ChevronRight, ArrowLeft, Check, X, Printer } from 'lucide-react'
+import { BUSINESS_DEPOSIT_TYPES, BUSINESS_DEPOSIT_TYPE_LABEL } from '@gam/shared'
 
 interface CustomerLite {
   id: string
@@ -21,6 +22,9 @@ interface InvoiceRow {
   taxAmount: string
   totalAmount: string
   amountPaid: string
+  depositAmount: string
+  depositType: 'service' | 'materials' | null
+  depositPaidAt: string | null
   sentAt: string | null
   paidAt: string | null
   voidedAt: string | null
@@ -385,6 +389,28 @@ function InvoiceDetailView({
           </div>
         </div>
 
+        {Number(inv.depositAmount) > 0 && (
+          <div style={{
+            marginTop: 16, padding: 12,
+            background: 'var(--bg-2)', border: '1px solid var(--border-1)',
+            borderRadius: 8, fontSize: 13, color: 'var(--text-1)',
+            display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+          }}>
+            <span>
+              {inv.depositType ? BUSINESS_DEPOSIT_TYPE_LABEL[inv.depositType] : ''} deposit:{' '}
+              <strong style={{ fontFamily: 'var(--font-mono)' as const }}>{fmtMoney(inv.depositAmount)}</strong>
+              {' '}due before the {fmtMoney(Math.max(0, Number(inv.totalAmount) - Number(inv.depositAmount)))} balance
+            </span>
+            <span style={{
+              fontSize: 11, fontWeight: 700, padding: '3px 10px', borderRadius: 6,
+              background: inv.depositPaidAt ? 'rgba(34,197,94,.12)' : 'rgba(245,158,11,.12)',
+              color: inv.depositPaidAt ? 'var(--green, #22c55e)' : 'var(--amber)',
+            }}>
+              {inv.depositPaidAt ? 'Deposit paid' : 'Deposit due'}
+            </span>
+          </div>
+        )}
+
         {inv.status === 'paid' && (
           <div style={{
             marginTop: 20, padding: 12,
@@ -499,6 +525,8 @@ function CreateInvoiceModal({
     taxAmount: '0',
     notes: '',
     lines: [blankLine()],
+    depositAmount: '0',
+    depositType: 'service' as 'service' | 'materials',
   })
   const [saving, setSaving] = useState(false)
   const [err, setErr] = useState<string | null>(null)
@@ -560,6 +588,9 @@ function CreateInvoiceModal({
     const badPct = form.lines.some(l => l.discountType === 'percent' && Number(l.discountValue) > 100)
     if (badPct) { setErr('A line percent discount cannot exceed 100'); return }
 
+    const depositAmount = Math.round((parseFloat(form.depositAmount) || 0) * 100) / 100
+    if (depositAmount > total + 0.005) { setErr('Deposit cannot exceed the invoice total'); return }
+
     setSaving(true)
     try {
       await apiPost('/business-invoices', {
@@ -570,6 +601,9 @@ function CreateInvoiceModal({
         discountCode: applied?.code,
         notes:     form.notes || undefined,
         lines:     cleanLines,
+        ...(depositAmount > 0
+          ? { depositAmount, depositType: form.depositType }
+          : {}),
       })
       onCreated()
     } catch (e: any) {
@@ -733,6 +767,33 @@ function CreateInvoiceModal({
           </div>
         </div>
       </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginTop: 12 }}>
+        <div>
+          <label style={labelStyle}>Upfront deposit (optional)</label>
+          <input value={form.depositAmount}
+            onChange={e => setForm({ ...form, depositAmount: e.target.value })}
+            type="number" step="0.01" min="0" max={total}
+            style={inputStyle} />
+        </div>
+        <div>
+          <label style={labelStyle}>Deposit is for</label>
+          <select value={form.depositType}
+            onChange={e => setForm({ ...form, depositType: e.target.value as 'service' | 'materials' })}
+            disabled={(parseFloat(form.depositAmount) || 0) <= 0}
+            style={inputStyle}>
+            {BUSINESS_DEPOSIT_TYPES.map(t => (
+              <option key={t} value={t}>{BUSINESS_DEPOSIT_TYPE_LABEL[t]}</option>
+            ))}
+          </select>
+        </div>
+      </div>
+      {(parseFloat(form.depositAmount) || 0) > 0 && (
+        <div style={{ fontSize: 12, color: 'var(--text-3)', marginTop: 6 }}>
+          Customer pays {fmtMoney(parseFloat(form.depositAmount) || 0)} up front, then{' '}
+          {fmtMoney(Math.max(0, total - (parseFloat(form.depositAmount) || 0)))} balance.
+        </div>
+      )}
 
       <label style={labelStyle}>Notes for customer (optional)</label>
       <textarea value={form.notes}

@@ -939,3 +939,189 @@ export async function routeMaintenanceNotification(requestId: string) {
 // counterpart that fired when a tenant responded to the survey above.
 // With the survey retired in S68, this helper had no live trigger and
 // no callers — clean removal.
+
+// ── Common-area reservations & amenity alerts ─────────────────────────
+// Three flows: a resident requests a reservation (→ landlord), the
+// landlord decides (→ resident), and a live reservation/closure alerts
+// every resident the amenity is unavailable.
+
+function fmtWindow(startsAt: string | Date, endsAt: string | Date): string {
+  const s = new Date(startsAt), e = new Date(endsAt)
+  const day = s.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' })
+  const t = (d: Date) => d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })
+  // same calendar day → "Fri, Jun 19 · 3:00 PM – 6:00 PM"; else span both
+  const sameDay = s.toDateString() === e.toDateString()
+  return sameDay
+    ? `${day} · ${t(s)} – ${t(e)}`
+    : `${day} ${t(s)} – ${e.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })} ${t(e)}`
+}
+
+// A resident submitted a reservation request → tell the landlord it needs
+// a decision (skipped silently when the area is auto-approve).
+export async function notifyReservationRequested(o: {
+  landlordUserId: string; landlordId: string; landlordEmail: string;
+  tenantName: string; areaName: string; propertyName: string;
+  startsAt: string | Date; endsAt: string | Date; reservationId: string;
+  guestCount?: number | null
+}) {
+  const when = fmtWindow(o.startsAt, o.endsAt)
+  const guests = o.guestCount ? ` for ${o.guestCount} guest${o.guestCount > 1 ? 's' : ''}` : ''
+  await createNotification({
+    userId: o.landlordUserId, landlordId: o.landlordId,
+    type: 'reservation_requested',
+    title: `Reservation request — ${o.areaName}`,
+    body: `${o.tenantName} requested ${o.areaName} at ${o.propertyName} (${when})${guests}. Approve or decline.`,
+    data: { ...o }, sendEmail: true, emailTo: o.landlordEmail,
+    emailSubject: `Reservation request — ${o.areaName}`,
+    emailHtml: emailTemplate('Reservation request',
+      `<b>${o.tenantName}</b> requested <b>${o.areaName}</b> at ${o.propertyName}.<br>${when}${guests}<br><br>Review it in your portal to approve or decline.`),
+  })
+}
+
+// The landlord approved/rejected a resident's request → tell the resident.
+export async function notifyReservationDecision(o: {
+  tenantUserId: string; tenantEmail: string;
+  areaName: string; propertyName: string; approved: boolean;
+  startsAt: string | Date; endsAt: string | Date; decisionNote?: string | null
+}) {
+  const when = fmtWindow(o.startsAt, o.endsAt)
+  const verb = o.approved ? 'approved' : 'declined'
+  const note = o.decisionNote ? `<br><br>Note from management: ${o.decisionNote}` : ''
+  await createNotification({
+    userId: o.tenantUserId,
+    type: 'reservation_decision',
+    title: `Reservation ${verb} — ${o.areaName}`,
+    body: `Your reservation for ${o.areaName} (${when}) was ${verb}.${o.decisionNote ? ` Note: ${o.decisionNote}` : ''}`,
+    data: { ...o }, sendEmail: true, emailTo: o.tenantEmail,
+    emailSubject: `Reservation ${verb} — ${o.areaName}`,
+    emailHtml: emailTemplate(`Reservation ${verb}`,
+      `Your reservation for <b>${o.areaName}</b> at ${o.propertyName} was <b>${verb}</b>.<br>${when}${note}`),
+  })
+}
+
+// A reservation/closure went live → alert every active resident of the
+// property that the amenity is unavailable for that window. The resident
+// who made the booking is excluded (they already know). Returns the count
+// notified so the caller can stamp residents_notified_at.
+export async function notifyAmenityUnavailable(o: {
+  propertyId: string; landlordId: string; propertyName: string;
+  areaName: string; kind: string; reason?: string | null;
+  startsAt: string | Date; endsAt: string | Date;
+  excludeTenantId?: string | null
+}): Promise<number> {
+  const recipients = await query<{ user_id: string; email: string; first_name: string | null; phone: string | null }>(
+    `SELECT DISTINCT t.user_id, us.email, us.first_name, us.phone
+       FROM v_lease_active_tenants vlat
+       JOIN tenants t  ON t.id = vlat.tenant_id
+       JOIN users   us ON us.id = t.user_id
+       JOIN leases  l  ON l.id = vlat.lease_id
+       JOIN units   u  ON u.id = l.unit_id
+      WHERE u.property_id = $1
+        AND ($2::uuid IS NULL OR t.id <> $2::uuid)`,
+    [o.propertyId, o.excludeTenantId ?? null]
+  )
+  const when = fmtWindow(o.startsAt, o.endsAt)
+  // closure → "closed for…"; otherwise the area is occupied/reserved
+  const isClosure = o.kind === 'maintenance_closure'
+  const headline = isClosure
+    ? `${o.areaName} closed`
+    : `${o.areaName} reserved`
+  const because = o.reason ? ` (${o.reason})` : ''
+  const sentence = isClosure
+    ? `${o.areaName} at ${o.propertyName} will be closed${because}.`
+    : `${o.areaName} at ${o.propertyName} is reserved and unavailable${because}.`
+  for (const r of recipients) {
+    await createNotification({
+      userId: r.user_id, landlordId: o.landlordId,
+      type: 'amenity_unavailable',
+      title: `${headline} — ${when}`,
+      body: `${sentence} ${when}.`,
+      data: { ...o },
+      sendEmail: true, emailTo: r.email,
+      emailSubject: `${headline} — ${when}`,
+      emailHtml: emailTemplate(headline, `${sentence}<br><b>${when}</b>`),
+    })
+  }
+  return recipients.length
+}
+
+// ── Service interruptions (utility outage broadcasts) ─────────────────
+// Resolve the residents affected by an interruption: whole property when
+// unitIds is empty, else only residents whose active lease unit is in the
+// subset.
+async function interruptionRecipients(propertyId: string, unitIds: string[]) {
+  const subset = unitIds.length > 0
+  return query<{ user_id: string; email: string; phone: string | null }>(
+    `SELECT DISTINCT t.user_id, us.email, us.phone
+       FROM v_lease_active_tenants vlat
+       JOIN tenants t  ON t.id = vlat.tenant_id
+       JOIN users   us ON us.id = t.user_id
+       JOIN leases  l  ON l.id = vlat.lease_id
+       JOIN units   u  ON u.id = l.unit_id
+      WHERE u.property_id = $1
+        AND ($2::boolean = false OR u.id = ANY($3::uuid[]))`,
+    [propertyId, subset, unitIds]
+  )
+}
+
+function interruptionWindow(startsAt: string | Date, restoreAt: string | Date | null): string {
+  const s = new Date(startsAt)
+  const start = s.toLocaleString(undefined,
+    { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
+  if (!restoreAt) return `Starting ${start} — until further notice`
+  const e = new Date(restoreAt)
+  const sameDay = s.toDateString() === e.toDateString()
+  const end = e.toLocaleString(undefined, sameDay
+    ? { hour: 'numeric', minute: '2-digit' }
+    : { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
+  return `${start} — expected back by ${end}`
+}
+
+// A utility interruption was posted → alert affected residents. SMS fires
+// for emergencies (immediate/unplanned). Returns count notified.
+export async function notifyServiceInterruption(o: {
+  propertyId: string; landlordId: string; unitIds: string[];
+  utilityLabel: string; title?: string | null; message?: string | null;
+  isEmergency: boolean; startsAt: string | Date; expectedRestoreAt: string | Date | null;
+}): Promise<number> {
+  const recipients = await interruptionRecipients(o.propertyId, o.unitIds)
+  const when = interruptionWindow(o.startsAt, o.expectedRestoreAt)
+  const tag = o.isEmergency ? '🚨 ' : ''
+  const headline = `${tag}${o.utilityLabel} ${o.isEmergency ? 'outage' : 'service interruption'}`
+  const detail = [o.title, o.message].filter(Boolean).join(' — ')
+  for (const r of recipients) {
+    await createNotification({
+      userId: r.user_id, landlordId: o.landlordId,
+      type: 'service_interruption',
+      title: `${headline} — ${when}`,
+      body: `${detail ? detail + '. ' : ''}${o.utilityLabel}: ${when}.`,
+      data: { ...o },
+      sendEmail: true, emailTo: r.email,
+      emailSubject: `${headline}`,
+      emailHtml: emailTemplate(headline, `${detail ? detail + '<br><br>' : ''}<b>${when}</b>`),
+      sendSMS: o.isEmergency, smsTo: r.phone ?? undefined,
+      smsBody: `GAM ${tag}${o.utilityLabel}: ${when}.${detail ? ' ' + detail : ''}`,
+    })
+  }
+  return recipients.length
+}
+
+// Landlord marked an interruption resolved and chose to send an all-clear.
+export async function notifyServiceRestored(o: {
+  propertyId: string; landlordId: string; unitIds: string[]; utilityLabel: string;
+}): Promise<number> {
+  const recipients = await interruptionRecipients(o.propertyId, o.unitIds)
+  for (const r of recipients) {
+    await createNotification({
+      userId: r.user_id, landlordId: o.landlordId,
+      type: 'service_interruption',
+      title: `✅ ${o.utilityLabel} restored`,
+      body: `${o.utilityLabel} service has been restored. Thank you for your patience.`,
+      data: { ...o, restored: true },
+      sendEmail: true, emailTo: r.email,
+      emailSubject: `✅ ${o.utilityLabel} restored`,
+      emailHtml: emailTemplate(`${o.utilityLabel} restored`, `<b>${o.utilityLabel}</b> service has been restored. Thank you for your patience.`),
+    })
+  }
+  return recipients.length
+}

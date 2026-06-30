@@ -8,7 +8,17 @@ interface AuthUser {
   firstName: string
   lastName: string
   profileId: string
+  // 2FA state. PM-company users are NOT in the backend's
+  // MANDATORY_TOTP_ROLES, so mustEnrollTotp is always false here —
+  // 2FA is optional-with-prompts. totpEnabled drives the Settings
+  // surface + the dismissible nudge.
+  totpEnabled?: boolean
+  mustEnrollTotp?: boolean
 }
+
+// login() returns a discriminated result so LoginPage can branch into
+// the TOTP second step when the backend gates on 2FA.
+type LoginResult = { kind: 'success' } | { kind: 'totp_required'; totpSession: string }
 
 /** A pm_staff membership: which pm_company the current user belongs to,
  *  and at what role. Populated lazily after auth (one /api/pm/companies
@@ -29,7 +39,8 @@ interface AuthCtx {
   pmCompanies: ActivePmCompany[]
   activePmCompany: ActivePmCompany | null
   setActivePmCompany: (c: ActivePmCompany) => void
-  login:  (email: string, password: string) => Promise<void>
+  login:  (email: string, password: string) => Promise<LoginResult>
+  loginWithTotp: (totpSession: string, code: string) => Promise<void>
   logout: () => void
   refresh: () => Promise<void>
 }
@@ -82,18 +93,38 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => { token ? refresh() : setLoading(false) }, [token, refresh])
 
-  const login = async (email: string, password: string) => {
-    const res = await apiPost<{ token: string; user: AuthUser }>('/auth/login', { email, password })
+  // Post-credentials login. Returns a discriminated result so LoginPage
+  // can pivot into the TOTP second step when 2FA is enabled on the
+  // account. Doesn't set token/user until the full JWT lands — a
+  // totp_session JWT is not a valid auth token.
+  const login = async (email: string, password: string): Promise<LoginResult> => {
+    const res = await apiPost<any>('/auth/login', { email, password })
+    const data = res.data!
+    if (data.requiresTotp) {
+      return { kind: 'totp_required', totpSession: data.totpSession as string }
+    }
+    localStorage.setItem('gam_token', data.token)
+    setToken(data.token)
+    setUser(data.user ?? data)
+    return { kind: 'success' }
+  }
+
+  // TOTP second-step exchange. Trades the short-lived totp_session JWT
+  // (from /login) plus a 6-digit token or recovery code for the full
+  // session JWT. Setting the token triggers the refresh() effect, which
+  // loads /auth/me + the pm_staff memberships.
+  const loginWithTotp = async (totpSession: string, code: string): Promise<void> => {
+    const res = await apiPost<{ token: string }>('/auth/totp/verify', { totpSession, code })
     localStorage.setItem('gam_token', res.data!.token)
     setToken(res.data!.token)
-    setUser(res.data!.user)
+    await refresh()
   }
 
   return (
     <Ctx.Provider value={{
       user, token, loading,
       pmCompanies, activePmCompany, setActivePmCompany,
-      login, logout, refresh,
+      login, loginWithTotp, logout, refresh,
     }}>
       {children}
     </Ctx.Provider>

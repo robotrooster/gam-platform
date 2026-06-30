@@ -35,7 +35,7 @@ const {
   isFlexPayVisibleMock, getFlexPayEligibilityMock, calculateFlexPayFeeMock,
   enrollFlexPayMock, cancelFlexPayMock,
   isFlexDepositVisibleMock, getFlexDepositEligibilityMock,
-  enrollFlexDepositMock, retryFlexDepositAccelerationMock, cancelFlexDepositMock,
+  enrollFlexDepositMock, payAheadFlexDepositMock, cancelFlexDepositMock,
   previewFlexDepositScheduleMock,
   getPendingReAcceptancesMock, renderReAcceptanceTermsMock, commitReAcceptanceMock,
   renderFlexPayAcceptanceTextMock, renderFlexDepositAcceptanceTextMock,
@@ -54,13 +54,13 @@ const {
   getFlexDepositEligibilityMock:     vi.fn(async (..._a: any[]) => ({ eligible: true })),
   enrollFlexDepositMock:             vi.fn<any[], Promise<{ ok: boolean; plan?: any; acceptanceId?: string; reason?: string }>>(
     async () => ({ ok: true, plan: { installmentCount: 3 }, acceptanceId: 'acc_dep' })),
-  retryFlexDepositAccelerationMock:  vi.fn<any[], Promise<{ ok: boolean; reason?: string }>>(
+  payAheadFlexDepositMock:  vi.fn<any[], Promise<{ ok: boolean; reason?: string }>>(
     async () => ({ ok: true })),
   cancelFlexDepositMock:             vi.fn<any[], Promise<{ ok: boolean; reason?: string }>>(
     async () => ({ ok: true })),
   previewFlexDepositScheduleMock:    vi.fn<any[], Promise<any>>(
     async () => ({ ok: true, depositId: 'dep_mock',
-      schedule: { installments: [], gamAdvanceAmount: 1000, totalInstallmentAmount: 1500, startDate: '2026-06-01' } })),
+      schedule: { installments: [], uncollectedAtMoveIn: 1000, totalInstallmentAmount: 1500, startDate: '2026-06-01' } })),
   getPendingReAcceptancesMock:       vi.fn(async (..._a: any[]) => [] as any[]),
   renderReAcceptanceTermsMock:       vi.fn(async (..._a: any[]) => ({ renderedText: 'terms text' })),
   commitReAcceptanceMock:            vi.fn(async (..._a: any[]) => 'acc_reaccept'),
@@ -97,7 +97,7 @@ vi.mock('../services/flexDeposit', async (importOriginal) => {
     isFlexDepositVisible:         isFlexDepositVisibleMock,
     getFlexDepositEligibility:    getFlexDepositEligibilityMock,
     enrollFlexDeposit:            enrollFlexDepositMock,
-    retryFlexDepositAcceleration: retryFlexDepositAccelerationMock,
+    payAheadFlexDeposit: payAheadFlexDepositMock,
     cancelFlexDeposit:            cancelFlexDepositMock,
     previewFlexDepositSchedule:   previewFlexDepositScheduleMock,
   }
@@ -150,11 +150,11 @@ beforeEach(async () => {
   isFlexDepositVisibleMock.mockClear(); isFlexDepositVisibleMock.mockResolvedValue(true)
   getFlexDepositEligibilityMock.mockClear(); getFlexDepositEligibilityMock.mockResolvedValue({ eligible: true } as any)
   enrollFlexDepositMock.mockClear(); enrollFlexDepositMock.mockResolvedValue({ ok: true, plan: { installmentCount: 3 }, acceptanceId: 'acc_dep' })
-  retryFlexDepositAccelerationMock.mockClear(); retryFlexDepositAccelerationMock.mockResolvedValue({ ok: true })
+  payAheadFlexDepositMock.mockClear(); payAheadFlexDepositMock.mockResolvedValue({ ok: true })
   cancelFlexDepositMock.mockClear(); cancelFlexDepositMock.mockResolvedValue({ ok: true })
   previewFlexDepositScheduleMock.mockClear()
   previewFlexDepositScheduleMock.mockResolvedValue({ ok: true, depositId: 'dep_mock',
-    schedule: { installments: [], gamAdvanceAmount: 1000, totalInstallmentAmount: 1500, startDate: '2026-06-01' } } as any)
+    schedule: { installments: [], uncollectedAtMoveIn: 1000, totalInstallmentAmount: 1500, startDate: '2026-06-01' } } as any)
   getPendingReAcceptancesMock.mockClear(); getPendingReAcceptancesMock.mockResolvedValue([])
   renderReAcceptanceTermsMock.mockClear(); renderReAcceptanceTermsMock.mockResolvedValue({ renderedText: 'terms text' } as any)
   commitReAcceptanceMock.mockClear(); commitReAcceptanceMock.mockResolvedValue('acc_reaccept' as any)
@@ -407,31 +407,31 @@ describe('FlexDeposit — GET + enroll + terms + retry + DELETE', () => {
   it('GET /flexdeposit/terms installmentCount out of range → 400; happy returns rendered terms', async () => {
     const f = await seedTenantFixture()
     const bad = await request(buildApp())
-      .get('/api/tenants/flexdeposit/terms?installmentCount=5')
+      .get('/api/tenants/flexdeposit/terms?installmentCount=7')
       .set('Authorization', `Bearer ${f.token}`)
     expect(bad.status).toBe(400)
-    expect(bad.body.error).toMatch(/installmentCount must be an integer 2\.\.4/)
+    expect(bad.body.error).toMatch(/installmentCount must be an integer 2\.\.6/)
 
     const ok = await request(buildApp())
       .get('/api/tenants/flexdeposit/terms?installmentCount=3')
       .set('Authorization', `Bearer ${f.token}`)
     expect(ok.status).toBe(200)
     expect(ok.body.data).toMatchObject({
-      version: 'v1.0', installmentCount: 3, gamAdvanceAmount: 1000, renderedText: 'deposit terms',
+      version: 'v1.0', installmentCount: 3, uncollectedAtMoveIn: 1000, renderedText: 'deposit terms',
     })
   })
 
-  it('POST /flexdeposit/retry-acceleration: service ok:false → 400; happy passes through', async () => {
+  it('POST /flexdeposit/pay-ahead: service ok:false → 400; happy passes through', async () => {
     const f = await seedTenantFixture()
-    retryFlexDepositAccelerationMock.mockResolvedValueOnce({ ok: false, reason: 'no in_default plan' })
+    payAheadFlexDepositMock.mockResolvedValueOnce({ ok: false, reason: 'No active FlexDeposit plan' })
     const fail = await request(buildApp())
-      .post('/api/tenants/flexdeposit/retry-acceleration')
+      .post('/api/tenants/flexdeposit/pay-ahead')
       .set('Authorization', `Bearer ${f.token}`).send({})
     expect(fail.status).toBe(400)
-    expect(fail.body.error).toBe('no in_default plan')
+    expect(fail.body.error).toBe('No active FlexDeposit plan')
 
     const ok = await request(buildApp())
-      .post('/api/tenants/flexdeposit/retry-acceleration')
+      .post('/api/tenants/flexdeposit/pay-ahead')
       .set('Authorization', `Bearer ${f.token}`).send({})
     expect(ok.status).toBe(200)
   })

@@ -43,8 +43,8 @@ import { logger } from '../lib/logger'
 //     payment_intent.succeeded → flexpay_advances → 'reconciled'.
 //     payment_intent.payment_failed → first failure triggers a
 //     NACHA retry via the standard achRetry path; second failure
-//     → 'defaulted' + 60-day tenant suspension. UI copy at the
-//     enroll modal already states this.
+//     → 'defaulted' + 90-day tenant suspension (Consumer ToS lockout).
+//     UI copy at the enroll modal states this.
 //
 // ── OTP coexistence ───────────────────────────────────────────
 // Both flags can be on for the same tenant simultaneously. OTP is
@@ -58,7 +58,11 @@ import { logger } from '../lib/logger'
 
 export const FLEXPAY_FEE_BASE = 5            // dollars
 export const FLEXPAY_MAX_PULL_DAY = 28       // SSDI 4th-Wednesday cap
-export const FLEXPAY_NSF_COOLDOWN_DAYS = 60  // per existing tenant UI copy
+export const FLEXPAY_NSF_COOLDOWN_DAYS = 90  // matches Consumer ToS § (re-enroll lockout after a FlexPay failure)
+// Stripe ACH-return fee passed through to the tenant at cost on a retry pull
+// (Consumer ToS § 4.2 / 9.2). Constant approximates Stripe's published ACH
+// failure fee; reconcile to the live fee schedule once Stripe keys are live.
+export const FLEXPAY_ACH_RETURN_FEE = 4
 export const FLEXPAY_DEFAULT_GRACE_DAYS = 5  // when lease.late_fee_grace_days is NULL
 
 /**
@@ -93,35 +97,34 @@ export interface FlexPayEligibility {
     | 'no_active_lease'
     | 'tenant_not_found'
     | 'flex_deposit_active'
+    | 'not_ssi_ssdi'
   >
   suspended_until: string | null
 }
 
 /**
- * Eligibility check for enrolling a tenant in FlexPay. Note this is
- * INDEPENDENT of OTP eligibility — the two products coexist; FlexPay
- * doesn't gate on deposit-funded or background-check (those are OTP
- * concerns). FlexPay only needs ACH verified + active lease + not in
- * NSF cooldown + no in-flight FlexDeposit installment plan.
+ * Eligibility check for enrolling a tenant in FlexPay. Per the S512
+ * product spec: SSDI/SSI recipients only, ACH verified, active lease,
+ * not in the post-failure re-enroll cooldown, and — when the tenant is
+ * funding their deposit via FlexDeposit — that plan must be FUNDED first.
  *
- * S310: the FlexDeposit-active blocker implements the Consumer ToS
- * § 9.1.4(i) cross-product restriction lever — "Your eligibility to
- * enroll in additional FlexSuite products (FlexPay, FlexCharge,
- * FlexCredit) may be restricted at GAM's discretion until the
- * FlexDeposit SLA installment schedule is brought current." Mirrors
- * the FlexCharge S261 gate in services/flexCharge.ts and the OTP gate
- * in services/otp.ts. The check uses plan_status ∈ ('active',
- * 'accelerated') rather than installments_remaining > 0 so the
- * trigger is consistent with FlexCharge; both signals are equivalent
- * in practice (an accelerated plan has zero remaining but is still
- * in-flight on the balance).
+ * The deposit gate is SPECIFIC to FlexDeposit (an in-flight installment
+ * plan, below). FlexPay does NOT gate on generic security_deposits funded
+ * status: landlords onboarding to GAM bring tenants with deposits already
+ * paid off-platform, whose imported rows can read "unfunded" — those must
+ * not block FlexPay (Nic 2026-06-27).
+ *
+ * S310/S514: the FlexDeposit-active blocker = Consumer ToS § 9.1.4(i)
+ * cross-product lever; clears once the plan completes (custody model
+ * plan_status is 'active' | 'completed').
  */
 export async function getFlexPayEligibility(tenantId: string): Promise<FlexPayEligibility> {
   const row = await queryOne<{
     ach_verified: boolean
+    ssi_ssdi: boolean
     flexpay_disqualified_until: string | null
   }>(
-    `SELECT ach_verified, flexpay_disqualified_until
+    `SELECT ach_verified, ssi_ssdi, flexpay_disqualified_until
        FROM tenants
       WHERE id = $1`,
     [tenantId],
@@ -132,6 +135,9 @@ export async function getFlexPayEligibility(tenantId: string): Promise<FlexPayEl
   let suspendedUntil: string | null = null
 
   if (!row.ach_verified) blockers.push('ach_unverified')
+  // S512: FlexPay is an SSDI/SSI service tier (income verified at onboarding,
+  // not a credit decision). Same field/gate FlexDeposit uses (tenants.ssi_ssdi).
+  if (!row.ssi_ssdi) blockers.push('not_ssi_ssdi')
   if (row.flexpay_disqualified_until) {
     const until = new Date(row.flexpay_disqualified_until)
     if (until.getTime() > Date.now()) {
@@ -140,16 +146,15 @@ export async function getFlexPayEligibility(tenantId: string): Promise<FlexPayEl
     }
   }
 
-  // S310: FlexDeposit-active gate. A tenant with an in-flight
-  // FlexDeposit installment plan ('active' or 'accelerated') cannot
-  // enroll in FlexPay until the deposit plan completes. Mirrors the
-  // FlexCharge gate and the SLA § 9.1.4(i) restriction lever.
+  // S310: FlexDeposit-active gate. A tenant funding their deposit over an
+  // in-flight FlexDeposit installment plan can't also enroll in FlexPay until
+  // it completes. (S514 custody model: plan_status is 'active' | 'completed'.)
   const activeDepositPlan = await queryOne<{ id: string }>(
     `SELECT id
        FROM security_deposits
       WHERE tenant_id = $1
         AND flex_deposit_enabled = TRUE
-        AND flex_deposit_plan_status IN ('active', 'accelerated')
+        AND flex_deposit_plan_status = 'active'
       LIMIT 1`,
     [tenantId],
   )
@@ -272,6 +277,43 @@ export async function cancelFlexPay(tenantId: string): Promise<void> {
       WHERE id = $1`,
     [tenantId],
   )
+}
+
+export interface ChangePullDayResult {
+  ok: boolean
+  reason?: string
+  pullDay?: number
+  fee?: number
+  effective?: 'next_cycle'
+}
+
+/**
+ * Change an enrolled tenant's FlexPay pull day. Takes effect NEXT cycle (Nic
+ * 2026-06-27): the current cycle's advance already snapshotted its pull_day +
+ * fee at grace-end, so this never disturbs or lets a tenant dodge an in-flight
+ * pull — it only changes which day (and therefore the fee = $5 + day) the NEXT
+ * grace-end advance uses. No outstanding-balance block is needed for that
+ * reason. `flexpay_monthly_fee` is the display value, recomputed here; the
+ * authoritative per-cycle fee is computed from pull_day at grace-end.
+ */
+export async function changeFlexPayPullDay(tenantId: string, newPullDay: number): Promise<ChangePullDayResult> {
+  if (!await isFlexPayVisible()) return { ok: false, reason: 'FlexPay is not enabled on this platform' }
+  // Validates the 1..28 integer range (throws otherwise) and gives the new fee.
+  let fee: number
+  try { fee = calculateFlexPayFee(newPullDay) }
+  catch (e: any) { return { ok: false, reason: e?.message ?? 'Invalid pull day' } }
+
+  const updated = await query<{ id: string }>(
+    `UPDATE tenants
+        SET flexpay_pull_day    = $2,
+            flexpay_monthly_fee = $3,
+            updated_at          = NOW()
+      WHERE id = $1 AND flexpay_enrolled = TRUE
+      RETURNING id`,
+    [tenantId, newPullDay, fee],
+  )
+  if (updated.length === 0) return { ok: false, reason: 'Not enrolled in FlexPay' }
+  return { ok: true, pullDay: newPullDay, fee, effective: 'next_cycle' }
 }
 
 // ── Grace-period-end advance (GAM → landlord) ───────────────────
@@ -687,6 +729,71 @@ export async function processFlexPayPullDay(now: Date = new Date()): Promise<Pul
   return out
 }
 
+/**
+ * Re-price a FlexPay cycle's pull right before an ACH RETRY fires (Consumer
+ * ToS § 4.1 + § 4.2): the monthly fee recalculates under the formula at the
+ * RETRY day (e.g. a pull that bounced on the 11th and retries on the 15th
+ * recomputes $16 → $20), and the bounced attempt's Stripe ACH-return fee
+ * passes through at cost. The original pull is all-or-nothing ACH, so the
+ * failed attempt collected nothing — the recomputed fee REPLACES the prior
+ * one (no double charge).
+ *
+ * Mutates the EXISTING PaymentIntent's amount (+ the advance fee + payment
+ * row) so the generic achRetry confirm re-pulls the corrected total. Called
+ * by processAchRetries for entry_description='FLEXPAY' payments before confirm.
+ * Throws on failure so the caller skips the (stale-amount) confirm.
+ */
+export async function repriceFlexPayRetryPayment(paymentId: string): Promise<void> {
+  const pay = await queryOne<{ stripe_payment_intent_id: string | null; tenant_id: string }>(
+    `SELECT stripe_payment_intent_id, tenant_id
+       FROM payments WHERE id = $1 AND entry_description = 'FLEXPAY'`,
+    [paymentId],
+  )
+  if (!pay || !pay.stripe_payment_intent_id) return  // not a FlexPay PI — nothing to reprice
+
+  const adv = await queryOne<{ id: string; rent_amount: string }>(
+    `SELECT id, rent_amount FROM flexpay_advances WHERE rent_payment_id = $1`,
+    [paymentId],
+  )
+  if (!adv) return  // no linked advance (shouldn't happen) — leave the confirm to run as-is
+
+  const rent = Number(adv.rent_amount)
+  // Retry day = today's calendar day, clamped to the 1..28 formula range.
+  const retryDay = Math.min(Math.max(new Date().getUTCDate(), 1), FLEXPAY_MAX_PULL_DAY)
+  const newFee = calculateFlexPayFee(retryDay)
+  const boost = await computeTenantGamOutstandingTotal(pay.tenant_id)
+  const newAmount = Math.round((rent + newFee + FLEXPAY_ACH_RETURN_FEE + boost) * 100) / 100
+
+  const stripe = getStripe()
+  await stripe.paymentIntents.update(pay.stripe_payment_intent_id, {
+    amount: Math.round(newAmount * 100),
+    metadata: {
+      gam_purpose:            'flexpay_pull',
+      gam_advance_id:         adv.id,
+      gam_tenant_id:          pay.tenant_id,
+      gam_rent:               String(rent),
+      gam_fee:                String(newFee),
+      gam_ach_return_fee:     String(FLEXPAY_ACH_RETURN_FEE),
+      gam_repriced_retry_day: String(retryDay),
+    },
+  })
+
+  await query(
+    `UPDATE flexpay_advances SET tenant_fee_amount = $1, updated_at = NOW() WHERE id = $2`,
+    [newFee, adv.id],
+  )
+  await query(
+    `UPDATE payments
+        SET amount = $1, gam_supersedence_amount = $2, notes = $3
+      WHERE id = $4`,
+    [
+      newAmount, boost.toFixed(2),
+      `FlexPay retry (day ${retryDay}) — rent $${rent.toFixed(2)} + fee $${newFee.toFixed(2)} + ACH-return $${FLEXPAY_ACH_RETURN_FEE.toFixed(2)}`,
+      paymentId,
+    ],
+  )
+}
+
 // ── Webhook reconciliation hooks ────────────────────────────────
 
 /**
@@ -727,7 +834,7 @@ export async function reconcileSettledFlexPayPayment(paymentId: string): Promise
  * NACHA semantics: ACH may retry on insufficient/uncollected funds
  * codes; the existing achRetry pipeline schedules + fires retries.
  * FlexPay's 2-strike rule (original attempt + 1 retry, both failed
- * → 60-day suspension) is enforced by checking retry_count on the
+ * → 90-day suspension) is enforced by checking retry_count on the
  * payments row: if retry_count >= 1 and we're here on a payment_
  * failed event, the retry just failed, so we're at the suspension
  * trigger.

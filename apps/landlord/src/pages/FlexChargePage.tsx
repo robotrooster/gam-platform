@@ -93,7 +93,7 @@ export function FlexChargePage() {
           <h1 style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
             <CreditCard size={22} /> FlexCharge
           </h1>
-          <p className="page-sub">Per-property charge accounts for tenants and POS customers. 1.5% service fee on monthly statements.</p>
+          <p className="page-sub">Per-property charge accounts for tenants and POS customers. The account holder pays a 1.5% finance charge on their outstanding monthly balance, paid to you (the account owner) — GAM provides the software, not the credit.</p>
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
           <button className="btn btn-ghost" onClick={() => setShowNewCustomer(true)}>+ POS Customer</button>

@@ -362,6 +362,24 @@ export async function emailInvitation(to: string, inviterName: string, role: Lan
   )
 }
 
+// ── CUSTOMER PORTAL MAGIC-LINK (service-business) ─────────────
+// A business's customer (no GAM account) requests access to their
+// self-service portal by email; we mail them their portal link. The
+// token in the URL is the bearer credential — this is the magic-link
+// "login": no password to manage.
+export async function emailCustomerPortalLink(to: string, businessName: string, portalUrl: string) {
+  await send(to, `Your ${businessName} customer portal link`,
+    base(
+      h('Your portal link') +
+      p(`Here's your secure link to view your service status, history, and invoices from <strong style="color:#eef1f8">${businessName}</strong>.`) +
+      btn('Open my portal', portalUrl) +
+      `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">If you didn't request this, you can safely ignore this email.</div>`
+    ),
+    { category: 'customer_portal' },
+    'support',
+  )
+}
+
 // ── PM COMPANY STAFF INVITATION (S112) ────────────────────────
 // Distinct from emailInvitation (in-house worker) — PM staff invitations
 // land them as employees of a third-party PM company, not as a landlord's

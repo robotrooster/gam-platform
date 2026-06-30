@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { apiGet, apiPost } from '../lib/api'
-import { Play, CheckCircle2, ChevronRight, ArrowLeft, Plus, MapPin, Smartphone } from 'lucide-react'
+import { apiGet, apiPost, apiPatch } from '../lib/api'
+import { Play, CheckCircle2, ChevronRight, ArrowLeft, Plus, MapPin, Smartphone, ChevronUp, ChevronDown } from 'lucide-react'
 
 // ─────────────────────────────────────────────────────────────
 //  Types
@@ -42,6 +42,7 @@ interface RouteStop {
   estimatedDeparture: string | null
   actualArrival: string | null
   actualDeparture: string | null
+  expectedSeconds: number | null
   status: 'planned' | 'completed' | 'skipped'
   driverNotes: string | null
   firstName: string | null
@@ -117,6 +118,7 @@ export function RoutesPage() {
   const [detail, setDetail] = useState<RouteDetail | null>(null)
   const [detailLoading, setDetailLoading] = useState(false)
   const [stopActioning, setStopActioning] = useState<string | null>(null)
+  const [showAddStop, setShowAddStop] = useState(false)
 
   const reload = async () => {
     setErr(null)
@@ -222,6 +224,17 @@ export function RoutesPage() {
     } finally { setStopActioning(null) }
   }
 
+  const onReorder = async (orderedStopIds: string[]) => {
+    if (!selectedId) return
+    setErr(null)
+    try {
+      await apiPatch(`/routes/${selectedId}/stop-order`, { orderedStopIds })
+      await loadDetail(selectedId)
+    } catch (e: any) {
+      setErr(e?.response?.data?.error || 'Reorder failed')
+    }
+  }
+
   // ─── Gated empty state ──────────────────────────────────────
   if (!loading && vehicles.length === 0) {
     return (
@@ -238,17 +251,29 @@ export function RoutesPage() {
   // ─── Detail view ────────────────────────────────────────────
   if (selectedId) {
     return (
-      <RouteDetailView
-        loading={detailLoading}
-        detail={detail}
-        err={err}
-        stopActioning={stopActioning}
-        onBack={() => { setSelectedId(null); setDetail(null) }}
-        onStart={() => onStart(selectedId)}
-        onComplete={() => onComplete(selectedId)}
-        onStopComplete={onStopComplete}
-        onStopSkip={onStopSkip}
-      />
+      <>
+        <RouteDetailView
+          loading={detailLoading}
+          detail={detail}
+          err={err}
+          stopActioning={stopActioning}
+          canAddStop={!!detail && detail.route.status !== 'completed'}
+          onBack={() => { setSelectedId(null); setDetail(null) }}
+          onStart={() => onStart(selectedId)}
+          onComplete={() => onComplete(selectedId)}
+          onStopComplete={onStopComplete}
+          onStopSkip={onStopSkip}
+          onAddStop={() => setShowAddStop(true)}
+          onReorder={onReorder}
+        />
+        {showAddStop && (
+          <AddStopModal
+            routeId={selectedId}
+            onClose={() => setShowAddStop(false)}
+            onAdded={async () => { setShowAddStop(false); await loadDetail(selectedId); await reload() }}
+          />
+        )}
+      </>
     )
   }
 
@@ -371,18 +396,21 @@ export function RoutesPage() {
 // ─────────────────────────────────────────────────────────────
 
 function RouteDetailView({
-  loading, detail, err, stopActioning,
-  onBack, onStart, onComplete, onStopComplete, onStopSkip,
+  loading, detail, err, stopActioning, canAddStop,
+  onBack, onStart, onComplete, onStopComplete, onStopSkip, onAddStop, onReorder,
 }: {
   loading: boolean
   detail: RouteDetail | null
   err: string | null
   stopActioning: string | null
+  canAddStop: boolean
   onBack: () => void
   onStart: () => void
   onComplete: () => void
   onStopComplete: (stopId: string) => void
   onStopSkip: (stopId: string) => void
+  onAddStop: () => void
+  onReorder: (orderedStopIds: string[]) => void
 }) {
   if (loading || !detail) {
     return (
@@ -397,6 +425,19 @@ function RouteDetailView({
   const { route, stops } = detail
   const finalized = stops.filter(s => s.status !== 'planned').length
   const allDone = stops.length > 0 && finalized === stops.length
+
+  // #16: pre-start manual reorder. Only while generated; depot_return is
+  // always pinned last by the backend, so it's excluded here.
+  const reorderable = stops.filter(s => s.stopKind !== 'depot_return')
+  const canReorder = route.status === 'generated' && reorderable.length > 1
+  const moveStop = (stopId: string, dir: -1 | 1) => {
+    const ids = reorderable.map(s => s.id)
+    const i = ids.indexOf(stopId)
+    const j = i + dir
+    if (i < 0 || j < 0 || j >= ids.length) return
+    ;[ids[i], ids[j]] = [ids[j], ids[i]]
+    onReorder(ids)
+  }
 
   return (
     <div>
@@ -453,6 +494,12 @@ function RouteDetailView({
               Completed {fmtTime(route.completedAt)}
             </div>
           )}
+          {canAddStop && (
+            <button onClick={onAddStop}
+              style={{ ...primaryBtnStyle, background: 'var(--bg-2)', color: 'var(--gold)', border: '1px solid var(--gold)' }}>
+              <Plus size={14} /> Add stop
+            </button>
+          )}
           <Link to={`/drive/${route.id}`}
             style={{ ...primaryBtnStyle,
               background: 'var(--bg-2)', color: 'var(--gold)',
@@ -462,33 +509,48 @@ function RouteDetailView({
         </div>
       </div>
 
-      <h2 style={{ ...h2Style, marginTop: 32 }}>Stops</h2>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 32 }}>
+        <h2 style={{ ...h2Style, margin: 0 }}>Stops</h2>
+        {canReorder && (
+          <button onClick={() => onReorder([...reorderable].reverse().map(s => s.id))}
+            style={reverseBtnStyle} title="Reverse the stop order (e.g. to finish near the transfer station)">
+            Reverse order
+          </button>
+        )}
+      </div>
       {stops.length === 0 ? (
         <div style={emptyStyle}>No stops on this route.</div>
       ) : (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-          {stops.map(s => (
-            <StopCard
-              key={s.id}
-              stop={s}
-              routeStatus={route.status}
-              actioning={stopActioning === s.id}
-              onComplete={() => onStopComplete(s.id)}
-              onSkip={() => onStopSkip(s.id)}
-            />
-          ))}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginTop: 12 }}>
+          {stops.map(s => {
+            const ri = reorderable.findIndex(x => x.id === s.id)
+            return (
+              <StopCard
+                key={s.id}
+                stop={s}
+                routeStatus={route.status}
+                actioning={stopActioning === s.id}
+                onComplete={() => onStopComplete(s.id)}
+                onSkip={() => onStopSkip(s.id)}
+                reorder={canReorder && ri >= 0
+                  ? { isFirst: ri === 0, isLast: ri === reorderable.length - 1, onUp: () => moveStop(s.id, -1), onDown: () => moveStop(s.id, 1) }
+                  : undefined}
+              />
+            )
+          })}
         </div>
       )}
     </div>
   )
 }
 
-function StopCard({ stop, routeStatus, actioning, onComplete, onSkip }: {
+function StopCard({ stop, routeStatus, actioning, onComplete, onSkip, reorder }: {
   stop: RouteStop
   routeStatus: 'generated' | 'in_progress' | 'completed'
   actioning: boolean
   onComplete: () => void
   onSkip: () => void
+  reorder?: { isFirst: boolean; isLast: boolean; onUp: () => void; onDown: () => void }
 }) {
   const kindBadge = stop.stopKind === 'customer'
     ? { label: 'CUSTOMER', color: 'var(--gold)' }
@@ -571,6 +633,18 @@ function StopCard({ stop, routeStatus, actioning, onComplete, onSkip }: {
               </span>
             )}
           </div>
+          {stop.status === 'completed' && stop.expectedSeconds != null && stop.actualArrival && stop.actualDeparture && (() => {
+            const actualS = Math.max(0, (new Date(stop.actualDeparture).getTime() - new Date(stop.actualArrival).getTime()) / 1000)
+            const deltaS = actualS - stop.expectedSeconds
+            const mins = (s: number) => `${Math.round(s / 60)}m`
+            const onTarget = Math.abs(deltaS) < 30
+            return (
+              <div style={{ fontSize: 11, marginTop: 4, color: onTarget ? 'var(--text-3)' : deltaS > 0 ? 'var(--amber)' : 'var(--green, #4ade80)' }}>
+                On site {mins(actualS)} · expected {mins(stop.expectedSeconds)}
+                {onTarget ? ' · on target' : ` · ${deltaS > 0 ? '+' : '−'}${mins(Math.abs(deltaS))}`}
+              </div>
+            )
+          })()}
         </div>
 
         {routeStatus === 'in_progress' && stop.status === 'planned' && stop.stopKind !== 'depot_return' && (
@@ -581,6 +655,16 @@ function StopCard({ stop, routeStatus, actioning, onComplete, onSkip }: {
             <button onClick={onSkip} disabled={actioning} style={stopActionSecondary}>
               Skip
             </button>
+          </div>
+        )}
+        {reorder && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+            <button onClick={reorder.onUp} disabled={reorder.isFirst}
+              style={{ ...arrowBtnStyle, opacity: reorder.isFirst ? 0.3 : 1, cursor: reorder.isFirst ? 'default' : 'pointer' }}
+              title="Move earlier"><ChevronUp size={16} /></button>
+            <button onClick={reorder.onDown} disabled={reorder.isLast}
+              style={{ ...arrowBtnStyle, opacity: reorder.isLast ? 0.3 : 1, cursor: reorder.isLast ? 'default' : 'pointer' }}
+              title="Move later"><ChevronDown size={16} /></button>
           </div>
         )}
       </div>
@@ -611,6 +695,98 @@ function StatusBadge({ status }: { status: 'generated' | 'in_progress' | 'comple
       fontSize: 11, fontWeight: 700, letterSpacing: 0.5,
       color: cfg.color, background: 'var(--bg-2)', border: '1px solid var(--border-1)',
     }}>{cfg.label}</span>
+  )
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Add-stop modal (live insert — #14)
+// ─────────────────────────────────────────────────────────────
+
+interface InsertableAppt {
+  id: string
+  serviceType: string | null
+  scheduledFor: string
+  firstName: string | null
+  lastName: string | null
+  companyName: string | null
+  street1: string | null
+  city: string | null
+  state: string | null
+  zip: string | null
+  geocoded: boolean
+}
+
+function AddStopModal({ routeId, onClose, onAdded }: {
+  routeId: string
+  onClose: () => void
+  onAdded: () => void
+}) {
+  const [list, setList] = useState<InsertableAppt[]>([])
+  const [loading, setLoading] = useState(true)
+  const [adding, setAdding] = useState<string | null>(null)
+  const [err, setErr] = useState<string | null>(null)
+
+  useEffect(() => {
+    apiGet<InsertableAppt[]>(`/routes/${routeId}/insertable-appointments`)
+      .then(setList)
+      .catch((e: any) => setErr(e?.response?.data?.error || 'Failed to load appointments'))
+      .finally(() => setLoading(false))
+  }, [routeId])
+
+  const add = async (id: string) => {
+    setAdding(id); setErr(null)
+    try {
+      await apiPost(`/routes/${routeId}/stops`, { appointmentId: id })
+      onAdded()
+    } catch (e: any) {
+      setErr(e?.response?.data?.error || 'Could not add the stop')
+      setAdding(null)
+    }
+  }
+
+  return (
+    <div style={overlayStyle} onClick={onClose}>
+      <div style={modalStyle} onClick={(e) => e.stopPropagation()}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+          <h2 style={{ ...h2Style, margin: 0 }}>Add a stop</h2>
+          <button onClick={onClose} style={modalCloseStyle}>✕</button>
+        </div>
+        <div style={{ fontSize: 13, color: 'var(--text-2)', marginBottom: 12 }}>
+          Scheduled appointments for this day not yet on the route. Adding one re-optimizes the remaining stops.
+        </div>
+        {err && <div style={errStyle}>{err}</div>}
+        {loading ? (
+          <div style={{ color: 'var(--text-2)' }}>Loading…</div>
+        ) : list.length === 0 ? (
+          <div style={emptyStyle}>No schedulable appointments left for this day.</div>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, maxHeight: 360, overflowY: 'auto' }}>
+            {list.map((a) => {
+              const name = a.companyName || `${a.firstName ?? ''} ${a.lastName ?? ''}`.trim() || 'Customer'
+              const addr = a.street1 ? `${a.street1}, ${a.city}, ${a.state} ${a.zip}` : null
+              return (
+                <div key={a.id} style={insertRowStyle}>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontWeight: 600 }}>{name}</div>
+                    {addr && <div style={{ fontSize: 12, color: 'var(--text-2)' }}>{addr}</div>}
+                    {a.serviceType && <div style={{ fontSize: 12, color: 'var(--text-3)' }}>{a.serviceType}</div>}
+                    {!a.geocoded && (
+                      <div style={{ fontSize: 11, color: 'var(--amber)' }}>
+                        No coordinates — geocode on the Customers page first
+                      </div>
+                    )}
+                  </div>
+                  <button onClick={() => add(a.id)} disabled={!a.geocoded || adding === a.id}
+                    style={{ ...stopActionPrimary, opacity: (!a.geocoded || adding === a.id) ? 0.5 : 1, cursor: a.geocoded ? 'pointer' : 'not-allowed' }}>
+                    {adding === a.id ? '…' : 'Add'}
+                  </button>
+                </div>
+              )
+            })}
+          </div>
+        )}
+      </div>
+    </div>
   )
 }
 
@@ -712,4 +888,30 @@ const stopActionSecondary: React.CSSProperties = {
   padding: '6px 12px', background: 'var(--bg-2)', color: 'var(--text-2)',
   border: '1px solid var(--border-1)', borderRadius: 6, fontSize: 12,
   cursor: 'pointer',
+}
+const overlayStyle: React.CSSProperties = {
+  position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.7)',
+  display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 100, padding: 16,
+}
+const modalStyle: React.CSSProperties = {
+  width: '100%', maxWidth: 520, background: 'var(--bg-1)',
+  border: '1px solid var(--border-1)', borderRadius: 14, padding: 20,
+}
+const modalCloseStyle: React.CSSProperties = {
+  background: 'transparent', border: 'none', color: 'var(--text-2)',
+  fontSize: 16, cursor: 'pointer', padding: 4,
+}
+const insertRowStyle: React.CSSProperties = {
+  display: 'flex', alignItems: 'center', gap: 12, padding: 12,
+  background: 'var(--bg-2)', border: '1px solid var(--border-0)', borderRadius: 8,
+}
+const reverseBtnStyle: React.CSSProperties = {
+  padding: '6px 12px', background: 'var(--bg-2)', color: 'var(--gold)',
+  border: '1px solid var(--gold)', borderRadius: 6, fontSize: 12, fontWeight: 600,
+  cursor: 'pointer',
+}
+const arrowBtnStyle: React.CSSProperties = {
+  display: 'flex', alignItems: 'center', justifyContent: 'center',
+  padding: 4, background: 'var(--bg-2)', color: 'var(--text-1)',
+  border: '1px solid var(--border-1)', borderRadius: 6,
 }

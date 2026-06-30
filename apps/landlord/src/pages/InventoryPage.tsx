@@ -8,7 +8,7 @@ export function InventoryPage() {
   return (
     <div>
       <div className="page-header">
-        <div><h1 className="page-title">Inventory</h1><p className="page-subtitle">Supplies and resale items</p></div>
+        <div><h1 className="page-title">Inventory</h1><p className="page-subtitle">Business-use supplies (cleaning, toiletries, maintenance) — not POS resale stock</p></div>
       </div>
       <div className="card" style={{padding:0,overflowX:'auto'}}>
         {isLoading ? <div style={{padding:32,color:'var(--text-3)',textAlign:'center'}}>Loading…</div> : (

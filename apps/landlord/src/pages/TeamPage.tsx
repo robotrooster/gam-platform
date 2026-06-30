@@ -178,8 +178,8 @@ export function TeamPage() {
                                     onChange={(enabled) => {
                                       if (enabled && !confirm(
                                         `Enable direct deposit for ${m.firstName} ${m.lastName}? ` +
-                                        `They'll get an email + in-app notification to complete Stripe Connect ` +
-                                        `onboarding before manager fees can be paid out.`
+                                        `They'll get an email + in-app notification to link their ` +
+                                        `bank account before manager fees can be paid out.`
                                       )) return
                                       toggleDirectDeposit.mutate({ userId: m.userId, enabled })
                                     }}
@@ -236,7 +236,7 @@ export function TeamPage() {
               <div className="card" style={{ padding: 12, marginBottom: 16, fontSize: '.82rem', color: 'var(--text-2)' }}>
                 <strong style={{ color: 'var(--gold)' }}>{pending.length}</strong>{' '}
                 manager{pending.length === 1 ? '' : 's'} have direct deposit enabled but
-                {' '}haven't completed Stripe Connect onboarding yet. Their fees will
+                {' '}haven't linked their bank account yet. Their fees will
                 accumulate as unpaid until they finish setup.
               </div>
             )
@@ -283,9 +283,9 @@ function DirectDepositToggle({
   const ready   = !!(member.connectPayoutsEnabled && member.connectDetailsSubmitted)
   const status: { tone: 'green' | 'gold' | 'muted'; text: string } =
     !enabled                             ? { tone: 'muted', text: 'Disabled' }
-    : ready                              ? { tone: 'green', text: 'Connected' }
+    : ready                              ? { tone: 'green', text: 'Bank ready' }
     : member.connectDetailsSubmitted   ? { tone: 'gold',  text: 'Verifying' }
-    :                                      { tone: 'gold',  text: 'Awaiting onboarding' }
+    :                                      { tone: 'gold',  text: 'Awaiting bank setup' }
   const showReqsButton = enabled && !ready
 
   return (
@@ -325,7 +325,7 @@ function DirectDepositToggle({
         </button>
       )}
       <div style={{ fontSize: '.74rem', color: 'var(--text-3)', marginLeft: 'auto' }}>
-        Pays out manager fees through Stripe Connect once enabled and onboarded.
+        Pays out manager fees to their linked bank account once enabled and set up.
       </div>
       {showReqs && (
         <ConnectRequirementsModal userId={member.userId} memberName={`${member.firstName} ${member.lastName}`} onClose={() => setShowReqs(false)} />
@@ -365,20 +365,20 @@ function ConnectRequirementsModal({
   return (
     <div className="modal-overlay" onClick={onClose}>
       <div className="modal" style={{ maxWidth: 520, width: '95vw' }} onClick={e => e.stopPropagation()}>
-        <div className="modal-title" style={{ marginBottom: 6 }}>Stripe Onboarding Requirements</div>
+        <div className="modal-title" style={{ marginBottom: 6 }}>Bank Account Verification</div>
         <div style={{ fontSize: '.78rem', color: 'var(--text-3)', marginBottom: 14 }}>
-          {memberName} — pulled live from Stripe. Forward these items to them so they
-          can finish onboarding.
+          {memberName} — items required to finish verifying their bank account.
+          Forward these to them so they can complete setup.
         </div>
         {isLoading && <div style={{ color: 'var(--text-3)', padding: 16 }}>Loading…</div>}
         {error != null && (
           <div style={{ color: 'var(--red, #dc4c4c)', fontSize: '.82rem', padding: 12, background: 'rgba(255,71,87,.08)', borderRadius: 8 }}>
-            Couldn't fetch Stripe status right now.
+            Couldn't fetch verification status right now.
           </div>
         )}
         {data && !data.exists && (
           <div style={{ fontSize: '.82rem', color: 'var(--text-2)', padding: 12 }}>
-            This manager hasn't started Stripe onboarding yet. Their account will be
+            This manager hasn't started bank account setup yet. Their account will be
             created the first time they visit Banking in their portal.
           </div>
         )}
@@ -394,7 +394,7 @@ function ConnectRequirementsModal({
             <RequirementsList title="Currently due" items={currentlyDue} tone="gold" />
             {pastDue.length === 0 && currentlyDue.length === 0 && !data.requirementsDisabledReason && (
               <div style={{ fontSize: '.82rem', color: 'var(--text-3)', padding: 12 }}>
-                No outstanding requirements. Stripe is verifying their submission —
+                No outstanding requirements. Verification is in progress —
                 this can take up to a business day.
               </div>
             )}

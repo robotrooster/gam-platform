@@ -24,6 +24,10 @@ const pct = (n: any) => n != null ? `${(Number(n)*100).toFixed(2)}%` : '—'
 
 const STATUS_MAP: Record<string,string> = { completed:'badge-green', voided:'badge-red', refunded:'badge-amber', partial_refund:'badge-amber' }
 const METHOD_MAP: Record<string,string> = { cash:'badge-green', card:'badge-blue', charge:'badge-amber' }
+// S512 LAUNCH: the "charge" (FlexCharge) tender is hidden at launch with the
+// rest of the Flex Suite. The button is filtered out of the register picker so
+// a clerk can only ring cash/card; all charge code stays for post-launch.
+const LAUNCH_HIDE_CHARGE = true
 const TAX_TYPES = ['state','city','county','special']
 // S218: pos_categories is the source of truth for the category list.
 // Pre-S218 this file used a hardcoded ['fuel','amenity','laundry',
@@ -98,7 +102,7 @@ export function POSPage() {
   const [filterCategoryProperty, setFilterCategoryProperty] = useState<string>('all')
   // S227: form now stores categoryId (uuid). Default '' until categories
   // load, then we auto-pick the first available (see useEffect below).
-  const [newItem, setNewItem] = useState({ name:'', categoryId:'', icon:'📦', sellPrice:'', costPrice:'', taxRate:'0', chargeEligible:true, stockQty:'0', stockMin:'5', stockMax:'50', propertyId:'' as string })
+  const [newItem, setNewItem] = useState({ name:'', categoryId:'', icon:'📦', sellPrice:'', costPrice:'', marginPct:'', taxRate:'0', chargeEligible:true, stockQty:'0', stockMin:'5', stockMax:'50', propertyId:'' as string })
   const [newTax, setNewTax] = useState({ name:'', rate:'', taxType:'state', appliesTo:'all', propertyId:'' as string })
   // S217: tax-rate list filter on the taxes tab.
   const [filterTaxProperty, setFilterTaxProperty] = useState<string>('all')
@@ -111,6 +115,14 @@ export function POSPage() {
   const [expandedPO, setExpandedPO] = useState<string|null>(null)
 
   const { data: items = [] } = useQuery<any[]>('pos-items', () => apiGet('/pos/items'))
+  // POS #1: business-level default margin → drives item auto-pricing.
+  const { data: posSettings } = useQuery<any>('pos-settings', () => apiGet<any>('/pos/settings'))
+  const defaultMarginPct: number | null = posSettings?.defaultMarginPct ?? null
+  const [marginEdit, setMarginEdit] = useState('')
+  const saveMarginMut = useMutation(
+    (v: string) => apiPatch('/pos/settings', { defaultMarginPct: v === '' ? null : Number(v) }),
+    { onSuccess: () => qc.invalidateQueries('pos-settings') }
+  )
   // S218: pos_categories from the API replaces the old hardcoded
   // CATEGORIES const. First GET auto-seeds defaults if empty.
   const { data: posCategories = [] } = useQuery<any[]>('pos-categories', () => apiGet('/pos/categories'))
@@ -405,7 +417,46 @@ export function POSPage() {
 
   const toggleChargeMut = useMutation(({ id, val }:{ id:string; val:boolean }) => apiPatch(`/pos/items/${id}`, { chargeEligible:val }), { onSuccess: () => qc.invalidateQueries('pos-items') })
   const toggleActiveMut = useMutation(({ id, val }:{ id:string; val:boolean }) => apiPatch(`/pos/items/${id}`, { isActive:val }), { onSuccess: () => qc.invalidateQueries('pos-items') })
-  const createItemMut = useMutation(() => apiPost('/pos/items', { ...newItem, propertyId: newItem.propertyId || null, categoryId: newItem.categoryId, costPrice:Number(newItem.costPrice), sellPrice:Number(newItem.sellPrice), taxRate:Number(newItem.taxRate), chargeEligible:newItem.chargeEligible, stockQty:Number(newItem.stockQty), stockMin:Number(newItem.stockMin), stockMax:Number(newItem.stockMax) }), { onSuccess: () => { qc.invalidateQueries('pos-items'); setNewItem({ name:'', categoryId:'', icon:'📦', sellPrice:'', costPrice:'', taxRate:'0', chargeEligible:true, stockQty:'0', stockMin:'5', stockMax:'50', propertyId:'' }) } })
+  const createItemMut = useMutation(() => apiPost('/pos/items', { ...newItem, propertyId: newItem.propertyId || null, categoryId: newItem.categoryId, costPrice:Number(newItem.costPrice), sellPrice:Number(newItem.sellPrice), marginPct: newItem.marginPct === '' ? null : Number(newItem.marginPct), taxRate:Number(newItem.taxRate), chargeEligible:newItem.chargeEligible, stockQty:Number(newItem.stockQty), stockMin:Number(newItem.stockMin), stockMax:Number(newItem.stockMax) }), { onSuccess: () => { qc.invalidateQueries('pos-items'); setNewItem({ name:'', categoryId:'', icon:'📦', sellPrice:'', costPrice:'', marginPct: defaultMarginPct!=null?String(defaultMarginPct):'', taxRate:'0', chargeEligible:true, stockQty:'0', stockMin:'5', stockMax:'50', propertyId:'' }) } })
+
+  // POS #1 auto-pricing helpers. Margin is gross % of sell price:
+  // sell = cost / (1 - margin/100); margin = (sell - cost) / sell * 100.
+  const round2 = (n: number) => Math.round(n * 100) / 100
+  const priceFromMargin = (cost: number, margin: number) =>
+    (margin >= 0 && margin < 100 && cost > 0) ? round2(cost / (1 - margin / 100)) : null
+  const setItemCost = (v: string) => setNewItem(s => {
+    const cost = Number(v), m = Number(s.marginPct)
+    const next = { ...s, costPrice: v }
+    if (s.marginPct !== '' && cost > 0) { const p = priceFromMargin(cost, m); if (p != null) next.sellPrice = String(p) }
+    return next
+  })
+  const setItemMargin = (v: string) => setNewItem(s => {
+    const cost = Number(s.costPrice), m = Number(v)
+    const next = { ...s, marginPct: v }
+    const p = priceFromMargin(cost, m); if (p != null) next.sellPrice = String(p)
+    return next
+  })
+  const setItemSell = (v: string) => setNewItem(s => {
+    const sell = Number(v), cost = Number(s.costPrice)
+    const next = { ...s, sellPrice: v }
+    if (sell > 0 && cost > 0) next.marginPct = String(round2(((sell - cost) / sell) * 100))
+    return next
+  })
+  // Seed the item form's margin with the business default once it loads.
+  useEffect(() => {
+    if (defaultMarginPct != null) setNewItem(s => s.marginPct === '' && s.costPrice === '' && s.sellPrice === '' ? { ...s, marginPct: String(defaultMarginPct) } : s)
+  }, [defaultMarginPct])
+  // Override-confirm: if a default margin exists and this item's margin
+  // deviates from it, confirm before saving.
+  const submitNewItem = () => {
+    if (defaultMarginPct != null && newItem.marginPct !== '') {
+      const m = Number(newItem.marginPct)
+      if (Math.abs(m - defaultMarginPct) > 0.5) {
+        if (!window.confirm(`This price is a ${m.toFixed(1)}% margin, not your ${defaultMarginPct}% default. Save anyway?`)) return
+      }
+    }
+    createItemMut.mutate()
+  }
   const updateItemMut = useMutation((data:any) => apiPatch(`/pos/items/${editItem.id}`, data), { onSuccess: () => { qc.invalidateQueries('pos-items'); setEditItem(null) } })
 
   const createVendorMut = useMutation(() => apiPost('/pos/vendors', { ...newVendor, leadTimeDays:Number(newVendor.leadTimeDays) }), { onSuccess: () => { qc.invalidateQueries('pos-vendors'); setNewVendor({ name:'', contactName:'', email:'', phone:'', address:'', leadTimeDays:'3', notes:'' }) } })
@@ -670,7 +721,7 @@ export function POSPage() {
             <div style={{marginBottom:10}}>
               <div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:5}}>Payment method</div>
               <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:5}}>
-                {(['cash','card','charge'] as const).map(m=>(<button key={m} onClick={()=>setMethod(m)} style={{padding:'7px 0',border:"1px solid "+(method===m?'var(--gold)':'var(--border-1)'),background:method===m?'var(--gold-bg)':'var(--bg-2)',borderRadius:'var(--r-md)',cursor:'pointer',fontSize:'.75rem',fontWeight:method===m?700:400,color:method===m?'var(--gold)':'var(--text-2)',textTransform:'capitalize'}}>{m==='charge'?'charge':m}</button>))}
+                {(['cash','card','charge'] as const).filter(m=>!(LAUNCH_HIDE_CHARGE && m==='charge')).map(m=>(<button key={m} onClick={()=>setMethod(m)} style={{padding:'7px 0',border:"1px solid "+(method===m?'var(--gold)':'var(--border-1)'),background:method===m?'var(--gold-bg)':'var(--bg-2)',borderRadius:'var(--r-md)',cursor:'pointer',fontSize:'.75rem',fontWeight:method===m?700:400,color:method===m?'var(--gold)':'var(--text-2)',textTransform:'capitalize'}}>{m==='charge'?'charge':m}</button>))}
               </div>
             </div>
             {method==='cash'&&(<div style={{marginBottom:10}}>
@@ -769,16 +820,27 @@ export function POSPage() {
       {tab==='items' && (
         <div style={{display:'grid',gap:16}}>
           <div className="card">
-            <div className="card-header"><span className="card-title">Add Item</span></div>
+            <div className="card-header" style={{display:'flex',justifyContent:'space-between',alignItems:'center',flexWrap:'wrap',gap:8}}>
+              <span className="card-title">Add Item</span>
+              <div style={{display:'flex',alignItems:'center',gap:6}}>
+                <span style={{fontSize:'.72rem',color:'var(--text-3)'}}>Default margin %</span>
+                <input className="form-input" type="number" style={{width:80}} value={marginEdit}
+                  placeholder={defaultMarginPct!=null?String(defaultMarginPct):'none'}
+                  onChange={e=>setMarginEdit(e.target.value)} />
+                <button className="btn btn-ghost btn-sm" disabled={saveMarginMut.isLoading}
+                  onClick={()=>saveMarginMut.mutate(marginEdit)}>Save</button>
+              </div>
+            </div>
             <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:12,marginTop:12}}>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Icon</div><input className="form-input" value={newItem.icon} onChange={e=>setNewItem(s=>({...s,icon:e.target.value}))} style={{width:'100%'}} /></div>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Name</div><input className="form-input" value={newItem.name} onChange={e=>setNewItem(s=>({...s,name:e.target.value}))} style={{width:'100%'}} /></div>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Category</div><select className="form-select" value={newItem.categoryId} onChange={e=>setNewItem(s=>({...s,categoryId:e.target.value}))} style={{width:'100%'}}>{categoriesForProperty(newItem.propertyId).map(c=><option key={c.id} value={c.id}>{c.icon} {c.name}</option>)}</select></div>
-              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Sell Price</div><input className="form-input" type="number" value={newItem.sellPrice} onChange={e=>setNewItem(s=>({...s,sellPrice:e.target.value}))} style={{width:'100%'}} /></div>
-              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Cost Price</div><input className="form-input" type="number" value={newItem.costPrice} onChange={e=>setNewItem(s=>({...s,costPrice:e.target.value}))} style={{width:'100%'}} /></div>
+              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Cost Price</div><input className="form-input" type="number" value={newItem.costPrice} onChange={e=>setItemCost(e.target.value)} style={{width:'100%'}} /></div>
+              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Margin %{defaultMarginPct!=null?` (default ${defaultMarginPct})`:''}</div><input className="form-input" type="number" value={newItem.marginPct} onChange={e=>setItemMargin(e.target.value)} placeholder={defaultMarginPct!=null?String(defaultMarginPct):'—'} style={{width:'100%'}} /></div>
+              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Sell Price{newItem.costPrice&&newItem.marginPct?' (auto)':''}</div><input className="form-input" type="number" value={newItem.sellPrice} onChange={e=>setItemSell(e.target.value)} style={{width:'100%'}} /></div>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Tax Rate %</div><input className="form-input" type="number" value={newItem.taxRate} onChange={e=>setNewItem(s=>({...s,taxRate:e.target.value}))} style={{width:'100%'}} /></div>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Stock Qty</div><input className="form-input" type="number" value={newItem.stockQty} onChange={e=>setNewItem(s=>({...s,stockQty:e.target.value}))} style={{width:'100%'}} /></div>
-              <div style={{display:'flex',alignItems:'center',gap:8,paddingTop:20}}><input type="checkbox" id="ce" checked={newItem.chargeEligible} onChange={e=>setNewItem(s=>({...s,chargeEligible:e.target.checked}))} /><label htmlFor="ce" style={{fontSize:'.82rem'}}>Charge eligible</label></div>
+              {!LAUNCH_HIDE_CHARGE && <div style={{display:'flex',alignItems:'center',gap:8,paddingTop:20}}><input type="checkbox" id="ce" checked={newItem.chargeEligible} onChange={e=>setNewItem(s=>({...s,chargeEligible:e.target.checked}))} /><label htmlFor="ce" style={{fontSize:'.82rem'}}>Charge eligible</label></div>}
               {/* S192: property selector. Empty = landlord-wide. */}
               <div style={{gridColumn:'span 2'}}>
                 <div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>
@@ -797,7 +859,7 @@ export function POSPage() {
                 </select>
               </div>
             </div>
-            <button className="btn btn-primary" style={{marginTop:12}} onClick={()=>createItemMut.mutate()} disabled={!newItem.name||!newItem.sellPrice}>Add Item</button>
+            <button className="btn btn-primary" style={{marginTop:12}} onClick={submitNewItem} disabled={!newItem.name||!newItem.sellPrice}>Add Item</button>
           </div>
           {/* S216: property filter for the items management list.
               Default 'all' shows everything; 'landlord-wide' shows only
@@ -822,7 +884,7 @@ export function POSPage() {
           </div>
           <div className="card" style={{padding:0}}>
             <table className="data-table">
-              <thead><tr><th>Item</th><th>Category</th><th>Property</th><th>Cost</th><th>Price</th><th>Tax</th><th>Stock</th><th>Charge</th><th>Active</th><th></th></tr></thead>
+              <thead><tr><th>Item</th><th>Category</th><th>Property</th><th>Cost</th><th>Price</th><th>Tax</th><th>Stock</th>{!LAUNCH_HIDE_CHARGE && <th>Charge</th>}<th>Active</th><th></th></tr></thead>
               <tbody>
                 {(items as any[])
                   .filter((i:any) =>
@@ -845,7 +907,7 @@ export function POSPage() {
                   <td className="mono" style={{color:'var(--gold)',fontWeight:600}}>{fmt(item.sellPrice)}</td>
                   <td className="mono">{pct(item.taxRate)}</td>
                   <td className="mono">{item.stockQty>=999?'inf':item.stockQty}</td>
-                  <td><button onClick={()=>toggleChargeMut.mutate({id:item.id,val:!item.chargeEligible})} style={{background:item.chargeEligible?'var(--gold-bg)':'var(--bg-3)',border:"1px solid "+(item.chargeEligible?'var(--gold)':'var(--border-1)'),borderRadius:4,padding:'2px 8px',cursor:'pointer',fontSize:'.75rem',color:item.chargeEligible?'var(--gold)':'var(--text-3)'}}>{item.chargeEligible?'Yes':'No'}</button></td>
+                  {!LAUNCH_HIDE_CHARGE && <td><button onClick={()=>toggleChargeMut.mutate({id:item.id,val:!item.chargeEligible})} style={{background:item.chargeEligible?'var(--gold-bg)':'var(--bg-3)',border:"1px solid "+(item.chargeEligible?'var(--gold)':'var(--border-1)'),borderRadius:4,padding:'2px 8px',cursor:'pointer',fontSize:'.75rem',color:item.chargeEligible?'var(--gold)':'var(--text-3)'}}>{item.chargeEligible?'Yes':'No'}</button></td>}
                   <td><button onClick={()=>toggleActiveMut.mutate({id:item.id,val:!item.isActive})} style={{background:'var(--bg-2)',border:'1px solid var(--border-1)',borderRadius:4,padding:'2px 8px',cursor:'pointer',fontSize:'.75rem',color:item.isActive?'var(--green)':'var(--text-3)'}}>{item.isActive?'Active':'Off'}</button></td>
                   <td><button className="btn btn-ghost btn-sm" onClick={()=>setEditItem({...item,_sell:String(item.sellPrice),_cost:String(item.costPrice),_tax:String(Number(item.taxRate)*100),_stock:String(item.stockQty),_min:String(item.stockMin),_max:String(item.stockMax)})}>Edit</button></td>
                 </tr>)})}
@@ -941,7 +1003,7 @@ export function POSPage() {
                   Property <span style={{color:'var(--text-3)'}}>(scopes which properties this rate is configured at)</span>
                 </div>
                 <select className="form-select" value={newTax.propertyId} onChange={e=>setNewTax(s=>({...s,propertyId:e.target.value}))} style={{width:'100%'}}>
-                  <option value="">Landlord-wide (no specific property)</option>
+                  <option value="">All locations</option>
                   {(properties as any[]).map((p:any)=>(<option key={p.id} value={p.id}>{p.name}</option>))}
                 </select>
               </div>
@@ -953,7 +1015,7 @@ export function POSPage() {
             <label style={{fontSize:'.78rem',color:'var(--text-3)',marginBottom:0}}>Filter by property:</label>
             <select className="form-select" value={filterTaxProperty} onChange={e=>setFilterTaxProperty(e.target.value)} style={{width:'auto',padding:'4px 10px',fontSize:'.82rem'}}>
               <option value="all">All ({(taxRates as any[]).length})</option>
-              <option value="landlord-wide">Landlord-wide ({(taxRates as any[]).filter((r:any)=>!r.propertyId).length})</option>
+              <option value="landlord-wide">All locations ({(taxRates as any[]).filter((r:any)=>!r.propertyId).length})</option>
               {(properties as any[]).map((p:any)=>{
                 const n = (taxRates as any[]).filter((r:any)=>r.propertyId===p.id).length
                 return <option key={p.id} value={p.id}>{p.name} ({n})</option>
@@ -978,7 +1040,7 @@ export function POSPage() {
                       <td style={{fontWeight:500}}>{r.name}</td><td><span className="badge badge-muted">{r.taxType}</span></td>
                       <td>{propName
                         ? <span style={{color:'var(--gold)',fontWeight:500,fontSize:'.78rem'}}>{propName}</span>
-                        : <span style={{color:'var(--text-3)',fontStyle:'italic',fontSize:'.78rem'}}>Landlord-wide</span>
+                        : <span style={{color:'var(--text-3)',fontStyle:'italic',fontSize:'.78rem'}}>All locations</span>
                       }</td>
                       <td className="mono">{pct(r.rate)}</td>
                       <td style={{fontSize:'.82rem'}}>{Array.isArray(r.appliesTo)?r.appliesTo.join(', '):r.appliesTo}</td>
@@ -1401,7 +1463,7 @@ export function POSPage() {
           <div style={{fontSize:'.85rem',color:'var(--text-3)'}}>Original total: <strong style={{color:'var(--text-0)'}}>{fmt(refundModal.tx?.total)}</strong></div>
           <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Refund Amount (blank for full refund)</div><input className="form-input" style={{width:'100%'}} type="number" value={refundAmt} onChange={e=>setRefundAmt(e.target.value)} /></div>
           <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Reason</div><input className="form-input" style={{width:'100%'}} value={refundReason} onChange={e=>setRefundReason(e.target.value)} /></div>
-          {refundModal.tx?.paymentMethod === 'charge' ? (
+          {!LAUNCH_HIDE_CHARGE && refundModal.tx?.paymentMethod === 'charge' ? (
             <div style={{fontSize:'.8rem',color:'var(--text-3)',padding:'8px 12px',background:'var(--bg-2)',borderRadius:4}}>Reverses on FlexCharge account (no cash payout).</div>
           ) : (
             <div>

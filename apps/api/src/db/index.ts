@@ -1,6 +1,6 @@
 import dotenv from 'dotenv'
 import { logger } from '../lib/logger'
-dotenv.config({ path: '/Users/nicholasrhoades/Downloads/gam/apps/api/.env' })
+dotenv.config({ path: '/Users/nicholasrhoades/gam/apps/api/.env' })
 
 import { Pool, PoolClient } from 'pg'
 

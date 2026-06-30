@@ -125,9 +125,8 @@ async function seed(): Promise<Fixture> {
 async function seedAgreement(f: Fixture, landlordId = f.landlordAId, tenantId = f.tenantAId, unitId = f.unitAId, status = 'active'): Promise<string> {
   const r = await db.query<{ id: string }>(
     `INSERT INTO work_trade_agreements
-       (unit_id, tenant_id, landlord_id, trade_type, hourly_rate, weekly_hours,
-        market_rent, cash_rent, trade_credit_max, start_date, status)
-     VALUES ($1, $2, $3, 'full', 25, 10, 1200, 0, 1083.33, '2026-01-01', $4) RETURNING id`,
+       (unit_id, tenant_id, landlord_id, start_date, status)
+     VALUES ($1, $2, $3, '2026-01-01', $4) RETURNING id`,
     [unitId, tenantId, landlordId, status])
   return r.rows[0].id
 }
@@ -142,11 +141,7 @@ describe('POST /  — S397 tenant scope fix', () => {
     const res = await request(buildApp())
       .post('/api/work-trade/')
       .set('Authorization', `Bearer ${f.tokenA}`)
-      .send({
-        unitId: f.unitBId, tenantId: f.tenantAId, tradeType: 'full',
-        hourlyRate: 25, weeklyHours: 10, marketRent: 1200,
-        startDate: '2026-06-01',
-      })
+      .send({ unitId: f.unitBId, tenantId: f.tenantAId, startDate: '2026-06-01' })
     expect(res.status).toBe(404)
   })
 
@@ -155,32 +150,24 @@ describe('POST /  — S397 tenant scope fix', () => {
     const res = await request(buildApp())
       .post('/api/work-trade/')
       .set('Authorization', `Bearer ${f.tokenA}`)
-      .send({
-        unitId: f.unitAId, tenantId: f.tenantBId,  // B's tenant, A's unit
-        tradeType: 'full', hourlyRate: 25, weeklyHours: 10, marketRent: 1200,
-        startDate: '2026-06-01',
-      })
+      .send({ unitId: f.unitAId, tenantId: f.tenantBId, startDate: '2026-06-01' }) // B's tenant, A's unit
     expect(res.status).toBe(404)
     expect(res.body.error).toMatch(/no lease under this landlord/i)
     const rows = await db.query(`SELECT id FROM work_trade_agreements`)
     expect(rows.rows).toHaveLength(0)
   })
 
-  it('happy: creates agreement + opens first period', async () => {
+  it('happy: creates enrollment (no dollar terms)', async () => {
     const f = await seed()
     const res = await request(buildApp())
       .post('/api/work-trade/')
       .set('Authorization', `Bearer ${f.tokenA}`)
-      .send({
-        unitId: f.unitAId, tenantId: f.tenantAId, tradeType: 'full',
-        hourlyRate: 25, weeklyHours: 10, marketRent: 1200,
-        startDate: '2026-06-01', duties: 'groundskeeping',
-      })
+      .send({ unitId: f.unitAId, tenantId: f.tenantAId, startDate: '2026-06-01', duties: 'groundskeeping' })
     expect(res.status).toBe(200)
-    expect(res.body.data.trade_type).toBe('full')
-    expect(Number(res.body.data.cash_rent)).toBe(0)  // 'full' forces cash_rent=0
-    const periods = await db.query(`SELECT id FROM work_trade_periods WHERE agreement_id=$1`, [res.body.data.id])
-    expect(periods.rows).toHaveLength(1)
+    expect(res.body.data.id).toBeDefined()
+    expect(res.body.data.status).toBe('active')
+    expect(res.body.data.duties).toBe('groundskeeping')
+    expect(res.body.data.hourly_rate).toBeUndefined()  // dollar model is gone
   })
 })
 
@@ -258,7 +245,7 @@ describe('GET /:id — S397 scope fix', () => {
     expect(res.body.data).toBeUndefined()
   })
 
-  it('happy: own-landlord sees agreement + logs + periods + stats', async () => {
+  it('happy: own-landlord sees agreement + logs + stats (property target)', async () => {
     const f = await seed()
     const agId = await seedAgreement(f)
     const res = await request(buildApp())
@@ -267,7 +254,8 @@ describe('GET /:id — S397 scope fix', () => {
     expect(res.status).toBe(200)
     expect(res.body.data.agreement.id).toBe(agId)
     expect(res.body.data.logs).toEqual([])
-    expect(res.body.data.stats.hoursCommitted).toBeCloseTo(43.33, 1)  // 10 * 52/12
+    expect(res.body.data.stats.target).toBe(80)              // default property target
+    expect(res.body.data.stats.hoursApprovedThisMonth).toBe(0)
   })
 
   it('happy: own tenant sees agreement', async () => {
@@ -358,29 +346,21 @@ describe('PATCH /logs/:logId', () => {
     expect(res.status).toBe(403)
   })
 
-  it('approve happy: flips status + computes credit_value + bumps period + ytd_value', async () => {
+  it('approve happy: flips status + stamps reviewer (no dollar credit_value)', async () => {
     const f = await seed()
     const agId = await seedAgreement(f)
     const log = await db.query<{ id: string }>(
       `INSERT INTO work_trade_logs (agreement_id, tenant_id, submitted_by, work_date, hours, description)
        VALUES ($1, $2, $3, $4, 4, 'mowed') RETURNING id`,
       [agId, f.tenantAId, f.tenantAUserId, new Date().toISOString().slice(0, 10)])
-    // Seed the period that the approval will UPDATE
-    const now = new Date()
-    await db.query(
-      `INSERT INTO work_trade_periods (agreement_id, period_month, period_year, hours_committed, cash_due)
-       VALUES ($1, $2, $3, 43.33, 0)`,
-      [agId, now.getMonth() + 1, now.getFullYear()])
     const res = await request(buildApp())
       .patch(`/api/work-trade/logs/${log.rows[0].id}`)
       .set('Authorization', `Bearer ${f.tokenA}`)
       .send({ action: 'approve' })
     expect(res.status).toBe(200)
     expect(res.body.data.status).toBe('approved')
-    expect(Number(res.body.data.credit_value)).toBe(100)  // 4 hrs × 25 rate
-    const ag = await db.query<{ ytd_value: string }>(
-      `SELECT ytd_value FROM work_trade_agreements WHERE id=$1`, [agId])
-    expect(Number(ag.rows[0].ytd_value)).toBe(100)
+    expect(res.body.data.reviewed_by).toBe(f.landlordAUserId)
+    expect(res.body.data.credit_value).toBeUndefined()  // percent model — no per-log dollars
   })
 
   it('reject happy: stamps rejection_reason', async () => {
@@ -401,49 +381,41 @@ describe('PATCH /logs/:logId', () => {
 })
 
 // ───────────────────────────────────────────────────────────────────
-// POST /:id/reconcile
+// PATCH/GET /property/:propertyId/target  (the credit denominator)
 // ───────────────────────────────────────────────────────────────────
 
-describe('POST /:id/reconcile', () => {
-  it('cross-landlord → 403', async () => {
+describe('property hours target', () => {
+  it('GET returns default 80', async () => {
     const f = await seed()
-    const agId = await seedAgreement(f)
     const res = await request(buildApp())
-      .post(`/api/work-trade/${agId}/reconcile`)
-      .set('Authorization', `Bearer ${f.tokenB}`)
-      .send({ month: 6, year: 2026 })
-    expect(res.status).toBe(403)
-  })
-
-  it('period not found → 404', async () => {
-    const f = await seed()
-    const agId = await seedAgreement(f)
-    const res = await request(buildApp())
-      .post(`/api/work-trade/${agId}/reconcile`)
+      .get(`/api/work-trade/property/${f.propertyAId}/target`)
       .set('Authorization', `Bearer ${f.tokenA}`)
-      .send({ month: 11, year: 2026 })
-    expect(res.status).toBe(404)
-  })
-
-  it('happy: marks period reconciled + computes shortfall + opens next period', async () => {
-    const f = await seed()
-    const agId = await seedAgreement(f)
-    await db.query(
-      `INSERT INTO work_trade_periods (agreement_id, period_month, period_year, hours_committed, hours_worked, cash_due)
-       VALUES ($1, 6, 2026, 43.33, 30, 0)`,
-      [agId])
-    const res = await request(buildApp())
-      .post(`/api/work-trade/${agId}/reconcile`)
-      .set('Authorization', `Bearer ${f.tokenA}`)
-      .send({ month: 6, year: 2026 })
     expect(res.status).toBe(200)
-    expect(res.body.data.status).toBe('reconciled')
-    // 43.33 - 30 = 13.33 hours short × $25 = $333.25
-    expect(Number(res.body.data.hours_short)).toBeCloseTo(13.33, 1)
-    expect(Number(res.body.data.shortfall_charge)).toBeCloseTo(333.25, 1)
-    // Next period (July 2026) opened
-    const next = await db.query(`SELECT id FROM work_trade_periods WHERE agreement_id=$1 AND period_month=7 AND period_year=2026`, [agId])
-    expect(next.rows).toHaveLength(1)
+    expect(res.body.data.target).toBe(80)
+  })
+
+  it('PATCH sets the target; cross-landlord → 403', async () => {
+    const f = await seed()
+    const bad = await request(buildApp())
+      .patch(`/api/work-trade/property/${f.propertyAId}/target`)
+      .set('Authorization', `Bearer ${f.tokenB}`)
+      .send({ target: 120 })
+    expect(bad.status).toBe(403)
+    const ok = await request(buildApp())
+      .patch(`/api/work-trade/property/${f.propertyAId}/target`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ target: 120 })
+    expect(ok.status).toBe(200)
+    expect(ok.body.data.target).toBe(120)
+  })
+
+  it('PATCH rejects non-positive target', async () => {
+    const f = await seed()
+    const res = await request(buildApp())
+      .patch(`/api/work-trade/property/${f.propertyAId}/target`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ target: 0 })
+    expect(res.status).toBe(400)
   })
 })
 
@@ -452,7 +424,7 @@ describe('POST /:id/reconcile', () => {
 // ───────────────────────────────────────────────────────────────────
 
 describe('GET /  (dashboard)', () => {
-  it('landlord-scoped: returns own agreements with joins + pending_count', async () => {
+  it('landlord-scoped: returns own agreements with joins + pending_count + hours_this_month', async () => {
     const f = await seed()
     const agId = await seedAgreement(f)
     await seedAgreement(f, f.landlordBId, f.tenantBId, f.unitBId)
@@ -466,6 +438,7 @@ describe('GET /  (dashboard)', () => {
     expect(res.status).toBe(200)
     expect(res.body.data).toHaveLength(1)
     expect(Number(res.body.data[0].pending_count)).toBe(1)
+    expect(Number(res.body.data[0].target)).toBe(80)
   })
 })
 

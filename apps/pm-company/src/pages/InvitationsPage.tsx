@@ -160,7 +160,7 @@ function SendInviteModal({ pmCompanyId, onClose }: { pmCompanyId: string; onClos
 
         {sendMut.isError && (
           <div style={{ padding: 8, background: 'rgba(220,76,76,.1)', borderRadius: 6, fontSize: '.74rem', color: 'var(--red, #dc4c4c)', marginBottom: 12 }}>
-            {(sendMut.error as any)?.response?.data?.error?.message || 'Send failed.'}
+            {(sendMut.error as any)?.response?.data?.error || 'Send failed.'}
           </div>
         )}
 
@@ -214,7 +214,7 @@ export function InvitationsPage() {
     try { await acceptMut.mutateAsync({ id, replace: false }) }
     catch (e: any) {
       const status = e?.response?.status
-      const msg: string = e?.response?.data?.error?.message ?? ''
+      const msg: string = e?.response?.data?.error ?? ''
       if (status === 409 && msg.toLowerCase().includes('currently managed')) {
         if (window.confirm(
           'This property is currently managed by another PM company. ' +

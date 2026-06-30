@@ -7,7 +7,10 @@ export function DocumentsPage() {
   return (
     <div>
       <div className="page-header">
-        <div><h1 className="page-title">Documents</h1><p className="page-subtitle">Leases, addenda, and uploaded files</p></div>
+        <div><h1 className="page-title">Documents</h1><p className="page-subtitle">Signed addenda, uploads, and supporting files</p></div>
+      </div>
+      <div className="alert alert-gold" style={{ marginBottom: 16, fontSize: '.82rem' }}>
+        Looking for a lease? Print or download signed leases from the <a href="/leases" style={{ color: 'var(--gold)', fontWeight: 600 }}>Leases</a> tab. This page holds addenda and other uploaded files.
       </div>
       <div className="card" style={{padding:0,overflowX:'auto'}}>
         {isLoading ? <div style={{padding:32,color:'var(--text-3)',textAlign:'center'}}>Loading…</div> : (

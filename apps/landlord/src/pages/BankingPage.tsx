@@ -81,10 +81,10 @@ export function BankingPage() {
           <h1 style={{ fontSize: '1.4rem', fontWeight: 600, margin: 0 }}>Banking</h1>
         </div>
         <div style={{ fontSize: '.82rem', color: 'var(--text-3)', marginBottom: 14, lineHeight: 1.5 }}>
-          Your landlord has enabled direct deposit on your account. Complete
-          Stripe Connect onboarding below so your manager fees can be paid out.
-          Once onboarded, every rent payment you're cut from will deposit to
-          your bank automatically.
+          Your landlord has enabled direct deposit on your account. Link your
+          bank account below so your manager fees can be paid out. Once set up,
+          every rent payment you're cut from will deposit to your bank
+          automatically.
         </div>
         <StripeConnectSection />
       </div>
@@ -400,11 +400,11 @@ function StripeConnectSection() {
     <div className="card" style={{ padding: 16, marginBottom: 18 }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
         <div>
-          <div style={{ fontWeight: 600, color: 'var(--text-0)' }}>Stripe Connect Account</div>
+          <div style={{ fontWeight: 600, color: 'var(--text-0)' }}>Bank Account</div>
           <div style={{ fontSize: '.82rem', color: 'var(--text-2)', marginTop: 4 }}>
             {ready
-              ? 'Banking ready. Rent collected via GAM routes through your Connect account.'
-              : 'Complete Stripe Connect onboarding before tenants can pay rent through GAM.'}
+              ? 'Banking ready. Rent collected through GAM deposits to your linked account.'
+              : 'Link your bank account before tenants can pay rent through GAM.'}
           </div>
         </div>
         <span style={{
@@ -425,7 +425,7 @@ function StripeConnectSection() {
       {!ready && !showOnboarding && (
         <div style={{ marginTop: 14 }}>
           <button className="btn btn-primary" onClick={startOnboarding}>
-            {statusQ.data?.exists ? 'Continue Onboarding' : 'Start Stripe Onboarding'}
+            {statusQ.data?.exists ? 'Continue Setup' : 'Link Bank Account'}
           </button>
           {initErr && (
             <div style={{ marginTop: 8, fontSize: '.74rem', color: 'var(--red, #dc4c4c)' }}>{initErr}</div>

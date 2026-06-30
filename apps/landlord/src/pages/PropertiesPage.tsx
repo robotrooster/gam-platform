@@ -200,10 +200,10 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
         (property?.allocationRule?.achFeePayer
           || property?.allocationRule?.bankingFeePayer
           || 'tenant') as FeePayer,
-      cardFeePayer:
-        (property?.allocationRule?.cardFeePayer
-          || property?.allocationRule?.bankingFeePayer
-          || 'tenant') as FeePayer,
+      // S513 lock (#2): card is always the tenant's — never landlord. Pinned
+      // to 'tenant' regardless of any legacy 'landlord' row (the diff on save
+      // then heals such rows; the backend also clamps card to tenant).
+      cardFeePayer: 'tenant' as FeePayer,
       platformFeePayer:
         (property?.allocationRule?.platformFeePayer || 'landlord') as FeePayer,
       rentPercent: property?.allocationRule?.rentPercent != null ? String(property.allocationRule.rentPercent) : '',
@@ -865,12 +865,14 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
               value={form.allocationRule.achFeePayer}
               onChange={(v) => setForm(f => ({ ...f, allocationRule: { ...f.allocationRule, achFeePayer: v } }))}
             />
-            <FeePayerToggle
-              label="Card processing"
-              hint="3.25% per card charge (+1.5% on non-US-issued cards)"
-              value={form.allocationRule.cardFeePayer}
-              onChange={(v) => setForm(f => ({ ...f, allocationRule: { ...f.allocationRule, cardFeePayer: v } }))}
-            />
+            {/* S513 lock (#2): card is always the tenant's — not selectable. */}
+            <div style={{ marginBottom: 12 }}>
+              <div style={{ fontSize: '.74rem', fontWeight: 600, color: 'var(--text-1)', marginBottom: 2 }}>Card processing</div>
+              <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginBottom: 6 }}>3.25% per card charge (+1.5% on non-US-issued cards)</div>
+              <div style={{ padding: '6px 10px', borderRadius: 8, fontSize: '.74rem', border: '1px solid var(--border-0)', background: 'var(--bg-2)', color: 'var(--text-2)' }}>
+                Tenant pays — always (landlords never cover card)
+              </div>
+            </div>
             <FeePayerToggle
               label="Platform SaaS fee"
               hint="$2 per occupied unit per month (min $10/property/mo)"
@@ -1104,7 +1106,7 @@ export function PropertiesPage() {
         <div className="empty-state">
           <Building2 size={48} />
           <h3>No properties yet</h3>
-          <p>Add your first property to start managing units and enrolling tenants in On-Time Pay.</p>
+          <p>Add your first property to start managing units and collecting rent.</p>
           <button className="btn btn-primary" onClick={() => setShowAdd(true)}><Plus size={14} /> Add First Property</button>
         </div>
       ) : (
@@ -1243,10 +1245,10 @@ function ConnectReadinessBanner() {
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
         <div>
           <div style={{ fontWeight: 600, color: 'var(--gold)' }}>
-            Stripe Connect onboarding incomplete
+            Bank account setup incomplete
           </div>
           <div style={{ fontSize: '.78rem', color: 'var(--text-2)', marginTop: 4 }}>
-            Properties can still be added now, but tenants won&apos;t be able to pay rent through GAM until you finish KYC.
+            Properties can still be added now, but tenants won&apos;t be able to pay rent through GAM until you finish linking your bank account.
           </div>
         </div>
         <button className="btn btn-ghost btn-sm" onClick={(e) => { e.stopPropagation(); navigate('/banking') }}>

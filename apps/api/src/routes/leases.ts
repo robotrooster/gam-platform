@@ -60,6 +60,101 @@ async function isTenantOnLease(leaseId: string, tenantProfileId: string): Promis
 }
 
 // ─────────────────────────────────────────────────────────────
+// GET /api/leases/:id/pdf — the lease agreement rendered as a PDF.
+// Generated on-demand from the structured lease terms (services/leasePdf)
+// so EVERY lease — e-signed, manually created, or imported — is viewable
+// in the in-browser pdf.js viewer on both the tenant and landlord sides.
+// Auth: tenant on the lease, or landlord/team with access to the lease.
+// ─────────────────────────────────────────────────────────────
+leasesRouter.get('/:id/pdf', async (req, res, next) => {
+  try {
+    const lease = await queryOne<{ id: string; landlord_id: string }>(
+      'SELECT id, landlord_id FROM leases WHERE id = $1', [req.params.id])
+    if (!lease) throw new AppError(404, 'Lease not found')
+
+    const u = req.user!
+    const allowed = u.role === 'tenant'
+      ? (u.profileId ? await isTenantOnLease(lease.id, u.profileId) : false)
+      : canAccessLandlordResource(u, lease.landlord_id)
+    if (!allowed) throw new AppError(403, 'Forbidden')
+
+    const { generateLeasePdfBytes } = await import('../services/leasePdf')
+    const bytes = await generateLeasePdfBytes(lease.id)
+    res.setHeader('Content-Type', 'application/pdf')
+    res.setHeader('Content-Disposition', 'inline; filename="lease-agreement.pdf"')
+    res.send(Buffer.from(bytes))
+  } catch (e) { next(e) }
+})
+
+// ─────────────────────────────────────────────────────────────
+// GET /api/leases/:id/move-in-photos — S512 #15 follow-up.
+// Surfaces the photos captured on the unit's move-in inspection so
+// the read-only lease detail can show move-in condition pics. A
+// lease points at one unit; the move-in inspection is found by lease
+// first (the inspection carries lease_id once one is created), then
+// falls back to the unit's most recent move_in inspection for leases
+// whose inspection predates the lease_id link. Returns [] when none
+// exists (the section then renders nothing). Auth mirrors /pdf:
+// tenant on the lease, or landlord/team with access.
+// photoUrl is the existing /api/inspections/photo-files/<name> path;
+// the client fetches each file with its bearer token (the file route
+// is auth-gated, so a plain <img src> would 401).
+// ─────────────────────────────────────────────────────────────
+leasesRouter.get('/:id/move-in-photos', async (req, res, next) => {
+  try {
+    const lease = await queryOne<{ id: string; landlord_id: string; unit_id: string }>(
+      'SELECT id, landlord_id, unit_id FROM leases WHERE id = $1', [req.params.id])
+    if (!lease) throw new AppError(404, 'Lease not found')
+
+    const u = req.user!
+    const allowed = u.role === 'tenant'
+      ? (u.profileId ? await isTenantOnLease(lease.id, u.profileId) : false)
+      : canAccessLandlordResource(u, lease.landlord_id)
+    if (!allowed) throw new AppError(403, 'Forbidden')
+
+    const insp = await queryOne<{ id: string; status: string; conducted_at: string | null }>(
+      `SELECT id, status, conducted_at
+         FROM unit_inspections
+        WHERE inspection_type = 'move_in'
+          AND status <> 'cancelled'
+          AND (lease_id = $1 OR (lease_id IS NULL AND unit_id = $2))
+        ORDER BY (lease_id = $1) DESC,
+                 finalized_at DESC NULLS LAST,
+                 conducted_at DESC NULLS LAST,
+                 created_at DESC
+        LIMIT 1`,
+      [lease.id, lease.unit_id])
+
+    if (!insp) {
+      res.json({ success: true, data: { inspectionId: null, status: null, photos: [] } })
+      return
+    }
+
+    const photos = await query<{ id: string; photo_url: string; caption: string | null; uploaded_at: string }>(
+      `SELECT id, photo_url, caption, uploaded_at
+         FROM unit_inspection_photos
+        WHERE inspection_id = $1
+        ORDER BY uploaded_at`,
+      [insp.id])
+
+    res.json({
+      success: true,
+      data: {
+        inspectionId: insp.id,
+        status: insp.status,
+        conductedAt: insp.conducted_at,
+        photos: photos.map(p => ({
+          id: p.id,
+          photoUrl: p.photo_url,
+          caption: p.caption,
+          uploadedAt: p.uploaded_at,
+        })),
+      },
+    })
+  } catch (e) { next(e) }
+})
+
+// ─────────────────────────────────────────────────────────────
 // LIST LEASES
 // Landlords see their own; tenants see leases they're active on.
 // ─────────────────────────────────────────────────────────────

@@ -21,6 +21,7 @@ import {
 } from '../lib/csvImportMappings'
 import { AUTO_RENEW_MODES, PM_LINK_SCOPES, formatInvoiceNumber } from '@gam/shared'
 import { emailPmPropertyInvitation } from '../services/email'
+import { platformFeesByProperty, periodMonths } from '../services/platformFee'
 import {
   sendPropertyInvitation, acceptPropertyInvitation,
   rejectPropertyInvitation, revokePropertyInvitation,
@@ -329,7 +330,20 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
         AND t.on_time_pay_enrolled = TRUE
         AND u.status = 'active'`, [id])
 
-    res.json({ success: true, data: { ...stats, upcoming_disbursement: upcoming, trend, maintenance, bg_pending: bgPending?.count||0, otp_units: otpStats?.otp_units||0, projected_otp_disbursement: otpStats?.projected_otp_disbursement||0 } })
+    // Authoritative platform fee for the current month — per property, $2/billable
+    // unit floored at the $10 property minimum (full stop), summed. This is the
+    // SAME calc the billing cron + Reports use, so the Dashboard agrees with the
+    // bill. Replaces the old portfolio max(occupied×2, propertyCount×10) estimate.
+    const feeMonth = periodMonths(new Date().getFullYear(), new Date().getMonth() + 1)
+    const feeMap = await platformFeesByProperty(id, feeMonth)
+    const feeProps = await query<any>(
+      `SELECT id, name FROM properties WHERE landlord_id = $1 ORDER BY name`, [id])
+    const platformFeeByProperty = feeProps.map((p: any) => ({
+      propertyId: p.id, name: p.name, fee: Math.round((feeMap.get(p.id) ?? 0) * 100) / 100,
+    }))
+    const platformFee = Math.round(platformFeeByProperty.reduce((s, p) => s + p.fee, 0) * 100) / 100
+
+    res.json({ success: true, data: { ...stats, upcoming_disbursement: upcoming, trend, maintenance, bg_pending: bgPending?.count||0, otp_units: otpStats?.otp_units||0, projected_otp_disbursement: otpStats?.projected_otp_disbursement||0, platformFee, platformFeeByProperty } })
   } catch (e) { next(e) }
 })
 
@@ -338,16 +352,34 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
 // their own onboarding (legal agreement signature). Not delegable.
 landlordsRouter.post('/complete-onboarding', requireAuth, requireLandlord, async (req, res, next) => {
   try {
-    const { signature, agreedAt } = req.body
+    const { signature, agreedAt, coverTenantAch } = req.body
     if (!signature) return res.status(400).json({ success: false, error: 'Signature required' })
+
+    // S513 fee-payer election (walkthrough #2). The landlord may elect to
+    // cover its tenants' ACH fees; card is ALWAYS the tenant's. Default tenant.
+    const achPayer: 'landlord' | 'tenant' = coverTenantAch === true ? 'landlord' : 'tenant'
 
     await query(`
       UPDATE landlords SET
         onboarding_complete = TRUE,
         agreement_signed_at = NOW(),
-        agreement_signature = $1
+        agreement_signature = $1,
+        default_ach_fee_payer = $3
       WHERE id = $2`,
-      [signature, req.user!.profileId]
+      [signature, req.user!.profileId, achPayer]
+    )
+
+    // Apply the election across the landlord's existing properties so it takes
+    // effect on the portfolio they just onboarded (the first property is created
+    // before this step). card_fee_payer is force-healed to 'tenant' — the
+    // landlord never covers card (S512 lock); this also repairs any legacy
+    // 'landlord' card rows.
+    await query(`
+      UPDATE property_allocation_rules SET
+        ach_fee_payer = $1,
+        card_fee_payer = 'tenant'
+      WHERE property_id IN (SELECT id FROM properties WHERE landlord_id = $2)`,
+      [achPayer, req.user!.profileId]
     )
 
     // Also update user profile phone/business if provided

@@ -1,0 +1,100 @@
+/* GAM Fitness — dark/gold, mirrors the platform aesthetic. */
+:root {
+  --gold:      #d4af37;
+  --gold-soft: #b8941f;
+  --gold-dim:  rgba(212, 175, 55, 0.12);
+  --bg:        #0b0b0d;
+  --bg-2:      #121216;
+  --panel:     #17171c;
+  --panel-2:   #1e1e25;
+  --border:    #2a2a33;
+  --text-0:    #f5f5f7;
+  --text-1:    #a9a9b3;
+  --text-2:    #6f6f7a;
+  --green:     #3fb950;
+  --red:       #f85149;
+  --radius:    14px;
+}
+
+* { box-sizing: border-box; }
+html, body, #root { height: 100%; margin: 0; }
+body {
+  background: radial-gradient(1200px 700px at 80% -10%, rgba(212,175,55,0.06), transparent 60%), var(--bg);
+  color: var(--text-0);
+  font-family: 'Inter', system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+a { color: inherit; text-decoration: none; }
+h1,h2,h3,h4 { margin: 0; font-weight: 700; letter-spacing: -0.01em; }
+.mono { font-family: 'JetBrains Mono', monospace; }
+
+/* Layout shell */
+.shell { display: flex; min-height: 100vh; }
+.sidebar {
+  width: 230px; flex-shrink: 0; background: var(--bg-2);
+  border-right: 1px solid var(--border); padding: 22px 14px;
+  display: flex; flex-direction: column; gap: 4px; position: sticky; top: 0; height: 100vh;
+}
+.brand { display: flex; align-items: center; gap: 10px; padding: 4px 8px 20px; }
+.brand .logo { width: 30px; height: 30px; border-radius: 8px; background: linear-gradient(135deg, var(--gold), var(--gold-soft)); display: grid; place-items: center; color: #0b0b0d; font-weight: 800; }
+.brand b { font-size: 16px; }
+.brand span { color: var(--gold); }
+.navlink { display: flex; align-items: center; gap: 11px; padding: 10px 12px; border-radius: 10px; color: var(--text-1); font-size: 14px; font-weight: 500; cursor: pointer; }
+.navlink:hover { background: var(--panel); color: var(--text-0); }
+.navlink.active { background: var(--gold-dim); color: var(--gold); }
+.navlink .ico { width: 18px; text-align: center; }
+.sidebar .spacer { flex: 1; }
+.main { flex: 1; padding: 32px 38px; max-width: 1100px; }
+.topbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 26px; }
+.topbar .sub { color: var(--text-1); font-size: 14px; margin-top: 4px; }
+
+/* Cards & grid */
+.grid { display: grid; gap: 16px; }
+.cols-2 { grid-template-columns: repeat(2, 1fr); }
+.cols-3 { grid-template-columns: repeat(3, 1fr); }
+.cols-4 { grid-template-columns: repeat(4, 1fr); }
+.card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; }
+.card.tight { padding: 16px; }
+.stat .label { color: var(--text-2); font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; }
+.stat .value { font-size: 28px; font-weight: 800; margin-top: 6px; }
+.stat .value.gold { color: var(--gold); }
+
+/* Buttons & inputs */
+.btn { display: inline-flex; align-items: center; gap: 8px; border: 1px solid var(--border); background: var(--panel-2); color: var(--text-0); padding: 10px 16px; border-radius: 10px; font-size: 14px; font-weight: 600; cursor: pointer; font-family: inherit; }
+.btn:hover { border-color: var(--gold-soft); }
+.btn.primary { background: linear-gradient(135deg, var(--gold), var(--gold-soft)); color: #0b0b0d; border: none; }
+.btn.primary:hover { filter: brightness(1.06); }
+.btn.ghost { background: transparent; }
+.btn.danger { color: var(--red); border-color: rgba(248,81,73,0.4); background: transparent; }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn.sm { padding: 6px 12px; font-size: 13px; }
+input, select, textarea {
+  width: 100%; background: var(--bg-2); border: 1px solid var(--border); color: var(--text-0);
+  padding: 11px 13px; border-radius: 10px; font-size: 14px; font-family: inherit;
+}
+input:focus, select:focus, textarea:focus { outline: none; border-color: var(--gold-soft); }
+label.field { display: block; margin-bottom: 14px; }
+label.field .lbl { display: block; color: var(--text-1); font-size: 13px; margin-bottom: 6px; }
+.row { display: flex; gap: 12px; }
+.row > * { flex: 1; }
+
+/* Table */
+table { width: 100%; border-collapse: collapse; }
+th { text-align: left; color: var(--text-2); font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+td { padding: 12px; border-bottom: 1px solid var(--border); font-size: 14px; }
+tr:last-child td { border-bottom: none; }
+tr.me td { background: var(--gold-dim); }
+
+/* Misc */
+.pill { display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; background: var(--panel-2); color: var(--text-1); }
+.pill.gold { background: var(--gold-dim); color: var(--gold); }
+.muted { color: var(--text-1); }
+.center { display: grid; place-items: center; min-height: 100vh; padding: 24px; }
+.auth-card { width: 100%; max-width: 400px; }
+.divider { height: 1px; background: var(--border); margin: 18px 0; }
+.bar-track { height: 8px; background: var(--bg-2); border-radius: 999px; overflow: hidden; }
+.bar-fill { height: 100%; background: linear-gradient(90deg, var(--gold-soft), var(--gold)); }
+.err { color: var(--red); font-size: 13px; margin-top: 8px; }
+.toast { position: fixed; bottom: 26px; left: 50%; transform: translateX(-50%); background: var(--panel-2); border: 1px solid var(--gold-soft); color: var(--gold); padding: 14px 22px; border-radius: 12px; font-weight: 600; box-shadow: 0 10px 30px rgba(0,0,0,0.5); z-index: 50; }
+.rank { font-weight: 800; color: var(--gold); width: 36px; }
+.empty { text-align: center; color: var(--text-2); padding: 40px 0; }

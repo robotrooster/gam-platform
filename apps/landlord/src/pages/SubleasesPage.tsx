@@ -40,6 +40,7 @@ export function SubleasesPage() {
   const qc = useQueryClient()
   const [decideTarget, setDecideTarget] = useState<{ sublease: Sublease; decision: 'approve' | 'deny' } | null>(null)
   const [terminateTarget, setTerminateTarget] = useState<Sublease | null>(null)
+  const [viewTarget, setViewTarget] = useState<Sublease | null>(null)
   const [decideNote, setDecideNote] = useState('')
   const [terminateReason, setTerminateReason] = useState('')
 
@@ -170,15 +171,20 @@ export function SubleasesPage() {
                         </button>
                       </div>
                     )}
-                    {s.status === 'active' && (
-                      <button
-                        className="btn btn-ghost btn-sm"
-                        style={{ color: 'var(--red)' }}
-                        onClick={() => setTerminateTarget(s)}
-                      >
-                        Terminate
-                      </button>
-                    )}
+                    <div style={{ display: 'flex', gap: 4, justifyContent: 'flex-end' }}>
+                      {s.status !== 'pending' && (
+                        <button className="btn btn-ghost btn-sm" onClick={() => setViewTarget(s)}>View</button>
+                      )}
+                      {s.status === 'active' && (
+                        <button
+                          className="btn btn-ghost btn-sm"
+                          style={{ color: 'var(--red)' }}
+                          onClick={() => setTerminateTarget(s)}
+                        >
+                          Terminate
+                        </button>
+                      )}
+                    </div>
                   </td>
                 </tr>
               ))}
@@ -186,6 +192,40 @@ export function SubleasesPage() {
           </table>
         )}
       </div>
+
+      {/* Read-only detail (S511 leases read-only pattern applied to subleases) */}
+      {viewTarget && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }} onClick={() => setViewTarget(null)}>
+          <div className="card" style={{ width: 520, maxWidth: '92vw', maxHeight: '88vh', overflow: 'auto' }} onClick={e => e.stopPropagation()}>
+            <h3 style={{ marginBottom: 4 }}>Sublease details</h3>
+            <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginBottom: 14 }}>Read-only</div>
+            <fieldset disabled style={{ border: 'none', padding: 0, margin: 0, display: 'grid', gap: 10 }}>
+              {([
+                ['Status', viewTarget.status],
+                ['Unit', `${viewTarget.unitNumber} — ${viewTarget.propertyName}`],
+                ['Sublessor', `${viewTarget.sublessorName} · ${viewTarget.sublessorEmail}`],
+                ['Sublessee', `${viewTarget.sublesseeName} · ${viewTarget.sublesseeEmail}`],
+                ['Term', `${fmtDate(viewTarget.startDate)} → ${fmtDate(viewTarget.endDate)}`],
+                ['Sub-rent', fmtMoney(viewTarget.subMonthlyAmount)],
+                ['Master share', fmtMoney(viewTarget.masterShareAmount)],
+                ['Landlord consent', fmtDate(viewTarget.landlordConsentDate)],
+                ['Notes', viewTarget.notes || '—'],
+                ...(viewTarget.status === 'terminated'
+                  ? [['Terminated', `${fmtDate(viewTarget.terminatedAt)}${viewTarget.terminatedReason ? ` — ${viewTarget.terminatedReason}` : ''}`] as [string, string]]
+                  : []),
+              ] as [string, string][]).map(([label, val]) => (
+                <div key={label}>
+                  <div style={{ fontSize: '.68rem', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.04em' }}>{label}</div>
+                  <div style={{ color: 'var(--text-0)', fontSize: '.88rem' }}>{val}</div>
+                </div>
+              ))}
+            </fieldset>
+            <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 16 }}>
+              <button className="btn btn-ghost" onClick={() => setViewTarget(null)}>Close</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Approve / Deny modal */}
       {decideTarget && (

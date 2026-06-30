@@ -161,8 +161,7 @@ export async function cleanupAllSchema(): Promise<void> {
   await db.query(`DELETE FROM unit_entry_request_responses`)
   await db.query(`DELETE FROM unit_entry_requests`)
   // S381: work_trade_agreements FKs units (RESTRICT) and is the parent
-  // for work_trade_logs + work_trade_periods (both CASCADE on agreement
-  // delete). Clear before units.
+  // for work_trade_logs (CASCADE on agreement delete). Clear before units.
   await db.query(`DELETE FROM work_trade_agreements`)
   await db.query(`DELETE FROM units`)
   await db.query(`DELETE FROM property_allocation_rules`)

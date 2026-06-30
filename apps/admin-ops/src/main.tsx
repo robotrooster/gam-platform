@@ -16,8 +16,18 @@ applyCamelizeInterceptor(api)
 const get = <T,>(url: string) => api.get<{success:boolean;data:T}>(url).then(r=>r.data.data)
 const post = <T,>(url: string, body?: any) => api.post<{success:boolean;data:T;message?:string}>(url,body).then(r=>r.data)
 
-interface AuthUser { id:string; email:string; role:string; firstName:string; lastName:string }
-interface AuthCtx { user:AuthUser|null; loading:boolean; login:(e:string,p:string)=>Promise<void>; logout:()=>void }
+interface AuthUser { id:string; email:string; role:string; firstName:string; lastName:string; totpEnabled?:boolean; mustEnrollTotp?:boolean }
+// S289: login() returns a discriminated result so LoginPage can branch
+// into the TOTP second step when the backend gates on 2FA.
+type LoginResult = { kind:'success' } | { kind:'totp_required'; totpSession:string }
+interface AuthCtx {
+  user:AuthUser|null
+  loading:boolean
+  login:(e:string,p:string)=>Promise<LoginResult>
+  loginWithTotp:(totpSession:string,code:string)=>Promise<void>
+  refresh:()=>Promise<void>
+  logout:()=>void
+}
 const Ctx = React.createContext<AuthCtx>(null!)
 const useAuth = () => useContext(Ctx)
 
@@ -25,25 +35,54 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<AuthUser|null>(null)
   const [loading, setLoading] = useState(true)
   const logout = useCallback(() => { localStorage.removeItem(TOKEN); delete api.defaults.headers.common['Authorization']; setUser(null) }, [])
-  React.useEffect(() => {
+
+  const refresh = useCallback(async () => {
     const t = localStorage.getItem(TOKEN)
     if (!t) { setLoading(false); return }
     api.defaults.headers.common['Authorization'] = 'Bearer ' + t
-    api.get('/auth/me').then(res => {
+    try {
+      const res = await api.get('/auth/me')
       const u = res.data.data
       if (!u || (u.role !== 'admin' && u.role !== 'super_admin')) { logout(); return }
-      setUser({ id:u.id, email:u.email, role:u.role, firstName:u.firstName||u.firstName||'', lastName:u.lastName||u.lastName||'' })
-    }).catch(logout).finally(() => setLoading(false))
+      setUser({ id:u.id, email:u.email, role:u.role, firstName:u.firstName||'', lastName:u.lastName||'', totpEnabled:!!u.totpEnabled, mustEnrollTotp:!!u.mustEnrollTotp })
+    } catch { logout() }
+    finally { setLoading(false) }
   }, [logout])
-  const login = async (email: string, password: string) => {
+
+  React.useEffect(() => { refresh() }, [refresh])
+
+  // S289: post-credentials login. Returns a discriminated result so
+  // LoginPage can pivot into the TOTP second step when 2FA is enabled
+  // on the account. Doesn't set user state until the full JWT lands —
+  // a totp_session JWT is not a valid auth token.
+  const login = async (email: string, password: string): Promise<LoginResult> => {
     const res = await axios.post(`${API}/api/auth/login`, { email, password })
+    const data = res.data.data
+    if (data.requiresTotp) {
+      return { kind: 'totp_required', totpSession: data.totpSession as string }
+    }
+    const { token: tk, user: u } = data
+    if (!u || (u.role !== 'admin' && u.role !== 'super_admin')) throw new Error('Admin access required')
+    localStorage.setItem(TOKEN, tk)
+    api.defaults.headers.common['Authorization'] = 'Bearer ' + tk
+    setUser({ id:u.id, email:u.email, role:u.role, firstName:u.firstName||'', lastName:u.lastName||'', totpEnabled:!!u.totpEnabled, mustEnrollTotp:!!u.mustEnrollTotp })
+    return { kind: 'success' }
+  }
+
+  // S289: TOTP second-step exchange. Trades the short-lived totp_session
+  // JWT (from /login) plus a 6-digit token or recovery code for the full
+  // session JWT, then loads /me for accurate totp state.
+  const loginWithTotp = async (totpSession: string, code: string): Promise<void> => {
+    const res = await axios.post(`${API}/api/auth/totp/verify`, { totpSession, code })
     const { token: tk, user: u } = res.data.data
     if (!u || (u.role !== 'admin' && u.role !== 'super_admin')) throw new Error('Admin access required')
     localStorage.setItem(TOKEN, tk)
     api.defaults.headers.common['Authorization'] = 'Bearer ' + tk
-    setUser({ id:u.id, email:u.email, role:u.role, firstName:u.firstName||u.firstName||'', lastName:u.lastName||u.lastName||'' })
+    setUser({ id:u.id, email:u.email, role:u.role, firstName:'', lastName:'' })
+    await refresh()
   }
-  return <Ctx.Provider value={{ user, loading, login, logout }}>{children}</Ctx.Provider>
+
+  return <Ctx.Provider value={{ user, loading, login, loginWithTotp, refresh, logout }}>{children}</Ctx.Provider>
 }
 
 const qc = new QueryClient({ defaultOptions: { queries: { retry:1, staleTime:30000, refetchOnWindowFocus:false } } })
@@ -149,6 +188,8 @@ function Layout() {
           <NavLink to="/property-reviews" className={({isActive})=>`ni${isActive?' active':''}`}>📋 Property Reviews</NavLink>
           <NavLink to="/units"     className={({isActive})=>`ni${isActive?' active':''}`}>🚪 Units</NavLink>
           <NavLink to="/payments"  className={({isActive})=>`ni${isActive?' active':''}`}>💳 Payments</NavLink>
+          <div className="nl" style={{marginTop:8}}>Account</div>
+          <NavLink to="/security"  className={({isActive})=>`ni${isActive?' active':''}`}>🔐 Security</NavLink>
         </nav>
         <div className="sfooter">
           <div style={{padding:'6px 10px',marginBottom:4}}>
@@ -187,6 +228,9 @@ function Onboarding() {
   const { data: landlords = [] } = useQuery('ops-landlords', () => get<any[]>('/landlords'), { enabled: !!user })
   const { data: tenants = [] } = useQuery('ops-tenants', () => get<any[]>('/admin/tenants'), { enabled: !!user })
   const [tab, setTab] = useState<'landlords'|'tenants'>('landlords')
+  // Operations #1: the No-Flex KPI drills into the tenants with zero flex products.
+  const hasNoFlex = (t:any) => !(t.onTimePayEnrolled||t.creditReportingEnrolled||t.flexDepositEnrolled||t.floatFeeActive)
+  const [tFilter, setTFilter] = useState<'all'|'no_flex'>('all')
   const [search, setSearch] = useState('')
   const [selected, setSelected] = useState<any>(null)
   const { data: detail } = useQuery(['ops-detail', selected?.id, tab], () =>
@@ -218,7 +262,12 @@ function Onboarding() {
   }), [tenants])
 
   const filteredL = React.useMemo(() => search ? sortedLandlords.filter((l:any) => `${l.firstName} ${l.lastName} ${l.email} ${l.businessName||''}`.toLowerCase().includes(search.toLowerCase())) : sortedLandlords, [sortedLandlords, search])
-  const filteredT = React.useMemo(() => search ? sortedTenants.filter((t:any) => `${t.firstName} ${t.lastName} ${t.email} ${t.unitNumber||''} ${t.propertyName||''}`.toLowerCase().includes(search.toLowerCase())) : sortedTenants, [sortedTenants, search])
+  const filteredT = React.useMemo(() => {
+    let r = sortedTenants
+    if (tFilter === 'no_flex') r = r.filter(hasNoFlex)
+    if (search) r = r.filter((t:any) => `${t.firstName} ${t.lastName} ${t.email} ${t.unitNumber||''} ${t.propertyName||''}`.toLowerCase().includes(search.toLowerCase()))
+    return r
+  }, [sortedTenants, search, tFilter])
 
   return (
     <div>
@@ -230,15 +279,16 @@ function Onboarding() {
           <div className={`kv ${(stats?.landlordsNoBank||0)>0?'r':'g'}`}>{stats?.landlordsNoBank||0}</div>
           <div className="ks">Bank not verified</div>
         </div>
-        <div className="kpi" style={{cursor:'pointer',borderColor:tab==='tenants'?'var(--gold)':'var(--b1)'}} onClick={()=>{setTab('tenants');setSelected(null)}}>
+        <div className="kpi" style={{cursor:'pointer',borderColor:(tab==='tenants'&&tFilter==='all')?'var(--gold)':'var(--b1)'}} onClick={()=>{setTab('tenants');setSelected(null);setTFilter('all')}}>
           <div className="kl">Tenants — No ACH</div>
           <div className={`kv ${(stats?.tenantsNoAch||0)>0?'a':'g'}`}>{stats?.tenantsNoAch||0}</div>
           <div className="ks">ACH not verified</div>
         </div>
-        <div className="kpi">
+        <div className="kpi" style={{cursor:'pointer',borderColor:(tab==='tenants'&&tFilter==='no_flex')?'var(--gold)':'var(--b1)'}}
+          onClick={()=>{setTab('tenants');setSelected(null);setTFilter('no_flex')}}>
           <div className="kl">Tenants — No Flex</div>
           <div className={`kv ${(stats?.tenantsNoFlex||0)>0?'a':'g'}`}>{stats?.tenantsNoFlex||0}</div>
-          <div className="ks">No flex products</div>
+          <div className="ks">No flex products · tap to list →</div>
         </div>
         <div className="kpi">
           <div className="kl">Vacant Units</div>
@@ -247,8 +297,8 @@ function Onboarding() {
         </div>
       </div>
       <div className="tabs">
-        <button className={`tab ${tab==='landlords'?'on':''}`} onClick={()=>{setTab('landlords');setSelected(null);setSearch('')}}>🏢 Landlords ({(landlords as any[]).length})</button>
-        <button className={`tab ${tab==='tenants'?'on':''}`} onClick={()=>{setTab('tenants');setSelected(null);setSearch('')}}>👤 Tenants ({(tenants as any[]).length})</button>
+        <button className={`tab ${tab==='landlords'?'on':''}`} onClick={()=>{setTab('landlords');setSelected(null);setSearch('');setTFilter('all')}}>🏢 Landlords ({(landlords as any[]).length})</button>
+        <button className={`tab ${tab==='tenants'?'on':''}`} onClick={()=>{setTab('tenants');setSelected(null);setSearch('');setTFilter('all')}}>👤 Tenants ({(tenants as any[]).length})</button>
       </div>
       <div className="grid2" style={{gap:16,alignItems:'start'}}>
         <div className="card" style={{padding:0}}>
@@ -577,19 +627,92 @@ function Payments() {
 }
 
 // ── LOGIN ─────────────────────────────────────────────────────
+// S289: two-step login. Step 1 is email + password; if the backend
+// gates on 2FA the credentials call returns a totp_session and we
+// pivot to step 2 (6-digit authenticator code or a recovery code).
 function LoginPage() {
-  const { login } = useAuth()
+  const { login, loginWithTotp } = useAuth()
   const navigate = useNavigate()
+  React.useEffect(() => {
+    localStorage.removeItem(TOKEN)
+    delete api.defaults.headers.common['Authorization']
+  }, [])
   const [email, setEmail] = useState('')
   const [pw, setPw] = useState('')
   const [err, setErr] = useState('')
   const [loading, setLoading] = useState(false)
-  const onSubmit = async (e: React.FormEvent) => {
+  const [totpSession, setTotpSession] = useState<string|null>(null)
+  const [code, setCode] = useState('')
+
+  const onCredentialsSubmit = async (e: React.FormEvent) => {
     e.preventDefault(); setLoading(true); setErr('')
-    try { await login(email, pw); navigate('/onboarding') }
-    catch (ex: any) { setErr(ex.message || 'Login failed') }
+    try {
+      const r = await login(email, pw)
+      if (r.kind === 'totp_required') { setTotpSession(r.totpSession); setCode('') }
+      else navigate('/onboarding')
+    }
+    catch (ex: any) { setErr(ex.response?.data?.error || ex.message || 'Login failed') }
     finally { setLoading(false) }
   }
+
+  const onTotpSubmit = async (e: React.FormEvent) => {
+    e.preventDefault(); setLoading(true); setErr('')
+    try { await loginWithTotp(totpSession!, code.trim()); navigate('/onboarding') }
+    catch (ex: any) {
+      const msg = ex.response?.data?.error || 'Invalid code.'
+      setErr(msg)
+      if (/session/i.test(msg)) { setTotpSession(null); setCode(''); setPw('') }
+    }
+    finally { setLoading(false) }
+  }
+
+  const onBackToCredentials = () => { setTotpSession(null); setCode(''); setErr(''); setPw('') }
+
+  // ── Step 2: TOTP code ───────────────────────────────────────
+  if (totpSession) {
+    return (
+      <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',background:'var(--bg0)',padding:20}}>
+        <div style={{width:'100%',maxWidth:380}}>
+          <div style={{textAlign:'center',marginBottom:40}}>
+            <div style={{fontFamily:'var(--font-d)',fontSize:'1.8rem',fontWeight:800,color:'var(--gold)',marginBottom:8}}>GAM Operations</div>
+            <div style={{color:'var(--t3)',fontSize:'.82rem'}}>Two-factor authentication</div>
+          </div>
+          <div className="card" style={{padding:24}}>
+            <div style={{fontSize:'.85rem',color:'var(--t1)',marginBottom:14,lineHeight:1.6}}>
+              Enter the 6-digit code from your authenticator app, or one of your recovery codes.
+            </div>
+            {err&&<div className="alert ae" style={{marginBottom:14}}>{err}</div>}
+            <form onSubmit={onTotpSubmit}>
+              <div style={{marginBottom:16}}>
+                <label style={{display:'block',fontSize:'.72rem',fontWeight:600,color:'var(--t3)',marginBottom:5,textTransform:'uppercase',letterSpacing:'.06em'}}>Code</label>
+                <input
+                  style={{width:'100%',background:'var(--bg3)',border:'1px solid var(--b1)',borderRadius:7,color:'var(--t0)',padding:'8px 11px',fontSize:'1rem',fontFamily:'var(--font-m)',letterSpacing:'.2em',textAlign:'center',outline:'none'}}
+                  type="text"
+                  value={code}
+                  onChange={e=>setCode(e.target.value)}
+                  autoFocus
+                  required
+                  autoComplete="one-time-code"
+                  inputMode="text"
+                  placeholder="123 456 or xxxxx-xxxxx"
+                />
+              </div>
+              <button className="bp btn" type="submit" disabled={loading||!code.trim()} style={{width:'100%',justifyContent:'center'}}>
+                {loading?<span className="spinner"/>:'Verify'}
+              </button>
+            </form>
+            <div style={{marginTop:14,textAlign:'center'}}>
+              <button onClick={onBackToCredentials} style={{background:'none',border:'none',color:'var(--t2)',fontSize:'.82rem',cursor:'pointer',textDecoration:'underline'}}>
+                ← Back to sign in
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  // ── Step 1: credentials ─────────────────────────────────────
   return (
     <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',background:'var(--bg0)',padding:20}}>
       <div style={{width:'100%',maxWidth:380}}>
@@ -599,7 +722,7 @@ function LoginPage() {
         </div>
         <div className="card" style={{padding:24}}>
           {err&&<div className="alert ae" style={{marginBottom:14}}>{err}</div>}
-          <form onSubmit={onSubmit}>
+          <form onSubmit={onCredentialsSubmit}>
             <div style={{marginBottom:14}}>
               <label style={{display:'block',fontSize:'.72rem',fontWeight:600,color:'var(--t3)',marginBottom:5,textTransform:'uppercase',letterSpacing:'.06em'}}>Email</label>
               <input style={{width:'100%',background:'var(--bg3)',border:'1px solid var(--b1)',borderRadius:7,color:'var(--t0)',padding:'8px 11px',fontSize:'.875rem',outline:'none'}} type="email" value={email} onChange={e=>setEmail(e.target.value)} autoFocus required/>
@@ -618,6 +741,271 @@ function LoginPage() {
   )
 }
 
+// ── TOTP ENROLLMENT ───────────────────────────────────────────
+// S289: post-login mandatory enrollment for admin/super_admin ops
+// users. Scan QR / save recovery codes / confirm with a 6-digit code.
+function TotpEnrollPage() {
+  const { refresh, logout } = useAuth()
+  const navigate = useNavigate()
+  const [state, setState] = useState<'loading'|'showCodes'|'done'|'error'>('loading')
+  const [err, setErr] = useState('')
+  const [qrDataUri, setQrDataUri] = useState('')
+  const [otpauthUrl, setOtpauthUrl] = useState('')
+  const [recoveryCodes, setRecoveryCodes] = useState<string[]>([])
+  const [code, setCode] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+  const [savedAck, setSavedAck] = useState(false)
+
+  React.useEffect(() => {
+    let cancelled = false
+    api.post('/auth/totp/enroll-start')
+      .then(r => {
+        if (cancelled) return
+        const d = r.data.data
+        setQrDataUri(d.qrDataUri); setOtpauthUrl(d.otpauthUrl)
+        setRecoveryCodes(d.recoveryCodes || [])
+        setState('showCodes')
+      })
+      .catch((e: any) => {
+        if (cancelled) return
+        // 409 if already enrolled — nothing to do, go to the console.
+        if (e.response?.status === 409) { navigate('/onboarding', { replace: true }); return }
+        setErr(e.response?.data?.error || 'Could not start enrollment.')
+        setState('error')
+      })
+    return () => { cancelled = true }
+  }, [navigate])
+
+  const onConfirm = async (e: React.FormEvent) => {
+    e.preventDefault(); setSubmitting(true); setErr('')
+    try {
+      await api.post('/auth/totp/enroll-confirm', { token: code.trim() })
+      await refresh()
+      setState('done')
+      setTimeout(() => navigate('/onboarding', { replace: true }), 700)
+    } catch (ex: any) {
+      setErr(ex.response?.data?.error || 'Verification failed. Try the current code from your app.')
+      setSubmitting(false)
+    }
+  }
+
+  if (state === 'loading') {
+    return (
+      <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',background:'var(--bg0)'}}>
+        <div className="spinner"/>
+      </div>
+    )
+  }
+  if (state === 'error') {
+    return (
+      <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',background:'var(--bg0)',padding:20}}>
+        <div className="card" style={{padding:24,maxWidth:420,textAlign:'center'}}>
+          <div style={{fontSize:36,marginBottom:12}}>⚠️</div>
+          <h2 style={{marginBottom:12}}>Couldn't start enrollment</h2>
+          <p style={{color:'var(--t2)',fontSize:'.85rem',lineHeight:1.6,marginBottom:16}}>{err}</p>
+          <button onClick={logout} className="bp btn" style={{width:'100%',justifyContent:'center'}}>Sign out</button>
+        </div>
+      </div>
+    )
+  }
+  if (state === 'done') {
+    return (
+      <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',background:'var(--bg0)',padding:20}}>
+        <div className="card" style={{padding:24,maxWidth:420,textAlign:'center'}}>
+          <div style={{fontSize:36,marginBottom:12}}>✅</div>
+          <h2 style={{marginBottom:12}}>Two-factor authentication enabled</h2>
+          <p style={{color:'var(--t2)',fontSize:'.85rem',lineHeight:1.6}}>Redirecting to the console…</p>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',background:'var(--bg0)',padding:20}}>
+      <div style={{width:'100%',maxWidth:560}}>
+        <div style={{textAlign:'center',marginBottom:24}}>
+          <div style={{fontFamily:'var(--font-d)',fontSize:'1.6rem',fontWeight:800,color:'var(--gold)',marginBottom:6}}>GAM Operations</div>
+          <div style={{color:'var(--t3)',fontSize:'.82rem'}}>Set up two-factor authentication</div>
+        </div>
+        <div className="card" style={{padding:24}}>
+          <div style={{fontSize:'.82rem',color:'var(--t1)',marginBottom:14,lineHeight:1.6}}>
+            Operations accounts on GAM require a second factor. This is a one-time setup that adds an authenticator-app code to every sign-in. Without it your account is signed out.
+          </div>
+
+          <div style={{display:'grid',gridTemplateColumns:'auto 1fr',gap:16,alignItems:'start',marginBottom:18}}>
+            <div style={{padding:10,background:'#fff',borderRadius:8,lineHeight:0}}>
+              <img src={qrDataUri} alt="Scan this QR code with your authenticator app" style={{display:'block',width:180,height:180}}/>
+            </div>
+            <div style={{fontSize:'.82rem',color:'var(--t1)',lineHeight:1.6}}>
+              <div style={{fontWeight:700,color:'var(--t0)',marginBottom:6}}>1. Scan with your authenticator app</div>
+              <div style={{color:'var(--t2)',fontSize:'.78rem',marginBottom:10}}>Google Authenticator, Authy, 1Password, Bitwarden — any TOTP app works. Open the app, tap "Add account" or the + icon, then scan the QR code on the left.</div>
+              <div style={{fontSize:'.72rem',color:'var(--t3)'}}>Can't scan? <a href={otpauthUrl} style={{color:'var(--gold)',wordBreak:'break-all'}}>Tap to add manually →</a></div>
+            </div>
+          </div>
+
+          <div style={{marginBottom:18,padding:14,background:'rgba(245,158,11,.05)',border:'1px solid rgba(245,158,11,.2)',borderRadius:7}}>
+            <div style={{fontWeight:700,color:'var(--amber)',marginBottom:8,fontSize:'.85rem'}}>2. Save these recovery codes</div>
+            <div style={{fontSize:'.78rem',color:'var(--t2)',marginBottom:10,lineHeight:1.5}}>
+              If you ever lose access to your authenticator app, these one-time codes are the only way to get back in. Store them somewhere safe — a password manager works well.
+            </div>
+            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:6,marginBottom:10}}>
+              {recoveryCodes.map(rc => (
+                <div key={rc} style={{fontFamily:'var(--font-m)',fontSize:'.85rem',color:'var(--t0)',background:'var(--bg3)',padding:'5px 9px',borderRadius:5,letterSpacing:'.05em'}}>{rc}</div>
+              ))}
+            </div>
+            <label style={{display:'flex',alignItems:'center',gap:8,fontSize:'.78rem',color:'var(--t1)',cursor:'pointer'}}>
+              <input type="checkbox" checked={savedAck} onChange={e=>setSavedAck(e.target.checked)}/>
+              I've saved my recovery codes somewhere safe.
+            </label>
+          </div>
+
+          <form onSubmit={onConfirm}>
+            <div style={{marginBottom:12}}>
+              <label style={{display:'block',fontSize:'.72rem',fontWeight:600,color:'var(--t3)',marginBottom:5,textTransform:'uppercase',letterSpacing:'.06em'}}>3. Enter the 6-digit code from your app to confirm</label>
+              <input
+                style={{width:'100%',background:'var(--bg3)',border:'1px solid var(--b1)',borderRadius:7,color:'var(--t0)',padding:'10px 11px',fontSize:'1rem',fontFamily:'var(--font-m)',letterSpacing:'.2em',textAlign:'center',outline:'none'}}
+                type="text"
+                value={code}
+                onChange={e=>setCode(e.target.value)}
+                required
+                inputMode="numeric"
+                pattern="[0-9 ]*"
+                autoComplete="one-time-code"
+                placeholder="000000"
+                maxLength={7}
+              />
+            </div>
+            {err&&<div className="alert ae" style={{marginBottom:12}}>{err}</div>}
+            <button className="bp btn" type="submit" disabled={submitting||!savedAck||code.trim().length<6} style={{width:'100%',justifyContent:'center'}}>
+              {submitting?<span className="spinner"/>:'Enable two-factor'}
+            </button>
+            <div style={{marginTop:10,fontSize:'.72rem',color:'var(--t3)',textAlign:'center'}}>
+              Confirm the codes are saved before continuing — they're shown only once.
+            </div>
+          </form>
+
+          <div style={{marginTop:16,paddingTop:16,borderTop:'1px solid var(--b1)',textAlign:'center'}}>
+            <button onClick={logout} style={{background:'none',border:'none',color:'var(--t2)',fontSize:'.78rem',cursor:'pointer',textDecoration:'underline'}}>
+              Sign out instead
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// S289: gate that intercepts mustEnrollTotp users before they can
+// reach any other authenticated route. Layout-level guard.
+function MustEnrollTotpGate({ children }: { children: React.ReactNode }) {
+  const { user } = useAuth()
+  if (user?.mustEnrollTotp) return <Navigate to="/totp/enroll" replace/>
+  return <>{children}</>
+}
+
+// ── SECURITY PAGE ─────────────────────────────────────────────
+// Surfaces the user's 2FA state + a disable control. Mandatory-role
+// users who disable get bounced straight back to /totp/enroll by the
+// MustEnrollTotpGate.
+function SecurityPage() {
+  const { user, refresh } = useAuth()
+  const [showConfirm, setShowConfirm] = useState(false)
+  const [password, setPassword] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+  const [err, setErr] = useState('')
+  const [success, setSuccess] = useState('')
+
+  const onDisable = async (e: React.FormEvent) => {
+    e.preventDefault(); setSubmitting(true); setErr('')
+    try {
+      await api.post('/auth/totp/disable', { password })
+      await refresh()
+      setShowConfirm(false); setPassword('')
+      setSuccess('Two-factor disabled. Sign out and sign back in to re-enroll.')
+    } catch (ex: any) {
+      setErr(ex.response?.data?.error || 'Could not disable 2FA. Check your password.')
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <div>
+      <div className="ph"><div><h1 className="pt">Security</h1><p className="ps">Two-factor authentication</p></div></div>
+      <div className="card" style={{padding:20,maxWidth:560,marginBottom:16}}>
+        <div className="ct">Two-factor authentication</div>
+        <div style={{display:'flex',alignItems:'center',gap:12,marginBottom:14}}>
+          <div style={{width:36,height:36,borderRadius:8,background:user?.totpEnabled?'rgba(34,197,94,.1)':'rgba(245,158,11,.1)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'1.2rem'}}>
+            {user?.totpEnabled?'✅':'⚠️'}
+          </div>
+          <div>
+            <div style={{fontWeight:700,color:'var(--t0)',fontSize:'.95rem'}}>
+              {user?.totpEnabled?'Enabled':'Not enrolled'}
+            </div>
+            <div style={{fontSize:'.78rem',color:'var(--t2)'}}>
+              {user?.totpEnabled
+                ?'You will be prompted for a 6-digit code on every sign-in.'
+                :'Operations accounts are required to enroll. Sign out and sign back in to start.'}
+            </div>
+          </div>
+        </div>
+
+        {success&&<div className="alert" style={{background:'rgba(34,197,94,.08)',border:'1px solid rgba(34,197,94,.3)',color:'var(--green)',padding:'8px 12px',borderRadius:7,fontSize:'.82rem',marginBottom:12}}>{success}</div>}
+
+        {user?.totpEnabled&&!showConfirm&&(
+          <button
+            onClick={()=>{setShowConfirm(true);setSuccess('')}}
+            style={{background:'var(--bg3)',border:'1px solid var(--b2)',color:'var(--red)',padding:'7px 14px',borderRadius:7,fontSize:'.82rem',fontWeight:600,cursor:'pointer'}}
+          >
+            Disable two-factor
+          </button>
+        )}
+
+        {user?.totpEnabled&&showConfirm&&(
+          <form onSubmit={onDisable} style={{marginTop:8,padding:14,background:'var(--bg1)',border:'1px solid var(--b1)',borderRadius:8}}>
+            <div style={{fontSize:'.82rem',color:'var(--t1)',marginBottom:10,lineHeight:1.5}}>
+              Confirm your password to disable 2FA. After disable, any saved recovery codes are invalidated.
+            </div>
+            <div style={{marginBottom:10}}>
+              <label style={{display:'block',fontSize:'.7rem',fontWeight:600,color:'var(--t3)',marginBottom:4,textTransform:'uppercase',letterSpacing:'.06em'}}>Password</label>
+              <input
+                type="password"
+                value={password}
+                onChange={e=>setPassword(e.target.value)}
+                autoFocus
+                required
+                style={{width:'100%',background:'var(--bg3)',border:'1px solid var(--b1)',borderRadius:7,color:'var(--t0)',padding:'8px 11px',fontSize:'.875rem',outline:'none'}}
+              />
+            </div>
+            {err&&<div className="alert ae" style={{marginBottom:10,fontSize:'.8rem'}}>{err}</div>}
+            <div style={{display:'flex',gap:8}}>
+              <button
+                type="submit"
+                disabled={submitting||!password}
+                style={{flex:1,background:'var(--red)',border:'none',color:'#fff',padding:'8px 12px',borderRadius:7,fontSize:'.82rem',fontWeight:600,cursor:submitting||!password?'not-allowed':'pointer',opacity:submitting||!password?0.6:1}}
+              >
+                {submitting?'Disabling…':'Disable two-factor'}
+              </button>
+              <button
+                type="button"
+                onClick={()=>{setShowConfirm(false);setPassword('');setErr('')}}
+                disabled={submitting}
+                style={{background:'var(--bg3)',border:'1px solid var(--b2)',color:'var(--t1)',padding:'8px 12px',borderRadius:7,fontSize:'.82rem',cursor:'pointer'}}
+              >
+                Cancel
+              </button>
+            </div>
+          </form>
+        )}
+      </div>
+
+      <div style={{fontSize:'.72rem',color:'var(--t3)',maxWidth:560,lineHeight:1.5}}>
+        Disable is here mainly so admins testing the system can re-walk the enrollment flow without an SQL reset. In real ops, the only reason to disable would be losing your authenticator app + all recovery codes — in which case use this from a still-signed-in session, then re-enroll with the new app.
+      </div>
+    </div>
+  )
+}
+
 // ── APP ───────────────────────────────────────────────────────
 function App() {
   const { user, loading } = useAuth()
@@ -626,7 +1014,10 @@ function App() {
     <BrowserRouter>
       <Routes>
         <Route path="/login" element={user ? <Navigate to="/onboarding" replace/> : <LoginPage/>}/>
-        <Route path="/" element={user ? <Layout/> : <Navigate to="/login" replace/>}>
+        {/* S289: TOTP enrollment lives outside the Layout — it's the only
+            route a mustEnrollTotp user can reach until they complete it. */}
+        <Route path="/totp/enroll" element={user ? <TotpEnrollPage/> : <Navigate to="/login" replace/>}/>
+        <Route path="/" element={user ? <MustEnrollTotpGate><Layout/></MustEnrollTotpGate> : <Navigate to="/login" replace/>}>
           <Route index element={<Navigate to="/onboarding" replace/>}/>
           <Route path="onboarding" element={<Onboarding/>}/>
           <Route path="landlords"  element={<Landlords/>}/>
@@ -634,6 +1025,7 @@ function App() {
           <Route path="property-reviews" element={<PropertyReviews/>}/>
           <Route path="units"      element={<Units/>}/>
           <Route path="payments"   element={<Payments/>}/>
+          <Route path="security"   element={<SecurityPage/>}/>
         </Route>
       </Routes>
     </BrowserRouter>

@@ -7,6 +7,7 @@ import {
   firePmTransfersForReference, fireManagerTransfersForReference,
 } from '../services/stripeConnect'
 import { createAdminNotification } from '../services/adminNotifications'
+import { confirmBookingDeposit } from '../services/propertyBooking'
 import { applyTenantSupersedence, type PostCommitTransfer } from '../services/supersedence'
 import {
   emitPaymentSettledEvent,
@@ -146,9 +147,9 @@ webhooksRouter.post('/stripe', async (req, res) => {
                 }
               }
               // S246: FlexDeposit reconciles installments + custody-fee.
-              // S260: also handles acceleration-pull settlement via PI
-              // metadata (gam_purpose='flexdeposit_acceleration'). Pass
-              // the PI metadata so the reconciler can dispatch.
+              // S514: also handles voluntary pay-ahead settlement via PI
+              // metadata (gam_purpose='flexdeposit_payahead'). Pass the PI
+              // metadata so the reconciler can dispatch.
               // Idempotent and shape-checks internally — safe to call on
               // any settled payment regardless of type.
               try {
@@ -156,6 +157,15 @@ webhooksRouter.post('/stripe', async (req, res) => {
                 await reconcileSettledFlexDepositPayment(row.id, pi.metadata as Record<string, string>)
               } catch (e) {
                 logger.error({ err: e, payment_id: row.id }, 'flexdeposit reconcile-on-settle failed')
+              }
+              // S515: regular (non-FlexDeposit) deposit settle → advance the
+              // security_deposits row (collected_amount + status). Self-gates
+              // on type='deposit' and a non-FlexDeposit deposit row.
+              try {
+                const { reconcileSettledDepositPayment } = await import('../services/leaseFeesSync')
+                await reconcileSettledDepositPayment(row.id)
+              } catch (e) {
+                logger.error({ err: e, payment_id: row.id }, 'deposit reconcile-on-settle failed')
               }
               // S247: credit sublessor markup when this rent payment
               // belongs to an active sublease. No-op for non-sublease
@@ -193,8 +203,8 @@ webhooksRouter.post('/stripe', async (req, res) => {
 
           // S261: GAM-supersedence — distribute the boost portion of
           // this payment FIFO across the tenant's outstanding GAM
-          // debts (FlexDeposit defaults / acceleration / FlexCharge /
-          // FlexPay / custody). Idempotent + self-gates on
+          // balances (FlexDeposit installments / FlexCharge / FlexPay /
+          // custody). Idempotent + self-gates on
           // tenant_id + non-zero gam_supersedence_amount. FlexCharge
           // merchant Transfers are deferred to post-commit so we
           // don't hold the tx open across Stripe API calls.
@@ -425,14 +435,14 @@ webhooksRouter.post('/stripe', async (req, res) => {
       const reasonText = (returnCode && ACH_RETURN_CONFIG[returnCode]?.description)
         || 'Payment processor reported the charge failed'
 
-      // S260: FlexDeposit installment + acceleration pulls bypass the
+      // FlexDeposit installment + voluntary pay-ahead pulls bypass the
       // generic achRetry pipeline. Installment retries fire on the
-      // pre-scheduled retry_pull_date (set at enrollment); acceleration
-      // pulls fail terminally on the first NSF. Force next_retry_at=NULL
-      // so achRetry never picks these up.
+      // pre-scheduled retry_pull_date (set at enrollment); a failed
+      // pay-ahead is benign (no terminal state — the tenant can retry it).
+      // Force next_retry_at=NULL so achRetry never picks these up.
       const isFlexDepositPull = (
         pi.metadata?.gam_purpose === 'flexdeposit_installment' ||
-        pi.metadata?.gam_purpose === 'flexdeposit_acceleration'
+        pi.metadata?.gam_purpose === 'flexdeposit_payahead'
       )
 
       let willRetry = false
@@ -528,20 +538,18 @@ webhooksRouter.post('/stripe', async (req, res) => {
               } catch (e) {
                 logger.error({ err: e, payment_id: p.id }, 'flexpay nsf-handler failed')
               }
-              // S246 / S260: FlexDeposit NSF dispatcher.
+              // S246 / S514: FlexDeposit NSF dispatcher (custody model).
               // Installment pulls: handleFlexDepositPaymentNsf reads
               // attempt_count to decide between primary-failed-await-retry
-              // and retry-failed-default + 2-strike acceleration.
-              // Acceleration pulls (gam_purpose='flexdeposit_acceleration'):
-              // flips plan to 'in_default' terminal — no further retries.
+              // and retry-failed → mark installment 'missed' (no
+              // acceleration, no plan default — ToS § 9.1.5).
+              // Voluntary pay-ahead pulls (gam_purpose='flexdeposit_payahead')
+              // have no installment row, so the handler no-ops on them; a
+              // failed pay-ahead is benign — the plan stays 'active' and the
+              // scheduled installment pulls continue.
               try {
-                if (pi.metadata?.gam_purpose === 'flexdeposit_acceleration' && pi.metadata?.gam_deposit_id) {
-                  const { failFlexDepositAcceleration } = await import('../services/flexDeposit')
-                  await failFlexDepositAcceleration(pi.metadata.gam_deposit_id, pi.metadata.gam_tenant_id || null, reasonText)
-                } else {
-                  const { handleFlexDepositPaymentNsf } = await import('../services/flexDeposit')
-                  await handleFlexDepositPaymentNsf(p.id)
-                }
+                const { handleFlexDepositPaymentNsf } = await import('../services/flexDeposit')
+                await handleFlexDepositPaymentNsf(p.id)
               } catch (e) {
                 logger.error({ err: e, payment_id: p.id }, 'flexdeposit nsf-handler failed')
               }
@@ -742,6 +750,19 @@ webhooksRouter.post('/stripe', async (req, res) => {
     // the invoice paid, and stamp the PaymentIntent id for audit.
     case 'checkout.session.completed': {
       const session = event.data.object as Stripe.Checkout.Session
+      // S517: public property-booking deposit → confirm the held booking.
+      if (session.metadata?.gam_purpose === 'booking_deposit') {
+        const bookingId = session.metadata?.gam_booking_id ?? null
+        if (bookingId) {
+          try {
+            await confirmBookingDeposit(bookingId, session.id)
+            logger.info({ booking_id: bookingId, session_id: session.id }, '[webhook] booking deposit confirmed')
+          } catch (e) {
+            logger.error({ err: e, booking_id: bookingId }, '[webhook] booking deposit confirm failed')
+          }
+        }
+        break
+      }
       if (session.metadata?.gam_purpose !== 'business_invoice') {
         // Not ours — fall through silently.
         break
@@ -750,23 +771,62 @@ webhooksRouter.post('/stripe', async (req, res) => {
         ? session.payment_intent
         : session.payment_intent?.id ?? null
       const amountPaid = Number(session.amount_total ?? 0) / 100
+      // S511: invoices can be paid in two stages (deposit, then balance), so
+      // we no longer match on a single stored session id — we look the invoice
+      // up by metadata and record each payment in business_invoice_payments.
+      const invoiceId = session.metadata?.business_invoice_id ?? null
+      const paymentKind = session.metadata?.payment_kind === 'deposit' ? 'deposit'
+        : session.metadata?.payment_kind === 'balance' ? 'balance' : 'full'
       try {
+        if (!invoiceId || amountPaid <= 0) {
+          logger.warn({ session_id: session.id, invoice_id: invoiceId },
+            '[webhook] business_invoice checkout: missing invoice metadata or zero amount')
+          break
+        }
+        // Idempotent ledger insert keyed by the Checkout Session id (Stripe
+        // re-delivers events). On conflict we no-op so amount_paid (an additive
+        // SUM) can't be double-credited. Insert only succeeds for a real invoice.
+        const ins = await query<{ id: string }>(
+          `INSERT INTO business_invoice_payments
+             (business_id, invoice_id, amount, kind, method,
+              stripe_checkout_session_id, stripe_payment_intent_id)
+           SELECT bi.business_id, bi.id, $2, $3, 'card', $4, $5
+             FROM business_invoices bi
+            WHERE bi.id = $1
+           ON CONFLICT (stripe_checkout_session_id)
+             WHERE stripe_checkout_session_id IS NOT NULL DO NOTHING
+           RETURNING id`,
+          [invoiceId, amountPaid, paymentKind, session.id, piId],
+        )
+        if (ins.length === 0) {
+          // Already processed (re-delivery) or unknown invoice — no-op.
+          logger.info({ session_id: session.id, invoice_id: invoiceId },
+            '[webhook] business_invoice payment: duplicate or unknown — skipped')
+          break
+        }
+        // Recompute the invoice from the ledger SUM. Status flips to 'paid'
+        // only when the cumulative total is covered; a deposit-only payment
+        // stamps deposit_paid_at but keeps status 'sent' with the balance due.
         const r = await query<{ id: string; customer_id: string }>(
-          `UPDATE business_invoices
-              SET status                    = 'paid',
-                  paid_at                   = NOW(),
-                  sent_at                   = COALESCE(sent_at, NOW()),
-                  amount_paid               = $3,
-                  payment_method            = 'card',
-                  stripe_payment_intent_id  = $2
-            WHERE stripe_checkout_session_id = $1
-              AND status IN ('draft', 'sent')
-            RETURNING id, customer_id`,
-          [session.id, piId, amountPaid],
+          `UPDATE business_invoices bi
+              SET amount_paid     = sub.paid,
+                  sent_at         = COALESCE(bi.sent_at, NOW()),
+                  deposit_paid_at = CASE WHEN bi.deposit_amount > 0 AND sub.paid >= bi.deposit_amount - 0.005
+                                         THEN COALESCE(bi.deposit_paid_at, NOW()) ELSE bi.deposit_paid_at END,
+                  status          = CASE WHEN sub.paid >= bi.total_amount - 0.005 THEN 'paid' ELSE 'sent' END,
+                  paid_at         = CASE WHEN sub.paid >= bi.total_amount - 0.005 THEN COALESCE(bi.paid_at, NOW()) ELSE bi.paid_at END,
+                  payment_method  = 'card',
+                  stripe_payment_intent_id = COALESCE(bi.stripe_payment_intent_id, $2),
+                  updated_at      = NOW()
+             FROM (SELECT COALESCE(SUM(amount), 0) AS paid
+                     FROM business_invoice_payments WHERE invoice_id = $1) sub
+            WHERE bi.id = $1
+            RETURNING bi.id, bi.customer_id`,
+          [invoiceId, piId],
         )
         if (r.length === 0) {
-          logger.warn({ session_id: session.id },
-            '[webhook] checkout.session.completed: no matching draft/sent business_invoice')
+          logger.warn({ session_id: session.id, invoice_id: invoiceId },
+            '[webhook] business_invoice recompute: invoice vanished')
           break
         }
 

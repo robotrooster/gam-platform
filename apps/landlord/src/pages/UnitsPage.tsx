@@ -72,7 +72,7 @@ export function UnitsPage() {
           <div className="data-table-wrap">
             <table className="data-table">
               <thead><tr>
-                <th>Unit</th><th>Property</th><th>Tenant</th><th>Rent</th><th>Status</th><th>On-Time Pay</th><th>Eviction</th>
+                <th>Unit</th><th>Property</th><th>Tenant</th><th>Rent</th><th>Status</th><th>Eviction</th>
               </tr></thead>
               <tbody>
                 {filtered.map((u: any) => (
@@ -91,11 +91,6 @@ export function UnitsPage() {
                         {['occupied','vacant','maintenance','eviction'].map(s => <option key={s} value={s}>{s.replace('_', ' ')}</option>)}
                       </select>
                       <span className={'badge ' + (STATUS_COLORS[u.status] || 'badge-muted')} style={{ marginLeft: 4 }}>{u.status.replace('_', ' ')}</span>
-                    </td>
-                    <td>
-                      {u.onTimePayActive
-                        ? <span style={{ color: 'var(--green)', fontSize: '.75rem' }}>Active</span>
-                        : <span style={{ color: 'var(--text-3)', fontSize: '.75rem' }}>-</span>}
                     </td>
                     <td>
                       {u.paymentBlock

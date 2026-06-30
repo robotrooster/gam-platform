@@ -109,20 +109,15 @@ describe('GET /work-trade', () => {
     const f = await seedFixture()
     await db.query(
       `INSERT INTO work_trade_agreements
-         (unit_id, tenant_id, landlord_id, trade_type, hourly_rate,
-          weekly_hours, market_rent, trade_credit_max, start_date,
-          status, duties)
-       VALUES ($1, $2, $3, 'full', 25.00, 10, 1200, 1000,
-               CURRENT_DATE, 'active', 'groundskeeping')`,
+         (unit_id, tenant_id, landlord_id, start_date, status, duties)
+       VALUES ($1, $2, $3, CURRENT_DATE, 'active', 'groundskeeping')`,
       [f.unitId, f.tenantId, f.landlordId])
 
     const res = await request(buildApp())
       .get('/api/tenants/work-trade')
       .set('Authorization', `Bearer ${f.token}`)
     expect(res.status).toBe(200)
-    expect(res.body.data.trade_type).toBe('full')
-    expect(Number(res.body.data.hourly_rate)).toBe(25)
-    expect(Number(res.body.data.weekly_hours)).toBe(10)
+    expect(res.body.data.status).toBe('active')
     expect(res.body.data.duties).toBe('groundskeeping')
     expect(res.body.data.unit_number).toMatch(/^U-/)
     expect(res.body.data.property_name).toBe('Test Property')
@@ -132,10 +127,8 @@ describe('GET /work-trade', () => {
     const f = await seedFixture()
     await db.query(
       `INSERT INTO work_trade_agreements
-         (unit_id, tenant_id, landlord_id, trade_type, hourly_rate,
-          weekly_hours, market_rent, trade_credit_max, start_date, status)
-       VALUES ($1, $2, $3, 'partial', 20, 5, 1000, 500,
-               CURRENT_DATE - interval '1 year', 'ended')`,
+         (unit_id, tenant_id, landlord_id, start_date, status)
+       VALUES ($1, $2, $3, CURRENT_DATE - interval '1 year', 'ended')`,
       [f.unitId, f.tenantId, f.landlordId])
 
     const res = await request(buildApp())

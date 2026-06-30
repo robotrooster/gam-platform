@@ -1,10 +1,11 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
+import { sharedAlias } from '../../packages/shared/viteSharedAlias.mjs'
 
 export default defineConfig({
   plugins: [react()],
   resolve: {
-    alias: { '@gam/shared': '/Users/nicholasrhoades/Downloads/gam/packages/shared/src/index.ts' }
+    alias: sharedAlias
   },
   server: { strictPort: true, port: 3002 }
 })

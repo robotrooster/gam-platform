@@ -2,9 +2,10 @@ import { useEffect, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { apiGet, apiPost } from '../lib/api'
 import {
-  ArrowLeft, Check, X, MapPin, Phone, Navigation,
+  ArrowLeft, X, MapPin, Phone, Navigation,
   CheckCircle2, Play, Clock,
 } from 'lucide-react'
+import { RouteMapLive, type LiveMapStop, type RouteDirections } from '../components/RouteMapLive'
 
 // ─────────────────────────────────────────────────────────────
 //  Types (mirror the camelCase shape from /api/routes/:id)
@@ -24,6 +25,9 @@ interface RouteHeader {
   stopCount: number
   dumpCount: number
   skippedUngeocodedCount: number
+  depotLat: string | null
+  depotLon: string | null
+  arrivalGeofenceMeters: number | null
 }
 
 interface RouteStop {
@@ -75,16 +79,60 @@ function fmtTime(iso: string | null): string {
   return d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
 }
 
-/** Cross-platform deep link to driving directions. iOS Maps and
- *  Google Maps both accept the apple.com / google.com URL forms;
- *  Google's `/dir/?api=1&destination=` is the most reliable
- *  cross-platform anchor (iOS users get a "Open in" picker; Android
- *  users get Google Maps directly). */
-function mapsUrl(lat: string | null, lon: string | null, label?: string): string | null {
-  if (lat === null || lon === null) return null
-  const dest = `${lat},${lon}`
-  const q = label ? `&destination_place_id=${encodeURIComponent(label)}` : ''
-  return `https://www.google.com/maps/dir/?api=1&destination=${dest}${q}`
+/** Best-effort iOS detection so iPhone drivers get Apple Maps and
+ *  everyone else gets Google Maps. Falls back to Google on any doubt. */
+function isIOS(): boolean {
+  if (typeof navigator === 'undefined') return false
+  const ua = navigator.userAgent || ''
+  return /iPhone|iPad|iPod/.test(ua) ||
+    // iPadOS 13+ reports as Mac; disambiguate via touch points.
+    (/Mac/.test(navigator.platform) && navigator.maxTouchPoints > 1)
+}
+
+/** One stop's street address as a single line, or null if we don't
+ *  have one (depot returns carry no address in the payload). */
+function stopAddress(s: RouteStop): string | null {
+  if (s.stopKind === 'customer' && s.street1)
+    return `${s.street1}, ${s.city}, ${s.state} ${s.zip}`
+  if (s.stopKind === 'dump' && s.dumpStreet1)
+    return `${s.dumpStreet1}, ${s.dumpCity}, ${s.dumpState} ${s.dumpZip}`
+  return null
+}
+
+// Apple Maps and Google Maps both cap a single directions URL at ~10
+// stops. For longer days we split the route into sequential ARCS of
+// this size: the driver navigates one arc, and as those stops finalize
+// (the route timer auto-completes them) the next arc becomes available
+// here. One place to tune if either provider's limit changes.
+const MAX_MAPS_STOPS = 10
+
+// Arrival geofence radius (meters). Fixed, not owner-configurable — a
+// residential lot is ~18m but phone GPS is ±10–30m, so we pad to ~45m so
+// arrival reliably fires. We only ever test the CURRENT stop, so a
+// generous radius never mis-attributes to a neighbor.
+const ARRIVAL_GEOFENCE_M = 45
+
+/** Street addresses of the still-planned stops, in route order. The
+ *  current arc is the first MAX_MAPS_STOPS of these. */
+function plannedAddresses(stops: RouteStop[]): string[] {
+  return stops
+    .filter(s => s.status === 'planned')
+    .map(stopAddress)
+    .filter((a): a is string => a !== null)
+}
+
+/** ONE deep link for the given (already arc-capped) addresses, in our
+ *  optimized order — the free URL schemes never re-sort. iOS → Apple
+ *  Maps ("daddr" + "to:" chaining); everyone else → Google Maps path
+ *  form (/maps/dir/a/b/c). Returns null if empty. */
+function buildMapsUrl(addrs: string[]): string | null {
+  if (addrs.length === 0) return null
+  if (isIOS()) {
+    const daddr = addrs.map(encodeURIComponent).join('+to:')
+    return `http://maps.apple.com/?daddr=${daddr}&dirflg=d`
+  }
+  const path = addrs.map(encodeURIComponent).join('/')
+  return `https://www.google.com/maps/dir/${path}`
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -114,12 +162,34 @@ export function DriverPage() {
 
   useEffect(() => { reload() }, [routeId])
 
+  // While the route is running, poll so timer-driven stop completions —
+  // and the next map arc — appear without a manual refresh.
+  useEffect(() => {
+    if (detail?.route.status !== 'in_progress') return
+    const id = window.setInterval(() => { reload() }, 30_000)
+    return () => window.clearInterval(id)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [detail?.route.status])
+
   const currentIdx = (() => {
     if (!detail) return -1
     // The active stop is the first one still planned.
     return detail.stops.findIndex(s => s.status === 'planned')
   })()
   const current = currentIdx >= 0 && detail ? detail.stops[currentIdx] : null
+
+  // Road-following directions + turn list for the in-app map. Refetched
+  // as the route advances (a completed stop drops off the path).
+  const [directions, setDirections] = useState<RouteDirections | null>(null)
+  useEffect(() => {
+    if (!routeId || detail?.route.status !== 'in_progress') { setDirections(null); return }
+    let alive = true
+    apiGet<RouteDirections>(`/routes/${routeId}/directions`)
+      .then(d => { if (alive) setDirections(d) })
+      .catch(() => { /* map falls back to straight lines */ })
+    return () => { alive = false }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [routeId, detail?.route.status, currentIdx])
   const remainingPlanned = detail?.stops.filter(s => s.status === 'planned').length ?? 0
   const completedCount = detail?.stops.filter(s => s.status === 'completed').length ?? 0
   const skippedCount = detail?.stops.filter(s => s.status === 'skipped').length ?? 0
@@ -136,15 +206,32 @@ export function DriverPage() {
     } finally { setActioning(false) }
   }
 
+  // GPS geofence arrival from the in-app map → stamp arrival (the
+  // auto-advance job completes it after the dwell). Reload so the map +
+  // customer "you're next" reflect it.
+  const onArrive = async (stopId: string) => {
+    if (!routeId) return
+    try {
+      await apiPost(`/routes/${routeId}/stops/${stopId}/arrive`)
+      await reload()
+    } catch { /* best-effort; the server backstop still covers completion */ }
+  }
+
+  // GPS departure (left the geofence after arriving) → complete the stop
+  // with its real on-site time. The dwell/backstop only fires if this
+  // never arrives (driver closed the app mid-stop).
   const onComplete = async (stopId: string) => {
     if (!routeId) return
-    setActioning(true); setErr(null)
     try {
       await apiPost(`/routes/${routeId}/stops/${stopId}/complete`)
       await reload()
-    } catch (e: any) {
-      setErr(e?.response?.data?.error || 'Mark-complete failed')
-    } finally { setActioning(false) }
+    } catch { /* backstop covers it */ }
+  }
+
+  // Throttled GPS ping → live downstream ETAs. Fire-and-forget.
+  const onPosition = (lat: number, lon: number) => {
+    if (!routeId) return
+    apiPost(`/routes/${routeId}/position`, { lat, lon }).catch(() => {})
   }
 
   const onSkipConfirm = async () => {
@@ -312,9 +399,27 @@ export function DriverPage() {
     ? `${current.dumpStreet1}, ${current.dumpCity}, ${current.dumpState} ${current.dumpZip}`
     : null
 
-  const lat = isCustomer ? current.customerLat : isDump ? current.dumpLat : null
-  const lon = isCustomer ? current.customerLon : isDump ? current.dumpLon : null
-  const directions = mapsUrl(lat, lon, title ?? undefined)
+  // The day's remaining stops, split into provider-safe arcs. The driver
+  // navigates the current arc in Google/Apple Maps; as those stops
+  // finalize, the next arc loads here.
+  const remainingAddrs = plannedAddresses(stops)
+  const arcAddrs = remainingAddrs.slice(0, MAX_MAPS_STOPS)
+  const routeMapsUrl = buildMapsUrl(arcAddrs)
+  const splitRoute = remainingAddrs.length > MAX_MAPS_STOPS
+
+  // Stops for the in-app live map — resolve each to a coordinate.
+  const liveStops: LiveMapStop[] = stops.map((s) => ({
+    id: s.id,
+    sequenceOrder: s.sequenceOrder,
+    stopKind: s.stopKind,
+    status: s.status,
+    lat: s.stopKind === 'customer' ? (s.customerLat != null ? Number(s.customerLat) : null)
+       : s.stopKind === 'dump' ? (s.dumpLat != null ? Number(s.dumpLat) : null)
+       : route.depotLat != null ? Number(route.depotLat) : null,
+    lon: s.stopKind === 'customer' ? (s.customerLon != null ? Number(s.customerLon) : null)
+       : s.stopKind === 'dump' ? (s.dumpLon != null ? Number(s.dumpLon) : null)
+       : route.depotLon != null ? Number(route.depotLon) : null,
+  }))
 
   const stopNumDisplay = currentIdx + 1
   const totalStops = stops.length
@@ -333,6 +438,37 @@ export function DriverPage() {
       </div>
 
       {err && <div style={errStyle}>{err}</div>}
+
+      {/* In-app live map — keeps GAM foreground so device GPS keeps
+          running; auto-stamps arrival at the current stop's geofence. */}
+      <div style={{ margin: '0 16px 12px' }}>
+        <RouteMapLive
+          stops={liveStops}
+          currentStopId={current.id}
+          geofenceMeters={ARRIVAL_GEOFENCE_M}
+          onArrive={onArrive}
+          onComplete={onComplete}
+          onPosition={onPosition}
+          directions={directions}
+        />
+      </div>
+
+      {/* Whole-route navigation — one tap loads every remaining stop into
+          the phone's maps app, in order. Replaces per-stop reloads. */}
+      {routeMapsUrl && (
+        <>
+          <a href={routeMapsUrl} target="_blank" rel="noreferrer" style={fullRouteBtnStyle}>
+            <Navigation size={18} />
+            {splitRoute ? ` Open next ${arcAddrs.length} stops in Maps` : ' Open full route in Maps'}
+          </a>
+          {splitRoute && (
+            <div style={arcNoteStyle}>
+              {remainingAddrs.length} stops left — maps apps cap a route at {MAX_MAPS_STOPS}.
+              The next group loads here as you finish this one.
+            </div>
+          )}
+        </>
+      )}
 
       {/* Stop card */}
       <div style={stopCardStyle}>
@@ -369,24 +505,21 @@ export function DriverPage() {
         <div style={etaRowStyle}>
           <Clock size={14} />
           ETA {fmtTime(current.estimatedArrival)}
+          {current.actualArrival && (
+            <span style={{ marginLeft: 12, color: 'var(--gold)', fontWeight: 600 }}>
+              Arrived {fmtTime(current.actualArrival)}
+            </span>
+          )}
         </div>
-        {directions && (
-          <a href={directions} target="_blank" rel="noreferrer" style={directionsBtnStyle}>
-            <Navigation size={18} /> Open in Maps
-          </a>
-        )}
       </div>
 
-      {/* Action bar */}
+      {/* Action bar — Skip is the driver's only manual action; stops
+          auto-complete on the route timer (drive time + 1 min). */}
       {!isReturn ? (
         <div style={actionBarStyle}>
           <button onClick={() => setShowSkipPrompt(true)}
-            disabled={actioning} style={skipBtnStyle}>
-            <X size={18} /> Skip
-          </button>
-          <button onClick={() => onComplete(current.id)}
-            disabled={actioning} style={completeBtnStyle}>
-            <Check size={18} /> {actioning ? 'Saving…' : 'Complete'}
+            disabled={actioning} style={{ ...skipBtnStyle, flex: 1 }}>
+            <X size={18} /> Can’t complete — skip this stop
           </button>
         </div>
       ) : (
@@ -504,11 +637,15 @@ const etaRowStyle: React.CSSProperties = {
   display: 'flex', alignItems: 'center', gap: 6,
   fontSize: 12, color: 'var(--text-3)', marginBottom: 16,
 }
-const directionsBtnStyle: React.CSSProperties = {
+const fullRouteBtnStyle: React.CSSProperties = {
   display: 'flex', justifyContent: 'center', alignItems: 'center', gap: 8,
-  padding: '14px', background: 'var(--bg-2)',
-  color: 'var(--gold)', borderRadius: 10, textDecoration: 'none',
-  fontSize: 15, fontWeight: 600, border: '1px solid var(--border-1)',
+  margin: '0 16px', padding: '14px',
+  background: 'var(--gold)', color: 'var(--bg-0)',
+  borderRadius: 10, textDecoration: 'none',
+  fontSize: 16, fontWeight: 700,
+}
+const arcNoteStyle: React.CSSProperties = {
+  margin: '8px 16px 0', fontSize: 12, color: 'var(--text-3)', textAlign: 'center',
 }
 const actionBarStyle: React.CSSProperties = {
   display: 'flex', gap: 12, padding: 16,
@@ -519,14 +656,6 @@ const skipBtnStyle: React.CSSProperties = {
   flex: 1, padding: '16px',
   background: 'var(--bg-2)', color: 'var(--amber)',
   border: '1px solid var(--amber)', borderRadius: 10,
-  fontSize: 16, fontWeight: 700,
-  cursor: 'pointer',
-  display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
-}
-const completeBtnStyle: React.CSSProperties = {
-  flex: 2, padding: '16px',
-  background: 'var(--gold)', color: 'var(--bg-0)',
-  border: 'none', borderRadius: 10,
   fontSize: 16, fontWeight: 700,
   cursor: 'pointer',
   display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,

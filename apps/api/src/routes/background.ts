@@ -429,6 +429,31 @@ backgroundRouter.get('/status', requireAuth, async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
+// ── TENANT NOTIFICATIONS ─────────────────────────────────────
+// MUST be declared before the landlord `/:id` route below: Express matches
+// in definition order, so a literal `/notifications` registered after `/:id`
+// gets captured as id="notifications" and hits the landlord-only permission
+// gate — which 403'd tenants and white-screened the tenant notifications page.
+backgroundRouter.get('/notifications', requireAuth, async (req, res, next) => {
+  try {
+    const notifs = await query<any>(
+      'SELECT * FROM tenant_notifications WHERE user_id=$1 ORDER BY created_at DESC LIMIT 20',
+      [req.user!.userId]
+    )
+    res.json({ success: true, data: notifs })
+  } catch (e) { next(e) }
+})
+
+backgroundRouter.patch('/notifications/:id/read', requireAuth, async (req, res, next) => {
+  try {
+    await query(
+      'UPDATE tenant_notifications SET read=TRUE WHERE id=$1 AND user_id=$2',
+      [req.params.id, req.user!.userId]
+    )
+    res.json({ success: true })
+  } catch (e) { next(e) }
+})
+
 // ── LANDLORD: LIST + DETAIL ──────────────────────────────────
 backgroundRouter.get('/', requireAuth, requirePerm('tenants.run_background_check'), async (req, res, next) => {
   try {
@@ -817,27 +842,40 @@ backgroundRouter.post('/pool/withdraw', requireAuth, async (req, res, next) => {
 
 // ── POOL: LANDLORD SEARCH (REDACTED PREVIEW) ─────────────────
 // No name, contact info, or SSN in the preview. Full record only after $1 unlock.
+//
+// S512 #30: the pool is presented as a proximity-sorted reach-out list
+// (income/state/risk filtering removed). There is no street-level distance
+// yet — properties carry no lat/lon (geocoder self-host is deferred), so
+// proximity is administrative tiering against the landlord's property
+// zip / city / state:
+//   0 same ZIP · 1 same city+state · 2 same ZIP3 region · 3 same state · 4 elsewhere
+// Ties break on risk_score then recency (the prior ordering, now within a
+// tier). When the landlord owns no properties every row lands in tier 4 and
+// the result is the old risk/recency sort. When property geocoding lands,
+// the proximity_rank CASE can be swapped for a haversine ORDER BY.
 backgroundRouter.get('/pool/search', requireAuth, requirePerm('tenants.run_background_check'), async (req, res, next) => {
   try {
-    const { minIncome, maxIncome, state, riskLevel } = req.query as Record<string, string>
-    const where: string[] = ["ap.status='available'"]
-    const params: any[] = []
-    let idx = 1
-
-    if (minIncome) { where.push(`ap.monthly_income >= $${idx++}`); params.push(parseFloat(minIncome)) }
-    if (maxIncome) { where.push(`ap.monthly_income <= $${idx++}`); params.push(parseFloat(maxIncome)) }
-    if (state)     { where.push(`ap.state = $${idx++}`); params.push(state) }
-    if (riskLevel) { where.push(`ap.risk_level = $${idx++}`); params.push(riskLevel) }
-
+    const landlordId = req.user!.profileId
     const pool = await query<any>(`
+      WITH props AS (
+        SELECT DISTINCT zip, lower(city) AS city, state
+          FROM properties WHERE landlord_id = $1
+      )
       SELECT ap.id, ap.employment_status, ap.monthly_income, ap.city, ap.state, ap.zip,
-        ap.risk_level, ap.risk_score, ap.created_at,
-        CASE WHEN mr.id IS NOT NULL THEN TRUE ELSE FALSE END as already_contacted
-      FROM application_pool ap
-      LEFT JOIN pool_match_requests mr ON mr.pool_entry_id=ap.id AND mr.landlord_id=$${idx}
-      WHERE ${where.join(' AND ')}
-      ORDER BY ap.risk_score ASC NULLS LAST, ap.created_at DESC
-      LIMIT 50`, [...params, req.user!.profileId])
+             ap.risk_level, ap.risk_score, ap.created_at,
+             CASE
+               WHEN ap.zip IS NOT NULL AND ap.zip IN (SELECT zip FROM props) THEN 0
+               WHEN lower(ap.city) IN (SELECT city FROM props WHERE state = ap.state) THEN 1
+               WHEN ap.zip IS NOT NULL AND left(ap.zip, 3) IN (SELECT left(zip, 3) FROM props) THEN 2
+               WHEN ap.state IN (SELECT state FROM props) THEN 3
+               ELSE 4
+             END AS proximity_rank,
+             CASE WHEN mr.id IS NOT NULL THEN TRUE ELSE FALSE END as already_contacted
+        FROM application_pool ap
+        LEFT JOIN pool_match_requests mr ON mr.pool_entry_id = ap.id AND mr.landlord_id = $1
+       WHERE ap.status = 'available'
+       ORDER BY proximity_rank ASC, ap.risk_score ASC NULLS LAST, ap.created_at DESC
+       LIMIT 50`, [landlordId])
     res.json({ success: true, data: pool })
   } catch (e) { next(e) }
 })
@@ -1070,26 +1108,5 @@ backgroundRouter.post('/pool/match/:matchId/purchase-report', requireAuth, requi
       success: true,
       data: { report: safeCheck, fee: POOL_REPORT_UNLOCK_USD, paymentId: paymentIntentId },
     })
-  } catch (e) { next(e) }
-})
-
-// ── TENANT NOTIFICATIONS ─────────────────────────────────────
-backgroundRouter.get('/notifications', requireAuth, async (req, res, next) => {
-  try {
-    const notifs = await query<any>(
-      'SELECT * FROM tenant_notifications WHERE user_id=$1 ORDER BY created_at DESC LIMIT 20',
-      [req.user!.userId]
-    )
-    res.json({ success: true, data: notifs })
-  } catch (e) { next(e) }
-})
-
-backgroundRouter.patch('/notifications/:id/read', requireAuth, async (req, res, next) => {
-  try {
-    await query(
-      'UPDATE tenant_notifications SET read=TRUE WHERE id=$1 AND user_id=$2',
-      [req.params.id, req.user!.userId]
-    )
-    res.json({ success: true })
   } catch (e) { next(e) }
 })

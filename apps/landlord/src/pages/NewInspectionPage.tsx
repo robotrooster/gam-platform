@@ -1,10 +1,11 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useQuery, useMutation } from 'react-query'
 import { useNavigate } from 'react-router-dom'
-import { ClipboardCheck, ArrowLeft } from 'lucide-react'
+import { ClipboardCheck, ArrowLeft, Sparkles } from 'lucide-react'
 import { apiGet, apiPost } from '../lib/api'
+import { openAssistant } from '../components/ChatWidget'
 
-type Unit = { id: string; unitNumber: string; propertyId: string; propertyName: string }
+type Unit = { id: string; unitNumber: string; propertyId: string; propertyName: string; tenantId?: string | null }
 type Tenant = { id: string; firstName: string; lastName: string }
 type Lease = { id: string; unitId: string; startDate: string; status: string }
 
@@ -27,6 +28,20 @@ export function NewInspectionPage() {
     () => unitId ? apiGet<any[]>(`/inspections?unitId=${unitId}`) : Promise.resolve([]),
     { enabled: type === 'move_out' && !!unitId },
   )
+
+  // #24: picking a unit auto-fills its active lease + primary tenant from the
+  // unit's current tenancy (v_unit_occupancy on /units, active lease on /leases).
+  // The landlord can still override either dropdown. autoFilled drives the hint.
+  const [autoFilled, setAutoFilled] = useState(false)
+  useEffect(() => {
+    if (!unitId) { setAutoFilled(false); return }
+    const u = (units as Unit[]).find(x => x.id === unitId)
+    const unitLeases = (leases as Lease[]).filter(l => l.unitId === unitId)
+    const pickLease = unitLeases.find(l => l.status === 'active') || unitLeases[0]
+    setTenantId(u?.tenantId || '')
+    setLeaseId(pickLease?.id || '')
+    setAutoFilled(!!(u?.tenantId || pickLease))
+  }, [unitId, units, leases])
 
   const createMut = useMutation(
     (body: any) => apiPost<{ id: string }>('/inspections', body),
@@ -76,6 +91,19 @@ export function NewInspectionPage() {
         </div>
       </div>
 
+      {/* Agent-guided walkthrough offer. Fill it in manually, or let the
+          assistant create + walk you through documenting each item. */}
+      <div className="card" style={{ padding: '12px 16px', marginBottom: 16, display: 'flex', alignItems: 'center', gap: 12, borderColor: 'var(--gold)' }}>
+        <Sparkles size={18} style={{ color: 'var(--gold)', flexShrink: 0 }} />
+        <div style={{ flex: 1, fontSize: '.85rem' }}>
+          Prefer to do this hands-free? The assistant can run this walkthrough — creating the inspection and recording each item's condition as you go.
+        </div>
+        <button type="button" className="btn btn-secondary btn-sm"
+          onClick={() => openAssistant("I'd like to run a unit walkthrough with your help — can you create the inspection and guide me through documenting each item's condition?")}>
+          Automate with assistant
+        </button>
+      </div>
+
       <form onSubmit={onSubmit} className="card" style={{ padding: 24 }}>
         {error && (
           <div style={{ background: 'rgba(239,68,68,.08)', border: '1px solid rgba(239,68,68,.3)', borderRadius: 8, padding: 12, color: 'var(--red)', marginBottom: 16 }}>
@@ -108,6 +136,11 @@ export function NewInspectionPage() {
               <option key={t.id} value={t.id}>{t.firstName} {t.lastName}</option>
             ))}
           </select>
+          {autoFilled && (
+            <div style={{ fontSize: '.72rem', color: 'var(--gold)', marginTop: 4 }}>
+              Auto-filled from the unit's current tenancy — change if needed.
+            </div>
+          )}
         </Field>
 
         <Field label="Lease (optional)">

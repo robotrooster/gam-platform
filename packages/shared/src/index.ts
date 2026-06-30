@@ -20,6 +20,14 @@ export const USER_ROLES = [
   // See `BUSINESS_*` exports below for the per-business enums.
   'business_owner',
   'business_staff',
+  // Fitness tracker standalone-app role. Not a portal role: a fitness_user
+  // is someone who signed up directly through the fitness app (:3013) to
+  // try it out without being a GAM landlord/tenant. They have no
+  // landlord/tenant profile row. Tenants/landlords also use the fitness
+  // app, but keep their own role — fitness_user is only the "no other GAM
+  // relationship" case. Auth on /api/fitness/* is plain requireAuth, so
+  // every role (including this one) is accepted there.
+  'fitness_user',
 ] as const
 
 export type UserRole = typeof USER_ROLES[number]
@@ -123,6 +131,70 @@ export type BookingChangeRequestStatus = typeof BOOKING_CHANGE_REQUEST_STATUSES[
 // has a record for the turn.
 export const INSPECTION_TYPES = ['move_in', 'move_out', 'periodic', 'turnover'] as const
 export type InspectionType = typeof INSPECTION_TYPES[number]
+
+// Per-item condition rating on an inspection checklist item. Single source
+// for the route + agent-tool validators; mirrors the existing
+// unit_inspection_items.condition CHECK (same five values).
+export const INSPECTION_ITEM_CONDITIONS = ['good', 'fair', 'damaged', 'missing', 'na'] as const
+export type InspectionItemCondition = typeof INSPECTION_ITEM_CONDITIONS[number]
+
+// ── Common areas & amenity reservations ───────────────────────────────
+// Property-level shared amenities (pool, clubhouse, gym, BBQ pavilion…)
+// that residents can reserve for private use (parties etc.) and that the
+// landlord can take offline (chemical treatment, private rental, event).
+// An approved reservation or a landlord closure fans out an
+// "amenity unavailable" notification to every active resident of the
+// property. Single source for the route/service validators + the two
+// migration CHECK constraints.
+//
+// kind drives the notification copy and who created the row:
+//   tenant_reservation — a resident booked it (private use, e.g. a party)
+//   private_rental     — landlord rented it out privately to one party
+//   maintenance_closure— closed for upkeep (chemical treatment, repair)
+//   event              — landlord-run community event (still occupies it)
+export const COMMON_AREA_RESERVATION_KINDS = [
+  'tenant_reservation', 'private_rental', 'maintenance_closure', 'event',
+] as const
+export type CommonAreaReservationKind = typeof COMMON_AREA_RESERVATION_KINDS[number]
+
+// pending  — tenant request awaiting landlord decision (auto-skipped when
+//            the area is auto-approve or the row is landlord-created)
+// approved — live; occupies the area + (if notify_residents) alerts residents
+// rejected — landlord declined the request
+// cancelled— withdrawn by the requester or landlord after the fact
+export const COMMON_AREA_RESERVATION_STATUSES = [
+  'pending', 'approved', 'rejected', 'cancelled',
+] as const
+export type CommonAreaReservationStatus = typeof COMMON_AREA_RESERVATION_STATUSES[number]
+
+// Landlord-created kinds never need tenant-request approval; they go live
+// immediately. tenant_reservation is the only resident-initiated kind.
+export const LANDLORD_RESERVATION_KINDS = [
+  'private_rental', 'maintenance_closure', 'event',
+] as const
+
+// ── Service interruptions (utility outage broadcasts) ─────────────────
+// Landlord-initiated notice that a utility/service will be down — planned
+// (scheduled main repair) or emergency (unplanned shutoff) — fanned out to
+// affected residents with an expected-restore time. A notice targets a
+// whole property (empty unit set) or a specific unit subset. Single source
+// for the route validator + the migration CHECK constraints.
+export const SERVICE_INTERRUPTION_TYPES = [
+  'water', 'power', 'gas', 'heat_ac', 'elevator', 'internet', 'parking', 'other',
+] as const
+export type ServiceInterruptionType = typeof SERVICE_INTERRUPTION_TYPES[number]
+
+export const SERVICE_INTERRUPTION_TYPE_LABELS: Record<ServiceInterruptionType, string> = {
+  water: 'Water', power: 'Power', gas: 'Gas', heat_ac: 'Heat / AC',
+  elevator: 'Elevator', internet: 'Internet', parking: 'Parking', other: 'Other',
+}
+
+// scheduled — starts in the future; active — ongoing now; resolved —
+// landlord marked it restored (may fire an all-clear); cancelled — called off.
+export const SERVICE_INTERRUPTION_STATUSES = [
+  'scheduled', 'active', 'resolved', 'cancelled',
+] as const
+export type ServiceInterruptionStatus = typeof SERVICE_INTERRUPTION_STATUSES[number]
 
 // ── Standard inspection walkthrough checklist (single source) ──────────
 // The areas the agent walks a tenant/landlord through on a move-in / move-out
@@ -547,6 +619,118 @@ export const RECURRING_SCHEDULE_STATUS_LABEL: Record<RecurringScheduleStatus, st
   ended:  'Ended',
 }
 
+// business_recurring_invoice_schedules.frequency CHECK enum (S505 weekly/monthly;
+// S511 added the month-stepped intervals). All non-weekly frequencies anchor to a
+// day_of_month and differ only in how many months the cadence advances per cycle.
+export const RECURRING_INVOICE_FREQUENCIES = [
+  'weekly',
+  'monthly',
+  'quarterly',
+  'semiannual',
+  'annual',
+] as const
+export type RecurringInvoiceFrequency = typeof RECURRING_INVOICE_FREQUENCIES[number]
+export const RECURRING_INVOICE_FREQUENCY_LABEL: Record<RecurringInvoiceFrequency, string> = {
+  weekly:     'Weekly',
+  monthly:    'Monthly',
+  quarterly:  'Quarterly',
+  semiannual: 'Every 6 months',
+  annual:     'Yearly',
+}
+// Month-based frequencies advance the due date by this many months each cycle;
+// 'weekly' is special-cased (+7 days) and is intentionally absent here.
+export const RECURRING_INVOICE_MONTH_STEP: Record<
+  Exclude<RecurringInvoiceFrequency, 'weekly'>, number
+> = {
+  monthly:    1,
+  quarterly:  3,
+  semiannual: 6,
+  annual:     12,
+}
+// True for every frequency that anchors to a day_of_month (i.e. not weekly).
+export function isMonthlyRecurrence(
+  freq: RecurringInvoiceFrequency
+): freq is Exclude<RecurringInvoiceFrequency, 'weekly'> {
+  return freq !== 'weekly'
+}
+
+// business_invoices.deposit_type CHECK enum (S511, walkthrough Business #9).
+// A bookkeeping label only — service vs materials deposits behave identically.
+export const BUSINESS_DEPOSIT_TYPES = ['service', 'materials'] as const
+export type BusinessDepositType = typeof BUSINESS_DEPOSIT_TYPES[number]
+export const BUSINESS_DEPOSIT_TYPE_LABEL: Record<BusinessDepositType, string> = {
+  service:   'Service',
+  materials: 'Materials',
+}
+
+// Two-stage payment math for a business invoice with an optional upfront
+// deposit. PURE — shared by the API (checkout amount + webhook status) and the
+// frontend (what's due now). All amounts are dollars.
+export interface InvoiceDueInput {
+  totalAmount: number
+  amountPaid: number
+  depositAmount: number
+}
+export interface InvoiceDue {
+  depositRemaining: number              // deposit not yet covered
+  balanceRemaining: number              // total not yet covered
+  amountDueNow: number                  // deposit portion first, then the balance
+  nextPaymentKind: 'deposit' | 'balance' | 'none'
+  depositPaid: boolean                  // deposit fully covered (true when there's no deposit)
+  fullyPaid: boolean
+}
+export function computeInvoiceDue(i: InvoiceDueInput): InvoiceDue {
+  const round2 = (n: number) => Math.round(n * 100) / 100
+  const EPS = 0.005
+  const balanceRemaining = round2(Math.max(0, i.totalAmount - i.amountPaid))
+  const depositRemaining = round2(Math.max(0, i.depositAmount - i.amountPaid))
+  const fullyPaid = balanceRemaining <= EPS
+  const depositPaid = i.depositAmount <= EPS || i.amountPaid >= i.depositAmount - EPS
+  let amountDueNow: number
+  let nextPaymentKind: 'deposit' | 'balance' | 'none'
+  if (fullyPaid) { amountDueNow = 0; nextPaymentKind = 'none' }
+  else if (depositRemaining > EPS) { amountDueNow = depositRemaining; nextPaymentKind = 'deposit' }
+  else { amountDueNow = balanceRemaining; nextPaymentKind = 'balance' }
+  return { depositRemaining, balanceRemaining, amountDueNow, nextPaymentKind, depositPaid, fullyPaid }
+}
+
+// business_bookable_services.recurrence CHECK enum (S511, Business #8). Cadence a
+// self-booking customer is enrolled into. Recurring services fix a day of week
+// (owner-set) and create a recurring_schedule on booking; one_time books a single
+// appointment.
+export const BOOKABLE_SERVICE_RECURRENCES = ['one_time', 'weekly', 'biweekly', 'monthly'] as const
+export type BookableServiceRecurrence = typeof BOOKABLE_SERVICE_RECURRENCES[number]
+export const BOOKABLE_SERVICE_RECURRENCE_LABEL: Record<BookableServiceRecurrence, string> = {
+  one_time: 'One-time',
+  weekly:   'Weekly',
+  biweekly: 'Every 2 weeks',
+  monthly:  'Every 4 weeks',
+}
+// Display helper: turn a code-style service_type ('trash_pickup') into a human
+// label ('Trash pickup'). Leaves already-spaced free text untouched. Shared so
+// the appointments UI, the public booking page, and the ICS feed all agree.
+export function humanizeServiceType(s: string): string {
+  if (!s || s.includes(' ')) return s
+  const spaced = s.replace(/[_-]+/g, ' ')
+  return spaced.charAt(0).toUpperCase() + spaced.slice(1)
+}
+
+// rrule BYDAY codes indexed by JS getDay() (0=Sun .. 6=Sat).
+export const RRULE_WEEKDAY_CODES = ['SU', 'MO', 'TU', 'WE', 'TH', 'FR', 'SA'] as const
+export const WEEKDAY_LABEL = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
+// Build the rrule for a recurring bookable service (null for one_time). Every
+// recurring cadence is weekly-frequency on the owner's fixed weekday; biweekly
+// and monthly just widen the interval (2 / 4 weeks) so "owner fixes the day" holds.
+export function bookableServiceRrule(
+  recurrence: BookableServiceRecurrence,
+  dayOfWeek: number,
+): string | null {
+  if (recurrence === 'one_time') return null
+  const interval = recurrence === 'weekly' ? 1 : recurrence === 'biweekly' ? 2 : 4
+  const code = RRULE_WEEKDAY_CODES[dayOfWeek] ?? 'MO'
+  return `FREQ=WEEKLY;INTERVAL=${interval};BYDAY=${code}`
+}
+
 // generated_routes.status enum (S462 / Phase 1a.3).
 export const GENERATED_ROUTE_STATUSES = [
   'generated',
@@ -946,6 +1130,52 @@ export const UNIT_TYPE_HAS_BEDROOMS: Record<UnitType, boolean> = {
   mobile_home:   true,
   storage:       false,
   commercial:    false,
+}
+
+// Single source of truth for units.rv_site_layout / unit_bookings.required_site_layout
+// CHECK constraints. RV sites differ by how a rig pulls in: a pull-through lets
+// you drive straight through (no reversing, easy for big rigs/trailers), a
+// back-in requires reversing. 'none' = not an RV site / no preference. A
+// reservation can require a specific layout; staff are WARNED (not blocked) when
+// a move/edit would put it on a mismatched site (Nic 2026-06-27).
+export const RV_SITE_LAYOUTS = ['none', 'back_in', 'pull_through'] as const
+export type RvSiteLayout = typeof RV_SITE_LAYOUTS[number]
+export const RV_SITE_LAYOUT_LABEL: Record<RvSiteLayout, string> = {
+  none:         'Not specified',
+  back_in:      'Back-in',
+  pull_through: 'Pull-through',
+}
+/** True when a required layout is set and the target site's layout doesn't match.
+ *  'none' on either side is treated as "no constraint" → never a mismatch. */
+export function isSiteLayoutMismatch(required: string | null | undefined, actual: string | null | undefined): boolean {
+  if (!required || required === 'none') return false
+  if (!actual || actual === 'none') return true
+  return required !== actual
+}
+
+// Single source of truth for units.rv_amp_service / unit_bookings.required_amp_service
+// CHECK constraints. RV electrical pedestals provide 30-amp service, 50-amp
+// service, or BOTH simultaneously. A rig needs a specific amperage; a 50-amp rig
+// can't draw from a 30-amp-only pedestal (and vice versa). Owner sets the unit's
+// service; a reservation can require an amperage; staff are WARNED (not blocked)
+// on a mismatched move/edit (same posture as site layout — Nic 2026-06-27).
+// 'none' = not an RV site / unspecified. 'both' on the UNIT satisfies either.
+export const RV_AMP_SERVICES = ['none', '30', '50', 'both'] as const
+export type RvAmpService = typeof RV_AMP_SERVICES[number]
+export const RV_AMP_SERVICE_LABEL: Record<RvAmpService, string> = {
+  none: 'Not specified',
+  '30': '30 amp',
+  '50': '50 amp',
+  both: '30 & 50 amp',
+}
+/** True when a required amperage is set and the unit can't supply it.
+ *  A unit set to 'both' supplies either; 'none'/unset on the unit can't be
+ *  guaranteed → mismatch. 'none' required = no constraint → never a mismatch. */
+export function isAmpServiceMismatch(required: string | null | undefined, actual: string | null | undefined): boolean {
+  if (!required || required === 'none') return false
+  if (actual === 'both') return false
+  if (!actual || actual === 'none') return true
+  return required !== actual
 }
 
 export enum PropertyType {
@@ -1580,6 +1810,62 @@ export const FEE_TYPES: readonly FeeType[] = [
 export type FeeDueTiming = 'move_in' | 'monthly_ongoing' | 'move_out' | 'other'
 export const FEE_DUE_TIMINGS: readonly FeeDueTiming[] = ['move_in', 'monthly_ongoing', 'move_out', 'other'] as const
 
+// Work-trade (Landlord #29, locked 2026-06-26). Rent is traded as a PERCENT
+// of hours worked: each verified hour is worth 1/target of the TOTAL monthly
+// invoice (rent + utilities + fees), so a full target month = 100% covered.
+// The target is a per-property setting (properties.work_trade_hours_target);
+// this is the default applied to new/legacy properties.
+export const DEFAULT_WORK_TRADE_HOURS_TARGET = 80
+
+// Public per-property booking sites (Walkthrough #11 + booking-sites, Nic
+// 2026-06-26). The public site books short-term stays only; guests pay a
+// deposit at booking. A full unit/date routes guests to the waitlist.
+export const PUBLIC_BOOKING_STAY_TYPES = ['nightly', 'weekly'] as const
+export type PublicBookingStayType = typeof PUBLIC_BOOKING_STAY_TYPES[number]
+
+export const UNIT_BOOKING_WAITLIST_STATUSES = ['waiting', 'notified', 'claimed', 'expired', 'cancelled'] as const
+export type UnitBookingWaitlistStatus = typeof UNIT_BOOKING_WAITLIST_STATUSES[number]
+
+// Master Schedule change-history (Walkthrough #10).
+export const UNIT_BOOKING_EVENT_TYPES = ['created', 'moved', 'dates_changed', 'status_changed', 'cancelled'] as const
+export type UnitBookingEventType = typeof UNIT_BOOKING_EVENT_TYPES[number]
+
+// Master Schedule stay pricing (Nic 2026-06-27). The rate tier is implied by
+// the length of stay and prorated for odd lengths; short-term stays add a
+// lodging tax, 30+ nights are tax-exempt.
+//   < 7 nights  → nightly × nights
+//   7–29 nights → weekly  × nights/7   (a 10-night stay = weekly + 3/7·weekly)
+//   ≥ 30 nights → monthly × nights/30  (32 nights = monthly + 2/30·monthly), NO tax
+// Each tier falls back to whatever rate is configured if its own is unset.
+export interface StayRates { nightly?: number | null; weekly?: number | null; monthly?: number | null }
+export interface StayPrice { base: number; tax: number; total: number; tier: 'nightly' | 'weekly' | 'monthly'; taxable: boolean }
+
+export function computeStayPrice(rates: StayRates, taxRatePct: number, nights: number): StayPrice {
+  const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100
+  if (nights <= 0) return { base: 0, tax: 0, total: 0, tier: 'nightly', taxable: false }
+  const nightly = rates.nightly != null ? Number(rates.nightly) : null
+  const weekly  = rates.weekly  != null ? Number(rates.weekly)  : null
+  const monthly = rates.monthly != null ? Number(rates.monthly) : null
+
+  let base = 0
+  let tier: 'nightly' | 'weekly' | 'monthly' = 'nightly'
+  if (nights >= 30 && monthly != null)      { base = monthly * nights / 30; tier = 'monthly' }
+  else if (nights >= 7 && weekly != null)   { base = weekly  * nights / 7;  tier = 'weekly' }
+  else if (nightly != null)                 { base = nightly * nights;      tier = 'nightly' }
+  // graceful fallbacks when the preferred-tier rate isn't configured
+  else if (monthly != null)                 { base = monthly * nights / 30; tier = 'monthly' }
+  else if (weekly != null)                  { base = weekly  * nights / 7;  tier = 'weekly' }
+
+  base = round2(base)
+  const taxable = nights < 30
+  const tax = taxable ? round2(base * (taxRatePct / 100)) : 0
+  return { base, tax, total: round2(base + tax), tier, taxable }
+}
+
+// How long a promoted waitlister has to claim before it rolls to the next
+// person (Nic: short on purpose — high-demand next-day stays).
+export const WAITLIST_CLAIM_WINDOW_MINUTES = 60
+
 // Per-fee-type metadata: default refundability + default timing.
 // Landlord can override at review page; these are starting values.
 export interface FeeTypeMeta {
@@ -2182,9 +2468,39 @@ export const PLATFORM_FEES = {
   FLOAT_FEE_MO:    20.00,     // SSI/SSDI opt-in service fee
   REINSTATEMENT:   25.00,     // After FlexDeposit default
   BG_CHECK_NET:    15.00,     // Platform nets $15, applicant pays $40
-  MAINTENANCE_PCT: 0.08,      // 8% of job value
+  MAINTENANCE_PCT: 0.03,      // 3% of job value — reserved for the future on-platform
+                              // contractor marketplace (Angi competitor). NOT billed
+                              // today; never charged to the landlord, who pays only
+                              // actual maintenance cost. Kept out of all landlord surfaces.
   DEPOSIT_XFER:    15.00,     // Deposit transfer between GAM properties
 } as const
+
+// Live launch platform-fee model (S113 pricing). The PLATFORM_FEES
+// ACTIVE_UNIT (15) / DIRECT_PAY_UNIT (5) tiers above are the pre-launch
+// model still referenced by the admin income calc + reserve math; the
+// LIVE landlord-facing fee is a flat $2 per OCCUPIED unit (vacant units
+// free) with a $10/property monthly minimum. The landlord Dashboard +
+// Settings already show these numbers; this is their single source so
+// Reports (S512 #20) reconciles. Retiring ACTIVE_UNIT/DIRECT_PAY_UNIT in
+// the admin income calc is tracked as walkthrough #34 (backend TODO).
+export const LAUNCH_PLATFORM_FEE = {
+  PER_OCCUPIED_UNIT: 2.00,
+  PROPERTY_MIN_MO:   10.00,
+  VACANT_UNIT:       0.00,
+} as const
+
+/**
+ * Monthly GAM platform fee for one property under the live model:
+ * $2 × occupied units, floored at the $10 PER-PROPERTY MINIMUM — full stop.
+ * Every property is charged at least $10/month whether or not any unit is
+ * occupied (the minimum is for having the property on the platform). Authoritative
+ * per-property billing (incl. short-stay nights) lives in
+ * services/platformFee.ts → platformFeesByProperty; this is the simple
+ * occupied-unit form used where only an occupied count is known.
+ */
+export function launchPlatformFeeForProperty(occupiedUnits: number): number {
+  return Math.max(occupiedUnits * LAUNCH_PLATFORM_FEE.PER_OCCUPIED_UNIT, LAUNCH_PLATFORM_FEE.PROPERTY_MIN_MO)
+}
 
 export const RESERVE_CONFIG = {
   PHASE1_MAX:      1000,
@@ -2196,25 +2512,34 @@ export const RESERVE_CONFIG = {
   DEFAULT_RATE:    0.03,
 } as const
 
-// FlexDeposit tier matrix (S246). Larger deposits get FEWER
-// installments to minimize GAM's outstanding float exposure — GAM
-// can't pursue tenants for damages, so the higher the dollar amount
-// fronted, the faster GAM wants it recovered.
-//   $0 – $1000     → 4 installments max
-//   $1001 – $2000  → 3 installments max
-//   $2001+         → 2 installments max
+// FlexDeposit tier matrix (S246; re-tiered S514 to the 2–6 range the live
+// Consumer ToS § 9.1.1 discloses). Under the custody model GAM advances/
+// floats NOTHING, so there is no GAM exposure to cap — the only thing that
+// matters is tenant affordability. BIGGER deposits get MORE installments
+// (they are the ones that need spreading); a small deposit is affordable in
+// fewer payments.
+//   $0 – $500      → 2 installments max
+//   $501 – $1000   → 3 installments max
+//   $1001 – $1500  → 4 installments max
+//   $1501 – $2000  → 5 installments max
+//   $2001+         → 6 installments max
 // The risk_level from the Checkr BG report further constrains:
 //   low risk      → max for the band
 //   medium risk   → max − 1 (floor 2)
 //   high+         → 2 only
 export const FLEX_DEPOSIT_TIERS = [
-  { maxDeposit: 1000,    maxInstallments: 4 },
-  { maxDeposit: 2000,    maxInstallments: 3 },
-  { maxDeposit: Infinity, maxInstallments: 2 },
+  { maxDeposit: 500,     maxInstallments: 2 },
+  { maxDeposit: 1000,    maxInstallments: 3 },
+  { maxDeposit: 1500,    maxInstallments: 4 },
+  { maxDeposit: 2000,    maxInstallments: 5 },
+  { maxDeposit: Infinity, maxInstallments: 6 },
 ] as const
 
-export const FLEX_DEPOSIT_CUSTODY_FEE = 3       // $/month while on platform
-export const FLEX_DEPOSIT_NSF_COOLDOWN_DAYS = 60
+export const FLEX_DEPOSIT_CUSTODY_FEE = 3       // $/month while GAM holds the deposit in custody
+// S514: the 60-day NSF cooldown was removed with the advance/default model.
+// Under the custody model (Consumer ToS § 9.1.5) a missed installment only
+// leaves the deposit under-funded; re-enrollment restriction is "until
+// current," not a fixed cooldown. See getFlexDepositEligibility.
 
 // FlexCharge (S252+). Consolidated POS charge-account with monthly
 // statement + 1.5% service fee on the cycle balance. No interest;

@@ -108,12 +108,8 @@ function App() {
   const [filtered, setFiltered] = useState<any[]>([])
   const [loading, setLoading] = useState(true)
   const [selected, setSelected] = useState<any>(null)
-  const [applying, setApplying] = useState<any>(null) // unit or null for general
   const [search, setSearch] = useState({ city: '', maxRent: '', beds: '' })
-  const [submitted, setSubmitted] = useState(false)
-  const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState('')
-  const [form, setForm] = useState({ firstName: '', lastName: '', email: '', phone: '', password: '', confirmPassword: '' })
 
   useEffect(() => {
     axios.get(`${API}/api/public/properties/listings`)
@@ -129,31 +125,6 @@ function App() {
     if (search.beds) f = f.filter(l => +l.bedrooms >= +search.beds)
     setFiltered(f)
   }, [search, listings])
-
-  const submitApp = async (e: React.FormEvent) => {
-    e.preventDefault()
-    setSubmitting(true); setError('')
-    try {
-      const res = await axios.post(`${API}/api/auth/register-prospect`, {
-        firstName: form.firstName,
-        lastName: form.lastName,
-        email: form.email,
-        password: form.password,
-        phone: form.phone || null,
-        unitId: applying?.general ? null : applying?.id || null,
-        landlordId: applying?.landlordId || null,
-      })
-      const { token } = res.data.data
-      // Store token and redirect to tenant portal background check
-      localStorage.setItem('gam_prospect_token', token)
-      window.location.href = `${TENANT_URL}/accept-invite?token=${token}&unit=${applying?.id || ''}`
-    } catch (ex: any) {
-      setError(ex.response?.data?.error || 'Submission failed. Please try again.')
-    } finally { setSubmitting(false) }
-  }
-
-  const f = (k: string) => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>) =>
-    setForm(p => ({ ...p, [k]: e.target.value }))
 
   return (
     <>
@@ -261,46 +232,6 @@ function App() {
         </div>
       )}
 
-      {/* APPLICATION MODAL */}
-      {applying && (
-        <div className="app-overlay" onClick={e => { if (e.target === e.currentTarget) { setApplying(null); setSubmitted(false); setForm({ firstName: '', lastName: '', email: '', phone: '', password: '', confirmPassword: '' }) } }}>
-          <div className="app-modal">
-            <h2>{applying.general ? 'General Rental Application' : `Apply — Unit ${applying.unitNumber}`}</h2>
-            <p>{applying.general ? 'No specific unit in mind? Submit a general application and a landlord will reach out.' : `${applying.propertyName} · ${applying.street1}, ${applying.city} · ${formatCurrency(+applying.rentAmount)}/mo`}</p>
-
-            {submitted ? (
-              <div>
-                <div className="alert alert-success">✅ Application submitted! A landlord will reach out to you within 1-2 business days.</div>
-                <button className="btn-primary" style={{ width: '100%' }} onClick={() => { setApplying(null); setSubmitted(false) }}>Done</button>
-              </div>
-            ) : (
-              <form onSubmit={submitApp}>
-                {error && <div className="alert alert-error">{error}</div>}
-                <div style={{padding:'10px 14px',background:'#f0f7ff',border:'1px solid #bdd7f5',borderRadius:8,fontSize:'.78rem',color:'#1d4e89',marginBottom:14}}>
-                  Create your account to start the background check process. You'll be redirected to complete your application.
-                </div>
-                <div className="frow2">
-                  <div><label>First Name</label><input value={form.firstName} onChange={f('firstName')} required /></div>
-                  <div><label>Last Name</label><input value={form.lastName} onChange={f('lastName')} required /></div>
-                </div>
-                <div className="frow"><label>Email</label><input type="email" value={form.email} onChange={f('email')} required /></div>
-                <div className="frow"><label>Phone (optional)</label><input type="tel" value={form.phone} onChange={f('phone')} /></div>
-                <div className="frow2">
-                  <div><label>Password</label><input type="password" value={form.password} onChange={f('password')} required minLength={8} /></div>
-                  <div><label>Confirm Password</label><input type="password" value={form.confirmPassword} onChange={f('confirmPassword')} required /></div>
-                </div>
-                {form.password && form.confirmPassword && form.password !== form.confirmPassword && (
-                  <div style={{fontSize:'.75rem',color:'var(--red)',marginBottom:8}}>Passwords do not match</div>
-                )}
-                <div className="factions">
-                  <button type="button" className="btn-secondary" onClick={() => { setApplying(null); setSubmitted(false) }}>Cancel</button>
-                  <button type="submit" className="btn-primary" disabled={submitting||!form.password||form.password!==form.confirmPassword} style={{ padding: '10px 28px' }}>{submitting ? 'Creating account…' : 'Create Account & Apply →'}</button>
-                </div>
-              </form>
-            )}
-          </div>
-        </div>
-      )}
     </>
   )
 }

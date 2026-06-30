@@ -18,7 +18,7 @@ import { logger } from '../lib/logger'
 const PORTAL_TOKEN_TTL_DAYS = 180
 
 export function customerPortalUrl(token: string): string {
-  const base = process.env.MARKETING_URL || 'http://localhost:3004'
+  const base = process.env.CUSTOMER_PORTAL_URL || 'http://localhost:3014'
   return `${base}/account/${token}`
 }
 

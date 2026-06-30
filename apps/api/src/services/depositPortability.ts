@@ -289,11 +289,13 @@ export async function executeDepositPortability(args: {
     const dep = await client.query<{
       id: string; tenant_id: string; lease_id: string; unit_id: string;
       portability_status: string; portability_target_lease_id: string | null;
-      held_by: string; total_amount: string;
+      held_by: string; total_amount: string; collected_amount: string;
+      flex_deposit_enabled: boolean;
     }>(
       `SELECT id, tenant_id, lease_id, unit_id,
               portability_status, portability_target_lease_id,
-              held_by, total_amount::text
+              held_by, total_amount::text, collected_amount::text,
+              flex_deposit_enabled
          FROM security_deposits
         WHERE id = $1
         FOR UPDATE`,
@@ -311,11 +313,24 @@ export async function executeDepositPortability(args: {
       throw new AppError(500, 'Authorized but no target lease set')
     }
 
-    // Confirm target lease is still valid
-    const target = await client.query<{ id: string; unit_id: string }>(
-      `SELECT l.id, l.unit_id
+    // Confirm target lease is still valid + read its own (S515-created)
+    // deposit row so we can merge into it rather than leave a duplicate.
+    const target = await client.query<{
+      id: string; unit_id: string;
+      target_dep_id: string | null; required: string | null; target_touched: boolean;
+    }>(
+      `SELECT l.id, l.unit_id,
+              td.id AS target_dep_id,
+              td.total_amount::text AS required,
+              COALESCE(td.flex_deposit_enabled OR td.collected_amount > 0, false) AS target_touched
          FROM leases l
          JOIN lease_tenants lt ON lt.lease_id = l.id
+         LEFT JOIN LATERAL (
+           SELECT id, total_amount, flex_deposit_enabled, collected_amount
+             FROM security_deposits
+            WHERE lease_id = l.id
+            ORDER BY created_at DESC LIMIT 1
+         ) td ON TRUE
         WHERE l.id = $1
           AND lt.tenant_id = $2
           AND lt.status = 'active'
@@ -334,18 +349,96 @@ export async function executeDepositPortability(args: {
     const willConvertToEscrow = dep.held_by === 'landlord'
     const nextStatus = willConvertToEscrow ? 'pending_transfer' : 'carried_forward'
 
+    // Required deposit at the target = its own row's amount (S515), falling
+    // back to the carried amount (no increase) when the target has no row.
+    const requiredAmount = target.required != null
+      ? Number(target.required)
+      : Number(dep.total_amount)
+
+    // Remove the target lease's own untouched deposit row so the carried
+    // (funded) row becomes the canonical deposit for the target lease — no
+    // duplicate, no double-charge. Never delete a touched target row.
+    if (target.target_dep_id && target.target_dep_id !== dep.id && !target.target_touched) {
+      await client.query(`DELETE FROM security_deposits WHERE id = $1`, [target.target_dep_id])
+    }
+
+    // Re-point the carried row onto the target lease, set its required amount.
     await client.query(
       `UPDATE security_deposits
           SET lease_id            = $1,
               unit_id             = $2,
               held_by             = 'gam_escrow',
               portability_status  = $3,
+              total_amount        = $4,
               updated_at          = NOW()
-        WHERE id = $4`,
-      [target.id, target.unit_id, nextStatus, args.depositId],
+        WHERE id = $5`,
+      [target.id, target.unit_id, nextStatus, requiredAmount.toFixed(2), args.depositId],
     )
 
+    // Custody-fee + funding state — only for gam_escrow (FlexDeposit custody)
+    // deposits. (Landlord-held funds are still pending an admin sweep.)
+    let topUpOwed = 0
+    if (!willConvertToEscrow) {
+      const collected = Number(dep.collected_amount)
+      const difference = Math.round((requiredAmount - collected) * 100) / 100
+      if (difference <= 0) {
+        // Fully funded by the carry-forward → ToS § 9.1.6: custody fee dissolves.
+        await client.query(
+          `UPDATE security_deposits
+              SET status = 'funded',
+                  flex_deposit_plan_status = CASE WHEN flex_deposit_enabled
+                                                  THEN 'completed' ELSE flex_deposit_plan_status END,
+                  installments_remaining = 0,
+                  next_installment_date  = NULL,
+                  custody_fee_active     = FALSE,
+                  updated_at             = NOW()
+            WHERE id = $1`,
+          [args.depositId],
+        )
+      } else {
+        // Larger deposit at the new property → a top-up is owed. The deposit
+        // stays under-funded; custody fee continues. For a FlexDeposit, spread
+        // the difference into installments the cron auto-collects (option 1,
+        // fee stays); the tenant may pay it off via pay-ahead (option 2, fee
+        // stops). For a non-FlexDeposit gam_escrow deposit, just flag it.
+        topUpOwed = difference
+        if (dep.flex_deposit_enabled) {
+          await client.query(
+            `UPDATE security_deposits
+                SET status = 'partial', flex_deposit_plan_status = 'active',
+                    custody_fee_active = TRUE, updated_at = NOW()
+              WHERE id = $1`,
+            [args.depositId],
+          )
+          const { scheduleFlexDepositTopUp } = await import('./flexDeposit')
+          await scheduleFlexDepositTopUp(client, { depositId: args.depositId, topUpAmount: difference })
+        } else {
+          await client.query(
+            `UPDATE security_deposits
+                SET status = 'partial', custody_fee_active = TRUE, updated_at = NOW()
+              WHERE id = $1`,
+            [args.depositId],
+          )
+        }
+      }
+    }
+
     await client.query('COMMIT')
+
+    if (topUpOwed > 0) {
+      try {
+        const { createAdminNotification } = await import('./adminNotifications')
+        await createAdminNotification({
+          severity: 'info',
+          category: 'deposit_portability_topup_owed',
+          title:    `FlexDeposit forward — top-up of $${topUpOwed.toFixed(2)} scheduled — tenant ${dep.tenant_id}`,
+          body:     `Deposit ${args.depositId} carried forward to lease ${target.id}; the new property's required deposit is $${topUpOwed.toFixed(2)} more than the carried balance. ${dep.flex_deposit_enabled ? 'Top-up installments scheduled (auto-collected monthly); the tenant may pay it off early via pay-ahead, which stops the custody fee.' : 'Custody fee continues until funded.'}`,
+          context:  { deposit_id: args.depositId, tenant_id: dep.tenant_id, new_lease_id: target.id, top_up_owed: topUpOwed },
+        })
+      } catch (e) {
+        logger.error({ err: e }, '[deposit-portability][topup-alert]')
+      }
+    }
 
     // Admin alert outside tx for the landlord-held case
     if (willConvertToEscrow) {

@@ -82,8 +82,8 @@ export async function processAchRetries(): Promise<RetryResult> {
     scanned: 0, fired: 0, succeeded: 0, failed: 0, errors: [],
   }
 
-  const due = await query<{ id: string; stripe_payment_intent_id: string; retry_count: number }>(
-    `SELECT id, stripe_payment_intent_id, retry_count
+  const due = await query<{ id: string; stripe_payment_intent_id: string; retry_count: number; entry_description: string | null }>(
+    `SELECT id, stripe_payment_intent_id, retry_count, entry_description
        FROM payments
       WHERE status = 'failed'
         AND next_retry_at IS NOT NULL
@@ -112,6 +112,30 @@ export async function processAchRetries(): Promise<RetryResult> {
     )
     if (claimed.length === 0) continue  // Lost the race; skip
     result.fired++
+
+    // FlexPay re-prices the cycle on retry (Consumer ToS § 4.1/4.2): the fee
+    // recalculates to the retry day and the bounced attempt's ACH-return fee
+    // passes through. This updates the PI amount BEFORE we confirm it. If the
+    // reprice fails, skip the confirm (don't pull a stale amount) and alert.
+    if (pmt.entry_description === 'FLEXPAY') {
+      try {
+        const { repriceFlexPayRetryPayment } = await import('./flexpay')
+        await repriceFlexPayRetryPayment(pmt.id)
+      } catch (e: any) {
+        result.failed++
+        const errMsg = e?.message ?? String(e)
+        result.errors.push({ payment_id: pmt.id, error: errMsg })
+        logger.error({ err: errMsg }, `[ach-retry] flexpay reprice failed for payment ${pmt.id}`)
+        await createAdminNotification({
+          severity: 'warn',
+          category: 'flexpay_reprice_failure',
+          title:    `FlexPay retry reprice failed for payment ${pmt.id}`,
+          body:     errMsg,
+          context:  { payment_id: pmt.id, stripe_payment_intent_id: pmt.stripe_payment_intent_id },
+        })
+        continue  // skip the confirm — don't re-pull the original (wrong) amount
+      }
+    }
 
     try {
       await stripe.paymentIntents.confirm(pmt.stripe_payment_intent_id)

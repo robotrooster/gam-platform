@@ -100,6 +100,34 @@ describe('POST /', () => {
     expect(res.body.data.next_due_date.slice(0, 10)).toBe('2026-06-15')
   })
 
+  it('creates a quarterly schedule (month-based, anchors to day_of_month)', async () => {
+    const f = await seedFixture()
+    const res = await request(buildApp())
+      .post('/api/business-recurring-invoices')
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send(validMonthlyBody(f.customerId, {
+        frequency: 'quarterly', dayOfMonth: 10, startDate: '2026-06-01', name: 'Quarterly service',
+      }))
+    expect(res.status).toBe(201)
+    expect(res.body.data.frequency).toBe('quarterly')
+    expect(res.body.data.day_of_month).toBe(10)
+    expect(res.body.data.day_of_week).toBeNull()
+    // First due seeds on the first day_of_month on/after start (same as monthly).
+    expect(res.body.data.next_due_date.slice(0, 10)).toBe('2026-06-10')
+  })
+
+  it('annual schedule carrying dayOfWeek → 400 (discriminated union rejects)', async () => {
+    const f = await seedFixture()
+    const res = await request(buildApp())
+      .post('/api/business-recurring-invoices')
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send({
+        customerId: f.customerId, name: 'X', frequency: 'annual', dayOfWeek: 3,
+        startDate: '2026-06-01', lines: [{ description: 'Y', quantity: 1, unitPrice: 10 }],
+      })
+    expect(res.status).toBe(400)
+  })
+
   it('creates a weekly schedule with next due on the chosen weekday', async () => {
     const f = await seedFixture()
     const res = await request(buildApp())
@@ -196,6 +224,30 @@ describe('POST /:id/generate-now', () => {
          FROM business_invoices WHERE id = $1`, [res.body.data.id])
     expect(inv.source_recurring_schedule_id).toBe(c.body.data.id)
     expect(Number(inv.total_amount)).toBeCloseTo(150)
+  })
+
+  it('quarterly: bumps next_due_date by exactly 3 months', async () => {
+    const f = await seedFixture()
+    const c = await request(buildApp())
+      .post('/api/business-recurring-invoices')
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+      .send(validMonthlyBody(f.customerId, {
+        frequency: 'quarterly', dayOfMonth: 15, autoSend: false, name: 'Quarterly',
+      }))
+    // Park next_due in-range on a known date so the +3-month step is exact.
+    await db.query(
+      `UPDATE business_recurring_invoice_schedules
+          SET next_due_date = '2026-06-15' WHERE id = $1`, [c.body.data.id])
+
+    const res = await request(buildApp())
+      .post(`/api/business-recurring-invoices/${c.body.data.id}/generate-now`)
+      .set('Authorization', `Bearer ${f.ownerToken}`)
+    expect(res.status).toBe(200)
+
+    const { rows: [s] } = await db.query<{ next_due_date: string }>(
+      `SELECT next_due_date::text FROM business_recurring_invoice_schedules WHERE id = $1`,
+      [c.body.data.id])
+    expect(s.next_due_date.slice(0, 10)).toBe('2026-09-15')
   })
 
   it('weekly: bumps next_due_date by exactly 7 days', async () => {

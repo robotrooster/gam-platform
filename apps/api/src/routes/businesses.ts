@@ -174,6 +174,7 @@ businessesRouter.get('/me', requireAuth, async (req, res, next) => {
               public_booking_enabled, public_booking_slug,
               public_booking_intro, business_hours,
               appointment_reminders_enabled,
+              service_seconds_per_unit, service_unit_label,
               onboarding_completed_at,
               created_at, updated_at
          FROM businesses
@@ -318,6 +319,9 @@ const patchMeSchema = z.object({
   ])).optional(),
   // S502 — opt out of automated 24h appointment reminders.
   appointmentRemindersEnabled: z.boolean().optional(),
+  // S510 — per-unit service time (route efficiency).
+  serviceSecondsPerUnit: z.number().int().min(0).max(86400).optional(),
+  serviceUnitLabel:      z.string().min(1).max(30).optional(),
 }).strict()  // refuses unknown keys (status flip is the admin route)
 
 // PATCH /api/businesses/me — update mutable fields for the owner's business
@@ -356,7 +360,9 @@ businessesRouter.patch('/me', requireAuth, async (req, res, next) => {
               public_booking_slug    = COALESCE($16, public_booking_slug),
               public_booking_intro   = COALESCE($17, public_booking_intro),
               business_hours         = COALESCE($18, business_hours),
-              appointment_reminders_enabled = COALESCE($19, appointment_reminders_enabled)
+              appointment_reminders_enabled = COALESCE($19, appointment_reminders_enabled),
+              service_seconds_per_unit = COALESCE($20, service_seconds_per_unit),
+              service_unit_label       = COALESCE($21, service_unit_label)
         WHERE owner_user_id = $12
           AND status IN ('active', 'suspended')`,
       [
@@ -379,6 +385,8 @@ businessesRouter.patch('/me', requireAuth, async (req, res, next) => {
         patch.publicBookingIntro === undefined ? null : (patch.publicBookingIntro?.trim() ?? null),
         patch.businessHours ? JSON.stringify(patch.businessHours) : null,
         patch.appointmentRemindersEnabled ?? null,
+        patch.serviceSecondsPerUnit ?? null,
+        patch.serviceUnitLabel ?? null,
       ])
     const biz = await queryOne<any>(
       `SELECT id, name, business_type, email, phone,
@@ -387,7 +395,8 @@ businessesRouter.patch('/me', requireAuth, async (req, res, next) => {
               default_tax_rate, tax_label,
               public_booking_enabled, public_booking_slug,
               public_booking_intro, business_hours,
-              appointment_reminders_enabled
+              appointment_reminders_enabled,
+              service_seconds_per_unit, service_unit_label
          FROM businesses
         WHERE owner_user_id = $1
           AND status IN ('active', 'suspended')

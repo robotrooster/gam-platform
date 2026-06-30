@@ -204,7 +204,7 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
                 {[
                   { value: 'vacant', label: 'Vacant', desc: 'No tenant, $0 charge', color: 'var(--text-3)' },
-                  { value: 'active', label: 'Active', desc: 'Occupied, On-Time Pay', color: 'var(--green)' },
+                  { value: 'active', label: 'Active', desc: 'Occupied, rent collected', color: 'var(--green)' },
                   { value: 'direct_pay', label: 'Direct Pay', desc: 'Tenant pays landlord', color: 'var(--blue)' },
                 ].map(s => (
                   <div

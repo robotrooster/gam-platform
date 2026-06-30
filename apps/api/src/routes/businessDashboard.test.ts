@@ -230,14 +230,14 @@ describe('AR aging', () => {
     const a = res.body.data.ar_aging
     expect(a.current.count).toBe(1)
     expect(Number(a.current.amount)).toBeCloseTo(100)
-    expect(a.d1_30.count).toBe(1)
-    expect(Number(a.d1_30.amount)).toBeCloseTo(200)
-    expect(a.d31_60.count).toBe(1)
-    expect(Number(a.d31_60.amount)).toBeCloseTo(300)
-    expect(a.d61_90.count).toBe(1)
-    expect(Number(a.d61_90.amount)).toBeCloseTo(400)
-    expect(a.over90.count).toBe(1)
-    expect(Number(a.over90.amount)).toBeCloseTo(500)
+    expect(a.d1to30.count).toBe(1)
+    expect(Number(a.d1to30.amount)).toBeCloseTo(200)
+    expect(a.d31to60.count).toBe(1)
+    expect(Number(a.d31to60.amount)).toBeCloseTo(300)
+    expect(a.d61to90.count).toBe(1)
+    expect(Number(a.d61to90.amount)).toBeCloseTo(400)
+    expect(a.d90plus.count).toBe(1)
+    expect(Number(a.d90plus.amount)).toBeCloseTo(500)
   })
 
   it('partially-paid invoice owed = total - amount_paid', async () => {
@@ -273,7 +273,7 @@ describe('AR aging', () => {
       .get('/api/business-dashboard/overview')
       .set('Authorization', `Bearer ${f.ownerToken}`)
     const a = res.body.data.ar_aging
-    const total = [a.current, a.d1_30, a.d31_60, a.d61_90, a.over90]
+    const total = [a.current, a.d1to30, a.d31to60, a.d61to90, a.d90plus]
       .reduce((s, b) => s + Number(b.amount), 0)
     expect(total).toBe(0)
   })
@@ -421,7 +421,7 @@ describe('Cross-business isolation', () => {
     const res = await request(buildApp())
       .get('/api/business-dashboard/overview')
       .set('Authorization', `Bearer ${a.ownerToken}`)
-    const total = ['current', 'd1_30', 'd31_60', 'd61_90', 'over90']
+    const total = ['current', 'd1to30', 'd31to60', 'd61to90', 'd90plus']
       .reduce((s, k) => s + Number(res.body.data.ar_aging[k].amount), 0)
     expect(total).toBe(0)
   })

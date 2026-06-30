@@ -160,14 +160,31 @@ Plus "Forgot password?" link added to LoginPage.
 
 ---
 
-## 6. Legal documents (ToS + Privacy Policy)
+## 6. Legal documents (ToS + Privacy Policy) — BUILT (counsel review still pending)
 
-**Status: Nic said we draft these together when ready, no
-attorney.**
+**Status (S517 recon): the surface + gate are SHIPPED.** Verified
+already in the codebase:
+- Four legal pages render live from the `legal/*.md` docs via the
+  marketing server (`apps/marketing/server.js`): `/consumer/terms`,
+  `/consumer/privacy`, `/business/terms`, `/business/privacy`, plus an
+  audience picker at bare `/terms` + `/privacy`. All four render clean.
+- ToS split into business vs consumer tracks (per `TOS_LEGAL_REVIEW.md`).
+- Signup acceptance gate wired front + back: landlord `RegisterPage` +
+  tenant `AcceptInvitePage` carry the acceptance checkbox + deep-link to
+  the audience-correct docs; `auth.ts /register` requires
+  `acceptedTerms: z.literal(true)` and stamps `users.accepted_tos_at` +
+  `accepted_privacy_at` (tenant accept stamps them too).
 
-Pre-launch, GAM needs Terms of Service + Privacy Policy on
-the marketing site + a signup acceptance gate so users agree
-on registration.
+**Real residuals (NOT code):**
+- **Counsel review** — `TOS_LEGAL_REVIEW.md` explicitly requires
+  qualified multi-state counsel to review before public launch
+  (McGill/Atalese/Feeney arbitration exposure). Nic decision.
+- **Deploy** — the legal pages live on the marketing server (3004),
+  which is NOT in the launch trio. It must be deployed and
+  `VITE_MARKETING_URL` set in the landlord/tenant prod builds, or the
+  signup links 404. Dev-team/infra.
+
+*Historical note (original pending text):*
 
 **What you need to do:**
 - Decide a session to sit down and draft both with me.

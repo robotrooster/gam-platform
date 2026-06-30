@@ -63,7 +63,10 @@ import { billFee } from './billFee'
 import { flagApplicantDecision } from './flagApplicantDecision'
 import { draftTenantNotice } from './draftTenantNotice'
 import { getInspectionChecklist } from './getInspectionChecklist'
+import { declineGuidedInspection } from './declineGuidedInspection'
 import { getInspectionProgress } from './getInspectionProgress'
+import { createInspection } from './createInspection'
+import { setInspectionItemCondition } from './setInspectionItemCondition'
 import { getGuestBooking } from './getGuestBooking'
 import { requestBookingChange } from './requestBookingChange'
 import type { AgentTool } from './types'
@@ -90,6 +93,7 @@ export const ALL_TOOLS: readonly AgentTool[] = [
   getMyLandlordRenewalTendency,
   requestLeaseRenewal,
   getInspectionChecklist,
+  declineGuidedInspection,
   // landlord reads
   getLandlordPortfolio,
   getPropertyRentRoll,
@@ -119,6 +123,8 @@ export const ALL_TOOLS: readonly AgentTool[] = [
   billFee,
   flagApplicantDecision,
   draftTenantNotice,
+  createInspection,
+  setInspectionItemCondition,
   // sales (prospect)
   captureLead,
   // booking guest (token-scoped)

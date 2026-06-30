@@ -1,4 +1,6 @@
 import { Router, Request, Response } from 'express';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
 import { db } from '../db';
 import { requireAuth } from '../middleware/auth';
 
@@ -15,6 +17,44 @@ const adminAuth = (req: Request, res: Response, next: any) => {
     next();
   });
 };
+
+// Public "try it out" signup. Creates a standalone fitness_user — someone who
+// is NOT a GAM landlord/tenant, no profile row. Issues the same 7-day JWT the
+// portals use, so /api/fitness/* (plain requireAuth) accepts it immediately.
+// Auto email-verified: the fitness app has no email-verification surface and
+// the platform login gate (auth.ts) blocks unverified accounts; gating a
+// try-it-out signup behind an email round-trip would break the walkthrough.
+// GAM landlords/tenants do NOT use this path — they arrive via portal SSO with
+// their existing token.
+router.post('/register', async (req: Request, res: Response) => {
+  const { email, password, first_name, last_name } = req.body;
+  try {
+    if (!email || !password || !first_name || !last_name) {
+      return res.json({ success: false, error: 'Email, password, first and last name are required' });
+    }
+    if (String(password).length < 8) {
+      return res.json({ success: false, error: 'Password must be at least 8 characters' });
+    }
+    const existing = await pool.query('SELECT id FROM users WHERE email = $1', [String(email).toLowerCase()]);
+    if (existing.rows.length) return res.json({ success: false, error: 'Email already registered' });
+
+    const hash = await bcrypt.hash(password, 12);
+    const { rows } = await pool.query(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name,
+                          email_verified, email_verified_at, accepted_tos_at, accepted_privacy_at)
+       VALUES ($1,$2,'fitness_user',$3,$4, TRUE, NOW(), NOW(), NOW())
+       RETURNING id, email, role, first_name, last_name`,
+      [String(email).toLowerCase(), hash, first_name, last_name]
+    );
+    const user = rows[0];
+    const token = jwt.sign(
+      { userId: user.id, role: user.role, email: user.email, profileId: null },
+      process.env.JWT_SECRET!,
+      { expiresIn: '7d' }
+    );
+    res.json({ success: true, data: { token, user: { id: user.id, email: user.email, role: user.role, first_name: user.first_name, last_name: user.last_name } } });
+  } catch (e: any) { res.json({ success: false, error: e.message }); }
+});
 
 router.get('/profile', auth, async (req: Request, res: Response) => {
   try {
@@ -209,6 +249,47 @@ router.get('/admin/stats', adminAuth, async (req: Request, res: Response) => {
       pool.query('SELECT milestone_type, COUNT(*) as users_achieved FROM fitness_milestones GROUP BY milestone_type ORDER BY milestone_type')
     ]);
     res.json({ success: true, data: { platform: platform.rows[0], top_lifters: topLifters.rows, recent_users: recentUsers.rows, milestone_counts: milestoneCounts.rows } });
+  } catch (e: any) { res.json({ success: false, error: e.message }); }
+});
+
+// Platform-wide leaderboard — visible to ANY authenticated user (not admin-
+// gated). Ranks every lifter by counted total volume (weight × reps). Returns
+// display names only (first name + last initial) — no email/PII — plus the
+// caller's own rank so the app can show "you're #N" even when they're off the
+// top of the board.
+router.get('/leaderboard', auth, async (req: Request, res: Response) => {
+  try {
+    const userId = req.user!.userId;
+    const { rows } = await pool.query(
+      `WITH ranked AS (
+         SELECT sl.user_id,
+                u.first_name,
+                u.last_name,
+                COALESCE(SUM(sl.weight_lbs * sl.reps), 0)        AS total_lbs,
+                COALESCE(SUM(sl.reps), 0)                        AS total_reps,
+                COUNT(DISTINCT sl.log_id)                        AS total_workouts,
+                RANK() OVER (ORDER BY COALESCE(SUM(sl.weight_lbs * sl.reps), 0) DESC) AS rank
+           FROM fitness_set_logs sl
+           JOIN users u ON sl.user_id = u.id
+          WHERE sl.is_counted = TRUE
+          GROUP BY sl.user_id, u.first_name, u.last_name
+       )
+       SELECT user_id,
+              first_name || ' ' || LEFT(COALESCE(last_name, ''), 1) ||
+                CASE WHEN COALESCE(last_name, '') <> '' THEN '.' ELSE '' END AS display_name,
+              total_lbs,
+              total_reps,
+              total_workouts,
+              rank,
+              (user_id = $1) AS is_me
+         FROM ranked
+        ORDER BY rank
+        LIMIT 100`,
+      [userId]
+    );
+    const top = rows.map((r: any) => ({ ...r, total_lbs: parseFloat(r.total_lbs), total_reps: parseInt(r.total_reps), total_workouts: parseInt(r.total_workouts), rank: parseInt(r.rank) }));
+    const me = top.find((r: any) => r.is_me) || null;
+    res.json({ success: true, data: { top, me, total_lifters: top.length } });
   } catch (e: any) { res.json({ success: false, error: e.message }); }
 });
 

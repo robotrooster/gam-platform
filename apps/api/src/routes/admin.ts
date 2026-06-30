@@ -1,10 +1,12 @@
+import os from 'os'
 import { Router } from 'express'
 import { query, queryOne } from '../db'
 import { requireAuth, requireAdmin, requireSuperAdmin } from '../middleware/auth'
+import { latencyP95, sampleSize } from '../lib/apiMetrics'
 import { AppError } from '../middleware/errorHandler'
 import { logAdminAction } from '../lib/adminAudit'
 import { backfillInvoices } from '../jobs/invoiceGeneration'
-import { PropertyReviewStatus } from '@gam/shared'
+import { PropertyReviewStatus, PLATFORM_FEES, LAUNCH_PLATFORM_FEE } from '@gam/shared'
 import { fetchAccountStatus } from '../services/stripeConnect'
 
 export const adminRouter = Router()
@@ -52,6 +54,66 @@ adminRouter.get('/overview', async (_req, res, next) => {
         ) AS csv_imports_pending_review
     `)
     res.json({ success: true, data: platform })
+  } catch (e) { next(e) }
+})
+
+// ── SCALING READINESS (super-admin) ───────────────────────────
+// Live trackers for the "stay on the Mac vs. move Postgres/API to Render"
+// decision. Each metric reports its value + the watch/move thresholds + a
+// status; the overall verdict is the worst status across them. The game-plan
+// copy lives on the frontend panel. Admin-level (the whole adminRouter is
+// already admin/super_admin only) so the demo admin account can see it.
+adminRouter.get('/infra-readiness', async (_req, res, next) => {
+  try {
+    const round2 = (n: number) => Math.round(n * 100) / 100
+    // higher value = closer to needing a migration
+    const statusOf = (v: number, watchAt: number, moveAt: number) =>
+      v >= moveAt ? 'move' : v >= watchAt ? 'watch' : 'ok'
+
+    const [biz] = await query<any>(`
+      SELECT
+        (SELECT COUNT(*)::int FROM units WHERE status IN ('active','direct_pay')) AS occupied_units,
+        (SELECT COALESCE(SUM(amount),0)::numeric
+           FROM payments
+          WHERE status='settled' AND settled_at >= date_trunc('month', NOW())) AS monthly_volume`)
+    const [db] = await query<any>(`
+      SELECT
+        (SELECT count(*)::int FROM pg_stat_activity WHERE datname = current_database()) AS active_conns,
+        (SELECT setting::int FROM pg_settings WHERE name='max_connections')           AS max_conns`)
+
+    const cores      = os.cpus().length || 1
+    const loadPerCore = round2(os.loadavg()[0] / cores)
+    const occupied   = parseInt(biz?.occupied_units ?? '0', 10)
+    const volume     = round2(parseFloat(biz?.monthly_volume ?? '0'))
+    const conns      = parseInt(db?.active_conns ?? '0', 10)
+    const maxConns   = parseInt(db?.max_conns ?? '100', 10)
+    const connPct    = maxConns > 0 ? (conns / maxConns) * 100 : 0
+    const p95        = latencyP95()
+
+    const metrics = [
+      { key: 'occupiedUnits', label: 'Occupied units', value: occupied, display: occupied.toLocaleString(),
+        watchAt: 300, moveAt: 500, status: statusOf(occupied, 300, 500),
+        note: 'Platform-wide occupied units (active + direct-pay). The customer base whose payments an outage would put at risk.' },
+      { key: 'monthlyVolume', label: 'Payments this month', value: volume, display: '$' + Math.round(volume).toLocaleString(),
+        watchAt: 35000, moveAt: 50000, status: statusOf(volume, 35000, 50000),
+        note: 'Settled payment volume this calendar month. At ~$50k+/mo a managed DB is trivial insurance vs. a home-internet outage.' },
+      { key: 'cpuLoad', label: 'Mac CPU load (per core)', value: loadPerCore, display: loadPerCore.toFixed(2) + '×',
+        watchAt: 0.7, moveAt: 1.0, status: statusOf(loadPerCore, 0.7, 1.0),
+        note: `1-min load average ÷ ${cores} cores. Sustained spikes here usually mean the LLM is competing with Postgres/API for the machine.` },
+      { key: 'dbConnections', label: 'Postgres connections', value: conns, display: `${conns} / ${maxConns}`,
+        watchAt: Math.round(maxConns * 0.7), moveAt: Math.round(maxConns * 0.85), status: statusOf(connPct, 70, 85),
+        note: `${conns} of ${maxConns} max connections in use. Regularly near the cap = the database should move first.` },
+      { key: 'apiLatency', label: 'API p95 latency', value: p95 == null ? 0 : Math.round(p95), display: p95 == null ? '—' : Math.round(p95) + ' ms',
+        watchAt: 300, moveAt: 500, status: p95 == null ? 'ok' : statusOf(p95, 300, 500),
+        note: `95th-percentile response time over the last ${sampleSize()} requests.` },
+    ]
+    const rank: Record<string, number> = { ok: 0, watch: 1, move: 2 }
+    const overall = metrics.reduce((worst, m) => (rank[m.status] > rank[worst] ? m.status : worst), 'ok')
+
+    res.json({ success: true, data: {
+      overall, metrics,
+      host: { hostname: os.hostname(), cores, uptimeSec: Math.round(os.uptime()) },
+    } })
   } catch (e) { next(e) }
 })
 
@@ -383,15 +445,21 @@ adminRouter.get('/income/projection', async (_req, res, next) => {
       WHERE created_at >= date_trunc('month', CURRENT_DATE)
     `).catch(() => [{ count: 0 }])
 
-    // Fee constants
-    const ACTIVE_UNIT     = 15.00
-    const DIRECT_PAY_UNIT = 5.00
-    const FLOAT_FEE_MO    = 20.00
-    const BG_CHECK_NET    = 15.00
+    // Fee constants. Launch model (walkthrough #34): the platform fee is a
+    // flat $2 per OCCUPIED unit — the old OTP ($15) vs direct-pay ($5) tiers
+    // are retired, so every occupied unit (OTP or direct) bills at the same
+    // per-occupied-unit rate. Vacant units never charged. The $10/property
+    // monthly minimum is a per-property accrual floor (platformFeeAccrual.ts);
+    // this platform-wide projection sums the per-unit rate and does not apply
+    // per-property floors. FLOAT_FEE_MO + BG_CHECK_NET unchanged.
+    const OCCUPIED_UNIT   = LAUNCH_PLATFORM_FEE.PER_OCCUPIED_UNIT
+    const FLOAT_FEE_MO    = PLATFORM_FEES.FLOAT_FEE_MO
+    const BG_CHECK_NET    = PLATFORM_FEES.BG_CHECK_NET
 
-    // Monthly projections
-    const otpFees        = +units.otp_units    * ACTIVE_UNIT
-    const directFees     = +units.direct_units * DIRECT_PAY_UNIT
+    // Monthly projections. otpFees/directFees retain their separate fields for
+    // the admin KPI's count breakdown, but both now bill at the flat $2 rate.
+    const otpFees        = +units.otp_units    * OCCUPIED_UNIT
+    const directFees     = +units.direct_units * OCCUPIED_UNIT
     const flexPayFees    = +flex.flex_pay       * FLOAT_FEE_MO
     const bgCheckFees    = +bgChecks.count      * BG_CHECK_NET
 

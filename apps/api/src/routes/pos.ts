@@ -141,6 +141,29 @@ posRouter.get('/items', requirePerm('pos.ring_sale', 'pos.manage_inventory'), as
 // POST /api/pos/items
 // S227: now requires categoryId (uuid). The free-text `category` field
 // is gone — frontend must pre-resolve via GET /pos/categories.
+// GET /api/pos/settings — business-level POS config (default margin).
+posRouter.get('/settings', requirePerm('pos.ring_sale', 'pos.manage_inventory'), async (req, res, next) => {
+  try {
+    const row = await queryOne<{ pos_default_margin_pct: string | null }>(
+      `SELECT pos_default_margin_pct FROM landlords WHERE id = $1`, [req.user!.profileId])
+    res.json({ success: true, data: { defaultMarginPct: row?.pos_default_margin_pct != null ? Number(row.pos_default_margin_pct) : null } })
+  } catch (e) { next(e) }
+})
+
+// PATCH /api/pos/settings — set the business default margin (null clears it).
+posRouter.patch('/settings', requirePerm('pos.manage_inventory'), async (req, res, next) => {
+  try {
+    const { defaultMarginPct } = req.body
+    let val: number | null = null
+    if (defaultMarginPct !== null && defaultMarginPct !== undefined && defaultMarginPct !== '') {
+      val = Number(defaultMarginPct)
+      if (!Number.isFinite(val) || val < 0 || val >= 100) throw new AppError(400, 'Margin must be 0–99.99%')
+    }
+    await query(`UPDATE landlords SET pos_default_margin_pct = $1 WHERE id = $2`, [val, req.user!.profileId])
+    res.json({ success: true, data: { defaultMarginPct: val } })
+  } catch (e) { next(e) }
+})
+
 posRouter.post('/items', requirePerm('pos.manage_inventory'), async (req, res, next) => {
   try {
     const { name, categoryId, icon, costPrice, sellPrice, marginPct, taxRate,

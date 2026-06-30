@@ -75,11 +75,11 @@ export function RegisterPage() {
             The smarter way to manage property
           </div>
           <div style={{ fontSize: '.85rem', color: 'var(--text-3)', lineHeight: 1.8, marginBottom: 40 }}>
-            Guaranteed rent on the 1st. Automated ACH. On-Time Pay SLA for every unit.
+            Automated ACH rent collection. Fast payouts. Full portfolio visibility.
           </div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
             {[
-              { icon: '💸', title: 'On-Time Pay SLA', desc: 'Rent initiated every 1st — guaranteed' },
+              { icon: '💸', title: 'Fast payouts', desc: 'Auto-payouts to your bank every Friday' },
               { icon: '🏦', title: 'Automated ACH', desc: 'No checks, no chasing tenants' },
               { icon: '📊', title: 'Full portfolio view', desc: 'Every unit, every payment, one dashboard' },
             ].map(f => (

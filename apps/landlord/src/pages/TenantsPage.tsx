@@ -27,7 +27,7 @@ export function TenantsPage() {
       {isLoading ? <div style={{color:'var(--text-3)',padding:32}}>Loading…</div> : (
         <div className="card" style={{padding:0,overflowX:'auto'}}>
           <table className="data-table" style={{minWidth:880}}>
-            <thead><tr><th>Tenant</th><th>Unit</th><th>Property</th><th>Rent</th><th>ACH</th><th>On-Time Pay</th><th>SSI/SSDI</th></tr></thead>
+            <thead><tr><th>Tenant</th><th>Unit</th><th>Property</th><th>Rent</th><th>ACH</th><th>SSI/SSDI</th></tr></thead>
             <tbody>
               {tenants.length ? tenants.map((u: any) => (
                 <tr key={u.id} onClick={() => u.tenantId && navigate(`/tenants/${u.tenantId}`)} style={{ cursor: u.tenantId ? 'pointer' : 'default' }}>
@@ -36,11 +36,10 @@ export function TenantsPage() {
                   <td style={{fontSize:'.82rem'}}>{u.propertyName}</td>
                   <td className="mono">{u.rentAmount ? `$${Number(u.rentAmount).toLocaleString()}` : '—'}</td>
                   <td><span className={`badge ${u.achVerified?'badge-green':'badge-amber'}`}>{u.achVerified?'Verified':'Pending'}</span></td>
-                  <td><span className={`badge ${u.onTimePayEnrolled?'badge-green':'badge-muted'}`}>{u.onTimePayEnrolled?'Active':'—'}</span></td>
                   <td>{u.ssiSsdi ? <span className="badge badge-gold">SSI/SSDI</span> : <span style={{color:'var(--text-3)'}}>—</span>}</td>
                 </tr>
               )) : (
-                <tr><td colSpan={7} style={{textAlign:'center',color:'var(--text-3)',padding:32}}>No tenants yet.</td></tr>
+                <tr><td colSpan={6} style={{textAlign:'center',color:'var(--text-3)',padding:32}}>No tenants yet.</td></tr>
               )}
             </tbody>
           </table>

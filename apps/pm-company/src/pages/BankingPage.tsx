@@ -129,7 +129,7 @@ export function BankingPage() {
       setConnectInstance(instance)
       setShowOnboarding(true)
     } catch (e: any) {
-      setInitErr(e?.response?.data?.error?.message || e?.message || 'Failed to start onboarding')
+      setInitErr(e?.response?.data?.error || e?.message || 'Failed to start onboarding')
     }
   }
 

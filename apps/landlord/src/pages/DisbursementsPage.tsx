@@ -18,13 +18,13 @@ export function DisbursementsPage() {
       <div className="page-header">
         <div>
           <h1 className="page-title">Disbursements</h1>
-          <p className="page-subtitle">On-Time Pay - rent initiated on or before the 1st business day of each month</p>
+          <p className="page-subtitle">Auto-payouts of your available balance to your linked bank account</p>
         </div>
       </div>
 
       <div className="alert alert-gold" style={{ marginBottom: 24 }}>
         <ArrowDownToLine size={16} />
-        <span><strong>Auto-Friday payouts:</strong> Available balance pays out automatically every Friday (Monday if Friday is a US federal holiday). Need it sooner? Withdraw on demand — standard ACH is free, instant payout carries a Stripe surcharge.</span>
+        <span><strong>Auto-Friday payouts:</strong> Available balance pays out automatically every Friday (Monday if Friday is a US federal holiday). Need it sooner? Withdraw your available balance on demand.</span>
       </div>
 
       <BalanceWithdrawSection onWithdraw={() => setWithdrawBank({ open: true })} />
@@ -146,13 +146,13 @@ function BalanceWithdrawSection({ onWithdraw }: { onWithdraw: () => void }) {
         <div className="kpi-card">
           <div className="kpi-label">Available Now</div>
           <div className="kpi-value gold">{fmt(balance)}</div>
-          <div className="kpi-sub">{connectReady ? 'Eligible to withdraw' : 'Finish Stripe onboarding first'}</div>
+          <div className="kpi-sub">{connectReady ? 'Eligible to withdraw' : 'Link your bank account first'}</div>
         </div>
         {pending > 0 && (
           <div className="kpi-card">
             <div className="kpi-label">Pending Settlement</div>
             <div className="kpi-value amber">{fmt(pending)}</div>
-            <div className="kpi-sub">In flight from Stripe — clears in 1–3 days</div>
+            <div className="kpi-sub">In flight — clears in 1–3 days</div>
           </div>
         )}
       </div>
@@ -160,7 +160,7 @@ function BalanceWithdrawSection({ onWithdraw }: { onWithdraw: () => void }) {
       {!connectReady && (
         <div className="card" style={{ padding: 14, marginTop: 12, fontSize: '.82rem' }}>
           <Landmark size={14} color="var(--gold)" style={{ verticalAlign: 'middle', marginRight: 8 }} />
-          Complete Stripe Connect onboarding at{' '}
+          Link your bank account at{' '}
           <Link to="/banking" style={{ color: 'var(--gold)' }}>Banking →</Link>
           {' '}before you can withdraw.
         </div>
@@ -249,7 +249,7 @@ function WithdrawNowModal({ onClose }: { onClose: () => void }) {
               </div>
               {method === 'instant' && (
                 <div className="data-row">
-                  <span className="data-key">Stripe instant fee</span>
+                  <span className="data-key">Instant payout fee</span>
                   <span className="data-val mono" style={{ color: 'var(--red)' }}>−{fmt(instant?.fee ?? 0)}</span>
                 </div>
               )}
@@ -263,8 +263,8 @@ function WithdrawNowModal({ onClose }: { onClose: () => void }) {
 
             <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginBottom: 14, lineHeight: 1.5 }}>
               {method === 'standard'
-                ? 'Standard ACH typically settles in 1–2 business days. No fee.'
-                : 'Instant payouts arrive in minutes. Stripe deducts a 1.5% fee (min $0.50) from the amount.'}
+                ? 'Standard ACH typically settles in 1–2 business days.'
+                : 'Instant payouts arrive in minutes. An instant payout fee (1.5%, min $0.50) is deducted from the amount.'}
             </div>
           </>
         )}

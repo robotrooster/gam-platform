@@ -49,6 +49,10 @@ async function seed(opts: {
   slug?: string
   hours?: any
   serviceMinutes?: number
+  routing?: boolean
+  vehicles?: boolean
+  recurrence?: string
+  recurrenceDow?: number
 } = {}): Promise<Fixture> {
   const hash = await bcrypt.hash('pw', 12)
   const email = `o-${randomUUID()}@test.dev`
@@ -72,16 +76,22 @@ async function seed(opts: {
         public_booking_enabled, public_booking_slug, public_booking_intro,
         business_hours, street1, city, state, zip)
      VALUES ($1, 'Test Shop', 'mechanic_stationary', $2,
-             ARRAY['customers','staff','appointments']::text[],
+             $6::text[],
              $3, $4, 'Welcome!', $5::jsonb,
              '100 Main', 'Phoenix', 'AZ', '85001')
      RETURNING id`,
-    [u.id, email, opts.enabled ?? true, slug, hoursJson])
+    [u.id, email, opts.enabled ?? true, slug, hoursJson,
+     ['customers', 'staff', 'appointments',
+      ...(opts.routing ? ['routing'] : []),
+      ...(opts.vehicles ? ['customer_vehicles'] : [])]])
+  const recurrence = opts.recurrence ?? 'one_time'
+  const recDow = recurrence === 'one_time' ? null : (opts.recurrenceDow ?? 2)
   const { rows: [s] } = await db.query<{ id: string }>(
     `INSERT INTO business_bookable_services
-       (business_id, name, description, duration_minutes, price)
-     VALUES ($1, 'Oil change', 'Standard oil + filter', $2, 79.99)
-     RETURNING id`, [b.id, opts.serviceMinutes ?? 30])
+       (business_id, name, description, duration_minutes, price,
+        recurrence, recurrence_day_of_week)
+     VALUES ($1, 'Oil change', 'Standard oil + filter', $2, 79.99, $3, $4)
+     RETURNING id`, [b.id, opts.serviceMinutes ?? 30, recurrence, recDow])
   return { businessId: b.id, serviceId: s.id, slug }
 }
 
@@ -306,6 +316,94 @@ describe('POST /booking/:slug/book', () => {
       .post(`/api/public/booking/${a.slug}/book`)
       .send(validBody(b.serviceId, slot))
     expect(res.status).toBe(404)
+  })
+})
+
+// ═══════════════════════════════════════════════════════════════
+//  S511 — recurring + route-aware (day-mode) booking
+// ═══════════════════════════════════════════════════════════════
+
+describe('S511 booking modes', () => {
+  it('non-route business profile is slot-mode with a one_time service', async () => {
+    const f = await seed()
+    const res = await request(buildApp()).get(`/api/public/booking/${f.slug}`)
+    expect(res.body.data.booking_mode).toBe('slot')
+    expect(res.body.data.services[0].recurrence).toBe('one_time')
+  })
+
+  it('routing business profile is day-mode; availability returns days, not slots', async () => {
+    const f = await seed({ routing: true })
+    const profile = await request(buildApp()).get(`/api/public/booking/${f.slug}`)
+    expect(profile.body.data.booking_mode).toBe('day')
+    const avail = await request(buildApp())
+      .get(`/api/public/booking/${f.slug}/availability?serviceId=${f.serviceId}&fromDate=${new Date().toISOString().slice(0, 10)}`)
+    expect(avail.body.data.mode).toBe('day')
+    expect(avail.body.data.days.some((d: any) => d.available === true)).toBe(true)
+    expect(avail.body.data.days[0].slots).toBeUndefined()
+  })
+
+  it('recurring service booking ENROLLS into a recurring_schedule (no one-off appointment)', async () => {
+    const f = await seed({ routing: true, recurrence: 'weekly', recurrenceDow: 2 }) // Tuesdays
+    const res = await request(buildApp())
+      .post(`/api/public/booking/${f.slug}/book`)
+      .send({ serviceId: f.serviceId, firstName: 'Dana', lastName: 'B', email: 'dana@x.dev', phone: '5551234' })
+    expect(res.status).toBe(201)
+    expect(res.body.data.enrolled).toBe(true)
+    const sched = await db.query(
+      `SELECT rrule, time_of_day FROM recurring_schedules WHERE business_id = $1`, [f.businessId])
+    expect(sched.rows.length).toBe(1)
+    expect(sched.rows[0].rrule).toBe('FREQ=WEEKLY;INTERVAL=1;BYDAY=TU')
+    const appts = await db.query(`SELECT id FROM appointments WHERE business_id = $1`, [f.businessId])
+    expect(appts.rows.length).toBe(0) // materializer creates appts later, not the book call
+  })
+
+  it('one-time route booking creates an appointment on the picked day (no time pick)', async () => {
+    const f = await seed({ routing: true }) // one_time service, day mode
+    const day = nextMondayIso(7)
+    const res = await request(buildApp())
+      .post(`/api/public/booking/${f.slug}/book`)
+      .send({ serviceId: f.serviceId, scheduledDate: day, firstName: 'Sam', lastName: 'P', email: 'sam@x.dev', phone: '5559999' })
+    expect(res.status).toBe(201)
+    const appts = await db.query<{ scheduled_for: Date }>(
+      `SELECT scheduled_for FROM appointments WHERE business_id = $1`, [f.businessId])
+    expect(appts.rows.length).toBe(1)
+    expect(new Date(appts.rows[0]!.scheduled_for).toISOString().slice(0, 10)).toBe(day)
+  })
+
+  it('#11: customer-entered vehicle is filed when the business tracks vehicles', async () => {
+    const f = await seed({ vehicles: true })
+    const profile = await request(buildApp()).get(`/api/public/booking/${f.slug}`)
+    expect(profile.body.data.collects_vehicle).toBe(true)
+    const slot = new Date(`${nextMondayIso(14)}T11:00:00`).toISOString()
+    const res = await request(buildApp())
+      .post(`/api/public/booking/${f.slug}/book`)
+      .send({ serviceId: f.serviceId, scheduledFor: slot, firstName: 'Val', lastName: 'V',
+              email: 'val@x.dev', phone: '5550000',
+              vehicleYear: 2019, vehicleMake: 'Toyota', vehicleModel: 'Tacoma', vehiclePlate: 'ABC123' })
+    expect(res.status).toBe(201)
+    const v = await db.query<{ year: number; make: string; model: string; license_plate: string }>(
+      `SELECT year, make, model, license_plate FROM business_customer_vehicles WHERE business_id = $1`, [f.businessId])
+    expect(v.rows.length).toBe(1)
+    expect(v.rows[0]).toMatchObject({ year: 2019, make: 'Toyota', model: 'Tacoma', license_plate: 'ABC123' })
+  })
+
+  it('#11: vehicle fields ignored when the business does NOT track vehicles', async () => {
+    const f = await seed() // no customer_vehicles
+    const slot = new Date(`${nextMondayIso(14)}T11:00:00`).toISOString()
+    await request(buildApp())
+      .post(`/api/public/booking/${f.slug}/book`)
+      .send({ serviceId: f.serviceId, scheduledFor: slot, firstName: 'Val', lastName: 'V',
+              email: 'val2@x.dev', phone: '5550000', vehicleMake: 'Toyota' })
+    const v = await db.query(`SELECT id FROM business_customer_vehicles WHERE business_id = $1`, [f.businessId])
+    expect(v.rows.length).toBe(0)
+  })
+
+  it('day-mode booking without a date → 400', async () => {
+    const f = await seed({ routing: true })
+    const res = await request(buildApp())
+      .post(`/api/public/booking/${f.slug}/book`)
+      .send({ serviceId: f.serviceId, firstName: 'Sam', lastName: 'P', email: 'sam@x.dev', phone: '5559999' })
+    expect(res.status).toBe(400)
   })
 })
 

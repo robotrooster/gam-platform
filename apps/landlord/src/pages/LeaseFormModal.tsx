@@ -7,7 +7,7 @@ const AUTO_RENEW_MODE_DESC: Record<AutoRenewMode, string> = {
   convert_to_month_to_month: 'Switch to month-to-month with no fixed end date',
 }
 
-import { X, Check, DollarSign, AlertTriangle } from 'lucide-react'
+import { X, Check, DollarSign, AlertTriangle, Image as ImageIcon } from 'lucide-react'
 import { LawWarningBanner, type LawFlag } from '../components/LawWarningBanner'
 
 // S225: this modal is currently invoked in EDIT MODE ONLY. The
@@ -25,6 +25,10 @@ interface Props {
   leaseId?: string  // if provided, modal is in edit mode
   preselectedUnitId?: string
   preselectedTenantId?: string
+  // S511 #15: view-only — a signed/confirmed lease opens read-only (terms are
+  // locked once signed). All fields disabled, no Save. Needs-review imports stay
+  // editable so the owner can confirm imported defaults.
+  readOnly?: boolean
 }
 
 const LABEL_STYLE: React.CSSProperties = {
@@ -48,7 +52,7 @@ const SECTION_HEADER_STYLE: React.CSSProperties = {
   borderBottom: '1px solid var(--border-0)',
 }
 
-export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselectedTenantId }: Props) {
+export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselectedTenantId, readOnly = false }: Props) {
   const qc = useQueryClient()
   const isEdit = Boolean(leaseId)
 
@@ -394,7 +398,7 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
 
         {/* Header */}
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8, flexShrink: 0 }}>
-          <div className="modal-title">{isEdit ? 'Edit Lease' : 'Add Lease'}</div>
+          <div className="modal-title">{readOnly ? 'Lease details' : isEdit ? 'Edit Lease' : 'Add Lease'}</div>
           <button className="btn btn-ghost btn-sm" onClick={onClose} style={{ padding: 6 }}><X size={15} /></button>
         </div>
 
@@ -417,8 +421,10 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
           </div>
         )}
 
-        {/* Scrollable form body */}
+        {/* Scrollable form body. S511 #15: a single <fieldset disabled> makes
+            every control inside read-only in one shot for view mode. */}
         <div style={{ overflowY: 'auto', flex: 1, paddingRight: 4 }}>
+        <fieldset disabled={readOnly} style={{ border: 'none', margin: 0, padding: 0, minWidth: 0 }}>
 
           {/* PARTIES */}
           <div style={SECTION_HEADER_STYLE}>Parties</div>
@@ -865,6 +871,13 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
             <AddendumHistorySection leaseId={leaseId} />
           )}
 
+          {/* S512 #15: move-in condition photos from the unit's move-in
+              inspection. Edit/read-only only; renders nothing when the
+              lease has no move-in inspection or no photos on it. */}
+          {isEdit && leaseId && (
+            <MoveInPhotosSection leaseId={leaseId} />
+          )}
+
           {submitError && (
             <div className="alert alert-danger" style={{ marginTop: 12, fontSize: '.78rem' }}>
               {submitError}
@@ -884,11 +897,14 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
               </div>
             </div>
           )}
+        </fieldset>
         </div>
 
         {/* Footer */}
         <div className="modal-footer" style={{ marginTop: 16, flexShrink: 0 }}>
-          {stateLawWarnings.length > 0 ? (
+          {readOnly ? (
+            <button className="btn btn-primary" onClick={onClose}>Close</button>
+          ) : stateLawWarnings.length > 0 ? (
             // Post-warning state: save is already done; offer a single
             // close action.
             <button className="btn btn-primary" onClick={onClose}>
@@ -1078,6 +1094,104 @@ function AddendumHistorySection({ leaseId }: { leaseId: string }) {
           </div>
         </div>
       ))}
+    </div>
+  )
+}
+
+// ─────────────────────────────────────────────────────────────
+// S512 #15: move-in condition photos.
+// The photo file route (/api/inspections/photo-files/<name>) is
+// auth-gated, so a plain <img src> 401s. AuthedImg fetches the file
+// with the bearer token and renders it through an object URL, the
+// same pattern openLandlordAddendumPdf uses for addendum PDFs.
+// ─────────────────────────────────────────────────────────────
+interface MoveInPhotos {
+  inspectionId: string | null
+  status: string | null
+  conductedAt?: string | null
+  photos: Array<{ id: string; photoUrl: string; caption: string | null; uploadedAt: string }>
+}
+
+function AuthedImg({ path, alt }: { path: string; alt: string }) {
+  const [src, setSrc] = useState<string | null>(null)
+  const [failed, setFailed] = useState(false)
+  useEffect(() => {
+    let url: string | null = null
+    let cancelled = false
+    const token = localStorage.getItem('gam_token') || ''
+    fetch(`${ADDENDUM_API_BASE}${path}`, { headers: { Authorization: 'Bearer ' + token } })
+      .then(r => (r.ok ? r.blob() : Promise.reject(new Error('status ' + r.status))))
+      .then(blob => {
+        if (cancelled) return
+        url = URL.createObjectURL(blob)
+        setSrc(url)
+      })
+      .catch(() => { if (!cancelled) setFailed(true) })
+    return () => { cancelled = true; if (url) URL.revokeObjectURL(url) }
+  }, [path])
+
+  if (failed) {
+    return (
+      <div style={{ width: '100%', aspectRatio: '1 / 1', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--bg-1)', border: '1px solid var(--border-0)', borderRadius: 6, color: 'var(--text-3)', fontSize: '.6rem' }}>
+        unavailable
+      </div>
+    )
+  }
+  if (!src) {
+    return <div style={{ width: '100%', aspectRatio: '1 / 1', background: 'var(--bg-1)', border: '1px solid var(--border-0)', borderRadius: 6 }} />
+  }
+  return (
+    <a href={src} target="_blank" rel="noreferrer" style={{ display: 'block' }}>
+      <img src={src} alt={alt} style={{ width: '100%', aspectRatio: '1 / 1', objectFit: 'cover', borderRadius: 6, border: '1px solid var(--border-0)' }} />
+    </a>
+  )
+}
+
+function MoveInPhotosSection({ leaseId }: { leaseId: string }) {
+  const { data, isLoading } = useQuery<MoveInPhotos>(
+    ['lease-move-in-photos', leaseId],
+    () => apiGet('/leases/' + leaseId + '/move-in-photos'),
+  )
+  const photos = data?.photos ?? []
+
+  if (isLoading || photos.length === 0) return null
+
+  return (
+    <div style={{
+      marginTop: 12,
+      padding: 14,
+      background: 'var(--bg-2)',
+      border: '1px solid var(--border-0)',
+      borderRadius: 8,
+    }}>
+      <div style={{
+        fontSize: '.7rem',
+        fontWeight: 700,
+        color: 'var(--text-3)',
+        textTransform: 'uppercase',
+        letterSpacing: '.07em',
+        marginBottom: 10,
+        display: 'flex',
+        alignItems: 'center',
+        gap: 6,
+      }}>
+        <ImageIcon size={13} /> Move-in Photos ({photos.length})
+      </div>
+      <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginBottom: 12 }}>
+        Condition photos captured on the unit's move-in inspection. Click to open full size.
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(110px, 1fr))', gap: 8 }}>
+        {photos.map(p => (
+          <div key={p.id}>
+            <AuthedImg path={p.photoUrl} alt={p.caption || 'Move-in photo'} />
+            {p.caption && (
+              <div style={{ fontSize: '.62rem', color: 'var(--text-3)', marginTop: 3, lineHeight: 1.3 }}>
+                {p.caption}
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
     </div>
   )
 }

@@ -71,7 +71,7 @@ function PlanModal({ pmCompanyId, onClose }: { pmCompanyId: string; onClose: () 
         <div style={{ marginBottom: 12 }}>
           <label style={lbl}>Fee type *</label>
           <select className="input" value={feeType} onChange={e => setFeeType(e.target.value as any)} style={{ width: '100%' }}>
-            {FEE_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
+            {FEE_TYPES.map(t => <option key={t} value={t}>{t.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase())}</option>)}
           </select>
         </div>
 
@@ -127,7 +127,7 @@ function PlanModal({ pmCompanyId, onClose }: { pmCompanyId: string; onClose: () 
 
         {saveMut.isError && (
           <div style={{ padding: 8, background: 'rgba(220,76,76,.1)', borderRadius: 6, fontSize: '.74rem', color: 'var(--red, #dc4c4c)', marginBottom: 12 }}>
-            {(saveMut.error as any)?.response?.data?.error?.message || 'Save failed.'}
+            {(saveMut.error as any)?.response?.data?.error || 'Save failed.'}
           </div>
         )}
 

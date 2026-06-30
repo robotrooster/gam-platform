@@ -2,6 +2,8 @@ import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useSearchParams } from 'react-router-dom'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
+import { EntryRequestsPage } from './EntryRequestsPage'
+import { ServiceInterruptionsPanel } from '../components/ServiceInterruptionsPanel'
 import {
   Wrench, Plus, X, Check, AlertTriangle, MessageSquare,
   DollarSign, Send, Lock
@@ -144,7 +146,7 @@ function RequestDetailModal({ request: r, onClose }: { request: any; onClose: ()
             {/* Cost */}
             <div style={{ marginBottom: 10 }}>
               <label style={{ fontSize: '.68rem', color: 'var(--text-3)', display: 'block', marginBottom: 3 }}>
-                Actual Cost {req.actualCost && <span style={{ color: 'var(--gold)' }}>→ Platform fee: {fmt(req.actualCost * 0.08)}</span>}
+                Actual Cost
               </label>
               <div style={{ display: 'flex', gap: 6 }}>
                 <div style={{ position: 'relative', flex: 1 }}>
@@ -345,6 +347,7 @@ export function MaintenancePage() {
   const [filterStatus, setFilterStatus] = useState('all')
   const [filterPriority, setFilterPriority] = useState('all')
   const [showCostBreakdown, setShowCostBreakdown] = useState(false)
+  const [view, setView] = useState<'work' | 'entry' | 'outage'>('work')
 
   const { data: requests = [], isLoading } = useQuery<any[]>('maintenance', () => apiGet('/maintenance'))
 
@@ -375,8 +378,25 @@ export function MaintenancePage() {
 
   const emergencies = (requests as any[]).filter(r => r.priority === 'emergency' && r.status !== 'completed')
 
+  // S507: Entry Requests folded into the Maintenance module as a sub-tab
+  // (no standalone nav item). Work Orders is the default view.
+  const tabs = (
+    <div style={{ display: 'flex', gap: 4, borderBottom: '1px solid var(--border-0)', marginBottom: 20 }}>
+      {[{ id: 'work', label: 'Work Orders' }, { id: 'entry', label: 'Entry Requests' }, { id: 'outage', label: 'Outages' }].map(t => (
+        <button key={t.id} onClick={() => setView(t.id as 'work' | 'entry' | 'outage')}
+          style={{ padding: '8px 16px', border: 'none', background: 'none', cursor: 'pointer', fontSize: '.82rem', fontWeight: 600, color: view === t.id ? 'var(--gold)' : 'var(--text-3)', borderBottom: view === t.id ? '2px solid var(--gold)' : '2px solid transparent', marginBottom: -1 }}>
+          {t.label}
+        </button>
+      ))}
+    </div>
+  )
+
+  if (view === 'entry') return <div>{tabs}<EntryRequestsPage /></div>
+  if (view === 'outage') return <div>{tabs}<ServiceInterruptionsPanel /></div>
+
   return (
     <div>
+      {tabs}
       <div className="page-header">
         <div>
           <h1 className="page-title">Maintenance</h1>

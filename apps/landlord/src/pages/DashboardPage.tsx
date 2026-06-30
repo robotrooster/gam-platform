@@ -3,7 +3,7 @@ import { useQuery } from 'react-query'
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
 import { apiGet } from '../lib/api'
 import { useNavigate } from 'react-router-dom'
-import { AlertTriangle, CheckCircle, TrendingUp, ArrowDownToLine, Clock, FileText, CreditCard, Wrench, ChevronRight, Bot } from 'lucide-react'
+import { AlertTriangle, CheckCircle, TrendingUp, ArrowDownToLine, Clock, FileText, CreditCard, Wrench, ChevronRight } from 'lucide-react'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
 interface DashStats {
@@ -18,6 +18,8 @@ interface DashStats {
   upcomingDisbursement: { count: number; amount: number }
   otpUnits?: number
   projectedOtpDisbursement?: number
+  platformFee?: number
+  platformFeeByProperty?: { propertyId: string; name: string; fee: number }[]
 }
 
 export function DashboardPage() {
@@ -46,6 +48,23 @@ export function DashboardPage() {
     })
     const apiTrend: any[] = (stats as any)?.trend || []
     return slots.map(m => ({ month: m, revenue: apiTrend.find((r:any) => r.month === m)?.revenue || 0 }))
+  })()
+
+  // Platform fee: authoritative per-property number from the API — $2/billable
+  // unit floored at the $10 property minimum (full stop), summed across every
+  // property. Same calc the billing cron + Reports use, so this matches the bill.
+  const occupiedUnits = (stats?.activeUnits || 0) + (stats?.directPayUnits || 0)
+  const platformFee = stats?.platformFee ?? 0
+  const platformFeeByProperty: { propertyId: string; name: string; fee: number }[] =
+    (stats as any)?.platformFeeByProperty ?? []
+
+  // Auto-payout cadence is weekly (Fridays). Show the next Friday as the
+  // concrete next-payout date rather than a fixed "1st of month" SLA label.
+  const nextPayoutDate = (() => {
+    const d = new Date()
+    const add = ((5 - d.getDay()) + 7) % 7 || 7
+    d.setDate(d.getDate() + add)
+    return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
   })()
 
   if (isLoading) return (
@@ -105,13 +124,13 @@ export function DashboardPage() {
           <div className="kpi-value" style={{fontSize:'1.4rem'}}>{fmt(stats?.upcomingDisbursement?.amount || 0)}</div>
           <div className="kpi-sub flex items-center gap-8">
             <span className="status-dot dot-green" />
-            On-Time Pay SLA — 1st of month
+            Next payout {nextPayoutDate}
           </div>
         </div>
         <div className="kpi-card" style={{cursor:'pointer'}} onClick={()=>setShowFeeModal(true)}>
           <div className="kpi-label">Platform Fee / Mo</div>
-          <div className="kpi-value">{fmt(((stats?.otpUnits||0) * 15) + (Math.max(0,(stats?.activeUnits||0)-(stats?.otpUnits||0)) * 5))}</div>
-          <div className="kpi-sub">{stats?.otpUnits||0} OTP × $15 · {Math.max(0,(stats?.activeUnits||0)-(stats?.otpUnits||0))} direct × $5</div>
+          <div className="kpi-value">{fmt(platformFee)}</div>
+          <div className="kpi-sub">{occupiedUnits} occupied × $2/unit · $10/property min</div>
         </div>
       </div>
 
@@ -119,39 +138,7 @@ export function DashboardPage() {
             an active PM linkage with measurable cut this month. */}
       <PmCutThisMonthCard />
 
-      {/* OTP Pipeline */}
-      <div className="card" style={{marginBottom:20,background:'rgba(201,162,39,.04)',border:'1px solid rgba(201,162,39,.2)'}}>
-        <div className="card-header">
-          <span className="card-title">⚡ On-Time Pay Pipeline</span>
-        </div>
-        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr 1fr',gap:20}}>
-          <div>
-            <div className="kpi-label">Qualified Units</div>
-            <div className="kpi-value" style={{color:'var(--gold)',fontSize:'1.8rem'}}>{stats?.otpUnits || 0}</div>
-            <div className="kpi-sub">of {stats?.activeUnits || 0} active units</div>
-          </div>
-          <div>
-            <div className="kpi-label">Unit Qualification Rate</div>
-            <div className="kpi-value" style={{color:'var(--gold)',fontSize:'1.8rem'}}>
-              {stats?.activeUnits ? Math.round(((stats?.otpUnits || 0) / stats.activeUnits) * 100) : 0}%
-            </div>
-            <div className="kpi-sub">of occupied portfolio</div>
-          </div>
-          <div>
-            <div className="kpi-label">Projected Disbursement</div>
-            <div className="kpi-value" style={{color:'var(--green)',fontSize:'1.8rem'}}>{fmt(stats?.projectedOtpDisbursement || 0)}</div>
-            <div className="kpi-sub">guaranteed to landlord</div>
-          </div>
-          <div>
-            <div className="kpi-label">% of Rent Volume</div>
-            <div className="kpi-value" style={{color:'var(--green)',fontSize:'1.8rem'}}>
-              {stats?.monthlyRentVolume ? Math.round(((stats?.projectedOtpDisbursement || 0) / stats.monthlyRentVolume) * 100) : 0}%
-            </div>
-            <div className="kpi-sub">of total monthly income</div>
-          </div>
-        </div>
-      </div>
-            <div className="grid-2" style={{gap:20}}>
+      <div className="grid-2" style={{gap:20}}>
         {/* Revenue trend */}
         <div className="card">
           <div className="card-header">
@@ -225,144 +212,38 @@ export function DashboardPage() {
             <div style={{padding:'0 24px 24px'}}>
               <table className="data-table" style={{marginTop:8}}>
                 <thead>
-                  <tr><th>Tier</th><th>Units</th><th>Rate</th><th>Subtotal</th></tr>
+                  <tr><th>Property</th><th style={{textAlign:'right'}}>Monthly Fee</th></tr>
                 </thead>
                 <tbody>
-                  <tr>
-                    <td>OTP Enrolled</td>
-                    <td className="mono">{stats?.otpUnits || 0}</td>
-                    <td className="mono">$15/unit</td>
-                    <td className="mono" style={{color:'var(--green)'}}>{fmt((stats?.otpUnits || 0) * 15)}</td>
-                  </tr>
-                  <tr>
-                    <td>Direct Pay</td>
-                    <td className="mono">{Math.max(0,(stats?.activeUnits||0)-(stats?.otpUnits||0))}</td>
-                    <td className="mono">$5/unit</td>
-                    <td className="mono" style={{color:'var(--green)'}}>{fmt(Math.max(0,(stats?.activeUnits||0)-(stats?.otpUnits||0)) * 5)}</td>
-                  </tr>
-                  <tr>
-                    <td>Vacant</td>
-                    <td className="mono">{stats?.vacantUnits || 0}</td>
-                    <td className="mono">$0/unit</td>
-                    <td className="mono" style={{color:'var(--text-3)'}}>—</td>
-                  </tr>
+                  {platformFeeByProperty.length ? platformFeeByProperty.map(p => (
+                    <tr key={p.propertyId}>
+                      <td style={{color:'var(--text-0)'}}>{p.name}</td>
+                      <td className="mono" style={{textAlign:'right',color:'var(--gold)'}}>{fmt(p.fee)}</td>
+                    </tr>
+                  )) : (
+                    <tr><td colSpan={2} style={{textAlign:'center',color:'var(--text-3)',padding:16}}>No properties yet.</td></tr>
+                  )}
                 </tbody>
                 <tfoot>
                   <tr style={{borderTop:'1px solid var(--border-2)'}}>
-                    <td colSpan={3} style={{fontWeight:600}}>Total Monthly Fee</td>
-                    <td className="mono" style={{fontWeight:600,color:'var(--gold)'}}>{fmt(((stats?.otpUnits||0) * 15) + (Math.max(0,(stats?.activeUnits||0)-(stats?.otpUnits||0)) * 5))}</td>
+                    <td style={{fontWeight:600}}>Total Monthly Fee</td>
+                    <td className="mono" style={{textAlign:'right',fontWeight:600,color:'var(--gold)'}}>{fmt(platformFee)}</td>
                   </tr>
                 </tfoot>
               </table>
               <div style={{marginTop:16,fontSize:'.78rem',color:'var(--text-3)'}}>
-                Billed on the 1st · OTP tier unlocks guaranteed 28th disbursement
+                $2 per occupied unit · $10 per-property monthly minimum (charged on every property)
               </div>
             </div>
           </div>
         </div>
       )}
 
-      {/* Agent Activity preview */}
-      <AgentActivityCard />
-
       {/* Bulletin Board */}
       <BulletinBoard />
     </div>
   )
 }
-
-// S482: agent-activity preview card. Reuses /api/landlord/agent-activity
-// (S480) for the 30-day rollup. Renders a 3-tile mini-summary +
-// "View all" deep link to the full AgentActivityPage. Hides itself
-// when the landlord has no agent traffic yet (pre-launch state).
-function AgentActivityCard() {
-  const navigate = useNavigate()
-  const { data, isLoading } = useQuery<{
-    days: number
-    totals: {
-      total: number
-      tenant_count: number
-      landlord_count: number
-      escalated_count: number
-      avg_latency_ms: number | null
-    }
-    by_agent: Array<{ agent_name: string; count: number }>
-  }>(
-    'dash-agent-activity',
-    () => apiGet('/landlord/agent-activity?days=30'),
-    { retry: false },
-  )
-
-  if (isLoading || !data) return null
-  if (data.totals.total === 0) return null
-
-  return (
-    <div className="card mt-16">
-      <div className="card-header" style={{ display: 'flex', justifyContent: 'space-between' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <Bot size={16} style={{ color: 'var(--gold)' }} />
-          <span className="card-title">Agent Activity</span>
-          <span style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>last 30 days</span>
-        </div>
-        <button
-          onClick={() => navigate('/agent-activity')}
-          className="btn btn-ghost btn-sm"
-          style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}
-        >
-          View all <ChevronRight size={12} />
-        </button>
-      </div>
-      <div style={{
-        display: 'grid',
-        gridTemplateColumns: 'repeat(3, 1fr)',
-        gap: 12,
-        padding: '8px 0',
-      }}>
-        <div>
-          <div style={{ fontSize: '.7rem', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 4 }}>
-            Conversations
-          </div>
-          <div style={{ fontSize: '1.5rem', fontWeight: 700, color: 'var(--gold)' }}>
-            {data.totals.total}
-          </div>
-          <div style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>
-            {data.totals.tenant_count} tenant · {data.totals.landlord_count} you
-          </div>
-        </div>
-        <div>
-          <div style={{ fontSize: '.7rem', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 4 }}>
-            Escalated
-          </div>
-          <div style={{
-            fontSize: '1.5rem', fontWeight: 700,
-            color: data.totals.escalated_count > 0 ? 'var(--amber)' : 'var(--text-1)',
-          }}>
-            {data.totals.escalated_count}
-          </div>
-          <div style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>
-            {data.totals.total > 0
-              ? `${Math.round((data.totals.escalated_count / data.totals.total) * 100)}% of total`
-              : '—'}
-          </div>
-        </div>
-        <div>
-          <div style={{ fontSize: '.7rem', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 4 }}>
-            Top agent
-          </div>
-          <div style={{ fontSize: '1.5rem', fontWeight: 700, color: 'var(--text-0)' }}>
-            {data.by_agent[0]?.agent_name ?? '—'}
-          </div>
-          <div style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>
-            {data.by_agent[0]
-              ? `${data.by_agent[0].count} conversation${data.by_agent[0].count === 1 ? '' : 's'}`
-              : 'no agent traffic yet'}
-          </div>
-        </div>
-      </div>
-    </div>
-  )
-}
-
 
 function TodoCard() {
   const navigate = useNavigate()

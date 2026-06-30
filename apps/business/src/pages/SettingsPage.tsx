@@ -149,6 +149,7 @@ export function SettingsPage() {
 
       {biz && <StripeConnectSection biz={biz} />}
       {biz && <TaxSection biz={biz} setBiz={setBiz} />}
+      {biz && <ServiceTimeSection biz={biz} setBiz={setBiz} />}
       {biz && <PublicBookingSection biz={biz} setBiz={setBiz} />}
       {biz && ((biz.enabledFeatures ?? biz.enabled_features ?? []) as string[]).includes('appointments') &&
         <AppointmentRemindersSection biz={biz} setBiz={setBiz} />}
@@ -238,8 +239,10 @@ function PublicBookingSection({ biz, setBiz }: { biz: any; setBiz: (b: any) => v
   const [err, setErr] = useState<string | null>(null)
   const [ok, setOk] = useState(false)
 
-  const marketingBase = (import.meta as any).env?.VITE_MARKETING_URL || 'http://localhost:3004'
-  const publicUrl = slug ? `${marketingBase}/book/${slug}` : null
+  // S511: the public booking page lives in the customer app (the public
+  // customer-facing surface that already serves /login and /account).
+  const bookingBase = (import.meta as any).env?.VITE_CUSTOMER_PORTAL_URL || 'http://localhost:3014'
+  const publicUrl = slug ? `${bookingBase}/book/${slug}` : null
 
   const toggleDay = (dow: string) => {
     setHours(p => ({
@@ -318,7 +321,7 @@ function PublicBookingSection({ biz, setBiz }: { biz: any; setBiz: (b: any) => v
         style={{ ...inputStyle, fontFamily: 'var(--font-mono)' as const }} />
       {slug && (
         <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 4 }}>
-          Booking page will live at: <span style={{ color: 'var(--gold)' }}>{marketingBase}/book/{slug}</span>
+          Booking page will live at: <span style={{ color: 'var(--gold)' }}>{bookingBase}/book/{slug}</span>
         </div>
       )}
 
@@ -444,6 +447,74 @@ function TaxSection({ biz, setBiz }: { biz: any; setBiz: (b: any) => void }) {
       <button onClick={onSave} disabled={saving}
         style={{ ...btnStyle, marginTop: 16, opacity: saving ? 0.6 : 1 }}>
         {saving ? 'Saving…' : 'Save tax settings'}
+      </button>
+    </div>
+  )
+}
+
+// S510: per-unit service time. The owner sets seconds per unit and the
+// unit noun ("can"); a stop's expected time = rate × that customer's
+// unit count, and we track real on-site time against it for efficiency.
+function ServiceTimeSection({ biz, setBiz }: { biz: any; setBiz: (b: any) => void }) {
+  const [secs, setSecs] = useState(String(biz.serviceSecondsPerUnit ?? 60))
+  const [label, setLabel] = useState(biz.serviceUnitLabel || 'unit')
+  const [saving, setSaving] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+  const [ok, setOk] = useState(false)
+
+  const onSave = async () => {
+    setErr(null); setOk(false); setSaving(true)
+    try {
+      const updated = await apiPatch<any>('/businesses/me', {
+        serviceSecondsPerUnit: Math.max(0, Math.round(Number(secs) || 0)),
+        serviceUnitLabel: label.trim() || 'unit',
+      })
+      setBiz(updated); setOk(true)
+    } catch (e: any) {
+      setErr(e?.response?.data?.error || 'Save failed')
+    } finally { setSaving(false) }
+  }
+
+  return (
+    <div style={{
+      marginTop: 24, padding: 24,
+      background: 'var(--bg-1)', border: '1px solid var(--border-0)',
+      borderRadius: 12, maxWidth: 640,
+    }}>
+      <h2 style={{ fontFamily: 'var(--font-display)', fontSize: 18, marginTop: 0 }}>
+        Service time per {label.trim() || 'unit'}
+      </h2>
+      <div style={{ color: 'var(--text-2)', fontSize: 13, marginBottom: 16 }}>
+        How long one {label.trim() || 'unit'} should take. A stop's expected time = this
+        × the customer's {label.trim() || 'unit'} count (set per customer). The driver's
+        real on-site time is tracked against it on each route for efficiency.
+      </div>
+
+      {err && <div style={errStyle}>{err}</div>}
+      {ok && <div style={okStyle}>Saved.</div>}
+
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 2fr', gap: 12 }}>
+        <div>
+          <label style={labelStyle}>Seconds per {label.trim() || 'unit'}</label>
+          <input value={secs} onChange={e => setSecs(e.target.value)}
+            type="number" step="1" min="0" placeholder="60" style={inputStyle} />
+          <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 4 }}>
+            e.g. 60 = 1 minute per {label.trim() || 'unit'}.
+          </div>
+        </div>
+        <div>
+          <label style={labelStyle}>Unit name</label>
+          <input value={label} onChange={e => setLabel(e.target.value)}
+            placeholder="can" style={inputStyle} />
+          <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 4 }}>
+            "can" / "bin" / "bag" / "unit"
+          </div>
+        </div>
+      </div>
+
+      <button onClick={onSave} disabled={saving}
+        style={{ ...btnStyle, marginTop: 16, opacity: saving ? 0.6 : 1 }}>
+        {saving ? 'Saving…' : 'Save service time'}
       </button>
     </div>
   )

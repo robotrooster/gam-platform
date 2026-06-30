@@ -1,0 +1,38 @@
+/* GAM customer portal — dark/gold, mirrors the platform design tokens. */
+@import url('https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&family=DM+Sans:ital,wght@0,300;0,400;0,500;0,600;1,400&family=DM+Mono:wght@400;500&display=swap');
+
+:root {
+  --bg-0: #0a0b0e;
+  --bg-1: #0f1116;
+  --bg-2: #141720;
+  --border-0: #1e2435;
+  --border-1: #252d42;
+  --text-0: #f0f2f7;
+  --text-1: #c4ccde;
+  --text-2: #8a96b0;
+  --text-3: #555f7a;
+  --gold: #c9a227;
+  --gold-bg: rgba(201,162,39,.08);
+  --green: #22c55e;
+  --green-bg: rgba(34,197,94,.08);
+  --red: #ef4444;
+  --red-bg: rgba(239,68,68,.08);
+  --amber: #f59e0b;
+  --amber-bg: rgba(245,158,11,.08);
+  --font-display: 'Syne', sans-serif;
+  --font-body: 'DM Sans', sans-serif;
+  --font-mono: 'DM Mono', monospace;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { font-size: 16px; -webkit-font-smoothing: antialiased; }
+body {
+  font-family: var(--font-body);
+  background: var(--bg-0);
+  color: var(--text-1);
+  line-height: 1.6;
+  min-height: 100vh;
+}
+a { color: var(--gold); text-decoration: none; }
+button { cursor: pointer; font-family: var(--font-body); }
+input { font-family: var(--font-body); }

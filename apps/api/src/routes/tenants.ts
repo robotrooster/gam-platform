@@ -346,6 +346,99 @@ tenantsRouter.get('/me', async (req, res, next) => {
 })
 
 
+// ── GET /api/tenants/me/payment-health ───────────────────────────────────
+// #12: the tenant's own view of the Payment Health card the landlord sees on
+// TenantDetailPage — same metric (settled / total payments → on-time rate)
+// computed from the authenticated tenant's own payments. Gives the resident
+// a positive, at-a-glance read on their standing.
+tenantsRouter.get('/me/payment-health', async (req, res, next) => {
+  try {
+    if (req.user!.role !== 'tenant') throw new AppError(403, 'Tenant only')
+    const s = await queryOne<any>(`
+      SELECT
+        COUNT(*) AS total_payments,
+        COUNT(*) FILTER (WHERE status = 'settled') AS settled,
+        COUNT(*) FILTER (WHERE status = 'failed')  AS failed,
+        COALESCE(SUM(amount) FILTER (WHERE status = 'settled'), 0) AS total_paid,
+        MIN(due_date) AS first_payment
+      FROM payments WHERE tenant_id = $1`, [req.user!.profileId])
+    const total = parseInt(s?.total_payments || 0)
+    const settled = parseInt(s?.settled || 0)
+    const firstPayment = s?.first_payment ? new Date(s.first_payment) : null
+    const tenantMonths = firstPayment
+      ? Math.floor((Date.now() - firstPayment.getTime()) / (1000 * 60 * 60 * 24 * 30))
+      : 0
+    res.json({
+      success: true,
+      data: {
+        onTimeRate: total > 0 ? Math.round((settled / total) * 100) : 0,
+        settledCount: settled,
+        failedCount: parseInt(s?.failed || 0),
+        totalPayments: total,
+        totalPaid: parseFloat(s?.total_paid || 0),
+        tenantMonths,
+      },
+    })
+  } catch (e) { next(e) }
+})
+
+
+// ── GET /api/tenants/me/move-in-gate ─────────────────────────────────────
+// Tenant #6 (Nic 2026-06-26): the move-in inspection must be COMPLETED within
+// 48 hours of the lease start date. Past that, an incomplete (still-draft)
+// move-in inspection LOCKS the tenant out of the rest of the portal until they
+// finish it, and they assume liability for any undocumented conditions. The
+// first time the window lapses we stamp move_in_deadline_missed_at as the audit
+// record of when that liability shifted.
+//
+// Scope choice: the gate only fires when a move-in inspection actually EXISTS
+// and is still 'draft' past the deadline — a tenant is never locked out for the
+// landlord never having started one. The inspection routes stay reachable so
+// the locked-out tenant can still go complete it (the one allowed action).
+tenantsRouter.get('/me/move-in-gate', async (req, res, next) => {
+  try {
+    if (req.user!.role !== 'tenant') throw new AppError(403, 'Tenant only')
+    const row = await queryOne<any>(`
+      SELECT i.id, i.status, i.move_in_deadline_missed_at,
+             l.start_date,
+             (l.start_date::timestamptz + interval '48 hours') AS deadline
+        FROM v_lease_active_tenants vlat
+        JOIN leases l ON l.id = vlat.lease_id AND l.status = 'active'
+        JOIN unit_inspections i
+          ON i.tenant_id = vlat.tenant_id
+         AND i.inspection_type = 'move_in'
+         AND (i.lease_id = l.id OR i.unit_id = l.unit_id)
+       WHERE vlat.tenant_id = $1
+         AND i.status <> 'cancelled'
+       ORDER BY i.created_at DESC
+       LIMIT 1`, [req.user!.profileId])
+
+    if (!row) { res.json({ success: true, data: { gated: false, hasMoveIn: false } }); return }
+
+    const completed = row.status !== 'draft'   // tenant_signed/landlord_signed/finalized/disputed
+    const overdue = !completed && new Date() > new Date(row.deadline)
+
+    // Stamp the moment liability first shifts (idempotent).
+    if (overdue && !row.move_in_deadline_missed_at) {
+      await query(`UPDATE unit_inspections SET move_in_deadline_missed_at = now() WHERE id = $1 AND move_in_deadline_missed_at IS NULL`, [row.id])
+    }
+
+    res.json({
+      success: true,
+      data: {
+        hasMoveIn: true,
+        inspectionId: row.id,
+        completed,
+        deadline: row.deadline,
+        overdue,
+        gated: overdue,            // locked out of the rest of the portal
+        liabilityAssumedAt: row.move_in_deadline_missed_at ?? (overdue ? new Date().toISOString() : null),
+      },
+    })
+  } catch (e) { next(e) }
+})
+
+
 // ── GET /api/tenants/me/deposit-interest ─────────────────────────────────
 // S189: tenant-facing view of statutory deposit interest. Surfaces the
 // principal + collected_amount + cumulative interest_accrued + per-month
@@ -629,6 +722,18 @@ tenantsRouter.post('/flexpay/enroll', async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
+// PATCH /api/tenants/flexpay/pull-day — change the scheduled pull day.
+// Takes effect NEXT cycle (the current cycle's advance is already locked);
+// the fee recomputes to $5 + the new day for future cycles.
+tenantsRouter.patch('/flexpay/pull-day', async (req, res, next) => {
+  try {
+    const { changeFlexPayPullDay } = await import('../services/flexpay')
+    const out = await changeFlexPayPullDay(req.user!.profileId, Number(req.body?.pullDay))
+    if (!out.ok) return res.status(400).json({ success: false, error: out.reason })
+    res.json({ success: true, data: { pullDay: out.pullDay, fee: out.fee, effective: out.effective } })
+  } catch (e) { next(e) }
+})
+
 // GET /api/tenants/flexpay/terms?pullDay=15
 // S314: server-rendered populated Subscription Terms preview for the
 // "Read full terms" link in the enrollment modal. No persistence —
@@ -741,13 +846,14 @@ tenantsRouter.delete('/flexpay', async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
-// ── FLEXDEPOSIT (S246) ────────────────────────────────────────────────────
-// FlexDeposit splits the security deposit into 2-4 installments based on
-// deposit amount × Checkr BG risk_level. Installment 1 paid at move-in;
-// remaining N-1 spread monthly. GAM fronts the gap to landlord on
-// move-in so the landlord sees deposit funded in full from day 1.
-// $3/month custody fee continues for as long as the tenant has a
-// deposit on the GAM platform.
+// ── FLEXDEPOSIT (S246; custody model S514) ─────────────────────────────────
+// FlexDeposit splits the security deposit into 2-6 installments based on
+// deposit amount × Checkr BG risk_level. The tenant funds their OWN deposit
+// into GAM custody: installment 1 at move-in, the rest monthly. GAM advances
+// nothing — the deposit is held in custody (gam_escrow) and the deposit-return
+// flow settles against what was actually collected. A missed installment only
+// leaves the deposit under-funded (no acceleration/recourse — ToS § 9.1.5).
+// $3/month custody fee applies while GAM holds the deposit.
 
 // GET /api/tenants/flexdeposit — eligibility + active plan + schedule
 tenantsRouter.get('/flexdeposit', async (req, res, next) => {
@@ -769,27 +875,30 @@ tenantsRouter.get('/flexdeposit', async (req, res, next) => {
       [req.user!.profileId],
     )
 
-    // S262: deposit-row context for the LeasePage accelerated /
-    // in_default banner. Returns the most recently created deposit
-    // belonging to this tenant whose plan_status is one of the
-    // banner-relevant states. Null when no banner needed.
+    // S514: deposit-row context for the LeasePage. Returns the most recently
+    // created FlexDeposit deposit for this tenant + how much is still
+    // unfunded into custody, so the page can offer the voluntary pay-ahead.
+    // No acceleration/in_default banner exists under the custody model.
     const deposit = await queryOne<{
       id:                        string
       flex_deposit_plan_status:  string | null
-      balance_due_full_at:       string | null
-      balance_due_total:         string | null
       total_amount:              string
       collected_amount:          string
+      unfunded_amount:           string
     }>(
-      `SELECT id, flex_deposit_plan_status,
-              balance_due_full_at::text AS balance_due_full_at,
-              balance_due_total::text   AS balance_due_total,
-              total_amount::text        AS total_amount,
-              collected_amount::text    AS collected_amount
-         FROM security_deposits
-        WHERE tenant_id = $1
-          AND flex_deposit_enabled = TRUE
-        ORDER BY created_at DESC
+      `SELECT sd.id, sd.flex_deposit_plan_status,
+              sd.total_amount::text     AS total_amount,
+              sd.collected_amount::text AS collected_amount,
+              COALESCE((
+                SELECT SUM(amount)
+                  FROM flex_deposit_installments
+                 WHERE security_deposit_id = sd.id
+                   AND status IN ('pending', 'missed')
+              ), 0)::text               AS unfunded_amount
+         FROM security_deposits sd
+        WHERE sd.tenant_id = $1
+          AND sd.flex_deposit_enabled = TRUE
+        ORDER BY sd.created_at DESC
         LIMIT 1`,
       [req.user!.profileId],
     )
@@ -798,21 +907,22 @@ tenantsRouter.get('/flexdeposit', async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
-// POST /api/tenants/flexdeposit/retry-acceleration — manual retry from
-// the LeasePage banner when plan_status='in_default'. Re-fires the
-// full-balance ACH pull; success flips plan to 'completed', failure
-// returns it to 'in_default'.
-tenantsRouter.post('/flexdeposit/retry-acceleration', async (req, res, next) => {
+// POST /api/tenants/flexdeposit/pay-ahead — tenant-initiated voluntary
+// pay-ahead from the LeasePage. Fires one ACH pull for the unfunded
+// (pending + missed) installments; success flips the plan to 'completed'.
+// A failure is benign — the plan stays 'active' and scheduled pulls
+// continue (custody model: no acceleration, no balance-due-in-full).
+tenantsRouter.post('/flexdeposit/pay-ahead', async (req, res, next) => {
   try {
-    const { retryFlexDepositAcceleration } = await import('../services/flexDeposit')
-    const out = await retryFlexDepositAcceleration({ tenantId: req.user!.profileId })
+    const { payAheadFlexDeposit } = await import('../services/flexDeposit')
+    const out = await payAheadFlexDeposit({ tenantId: req.user!.profileId })
     if (!out.ok) return res.status(400).json({ success: false, error: out.reason })
     res.json({ success: true, data: out })
   } catch (e) { next(e) }
 })
 
 // POST /api/tenants/flexdeposit/enroll
-// body: { installmentCount: 2..4, acceptedTerms: true }
+// body: { installmentCount: 2..6, acceptedTerms: true }
 // S260 (acknowledgedTos) → S314 (acceptedTerms): the gate now also
 // persists the populated SLA snapshot to
 // flexsuite_enrollment_acceptances inside the same tx as the
@@ -848,8 +958,8 @@ tenantsRouter.get('/flexdeposit/terms', async (req, res, next) => {
     const { renderFlexDepositAcceptanceText, FLEXDEPOSIT_TEMPLATE_VERSION } =
       await import('../services/flexsuiteAcceptance')
     const installmentCount = Number(req.query.installmentCount)
-    if (!Number.isInteger(installmentCount) || installmentCount < 2 || installmentCount > 4) {
-      throw new AppError(400, 'installmentCount must be an integer 2..4')
+    if (!Number.isInteger(installmentCount) || installmentCount < 2 || installmentCount > 6) {
+      throw new AppError(400, 'installmentCount must be an integer 2..6')
     }
     const preview = await previewFlexDepositSchedule({
       tenantId: req.user!.profileId,
@@ -862,7 +972,6 @@ tenantsRouter.get('/flexdeposit/terms', async (req, res, next) => {
       depositId:              preview.depositId,
       installmentCount,
       installments:           preview.schedule.installments,
-      gamAdvanceAmount:       preview.schedule.gamAdvanceAmount,
       totalInstallmentAmount: preview.schedule.totalInstallmentAmount,
       moveInDate:             preview.schedule.startDate,
       ip:                     null,
@@ -874,7 +983,7 @@ tenantsRouter.get('/flexdeposit/terms', async (req, res, next) => {
         version:          FLEXDEPOSIT_TEMPLATE_VERSION,
         installmentCount,
         installments:     preview.schedule.installments,
-        gamAdvanceAmount: preview.schedule.gamAdvanceAmount,
+        uncollectedAtMoveIn: preview.schedule.uncollectedAtMoveIn,
         renderedText,
       },
     })
@@ -958,8 +1067,16 @@ tenantsRouter.post('/enroll-on-time-pay', async (_req, res) => {
 })
 
 // POST /api/tenants/enroll-credit-reporting
+// FlexCredit (rent-payment reporting via Esusu). Gated on the
+// flexcredit_rollout_visible flag — OFF at launch. The product is NOT built
+// (no Esusu integration / billing yet), so until the flag is on we must NOT
+// flip the column or promise reporting that doesn't happen.
 tenantsRouter.post('/enroll-credit-reporting', async (req, res, next) => {
   try {
+    const { isFeatureEnabled } = await import('../services/systemFeatures')
+    if (!await isFeatureEnabled('flexcredit_rollout_visible')) {
+      return res.json({ success: true, data: { visible: false } })
+    }
     await query(`UPDATE tenants SET credit_reporting_enrolled=TRUE WHERE id=$1`, [req.user!.profileId])
     res.json({ success: true, message: 'Credit reporting enrolled — $5/month reported to all 3 bureaus' })
   } catch (e) { next(e) }
@@ -1381,7 +1498,12 @@ tenantsRouter.get('/lease', requireAuth, async (req, res, next) => {
 
     res.json({
       success: true,
-      data: lease ? { ...lease, state_law_warnings: stateLawWarnings } : lease,
+      // S508: document_url always points at the on-demand lease-PDF endpoint
+      // so the in-browser viewer renders every lease (generated from terms when
+      // there's no e-signed/imported PDF). camelized → lease.documentUrl.
+      data: lease
+        ? { ...lease, document_url: `/api/leases/${lease.id}/pdf`, state_law_warnings: stateLawWarnings }
+        : lease,
     })
   } catch (e) { next(e) }
 })

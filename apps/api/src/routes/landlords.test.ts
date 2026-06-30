@@ -27,7 +27,7 @@ import request from 'supertest'
 import jwt from 'jsonwebtoken'
 import { randomUUID } from 'crypto'
 import { db } from '../db'
-import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedManager } from '../test/dbHelpers'
+import { cleanupAllSchema, seedLandlord, seedProperty, seedAllocationRule, seedUnit, seedManager } from '../test/dbHelpers'
 import { landlordsRouter } from './landlords'
 import { errorHandler } from '../middleware/errorHandler'
 
@@ -199,6 +199,47 @@ describe('POST /api/landlords/complete-onboarding', () => {
     expect(row.rows[0].onboarding_complete).toBe(true)
     expect(row.rows[0].agreement_signature).toBe('Nic Rhoades')
     expect(row.rows[0].agreement_signed_at).not.toBeNull()
+  })
+
+  it('no coverTenantAch → default_ach_fee_payer stays tenant (S513 #2)', async () => {
+    const f = await seedLFixture()
+    const res = await request(buildApp())
+      .post('/api/landlords/complete-onboarding')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ signature: 'Nic Rhoades' })
+    expect(res.status).toBe(200)
+    const ll = await db.query<{ default_ach_fee_payer: string }>(
+      `SELECT default_ach_fee_payer FROM landlords WHERE id=$1`, [f.landlordId])
+    expect(ll.rows[0].default_ach_fee_payer).toBe('tenant')
+  })
+
+  it('coverTenantAch=true → default landlord + applies to existing properties; card stays tenant (S513 #2)', async () => {
+    const f = await seedLFixture()
+    const client = await db.connect()
+    let propertyId = ''
+    try {
+      await client.query('BEGIN')
+      propertyId = await seedProperty(client, {
+        landlordId: f.landlordId, ownerUserId: f.landlordUserId, managedByUserId: f.landlordUserId,
+      })
+      await seedAllocationRule(client, { propertyId, achFeePayer: 'tenant', cardFeePayer: 'tenant' })
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+
+    const res = await request(buildApp())
+      .post('/api/landlords/complete-onboarding')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ signature: 'Nic Rhoades', coverTenantAch: true })
+    expect(res.status).toBe(200)
+
+    const ll = await db.query<{ default_ach_fee_payer: string }>(
+      `SELECT default_ach_fee_payer FROM landlords WHERE id=$1`, [f.landlordId])
+    expect(ll.rows[0].default_ach_fee_payer).toBe('landlord')
+
+    const ar = await db.query<{ ach_fee_payer: string; card_fee_payer: string }>(
+      `SELECT ach_fee_payer, card_fee_payer FROM property_allocation_rules WHERE property_id=$1`, [propertyId])
+    expect(ar.rows[0].ach_fee_payer).toBe('landlord')  // election applied to the portfolio
+    expect(ar.rows[0].card_fee_payer).toBe('tenant')   // card never covered
   })
 })
 

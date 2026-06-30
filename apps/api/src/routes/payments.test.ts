@@ -499,6 +499,21 @@ describe('POST /api/payments/:id/pay', () => {
     expect(res.status).toBe(409)
   })
 
+  it('S511 #8b: eviction mode (payment_block) blocks the landlord-bound payment → 409', async () => {
+    const f = await seed()
+    await setupTenantForPay(f, { connectReady: true })
+    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid })
+    await db.query(`UPDATE units SET payment_block=TRUE WHERE id=$1`, [f.aUnitId])
+    const res = await request(buildApp()).post(`/api/payments/${pid}/pay`)
+      .set('Authorization', `Bearer ${f.tokenTenant1}`)
+      .send({ paymentMethodId: 'pm_x', paymentMethodType: 'ach' })
+    expect(res.status).toBe(409)
+    expect(res.body.message || res.body.error).toMatch(/eviction/i)
+    // No charge attempted.
+    expect(stripeConnect.createRentDestinationCharge).not.toHaveBeenCalled()
+    expect(stripeConnect.createRentPlatformCharge).not.toHaveBeenCalled()
+  })
+
   it('payment already processing (with PI id) → 409', async () => {
     const f = await seed()
     await setupTenantForPay(f, { connectReady: true })

@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.gam.api</string>
+  <!-- Production API: built dist (NOT ts-node-dev). Hosts the agent routes AND
+       the in-process scheduler (rent invoices, late fees, platform-fee accrual),
+       so KeepAlive here is also the "production cron runner". Loads its own .env
+       via dotenv (apps/api/src/db/index.ts). Run `npm run build` first — the
+       install script does this. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/opt/node@22/bin/node</string>
+    <string>/Users/nicholasrhoades/gam/apps/api/dist/index.js</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/nicholasrhoades/gam/apps/api</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/opt/node@22/bin:/opt/homebrew/opt/postgresql@16/bin:/usr/bin:/bin</string>
+    <key>NODE_ENV</key>
+    <string>production</string>
+  </dict>
+  <key>KeepAlive</key>
+  <true/>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>/tmp/gam-api.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/gam-api.err.log</string>
+</dict>
+</plist>

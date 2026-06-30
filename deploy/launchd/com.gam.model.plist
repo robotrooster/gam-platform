@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.gam.model</string>
+  <!-- Hermes chat model (the in-house agents' LLM). ~27GB into RAM, ~1-2 min to load. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/nicholasrhoades/gam-mlx-env/bin/mlx_lm.server</string>
+    <string>--model</string>
+    <string>/Users/nicholasrhoades/models/Hermes-4.3-36B-6bit-mlx</string>
+    <string>--host</string>
+    <string>127.0.0.1</string>
+    <string>--port</string>
+    <string>8080</string>
+  </array>
+  <key>KeepAlive</key>
+  <true/>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/gam-mlx.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/gam-mlx.log</string>
+</dict>
+</plist>

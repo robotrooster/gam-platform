@@ -3,6 +3,7 @@ import { useQuery } from 'react-query'
 import { Link } from 'react-router-dom'
 import { ClipboardCheck, Plus, CheckCircle2 } from 'lucide-react'
 import { apiGet } from '../lib/api'
+import type { InspectionType } from '@gam/shared'
 
 type InspectionRow = {
   id: string
@@ -10,7 +11,7 @@ type InspectionRow = {
   leaseId: string | null
   tenantId: string | null
   landlordId: string
-  inspectionType: 'move_in' | 'move_out' | 'periodic'
+  inspectionType: InspectionType
   status: 'draft' | 'tenant_signed' | 'landlord_signed' | 'finalized' | 'disputed' | 'cancelled'
   comparisonInspectionId: string | null
   scheduledFor: string | null
@@ -27,10 +28,11 @@ const STATUS_BADGE: Record<string, string> = {
   cancelled:       'badge-muted',
 }
 
-const TYPE_LABEL: Record<string, string> = {
+const TYPE_LABEL: Record<InspectionType, string> = {
   move_in:  'Move-in',
   move_out: 'Move-out',
   periodic: 'Periodic',
+  turnover: 'Turnover',
 }
 
 export function InspectionsPage() {
@@ -57,11 +59,16 @@ export function InspectionsPage() {
           <h1 style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
             <ClipboardCheck size={22} /> Inspections
           </h1>
-          <div className="page-sub">Move-in, move-out, and periodic unit inspections</div>
+          <div className="page-sub">Move-in, move-out, turnover, and periodic unit inspections</div>
         </div>
-        <Link to="/inspections/new" className="btn btn-primary">
-          <Plus size={15} /> New Inspection
-        </Link>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <Link to="/inspections/new?walkthrough=1" className="btn btn-secondary">
+            Start guided walkthrough
+          </Link>
+          <Link to="/inspections/new" className="btn btn-primary">
+            <Plus size={15} /> New Inspection
+          </Link>
+        </div>
       </div>
 
       <div className="card" style={{ padding: 16, marginBottom: 16 }}>
@@ -73,6 +80,7 @@ export function InspectionsPage() {
               <option value="move_in">Move-in</option>
               <option value="move_out">Move-out</option>
               <option value="periodic">Periodic</option>
+              <option value="turnover">Turnover</option>
             </select>
           </div>
           <div>

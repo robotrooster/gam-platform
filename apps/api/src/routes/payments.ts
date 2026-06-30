@@ -8,6 +8,7 @@ import { getStripe } from '../lib/stripe'
 import { computeApplicationFee, createRentDestinationCharge, createRentPlatformCharge } from '../services/stripeConnect'
 import { createAdminNotification } from '../services/adminNotifications'
 import { computeTenantGamOutstandingTotal } from '../services/supersedence'
+import { logger } from '../lib/logger'
 
 export const paymentsRouter = Router()
 paymentsRouter.use(requireAuth)
@@ -204,6 +205,18 @@ paymentsRouter.post('/:id/handle-return', requireAdmin, async (req, res, next) =
         VALUES ($1,'zero_tolerance_block',$2,$3,TRUE,'Tenant ACH suspended per NACHA zero-tolerance policy')`,
         [payment.id, payment.tenant_id, returnCode]
       )
+      // ACH is the operating rail for FlexPay + OTP — once it's suspended those
+      // subscriptions can't pull, so disenroll the tenant (best-effort; never
+      // block the return handler). These were previously dead code (exported,
+      // never called).
+      try {
+        const { autoDisenrollFlexPayOnAchUnverified } = await import('../services/flexpay')
+        await autoDisenrollFlexPayOnAchUnverified(payment.tenant_id)
+      } catch (e) { logger.error({ err: e, tenant_id: payment.tenant_id }, '[ach-return] flexpay auto-disenroll failed') }
+      try {
+        const { autoDisenrollOnAchUnverified } = await import('../services/otp')
+        await autoDisenrollOnAchUnverified(payment.tenant_id)
+      } catch (e) { logger.error({ err: e, tenant_id: payment.tenant_id }, '[ach-return] otp auto-disenroll failed') }
     }
 
     res.json({ success: true, data: {
@@ -248,7 +261,7 @@ paymentsRouter.post('/:id/pay', async (req: any, res, next) => {
       `SELECT p.id, p.tenant_id, p.landlord_id, p.amount, p.status, p.type,
               p.entry_description, p.stripe_payment_intent_id, p.unit_id,
               p.due_date::text AS due_date,
-              u.property_id,
+              u.property_id, u.payment_block,
               t.stripe_customer_id,
               l.user_id AS landlord_user_id,
               lu.stripe_connect_account_id,
@@ -265,6 +278,14 @@ paymentsRouter.post('/:id/pay', async (req: any, res, next) => {
     if (!pmt) throw new AppError(404, 'Payment not found')
     if (pmt.tenant_id !== req.user!.profileId) {
       throw new AppError(403, 'Not your payment')
+    }
+    // S511 #8b: eviction mode blocks ALL money routed to the landlord — every
+    // payments-row charge here is a destination charge to the landlord's Connect,
+    // and accepting any landlord-bound payment during an eviction can reset the
+    // eviction timeline. GAM-side balances (FlexDeposit installments, etc.) run
+    // through separate flows that aren't gated, so they keep collecting.
+    if (pmt.payment_block) {
+      throw new AppError(409, 'This unit is in eviction mode — payments to the landlord are paused. Accepting one could reset the eviction timeline. Contact the landlord.')
     }
     if (pmt.status === 'settled') {
       throw new AppError(409, 'Payment already settled')

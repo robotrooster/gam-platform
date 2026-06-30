@@ -44,6 +44,7 @@ async function seed() {
 
 async function addInvoice(businessId: string, customerId: string, opts: {
   status: string; total: number; paid?: number; hostedPayUrl?: string | null;
+  deposit?: number; depositType?: 'service' | 'materials' | null;
 }) {
   n += 1
   // Satisfy the status-audit CHECKs: sent/paid need sent_at, paid needs
@@ -55,10 +56,12 @@ async function addInvoice(businessId: string, customerId: string, opts: {
     `INSERT INTO business_invoices
        (business_id, customer_id, invoice_number, status, issue_date, due_date,
         subtotal, tax_amount, total_amount, amount_paid, hosted_pay_url,
+        deposit_amount, deposit_type,
         sent_at, paid_at, voided_at)
      VALUES ($1, $2, $3, $4, '2026-06-14', '2026-07-14',
-        $5, 0, $5, $6, $7, ${sentAt}, ${paidAt}, ${voidedAt}) RETURNING id`,
-    [businessId, customerId, `INV-${n}`, opts.status, opts.total, opts.paid ?? 0, opts.hostedPayUrl ?? null])
+        $5, 0, $5, $6, $7, $8, $9, ${sentAt}, ${paidAt}, ${voidedAt}) RETURNING id`,
+    [businessId, customerId, `INV-${n}`, opts.status, opts.total, opts.paid ?? 0,
+     opts.hostedPayUrl ?? null, opts.deposit ?? 0, opts.depositType ?? null])
   return i.id
 }
 
@@ -92,6 +95,30 @@ describe('GET /api/public/customer/:token', () => {
     const { token } = await getOrCreateCustomerPortalToken({ businessId, customerId })
     const res = await request(buildApp()).get(`/api/public/customer/${token}`)
     expect(res.body.data.outstanding).toBeCloseTo(70)
+  })
+
+  it('S511: a deposit invoice exposes deposit fields + amount-due-now (deposit first)', async () => {
+    const { businessId, customerId } = await seed()
+    await addInvoice(businessId, customerId, { status: 'sent', total: 1000, paid: 0, deposit: 300, depositType: 'materials' })
+    const { token } = await getOrCreateCustomerPortalToken({ businessId, customerId })
+    const res = await request(buildApp()).get(`/api/public/customer/${token}`)
+    const inv = res.body.data.invoices[0]
+    expect(inv.depositAmount).toBeCloseTo(300)
+    expect(inv.depositType).toBe('materials')
+    expect(inv.depositPaid).toBe(false)
+    expect(inv.nextPaymentKind).toBe('deposit')
+    expect(inv.amountDueNow).toBeCloseTo(300)
+  })
+
+  it('S511: after the deposit is covered, amount-due-now is the balance', async () => {
+    const { businessId, customerId } = await seed()
+    await addInvoice(businessId, customerId, { status: 'sent', total: 1000, paid: 300, deposit: 300, depositType: 'service' })
+    const { token } = await getOrCreateCustomerPortalToken({ businessId, customerId })
+    const res = await request(buildApp()).get(`/api/public/customer/${token}`)
+    const inv = res.body.data.invoices[0]
+    expect(inv.depositPaid).toBe(true)
+    expect(inv.nextPaymentKind).toBe('balance')
+    expect(inv.amountDueNow).toBeCloseTo(700)
   })
 
   it('unknown token → 404', async () => {
@@ -133,5 +160,101 @@ describe('POST /api/public/customer/:token/invoices/:id/pay', () => {
     const { token } = await getOrCreateCustomerPortalToken({ businessId: a.businessId, customerId: a.customerId })
     const res = await request(buildApp()).post(`/api/public/customer/${token}/invoices/${otherInv}/pay`)
     expect(res.status).toBe(404)
+  })
+})
+
+async function addAppointment(businessId: string, customerId: string, opts: {
+  status: string; scheduledFor: string; completedAt?: string | null;
+}) {
+  const { rows: [a] } = await db.query<{ id: string }>(
+    `INSERT INTO appointments (business_id, customer_id, service_type, scheduled_for, status, completed_at)
+     VALUES ($1, $2, 'pickup', $3::timestamptz, $4, $5::timestamptz) RETURNING id`,
+    [businessId, customerId, opts.scheduledFor, opts.status, opts.completedAt ?? null])
+  return a.id
+}
+
+/** Attach a skipped route_stop (with reason + departure time) to an appointment. */
+async function addSkippedStop(businessId: string, apptId: string, opts: { reason: string; departedAt: string }) {
+  const { rows: [d] } = await db.query<{ id: string }>(
+    `INSERT INTO depots (business_id, name, street1, city, state, zip, lat, lon)
+     VALUES ($1, 'Yard', '1 Yard', 'Phoenix', 'AZ', '85001', 33.4, -112.0) RETURNING id`, [businessId])
+  const { rows: [v] } = await db.query<{ id: string }>(
+    `INSERT INTO vehicles (business_id, home_depot_id, name) VALUES ($1, $2, 'Truck 1') RETURNING id`, [businessId, d.id])
+  const { rows: [r] } = await db.query<{ id: string }>(
+    `INSERT INTO generated_routes
+       (business_id, vehicle_id, depot_id, generated_for_date, start_at_planned,
+        status, started_at, total_miles, total_minutes, stop_count, dump_count)
+     VALUES ($1, $2, $3, '2026-06-19', '2026-06-19T15:00:00Z', 'in_progress',
+             '2026-06-19T15:00:00Z', 1, 10, 1, 0) RETURNING id`, [businessId, v.id, d.id])
+  await db.query(
+    `INSERT INTO route_stops
+       (route_id, sequence_order, stop_kind, appointment_id, estimated_arrival,
+        estimated_departure, status, driver_notes, actual_departure)
+     VALUES ($1, 1, 'customer', $2, '2026-06-19T15:10:00Z', '2026-06-19T15:15:00Z',
+             'skipped', $3, $4::timestamptz)`, [r.id, apptId, opts.reason, opts.departedAt])
+}
+
+describe('GET /api/public/customer/:token/service', () => {
+  it('reports completed / skipped / scheduled with timestamps + skip reason', async () => {
+    const { businessId, customerId } = await seed()
+    await addAppointment(businessId, customerId, { status: 'completed', scheduledFor: '2026-06-20T15:00:00Z', completedAt: '2026-06-20T15:11:00Z' })
+    const skipAppt = await addAppointment(businessId, customerId, { status: 'no_show', scheduledFor: '2026-06-19T15:00:00Z' })
+    await addSkippedStop(businessId, skipAppt, { reason: 'Gate locked', departedAt: '2026-06-19T15:20:00Z' })
+    await addAppointment(businessId, customerId, { status: 'scheduled', scheduledFor: '2026-06-25T15:00:00Z' })
+    const { token } = await getOrCreateCustomerPortalToken({ businessId, customerId })
+
+    const res = await request(buildApp()).get(`/api/public/customer/${token}/service`)
+    expect(res.status).toBe(200)
+    const appts = res.body.data.appointments
+    expect(appts).toHaveLength(3)
+    expect(appts.find((a: any) => a.state === 'completed').completedAt).toBeTruthy()
+    const skipped = appts.find((a: any) => a.state === 'skipped')
+    expect(skipped.skipReason).toBe('Gate locked')
+    expect(skipped.skippedAt).toBeTruthy()
+    expect(appts.find((a: any) => a.state === 'scheduled')).toBeTruthy()
+  })
+
+  it('only this customer’s appointments are visible', async () => {
+    const a = await seed()
+    const b = await seed()
+    await addAppointment(b.businessId, b.customerId, { status: 'completed', scheduledFor: '2026-06-20T15:00:00Z', completedAt: '2026-06-20T15:11:00Z' })
+    const { token } = await getOrCreateCustomerPortalToken({ businessId: a.businessId, customerId: a.customerId })
+    const res = await request(buildApp()).get(`/api/public/customer/${token}/service`)
+    expect(res.body.data.appointments).toHaveLength(0)
+  })
+
+  it('unknown token → 404', async () => {
+    const res = await request(buildApp()).get(`/api/public/customer/${'a'.repeat(64)}/service`)
+    expect(res.status).toBe(404)
+  })
+})
+
+async function setSlug(businessId: string, slug: string) {
+  await db.query(`UPDATE businesses SET public_booking_slug = $2 WHERE id = $1`, [businessId, slug])
+}
+
+describe('POST /api/public/portal-login/:slug', () => {
+  it('a matching email mints a portal token (generic 200)', async () => {
+    const { businessId } = await seed()
+    await setSlug(businessId, 'acme-hauling')
+    const res = await request(buildApp()).post('/api/public/portal-login/acme-hauling').send({ email: 'jane@cust.dev' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.sent).toBe(true)
+    const { rows } = await db.query(`SELECT 1 FROM business_customer_portal_tokens WHERE business_id = $1`, [businessId])
+    expect(rows).toHaveLength(1)
+  })
+
+  it('a non-matching email still returns 200 but mints nothing (no enumeration)', async () => {
+    const { businessId } = await seed()
+    await setSlug(businessId, 'acme-hauling')
+    const res = await request(buildApp()).post('/api/public/portal-login/acme-hauling').send({ email: 'nobody@nope.dev' })
+    expect(res.status).toBe(200)
+    const { rows } = await db.query(`SELECT 1 FROM business_customer_portal_tokens WHERE business_id = $1`, [businessId])
+    expect(rows).toHaveLength(0)
+  })
+
+  it('an unknown slug still returns 200 (no enumeration)', async () => {
+    const res = await request(buildApp()).post('/api/public/portal-login/no-such-biz').send({ email: 'jane@cust.dev' })
+    expect(res.status).toBe(200)
   })
 })

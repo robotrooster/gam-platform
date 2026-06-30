@@ -67,6 +67,7 @@ const createSchema = z.object({
   state:        z.string().min(1),
   zip:          z.string().min(1),
   notes:        z.string().optional(),
+  unitCount:    z.number().int().min(0).optional(),
 })
 
 businessCustomersRouter.post('/', requireAuth, async (req, res, next) => {
@@ -84,8 +85,8 @@ businessCustomersRouter.post('/', requireAuth, async (req, res, next) => {
       `INSERT INTO business_customers
          (business_id, customer_type, company_name,
           first_name, last_name, email, phone,
-          street1, street2, city, state, zip, notes)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+          street1, street2, city, state, zip, notes, unit_count)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
        RETURNING id`,
       [businessId, body.customerType,
        body.customerType === 'business' ? body.companyName?.trim() : null,
@@ -93,7 +94,7 @@ businessCustomersRouter.post('/', requireAuth, async (req, res, next) => {
        body.email ?? null, body.phone ?? null,
        body.street1, body.street2 ?? null,
        body.city, body.state, body.zip,
-       body.notes ?? null])
+       body.notes ?? null, body.unitCount ?? 1])
 
     // S465: synchronous geocode on create. Failure-tolerant — if the
     // geocoder can't resolve the address, the row stays with
@@ -279,7 +280,7 @@ businessCustomersRouter.get('/', requireAuth, async (req, res, next) => {
       `SELECT bc.id, bc.customer_type, bc.company_name,
               bc.first_name, bc.last_name, bc.email, bc.phone,
               bc.street1, bc.street2, bc.city, bc.state, bc.zip,
-              bc.lat, bc.lon, bc.notes, bc.status,
+              bc.lat, bc.lon, bc.notes, bc.status, bc.unit_count,
               bc.tax_exempt, bc.tax_exempt_reason,
               bc.payment_method_brand, bc.payment_method_last4,
               bc.payment_method_exp_month, bc.payment_method_exp_year,
@@ -345,6 +346,8 @@ const patchSchema = z.object({
   // S506: tax exemption.
   taxExempt:       z.boolean().optional(),
   taxExemptReason: z.string().max(500).nullable().optional(),
+  // S510: standing quantity (e.g. # cans) — drives per-unit service time.
+  unitCount:       z.number().int().min(0).optional(),
 }).strict()
 
 // S510: owner triggers a card-update email for a customer.
@@ -481,7 +484,8 @@ businessCustomersRouter.patch('/:id', requireAuth, async (req, res, next) => {
               zip           = COALESCE($11, zip),
               notes         = COALESCE($12, notes),
               tax_exempt        = COALESCE($15, tax_exempt),
-              tax_exempt_reason = COALESCE($16, tax_exempt_reason)
+              tax_exempt_reason = COALESCE($16, tax_exempt_reason),
+              unit_count        = COALESCE($17, unit_count)
         WHERE id = $13 AND business_id = $14
        RETURNING id`,
       [
@@ -500,6 +504,7 @@ businessCustomersRouter.patch('/:id', requireAuth, async (req, res, next) => {
         req.params.id, businessId,
         patch.taxExempt    ?? null,
         patch.taxExemptReason === undefined ? null : patch.taxExemptReason,
+        patch.unitCount    ?? null,
       ])
     if (r.length === 0) throw new AppError(404, 'Customer not found')
 

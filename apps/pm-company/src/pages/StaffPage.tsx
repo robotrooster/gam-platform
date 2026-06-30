@@ -57,7 +57,7 @@ function InviteModal({ pmCompanyId, onClose }: { pmCompanyId: string; onClose: (
 
         {sendMut.isError && (
           <div style={{ padding: 8, background: 'rgba(220,76,76,.1)', borderRadius: 6, fontSize: '.74rem', color: 'var(--red, #dc4c4c)', marginBottom: 12 }}>
-            {(sendMut.error as any)?.response?.data?.error?.message || 'Send failed.'}
+            {(sendMut.error as any)?.response?.data?.error || 'Send failed.'}
           </div>
         )}
 

@@ -74,7 +74,7 @@ GAM does not custody funds intended for your Landlord. Subject to Section 5.5 be
 
 ### 5.2 Fees You May Pay
 
-Some properties pass through the Platform's payment-processing fees to the Tenant. Where this is the case, the fee is disclosed at the checkout step before you confirm the payment. Other properties absorb the fee into the Landlord's settlement, in which case no fee is shown to you. The applicable fee schedule is configured per property by your Landlord; you can see whether a given charge is being passed through at the point you authorize payment.
+You pay the Platform's payment-processing fees on your payments by default, and the fee is disclosed at the checkout step before you confirm. Your Landlord may have elected at onboarding to cover your **ACH** processing fee — where your Landlord has done so, no ACH fee is shown to you. **Card processing fees are always paid by you and are never covered by your Landlord.** You can see whether a given charge carries a fee at the point you authorize payment.
 
 When fees are passed through, the rates are:
 
@@ -83,7 +83,7 @@ When fees are passed through, the rates are:
 
 If you enroll in FlexPay, the FlexPay enrollment terms disclose the monthly subscription fee (calculated per the date-based formula in Section 9.2 below); the fee is charged to you separately from your rent on the cadence disclosed at enrollment.
 
-If you enroll in FlexDeposit, the FlexDeposit disclosure terms govern the repayment schedule for the deposit financed on your behalf.
+If you enroll in FlexDeposit, the FlexDeposit terms (Section 9.1) govern the installment schedule for funding your security deposit into GAM custody, plus the $3.00 monthly custody fee.
 
 ### 5.3 No Cash, No Check
 
@@ -174,65 +174,57 @@ Material lease modifications and early-termination agreements require both your 
 
 GAM offers an opt-in suite of products under the FlexSuite brand. **The four products differ materially in who is providing the financial component**, and the disclosures and rights applicable to each depend on that structure. Each product is opt-in only; enrollment requires that you accept the product-specific terms presented at the enrollment surface.
 
-### 9.1 FlexDeposit (Service-Level Agreement, not credit)
+### 9.1 FlexDeposit (deposit installments with GAM custody — not credit)
 
-#### 9.1.1 Express Characterization and Intent
+#### 9.1.1 What FlexDeposit Is
 
-**FlexDeposit is a service-level agreement (the "FlexDeposit SLA") between you and GAM. The FlexDeposit SLA is not, and shall not be construed as, a loan, an extension of consumer credit, a "credit transaction" under the Truth in Lending Act (15 U.S.C. § 1601 et seq.) or Regulation Z (12 C.F.R. Part 1026), an extension of credit under the Equal Credit Opportunity Act (15 U.S.C. § 1691 et seq.) or Regulation B (12 C.F.R. Part 1002), a consumer financial product or service under the Consumer Financial Protection Act (12 U.S.C. § 5481 et seq.), a debt under the Fair Debt Collection Practices Act (15 U.S.C. § 1692 et seq.), or a "loan" or "extension of credit" under the consumer-finance, consumer-installment-loan, small-loan, or usury statutes of any state.** The parties expressly agree and intend that the FlexDeposit SLA shall be construed as a service-level agreement only.
+FlexDeposit lets you fund your security deposit in installments while GAM holds the deposit in custody. You opt in **at move-in**. Eligibility is limited to recipients of Social Security Disability Insurance (SSDI) or Supplemental Security Income (SSI) at this time, and your income is verified at enrollment. **FlexDeposit involves no credit check, no credit decision, and no extension of credit.** Your deposit is divided into **between two and six monthly installments based on your deposit amount, as disclosed to you at enrollment.**
 
-When you enroll in FlexDeposit at move-in, GAM, in its sole discretion and as a discretionary service-level accommodation, advances the amount of your security deposit to your Landlord's pooled-custody account on your behalf. **The advance is not a loan to you.** GAM does not extend credit to you, does not bill you for principal or interest, does not charge a finance charge as that term is defined in 12 C.F.R. § 1026.4, and does not record the advance as a receivable from you on its books.
+**GAM holds your deposit in custody as you fund it; GAM does not advance, lend, or float any portion of your deposit to your Landlord.** Your Landlord's books reflect your deposit in full at move-in, but the funds are held by GAM, not paid to your Landlord. GAM charges a **custody fee of $3.00 per month** for as long as it holds your deposit.
 
-Under the FlexDeposit SLA, you agree to make a schedule of service-fee installments to GAM. **The service-fee installments are consideration for the ongoing service-level accommodation, not repayment of principal or interest on a loan.** The total of the service-fee installments may equal, exceed, or fall below the amount GAM advanced; that relationship does not transform the FlexDeposit SLA into a credit transaction.
+#### 9.1.2 Not a Loan or Credit
 
-#### 9.1.2 No Debt Created; No Recourse
+The installments you pay under FlexDeposit fund **your own security deposit** — they are not repayment of any advance, loan, or extension of credit, because GAM does not advance or lend anything to you. FlexDeposit is not, and shall not be construed as, a loan, an extension of consumer credit, a "credit transaction" under the Truth in Lending Act (15 U.S.C. § 1601 et seq.) or Regulation Z (12 C.F.R. Part 1026), an extension of credit under the Equal Credit Opportunity Act (15 U.S.C. § 1691 et seq.) or Regulation B (12 C.F.R. Part 1002), a consumer financial product or service under the Consumer Financial Protection Act (12 U.S.C. § 5481 et seq.), a debt under the Fair Debt Collection Practices Act (15 U.S.C. § 1692 et seq.), or a loan or extension of credit under the consumer-finance, consumer-installment-loan, small-loan, or usury statutes of any state. GAM holds your deposit as a custodian; it does not bill you principal or interest and does not charge a finance charge as defined in 12 C.F.R. § 1026.4. The custody fee is consideration for the custody service only.
 
-The FlexDeposit SLA does not create a debt, a credit obligation, or any enforceable obligation to repay any amount to GAM. **You do not "owe" GAM any sum under the FlexDeposit SLA.** Your service-fee installment obligation is contingent on your continued election to remain enrolled in FlexDeposit and on your authorization of the ACH-pull schedule disclosed at enrollment.
+#### 9.1.3 Custody, Return, and Default
 
-If you do not make a scheduled installment, **GAM's sole and exclusive remedies are the service-tier consequences described in Section 9.1.4 below.** GAM will not, and may not under the FlexDeposit SLA:
+While GAM holds your deposit:
 
-- Sue you, file an action in any court, or seek a judgment against you;
-- Engage any collection agency or third-party debt collector to recover any amount from you;
-- Garnish your wages, place a lien on your property, or seize any asset of yours;
-- Take or assert any security interest in your security deposit, in any deposit refund owed to you (except as expressly authorized in Section 9.1.4(iii) below as a contractual offset, not as a secured claim), or in any other property of yours;
-- Furnish any payment-history data, default, or other negative information about your FlexDeposit SLA to any consumer reporting agency or other credit-reporting database;
-- Threaten any of the foregoing.
+- **At lease end / move-out**, GAM returns the deposit to you through the deposit-return flow in Section 6, less any deductions your Landlord is entitled to take under the lease and applicable law.
+- **On your default**, your Landlord's claim is satisfied from the deposit GAM holds for you.
+- **Because GAM does not float the deposit, if you have not finished funding it, the amount available to your Landlord and to you is limited to what you have actually paid into custody.**
+- Where applicable law requires a security deposit to be held in a separate, escrow, or interest-bearing account, GAM holds it accordingly and pays any required statutory interest. GAM keeps the deposit available for return or disbursement in accordance with the lease and applicable law.
 
-For the avoidance of doubt: the Collections Partner described in Section 5.6 is engaged only for landlord-owed unpaid rent. The Collections Partner has no role in FlexDeposit, and GAM does not refer FlexDeposit SLA balances to the Collections Partner or any other collector.
+#### 9.1.4 Payment Routing
 
-#### 9.1.3 Payment Routing Authorization
+By enrolling in FlexDeposit, you authorize the payment routing described in Section 5.5: when you authorize an ACH or card payment through the Platform for any amount (including rent), the Platform applies the payment first to any then-due FlexDeposit installment, on a first-in, first-out basis, before settling any remainder to your Landlord. This is the operational mechanism by which your deposit is funded; **it is not a debt-collection mechanism.** You may revoke the ACH authorization at any time by writing to `support@goldassetmanagement.com`; revocation stops further routing to your FlexDeposit installments and may trigger Section 9.1.5.
 
-By enrolling in FlexDeposit, you authorize the payment routing described in Section 5.5 above as it applies to your FlexDeposit SLA installments. Specifically:
+#### 9.1.5 If You Stop Funding (Service-Tier, Not Debt-Collection)
 
-- When you authorize an ACH or card payment through the Platform for any amount (including rent), the Platform applies the payment first to any then-due FlexDeposit SLA installment, on a first-in, first-out basis, before settling any remainder to your Landlord's Stripe Connect balance.
-- This routing is the operational mechanism by which your FlexDeposit SLA installments are satisfied. It is not a debt-collection mechanism.
-- You may revoke the ACH authorization at any time by notifying GAM in writing (email to `support@goldassetmanagement.com` is sufficient). Revocation stops further routing of your payments to the FlexDeposit SLA installment schedule and triggers Section 9.1.4.
+If you do not make a scheduled installment, your deposit is simply under-funded, and the consequences are limited to the following. **None of these is a debt, debt collection, or credit-reporting action. You do not "owe" GAM, and GAM will not** sue you, obtain a judgment against you, engage any collection agency or debt collector, garnish your wages, lien or seize your property, take a security interest in your deposit or refund, furnish any information about you to a consumer reporting agency, or threaten any of the foregoing.
 
-#### 9.1.4 Consequences of Non-Payment (Service-Tier, Not Debt-Collection)
+- Your eligibility to enroll in other FlexSuite products (FlexPay, FlexCharge, FlexCredit) may be restricted until your installments are current.
+- At lease end, any portion of the deposit you did not fund is not part of the deposit held for you; your Landlord's deductions and your refund are calculated against the amount actually held.
 
-If you do not make a scheduled installment under the FlexDeposit SLA, the consequences are limited to the following service-tier adjustments to your Platform account. None of these consequences is a debt, debt collection, or credit-reporting action.
+For the avoidance of doubt: the Collections Partner described in Section 5.6 is engaged only for landlord-owed unpaid rent and has no role in FlexDeposit.
 
-- **(i)** **On-Time Pay (OTP) suspension.** Your eligibility for the On-Time Pay reporting product (if your Landlord enrolls you) is suspended until your FlexDeposit SLA installment schedule is brought current.
-- **(ii)** **FlexSuite enrollment restriction.** Your eligibility to enroll in additional FlexSuite products (FlexPay, FlexCharge, FlexCredit) may be restricted at GAM's discretion until the FlexDeposit SLA installment schedule is brought current.
-- **(iii)** **Contractual offset at lease end.** At lease end, after your Landlord has itemized deductions against your security deposit under Section 6 above, any remaining unpaid balance under your FlexDeposit SLA may be offset against the deposit refund otherwise payable to you. **This is a contractual offset under the FlexDeposit SLA, not a secured claim or a debt-collection action.** The offset is limited to the deposit-refund residual; if the residual is insufficient to cover the unpaid FlexDeposit SLA balance, the shortfall is absorbed by GAM and is not pursued against you under any theory.
+#### 9.1.6 Transfers Between GAM Properties
 
-#### 9.1.5 Bankruptcy and Recharacterization
+If you move to another property on the Platform, your deposit is forwarded and **remains in GAM custody — your prior Landlord does not receive a payout on the transfer.** Your new operator's books are updated to reflect the deposit, and **once it is marked in the new operator's books, the $3.00 monthly custody fee dissolves and you will not be charged a further custody fee.** If your new property's required deposit is larger than the amount forwarded, you fund the difference by topping up to GAM through additional monthly installments — not by paying your Landlord.
 
-If you commence any bankruptcy, insolvency, receivership, or similar proceeding, the FlexDeposit SLA is terminable by GAM at its option and any unpaid installment obligation under the FlexDeposit SLA is forgiven. GAM will not assert any claim, secured or unsecured, against your bankruptcy estate for the unpaid FlexDeposit SLA balance.
+#### 9.1.7 No Consumer Report for Eligibility
 
-If any court, regulator, or other authority determines that the FlexDeposit SLA, in whole or in part, constitutes an extension of consumer credit, a debt, or any analogous financial obligation notwithstanding the parties' express intent in Section 9.1.1, the following severability rules apply:
+GAM determines your eligibility for FlexDeposit from your existing Platform account data and your verified income — not from a consumer report. **GAM does not obtain a consumer report from any consumer reporting agency for the FlexDeposit eligibility determination.** The determination is not a "credit decision" under the Equal Credit Opportunity Act and is not subject to the Fair Credit Reporting Act's adverse-action requirements. If GAM declines to enroll you, you may request a written explanation by emailing `support@goldassetmanagement.com`; GAM will respond within thirty (30) days.
 
-- **(a)** the provisions of Sections 9.1.1 through 9.1.4 shall be construed to give maximum effect to the parties' service-level-agreement intent;
-- **(b)** any provision found to constitute an extension of credit shall be severed from the FlexDeposit SLA, and the remaining provisions shall continue in force as a service-level agreement;
-- **(c)** in no event shall any provision of the FlexDeposit SLA be construed to create an obligation to repay that GAM has not affirmatively elected to enforce; GAM's no-recourse election in Section 9.1.2 shall remain operative as to GAM regardless of the recharacterization determination; and
-- **(d)** if recharacterization triggers any disclosure, licensing, or other regulatory requirement under federal or state law that GAM has not satisfied, GAM's sole remedy is to terminate the FlexDeposit SLA, forgive any unpaid installment obligation, and refund to you any service-fee installments you have paid in excess of the amount GAM advanced on your behalf.
+#### 9.1.8 Bankruptcy
 
-#### 9.1.6 No Eligibility-Decision Consumer Report
-
-GAM determines your eligibility for FlexDeposit from your existing Platform account data — your tenancy record, your active-lease status, your payment history on the Platform, and similar internal data. **GAM does not obtain a consumer report from any consumer reporting agency for the FlexDeposit eligibility determination.** The eligibility determination is not a "credit decision" under the Equal Credit Opportunity Act, is not subject to the Fair Credit Reporting Act's adverse-action requirements, and does not generate an adverse-action notice if GAM declines to enroll you. If GAM declines to enroll you in FlexDeposit, you may request a written explanation of the basis for the decision by emailing `support@goldassetmanagement.com`; GAM will respond within thirty (30) days.
+If you commence any bankruptcy, insolvency, receivership, or similar proceeding, GAM may terminate FlexDeposit at its option. GAM will not assert any claim, secured or unsecured, against your bankruptcy estate arising from FlexDeposit, and your deposit — to the extent held by GAM and not subject to your Landlord's lawful deductions — remains returnable to you under Section 6 and applicable law.
 
 ### 9.2 FlexPay (Payment-date coordination subscription)
 
 **FlexPay is a payment-scheduling service. It is not a loan or extension of credit.** When you enroll in FlexPay, you select a payment-date arrangement for your rent and other recurring charges — for example, designating a date later in the month for your rent ACH pull, splitting rent into two pulls within the month, or aligning the pull date with your payday. **GAM does not advance any funds on your behalf for FlexPay.** The Platform's payment processor (Stripe) initiates the ACH pull from your bank account on the date you scheduled; if the funds are not available on that date, the pull fails and your account reflects unpaid rent until you bring it current.
+
+**FlexPay is available only to recipients of SSDI or SSI at this time. If you are funding your security deposit through FlexDeposit, you must complete that installment plan before you can enroll in FlexPay. A deposit you have otherwise already paid — including one carried over from before your Landlord joined the Platform — does not affect your FlexPay eligibility.**
 
 FlexPay is a subscription priced on a **date-based formula**:
 
@@ -241,20 +233,21 @@ FlexPay is a subscription priced on a **date-based formula**:
 - Example: a Scheduled Pull Date of the 11th of each month produces a Monthly Fee of $5 + $11 = **$16.00**.
 - **Failed pulls re-price.** If your rent ACH pull fails on the Scheduled Pull Date and the Platform retries on a later calendar day under the failed-pull retry policy described in Section 5.4, your FlexPay Monthly Fee for that cycle is **recalculated** using the formula at the actual (retry) pull date. A retry on the 15th, for example, recalculates the cycle's Monthly Fee to $5 + $15 = **$20.00**, replacing the originally-scheduled $16.00. **Plus, any Stripe ACH-return fees that GAM is charged are passed through to you** at GAM's actual cost. The full recalculation mechanics and Stripe pass-through provisions are set out in the FlexPay Subscription Terms § 4.1 and § 4.2.
 - The fee is for the scheduling-service access, not for any credit, advance, or money movement on your behalf.
-- You may change your Scheduled Pull Date at any time through the in-platform FlexPay settings; the change (and the corresponding new Monthly Fee) takes effect from the next full billing cycle.
+- **Failure and re-enrollment.** Your scheduled pull is retried up to two more times: the second attempt on the next business day, and the final attempt on the third business day after your original due date. A **FlexPay failure** occurs only if all three attempts fail. **Following a FlexPay failure, you may not re-enroll in FlexPay for 90 days.**
+- You may change your Scheduled Pull Date at any time through the in-platform FlexPay settings. The change (and the corresponding new Monthly Fee) **takes effect from the next full billing cycle** — it does not alter any pull already scheduled for the current cycle, so an outstanding balance does not block the change.
 - You may cancel FlexPay at any time through the in-platform cancellation surface; the cancellation takes effect at the end of the then-current billing cycle.
 
 Because GAM is not advancing funds, **no Truth in Lending Act, FCRA, or state lending-law framework applies to FlexPay.** Auto-renewal of the FlexPay subscription is disclosed at enrollment per the state automatic-renewal laws listed in Section 9.5.
 
 ### 9.3 FlexCharge (Business-Account-Owner-extended credit; GAM accounting)
 
-**The Business Account Owner is the creditor.** GAM is not. FlexCharge is an accounting feature that lets a **Business Account Owner** — your Landlord, or a separate point-of-sale ("**POS**") operator who has not also rented you a unit — operate a rolling charge account at a specific Location. It is typical at RV parks, extended-stay properties, and on-site stores or service desks where account holders run a tab for property-store purchases, utilities, services, and other charges. The Business Account Owner sets the credit limit, sets any interest or finance charges, sets the payment cadence, and is the party to whom you owe the charged balance.
+**FlexCharge is a product organized by GAM but not operated by GAM. The Business Account Owner is the creditor.** GAM is not. FlexCharge is an accounting feature that lets a **Business Account Owner** — your Landlord, or a separate point-of-sale ("**POS**") operator who has not also rented you a unit — operate a rolling charge account at a specific Location. It is typical at RV parks, extended-stay properties, and on-site stores or service desks where account holders run a tab for property-store purchases, utilities, services, and other charges. The Business Account Owner sets the credit limit, sets any interest or finance charges, sets the payment cadence, and is the party to whom you owe the charged balance.
 
 You may be either: (a) a Tenant of the Business Account Owner with a lease at the Location; or (b) a POS Customer with no lease, who uses FlexCharge solely to run a charge tab at the Location's POS surface. Your status is recorded at enrollment.
 
 **FlexCharge is enabled per Location.** A Business Account Owner who operates multiple locations may offer FlexCharge at some Locations and not others. You will not see FlexCharge enrollment surfaces, copy, or disclosures with respect to any Location at which the Business Account Owner has not enabled FlexCharge.
 
-GAM's role on FlexCharge is **software only**: the Platform tracks each charge posted by the Business Account Owner, applies your payments, and surfaces the statement to you in your tenant or POS-customer portal. The fee GAM charges for FlexCharge is for that accounting service, not for credit extension.
+GAM's role on FlexCharge is **software only**: the Platform tracks each charge posted by the Business Account Owner, applies your payments, and surfaces the statement to you in your tenant or POS-customer portal. The fee GAM charges for FlexCharge is for that accounting service, not for credit extension. **GAM sets no rules on how a Business Account Owner operates its charge accounts — GAM provides only the ability to offer them — and advises Business Account Owners to operate within their local laws.**
 
 Because the Business Account Owner is the creditor:
 
@@ -263,17 +256,14 @@ Because the Business Account Owner is the creditor:
 - GAM is not responsible for the Business Account Owner's underwriting decisions, credit-limit settings, finance-charge calculations, or collection activity. Disputes about charges on your FlexCharge account should be raised with the Business Account Owner first; GAM will help facilitate the dispute through the Platform's dispute interface where you elect to use it.
 - The Collections Partner integration described in Section 5.6 is **not engaged** on FlexCharge balances; it applies only to unpaid rent owed to a Landlord under a lease.
 
-### 9.4 FlexCredit (Third-party lender; GAM is a referral partner)
+### 9.4 FlexCredit (Rent-payment credit reporting — not a loan)
 
-**A third-party lender is the creditor.** GAM is not. FlexCredit refers you to a third-party financial-services partner (the "**FlexCredit Lender**") that offers the credit or financial product. The FlexCredit Lender is identified at the enrollment surface at the time you apply.
+**FlexCredit is a credit-reporting service, not a loan, a line of credit, or any extension of credit.** When you opt in to FlexCredit, GAM reports your **positive (on-time) rent payments** to consumer reporting agencies through a third-party registered furnisher, to help you build credit history from rent you already pay. GAM does not lend you money, does not advance funds, and makes no credit decision about you.
 
-GAM's role on FlexCredit is **introduction and integration**: GAM presents you with the offer, hands off your application to the FlexCredit Lender, and integrates the resulting product's payment flow into your tenant account. The fee GAM receives for FlexCredit is a referral fee or markup paid by the FlexCredit Lender or built into the product's pricing, as disclosed at enrollment.
-
-Because the third-party lender is the creditor:
-
-- The credit terms (APR, fees, repayment schedule, default consequences, dispute rights) are between you and the FlexCredit Lender and are governed by the FlexCredit Lender's terms presented at enrollment.
-- TILA, ECOA, FCRA, and state lending-law rights run against the FlexCredit Lender. The FlexCredit Lender is responsible for compliance with those laws.
-- GAM is not responsible for the FlexCredit Lender's underwriting decisions, credit decisions, finance-charge calculations, or collection activity.
+- **Opt-in and opt-out.** FlexCredit is voluntary. You may opt out at any time; opting out stops future reporting. Payment history already furnished is handled according to the furnisher's and the consumer reporting agencies' standard rules.
+- **No guaranteed result.** Credit scores are determined by the consumer reporting agencies and their scoring models, not by GAM. **GAM does not warranty, guarantee, or promise any particular change to your credit score or any other outcome** from FlexCredit.
+- **What is reported.** FlexCredit is designed to report positive payment activity. The third-party furnisher and the consumer reporting agencies maintain and report the data; their identities and the applicable disclosures are presented to you at enrollment.
+- **Fees.** Any FlexCredit fee is disclosed at enrollment. **FlexCredit fees are not prorated and are non-refundable.**
 
 ### 9.5 Auto-Renewal Disclosures
 
@@ -285,7 +275,7 @@ If a FlexSuite product you enroll in automatically renews on a billing cycle (e.
 - Oregon ORS 646A.295
 - New Jersey N.J.S.A. 56:12-14.1
 
-You may cancel an auto-renewing FlexSuite subscription at any time through the in-platform cancellation surface; the cancellation takes effect at the end of the then-current billing cycle. Cancellation of FlexCharge or FlexCredit (where applicable) is handled through the dispute-resolution channel of the respective creditor (the Business Account Owner for FlexCharge; the FlexCredit Lender for FlexCredit), with GAM's assistance through the Platform.
+You may cancel an auto-renewing FlexSuite subscription at any time through the in-platform cancellation surface; the cancellation takes effect at the end of the then-current billing cycle. Cancellation of FlexCharge is handled with the Business Account Owner (the creditor) through the Platform. FlexCredit is cancelled by opting out at any time through the in-platform FlexCredit settings, which stops future reporting.
 
 ## 10. Refunds
 
@@ -498,6 +488,14 @@ Headings in these Terms are for convenience only and do not affect interpretatio
 ### 23.8 Relationship of the Parties
 
 Nothing in these Terms creates any agency, partnership, joint venture, employment, or fiduciary relationship between you and GAM. **GAM is not a party to your lease and is not your Landlord.**
+
+## 24. Automated Systems and AI Agents
+
+The Platform operates in part through automated systems and AI-assisted agents that may communicate with you, generate documents and notices, schedule and process activity, and perform routine actions within the Platform. **Where an automated or AI agent presents an action for your review, you are responsible for confirming the action before it is taken, and you are responsible for any action you confirm or direct the agent to take.** These systems may occasionally make an error or take an incorrect action; GAM may review, correct, reverse, or adjust any erroneous action, entry, communication, or record produced by such systems, and you authorize GAM to make those corrections. Automated or AI-generated communications are operational tools — they are not legal, tax, or financial advice and do not replace your own judgment. GAM's responsibility for the actions of its automated systems is governed by the Disclaimers and Limitation of Liability sections, and you agree to promptly notify GAM of any error you identify so it can be corrected.
+
+## 25. Communications and Consent to Contact
+
+You consent to receive communications from GAM — including account, billing, transaction, security, and service messages — by email, SMS/text message, push notification, and telephone, **including messages sent using automated or autodialed systems and prerecorded or AI-generated voices**, at the email address and phone numbers you provide. Message and data rates may apply and message frequency varies. **Consent to receive marketing communications is not a condition of using the Platform.** You may opt out of marketing communications at any time (for example, by replying STOP to a marketing text or using an unsubscribe link), but you may not opt out of operational and transactional messages necessary to provide the service while you maintain an account. You are responsible for keeping your contact information current and will promptly notify GAM if you stop using a phone number you provided.
 
 ---
 

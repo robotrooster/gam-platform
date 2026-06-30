@@ -649,7 +649,10 @@ describe('GET /maintenance/stats/summary', () => {
     expect(Number(res.body.data.completed_count)).toBe(2)
     expect(Number(res.body.data.emergency_count)).toBe(1)
     expect(Number(res.body.data.total_cost)).toBe(550)
-    expect(Number(res.body.data.total_fees)).toBe(44)
+    // total_fees (maintenance platform fee) intentionally not returned — the
+    // landlord pays only actual cost; the fee is reserved for the future
+    // contractor marketplace and surfaced nowhere.
+    expect(res.body.data.total_fees).toBeUndefined()
   })
 
   it('cross-landlord rows excluded', async () => {
@@ -673,7 +676,7 @@ describe('GET /maintenance/stats/summary', () => {
     expect(res.status).toBe(200)
     expect(Number(res.body.data.open_count)).toBe(0)
     expect(Number(res.body.data.total_cost)).toBe(0)
-    expect(Number(res.body.data.total_fees)).toBe(0)
+    expect(res.body.data.total_fees).toBeUndefined()
   })
 
   it('tenant role → empty data response (route short-circuits)', async () => {

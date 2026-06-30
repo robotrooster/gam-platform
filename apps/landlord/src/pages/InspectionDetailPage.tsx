@@ -7,6 +7,7 @@ import {
 } from 'lucide-react'
 import { api, apiGet, apiPatch, apiPost } from '../lib/api'
 import { CameraCapture } from '../components/CameraCapture'
+import { AuthedImg, AuthedVideo } from '../components/AuthedMedia'
 
 type Item = {
   id: string
@@ -366,11 +367,10 @@ export function InspectionDetailPage() {
           <div style={{ padding: 16, display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(150px, 1fr))', gap: 12 }}>
             {insp.photos.map(p => (
               <div key={p.id} style={{ position: 'relative' }}>
-                <a href={(import.meta as any).env.VITE_API_URL + p.photoUrl} target="_blank" rel="noreferrer"
-                   style={{ display: 'block', aspectRatio: '1/1', borderRadius: 8, overflow: 'hidden', background: 'var(--bg-3)' }}>
-                  <img src={(import.meta as any).env.VITE_API_URL + p.photoUrl} alt={p.caption || ''}
-                       style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
-                </a>
+                <div style={{ aspectRatio: '1/1', borderRadius: 8, overflow: 'hidden', background: 'var(--bg-3)' }}>
+                  <AuthedImg path={p.photoUrl} alt={p.caption || ''}
+                             style={{ width: '100%', height: '100%', objectFit: 'cover', borderRadius: 8 }} />
+                </div>
                 {p.capturedLive && (
                   <span className="badge badge-green" style={{ position: 'absolute', top: 6, left: 6 }}>live</span>
                 )}
@@ -412,10 +412,8 @@ export function InspectionDetailPage() {
           <div style={{ padding: 16, display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: 16 }}>
             {videos.map(v => (
               <div key={v.id}>
-                <video
-                  controls
-                  preload="metadata"
-                  src={(import.meta as any).env.VITE_API_URL + v.videoUrl}
+                <AuthedVideo
+                  path={v.videoUrl}
                   style={{ width: '100%', borderRadius: 8, background: '#000', aspectRatio: '16/9' }}
                 />
                 <div style={{ marginTop: 6, fontSize: '.78rem', color: 'var(--text-2)', display: 'flex', alignItems: 'center', gap: 6 }}>

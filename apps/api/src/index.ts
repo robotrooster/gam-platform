@@ -21,6 +21,7 @@ import { validateEnv } from './lib/validateEnv'
 import dotenv from 'dotenv'
 import { errorHandler } from './middleware/errorHandler'
 import { camelCaseKeys } from './lib/caseConversion'
+import { recordLatency } from './lib/apiMetrics'
 import { authRouter }         from './routes/auth'
 import { totpRouter }         from './routes/totp'
 import { landlordsRouter }    from './routes/landlords'
@@ -41,9 +42,11 @@ import { businessReportsRouter } from './routes/businessReports'
 import { businessRecurringInvoicesRouter } from './routes/businessRecurringInvoices'
 import { businessBookableServicesRouter } from './routes/businessBookableServices'
 import { publicBookingRouter } from './routes/publicBooking'
+import { publicPropertyBookingRouter } from './routes/publicPropertyBooking'
 import { businessAttachmentsRouter } from './routes/businessAttachments'
 import { publicCardUpdateRouter } from './routes/publicCardUpdate'
 import { publicCustomerPortalRouter } from './routes/publicCustomerPortal'
+import { publicBusinessCalendarRouter } from './routes/publicBusinessCalendar'
 import { businessSearchRouter } from './routes/businessSearch'
 import { appointmentsRouter } from './routes/appointments'
 import { recurringSchedulesRouter } from './routes/recurringSchedules'
@@ -54,6 +57,7 @@ import { dumpLocationsRouter } from './routes/dumpLocations'
 import { tenantsRouter }      from './routes/tenants'
 import { propertiesRouter, publicPropertiesRouter } from './routes/properties'
 import { unitsRouter }        from './routes/units'
+import { propertyBookingAdminRouter } from './routes/propertyBookingAdmin'
 import { leasesRouter }       from './routes/leases'
 import { subleasesRouter }    from './routes/subleases'
 import { subleaseInvitationsRouter } from './routes/subleaseInvitations'
@@ -81,6 +85,8 @@ import { pmRouter } from './routes/pm'
 import { creditRouter }       from './routes/credit'
 import { bookingsRouter }     from './routes/bookings'
 import { inspectionsRouter }  from './routes/inspections'
+import { commonAreasRouter }  from './routes/commonAreas'
+import { serviceInterruptionsRouter } from './routes/serviceInterruptions'
 import { agentRouter, salesAgentRouter, guestAgentRouter } from './routes/agent'
 import { entryRequestsRouter } from './routes/entryRequests'
 import { bulletinRouter }      from './routes/bulletin'
@@ -121,6 +127,9 @@ app.use(cors({
     process.env.LISTINGS_APP_URL       || 'http://localhost:3008',
     process.env.ADMIN_OPS_APP_URL      || 'http://localhost:3009',
     process.env.PM_COMPANY_APP_URL     || 'http://localhost:3011',
+    process.env.BUSINESS_APP_URL       || 'http://localhost:3012',
+    process.env.FITNESS_APP_URL        || 'http://localhost:3013',
+    process.env.CUSTOMER_PORTAL_URL    || 'http://localhost:3014',
     'https://experience.arcgis.com',
   ],
   credentials: true,
@@ -139,6 +148,15 @@ app.use('/api/background/webhook', express.raw({ type: 'application/json' }))
 
 app.use(express.json())
 app.use(express.urlencoded({ extended: true }))
+
+// Record per-request latency for the super-admin Scaling Readiness panel (p95).
+app.use((_req, res, next) => {
+  const start = process.hrtime.bigint()
+  res.on('finish', () => {
+    recordLatency(Number(process.hrtime.bigint() - start) / 1e6)
+  })
+  next()
+})
 
 // Outgoing camelCase middleware — converts snake_case DB keys to camelCase
 // wire format on the way out. DB stays snake_case; frontend sees camelCase.
@@ -197,10 +215,12 @@ app.use('/api/business-reports', businessReportsRouter)
 app.use('/api/business-recurring-invoices', businessRecurringInvoicesRouter)
 app.use('/api/business-bookable-services', businessBookableServicesRouter)
 app.use('/api/public', publicBookingRouter)
+app.use('/api/public', publicPropertyBookingRouter)
 app.use('/api/business-attachments', businessAttachmentsRouter)
 app.use('/api/business-search', businessSearchRouter)
 app.use('/api/public', publicCardUpdateRouter)
 app.use('/api/public', publicCustomerPortalRouter)
+app.use('/api/public', publicBusinessCalendarRouter)
 app.use('/api/appointments',  appointmentsRouter)
 app.use('/api/recurring-schedules', recurringSchedulesRouter)
 app.use('/api/routes',        routesRouter)
@@ -211,6 +231,7 @@ app.use('/api/tenants',       tenantsRouter)
 app.use('/api/properties',    propertiesRouter)
 app.use('/api/public/properties', publicPropertiesRouter)
 app.use('/api/units',         unitsRouter)
+app.use('/api',               propertyBookingAdminRouter)
 app.use('/api/leases',        leasesRouter)
 app.use('/api/subleases',     subleasesRouter)
 app.use('/api/sublease-invitations', subleaseInvitationsRouter)
@@ -258,6 +279,8 @@ app.use('/api/pm/:pmCompanyId/agent-activity', pmAgentActivityRouter)
 app.use('/api/credit',         creditRouter)
 app.use('/api/bookings',       bookingsRouter)
 app.use('/api/inspections',    inspectionsRouter)
+app.use('/api/common-areas',   commonAreasRouter)
+app.use('/api/service-interruptions', serviceInterruptionsRouter)
 app.use('/api/agent',          agentRouter)
 app.use('/api/sales',          salesAgentRouter)
 app.use('/api/guest',          guestAgentRouter)

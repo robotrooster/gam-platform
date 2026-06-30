@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.gam.embeddings</string>
+  <!-- bge-large embeddings server (:8081) — powers agent knowledge retrieval.
+       Runs from ~/gam-services (NOT the repo) to avoid the macOS TCC block on
+       ~/Downloads; the script is self-contained (only ~/models + llama-server).
+       install-services.sh copies it out. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/nicholasrhoades/gam-services/start-embeddings.sh</string>
+  </array>
+  <key>KeepAlive</key>
+  <true/>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/gam-embeddings.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/gam-embeddings.log</string>
+</dict>
+</plist>

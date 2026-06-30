@@ -2,6 +2,7 @@ import { useQuery } from 'react-query'
 import { useParams, useNavigate } from 'react-router-dom'
 import { Film, ArrowLeft, Video } from 'lucide-react'
 import { apiGet } from '../lib/api'
+import { AuthedVideo } from '../components/AuthedMedia'
 
 type LifecycleVideo = {
   id: string
@@ -51,7 +52,6 @@ export function UnitLifecyclePage() {
 
   if (isLoading || !data) return <div style={{ padding: 32, color: 'var(--text-3)' }}>Loading…</div>
 
-  const apiUrl = (import.meta as any).env.VITE_API_URL
   const totalVideos = data.stages.reduce((n, s) => n + s.videos.length, 0)
 
   return (
@@ -95,10 +95,8 @@ export function UnitLifecyclePage() {
                 <div style={{ padding: 16, display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: 16 }}>
                   {stage.videos.map(v => (
                     <div key={v.id}>
-                      <video
-                        controls
-                        preload="metadata"
-                        src={apiUrl + v.url}
+                      <AuthedVideo
+                        path={v.url}
                         style={{ width: '100%', borderRadius: 8, background: '#000', aspectRatio: '16/9' }}
                       />
                       <div style={{ marginTop: 6, fontSize: '.78rem', color: 'var(--text-2)', display: 'flex', alignItems: 'center', gap: 6 }}>

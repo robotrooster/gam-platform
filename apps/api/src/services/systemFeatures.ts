@@ -28,10 +28,16 @@ export async function setFeatureEnabled(
   enabled: boolean,
   updatedByUserId: string,
 ): Promise<void> {
+  // Upsert, not UPDATE: a missing row must not silently no-op the toggle.
+  // (description defaults to the key on first insert; the seed migration carries
+  // the human-readable text for known flags.)
   await query(
-    `UPDATE system_features
-        SET enabled = $1, updated_at = NOW(), updated_by_user_id = $2
-      WHERE key = $3`,
-    [enabled, updatedByUserId, key],
+    `INSERT INTO system_features (key, enabled, description, updated_by_user_id)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (key) DO UPDATE
+        SET enabled = EXCLUDED.enabled,
+            updated_at = NOW(),
+            updated_by_user_id = EXCLUDED.updated_by_user_id`,
+    [key, enabled, key, updatedByUserId],
   )
 }
