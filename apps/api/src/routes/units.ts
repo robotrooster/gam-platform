@@ -130,6 +130,16 @@ unitsRouter.patch('/:id/status', requirePerm('units.edit'), async (req, res, nex
     if (!canManageLandlordResource(req.user, unit.landlord_id)) {
       throw new AppError(403, 'Forbidden')
     }
+    // 'suspended' is coupled 1:1 to eviction mode (see POST /:id/eviction-mode).
+    // It can't be set directly, and a unit that IS suspended can't be moved off
+    // 'suspended' here — both directions go through the eviction-mode toggle so
+    // status and payment_block never desync.
+    if (status === 'suspended') {
+      throw new AppError(400, "Use eviction mode to suspend a unit — 'suspended' can't be set directly")
+    }
+    if (unit.status === 'suspended') {
+      throw new AppError(400, 'This unit is in eviction mode. Turn eviction mode off to change its status')
+    }
     const [updated] = await query<any>(
       `UPDATE units SET status = $1 WHERE id = $2 RETURNING *`, [status, req.params.id]
     )
@@ -159,11 +169,27 @@ unitsRouter.post('/:id/eviction-mode', requireLandlord, async (req, res, next) =
     // payment_block_set_by is of type uuid but expression is of type
     // text" → 500 on every call. The eviction-mode toggle was effectively
     // non-functional before this cast.
+    // Eviction mode is coupled 1:1 to the 'suspended' unit status. Turning it
+    // ON suspends the unit (saving the prior status so we can restore it);
+    // turning it OFF restores that prior status. A unit is 'suspended' iff
+    // eviction mode is on — 'suspended' is never set any other way. All SET
+    // RHS expressions read the OLD row, so `status` / `status_before_block`
+    // below reference the pre-update values.
     const [updated] = await query<any>(`
       UPDATE units
       SET payment_block = $1,
           payment_block_set_at = CASE WHEN $1 THEN NOW() ELSE NULL END,
-          payment_block_set_by = CASE WHEN $1 THEN $2::uuid ELSE NULL END
+          payment_block_set_by = CASE WHEN $1 THEN $2::uuid ELSE NULL END,
+          status = CASE
+                     WHEN $1 AND status <> 'suspended' THEN 'suspended'
+                     WHEN NOT $1 AND status = 'suspended' THEN COALESCE(status_before_block, 'active')
+                     ELSE status
+                   END,
+          status_before_block = CASE
+                     WHEN $1 AND status <> 'suspended' THEN status
+                     WHEN NOT $1 AND status = 'suspended' THEN NULL
+                     ELSE status_before_block
+                   END
       WHERE id = $3
       RETURNING *`,
       [enable, req.user!.userId, req.params.id]

@@ -281,7 +281,13 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
         COUNT(*) FILTER (WHERE u.status='delinquent')::int AS delinquent_units,
         COUNT(*) FILTER (WHERE u.status='suspended')::int AS suspended_units,
         COUNT(*) FILTER (WHERE u.payment_block=TRUE)::int AS eviction_mode_units,
-        COALESCE(SUM(CASE WHEN u.status='active' THEN u.rent_amount ELSE 0 END),0) AS monthly_rent_volume,
+        COUNT(u.id)::int AS total_units,
+        -- Expected Monthly Rent = full rent roll across ALL occupied units
+        -- (active + direct_pay + delinquent + suspended), NOT active-only.
+        -- Delinquent/suspended units are occupied and still owe rent, and their
+        -- payments appear in income — counting only 'active' made Expected read
+        -- LOWER than the income reports. 'vacant'/'available' are empty → excluded.
+        COALESCE(SUM(CASE WHEN u.status IN ('active','direct_pay','delinquent','suspended') THEN u.rent_amount ELSE 0 END),0) AS monthly_rent_volume,
         COUNT(DISTINCT p.id)::int AS property_count
       FROM units u
       JOIN properties p ON p.id = u.property_id
@@ -343,7 +349,42 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
     }))
     const platformFee = Math.round(platformFeeByProperty.reduce((s, p) => s + p.fee, 0) * 100) / 100
 
-    res.json({ success: true, data: { ...stats, upcoming_disbursement: upcoming, trend, maintenance, bg_pending: bgPending?.count||0, otp_units: otpStats?.otp_units||0, projected_otp_disbursement: otpStats?.projected_otp_disbursement||0, platformFee, platformFeeByProperty } })
+    // Rent KPIs that reconcile with the Reports page (/reports/summary) — same
+    // SQL definitions, so the Dashboard's Collected/Outstanding cards agree with
+    // Reports. Distinct from monthly_rent_volume above, which is CONTRACTED rent
+    // on active units (the "Expected" capacity number), not collected cash.
+    //   collected_mtd — settled rent payments this calendar month
+    //   outstanding   — unpaid (pending+partial) invoice balances
+    const [collectedRow] = await query<any>(`
+      SELECT COALESCE(SUM(amount), 0)::float AS collected_mtd
+        FROM payments
+       WHERE landlord_id=$1 AND status='settled' AND type='rent'
+         AND settled_at >= date_trunc('month', NOW())`, [id])
+    const [outstandingRow] = await query<any>(`
+      SELECT COALESCE(SUM(i.total_amount - COALESCE(p.paid, 0)), 0)::float AS outstanding
+        FROM invoices i
+        LEFT JOIN (
+          SELECT invoice_id, SUM(amount) AS paid
+            FROM payments WHERE status='settled' AND invoice_id IS NOT NULL
+           GROUP BY invoice_id
+        ) p ON p.invoice_id = i.id
+       WHERE i.landlord_id = $1 AND i.status IN ('pending', 'partial')`, [id])
+
+    // Leases expiring soon — active leases whose end_date falls inside the next
+    // 30 / 60 days. Drives the renewal-action KPI. Scoped by leases.landlord_id.
+    const [expiring] = await query<any>(`
+      SELECT
+        COUNT(*) FILTER (WHERE end_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '30 days')::int AS leases_expiring_30d,
+        COUNT(*) FILTER (WHERE end_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '60 days')::int AS leases_expiring_60d
+      FROM leases
+      WHERE landlord_id = $1 AND status = 'active' AND end_date IS NOT NULL`, [id])
+
+    // Occupancy rate — round(100 × active / total). SAME formula as the Reports
+    // page (/reports/summary), so the Dashboard's Occupancy card agrees with it.
+    const totalUnits = stats?.total_units || 0
+    const occupancyRate = totalUnits > 0 ? Math.round(100 * (stats?.active_units || 0) / totalUnits) : 0
+
+    res.json({ success: true, data: { ...stats, upcoming_disbursement: upcoming, trend, maintenance, bg_pending: bgPending?.count||0, otp_units: otpStats?.otp_units||0, projected_otp_disbursement: otpStats?.projected_otp_disbursement||0, platformFee, platformFeeByProperty, collected_mtd: collectedRow?.collected_mtd||0, outstanding: outstandingRow?.outstanding||0, leases_expiring_30d: expiring?.leases_expiring_30d||0, leases_expiring_60d: expiring?.leases_expiring_60d||0, occupancy_rate: occupancyRate } })
   } catch (e) { next(e) }
 })
 

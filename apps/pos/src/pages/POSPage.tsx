@@ -8,7 +8,7 @@ import {
 } from '../lib/terminal'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPatch, apiDel } from '../lib/api'
-import { enqueue as enqueueSync, preloadMapping, mintClientId, subscribe as subscribeSync, clearAll as clearSyncQueue, drain as drainSync } from '../lib/syncQueue'
+import { enqueue as enqueueSync, preloadMapping, mintClientId } from '../lib/syncQueue'
 
 // S243: Active reader for the terminal flow. Two paths:
 //   - 'smart'     — server-driven (S700, WisePOS E, etc.) registered
@@ -41,6 +41,26 @@ const TAX_TYPES = ['state','city','county','special']
 
 interface CartItem { id:string; name:string; price:number; qty:number; tax:number; cat:string; icon:string; chargeEligible:boolean }
 
+// Preset icons for categories AND items — a clickable dropdown replaces the old
+// free-text box (you can't type an arbitrary character in as an "icon"). ~130.
+const POS_ICON_OPTIONS = [
+  '📦','🛒','🛍️','🏷️','🎁','🎟️','💳','🧾',
+  '⛽','🔥','🪵','🔋','💡','🔌','🕯️','🔦','♨️','🧯',
+  '🍔','🌭','🍕','🌮','🌯','🥪','🍟','🥨','🍿','🥓','🥚','🧀','🥖','🍞',
+  '🍩','🍪','🍫','🍬','🍭','🧁','🍰','🍦','🍨',
+  '🍎','🍌','🍇','🍓','🍊','🍉','🥑','🥕','🌽','🥔','🥜','🍅',
+  '☕','🥤','🧃','🧋','🍵','🍺','🍷','🥛','🧉','🍶','🧊',
+  '🧺','🧹','🧴','🧻','🧼','🪣','🧽','🪥','🚿','🛁','🚽',
+  '🔧','🛠️','🔨','🪛','🔩','⚙️','🪚','🧲','🪝',
+  '🏕️','⛺','🎣','🚲','🛶','🧭','🏊','🏖️','⛱️','🥾','🌅',
+  '🅿️','🚗','🚙','🚐','🛻','🏍️','🛞','🛴',
+  '🐾','🦴','🐕','🐈','🐟',
+  '🩹','💊','🪒','👕','🧢','🕶️','☂️','🧦','🧤',
+  '🔑','🗝️','⏰','✂️','🖊️','📎','🔒','🎈','🧸','🎀',
+  '🎱','🎰','🎮','🎲','🏓','⚽','🎯',
+  '🌱','🪴','🌸','🌵','🍄',
+]
+
 export function POSPage() {
   const qc = useQueryClient()
   const [tab, setTab] = useState<'register'|'history'|'items'|'categories'|'taxes'|'discounts'|'vendors'|'orders'|'inventory'|'readers'>('register')
@@ -54,12 +74,6 @@ export function POSPage() {
   // id is pre-mapped so the queue resolves it immediately.
   const [clientSessionId, setClientSessionId] = useState<string|null>(null)
   const [openTabBanner, setOpenTabBanner] = useState<{ id:string; total:number; openedAt:string; itemCount:number }|null>(null)
-  // S264: offline-sync status surfaced in the POS header.
-  const [syncStatus, setSyncStatus] = useState<{ online:boolean; pendingCount:number; syncing:boolean; lastError:string|null }>({ online: typeof navigator==='undefined'?true:navigator.onLine, pendingCount: 0, syncing: false, lastError: null })
-  useEffect(() => {
-    const unsub = subscribeSync(s => setSyncStatus(s))
-    return () => { unsub() }
-  }, [])
   const [method, setMethod] = useState<'cash'|'card'|'charge'>('cash')
   const [tenantId, setTenantId] = useState('')
   // S254: FlexCharge customer can be a tenant OR a pos_customer
@@ -68,7 +82,7 @@ export function POSPage() {
   const [posCustomerId, setPosCustomerId] = useState('')
   const [cashGiven, setCashGiven] = useState('')
   const [filterCat, setFilterCat] = useState('all')
-  // S216: items-tab property filter. 'all' = no filter, 'landlord-wide'
+  // S216: items-tab property filter. 'all' = no filter, 'company-wide'
   // = items with NULL property_id, or a specific property uuid.
   const [filterItemProperty, setFilterItemProperty] = useState<string>('all')
   const [receipt, setReceipt] = useState<any>(null)
@@ -97,12 +111,24 @@ export function POSPage() {
   // S219: Manage Categories tab state.
   // S220: + propertyId on the Add form, + filterCategoryProperty for
   // the management-list filter (mirrors items + tax-rates filters).
-  const [newCategory, setNewCategory] = useState({ name:'', icon:'📦', sortOrder:'', propertyId:'' as string })
+  // propertyIds: [] = all properties (company-wide); a non-empty list scopes
+  // the category to exactly those properties (toggle per property).
+  const [newCategory, setNewCategory] = useState({ name:'', icon:'📦', sortOrder:'', propertyIds: [] as string[] })
   const [editCategory, setEditCategory] = useState<any>(null)
   const [filterCategoryProperty, setFilterCategoryProperty] = useState<string>('all')
+  // Categories table sort — click a column header to sort; click again to flip.
+  const [catSort, setCatSort] = useState<{ key: 'name' | 'property'; dir: 'asc' | 'desc' }>({ key: 'name', dir: 'asc' })
+  const toggleCatSort = (key: 'name' | 'property') =>
+    setCatSort(s => s.key === key ? { key, dir: s.dir === 'asc' ? 'desc' : 'asc' } : { key, dir: 'asc' })
+  // New-category property picker is a popup (clearer than inline checkboxes).
+  const [showCatPropPicker, setShowCatPropPicker] = useState(false)
+  // Items table sort — click a column header to sort; click again to flip.
+  const [itemSort, setItemSort] = useState<{ key: 'name'|'category'|'property'|'price'|'stock'; dir: 'asc'|'desc' }>({ key: 'name', dir: 'asc' })
+  const toggleItemSort = (key: 'name'|'category'|'property'|'price'|'stock') =>
+    setItemSort(s => s.key === key ? { key, dir: s.dir === 'asc' ? 'desc' : 'asc' } : { key, dir: 'asc' })
   // S227: form now stores categoryId (uuid). Default '' until categories
   // load, then we auto-pick the first available (see useEffect below).
-  const [newItem, setNewItem] = useState({ name:'', categoryId:'', icon:'📦', sellPrice:'', costPrice:'', marginPct:'', taxRate:'0', chargeEligible:true, stockQty:'0', stockMin:'5', stockMax:'50', propertyId:'' as string })
+  const [newItem, setNewItem] = useState({ name:'', categoryId:'', icon:'📦', sellPrice:'', costPrice:'', marginPct:'', taxCategoryId:'', chargeEligible:true, stockQty:'0', stockMin:'5', stockMax:'50', propertyId:'' as string })
   const [newTax, setNewTax] = useState({ name:'', rate:'', taxType:'state', appliesTo:'all', propertyId:'' as string })
   // S217: tax-rate list filter on the taxes tab.
   const [filterTaxProperty, setFilterTaxProperty] = useState<string>('all')
@@ -136,6 +162,8 @@ export function POSPage() {
   // S254: pos_customers roster for FlexCharge non-tenant picker
   const { data: posCustomers = [] } = useQuery<any[]>('pos-customers', () => apiGet('/landlords/pos-customers'), { enabled: method==='charge' })
   const { data: taxRates = [] } = useQuery<any[]>('pos-tax-rates', () => apiGet('/pos/tax-rates'), { enabled: tab==='taxes'||tab==='register' })
+  // Tax categories (simple: name + one rate). Items pick a tax category → rate.
+  const { data: posTaxCategories = [] } = useQuery<any[]>('pos-tax-categories', () => apiGet('/pos/tax-categories'), { enabled: tab==='taxes'||tab==='items'||tab==='register' })
   const { data: discounts = [] } = useQuery<any[]>('pos-discounts', () => apiGet('/pos/discounts'), { enabled: tab==='discounts'||tab==='register' })
   const { data: txns = [], isLoading: txLoading } = useQuery<any[]>('pos-transactions', () => apiGet('/pos/transactions'), { enabled: tab==='history' })
   const { data: vendors = [] } = useQuery<any[]>('pos-vendors', () => apiGet('/pos/vendors'), { enabled: tab==='vendors'||tab==='orders' })
@@ -157,12 +185,12 @@ export function POSPage() {
   // Replaces the old unconditional `categoryOptions` derivation —
   // every dropdown consumer now passes its form's propertyId so the
   // filter respects category scope.
-  // - landlord-wide categories (propertyId NULL) appear everywhere
+  // - company-wide categories (propertyId NULL) appear everywhere
   // - property-scoped categories appear only when the consuming form's
   //   property matches
-  // - landlord-wide consuming context (propertyId empty/null) sees only
-  //   landlord-wide categories — picking a property-scoped category for
-  //   a landlord-wide item is logically inconsistent
+  // - company-wide consuming context (propertyId empty/null) sees only
+  //   company-wide categories — picking a property-scoped category for
+  //   a company-wide item is logically inconsistent
   // S227: returns {id, name, icon} so dropdowns can use the uuid as the
   // option value. Pre-S227 returned only name+icon and the dropdown
   // submitted the name string — the FK refactor moved the source of
@@ -170,13 +198,19 @@ export function POSPage() {
   const categoriesForProperty = (propertyId: string | null | undefined): { id: string; name: string; icon: string }[] => {
     return (posCategories as any[])
       .filter((c:any) => {
-        if (!c.propertyId) return true
-        if (!propertyId) return false
-        return c.propertyId === propertyId
+        const ids = c.propertyIds as string[] | null | undefined
+        if (!ids || ids.length === 0) return true   // all properties (company-wide)
+        if (!propertyId) return false                // scoped category, no property context
+        return ids.includes(propertyId)
       })
       .map((c:any) => ({ id: c.id, name: c.name, icon: c.icon || '📦' }))
   }
-  const visibleItems = filterCat === 'all' ? (items as any[]) : (items as any[]).filter((i:any) => i.category === filterCat)
+  // Register shows items for the selected property (+ any company-wide),
+  // then the active category filter. Items are per-property, so ringing is
+  // scoped to the chosen register/property.
+  const visibleItems = (items as any[])
+    .filter((i:any) => !registerProperty || !i.propertyId || i.propertyId === registerProperty)
+    .filter((i:any) => filterCat === 'all' || i.category === filterCat)
 
   // S243: single-property landlords don't see a property selector —
   // auto-pick on first load so the card-charge flow Just Works. Multi-
@@ -417,7 +451,7 @@ export function POSPage() {
 
   const toggleChargeMut = useMutation(({ id, val }:{ id:string; val:boolean }) => apiPatch(`/pos/items/${id}`, { chargeEligible:val }), { onSuccess: () => qc.invalidateQueries('pos-items') })
   const toggleActiveMut = useMutation(({ id, val }:{ id:string; val:boolean }) => apiPatch(`/pos/items/${id}`, { isActive:val }), { onSuccess: () => qc.invalidateQueries('pos-items') })
-  const createItemMut = useMutation(() => apiPost('/pos/items', { ...newItem, propertyId: newItem.propertyId || null, categoryId: newItem.categoryId, costPrice:Number(newItem.costPrice), sellPrice:Number(newItem.sellPrice), marginPct: newItem.marginPct === '' ? null : Number(newItem.marginPct), taxRate:Number(newItem.taxRate), chargeEligible:newItem.chargeEligible, stockQty:Number(newItem.stockQty), stockMin:Number(newItem.stockMin), stockMax:Number(newItem.stockMax) }), { onSuccess: () => { qc.invalidateQueries('pos-items'); setNewItem({ name:'', categoryId:'', icon:'📦', sellPrice:'', costPrice:'', marginPct: defaultMarginPct!=null?String(defaultMarginPct):'', taxRate:'0', chargeEligible:true, stockQty:'0', stockMin:'5', stockMax:'50', propertyId:'' }) } })
+  const createItemMut = useMutation(() => apiPost('/pos/items', { ...newItem, propertyId: newItem.propertyId || null, categoryId: newItem.categoryId, costPrice:Number(newItem.costPrice), sellPrice:Number(newItem.sellPrice), marginPct: newItem.marginPct === '' ? null : Number(newItem.marginPct), taxCategoryId: newItem.taxCategoryId || null, chargeEligible:newItem.chargeEligible, stockQty:Number(newItem.stockQty), stockMin:Number(newItem.stockMin), stockMax:Number(newItem.stockMax) }), { onSuccess: () => { qc.invalidateQueries('pos-items'); setNewItem({ name:'', categoryId:'', icon:'📦', sellPrice:'', costPrice:'', marginPct: defaultMarginPct!=null?String(defaultMarginPct):'', taxCategoryId:'', chargeEligible:true, stockQty:'0', stockMin:'5', stockMax:'50', propertyId:'' }) }, onError: (e:any) => alert(e?.response?.data?.error?.message || e?.response?.data?.error || 'Could not add item — set name, sell price, category, and property') })
 
   // POS #1 auto-pricing helpers. Margin is gross % of sell price:
   // sell = cost / (1 - margin/100); margin = (sell - cost) / sell * 100.
@@ -469,8 +503,8 @@ export function POSPage() {
   // dropdowns) and the all-inclusive query (drives the manage tab).
   const invalCats = () => { qc.invalidateQueries('pos-categories'); qc.invalidateQueries('pos-categories-all') }
   const createCategoryMut = useMutation(
-    () => apiPost('/pos/categories', { name:newCategory.name, icon:newCategory.icon||'📦', sortOrder: newCategory.sortOrder===''?0:Number(newCategory.sortOrder), propertyId: newCategory.propertyId || null }),
-    { onSuccess: () => { invalCats(); setNewCategory({ name:'', icon:'📦', sortOrder:'', propertyId:'' }) } }
+    () => apiPost('/pos/categories', { name:newCategory.name, icon:newCategory.icon||'📦', sortOrder: newCategory.sortOrder===''?0:Number(newCategory.sortOrder), propertyIds: newCategory.propertyIds }),
+    { onSuccess: () => { invalCats(); setNewCategory({ name:'', icon:'📦', sortOrder:'', propertyIds:[] }) } }
   )
   const updateCategoryMut = useMutation(
     (data:any) => apiPatch(`/pos/categories/${editCategory.id}`, data),
@@ -483,6 +517,10 @@ export function POSPage() {
 
   const createTaxMut = useMutation(() => apiPost('/pos/tax-rates', { ...newTax, propertyId: newTax.propertyId || null, rate:Number(newTax.rate)/100, taxType:newTax.taxType, appliesTo:newTax.appliesTo==='all'?['all']:[newTax.appliesTo] }), { onSuccess: () => { qc.invalidateQueries('pos-tax-rates'); setNewTax({ name:'', rate:'', taxType:'state', appliesTo:'all', propertyId:'' }) } })
   const deleteTaxMut = useMutation((id:string) => apiDel(`/pos/tax-rates/${id}`), { onSuccess: () => qc.invalidateQueries('pos-tax-rates') })
+  // Tax categories: add + edit-rate. Rates entered as % in the UI, stored as decimals.
+  const [newTaxCat, setNewTaxCat] = useState({ name:'', ratePct:'' })
+  const createTaxCatMut = useMutation(() => apiPost('/pos/tax-categories', { name:newTaxCat.name, rate:Number(newTaxCat.ratePct||0)/100 }), { onSuccess: () => { qc.invalidateQueries('pos-tax-categories'); setNewTaxCat({ name:'', ratePct:'' }) }, onError:(e:any)=>alert(e?.response?.data?.error?.message||e?.response?.data?.error||'Could not add tax category') })
+  const updateTaxCatMut = useMutation((v:any) => apiPatch(`/pos/tax-categories/${v.id}`, { rate:v.rate, isActive:v.isActive }), { onSuccess: () => { qc.invalidateQueries('pos-tax-categories'); qc.invalidateQueries('pos-items') } })
   const createDiscountMut = useMutation(() => apiPost('/pos/discounts', { ...newDiscount, value:Number(newDiscount.value) }), { onSuccess: () => { qc.invalidateQueries('pos-discounts'); setNewDiscount({ name:'', type:'percent', value:'', code:'' }) } })
   const deleteDiscountMut = useMutation((id:string) => apiDel(`/pos/discounts/${id}`), { onSuccess: () => qc.invalidateQueries('pos-discounts') })
   const refundMut = useMutation(() => apiPost(`/pos/transactions/${refundModal.tx?.id}/refund`, { amount:Number(refundAmt)||refundModal.tx?.total, reason:refundReason, refundMethod }), { onSuccess: () => { qc.invalidateQueries('pos-transactions'); setRefundModal({show:false,tx:null}); setRefundAmt(''); setRefundReason(''); setRefundMethod('cash') } })
@@ -621,14 +659,7 @@ export function POSPage() {
   return (
     <div>
       <div className="page-header">
-        <div style={{display:'flex',alignItems:'center',gap:14}}>
-          <div><h1 className="page-title">Point of Sale</h1><p className="page-subtitle">Register · Vendors · Orders · Inventory</p></div>
-          <SyncStatusBadge status={syncStatus} onClearQueue={() => {
-            if (typeof window !== 'undefined' && window.confirm(`Discard ${syncStatus.pendingCount} unsent change(s)? This cannot be undone.`)) {
-              void clearSyncQueue()
-            }
-          }} onForceDrain={() => { void drainSync() }} />
-        </div>
+        <div><h1 className="page-title">Point of Sale</h1></div>
         <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>
           {TABS.map(t => <button key={t.key} className={"tab-btn "+(tab===t.key?'active':'')} onClick={()=>setTab(t.key as any)}>{t.label}</button>)}
         </div>
@@ -637,6 +668,23 @@ export function POSPage() {
       {tab==='register' && (
         <div style={{display:'grid',gridTemplateColumns:'1fr 340px',gap:16,alignItems:'start'}}>
           <div>
+            {/* Register/property picker — you must choose which property you're
+                ringing on before adding items (items, tax, and sessions are all
+                per property). Single-property operators are auto-selected. */}
+            {(properties as any[]).length > 1 && (
+              <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:12}}>
+                <label style={{fontSize:'.78rem',color:'var(--text-3)'}}>Register:</label>
+                <select className="form-select" value={registerProperty} onChange={e=>{ setRegisterProperty(e.target.value); setTenantId(''); setPosCustomerId('') }} style={{width:'auto',minWidth:220}}>
+                  <option value="" disabled>Select a property…</option>
+                  {(properties as any[]).map((p:any)=><option key={p.id} value={p.id}>{p.name||p.street1}</option>)}
+                </select>
+              </div>
+            )}
+            {!registerProperty ? (
+              <div style={{padding:'48px 24px',textAlign:'center',color:'var(--text-3)',border:'1px dashed var(--border-1)',borderRadius:12}}>
+                Select a property above to start ringing up sales.
+              </div>
+            ) : (<>
             {/* S263: open-tab banner — appears when there's an unclosed
                 session on this property from a prior terminal visit /
                 crash / handoff. Resume loads the items; Discard voids. */}
@@ -669,6 +717,7 @@ export function POSPage() {
                 </button>
               ))}
             </div>
+            </>)}
           </div>
           <div className="card" style={{position:'sticky',top:80}}>
             <div className="card-header"><span className="card-title">Current Sale</span>
@@ -832,16 +881,16 @@ export function POSPage() {
               </div>
             </div>
             <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:12,marginTop:12}}>
-              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Icon</div><input className="form-input" value={newItem.icon} onChange={e=>setNewItem(s=>({...s,icon:e.target.value}))} style={{width:'100%'}} /></div>
+              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Icon</div><select className="form-select" value={newItem.icon} onChange={e=>setNewItem(s=>({...s,icon:e.target.value}))} style={{width:'100%'}}>{POS_ICON_OPTIONS.map(ic=><option key={ic} value={ic}>{ic}</option>)}</select></div>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Name</div><input className="form-input" value={newItem.name} onChange={e=>setNewItem(s=>({...s,name:e.target.value}))} style={{width:'100%'}} /></div>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Category</div><select className="form-select" value={newItem.categoryId} onChange={e=>setNewItem(s=>({...s,categoryId:e.target.value}))} style={{width:'100%'}}>{categoriesForProperty(newItem.propertyId).map(c=><option key={c.id} value={c.id}>{c.icon} {c.name}</option>)}</select></div>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Cost Price</div><input className="form-input" type="number" value={newItem.costPrice} onChange={e=>setItemCost(e.target.value)} style={{width:'100%'}} /></div>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Margin %{defaultMarginPct!=null?` (default ${defaultMarginPct})`:''}</div><input className="form-input" type="number" value={newItem.marginPct} onChange={e=>setItemMargin(e.target.value)} placeholder={defaultMarginPct!=null?String(defaultMarginPct):'—'} style={{width:'100%'}} /></div>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Sell Price{newItem.costPrice&&newItem.marginPct?' (auto)':''}</div><input className="form-input" type="number" value={newItem.sellPrice} onChange={e=>setItemSell(e.target.value)} style={{width:'100%'}} /></div>
-              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Tax Rate %</div><input className="form-input" type="number" value={newItem.taxRate} onChange={e=>setNewItem(s=>({...s,taxRate:e.target.value}))} style={{width:'100%'}} /></div>
+              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Tax Category</div><select className="form-select" value={newItem.taxCategoryId} onChange={e=>setNewItem(s=>({...s,taxCategoryId:e.target.value}))} style={{width:'100%'}}><option value="">— none (0%) —</option>{(posTaxCategories as any[]).map((t:any)=><option key={t.id} value={t.id}>{t.name} ({(Number(t.rate)*100).toFixed(2)}%)</option>)}</select></div>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Stock Qty</div><input className="form-input" type="number" value={newItem.stockQty} onChange={e=>setNewItem(s=>({...s,stockQty:e.target.value}))} style={{width:'100%'}} /></div>
               {!LAUNCH_HIDE_CHARGE && <div style={{display:'flex',alignItems:'center',gap:8,paddingTop:20}}><input type="checkbox" id="ce" checked={newItem.chargeEligible} onChange={e=>setNewItem(s=>({...s,chargeEligible:e.target.checked}))} /><label htmlFor="ce" style={{fontSize:'.82rem'}}>Charge eligible</label></div>}
-              {/* S192: property selector. Empty = landlord-wide. */}
+              {/* S192: property selector. Empty = company-wide. */}
               <div style={{gridColumn:'span 2'}}>
                 <div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>
                   Property <span style={{color:'var(--text-3)'}}>(low-stock alerts route to this property's manager)</span>
@@ -852,17 +901,17 @@ export function POSPage() {
                   onChange={e=>setNewItem(s=>({...s,propertyId:e.target.value}))}
                   style={{width:'100%'}}
                 >
-                  <option value="">Landlord-wide (no specific property)</option>
+                  <option value="" disabled>Select a property…</option>
                   {(properties as any[]).map((p:any)=>(
                     <option key={p.id} value={p.id}>{p.name}</option>
                   ))}
                 </select>
               </div>
             </div>
-            <button className="btn btn-primary" style={{marginTop:12}} onClick={submitNewItem} disabled={!newItem.name||!newItem.sellPrice}>Add Item</button>
+            <button className="btn btn-primary" style={{marginTop:12}} onClick={submitNewItem} disabled={!newItem.name||!newItem.sellPrice||!newItem.categoryId||!newItem.propertyId||createItemMut.isLoading}>{createItemMut.isLoading?'Adding…':'Add Item'}</button>
           </div>
           {/* S216: property filter for the items management list.
-              Default 'all' shows everything; 'landlord-wide' shows only
+              Default 'all' shows everything; 'company-wide' shows only
               NULL-property_id items; specific uuid scopes to one property. */}
           <div style={{display:'flex',alignItems:'center',gap:8,padding:'4px 4px 0'}}>
             <label style={{fontSize:'.78rem',color:'var(--text-3)',marginBottom:0}}>Filter by property:</label>
@@ -873,8 +922,8 @@ export function POSPage() {
               style={{width:'auto',padding:'4px 10px',fontSize:'.82rem'}}
             >
               <option value="all">All ({(items as any[]).length})</option>
-              <option value="landlord-wide">
-                Landlord-wide ({(items as any[]).filter((i:any)=>!i.propertyId).length})
+              <option value="company-wide">
+                Company-wide ({(items as any[]).filter((i:any)=>!i.propertyId).length})
               </option>
               {(properties as any[]).map((p:any)=>{
                 const n = (items as any[]).filter((i:any)=>i.propertyId===p.id).length
@@ -884,24 +933,45 @@ export function POSPage() {
           </div>
           <div className="card" style={{padding:0}}>
             <table className="data-table">
-              <thead><tr><th>Item</th><th>Category</th><th>Property</th><th>Cost</th><th>Price</th><th>Tax</th><th>Stock</th>{!LAUNCH_HIDE_CHARGE && <th>Charge</th>}<th>Active</th><th></th></tr></thead>
+              <thead><tr>
+                <th style={{cursor:'pointer',userSelect:'none'}} onClick={()=>toggleItemSort('name')}>Item {itemSort.key==='name'?(itemSort.dir==='asc'?'▲':'▼'):''}</th>
+                <th style={{cursor:'pointer',userSelect:'none'}} onClick={()=>toggleItemSort('category')}>Category {itemSort.key==='category'?(itemSort.dir==='asc'?'▲':'▼'):''}</th>
+                <th style={{cursor:'pointer',userSelect:'none'}} onClick={()=>toggleItemSort('property')}>Property {itemSort.key==='property'?(itemSort.dir==='asc'?'▲':'▼'):''}</th>
+                <th>Cost</th>
+                <th style={{cursor:'pointer',userSelect:'none'}} onClick={()=>toggleItemSort('price')}>Price {itemSort.key==='price'?(itemSort.dir==='asc'?'▲':'▼'):''}</th>
+                <th>Tax</th>
+                <th style={{cursor:'pointer',userSelect:'none'}} onClick={()=>toggleItemSort('stock')}>Stock {itemSort.key==='stock'?(itemSort.dir==='asc'?'▲':'▼'):''}</th>
+                {!LAUNCH_HIDE_CHARGE && <th>Charge</th>}
+                <th>Active</th>
+                <th></th>
+              </tr></thead>
               <tbody>
                 {(items as any[])
                   .filter((i:any) =>
                     filterItemProperty === 'all' ||
-                    (filterItemProperty === 'landlord-wide' && !i.propertyId) ||
+                    (filterItemProperty === 'company-wide' && !i.propertyId) ||
                     i.propertyId === filterItemProperty
                   )
+                  .sort((a:any,b:any)=>{
+                    const propLabel=(i:any)=>{ const p=i.propertyId?(properties as any[]).find((x:any)=>x.id===i.propertyId):null; return p?(p.street1||p.name||''):(posSettings?.businessName||'') }
+                    let av:any, bv:any
+                    if(itemSort.key==='name'){av=a.name||'';bv=b.name||''}
+                    else if(itemSort.key==='category'){av=a.category||'';bv=b.category||''}
+                    else if(itemSort.key==='property'){av=propLabel(a);bv=propLabel(b)}
+                    else if(itemSort.key==='price'){av=Number(a.sellPrice)||0;bv=Number(b.sellPrice)||0}
+                    else {av=Number(a.stockQty)||0;bv=Number(b.stockQty)||0}
+                    const cmp = (typeof av==='number'&&typeof bv==='number') ? (av-bv) : String(av).localeCompare(String(bv),undefined,{numeric:true,sensitivity:'base'})
+                    return itemSort.dir==='asc'?cmp:-cmp
+                  })
                   .map((item:any)=>{
-                  const propName = item.propertyId
-                    ? (properties as any[]).find((p:any)=>p.id===item.propertyId)?.name ?? '(unknown)'
-                    : null
+                  const iprop = item.propertyId ? (properties as any[]).find((p:any)=>p.id===item.propertyId) : null
+                  const ipropAddr = iprop ? (iprop.street1 || iprop.name || '(unknown)') : null
                   return (<tr key={item.id}>
                   <td style={{fontWeight:500}}>{item.icon} {item.name}</td>
                   <td><span className="badge badge-muted">{item.category}</span></td>
-                  <td>{propName
-                    ? <span style={{color:'var(--gold)',fontWeight:500,fontSize:'.78rem'}}>{propName}</span>
-                    : <span style={{color:'var(--text-3)',fontStyle:'italic',fontSize:'.78rem'}}>Landlord-wide</span>
+                  <td>{ipropAddr
+                    ? <span style={{color:'var(--gold)',fontWeight:500,fontSize:'.78rem'}}>{ipropAddr}</span>
+                    : <span style={{color:'var(--text-3)',fontSize:'.78rem'}}>{posSettings?.businessName || 'Company-wide'}</span>
                   }</td>
                   <td className="mono">{fmt(item.costPrice)}</td>
                   <td className="mono" style={{color:'var(--gold)',fontWeight:600}}>{fmt(item.sellPrice)}</td>
@@ -909,7 +979,7 @@ export function POSPage() {
                   <td className="mono">{item.stockQty>=999?'inf':item.stockQty}</td>
                   {!LAUNCH_HIDE_CHARGE && <td><button onClick={()=>toggleChargeMut.mutate({id:item.id,val:!item.chargeEligible})} style={{background:item.chargeEligible?'var(--gold-bg)':'var(--bg-3)',border:"1px solid "+(item.chargeEligible?'var(--gold)':'var(--border-1)'),borderRadius:4,padding:'2px 8px',cursor:'pointer',fontSize:'.75rem',color:item.chargeEligible?'var(--gold)':'var(--text-3)'}}>{item.chargeEligible?'Yes':'No'}</button></td>}
                   <td><button onClick={()=>toggleActiveMut.mutate({id:item.id,val:!item.isActive})} style={{background:'var(--bg-2)',border:'1px solid var(--border-1)',borderRadius:4,padding:'2px 8px',cursor:'pointer',fontSize:'.75rem',color:item.isActive?'var(--green)':'var(--text-3)'}}>{item.isActive?'Active':'Off'}</button></td>
-                  <td><button className="btn btn-ghost btn-sm" onClick={()=>setEditItem({...item,_sell:String(item.sellPrice),_cost:String(item.costPrice),_tax:String(Number(item.taxRate)*100),_stock:String(item.stockQty),_min:String(item.stockMin),_max:String(item.stockMax)})}>Edit</button></td>
+                  <td><button className="btn btn-ghost btn-sm" onClick={()=>setEditItem({...item,_sell:String(item.sellPrice),_cost:String(item.costPrice),_taxCategoryId:item.taxCategoryId||'',_stock:String(item.stockQty),_min:String(item.stockMin),_max:String(item.stockMax)})}>Edit</button></td>
                 </tr>)})}
               </tbody>
             </table>
@@ -921,24 +991,27 @@ export function POSPage() {
         <div style={{display:'grid',gap:16}}>
           <div className="card">
             <div className="card-header"><span className="card-title">Add Category</span></div>
-            <div style={{display:'grid',gridTemplateColumns:'80px 1fr 120px auto',gap:12,marginTop:12,alignItems:'end'}}>
-              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Icon</div><input className="form-input" value={newCategory.icon} onChange={e=>setNewCategory(s=>({...s,icon:e.target.value}))} style={{width:'100%'}} /></div>
+            <div style={{display:'grid',gridTemplateColumns:'80px 1fr auto',gap:12,marginTop:12,alignItems:'end'}}>
+              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Icon</div><select className="form-select" value={newCategory.icon} onChange={e=>setNewCategory(s=>({...s,icon:e.target.value}))} style={{width:'100%'}}>{POS_ICON_OPTIONS.map(ic=><option key={ic} value={ic}>{ic}</option>)}</select></div>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Name *</div><input className="form-input" placeholder="Snacks" value={newCategory.name} onChange={e=>setNewCategory(s=>({...s,name:e.target.value}))} style={{width:'100%'}} /></div>
-              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Sort Order</div><input className="form-input" type="number" placeholder="0" value={newCategory.sortOrder} onChange={e=>setNewCategory(s=>({...s,sortOrder:e.target.value}))} style={{width:'100%'}} /></div>
               <button className="btn btn-primary" onClick={()=>createCategoryMut.mutate()} disabled={!newCategory.name||createCategoryMut.isLoading}>{createCategoryMut.isLoading?'Adding...':'Add'}</button>
             </div>
-            {/* S220: property scope selector. Empty = landlord-wide (default). */}
+            {/* Property scope — opens a popup picker (clearer than inline).
+                "All properties" (empty) = company-wide; else the chosen subset. */}
             <div style={{marginTop:12}}>
-              <div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>
-                Property <span style={{color:'var(--text-3)'}}>(scopes which property's dropdowns this category appears in)</span>
-              </div>
-              <select className="form-select" value={newCategory.propertyId} onChange={e=>setNewCategory(s=>({...s,propertyId:e.target.value}))} style={{width:'100%'}}>
-                <option value="">Landlord-wide (appears at every property)</option>
-                {(properties as any[]).map((p:any)=>(<option key={p.id} value={p.id}>{p.name}</option>))}
-              </select>
+              <div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:6}}>Available at</div>
+              <button type="button" className="form-select" onClick={()=>setShowCatPropPicker(true)}
+                style={{width:'100%',textAlign:'left',cursor:'pointer',display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+                <span>{newCategory.propertyIds.length===0
+                  ? 'All properties'
+                  : newCategory.propertyIds.length===1
+                    ? ((properties as any[]).find((p:any)=>p.id===newCategory.propertyIds[0])?.name || '1 property')
+                    : `${newCategory.propertyIds.length} properties`}</span>
+                <span style={{color:'var(--text-3)'}}>▾</span>
+              </button>
             </div>
             <div style={{fontSize:'.72rem',color:'var(--text-3)',marginTop:8}}>
-              Categories appear in the Add/Edit Item dropdown and the tax-rate Applies-To dropdown. Sort order is ascending — lower numbers show first. Inactive categories stay attached to existing items but won't appear in dropdowns.
+              Categories appear in the Add/Edit Item dropdown and the tax-rate Applies-To dropdown. Click the Name or Property column header below to sort. Inactive categories stay attached to existing items but won't appear in dropdowns.
             </div>
           </div>
           {/* S220: list filter mirrors the items + tax-rates property filters. */}
@@ -946,41 +1019,61 @@ export function POSPage() {
             <label style={{fontSize:'.78rem',color:'var(--text-3)',marginBottom:0}}>Filter by property:</label>
             <select className="form-select" value={filterCategoryProperty} onChange={e=>setFilterCategoryProperty(e.target.value)} style={{width:'auto',padding:'4px 10px',fontSize:'.82rem'}}>
               <option value="all">All ({(posCategoriesAll as any[]).length})</option>
-              <option value="landlord-wide">Landlord-wide ({(posCategoriesAll as any[]).filter((c:any)=>!c.propertyId).length})</option>
+              <option value="company-wide">Company-wide ({(posCategoriesAll as any[]).filter((c:any)=>!c.propertyIds?.length).length})</option>
               {(properties as any[]).map((p:any)=>{
-                const n = (posCategoriesAll as any[]).filter((c:any)=>c.propertyId===p.id).length
+                const n = (posCategoriesAll as any[]).filter((c:any)=>!c.propertyIds?.length || c.propertyIds.includes(p.id)).length
                 return <option key={p.id} value={p.id}>{p.name} ({n})</option>
               })}
             </select>
           </div>
           <div className="card" style={{padding:0}}>
             <table className="data-table">
-              <thead><tr><th style={{width:60}}>Icon</th><th>Name</th><th>Property</th><th style={{width:80}}>Sort</th><th style={{width:80}}>Items</th><th style={{width:90}}>Status</th><th style={{width:80}}></th></tr></thead>
+              <thead><tr>
+                <th style={{width:60}}>Icon</th>
+                <th style={{cursor:'pointer',userSelect:'none'}} onClick={()=>toggleCatSort('name')}>Name {catSort.key==='name' ? (catSort.dir==='asc'?'▲':'▼') : ''}</th>
+                <th style={{cursor:'pointer',userSelect:'none'}} onClick={()=>toggleCatSort('property')}>Property {catSort.key==='property' ? (catSort.dir==='asc'?'▲':'▼') : ''}</th>
+                <th style={{width:80}}>Items</th>
+                <th style={{width:90}}>Status</th>
+                <th style={{width:80}}></th>
+              </tr></thead>
               <tbody>
                 {(() => {
-                  const filtered = (posCategoriesAll as any[]).filter((c:any) =>
-                    filterCategoryProperty === 'all' ||
-                    (filterCategoryProperty === 'landlord-wide' && !c.propertyId) ||
-                    c.propertyId === filterCategoryProperty
-                  )
-                  return filtered.length ? filtered.map((c:any) => {
+                  const filtered = (posCategoriesAll as any[]).filter((c:any) => {
+                    if (filterCategoryProperty === 'all') return true
+                    const ids = c.propertyIds as string[] | null | undefined
+                    if (filterCategoryProperty === 'company-wide') return !ids || ids.length === 0
+                    // A specific property shows categories available there:
+                    // company-wide ones plus any scoped to include it.
+                    return !ids || ids.length === 0 || ids.includes(filterCategoryProperty)
+                  })
+                  // Scope label for the Property column + sort. Company-wide →
+                  // business name; one property → its address; many → "N properties".
+                  const catScopeLabel = (c:any): { text: string; scoped: boolean } => {
+                    const ids = c.propertyIds as string[] | null | undefined
+                    if (!ids || ids.length === 0) return { text: posSettings?.businessName || 'Company-wide', scoped: false }
+                    if (ids.length === 1) { const p = (properties as any[]).find((x:any)=>x.id===ids[0]); return { text: p ? (p.street1||p.name||'(unknown)') : '(unknown)', scoped: true } }
+                    return { text: `${ids.length} properties`, scoped: true }
+                  }
+                  const sorted = [...filtered].sort((a:any,b:any) => {
+                    const av = catSort.key==='name' ? (a.name||'') : catScopeLabel(a).text
+                    const bv = catSort.key==='name' ? (b.name||'') : catScopeLabel(b).text
+                    const cmp = String(av).localeCompare(String(bv), undefined, { numeric:true, sensitivity:'base' })
+                    return catSort.dir==='asc' ? cmp : -cmp
+                  })
+                  return sorted.length ? sorted.map((c:any) => {
                     const itemCount = (items as any[]).filter((i:any) => i.categoryId === c.id).length
-                    const propName = c.propertyId
-                      ? (properties as any[]).find((p:any)=>p.id===c.propertyId)?.name ?? '(unknown)'
-                      : null
+                    // Property column shows where the category is available:
+                    // company-wide → business name; else the address (1) or count.
+                    const scope = catScopeLabel(c)
                     return (<tr key={c.id}>
                       <td style={{fontSize:'1.2rem'}}>{c.icon || '📦'}</td>
                       <td style={{fontWeight:500}}>{c.name}</td>
-                      <td>{propName
-                        ? <span style={{color:'var(--gold)',fontWeight:500,fontSize:'.78rem'}}>{propName}</span>
-                        : <span style={{color:'var(--text-3)',fontStyle:'italic',fontSize:'.78rem'}}>Landlord-wide</span>
-                      }</td>
-                      <td className="mono">{c.sortOrder}</td>
+                      <td><span style={{color:scope.scoped?'var(--gold)':'var(--text-3)',fontWeight:scope.scoped?500:400,fontSize:'.78rem'}}>{scope.text}</span></td>
                       <td className="mono" style={{color:'var(--text-3)'}}>{itemCount}</td>
                       <td><button onClick={()=>toggleCategoryActiveMut.mutate({id:c.id,val:!c.isActive})} style={{background:'var(--bg-2)',border:'1px solid var(--border-1)',borderRadius:4,padding:'2px 8px',cursor:'pointer',fontSize:'.75rem',color:c.isActive?'var(--green)':'var(--text-3)'}}>{c.isActive?'Active':'Off'}</button></td>
-                      <td><button className="btn btn-ghost btn-sm" onClick={()=>setEditCategory({...c, _name:c.name, _icon:c.icon||'📦', _sort:String(c.sortOrder ?? 0), _propertyId:c.propertyId||''})}>Edit</button></td>
+                      <td><button className="btn btn-ghost btn-sm" onClick={()=>setEditCategory({...c, _name:c.name, _icon:c.icon||'📦', _sort:String(c.sortOrder ?? 0), _propertyIds: Array.isArray(c.propertyIds) ? c.propertyIds : []})}>Edit</button></td>
                     </tr>)
-                  }) : <tr><td colSpan={7} style={{textAlign:'center',color:'var(--text-3)',padding:32}}>{(posCategoriesAll as any[]).length ? 'No categories at this property scope.' : 'Loading…'}</td></tr>
+                  }) : <tr><td colSpan={6} style={{textAlign:'center',color:'var(--text-3)',padding:32}}>{(posCategoriesAll as any[]).length ? 'No categories at this property scope.' : 'Loading…'}</td></tr>
                 })()}
               </tbody>
             </table>
@@ -991,13 +1084,34 @@ export function POSPage() {
       {tab==='taxes' && (
         <div style={{display:'grid',gap:16}}>
           <div className="card">
+            <div className="card-header"><span className="card-title">Tax Categories</span></div>
+            <div style={{fontSize:'.72rem',color:'var(--text-3)',margin:'4px 0 10px'}}>Set one rate per category. Items pick a tax category and use its rate — no need to type tax on each item.</div>
+            <table className="data-table">
+              <thead><tr><th>Category</th><th style={{width:150}}>Rate %</th><th style={{width:90}}>Status</th></tr></thead>
+              <tbody>
+                {(posTaxCategories as any[]).map((t:any)=>(
+                  <tr key={t.id}>
+                    <td style={{fontWeight:500}}>{t.name}</td>
+                    <td><input className="form-input" type="number" step="0.01" key={t.rate} defaultValue={(Number(t.rate)*100).toFixed(2)} onBlur={e=>{const v=Number(e.target.value)/100; if(v!==Number(t.rate)) updateTaxCatMut.mutate({id:t.id,rate:v})}} style={{width:100}} /></td>
+                    <td><button onClick={()=>updateTaxCatMut.mutate({id:t.id,isActive:!t.isActive})} style={{background:'var(--bg-2)',border:'1px solid var(--border-1)',borderRadius:4,padding:'2px 8px',cursor:'pointer',fontSize:'.75rem',color:t.isActive?'var(--green)':'var(--text-3)'}}>{t.isActive?'Active':'Off'}</button></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <div style={{display:'flex',gap:8,marginTop:12,alignItems:'center'}}>
+              <input className="form-input" placeholder="New tax category (e.g. Candy)" value={newTaxCat.name} onChange={e=>setNewTaxCat(s=>({...s,name:e.target.value}))} style={{flex:1}} />
+              <input className="form-input" type="number" step="0.01" placeholder="Rate %" value={newTaxCat.ratePct} onChange={e=>setNewTaxCat(s=>({...s,ratePct:e.target.value}))} style={{width:110}} />
+              <button className="btn btn-primary" onClick={()=>createTaxCatMut.mutate()} disabled={!newTaxCat.name||createTaxCatMut.isLoading}>{createTaxCatMut.isLoading?'Adding…':'Add'}</button>
+            </div>
+          </div>
+          <div className="card">
             <div className="card-header"><span className="card-title">Add Tax Rate</span></div>
             <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:12,marginTop:12}}>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Name</div><input className="form-input" placeholder="State Tax" value={newTax.name} onChange={e=>setNewTax(s=>({...s,name:e.target.value}))} style={{width:'100%'}} /></div>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Rate %</div><input className="form-input" type="number" value={newTax.rate} onChange={e=>setNewTax(s=>({...s,rate:e.target.value}))} style={{width:'100%'}} /></div>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Type</div><select className="form-select" value={newTax.taxType} onChange={e=>setNewTax(s=>({...s,taxType:e.target.value}))} style={{width:'100%'}}>{TAX_TYPES.map(t=><option key={t} value={t}>{t}</option>)}</select></div>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Applies To</div><select className="form-select" value={newTax.appliesTo} onChange={e=>setNewTax(s=>({...s,appliesTo:e.target.value}))} style={{width:'100%'}}><option value="all">All categories</option>{categoriesForProperty(newTax.propertyId).map(c=><option key={c.name} value={c.name}>{c.icon} {c.name}</option>)}</select></div>
-              {/* S217: property selector. Empty = landlord-wide library. */}
+              {/* S217: property selector. Empty = company-wide library. */}
               <div style={{gridColumn:'span 2'}}>
                 <div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>
                   Property <span style={{color:'var(--text-3)'}}>(scopes which properties this rate is configured at)</span>
@@ -1015,7 +1129,7 @@ export function POSPage() {
             <label style={{fontSize:'.78rem',color:'var(--text-3)',marginBottom:0}}>Filter by property:</label>
             <select className="form-select" value={filterTaxProperty} onChange={e=>setFilterTaxProperty(e.target.value)} style={{width:'auto',padding:'4px 10px',fontSize:'.82rem'}}>
               <option value="all">All ({(taxRates as any[]).length})</option>
-              <option value="landlord-wide">All locations ({(taxRates as any[]).filter((r:any)=>!r.propertyId).length})</option>
+              <option value="company-wide">All locations ({(taxRates as any[]).filter((r:any)=>!r.propertyId).length})</option>
               {(properties as any[]).map((p:any)=>{
                 const n = (taxRates as any[]).filter((r:any)=>r.propertyId===p.id).length
                 return <option key={p.id} value={p.id}>{p.name} ({n})</option>
@@ -1029,7 +1143,7 @@ export function POSPage() {
                 {(() => {
                   const filtered = (taxRates as any[]).filter((r:any) =>
                     filterTaxProperty === 'all' ||
-                    (filterTaxProperty === 'landlord-wide' && !r.propertyId) ||
+                    (filterTaxProperty === 'company-wide' && !r.propertyId) ||
                     r.propertyId === filterTaxProperty
                   )
                   return filtered.length ? filtered.map((r:any)=>{
@@ -1332,14 +1446,14 @@ export function POSPage() {
         <div className="modal-header"><span className="modal-title">{editItem.icon} Edit {editItem.name}</span><button className="btn btn-ghost btn-sm" onClick={()=>setEditItem(null)}>x</button></div>
         <div style={{padding:'0 24px 24px',display:'grid',gridTemplateColumns:'1fr 1fr',gap:12}}>
           <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Name</div><input className="form-input" style={{width:'100%'}} value={editItem.name} onChange={e=>setEditItem((s:any)=>({...s,name:e.target.value}))} /></div>
-          <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Icon</div><input className="form-input" style={{width:'100%'}} value={editItem.icon} onChange={e=>setEditItem((s:any)=>({...s,icon:e.target.value}))} /></div>
+          <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Icon</div><select className="form-select" style={{width:'100%'}} value={editItem.icon} onChange={e=>setEditItem((s:any)=>({...s,icon:e.target.value}))}>{(POS_ICON_OPTIONS.includes(editItem.icon)?POS_ICON_OPTIONS:[editItem.icon,...POS_ICON_OPTIONS]).map((ic:string)=><option key={ic} value={ic}>{ic}</option>)}</select></div>
           <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Category</div><select className="form-select" style={{width:'100%'}} value={editItem.categoryId} onChange={e=>setEditItem((s:any)=>({...s,categoryId:e.target.value}))}>{categoriesForProperty(editItem.propertyId).map(c=><option key={c.id} value={c.id}>{c.icon} {c.name}</option>)}</select></div>
           <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Sell Price</div><input className="form-input" style={{width:'100%'}} type="number" value={editItem._sell} onChange={e=>setEditItem((s:any)=>({...s,_sell:e.target.value}))} /></div>
           <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Cost Price</div><input className="form-input" style={{width:'100%'}} type="number" value={editItem._cost} onChange={e=>setEditItem((s:any)=>({...s,_cost:e.target.value}))} /></div>
-          <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Tax Rate %</div><input className="form-input" style={{width:'100%'}} type="number" value={editItem._tax} onChange={e=>setEditItem((s:any)=>({...s,_tax:e.target.value}))} /></div>
+          <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Tax Category</div><select className="form-select" style={{width:'100%'}} value={editItem._taxCategoryId} onChange={e=>setEditItem((s:any)=>({...s,_taxCategoryId:e.target.value}))}><option value="">— none (0%) —</option>{(posTaxCategories as any[]).map((t:any)=><option key={t.id} value={t.id}>{t.name} ({(Number(t.rate)*100).toFixed(2)}%)</option>)}</select></div>
           <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Stock Qty</div><input className="form-input" style={{width:'100%'}} type="number" value={editItem._stock} onChange={e=>setEditItem((s:any)=>({...s,_stock:e.target.value}))} /></div>
           <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Stock Min</div><input className="form-input" style={{width:'100%'}} type="number" value={editItem._min} onChange={e=>setEditItem((s:any)=>({...s,_min:e.target.value}))} /></div>
-          {/* S192: property reassignment. null = landlord-wide. */}
+          {/* S192: property reassignment. null = company-wide. */}
           <div style={{gridColumn:'1/-1'}}>
             <div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>
               Property <span style={{color:'var(--text-3)'}}>(low-stock alerts route to this property's manager)</span>
@@ -1350,13 +1464,13 @@ export function POSPage() {
               value={editItem.propertyId || ''}
               onChange={e=>setEditItem((s:any)=>({...s,propertyId:e.target.value || null}))}
             >
-              <option value="">Landlord-wide (no specific property)</option>
+              <option value="" disabled>Select a property…</option>
               {(properties as any[]).map((p:any)=>(
                 <option key={p.id} value={p.id}>{p.name}</option>
               ))}
             </select>
           </div>
-          <div style={{gridColumn:'1/-1',marginTop:8}}><button className="btn btn-primary" style={{width:'100%'}} onClick={()=>updateItemMut.mutate({name:editItem.name,icon:editItem.icon,categoryId:editItem.categoryId,sellPrice:Number(editItem._sell),costPrice:Number(editItem._cost),taxRate:Number(editItem._tax)/100,stockQty:Number(editItem._stock),stockMin:Number(editItem._min),chargeEligible:editItem.chargeEligible,propertyId:editItem.propertyId || null})} disabled={updateItemMut.isLoading}>{updateItemMut.isLoading?'Saving...':'Save Changes'}</button></div>
+          <div style={{gridColumn:'1/-1',marginTop:8}}><button className="btn btn-primary" style={{width:'100%'}} onClick={()=>updateItemMut.mutate({name:editItem.name,icon:editItem.icon,categoryId:editItem.categoryId,sellPrice:Number(editItem._sell),costPrice:Number(editItem._cost),taxCategoryId:editItem._taxCategoryId||null,stockQty:Number(editItem._stock),stockMin:Number(editItem._min),chargeEligible:editItem.chargeEligible,propertyId:editItem.propertyId || null})} disabled={updateItemMut.isLoading}>{updateItemMut.isLoading?'Saving...':'Save Changes'}</button></div>
         </div>
       </div></div>)}
 
@@ -1364,41 +1478,44 @@ export function POSPage() {
         <div className="modal-header"><span className="modal-title">Edit Category — {editCategory.name}</span><button className="btn btn-ghost btn-sm" onClick={()=>setEditCategory(null)}>x</button></div>
         <div style={{padding:'0 24px 24px',display:'grid',gap:12}}>
           <div style={{display:'grid',gridTemplateColumns:'80px 1fr',gap:12}}>
-            <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Icon</div><input className="form-input" style={{width:'100%'}} value={editCategory._icon} onChange={e=>setEditCategory((s:any)=>({...s,_icon:e.target.value}))} /></div>
+            <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Icon</div><select className="form-select" style={{width:'100%'}} value={editCategory._icon} onChange={e=>setEditCategory((s:any)=>({...s,_icon:e.target.value}))}>{(POS_ICON_OPTIONS.includes(editCategory._icon)?POS_ICON_OPTIONS:[editCategory._icon,...POS_ICON_OPTIONS]).map((ic:string)=><option key={ic} value={ic}>{ic}</option>)}</select></div>
             <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Name</div><input className="form-input" style={{width:'100%'}} value={editCategory._name} onChange={e=>setEditCategory((s:any)=>({...s,_name:e.target.value}))} /></div>
           </div>
-          <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Sort Order <span style={{color:'var(--text-3)'}}>(lower = first)</span></div><input className="form-input" type="number" style={{width:'100%'}} value={editCategory._sort} onChange={e=>setEditCategory((s:any)=>({...s,_sort:e.target.value}))} /></div>
-          {/* S220: property scope. Empty = landlord-wide. */}
+          {/* Property scope — toggle per property. "All properties" (empty) = company-wide. */}
           <div>
-            <div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Property <span style={{color:'var(--text-3)'}}>(scopes which dropdowns this category appears in)</span></div>
-            <select className="form-select" style={{width:'100%'}} value={editCategory._propertyId} onChange={e=>setEditCategory((s:any)=>({...s,_propertyId:e.target.value}))}>
-              <option value="">Landlord-wide (appears at every property)</option>
-              {(properties as any[]).map((p:any)=>(<option key={p.id} value={p.id}>{p.name}</option>))}
-            </select>
+            <div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:6}}>Available at <span style={{color:'var(--text-3)'}}>(toggle the properties that carry this category)</span></div>
+            <div style={{display:'flex',flexWrap:'wrap',gap:'8px 16px'}}>
+              <label style={{display:'flex',alignItems:'center',gap:6,fontSize:'.82rem',cursor:'pointer'}}>
+                <input type="checkbox" checked={(editCategory._propertyIds||[]).length===0} onChange={()=>setEditCategory((s:any)=>({...s,_propertyIds:[]}))} />
+                All properties
+              </label>
+              {(properties as any[]).map((p:any)=>(
+                <label key={p.id} style={{display:'flex',alignItems:'center',gap:6,fontSize:'.82rem',cursor:'pointer'}}>
+                  <input type="checkbox" checked={(editCategory._propertyIds||[]).includes(p.id)} onChange={e=>setEditCategory((s:any)=>({...s,_propertyIds: e.target.checked ? [...(s._propertyIds||[]), p.id] : (s._propertyIds||[]).filter((x:string)=>x!==p.id)}))} />
+                  {p.name || p.street1}
+                </label>
+              ))}
+            </div>
           </div>
-          {/* S227: rename-doesnt-cascade warning removed — the FK refactor
-              means items reference category_id, so renames apply
-              automatically to every linked item. */}
-          {/* S220 / S227: scope-change warning. If items point at this  */}
-          {/* category by FK and the new scope wouldn't include them at  */}
-          {/* their property, they vanish from that property's dropdown  */}
-          {/* (the FK link itself is preserved — just the dropdown       */}
-          {/* visibility shifts).                                         */}
-          {(editCategory._propertyId || '') !== (editCategory.propertyId || '') && (() => {
-            const itemsAtCat = (items as any[]).filter((i:any)=>i.categoryId===editCategory.id)
-            const newScopePropId = editCategory._propertyId || null
-            const orphaned = itemsAtCat.filter((i:any) => {
-              if (!newScopePropId) return false
-              return !i.propertyId || i.propertyId !== newScopePropId
-            })
-            if (orphaned.length === 0) return null
-            return (
-              <div style={{fontSize:'.72rem',color:'var(--amber)',background:'var(--bg-2)',borderRadius:6,padding:'8px 10px'}}>
-                Re-scoping this category will hide it from {orphaned.length} existing item{orphaned.length===1?'':'s'} on properties outside the new scope (the items still point at this category by FK; only the dropdown visibility shifts). Re-categorize via the Items tab if needed.
-              </div>
-            )
-          })()}
-          <button className="btn btn-primary" style={{width:'100%'}} onClick={()=>updateCategoryMut.mutate({name:editCategory._name,icon:editCategory._icon,sortOrder:Number(editCategory._sort),propertyId: editCategory._propertyId || null})} disabled={updateCategoryMut.isLoading||!editCategory._name}>{updateCategoryMut.isLoading?'Saving...':'Save Changes'}</button>
+          <button className="btn btn-primary" style={{width:'100%'}} onClick={()=>updateCategoryMut.mutate({name:editCategory._name,icon:editCategory._icon,sortOrder:Number(editCategory._sort),propertyIds: editCategory._propertyIds||[]})} disabled={updateCategoryMut.isLoading||!editCategory._name}>{updateCategoryMut.isLoading?'Saving...':'Save Changes'}</button>
+        </div>
+      </div></div>)}
+
+      {showCatPropPicker&&(<div className="modal-overlay" onClick={()=>setShowCatPropPicker(false)}><div className="modal" style={{maxWidth:420}} onClick={e=>e.stopPropagation()}>
+        <div className="modal-header"><span className="modal-title">Available at which properties?</span><button className="btn btn-ghost btn-sm" onClick={()=>setShowCatPropPicker(false)}>x</button></div>
+        <div style={{padding:'0 24px 24px',display:'grid',gap:10}}>
+          <div style={{fontSize:'.75rem',color:'var(--text-3)'}}>Choose "All properties" (company-wide) or toggle the specific properties that carry this category.</div>
+          <label style={{display:'flex',alignItems:'center',gap:8,fontSize:'.88rem',cursor:'pointer',padding:'6px 0',borderBottom:'1px solid var(--border-1)'}}>
+            <input type="checkbox" checked={newCategory.propertyIds.length===0} onChange={()=>setNewCategory(s=>({...s,propertyIds:[]}))} />
+            All properties
+          </label>
+          {(properties as any[]).map((p:any)=>(
+            <label key={p.id} style={{display:'flex',alignItems:'center',gap:8,fontSize:'.88rem',cursor:'pointer',padding:'4px 0'}}>
+              <input type="checkbox" checked={newCategory.propertyIds.includes(p.id)} onChange={e=>setNewCategory(s=>({...s,propertyIds: e.target.checked ? [...s.propertyIds, p.id] : s.propertyIds.filter((x:string)=>x!==p.id)}))} />
+              {p.name || p.street1}
+            </label>
+          ))}
+          <button className="btn btn-primary" style={{width:'100%',marginTop:8}} onClick={()=>setShowCatPropPicker(false)}>Done</button>
         </div>
       </div></div>)}
 
@@ -1480,98 +1597,3 @@ export function POSPage() {
     </div>
   )
 }
-
-// ── S264: connection-status badge ─────────────────────────────────────────
-// Compact element in the POS header. Three visual states:
-//   online + 0 pending  → muted "Synced" badge
-//   online + N pending  → amber "Syncing N…" with click-to-force-drain
-//   offline             → red "Offline — N pending" with click for menu
-// Click opens a popover with Force-sync + Clear-queue actions.
-function SyncStatusBadge({
-  status, onClearQueue, onForceDrain,
-}: {
-  status: { online:boolean; pendingCount:number; syncing:boolean; lastError:string|null }
-  onClearQueue: () => void
-  onForceDrain: () => void
-}) {
-  const [open, setOpen] = useState(false)
-  const tone = !status.online
-    ? { fg: 'var(--red)', bg: 'rgba(239,68,68,.08)', border: 'rgba(239,68,68,.3)' }
-    : status.pendingCount > 0
-      ? { fg: 'var(--amber)', bg: 'rgba(245,158,11,.08)', border: 'rgba(245,158,11,.3)' }
-      : { fg: 'var(--text-3)', bg: 'var(--bg-2)', border: 'var(--border-0)' }
-  const label = !status.online
-    ? `Offline${status.pendingCount > 0 ? ` · ${status.pendingCount} pending` : ''}`
-    : status.pendingCount > 0
-      ? (status.syncing ? `Syncing ${status.pendingCount}…` : `${status.pendingCount} pending`)
-      : 'Synced'
-  return (
-    <div style={{ position:'relative' }}>
-      <button
-        onClick={() => setOpen(o => !o)}
-        style={{
-          padding:'4px 10px',
-          borderRadius:6,
-          border:`1px solid ${tone.border}`,
-          background: tone.bg,
-          color: tone.fg,
-          fontSize:'.72rem',
-          fontWeight:600,
-          cursor:'pointer',
-          display:'flex',
-          alignItems:'center',
-          gap:6,
-        }}
-      >
-        <span style={{ width:6, height:6, borderRadius:'50%', background: tone.fg, opacity: status.syncing ? 0.5 : 1 }} />
-        {label}
-      </button>
-      {open && (
-        <div
-          onMouseLeave={() => setOpen(false)}
-          style={{
-            position:'absolute',
-            top: 'calc(100% + 4px)',
-            left: 0,
-            zIndex: 100,
-            minWidth: 220,
-            padding: 8,
-            background: 'var(--bg-1)',
-            border: '1px solid var(--border-0)',
-            borderRadius: 8,
-            boxShadow: '0 4px 16px rgba(0,0,0,.3)',
-            fontSize:'.78rem',
-          }}
-        >
-          <div style={{ padding:'6px 8px', color:'var(--text-3)' }}>
-            {status.online ? 'Connection: online' : 'Connection: offline'} · {status.pendingCount} pending
-          </div>
-          {status.lastError && (
-            <div style={{ padding:'6px 8px', color:'var(--red)', fontSize:'.72rem' }}>
-              Last error: {status.lastError}
-            </div>
-          )}
-          <button
-            onClick={() => { setOpen(false); onForceDrain() }}
-            disabled={!status.online || status.pendingCount === 0}
-            style={{
-              width:'100%', textAlign:'left', padding:'8px 10px', borderRadius:6,
-              border:'none', background:'transparent', color:'var(--text-1)', cursor:'pointer',
-              opacity: (!status.online || status.pendingCount === 0) ? 0.5 : 1,
-            }}
-          >Force sync now</button>
-          <button
-            onClick={() => { setOpen(false); onClearQueue() }}
-            disabled={status.pendingCount === 0}
-            style={{
-              width:'100%', textAlign:'left', padding:'8px 10px', borderRadius:6,
-              border:'none', background:'transparent', color:'var(--red)', cursor:'pointer',
-              opacity: status.pendingCount === 0 ? 0.5 : 1,
-            }}
-          >Discard {status.pendingCount} unsent change{status.pendingCount === 1 ? '' : 's'}</button>
-        </div>
-      )}
-    </div>
-  )
-}
-

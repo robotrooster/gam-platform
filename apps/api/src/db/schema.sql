@@ -21,7 +21,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict Ekg5sPhQLLDePfII75QzIdkgDe6xZhQacFwwdp1HMxFdLEJelKG8fAN9y8LOgXD
+\restrict q9qRADOVz0Qm5dLKndL0Tlh2prBQeuzeE6ybLJBc45JJCgl8SjI1PFlbWJIDBOd
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -4346,7 +4346,8 @@ CREATE TABLE public.pos_categories (
     sort_order integer DEFAULT 0 NOT NULL,
     is_active boolean DEFAULT true NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    property_id uuid
+    property_id uuid,
+    property_ids uuid[]
 );
 
 
@@ -4514,6 +4515,7 @@ CREATE TABLE public.pos_items (
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     property_id uuid NOT NULL,
     category_id uuid NOT NULL,
+    tax_category_id uuid,
     CONSTRAINT pos_items_stock_qty_nonneg CHECK ((stock_qty >= 0))
 );
 
@@ -4684,6 +4686,21 @@ COMMENT ON COLUMN public.pos_sessions.tenant_id IS 'S263: optional FK to tenants
 --
 
 COMMENT ON COLUMN public.pos_sessions.completed_transaction_id IS 'S263: FK to pos_transactions.id once /checkout fires. NULL while open.';
+
+
+--
+-- Name: pos_tax_categories; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pos_tax_categories (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    landlord_id uuid NOT NULL,
+    name text NOT NULL,
+    rate numeric DEFAULT 0 NOT NULL,
+    is_active boolean DEFAULT true NOT NULL,
+    sort_order integer DEFAULT 0 NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
 
 
 --
@@ -5993,6 +6010,7 @@ CREATE TABLE public.units (
     import_extra_data jsonb,
     rv_site_layout text DEFAULT 'none'::text NOT NULL,
     rv_amp_service text DEFAULT 'none'::text NOT NULL,
+    status_before_block text,
     CONSTRAINT units_rv_amp_service_check CHECK ((rv_amp_service = ANY (ARRAY['none'::text, '30'::text, '50'::text, 'both'::text]))),
     CONSTRAINT units_rv_site_layout_check CHECK ((rv_site_layout = ANY (ARRAY['none'::text, 'back_in'::text, 'pull_through'::text]))),
     CONSTRAINT units_status_check CHECK ((status = ANY (ARRAY['vacant'::text, 'available'::text, 'active'::text, 'direct_pay'::text, 'delinquent'::text, 'suspended'::text]))),
@@ -8030,6 +8048,22 @@ ALTER TABLE ONLY public.pos_session_items
 
 ALTER TABLE ONLY public.pos_sessions
     ADD CONSTRAINT pos_sessions_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: pos_tax_categories pos_tax_categories_landlord_id_name_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_tax_categories
+    ADD CONSTRAINT pos_tax_categories_landlord_id_name_key UNIQUE (landlord_id, name);
+
+
+--
+-- Name: pos_tax_categories pos_tax_categories_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_tax_categories
+    ADD CONSTRAINT pos_tax_categories_pkey PRIMARY KEY (id);
 
 
 --
@@ -15302,6 +15336,14 @@ ALTER TABLE ONLY public.pos_items
 
 
 --
+-- Name: pos_items pos_items_tax_category_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_items
+    ADD CONSTRAINT pos_items_tax_category_id_fkey FOREIGN KEY (tax_category_id) REFERENCES public.pos_tax_categories(id) ON DELETE SET NULL;
+
+
+--
 -- Name: pos_items pos_items_vendor_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -15443,6 +15485,14 @@ ALTER TABLE ONLY public.pos_sessions
 
 ALTER TABLE ONLY public.pos_sessions
     ADD CONSTRAINT pos_sessions_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id);
+
+
+--
+-- Name: pos_tax_categories pos_tax_categories_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_tax_categories
+    ADD CONSTRAINT pos_tax_categories_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
 
 
 --
@@ -16529,5 +16579,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict Ekg5sPhQLLDePfII75QzIdkgDe6xZhQacFwwdp1HMxFdLEJelKG8fAN9y8LOgXD
+\unrestrict q9qRADOVz0Qm5dLKndL0Tlh2prBQeuzeE6ybLJBc45JJCgl8SjI1PFlbWJIDBOd
 

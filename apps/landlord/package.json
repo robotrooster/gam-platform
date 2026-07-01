@@ -12,6 +12,7 @@
     "@sentry/react": "^8.55.2",
     "@stripe/connect-js": "^3.4.2",
     "@stripe/react-connect-js": "^3.4.1",
+    "@stripe/terminal-js": "^0.26.0",
     "axios": "^1.6.5",
     "clsx": "^2.1.0",
     "date-fns": "^3.2.0",

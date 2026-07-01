@@ -85,5 +85,5 @@ per-app `vercel.json` + the env manifest once the account is linked.
 2. `bash deploy/install-services.sh` (backend up on the Mac).
 3. Cloudflare Tunnel → public API URL.
 4. Vercel deploy frontends pointed at that URL.
-5. Stripe live keys + webhook → `https://api.<domain>/api/webhooks/stripe`.
+5. Stripe live keys + webhook → `https://api.<domain>/webhooks/stripe`.
 6. Resend domain verification; Checkr/Twilio keys.

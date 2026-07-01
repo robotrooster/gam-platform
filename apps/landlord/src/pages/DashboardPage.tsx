@@ -14,6 +14,12 @@ interface DashStats {
   suspendedUnits: number
   evictionModeUnits: number
   monthlyRentVolume: number
+  collectedMtd: number
+  outstanding: number
+  totalUnits: number
+  occupancyRate: number
+  leasesExpiring30d: number
+  leasesExpiring60d: number
   propertyCount: number
   upcomingDisbursement: { count: number; amount: number }
   otpUnits?: number
@@ -54,6 +60,10 @@ export function DashboardPage() {
   // unit floored at the $10 property minimum (full stop), summed across every
   // property. Same calc the billing cron + Reports use, so this matches the bill.
   const occupiedUnits = (stats?.activeUnits || 0) + (stats?.directPayUnits || 0)
+  // Full rent roll = every occupied unit (active + direct_pay + delinquent +
+  // suspended). Backs the "Expected Monthly Rent" subtext so the count matches
+  // the units actually summed into that figure.
+  const rentRollUnits = occupiedUnits + (stats?.delinquentUnits || 0) + (stats?.suspendedUnits || 0)
   const platformFee = stats?.platformFee ?? 0
   const platformFeeByProperty: { propertyId: string; name: string; fee: number }[] =
     (stats as any)?.platformFeeByProperty ?? []
@@ -97,29 +107,52 @@ export function DashboardPage() {
       )}
 
 
-      {/* KPI Grid */}
-      <div className="kpi-grid" style={{gridTemplateColumns:"repeat(3, 1fr)"}}>
-        <div className="kpi-card" style={{cursor:'pointer'}} onClick={()=>navigate('/units')}>
+      {/* KPI Grid — 12-col so we can run 3 / 4 / 3 cards per row (spans 4 / 3 / 4). */}
+      <div className="kpi-grid" style={{gridTemplateColumns:"repeat(12, 1fr)"}}>
+        {/* Row 1 (span 4): rent money trio */}
+        <div className="kpi-card" style={{gridColumn:'span 4'}}>
+          <div className="kpi-label">Expected Monthly Rent</div>
+          <div className="kpi-value gold">{fmt(stats?.monthlyRentVolume || 0)}</div>
+          <div className="kpi-sub">contracted across {rentRollUnits} occupied units</div>
+        </div>
+        <div className="kpi-card" style={{gridColumn:'span 4',cursor:'pointer'}} onClick={()=>navigate('/reports')}>
+          <div className="kpi-label">Collected This Month</div>
+          <div className="kpi-value green">{fmt(stats?.collectedMtd || 0)}</div>
+          <div className="kpi-sub">settled rent payments MTD</div>
+        </div>
+        <div className="kpi-card" style={{gridColumn:'span 4',cursor:'pointer'}} onClick={()=>navigate('/reports')}>
+          <div className="kpi-label">Outstanding</div>
+          <div className="kpi-value" style={{color:(stats?.outstanding||0)>0?'var(--amber)':'var(--text-0)'}}>{fmt(stats?.outstanding || 0)}</div>
+          <div className="kpi-sub">unpaid invoice balances</div>
+        </div>
+        {/* Row 2 (span 3): portfolio + operations */}
+        <div className="kpi-card" style={{gridColumn:'span 3',cursor:'pointer'}} onClick={()=>navigate('/units')}>
+          <div className="kpi-label">Occupancy Rate</div>
+          <div className="kpi-value">{stats?.occupancyRate ?? 0}%</div>
+          <div className="kpi-sub">{stats?.activeUnits || 0} of {stats?.totalUnits || 0} units active</div>
+        </div>
+        <div className="kpi-card" style={{gridColumn:'span 3',cursor:'pointer'}} onClick={()=>navigate('/units')}>
           <div className="kpi-label">Active Units</div>
           <div className="kpi-value green">{stats?.activeUnits || 0}</div>
           <div className="kpi-sub">{stats?.directPayUnits || 0} direct pay · {stats?.vacantUnits || 0} vacant</div>
         </div>
-        <div className="kpi-card">
-          <div className="kpi-label">Monthly Rent Volume</div>
-          <div className="kpi-value gold">{fmt(stats?.monthlyRentVolume || 0)}</div>
-          <div className="kpi-sub">across {stats?.activeUnits || 0} occupied units</div>
+        <div className="kpi-card" style={{gridColumn:'span 3',cursor:'pointer'}} onClick={()=>navigate('/leases')}>
+          <div className="kpi-label">Leases Expiring</div>
+          <div className="kpi-value" style={{fontSize:'1.4rem',color:(stats?.leasesExpiring30d||0)>0?'var(--amber)':'var(--text-0)'}}>{stats?.leasesExpiring30d || 0} in 30d</div>
+          <div className="kpi-sub">{stats?.leasesExpiring60d || 0} within 60 days</div>
         </div>
-        <div className="kpi-card" style={{cursor:'pointer'}} onClick={()=>navigate('/maintenance')}>
+        <div className="kpi-card" style={{gridColumn:'span 3',cursor:'pointer'}} onClick={()=>navigate('/maintenance')}>
           <div className="kpi-label">Maintenance</div>
           <div className="kpi-value" style={{fontSize:'1.4rem'}}>{(stats as any)?.maintenance?.openRequests||0} open</div>
           <div className="kpi-sub">{(stats as any)?.maintenance?.inProgress||0} in progress · {(stats as any)?.maintenance?.completed30d||0} done this month</div>
         </div>
-        <div className="kpi-card" style={{cursor:'pointer'}} onClick={()=>navigate('/background')}>
+        {/* Row 3 (span 4): applications, payout, fee */}
+        <div className="kpi-card" style={{gridColumn:'span 4',cursor:'pointer'}} onClick={()=>navigate('/background')}>
           <div className="kpi-label">Applications</div>
           <div className="kpi-value" style={{fontSize:'1.4rem',color:(stats as any)?.bgPending>0?'var(--amber)':'var(--green)'}}>{(stats as any)?.bgPending||0}</div>
           <div className="kpi-sub">{(stats as any)?.bgPending>0?'pending review':'no pending applications'}</div>
         </div>
-        <div className="kpi-card">
+        <div className="kpi-card" style={{gridColumn:'span 4'}}>
           <div className="kpi-label">Next Disbursement</div>
           <div className="kpi-value" style={{fontSize:'1.4rem'}}>{fmt(stats?.upcomingDisbursement?.amount || 0)}</div>
           <div className="kpi-sub flex items-center gap-8">
@@ -127,7 +160,7 @@ export function DashboardPage() {
             Next payout {nextPayoutDate}
           </div>
         </div>
-        <div className="kpi-card" style={{cursor:'pointer'}} onClick={()=>setShowFeeModal(true)}>
+        <div className="kpi-card" style={{gridColumn:'span 4',cursor:'pointer'}} onClick={()=>setShowFeeModal(true)}>
           <div className="kpi-label">Platform Fee / Mo</div>
           <div className="kpi-value">{fmt(platformFee)}</div>
           <div className="kpi-sub">{occupiedUnits} occupied × $2/unit · $10/property min</div>
@@ -142,7 +175,7 @@ export function DashboardPage() {
         {/* Revenue trend */}
         <div className="card">
           <div className="card-header">
-            <span className="card-title">Monthly Rent Volume</span>
+            <span className="card-title">Rent Collected — last 6 months</span>
             <TrendingUp size={16} style={{color:'var(--text-3)'}} />
           </div>
           <ResponsiveContainer width="100%" height={180}>
@@ -239,8 +272,8 @@ export function DashboardPage() {
         </div>
       )}
 
-      {/* Bulletin Board */}
-      <BulletinBoard />
+      {/* Bulletin Board — hidden from landlord portal (toggle to re-enable) */}
+      {false && <BulletinBoard />}
     </div>
   )
 }

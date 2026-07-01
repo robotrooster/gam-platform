@@ -75,9 +75,11 @@ posRouter.get('/items', requirePerm('pos.ring_sale', 'pos.manage_inventory'), as
     let items: any[]
     if (propertyFilter) {
       items = await query<any>(
-        `SELECT pi.*, pc.name AS category
+        `SELECT pi.*, pc.name AS category, tc.name AS tax_category,
+                COALESCE(tc.rate, pi.tax_rate, 0) AS tax_rate
           FROM pos_items pi
           LEFT JOIN pos_categories pc ON pc.id = pi.category_id
+          LEFT JOIN pos_tax_categories tc ON tc.id = pi.tax_category_id
           WHERE pi.landlord_id = $1
             AND pi.is_active = TRUE
             AND pi.property_id = $2
@@ -86,9 +88,11 @@ posRouter.get('/items', requirePerm('pos.ring_sale', 'pos.manage_inventory'), as
       )
     } else {
       items = await query<any>(
-        `SELECT pi.*, pc.name AS category
+        `SELECT pi.*, pc.name AS category, tc.name AS tax_category,
+                COALESCE(tc.rate, pi.tax_rate, 0) AS tax_rate
           FROM pos_items pi
           LEFT JOIN pos_categories pc ON pc.id = pi.category_id
+          LEFT JOIN pos_tax_categories tc ON tc.id = pi.tax_category_id
           WHERE pi.landlord_id=$1 AND pi.is_active=TRUE
           ORDER BY pc.name, pi.name`,
         [req.user!.profileId],
@@ -144,9 +148,12 @@ posRouter.get('/items', requirePerm('pos.ring_sale', 'pos.manage_inventory'), as
 // GET /api/pos/settings — business-level POS config (default margin).
 posRouter.get('/settings', requirePerm('pos.ring_sale', 'pos.manage_inventory'), async (req, res, next) => {
   try {
-    const row = await queryOne<{ pos_default_margin_pct: string | null }>(
-      `SELECT pos_default_margin_pct FROM landlords WHERE id = $1`, [req.user!.profileId])
-    res.json({ success: true, data: { defaultMarginPct: row?.pos_default_margin_pct != null ? Number(row.pos_default_margin_pct) : null } })
+    const row = await queryOne<{ pos_default_margin_pct: string | null; business_name: string | null }>(
+      `SELECT pos_default_margin_pct, business_name FROM landlords WHERE id = $1`, [req.user!.profileId])
+    res.json({ success: true, data: {
+      defaultMarginPct: row?.pos_default_margin_pct != null ? Number(row.pos_default_margin_pct) : null,
+      businessName: row?.business_name || null,
+    } })
   } catch (e) { next(e) }
 })
 
@@ -168,7 +175,7 @@ posRouter.post('/items', requirePerm('pos.manage_inventory'), async (req, res, n
   try {
     const { name, categoryId, icon, costPrice, sellPrice, marginPct, taxRate,
             chargeEligible, stockQty, stockMin, stockMax, vendorId, shelfLabelEnabled,
-            propertyId } = req.body
+            propertyId, taxCategoryId } = req.body
 
     if (!categoryId) {
       throw new AppError(400, 'categoryId is required')
@@ -197,11 +204,11 @@ posRouter.post('/items', requirePerm('pos.manage_inventory'), async (req, res, n
     }
 
     const item = await queryOne<any>(`INSERT INTO pos_items
-      (landlord_id,property_id,name,category_id,icon,cost_price,sell_price,margin_pct,tax_rate,charge_eligible,stock_qty,stock_min,stock_max,vendor_id,shelf_label_enabled)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *`,
+      (landlord_id,property_id,name,category_id,icon,cost_price,sell_price,margin_pct,tax_rate,charge_eligible,stock_qty,stock_min,stock_max,vendor_id,shelf_label_enabled,tax_category_id)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`,
       [req.user!.profileId, propertyId, name, categoryId, icon||'📦', costPrice||0, sellPrice,
        margin, taxRate||0, chargeEligible??true, stockQty||0, stockMin||5, stockMax||50,
-       vendorId||null, shelfLabelEnabled??true])
+       vendorId||null, shelfLabelEnabled??true, taxCategoryId||null])
 
     res.status(201).json({ success: true, data: item })
   } catch (e) { next(e) }
@@ -215,7 +222,9 @@ posRouter.patch('/items/:id', requirePerm('pos.manage_inventory'), async (req, r
     if (!item) throw new AppError(404, 'Item not found')
 
     const { name, categoryId, icon, costPrice, sellPrice, marginPct, taxRate,
-            chargeEligible, stockMin, stockMax, vendorId, isActive, propertyId } = req.body
+            chargeEligible, stockMin, stockMax, vendorId, isActive, propertyId, taxCategoryId } = req.body
+    // undefined preserves; null/value re-assigns the tax category.
+    const newTaxCategoryId = taxCategoryId !== undefined ? (taxCategoryId || null) : item.tax_category_id
 
     const newSellPrice = sellPrice ?? item.sell_price
     const newCostPrice = costPrice ?? item.cost_price
@@ -285,14 +294,71 @@ posRouter.patch('/items/:id', requirePerm('pos.manage_inventory'), async (req, r
     const updated = await queryOne<any>(`UPDATE pos_items SET
       name=$1, category_id=$2, icon=$3, cost_price=$4, sell_price=$5, margin_pct=$6,
       tax_rate=$7, charge_eligible=$8, stock_min=$9, stock_max=$10, vendor_id=$11,
-      is_active=$12, property_id=$13, updated_at=NOW() WHERE id=$14 RETURNING *`,
+      is_active=$12, property_id=$13, tax_category_id=$15, updated_at=NOW() WHERE id=$14 RETURNING *`,
       [name??item.name, newCategoryId, icon??item.icon,
        newCostPrice, newSellPrice, newMargin,
        taxRate??item.tax_rate, chargeEligible??item.charge_eligible,
        stockMin??item.stock_min, stockMax??item.stock_max,
-       newVendorId, isActive??item.is_active, newPropertyId, item.id])
+       newVendorId, isActive??item.is_active, newPropertyId, item.id, newTaxCategoryId])
 
     res.json({ success: true, data: updated })
+  } catch (e) { next(e) }
+})
+
+// ── Tax categories — simple: each has ONE rate; items pick a tax category and
+// inherit its rate (resolved in GET /items). Rates stored as decimals (0.08=8%).
+const DEFAULT_TAX_CATEGORIES = [
+  { name: 'Non-taxable', rate: 0, sort_order: 1 },
+  { name: 'General',     rate: 0, sort_order: 2 },
+  { name: 'Food',        rate: 0, sort_order: 3 },
+  { name: 'Tobacco',     rate: 0, sort_order: 4 },
+  { name: 'Alcohol',     rate: 0, sort_order: 5 },
+]
+
+posRouter.get('/tax-categories', requirePerm('pos.ring_sale', 'pos.manage_inventory'), async (req, res, next) => {
+  try {
+    const inactive = req.query.all === '1' ? '' : 'AND is_active=TRUE'
+    let rows = await query(`SELECT * FROM pos_tax_categories WHERE landlord_id=$1 ${inactive} ORDER BY sort_order, name`, [req.user!.profileId])
+    if (rows.length === 0) {
+      for (const t of DEFAULT_TAX_CATEGORIES) {
+        await query('INSERT INTO pos_tax_categories (landlord_id,name,rate,sort_order) VALUES ($1,$2,$3,$4)', [req.user!.profileId, t.name, t.rate, t.sort_order])
+      }
+      rows = await query(`SELECT * FROM pos_tax_categories WHERE landlord_id=$1 ${inactive} ORDER BY sort_order, name`, [req.user!.profileId])
+    }
+    res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
+posRouter.post('/tax-categories', requirePerm('pos.manage_inventory'), async (req, res, next) => {
+  try {
+    const { name, rate, sortOrder } = req.body
+    if (!name || typeof name !== 'string' || !name.trim()) throw new AppError(400, 'name is required')
+    const r = Number(rate)
+    if (!Number.isFinite(r) || r < 0 || r > 1) throw new AppError(400, 'rate must be a decimal 0–1 (e.g. 0.08 for 8%)')
+    try {
+      const row = await queryOne('INSERT INTO pos_tax_categories (landlord_id,name,rate,sort_order) VALUES ($1,$2,$3,$4) RETURNING *', [req.user!.profileId, name.trim(), r, sortOrder||0])
+      res.status(201).json({ success: true, data: row })
+    } catch (e: any) {
+      if (e?.code === '23505') throw new AppError(409, `A tax category named "${name.trim()}" already exists`)
+      throw e
+    }
+  } catch (e) { next(e) }
+})
+
+posRouter.patch('/tax-categories/:id', requirePerm('pos.manage_inventory'), async (req, res, next) => {
+  try {
+    const cat = await queryOne<any>('SELECT * FROM pos_tax_categories WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
+    if (!cat) throw new AppError(404, 'Tax category not found')
+    const { name, rate, isActive, sortOrder } = req.body
+    let r = cat.rate
+    if (rate !== undefined) { r = Number(rate); if (!Number.isFinite(r) || r < 0 || r > 1) throw new AppError(400, 'rate must be a decimal 0–1') }
+    try {
+      const row = await queryOne('UPDATE pos_tax_categories SET name=$1, rate=$2, is_active=$3, sort_order=$4 WHERE id=$5 RETURNING *', [name||cat.name, r, isActive!==undefined?isActive:cat.is_active, sortOrder!==undefined?sortOrder:cat.sort_order, cat.id])
+      res.json({ success: true, data: row })
+    } catch (e: any) {
+      if (e?.code === '23505') throw new AppError(409, `A tax category named "${name}" already exists`)
+      throw e
+    }
   } catch (e) { next(e) }
 })
 
@@ -795,6 +861,20 @@ posRouter.get('/low-stock', requirePerm('pos.manage_inventory'), async (req, res
 // DEFAULT_CATEGORIES is defined at the top of this file so the items
 // seed flow can also resolve names → ids (S227).
 
+// Category property scope: null/empty array → all properties (company-wide);
+// a non-empty array scopes the category to exactly those properties. Each id is
+// validated to belong to the landlord. Returns the normalized value to store.
+async function validateCategoryPropertyIds(propertyIds: any, landlordId: string): Promise<string[] | null> {
+  if (!Array.isArray(propertyIds) || propertyIds.length === 0) return null
+  const ids = Array.from(new Set(propertyIds.map(String)))
+  const owned = await query<{ id: string }>(
+    'SELECT id FROM properties WHERE landlord_id=$1 AND id = ANY($2::uuid[])', [landlordId, ids])
+  if (owned.length !== ids.length) {
+    throw new AppError(400, 'One or more properties do not belong to this landlord')
+  }
+  return ids
+}
+
 posRouter.get('/categories', requirePerm('pos.ring_sale', 'pos.manage_inventory'), async (req, res, next) => {
   try {
     // S219: ?all=1 returns inactive categories too (for the management
@@ -812,7 +892,8 @@ posRouter.get('/categories', requirePerm('pos.ring_sale', 'pos.manage_inventory'
     if (!includeInactive) where += ' AND is_active=TRUE'
     if (propertyFilter) {
       params.push(propertyFilter)
-      where += ' AND (property_id = $2 OR property_id IS NULL)'
+      // property_ids NULL = all properties; otherwise the property must be in the set.
+      where += ' AND (property_ids IS NULL OR $2 = ANY(property_ids))'
     }
     let cats = await query(`SELECT * FROM pos_categories ${where} ORDER BY sort_order, name`, params)
     if (cats.length === 0 && !propertyFilter) {
@@ -831,27 +912,19 @@ posRouter.get('/categories', requirePerm('pos.ring_sale', 'pos.manage_inventory'
 
 posRouter.post('/categories', requirePerm('pos.manage_inventory'), async (req, res, next) => {
   try {
-    const { name, icon, sortOrder, propertyId } = req.body
+    const { name, icon, sortOrder, propertyIds } = req.body
     if (!name || typeof name !== 'string' || !name.trim()) {
       throw new AppError(400, 'name is required')
     }
-    // S220: validate propertyId belongs to this landlord. NULL = the
-    // landlord-wide posture (default).
-    if (propertyId) {
-      const prop = await queryOne<{ landlord_id: string }>(
-        'SELECT landlord_id FROM properties WHERE id = $1',
-        [propertyId],
-      )
-      if (!prop || prop.landlord_id !== req.user!.profileId) {
-        throw new AppError(400, 'propertyId does not belong to this landlord')
-      }
-    }
+    // property_ids: null/empty → all properties (company-wide); a non-empty
+    // array scopes the category to exactly those properties (each validated
+    // to belong to this landlord).
+    const propIds = await validateCategoryPropertyIds(propertyIds, req.user!.profileId)
     try {
-      const cat = await queryOne('INSERT INTO pos_categories (landlord_id,name,icon,sort_order,property_id) VALUES ($1,$2,$3,$4,$5) RETURNING *', [req.user!.profileId, name.trim(), icon||'📦', sortOrder||0, propertyId||null])
+      const cat = await queryOne('INSERT INTO pos_categories (landlord_id,name,icon,sort_order,property_ids) VALUES ($1,$2,$3,$4,$5::uuid[]) RETURNING *', [req.user!.profileId, name.trim(), icon||'📦', sortOrder||0, propIds])
       res.status(201).json({ success: true, data: cat })
     } catch (e: any) {
-      // S227: pos_categories_landlord_name_uniq violation → 409 with
-      // a clear message instead of leaking the constraint name.
+      // Category names are unique per landlord → clean 409 instead of a 500.
       if (e?.code === '23505' && e?.constraint === 'pos_categories_landlord_name_uniq') {
         throw new AppError(409, `A category named "${name.trim()}" already exists`)
       }
@@ -862,35 +935,25 @@ posRouter.post('/categories', requirePerm('pos.manage_inventory'), async (req, r
 
 posRouter.patch('/categories/:id', requirePerm('pos.manage_inventory'), async (req, res, next) => {
   try {
-    const { name, icon, sortOrder, isActive, propertyId } = req.body
+    const { name, icon, sortOrder, isActive, propertyIds } = req.body
     const cat = await queryOne<any>('SELECT * FROM pos_categories WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
     if (!cat) { res.status(404).json({ success: false, error: 'Not found' }); return }
 
-    // S220: propertyId trichotomy — null clears, undefined preserves,
-    // uuid re-assigns. Validate ownership when reassigning. Mirrors the
-    // S217 pos_tax_rates PATCH shape.
-    let newPropertyId: string | null = cat.property_id
-    if (propertyId === null) {
-      newPropertyId = null
-    } else if (propertyId !== undefined) {
-      const prop = await queryOne<{ landlord_id: string }>(
-        'SELECT landlord_id FROM properties WHERE id = $1',
-        [propertyId],
-      )
-      if (!prop || prop.landlord_id !== req.user!.profileId) {
-        throw new AppError(400, 'propertyId does not belong to this landlord')
-      }
-      newPropertyId = propertyId
+    // property_ids: undefined preserves the existing scope; otherwise
+    // null/empty → all properties, a non-empty array → that specific subset.
+    let newPropIds: string[] | null = cat.property_ids
+    if (propertyIds !== undefined) {
+      newPropIds = await validateCategoryPropertyIds(propertyIds, req.user!.profileId)
     }
 
     // S219: sortOrder uses !==undefined so a deliberate 0 (top of list)
     // sticks; pre-S219 the `||` fell through to the existing value.
     try {
-      const updated = await queryOne('UPDATE pos_categories SET name=$1,icon=$2,sort_order=$3,is_active=$4,property_id=$5 WHERE id=$6 RETURNING *', [name||cat.name, icon||cat.icon, sortOrder!==undefined?sortOrder:cat.sort_order, isActive!==undefined?isActive:cat.is_active, newPropertyId, cat.id])
+      const updated = await queryOne('UPDATE pos_categories SET name=$1,icon=$2,sort_order=$3,is_active=$4,property_ids=$5::uuid[] WHERE id=$6 RETURNING *', [name||cat.name, icon||cat.icon, sortOrder!==undefined?sortOrder:cat.sort_order, isActive!==undefined?isActive:cat.is_active, newPropIds, cat.id])
       res.json({ success: true, data: updated })
     } catch (e: any) {
-      // S227: rename collision against another category under the same
-      // landlord — surface as 409 instead of a generic 500.
+      // Rename collision against another category under the same landlord —
+      // surface as 409 instead of a generic 500.
       if (e?.code === '23505' && e?.constraint === 'pos_categories_landlord_name_uniq') {
         throw new AppError(409, `Another category named "${name}" already exists`)
       }

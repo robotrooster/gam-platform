@@ -581,7 +581,8 @@ function HomePage() {
         )}
       </div>
 
-      {/* ── Community Bulletin Board ─────────────────────────── */}
+      {/* ── Community Bulletin Board — hidden from tenant portal (toggle to re-enable) ── */}
+      {false && (
       <div style={{marginTop:24,background:'var(--bg2)',border:'1px solid var(--b1)',borderRadius:12,overflow:'hidden'}}>
 
         {/* Header */}
@@ -739,6 +740,7 @@ function HomePage() {
           })()}
         </div>
       </div>
+      )}
     </div>
   )
 }

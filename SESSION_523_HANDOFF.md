@@ -51,7 +51,7 @@ CORS change.
 
 ## Deferred / next session should target
 1. **Resend** (Free) — verify sending domain (DNS via Cloudflare), `RESEND_API_KEY` → `apps/api/.env`.
-2. **Stripe webhook** → `https://api.goldassetmanagement.com/api/webhooks/stripe` + live keys
+2. **Stripe webhook** → `https://api.goldassetmanagement.com/webhooks/stripe` + live keys
    (Nic wants a very broken-down walkthrough).
 3. **Harden backend to prod launchd before go-live.** `api.goldassetmanagement.com` is
    currently served by the **dev** `ts-node-dev` API on :4000 (+ dev model/embeddings).

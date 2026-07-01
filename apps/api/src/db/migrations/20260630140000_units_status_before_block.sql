@@ -1,0 +1,17 @@
+-- Couple the 'suspended' unit status to eviction mode (payment_block).
+--
+-- Product decision: a unit's status is 'suspended' if and ONLY if eviction mode
+-- is on for it. Turning eviction mode ON auto-suspends the unit; turning it OFF
+-- restores the unit's prior status (active / delinquent). 'suspended' can no
+-- longer be set manually (enforced in the route layer). Before this, 'suspended'
+-- was a dead placeholder status with no automated trigger and no behavior.
+--
+-- This column stores the status the unit held immediately BEFORE eviction mode
+-- suspended it, so we can deterministically restore it when eviction mode is
+-- lifted (rather than guessing 'active' and waiting for the delinquency cron to
+-- re-flag an overdue unit).
+--
+-- No backfill needed: there are currently zero payment_block=TRUE units and zero
+-- 'suspended' units, so nothing to reconcile. Nullable; NULL means "not currently
+-- suspended via eviction mode" (the normal case).
+ALTER TABLE units ADD COLUMN IF NOT EXISTS status_before_block TEXT;

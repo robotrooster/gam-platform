@@ -149,7 +149,7 @@ Platform agreement signed (per Nic). Operational steps remain:
 - Switch `STRIPE_SECRET_KEY` and `STRIPE_WEBHOOK_SECRET` from test
   to live values.
 - Register the production webhook endpoint in the Stripe live
-  dashboard pointing at `<prod-host>/api/webhooks/stripe`.
+  dashboard pointing at `<prod-host>/webhooks/stripe`.
 - Confirm Connect Express is enabled on the live account (should be
   already given the agreement; verify in the live dashboard).
 - Set `VITE_STRIPE_PUBLISHABLE_KEY` to `pk_live_*` in every frontend
