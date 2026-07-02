@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { Link } from 'react-router-dom'
 import { apiGet, apiPost } from '../lib/api'
+import { usePerms } from '../lib/permissions'
 import { ArrowDownToLine, X, Landmark, Check } from 'lucide-react'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
@@ -9,6 +10,7 @@ export function DisbursementsPage() {
   const { data: disbs = [], isLoading } = useQuery<any[]>('disbursements', () => apiGet('/disbursements'))
   const [selected, setSelected] = useState<any | null>(null)
   const [withdrawBank, setWithdrawBank] = useState<any | null>(null)
+  const { can } = usePerms()
 
   const totalSettled = (disbs as any[]).filter((d: any) => d.status === 'settled').reduce((sum: number, d: any) => sum + Number(d.amount), 0)
   const totalPending = (disbs as any[]).filter((d: any) => d.status === 'pending').reduce((sum: number, d: any) => sum + Number(d.amount), 0)
@@ -29,7 +31,7 @@ export function DisbursementsPage() {
 
       <BalanceWithdrawSection onWithdraw={() => setWithdrawBank({ open: true })} />
 
-      <PmImpactSection />
+      {can('disbursements.pm_impact_view') && <PmImpactSection />}
 
       <div className="kpi-grid" style={{ marginBottom: 24 }}>
         <div className="kpi-card">

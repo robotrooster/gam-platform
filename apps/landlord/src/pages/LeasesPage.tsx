@@ -5,6 +5,7 @@ import { apiGet, apiPost } from '../lib/api'
 import { UserPlus, AlertTriangle, DollarSign, FileText, Eye, X } from 'lucide-react'
 import { LEASE_TYPE_LABEL, LeaseStatus } from '@gam/shared'
 import { LeaseFormModal } from './LeaseFormModal'
+import { usePerms } from '../lib/permissions'
 
 const fmt = (n: any) => n != null
   ? '$' + Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
@@ -41,6 +42,7 @@ export function LeasesPage() {
   const [billFeeLease, setBillFeeLease] = useState<any | null>(null)
   const [searchParams, setSearchParams] = useSearchParams()
   const navigate = useNavigate()
+  const { can } = usePerms()
 
   // Deep-link: ?open=<leaseId> opens the edit modal directly
   useEffect(() => {
@@ -52,8 +54,10 @@ export function LeasesPage() {
   }, [searchParams])
 
   // Row click: needs-review → editable (confirm import); otherwise view-only.
+  // Staff without leases.edit never get the editable confirm path — the
+  // needs-review row opens read-only for them too.
   const openLease = (l: any) => {
-    setViewOnly(!l.needsReview)
+    setViewOnly(!l.needsReview || !can('leases.edit'))
     setEditingLeaseId(l.id)
     setModalOpen(true)
   }
@@ -172,15 +176,17 @@ export function LeasesPage() {
                     </td>
                     <td onClick={e => e.stopPropagation()}>
                       <div style={{ display: 'flex', gap: 6 }}>
-                        <button
-                          className="btn btn-ghost btn-sm"
-                          title="View the lease agreement (PDF)"
-                          onClick={() => openLeasePdf(l.id)}
-                          style={{ padding: '3px 8px' }}
-                        >
-                          <Eye size={12} /> View
-                        </button>
-                        {l.status === 'active' && (
+                        {can('leases.view_pdf') && (
+                          <button
+                            className="btn btn-ghost btn-sm"
+                            title="View the lease agreement (PDF)"
+                            onClick={() => openLeasePdf(l.id)}
+                            style={{ padding: '3px 8px' }}
+                          >
+                            <Eye size={12} /> View
+                          </button>
+                        )}
+                        {can('leases.bill_fee') && l.status === 'active' && (
                           <button
                             className="btn btn-ghost btn-sm"
                             title="Bill the tenant a one-off fee on this lease"
@@ -190,7 +196,7 @@ export function LeasesPage() {
                             <FileText size={12} /> Bill fee
                           </button>
                         )}
-                        {(l.status === 'active' || l.status === 'expired' || l.status === 'terminated') && (
+                        {can('leases.deposit_return') && (l.status === 'active' || l.status === 'expired' || l.status === 'terminated') && (
                           <button
                             className="btn btn-ghost btn-sm"
                             title="Process move-out / deposit return"

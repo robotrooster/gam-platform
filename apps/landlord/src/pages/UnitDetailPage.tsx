@@ -2,6 +2,7 @@ import { useState, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
+import { usePerms } from '../lib/permissions'
 import { ArrowLeft, Shield, AlertTriangle, Camera, Trash2, ExternalLink } from 'lucide-react'
 
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
@@ -37,6 +38,8 @@ export function UnitDetailPage() {
   const cancelSchedMut = useMutation(() => apiPost('/units/' + id + '/cancel-scheduled-activation', {}), { onSuccess: () => qc.invalidateQueries(['unit', id]) })
 
   const { data: photos = [], refetch: refetchPhotos } = useQuery(['unit-photos', id], () => apiGet<any[]>('/properties/units/' + id + '/photos'))
+
+  const { can } = usePerms()
 
   // Init listing form from unit data
   if (unit && !listingInit) {
@@ -124,12 +127,14 @@ export function UnitDetailPage() {
               <button className="btn btn-sm btn-primary" onClick={() => navigate('/tenant-onboarding')}>
                 Onboard Existing Tenant
               </button>
-              <button className="btn btn-sm btn-secondary" onClick={() => markAvailMut.mutate()} disabled={markAvailMut.isLoading}>
-                {markAvailMut.isLoading ? 'Saving…' : 'Mark Available'}
-              </button>
+              {can('units.manage_lifecycle') && (
+                <button className="btn btn-sm btn-secondary" onClick={() => markAvailMut.mutate()} disabled={markAvailMut.isLoading}>
+                  {markAvailMut.isLoading ? 'Saving…' : 'Mark Available'}
+                </button>
+              )}
             </>
           )}
-          {unit.status === 'available' && (
+          {unit.status === 'available' && can('units.manage_lifecycle') && (
             <>
               <button className="btn btn-sm btn-primary" onClick={() => setActivateModal(true)}>
                 Activate
@@ -139,17 +144,19 @@ export function UnitDetailPage() {
               </button>
             </>
           )}
-          {unit.scheduledActivationAt && (
+          {unit.scheduledActivationAt && can('units.manage_lifecycle') && (
             <button className="btn btn-sm btn-ghost" onClick={() => cancelSchedMut.mutate()} disabled={cancelSchedMut.isLoading}>
               Cancel schedule
             </button>
           )}
-          <button
-            className={'btn btn-sm ' + (unit.paymentBlock ? 'btn-secondary' : 'btn-danger')}
-            onClick={() => { setEvictModal(true); setEvictConfirm(false) }}
-          >
-            <Shield size={13} /> {unit.paymentBlock ? 'Deactivate Eviction Mode' : 'Activate Eviction Mode'}
-          </button>
+          {can('units.eviction_mode') && (
+            <button
+              className={'btn btn-sm ' + (unit.paymentBlock ? 'btn-secondary' : 'btn-danger')}
+              onClick={() => { setEvictModal(true); setEvictConfirm(false) }}
+            >
+              <Shield size={13} /> {unit.paymentBlock ? 'Deactivate Eviction Mode' : 'Activate Eviction Mode'}
+            </button>
+          )}
         </div>
       </div>
 
@@ -309,9 +316,11 @@ export function UnitDetailPage() {
           <a href={LISTINGS_URL} target="_blank" rel="noreferrer" style={{ fontSize: '.78rem', color: 'var(--text-3)', display: 'flex', alignItems: 'center', gap: 4 }}>
             <ExternalLink size={12} /> View public listings page
           </a>
-          <button className="btn btn-primary btn-sm" onClick={saveListing} disabled={savingListing}>
-            {savingListing ? 'Saving…' : 'Save Listing'}
-          </button>
+          {can('units.edit_listing') && (
+            <button className="btn btn-primary btn-sm" onClick={saveListing} disabled={savingListing}>
+              {savingListing ? 'Saving…' : 'Save Listing'}
+            </button>
+          )}
         </div>
       </div>
 

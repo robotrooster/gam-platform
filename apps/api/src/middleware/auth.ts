@@ -1,6 +1,8 @@
 import { Request, Response, NextFunction } from 'express'
 import jwt from 'jsonwebtoken'
 import { UserRole, LandlordAssignableRole } from '@gam/shared'
+import { query } from '../db'
+import { AppError } from './errorHandler'
 
 export interface AuthPayload {
   userId:      string
@@ -86,6 +88,40 @@ export const requireBookkeeper      = requireLandlordAssignableRole('bookkeeper'
 // landlord (and platform staff acting on the landlord's behalf), so by
 // definition they hold every permission within their scope.
 const OWNER_ROLES: UserRole[] = ['admin', 'super_admin', 'landlord']
+
+// Worker roles that carry a property scope (property_ids + all_properties).
+// Fixed whitelist — the value is interpolated into SQL below, so it must
+// never come from user input.
+const WORKER_SCOPE_TABLE: Record<string, string> = {
+  property_manager: 'property_manager_scopes',
+  onsite_manager:   'onsite_manager_scopes',
+  maintenance:      'maintenance_worker_scopes',
+}
+
+// Property-scope guard. Owners (admin/super_admin/landlord) bypass. A scoped
+// worker may only act on a property in their scope: all_properties=true grants
+// every property; otherwise the target propertyId must be in property_ids.
+// Read fresh from the scope table (not the JWT) so an owner's scope change
+// takes effect on the next request — same posture as /me re-fetching perms,
+// and it avoids threading property scope through the login/TOTP/refresh chain.
+export async function assertPropertyInScope(
+  user: AuthPayload | undefined,
+  propertyId: string | null | undefined,
+): Promise<void> {
+  if (!user) throw new AppError(401, 'Unauthenticated')
+  if (OWNER_ROLES.includes(user.role)) return
+  const table = WORKER_SCOPE_TABLE[user.role]
+  if (!table) throw new AppError(403, 'Not authorized for property-scoped actions')
+  const rows = await query<{ property_ids: string[]; all_properties: boolean }>(
+    `SELECT property_ids, all_properties FROM ${table} WHERE user_id = $1 LIMIT 1`,
+    [user.userId],
+  )
+  const row = rows[0]
+  if (!row) throw new AppError(403, 'No property scope assigned')
+  if (row.all_properties) return
+  if (!propertyId) throw new AppError(400, 'A property must be selected for this action')
+  if (!row.property_ids.includes(propertyId)) throw new AppError(403, 'You are not assigned to this property')
+}
 
 // requirePerm — gate a worker route by sub-permission key. Owner roles
 // always pass. Worker roles pass if JWT.permissions[key] === true for

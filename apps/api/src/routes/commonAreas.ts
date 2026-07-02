@@ -24,7 +24,7 @@ import {
   LANDLORD_RESERVATION_KINDS,
 } from '@gam/shared'
 import { query, queryOne, getClient } from '../db'
-import { requireAuth } from '../middleware/auth'
+import { requireAuth, requirePerm } from '../middleware/auth'
 import { canAccessLandlordResource, canManageLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
 import { lockArea, findApprovedConflict, computeReservationFee, billReservationFee, settleReservationFeeOnCancel } from '../services/commonAreas'
@@ -143,7 +143,7 @@ commonAreasRouter.get('/', async (req, res, next) => {
 })
 
 // Create an area.
-commonAreasRouter.post('/', async (req, res, next) => {
+commonAreasRouter.post('/', requirePerm('amenities.manage_areas'), async (req, res, next) => {
   try {
     const u = req.user!
     const b = areaCreateSchema.parse(req.body)
@@ -165,7 +165,7 @@ commonAreasRouter.post('/', async (req, res, next) => {
 })
 
 // Update an area.
-commonAreasRouter.patch('/:id', async (req, res, next) => {
+commonAreasRouter.patch('/:id', requirePerm('amenities.manage_areas'), async (req, res, next) => {
   try {
     const u = req.user!
     const b = areaUpdateSchema.parse(req.body)
@@ -192,7 +192,7 @@ commonAreasRouter.patch('/:id', async (req, res, next) => {
 })
 
 // Soft-delete (deactivate) an area.
-commonAreasRouter.delete('/:id', async (req, res, next) => {
+commonAreasRouter.delete('/:id', requirePerm('amenities.manage_areas'), async (req, res, next) => {
   try {
     const u = req.user!
     const area = await loadArea(req.params.id)
@@ -226,7 +226,7 @@ commonAreasRouter.get('/:id/reservations', async (req, res, next) => {
 })
 
 // Landlord creates a private rental / closure / event — goes live immediately.
-commonAreasRouter.post('/:id/reservations', async (req, res, next) => {
+commonAreasRouter.post('/:id/reservations', requirePerm('amenities.hold'), async (req, res, next) => {
   try {
     const u = req.user!
     const b = landlordReservationSchema.parse(req.body)
@@ -263,7 +263,7 @@ commonAreasRouter.post('/:id/reservations', async (req, res, next) => {
 })
 
 // Landlord decides a pending resident request: approve or reject.
-commonAreasRouter.post('/reservations/:rid/decide', async (req, res, next) => {
+commonAreasRouter.post('/reservations/:rid/decide', requirePerm('amenities.review_reservations'), async (req, res, next) => {
   try {
     const u = req.user!
     const b = z.object({

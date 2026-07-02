@@ -1100,7 +1100,7 @@ tenantsRouter.get('/payments', async (req, res, next) => {
 // (router-level), so any authenticated user including the tenant being
 // invited could call it. canAccessLandlordResource still enforces unit
 // scope after admission.
-tenantsRouter.post('/invite', requirePerm('tenants.create'), async (req, res, next) => {
+tenantsRouter.post('/invite', requirePerm('tenants.invite'), async (req, res, next) => {
   try {
     const { email, firstName, lastName, unitId, phone } = req.body
     if (!email || !firstName || !unitId) {
@@ -1303,7 +1303,7 @@ tenantsRouter.get('/:id/profile', async (req, res, next) => {
 })
 
 // POST /api/tenants/:id/transfer — move tenant to a new unit
-tenantsRouter.post('/:id/transfer', requirePerm('tenants.archive'), async (req, res, next) => {
+tenantsRouter.post('/:id/transfer', requirePerm('tenants.transfer_unit'), async (req, res, next) => {
   // Removed S20. Unit transfers are not a distinct operation under the
   // multi-tenant lease model. The equivalent workflow is:
   //   1. Terminate the existing lease (PATCH /leases/:id status=terminated)

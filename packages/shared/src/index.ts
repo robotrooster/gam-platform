@@ -886,6 +886,349 @@ export const SUB_PERMISSION_LABEL: Record<AnySubPermission, string> = {
   'time.clock_in_out':                 'Clock in/out',
 }
 
+// ---------- Permission catalog (modular per-user access) ----------
+//
+// The single source of truth for the per-user permissions page. Access is
+// composed by toggling individual keys per staff user — there is no fixed
+// role bundle. Each nav category is a group; within it, every independently-
+// grantable surface (a tab, a table, an action) is one entry. Surfaces that
+// only function together share ONE key rather than getting a key each.
+//
+// Consumers:
+//   - The per-user permissions page renders these groups as toggle sections.
+//   - Each page/route gates its surfaces on the same keys (owner roles bypass).
+// Keys are stored in the scope row's `permissions` jsonb as { key: true }.
+//
+// This catalog grows category-by-category. POS is the fully-wired reference;
+// append a group per category as each is enumerated + gated.
+export interface PermissionItem {
+  key: string
+  label: string
+  /** Optional one-liner shown under the toggle on the permissions page. */
+  hint?: string
+  /** Renders a "sensitive" badge on the permissions page. Still grantable —
+   *  the owner decides — but visually flagged (financials, PII, money movement,
+   *  third-party control). */
+  sensitive?: boolean
+}
+export interface PermissionGroup {
+  /** Stable category id (matches the nav section / page family). */
+  category: string
+  label: string
+  /** Sub-sections keep large groups readable on the permissions page. */
+  sections: { label: string; items: PermissionItem[] }[]
+}
+
+export const PERMISSION_CATALOG: PermissionGroup[] = [
+  {
+    category: 'pos', label: 'Point of Sale',
+    sections: [
+      { label: 'Tabs', items: [
+        { key: 'pos.tab.register',   label: 'Register' },
+        { key: 'pos.tab.history',    label: 'Sales history' },
+        { key: 'pos.tab.items',      label: 'Items' },
+        { key: 'pos.tab.categories', label: 'Categories' },
+        { key: 'pos.tab.taxes',      label: 'Tax rates' },
+        { key: 'pos.tab.discounts',  label: 'Discounts' },
+        { key: 'pos.tab.vendors',    label: 'Vendors' },
+        { key: 'pos.tab.orders',     label: 'Purchase orders' },
+        { key: 'pos.tab.inventory',  label: 'Inventory log' },
+        { key: 'pos.tab.readers',    label: 'Card readers' },
+      ]},
+      { label: 'Actions', items: [
+        { key: 'pos.ring_sale',        label: 'Ring sales' },
+        { key: 'pos.refund',           label: 'Issue refunds' },
+        { key: 'pos.void',             label: 'Void transactions' },
+        { key: 'pos.discount',         label: 'Apply discounts' },
+        { key: 'pos.end_of_day',       label: 'End-of-day close' },
+        { key: 'pos.manage_inventory', label: 'Create / edit items, tax, vendors' },
+      ]},
+    ],
+  },
+  {
+    category: 'dashboard', label: 'Dashboard',
+    sections: [{ label: 'Access', items: [
+      { key: 'dashboard.view', label: 'View dashboard', sensitive: true, hint: 'portfolio-wide financials' },
+    ]}],
+  },
+  {
+    category: 'properties', label: 'Properties',
+    sections: [{ label: 'Access & actions', items: [
+      { key: 'properties.view',           label: 'View properties' },
+      { key: 'properties.create',         label: 'Add property' },
+      { key: 'properties.edit',           label: 'Edit property' },
+      { key: 'properties.bulk_import',    label: 'Bulk import (CSV)' },
+      { key: 'properties.add_unit',       label: 'Add unit' },
+      { key: 'properties.assign_manager', label: 'Assign property manager' },
+    ]}],
+  },
+  {
+    category: 'units', label: 'Units',
+    sections: [{ label: 'Access & actions', items: [
+      { key: 'units.view',             label: 'View units' },
+      { key: 'units.set_status',       label: 'Change unit status' },
+      { key: 'units.manage_lifecycle', label: 'Unit lifecycle (available / vacant / activate)' },
+      { key: 'units.edit_listing',     label: 'Edit listing fields' },
+      { key: 'units.eviction_mode',    label: 'Eviction mode', sensitive: true, hint: 'blocks tenant ACH; legal' },
+    ]}],
+  },
+  {
+    category: 'schedule', label: 'Master Schedule',
+    sections: [
+      { label: 'Tabs', items: [
+        { key: 'schedule.tab.timeline', label: 'Timeline' },
+        { key: 'schedule.tab.list',     label: 'List' },
+        { key: 'schedule.tab.units',    label: 'Units' },
+        { key: 'schedule.tab.history',  label: 'History' },
+      ]},
+      { label: 'Actions', items: [
+        { key: 'schedule.create_reservation', label: 'Create reservations' },
+        { key: 'schedule.edit_reservation',   label: 'Edit / move / cancel reservations' },
+        { key: 'schedule.configure_unit',     label: 'Configure unit (rates, type, amenities)' },
+        { key: 'guest_access',                label: 'Guest stay links', hint: 'shared with Reservations' },
+      ]},
+    ],
+  },
+  {
+    category: 'bookings', label: 'Reservations',
+    sections: [{ label: 'Access & actions', items: [
+      { key: 'bookings.view',                   label: 'View reservations' },
+      { key: 'bookings.change_requests',        label: 'View guest change requests' },
+      { key: 'bookings.acknowledge',            label: 'Acknowledge property rules' },
+      { key: 'bookings.resolve_change_request', label: 'Approve / decline change requests' },
+    ]}],
+  },
+  {
+    category: 'booking_sites', label: 'Booking Sites',
+    sections: [{ label: 'Access & actions', items: [
+      { key: 'booking_sites.view', label: 'View booking-site config' },
+      { key: 'booking_sites.edit', label: 'Edit & publish booking site', sensitive: true, hint: 'publishes a public site' },
+    ]}],
+  },
+  {
+    category: 'tenants', label: 'Tenants',
+    sections: [{ label: 'Access & actions', items: [
+      { key: 'tenants.view',          label: 'View tenants' },
+      { key: 'tenants.invite',        label: 'Invite tenant' },
+      { key: 'tenants.onboard',       label: 'Onboard existing tenant' },
+      { key: 'tenants.transfer_unit', label: 'Transfer tenant unit' },
+    ]}],
+  },
+  {
+    category: 'tenant_onboarding', label: 'Tenant Onboarding',
+    sections: [{ label: 'Access & actions', items: [
+      { key: 'tenant_onboarding.view',           label: 'Onboarding & import flows' },
+      { key: 'tenant_onboarding.pending_manage', label: 'Manage pending pool (builds leases)' },
+    ]}],
+  },
+  {
+    category: 'leases', label: 'Leases',
+    sections: [{ label: 'Access & actions', items: [
+      { key: 'leases.view',           label: 'View leases' },
+      { key: 'leases.edit',           label: 'Edit / confirm leases' },
+      { key: 'leases.view_pdf',       label: 'View lease PDF' },
+      { key: 'leases.bill_fee',       label: 'Bill a fee' },
+      { key: 'leases.deposit_return', label: 'Deposit return / move-out', sensitive: true, hint: 'moves deposit money' },
+    ]}],
+  },
+  {
+    category: 'subleases', label: 'Subleases',
+    sections: [{ label: 'Access & actions', items: [
+      { key: 'subleases.view',      label: 'View subleases' },
+      { key: 'subleases.decide',    label: 'Approve / deny subleases' },
+      { key: 'subleases.terminate', label: 'Terminate sublease' },
+    ]}],
+  },
+  {
+    category: 'esign', label: 'E-Sign',
+    sections: [
+      { label: 'Tabs', items: [
+        { key: 'esign.tab.documents', label: 'Documents' },
+        { key: 'esign.tab.templates', label: 'Templates' },
+      ]},
+      { label: 'Actions', items: [
+        { key: 'esign.send',            label: 'Send documents' },
+        { key: 'esign.void',            label: 'Void documents' },
+        { key: 'esign.download',        label: 'Download signed PDFs' },
+        { key: 'esign.template_manage', label: 'Create / edit templates' },
+      ]},
+    ],
+  },
+  {
+    category: 'disbursements', label: 'Disbursements',
+    sections: [{ label: 'Access & actions', items: [
+      { key: 'disbursements.view',           label: 'View disbursements' },
+      { key: 'disbursements.pm_impact_view',  label: 'View PM impact', sensitive: true, hint: 'PM fee economics' },
+      // "withdraw now" is self-service (withdraws the caller's OWN balance) — not
+      // a landlord-staff action, so not a catalog key.
+    ]}],
+  },
+  {
+    // NOTE: add-account / archive / Connect-onboarding are SELF-SERVICE routes
+    // (each user manages their OWN account, incl. property_manager direct
+    // deposit) — they are not landlord-staff actions, so they're intentionally
+    // NOT catalog keys. Only page visibility is grantable.
+    category: 'banking', label: 'Banking',
+    sections: [{ label: 'Access', items: [
+      { key: 'banking.view', label: 'View banking' },
+    ]}],
+  },
+  {
+    category: 'payments', label: 'Payments',
+    sections: [{ label: 'Access & actions', items: [
+      { key: 'payments.view',           label: 'View payments' },
+      { key: 'payments.import_history', label: 'Import payment history' },
+    ]}],
+  },
+  {
+    category: 'balances', label: 'Outstanding Balances',
+    sections: [{ label: 'Access', items: [
+      { key: 'balances.view', label: 'View who owes + contact', hint: 'read-only: name, unit, amount owed, phone/email' },
+    ]}],
+  },
+  {
+    category: 'reports', label: 'Reports',
+    sections: [
+      { label: 'Reports', items: [
+        { key: 'reports.tab.overview',  label: 'Overview' },
+        { key: 'reports.tab.property',  label: 'By property' },
+        { key: 'reports.tab.annual',    label: 'Annual & tax', sensitive: true, hint: 'tenant 1099 PII' },
+        { key: 'reports.tab.statement', label: 'Owner statement' },
+      ]},
+      { label: 'Actions', items: [
+        { key: 'reports.export', label: 'Export / print' },
+      ]},
+    ],
+  },
+  {
+    category: 'maintenance', label: 'Maintenance',
+    sections: [
+      { label: 'Tabs', items: [
+        { key: 'maintenance.tab.outages', label: 'Outages' },
+      ]},
+      { label: 'Access & actions', items: [
+        { key: 'maintenance.view',       label: 'View work orders' },
+        { key: 'maintenance.create',     label: 'Log request' },
+        { key: 'maintenance.approve',    label: 'Approve / reject' },
+        { key: 'maintenance.assign',     label: 'Assign worker' },
+        { key: 'maintenance.update',     label: 'Update work order' },
+        { key: 'maintenance.comment',    label: 'Add notes' },
+        { key: 'maintenance.view_costs', label: 'View cost breakdown', sensitive: true, hint: 'financial roll-up' },
+      ]},
+    ],
+  },
+  {
+    category: 'inspections', label: 'Inspections',
+    sections: [{ label: 'Access & actions', items: [
+      { key: 'inspections.view',   label: 'View inspections' },
+      { key: 'inspections.create', label: 'Create inspection' },
+      { key: 'inspections.manage', label: 'Manage / finalize inspections' },
+    ]}],
+  },
+  {
+    category: 'amenities', label: 'Amenities',
+    sections: [{ label: 'Access & actions', items: [
+      { key: 'amenities.view',                label: 'View common areas' },
+      { key: 'amenities.manage_areas',        label: 'Manage areas' },
+      { key: 'amenities.hold',                label: 'Place holds' },
+      { key: 'amenities.review_reservations', label: 'Review reservations' },
+    ]}],
+  },
+  {
+    category: 'documents', label: 'Documents',
+    sections: [{ label: 'Access', items: [
+      { key: 'documents.view', label: 'View documents' },
+    ]}],
+  },
+  {
+    category: 'inventory', label: 'Inventory',
+    sections: [{ label: 'Access', items: [
+      { key: 'inventory.view', label: 'View inventory' },
+    ]}],
+  },
+  {
+    category: 'entry_requests', label: 'Entry Requests',
+    sections: [{ label: 'Access & actions', items: [
+      { key: 'entry_requests.view',   label: 'View entry requests' },
+      { key: 'entry_requests.create', label: 'Create entry request' },
+      { key: 'entry_requests.manage', label: 'Grant / deny / record entry' },
+    ]}],
+  },
+  {
+    category: 'applicant_pool', label: 'Applicant Pool',
+    sections: [{ label: 'Access & actions', items: [
+      { key: 'applicant_pool.view',      label: 'View applicant pool' },
+      { key: 'applicant_pool.reach_out', label: 'Reach out to candidates' },
+    ]}],
+  },
+  {
+    category: 'background_checks', label: 'Background Checks',
+    sections: [{ label: 'Access', items: [
+      { key: 'background_checks.view', label: 'View background checks', sensitive: true, hint: 'applicant risk PII' },
+    ]}],
+  },
+  {
+    category: 'screening', label: 'Rental History',
+    sections: [{ label: 'Access', items: [
+      { key: 'screening.view', label: 'View rental history', sensitive: true, hint: 'cross-landlord behavioral PII' },
+    ]}],
+  },
+  {
+    category: 'pm_invitations', label: 'PM Invitations',
+    sections: [{ label: 'Access & actions', items: [
+      { key: 'pm_invitations.view',    label: 'View PM invitations' },
+      { key: 'pm_invitations.send',    label: 'Send PM invitation', sensitive: true, hint: 'grants 3rd-party control + fee cut' },
+      { key: 'pm_invitations.respond', label: 'Accept / reject PM invitation', sensitive: true, hint: 'grants 3rd-party control + fee cut' },
+    ]}],
+  },
+  {
+    category: 'settings', label: 'Settings',
+    // settings.security (the owner's own login 2FA) is intentionally excluded —
+    // it can't meaningfully apply to another user.
+    sections: [{ label: 'Sections', items: [
+      { key: 'settings.account_view',         label: 'Account info' },
+      { key: 'settings.billing_view',         label: 'Billing info', sensitive: true },
+      { key: 'settings.maintenance_approval', label: 'Maintenance approval threshold', sensitive: true, hint: 'controls spend that bypasses approval' },
+      { key: 'settings.default_pm_company',   label: 'Default PM company', sensitive: true },
+    ]}],
+  },
+  {
+    category: 'notification_prefs', label: 'Notification Prefs',
+    sections: [{ label: 'Access & actions', items: [
+      { key: 'notification_prefs.view',           label: 'Notification preferences' },
+      { key: 'notification_prefs.email_failures', label: 'Email delivery issues', sensitive: true, hint: 'exposes recipient emails' },
+    ]}],
+  },
+]
+
+/** Flat list of every catalog key — for validation / "grant all" helpers. */
+export const ALL_CATALOG_PERMISSION_KEYS: string[] =
+  PERMISSION_CATALOG.flatMap(g => g.sections.flatMap(s => s.items.map(i => i.key)))
+
+// Presets = named bundles of catalog keys. NOT roles — a preset is a one-click
+// convenience on the permissions page that flips its keys ON; the owner edits
+// freely afterward. Each user stays fully custom.
+export interface PermissionPreset {
+  id: string
+  label: string
+  description: string
+  keys: string[]
+}
+export const PERMISSION_PRESETS: PermissionPreset[] = [
+  {
+    id: 'front_desk',
+    label: 'Front Desk',
+    description: 'The occupancy picture + who owes: Reservations, Leases, Master Schedule, and Outstanding Balances (with contact info).',
+    keys: [
+      // Bookings ops now live as tabs inside Master Schedule (Reservations + Requests).
+      'bookings.view', 'bookings.change_requests', 'bookings.resolve_change_request', 'bookings.acknowledge',
+      'leases.view', 'leases.view_pdf',
+      'schedule.tab.timeline', 'schedule.tab.list', 'schedule.tab.units', 'schedule.tab.history',
+      'balances.view',
+    ],
+  },
+]
+
 // ---------- Maintenance job categories ----------
 
 export const MAINTENANCE_JOB_CATEGORIES = [

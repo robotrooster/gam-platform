@@ -17,6 +17,7 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost } from '../lib/api'
+import { usePerms } from '../lib/permissions'
 
 type InviteStatus = 'pending' | 'accepted' | 'rejected' | 'expired' | 'revoked'
 type InviteDirection = 'owner_to_pm' | 'pm_to_owner'
@@ -94,6 +95,8 @@ export function PmInvitationsPage() {
     },
   )
 
+  const { can } = usePerms()
+
   const invites = invQ.data ?? []
   const incomingPending = invites.filter(i => i.direction === 'pm_to_owner' && i.status === 'pending')
   const outgoingPending = invites.filter(i => i.direction === 'owner_to_pm' && i.status === 'pending')
@@ -106,7 +109,9 @@ export function PmInvitationsPage() {
           <h1 className="page-title">PM company invitations</h1>
           <p className="page-subtitle">Owner ↔ PM-company property-management handshake</p>
         </div>
-        <button className="btn btn-primary" onClick={() => setSending(true)}>+ Send invitation</button>
+        {can('pm_invitations.send') && (
+          <button className="btn btn-primary" onClick={() => setSending(true)}>+ Send invitation</button>
+        )}
       </div>
 
       {msg && (
@@ -132,23 +137,25 @@ export function PmInvitationsPage() {
               {inv.feePlanName ? <>Fee plan: <strong>{inv.feePlanName}</strong> ({inv.feePlanType})</> : 'View-only — no fee plan'}
               {' · '}Sent {fmtDate(inv.createdAt)} · Expires {fmtDate(inv.expiresAt)}
             </div>
-            <div style={{ display: 'flex', gap: 8 }}>
-              <button
-                className="btn btn-primary btn-sm"
-                disabled={acceptMut.isLoading}
-                onClick={() => acceptMut.mutate({ id: inv.id, replace: !!inv.replacedPmCompanyId })}>
-                {acceptMut.isLoading ? 'Accepting…' : 'Accept'}
-              </button>
-              <button
-                className="btn btn-danger btn-sm"
-                disabled={rejectMut.isLoading}
-                onClick={() => {
-                  const reason = prompt('Reject this invitation? (Optional reason)') ?? ''
-                  rejectMut.mutate({ id: inv.id, reason })
-                }}>
-                Reject
-              </button>
-            </div>
+            {can('pm_invitations.respond') && (
+              <div style={{ display: 'flex', gap: 8 }}>
+                <button
+                  className="btn btn-primary btn-sm"
+                  disabled={acceptMut.isLoading}
+                  onClick={() => acceptMut.mutate({ id: inv.id, replace: !!inv.replacedPmCompanyId })}>
+                  {acceptMut.isLoading ? 'Accepting…' : 'Accept'}
+                </button>
+                <button
+                  className="btn btn-danger btn-sm"
+                  disabled={rejectMut.isLoading}
+                  onClick={() => {
+                    const reason = prompt('Reject this invitation? (Optional reason)') ?? ''
+                    rejectMut.mutate({ id: inv.id, reason })
+                  }}>
+                  Reject
+                </button>
+              </div>
+            )}
           </div>
         ))}
       </Section>

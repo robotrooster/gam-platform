@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { CalendarClock, Plus, Building2, Check, X, Ban } from 'lucide-react'
 import { apiGet, apiPost } from '../lib/api'
+import { usePerms } from '../lib/permissions'
 
 // NOTE: the landlord axios client camelizes responses (applyCamelizeInterceptor),
 // so server snake_case arrives camelCase here.
@@ -41,6 +42,7 @@ export function AmenitiesPage() {
   const [showArea, setShowArea] = useState(false)
   const [holdFor, setHoldFor] = useState<Area | null>(null)
   const [reservationsFor, setReservationsFor] = useState<Area | null>(null)
+  const { can } = usePerms()
 
   return (
     <div>
@@ -55,9 +57,11 @@ export function AmenitiesPage() {
             every resident the amenity is unavailable.
           </div>
         </div>
-        <button className="btn btn-primary" disabled={!pid} onClick={() => setShowArea(true)}>
-          <Plus size={15} /> New Area
-        </button>
+        {can('amenities.manage_areas') && (
+          <button className="btn btn-primary" disabled={!pid} onClick={() => setShowArea(true)}>
+            <Plus size={15} /> New Area
+          </button>
+        )}
       </div>
 
       <div className="card" style={{ padding: 16, marginBottom: 16 }}>
@@ -97,8 +101,8 @@ export function AmenitiesPage() {
                 </div>
               </div>
               <div style={{ display: 'flex', gap: 8, flexShrink: 0 }}>
-                <button className="btn btn-sm" onClick={() => setReservationsFor(a)}>Reservations</button>
-                <button className="btn btn-sm" onClick={() => setHoldFor(a)}>+ Hold</button>
+                {can('amenities.review_reservations') && <button className="btn btn-sm" onClick={() => setReservationsFor(a)}>Reservations</button>}
+                {can('amenities.hold') && <button className="btn btn-sm" onClick={() => setHoldFor(a)}>+ Hold</button>}
               </div>
             </div>
           </div>

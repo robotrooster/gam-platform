@@ -98,9 +98,11 @@ export function BankingPage() {
           <Landmark size={22} color="var(--gold)" />
           <h1 style={{ fontSize: '1.4rem', fontWeight: 600, margin: 0 }}>Banking</h1>
         </div>
-        <button className="btn btn-primary" onClick={() => setShowAdd(true)}>
-          <Plus size={14} /> Add Account
-        </button>
+        {(
+          <button className="btn btn-primary" onClick={() => setShowAdd(true)}>
+            <Plus size={14} /> Add Account
+          </button>
+        )}
       </div>
 
       {/* S160: Stripe Connect Express onboarding section. Sits above the

@@ -914,7 +914,7 @@ backgroundRouter.get('/pool/matches', requireAuth, requirePerm('tenants.run_back
 })
 
 // ── POOL: LANDLORD EXPRESSES INTEREST (FREE) ─────────────────
-backgroundRouter.post('/pool/:poolId/reach-out', requireAuth, requirePerm('tenants.run_background_check'), async (req, res, next) => {
+backgroundRouter.post('/pool/:poolId/reach-out', requireAuth, requirePerm('applicant_pool.reach_out'), async (req, res, next) => {
   try {
     const { unitId, message } = req.body
     const entry = await queryOne<any>(

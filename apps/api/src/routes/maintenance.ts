@@ -132,7 +132,7 @@ maintenanceRouter.post('/', async (req, res, next) => {
 })
 
 // PATCH /api/maintenance/:id — update status, assign, add cost, approve
-maintenanceRouter.patch('/:id', requirePerm('work_orders.complete', 'work_orders.reassign', 'maintenance.approve_above_threshold'), async (req, res, next) => {
+maintenanceRouter.patch('/:id', requirePerm('maintenance.update'), async (req, res, next) => {
   try {
     const { status: rawStatus, assignedTo, estimatedCost, actualCost, scheduledAt, landlordNotes, manHours } = req.body
 
@@ -247,7 +247,7 @@ maintenanceRouter.patch('/:id', requirePerm('work_orders.complete', 'work_orders
 
 // POST /api/maintenance/:id/approve — landlord approves a request in awaiting_approval
 // Approval over the threshold is a financial/policy decision — landlord/admin only.
-maintenanceRouter.post('/:id/approve', requirePerm('maintenance.approve_above_threshold'), async (req, res, next) => {
+maintenanceRouter.post('/:id/approve', requirePerm('maintenance.approve'), async (req, res, next) => {
   try {
     const request = await queryOne<any>(
       'SELECT * FROM maintenance_requests WHERE id=$1', [req.params.id])

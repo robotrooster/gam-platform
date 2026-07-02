@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useQuery } from 'react-query'
 import { apiGet, apiPatch } from '../lib/api'
+import { usePerms } from '../lib/permissions'
 
 const CUSTOMER_URL = (import.meta as any).env?.VITE_CUSTOMER_PORTAL_URL || 'http://localhost:3014'
 
@@ -11,6 +12,7 @@ export function BookingSitesPage() {
   const [msg, setMsg] = useState('')
   const [err, setErr] = useState('')
   const [saving, setSaving] = useState(false)
+  const { can } = usePerms()
 
   useEffect(() => { if (!propId && properties.length) setPropId(properties[0].id) }, [properties])
   useEffect(() => {
@@ -111,7 +113,7 @@ export function BookingSitesPage() {
               <span><b>Publish</b> this booking site (live to the public)</span>
             </label>
 
-            <button className="btn" disabled={saving} onClick={save}>{saving ? 'Saving…' : 'Save'}</button>
+            {can('booking_sites.edit') && <button className="btn" disabled={saving} onClick={save}>{saving ? 'Saving…' : 'Save'}</button>}
             {msg && <span style={{ color: 'var(--green)', marginLeft: 12 }}>{msg}</span>}
             {err && <span style={{ color: 'var(--red,#ff6b81)', marginLeft: 12 }}>{err}</span>}
           </>

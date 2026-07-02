@@ -5,6 +5,7 @@ import { api, apiGet, apiPatch } from '../lib/api'
 import { Check, DollarSign, X, ShieldCheck } from 'lucide-react'
 import { LAUNCH_HIDDEN } from '../components/layout/Layout'
 import { useAuth } from '../context/AuthContext'
+import { usePerms } from '../lib/permissions'
 
 interface LinkedPmCompany {
   id: string
@@ -44,6 +45,8 @@ export function SettingsPage() {
     }
   )
 
+  const { can } = usePerms()
+
   const thresholdNum = Number(threshold)
   const thresholdValid = !isNaN(thresholdNum) && thresholdNum >= 0
   const thresholdChanged = me && (
@@ -65,6 +68,7 @@ export function SettingsPage() {
         <div style={{ display: 'grid', gap: 16 }}>
 
           {/* Account */}
+          {can('settings.account_view') && (
           <div className="card">
             <div className="card-header"><span className="card-title">Account</span></div>
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginTop: 12 }}>
@@ -86,11 +90,13 @@ export function SettingsPage() {
               </div>
             </div>
           </div>
+          )}
 
           {/* Security / 2FA */}
           <SecurityCard />
 
           {/* Billing */}
+          {can('settings.billing_view') && (
           <div className="card">
             <div className="card-header"><span className="card-title">Billing</span></div>
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginTop: 12 }}>
@@ -109,8 +115,10 @@ export function SettingsPage() {
               </div>
             </div>
           </div>
+          )}
 
           {/* Maintenance Approval */}
+          {can('settings.maintenance_approval') && (
           <div className="card">
             <div className="card-header"><span className="card-title">Maintenance Approval</span></div>
             <div style={{ marginTop: 12 }}>
@@ -174,10 +182,11 @@ export function SettingsPage() {
               </div>
             </div>
           </div>
+          )}
 
           {/* Default PM Company (S157) — S512: hidden at launch with the
               PM-company surface (PM Invitations not in the launch trio). */}
-          {!LAUNCH_HIDDEN.has('/pm-invitations') && (
+          {can('settings.default_pm_company') && !LAUNCH_HIDDEN.has('/pm-invitations') && (
             <DefaultPmCompanyCard
               currentDefaultId={me?.defaultPmCompanyId ?? null}
               onChange={() => qc.invalidateQueries('landlord-me')}

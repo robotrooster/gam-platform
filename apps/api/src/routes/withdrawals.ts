@@ -32,7 +32,7 @@
 import { Router } from 'express'
 import { z } from 'zod'
 import { query, queryOne } from '../db'
-import { requireAuth } from '../middleware/auth'
+import { requireAuth, requirePerm } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import {
   firePayoutForConnectAccount,
@@ -100,6 +100,10 @@ const withdrawalSchema = z.object({
   method: z.enum(['standard', 'instant']).optional(),
 })
 
+// Self-service: withdraws the CALLER's own Connect balance (req.user.userId),
+// never the landlord's — so it is NOT gated on the landlord-staff catalog key
+// (that would break property_manager direct-deposit self-withdrawal for zero
+// security gain; a staff member can only ever move their own balance here).
 withdrawalsRouter.post('/me/withdrawals', async (req, res, next) => {
   try {
     const userId = req.user!.userId

@@ -4,6 +4,7 @@ import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPatch, apiDelete, apiPut } from '../lib/api'
 import { LEASE_COLUMNS, LEASE_COLUMN_LABEL, LEASE_COLUMN_INPUT } from '@gam/shared'
 import { useAuth } from '../context/AuthContext'
+import { usePerms } from '../lib/permissions'
 import { Plus, X, FileText, Send, Settings, Eye, Trash2, ChevronRight, Check, AlertCircle, Download, MoreVertical } from 'lucide-react'
 
 const API_URL = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
@@ -621,6 +622,7 @@ function SendDocumentModal({ onClose }) {
 
 export function ESignPage() {
   const qc = useQueryClient()
+  const { can } = usePerms()
   const [tab, setTab]           = useState<'documents'|'templates'>('documents')
   const [editTemplate, setEditTemplate] = useState<any>(null)
   const [showSend, setShowSend] = useState(false)
@@ -660,6 +662,19 @@ export function ESignPage() {
     completed:'badge-green', voided:'badge-red'
   }
 
+  // Per-user tab gating (canonical POSPage pattern): staff see only the tabs
+  // they hold; owners see both. Snap the active tab to the first visible one
+  // if the current tab is hidden for this user.
+  const TABS = [
+    { id:'documents', label:'Documents', perm:'esign.tab.documents' },
+    { id:'templates', label:'Templates', perm:'esign.tab.templates' },
+  ].filter(t => can(t.perm))
+  const visibleTabIds = TABS.map(t => t.id).join(',')
+  useEffect(() => {
+    if (TABS.length && !TABS.some(t => t.id === tab)) setTab(TABS[0].id as any)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visibleTabIds])
+
   if (editTemplate) return <TemplateEditor template={editTemplate} onClose={() => setEditTemplate(null)} />
 
   return (
@@ -670,13 +685,13 @@ export function ESignPage() {
           <p className="page-subtitle">Send documents for electronic signature</p>
         </div>
         <div style={{ display:'flex', gap:8 }}>
-          {tab === 'documents' && <button className="btn btn-primary" onClick={() => setShowSend(true)}><Send size={15} /> Send Document</button>}
-          {tab === 'templates' && <button className="btn btn-primary" onClick={() => setShowNewTemplate(true)}><Plus size={15} /> New Template</button>}
+          {tab === 'documents' && can('esign.send') && <button className="btn btn-primary" onClick={() => setShowSend(true)}><Send size={15} /> Send Document</button>}
+          {tab === 'templates' && can('esign.template_manage') && <button className="btn btn-primary" onClick={() => setShowNewTemplate(true)}><Plus size={15} /> New Template</button>}
         </div>
       </div>
 
       <div style={{ display:'flex', gap:8, marginBottom:20 }}>
-        {[{id:'documents',label:'Documents'},{id:'templates',label:'Templates'}].map(t => (
+        {TABS.map(t => (
           <button key={t.id} onClick={() => setTab(t.id as any)} className={`btn btn-sm ${tab===t.id?'btn-primary':'btn-ghost'}`}>{t.label}</button>
         ))}
       </div>
@@ -690,7 +705,7 @@ export function ESignPage() {
               <FileText size={40} />
               <h3>No documents yet</h3>
               <p>Send your first document for signature.</p>
-              <button className="btn btn-primary" onClick={() => setShowSend(true)}><Send size={14} /> Send Document</button>
+              {can('esign.send') && <button className="btn btn-primary" onClick={() => setShowSend(true)}><Send size={14} /> Send Document</button>}
             </div>
           ) : (
             <table className="data-table">
@@ -706,8 +721,8 @@ export function ESignPage() {
                     <td style={{ fontSize:'.72rem', color: d.completedAt ? 'var(--green)' : 'var(--text-3)' }}>{d.completedAt ? new Date(d.completedAt).toLocaleDateString() : '—'}</td>
                     <td>
                       <div style={{ display:'flex', gap:6 }}>
-                        {d.completedPdfUrl && <a href={d.completedPdfUrl} className="btn btn-ghost btn-sm"><Download size={12} /></a>}
-                        {d.status !== 'completed' && d.status !== 'voided' && (
+                        {can('esign.download') && d.completedPdfUrl && <a href={d.completedPdfUrl} className="btn btn-ghost btn-sm"><Download size={12} /></a>}
+                        {can('esign.void') && d.status !== 'completed' && d.status !== 'voided' && (
                           <button className="btn btn-ghost btn-sm" style={{ color:'var(--red)' }} onClick={() => { if(window.confirm('Void this document?')) voidMut.mutate(d.id) }}><X size={12} /></button>
                         )}
                       </div>
@@ -729,7 +744,7 @@ export function ESignPage() {
               <FileText size={40} />
               <h3>No templates yet</h3>
               <p>Create a template to define reusable signature fields.</p>
-              <button className="btn btn-primary" onClick={() => setShowNewTemplate(true)}><Plus size={14} /> New Template</button>
+              {can('esign.template_manage') && <button className="btn btn-primary" onClick={() => setShowNewTemplate(true)}><Plus size={14} /> New Template</button>}
             </div>
           ) : (
             <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fill,minmax(260px,1fr))', gap:12 }}>
@@ -743,21 +758,23 @@ export function ESignPage() {
                     <FileText size={18} style={{ color:'var(--text-3)' }} />
                   </div>
                   {t.description && <div style={{ fontSize:'.75rem', color:'var(--text-3)', marginBottom:12 }}>{t.description}</div>}
-                  <div style={{ display:'flex', gap:6 }}>
-                    <button className="btn btn-ghost btn-sm" onClick={async () => {
-                      const full = await apiGet<any>(`/esign/templates/${t.id}`)
-                      setEditTemplate(full)
-                    }}>
-                      <Settings size={12} /> Edit Fields
-                    </button>
-                    <button className="btn btn-ghost btn-sm" style={{ color:'var(--red)' }} onClick={() => {
-                      if (window.confirm('Delete template "' + t.name + '"? This cannot be undone.')) {
-                        deleteTemplateMut.mutate(t.id)
-                      }
-                    }}>
-                      <Trash2 size={12} />
-                    </button>
-                  </div>
+                  {can('esign.template_manage') && (
+                    <div style={{ display:'flex', gap:6 }}>
+                      <button className="btn btn-ghost btn-sm" onClick={async () => {
+                        const full = await apiGet<any>(`/esign/templates/${t.id}`)
+                        setEditTemplate(full)
+                      }}>
+                        <Settings size={12} /> Edit Fields
+                      </button>
+                      <button className="btn btn-ghost btn-sm" style={{ color:'var(--red)' }} onClick={() => {
+                        if (window.confirm('Delete template "' + t.name + '"? This cannot be undone.')) {
+                          deleteTemplateMut.mutate(t.id)
+                        }
+                      }}>
+                        <Trash2 size={12} />
+                      </button>
+                    </div>
+                  )}
                 </div>
               ))}
             </div>

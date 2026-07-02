@@ -1,7 +1,7 @@
 import { Router } from 'express'
 import { z } from 'zod'
 import { query, queryOne } from '../db'
-import { requireAuth } from '../middleware/auth'
+import { requireAuth, requirePerm } from '../middleware/auth'
 import { canAccessLandlordResource, canManageLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
 
@@ -184,7 +184,7 @@ bookingsRouter.get('/change-requests', async (req, res, next) => {
 // no-op error. Stamps resolver + time. The guest has no account, so there's
 // no guest notification — the host follows up with the guest directly (as the
 // agent already told them it would).
-bookingsRouter.patch('/change-requests/:id', async (req, res, next) => {
+bookingsRouter.patch('/change-requests/:id', requirePerm('bookings.resolve_change_request'), async (req, res, next) => {
   try {
     const u = req.user!
     const body = z.object({ status: z.enum(['approved', 'declined']) }).parse(req.body ?? {})

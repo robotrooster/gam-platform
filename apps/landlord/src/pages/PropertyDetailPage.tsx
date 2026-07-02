@@ -4,6 +4,7 @@ import { useQuery, useQueryClient, useMutation } from 'react-query'
 import { apiGet, apiPatch } from '../lib/api'
 import { ArrowLeft, Plus, DoorOpen, DollarSign, Building2, MapPin, UserCheck } from 'lucide-react'
 import { AddUnitModal } from './AddUnitModal'
+import { usePerms } from '../lib/permissions'
 import { PropertyFeeScheduleSection } from './PropertyFeeScheduleSection'
 import { PropertyAgentPermissionsSection } from './PropertyAgentPermissionsSection'
 import { LawWarningBanner } from '../components/LawWarningBanner'
@@ -365,6 +366,7 @@ function PmLinkageCard({
 // meaningless under a contract.
 function PropertyManagerCard({ propertyId }: { propertyId: string }) {
   const qc = useQueryClient()
+  const { can } = usePerms()
   const [selected, setSelected] = useState<string>('')
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState(false)
@@ -462,16 +464,18 @@ function PropertyManagerCard({ propertyId }: { propertyId: string }) {
           )}
         </select>
 
-        <button
-          className="btn btn-primary btn-sm"
-          disabled={!dirty || saveMut.isLoading}
-          onClick={() => {
-            const userId = selected === data.ownerUserId ? null : selected
-            saveMut.mutate(userId)
-          }}
-        >
-          {saveMut.isLoading ? 'Saving…' : 'Save'}
-        </button>
+        {can('properties.assign_manager') && (
+          <button
+            className="btn btn-primary btn-sm"
+            disabled={!dirty || saveMut.isLoading}
+            onClick={() => {
+              const userId = selected === data.ownerUserId ? null : selected
+              saveMut.mutate(userId)
+            }}
+          >
+            {saveMut.isLoading ? 'Saving…' : 'Save'}
+          </button>
+        )}
 
         {currentlyDelegated && (
           <span className="badge badge-blue" style={{ fontSize: '.7rem' }}>

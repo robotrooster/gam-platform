@@ -17,6 +17,21 @@ function snakeToCamel(key: string): string {
   return key.replace(/_([a-z0-9])/g, (_, c) => c.toUpperCase())
 }
 
+// A `permissions` value is a scope permission MAP, not a normal field object.
+// Its keys are semantic identifiers: catalog permission keys are DOTTED
+// (e.g. 'pos.ring_sale') and must survive verbatim — camelCasing them to
+// 'pos.ringSale' silently breaks every underscore permission on the frontend.
+// Non-dotted keys inside it (e.g. bookkeeper's 'access_level') are config and
+// still camelCase. Values are primitives (boolean / string), never recursed.
+function camelCasePermissionsMap(perms: any): any {
+  if (!perms || typeof perms !== 'object' || Array.isArray(perms)) return camelCaseKeys(perms)
+  const out: Record<string, any> = {}
+  for (const [k, v] of Object.entries(perms)) {
+    out[k.includes('.') ? k : snakeToCamel(k)] = v
+  }
+  return out
+}
+
 export function camelCaseKeys<T = any>(input: any): T {
   if (input === null || input === undefined) return input
   if (typeof input !== 'object') return input
@@ -27,7 +42,7 @@ export function camelCaseKeys<T = any>(input: any): T {
   }
   const out: Record<string, any> = {}
   for (const [key, value] of Object.entries(input)) {
-    out[snakeToCamel(key)] = camelCaseKeys(value)
+    out[snakeToCamel(key)] = key === 'permissions' ? camelCasePermissionsMap(value) : camelCaseKeys(value)
   }
   return out as T
 }

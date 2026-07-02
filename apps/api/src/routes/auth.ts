@@ -23,6 +23,12 @@ async function getScopeForUser(userId: string, role: string):
     /** S168: per-manager Connect opt-in toggle. Property_manager only;
      *  null for other worker roles since they have no rent-share path. */
     directDepositEnabled?: boolean
+    /** Property scope for worker roles that carry it (property_manager,
+     *  onsite_manager, maintenance). Drives the register property-lock:
+     *  allProperties=true → every property; else scoped to propertyIds.
+     *  Undefined for roles without a property scope. */
+    propertyIds?:  string[]
+    allProperties?: boolean
     /** S453: business-side scope. Set for business_staff (resolved from
      *  business_users). landlordId stays null — business_staff lives
      *  in a parallel scope tree, not the landlord one. */
@@ -46,26 +52,28 @@ async function getScopeForUser(userId: string, role: string):
   }
   if (role === 'property_manager') {
     const r = await queryOne<any>(
-      `SELECT landlord_id, permissions, direct_deposit_enabled
+      `SELECT landlord_id, permissions, direct_deposit_enabled, property_ids, all_properties
          FROM property_manager_scopes WHERE user_id = $1 LIMIT 1`,
       [userId])
     return r ? {
       landlordId: r.landlord_id,
       permissions: r.permissions || {},
       directDepositEnabled: !!r.direct_deposit_enabled,
+      propertyIds: r.property_ids || [],
+      allProperties: !!r.all_properties,
     } : null
   }
   if (role === 'onsite_manager') {
     const r = await queryOne<any>(
-      `SELECT landlord_id, permissions FROM onsite_manager_scopes WHERE user_id = $1 LIMIT 1`,
+      `SELECT landlord_id, permissions, property_ids, all_properties FROM onsite_manager_scopes WHERE user_id = $1 LIMIT 1`,
       [userId])
-    return r ? { landlordId: r.landlord_id, permissions: r.permissions || {} } : null
+    return r ? { landlordId: r.landlord_id, permissions: r.permissions || {}, propertyIds: r.property_ids || [], allProperties: !!r.all_properties } : null
   }
   if (role === 'maintenance') {
     const r = await queryOne<any>(
-      `SELECT landlord_id, permissions FROM maintenance_worker_scopes WHERE user_id = $1 LIMIT 1`,
+      `SELECT landlord_id, permissions, property_ids, all_properties FROM maintenance_worker_scopes WHERE user_id = $1 LIMIT 1`,
       [userId])
-    return r ? { landlordId: r.landlord_id, permissions: r.permissions || {} } : null
+    return r ? { landlordId: r.landlord_id, permissions: r.permissions || {}, propertyIds: r.property_ids || [], allProperties: !!r.all_properties } : null
   }
   if (role === 'bookkeeper') {
     const r = await queryOne<any>(
@@ -317,6 +325,9 @@ authRouter.post('/login', async (req, res, next) => {
         staffRole,
         permissions: scope?.permissions || null,
         directDepositEnabled: scope?.directDepositEnabled ?? false,
+        // Property scope — frontend locks the POS register dropdown to these.
+        propertyIds: scope?.propertyIds ?? null,
+        allProperties: scope?.allProperties ?? false,
         // S288: forces enrollment-flow on first login post-rollout for
         // roles where TOTP is mandatory at launch. Frontend uses this
         // to gate access until totp_enabled flips TRUE.
@@ -380,6 +391,9 @@ authRouter.get('/me', requireAuth, async (req, res, next) => {
       staff_role:  staffRole,
       staffRole,
       permissions: scope?.permissions || null,
+      // Property scope — frontend locks the POS register dropdown to these.
+      propertyIds: scope?.propertyIds ?? null,
+      allProperties: scope?.allProperties ?? false,
       // S168: surfaces the per-manager Connect opt-in toggle so the
       // landlord-portal nav can gate the /banking entry for managers
       // without an extra round-trip on each render.

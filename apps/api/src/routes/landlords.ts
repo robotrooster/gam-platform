@@ -433,7 +433,7 @@ landlordsRouter.post('/complete-onboarding', requireAuth, requireLandlord, async
 // PATCH /api/landlords/me — update landlord settings
 // S131: stays requireLandlord — owner business profile (business_name,
 // EIN, approval threshold). Not a team-worker surface.
-landlordsRouter.patch('/me', requireAuth, requireLandlord, async (req, res, next) => {
+landlordsRouter.patch('/me', requireAuth, requirePerm('settings.maintenance_approval'), async (req, res, next) => {
   try {
     const { businessName, ein, maintApprovalThreshold, defaultEarlyTerminationMonthsRent } = req.body
     // Sentinel value 'CLEAR' on the months-rent field nulls it out
@@ -806,7 +806,7 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
 // ── ONBOARDING (S29c) — existing-tenant migration ───────────────────────
 // Single-tenant manual onboarding. Creates tenant + imported lease + activation
 // email in one transaction. No background check, no application gate.
-landlordsRouter.post('/me/onboard-tenant', requirePerm('tenants.create'), async (req, res, next) => {
+landlordsRouter.post('/me/onboard-tenant', requirePerm('tenants.onboard'), async (req, res, next) => {
   const client = await getClient()
   try {
     const {
@@ -1428,7 +1428,7 @@ landlordsRouter.get('/me/pending-tenants', requirePerm('tenants.create'), async 
 // existing-user reuse path on /onboard-tenant-pending wires this up — that
 // person was already a tenant elsewhere), we keep them. Detected by checking
 // for any active lease_tenants row before deleting user/tenant.
-landlordsRouter.delete('/me/pending-tenants/:intentId', requirePerm('tenants.create'), async (req, res, next) => {
+landlordsRouter.delete('/me/pending-tenants/:intentId', requirePerm('tenant_onboarding.pending_manage'), async (req, res, next) => {
   const client = await getClient()
   try {
     const { intentId } = req.params
@@ -1535,7 +1535,7 @@ const pendingPdfUpload = multer({
 // to see status transition from 'parsing' to 'parsed'/'mismatch'/'error'.
 landlordsRouter.post(
   '/me/pending-tenants/:intentId/document',
-  requirePerm('tenants.create'),
+  requirePerm('tenant_onboarding.pending_manage'),
   pendingPdfUpload.single('file'),
   async (req: any, res: any, next: any) => {
     try {
@@ -1729,7 +1729,7 @@ landlordsRouter.get(
 // else; auto-resolve is gone.
 landlordsRouter.post(
   '/me/pending-tenants/:intentId/resolve',
-  requirePerm('tenants.create'),
+  requirePerm('tenant_onboarding.pending_manage'),
   async (req, res, next) => {
     try {
       const { intentId } = req.params
@@ -1814,7 +1814,7 @@ landlordsRouter.get('/me/onboard-properties-csv/template', requirePerm('properti
 // Body: { csv: string, source: CsvImportPlatform }
 // Returns: { rows: PropertyCsvRow[], summary: { total, blockers, warnings, ready,
 //   newProperties, newUnits } }
-landlordsRouter.post('/me/onboard-properties-csv/validate', requirePerm('properties.create'), async (req, res, next) => {
+landlordsRouter.post('/me/onboard-properties-csv/validate', requirePerm('properties.bulk_import'), async (req, res, next) => {
   try {
     const { csv, source, claimedPlatformName } = req.body
     if (!csv) throw new AppError(400, 'csv body required')
@@ -2073,7 +2073,7 @@ landlordsRouter.post('/me/onboard-properties-csv/validate', requirePerm('propert
 // recorded with the correct platform key in the S295 review queue.
 // Atomic: creates properties (find-or-create on name+street1) + units
 // (skip if already resolved) within one transaction.
-landlordsRouter.post('/me/onboard-properties-csv/commit', requirePerm('properties.create'), async (req, res, next) => {
+landlordsRouter.post('/me/onboard-properties-csv/commit', requirePerm('properties.bulk_import'), async (req, res, next) => {
   const client = await getClient()
   try {
     const { rows, source, claimedPlatformName } = req.body
@@ -3181,7 +3181,7 @@ landlordsRouter.post('/me/onboard-payment-history-csv/validate', requirePerm('te
 
 // POST /api/landlords/me/onboard-payment-history-csv/commit
 // Body: { rows: PaymentCsvRow[], source: CsvImportPlatform }
-landlordsRouter.post('/me/onboard-payment-history-csv/commit', requirePerm('tenants.create'), async (req, res, next) => {
+landlordsRouter.post('/me/onboard-payment-history-csv/commit', requirePerm('payments.import_history'), async (req, res, next) => {
   const client = await getClient()
   try {
     const { rows, source, claimedPlatformName } = req.body
@@ -3701,7 +3701,7 @@ function buildPropertyInviteAcceptUrlLL(token: string): string {
 }
 
 // PATCH /api/landlords/me/default-pm-company — set/clear landlord-level default
-landlordsRouter.patch('/me/default-pm-company', requireLandlord, async (req: any, res, next) => {
+landlordsRouter.patch('/me/default-pm-company', requirePerm('settings.default_pm_company'), async (req: any, res, next) => {
   try {
     const body = z.object({
       pmCompanyId: z.string().uuid().nullable(),
@@ -3743,7 +3743,7 @@ landlordsRouter.get('/me/linked-pm-companies', requireLandlord, async (req: any,
 })
 
 // POST /api/landlords/me/pm-property-invitations — owner sends owner_to_pm invite
-landlordsRouter.post('/me/pm-property-invitations', requireLandlord, async (req: any, res, next) => {
+landlordsRouter.post('/me/pm-property-invitations', requirePerm('pm_invitations.send'), async (req: any, res, next) => {
   try {
     const body = z.object({
       pmCompanyId:       z.string().uuid(),
@@ -3839,7 +3839,7 @@ landlordsRouter.get('/me/pm-property-invitations', requireLandlord, async (req: 
 })
 
 // POST /api/landlords/me/pm-property-invitations/:invId/accept — owner accepts pm_to_owner
-landlordsRouter.post('/me/pm-property-invitations/:invId/accept', requireLandlord, async (req: any, res, next) => {
+landlordsRouter.post('/me/pm-property-invitations/:invId/accept', requirePerm('pm_invitations.respond'), async (req: any, res, next) => {
   try {
     const body = z.object({ replace: z.boolean().default(false) }).parse(req.body ?? {})
 
@@ -3875,7 +3875,7 @@ landlordsRouter.post('/me/pm-property-invitations/:invId/accept', requireLandlor
 })
 
 // POST /api/landlords/me/pm-property-invitations/:invId/reject — owner rejects pm_to_owner
-landlordsRouter.post('/me/pm-property-invitations/:invId/reject', requireLandlord, async (req: any, res, next) => {
+landlordsRouter.post('/me/pm-property-invitations/:invId/reject', requirePerm('pm_invitations.respond'), async (req: any, res, next) => {
   try {
     const body = z.object({ reason: z.string().max(500).nullish() }).parse(req.body ?? {})
 
@@ -3909,7 +3909,7 @@ landlordsRouter.post('/me/pm-property-invitations/:invId/reject', requireLandlor
 })
 
 // DELETE /api/landlords/me/pm-property-invitations/:invId — owner revokes own owner_to_pm invite
-landlordsRouter.delete('/me/pm-property-invitations/:invId', requireLandlord, async (req: any, res, next) => {
+landlordsRouter.delete('/me/pm-property-invitations/:invId', requirePerm('pm_invitations.send'), async (req: any, res, next) => {
   try {
     const inv = await queryOne<{ direction: string; landlord_id: string }>(
       `SELECT direction, landlord_id

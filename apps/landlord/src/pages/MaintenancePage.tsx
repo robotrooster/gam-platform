@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useSearchParams } from 'react-router-dom'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
+import { usePerms } from '../lib/permissions'
 import { EntryRequestsPage } from './EntryRequestsPage'
 import { ServiceInterruptionsPanel } from '../components/ServiceInterruptionsPanel'
 import {
@@ -53,6 +54,8 @@ function RequestDetailModal({ request: r, onClose }: { request: any; onClose: ()
     { onSuccess: () => { qc.invalidateQueries(['maint-detail', r.id]); setComment('') } }
   )
 
+  const { can } = usePerms()
+
   const req = data || r
   const comments = (data as any)?.comments || []
   const currentStep = STATUS_FLOW.indexOf(req.status)
@@ -86,10 +89,10 @@ function RequestDetailModal({ request: r, onClose }: { request: any; onClose: ()
           {STATUS_FLOW.map((s, i) => (
             <div key={s} style={{ display: 'flex', alignItems: 'center', flex: i < STATUS_FLOW.length-1 ? 1 : 'none' }}>
               <div
-                onClick={() => req.status !== 'completed' && updateMut.mutate({ status: s })}
+                onClick={() => can('maintenance.update') && req.status !== 'completed' && updateMut.mutate({ status: s })}
                 style={{
                   width: 28, height: 28, borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center',
-                  cursor: req.status !== 'completed' ? 'pointer' : 'default',
+                  cursor: can('maintenance.update') && req.status !== 'completed' ? 'pointer' : 'default',
                   background: i <= currentStep ? 'var(--gold)' : 'var(--bg-3)',
                   border: `2px solid ${i <= currentStep ? 'var(--gold)' : 'var(--border-0)'}`,
                   transition: 'all .15s', flexShrink: 0,
@@ -133,6 +136,7 @@ function RequestDetailModal({ request: r, onClose }: { request: any; onClose: ()
             <div style={{ fontSize: '.68rem', fontWeight: 700, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.08em', marginBottom: 8 }}>Management</div>
 
             {/* Schedule */}
+            {can('maintenance.update') && (
             <div style={{ marginBottom: 10 }}>
               <label style={{ fontSize: '.68rem', color: 'var(--text-3)', display: 'block', marginBottom: 3 }}>Scheduled Date</label>
               <div style={{ display: 'flex', gap: 6 }}>
@@ -142,8 +146,10 @@ function RequestDetailModal({ request: r, onClose }: { request: any; onClose: ()
                 </button>
               </div>
             </div>
+            )}
 
             {/* Cost */}
+            {can('maintenance.update') && (
             <div style={{ marginBottom: 10 }}>
               <label style={{ fontSize: '.68rem', color: 'var(--text-3)', display: 'block', marginBottom: 3 }}>
                 Actual Cost
@@ -158,8 +164,10 @@ function RequestDetailModal({ request: r, onClose }: { request: any; onClose: ()
                 </button>
               </div>
             </div>
+            )}
 
             {/* Man Hours */}
+            {can('maintenance.update') && (
             <div style={{ marginBottom: 10 }}>
               <label style={{ fontSize: '.68rem', color: 'var(--text-3)', display: 'block', marginBottom: 3 }}>Man Hours</label>
               <div style={{ display: 'flex', gap: 6 }}>
@@ -179,8 +187,10 @@ function RequestDetailModal({ request: r, onClose }: { request: any; onClose: ()
                 </div>
               )}
             </div>
+            )}
 
             {/* Assign — S475: editable dropdown over the team roster */}
+            {can('maintenance.assign') && (
             <div style={{ marginBottom: 10 }}>
               <label style={{ fontSize: '.68rem', color: 'var(--text-3)', display: 'block', marginBottom: 3 }}>Assigned To</label>
               {req.assignedFirst && (
@@ -223,10 +233,11 @@ function RequestDetailModal({ request: r, onClose }: { request: any; onClose: ()
                 </div>
               )}
             </div>
+            )}
 
             {/* Quick status buttons */}
             <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-              {req.status === 'awaiting_approval' && (
+              {can('maintenance.approve') && req.status === 'awaiting_approval' && (
                 <>
                   <button className="btn btn-sm btn-primary" onClick={() => approveMut.mutate()}>
                     <Check size={12} /> Approve
@@ -236,12 +247,12 @@ function RequestDetailModal({ request: r, onClose }: { request: any; onClose: ()
                   </button>
                 </>
               )}
-              {req.status !== 'completed' && req.status !== 'cancelled' && req.status !== 'awaiting_approval' && (
+              {can('maintenance.update') && req.status !== 'completed' && req.status !== 'cancelled' && req.status !== 'awaiting_approval' && (
                 <button className="btn btn-sm btn-primary" onClick={() => updateMut.mutate({ status: 'completed', actualCost: editCost ? parseFloat(editCost) : undefined })}>
                   <Check size={12} /> Mark Complete
                 </button>
               )}
-              {req.status === 'open' && (
+              {can('maintenance.update') && req.status === 'open' && (
                 <button className="btn btn-sm btn-ghost" onClick={() => updateMut.mutate({ status: 'cancelled' })}>
                   <X size={12} /> Cancel
                 </button>
@@ -275,6 +286,7 @@ function RequestDetailModal({ request: r, onClose }: { request: any; onClose: ()
           </div>
 
           {/* Add comment */}
+          {can('maintenance.comment') && (
           <div style={{ display: 'flex', gap: 8 }}>
             <div style={{ flex: 1 }}>
               <input className="input" placeholder="Add a note or update…" value={comment} onChange={e => setComment(e.target.value)} onKeyDown={e => e.key === 'Enter' && !e.shiftKey && comment.trim() && commentMut.mutate({ message: comment, isInternal })} style={{ width: '100%' }} />
@@ -287,6 +299,7 @@ function RequestDetailModal({ request: r, onClose }: { request: any; onClose: ()
               <Send size={13} />
             </button>
           </div>
+          )}
         </div>
       </div>
     </div>
@@ -348,6 +361,7 @@ export function MaintenancePage() {
   const [filterPriority, setFilterPriority] = useState('all')
   const [showCostBreakdown, setShowCostBreakdown] = useState(false)
   const [view, setView] = useState<'work' | 'entry' | 'outage'>('work')
+  const { can } = usePerms()
 
   const { data: requests = [], isLoading } = useQuery<any[]>('maintenance', () => apiGet('/maintenance'))
 
@@ -380,10 +394,25 @@ export function MaintenancePage() {
 
   // S507: Entry Requests folded into the Maintenance module as a sub-tab
   // (no standalone nav item). Work Orders is the default view.
+  // Work Orders is the baseline (always visible — nav-gated on maintenance.view);
+  // the Entry Requests + Outages sub-tabs carry their own permission keys.
+  const TAB_DEFS: { id: 'work' | 'entry' | 'outage'; label: string; perm: string | null }[] = [
+    { id: 'work',   label: 'Work Orders',    perm: null },
+    { id: 'entry',  label: 'Entry Requests', perm: 'entry_requests.view' },
+    { id: 'outage', label: 'Outages',        perm: 'maintenance.tab.outages' },
+  ]
+  const visibleTabs = TAB_DEFS.filter(t => t.perm === null || can(t.perm))
+  // If the active view isn't one this user can see, snap to the first visible tab.
+  const visibleTabIds = visibleTabs.map(t => t.id).join(',')
+  useEffect(() => {
+    if (visibleTabs.length && !visibleTabs.some(t => t.id === view)) setView(visibleTabs[0].id)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visibleTabIds])
+
   const tabs = (
     <div style={{ display: 'flex', gap: 4, borderBottom: '1px solid var(--border-0)', marginBottom: 20 }}>
-      {[{ id: 'work', label: 'Work Orders' }, { id: 'entry', label: 'Entry Requests' }, { id: 'outage', label: 'Outages' }].map(t => (
-        <button key={t.id} onClick={() => setView(t.id as 'work' | 'entry' | 'outage')}
+      {visibleTabs.map(t => (
+        <button key={t.id} onClick={() => setView(t.id)}
           style={{ padding: '8px 16px', border: 'none', background: 'none', cursor: 'pointer', fontSize: '.82rem', fontWeight: 600, color: view === t.id ? 'var(--gold)' : 'var(--text-3)', borderBottom: view === t.id ? '2px solid var(--gold)' : '2px solid transparent', marginBottom: -1 }}>
           {t.label}
         </button>
@@ -405,9 +434,11 @@ export function MaintenancePage() {
             {emergencies.length > 0 && <span style={{ color: 'var(--red)', marginLeft: 8 }}>· {emergencies.length} emergency</span>}
           </p>
         </div>
-        <button className="btn btn-primary" onClick={() => setShowAdd(true)}>
-          <Plus size={15} /> Log Request
-        </button>
+        {can('maintenance.create') && (
+          <button className="btn btn-primary" onClick={() => setShowAdd(true)}>
+            <Plus size={15} /> Log Request
+          </button>
+        )}
       </div>
 
       {/* Emergency alert */}
@@ -432,7 +463,7 @@ export function MaintenancePage() {
             { label: 'In Progress', val: (stats as any).inProgressCount, color: 'var(--blue)',   filter: 'in_progress' },
             { label: 'Completed',   val: (stats as any).completedCount,   color: 'var(--green)',  filter: 'completed' },
             { label: 'Total Cost',  val: fmt((stats as any).totalCost),   color: 'var(--text-0)', filter: 'cost' },
-          ].map(s => (
+          ].filter(s => s.filter !== 'cost' || can('maintenance.view_costs')).map(s => (
             <div key={s.label} className="card" style={{ padding: '12px 14px', cursor: 'pointer', border: filterStatus===s.filter?'1px solid var(--gold)':'1px solid var(--border-1)' }}
               onClick={() => s.filter==='cost' ? setShowCostBreakdown(true) : setFilterStatus(filterStatus===s.filter?'all':s.filter)}>
               <div style={{ fontSize: '.62rem', fontWeight: 700, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.08em', marginBottom: 5 }}>{s.label}</div>

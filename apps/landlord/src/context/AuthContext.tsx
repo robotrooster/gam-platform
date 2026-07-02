@@ -11,6 +11,11 @@ interface AuthUser {
   // null for both — they're handled by role-based gates, not perms.
   landlordId?: string | null
   permissions?: Record<string, boolean | string> | null
+  // Property scope for scoped workers (cashier/onsite/PM/maintenance). The POS
+  // register locks its property dropdown to these. allProperties=true → every
+  // property; else only propertyIds. Owners get allProperties implicitly.
+  propertyIds?: string[] | null
+  allProperties?: boolean
   // 2FA state. The landlord role is NOT in the backend's
   // MANDATORY_TOTP_ROLES, so mustEnrollTotp is always false here —
   // 2FA is optional-with-prompts. totpEnabled drives the Settings

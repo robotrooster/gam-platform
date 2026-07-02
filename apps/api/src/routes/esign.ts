@@ -984,7 +984,7 @@ esignRouter.get('/templates', requireAuth, requirePerm('leases.create'), async (
   } catch (e) { next(e) }
 })
 
-esignRouter.post('/templates', requireAuth, requirePerm('leases.create'), async (req, res, next) => {
+esignRouter.post('/templates', requireAuth, requirePerm('esign.template_manage'), async (req, res, next) => {
   try {
     const { name, description, basePdfUrl, pageCount } = req.body
     if (!name) throw new AppError(400, 'Template name required')
@@ -1005,7 +1005,7 @@ esignRouter.get('/templates/:id', requireAuth, requirePerm('leases.create'), asy
   } catch (e) { next(e) }
 })
 
-esignRouter.patch('/templates/:id', requireAuth, requirePerm('leases.create'), async (req, res, next) => {
+esignRouter.patch('/templates/:id', requireAuth, requirePerm('esign.template_manage'), async (req, res, next) => {
   try {
     const { name, description, basePdfUrl, pageCount, isActive } = req.body
     const t = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
@@ -1018,14 +1018,14 @@ esignRouter.patch('/templates/:id', requireAuth, requirePerm('leases.create'), a
   } catch (e) { next(e) }
 })
 
-esignRouter.delete('/templates/:id', requireAuth, requirePerm('leases.create'), async (req, res, next) => {
+esignRouter.delete('/templates/:id', requireAuth, requirePerm('esign.template_manage'), async (req, res, next) => {
   try {
     await query('UPDATE lease_templates SET is_active=FALSE WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
     res.json({ success: true })
   } catch (e) { next(e) }
 })
 
-esignRouter.put('/templates/:id/fields', requireAuth, requirePerm('leases.create'), async (req, res, next) => {
+esignRouter.put('/templates/:id/fields', requireAuth, requirePerm('esign.template_manage'), async (req, res, next) => {
   try {
     const { fields } = req.body
     const template = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
@@ -1053,7 +1053,7 @@ esignRouter.put('/templates/:id/fields', requireAuth, requirePerm('leases.create
   } catch (e) { next(e) }
 })
 
-esignRouter.delete('/templates/:id/fields/:fieldId', requireAuth, requirePerm('leases.create'), async (req, res, next) => {
+esignRouter.delete('/templates/:id/fields/:fieldId', requireAuth, requirePerm('esign.template_manage'), async (req, res, next) => {
   try {
     // S393 fix: verify template ownership before deleting a field.
     // Pre-fix, a caller knowing both a stranger template UUID and a
@@ -1808,7 +1808,7 @@ esignRouter.get('/documents/:id', requireAuth, async (req, res, next) => {
 // SEND DOCUMENT
 // ─────────────────────────────────────────────────────────────
 
-esignRouter.post('/documents/:id/send', requireAuth, requirePerm('leases.sign'), async (req, res, next) => {
+esignRouter.post('/documents/:id/send', requireAuth, requirePerm('esign.send'), async (req, res, next) => {
   try {
     const doc = await queryOne<any>(`
       SELECT d.*, u.unit_number, p.name as property_name, lu.first_name || ' ' || lu.last_name as landlord_name
@@ -1910,7 +1910,7 @@ esignRouter.post('/documents/:id/send', requireAuth, requirePerm('leases.sign'),
 // VOID
 // ─────────────────────────────────────────────────────────────
 
-esignRouter.post('/documents/:id/void', requireAuth, requirePerm('leases.terminate'), async (req, res, next) => {
+esignRouter.post('/documents/:id/void', requireAuth, requirePerm('esign.void'), async (req, res, next) => {
   const client = await getClient()
   try {
     const { reason } = req.body

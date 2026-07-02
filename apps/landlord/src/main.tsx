@@ -7,6 +7,7 @@ import { AuthProvider, useAuth } from './context/AuthContext'
 import { Layout, LAUNCH_HIDDEN } from './components/layout/Layout'
 import { LoginPage }       from './pages/LoginPage'
 import { RegisterPage }    from './pages/RegisterPage'
+import { AcceptInvitePage } from './pages/AcceptInvitePage'
 import { DashboardPage }   from './pages/DashboardPage'
 import { PropertiesPage }  from './pages/PropertiesPage'
 import { PropertyDetailPage } from './pages/PropertyDetailPage'
@@ -17,6 +18,7 @@ import { TenantsPage }     from './pages/TenantsPage'
 import { TenantDetailPage } from './pages/TenantDetailPage'
 import { PendingTenantsPage } from './pages/PendingTenantsPage'
 import { PaymentsPage }    from './pages/PaymentsPage'
+import { BalancesPage }    from './pages/BalancesPage'
 import { DisbursementsPage } from './pages/DisbursementsPage'
 import { BankingPage }      from './pages/BankingPage'
 import { MaintenancePage } from './pages/MaintenancePage'
@@ -36,6 +38,7 @@ import { ApplicantPoolPage } from './pages/ApplicantPoolPage'
 import { LeasesPage } from "./pages/LeasesPage"
 import { SubleasesPage } from "./pages/SubleasesPage"
 import { TeamPage } from './pages/TeamPage'
+import { StaffPermissionsPage } from './pages/StaffPermissionsPage'
 import { WorkTradePage } from './pages/WorkTradePage'
 import { POSPage } from './pages/POSPage'
 import { InventoryPage } from './pages/InventoryPage'
@@ -51,8 +54,6 @@ import { NewEntryRequestPage } from './pages/NewEntryRequestPage'
 import { EntryRequestDetailPage } from './pages/EntryRequestDetailPage'
 import { TenantScreeningPage } from './pages/TenantScreeningPage'
 import { NotificationPrefsPage } from './pages/NotificationPrefsPage'
-import { BookingsPage } from './pages/BookingsPage'
-import { BookingSitesPage } from './pages/BookingSitesPage'
 import { NotificationsPage } from './pages/NotificationsPage'
 import { DepositReturnPage } from './pages/DepositReturnPage'
 import { LeaseTerminationPage } from './pages/LeaseTerminationPage'
@@ -98,6 +99,7 @@ export default function App() {
           <Routes>
             <Route path="/login"    element={<LoginPage />} />
             <Route path="/register" element={<RegisterPage />} />
+            <Route path="/invite/:token" element={<AcceptInvitePage />} />
             <Route path="/shelf/:id" element={<ShelfLabelPage />} />
             <Route path="/" element={<PrivateRoute><ErrorBoundary><Layout /></ErrorBoundary></PrivateRoute>}>
               <Route index element={<RoleRedirect />} />
@@ -125,11 +127,13 @@ export default function App() {
               <Route path="maint-portal"    element={<MaintenancePortalPage />} />
               <Route path="sign/:token"    element={<SignPage />} />
               <Route path="payments"       element={<PaymentsPage />} />
+              <Route path="balances"       element={<BalancesPage />} />
               <Route path="disbursements"  element={<DisbursementsPage />} />
               <Route path="banking"        element={<BankingPage />} />
               <Route path="maintenance"    element={<MaintenancePage />} />
               <Route path="reports"        element={<ReportsPage />} />
               <Route path="team"           element={<TeamPage />} />
+              <Route path="team/:userId/permissions" element={<StaffPermissionsPage />} />
               <Route path="work-trade"     element={LAUNCH_HIDDEN.has('/work-trade') ? <Navigate to="/dashboard" replace /> : <WorkTradePage />} />
               <Route path="pos"            element={<POSPage />} />
               <Route path="inventory"       element={<InventoryPage />} />
@@ -144,8 +148,8 @@ export default function App() {
               <Route path="entry-requests/:id" element={<EntryRequestDetailPage />} />
               <Route path="screening"          element={<TenantScreeningPage />} />
               <Route path="notification-prefs" element={<NotificationPrefsPage />} />
-              <Route path="bookings"           element={<BookingsPage />} />
-              <Route path="booking-sites"      element={<BookingSitesPage />} />
+              <Route path="bookings"           element={<Navigate to="/schedule" replace />} />
+              <Route path="booking-sites"      element={<Navigate to="/schedule" replace />} />
               <Route path="notifications"     element={<NotificationsPage />} />
               <Route path="leases/:id/deposit-return" element={<DepositReturnPage />} />
               <Route path="leases/:id/termination"   element={<LeaseTerminationPage />} />

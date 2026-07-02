@@ -42,7 +42,7 @@
 import { Router } from 'express'
 import { z } from 'zod'
 import { query, queryOne, getClient } from '../db'
-import { requireAuth, requireLandlord } from '../middleware/auth'
+import { requireAuth, requirePerm } from '../middleware/auth'
 import { canManageLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
 import { appendEvent } from '../services/creditLedger'
@@ -341,7 +341,7 @@ const decisionSchema = z.object({
   notes:    z.string().max(2000).optional(),
 })
 
-subleasesRouter.patch('/:id/decision', requireLandlord, async (req, res, next) => {
+subleasesRouter.patch('/:id/decision', requirePerm('subleases.decide'), async (req, res, next) => {
   try {
     const body = decisionSchema.parse(req.body)
 

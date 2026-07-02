@@ -2,6 +2,7 @@ import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { Bell, MailX } from 'lucide-react'
 import { api, apiGet } from '../lib/api'
 import { useAuth } from '../context/AuthContext'
+import { usePerms } from '../lib/permissions'
 
 const LANDLORD_NOTIFICATION_TYPES: { type: string; label: string }[] = [
   { type: 'rent_collected',                label: 'Rent collected' },
@@ -46,6 +47,8 @@ export function NotificationPrefsPage() {
       api.patch('/notifications/preferences', body).then(r => r.data),
     { onSuccess: () => qc.invalidateQueries('notification-prefs') },
   )
+
+  const { can } = usePerms()
 
   const toggle = (type: string, channel: 'email' | 'sms', currentVal: boolean) => {
     const current = prefMap.get(type) || { emailEnabled: true, smsEnabled: false, inAppEnabled: true }
@@ -110,7 +113,7 @@ export function NotificationPrefsPage() {
             land. Endpoint is requireLandlord; PMs don't see this. Failures
             are scoped per-landlord by senders that thread landlord_id ctx
             (see services/email.ts — most senders do). */}
-      {user?.role === 'landlord' && <EmailFailuresCard />}
+      {user?.role === 'landlord' && can('notification_prefs.email_failures') && <EmailFailuresCard />}
     </div>
   )
 }

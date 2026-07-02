@@ -5,6 +5,7 @@ import { apiGet } from '../../lib/api'
 import { Outlet, NavLink, useNavigate, useLocation } from 'react-router-dom'
 import { useQuery } from 'react-query'
 import { useAuth } from '../../context/AuthContext'
+import { PERMISSION_CATALOG } from '@gam/shared'
 import {
   LayoutDashboard, Building2, DoorOpen, Users, CreditCard,
   ArrowDownToLine, Wrench, FileText, LogOut, Settings,
@@ -21,54 +22,59 @@ import {
 // in the catalog applies. Reports + Work Trade are landlord-only at
 // the backend (S81); PMs can't reach those endpoints, so they're
 // dropped from `roles` here to match.
+// Nav is driven by the permission CATALOG, not roles. A staff user sees an item
+// iff they hold ANY permission key in that item's `category` (owners see all).
+// Items with no `category` are owner-only (Team = permission management itself;
+// Work Trade). `guest_access` lives under the schedule category in the catalog.
 const NAV_ITEMS: Array<{
   to: string
   icon: any
   label: string
   section: string | null
-  roles: string[]
-  perm?: string[]
+  category?: string
 }> = [
   // Overview
-  { to: '/dashboard',     icon: LayoutDashboard, label: 'Dashboard',        section: 'Overview',    roles: ['landlord','property_manager'] },
-  { to: '/pos',           icon: ShoppingCart,     label: 'Point of Sale',    section: null,          roles: ['landlord','property_manager','onsite_manager'], perm: ['pos.ring_sale','pos.refund','pos.void','pos.discount','pos.end_of_day','pos.manage_inventory'] },
+  { to: '/dashboard',     icon: LayoutDashboard, label: 'Dashboard',        section: 'Overview',    category: 'dashboard' },
+  { to: '/pos',           icon: ShoppingCart,     label: 'Point of Sale',    section: null,          category: 'pos' },
   // Portfolio
-  { to: '/properties',    icon: Building2,        label: 'Properties',       section: 'Portfolio',   roles: ['landlord','property_manager'], perm: ['properties.create','properties.edit'] },
-  { to: '/units',         icon: DoorOpen,         label: 'Unit Overview',    section: null,          roles: ['landlord','property_manager','onsite_manager'], perm: ['units.create','units.edit','units.view_status'] },
-  { to: '/schedule',      icon: DoorOpen,         label: 'Master Schedule',  section: null,          roles: ['landlord','property_manager','onsite_manager'], perm: ['units.view_status','units.edit','guests.check_in','guests.check_out'] },
-  { to: '/bookings',      icon: DoorOpen,         label: 'Bookings',         section: null,          roles: ['landlord','property_manager','onsite_manager'], perm: ['units.view_status','units.edit','guests.check_in','guests.check_out'] },
-  { to: '/booking-sites', icon: Building2,        label: 'Booking Sites',    section: null,          roles: ['landlord','property_manager'], perm: ['properties.edit'] },
-  { to: '/tenants',       icon: Users,            label: 'Tenants',          section: null,          roles: ['landlord','property_manager'], perm: ['tenants.create','tenants.archive','tenants.run_background_check'] },
-  { to: '/tenant-onboarding', icon: UserPlus,    label: 'Tenant Onboarding',section: null,          roles: ['landlord','property_manager'], perm: ['tenants.create'] },
-  { to: '/leases',        icon: ScrollText,       label: 'Leases',           section: null,          roles: ['landlord','property_manager'], perm: ['leases.create','leases.sign','leases.terminate'] },
-  { to: '/subleases',     icon: ScrollText,       label: 'Subleases',        section: null,          roles: ['landlord','property_manager'], perm: ['leases.create','leases.terminate'] },
-  { to: '/esign',         icon: PenTool,          label: 'E-Sign',           section: null,          roles: ['landlord','property_manager'], perm: ['leases.create','leases.sign','leases.terminate'] },
+  { to: '/properties',    icon: Building2,        label: 'Properties',       section: 'Portfolio',   category: 'properties' },
+  { to: '/units',         icon: DoorOpen,         label: 'Unit Overview',    section: null,          category: 'units' },
+  { to: '/schedule',      icon: DoorOpen,         label: 'Master Schedule',  section: null,          category: 'schedule' },
+  { to: '/tenants',       icon: Users,            label: 'Tenants',          section: null,          category: 'tenants' },
+  { to: '/tenant-onboarding', icon: UserPlus,    label: 'Tenant Onboarding',section: null,          category: 'tenant_onboarding' },
+  { to: '/leases',        icon: ScrollText,       label: 'Leases',           section: null,          category: 'leases' },
+  { to: '/subleases',     icon: ScrollText,       label: 'Subleases',        section: null,          category: 'subleases' },
+  { to: '/esign',         icon: PenTool,          label: 'E-Sign',           section: null,          category: 'esign' },
   // Financials
-  { to: '/disbursements', icon: ArrowDownToLine,  label: 'Disbursements',    section: 'Financials',  roles: ['landlord'] },
-  // S168: managers see /banking only when their landlord has flipped
-  // their per-scope direct_deposit_enabled toggle on. The visibility
-  // filter below special-cases this item; the role list intentionally
-  // includes property_manager so the visibility check has a chance to run.
-  { to: '/banking',       icon: Landmark,         label: 'Banking',          section: null,          roles: ['landlord','property_manager'] },
-  { to: '/payments',      icon: CreditCard,       label: 'Payments',         section: null,          roles: ['landlord','property_manager'], perm: ['payments.view_all'] },
-  { to: '/reports',       icon: BarChart2,        label: 'Reports',          section: null,          roles: ['landlord'] },
+  { to: '/disbursements', icon: ArrowDownToLine,  label: 'Disbursements',    section: 'Financials',  category: 'disbursements' },
+  // S168: managers see /banking only when their landlord has flipped their
+  // per-scope direct_deposit_enabled toggle on — special-cased in the filter.
+  { to: '/banking',       icon: Landmark,         label: 'Banking',          section: null,          category: 'banking' },
+  { to: '/payments',      icon: CreditCard,       label: 'Payments',         section: null,          category: 'payments' },
+  { to: '/balances',      icon: CreditCard,       label: 'Outstanding Balances', section: null,      category: 'balances' },
+  { to: '/reports',       icon: BarChart2,        label: 'Reports',          section: null,          category: 'reports' },
   // Operations
-  { to: '/maintenance',   icon: Wrench,           label: 'Maintenance',      section: 'Operations',  roles: ['landlord','property_manager','onsite_manager','maintenance'], perm: ['work_orders.create','work_orders.complete','work_orders.reassign','maintenance.approve_above_threshold'] },
-  { to: '/inspections',   icon: ClipboardCheck,   label: 'Inspections',      section: null,          roles: ['landlord','property_manager','onsite_manager'] },
-  { to: '/amenities',     icon: CalendarClock,    label: 'Amenities',        section: null,          roles: ['landlord','property_manager','onsite_manager'] },
-  { to: '/documents',     icon: FileText,         label: 'Documents',        section: null,          roles: ['landlord','property_manager'], perm: ['leases.create','leases.sign','leases.terminate'] },
-  { to: '/inventory',     icon: Package,          label: 'Inventory',        section: null,          roles: ['landlord','property_manager','onsite_manager'], perm: ['pos.manage_inventory'] },
-  { to: '/work-trade',    icon: HeartHandshake,   label: 'Work Trade',       section: null,          roles: ['landlord'] },
+  { to: '/maintenance',   icon: Wrench,           label: 'Maintenance',      section: 'Operations',  category: 'maintenance' },
+  { to: '/inspections',   icon: ClipboardCheck,   label: 'Inspections',      section: null,          category: 'inspections' },
+  { to: '/amenities',     icon: CalendarClock,    label: 'Amenities',        section: null,          category: 'amenities' },
+  { to: '/documents',     icon: FileText,         label: 'Documents',        section: null,          category: 'documents' },
+  { to: '/inventory',     icon: Package,          label: 'Inventory',        section: null,          category: 'inventory' },
+  { to: '/work-trade',    icon: HeartHandshake,   label: 'Work Trade',       section: null },
   // Screening
-  { to: '/pool',          icon: UserSearch,       label: 'Applicant Pool',   section: 'Screening',   roles: ['landlord','property_manager'], perm: ['tenants.run_background_check'] },
-  { to: '/background',    icon: ClipboardList,    label: 'Background Checks',section: null,          roles: ['landlord','property_manager'], perm: ['tenants.run_background_check'] },
-  { to: '/screening',     icon: ScrollText,       label: 'Rental History',   section: null,          roles: ['landlord','property_manager'], perm: ['tenants.run_background_check'] },
+  { to: '/pool',          icon: UserSearch,       label: 'Applicant Pool',   section: 'Screening',   category: 'applicant_pool' },
+  { to: '/background',    icon: ClipboardList,    label: 'Background Checks',section: null,          category: 'background_checks' },
+  { to: '/screening',     icon: ScrollText,       label: 'Rental History',   section: null,          category: 'screening' },
   // Admin
-  { to: '/team',          icon: Shield,           label: 'Team',             section: 'Admin',       roles: ['landlord','property_manager'], perm: ['team.invite','team.manage_permissions'] },
-  { to: '/pm-invitations', icon: HeartHandshake,  label: 'PM Invitations',   section: null,          roles: ['landlord'] },
-  { to: '/settings',      icon: Settings,         label: 'Settings',         section: null,          roles: ['landlord'] },
-  { to: '/notification-prefs', icon: Settings,    label: 'Notification Prefs', section: null,        roles: ['landlord','property_manager','onsite_manager','maintenance'] },
+  { to: '/team',          icon: Shield,           label: 'Team',             section: 'Admin' },
+  { to: '/pm-invitations', icon: HeartHandshake,  label: 'PM Invitations',   section: null,          category: 'pm_invitations' },
+  { to: '/settings',      icon: Settings,         label: 'Settings',         section: null,          category: 'settings' },
+  { to: '/notification-prefs', icon: Settings,    label: 'Notification Prefs', section: null,        category: 'notification_prefs' },
 ]
+
+// category → its catalog permission keys (built once from the shared catalog).
+const CATALOG_KEYS_BY_CATEGORY: Record<string, string[]> = Object.fromEntries(
+  PERMISSION_CATALOG.map(g => [g.category, g.sections.flatMap(s => s.items.map(i => i.key))])
+)
 
 const OWNER_ROLES = new Set(['admin','super_admin','landlord'])
 
@@ -235,16 +241,13 @@ export function Layout() {
   const directDepositEnabled = (user as any)?.directDepositEnabled === true
   const visibleItems = NAV_ITEMS.filter(item => {
     if (LAUNCH_HIDDEN.has(item.to)) return false  // S512 launch hide
-    if (!item.roles.includes(role)) return false
-    // S168: /banking for property_manager — only visible when their
-    // landlord has flipped the direct-deposit toggle on. Without this
-    // gate, the link would render for every PM regardless of opt-in.
-    if (item.to === '/banking' && role === 'property_manager') {
-      return directDepositEnabled
-    }
-    if (isOwner) return true
-    if (!item.perm) return false  // worker hitting a no-perm item — not visible
-    return item.perm.some(k => perms[k] === true)
+    if (isOwner) return true                       // owners see everything
+    // --- staff: driven purely by catalog permissions ---
+    // S168: /banking for property_manager — only when direct-deposit is on.
+    if (item.to === '/banking' && role === 'property_manager') return directDepositEnabled
+    if (!item.category) return false               // owner-only items (Team, Work Trade)
+    const keys = CATALOG_KEYS_BY_CATEGORY[item.category]
+    return !!keys && keys.some(k => perms[k] === true)
   })
 
   // Track section headers without side effects

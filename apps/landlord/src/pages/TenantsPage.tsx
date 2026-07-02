@@ -4,24 +4,30 @@ import { useQuery } from 'react-query'
 import { apiGet } from '../lib/api'
 import { Plus, UserPlus } from 'lucide-react'
 import { InviteTenantModal } from './InviteTenantModal'
+import { usePerms } from '../lib/permissions'
 
 export function TenantsPage() {
   const [showInvite, setShowInvite] = useState(false)
   const navigate = useNavigate()
   const { data: units = [], isLoading } = useQuery<any[]>('units', () => apiGet('/units'))
   const tenants = units.filter(u => u.tenantFirst)
+  const { can } = usePerms()
 
   return (
     <div>
       <div className="page-header">
         <div><h1 className="page-title">Tenants</h1><p className="page-subtitle">{tenants.length} active tenants</p></div>
         <div style={{ display: 'flex', gap: 8 }}>
-          <button className="btn btn-ghost" onClick={() => navigate('/tenant-onboarding')}>
-            <UserPlus size={15} /> Onboard Existing Tenant
-          </button>
-          <button className="btn btn-primary" onClick={() => setShowInvite(true)}>
-            <Plus size={15} /> Invite Tenant
-          </button>
+          {can('tenants.onboard') && (
+            <button className="btn btn-ghost" onClick={() => navigate('/tenant-onboarding')}>
+              <UserPlus size={15} /> Onboard Existing Tenant
+            </button>
+          )}
+          {can('tenants.invite') && (
+            <button className="btn btn-primary" onClick={() => setShowInvite(true)}>
+              <Plus size={15} /> Invite Tenant
+            </button>
+          )}
         </div>
       </div>
       {isLoading ? <div style={{color:'var(--text-3)',padding:32}}>Loading…</div> : (

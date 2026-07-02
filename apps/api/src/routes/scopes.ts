@@ -371,6 +371,12 @@ scopesRouter.post('/:roleType/invite', requirePerm('team.invite'), async (req, r
     const body = z.object({
       email: z.string().email(),
       scope: z.any(),
+      // Pre-fill fields — the landlord enters the staff member's identity on
+      // the Team form; they ride the invitation so the accept page can
+      // populate them. All optional (the invitee can still type their own).
+      firstName: z.string().trim().min(1).optional(),
+      lastName:  z.string().trim().min(1).optional(),
+      phone:     z.string().trim().optional(),
     }).parse(req.body)
     const scope = validateScopePayload(role, body.scope)
 
@@ -399,10 +405,12 @@ scopesRouter.post('/:roleType/invite', requirePerm('team.invite'), async (req, r
       await client.query('BEGIN')
       const invRes = await client.query(
         `INSERT INTO invitations
-           (email, landlord_id, role, scope_payload, invited_by_user_id, token, expires_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+           (email, landlord_id, role, scope_payload, invited_by_user_id, token, expires_at,
+            first_name, last_name, phone)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
         [body.email, landlordId, role, JSON.stringify(scope),
-         req.user!.userId, token, expiresAt])
+         req.user!.userId, token, expiresAt,
+         body.firstName || null, body.lastName || null, body.phone || null])
       const invitation = invRes.rows[0]
 
       await client.query(
@@ -644,6 +652,10 @@ invitationsRouter.get('/:token', async (req, res, next) => {
           || [inv.inviter_first, inv.inviter_last].filter(Boolean).join(' ')
           || 'Your landlord',
         userExists:  !!existingUser,
+        // Landlord-provided pre-fill so the accept page can populate these.
+        firstName:   inv.first_name || null,
+        lastName:    inv.last_name || null,
+        phone:       inv.phone || null,
       }
     })
   } catch (e) { next(e) }
@@ -686,8 +698,12 @@ invitationsRouter.post('/:token/accept', async (req, res, next) => {
         if (!body.firstName || !body.lastName) throw new AppError(400, 'First and last name required')
         const hash = await bcrypt.hash(body.password, 12)
         const newUser = await client.query(
-          `INSERT INTO users (email, password_hash, role, first_name, last_name, phone)
-           VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+          // email_verified=TRUE: clicking the invite link (delivered to this
+          // exact address) proves email ownership, so the staff member is
+          // verified on accept — no separate verification step to block login.
+          `INSERT INTO users (email, password_hash, role, first_name, last_name, phone,
+                              email_verified, email_verified_at)
+           VALUES ($1, $2, $3, $4, $5, $6, TRUE, NOW()) RETURNING *`,
           [inv.email, hash, role, body.firstName, body.lastName, body.phone || null])
         user = newUser.rows[0]
       } else {

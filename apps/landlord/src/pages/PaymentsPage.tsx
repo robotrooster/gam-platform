@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useQuery } from 'react-query'
 import { apiGet } from '../lib/api'
+import { usePerms } from '../lib/permissions'
 import { X, AlertTriangle, CheckCircle, Clock, XCircle } from 'lucide-react'
 
 const fmt = (n: any) => n != null
@@ -197,6 +198,7 @@ export function PaymentsPage() {
   const { data: payments = [], isLoading } = useQuery<any[]>('payments', () => apiGet('/payments'))
   const [selected, setSelected] = useState<any>(null)
   const navigate = useNavigate()
+  const { can } = usePerms()
 
   return (
     <div>
@@ -205,9 +207,11 @@ export function PaymentsPage() {
           <h1 className="page-title">Payments</h1>
           <p className="page-subtitle">Tenant ACH collections</p>
         </div>
-        <button className="btn btn-ghost" onClick={() => navigate('/payment-history-onboarding')}>
-          Import payment history
-        </button>
+        {can('payments.import_history') && (
+          <button className="btn btn-ghost" onClick={() => navigate('/payment-history-onboarding')}>
+            Import payment history
+          </button>
+        )}
       </div>
 
       <div className="card" style={{ padding: 0, overflowX: 'auto' }}>

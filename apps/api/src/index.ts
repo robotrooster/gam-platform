@@ -63,6 +63,7 @@ import { subleasesRouter }    from './routes/subleases'
 import { subleaseInvitationsRouter } from './routes/subleaseInvitations'
 import { posCustomerOnboardingRouter } from './routes/posCustomerOnboarding'
 import { paymentsRouter }     from './routes/payments'
+import { balancesRouter }     from './routes/balances'
 import { disbursementsRouter } from './routes/disbursements'
 import { maintenanceRouter }  from './routes/maintenance'
 import { documentsRouter }    from './routes/documents'
@@ -254,6 +255,7 @@ app.use('/api/subleases',     subleasesRouter)
 app.use('/api/sublease-invitations', subleaseInvitationsRouter)
 app.use('/api/pos-customer-onboarding', posCustomerOnboardingRouter)
 app.use('/api/payments',      paymentsRouter)
+app.use('/api/balances',      balancesRouter)
 app.use('/api/disbursements', disbursementsRouter)
 app.use('/api/maintenance',   maintenanceRouter)
 app.use('/api/documents',     documentsRouter)

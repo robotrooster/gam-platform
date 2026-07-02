@@ -3,6 +3,7 @@ import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useNavigate, Link } from 'react-router-dom'
 import { apiGet, apiPatch } from '../lib/api'
+import { usePerms } from '../lib/permissions'
 import { Search, AlertTriangle, Shield, DoorOpen } from 'lucide-react'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
@@ -18,6 +19,7 @@ export function UnitsPage() {
   const [search, setSearch] = useState('')
   const [filter, setFilter] = useState('all')
   const { data: units = [], isLoading } = useQuery<any[]>('units', () => apiGet('/units'))
+  const { can } = usePerms()
 
   const setStatusMut = useMutation(
     ({ id, status }: { id: string; status: string }) => apiPatch(`/units/${id}/status`, { status }),
@@ -86,10 +88,12 @@ export function UnitsPage() {
                     </td>
                     <td className="mono">{fmt(u.rentAmount)}</td>
                     <td onClick={e => e.stopPropagation()}>
-                      <select value={u.status} onChange={e => setStatusMut.mutate({ id: u.id, status: e.target.value })}
-                        style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '.75rem', color: 'inherit', padding: 0 }}>
-                        {['occupied','vacant','maintenance','eviction'].map(s => <option key={s} value={s}>{s.replace('_', ' ')}</option>)}
-                      </select>
+                      {can('units.set_status') && (
+                        <select value={u.status} onChange={e => setStatusMut.mutate({ id: u.id, status: e.target.value })}
+                          style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '.75rem', color: 'inherit', padding: 0 }}>
+                          {['occupied','vacant','maintenance','eviction'].map(s => <option key={s} value={s}>{s.replace('_', ' ')}</option>)}
+                        </select>
+                      )}
                       <span className={'badge ' + (STATUS_COLORS[u.status] || 'badge-muted')} style={{ marginLeft: 4 }}>{u.status.replace('_', ' ')}</span>
                     </td>
                     <td>

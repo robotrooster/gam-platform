@@ -1,6 +1,6 @@
 import { Router } from 'express'
 import { query, queryOne, getClient } from '../db'
-import { requireAuth, requirePerm } from '../middleware/auth'
+import { requireAuth, requirePerm, assertPropertyInScope } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { calculateCartTax } from '../services/posTax'
 import {
@@ -14,6 +14,18 @@ import { logger } from '../lib/logger'
 
 export const posRouter = Router()
 posRouter.use(requireAuth)
+
+// POS money/quantity fields are never negative. Mirrors the client-side nonNeg
+// guards on POSPage so a negative can't slip in via a direct API call. Optional
+// fields (undefined/null/'') pass through untouched; a present value must parse
+// finite and ≥ 0, else 400. Each entry is [value, human-readable field name].
+function assertNonNeg(...fields: [unknown, string][]): void {
+  for (const [val, name] of fields) {
+    if (val === undefined || val === null || val === '') continue
+    const n = Number(val)
+    if (!Number.isFinite(n) || n < 0) throw new AppError(400, `${name} cannot be negative`)
+  }
+}
 
 // S227: DEFAULT_ITEMS.category strings now align with DEFAULT_CATEGORIES
 // names (Title Case). Pre-S227 they were lowercase ('fuel' / 'amenity'),
@@ -180,6 +192,8 @@ posRouter.post('/items', requirePerm('pos.manage_inventory'), async (req, res, n
     if (!categoryId) {
       throw new AppError(400, 'categoryId is required')
     }
+    assertNonNeg([costPrice, 'Cost price'], [sellPrice, 'Sell price'], [marginPct, 'Margin'],
+      [taxRate, 'Tax rate'], [stockQty, 'Stock qty'], [stockMin, 'Stock min'], [stockMax, 'Stock max'])
     // S241: propertyId now required (NOT NULL at the schema level).
     if (!propertyId) {
       throw new AppError(400, 'propertyId is required — items are per-property')
@@ -223,6 +237,8 @@ posRouter.patch('/items/:id', requirePerm('pos.manage_inventory'), async (req, r
 
     const { name, categoryId, icon, costPrice, sellPrice, marginPct, taxRate,
             chargeEligible, stockMin, stockMax, vendorId, isActive, propertyId, taxCategoryId } = req.body
+    assertNonNeg([costPrice, 'Cost price'], [sellPrice, 'Sell price'], [marginPct, 'Margin'],
+      [taxRate, 'Tax rate'], [stockMin, 'Stock min'], [stockMax, 'Stock max'])
     // undefined preserves; null/value re-assigns the tax category.
     const newTaxCategoryId = taxCategoryId !== undefined ? (taxCategoryId || null) : item.tax_category_id
 
@@ -411,6 +427,17 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
     if (!Array.isArray(items) || items.length === 0) {
       throw new AppError(400, 'items array required')
     }
+    // Reject negative line values before they corrupt the sale total. Catalog
+    // items get price/tax recomputed server-side below, but qty and walk-up
+    // price/tax are client-declared — a negative would shrink or invert the total.
+    for (const it of items) {
+      assertNonNeg([it.qty, 'Quantity'], [it.price, 'Price'], [it.tax ?? it.tax_rate, 'Tax rate'])
+    }
+    assertNonNeg([surcharge, 'Surcharge'])
+    // Property lock: a scoped worker (cashier) can only ring on a property in
+    // their scope. Owners + all_properties bypass. Requires the client to send
+    // propertyId on every sale (not just FlexCharge) — see POSPage checkout.
+    await assertPropertyInScope(req.user, propertyId)
 
     // S254: paymentMethod='charge' is FlexCharge. Gate up-front so
     // the rest of the route knows the call is FlexCharge-shaped.
@@ -540,11 +567,11 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
       let tx: any
       try {
         const txRes = await client.query(`INSERT INTO pos_transactions
-          (landlord_id,tenant_id,pos_customer_id,cashier_id,payment_method,subtotal,tax_amount,surcharge,total,change_given,platform_fee,stripe_payment_intent_id)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
+          (landlord_id,tenant_id,pos_customer_id,cashier_id,payment_method,subtotal,tax_amount,surcharge,total,change_given,platform_fee,stripe_payment_intent_id,property_id)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
           [req.user!.profileId, tenantId||null, posCustomerId||null, req.user!.userId,
            paymentMethod, subtotal, taxAmount, surchargeAmt, total, changeGiven||0, platformFee,
-           stripePaymentIntentId || null])
+           stripePaymentIntentId || null, propertyId || null])
         tx = txRes.rows[0]
       } catch (e: any) {
         // UNIQUE on pos_transactions_stripe_pi_uniq — same PI already
@@ -757,6 +784,7 @@ posRouter.get('/vendors', requirePerm('pos.manage_inventory'), async (req, res, 
 posRouter.post('/vendors', requirePerm('pos.manage_inventory'), async (req, res, next) => {
   try {
     const { name, contactName, email, phone, address, leadTimeDays, notes } = req.body
+    assertNonNeg([leadTimeDays, 'Lead time'])
     const vendor = await queryOne<any>(`INSERT INTO pos_vendors
       (landlord_id,name,contact_name,email,phone,address,lead_time_days,notes)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
@@ -769,6 +797,7 @@ posRouter.post('/vendors', requirePerm('pos.manage_inventory'), async (req, res,
 posRouter.patch('/vendors/:id', requirePerm('pos.manage_inventory'), async (req, res, next) => {
   try {
     const { name, contactName, email, phone, address, leadTimeDays, notes, isActive } = req.body
+    assertNonNeg([leadTimeDays, 'Lead time'])
     const vendor = await queryOne<any>('SELECT * FROM pos_vendors WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
     if (!vendor) throw new AppError(404, 'Vendor not found')
     const updated = await queryOne<any>(`UPDATE pos_vendors SET
@@ -1053,6 +1082,7 @@ posRouter.get('/tax-rates', requirePerm('pos.ring_sale', 'pos.manage_inventory')
 posRouter.post('/tax-rates', requirePerm('pos.manage_inventory'), async (req, res, next) => {
   try {
     const { name, rate, taxType, appliesTo, propertyId } = req.body
+    assertNonNeg([rate, 'Rate'])
 
     // S217: validate propertyId belongs to this landlord. NULL is the
     // legacy "applies landlord-wide" posture and is allowed.
@@ -1082,6 +1112,7 @@ posRouter.patch('/tax-rates/:id', requirePerm('pos.manage_inventory'), async (re
     if (!existing) throw new AppError(404, 'Tax rate not found')
 
     const { name, rate, taxType, appliesTo, isActive, propertyId } = req.body
+    assertNonNeg([rate, 'Rate'])
 
     // S217: propertyId update — null clears, undefined preserves, uuid
     // re-assigns. Validate ownership when reassigning.
@@ -1128,6 +1159,7 @@ posRouter.get('/discounts', requirePerm('pos.discount', 'pos.manage_inventory'),
 posRouter.post('/discounts', requirePerm('pos.manage_inventory'), async (req, res, next) => {
   try {
     const { name, type, value, code } = req.body
+    assertNonNeg([value, 'Discount value'])
     const d = await queryOne<any>(`INSERT INTO pos_discounts (landlord_id,name,type,value,code)
       VALUES ($1,$2,$3,$4,$5) RETURNING *`,
       [req.user!.profileId, name, type, value, code||null])
@@ -1138,6 +1170,7 @@ posRouter.post('/discounts', requirePerm('pos.manage_inventory'), async (req, re
 posRouter.patch('/discounts/:id', requirePerm('pos.manage_inventory'), async (req, res, next) => {
   try {
     const { name, type, value, code, isActive } = req.body
+    assertNonNeg([value, 'Discount value'])
     const d = await queryOne<any>(`UPDATE pos_discounts SET
       name=COALESCE($1,name), type=COALESCE($2,type), value=COALESCE($3,value),
       code=COALESCE($4,code), is_active=COALESCE($5,is_active)
@@ -1180,6 +1213,7 @@ posRouter.post('/transactions/:id/refund', requirePerm('pos.refund'), async (req
     // Coerce both sides to numbers: tx.total comes back from pg numeric
     // as a string, and amount may arrive as a number or string from JSON.
     const refundAmt = Number(amount ?? tx.total)
+    if (!Number.isFinite(refundAmt) || refundAmt <= 0) throw new AppError(400, 'Refund amount must be positive')
     const txTotalNum = Number(tx.total)
     const isFullRefund = refundAmt >= txTotalNum
 
@@ -1280,6 +1314,7 @@ posRouter.post('/purchase-orders', requirePerm('pos.manage_inventory'), async (r
     let subtotal = 0
     if (items && items.length > 0) {
       for (const item of items) {
+        assertNonNeg([item.unitCost, 'Unit cost'], [item.qtyOrdered, 'Qty ordered'])
         const lineTotal = (item.unitCost||0) * (item.qtyOrdered||1)
         subtotal += lineTotal
         await query(`INSERT INTO pos_purchase_order_items
@@ -1298,6 +1333,7 @@ posRouter.post('/purchase-orders', requirePerm('pos.manage_inventory'), async (r
 posRouter.post('/purchase-orders/:id/items', requirePerm('pos.manage_inventory'), async (req, res, next) => {
   try {
     const { itemId, itemName, qtyOrdered, unitCost } = req.body
+    assertNonNeg([unitCost, 'Unit cost'], [qtyOrdered, 'Qty ordered'])
     const po = await queryOne<any>('SELECT * FROM pos_purchase_orders WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
     if (!po) throw new AppError(404, 'PO not found')
     if (po.status !== 'draft') throw new AppError(400, 'Can only add items to draft POs')
@@ -1715,6 +1751,8 @@ posRouter.post('/sessions', requirePerm('pos.ring_sale'), async (req, res, next)
     if (!prop || prop.landlord_id !== req.user!.profileId) {
       throw new AppError(403, 'Property does not belong to this landlord')
     }
+    // Property lock: scoped cashier may only open a session on their property.
+    await assertPropertyInScope(req.user, propertyId)
 
     const row = await queryOne<any>(
       `INSERT INTO pos_sessions
@@ -1809,6 +1847,7 @@ posRouter.post('/sessions/:id/items', requirePerm('pos.ring_sale'), async (req, 
     if (!b.itemName) throw new AppError(400, 'itemName required')
     if (!Number.isFinite(qty) || qty <= 0) throw new AppError(400, 'qty must be positive')
     if (!Number.isFinite(unitPrice) || unitPrice < 0) throw new AppError(400, 'unitPrice must be non-negative')
+    assertNonNeg([b.taxRate, 'Tax rate'], [b.costPrice, 'Cost price'])
 
     const taxRate = Number(b.taxRate) || 0
     const costPrice = Number(b.costPrice) || 0

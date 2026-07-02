@@ -3,6 +3,7 @@ import { useQuery } from 'react-query'
 import { Link } from 'react-router-dom'
 import { ClipboardCheck, Plus, CheckCircle2 } from 'lucide-react'
 import { apiGet } from '../lib/api'
+import { usePerms } from '../lib/permissions'
 import type { InspectionType } from '@gam/shared'
 
 type InspectionRow = {
@@ -44,6 +45,8 @@ export function InspectionsPage() {
     () => apiGet<InspectionRow[]>('/inspections'),
   )
 
+  const { can } = usePerms()
+
   const filtered = useMemo(() => {
     return (data as InspectionRow[]).filter(r => {
       if (typeFilter && r.inspectionType !== typeFilter) return false
@@ -61,14 +64,16 @@ export function InspectionsPage() {
           </h1>
           <div className="page-sub">Move-in, move-out, turnover, and periodic unit inspections</div>
         </div>
-        <div style={{ display: 'flex', gap: 8 }}>
-          <Link to="/inspections/new?walkthrough=1" className="btn btn-secondary">
-            Start guided walkthrough
-          </Link>
-          <Link to="/inspections/new" className="btn btn-primary">
-            <Plus size={15} /> New Inspection
-          </Link>
-        </div>
+        {can('inspections.create') && (
+          <div style={{ display: 'flex', gap: 8 }}>
+            <Link to="/inspections/new?walkthrough=1" className="btn btn-secondary">
+              Start guided walkthrough
+            </Link>
+            <Link to="/inspections/new" className="btn btn-primary">
+              <Plus size={15} /> New Inspection
+            </Link>
+          </div>
+        )}
       </div>
 
       <div className="card" style={{ padding: 16, marginBottom: 16 }}>

@@ -3,6 +3,7 @@ import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useNavigate } from 'react-router-dom'
 import { CalendarRange, Search, ArrowRight, FileSignature, CheckCircle2, AlertTriangle, MessageSquare, Check, X, QrCode, Copy, Mail, Ban } from 'lucide-react'
 import { apiGet, apiPatch, apiPost, apiDelete } from '../lib/api'
+import { usePerms } from '../lib/permissions'
 import { BOOKING_CHANGE_REQUEST_TYPE_LABEL, type BookingChangeRequestType } from '@gam/shared'
 
 type Booking = {
@@ -185,6 +186,7 @@ function GuestAccessModal({ booking, onClose }: { booking: Booking; onClose: () 
 export function BookingsPage() {
   const navigate = useNavigate()
   const qc = useQueryClient()
+  const { can } = usePerms()
   const [linkBooking, setLinkBooking] = useState<Booking | null>(null)
   const [search, setSearch] = useState('')
   const [status, setStatus] = useState('')
@@ -264,7 +266,7 @@ export function BookingsPage() {
         </div>
       </div>
 
-      {changeRequests.length > 0 && (
+      {can('bookings.change_requests') && changeRequests.length > 0 && (
         <div className="card" style={{ padding: 16, marginBottom: 16 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
             <MessageSquare size={16} style={{ color: 'var(--gold)' }} />
@@ -295,22 +297,24 @@ export function BookingsPage() {
                     <div style={{ fontSize: '.82rem', color: 'var(--text-1)', marginTop: 4 }}>{cr.details}</div>
                   )}
                 </div>
-                <div style={{ display: 'flex', gap: 8, flexShrink: 0 }}>
-                  <button
-                    className="btn btn-sm"
-                    disabled={resolveMut.isLoading}
-                    onClick={() => resolveMut.mutate({ id: cr.id, status: 'approved' })}
-                  >
-                    <Check size={13} /> Approve
-                  </button>
-                  <button
-                    className="btn btn-ghost btn-sm"
-                    disabled={resolveMut.isLoading}
-                    onClick={() => resolveMut.mutate({ id: cr.id, status: 'declined' })}
-                  >
-                    <X size={13} /> Decline
-                  </button>
-                </div>
+                {can('bookings.resolve_change_request') && (
+                  <div style={{ display: 'flex', gap: 8, flexShrink: 0 }}>
+                    <button
+                      className="btn btn-sm"
+                      disabled={resolveMut.isLoading}
+                      onClick={() => resolveMut.mutate({ id: cr.id, status: 'approved' })}
+                    >
+                      <Check size={13} /> Approve
+                    </button>
+                    <button
+                      className="btn btn-ghost btn-sm"
+                      disabled={resolveMut.isLoading}
+                      onClick={() => resolveMut.mutate({ id: cr.id, status: 'declined' })}
+                    >
+                      <X size={13} /> Decline
+                    </button>
+                  </div>
+                )}
               </div>
             ))}
           </div>
@@ -442,7 +446,7 @@ export function BookingsPage() {
                       >
                         <CheckCircle2 size={13} /> Acknowledged
                       </span>
-                    ) : needsAck(b) ? (
+                    ) : needsAck(b) && can('bookings.acknowledge') ? (
                       <button
                         className="btn btn-ghost btn-sm"
                         onClick={() => ackMut.mutate(b)}
@@ -458,14 +462,16 @@ export function BookingsPage() {
                     )}
                   </td>
                   <td>
-                    <button
-                      className="btn btn-ghost btn-sm"
-                      onClick={() => setLinkBooking(b)}
-                      style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}
-                      title="Show the guest stay-assistant link and QR, or revoke access"
-                    >
-                      <QrCode size={12} /> Stay link
-                    </button>
+                    {can('guest_access') && (
+                      <button
+                        className="btn btn-ghost btn-sm"
+                        onClick={() => setLinkBooking(b)}
+                        style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}
+                        title="Show the guest stay-assistant link and QR, or revoke access"
+                      >
+                        <QrCode size={12} /> Stay link
+                      </button>
+                    )}
                   </td>
                 </tr>
               ))}

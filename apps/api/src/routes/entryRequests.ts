@@ -1,7 +1,7 @@
 import { Router } from 'express'
 import { z } from 'zod'
 import { query, queryOne, getClient } from '../db'
-import { requireAuth } from '../middleware/auth'
+import { requireAuth, requirePerm } from '../middleware/auth'
 import { canManageLandlordResource, canAccessLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
 import {
@@ -112,7 +112,7 @@ const createSchema = z.object({
   proposedEntryWindowEnd: z.string(),
 })
 
-entryRequestsRouter.post('/', async (req, res, next) => {
+entryRequestsRouter.post('/', requirePerm('entry_requests.create'), async (req, res, next) => {
   try {
     const body = createSchema.parse(req.body)
     const unit = await queryOne<{ id: string; landlord_id: string }>(
@@ -392,7 +392,7 @@ const recordSchema = z.object({
   notes: z.string().optional(),
 })
 
-entryRequestsRouter.post('/:id/record-entry', async (req, res, next) => {
+entryRequestsRouter.post('/:id/record-entry', requirePerm('entry_requests.manage'), async (req, res, next) => {
   try {
     const body = recordSchema.parse(req.body)
     const r = await loadRequest(req.params.id, req)
@@ -464,7 +464,7 @@ entryRequestsRouter.post('/:id/record-entry', async (req, res, next) => {
   }
 })
 
-entryRequestsRouter.post('/:id/cancel', async (req, res, next) => {
+entryRequestsRouter.post('/:id/cancel', requirePerm('entry_requests.manage'), async (req, res, next) => {
   try {
     const r = await loadRequest(req.params.id, req)
     if (!canManageLandlordResource(req.user, r.landlord_id)) {

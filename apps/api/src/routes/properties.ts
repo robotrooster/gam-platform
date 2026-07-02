@@ -748,7 +748,7 @@ const managerAssignmentSchema = z.object({
   userId: z.string().uuid().nullable(),
 })
 
-propertiesRouter.patch('/:id/manager', requireLandlord, async (req, res, next) => {
+propertiesRouter.patch('/:id/manager', requirePerm('properties.assign_manager'), async (req, res, next) => {
   try {
     const body = managerAssignmentSchema.parse(req.body)
 
@@ -1008,7 +1008,7 @@ propertiesRouter.get('/units/:id/photos', requirePerm('units.edit', 'units.view_
 // Listing changes are operational, not financial. PMs and onsite managers
 // routinely refresh listing photos; default canManageLandlordResource policy
 // (all team roles) is correct here.
-propertiesRouter.post('/units/:id/photos', requirePerm('units.edit'), upload.array('photos', 20), async (req, res, next) => {
+propertiesRouter.post('/units/:id/photos', requirePerm('units.edit_listing'), upload.array('photos', 20), async (req, res, next) => {
   try {
     const unit = await queryOne<any>('SELECT * FROM units WHERE id=$1', [req.params.id])
     if (!unit) throw new AppError(404, 'Unit not found')
@@ -1033,7 +1033,7 @@ propertiesRouter.post('/units/:id/photos', requirePerm('units.edit'), upload.arr
 })
 
 // DELETE /api/properties/units/:id/photos/:photoId
-propertiesRouter.delete('/units/:id/photos/:photoId', requirePerm('units.edit'), async (req, res, next) => {
+propertiesRouter.delete('/units/:id/photos/:photoId', requirePerm('units.edit_listing'), async (req, res, next) => {
   try {
     const photo = await queryOne<any>(
       'SELECT * FROM unit_photos WHERE id=$1 AND unit_id=$2',
@@ -1051,7 +1051,7 @@ propertiesRouter.delete('/units/:id/photos/:photoId', requirePerm('units.edit'),
 })
 
 // PATCH /api/properties/units/:id/listing — update listing details
-propertiesRouter.patch('/units/:id/listing', requirePerm('units.edit'), async (req, res, next) => {
+propertiesRouter.patch('/units/:id/listing', requirePerm('units.edit_listing'), async (req, res, next) => {
   try {
     const unit = await queryOne<any>('SELECT id, landlord_id FROM units WHERE id=$1', [req.params.id])
     if (!unit) throw new AppError(404, 'Unit not found')
@@ -1108,7 +1108,7 @@ publicPropertiesRouter.post('/apply', async (req, res, next) => {
 // POST /api/properties/:id/units/bulk — create multiple units by type.
 // Creating units is operational — PMs do this regularly. Default
 // canManageLandlordResource policy (all team roles) is correct.
-propertiesRouter.post('/:id/units/bulk', requirePerm('units.create'), async (req, res, next) => {
+propertiesRouter.post('/:id/units/bulk', requirePerm('properties.add_unit'), async (req, res, next) => {
   try {
     const prop = await queryOne<any>(
       'SELECT * FROM properties WHERE id=$1',

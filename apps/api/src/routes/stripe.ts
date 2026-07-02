@@ -1,7 +1,7 @@
 import { Router } from 'express'
 import { z } from 'zod'
 import { query, queryOne } from '../db'
-import { requireAuth } from '../middleware/auth'
+import { requireAuth, requirePerm } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { createTenantAchSetup, getStripe } from '../lib/stripe'
 import {
@@ -28,6 +28,10 @@ stripeRouter.use(requireAuth)
 //   entityId is the pm_company.id to onboard.
 // Returns the Account Session client_secret the frontend uses to render
 // the embedded onboarding component.
+// Self-service: onboards the CALLER's own Connect account (entity resolves to
+// req.user or their PM company via the inner owner check) — NOT gated on a
+// landlord-staff catalog key, which would break property_manager / PM-company
+// direct-deposit self-onboarding for no security gain.
 stripeRouter.post('/connect/onboarding-session', async (req: any, res, next) => {
   try {
     const body = z.object({

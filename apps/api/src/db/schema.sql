@@ -21,7 +21,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict q9qRADOVz0Qm5dLKndL0Tlh2prBQeuzeE6ybLJBc45JJCgl8SjI1PFlbWJIDBOd
+\restrict xpzb8Um3P1XUjhTD9i6rMBrGwswolAPqOTdC9RWUSFrdd1j7sM0H0CslY6IasP2
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -3016,6 +3016,9 @@ CREATE TABLE public.invitations (
     revoked_at timestamp with time zone,
     revoked_by_user_id uuid,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
+    first_name text,
+    last_name text,
+    phone text,
     CONSTRAINT invitations_role_check CHECK ((role = ANY (ARRAY['property_manager'::text, 'onsite_manager'::text, 'maintenance'::text, 'bookkeeper'::text]))),
     CONSTRAINT invitations_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'accepted'::text, 'expired'::text, 'revoked'::text])))
 );
@@ -4788,6 +4791,7 @@ CREATE TABLE public.pos_transactions (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     stripe_payment_intent_id text,
     pos_customer_id uuid,
+    property_id uuid,
     CONSTRAINT pos_transactions_payment_method_check CHECK ((payment_method = ANY (ARRAY['cash'::text, 'card'::text, 'charge'::text]))),
     CONSTRAINT pos_transactions_status_check CHECK ((status = ANY (ARRAY['completed'::text, 'refunded'::text, 'partial_refund'::text, 'voided'::text])))
 );
@@ -11022,6 +11026,13 @@ CREATE INDEX idx_pos_transactions_pos_customer ON public.pos_transactions USING 
 
 
 --
+-- Name: idx_pos_transactions_property; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pos_transactions_property ON public.pos_transactions USING btree (property_id);
+
+
+--
 -- Name: idx_pos_transactions_tenant; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -15552,6 +15563,14 @@ ALTER TABLE ONLY public.pos_transactions
 
 
 --
+-- Name: pos_transactions pos_transactions_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_transactions
+    ADD CONSTRAINT pos_transactions_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE SET NULL;
+
+
+--
 -- Name: pos_transactions pos_transactions_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -16579,5 +16598,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict q9qRADOVz0Qm5dLKndL0Tlh2prBQeuzeE6ybLJBc45JJCgl8SjI1PFlbWJIDBOd
+\unrestrict xpzb8Um3P1XUjhTD9i6rMBrGwswolAPqOTdC9RWUSFrdd1j7sM0H0CslY6IasP2
 

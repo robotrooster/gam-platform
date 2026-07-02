@@ -14,6 +14,7 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost } from '../lib/api'
+import { usePerms } from '../lib/permissions'
 
 interface PoolEntry {
   id:                 string
@@ -110,6 +111,8 @@ export function ApplicantPoolPage() {
     () => apiGet<MatchRequest[]>('/background/pool/matches'),
   )
 
+  const { can } = usePerms()
+
   return (
     <div>
       <div className="page-header">
@@ -182,7 +185,7 @@ export function ApplicantPoolPage() {
                     <span style={{ fontSize: '.74rem', color: 'var(--text-3)', fontStyle: 'italic' }}>
                       Already contacted
                     </span>
-                  ) : (
+                  ) : can('applicant_pool.reach_out') && (
                     <button
                       type="button"
                       className="btn btn-primary btn-sm"

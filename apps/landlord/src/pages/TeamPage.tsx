@@ -1,8 +1,8 @@
 import { useMemo, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPatch, apiPost } from '../lib/api'
 import {
-  LANDLORD_ASSIGNABLE_ROLES,
   LANDLORD_ASSIGNABLE_ROLE_LABEL,
   LandlordAssignableRole,
   SUB_PERMISSIONS_BY_ROLE,
@@ -11,7 +11,6 @@ import {
   MAINTENANCE_JOB_CATEGORIES,
   MAINTENANCE_JOB_CATEGORY_LABEL,
   MaintenanceJobCategory,
-  BookkeeperAccessLevel,
 } from '@gam/shared'
 
 type NonBookkeeperRole = Exclude<LandlordAssignableRole, 'bookkeeper'>
@@ -72,6 +71,7 @@ const ROLE_BADGE: Record<LandlordAssignableRole, string> = {
 
 export function TeamPage() {
   const qc = useQueryClient()
+  const navigate = useNavigate()
   const { data, isLoading } = useQuery<TeamPayload>('team', () => apiGet('/scopes/team'))
   const [expandedId, setExpandedId] = useState<string | null>(null)
 
@@ -143,7 +143,6 @@ export function TeamPage() {
                   const isBookkeeper = m.role === 'bookkeeper'
                   const perms = (m.permissions || {}) as Record<string, boolean>
                   const enabledCount = isBookkeeper ? 0 : Object.values(perms).filter(Boolean).length
-                  const totalKeys = isBookkeeper ? 0 : (SUB_PERMISSIONS_BY_ROLE[m.role as Exclude<LandlordAssignableRole,'bookkeeper'>]?.length || 0)
                   return (
                     <>
                       <tr key={m.userId} style={{ cursor: 'pointer' }} onClick={() => setExpandedId(expanded ? null : m.userId)}>
@@ -153,9 +152,20 @@ export function TeamPage() {
                         <td style={{ fontSize: '.82rem', color: 'var(--text-3)' }}>
                           {isBookkeeper
                             ? <span className="mono">access: {(m.permissions as any)?.accessLevel || '—'}</span>
-                            : `${enabledCount} / ${totalKeys} enabled`}
+                            : `${enabledCount} permission${enabledCount === 1 ? '' : 's'} granted`}
                         </td>
-                        <td style={{ textAlign: 'right', color: 'var(--text-3)', fontSize: '.82rem' }}>{expanded ? '▾' : '▸'}</td>
+                        <td style={{ textAlign: 'right', color: 'var(--text-3)', fontSize: '.82rem', whiteSpace: 'nowrap' }}>
+                          {!isBookkeeper && (
+                            <button
+                              className="btn btn-ghost btn-sm"
+                              style={{ fontSize: '.74rem', marginRight: 10 }}
+                              onClick={(e) => { e.stopPropagation(); navigate(`/team/${m.userId}/permissions`) }}
+                            >
+                              Permissions →
+                            </button>
+                          )}
+                          {expanded ? '▾' : '▸'}
+                        </td>
                       </tr>
                       {expanded && (
                         <tr key={m.userId + '_expanded'}>
@@ -431,37 +441,40 @@ function RequirementsList({ title, items, tone }: { title: string; items: string
 // per-property pickers + permission toggles happen on the team table
 // rows below after the invite is accepted.
 function InviteForm({ onSent }: { onSent: () => void }) {
+  const [firstName, setFirstName] = useState('')
+  const [lastName, setLastName] = useState('')
   const [email, setEmail] = useState('')
-  const [role, setRole] = useState<LandlordAssignableRole>('maintenance')
-  const [allProperties, setAllProperties] = useState(false)
-  const [jobCategories, setJobCategories] = useState<MaintenanceJobCategory[]>([])
-  const [accessLevel, setAccessLevel] = useState<BookkeeperAccessLevel>('read_only')
+  const [phone, setPhone] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState<string | null>(null)
 
   const reset = () => {
+    setFirstName('')
+    setLastName('')
     setEmail('')
-    setAllProperties(false)
-    setJobCategories([])
-    setAccessLevel('read_only')
+    setPhone('')
   }
 
   const mut = useMutation(
-    () => {
-      const scope: any =
-        role === 'bookkeeper'  ? { accessLevel } :
-        role === 'maintenance' ? { propertyIds: [], unitIds: [], jobCategories, allProperties } :
-        role === 'onsite_manager' ? { propertyIds: [], unitIds: [], allProperties } :
-        /* property_manager */ { propertyIds: [], unitIds: [], allProperties, maintApprovalCeilingCents: null }
-      return apiPost(`/scopes/${role}/invite`, { email: email.trim(), scope })
-    },
+    // No role dropdown: every staff user is created generic and fully defined
+    // by their permission toggles. onsite_manager is the internal backing type
+    // (has a property-scoped table + is wired through auth/POS) — invisible to
+    // the landlord. Property access + permissions are set on the user's
+    // dedicated permissions page after they accept; the invite grants nothing.
+    () => apiPost(`/scopes/onsite_manager/invite`, {
+      email: email.trim(),
+      firstName: firstName.trim() || undefined,
+      lastName: lastName.trim() || undefined,
+      phone: phone.trim() || undefined,
+      scope: { propertyIds: [], unitIds: [], allProperties: false },
+    }),
     {
       onSuccess: () => {
         setError(null)
-        setSuccess(`Invitation emailed to ${email.trim()}.`)
+        setSuccess(`Invitation emailed to ${email.trim()}. Set their permissions once they accept.`)
         reset()
         onSent()
-        setTimeout(() => setSuccess(null), 4000)
+        setTimeout(() => setSuccess(null), 5000)
       },
       onError: (e: any) => {
         setSuccess(null)
@@ -473,6 +486,10 @@ function InviteForm({ onSent }: { onSent: () => void }) {
   const submit = (e: React.FormEvent) => {
     e.preventDefault()
     setError(null)
+    if (!firstName.trim() || !lastName.trim()) {
+      setError('First and last name are required')
+      return
+    }
     if (!email.trim()) {
       setError('Email is required')
       return
@@ -480,114 +497,63 @@ function InviteForm({ onSent }: { onSent: () => void }) {
     mut.mutate()
   }
 
-  const toggleJobCat = (cat: MaintenanceJobCategory) => {
-    setJobCategories(prev => prev.includes(cat) ? prev.filter(c => c !== cat) : [...prev, cat])
-  }
-
-  const showAllPropsToggle = role === 'property_manager' || role === 'onsite_manager' || role === 'maintenance'
-  const showJobCats = role === 'maintenance'
-  const showAccessLevel = role === 'bookkeeper'
+  const labelStyle = { fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase' as const, letterSpacing: '.05em', display: 'block', marginBottom: 4 }
+  const inputStyle = { width: '100%', padding: '8px 12px', borderRadius: 8, border: '1px solid var(--border-0)', background: 'var(--bg-2)', fontSize: '.85rem', boxSizing: 'border-box' as const }
 
   return (
     <div className="card" style={{ padding: 16, marginBottom: 20 }}>
-      <div style={{ fontSize: '.95rem', fontWeight: 600, marginBottom: 4 }}>Invite team member</div>
+      <div style={{ fontSize: '.95rem', fontWeight: 600, marginBottom: 4 }}>Add a staff member</div>
       <div style={{ fontSize: '.75rem', color: 'var(--text-3)', marginBottom: 12, lineHeight: 1.5 }}>
-        Sends an email with a link to claim the invitation. After acceptance, you can refine per-property scope and per-permission toggles on the team row below.
+        Enter their details and send an email invite. Once they accept, open their row to set exactly what they can see and do on their permissions page — every user is configured individually.
       </div>
       <form onSubmit={submit} style={{ display: 'grid', gap: 10 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+          <div>
+            <label style={labelStyle}>First name</label>
+            <input
+              type="text"
+              required
+              value={firstName}
+              onChange={e => setFirstName(e.target.value)}
+              placeholder="Jane"
+              style={inputStyle}
+            />
+          </div>
+          <div>
+            <label style={labelStyle}>Last name</label>
+            <input
+              type="text"
+              required
+              value={lastName}
+              onChange={e => setLastName(e.target.value)}
+              placeholder="Doe"
+              style={inputStyle}
+            />
+          </div>
+        </div>
         <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: 10 }}>
           <div>
-            <label style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.05em', display: 'block', marginBottom: 4 }}>
-              Email
-            </label>
+            <label style={labelStyle}>Email</label>
             <input
               type="email"
               required
               value={email}
               onChange={e => setEmail(e.target.value)}
               placeholder="name@example.com"
-              style={{ width: '100%', padding: '8px 12px', borderRadius: 8, border: '1px solid var(--border-0)', background: 'var(--bg-2)', fontSize: '.85rem', boxSizing: 'border-box' }}
+              style={inputStyle}
             />
           </div>
           <div>
-            <label style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.05em', display: 'block', marginBottom: 4 }}>
-              Role
-            </label>
-            <select
-              value={role}
-              onChange={e => setRole(e.target.value as LandlordAssignableRole)}
-              style={{ width: '100%', padding: '8px 12px', borderRadius: 8, border: '1px solid var(--border-0)', background: 'var(--bg-2)', fontSize: '.85rem', color: 'var(--text-0)', boxSizing: 'border-box' }}
-            >
-              {LANDLORD_ASSIGNABLE_ROLES.map(r => (
-                <option key={r} value={r}>{LANDLORD_ASSIGNABLE_ROLE_LABEL[r]}</option>
-              ))}
-            </select>
+            <label style={labelStyle}>Phone <span style={{ fontWeight: 400, textTransform: 'none', letterSpacing: 0 }}>(optional)</span></label>
+            <input
+              type="tel"
+              value={phone}
+              onChange={e => setPhone(e.target.value)}
+              placeholder="(555) 123-4567"
+              style={inputStyle}
+            />
           </div>
         </div>
-
-        {showAllPropsToggle && (
-          <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '.82rem', cursor: 'pointer', padding: '4px 0' }}>
-            <input
-              type="checkbox"
-              checked={allProperties}
-              onChange={e => setAllProperties(e.target.checked)}
-              style={{ width: 16, height: 16, cursor: 'pointer' }}
-            />
-            <span>Grant access to <strong>all current and future properties</strong></span>
-            <span style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>(otherwise scope to specific properties after acceptance)</span>
-          </label>
-        )}
-
-        {showJobCats && (
-          <div>
-            <label style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.05em', display: 'block', marginBottom: 6 }}>
-              Job categories <span style={{ fontWeight: 400, textTransform: 'none', letterSpacing: 0, color: 'var(--text-3)' }}>(empty = all)</span>
-            </label>
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-              {MAINTENANCE_JOB_CATEGORIES.map(cat => {
-                const on = jobCategories.includes(cat)
-                return (
-                  <button
-                    key={cat}
-                    type="button"
-                    onClick={() => toggleJobCat(cat)}
-                    style={{
-                      padding: '4px 10px',
-                      borderRadius: 6,
-                      fontSize: '.72rem',
-                      fontWeight: 500,
-                      border: `1px solid ${on ? 'var(--gold)' : 'var(--border-0)'}`,
-                      background: on ? 'rgba(201,162,39,.12)' : 'var(--bg-2)',
-                      color: on ? 'var(--gold)' : 'var(--text-2)',
-                      cursor: 'pointer',
-                    }}
-                  >
-                    {MAINTENANCE_JOB_CATEGORY_LABEL[cat]}
-                  </button>
-                )
-              })}
-            </div>
-          </div>
-        )}
-
-        {showAccessLevel && (
-          <div>
-            <label style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.05em', display: 'block', marginBottom: 4 }}>
-              Access level
-            </label>
-            <select
-              value={accessLevel}
-              onChange={e => setAccessLevel(e.target.value as BookkeeperAccessLevel)}
-              style={{ width: '100%', padding: '8px 12px', borderRadius: 8, border: '1px solid var(--border-0)', background: 'var(--bg-2)', fontSize: '.85rem', color: 'var(--text-0)', boxSizing: 'border-box' }}
-            >
-              {BOOKKEEPER_ACCESS_LEVELS.map(lvl => (
-                <option key={lvl} value={lvl}>
-                  {lvl === 'read_only' ? 'Read only — view books, no edits' : 'Read + write — full books access'}
-                </option>
-              ))}
-            </select>
-          </div>
-        )}
 
         {error && (
           <div style={{ padding: '8px 12px', borderRadius: 6, background: 'rgba(220,76,76,.08)', border: '1px solid rgba(220,76,76,.25)', color: 'var(--red, #dc4c4c)', fontSize: '.78rem' }}>

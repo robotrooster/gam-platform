@@ -399,7 +399,7 @@ leasesRouter.get('/:id/addendum-pdf/:filename', async (req, res, next) => {
 // to a flagged lease_fees row. Only updates override_reason; amount /
 // timing / refundable stay frozen (they're contractual).
 const overrideReasonSchema = z.object({ override_reason: z.string().min(1).max(2000) })
-leasesRouter.patch('/:id/fees/:feeId', requirePerm('leases.create'), async (req, res, next) => {
+leasesRouter.patch('/:id/fees/:feeId', requirePerm('leases.edit'), async (req, res, next) => {
   try {
     const lease = await queryOne<any>('SELECT id, landlord_id FROM leases WHERE id=$1', [req.params.id])
     if (!lease) throw new AppError(404, 'Lease not found')
@@ -430,7 +430,7 @@ leasesRouter.patch('/:id/fees/:feeId', requirePerm('leases.create'), async (req,
 //   - units.status → 'vacant' (units.tenant_id no longer exists; occupancy
 //     derives from v_unit_occupancy)
 // ─────────────────────────────────────────────────────────────
-leasesRouter.patch('/:id', requirePerm('leases.create', 'leases.terminate'), async (req, res, next) => {
+leasesRouter.patch('/:id', requirePerm('leases.edit'), async (req, res, next) => {
   try {
     const body = z.object({
       status: z.enum(LEASE_STATUSES).optional(),
@@ -893,7 +893,7 @@ const billFeeSchema = z.object({
   dueDate:     z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
 })
 
-leasesRouter.post('/:id/bill-fee', requirePerm('properties.edit'), async (req, res, next) => {
+leasesRouter.post('/:id/bill-fee', requirePerm('leases.bill_fee'), async (req, res, next) => {
   try {
     const lease = await queryOne<{
       id: string
@@ -944,7 +944,7 @@ leasesRouter.post('/:id/bill-fee', requirePerm('properties.edit'), async (req, r
   } catch (e) { next(e) }
 })
 
-leasesRouter.post('/:id/deposit-return', requirePerm('leases.terminate'), async (req, res, next) => {
+leasesRouter.post('/:id/deposit-return', requirePerm('leases.deposit_return'), async (req, res, next) => {
   try {
     const lease = await queryOne<any>('SELECT id, landlord_id FROM leases WHERE id=$1', [req.params.id])
     if (!lease) throw new AppError(404, 'Lease not found')
@@ -962,7 +962,7 @@ const patchSchema = z.object({
   notes: z.string().optional(),
 })
 
-leasesRouter.patch('/:id/deposit-return', requirePerm('leases.terminate'), async (req, res, next) => {
+leasesRouter.patch('/:id/deposit-return', requirePerm('leases.deposit_return'), async (req, res, next) => {
   try {
     const lease = await queryOne<any>('SELECT id, landlord_id FROM leases WHERE id=$1', [req.params.id])
     if (!lease) throw new AppError(404, 'Lease not found')
@@ -982,7 +982,7 @@ leasesRouter.patch('/:id/deposit-return', requirePerm('leases.terminate'), async
   } catch (e) { next(e) }
 })
 
-leasesRouter.post('/:id/deposit-return/finalize', requirePerm('leases.terminate'), async (req, res, next) => {
+leasesRouter.post('/:id/deposit-return/finalize', requirePerm('leases.deposit_return'), async (req, res, next) => {
   try {
     const lease = await queryOne<any>('SELECT id, landlord_id FROM leases WHERE id=$1', [req.params.id])
     if (!lease) throw new AppError(404, 'Lease not found')

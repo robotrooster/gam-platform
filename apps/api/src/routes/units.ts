@@ -85,7 +85,7 @@ unitsRouter.get('/:id', async (req, res, next) => {
 })
 
 // POST /api/units
-unitsRouter.post('/', requirePerm('units.create'), async (req, res, next) => {
+unitsRouter.post('/', requirePerm('properties.add_unit'), async (req, res, next) => {
   try {
     const body = z.object({
       propertyId:      z.string().uuid(),
@@ -119,7 +119,7 @@ unitsRouter.post('/', requirePerm('units.create'), async (req, res, next) => {
 })
 
 // PATCH /api/units/:id/status — set unit status
-unitsRouter.patch('/:id/status', requirePerm('units.edit'), async (req, res, next) => {
+unitsRouter.patch('/:id/status', requirePerm('units.set_status'), async (req, res, next) => {
   try {
     const { status } = z.object({
       status: z.enum([...UNIT_STATUSES] as [string, ...string[]])
@@ -149,7 +149,7 @@ unitsRouter.patch('/:id/status', requirePerm('units.edit'), async (req, res, nex
 
 // POST /api/units/:id/eviction-mode — Eviction mode — HARD BLOCK all tenant ACH
 // Hard-blocks tenant ACH while eviction is active. Landlord is responsible for knowing their local eviction rules.
-unitsRouter.post('/:id/eviction-mode', requireLandlord, async (req, res, next) => {
+unitsRouter.post('/:id/eviction-mode', requirePerm('units.eviction_mode'), async (req, res, next) => {
   try {
     const { enable, confirm } = z.object({
       enable:  z.boolean(),
@@ -244,7 +244,7 @@ const LEASE_TYPE_MATRIX: Record<string, string[]> = {
 }
 
 // PATCH /api/units/:id/type — set unit type and rates
-unitsRouter.patch('/:id/type', requirePerm('units.edit'), async (req, res, next) => {
+unitsRouter.patch('/:id/type', requirePerm('schedule.configure_unit'), async (req, res, next) => {
   try {
     const { unitType, nightlyRate, weeklyRate, monthlyRate, minStayNights, maxStayNights,
             checkInTime, checkOutTime, amenities, unitDescription, isBookable, rvSiteLayout, rvAmpService } = req.body
@@ -310,7 +310,7 @@ unitsRouter.get('/:id/availability', async (req, res, next) => {
 // or CHECK violation instead of clean 400. checkOut <= checkIn was
 // also silently accepted, producing 0 or negative nights via the
 // Math.ceil calc. Both now caught at the zod / pre-INSERT layer.
-unitsRouter.post('/:id/bookings', requirePerm('guests.check_in', 'units.edit'), async (req, res, next) => {
+unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), async (req, res, next) => {
   try {
     const body = z.object({
       guestName:   z.string().nullish(),
@@ -413,7 +413,7 @@ unitsRouter.post('/:id/bookings', requirePerm('guests.check_in', 'units.edit'), 
 // the guest's stay-assistant token and return the link + a QR for the host to
 // show/print on-site. Optionally also emails the link to the guest. This is
 // the QR/email delivery surface for the booking-guest agent.
-unitsRouter.post('/:id/bookings/:bookingId/guest-access', requirePerm('guests.check_in', 'units.edit'), async (req, res, next) => {
+unitsRouter.post('/:id/bookings/:bookingId/guest-access', requirePerm('guest_access'), async (req, res, next) => {
   try {
     const body = z.object({
       delivery: z.enum(['email', 'qr']).optional(),
@@ -469,7 +469,7 @@ unitsRouter.post('/:id/bookings/:bookingId/guest-access', requirePerm('guests.ch
 // stay-assistant access. Kills EVERY outstanding link for the booking (each
 // issue mints a fresh token without retiring the last), so this is the host's
 // single kill switch. Same auth as issue. Idempotent: re-revoking returns 0.
-unitsRouter.delete('/:id/bookings/:bookingId/guest-access', requirePerm('guests.check_in', 'units.edit'), async (req, res, next) => {
+unitsRouter.delete('/:id/bookings/:bookingId/guest-access', requirePerm('guest_access'), async (req, res, next) => {
   try {
     const booking = await queryOne<any>(
       `SELECT b.id, b.landlord_id
@@ -515,7 +515,7 @@ unitsRouter.get('/:id/bookings', requirePerm('guests.check_in', 'guests.check_ou
 })
 
 // PATCH /api/units/:id/bookings/:bookingId — update booking (status, move dates, swap unit)
-unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('guests.check_in', 'guests.check_out', 'units.edit'), async (req, res, next) => {
+unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reservation'), async (req, res, next) => {
   try {
     const { status, notes, checkIn, checkOut, unitId, guestName, guestEmail, guestPhone, requiredSiteLayout, requiredAmpService } = req.body
     if (requiredSiteLayout != null && !RV_SITE_LAYOUTS.includes(requiredSiteLayout)) {
@@ -606,7 +606,7 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('guests.check_in', 'gu
 // (requires_booking_acknowledgment) governs whether the booking should be
 // gated on this; today the column is informational and surface UI badging
 // is a follow-on session.
-unitsRouter.patch('/:id/bookings/:bookingId/acknowledge', requirePerm('guests.check_in', 'units.edit'), async (req, res, next) => {
+unitsRouter.patch('/:id/bookings/:bookingId/acknowledge', requirePerm('bookings.acknowledge'), async (req, res, next) => {
   try {
     const booking = await queryOne<any>('SELECT * FROM unit_bookings WHERE id=$1', [req.params.bookingId])
     if (!booking) throw new AppError(404, 'Booking not found')
@@ -721,7 +721,7 @@ unitsRouter.get('/schedule/history', requirePerm('guests.check_in', 'units.view_
 // ─── UNIT ACTIVATION / AVAILABILITY (landlord-controlled) ──────
 
 // POST /api/units/:id/mark-available — vacant → available (listed, no billing yet)
-unitsRouter.post('/:id/mark-available', requirePerm('units.edit'), async (req, res, next) => {
+unitsRouter.post('/:id/mark-available', requirePerm('units.manage_lifecycle'), async (req, res, next) => {
   try {
     const unit = await queryOne<any>('SELECT * FROM units WHERE id=$1', [req.params.id])
     if (!unit) throw new AppError(404, 'Unit not found')
@@ -735,7 +735,7 @@ unitsRouter.post('/:id/mark-available', requirePerm('units.edit'), async (req, r
 })
 
 // POST /api/units/:id/mark-vacant — available → vacant (withdraw from listing)
-unitsRouter.post('/:id/mark-vacant', requirePerm('units.edit'), async (req, res, next) => {
+unitsRouter.post('/:id/mark-vacant', requirePerm('units.manage_lifecycle'), async (req, res, next) => {
   try {
     const unit = await queryOne<any>('SELECT * FROM units WHERE id=$1', [req.params.id])
     if (!unit) throw new AppError(404, 'Unit not found')
@@ -752,7 +752,7 @@ unitsRouter.post('/:id/mark-vacant', requirePerm('units.edit'), async (req, res,
 // S128: opened to property_manager with units.edit. Activation kicks off
 // billing but is fundamentally a unit-state change — same operational
 // surface as PATCH /:id/status, which is already units.edit.
-unitsRouter.post('/:id/activate', requirePerm('units.edit'), async (req, res, next) => {
+unitsRouter.post('/:id/activate', requirePerm('units.manage_lifecycle'), async (req, res, next) => {
   try {
     const body = z.object({ scheduledFor: z.string().datetime().optional() }).parse(req.body)
     const unit = await queryOne<any>('SELECT * FROM units WHERE id=$1', [req.params.id])
@@ -782,7 +782,7 @@ unitsRouter.post('/:id/activate', requirePerm('units.edit'), async (req, res, ne
 
 // POST /api/units/:id/cancel-scheduled-activation
 // S128: opened to property_manager with units.edit (same surface as activate).
-unitsRouter.post('/:id/cancel-scheduled-activation', requirePerm('units.edit'), async (req, res, next) => {
+unitsRouter.post('/:id/cancel-scheduled-activation', requirePerm('units.manage_lifecycle'), async (req, res, next) => {
   try {
     const unit = await queryOne<any>('SELECT * FROM units WHERE id=$1', [req.params.id])
     if (!unit) throw new AppError(404, 'Unit not found')

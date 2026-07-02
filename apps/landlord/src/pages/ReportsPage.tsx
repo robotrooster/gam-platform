@@ -1,6 +1,7 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useQuery } from 'react-query'
 import { apiGet } from '../lib/api'
+import { usePerms } from '../lib/permissions'
 import { X, Printer, Download } from 'lucide-react'
 
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
@@ -201,15 +202,26 @@ function AreaChart({ series }: { series: { label: string; cumulative: number; m:
 // REPORTS PAGE — tabbed
 // ══════════════════════════════════════════════════════════════
 type Tab = 'overview' | 'property' | 'annual' | 'statement'
-const TABS: { key: Tab; label: string }[] = [
-  { key: 'overview',  label: 'Overview' },
-  { key: 'property',  label: 'By Property' },
-  { key: 'annual',    label: 'Annual & Tax' },
-  { key: 'statement', label: 'Owner Statement' },
+const TABS: { key: Tab; label: string; perm: string }[] = [
+  { key: 'overview',  label: 'Overview',        perm: 'reports.tab.overview' },
+  { key: 'property',  label: 'By Property',     perm: 'reports.tab.property' },
+  { key: 'annual',    label: 'Annual & Tax',    perm: 'reports.tab.annual' },
+  { key: 'statement', label: 'Owner Statement', perm: 'reports.tab.statement' },
 ]
 
 export function ReportsPage() {
   const [tab, setTab] = useState<Tab>('overview')
+  const { can } = usePerms()
+
+  // Staff see only report tabs they're granted; owners see all. Snap the
+  // active tab to the first visible one if the current tab is hidden.
+  const visibleTabs = TABS.filter(t => can(t.perm))
+  const visibleTabKeys = visibleTabs.map(t => t.key).join(',')
+  useEffect(() => {
+    if (visibleTabs.length && !visibleTabs.some(t => t.key === tab)) setTab(visibleTabs[0].key)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visibleTabKeys])
+
   return (
     <div>
       <PrintStyles />
@@ -217,14 +229,14 @@ export function ReportsPage() {
         <div><h1 className="page-title">Reports</h1><p className="page-subtitle">Financial, tax, and occupancy summaries</p></div>
       </div>
       <div className="no-print" style={{ display: 'flex', gap: 4, borderBottom: '1px solid var(--border-0)', marginBottom: 18 }}>
-        {TABS.map(t => (
+        {visibleTabs.map(t => (
           <button key={t.key} className={`tab-btn ${tab === t.key ? 'active' : ''}`} onClick={() => setTab(t.key)}>{t.label}</button>
         ))}
       </div>
-      {tab === 'overview'  && <OverviewTab />}
-      {tab === 'property'  && <ByPropertyTab />}
-      {tab === 'annual'    && <AnnualTaxTab />}
-      {tab === 'statement' && <OwnerStatementTab />}
+      {tab === 'overview'  && can('reports.tab.overview')  && <OverviewTab />}
+      {tab === 'property'  && can('reports.tab.property')  && <ByPropertyTab />}
+      {tab === 'annual'    && can('reports.tab.annual')    && <AnnualTaxTab />}
+      {tab === 'statement' && can('reports.tab.statement') && <OwnerStatementTab />}
     </div>
   )
 }
@@ -284,6 +296,7 @@ function ByPropertyTab() {
   const [year, setYear]   = useState(now.getFullYear())
   const [month, setMonth] = useState<number | null>(null) // null = full year
   const [openProp, setOpenProp] = useState<{ id: string; name: string } | null>(null)
+  const { can } = usePerms()
   const qs = `year=${year}${month ? `&month=${month}` : ''}`
   const { data, isLoading } = useQuery<any>(['property-pl', year, month], () => apiGet(`/reports/property-pl?${qs}`))
   const props: any[] = data?.properties ?? []
@@ -309,10 +322,12 @@ function ByPropertyTab() {
     <div style={{ display: 'grid', gap: 14 }}>
       <div className="no-print" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
         <PeriodPicker year={year} setYear={setYear} month={month} setMonth={setMonth} allowAll />
-        <div style={{ display: 'flex', gap: 6 }}>
-          <ToolbarBtn onClick={exportCsv} icon={<Download size={14} />} label="CSV" />
-          <ToolbarBtn onClick={() => window.print()} icon={<Printer size={14} />} label="Print" />
-        </div>
+        {can('reports.export') && (
+          <div style={{ display: 'flex', gap: 6 }}>
+            <ToolbarBtn onClick={exportCsv} icon={<Download size={14} />} label="CSV" />
+            <ToolbarBtn onClick={() => window.print()} icon={<Printer size={14} />} label="Print" />
+          </div>
+        )}
       </div>
       <div className="card">
         <div className="card-header">
@@ -491,6 +506,7 @@ function PropertyDetailModal({ propertyId, name, year, month, onClose }: {
 function AnnualTaxTab() {
   const now = new Date()
   const [year, setYear] = useState(now.getFullYear())
+  const { can } = usePerms()
   const { data: tax, isLoading } = useQuery<any>(['tax-summary', year], () => apiGet(`/reports/tax-summary?year=${year}`))
   const { data: wt } = useQuery<any>(['wt-1099', year], () => apiGet(`/reports/work-trade-1099?year=${year}`))
 
@@ -501,7 +517,9 @@ function AnnualTaxTab() {
     <div style={{ display: 'grid', gap: 14 }}>
       <div className="no-print" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
         <PeriodPicker year={year} setYear={setYear} month={null} />
-        <ToolbarBtn onClick={() => window.print()} icon={<Printer size={14} />} label="Print" />
+        {can('reports.export') && (
+          <ToolbarBtn onClick={() => window.print()} icon={<Printer size={14} />} label="Print" />
+        )}
       </div>
 
       {isLoading ? <div style={{ padding: 32, color: 'var(--text-3)', textAlign: 'center' }}>Loading…</div> : (
@@ -580,6 +598,7 @@ function OwnerStatementTab() {
   const now = new Date()
   const [year, setYear]   = useState(now.getFullYear())
   const [month, setMonth] = useState<number | null>(now.getMonth() + 1)
+  const { can } = usePerms()
   const { data, isLoading } = useQuery<any>(['monthly-statement', year, month], () => apiGet(`/reports/monthly-statement?year=${year}&month=${month}`))
 
   const s = data?.summary
@@ -602,10 +621,12 @@ function OwnerStatementTab() {
     <div style={{ display: 'grid', gap: 14 }}>
       <div className="no-print" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
         <PeriodPicker year={year} setYear={setYear} month={month} setMonth={m => setMonth(m ?? 1)} />
-        <div style={{ display: 'flex', gap: 6 }}>
-          <ToolbarBtn onClick={exportPaymentsCsv} icon={<Download size={14} />} label="CSV" />
-          <ToolbarBtn onClick={() => window.print()} icon={<Printer size={14} />} label="Print" />
-        </div>
+        {can('reports.export') && (
+          <div style={{ display: 'flex', gap: 6 }}>
+            <ToolbarBtn onClick={exportPaymentsCsv} icon={<Download size={14} />} label="CSV" />
+            <ToolbarBtn onClick={() => window.print()} icon={<Printer size={14} />} label="Print" />
+          </div>
+        )}
       </div>
 
       {isLoading ? <div style={{ padding: 32, color: 'var(--text-3)', textAlign: 'center' }}>Loading…</div> : (

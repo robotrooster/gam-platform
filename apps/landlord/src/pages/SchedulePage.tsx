@@ -1,9 +1,14 @@
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef, useEffect, useMemo } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
-import { apiGet, apiPost, apiPatch } from '../lib/api'
-import { UNIT_TYPES, computeStayPrice, RV_SITE_LAYOUTS, RV_SITE_LAYOUT_LABEL, isSiteLayoutMismatch, RV_AMP_SERVICES, RV_AMP_SERVICE_LABEL, isAmpServiceMismatch } from '@gam/shared'
+import { Search, FileSignature, CheckCircle2, AlertTriangle, MessageSquare, Check, X, QrCode, Copy, Mail, Ban } from 'lucide-react'
+import { apiGet, apiPost, apiPatch, apiDelete } from '../lib/api'
+import { usePerms } from '../lib/permissions'
+import { UNIT_TYPES, computeStayPrice, RV_SITE_LAYOUTS, RV_SITE_LAYOUT_LABEL, isSiteLayoutMismatch, RV_AMP_SERVICES, RV_AMP_SERVICE_LABEL, isAmpServiceMismatch, BOOKING_CHANGE_REQUEST_TYPE_LABEL, type BookingChangeRequestType } from '@gam/shared'
 
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
+
+// Public customer-portal base for the booking-site preview URL (ported from BookingSitesPage).
+const CUSTOMER_URL = (import.meta as any).env?.VITE_CUSTOMER_PORTAL_URL || 'http://localhost:3014'
 
 const UNIT_TYPE_LABELS: Record<string,string> = {
   residential:'🏠 Residential', rv_spot:'🚐 RV Spot', storage:'📦 Storage',
@@ -43,10 +48,183 @@ function addDays(dateStr: string, days: number) {
   return d.toISOString().split('T')[0]
 }
 
+// ── Ported from BookingsPage (reservations table + change requests) ──
+type ResvBooking = {
+  id: string
+  unitId: string
+  unitNumber: string
+  unitType: string
+  propertyName: string
+  requiresBookingAcknowledgment: boolean
+  guestName: string | null
+  guestEmail: string | null
+  guestPhone: string | null
+  leaseType: string
+  checkIn: string
+  checkOut: string
+  nights: number
+  totalAmount: string | number | null
+  platformFee: string | number | null
+  status: string
+  source: string
+  notes: string | null
+  acknowledgmentSignedAt: string | null
+  createdAt: string
+}
+
+type ChangeRequest = {
+  id: string
+  bookingId: string
+  requestType: BookingChangeRequestType
+  details: string | null
+  status: string
+  guestName: string | null
+  checkIn: string
+  checkOut: string
+  unitNumber: string | null
+  propertyName: string | null
+  createdAt: string
+}
+
+const RESV_STATUS_BADGE: Record<string, string> = {
+  confirmed: 'badge-blue',
+  checked_in: 'badge-green',
+  checked_out: 'badge-muted',
+  cancelled: 'badge-muted',
+  no_show: 'badge-red',
+}
+
+// Date-only strings render at noon to dodge TZ off-by-one.
+const fmtDate = (d: string | null | undefined) => {
+  if (!d) return '—'
+  try { return new Date(`${d.slice(0, 10)}T12:00:00`).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) }
+  catch { return d }
+}
+
+// Guest stay-assistant access (S501 track). Shows the per-booking stay link +
+// QR the host displays/prints on-site, can re-email it to the guest, and can
+// revoke all access. Issuing mints a fresh reusable token bound to this one
+// booking; revoke kills every outstanding link for it. (Ported from BookingsPage.)
+type IssuedAccess = { url: string; qrDataUrl: string; expiresAt: string; emailed: boolean }
+
+function GuestAccessModal({ booking, onClose }: { booking: ResvBooking; onClose: () => void }) {
+  const base = `/units/${booking.unitId}/bookings/${booking.id}/guest-access`
+  const [issued, setIssued] = useState<IssuedAccess | null>(null)
+  const [copied, setCopied] = useState(false)
+  const [revoked, setRevoked] = useState<number | null>(null)
+
+  // Issue (or re-issue) the link + QR. sendEmail re-issues and emails the guest.
+  const issueMut = useMutation(
+    (sendEmail: boolean) => apiPost<IssuedAccess>(base, { sendEmail }),
+    {
+      onSuccess: (res) => {
+        setIssued(res.data)
+        setRevoked(null)
+        setCopied(false)
+      },
+    },
+  )
+
+  const revokeMut = useMutation(
+    () => apiDelete<{ revoked: number }>(base),
+    {
+      onSuccess: (res) => {
+        setRevoked(res.data.revoked)
+        setIssued(null)
+      },
+    },
+  )
+
+  const copyLink = () => {
+    if (!issued) return
+    navigator.clipboard?.writeText(issued.url).then(() => {
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1800)
+    }).catch(() => {})
+  }
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" style={{ maxWidth: 440, width: '95vw' }} onClick={e => e.stopPropagation()}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+          <div className="modal-title" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <QrCode size={18} style={{ color: 'var(--gold)' }} /> Stay link
+          </div>
+          <button className="btn btn-ghost btn-sm" onClick={onClose} aria-label="Close"><X size={16} /></button>
+        </div>
+        <div style={{ fontSize: '.8rem', color: 'var(--text-3)', marginBottom: 16 }}>
+          {booking.guestName || 'Guest'} · {booking.propertyName} Unit {booking.unitNumber} · {fmtDate(booking.checkIn)}–{fmtDate(booking.checkOut)}
+        </div>
+
+        {!issued && revoked == null && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+            <p style={{ fontSize: '.84rem', color: 'var(--text-1)' }}>
+              Generate the guest's stay-assistant link and a QR code to show or print on-site.
+              The guest chats with no account; the link works for the whole stay.
+            </p>
+            <button className="btn" disabled={issueMut.isLoading} onClick={() => issueMut.mutate(false)}>
+              {issueMut.isLoading ? 'Generating…' : 'Generate stay link'}
+            </button>
+          </div>
+        )}
+
+        {issued && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+            <div style={{ display: 'flex', justifyContent: 'center' }}>
+              <img src={issued.qrDataUrl} alt="Stay link QR code" width={200} height={200} style={{ borderRadius: 10, background: '#fff', padding: 8 }} />
+            </div>
+            <div>
+              <label style={{ display: 'block', fontSize: '.7rem', color: 'var(--text-3)', marginBottom: 4 }}>Link</label>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <input className="input" readOnly value={issued.url} onFocus={e => e.currentTarget.select()} style={{ fontSize: '.78rem' }} />
+                <button className="btn btn-ghost btn-sm" onClick={copyLink} title="Copy link" style={{ flexShrink: 0 }}>
+                  {copied ? <Check size={14} /> : <Copy size={14} />}
+                </button>
+              </div>
+            </div>
+            <div style={{ fontSize: '.74rem', color: 'var(--text-3)' }}>
+              Expires {new Date(issued.expiresAt).toLocaleDateString()}{issued.emailed ? ' · emailed to guest' : ''}
+            </div>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+              {booking.guestEmail && (
+                <button className="btn btn-ghost btn-sm" disabled={issueMut.isLoading} onClick={() => issueMut.mutate(true)}>
+                  <Mail size={13} /> Email to guest
+                </button>
+              )}
+              <button
+                className="btn btn-ghost btn-sm"
+                disabled={revokeMut.isLoading}
+                onClick={() => revokeMut.mutate()}
+                style={{ color: 'var(--red)', marginLeft: 'auto' }}
+              >
+                <Ban size={13} /> Revoke access
+              </button>
+            </div>
+          </div>
+        )}
+
+        {revoked != null && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            <p style={{ fontSize: '.84rem', color: 'var(--text-1)' }}>
+              {revoked > 0
+                ? `Access revoked. ${revoked} link${revoked === 1 ? '' : 's'} no longer work.`
+                : 'No active links to revoke.'}
+            </p>
+            <button className="btn btn-ghost btn-sm" disabled={issueMut.isLoading} onClick={() => issueMut.mutate(false)} style={{ alignSelf: 'flex-start' }}>
+              Generate a new link
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
 export function SchedulePage() {
   const qc = useQueryClient()
+  const { can } = usePerms()
   const today = new Date().toISOString().split('T')[0]
-  const [view, setView] = useState<'timeline'|'list'|'units'|'history'>('timeline')
+  const [view, setView] = useState<'timeline'|'list'|'units'|'history'|'reservations'|'requests'|'booking_page'>('timeline')
   // Wide fixed window — ~1 month back, ~5 months forward — so the timeline
   // scrolls both directions naturally (no date-range "search" controls). Day
   // columns size to fit roughly a month in the viewport (colW); the load
@@ -86,6 +264,26 @@ export function SchedulePage() {
   const scrollContainerRef = useRef<HTMLDivElement>(null)
   const theadRef = useRef<HTMLTableSectionElement>(null)
   const legendRef = useRef<HTMLDivElement>(null)
+
+  // ── Reservations tab (ported from BookingsPage) ──
+  // Separate filter state from the timeline's `search` (which jumps the
+  // calendar) — this drives the server-side /bookings query.
+  const [linkBooking, setLinkBooking] = useState<ResvBooking | null>(null)
+  const [resvSearch, setResvSearch] = useState('')
+  const [resvStatus, setResvStatus] = useState('')
+  const [resvSource, setResvSource] = useState('')
+  const [resvFrom, setResvFrom] = useState('')
+  const [resvTo, setResvTo] = useState('')
+
+  // ── Booking Page tab (ported from BookingSitesPage) ──
+  // Public per-property booking page config: slug, welcome text, stay rates,
+  // short-term tax %, deposit %, publish toggle. Prefixed bp* to avoid clashing
+  // with SchedulePage's existing reservation state.
+  const [bpPropId, setBpPropId] = useState('')
+  const [bpCfg, setBpCfg] = useState<any>(null)
+  const [bpMsg, setBpMsg] = useState('')
+  const [bpErr, setBpErr] = useState('')
+  const [bpSaving, setBpSaving] = useState(false)
 
 
   useEffect(() => {
@@ -146,6 +344,93 @@ export function SchedulePage() {
     () => apiGet('/units/schedule/history?limit=150'),
     { enabled: view === 'history', staleTime: 15000 }
   )
+
+  // ── Reservations tab data + mutations (ported from BookingsPage) ──
+  const resvQueryString = useMemo(() => {
+    const p: string[] = []
+    if (resvStatus) p.push(`status=${encodeURIComponent(resvStatus)}`)
+    if (resvSource) p.push(`source=${encodeURIComponent(resvSource)}`)
+    if (resvFrom) p.push(`from=${encodeURIComponent(resvFrom)}`)
+    if (resvTo) p.push(`to=${encodeURIComponent(resvTo)}`)
+    if (resvSearch) p.push(`q=${encodeURIComponent(resvSearch)}`)
+    return p.length ? `?${p.join('&')}` : ''
+  }, [resvStatus, resvSource, resvFrom, resvTo, resvSearch])
+
+  const { data: resvList = [], isLoading: resvLoading } = useQuery<ResvBooking[]>(
+    ['bookings', resvQueryString],
+    () => apiGet<ResvBooking[]>(`/bookings${resvQueryString}`),
+    { enabled: view === 'reservations', staleTime: 30000 },
+  )
+
+  // S191: acknowledge a booking (mark guest signed property rules).
+  const ackMut = useMutation(
+    (booking: ResvBooking) =>
+      apiPatch(`/units/${booking.unitId}/bookings/${booking.id}/acknowledge`),
+    { onSuccess: () => qc.invalidateQueries(['bookings']) },
+  )
+
+  // Guest-agent change requests (S501 track): open stay-change asks recorded
+  // by the guest agent. The host approves/declines here; approving is an
+  // acknowledgment, not an automatic booking edit.
+  const { data: changeRequests = [] } = useQuery<ChangeRequest[]>(
+    ['booking-change-requests'],
+    () => apiGet<ChangeRequest[]>('/bookings/change-requests'),
+    { enabled: view === 'reservations' || view === 'requests', staleTime: 30000 },
+  )
+  const resolveMut = useMutation(
+    ({ id, status }: { id: string; status: 'approved' | 'declined' }) =>
+      apiPatch(`/bookings/change-requests/${id}`, { status }),
+    { onSuccess: () => qc.invalidateQueries(['booking-change-requests']) },
+  )
+
+  // ── Booking Page tab data (ported from BookingSitesPage) ──
+  const { data: bpProperties = [] } = useQuery<any[]>(
+    'properties',
+    () => apiGet('/properties'),
+    { enabled: view === 'booking_page', staleTime: 30000 },
+  )
+  // Default to the first property once loaded.
+  useEffect(() => { if (!bpPropId && bpProperties.length) setBpPropId(bpProperties[0].id) }, [bpProperties])
+  // Load the selected property's booking-site config.
+  useEffect(() => {
+    if (!bpPropId) return
+    setBpMsg(''); setBpErr('')
+    apiGet(`/properties/${bpPropId}/booking-config`).then(setBpCfg).catch(() => setBpCfg(null))
+  }, [bpPropId])
+  const saveBookingConfig = async () => {
+    setBpSaving(true); setBpMsg(''); setBpErr('')
+    try {
+      const num = (v: any) => (v === '' || v == null ? null : Number(v))
+      const updated = await apiPatch(`/properties/${bpPropId}/booking-config`, {
+        slug: bpCfg.slug || null,
+        enabled: bpCfg.enabled,
+        intro: bpCfg.intro || null,
+        depositPct: Number(bpCfg.depositPct),
+        nightlyRate: num(bpCfg.nightlyRate),
+        weeklyRate: num(bpCfg.weeklyRate),
+        monthlyRate: num(bpCfg.monthlyRate),
+        shortTermTaxRate: Number(bpCfg.shortTermTaxRate) || 0,
+      })
+      setBpCfg(updated)
+      setBpMsg('Saved.')
+    } catch (e: any) {
+      setBpErr(e?.response?.data?.error || e.message || 'Could not save')
+    }
+    setBpSaving(false)
+  }
+  const bpPublicUrl = bpCfg?.slug ? `${CUSTOMER_URL}/property/${bpCfg.slug}` : null
+
+  const resvTotalAmount = resvList.reduce((s, b) => s + (parseFloat(String(b.totalAmount || 0)) || 0), 0)
+
+  // S191: which bookings still need a property-rules acknowledgment (toggle on,
+  // not yet signed, and not a closed/cancelled state — no point chasing acks there).
+  const needsAckResv = (b: ResvBooking) =>
+    b.requiresBookingAcknowledgment
+    && !b.acknowledgmentSignedAt
+    && b.status !== 'cancelled'
+    && b.status !== 'checked_out'
+    && b.status !== 'no_show'
+  const pendingAckCount = resvList.filter(needsAckResv).length
 
   const units: any[] = schedule?.units || []
 
@@ -243,7 +528,7 @@ export function SchedulePage() {
       }),
     {
       onSuccess: () => { qc.invalidateQueries('schedule') },
-      onError: () => { alert('Cannot move booking — date conflict on that unit.') }
+      onError: () => { alert('Cannot move reservation — date conflict on that unit.') }
     }
   )
 
@@ -526,13 +811,30 @@ export function SchedulePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isLoading, view, colW])
 
+  // Per-user tab gating: staff see only the sub-tabs they hold; owners see all.
+  const SCHEDULE_TABS = ([
+    { key: 'timeline',     perm: 'schedule.tab.timeline' },
+    { key: 'list',         perm: 'schedule.tab.list' },
+    { key: 'units',        perm: 'schedule.tab.units' },
+    { key: 'history',      perm: 'schedule.tab.history' },
+    { key: 'reservations', perm: 'bookings.view' },
+    { key: 'requests',     perm: 'bookings.change_requests' },
+    { key: 'booking_page', perm: 'booking_sites.view', label: 'Booking Page' },
+  ] as { key: string; perm: string; label?: string }[]).filter(t => can(t.perm))
+  // If the active view isn't visible to this user, snap to their first tab.
+  const visibleTabKeys = SCHEDULE_TABS.map(t => t.key).join(',')
+  useEffect(() => {
+    if (SCHEDULE_TABS.length && !SCHEDULE_TABS.some(t => t.key === view)) setView(SCHEDULE_TABS[0].key as any)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visibleTabKeys])
+
   return (
     <div style={{minWidth:0,overflow:'hidden'}}>
       {/* ── COMPACT TOOLBAR ── */}
       <div style={{display:'flex',gap:8,alignItems:'center',marginBottom:12,flexWrap:'wrap'}}>
         {/* View toggle */}
-        {(['timeline','list','units','history'] as const).map(v => (
-          <button key={v} className={`tab-btn ${view===v?'active':''}`} onClick={()=>setView(v)} style={{textTransform:'capitalize',fontSize:'.78rem'}}>{v}</button>
+        {SCHEDULE_TABS.map(({ key: v, label }) => (
+          <button key={v} className={`tab-btn ${view===v?'active':''}`} onClick={()=>setView(v as any)} style={{textTransform: label ? 'none' : 'capitalize',fontSize:'.78rem'}}>{label ?? v}</button>
         ))}
 
         {/* Reservation search */}
@@ -569,18 +871,14 @@ export function SchedulePage() {
           <span style={{fontSize:'.72rem',color:'var(--text-3)'}}>← scroll for past · future →</span>
         </>}
 
-        <div style={{width:1,height:20,background:'var(--border-1)',margin:'0 4px'}} />
-
-        {/* Unit type filters */}
-        {['all',...UNIT_TYPES].map(t => (
-          <button key={t} className={`tab-btn ${filterType===t?'active':''}`} style={{fontSize:'.70rem',padding:'3px 8px'}}
-            onClick={()=>setFilterType(t)}>{t==='all'?'All':UNIT_TYPE_LABELS[t]||t}</button>
-        ))}
+        {/* Unit-type filter chips removed (S: crowded the toolbar). filterType
+            stays 'all' so all units show; landlords still set unit type at
+            creation. */}
 
         {/* Stats + New Reservation */}
         <div style={{marginLeft:'auto',display:'flex',gap:8,alignItems:'center'}}>
-          <span style={{fontSize:'.72rem',color:'var(--text-3)'}}>{filteredUnits.length} units · {bookings.length} bookings</span>
-          <button className="btn btn-primary btn-sm" onClick={()=>setNewResvOpen(true)}>+ New Reservation</button>
+          <span style={{fontSize:'.72rem',color:'var(--text-3)'}}>{filteredUnits.length} units · {bookings.length} reservations</span>
+          {can('schedule.create_reservation') && <button className="btn btn-primary btn-sm" onClick={()=>setNewResvOpen(true)}>+ New Reservation</button>}
         </div>
       </div>
 
@@ -647,8 +945,8 @@ export function SchedulePage() {
                         <div style={{fontSize:'.65rem',color:'var(--text-3)'}}>{unit.propertyName}</div>
                       </div>
                       <div style={{display:'flex',gap:4}}>
-                        {unit.isBookable && <button className="btn btn-ghost btn-sm" style={{fontSize:'.65rem',padding:'2px 6px'}} onClick={()=>openBookingModal(unit)}>+ Book</button>}
-                        <button className="btn btn-ghost btn-sm" style={{fontSize:'.65rem',padding:'2px 6px'}} onClick={()=>openTypeModal(unit)}>⚙</button>
+                        {unit.isBookable && can('schedule.create_reservation') && <button className="btn btn-ghost btn-sm" style={{fontSize:'.65rem',padding:'2px 6px'}} onClick={()=>openBookingModal(unit)}>+ Book</button>}
+                        {can('schedule.configure_unit') && <button className="btn btn-ghost btn-sm" style={{fontSize:'.65rem',padding:'2px 6px'}} onClick={()=>openTypeModal(unit)}>⚙</button>}
                       </div>
                     </div>
                   </td>
@@ -844,7 +1142,7 @@ export function SchedulePage() {
                   <div style={{fontWeight:700,color:'var(--gold)'}}>{fmt(b.totalAmount)}</div>
                   <div style={{fontSize:'.72rem',color:'var(--text-3)'}}>Fee: {fmt(b.platformFee)}</div>
                 </div>
-                {!['cancelled','checked_out','no_show'].includes(b.status) && (
+                {can('guest_access') && !['cancelled','checked_out','no_show'].includes(b.status) && (
                   <button className="btn btn-ghost btn-sm" style={{fontSize:'.68rem',padding:'3px 8px',whiteSpace:'nowrap'}}
                     onClick={()=>openGuestAccess(b)}>Guest link</button>
                 )}
@@ -903,8 +1201,8 @@ export function SchedulePage() {
               )}
               {unit.unitDescription && <div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:10,lineHeight:1.5}}>{unit.unitDescription}</div>}
               <div style={{display:'flex',gap:6}}>
-                <button className="btn btn-ghost btn-sm" style={{flex:1}} onClick={()=>openTypeModal(unit)}>⚙ Configure</button>
-                {unit.isBookable && <button className="btn btn-primary btn-sm" style={{flex:1}} onClick={()=>openBookingModal(unit)}>+ Book</button>}
+                {can('schedule.configure_unit') && <button className="btn btn-ghost btn-sm" style={{flex:1}} onClick={()=>openTypeModal(unit)}>⚙ Configure</button>}
+                {unit.isBookable && can('schedule.create_reservation') && <button className="btn btn-primary btn-sm" style={{flex:1}} onClick={()=>openBookingModal(unit)}>+ Book</button>}
               </div>
             </div>
           ))}
@@ -935,6 +1233,310 @@ export function SchedulePage() {
               </div>
             )
           })}
+        </div>
+      )}
+
+      {/* ── RESERVATIONS VIEW ── filterable flat table (ported from Bookings) */}
+      {view==='reservations' && (
+        <div>
+          {/* Filters */}
+          <div className="card" style={{ padding: 16, marginBottom: 16 }}>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12 }}>
+              <div>
+                <label style={{ display: 'block', fontSize: '.7rem', color: 'var(--text-3)', marginBottom: 4 }}>Search guest</label>
+                <div style={{ position: 'relative' }}>
+                  <Search size={14} style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-3)' }} />
+                  <input value={resvSearch} onChange={e => setResvSearch(e.target.value)} placeholder="name or email" className="input" style={{ paddingLeft: 32 }} />
+                </div>
+              </div>
+              <div>
+                <label style={{ display: 'block', fontSize: '.7rem', color: 'var(--text-3)', marginBottom: 4 }}>Status</label>
+                <select value={resvStatus} onChange={e => setResvStatus(e.target.value)} className="input">
+                  <option value="">All</option>
+                  <option value="confirmed">Confirmed</option>
+                  <option value="checked_in">Checked-in</option>
+                  <option value="checked_out">Checked-out</option>
+                  <option value="cancelled">Cancelled</option>
+                  <option value="no_show">No-show</option>
+                </select>
+              </div>
+              <div>
+                <label style={{ display: 'block', fontSize: '.7rem', color: 'var(--text-3)', marginBottom: 4 }}>Source</label>
+                <select value={resvSource} onChange={e => setResvSource(e.target.value)} className="input">
+                  <option value="">All</option>
+                  <option value="direct">Direct</option>
+                  <option value="airbnb">Airbnb</option>
+                  <option value="vrbo">VRBO</option>
+                  <option value="booking_com">Booking.com</option>
+                  <option value="other">Other</option>
+                </select>
+              </div>
+              <div>
+                <label style={{ display: 'block', fontSize: '.7rem', color: 'var(--text-3)', marginBottom: 4 }}>From</label>
+                <input type="date" value={resvFrom} onChange={e => setResvFrom(e.target.value)} className="input" />
+              </div>
+              <div>
+                <label style={{ display: 'block', fontSize: '.7rem', color: 'var(--text-3)', marginBottom: 4 }}>To</label>
+                <input type="date" value={resvTo} onChange={e => setResvTo(e.target.value)} className="input" />
+              </div>
+            </div>
+          </div>
+
+          {pendingAckCount > 0 && (
+            <div
+              className="card"
+              style={{
+                padding: '10px 14px', marginBottom: 12,
+                background: 'rgba(245,158,11,.08)', border: '1px solid rgba(245,158,11,.3)',
+                display: 'flex', alignItems: 'center', gap: 10,
+              }}
+            >
+              <AlertTriangle size={16} style={{ color: 'var(--amber)' }} />
+              <span style={{ fontSize: '.85rem', color: 'var(--text-1)' }}>
+                <strong>{pendingAckCount}</strong> reservation{pendingAckCount === 1 ? '' : 's'} need{pendingAckCount === 1 ? 's' : ''} property-rules acknowledgment.
+                Click <FileSignature size={11} style={{ display: 'inline', verticalAlign: 'middle' }} /> on each row after collecting the guest's signature.
+              </span>
+            </div>
+          )}
+
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 8, padding: '0 4px' }}>
+            <div style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>{resvList.length} reservations</div>
+            <div style={{ fontSize: '.78rem', color: 'var(--text-2)' }}>
+              Total revenue: <strong style={{ color: 'var(--text-0)' }}>{fmt(resvTotalAmount)}</strong>
+            </div>
+          </div>
+
+          <div className="card" style={{ padding: 0, overflowX: 'auto' }}>
+            {resvLoading ? (
+              <div style={{ padding: 32, color: 'var(--text-3)', textAlign: 'center' }}>Loading…</div>
+            ) : resvList.length === 0 ? (
+              <div style={{ padding: 32, color: 'var(--text-3)', textAlign: 'center' }}>
+                No reservations match the filters.
+              </div>
+            ) : (
+              <table className="data-table" style={{ minWidth: 1000 }}>
+                <thead>
+                  <tr>
+                    <th>Status</th>
+                    <th>Guest</th>
+                    <th>Unit</th>
+                    <th>Check-in</th>
+                    <th>Nights</th>
+                    <th>Total</th>
+                    <th>Source</th>
+                    <th>Ack</th>
+                    <th>Stay link</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {resvList.map(b => (
+                    <tr key={b.id}>
+                      <td><span className={`badge ${RESV_STATUS_BADGE[b.status] || 'badge-muted'}`}>{b.status.replace('_', ' ')}</span></td>
+                      <td>
+                        <div style={{ color: 'var(--text-0)', fontWeight: 600 }}>{b.guestName || '—'}</div>
+                        <div style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>{b.guestEmail || ''}</div>
+                      </td>
+                      <td>
+                        <div style={{ color: 'var(--text-0)' }}>{b.unitNumber}</div>
+                        <div style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>{b.propertyName}</div>
+                      </td>
+                      <td className="mono" style={{ fontSize: '.78rem' }}>
+                        {new Date(b.checkIn).toLocaleDateString()}
+                        <div style={{ fontSize: '.65rem', color: 'var(--text-3)' }}>→ {new Date(b.checkOut).toLocaleDateString()}</div>
+                      </td>
+                      <td className="mono">{b.nights}</td>
+                      <td className="mono" style={{ color: 'var(--text-0)' }}>{fmt(b.totalAmount)}</td>
+                      <td>
+                        <span style={{ fontSize: '.72rem', color: 'var(--text-2)', textTransform: 'capitalize' }}>
+                          {b.source.replace('_', '.')}
+                        </span>
+                      </td>
+                      <td>
+                        {!b.requiresBookingAcknowledgment ? (
+                          <span style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>—</span>
+                        ) : b.acknowledgmentSignedAt ? (
+                          <span
+                            title={`Acknowledged ${new Date(b.acknowledgmentSignedAt).toLocaleString()}`}
+                            style={{ display: 'inline-flex', alignItems: 'center', gap: 4, color: 'var(--green)', fontSize: '.72rem' }}
+                          >
+                            <CheckCircle2 size={13} /> Acknowledged
+                          </span>
+                        ) : needsAckResv(b) && can('bookings.acknowledge') ? (
+                          <button
+                            className="btn btn-ghost btn-sm"
+                            onClick={() => ackMut.mutate(b)}
+                            disabled={ackMut.isLoading}
+                            style={{ display: 'inline-flex', alignItems: 'center', gap: 4, color: 'var(--amber)' }}
+                            title="Mark this reservation as having a signed property-rules acknowledgment"
+                          >
+                            <FileSignature size={12} />
+                            Acknowledge
+                          </button>
+                        ) : (
+                          <span style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>n/a</span>
+                        )}
+                      </td>
+                      <td>
+                        {can('guest_access') && (
+                          <button
+                            className="btn btn-ghost btn-sm"
+                            onClick={() => setLinkBooking(b)}
+                            style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}
+                            title="Show the guest stay-assistant link and QR, or revoke access"
+                          >
+                            <QrCode size={12} /> Stay link
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+
+          {linkBooking && (
+            <GuestAccessModal booking={linkBooking} onClose={() => setLinkBooking(null)} />
+          )}
+        </div>
+      )}
+
+      {/* ── REQUESTS VIEW ── guest change-requests (ported from Bookings) */}
+      {view==='requests' && (
+        <div className="card" style={{ padding: 16 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+            <MessageSquare size={16} style={{ color: 'var(--gold)' }} />
+            <strong style={{ fontSize: '.9rem' }}>Guest requests</strong>
+            {changeRequests.length > 0 && <span className="badge badge-blue" style={{ marginLeft: 2 }}>{changeRequests.length}</span>}
+          </div>
+          {changeRequests.length === 0 ? (
+            <div style={{ padding: 24, textAlign: 'center', color: 'var(--text-3)', fontSize: '.84rem' }}>No open guest requests.</div>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+              {changeRequests.map(cr => (
+                <div
+                  key={cr.id}
+                  style={{
+                    display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                    gap: 12, flexWrap: 'wrap',
+                    padding: '12px 14px', border: '1px solid var(--border)', borderRadius: 8,
+                    background: 'var(--bg-1)',
+                  }}
+                >
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                      <span className="badge badge-blue">{BOOKING_CHANGE_REQUEST_TYPE_LABEL[cr.requestType]}</span>
+                      <strong style={{ fontSize: '.88rem' }}>{cr.guestName || 'Guest'}</strong>
+                      <span style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>
+                        {cr.propertyName || '—'}{cr.unitNumber ? ` · Unit ${cr.unitNumber}` : ''}
+                        {' · '}{fmtDate(cr.checkIn)}–{fmtDate(cr.checkOut)}
+                      </span>
+                    </div>
+                    {cr.details && (
+                      <div style={{ fontSize: '.82rem', color: 'var(--text-1)', marginTop: 4 }}>{cr.details}</div>
+                    )}
+                  </div>
+                  {can('bookings.resolve_change_request') && (
+                    <div style={{ display: 'flex', gap: 8, flexShrink: 0 }}>
+                      <button
+                        className="btn btn-sm"
+                        disabled={resolveMut.isLoading}
+                        onClick={() => resolveMut.mutate({ id: cr.id, status: 'approved' })}
+                      >
+                        <Check size={13} /> Approve
+                      </button>
+                      <button
+                        className="btn btn-ghost btn-sm"
+                        disabled={resolveMut.isLoading}
+                        onClick={() => resolveMut.mutate({ id: cr.id, status: 'declined' })}
+                      >
+                        <X size={13} /> Decline
+                      </button>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── BOOKING PAGE VIEW ── public per-property booking-site config (ported from BookingSitesPage) */}
+      {view==='booking_page' && (
+        <div>
+          <div style={{ marginBottom: 12 }}>
+            <div style={{ fontSize: '.9rem', fontWeight: 700 }}>Booking Page</div>
+            <div style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>Public per-property booking pages — guests book short stays and pay a deposit</div>
+          </div>
+
+          <div className="card" style={{ padding: 16, maxWidth: 560 }}>
+            <label className="form-label">Property</label>
+            <select className="input" value={bpPropId} onChange={e => setBpPropId(e.target.value)} style={{ marginBottom: 16 }}>
+              {bpProperties.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+            </select>
+
+            {!bpCfg ? <div style={{ color: 'var(--text-3)' }}>Loading…</div> : (
+              <>
+                <label className="form-label">Booking address (slug)</label>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
+                  <input className="input" value={bpCfg.slug || ''} placeholder="sunny-rv-park"
+                    onChange={e => setBpCfg((c: any) => ({ ...c, slug: e.target.value.toLowerCase() }))} style={{ flex: 1 }} />
+                </div>
+                <div style={{ color: 'var(--text-3)', fontSize: '.8rem', marginBottom: 14 }}>
+                  Lowercase letters, numbers, hyphens. Your site: {bpPublicUrl
+                    ? <a href={bpPublicUrl} target="_blank" rel="noreferrer">{bpPublicUrl}</a>
+                    : '— set a slug first'}
+                </div>
+
+                <label className="form-label">Welcome text (optional)</label>
+                <textarea className="input" rows={3} value={bpCfg.intro || ''}
+                  onChange={e => setBpCfg((c: any) => ({ ...c, intro: e.target.value }))} style={{ marginBottom: 14, resize: 'vertical' }} />
+
+                <div style={{ borderTop: '1px solid var(--border-1)', margin: '6px 0 14px' }} />
+                <div style={{ fontWeight: 600, marginBottom: 4 }}>Stay rates</div>
+                <div style={{ color: 'var(--text-3)', fontSize: '.8rem', marginBottom: 10 }}>
+                  Used for every reservation at this property (Master Schedule + booking site). The rate tier
+                  follows the length of stay — under 7 nights nightly, 7–29 weekly, 30+ monthly — prorated for
+                  odd lengths.
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10, marginBottom: 12 }}>
+                  <div>
+                    <label className="form-label">Nightly ($)</label>
+                    <input className="input" type="number" min={0} value={bpCfg.nightlyRate ?? ''} placeholder="—"
+                      onChange={e => setBpCfg((c: any) => ({ ...c, nightlyRate: e.target.value }))} />
+                  </div>
+                  <div>
+                    <label className="form-label">Weekly ($)</label>
+                    <input className="input" type="number" min={0} value={bpCfg.weeklyRate ?? ''} placeholder="—"
+                      onChange={e => setBpCfg((c: any) => ({ ...c, weeklyRate: e.target.value }))} />
+                  </div>
+                  <div>
+                    <label className="form-label">Monthly ($)</label>
+                    <input className="input" type="number" min={0} value={bpCfg.monthlyRate ?? ''} placeholder="—"
+                      onChange={e => setBpCfg((c: any) => ({ ...c, monthlyRate: e.target.value }))} />
+                  </div>
+                </div>
+
+                <label className="form-label">Short-term lodging tax (% — applied to stays under 30 nights; 30+ is tax-exempt)</label>
+                <input className="input" type="number" min={0} max={100} value={bpCfg.shortTermTaxRate ?? 0}
+                  onChange={e => setBpCfg((c: any) => ({ ...c, shortTermTaxRate: e.target.value }))} style={{ marginBottom: 16, maxWidth: 140 }} />
+
+                <div style={{ borderTop: '1px solid var(--border-1)', margin: '6px 0 14px' }} />
+                <label className="form-label">Deposit at booking (% of stay total)</label>
+                <input className="input" type="number" min={0} max={100} value={bpCfg.depositPct}
+                  onChange={e => setBpCfg((c: any) => ({ ...c, depositPct: e.target.value }))} style={{ marginBottom: 16, maxWidth: 140 }} />
+
+                <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16, cursor: 'pointer' }}>
+                  <input type="checkbox" checked={!!bpCfg.enabled} onChange={e => setBpCfg((c: any) => ({ ...c, enabled: e.target.checked }))} />
+                  <span><b>Publish</b> this booking site (live to the public)</span>
+                </label>
+
+                {can('booking_sites.edit') && <button className="btn" disabled={bpSaving} onClick={saveBookingConfig}>{bpSaving ? 'Saving…' : 'Save'}</button>}
+                {bpMsg && <span style={{ color: 'var(--green)', marginLeft: 12 }}>{bpMsg}</span>}
+                {bpErr && <span style={{ color: 'var(--red,#ff6b81)', marginLeft: 12 }}>{bpErr}</span>}
+              </>
+            )}
+          </div>
         </div>
       )}
 
@@ -1023,13 +1625,15 @@ export function SchedulePage() {
                 <div style={{marginTop:16,fontSize:'.78rem',color:'var(--text-3)'}}>Leases are managed on the Leases page.</div>
               ) : (
                 <div style={{display:'flex',gap:8,marginTop:18}}>
-                  <button className="btn btn-ghost btn-sm" onClick={()=>copyStayLink(d)}>Copy stay link</button>
-                  {d.status!=='cancelled' && <button className="btn btn-ghost btn-sm" onClick={()=>startEdit(d)}>Edit</button>}
-                  <button className="btn btn-sm" style={{marginLeft:'auto',color:'var(--red,#ff6b81)',borderColor:'var(--red,#ff6b81)'}}
-                    disabled={cancelBookingMut.isLoading || d.status==='cancelled'}
-                    onClick={()=>{ if(confirm('Cancel this reservation?')) cancelBookingMut.mutate(d) }}>
-                    {cancelBookingMut.isLoading?'Cancelling…':'Cancel reservation'}
-                  </button>
+                  {can('guest_access') && <button className="btn btn-ghost btn-sm" onClick={()=>copyStayLink(d)}>Copy stay link</button>}
+                  {can('schedule.edit_reservation') && d.status!=='cancelled' && <button className="btn btn-ghost btn-sm" onClick={()=>startEdit(d)}>Edit</button>}
+                  {can('schedule.edit_reservation') && (
+                    <button className="btn btn-sm" style={{marginLeft:'auto',color:'var(--red,#ff6b81)',borderColor:'var(--red,#ff6b81)'}}
+                      disabled={cancelBookingMut.isLoading || d.status==='cancelled'}
+                      onClick={()=>{ if(confirm('Cancel this reservation?')) cancelBookingMut.mutate(d) }}>
+                      {cancelBookingMut.isLoading?'Cancelling…':'Cancel reservation'}
+                    </button>
+                  )}
                 </div>
               )}
               </>)}
@@ -1202,7 +1806,7 @@ export function SchedulePage() {
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Description</div><textarea className="form-input" style={{width:'100%',minHeight:70,resize:'vertical'}} placeholder="Pull-through site, full hookups..." value={typeForm.unitDescription} onChange={e=>setTypeForm((s:any)=>({...s,unitDescription:e.target.value}))} /></div>
               <div style={{display:'flex',alignItems:'center',gap:8}}>
                 <input type="checkbox" id="ib" checked={typeForm.isBookable} onChange={e=>setTypeForm((s:any)=>({...s,isBookable:e.target.checked}))} />
-                <label htmlFor="ib" style={{fontSize:'.82rem'}}>Allow short-term bookings on this unit</label>
+                <label htmlFor="ib" style={{fontSize:'.82rem'}}>Allow short-term reservations on this unit</label>
               </div>
               <button className="btn btn-primary" onClick={()=>updateTypeMut.mutate()} disabled={updateTypeMut.isLoading}>
                 {updateTypeMut.isLoading?'Saving...':'Save Configuration'}
@@ -1217,7 +1821,7 @@ export function SchedulePage() {
         <div className="modal-overlay" onClick={()=>setBookingModal({show:false,unit:null})}>
           <div className="modal" style={{maxWidth:480}} onClick={e=>e.stopPropagation()}>
             <div className="modal-header">
-              <span className="modal-title">New Booking — {bookingModal.unit?.unitNumber}</span>
+              <span className="modal-title">New Reservation — {bookingModal.unit?.unitNumber}</span>
               <button className="btn btn-ghost btn-sm" onClick={()=>setBookingModal({show:false,unit:null})}>✕</button>
             </div>
             <div style={{padding:'0 24px 24px',display:'grid',gap:12}}>
@@ -1239,7 +1843,7 @@ export function SchedulePage() {
                 Platform fee: 5% of total · Net to you: {fmt(Number(newBooking.totalAmount||0)*0.95)}
               </div>
               <button className="btn btn-primary" onClick={()=>createBookingMut.mutate()} disabled={!newBooking.checkIn||!newBooking.checkOut||createBookingMut.isLoading}>
-                {createBookingMut.isLoading?'Creating...':'Create Booking'}
+                {createBookingMut.isLoading?'Creating...':'Create Reservation'}
               </button>
             </div>
           </div>
@@ -1269,7 +1873,7 @@ export function SchedulePage() {
                     <button className="btn btn-ghost btn-sm" onClick={()=>navigator.clipboard?.writeText(guestAccess.data!.url)}>Copy</button>
                   </div>
                   <div style={{fontSize:'.7rem',color:'var(--text-3)',marginBottom:12}}>
-                    Link expires {new Date(guestAccess.data.expiresAt).toLocaleDateString()}. Keep it private — anyone with it can see this booking.
+                    Link expires {new Date(guestAccess.data.expiresAt).toLocaleDateString()}. Keep it private — anyone with it can see this reservation.
                   </div>
                   {guestAccess.booking?.guestEmail && (
                     guestAccess.data.emailed

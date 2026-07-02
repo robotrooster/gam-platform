@@ -18,7 +18,7 @@
 import { Router } from 'express'
 import { z } from 'zod'
 import { query, queryOne } from '../db'
-import { requireAuth } from '../middleware/auth'
+import { requireAuth, requirePerm } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { validateAbaRoutingNumber } from '../lib/banking'
 import { encryptBankAccountNumber, last4 } from '../lib/bankAccountCrypto'
@@ -59,6 +59,9 @@ const createSchema = z.object({
   accountNumber: z.string(),
 })
 
+// Self-service: adds the CALLER's own bank account (req.user), never the
+// landlord's — so it is NOT gated on a landlord-staff catalog key (that would
+// block property_manager/manager direct-deposit self-onboarding for no gain).
 bankAccountsRouter.post('/', async (req, res, next) => {
   try {
     const body = createSchema.parse(req.body)
@@ -115,6 +118,7 @@ bankAccountsRouter.patch('/:id', async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
+// Self-service: archives the CALLER's own bank account — not gated (see above).
 bankAccountsRouter.post('/:id/archive', async (req, res, next) => {
   try {
     const row = await queryOne<BankAccountSummary>(`

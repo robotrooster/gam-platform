@@ -1,7 +1,7 @@
 import { Router } from 'express'
 import { z } from 'zod'
 import { query, queryOne } from '../db'
-import { requireAuth } from '../middleware/auth'
+import { requireAuth, requirePerm } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { canManageLandlordResource } from '../middleware/scope'
 
@@ -49,7 +49,7 @@ propertyBookingAdminRouter.get('/properties/:id/booking-config', requireAuth, as
 const SLUG_RE = /^[a-z0-9][a-z0-9-]{1,60}$/
 
 // ── PATCH /api/properties/:id/booking-config ──
-propertyBookingAdminRouter.patch('/properties/:id/booking-config', requireAuth, async (req, res, next) => {
+propertyBookingAdminRouter.patch('/properties/:id/booking-config', requireAuth, requirePerm('booking_sites.edit'), async (req, res, next) => {
   try {
     const body = z.object({
       enabled:    z.boolean().optional(),
@@ -123,7 +123,7 @@ propertyBookingAdminRouter.patch('/properties/:id/booking-config', requireAuth, 
 
 // ── POST /api/properties/:id/waitlist — staff adds a guest to a property-wide
 // waitlist (any unit). Used when every unit is full for the requested dates. ──
-propertyBookingAdminRouter.post('/properties/:id/waitlist', requireAuth, async (req, res, next) => {
+propertyBookingAdminRouter.post('/properties/:id/waitlist', requireAuth, requirePerm('schedule.create_reservation'), async (req, res, next) => {
   try {
     const body = z.object({
       guestName:  z.string().min(1),

@@ -4,6 +4,7 @@ import { Link, useNavigate } from 'react-router-dom'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
 import { Building2, Plus, MapPin, DoorOpen, Users, DollarSign, X, Check, Edit2, Landmark } from 'lucide-react'
 import { AddUnitModal } from './AddUnitModal'
+import { usePerms } from '../lib/permissions'
 import { LawWarningBanner, type LawFlag } from '../components/LawWarningBanner'
 import { UNIT_TYPES, UNIT_TYPE_LABEL, UNIT_TYPE_PREFIX, UNIT_TYPE_ICON, UNIT_TYPE_HAS_BEDROOMS, UnitType, FEE_PAYER_VALUES, type FeePayer } from '@gam/shared'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
@@ -534,7 +535,7 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
               properties where rules need explicit guest sign-off. */}
           <div style={{ marginBottom: 14, paddingTop: 10, borderTop: '1px solid var(--border-0)' }}>
             <div style={{ fontSize: '.78rem', fontWeight: 600, marginBottom: 4, color: 'var(--text-2)' }}>
-              Booking policy
+              Reservation policy
             </div>
             <label style={{
               display:        'flex',
@@ -554,10 +555,10 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
                 style={{ marginTop: 3 }}
               />
               <div>
-                <div style={{ fontWeight: 600, color: 'var(--text-1)' }}>Require booking acknowledgment</div>
+                <div style={{ fontWeight: 600, color: 'var(--text-1)' }}>Require reservation acknowledgment</div>
                 <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 3, lineHeight: 1.5 }}>
-                  Every booking on this property will track whether the guest signed the property
-                  rules. Staff mark each booking acknowledged after the signature is on file. Useful
+                  Every reservation on this property will track whether the guest signed the property
+                  rules. Staff mark each reservation acknowledged after the signature is on file. Useful
                   for RV parks and short-stay properties where house rules need explicit sign-off.
                 </div>
               </div>
@@ -1048,6 +1049,7 @@ export function PropertiesPage() {
 
   const { data: props = [], isLoading } = useQuery<any[]>('properties', () => apiGet('/properties'))
   const { data: units = [] } = useQuery<any[]>('units', () => apiGet('/units'))
+  const { can } = usePerms()
 
   // Compute stats per property
   const propStats = (props as any[]).map(p => {
@@ -1071,12 +1073,16 @@ export function PropertiesPage() {
           <p className="page-subtitle">{(props as any[]).length} properties · {totalUnits} units · {totalOccupied} occupied</p>
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
-          <button className="btn btn-ghost" onClick={() => navigate('/property-onboarding')}>
-            Bulk import CSV
-          </button>
-          <button className="btn btn-primary" onClick={() => setShowAdd(true)}>
-            <Plus size={15} /> Add Property
-          </button>
+          {can('properties.bulk_import') && (
+            <button className="btn btn-ghost" onClick={() => navigate('/property-onboarding')}>
+              Bulk import CSV
+            </button>
+          )}
+          {can('properties.create') && (
+            <button className="btn btn-primary" onClick={() => setShowAdd(true)}>
+              <Plus size={15} /> Add Property
+            </button>
+          )}
         </div>
       </div>
 
@@ -1107,7 +1113,9 @@ export function PropertiesPage() {
           <Building2 size={48} />
           <h3>No properties yet</h3>
           <p>Add your first property to start managing units and collecting rent.</p>
-          <button className="btn btn-primary" onClick={() => setShowAdd(true)}><Plus size={14} /> Add First Property</button>
+          {can('properties.create') && (
+            <button className="btn btn-primary" onClick={() => setShowAdd(true)}><Plus size={14} /> Add First Property</button>
+          )}
         </div>
       ) : (
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))', gap: 16 }}>
@@ -1139,9 +1147,11 @@ export function PropertiesPage() {
                       </div>
                     </div>
                     <div style={{ display: 'flex', gap: 6 }}>
-                      <button className="btn btn-ghost btn-sm" onClick={e => { e.stopPropagation(); setEditProp(p) }} style={{ padding: '4px 8px' }}>
-                        <Edit2 size={12} />
-                      </button>
+                      {can('properties.edit') && (
+                        <button className="btn btn-ghost btn-sm" onClick={e => { e.stopPropagation(); setEditProp(p) }} style={{ padding: '4px 8px' }}>
+                          <Edit2 size={12} />
+                        </button>
+                      )}
                     </div>
                   </div>
 
@@ -1198,9 +1208,11 @@ export function PropertiesPage() {
                     <button className="btn btn-ghost btn-sm" style={{ flex: 1 }} onClick={e => { e.stopPropagation(); navigate(`/properties/${p.id}`) }}>
                       <DoorOpen size={13} /> View Units
                     </button>
-                    <button className="btn btn-primary btn-sm" style={{ flex: 1 }} onClick={e => { e.stopPropagation(); setAddUnitForProp(p) }}>
-                      <Plus size={13} /> Add Unit
-                    </button>
+                    {can('properties.add_unit') && (
+                      <button className="btn btn-primary btn-sm" style={{ flex: 1 }} onClick={e => { e.stopPropagation(); setAddUnitForProp(p) }}>
+                        <Plus size={13} /> Add Unit
+                      </button>
+                    )}
                   </div>
                 </div>
               </div>

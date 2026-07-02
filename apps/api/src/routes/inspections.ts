@@ -5,7 +5,7 @@ import path from 'path'
 import fs from 'fs'
 import crypto from 'crypto'
 import { query, queryOne, getClient } from '../db'
-import { requireAuth } from '../middleware/auth'
+import { requireAuth, requirePerm } from '../middleware/auth'
 import { canManageLandlordResource, canAccessLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
 import { emitInspectionFinalizedEvents } from '../services/creditLedgerEmitters'
@@ -90,7 +90,7 @@ const createSchema = z.object({
   notes: z.string().optional(),
 })
 
-inspectionsRouter.post('/', async (req, res, next) => {
+inspectionsRouter.post('/', requirePerm('inspections.create'), async (req, res, next) => {
   const client = await getClient()
   try {
     const body = createSchema.parse(req.body)
@@ -594,7 +594,7 @@ inspectionsRouter.post('/:id/sign', async (req, res, next) => {
 // ── POST /api/inspections/:id/finalize ─────────────────────────
 // Landlord-only. Requires both tenant + landlord signatures present.
 // Emits credit-ledger events transactionally.
-inspectionsRouter.post('/:id/finalize', async (req, res, next) => {
+inspectionsRouter.post('/:id/finalize', requirePerm('inspections.manage'), async (req, res, next) => {
   try {
     const insp = await loadInspectionRow(req.params.id, req)
     if (!canManageLandlordResource(req.user, insp.landlord_id)) {

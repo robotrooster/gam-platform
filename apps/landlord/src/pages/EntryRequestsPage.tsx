@@ -3,6 +3,7 @@ import { useQuery } from 'react-query'
 import { Link } from 'react-router-dom'
 import { DoorOpen, Plus } from 'lucide-react'
 import { apiGet } from '../lib/api'
+import { usePerms } from '../lib/permissions'
 
 type Row = {
   id: string
@@ -39,6 +40,7 @@ export function EntryRequestsPage() {
     () => (data as Row[]).filter(r => !statusFilter || r.status === statusFilter),
     [data, statusFilter],
   )
+  const { can } = usePerms()
 
   return (
     <div>
@@ -52,9 +54,11 @@ export function EntryRequestsPage() {
             time = landlord-side credit. Outside window or no grant = breach.
           </div>
         </div>
-        <Link to="/entry-requests/new" className="btn btn-primary">
-          <Plus size={15} /> New Request
-        </Link>
+        {can('entry_requests.create') && (
+          <Link to="/entry-requests/new" className="btn btn-primary">
+            <Plus size={15} /> New Request
+          </Link>
+        )}
       </div>
 
       <div className="card" style={{ padding: 16, marginBottom: 16 }}>

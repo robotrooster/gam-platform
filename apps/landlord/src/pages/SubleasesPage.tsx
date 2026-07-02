@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { ScrollText, Check, X, AlertTriangle } from 'lucide-react'
 import { apiGet, apiPatch } from '../lib/api'
+import { usePerms } from '../lib/permissions'
 
 // S198: landlord-side sublease decisions + termination.
 // Backend: routes/subleases.ts (S197).
@@ -43,6 +44,7 @@ export function SubleasesPage() {
   const [viewTarget, setViewTarget] = useState<Sublease | null>(null)
   const [decideNote, setDecideNote] = useState('')
   const [terminateReason, setTerminateReason] = useState('')
+  const { can } = usePerms()
 
   const { data: rows = [], isLoading } = useQuery<Sublease[]>(
     'subleases',
@@ -153,7 +155,7 @@ export function SubleasesPage() {
                   <td className="mono">{fmtMoney(s.subMonthlyAmount)}</td>
                   <td className="mono">{fmtMoney(s.masterShareAmount)}</td>
                   <td style={{ textAlign: 'right' }}>
-                    {s.status === 'pending' && (
+                    {can('subleases.decide') && s.status === 'pending' && (
                       <div style={{ display: 'flex', gap: 4, justifyContent: 'flex-end' }}>
                         <button
                           className="btn btn-ghost btn-sm"
@@ -175,7 +177,7 @@ export function SubleasesPage() {
                       {s.status !== 'pending' && (
                         <button className="btn btn-ghost btn-sm" onClick={() => setViewTarget(s)}>View</button>
                       )}
-                      {s.status === 'active' && (
+                      {can('subleases.terminate') && s.status === 'active' && (
                         <button
                           className="btn btn-ghost btn-sm"
                           style={{ color: 'var(--red)' }}
