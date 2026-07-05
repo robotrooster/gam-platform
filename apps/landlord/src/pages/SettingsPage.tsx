@@ -6,6 +6,7 @@ import { Check, DollarSign, X, ShieldCheck } from 'lucide-react'
 import { LAUNCH_HIDDEN } from '../components/layout/Layout'
 import { useAuth } from '../context/AuthContext'
 import { usePerms } from '../lib/permissions'
+import { NotificationPrefsSection } from './NotificationPrefsPage'
 
 interface LinkedPmCompany {
   id: string
@@ -193,13 +194,10 @@ export function SettingsPage() {
             />
           )}
 
-          {/* Notifications placeholder */}
-          <div className="card">
-            <div className="card-header"><span className="card-title">Notifications</span></div>
-            <div style={{ color: 'var(--text-3)', fontSize: '.88rem', marginTop: 12 }}>
-              See <a href="/notification-prefs">Notification Preferences</a> in the sidebar.
-            </div>
-          </div>
+          {/* W-53 (S531): Notification Prefs merged in as a real section —
+              the standalone nav item is gone. The section renders its own
+              cards, so no wrapper card here. */}
+          <NotificationPrefsSection />
         </div>
       )}
     </div>

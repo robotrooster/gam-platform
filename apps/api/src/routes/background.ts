@@ -8,6 +8,7 @@ import {
 } from '../services/email'
 import { buildAdverseActionNoticeText } from '../lib/adverseAction'
 import { calculateRiskScore } from '../services/riskScore'
+import { findStayConflict } from '../services/unitAvailability'
 import { getProvider } from '../services/backgroundProvider'
 import { query, queryOne } from '../db'
 import { requireAuth, requireAdmin, requirePerm } from '../middleware/auth'
@@ -929,18 +930,33 @@ backgroundRouter.post('/pool/:poolId/reach-out', requireAuth, requirePerm('appli
     )
     if (existing) throw new AppError(400, 'Already contacted this applicant')
 
+    // W-48 (S529): an offered unit must actually be AVAILABLE — free of any
+    // active lease or overlapping booking from today onward (same shared
+    // predicate as /units/available, which feeds the picker). Subtype joined
+    // for the preset-rent fallback below.
+    const unit = unitId
+      ? await queryOne<any>(
+          `SELECT u.*, p.name as property_name, s.rent_amount AS subtype_rent_amount
+           FROM units u JOIN properties p ON p.id=u.property_id
+           LEFT JOIN property_unit_subtypes s ON s.id=u.subtype_id
+           WHERE u.id=$1 AND u.landlord_id=$2`,
+          [unitId, req.user!.profileId]
+        )
+      : null
+    if (unitId && !unit) throw new AppError(404, 'Unit not found')
+    if (unit) {
+      const conflict = await findStayConflict(unit.id, { checkIn: new Date().toISOString().slice(0, 10) })
+      if (conflict) throw new AppError(409, 'That unit isn\u2019t available — it has an active lease or an upcoming reservation')
+    }
+    // W-48: monthly rent comes from the landlord's preset unit info (unit
+    // override, else subtype pricing) — nobody types it.
+    const monthlyRent = unit ? (unit.rent_amount ?? unit.subtype_rent_amount ?? null) : null
+
     const match = await queryOne<any>(`
       INSERT INTO pool_match_requests (pool_entry_id, landlord_id, unit_id, status, landlord_message)
       VALUES ($1, $2, $3, 'pending', $4) RETURNING id`,
       [entry.id, req.user!.profileId, unitId || null, message || null]
     )
-
-    const unit = unitId
-      ? await queryOne<any>(
-          'SELECT u.*, p.name as property_name FROM units u JOIN properties p ON p.id=u.property_id WHERE u.id=$1',
-          [unitId]
-        )
-      : null
     const landlordUser = await queryOne<any>(
       'SELECT u.first_name, u.last_name FROM landlords l JOIN users u ON u.id=l.user_id WHERE l.id=$1',
       [req.user!.profileId]
@@ -952,8 +968,8 @@ backgroundRouter.post('/pool/:poolId/reach-out', requireAuth, requirePerm('appli
       [
         entry.user_id,
         `${landlordUser?.first_name || ''} ${landlordUser?.last_name || ''}`.trim() +
-          ` has a vacancy that matches your profile${unit ? ` at ${unit.property_name} Unit ${unit.unit_number}` : ''}. Are you interested?`,
-        JSON.stringify({ matchRequestId: match!.id, unitId: unitId || null, landlordMessage: message || null }),
+          ` has a vacancy that matches your profile${unit ? ` at ${unit.property_name} Unit ${unit.unit_number}` : ''}${monthlyRent != null ? ` ($${Number(monthlyRent).toLocaleString('en-US', { maximumFractionDigits: 0 })}/mo)` : ''}. Are you interested?`,
+        JSON.stringify({ matchRequestId: match!.id, unitId: unitId || null, landlordMessage: message || null, monthlyRent }),
       ])
 
     try {
@@ -965,6 +981,7 @@ backgroundRouter.post('/pool/:poolId/reach-out', requireAuth, requirePerm('appli
           unit?.property_name || 'a property',
           unit?.unit_number || '—',
           message || null,
+          monthlyRent != null ? Number(monthlyRent) : null,
           undefined,
           { landlordId: req.user!.profileId, matchRequestId: match!.id }
         )

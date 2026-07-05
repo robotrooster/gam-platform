@@ -410,7 +410,7 @@ export function BookingsPage() {
                 <th>Total</th>
                 <th>Source</th>
                 <th>Ack</th>
-                <th>Stay link</th>
+                <th>Stay Link</th>
               </tr>
             </thead>
             <tbody>

@@ -84,7 +84,10 @@ utilityRouter.get('/meters', requirePerm('units.edit', 'units.view_status', 'pro
     const meters = await query<any>(`
       SELECT m.*, p.name AS property_name,
         (SELECT COUNT(*)::int FROM utility_meter_units WHERE meter_id = m.id) AS unit_count,
-        (SELECT MAX(billing_cycle_month) FROM utility_meter_readings WHERE meter_id = m.id) AS last_reading_cycle
+        (SELECT MAX(billing_cycle_month) FROM utility_meter_readings WHERE meter_id = m.id) AS last_reading_cycle,
+        -- W-36 (S531): assigned unit ids ride along so the management UI can
+        -- render/edit assignments without an N+1 per meter.
+        ARRAY(SELECT unit_id FROM utility_meter_units WHERE meter_id = m.id) AS assigned_unit_ids
       FROM utility_meters m
       JOIN properties p ON p.id = m.property_id
       ${where}

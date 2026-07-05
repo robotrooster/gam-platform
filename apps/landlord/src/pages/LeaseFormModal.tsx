@@ -908,7 +908,7 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
             // Post-warning state: save is already done; offer a single
             // close action.
             <button className="btn btn-primary" onClick={onClose}>
-              <Check size={14} /> Got it, close
+              <Check size={14} /> Got It
             </button>
           ) : (
             <>

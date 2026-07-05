@@ -6,7 +6,9 @@ import type { PoolClient } from 'pg'
 //
 // Locked model (Nic 2026-06-26): rent is traded as a PERCENT of hours
 // worked. Each verified hour is worth 1/target of the TOTAL monthly invoice
-// (rent + utilities + fees). The target is a per-property setting. A full
+// (rent + utilities + fees). The target is PER AGREEMENT (W-56, Nic:
+// different rents and different work don't translate equally — the
+// property value is only the default for new agreements). A full
 // target month covers 100% of the invoice; fewer hours cover a proportional
 // slice; excess hours are capped at 100% (a trade, not paid labor).
 //
@@ -95,7 +97,7 @@ export async function loadWorkTradeCreditContext(
 
   const r = await client.query<{ agreement_id: string; target: number; verified_hours: string }>(
     `SELECT wta.id AS agreement_id,
-            p.work_trade_hours_target AS target,
+            wta.monthly_hours_target AS target,
             COALESCE((
               SELECT SUM(l.hours)
                 FROM work_trade_logs l

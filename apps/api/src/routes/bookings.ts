@@ -1,7 +1,7 @@
 import { Router } from 'express'
 import { z } from 'zod'
 import { query, queryOne } from '../db'
-import { requireAuth, requirePerm } from '../middleware/auth'
+import { requireAuth, requirePerm, getScopedPropertyIds } from '../middleware/auth'
 import { canAccessLandlordResource, canManageLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
 
@@ -18,7 +18,7 @@ import { AppError } from '../middleware/errorHandler'
 export const bookingsRouter = Router()
 bookingsRouter.use(requireAuth)
 
-bookingsRouter.get('/', async (req, res, next) => {
+bookingsRouter.get('/', requirePerm('bookings.view'), async (req, res, next) => {
   try {
     const u = req.user!
     const role = u.role
@@ -31,6 +31,14 @@ bookingsRouter.get('/', async (req, res, next) => {
       if (!landlordId) throw new AppError(403, 'No landlord scope')
       params.push(landlordId)
       filters.push(`b.landlord_id = $${params.length}`)
+    }
+
+    // Property-scope: a property-locked worker only sees reservations at
+    // their assigned properties. NULL = unrestricted (owners/all_properties).
+    const scopedIds = await getScopedPropertyIds(u)
+    if (scopedIds !== null) {
+      params.push(scopedIds)
+      filters.push(`u.property_id = ANY($${params.length}::uuid[])`)
     }
 
     if (req.query.status) {
@@ -118,7 +126,7 @@ bookingsRouter.get('/', async (req, res, next) => {
 // GET /api/bookings/change-requests — the host's review queue.
 // Defaults to open ('requested') items; ?status=approved|declined|cancelled
 // or ?status=all returns history.
-bookingsRouter.get('/change-requests', async (req, res, next) => {
+bookingsRouter.get('/change-requests', requirePerm('bookings.change_requests', 'bookings.resolve_change_request'), async (req, res, next) => {
   try {
     const u = req.user!
     const role = u.role
@@ -130,6 +138,13 @@ bookingsRouter.get('/change-requests', async (req, res, next) => {
       if (!landlordId) throw new AppError(403, 'No landlord scope')
       params.push(landlordId)
       filters.push(`cr.landlord_id = $${params.length}`)
+    }
+
+    // Property-scope (see GET / above).
+    const scopedIds = await getScopedPropertyIds(u)
+    if (scopedIds !== null) {
+      params.push(scopedIds)
+      filters.push(`u.property_id = ANY($${params.length}::uuid[])`)
     }
 
     const status = typeof req.query.status === 'string' ? req.query.status : 'requested'

@@ -163,7 +163,7 @@ export function AgentActivityPage() {
       {/* Recent conversations */}
       <div className="card" style={{ padding: 16 }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 12 }}>
-          <h3 style={{ margin: 0, fontSize: '.95rem' }}>Recent activity</h3>
+          <h3 style={{ margin: 0, fontSize: '.95rem' }}>Recent Activity</h3>
           {outcomeFilter && (
             <button onClick={() => setOutcomeFilter('')}
               className="btn btn-sm btn-ghost">

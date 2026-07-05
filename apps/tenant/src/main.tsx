@@ -28,7 +28,7 @@ import { BrowserRouter, Routes, Route, Navigate, NavLink, Outlet, useNavigate, u
 import { QueryClient, QueryClientProvider, useQuery, useMutation, useQueryClient } from 'react-query'
 import { useForm } from 'react-hook-form'
 import axios from 'axios'
-import { formatCurrency, applyCamelizeInterceptor } from '@gam/shared'
+import { formatCurrency, applyCamelizeInterceptor, installDatePickerAutoClose } from '@gam/shared'
 import { AgentChatWidget, SupportPage } from './components/AgentChatWidget'
 import { CameraCapture } from './components/CameraCapture'
 
@@ -363,6 +363,7 @@ function Layout() {
             <NavLink to="/walkthroughs" className={({isActive})=>`ni${isActive?' active':''}`}>🎥 My walkthroughs</NavLink>
             <NavLink to="/entry-requests" className={({isActive})=>`ni${isActive?' active':''}`}>🚪 Entry Requests</NavLink>
             <NavLink to="/amenities" className={({isActive})=>`ni${isActive?' active':''}`}>🎉 Amenities</NavLink>
+            <NavLink to="/utilities" className={({isActive})=>`ni${isActive?' active':''}`}>💡 Utilities</NavLink>
             {!LAUNCH_HIDDEN.has('/credit') && <NavLink to="/credit" className={({isActive})=>`ni${isActive?' active':''}`}>📊 My Record</NavLink>}
             {!LAUNCH_HIDDEN.has('/my-disputes') && <NavLink to="/my-disputes" className={({isActive})=>`ni${isActive?' active':''}`}>⚖️ My Disputes</NavLink>}
             <LeaseNavLink/>
@@ -2844,9 +2845,15 @@ function TenantAmenitiesPage() {
 
 function ReserveModal({ area, onClose, onDone }: { area: AmenityArea; onClose: () => void; onDone: () => void }) {
   const [f, setF] = useState({ title: '', startsAt: '', endsAt: '', guestCount: '', notes: '' })
+  // W-44 (S531): areas the landlord opted in can host PRIVATE EVENTS — a
+  // non-refundable deposit (if set) locks it in; everyone at the property
+  // is notified once it's paid.
+  const eventsEnabled = (area as any).eventsEnabled === true
+  const eventDeposit = Number((area as any).eventDepositAmount || 0)
+  const [kind, setKind] = useState<'tenant_reservation' | 'event'>('tenant_reservation')
   const m = useMutation(
     () => post(`/common-areas/${area.id}/request`, {
-      title: f.title || undefined,
+      title: f.title || undefined, kind,
       startsAt: new Date(f.startsAt).toISOString(), endsAt: new Date(f.endsAt).toISOString(),
       guestCount: f.guestCount ? Number(f.guestCount) : null, notes: f.notes || undefined,
     }),
@@ -2858,6 +2865,20 @@ function ReserveModal({ area, onClose, onDone }: { area: AmenityArea; onClose: (
         <p className="ps" style={{ marginBottom: 12 }}>
           {area.requiresApproval ? 'Your request goes to management for approval.' : 'This area reserves instantly.'}
         </p>
+        {eventsEnabled && (
+          <div style={{ display: 'flex', gap: 8, marginBottom: 10 }}>
+            {([['tenant_reservation', 'Regular reservation'], ['event', 'Private event']] as const).map(([k, label]) => (
+              <button key={k} className={'btn btn-sm' + (kind === k ? ' btn-g' : '')} onClick={() => setKind(k)}>{label}</button>
+            ))}
+          </div>
+        )}
+        {kind === 'event' && (
+          <div style={{ fontSize: '.78rem', color: 'var(--t2,#b8c4d8)', background: 'rgba(201,162,39,.08)', border: '1px solid rgba(201,162,39,.3)', borderRadius: 8, padding: '8px 12px', marginBottom: 10 }}>
+            {eventDeposit > 0
+              ? <>Books the space privately for your event. A <b>non-refundable ${eventDeposit.toFixed(2)}</b> deposit locks it in — everyone at the property is notified once it's paid. Unpaid by the start time, the space opens back up.</>
+              : <>Books the space privately for your event — everyone at the property is notified when it's approved.</>}
+          </div>
+        )}
         <label className="ps">What for? (optional)</label>
         <input className="inp" value={f.title} onChange={e => setF({ ...f, title: e.target.value })} placeholder="Birthday party" style={{ marginBottom: 8 }} />
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
@@ -3493,7 +3514,16 @@ function Root() {
   )
 }
 
-ReactDOM.createRoot(document.getElementById('root')!).render(
+installDatePickerAutoClose()
+
+// HMR guard: when Vite re-executes this entry module, calling createRoot on
+// the same container again STACKS a second mounted app under the first
+// (duplicate dashboards/login screens, dead nav). Reuse the one root and
+// just re-render into it — idempotent across hot updates.
+const rootEl = document.getElementById('root')!
+const appRoot: ReturnType<typeof ReactDOM.createRoot> =
+  (window as any).__gam_app_root ?? ((window as any).__gam_app_root = ReactDOM.createRoot(rootEl))
+appRoot.render(
   <React.StrictMode>
     <SentryErrorBoundary fallback={<div style={{ padding: 40, textAlign: 'center', color: 'var(--text-0)' }}>
       <div style={{ fontSize: '1.1rem', fontWeight: 600, marginBottom: 8 }}>Something went wrong</div>

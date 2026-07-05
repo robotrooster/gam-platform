@@ -372,6 +372,13 @@ function IntentCard({
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 16, fontSize: '.8rem', color: 'var(--text-2)' }}>
             <span>{intent.email}</span>
             {intent.phone && <span>{intent.phone}</span>}
+            {/* W-27 (S531): the spot held for them — excluded from guest
+                booking until the intent resolves. */}
+            {(intent as any).heldUnitNumber && (
+              <span style={{ color: 'var(--gold)' }}>
+                Holding Unit {(intent as any).heldUnitNumber}{(intent as any).heldPropertyName ? ` — ${(intent as any).heldPropertyName}` : ''}
+              </span>
+            )}
             <span style={{ color: 'var(--text-3)' }}>
               Added {new Date(intent.createdAt).toLocaleDateString()}
             </span>
@@ -384,7 +391,7 @@ function IntentCard({
           {status === 'not_uploaded' && (
             <button onClick={onUpload} className="btn btn-primary btn-sm" disabled={uploading}>
               <Upload size={14} style={{ marginRight: 4 }} />
-              Upload document
+              Upload Document
             </button>
           )}
           {canReupload && (
@@ -438,7 +445,7 @@ function IntentCard({
               className="btn btn-primary btn-sm"
               onClick={onConfirm}
             >
-              Confirm and build lease
+              Confirm and Build Lease
             </button>
           </div>
         </div>

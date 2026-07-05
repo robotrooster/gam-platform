@@ -236,8 +236,13 @@ async function tryInsertBill(args: InsertBillArgs): Promise<boolean> {
 }
 
 function isoMonthStart(d: Date): string {
-  const y = d.getFullYear()
-  const m = String(d.getMonth() + 1).padStart(2, '0')
+  // W-36 fix-it-right (S531): the route builds this Date from
+  // 'YYYY-MM-01T00:00:00Z' — reading it with LOCAL getters in any
+  // negative-UTC-offset timezone rolls back to the last day of the PRIOR
+  // month, so every generate call silently billed the wrong cycle
+  // ("generate July" billed June). UTC getters match the UTC construction.
+  const y = d.getUTCFullYear()
+  const m = String(d.getUTCMonth() + 1).padStart(2, '0')
   return `${y}-${m}-01`
 }
 

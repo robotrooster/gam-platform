@@ -4,6 +4,7 @@ import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
 import { usePerms } from '../lib/permissions'
 import { ArrowLeft, Shield, AlertTriangle, Camera, Trash2, ExternalLink } from 'lucide-react'
+import { UNIT_TYPE_LABEL, UNIT_TYPE_HAS_BEDROOMS, type UnitType } from '@gam/shared'
 
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 const API_URL = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
@@ -164,10 +165,23 @@ export function UnitDetailPage() {
         <div className="card">
           <div className="card-title" style={{ marginBottom: 16 }}>Unit Details</div>
           <div className="data-row"><span className="data-key">Status</span><span className={'badge badge-' + (unit.status === 'active' ? 'green' : unit.status === 'vacant' ? 'muted' : 'amber')}>{unit.status}</span></div>
+          <div className="data-row"><span className="data-key">Type</span><span className="data-val">{UNIT_TYPE_LABEL[unit.unitType as UnitType] ?? unit.unitType}</span></div>
           <div className="data-row"><span className="data-key">Rent</span><span className="data-val mono">{fmt(unit.rentAmount)}/mo</span></div>
           <div className="data-row"><span className="data-key">Deposit</span><span className="data-val mono">{fmt(unit.securityDeposit)}</span></div>
-          <div className="data-row"><span className="data-key">Bedrooms</span><span className="data-val">{unit.bedrooms}</span></div>
-          <div className="data-row"><span className="data-key">Bathrooms</span><span className="data-val">{unit.bathrooms}</span></div>
+          {/* S527: type-appropriate facts — bedrooms only for bedroom types,
+              layout/amp for RV, size for storage (RV spots were showing
+              "Bedrooms 2" from their pre-typed seed shape). */}
+          {UNIT_TYPE_HAS_BEDROOMS[unit.unitType as UnitType] && <>
+            <div className="data-row"><span className="data-key">Bedrooms</span><span className="data-val">{unit.bedrooms}</span></div>
+            <div className="data-row"><span className="data-key">Bathrooms</span><span className="data-val">{unit.bathrooms}</span></div>
+          </>}
+          {unit.unitType === 'rv_spot' && <>
+            <div className="data-row"><span className="data-key">Site layout</span><span className="data-val">{unit.rvSiteLayout === 'pull_through' ? 'Pull-through' : unit.rvSiteLayout === 'back_in' ? 'Back-in' : '—'}</span></div>
+            <div className="data-row"><span className="data-key">Electrical</span><span className="data-val">{unit.rvAmpService && unit.rvAmpService !== 'none' ? (unit.rvAmpService === 'both' ? '30/50 amp' : `${unit.rvAmpService} amp`) : '—'}</span></div>
+          </>}
+          {unit.unitType === 'storage' && (
+            <div className="data-row"><span className="data-key">Size</span><span className="data-val">{unit.storageSize || '—'}</span></div>
+          )}
         </div>
 
         <div className="card">
@@ -259,7 +273,9 @@ export function UnitDetailPage() {
         {listingMsg && <div style={{ padding: '8px 12px', borderRadius: 7, marginBottom: 12, fontSize: '.78rem', background: listingMsg.startsWith('F') ? 'rgba(239,68,68,.08)' : 'rgba(34,197,94,.08)', color: listingMsg.startsWith('F') ? 'var(--red)' : 'var(--green)', border: `1px solid ${listingMsg.startsWith('F') ? 'rgba(239,68,68,.2)' : 'rgba(34,197,94,.2)'}` }}>{listingMsg}</div>}
 
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 16 }}>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: UNIT_TYPE_HAS_BEDROOMS[unit.unitType as UnitType] ? '1fr 1fr 1fr' : '1fr', gap: 10 }}>
+            {/* S527: bed/bath listing fields only for bedroom unit types. */}
+            {UNIT_TYPE_HAS_BEDROOMS[unit.unitType as UnitType] && <>
             <div>
               <label style={{ display: 'block', fontSize: '.68rem', fontWeight: 700, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 4 }}>Bedrooms</label>
               <input type="number" min="0" step="1" value={listingForm.bedrooms} onChange={e => setListingForm(f => ({ ...f, bedrooms: e.target.value }))} style={{ width: '100%', background: 'var(--bg-2)', border: '1px solid var(--border-1)', borderRadius: 7, color: 'var(--text-0)', padding: '7px 10px', fontSize: '.875rem' }} />
@@ -268,6 +284,7 @@ export function UnitDetailPage() {
               <label style={{ display: 'block', fontSize: '.68rem', fontWeight: 700, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 4 }}>Bathrooms</label>
               <input type="number" min="0" step="0.5" value={listingForm.bathrooms} onChange={e => setListingForm(f => ({ ...f, bathrooms: e.target.value }))} style={{ width: '100%', background: 'var(--bg-2)', border: '1px solid var(--border-1)', borderRadius: 7, color: 'var(--text-0)', padding: '7px 10px', fontSize: '.875rem' }} />
             </div>
+            </>}
             <div>
               <label style={{ display: 'block', fontSize: '.68rem', fontWeight: 700, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 4 }}>Sq Ft</label>
               <input type="number" min="0" value={listingForm.sqft} onChange={e => setListingForm(f => ({ ...f, sqft: e.target.value }))} style={{ width: '100%', background: 'var(--bg-2)', border: '1px solid var(--border-1)', borderRadius: 7, color: 'var(--text-0)', padding: '7px 10px', fontSize: '.875rem' }} />

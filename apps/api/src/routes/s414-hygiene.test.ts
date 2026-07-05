@@ -1,10 +1,11 @@
 /**
  * S414 hygiene bundle:
  *
- *   1. S399 bulk-create input hardening on
- *      POST /api/properties/:id/units/bulk
- *      - count cap (≤ 200)
- *      - prefix length cap (≤ 32)
+ *   1. S399 bulk-create input hardening — S527: the bulk route
+ *      (POST /api/properties/:id/units/bulk) is REMOVED; batch creation
+ *      is now POST /api/units with `quantity`. The same protections
+ *      carry over and are asserted here against the new path:
+ *      - quantity cap (≤ 200)
  *      - type enum validation (was: caught later by DB CHECK → 500)
  *
  *   2. S407 follow-on: UNIQUE constraint on
@@ -22,13 +23,13 @@ import { db } from '../db'
 import {
   cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant,
 } from '../test/dbHelpers'
-import { propertiesRouter } from './properties'
+import { unitsRouter } from './units'
 import { errorHandler } from '../middleware/errorHandler'
 
-function buildPropsApp() {
+function buildUnitsApp() {
   const app = express()
   app.use(express.json({ limit: '2mb' }))
-  app.use('/api/properties', propertiesRouter)
+  app.use('/api/units', unitsRouter)
   app.use(errorHandler)
   return app
 }
@@ -66,85 +67,116 @@ async function seedPropsFixture(): Promise<PropsFixture> {
   finally { c.release() }
 }
 
-// ─── S399: bulk-create input hardening ───────────────────────
+// ─── S399/S527: batch-create input hardening (POST /api/units quantity) ───
 
-describe('POST /api/properties/:id/units/bulk — S399 input hardening', () => {
-  it('happy: type=rv_spot, count=3 → 201 + 3 units', async () => {
+describe('POST /api/units quantity — S399 hardening carried to S527 path', () => {
+  it('happy: rv_spot quantity=3 → 201 + 3 numbered units', async () => {
     const f = await seedPropsFixture()
-    const res = await request(buildPropsApp())
-      .post(`/api/properties/${f.propertyId}/units/bulk`)
+    const res = await request(buildUnitsApp())
+      .post('/api/units')
       .set('Authorization', `Bearer ${f.token}`)
-      .send({ unitGroups: [{ type: 'rv_spot', count: 3, prefix: 'RV', rentAmount: 500 }] })
+      .send({ propertyId: f.propertyId, unitNumber: 'RV', quantity: 3, unitType: 'rv_spot', rentAmount: 500 })
     expect(res.status).toBe(201)
     expect(res.body.data.created).toBe(3)
+    const numbers = res.body.data.units.map((u: any) => u.unit_number)
+    expect(numbers).toEqual(['RV 01', 'RV 02', 'RV 03'])
   })
 
-  it('S414 fix: count > 200 → 400 "count must be ≤ 200"', async () => {
+  it('quantity > 200 → 400', async () => {
     const f = await seedPropsFixture()
-    const res = await request(buildPropsApp())
-      .post(`/api/properties/${f.propertyId}/units/bulk`)
+    const res = await request(buildUnitsApp())
+      .post('/api/units')
       .set('Authorization', `Bearer ${f.token}`)
-      .send({ unitGroups: [{ type: 'rv_spot', count: 201, rentAmount: 500 }] })
+      .send({ propertyId: f.propertyId, unitNumber: 'RV', quantity: 201, unitType: 'rv_spot', rentAmount: 500 })
     expect(res.status).toBe(400)
   })
 
-  it('S414 fix: count = 200 exactly → 201 (boundary)', async () => {
+  it('quantity = 200 exactly → 201 (boundary)', async () => {
     const f = await seedPropsFixture()
-    const res = await request(buildPropsApp())
-      .post(`/api/properties/${f.propertyId}/units/bulk`)
+    const res = await request(buildUnitsApp())
+      .post('/api/units')
       .set('Authorization', `Bearer ${f.token}`)
-      .send({ unitGroups: [{ type: 'rv_spot', count: 200, prefix: 'RV', rentAmount: 500 }] })
+      .send({ propertyId: f.propertyId, unitNumber: 'RV', quantity: 200, unitType: 'rv_spot', rentAmount: 500 })
     expect(res.status).toBe(201)
     expect(res.body.data.created).toBe(200)
   }, 30_000)
 
-  it('S414 fix: prefix > 32 chars → 400', async () => {
+  it('invalid type "house" → 400 (was 500 from DB CHECK pre-S414)', async () => {
     const f = await seedPropsFixture()
-    const res = await request(buildPropsApp())
-      .post(`/api/properties/${f.propertyId}/units/bulk`)
+    const res = await request(buildUnitsApp())
+      .post('/api/units')
       .set('Authorization', `Bearer ${f.token}`)
-      .send({ unitGroups: [{ type: 'rv_spot', count: 3, prefix: 'A'.repeat(33), rentAmount: 500 }] })
+      .send({ propertyId: f.propertyId, unitNumber: 'H', quantity: 3, unitType: 'house', rentAmount: 500 })
     expect(res.status).toBe(400)
   })
 
-  it('S414 fix: invalid type "house" → 400 (was 500 from DB CHECK pre-fix)', async () => {
+  it('quantity = 0 → 400', async () => {
     const f = await seedPropsFixture()
-    const res = await request(buildPropsApp())
-      .post(`/api/properties/${f.propertyId}/units/bulk`)
+    const res = await request(buildUnitsApp())
+      .post('/api/units')
       .set('Authorization', `Bearer ${f.token}`)
-      .send({ unitGroups: [{ type: 'house', count: 3, prefix: 'H', rentAmount: 500 }] })
+      .send({ propertyId: f.propertyId, unitNumber: 'RV', quantity: 0, unitType: 'rv_spot', rentAmount: 500 })
     expect(res.status).toBe(400)
   })
 
-  it('S414 fix: type=single_family (was missing from old prefix map) → 201', async () => {
+  it('numbering continues after existing max for the prefix', async () => {
     const f = await seedPropsFixture()
-    const res = await request(buildPropsApp())
-      .post(`/api/properties/${f.propertyId}/units/bulk`)
-      .set('Authorization', `Bearer ${f.token}`)
-      .send({ unitGroups: [{ type: 'single_family', count: 2, rentAmount: 1200 }] })
+    const app = buildUnitsApp()
+    await request(app).post('/api/units').set('Authorization', `Bearer ${f.token}`)
+      .send({ propertyId: f.propertyId, unitNumber: 'RV', quantity: 2, unitType: 'rv_spot', rentAmount: 500 })
+    const res = await request(app).post('/api/units').set('Authorization', `Bearer ${f.token}`)
+      .send({ propertyId: f.propertyId, unitNumber: 'RV', quantity: 2, unitType: 'rv_spot', rentAmount: 500 })
     expect(res.status).toBe(201)
-    expect(res.body.data.created).toBe(2)
-    // Default prefix for single_family is 'House' per the S414 prefix map.
     const numbers = res.body.data.units.map((u: any) => u.unit_number)
-    expect(numbers.every((n: string) => n.startsWith('House'))).toBe(true)
+    expect(numbers).toEqual(['RV 03', 'RV 04'])
   })
 
-  it('S414: empty unitGroups array → 400', async () => {
+  it('S527: subtypeId supplies type, facts, and pricing; units record it', async () => {
     const f = await seedPropsFixture()
-    const res = await request(buildPropsApp())
-      .post(`/api/properties/${f.propertyId}/units/bulk`)
+    const sub = await db.query<{ id: string }>(
+      `INSERT INTO property_unit_subtypes
+         (property_id, unit_type, name, rv_site_layout, rv_amp_service, rent_amount, security_deposit, nightly_rate)
+       VALUES ($1, 'rv_spot', 'Riverfront', 'pull_through', '50', 500, 300, 60) RETURNING id`,
+      [f.propertyId])
+    const res = await request(buildUnitsApp())
+      .post('/api/units')
       .set('Authorization', `Bearer ${f.token}`)
-      .send({ unitGroups: [] })
+      .send({ propertyId: f.propertyId, unitNumber: 'RV', quantity: 2, subtypeId: sub.rows[0].id })
+    expect(res.status).toBe(201)
+    const units = res.body.data.units
+    expect(units).toHaveLength(2)
+    for (const u of units) {
+      expect(u.unit_type).toBe('rv_spot')
+      expect(u.rv_site_layout).toBe('pull_through')
+      expect(u.rv_amp_service).toBe('50')
+      expect(Number(u.rent_amount)).toBe(500)
+      expect(Number(u.nightly_rate)).toBe(60)
+      expect(u.subtype_id).toBe(sub.rows[0].id)
+      expect(u.is_bookable).toBe(true)
+    }
+  })
+
+  it('S527: no rent anywhere (body or subtype) → 400', async () => {
+    const f = await seedPropsFixture()
+    const res = await request(buildUnitsApp())
+      .post('/api/units')
+      .set('Authorization', `Bearer ${f.token}`)
+      .send({ propertyId: f.propertyId, unitNumber: 'A1', unitType: 'apartment' })
     expect(res.status).toBe(400)
   })
 
-  it('S414: count = 0 → 400 (was: silently skipped pre-fix)', async () => {
+  it("S527: foreign property's subtypeId → 404", async () => {
     const f = await seedPropsFixture()
-    const res = await request(buildPropsApp())
-      .post(`/api/properties/${f.propertyId}/units/bulk`)
+    const g = await seedPropsFixture()
+    const sub = await db.query<{ id: string }>(
+      `INSERT INTO property_unit_subtypes (property_id, unit_type, name, rent_amount)
+       VALUES ($1, 'apartment', 'Studio', 600) RETURNING id`,
+      [g.propertyId])
+    const res = await request(buildUnitsApp())
+      .post('/api/units')
       .set('Authorization', `Bearer ${f.token}`)
-      .send({ unitGroups: [{ type: 'rv_spot', count: 0, rentAmount: 500 }] })
-    expect(res.status).toBe(400)
+      .send({ propertyId: f.propertyId, unitNumber: 'A1', subtypeId: sub.rows[0].id })
+    expect(res.status).toBe(404)
   })
 })
 

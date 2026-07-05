@@ -45,8 +45,11 @@ export function ClaimPage() {
     <div style={wrap}>
       <h1 style={{ fontSize: 24, marginBottom: 4 }}>A spot opened up!</h1>
       <p style={{ color: '#b8c4d8' }}>
-        {info.propertyName} · Unit {info.unitNumber}<br />
+        {info.propertyName}<br />
         {info.checkIn} → {info.checkOut}
+      </p>
+      <p style={{ color: '#8b97b3', fontSize: 13 }}>
+        Your site number is assigned automatically and sent the morning of check-in.
       </p>
       <p style={{ color: '#ffb84d', fontWeight: 700 }}>Claim it within the hour before it rolls to the next guest.</p>
       <button onClick={claim} disabled={busy} style={{ padding: '13px 28px', borderRadius: 8, border: 0, background: '#ffd23d', color: '#3a2a00', fontWeight: 800, cursor: 'pointer', fontSize: 16 }}>

@@ -146,7 +146,7 @@ export function FlexChargePage() {
               <tr>
                 <th>Customer</th>
                 <th>Property</th>
-                <th>Credit limit</th>
+                <th>Credit Limit</th>
                 <th>Balance</th>
                 <th>Status</th>
                 <th></th>
@@ -312,7 +312,7 @@ function AccountActions({ account, qc }: { account: AccountRow; qc: any }) {
   return (
     <div style={{ display: 'flex', gap: 6 }}>
       <button className="btn btn-ghost btn-sm" onClick={() => setShowStatements(true)}>Statements</button>
-      <button className="btn btn-ghost btn-sm" onClick={editLimit}>Edit limit</button>
+      <button className="btn btn-ghost btn-sm" onClick={editLimit}>Edit Limit</button>
       {account.status === 'active' ? (
         <button className="btn btn-ghost btn-sm" onClick={() => suspendMut.mutate()} style={{ color: 'var(--amber)' }}>Suspend</button>
       ) : account.status === 'suspended' ? (

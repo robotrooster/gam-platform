@@ -9,7 +9,7 @@
  */
 import { query } from '../../../db'
 import { isAgentCapabilityEnabled } from '../../agentPermissions'
-import { createLeaseFeePayment, type LeaseFeeType } from '../../leaseFees'
+import { createLeaseFeePayment } from '../../leaseFees'
 import type { AgentTool, AgentActor } from './types'
 
 type Candidate = {
@@ -28,30 +28,24 @@ const norm = (s: unknown) => (typeof s === 'string' && s.trim() ? s.trim().toLow
 export const billFee: AgentTool = {
   name: 'bill_fee',
   description:
-    "Bill a one-off fee to a tenant on one of the landlord's active leases — e.g. a late fee, cleaning fee, " +
-    'lease-violation, or early-termination fee. The fee is added to the tenant’s account as a PENDING charge they ' +
-    'pay normally (you are billing it, not collecting it). Identify the tenant by name and/or unit/property; if more ' +
-    'than one lease matches, ask which. Always include a clear description and the amount. Use fee_type ' +
-    "'early_termination_fee' for an early-termination charge, otherwise 'other_fee'.",
+    "Bill a fee authorized by the tenant's signed lease. Only fees that exist in the lease's own terms " +
+    '(its landlord-billable fee list) can be billed — the amount comes from the lease, never from you or the ' +
+    'landlord. The fee is added as a PENDING charge the tenant pays normally. Identify the tenant by name and/or ' +
+    "unit/property; if more than one lease matches, ask which. If the lease authorizes multiple billable fees, " +
+    'pass fee_type to pick one; the tool lists the options when ambiguous.',
   parameters: {
     type: 'object',
     properties: {
-      amount: { type: 'number', description: 'Fee amount in dollars, e.g. 50.' },
-      description: { type: 'string', description: 'What the fee is for — shown to the tenant (e.g. "Late fee — June rent", "Carpet cleaning").' },
-      fee_type: { type: 'string', enum: ['early_termination_fee', 'other_fee'], description: "Defaults to 'other_fee'." },
+      description: { type: 'string', description: 'Optional note shown to the tenant (e.g. "Per § 7 — early termination").' },
+      fee_type: { type: 'string', description: "Which of the lease's billable fees to bill (e.g. 'early_termination_fee'). Omit if the lease has exactly one." },
       tenant_name: { type: 'string', description: 'Tenant name to match.' },
       unit: { type: 'string', description: 'Unit number to match.' },
       property: { type: 'string', description: 'Property name to match.' },
     },
-    required: ['amount'],
+    required: [],
   },
   audiences: ['landlord'],
   async execute(args, actor: AgentActor) {
-    const amount = Number(args.amount)
-    if (!Number.isFinite(amount) || amount <= 0) {
-      return { ok: false, error: 'A positive fee amount is required.' }
-    }
-    const feeType: LeaseFeeType = args.fee_type === 'early_termination_fee' ? 'early_termination_fee' : 'other_fee'
 
     const rows = await query<Candidate>(
       `SELECT l.id AS lease_id, l.landlord_id, l.unit_id, u.property_id, u.unit_number,
@@ -97,14 +91,41 @@ export const billFee: AgentTool = {
       }
     }
 
+    // W-30 (lease-is-law): only fees the SIGNED LEASE authorizes for
+    // landlord-initiated billing (due_timing='other') can be billed, at the
+    // lease's own amount — the agent never invents a fee or an amount.
+    const billable = await query<{ id: string; fee_type: string; amount: string }>(
+      `SELECT id, fee_type, amount FROM lease_fees
+        WHERE lease_id = $1 AND due_timing = 'other'
+        ORDER BY fee_type`,
+      [lease.lease_id],
+    )
+    if (billable.length === 0) {
+      return {
+        ok: false,
+        error: 'not_authorized_by_lease',
+        note: `This tenant's lease has no landlord-billable fees in its terms — nothing can be billed that isn't in the signed lease.`,
+      }
+    }
+    const wanted = norm(args.fee_type)
+    const matched = wanted ? billable.filter((f) => f.fee_type.toLowerCase().includes(wanted)) : billable
+    if (matched.length !== 1) {
+      return {
+        ok: false,
+        error: 'ambiguous_fee',
+        note: 'This lease authorizes more than one billable fee — ask which one.',
+        options: billable.map((f) => ({ fee_type: f.fee_type, amount: Number(f.amount) })),
+      }
+    }
+    const fee = matched[0]
     const description = typeof args.description === 'string' && args.description.trim() ? args.description.trim() : undefined
     const res = await createLeaseFeePayment({
       landlordId: lease.landlord_id,
       tenantId: lease.tenant_id,
       leaseId: lease.lease_id,
       unitId: lease.unit_id,
-      feeType,
-      amount,
+      feeType: fee.fee_type,
+      amount: Number(fee.amount),
       description,
       source: 'agent',
     })
@@ -114,11 +135,11 @@ export const billFee: AgentTool = {
       tenant: lease.tenant_name,
       unit: lease.unit_number,
       property: lease.property_name,
-      amount,
-      feeType,
+      amount: Number(fee.amount),
+      feeType: fee.fee_type,
       description: res.description,
       dueDate: res.dueDate,
-      note: `Billed $${amount} (${res.description}) to ${lease.tenant_name}. It's now a pending charge on their account.`,
+      note: `Billed $${Number(fee.amount)} (${res.description}) to ${lease.tenant_name} — the amount comes from their lease terms. It's now a pending charge on their account.`,
     }
   },
 }

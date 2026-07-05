@@ -5,23 +5,17 @@ import { apiGet, apiPost } from '../lib/api'
 import { UserPlus, AlertTriangle, DollarSign, FileText, Eye, X } from 'lucide-react'
 import { LEASE_TYPE_LABEL, LeaseStatus } from '@gam/shared'
 import { LeaseFormModal } from './LeaseFormModal'
+import { LeaseOverviewModal } from './LeaseOverviewModal'
+import { RenewalDecisionModal } from './RenewalDecisionModal'
 import { usePerms } from '../lib/permissions'
 
 const fmt = (n: any) => n != null
   ? '$' + Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
   : '—'
 
-const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:4000'
-
-// Open the lease agreement PDF in a new tab. A plain <a download> can't carry
-// the Bearer token, so fetch with auth and open the blob.
-async function openLeasePdf(leaseId: string) {
-  const res = await fetch(`${API_BASE}/api/leases/${leaseId}/pdf`, {
-    headers: { Authorization: 'Bearer ' + (localStorage.getItem('gam_token') || '') },
-  })
-  if (!res.ok) { alert('Could not load lease PDF (status ' + res.status + ')'); return }
-  window.open(URL.createObjectURL(await res.blob()), '_blank')
-}
+// S527 W-29: the old flow fetched a blob then window.open'd it AFTER an
+// await — popup blockers silently killed it, so "View" looked dead. Now
+// routes to the in-app same-tab viewer (W-45 rule: no new-tab jumps).
 
 const STATUS_MAP: Record<LeaseStatus, string> = {
   pending:    'badge-amber',
@@ -40,6 +34,9 @@ export function LeasesPage() {
   // S181 / A2: bill-fee modal state. Holds the lease object to bill against,
   // or null when the modal is closed.
   const [billFeeLease, setBillFeeLease] = useState<any | null>(null)
+  // W-7 (S531): renewal decision form — deep-linked from the dashboard
+  // to-do's expiring-lease items via ?renew=<leaseId>.
+  const [renewalLeaseId, setRenewalLeaseId] = useState<string | null>(null)
   const [searchParams, setSearchParams] = useSearchParams()
   const navigate = useNavigate()
   const { can } = usePerms()
@@ -51,7 +48,19 @@ export function LeasesPage() {
       setEditingLeaseId(openId)
       setModalOpen(true)
     }
+    const renewId = searchParams.get('renew')
+    if (renewId && !renewalLeaseId) {
+      setRenewalLeaseId(renewId)
+    }
   }, [searchParams])
+
+  const closeRenewal = () => {
+    setRenewalLeaseId(null)
+    if (searchParams.get('renew')) {
+      searchParams.delete('renew')
+      setSearchParams(searchParams, { replace: true })
+    }
+  }
 
   // Row click: needs-review → editable (confirm import); otherwise view-only.
   // Staff without leases.edit never get the editable confirm path — the
@@ -72,6 +81,18 @@ export function LeasesPage() {
   }
 
   const needsReviewCount = (leases as any[]).filter(l => l.needsReview).length
+
+  // S527 W-5: ?expiring=<days> (dashboard KPI deep-link) narrows the table to
+  // active leases ending within the window.
+  const expiringDays = parseInt(searchParams.get('expiring') || '') || null
+  const visibleLeases = expiringDays
+    ? (leases as any[]).filter(l => {
+        if (l.status !== 'active' || !l.endDate) return false
+        const end = new Date(String(l.endDate).slice(0, 10) + 'T12:00:00')
+        const days = Math.ceil((end.getTime() - Date.now()) / 86400000)
+        return days >= 0 && days <= expiringDays
+      })
+    : (leases as any[])
 
   return (
     <div>
@@ -106,6 +127,13 @@ export function LeasesPage() {
         </div>
       )}
 
+      {expiringDays && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14, padding: '8px 14px', background: 'rgba(201,162,39,.06)', border: '1px solid rgba(201,162,39,.25)', borderRadius: 10, fontSize: '.82rem' }}>
+          <span>Showing active leases expiring within <strong>{expiringDays} days</strong> ({visibleLeases.length}).</span>
+          <button className="btn btn-ghost btn-sm" onClick={() => { searchParams.delete('expiring'); setSearchParams(searchParams) }}>Show all leases</button>
+        </div>
+      )}
+
       <div className="card" style={{ padding: 0, overflowX: 'auto' }}>
         {isLoading ? (
           <div style={{ padding: 32, color: 'var(--text-3)', textAlign: 'center' }}>Loading…</div>
@@ -124,8 +152,17 @@ export function LeasesPage() {
               </tr>
             </thead>
             <tbody>
-              {(leases as any[]).length ? (leases as any[]).map((l: any) => {
-                const tenantName = [l.tenantFirst, l.tenantLast].filter(Boolean).join(' ') || '—'
+              {visibleLeases.length ? visibleLeases.map((l: any) => {
+                // S527 fix: the API returns a tenants[] array (multi-tenant
+                // lease model); the old flat tenantFirst/tenantLast fields
+                // were never sent, so this column rendered "—" for every
+                // lease. Primary tenant first, "+N" for co-tenants.
+                const activeTenants = (l.tenants || []).filter((t: any) => t.status === 'active')
+                const primary = activeTenants.find((t: any) => t.role === 'primary') || activeTenants[0]
+                const tenantName = primary
+                  ? [primary.firstName, primary.lastName].filter(Boolean).join(' ')
+                    + (activeTenants.length > 1 ? ` +${activeTenants.length - 1}` : '')
+                  : '—'
                 return (
                   <tr
                     key={l.id}
@@ -158,6 +195,27 @@ export function LeasesPage() {
                           Review
                         </span>
                       )}
+                      {/* S526: auto-drafted from a 30+/7+ day reservation. */}
+                      {l.leaseSource === 'booking_draft' && (
+                        <span
+                          title="Drafted automatically from a long-stay reservation — attach the tenant and complete the terms"
+                          style={{
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            marginLeft: 6,
+                            padding: '1px 6px',
+                            borderRadius: 4,
+                            background: 'rgba(201,162,39,.12)',
+                            color: 'var(--gold)',
+                            fontSize: '.65rem',
+                            fontWeight: 600,
+                            textTransform: 'uppercase',
+                            letterSpacing: '.04em',
+                          }}
+                        >
+                          From reservation
+                        </span>
+                      )}
                     </td>
                     <td style={{ fontSize: '.78rem', color: 'var(--text-2)' }}>
                       {LEASE_TYPE_LABEL[l.leaseType as keyof typeof LEASE_TYPE_LABEL] || l.leaseType || '—'}
@@ -180,7 +238,7 @@ export function LeasesPage() {
                           <button
                             className="btn btn-ghost btn-sm"
                             title="View the lease agreement (PDF)"
-                            onClick={() => openLeasePdf(l.id)}
+                            onClick={() => navigate(`/view?src=${encodeURIComponent(`/leases/${l.id}/pdf`)}&title=${encodeURIComponent(`Lease — ${l.unitNumber || ''}`)}`)}
                             style={{ padding: '3px 8px' }}
                           >
                             <Eye size={12} /> View
@@ -222,13 +280,19 @@ export function LeasesPage() {
         )}
       </div>
 
-      {modalOpen && (
+      {/* W-28: view-only opens the clean read-only OVERVIEW (information, not
+          disabled inputs). The editable needs-review confirm path keeps the
+          full form. */}
+      {renewalLeaseId && <RenewalDecisionModal leaseId={renewalLeaseId} onClose={closeRenewal} />}
+      {modalOpen && (viewOnly && editingLeaseId ? (
+        <LeaseOverviewModal leaseId={editingLeaseId} onClose={closeModal} />
+      ) : (
         <LeaseFormModal
           onClose={closeModal}
           leaseId={editingLeaseId}
           readOnly={viewOnly}
         />
-      )}
+      ))}
 
       {billFeeLease && (
         <BillFeeModal
@@ -247,15 +311,21 @@ export function LeasesPage() {
 // flows through the standard /payments tenant Pay Now UI.
 function BillFeeModal({ lease, onClose }: { lease: any; onClose: () => void }) {
   const qc = useQueryClient()
-  const [feeType, setFeeType] = useState<'early_termination_fee' | 'other_fee'>('other_fee')
-  const [amount, setAmount] = useState('')
+  const [leaseFeeId, setLeaseFeeId] = useState('')
   const [description, setDescription] = useState('')
   const [dueDate, setDueDate] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState<string | null>(null)
 
+  // W-30 (lease-is-law): only fees in THIS lease's signed terms can be
+  // billed, at the lease's own amount. The billable set = due_timing='other'
+  // rows (everything else bills automatically).
+  const { data: leaseDetail } = useQuery(['lease-fees', lease.id], () => apiGet<any>(`/leases/${lease.id}`))
+  const billableFees: any[] = (leaseDetail?.fees || []).filter((f: any) => f.dueTiming === 'other')
+  const selectedFee = billableFees.find(f => f.id === leaseFeeId)
+
   const mut = useMutation(
-    (body: { feeType: string; amount: number; description?: string; dueDate?: string }) =>
+    (body: { leaseFeeId: string; description?: string; dueDate?: string }) =>
       apiPost(`/leases/${lease.id}/bill-fee`, body),
     {
       onSuccess: () => {
@@ -273,14 +343,9 @@ function BillFeeModal({ lease, onClose }: { lease: any; onClose: () => void }) {
 
   const submit = () => {
     setError(null)
-    const amt = parseFloat(amount)
-    if (!isFinite(amt) || amt <= 0) {
-      setError('Amount must be a positive number')
-      return
-    }
+    if (!leaseFeeId) { setError('Pick a fee from the lease terms'); return }
     mut.mutate({
-      feeType,
-      amount:      amt,
+      leaseFeeId,
       description: description.trim() || undefined,
       dueDate:     dueDate || undefined,
     })
@@ -306,7 +371,7 @@ function BillFeeModal({ lease, onClose }: { lease: any; onClose: () => void }) {
         style={{ width: '100%', maxWidth: 460, padding: 22 }}
       >
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
-          <h3 style={{ margin: 0, fontSize: '1.05rem' }}>Bill a fee</h3>
+          <h3 style={{ margin: 0, fontSize: '1.05rem' }}>Bill a Fee</h3>
           <button
             onClick={onClose}
             style={{ background: 'transparent', border: 'none', color: 'var(--text-3)', cursor: 'pointer' }}
@@ -315,36 +380,37 @@ function BillFeeModal({ lease, onClose }: { lease: any; onClose: () => void }) {
           </button>
         </div>
         <div style={{ fontSize: '.78rem', color: 'var(--text-3)', marginBottom: 14 }}>
-          Lease for {lease.tenantName ?? 'tenant'} — Unit {lease.unitNumber ?? '—'}
+          Lease for {(() => { const p = (lease.tenants || []).find((t: any) => t.role === 'primary' && t.status === 'active') || (lease.tenants || [])[0]; return p ? `${p.firstName ?? ''} ${p.lastName ?? ''}`.trim() : 'tenant' })()} — Unit {lease.unitNumber ?? '—'}
         </div>
 
         <div style={{ marginBottom: 12 }}>
           <label style={{ fontSize: '.74rem', fontWeight: 600, color: 'var(--text-2)', display: 'block', marginBottom: 4 }}>
-            Fee type
+            Fee (From Lease Terms)
           </label>
-          <select
-            value={feeType}
-            onChange={e => setFeeType(e.target.value as any)}
-            style={{ width: '100%', padding: '8px 12px', borderRadius: 8, border: '1px solid var(--border-0)', background: 'var(--bg-2)', fontSize: '.85rem', color: 'var(--text-0)' }}
-          >
-            <option value="other_fee">Other fee</option>
-            <option value="early_termination_fee">Early termination fee</option>
-          </select>
-        </div>
-
-        <div style={{ marginBottom: 12 }}>
-          <label style={{ fontSize: '.74rem', fontWeight: 600, color: 'var(--text-2)', display: 'block', marginBottom: 4 }}>
-            Amount (USD)
-          </label>
-          <input
-            type="number"
-            step="0.01"
-            min="0"
-            placeholder="500.00"
-            value={amount}
-            onChange={e => setAmount(e.target.value)}
-            style={{ width: '100%', padding: '8px 12px', borderRadius: 8, border: '1px solid var(--border-0)', background: 'var(--bg-2)', fontSize: '.85rem', boxSizing: 'border-box' }}
-          />
+          {billableFees.length === 0 ? (
+            <div style={{ padding: '10px 12px', borderRadius: 8, background: 'var(--bg-2)', border: '1px solid var(--border-0)', fontSize: '.8rem', color: 'var(--text-3)', lineHeight: 1.5 }}>
+              This lease's terms don't include any landlord-billable fees.
+              Nothing can be billed that isn't in the signed lease.
+            </div>
+          ) : (
+            <select
+              value={leaseFeeId}
+              onChange={e => setLeaseFeeId(e.target.value)}
+              style={{ width: '100%', padding: '8px 12px', borderRadius: 8, border: '1px solid var(--border-0)', background: 'var(--bg-2)', fontSize: '.85rem', color: 'var(--text-0)' }}
+            >
+              <option value="">— pick a fee —</option>
+              {billableFees.map((f: any) => (
+                <option key={f.id} value={f.id}>
+                  {String(f.feeType).replace(/_/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase())} — ${Number(f.amount).toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                </option>
+              ))}
+            </select>
+          )}
+          {selectedFee && (
+            <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 4 }}>
+              Amount is fixed by the lease — ${Number(selectedFee.amount).toLocaleString('en-US', { minimumFractionDigits: 2 })}.
+            </div>
+          )}
         </div>
 
         <div style={{ marginBottom: 12 }}>
@@ -391,7 +457,7 @@ function BillFeeModal({ lease, onClose }: { lease: any; onClose: () => void }) {
           <button
             className="btn btn-primary"
             style={{ flex: 1 }}
-            disabled={mut.isLoading || !!success || !amount}
+            disabled={mut.isLoading || !!success || !leaseFeeId}
             onClick={submit}
           >
             {mut.isLoading ? 'Billing…' : success ? '✓ Billed' : 'Bill fee'}

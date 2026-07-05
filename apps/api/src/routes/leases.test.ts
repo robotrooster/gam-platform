@@ -604,12 +604,24 @@ describe('PATCH /leases/:id/fees/:feeId', () => {
 // ─── POST /leases/:id/bill-fee ─────────────────────────────────
 
 describe('POST /leases/:id/bill-fee', () => {
-  it('landlord can bill an early-termination fee — payments row created', async () => {
+  // W-30 (S529, lease-is-law): billing requires a lease_fees row on THIS
+  // lease with due_timing='other' — the amount comes from the row.
+  const addBillableFee = async (leaseId: string, feeType = 'early_termination_fee', amount = 1500) => {
+    const r = await db.query<{ id: string }>(
+      `INSERT INTO lease_fees (lease_id, fee_type, amount, is_refundable, due_timing, is_override)
+       VALUES ($1, $2, $3, FALSE, 'other', FALSE) RETURNING id`,
+      [leaseId, feeType, amount],
+    )
+    return r.rows[0].id
+  }
+
+  it('landlord can bill a lease-authorized fee — payments row created at the lease amount', async () => {
     const f = await seedFixture()
+    const feeId = await addBillableFee(f.leaseId)
     const res = await request(buildApp())
       .post(`/api/leases/${f.leaseId}/bill-fee`)
       .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ feeType: 'early_termination_fee', amount: 1500, description: 'Per § 7 of lease' })
+      .send({ leaseFeeId: feeId, description: 'Per § 7 of lease' })
     expect(res.status).toBe(201)
     expect(res.body.data.fee_type).toBe('early_termination_fee')
     expect(res.body.data.amount).toBe(1500)
@@ -623,20 +635,32 @@ describe('POST /leases/:id/bill-fee', () => {
     expect(Number(row.rows[0].amount)).toBe(1500)
   })
 
+  it('client cannot set the amount — the lease row wins', async () => {
+    const f = await seedFixture()
+    const feeId = await addBillableFee(f.leaseId, 'other_fee', 250)
+    const res = await request(buildApp())
+      .post(`/api/leases/${f.leaseId}/bill-fee`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ leaseFeeId: feeId, amount: 9999 })
+    expect(res.status).toBe(201)
+    expect(res.body.data.amount).toBe(250)
+  })
+
   it('defaults dueDate to today when not provided', async () => {
     const f = await seedFixture()
+    const feeId = await addBillableFee(f.leaseId, 'other_fee', 100)
     const today = new Date().toISOString().slice(0, 10)
     const res = await request(buildApp())
       .post(`/api/leases/${f.leaseId}/bill-fee`)
       .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ feeType: 'other_fee', amount: 100 })
+      .send({ leaseFeeId: feeId })
     expect(res.status).toBe(201)
     expect(res.body.data.due_date).toBe(today)
   })
 
   it('409 when lease has no active primary tenant', async () => {
     const f = await seedFixture()
-    // Remove the primary tenant.
+    const feeId = await addBillableFee(f.leaseId)
     await db.query(
       `UPDATE lease_tenants SET status = 'removed', removed_reason = 'lease_ended' WHERE lease_id = $1`,
       [f.leaseId],
@@ -644,12 +668,13 @@ describe('POST /leases/:id/bill-fee', () => {
     const res = await request(buildApp())
       .post(`/api/leases/${f.leaseId}/bill-fee`)
       .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ feeType: 'other_fee', amount: 100 })
+      .send({ leaseFeeId: feeId })
     expect(res.status).toBe(409)
   })
 
   it('cross-landlord rejected', async () => {
     const f = await seedFixture()
+    const feeId = await addBillableFee(f.leaseId)
     const otherToken = jwt.sign(
       { userId: randomUUID(), role: 'landlord', email: 'o@test.dev', profileId: randomUUID(), permissions: {} },
       process.env.JWT_SECRET!, { expiresIn: '1h' },
@@ -657,18 +682,31 @@ describe('POST /leases/:id/bill-fee', () => {
     const res = await request(buildApp())
       .post(`/api/leases/${f.leaseId}/bill-fee`)
       .set('Authorization', `Bearer ${otherToken}`)
-      .send({ feeType: 'other_fee', amount: 100 })
+      .send({ leaseFeeId: feeId })
     expect(res.status).toBe(403)
   })
 
-  it('rejects invalid feeType enum', async () => {
+  it('404 when the fee is not on this lease', async () => {
     const f = await seedFixture()
     const res = await request(buildApp())
       .post(`/api/leases/${f.leaseId}/bill-fee`)
       .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ feeType: 'rent_makeup', amount: 100 })
-    expect(res.status).toBeGreaterThanOrEqual(400)
-    expect(res.status).toBeLessThan(500)
+      .send({ leaseFeeId: randomUUID() })
+    expect(res.status).toBe(404)
+  })
+
+  it('409 when the fee bills automatically (not due_timing=other)', async () => {
+    const f = await seedFixture()
+    const r = await db.query<{ id: string }>(
+      `INSERT INTO lease_fees (lease_id, fee_type, amount, is_refundable, due_timing, is_override)
+       VALUES ($1, 'pet_rent', 30, FALSE, 'monthly_ongoing', FALSE) RETURNING id`,
+      [f.leaseId],
+    )
+    const res = await request(buildApp())
+      .post(`/api/leases/${f.leaseId}/bill-fee`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ leaseFeeId: r.rows[0].id })
+    expect(res.status).toBe(409)
   })
 })
 

@@ -14,6 +14,7 @@ import {
   PLACEMENT_FEE_TYPE_VALUES,
   PropertyReviewStatus,
   AGENT_REVENUE_CAPABILITIES,
+  UNIT_TYPES,
 } from '@gam/shared'
 import { listAgentPermissions, setAgentCapability } from '../services/agentPermissions'
 import { logger } from '../lib/logger'
@@ -268,10 +269,130 @@ propertiesRouter.get('/:id', async (req, res, next) => {
 })
 
 // ─────────────────────────────────────────────────────────────
+// OWNER-DEFINED UNIT SUBTYPES (S527 — replaces the S526 subtype_key
+// pricing model). A subtype is the owner's own named class of unit on
+// a property ("Studio", "Riverfront pull-through", "10x10"): name +
+// type-relevant facts + creation-time pricing. Blank per landlord
+// until they add them. Add Unit prefills from the picked subtype; the
+// unit stores its own copy.
+// ─────────────────────────────────────────────────────────────
+
+// GET /api/properties/:id/unit-subtypes — all subtypes for a property
+propertiesRouter.get('/:id/unit-subtypes', async (req, res, next) => {
+  try {
+    const p = await queryOne<any>(`SELECT id, landlord_id FROM properties WHERE id=$1`, [req.params.id])
+    if (!p) throw new AppError(404, 'Property not found')
+    if (!canAccessLandlordResource(req.user, p.landlord_id)) throw new AppError(403, 'Forbidden')
+    const rows = await query<any>(
+      `SELECT id, unit_type, name, bedrooms, bathrooms, rv_site_layout,
+              rv_amp_service, storage_size, rent_amount, security_deposit,
+              nightly_rate, weekly_rate, monthly_rate, created_at, updated_at
+         FROM property_unit_subtypes
+        WHERE property_id = $1
+        ORDER BY unit_type, name`,
+      [req.params.id],
+    )
+    res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
+const unitSubtypeSchema = z.object({
+  unitType: z.enum(UNIT_TYPES as unknown as [string, ...string[]]),
+  name: z.string().trim().min(1).max(60),
+  bedrooms: z.number().int().min(0).nullable().optional(),
+  bathrooms: z.number().min(0).nullable().optional(),
+  rvSiteLayout: z.enum(['none', 'back_in', 'pull_through']).nullable().optional(),
+  rvAmpService: z.enum(['none', '30', '50', 'both']).nullable().optional(),
+  storageSize: z.string().trim().max(40).nullable().optional(),
+  rentAmount: z.number().min(0).nullable().optional(),
+  securityDeposit: z.number().min(0).nullable().optional(),
+  nightlyRate: z.number().min(0).nullable().optional(),
+  weeklyRate: z.number().min(0).nullable().optional(),
+  monthlyRate: z.number().min(0).nullable().optional(),
+})
+
+// POST /api/properties/:id/unit-subtypes — create (or update via id) one
+// subtype. Facts irrelevant to the unit type are nulled server-side so a
+// type switch can't leave stale attributes behind.
+propertiesRouter.post('/:id/unit-subtypes', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const p = await queryOne<any>(`SELECT id, landlord_id FROM properties WHERE id=$1`, [req.params.id])
+    if (!p) throw new AppError(404, 'Property not found')
+    if (!canManageLandlordResource(req.user, p.landlord_id)) throw new AppError(403, 'Forbidden')
+    const body = unitSubtypeSchema.extend({ id: z.string().uuid().optional() }).parse(req.body)
+
+    const hasBedrooms = ['apartment', 'single_family', 'mobile_home'].includes(body.unitType)
+    const isRv = body.unitType === 'rv_spot'
+    const isStorage = body.unitType === 'storage'
+    const vals = [
+      req.params.id, body.unitType, body.name,
+      hasBedrooms ? body.bedrooms ?? null : null,
+      hasBedrooms ? body.bathrooms ?? null : null,
+      isRv ? body.rvSiteLayout ?? null : null,
+      isRv ? body.rvAmpService ?? null : null,
+      isStorage ? (body.storageSize?.trim() || null) : null,
+      body.rentAmount ?? null, body.securityDeposit ?? null,
+      body.nightlyRate ?? null, body.weeklyRate ?? null, body.monthlyRate ?? null,
+    ]
+
+    let row
+    if (body.id) {
+      row = await queryOne<any>(
+        `UPDATE property_unit_subtypes SET
+           unit_type=$2, name=$3, bedrooms=$4, bathrooms=$5, rv_site_layout=$6,
+           rv_amp_service=$7, storage_size=$8, rent_amount=$9, security_deposit=$10,
+           nightly_rate=$11, weekly_rate=$12, monthly_rate=$13, updated_at=NOW()
+         WHERE id=$14 AND property_id=$1
+         RETURNING *`,
+        [...vals, body.id],
+      )
+      if (!row) throw new AppError(404, 'Subtype not found')
+    } else {
+      row = await queryOne<any>(
+        `INSERT INTO property_unit_subtypes
+           (property_id, unit_type, name, bedrooms, bathrooms, rv_site_layout,
+            rv_amp_service, storage_size, rent_amount, security_deposit,
+            nightly_rate, weekly_rate, monthly_rate)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+         ON CONFLICT (property_id, unit_type, name) DO UPDATE
+           SET bedrooms=EXCLUDED.bedrooms, bathrooms=EXCLUDED.bathrooms,
+               rv_site_layout=EXCLUDED.rv_site_layout, rv_amp_service=EXCLUDED.rv_amp_service,
+               storage_size=EXCLUDED.storage_size, rent_amount=EXCLUDED.rent_amount,
+               security_deposit=EXCLUDED.security_deposit, nightly_rate=EXCLUDED.nightly_rate,
+               weekly_rate=EXCLUDED.weekly_rate, monthly_rate=EXCLUDED.monthly_rate,
+               updated_at=NOW()
+         RETURNING *`,
+        vals,
+      )
+    }
+    res.json({ success: true, data: row })
+  } catch (e) { next(e) }
+})
+
+// DELETE /api/properties/:id/unit-subtypes/:rowId — units created from it
+// keep their copied values (units.subtype_id → NULL via FK).
+propertiesRouter.delete('/:id/unit-subtypes/:rowId', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const p = await queryOne<any>(`SELECT id, landlord_id FROM properties WHERE id=$1`, [req.params.id])
+    if (!p) throw new AppError(404, 'Property not found')
+    if (!canManageLandlordResource(req.user, p.landlord_id)) throw new AppError(403, 'Forbidden')
+    await query(
+      `DELETE FROM property_unit_subtypes WHERE id=$1 AND property_id=$2`,
+      [req.params.rowId, req.params.id],
+    )
+    res.json({ success: true })
+  } catch (e) { next(e) }
+})
+
+// ─────────────────────────────────────────────────────────────
 // PROPERTY FEE SCHEDULE (S154)
 // Anti-discrimination model: per-property standard fees that
 // pre-populate new lease documents. Lease remains the legal
 // contract; this is the policy.
+// NOTE (S526): the landlord-facing fee-schedule page is RETIRED — each
+// tenant is charged per their own signed lease (lease_fees, parsed at
+// e-sign finalize). These routes stay for the esign is_override audit
+// comparison and any legacy rows; no UI writes them anymore.
 // ─────────────────────────────────────────────────────────────
 
 // GET /api/properties/:id/fee-schedule — list rows for a property
@@ -468,6 +589,10 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
     // per property when they want to offer FlexCharge at that Location.
     const flexchargeEnabled =
       typeof raw.flexchargeEnabled === 'boolean' ? raw.flexchargeEnabled : undefined
+    // S526: weekly-lease jurisdictions — drops the auto-lease-draft threshold
+    // for long stays from 30 days to 7 (services/bookingLeaseDraft.ts).
+    const weeklyLeaseMode =
+      typeof raw.weeklyLeaseMode === 'boolean' ? raw.weeklyLeaseMode : undefined
 
     let updated = await queryOne<any>(`
       UPDATE properties SET
@@ -485,8 +610,9 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
         late_fee_initial_type   = COALESCE($12, late_fee_initial_type),
         subleasing_allowed      = COALESCE($13, subleasing_allowed),
         flexcharge_enabled      = COALESCE($14, flexcharge_enabled),
+        weekly_lease_mode       = COALESCE($15, weekly_lease_mode),
         updated_at  = NOW()
-      WHERE id=$15 RETURNING *`,
+      WHERE id=$16 RETURNING *`,
       [name||null, street1||null, street2||null, city||null, state||null,
        zip||null, type||null,
        reqAck === undefined ? null : reqAck,
@@ -496,6 +622,7 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
        lateFeeInitialType ?? null,
        subleasingAllowed === undefined ? null : subleasingAllowed,
        flexchargeEnabled === undefined ? null : flexchargeEnabled,
+       weeklyLeaseMode === undefined ? null : weeklyLeaseMode,
        req.params.id]
     )
 
@@ -734,9 +861,12 @@ propertiesRouter.patch('/:id/pm-assignment', requireLandlord, async (req, res, n
 // Body: { userId: string | null }. null reverts to owner self-management.
 //
 // Validation:
-//   - Target user_id must have an active property_manager_scopes row
-//     covering this property under this landlord (gate prevents the
-//     owner from routing to Random Stranger).
+//   - Target user_id must have an active property_manager_scopes OR
+//     onsite_manager_scopes row covering this property under this
+//     landlord (gate prevents the owner from routing to Random
+//     Stranger). S527: onsite managers added — they ARE the day-to-day
+//     person at a property; restricting to PM scopes predated the
+//     team consolidation.
 //   - Refuses while pm_company_id is set — PM company takes precedence
 //     in the resolver, and an individual manager assignment is
 //     meaningless under a PM company contract. Owner must clear the
@@ -778,12 +908,26 @@ propertiesRouter.patch('/:id/manager', requirePerm('properties.assign_manager'),
     const targetUserId = body.userId ?? prop.owner_user_id
 
     if (targetUserId !== prop.owner_user_id) {
-      // Validate the target has property_manager scope covering this
-      // property under this landlord. all_properties=true OR property_id
-      // listed OR a unit under the property listed all qualify.
+      // Validate the target has a property_manager OR onsite_manager
+      // scope covering this property under this landlord.
+      // all_properties=true OR property_id listed OR a unit under the
+      // property listed all qualify.
       const scope = await queryOne<{ id: string }>(
         `SELECT s.id
            FROM property_manager_scopes s
+          WHERE s.user_id = $1
+            AND s.landlord_id = $2
+            AND (
+              s.all_properties = true
+              OR $3::uuid = ANY(s.property_ids)
+              OR EXISTS (
+                SELECT 1 FROM units u
+                 WHERE u.property_id = $3 AND u.id = ANY(s.unit_ids)
+              )
+            )
+          UNION ALL
+         SELECT s.id
+           FROM onsite_manager_scopes s
           WHERE s.user_id = $1
             AND s.landlord_id = $2
             AND (
@@ -800,7 +944,7 @@ propertiesRouter.patch('/:id/manager', requirePerm('properties.assign_manager'),
       if (!scope) {
         throw new AppError(
           400,
-          'Target user is not a property_manager scope holder for this property under this landlord. Add the scope on the Team page first.'
+          'Target user is not a property-manager or on-site-manager scope holder for this property under this landlord. Add the scope on the Team page first.'
         )
       }
     }
@@ -819,9 +963,11 @@ propertiesRouter.patch('/:id/manager', requirePerm('properties.assign_manager'),
 
 // GET /api/properties/:id/eligible-managers — list of users who can be
 // assigned as the day-to-day manager for this property. Includes the
-// owner (as 'self') plus every active property_manager_scopes holder
-// whose scope covers this property. Frontend feeds this to the
-// manager-selection dropdown on the property detail page.
+// owner (as 'self') plus every property_manager_scopes AND
+// onsite_manager_scopes holder whose scope covers this property
+// (S527 — a user holding both dedups to property_manager). Frontend
+// feeds this to the manager-selection dropdown on the property detail
+// page; staff_role labels each row's origin.
 propertiesRouter.get('/:id/eligible-managers', async (req, res, next) => {
   try {
     const prop = await queryOne<{
@@ -855,19 +1001,41 @@ propertiesRouter.get('/:id/eligible-managers', async (req, res, next) => {
       email: string
       first_name: string | null
       last_name: string | null
+      staff_role: 'property_manager' | 'onsite_manager'
     }>(
-      `SELECT u.id AS user_id, u.email, u.first_name, u.last_name
-         FROM property_manager_scopes s
-         JOIN users u ON u.id = s.user_id
-        WHERE s.landlord_id = $1
-          AND (
-            s.all_properties = true
-            OR $2::uuid = ANY(s.property_ids)
-            OR EXISTS (
-              SELECT 1 FROM units un
-               WHERE un.property_id = $2 AND un.id = ANY(s.unit_ids)
+      `WITH scoped AS (
+         SELECT s.user_id, 'property_manager'::text AS staff_role
+           FROM property_manager_scopes s
+          WHERE s.landlord_id = $1
+            AND (
+              s.all_properties = true
+              OR $2::uuid = ANY(s.property_ids)
+              OR EXISTS (
+                SELECT 1 FROM units un
+                 WHERE un.property_id = $2 AND un.id = ANY(s.unit_ids)
+              )
             )
-          )
+         UNION ALL
+         SELECT s.user_id, 'onsite_manager'
+           FROM onsite_manager_scopes s
+          WHERE s.landlord_id = $1
+            AND (
+              s.all_properties = true
+              OR $2::uuid = ANY(s.property_ids)
+              OR EXISTS (
+                SELECT 1 FROM units un
+                 WHERE un.property_id = $2 AND un.id = ANY(s.unit_ids)
+              )
+            )
+       ), dedup AS (
+         -- staff_role DESC: 'property_manager' > 'onsite_manager', so a
+         -- user holding both scope rows surfaces as property_manager.
+         SELECT DISTINCT ON (user_id) user_id, staff_role
+           FROM scoped ORDER BY user_id, staff_role DESC
+       )
+       SELECT u.id AS user_id, u.email, u.first_name, u.last_name, d.staff_role
+         FROM dedup d
+         JOIN users u ON u.id = d.user_id
         ORDER BY u.last_name NULLS LAST, u.first_name NULLS LAST, u.email`,
       [prop.landlord_id, prop.id]
     )
@@ -1105,91 +1273,7 @@ publicPropertiesRouter.post('/apply', async (req, res, next) => {
 // (GET /api/properties/applications declared above, before GET /:id —
 // see S399 routing-order fix.)
 
-// POST /api/properties/:id/units/bulk — create multiple units by type.
-// Creating units is operational — PMs do this regularly. Default
-// canManageLandlordResource policy (all team roles) is correct.
-propertiesRouter.post('/:id/units/bulk', requirePerm('properties.add_unit'), async (req, res, next) => {
-  try {
-    const prop = await queryOne<any>(
-      'SELECT * FROM properties WHERE id=$1',
-      [req.params.id]
-    )
-    if (!prop) throw new AppError(404, 'Property not found')
-    if (!canManageLandlordResource(req.user, prop.landlord_id)) {
-      throw new AppError(403, 'Forbidden')
-    }
-
-    // unitGroups: [{ type: 'rv_spot', count: 20, prefix: 'RV', rentAmount: 500 }, ...]
-    const { unitGroups } = req.body
-    if (!unitGroups?.length) throw new AppError(400, 'unitGroups required')
-
-    // S414 (S399 finding): per-group input validation. Pre-fix accepted
-    // arbitrary count (DoS via count=10000), arbitrary prefix length,
-    // and arbitrary type strings (only caught later by the DB
-    // units_unit_type_check constraint at INSERT time → 500 with
-    // cryptic 23514). Now validated upfront with zod.
-    const UNIT_TYPES = ['apartment', 'single_family', 'rv_spot', 'mobile_home', 'storage', 'commercial'] as const
-    const bulkSchema = z.array(z.object({
-      type:            z.enum(UNIT_TYPES),
-      count:           z.number().int().min(1).max(200, 'count must be ≤ 200 per group'),
-      prefix:          z.string().max(32, 'prefix must be ≤ 32 chars').optional(),
-      rentAmount:      z.number().positive().optional(),
-      securityDeposit: z.number().min(0).optional(),
-    })).min(1, 'unitGroups must have at least one group')
-    const validatedGroups = bulkSchema.parse(unitGroups)
-
-    // Default prefix per unit type (user-typed prefix overrides this).
-    // S414: keys aligned to units_unit_type_check allow-list — pre-fix
-    // had 'house' and 'other' keys that never matched the schema CHECK.
-    const TYPE_PREFIXES: Record<string,string> = {
-      apartment:     'Apt',
-      single_family: 'House',
-      mobile_home:   'MH',
-      rv_spot:       'RV',
-      storage:       'Storage',
-      commercial:    'Com',
-    }
-
-    const created = []
-    for (const group of validatedGroups) {
-      const { type, count, prefix, rentAmount, securityDeposit } = group
-      // User prefix goes through formatName; fallback to TYPE_PREFIXES default.
-      const pfx = prefix ? formatName(prefix) : (TYPE_PREFIXES[type] || 'Unit')
-
-      // Find existing max number for this prefix in this property (case-insensitive match)
-      const { rows: existing } = await db.query(
-        `SELECT unit_number FROM units WHERE property_id=$1 AND LOWER(unit_number) LIKE LOWER($2) ORDER BY unit_number`,
-        [req.params.id, `${pfx} %`]
-      )
-      const existingNums = existing.map((r: any) => {
-        const m = r.unit_number.match(/\s(\d+)$/)
-        return m ? parseInt(m[1]) : 0
-      })
-      const startNum = existingNums.length > 0 ? Math.max(...existingNums) + 1 : 1
-
-      for (let i = 0; i < count; i++) {
-        const unitNum = `${pfx} ${String(startNum + i).padStart(2, '0')}`
-        const { rows: [unit] } = await db.query(
-          `INSERT INTO units (property_id, landlord_id, unit_number, unit_type, rent_amount, security_deposit, status)
-           VALUES ($1,$2,$3,$4,$5,$6,'vacant') RETURNING *`,
-          // S399 fix: security_deposit is NOT NULL with DEFAULT 0 in the
-          // schema. Pre-fix the route passed null when securityDeposit
-          // was omitted from a unitGroup, which overrode the default →
-          // 23502 not-null violation → 500 on every bulk-create that
-          // didn't explicitly provide securityDeposit per group.
-          [req.params.id, prop.landlord_id, unitNum, type, rentAmount||null, securityDeposit||0]
-        )
-        created.push(unit)
-      }
-    }
-
-    // Update property unit_types
-    const types = [...new Set(validatedGroups.map((g) => g.type))]
-    await db.query(
-      'UPDATE properties SET unit_types=$1 WHERE id=$2',
-      [types, req.params.id]
-    )
-
-    res.status(201).json({ success: true, data: { created: created.length, units: created } })
-  } catch (e) { next(e) }
-})
+// POST /api/properties/:id/units/bulk — REMOVED S527. The Add Property
+// wizard's bulk "Create Units" step is gone (Nic: one door for creating
+// units). Multi-unit creation is POST /api/units with `quantity` — same
+// type/subtype/pricing machinery as single-unit creation.

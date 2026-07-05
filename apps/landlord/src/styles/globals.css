@@ -1,11 +1,12 @@
 /* ============================================================
    GOLD ASSET MANAGEMENT — DESIGN SYSTEM
    Aesthetic: Dark industrial finance. Precision-engineered.
-   Fonts: DM Mono (data) + Syne (headers) + DM Sans (body)
+   Fonts: DM Mono (data) + Space Grotesk (headers) + Inter (body)
+   (W-47: Nic picked Space Grotesk + Inter over Syne + DM Sans)
    Colors: Near-black with gold accent, sharp data greens/reds
    ============================================================ */
 
-@import url('https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&family=DM+Sans:ital,wght@0,300;0,400;0,500;0,600;1,400&family=DM+Mono:wght@400;500&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400&family=DM+Mono:wght@400;500&display=swap');
 
 /* ── TOKENS ─────────────────────────────────────────────── */
 :root {
@@ -47,8 +48,8 @@
   --blue-bg:    rgba(59,130,246,.08);
 
   /* Fonts */
-  --font-display: 'Syne', sans-serif;
-  --font-body:    'DM Sans', sans-serif;
+  --font-display: 'Space Grotesk', sans-serif;
+  --font-body:    'Inter', sans-serif;
   --font-mono:    'DM Mono', monospace;
 
   /* Radii */
@@ -87,7 +88,7 @@ h1, h2, h3, h4, h5, h6 {
   line-height: 1.2;
   letter-spacing: -0.01em;
 }
-h1 { font-size: 2rem;   font-weight: 800; }
+h1 { font-size: 2rem;   font-weight: 700; }
 h2 { font-size: 1.5rem; font-weight: 700; }
 h3 { font-size: 1.2rem; font-weight: 700; }
 h4 { font-size: 1rem;   font-weight: 600; }
@@ -159,7 +160,7 @@ h4 { font-size: 1rem;   font-weight: 600; }
 .sidebar-logo-mark {
   font-family: var(--font-display);
   font-size: 1.1rem;
-  font-weight: 800;
+  font-weight: 700;
   color: var(--gold);
   letter-spacing: .02em;
 }
@@ -281,7 +282,7 @@ h4 { font-size: 1rem;   font-weight: 600; }
 .kpi-value {
   font-family: var(--font-display);
   font-size: 1.8rem;
-  font-weight: 800;
+  font-weight: 700;
   color: var(--text-0);
   line-height: 1;
   margin-bottom: 6px;
@@ -477,7 +478,7 @@ h4 { font-size: 1rem;   font-weight: 600; }
 .modal-title {
   font-family: var(--font-display);
   font-size: 1.1rem;
-  font-weight: 800;
+  font-weight: 700;
   color: var(--text-0);
   margin-bottom: 20px;
 }
@@ -502,7 +503,7 @@ h4 { font-size: 1rem;   font-weight: 600; }
 .page-title {
   font-family: var(--font-display);
   font-size: 1.5rem;
-  font-weight: 800;
+  font-weight: 700;
   color: var(--text-0);
 }
 .page-subtitle {

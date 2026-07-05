@@ -1,4 +1,8 @@
 import { Router } from 'express'
+import path from 'path'
+import fs from 'fs'
+import crypto from 'crypto'
+import multer from 'multer'
 import { z } from 'zod'
 import { query, queryOne, getClient } from '../db'
 import { requireAuth, requirePerm } from '../middleware/auth'
@@ -292,6 +296,55 @@ maintenanceRouter.post('/:id/approve', requirePerm('maintenance.approve'), async
 })
 
 // POST /api/maintenance/:id/comments — add comment
+// ── W-8 (S529): receipts on a request ────────────────────────────────────
+// A receipt is a documents row (type='receipt') AUTO-LINKED to the request's
+// unit — no manual linking where the source is known — and threaded back via
+// documents.maintenance_request_id. It shows up on the Documents tab too.
+const receiptDir = path.join(process.cwd(), 'uploads', 'docs')
+if (!fs.existsSync(receiptDir)) fs.mkdirSync(receiptDir, { recursive: true })
+const receiptUpload = multer({
+  storage: multer.diskStorage({
+    destination: receiptDir,
+    filename: (_req: any, file: any, cb: any) =>
+      cb(null, Date.now() + '-' + crypto.randomBytes(8).toString('hex') + path.extname(file.originalname)),
+  }),
+  limits: { fileSize: 25 * 1024 * 1024 },
+  fileFilter: (_req: any, file: any, cb: any) => {
+    if (['application/pdf', 'image/jpeg', 'image/png', 'image/webp', 'image/heic'].includes(file.mimetype)) cb(null, true)
+    else cb(new Error('PDF or image only'))
+  },
+})
+
+maintenanceRouter.get('/:id/receipts', async (req, res, next) => {
+  try {
+    const mr = await queryOne<any>('SELECT id, landlord_id FROM maintenance_requests WHERE id=$1', [req.params.id])
+    if (!mr) throw new AppError(404, 'Request not found')
+    if (!canAccessLandlordResource(req.user, mr.landlord_id)) throw new AppError(403, 'Forbidden')
+    const receipts = await query<any>(
+      `SELECT id, name, url, file_size, mime_type, created_at
+         FROM documents WHERE maintenance_request_id = $1 ORDER BY created_at DESC`,
+      [mr.id])
+    res.json({ success: true, data: receipts })
+  } catch (e) { next(e) }
+})
+
+maintenanceRouter.post('/:id/receipts', requirePerm('maintenance.update'), receiptUpload.single('file'), async (req, res, next) => {
+  try {
+    if (!req.file) throw new AppError(400, 'No file uploaded')
+    const mr = await queryOne<any>(
+      'SELECT id, landlord_id, unit_id FROM maintenance_requests WHERE id=$1', [req.params.id])
+    if (!mr) throw new AppError(404, 'Request not found')
+    if (!canManageLandlordResource(req.user, mr.landlord_id)) throw new AppError(403, 'Forbidden')
+    const doc = await queryOne<any>(
+      `INSERT INTO documents (landlord_id, unit_id, maintenance_request_id, type, name, url, file_size, mime_type)
+       VALUES ($1,$2,$3,'receipt',$4,$5,$6,$7) RETURNING *`,
+      [mr.landlord_id, mr.unit_id, mr.id,
+       (req.body.name || req.file.originalname).slice(0, 200),
+       `/uploads/docs/${req.file.filename}`, req.file.size, req.file.mimetype])
+    res.status(201).json({ success: true, data: doc })
+  } catch (e) { next(e) }
+})
+
 maintenanceRouter.post('/:id/comments', async (req, res, next) => {
   try {
     const { message, isInternal } = req.body

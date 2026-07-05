@@ -108,14 +108,27 @@ maintenancePortalRouter.post('/parts', requirePerm('purchases.request', 'purchas
 
 maintenancePortalRouter.patch('/parts/:id', requirePerm('purchases.request', 'purchases.approve'), async (req, res, next) => {
   try {
-    const { quantity, name, minQuantity, location, cost } = req.body
+    const { quantity, name, minQuantity, location, cost, sku, description, unit } = req.body
     // S348: 404 instead of silent data:null when no matching row.
     const part = await queryOne<any>(
-      'UPDATE parts_inventory SET quantity=COALESCE($1,quantity), name=COALESCE($2,name), min_quantity=COALESCE($3,min_quantity), location=COALESCE($4,location), cost=COALESCE($5,cost), updated_at=NOW() WHERE id=$6 AND landlord_id=$7 RETURNING *',
-      [quantity, name, minQuantity, location, cost, req.params.id, req.user!.profileId]
+      'UPDATE parts_inventory SET quantity=COALESCE($1,quantity), name=COALESCE($2,name), min_quantity=COALESCE($3,min_quantity), location=COALESCE($4,location), cost=COALESCE($5,cost), sku=COALESCE($6,sku), description=COALESCE($7,description), unit=COALESCE($8,unit), updated_at=NOW() WHERE id=$9 AND landlord_id=$10 RETURNING *',
+      [quantity, name, minQuantity, location, cost, sku, description, unit, req.params.id, req.user!.profileId]
     )
     if (!part) throw new AppError(404, 'Part not found')
     res.json({ success: true, data: part })
+  } catch(e) { next(e) }
+})
+
+// W-46: remove an inventory item. Approve-level only — request-level staff
+// can add/adjust stock but not erase items from the list.
+maintenancePortalRouter.delete('/parts/:id', requirePerm('purchases.approve'), async (req, res, next) => {
+  try {
+    const part = await queryOne<any>(
+      'DELETE FROM parts_inventory WHERE id=$1 AND landlord_id=$2 RETURNING id',
+      [req.params.id, req.user!.profileId]
+    )
+    if (!part) throw new AppError(404, 'Part not found')
+    res.json({ success: true, data: { id: part.id } })
   } catch(e) { next(e) }
 })
 

@@ -84,7 +84,6 @@ export function POSPage() {
   const [filterCat, setFilterCat] = useState('all')
   // S216: items-tab property filter. 'all' = no filter, 'company-wide'
   // = items with NULL property_id, or a specific property uuid.
-  const [filterItemProperty, setFilterItemProperty] = useState<string>('all')
   const [receipt, setReceipt] = useState<any>(null)
   const [appliedDiscount, setAppliedDiscount] = useState<any>(null)
   const [discountCode, setDiscountCode] = useState('')
@@ -140,7 +139,9 @@ export function POSPage() {
   const [poItemRow, setPoItemRow] = useState({ itemId:'', qtyOrdered:'1', unitCost:'' })
   const [expandedPO, setExpandedPO] = useState<string|null>(null)
 
-  const { data: items = [] } = useQuery<any[]>('pos-items', () => apiGet('/pos/items'))
+  // W-12 (S531): every POS read is scoped to the page-level property.
+  const propQ = registerProperty ? `?propertyId=${registerProperty}` : ''
+  const { data: items = [] } = useQuery<any[]>(['pos-items', registerProperty], () => apiGet(`/pos/items${propQ}`))
   // POS #1: business-level default margin → drives item auto-pricing.
   const { data: posSettings } = useQuery<any>('pos-settings', () => apiGet<any>('/pos/settings'))
   const defaultMarginPct: number | null = posSettings?.defaultMarginPct ?? null
@@ -151,9 +152,9 @@ export function POSPage() {
   )
   // S218: pos_categories from the API replaces the old hardcoded
   // CATEGORIES const. First GET auto-seeds defaults if empty.
-  const { data: posCategories = [] } = useQuery<any[]>('pos-categories', () => apiGet('/pos/categories'))
+  const { data: posCategories = [] } = useQuery<any[]>(['pos-categories', registerProperty], () => apiGet(`/pos/categories${propQ}`))
   // S219: full list (incl. inactive) for the manage-categories tab.
-  const { data: posCategoriesAll = [] } = useQuery<any[]>('pos-categories-all', () => apiGet('/pos/categories?all=1'), { enabled: tab==='categories' })
+  const { data: posCategoriesAll = [] } = useQuery<any[]>(['pos-categories-all', registerProperty], () => apiGet(`/pos/categories?all=1${registerProperty ? '&propertyId='+registerProperty : ''}`), { enabled: tab==='categories' })
   const { data: tenants = [] } = useQuery<any[]>('tenants', () => apiGet('/tenants'))
   // S192: per-property POS — properties list feeds the property
   // selector on item create/edit. NotificationBell already pulls
@@ -161,15 +162,15 @@ export function POSPage() {
   const { data: properties = [] } = useQuery<any[]>('properties', () => apiGet('/properties'))
   // S254: pos_customers roster for FlexCharge non-tenant picker
   const { data: posCustomers = [] } = useQuery<any[]>('pos-customers', () => apiGet('/landlords/pos-customers'), { enabled: method==='charge' })
-  const { data: taxRates = [] } = useQuery<any[]>('pos-tax-rates', () => apiGet('/pos/tax-rates'), { enabled: tab==='taxes'||tab==='register' })
+  const { data: taxRates = [] } = useQuery<any[]>(['pos-tax-rates', registerProperty], () => apiGet(`/pos/tax-rates${propQ}`), { enabled: tab==='taxes'||tab==='register' })
   // Tax categories (simple: name + one rate). Items pick a tax category → rate.
   const { data: posTaxCategories = [] } = useQuery<any[]>('pos-tax-categories', () => apiGet('/pos/tax-categories'), { enabled: tab==='taxes'||tab==='items'||tab==='register' })
-  const { data: discounts = [] } = useQuery<any[]>('pos-discounts', () => apiGet('/pos/discounts'), { enabled: tab==='discounts'||tab==='register' })
-  const { data: txns = [], isLoading: txLoading } = useQuery<any[]>('pos-transactions', () => apiGet('/pos/transactions'), { enabled: tab==='history' })
+  const { data: discounts = [] } = useQuery<any[]>(['pos-discounts', registerProperty], () => apiGet(`/pos/discounts${propQ}`), { enabled: tab==='discounts'||tab==='register' })
+  const { data: txns = [], isLoading: txLoading } = useQuery<any[]>(['pos-transactions', registerProperty], () => apiGet(`/pos/transactions${propQ}`), { enabled: tab==='history' })
   const { data: vendors = [] } = useQuery<any[]>('pos-vendors', () => apiGet('/pos/vendors'), { enabled: tab==='vendors'||tab==='orders' })
-  const { data: purchaseOrders = [] } = useQuery<any[]>('pos-purchase-orders', () => apiGet('/pos/purchase-orders'), { enabled: tab==='orders' })
-  const { data: inventoryLog = [] } = useQuery<any[]>('pos-inventory-log', () => apiGet('/pos/inventory-log'), { enabled: tab==='inventory' })
-  const { data: lowStock = [] } = useQuery<any[]>('pos-low-stock', () => apiGet('/pos/low-stock'), { enabled: tab==='inventory' })
+  const { data: purchaseOrders = [] } = useQuery<any[]>(['pos-purchase-orders', registerProperty], () => apiGet(`/pos/purchase-orders${propQ}`), { enabled: tab==='orders' })
+  const { data: inventoryLog = [] } = useQuery<any[]>(['pos-inventory-log', registerProperty], () => apiGet(`/pos/inventory-log${propQ}`), { enabled: tab==='inventory' })
+  const { data: lowStock = [] } = useQuery<any[]>(['pos-low-stock', registerProperty], () => apiGet(`/pos/low-stock${propQ}`), { enabled: tab==='inventory' })
 
   // S243: smart readers registered to the cart's property — filters
   // the smart-reader selector in the charge modal. Re-fetches when
@@ -228,14 +229,20 @@ export function POSPage() {
   // wins if present (matches the historical default).
   useEffect(() => {
     if (newItem.categoryId) {
-      const visible = categoriesForProperty(newItem.propertyId).find(c => c.id === newItem.categoryId)
+      const visible = categoriesForProperty(registerProperty).find(c => c.id === newItem.categoryId)
       if (visible) return
     }
-    const list = categoriesForProperty(newItem.propertyId)
+    const list = categoriesForProperty(registerProperty)
     if (list.length === 0) return
     const misc = list.find(c => c.name === 'Misc')
     setNewItem(s => ({ ...s, categoryId: (misc ?? list[0]).id }))
-  }, [posCategories, newItem.propertyId])
+  }, [posCategories, registerProperty])
+
+  // W-12: new tax rates default to the page property; "All locations"
+  // stays available as an explicit choice in the dropdown.
+  useEffect(() => {
+    if (registerProperty) setNewTax(s => ({ ...s, propertyId: registerProperty }))
+  }, [registerProperty])
 
   // S263: open-tab query (cross-terminal pickup + crash recovery). When
   // the register tab loads with a property selected and no live session,
@@ -422,7 +429,9 @@ export function POSPage() {
       // S254: charge mode posts customer + property scoping for FlexCharge
       tenantId: method==='charge' && chargeCustomerType==='tenant' ? (tenantId||null) : (method==='charge' ? null : (tenantId||null)),
       posCustomerId: method==='charge' && chargeCustomerType==='pos_customer' ? (posCustomerId||null) : null,
-      propertyId: method==='charge' ? (registerProperty||null) : null,
+      // W-12 (S531): every sale carries its property (backend rejects
+      // property-less sales — per-property books/EOD/history).
+      propertyId: registerProperty || null,
       subtotal:discountedSubtotal, taxAmount, surcharge, total, changeGiven:changeDue,
       discountAmount:discountAmt, discountReason:appliedDiscount?.name||null,
       stripePaymentIntentId: stripePaymentIntentId || null,
@@ -451,7 +460,7 @@ export function POSPage() {
 
   const toggleChargeMut = useMutation(({ id, val }:{ id:string; val:boolean }) => apiPatch(`/pos/items/${id}`, { chargeEligible:val }), { onSuccess: () => qc.invalidateQueries('pos-items') })
   const toggleActiveMut = useMutation(({ id, val }:{ id:string; val:boolean }) => apiPatch(`/pos/items/${id}`, { isActive:val }), { onSuccess: () => qc.invalidateQueries('pos-items') })
-  const createItemMut = useMutation(() => apiPost('/pos/items', { ...newItem, propertyId: newItem.propertyId || null, categoryId: newItem.categoryId, costPrice:Number(newItem.costPrice), sellPrice:Number(newItem.sellPrice), marginPct: newItem.marginPct === '' ? null : Number(newItem.marginPct), taxCategoryId: newItem.taxCategoryId || null, chargeEligible:newItem.chargeEligible, stockQty:Number(newItem.stockQty), stockMin:Number(newItem.stockMin), stockMax:Number(newItem.stockMax) }), { onSuccess: () => { qc.invalidateQueries('pos-items'); setNewItem({ name:'', categoryId:'', icon:'📦', sellPrice:'', costPrice:'', marginPct: defaultMarginPct!=null?String(defaultMarginPct):'', taxCategoryId:'', chargeEligible:true, stockQty:'0', stockMin:'5', stockMax:'50', propertyId:'' }) }, onError: (e:any) => alert(e?.response?.data?.error?.message || e?.response?.data?.error || 'Could not add item — set name, sell price, category, and property') })
+  const createItemMut = useMutation(() => apiPost('/pos/items', { ...newItem, propertyId: registerProperty, categoryId: newItem.categoryId, costPrice:Number(newItem.costPrice), sellPrice:Number(newItem.sellPrice), marginPct: newItem.marginPct === '' ? null : Number(newItem.marginPct), taxCategoryId: newItem.taxCategoryId || null, chargeEligible:newItem.chargeEligible, stockQty:Number(newItem.stockQty), stockMin:Number(newItem.stockMin), stockMax:Number(newItem.stockMax) }), { onSuccess: () => { qc.invalidateQueries('pos-items'); setNewItem({ name:'', categoryId:'', icon:'📦', sellPrice:'', costPrice:'', marginPct: defaultMarginPct!=null?String(defaultMarginPct):'', taxCategoryId:'', chargeEligible:true, stockQty:'0', stockMin:'5', stockMax:'50', propertyId:'' }) }, onError: (e:any) => alert(e?.response?.data?.error?.message || e?.response?.data?.error || 'Could not add item — set name, sell price, category, and property') })
 
   // POS #1 auto-pricing helpers. Margin is gross % of sell price:
   // sell = cost / (1 - margin/100); margin = (sell - cost) / sell * 100.
@@ -496,7 +505,7 @@ export function POSPage() {
   const createVendorMut = useMutation(() => apiPost('/pos/vendors', { ...newVendor, leadTimeDays:Number(newVendor.leadTimeDays) }), { onSuccess: () => { qc.invalidateQueries('pos-vendors'); setNewVendor({ name:'', contactName:'', email:'', phone:'', address:'', leadTimeDays:'3', notes:'' }) } })
   const updateVendorMut = useMutation((data:any) => apiPatch(`/pos/vendors/${editVendor.id}`, data), { onSuccess: () => { qc.invalidateQueries('pos-vendors'); setEditVendor(null) } })
 
-  const createPOMut = useMutation(() => apiPost('/pos/purchase-orders', { ...newPO, items: poItems }), { onSuccess: () => { qc.invalidateQueries('pos-purchase-orders'); setNewPO({ vendorId:'', notes:'', expectedDate:'' }); setPoItems([]) } })
+  const createPOMut = useMutation(() => apiPost('/pos/purchase-orders', { ...newPO, items: poItems, propertyId: registerProperty }), { onSuccess: () => { qc.invalidateQueries('pos-purchase-orders'); setNewPO({ vendorId:'', notes:'', expectedDate:'' }); setPoItems([]) } })
   const updatePOMut = useMutation(({ id, status }:{ id:string; status:string }) => apiPatch(`/pos/purchase-orders/${id}`, { status }), { onSuccess: () => qc.invalidateQueries('pos-purchase-orders') })
 
   // S219: category CRUD. Invalidates both the active-only query (drives
@@ -521,7 +530,7 @@ export function POSPage() {
   const [newTaxCat, setNewTaxCat] = useState({ name:'', ratePct:'' })
   const createTaxCatMut = useMutation(() => apiPost('/pos/tax-categories', { name:newTaxCat.name, rate:Number(newTaxCat.ratePct||0)/100 }), { onSuccess: () => { qc.invalidateQueries('pos-tax-categories'); setNewTaxCat({ name:'', ratePct:'' }) }, onError:(e:any)=>alert(e?.response?.data?.error?.message||e?.response?.data?.error||'Could not add tax category') })
   const updateTaxCatMut = useMutation((v:any) => apiPatch(`/pos/tax-categories/${v.id}`, { rate:v.rate, isActive:v.isActive }), { onSuccess: () => { qc.invalidateQueries('pos-tax-categories'); qc.invalidateQueries('pos-items') } })
-  const createDiscountMut = useMutation(() => apiPost('/pos/discounts', { ...newDiscount, value:Number(newDiscount.value) }), { onSuccess: () => { qc.invalidateQueries('pos-discounts'); setNewDiscount({ name:'', type:'percent', value:'', code:'' }) } })
+  const createDiscountMut = useMutation(() => apiPost('/pos/discounts', { ...newDiscount, value:Number(newDiscount.value), propertyId: registerProperty }), { onSuccess: () => { qc.invalidateQueries('pos-discounts'); setNewDiscount({ name:'', type:'percent', value:'', code:'' }) } })
   const deleteDiscountMut = useMutation((id:string) => apiDel(`/pos/discounts/${id}`), { onSuccess: () => qc.invalidateQueries('pos-discounts') })
   const refundMut = useMutation(() => apiPost(`/pos/transactions/${refundModal.tx?.id}/refund`, { amount:Number(refundAmt)||refundModal.tx?.total, reason:refundReason, refundMethod }), { onSuccess: () => { qc.invalidateQueries('pos-transactions'); setRefundModal({show:false,tx:null}); setRefundAmt(''); setRefundReason(''); setRefundMethod('cash') } })
   const voidMut = useMutation((id:string) => apiPost(`/pos/transactions/${id}/void`, { reason:'Voided by cashier' }), { onSuccess: () => qc.invalidateQueries('pos-transactions') })
@@ -659,32 +668,32 @@ export function POSPage() {
   return (
     <div>
       <div className="page-header">
-        <div><h1 className="page-title">Point of Sale</h1></div>
+        <div style={{display:'flex',alignItems:'center',gap:14}}>
+          <h1 className="page-title" style={{margin:0}}>Point of Sale</h1>
+          {/* W-12 (S531): ONE property context for the whole POS surface —
+              every tab reads and writes within this property. */}
+          {(properties as any[]).length > 1 && (
+            <select className="form-select" value={registerProperty} onChange={e=>{ setRegisterProperty(e.target.value); setTenantId(''); setPosCustomerId('') }} style={{width:'auto',minWidth:200}}>
+              <option value="" disabled>Select a property…</option>
+              {(properties as any[]).map((p:any)=><option key={p.id} value={p.id}>{p.name||p.street1}</option>)}
+            </select>
+          )}
+        </div>
         <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>
           {TABS.map(t => <button key={t.key} className={"tab-btn "+(tab===t.key?'active':'')} onClick={()=>setTab(t.key as any)}>{t.label}</button>)}
         </div>
       </div>
 
+      {!registerProperty && (
+        <div style={{padding:'48px 24px',textAlign:'center',color:'var(--text-3)',border:'1px dashed var(--border-1)',borderRadius:12}}>
+          Select a property above — POS is per-property: its register, sales history, items, and tax rates all live at one location.
+        </div>
+      )}
+
       {tab==='register' && (
         <div style={{display:'grid',gridTemplateColumns:'1fr 340px',gap:16,alignItems:'start'}}>
           <div>
-            {/* Register/property picker — you must choose which property you're
-                ringing on before adding items (items, tax, and sessions are all
-                per property). Single-property operators are auto-selected. */}
-            {(properties as any[]).length > 1 && (
-              <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:12}}>
-                <label style={{fontSize:'.78rem',color:'var(--text-3)'}}>Register:</label>
-                <select className="form-select" value={registerProperty} onChange={e=>{ setRegisterProperty(e.target.value); setTenantId(''); setPosCustomerId('') }} style={{width:'auto',minWidth:220}}>
-                  <option value="" disabled>Select a property…</option>
-                  {(properties as any[]).map((p:any)=><option key={p.id} value={p.id}>{p.name||p.street1}</option>)}
-                </select>
-              </div>
-            )}
-            {!registerProperty ? (
-              <div style={{padding:'48px 24px',textAlign:'center',color:'var(--text-3)',border:'1px dashed var(--border-1)',borderRadius:12}}>
-                Select a property above to start ringing up sales.
-              </div>
-            ) : (<>
+            {!registerProperty ? null : (<>
             {/* S263: open-tab banner — appears when there's an unclosed
                 session on this property from a prior terminal visit /
                 crash / handoff. Resume loads the items; Discard voids. */}
@@ -840,7 +849,7 @@ export function POSPage() {
         </div>
       )}
 
-      {tab==='history' && (
+      {tab==='history' && !!registerProperty && (
         <div className="card" style={{padding:0}}>
           {txLoading?<div style={{padding:32,textAlign:'center',color:'var(--text-3)'}}>Loading...</div>:(
             <table className="data-table">
@@ -866,7 +875,7 @@ export function POSPage() {
         </div>
       )}
 
-      {tab==='items' && (
+      {tab==='items' && !!registerProperty && (
         <div style={{display:'grid',gap:16}}>
           <div className="card">
             <div className="card-header" style={{display:'flex',justifyContent:'space-between',alignItems:'center',flexWrap:'wrap',gap:8}}>
@@ -883,7 +892,7 @@ export function POSPage() {
             <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:12,marginTop:12}}>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Icon</div><select className="form-select" value={newItem.icon} onChange={e=>setNewItem(s=>({...s,icon:e.target.value}))} style={{width:'100%'}}>{POS_ICON_OPTIONS.map(ic=><option key={ic} value={ic}>{ic}</option>)}</select></div>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Name</div><input className="form-input" value={newItem.name} onChange={e=>setNewItem(s=>({...s,name:e.target.value}))} style={{width:'100%'}} /></div>
-              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Category</div><select className="form-select" value={newItem.categoryId} onChange={e=>setNewItem(s=>({...s,categoryId:e.target.value}))} style={{width:'100%'}}>{categoriesForProperty(newItem.propertyId).map(c=><option key={c.id} value={c.id}>{c.icon} {c.name}</option>)}</select></div>
+              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Category</div><select className="form-select" value={newItem.categoryId} onChange={e=>setNewItem(s=>({...s,categoryId:e.target.value}))} style={{width:'100%'}}>{categoriesForProperty(registerProperty).map(c=><option key={c.id} value={c.id}>{c.icon} {c.name}</option>)}</select></div>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Cost Price</div><input className="form-input" type="number" value={newItem.costPrice} onChange={e=>setItemCost(e.target.value)} style={{width:'100%'}} /></div>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Margin %{defaultMarginPct!=null?` (default ${defaultMarginPct})`:''}</div><input className="form-input" type="number" value={newItem.marginPct} onChange={e=>setItemMargin(e.target.value)} placeholder={defaultMarginPct!=null?String(defaultMarginPct):'—'} style={{width:'100%'}} /></div>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Sell Price{newItem.costPrice&&newItem.marginPct?' (auto)':''}</div><input className="form-input" type="number" value={newItem.sellPrice} onChange={e=>setItemSell(e.target.value)} style={{width:'100%'}} /></div>
@@ -891,45 +900,8 @@ export function POSPage() {
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Stock Qty</div><input className="form-input" type="number" value={newItem.stockQty} onChange={e=>setNewItem(s=>({...s,stockQty:e.target.value}))} style={{width:'100%'}} /></div>
               {!LAUNCH_HIDE_CHARGE && <div style={{display:'flex',alignItems:'center',gap:8,paddingTop:20}}><input type="checkbox" id="ce" checked={newItem.chargeEligible} onChange={e=>setNewItem(s=>({...s,chargeEligible:e.target.checked}))} /><label htmlFor="ce" style={{fontSize:'.82rem'}}>Charge eligible</label></div>}
               {/* S192: property selector. Empty = company-wide. */}
-              <div style={{gridColumn:'span 2'}}>
-                <div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>
-                  Property <span style={{color:'var(--text-3)'}}>(low-stock alerts route to this property's manager)</span>
-                </div>
-                <select
-                  className="form-select"
-                  value={newItem.propertyId}
-                  onChange={e=>setNewItem(s=>({...s,propertyId:e.target.value}))}
-                  style={{width:'100%'}}
-                >
-                  <option value="" disabled>Select a property…</option>
-                  {(properties as any[]).map((p:any)=>(
-                    <option key={p.id} value={p.id}>{p.name}</option>
-                  ))}
-                </select>
-              </div>
             </div>
-            <button className="btn btn-primary" style={{marginTop:12}} onClick={submitNewItem} disabled={!newItem.name||!newItem.sellPrice||!newItem.categoryId||!newItem.propertyId||createItemMut.isLoading}>{createItemMut.isLoading?'Adding…':'Add Item'}</button>
-          </div>
-          {/* S216: property filter for the items management list.
-              Default 'all' shows everything; 'company-wide' shows only
-              NULL-property_id items; specific uuid scopes to one property. */}
-          <div style={{display:'flex',alignItems:'center',gap:8,padding:'4px 4px 0'}}>
-            <label style={{fontSize:'.78rem',color:'var(--text-3)',marginBottom:0}}>Filter by property:</label>
-            <select
-              className="form-select"
-              value={filterItemProperty}
-              onChange={e=>setFilterItemProperty(e.target.value)}
-              style={{width:'auto',padding:'4px 10px',fontSize:'.82rem'}}
-            >
-              <option value="all">All ({(items as any[]).length})</option>
-              <option value="company-wide">
-                Company-wide ({(items as any[]).filter((i:any)=>!i.propertyId).length})
-              </option>
-              {(properties as any[]).map((p:any)=>{
-                const n = (items as any[]).filter((i:any)=>i.propertyId===p.id).length
-                return <option key={p.id} value={p.id}>{p.name} ({n})</option>
-              })}
-            </select>
+            <button className="btn btn-primary" style={{marginTop:12}} onClick={submitNewItem} disabled={!newItem.name||!newItem.sellPrice||!newItem.categoryId||!registerProperty||createItemMut.isLoading}>{createItemMut.isLoading?'Adding…':'Add Item'}</button>
           </div>
           <div className="card" style={{padding:0}}>
             <table className="data-table">
@@ -947,11 +919,6 @@ export function POSPage() {
               </tr></thead>
               <tbody>
                 {(items as any[])
-                  .filter((i:any) =>
-                    filterItemProperty === 'all' ||
-                    (filterItemProperty === 'company-wide' && !i.propertyId) ||
-                    i.propertyId === filterItemProperty
-                  )
                   .sort((a:any,b:any)=>{
                     const propLabel=(i:any)=>{ const p=i.propertyId?(properties as any[]).find((x:any)=>x.id===i.propertyId):null; return p?(p.street1||p.name||''):(posSettings?.businessName||'') }
                     let av:any, bv:any
@@ -987,7 +954,7 @@ export function POSPage() {
         </div>
       )}
 
-      {tab==='categories' && (
+      {tab==='categories' && !!registerProperty && (
         <div style={{display:'grid',gap:16}}>
           <div className="card">
             <div className="card-header"><span className="card-title">Add Category</span></div>
@@ -1081,7 +1048,7 @@ export function POSPage() {
         </div>
       )}
 
-      {tab==='taxes' && (
+      {tab==='taxes' && !!registerProperty && (
         <div style={{display:'grid',gap:16}}>
           <div className="card">
             <div className="card-header"><span className="card-title">Tax Categories</span></div>
@@ -1169,7 +1136,7 @@ export function POSPage() {
         </div>
       )}
 
-      {tab==='discounts' && (
+      {tab==='discounts' && !!registerProperty && (
         <div style={{display:'grid',gap:16}}>
           <div className="card">
             <div className="card-header"><span className="card-title">Add Discount</span></div>
@@ -1197,7 +1164,7 @@ export function POSPage() {
         </div>
       )}
 
-      {tab==='vendors' && (
+      {tab==='vendors' && !!registerProperty && (
         <div style={{display:'grid',gap:16}}>
           <div className="card">
             <div className="card-header"><span className="card-title">Add Vendor</span></div>
@@ -1231,7 +1198,7 @@ export function POSPage() {
         </div>
       )}
 
-      {tab==='orders' && (
+      {tab==='orders' && !!registerProperty && (
         <div style={{display:'grid',gap:16}}>
           <div className="card">
             <div className="card-header"><span className="card-title">New Purchase Order</span></div>
@@ -1311,7 +1278,7 @@ export function POSPage() {
         </div>
       )}
 
-      {tab==='inventory' && (
+      {tab==='inventory' && !!registerProperty && (
         <div style={{display:'grid',gap:16}}>
           {(lowStock as any[]).length>0&&(<div className="card" style={{borderColor:'var(--amber)'}}>
             <div className="card-header"><span className="card-title" style={{color:'var(--amber)'}}>Low Stock ({(lowStock as any[]).length} items)</span></div>
@@ -1372,7 +1339,7 @@ export function POSPage() {
           surfaced in the charge modal when that property is selected.
           Bluetooth handheld readers don't appear here — they're paired
           via the JS SDK at charge time. */}
-      {tab==='readers' && (
+      {tab==='readers' && !!registerProperty && (
         <div style={{display:'grid',gap:16}}>
           <div className="card">
             <div className="card-header"><span className="card-title">Pair New Smart Reader</span></div>

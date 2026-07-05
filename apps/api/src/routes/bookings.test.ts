@@ -146,10 +146,11 @@ describe('GET /api/bookings — landlord scope', () => {
   it('team-role JWT without landlordId claim → 403', async () => {
     const f = await seedBookingsFixture()
     // PM token with no landlordId claim (the manager hasn't been
-    // assigned to a landlord at JWT-mint time — defensive guard).
+    // assigned to a landlord at JWT-mint time — defensive guard). Carries
+    // bookings.view so it passes requirePerm and reaches the scope guard.
     const teamToken = jwt.sign(
       { userId: randomUUID(), role: 'property_manager', email: 'pm@test.dev',
-        profileId: randomUUID(), permissions: { 'team.invite': true } },
+        profileId: randomUUID(), permissions: { 'bookings.view': true } },
       process.env.JWT_SECRET!, { expiresIn: '1h' },
     )
     await seedBooking(f)

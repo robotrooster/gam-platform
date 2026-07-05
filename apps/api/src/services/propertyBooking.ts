@@ -135,6 +135,11 @@ interface GuestBooking {
   // Legacy — the guest no longer picks a billing type; pricing auto-tiers by
   // length. Accepted for backward compat but ignored.
   stayType?: 'nightly' | 'weekly'
+  // W-20 (S531): the guest books a SITE TYPE, not a unit — these stamp what
+  // the booking is entitled to, so the nightly compressor can re-site it to
+  // any compatible unit. 'none' = no requirement (any site).
+  requiredSiteLayout?: string | null
+  requiredAmpService?: string | null
 }
 
 export interface BookingDepositResult { bookingId: string; depositAmount: number; total: number; checkoutUrl: string }
@@ -164,12 +169,14 @@ export async function bookStay(opts: GuestBooking): Promise<BookingDepositResult
       `INSERT INTO unit_bookings
          (unit_id, landlord_id, lease_type, check_in, check_out, nights,
           guest_name, guest_email, guest_phone, nightly_rate, weekly_rate,
-          total_amount, deposit_amount, platform_fee, status, source, hold_expires_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,0,'tentative','public',$14)
+          total_amount, deposit_amount, platform_fee, status, source, hold_expires_at,
+          required_site_layout, required_amp_service)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,0,'tentative','public',$14,$15,$16)
        RETURNING id`,
       [unit.id, prop.landlord_id, quote.tier, opts.checkIn, opts.checkOut, quote.nights,
        opts.guestName, opts.guestEmail, opts.guestPhone ?? null,
-       unit.nightly_rate, unit.weekly_rate, quote.total, quote.deposit, holdExpires])
+       unit.nightly_rate, unit.weekly_rate, quote.total, quote.deposit, holdExpires,
+       opts.requiredSiteLayout ?? 'none', opts.requiredAmpService ?? 'none'])
     const bookingId = ins.rows[0].id
     await client.query('COMMIT')
 

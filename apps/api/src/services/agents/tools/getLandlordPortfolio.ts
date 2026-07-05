@@ -43,12 +43,12 @@ export const getLandlordPortfolio: AgentTool = {
     const payoutLimit = Number.isFinite(rawLimit) ? Math.min(Math.max(Math.trunc(rawLimit), 1), 12) : 5
 
     const occ = await query<OccupancyRow>(
-      // units.status has six values; occupied = a live tenancy in any of
-      // its forms, vacant = no tenant. (active/direct_pay/delinquent/
-      // suspended are occupied; vacant/available are not.)
+      // occupied = a live tenancy in any of its forms, vacant = no tenant.
+      // (active/delinquent/suspended are occupied; vacant/available are not.
+      // direct_pay retired W-15/S531.)
       `SELECT COUNT(DISTINCT p.id)::int AS property_count,
               COUNT(u.id)::int AS total_units,
-              COUNT(u.id) FILTER (WHERE u.status IN ('active','direct_pay','delinquent','suspended'))::int AS occupied_units,
+              COUNT(u.id) FILTER (WHERE u.status IN ('active','delinquent','suspended'))::int AS occupied_units,
               COUNT(u.id) FILTER (WHERE u.status IN ('vacant','available'))::int AS vacant_units
          FROM properties p
          LEFT JOIN units u ON u.property_id = p.id

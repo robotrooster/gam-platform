@@ -69,6 +69,11 @@ const areaCreateSchema = z.object({
   closeTime: z.string().regex(/^\d{2}:\d{2}$/).nullable().optional(),
   maxReservationHours: z.number().int().positive().nullable().optional(),
   advanceBookingDays: z.number().int().positive().nullable().optional(),
+  // W-44 (S531): private-event posture, landlord-chosen per area.
+  eventsEnabled: z.boolean().optional(),
+  eventDepositAmount: z.number().nonnegative().optional(),
+  eventAnnounce: z.boolean().optional(),
+  eventAutoRelease: z.boolean().optional(),
 })
 const areaUpdateSchema = areaCreateSchema.partial().omit({ propertyId: true }).extend({
   active: z.boolean().optional(),
@@ -80,6 +85,10 @@ const requestSchema = z.object({
   endsAt: z.string().datetime(),
   guestCount: z.number().int().positive().nullable().optional(),
   notes: z.string().trim().max(2000).optional(),
+  // W-44 (S531): a tenant can book a PRIVATE EVENT on areas the landlord
+  // opted in (events_enabled). Deposit + announcement + auto-release
+  // posture comes from the area's event_* settings.
+  kind: z.enum(['tenant_reservation', 'event']).default('tenant_reservation'),
 })
 // Landlord-created hold: a kind + whether to alert residents.
 const landlordReservationSchema = requestSchema.extend({
@@ -114,6 +123,14 @@ async function fireAmenityAlert(reservationId: string) {
     [reservationId]
   )
   if (!r || r.status !== 'approved' || !r.notify_residents) return
+  // W-44: a tenant-booked EVENT with a deposit announces only once the
+  // deposit is PAID (the hourly event sweep fires it) — never at approval.
+  if (r.kind === 'event' && r.reserved_by_tenant_id && Number(r.fee_amount) > 0) {
+    const pay = r.fee_payment_id
+      ? await queryOne<any>(`SELECT status FROM payments WHERE id = $1`, [r.fee_payment_id])
+      : null
+    if (!pay || pay.status !== 'settled') return
+  }
   const count = await notifyAmenityUnavailable({
     propertyId: r.property_id, landlordId: r.landlord_id, propertyName: r.property_name,
     areaName: r.area_name, kind: r.kind, reason: r.title,
@@ -153,12 +170,14 @@ commonAreasRouter.post('/', requirePerm('amenities.manage_areas'), async (req, r
     const row = await queryOne(
       `INSERT INTO common_areas
          (property_id, landlord_id, name, description, reservable, requires_approval,
-          capacity, reservation_fee, weekend_fee, open_time, close_time, max_reservation_hours, advance_booking_days)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
+          capacity, reservation_fee, weekend_fee, open_time, close_time, max_reservation_hours, advance_booking_days,
+          events_enabled, event_deposit_amount, event_announce, event_auto_release)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING *`,
       [b.propertyId, prop.landlord_id, b.name, b.description ?? null,
        b.reservable ?? true, b.requiresApproval ?? true, b.capacity ?? null,
        b.reservationFee ?? 0, b.weekendFee ?? null, b.openTime ?? null, b.closeTime ?? null,
-       b.maxReservationHours ?? null, b.advanceBookingDays ?? null]
+       b.maxReservationHours ?? null, b.advanceBookingDays ?? null,
+       b.eventsEnabled ?? false, b.eventDepositAmount ?? 0, b.eventAnnounce ?? true, b.eventAutoRelease ?? true]
     )
     res.status(201).json({ success: true, data: row })
   } catch (e) { next(e) }
@@ -178,6 +197,8 @@ commonAreasRouter.patch('/:id', requirePerm('amenities.manage_areas'), async (re
       reservation_fee: b.reservationFee, weekend_fee: b.weekendFee, open_time: b.openTime, close_time: b.closeTime,
       max_reservation_hours: b.maxReservationHours, advance_booking_days: b.advanceBookingDays,
       active: b.active,
+      events_enabled: b.eventsEnabled, event_deposit_amount: b.eventDepositAmount,
+      event_announce: b.eventAnnounce, event_auto_release: b.eventAutoRelease,
     }
     const sets: string[] = [], vals: any[] = []
     for (const [col, val] of Object.entries(map)) {
@@ -330,7 +351,8 @@ commonAreasRouter.get('/mine', async (req, res, next) => {
     if (!propIds.length) { res.json({ success: true, data: [] }); return }
     const areas = await query(
       `SELECT id, property_id, name, description, reservable, requires_approval, capacity,
-              reservation_fee, open_time, close_time, max_reservation_hours, advance_booking_days
+              reservation_fee, open_time, close_time, max_reservation_hours, advance_booking_days,
+              events_enabled, event_deposit_amount
          FROM common_areas
         WHERE property_id = ANY($1) AND active AND reservable
         ORDER BY name`, [propIds])
@@ -371,9 +393,18 @@ commonAreasRouter.post('/:id/request', async (req, res, next) => {
     const area = await loadArea(req.params.id)
     if (!area) throw new AppError(404, 'Common area not found')
     if (!area.active || !area.reservable) throw new AppError(400, 'This area is not reservable')
+    if (b.kind === 'event' && !area.events_enabled) {
+      throw new AppError(400, `${area.name} does not host private events`)
+    }
     const propIds = await tenantPropertyIds(u.profileId)
     if (!propIds.includes(area.property_id)) throw new AppError(403, 'Not a resident of this property')
     validateWindow(area, b.startsAt, b.endsAt)
+    // W-44: events bill the area's NON-REFUNDABLE event deposit instead of
+    // the reservation fee; announcements follow the area's event_announce.
+    const feeFor = (startsAt: string) => b.kind === 'event'
+      ? Number(area.event_deposit_amount || 0)
+      : computeReservationFee(area, startsAt)
+    const notifyFlag = b.kind === 'event' ? area.event_announce !== false : true
 
     const autoApprove = !area.requires_approval
     let id: string
@@ -389,10 +420,11 @@ commonAreasRouter.post('/:id/request', async (req, res, next) => {
           `INSERT INTO common_area_reservations
              (common_area_id, property_id, landlord_id, reserved_by_tenant_id, created_by_user_id,
               title, kind, starts_at, ends_at, status, guest_count, notes, fee_amount,
-              decided_at)
-           VALUES ($1,$2,$3,$4,$5,$6,'tenant_reservation',$7,$8,'approved',$9,$10,$11,now()) RETURNING id`,
+              notify_residents, decided_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$12,$7,$8,'approved',$9,$10,$11,$13,now()) RETURNING id`,
           [area.id, area.property_id, area.landlord_id, u.profileId, u.userId,
-           b.title ?? null, b.startsAt, b.endsAt, b.guestCount ?? null, b.notes ?? null, computeReservationFee(area, b.startsAt)])
+           b.title ?? null, b.startsAt, b.endsAt, b.guestCount ?? null, b.notes ?? null, feeFor(b.startsAt),
+           b.kind, notifyFlag])
         id = ins.rows[0].id
         await client.query('COMMIT')
       } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
@@ -402,10 +434,12 @@ commonAreasRouter.post('/:id/request', async (req, res, next) => {
       const ins = await queryOne<any>(
         `INSERT INTO common_area_reservations
            (common_area_id, property_id, landlord_id, reserved_by_tenant_id, created_by_user_id,
-            title, kind, starts_at, ends_at, status, guest_count, notes, fee_amount)
-         VALUES ($1,$2,$3,$4,$5,$6,'tenant_reservation',$7,$8,'pending',$9,$10,$11) RETURNING id`,
+            title, kind, starts_at, ends_at, status, guest_count, notes, fee_amount,
+            notify_residents)
+         VALUES ($1,$2,$3,$4,$5,$6,$12,$7,$8,'pending',$9,$10,$11,$13) RETURNING id`,
         [area.id, area.property_id, area.landlord_id, u.profileId, u.userId,
-         b.title ?? null, b.startsAt, b.endsAt, b.guestCount ?? null, b.notes ?? null, computeReservationFee(area, b.startsAt)])
+         b.title ?? null, b.startsAt, b.endsAt, b.guestCount ?? null, b.notes ?? null, feeFor(b.startsAt),
+         b.kind, notifyFlag])
       id = ins!.id
       // notify the landlord a request is pending
       const meta = await queryOne<any>(
@@ -449,8 +483,40 @@ commonAreasRouter.post('/reservations/:rid/cancel', async (req, res, next) => {
       throw new AppError(400, `Reservation is already ${r.status}`)
     await query(
       `UPDATE common_area_reservations SET status='cancelled', updated_at=now() WHERE id=$1`, [r.id])
-    // #4: apply the fee refund policy (≥48h ahead → refundable; inside 48h → fee stands).
-    const feeOutcome = await settleReservationFeeOnCancel(r)
+    // #4: apply the fee refund policy (≥48h ahead → refundable; inside 48h →
+    // fee stands). W-44: EVENT deposits are NON-REFUNDABLE by design — a
+    // paid deposit always stands; an unpaid one is voided.
+    let feeOutcome: string
+    if (r.kind === 'event' && r.reserved_by_tenant_id) {
+      const pay = r.fee_payment_id
+        ? await queryOne<any>(`SELECT status FROM payments WHERE id = $1`, [r.fee_payment_id])
+        : null
+      if (pay && (pay.status === 'settled' || pay.status === 'processing')) {
+        feeOutcome = 'fee_stands'
+      } else if (r.fee_payment_id) {
+        await query(`DELETE FROM payments WHERE id = $1 AND status IN ('pending','failed')`, [r.fee_payment_id])
+        await query(`UPDATE common_area_reservations SET fee_voided = true, fee_payment_id = NULL WHERE id = $1`, [r.id])
+        feeOutcome = 'voided'
+      } else {
+        feeOutcome = 'none'
+      }
+      // The space "becomes not private": if the event had been announced,
+      // tell the property it's open again.
+      if (r.residents_notified_at && r.notify_residents) {
+        const meta2 = await queryOne<any>(
+          `SELECT ca.name AS area_name, p.name AS property_name
+             FROM common_areas ca JOIN properties p ON p.id = ca.property_id
+            WHERE ca.id = $1`, [r.common_area_id])
+        const { notifyAmenityEventReleased } = await import('../services/notifications')
+        await notifyAmenityEventReleased({
+          propertyId: r.property_id, landlordId: r.landlord_id,
+          propertyName: meta2?.property_name ?? '', areaName: meta2?.area_name ?? 'The amenity',
+          startsAt: r.starts_at, endsAt: r.ends_at,
+        })
+      }
+    } else {
+      feeOutcome = await settleReservationFeeOnCancel(r)
+    }
     if (feeOutcome === 'refund_due') {
       // The fee was already paid — flag the landlord to process the Stripe refund.
       const meta = await queryOne<any>(

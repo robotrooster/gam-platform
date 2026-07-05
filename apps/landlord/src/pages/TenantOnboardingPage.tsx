@@ -222,6 +222,11 @@ function splitFastPath(rows: CsvRow[]): { fastPathRows: CsvRow[]; dirtyRows: Csv
 
 function SingleTenantMode({ onBack, onComplete }: { onBack: () => void; onComplete: () => void }) {
   const [form, setForm] = useState({ firstName: '', lastName: '', email: '', phone: '' })
+  // W-27 (S531): optionally bind the unit the incoming tenant already
+  // occupies — the availability predicate excludes it from guest booking
+  // until the intent resolves (migration protection).
+  const [unitId, setUnitId] = useState('')
+  const { data: allUnits = [] } = useQuery<any[]>('units', () => apiGet('/units'))
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState<{ intentId: string | null; name: string } | null>(null)
   const [uploadError, setUploadError] = useState<string | null>(null)
@@ -231,7 +236,7 @@ function SingleTenantMode({ onBack, onComplete }: { onBack: () => void; onComple
   const set = (k: keyof typeof form, v: string) => setForm(prev => ({ ...prev, [k]: v }))
 
   const submitMut = useMutation(
-    () => apiPost<any>('/landlords/me/onboard-tenant-pending', form),
+    () => apiPost<any>('/landlords/me/onboard-tenant-pending', { ...form, unitId: unitId || undefined }),
     {
       onSuccess: (res: any) => {
         // Codebase convention: handlers return { success, data: { ... } }.
@@ -272,6 +277,7 @@ function SingleTenantMode({ onBack, onComplete }: { onBack: () => void; onComple
 
   const handleAddAnother = () => {
     setForm({ firstName: '', lastName: '', email: '', phone: '' })
+    setUnitId('')
     setSuccess(null)
     setError(null)
     setUploadError(null)
@@ -347,9 +353,21 @@ function SingleTenantMode({ onBack, onComplete }: { onBack: () => void; onComple
             <label style={{ display: 'block', fontSize: '.78rem', color: 'var(--text-2)', marginBottom: 4 }}>Email</label>
             <input className="input" type="email" placeholder="jane@example.com" value={form.email} onChange={e => set('email', e.target.value)} style={{ width: '100%' }} />
           </div>
-          <div style={{ marginBottom: 20 }}>
+          <div style={{ marginBottom: 12 }}>
             <label style={{ display: 'block', fontSize: '.78rem', color: 'var(--text-2)', marginBottom: 4 }}>Phone</label>
             <input className="input" type="tel" placeholder="(555) 000-0000" value={form.phone} onChange={e => set('phone', e.target.value)} style={{ width: '100%' }} />
+          </div>
+          <div style={{ marginBottom: 20 }}>
+            <label style={{ display: 'block', fontSize: '.78rem', color: 'var(--text-2)', marginBottom: 4 }}>Unit they occupy (optional)</label>
+            <select className="input" value={unitId} onChange={e => setUnitId(e.target.value)} style={{ width: '100%' }}>
+              <option value="">— None yet —</option>
+              {(allUnits as any[]).map((u: any) => (
+                <option key={u.id} value={u.id}>{u.propertyName} — Unit {u.unitNumber}</option>
+              ))}
+            </select>
+            <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 4 }}>
+              Holds their spot: guests can't book this unit while onboarding completes.
+            </div>
           </div>
 
           <button type="submit" disabled={submitMut.isLoading} className="btn btn-primary" style={{ width: '100%' }}>
@@ -409,15 +427,15 @@ function SingleTenantMode({ onBack, onComplete }: { onBack: () => void; onComple
             </button>
           ) : (
             <button onClick={onComplete} className="btn btn-primary" style={{ width: '100%' }}>
-              Go to Pending Pool to upload
+              Go to Pending Pool to Upload
             </button>
           )}
           <div style={{ display: 'flex', gap: 8 }}>
             <button onClick={handleAddAnother} className="btn btn-ghost" style={{ flex: 1 }}>
-              Add another
+              Add Another
             </button>
             <button onClick={onComplete} className="btn btn-ghost" style={{ flex: 1 }}>
-              View pending pool
+              View Pending Pool
             </button>
           </div>
         </div>
@@ -617,7 +635,7 @@ function BulkCsvMode({ onBack }: { onBack: () => void }) {
       <button onClick={onBack} className="btn btn-ghost" style={{ marginBottom: 16 }}>&larr; Back</button>
 
       <div style={{ padding: 24, borderRadius: 10, background: 'var(--bg-1)', border: '1px solid var(--border-0)', marginBottom: 16 }}>
-        <h2 style={{ fontSize: '1.05rem', fontWeight: 700, color: 'var(--text-0)', marginTop: 0, marginBottom: 12 }}>1. Pick the source platform</h2>
+        <h2 style={{ fontSize: '1.05rem', fontWeight: 700, color: 'var(--text-0)', marginTop: 0, marginBottom: 12 }}>1. Pick the Source Platform</h2>
         <p style={{ fontSize: '.82rem', color: 'var(--text-2)', marginTop: 0, marginBottom: 12, lineHeight: 1.5 }}>
           GAM recognizes the standard export column names from Buildium, AppFolio, DoorLoop,
           Yardi, RentManager, Propertyware, Rentec Direct, and TenantCloud. Pick yours and we'll
@@ -687,7 +705,7 @@ function BulkCsvMode({ onBack }: { onBack: () => void }) {
       </div>
 
       <div style={{ padding: 24, borderRadius: 10, background: 'var(--bg-1)', border: '1px solid var(--border-0)', marginBottom: 16 }}>
-        <h2 style={{ fontSize: '1.05rem', fontWeight: 700, color: 'var(--text-0)', marginTop: 0, marginBottom: 12 }}>3. Upload your filled-in CSV</h2>
+        <h2 style={{ fontSize: '1.05rem', fontWeight: 700, color: 'var(--text-0)', marginTop: 0, marginBottom: 12 }}>3. Upload Your Filled-In CSV</h2>
         <input
           ref={fileInputRef}
           type="file"
@@ -704,7 +722,7 @@ function BulkCsvMode({ onBack }: { onBack: () => void }) {
             <div style={{ display: 'inline-flex', alignItems: 'center', gap: 8, padding: '8px 12px', borderRadius: 8, background: 'var(--bg-0)', border: '1px solid var(--border-0)' }}>
               <FileText size={14} color="var(--text-2)" /> <span style={{ fontSize: '.85rem', color: 'var(--text-0)' }}>{fileName}</span>
             </div>
-            <button onClick={handleReset} className="btn btn-ghost" style={{ fontSize: '.82rem' }}>Replace file</button>
+            <button onClick={handleReset} className="btn btn-ghost" style={{ fontSize: '.82rem' }}>Replace File</button>
             <button onClick={handleValidate} className="btn btn-primary" disabled={validateMut.isLoading} style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
               {validateMut.isLoading ? <span className="spinner" /> : null}
               {validateMut.isLoading ? 'Validating…' : 'Validate'}
@@ -789,7 +807,7 @@ function BulkCsvMode({ onBack }: { onBack: () => void }) {
 function ValidateSummary({ summary, hasPunchList }: { summary: { total: number; blockers: number; warnings: number; ready: number }; hasPunchList: boolean }) {
   return (
     <div style={{ padding: 24, borderRadius: 10, background: 'var(--bg-1)', border: '1px solid var(--border-0)', marginBottom: 16 }}>
-      <h2 style={{ fontSize: '1.05rem', fontWeight: 700, color: 'var(--text-0)', marginTop: 0, marginBottom: 16 }}>Validation results</h2>
+      <h2 style={{ fontSize: '1.05rem', fontWeight: 700, color: 'var(--text-0)', marginTop: 0, marginBottom: 16 }}>Validation Results</h2>
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12 }}>
         <SummaryStat label="Total rows"     value={summary.total}    color="var(--text-0)" />
         <SummaryStat label="Ready"          value={summary.ready}    color="#22c55e" icon={<CheckCircle2 size={14} />} />

@@ -5,14 +5,18 @@ import { apiGet, apiPatch } from '../lib/api'
 import { ArrowLeft, Plus, DoorOpen, DollarSign, Building2, MapPin, UserCheck } from 'lucide-react'
 import { AddUnitModal } from './AddUnitModal'
 import { usePerms } from '../lib/permissions'
-import { PropertyFeeScheduleSection } from './PropertyFeeScheduleSection'
+// S526: PropertyFeeScheduleSection RETIRED — fees are charged per tenant's
+// signed lease (lease_fees), not property-wide. S527: pricing lives in
+// OWNER-DEFINED subtypes (UnitSubtypesSection) — blank until the owner
+// creates them; nothing pre-baked.
+import { UnitSubtypesSection } from './UnitSubtypesSection'
 import { PropertyAgentPermissionsSection } from './PropertyAgentPermissionsSection'
 import { LawWarningBanner } from '../components/LawWarningBanner'
 import { LAUNCH_HIDDEN } from '../components/layout/Layout'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
 const STATUS_COLORS: Record<string,string> = {
-  active:'badge-green', direct_pay:'badge-blue',
+  active:'badge-green',
   vacant:'badge-muted', delinquent:'badge-amber', suspended:'badge-red'
 }
 
@@ -265,9 +269,11 @@ function PropertyFinances({ propertyId }: { propertyId: string }) {
         </div>
       )}
 
-      <PropertyFeeScheduleSection propertyId={data.id} />
+      {/* data here is the FINANCES payload (no .id) — the old data.id passed
+          `undefined` and both sections 500'd silently (pre-existing bug). */}
+      <UnitSubtypesSection propertyId={propertyId} />
 
-      <PropertyAgentPermissionsSection propertyId={data.id} />
+      <PropertyAgentPermissionsSection propertyId={propertyId} />
     </div>
   )
 }
@@ -366,6 +372,7 @@ function PmLinkageCard({
 // meaningless under a contract.
 function PropertyManagerCard({ propertyId }: { propertyId: string }) {
   const qc = useQueryClient()
+  const navigate = useNavigate()
   const { can } = usePerms()
   const [selected, setSelected] = useState<string>('')
   const [error, setError] = useState<string | null>(null)
@@ -377,6 +384,7 @@ function PropertyManagerCard({ propertyId }: { propertyId: string }) {
     firstName: string | null
     lastName: string | null
     role: 'self' | 'manager'
+    staffRole?: 'property_manager' | 'onsite_manager'
   }
   type EligibleResponse = {
     currentManagedByUserId: string
@@ -420,6 +428,7 @@ function PropertyManagerCard({ propertyId }: { propertyId: string }) {
     return name ? `${name} (${m.email})` : m.email
   }
 
+
   const owner = data.owner
   const managers = data.managers
   const currentlyDelegated = data.currentManagedByUserId !== data.ownerUserId
@@ -453,15 +462,11 @@ function PropertyManagerCard({ propertyId }: { propertyId: string }) {
               Self-managed — {formatName(owner)}
             </option>
           )}
-          {managers.length === 0 ? (
-            <option disabled>No property-manager scope holders. Add via Team page first.</option>
-          ) : (
-            managers.map((m) => (
-              <option key={m.userId} value={m.userId}>
-                {formatName(m)}
-              </option>
-            ))
-          )}
+          {managers.map((m) => (
+            <option key={m.userId} value={m.userId}>
+              {formatName(m)}
+            </option>
+          ))}
         </select>
 
         {can('properties.assign_manager') && (
@@ -487,6 +492,20 @@ function PropertyManagerCard({ propertyId }: { propertyId: string }) {
           <span style={{ color: 'var(--green)', fontSize: '.78rem' }}>Saved.</span>
         )}
       </div>
+
+      {managers.length === 0 && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', marginTop: 10, padding: '8px 12px', background: 'var(--bg-2)', border: '1px solid var(--border-0)', borderRadius: 8 }}>
+          <span style={{ fontSize: '.74rem', color: 'var(--text-3)', flex: '1 1 260px' }}>
+            No managers to pick from yet. Day-to-day managers are team members with a
+            manager role, scoped to this property.
+          </span>
+          {can('properties.assign_manager') && (
+            <button className="btn btn-primary btn-sm" onClick={() => navigate('/team')}>
+              Add on Team page →
+            </button>
+          )}
+        </div>
+      )}
 
       {error && (
         <div style={{ marginTop: 10, padding: 10, background: 'rgba(239,68,68,.08)', border: '1px solid rgba(239,68,68,.3)', borderRadius: 6, color: 'var(--red)', fontSize: '.82rem' }}>

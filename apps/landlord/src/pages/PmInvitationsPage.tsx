@@ -106,7 +106,7 @@ export function PmInvitationsPage() {
     <div>
       <div className="page-header">
         <div>
-          <h1 className="page-title">PM company invitations</h1>
+          <h1 className="page-title">PM Company Invitations</h1>
           <p className="page-subtitle">Owner ↔ PM-company property-management handshake</p>
         </div>
         {can('pm_invitations.send') && (

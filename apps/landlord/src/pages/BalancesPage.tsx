@@ -5,16 +5,16 @@ import { apiGet } from '../lib/api'
 // + contact info, so a front-counter person knows who to call. Data from
 // GET /balances (unpaid invoice balances, per the platform's outstanding def).
 interface Owed {
-  tenant_id: string
-  first_name: string | null
-  last_name: string | null
+  tenantId: string
+  firstName: string | null
+  lastName: string | null
   phone: string | null
   email: string | null
-  unit_number: string | null
-  property_name: string | null
+  unitNumber: string | null
+  propertyName: string | null
   balance: string
-  open_invoices: number
-  oldest_due_date: string | null
+  openInvoices: number
+  oldestDueDate: string | null
 }
 
 const fmt = (n: number) => n.toLocaleString('en-US', { style: 'currency', currency: 'USD' })
@@ -61,29 +61,29 @@ export function BalancesPage() {
                 <th>Tenant</th>
                 <th>Unit / Property</th>
                 <th style={{ textAlign: 'right' }}>Owed</th>
-                <th>Oldest due</th>
+                <th>Oldest Due</th>
                 <th>Contact</th>
               </tr>
             </thead>
             <tbody>
               {(rows as Owed[]).map(r => {
-                const od = daysOverdue(r.oldest_due_date)
-                const name = [r.first_name, r.last_name].filter(Boolean).join(' ') || 'Tenant'
+                const od = daysOverdue(r.oldestDueDate)
+                const name = [r.firstName, r.lastName].filter(Boolean).join(' ') || 'Tenant'
                 return (
-                  <tr key={r.tenant_id + (r.unit_number || '')}>
+                  <tr key={r.tenantId + (r.unitNumber || '')}>
                     <td style={{ fontWeight: 500 }}>{name}</td>
                     <td style={{ fontSize: '.85rem', color: 'var(--text-2)' }}>
-                      {r.unit_number ? `Unit ${r.unit_number}` : '—'}
-                      {r.property_name && <span style={{ color: 'var(--text-3)' }}> · {r.property_name}</span>}
+                      {r.unitNumber ? `Unit ${r.unitNumber}` : '—'}
+                      {r.propertyName && <span style={{ color: 'var(--text-3)' }}> · {r.propertyName}</span>}
                     </td>
                     <td style={{ textAlign: 'right', fontWeight: 600, color: 'var(--gold)' }}>
                       {fmt(Number(r.balance))}
                       <div style={{ fontSize: '.68rem', color: 'var(--text-3)', fontWeight: 400 }}>
-                        {r.open_invoices} invoice{r.open_invoices === 1 ? '' : 's'}
+                        {r.openInvoices} invoice{r.openInvoices === 1 ? '' : 's'}
                       </div>
                     </td>
                     <td style={{ fontSize: '.82rem' }}>
-                      {r.oldest_due_date ? new Date(r.oldest_due_date.slice(0, 10) + 'T00:00:00').toLocaleDateString() : '—'}
+                      {r.oldestDueDate ? new Date(r.oldestDueDate.slice(0, 10) + 'T00:00:00').toLocaleDateString() : '—'}
                       {od != null && od > 0 && (
                         <span style={{ marginLeft: 6, fontSize: '.68rem', fontWeight: 600, color: od > 30 ? 'var(--red, #ef4444)' : 'var(--amber, #d0a02a)' }}>
                           {od}d overdue

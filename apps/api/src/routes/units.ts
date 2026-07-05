@@ -1,14 +1,16 @@
 import { Router } from 'express'
 import { z } from 'zod'
 import { query, queryOne } from '../db'
-import { requireAuth, requireLandlord, requirePerm } from '../middleware/auth'
+import { requireAuth, requireLandlord, requirePerm, getScopedPropertyIds, assertPropertyInScope } from '../middleware/auth'
 import { canAccessLandlordResource, canManageLandlordResource, canViewLandlordFinances } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
-import { UnitStatus, calcNetPerUnit, getReservePhase, LAUNCH_PLATFORM_FEE, UNIT_STATUSES, computeStayPrice, RV_SITE_LAYOUTS, RV_AMP_SERVICES } from '@gam/shared'
+import { UnitStatus, calcNetPerUnit, getReservePhase, LAUNCH_PLATFORM_FEE, UNIT_STATUSES, UNIT_TYPES, computeStayPrice, RV_SITE_LAYOUTS, RV_AMP_SERVICES, isSiteLayoutMismatch, isAmpServiceMismatch } from '@gam/shared'
+import { findStayConflict, findAvailableUnits, STAY_CONFLICT_MESSAGE } from '../services/unitAvailability'
 import { formatUnitNumber } from '../lib/format'
 import { logger } from '../lib/logger'
 import { promoteNextWaitlister } from '../services/propertyBooking'
 import { recordBookingEvent, recordBookingChange } from '../services/bookingEvents'
+import { maybeDraftLeaseFromBooking } from '../services/bookingLeaseDraft'
 import {
   sendBookingGuestAccessEmail,
   issueBookingGuestToken,
@@ -55,6 +57,43 @@ unitsRouter.get('/', async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
+// GET /api/units/available — W-19/W-48 (S529): the ONE availability surface.
+// Free-for-window units (no overlapping non-cancelled booking / active lease
+// via services/unitAvailability) with optional RV-requirement filtering, so
+// pickers offer only units the server would actually accept. Registered
+// BEFORE /:id so the literal path wins the match.
+unitsRouter.get('/available', async (req, res, next) => {
+  try {
+    const q = z.object({
+      checkIn:            z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+      checkOut:           z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullish(),
+      excludeBookingId:   z.string().uuid().nullish(),
+      requiredSiteLayout: z.enum(RV_SITE_LAYOUTS as unknown as [string, ...string[]]).nullish(),
+      requiredAmpService: z.enum(RV_AMP_SERVICES as unknown as [string, ...string[]]).nullish(),
+      propertyId:         z.string().uuid().nullish(),
+    }).parse(req.query)
+    const callerLandlordId = req.user!.role === 'landlord'
+      ? req.user!.profileId
+      : req.user!.landlordId
+    if (!callerLandlordId) throw new AppError(403, 'Forbidden')
+    const scopedIds = await getScopedPropertyIds(req.user)
+    const rows = await findAvailableUnits({
+      landlordId: callerLandlordId,
+      window: {
+        checkIn: q.checkIn || new Date().toISOString().slice(0, 10),
+        checkOut: q.checkOut ?? null,
+        excludeBookingId: q.excludeBookingId ?? null,
+      },
+      propertyId: q.propertyId ?? null,
+      scopedPropertyIds: scopedIds,
+    })
+    const data = rows.filter(u =>
+      !isSiteLayoutMismatch(q.requiredSiteLayout, u.rv_site_layout) &&
+      !isAmpServiceMismatch(q.requiredAmpService, u.rv_amp_service))
+    res.json({ success: true, data })
+  } catch (e) { next(e) }
+})
+
 // GET /api/units/:id
 unitsRouter.get('/:id', async (req, res, next) => {
   try {
@@ -87,14 +126,33 @@ unitsRouter.get('/:id', async (req, res, next) => {
 // POST /api/units
 unitsRouter.post('/', requirePerm('properties.add_unit'), async (req, res, next) => {
   try {
+    // S526: units are created WITH their type + attributes (RV layout/amp,
+    // bedrooms). S527: subtypeId prefills type/facts/pricing from the owner's
+    // named subtype (body fields override), and quantity creates a numbered
+    // batch — this replaces the removed POST /properties/:id/units/bulk, so
+    // there is ONE door for creating units.
     const body = z.object({
       propertyId:      z.string().uuid(),
       unitNumber:      z.string(),
-      bedrooms:        z.number().int().min(0).default(1),
-      bathrooms:       z.number().min(0).default(1),
+      subtypeId:       z.string().uuid().nullable().optional(),
+      quantity:        z.number().int().min(1).max(200).default(1),
+      unitType:        z.enum(UNIT_TYPES as unknown as [string, ...string[]]).optional(),
+      bedrooms:        z.number().int().min(0).optional(),
+      bathrooms:       z.number().min(0).optional(),
       sqft:            z.number().int().nullable().optional(),
-      rentAmount:      z.number().positive(),
-      securityDeposit: z.number().min(0).default(0),
+      rentAmount:      z.number().positive().optional(),
+      securityDeposit: z.number().min(0).optional(),
+      rvSiteLayout:    z.enum(RV_SITE_LAYOUTS as unknown as [string, ...string[]]).optional(),
+      rvAmpService:    z.enum(RV_AMP_SERVICES as unknown as [string, ...string[]]).optional(),
+      storageSize:     z.string().max(40).optional(),
+      nightlyRate:     z.number().min(0).nullable().optional(),
+      weeklyRate:      z.number().min(0).nullable().optional(),
+      monthlyRate:     z.number().min(0).nullable().optional(),
+      // S527 fix: the Add Unit modal always sent status but the schema
+      // stripped it — the "Initial Status" picker was a silent no-op and
+      // every unit was born vacant. Suspended stays excluded (eviction-mode
+      // coupling, S524). direct_pay retired W-15/S531.
+      status:          z.enum(['vacant', 'active']).default('vacant'),
     }).parse(req.body)
 
     // Verify the calling user can manage units on this property's landlord.
@@ -107,14 +165,94 @@ unitsRouter.post('/', requirePerm('properties.add_unit'), async (req, res, next)
       throw new AppError(403, 'Forbidden')
     }
 
-    const [unit] = await query<any>(`
-      INSERT INTO units (property_id, landlord_id, unit_number, bedrooms, bathrooms, sqft, rent_amount, security_deposit)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-      RETURNING *`,
-      [body.propertyId, prop.landlord_id, formatUnitNumber(body.unitNumber), body.bedrooms,
-       body.bathrooms, body.sqft ?? null, body.rentAmount, body.securityDeposit]
+    // Owner subtype (S527): the unit's defaults. Must belong to this property.
+    let sub: any = null
+    if (body.subtypeId) {
+      sub = await queryOne<any>(
+        `SELECT * FROM property_unit_subtypes WHERE id=$1 AND property_id=$2`,
+        [body.subtypeId, body.propertyId]
+      )
+      if (!sub) throw new AppError(404, 'Subtype not found on this property')
+    }
+
+    const unitType = body.unitType ?? sub?.unit_type ?? 'apartment'
+    const num = (v: any) => v == null ? null : Number(v)
+    const rentAmount = body.rentAmount ?? num(sub?.rent_amount)
+    if (rentAmount == null || rentAmount <= 0) {
+      throw new AppError(400, 'rentAmount required (directly or via the subtype)')
+    }
+    const securityDeposit = body.securityDeposit ?? num(sub?.security_deposit) ?? 0
+    const bedrooms  = body.bedrooms ?? (sub?.bedrooms ?? 1)
+    const bathrooms = body.bathrooms ?? num(sub?.bathrooms) ?? 1
+    // RV sub-type fields only apply to rv_spot units; storage size to storage.
+    const rvLayout = unitType === 'rv_spot' ? (body.rvSiteLayout ?? sub?.rv_site_layout ?? 'none') : 'none'
+    const rvAmp    = unitType === 'rv_spot' ? (body.rvAmpService ?? sub?.rv_amp_service ?? 'none') : 'none'
+    const storageSize = unitType === 'storage' ? (body.storageSize?.trim() || sub?.storage_size || null) : null
+    const nightlyRate = body.nightlyRate ?? num(sub?.nightly_rate)
+    const weeklyRate  = body.weeklyRate  ?? num(sub?.weekly_rate)
+    const monthlyRate = body.monthlyRate ?? num(sub?.monthly_rate)
+    // S526 (Nic): every RV site is short- AND long-term capable by default —
+    // bookable, all stay lengths allowed. Landlord can narrow later.
+    const isRv = unitType === 'rv_spot'
+
+    // quantity > 1: unitNumber is the PREFIX; continue numbering after the
+    // highest existing "<prefix> <n>" on the property (old bulk-route logic).
+    const unitNumbers: string[] = []
+    if (body.quantity > 1) {
+      const pfx = formatUnitNumber(body.unitNumber)
+      const existing = await query<{ unit_number: string }>(
+        `SELECT unit_number FROM units WHERE property_id=$1 AND LOWER(unit_number) LIKE LOWER($2)`,
+        [body.propertyId, `${pfx} %`]
+      )
+      const nums = existing.map(r => { const m = r.unit_number.match(/\s(\d+)$/); return m ? parseInt(m[1]) : 0 })
+      const start = nums.length ? Math.max(...nums) + 1 : 1
+      for (let i = 0; i < body.quantity; i++) unitNumbers.push(`${pfx} ${String(start + i).padStart(2, '0')}`)
+    } else {
+      unitNumbers.push(formatUnitNumber(body.unitNumber))
+    }
+
+    const created: any[] = []
+    for (const unitNumber of unitNumbers) {
+      // W-16: the units_property_unit_number_uniq index rejects duplicate
+      // numbers at a property — surface it as a friendly 409, not a 500.
+      try {
+      const [unit] = await query<any>(`
+        INSERT INTO units (property_id, landlord_id, unit_number, unit_type, bedrooms, bathrooms, sqft,
+                           rent_amount, security_deposit, rv_site_layout, rv_amp_service,
+                           nightly_rate, weekly_rate, monthly_rate, storage_size, subtype_id, status,
+                           is_bookable, lease_types_allowed)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
+                $18,
+                CASE WHEN $18 THEN ARRAY['nightly','weekly','month_to_month','long_term']::text[]
+                     ELSE ARRAY['nightly','weekly','month_to_month']::text[] END)
+        RETURNING *`,
+        [body.propertyId, prop.landlord_id, unitNumber, unitType, bedrooms,
+         bathrooms, body.sqft ?? null, rentAmount, securityDeposit, rvLayout, rvAmp,
+         nightlyRate, weeklyRate, monthlyRate, storageSize, sub?.id ?? null, body.status,
+         isRv]
+      )
+      created.push(unit)
+      } catch (err: any) {
+        // Two guards can fire: the pre-existing exact-case
+        // units_property_id_unit_number_key, or the S529 case-insensitive
+        // units_property_unit_number_uniq ("apt 204" vs "Apt 204").
+        if (err?.code === '23505' && /unit_number/.test(err?.constraint || '')) {
+          throw new AppError(409, `Unit "${unitNumber}" already exists at this property`)
+        }
+        throw err
+      }
+    }
+
+    // Keep the property's unit_types chips accurate (the removed bulk route
+    // did this; the single-unit path never had — fix-it-right).
+    await query(
+      `UPDATE properties
+          SET unit_types = (SELECT array_agg(DISTINCT t) FROM unnest(COALESCE(unit_types,'{}') || $1::text) AS t)
+        WHERE id = $2`,
+      [unitType, body.propertyId]
     )
-    res.status(201).json({ success: true, data: unit })
+
+    res.status(201).json({ success: true, data: created.length === 1 ? created[0] : { created: created.length, units: created } })
   } catch (e) { next(e) }
 })
 
@@ -216,11 +354,15 @@ unitsRouter.get('/:id/economics', async (req, res, next) => {
     const [{ count }] = await query('SELECT COUNT(*)::int AS count FROM units WHERE landlord_id = $1 AND status = $2', [unit.landlord_id, 'active'])
     const { rate } = getReservePhase(count)
     const econ = calcNetPerUnit(unit.rent_amount, rate)
-    // Launch fee model (walkthrough #34): flat $2 per OCCUPIED unit (active or
-    // direct_pay), vacant $0 — retires the old $15/$5 OTP/direct tiers. The
-    // $10/property minimum is a per-property accrual floor, not attributable to
-    // a single unit, so the per-unit lifetime fee is just $2 × occupied months.
-    const fee = (unit.status === 'active' || unit.status === 'direct_pay')
+    // Launch fee model (walkthrough #34): flat $2 per OCCUPIED unit, vacant
+    // $0 — retires the old $15/$5 OTP/direct tiers. The $10/property minimum
+    // is a per-property accrual floor, not attributable to a single unit, so
+    // the per-unit lifetime fee is just $2 × occupied months. Occupied =
+    // active + delinquent + suspended (rent-obligation principle): the real
+    // accrual in services/platformFee.ts counts by active LEASE, which those
+    // statuses all still carry — pre-W-15 this preview showed $0 for
+    // delinquent/suspended units while the accrual charged them.
+    const fee = ['active', 'delinquent', 'suspended'].includes(unit.status)
       ? LAUNCH_PLATFORM_FEE.PER_OCCUPIED_UNIT : 0
     const feeNum = Number(fee)
     const ps = await queryOne("SELECT COALESCE(SUM(amount) FILTER (WHERE status = 'settled'), 0) as total_collected, COALESCE(SUM(amount) FILTER (WHERE status = 'settled' AND due_date >= date_trunc('month', NOW())), 0) as this_month, COALESCE(SUM(amount) FILTER (WHERE status = 'settled' AND due_date >= date_trunc('year', NOW())), 0) as this_year, COUNT(*) FILTER (WHERE status = 'settled') as settled_count, COUNT(*) FILTER (WHERE status = 'failed') as failed_count, MIN(due_date) as first_payment FROM payments WHERE unit_id = $1", [req.params.id])
@@ -342,6 +484,8 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
     if (!canManageLandlordResource(req.user, unit.landlord_id)) {
       throw new AppError(403, 'Forbidden')
     }
+    // Property-locked workers may only create reservations at their properties.
+    await assertPropertyInScope(req.user, unit.property_id)
 
     // Check allowed lease types. An EMPTY list means unrestricted (a manual
     // staff reservation can book any unit) — only enforce when the unit has an
@@ -350,13 +494,10 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
       throw new AppError(400, `Lease type '${body.leaseType}' not allowed for ${unit.unit_type} units`)
     }
 
-    // Check for conflicts
-    const conflict = await queryOne<any>(`
-      SELECT id FROM unit_bookings
-      WHERE unit_id=$1 AND status NOT IN ('cancelled')
-      AND check_in < $2 AND check_out > $3`,
-      [unit.id, body.checkOut, body.checkIn])
-    if (conflict) throw new AppError(409, 'Unit is already booked for those dates')
+    // Conflicts (bookings + active leases): the shared predicate in
+    // services/unitAvailability — same rule GET /units/available filters by.
+    const conflict = await findStayConflict(unit.id, { checkIn: body.checkIn, checkOut: body.checkOut })
+    if (conflict) throw new AppError(409, STAY_CONFLICT_MESSAGE[conflict])
 
     const nights = Math.ceil((checkOutD.getTime() - checkInD.getTime()) / (1000*60*60*24))
     // Price authoritatively from the UNIT's stay rates, falling back to the
@@ -374,7 +515,9 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
         monthly: unit.monthly_rate ?? prop?.monthly_rate },
       Number(prop?.short_term_tax_rate || 0), nights)
     const total = price.total > 0 ? price.total : (body.totalAmount || 0)
-    const platformFee = total * 0.05 // 5% platform fee on short-term
+    // S526 (Nic): reservations carry ZERO platform fee — GAM's income is the
+    // $2/occupied-unit monthly fee (services/platformFee.ts), not a booking cut.
+    const platformFee = 0
 
     const booking = await queryOne<any>(`INSERT INTO unit_bookings
       (unit_id, landlord_id, tenant_id, guest_name, guest_email, guest_phone,
@@ -393,6 +536,11 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
       summary: `Reservation created for ${booking.guest_name || 'Guest'} (${body.checkIn}→${body.checkOut})`,
       detail: { check_in: body.checkIn, check_out: body.checkOut, lease_type: body.leaseType, source: body.source ?? 'direct' },
     }).catch((err) => logger.error({ err, bookingId: booking.id }, '[booking] event record failed'))
+
+    // S526: 30+ day stays (7+ in weekly-lease mode) get a lease drafted
+    // automatically for the landlord to review. Best-effort.
+    maybeDraftLeaseFromBooking(booking.id)
+      .catch((err) => logger.error({ err, bookingId: booking.id }, '[booking] lease draft failed'))
 
     // Booking guests with no GAM account get a stay-assistant link by email
     // (a host can also issue a QR from the booking). Best-effort — a missing
@@ -487,14 +635,21 @@ unitsRouter.delete('/:id/bookings/:bookingId/guest-access', requirePerm('guest_a
   } catch (e) { next(e) }
 })
 
-// GET /api/units/:id/bookings — list bookings for a unit
-unitsRouter.get('/:id/bookings', requirePerm('guests.check_in', 'guests.check_out', 'units.view_status', 'units.edit'), async (req, res, next) => {
+// GET /api/units/:id/bookings — list bookings for a unit.
+// Catalog keys first (what the permissions page grants), legacy keys kept
+// for existing scope rows. Property-locked workers may only read units at
+// their assigned properties.
+unitsRouter.get('/:id/bookings', requirePerm(
+  'schedule.tab.timeline', 'schedule.tab.list', 'schedule.tab.units', 'bookings.view',
+  'guests.check_in', 'guests.check_out', 'units.view_status', 'units.edit',
+), async (req, res, next) => {
   try {
-    const unit = await queryOne<any>('SELECT landlord_id FROM units WHERE id=$1', [req.params.id])
+    const unit = await queryOne<any>('SELECT landlord_id, property_id FROM units WHERE id=$1', [req.params.id])
     if (!unit) throw new AppError(404, 'Unit not found')
     if (!canAccessLandlordResource(req.user, unit.landlord_id)) {
       throw new AppError(403, 'Forbidden')
     }
+    await assertPropertyInScope(req.user, unit.property_id)
     // S313: JOIN properties to surface requires_booking_acknowledgment
     // per booking row. SchedulePage's "ack needed" badge (S200) reads
     // this flag from each booking; pre-S313 the column was undefined
@@ -529,11 +684,17 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
     if (!canManageLandlordResource(req.user, booking.landlord_id)) {
       throw new AppError(403, 'Forbidden')
     }
+    // Property-locked workers may only edit reservations at their properties.
+    const bookingUnit = await queryOne<any>('SELECT property_id FROM units WHERE id=$1', [booking.unit_id])
+    await assertPropertyInScope(req.user, bookingUnit?.property_id)
 
-    const newUnitId = unitId || booking.unit_id
+    let newUnitId = unitId || booking.unit_id
     const newCheckIn = checkIn || booking.check_in
     const newCheckOut = checkOut || booking.check_out
     const datesOrUnitChanged = !!(checkIn || checkOut || unitId)
+    // W-20: set when the extension fallback moved the EXTENDING guest to a
+    // different site — surfaced in the response so staff can tell them.
+    let extendedGuestMovedTo: { unitId: string; unitNumber: string } | null = null
 
     // If dates or unit changed, verify target unit exists, belongs to the
     // same landlord, and check for conflicts. Repricing below reads its rates.
@@ -541,13 +702,63 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
     if (datesOrUnitChanged) {
       targetUnit = await queryOne<any>('SELECT * FROM units WHERE id=$1 AND landlord_id=$2', [newUnitId, booking.landlord_id])
       if (!targetUnit) throw new AppError(404, 'Target unit not found')
+      // Moving to another unit: the destination property must also be in scope.
+      if (unitId && unitId !== booking.unit_id) {
+        await assertPropertyInScope(req.user, targetUnit.property_id)
+      }
 
-      const conflict = await queryOne<any>(`
-        SELECT id FROM unit_bookings
-        WHERE unit_id=$1 AND id != $2 AND status NOT IN ('cancelled')
-        AND check_in < $3 AND check_out > $4`,
-        [newUnitId, booking.id, newCheckOut, newCheckIn])
-      if (conflict) throw new AppError(409, 'Unit already booked for those dates')
+      // Shared predicate (services/unitAvailability): bookings + active
+      // leases, excluding this booking and any lease drafted from it.
+      let conflict = await findStayConflict(newUnitId, {
+        checkIn: newCheckIn, checkOut: newCheckOut, excludeBookingId: booking.id,
+      })
+      // W-20 extension protection (Nic): the sitting guest extending on
+      // their OWN site takes priority — the incoming reservation gets
+      // relocated to a compatible open site (it hasn't been revealed yet,
+      // so the incoming guest never sees the move). Only for same-unit
+      // date changes; a deliberate unit swap into a conflict still 409s.
+      if (conflict === 'booking' && !unitId && (checkIn || checkOut)) {
+        const { relocateBlockingBookings, rankUnitsBestFit } =
+          await import('../services/scheduleCompression')
+        const relo = await relocateBlockingBookings(
+          newUnitId, { checkIn: newCheckIn, checkOut: newCheckOut }, booking.id)
+        if (relo.ok) {
+          conflict = await findStayConflict(newUnitId, {
+            checkIn: newCheckIn, checkOut: newCheckOut, excludeBookingId: booking.id,
+          })
+        } else {
+          // BACKUP (Nic — busy seasons are competitive): the incoming
+          // reservation can't move, so try moving the EXTENDING guest
+          // instead — any compatible site where the WHOLE extended stay
+          // fits. Their site was already revealed, but this move is their
+          // own choice: extend-and-relocate beats no-extension.
+          const candidates = await query<any>(`
+            SELECT id, unit_number, rv_site_layout, rv_amp_service
+              FROM units
+             WHERE property_id = $1 AND id != $2
+               AND is_bookable = TRUE
+               AND (lease_types_allowed && ARRAY['nightly','weekly']::text[])
+             ORDER BY unit_number`, [targetUnit.property_id, booking.unit_id])
+          const compatible = candidates.filter((c: any) =>
+            !isSiteLayoutMismatch(booking.required_site_layout, c.rv_site_layout) &&
+            !isAmpServiceMismatch(booking.required_amp_service, c.rv_amp_service))
+          const ranked = await rankUnitsBestFit(
+            compatible.map((c: any) => c.id),
+            { checkIn: newCheckIn, checkOut: newCheckOut })
+          if (!ranked.length) {
+            throw new AppError(409,
+              `Cannot extend: ${relo.reason}, and no open site fits the extended stay`)
+          }
+          newUnitId = ranked[0]
+          const dest = candidates.find((c: any) => c.id === ranked[0])
+          extendedGuestMovedTo = { unitId: ranked[0], unitNumber: dest?.unit_number ?? '' }
+          targetUnit = await queryOne<any>(
+            'SELECT * FROM units WHERE id=$1 AND landlord_id=$2', [newUnitId, booking.landlord_id])
+          logger.info(`[extend] extending guest moves sites: booking=${booking.id} → ${dest?.unit_number}`)
+          conflict = null
+        }
+      }
+      if (conflict) throw new AppError(409, STAY_CONFLICT_MESSAGE[conflict])
     }
 
     const nights = Math.ceil((new Date(newCheckOut).getTime() - new Date(newCheckIn).getTime()) / (1000*60*60*24))
@@ -583,7 +794,13 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
       WHERE id=$7 RETURNING *`,
       [status||null, notes||null, newUnitId, newCheckIn, newCheckOut, nights, booking.id,
        guestName ?? null, guestEmail ?? null, guestPhone ?? null,
-       newTotal, newTotal != null ? newTotal * 0.05 : null, requiredSiteLayout ?? null, requiredAmpService ?? null])
+       // Reprice zeroes the fee too (S526: reservations carry no platform fee).
+       newTotal, newTotal != null ? 0 : null, requiredSiteLayout ?? null, requiredAmpService ?? null])
+
+    // S526: an extension can push the stay over the lease threshold (30d, or
+    // 7d in weekly-lease mode) — re-check on every edit. Best-effort.
+    maybeDraftLeaseFromBooking(booking.id)
+      .catch((err) => logger.error({ err, bookingId: booking.id }, '[booking] lease draft failed'))
 
     // S517: append the change-history events (moved / dates_changed / cancelled
     // / status_changed) by diffing old → new. Best-effort.
@@ -596,7 +813,14 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
       promoteNextWaitlister(booking.unit_id).catch(err =>
         logger.error({ err, unit_id: booking.unit_id }, '[booking] waitlist promote on cancel failed'))
     }
-    res.json({ success: true, data: updated })
+    res.json({
+      success: true,
+      data: updated,
+      // W-20: non-null when the extension moved the EXTENDING guest to a
+      // new site — the UI tells staff so they can coordinate the physical
+      // move with the guest.
+      extendedGuestMovedTo,
+    })
   } catch (e) { next(e) }
 })
 
@@ -629,8 +853,17 @@ unitsRouter.patch('/:id/bookings/:bookingId/acknowledge', requirePerm('bookings.
   } catch (e) { next(e) }
 })
 
-// GET /api/units/schedule — master schedule across all units for a landlord
-unitsRouter.get('/schedule/master', requirePerm('guests.check_in', 'units.view_status', 'units.edit'), async (req, res, next) => {
+// GET /api/units/schedule — master schedule across all units for a landlord.
+// Perm keys: the catalog schedule.tab.* / bookings.view keys (what the
+// permissions page actually grants — the Front Desk preset holds these) plus
+// the legacy pre-catalog keys so existing scope rows keep working.
+// Property-scoped: a property-locked worker only sees units/bookings/leases
+// at their assigned properties.
+unitsRouter.get('/schedule/master', requirePerm(
+  'schedule.tab.timeline', 'schedule.tab.list', 'schedule.tab.units', 'schedule.tab.history',
+  'bookings.view',
+  'guests.check_in', 'units.view_status', 'units.edit',
+), async (req, res, next) => {
   try {
     const { from, to, unitType } = req.query
     const fromDate = from || new Date().toISOString().split('T')[0]
@@ -643,6 +876,7 @@ unitsRouter.get('/schedule/master', requirePerm('guests.check_in', 'units.view_s
     const callerLandlordId = req.user!.role === 'landlord'
       ? req.user!.profileId
       : req.user!.landlordId
+    const scopedIds = await getScopedPropertyIds(req.user)
 
     const units = await query<any>(`
       SELECT u.id, u.unit_number, u.unit_type, u.status, u.rent_amount,
@@ -657,9 +891,11 @@ unitsRouter.get('/schedule/master', requirePerm('guests.check_in', 'units.view_s
       FROM units u
       JOIN properties p ON p.id = u.property_id
       LEFT JOIN v_unit_occupancy vuo ON vuo.unit_id = u.id
-      WHERE u.landlord_id=$1 ${unitType ? "AND u.unit_type=$2" : ""}
+      WHERE u.landlord_id=$1
+        AND ($2::uuid[] IS NULL OR u.property_id = ANY($2::uuid[]))
+        ${unitType ? "AND u.unit_type=$3" : ""}
       ORDER BY u.unit_type, p.name, u.unit_number`,
-      unitType ? [callerLandlordId, unitType] : [callerLandlordId])
+      unitType ? [callerLandlordId, scopedIds, unitType] : [callerLandlordId, scopedIds])
 
     // Get all bookings in range. S200: include the property's
     // requires_booking_acknowledgment flag so the schedule tile can
@@ -673,24 +909,32 @@ unitsRouter.get('/schedule/master', requirePerm('guests.check_in', 'units.view_s
       JOIN properties p ON p.id = u.property_id
       WHERE b.landlord_id=$1 AND b.status NOT IN ('cancelled')
         AND b.check_out >= $2 AND b.check_in <= $3
-      ORDER BY b.check_in`, [callerLandlordId, fromDate, toDate])
+        AND ($4::uuid[] IS NULL OR u.property_id = ANY($4::uuid[]))
+      ORDER BY b.check_in`, [callerLandlordId, fromDate, toDate, scopedIds])
 
     // Get active leases in range
     const leases = await query<any>(`
       SELECT l.*, u.unit_number, u.unit_type, p.name as property_name,
-        vlat.first_name, vlat.last_name
+        vlat.first_name, vlat.last_name, vlat.email, vlat.phone
       FROM leases l
       JOIN units u ON u.id = l.unit_id
       JOIN properties p ON p.id = u.property_id
       LEFT JOIN LATERAL (
-        SELECT first_name, last_name
+        -- S527 W-55: email/phone too — the schedule detail popup shows the
+        -- same contact fields for leases as for reservations.
+        SELECT first_name, last_name, email, phone
         FROM v_lease_active_tenants
         WHERE lease_id = l.id AND role = 'primary'
         LIMIT 1
       ) vlat ON TRUE
       WHERE u.landlord_id=$1 AND l.status='active'
-        AND l.end_date >= $2 AND l.start_date <= $3
-      ORDER BY l.start_date`, [callerLandlordId, fromDate, toDate])
+        -- S527 fix: NULL end_date = open-ended (month-to-month) lease. The
+        -- old "end_date >= $2" dropped those rows, so occupied units looked
+        -- EMPTY on the schedule (while the booking guard rightly blocked
+        -- them — "conflict on an empty spot" reports).
+        AND (l.end_date IS NULL OR l.end_date >= $2) AND l.start_date <= $3
+        AND ($4::uuid[] IS NULL OR u.property_id = ANY($4::uuid[]))
+      ORDER BY l.start_date`, [callerLandlordId, fromDate, toDate, scopedIds])
 
     res.json({ success: true, data: { units, bookings, leases, range: { from: fromDate, to: toDate } } })
   } catch (e) { next(e) }
@@ -698,9 +942,13 @@ unitsRouter.get('/schedule/master', requirePerm('guests.check_in', 'units.view_s
 
 // GET /api/units/schedule/history — S517 / #10. Master-schedule change log:
 // every reservation create / move / date-change / cancel, newest first.
-unitsRouter.get('/schedule/history', requirePerm('guests.check_in', 'units.view_status', 'units.edit'), async (req, res, next) => {
+unitsRouter.get('/schedule/history', requirePerm(
+  'schedule.tab.history',
+  'guests.check_in', 'units.view_status', 'units.edit',
+), async (req, res, next) => {
   try {
     const callerLandlordId = req.user!.role === 'landlord' ? req.user!.profileId : req.user!.landlordId
+    const scopedIds = await getScopedPropertyIds(req.user)
     const limit = Math.min(200, Math.max(1, parseInt(String(req.query.limit ?? '100')) || 100))
     const events = await query<any>(`
       SELECT e.id, e.event_type, e.summary, e.detail, e.created_at,
@@ -711,8 +959,9 @@ unitsRouter.get('/schedule/history', requirePerm('guests.check_in', 'units.view_
         JOIN properties p ON p.id = u.property_id
         LEFT JOIN users a ON a.id = e.actor_user_id
        WHERE e.landlord_id = $1
+         AND ($3::uuid[] IS NULL OR u.property_id = ANY($3::uuid[]))
        ORDER BY e.created_at DESC
-       LIMIT $2`, [callerLandlordId, limit])
+       LIMIT $2`, [callerLandlordId, limit, scopedIds])
     res.json({ success: true, data: events })
   } catch (e) { next(e) }
 })

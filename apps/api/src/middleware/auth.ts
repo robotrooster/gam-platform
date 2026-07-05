@@ -123,6 +123,29 @@ export async function assertPropertyInScope(
   if (!row.property_ids.includes(propertyId)) throw new AppError(403, 'You are not assigned to this property')
 }
 
+// Read-side companion to assertPropertyInScope: which properties may this
+// caller SEE? Returns null when unrestricted (owners, all_properties, or a
+// role with no property scope table — e.g. bookkeeper, whose reads are gated
+// elsewhere); otherwise the property_ids array from the caller's scope row
+// (empty array = sees nothing, same lockdown posture as the POS guard).
+// List endpoints splice it in as: AND ($n::uuid[] IS NULL OR x.property_id = ANY($n)).
+export async function getScopedPropertyIds(
+  user: AuthPayload | undefined,
+): Promise<string[] | null> {
+  if (!user) throw new AppError(401, 'Unauthenticated')
+  if (OWNER_ROLES.includes(user.role)) return null
+  const table = WORKER_SCOPE_TABLE[user.role]
+  if (!table) return null
+  const rows = await query<{ property_ids: string[] | null; all_properties: boolean }>(
+    `SELECT property_ids, all_properties FROM ${table} WHERE user_id = $1 LIMIT 1`,
+    [user.userId],
+  )
+  const row = rows[0]
+  if (!row) return []
+  if (row.all_properties) return null
+  return row.property_ids || []
+}
+
 // requirePerm — gate a worker route by sub-permission key. Owner roles
 // always pass. Worker roles pass if JWT.permissions[key] === true for
 // any of the listed keys (OR semantics — useful when a single endpoint

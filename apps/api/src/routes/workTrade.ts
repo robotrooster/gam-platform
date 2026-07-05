@@ -86,6 +86,8 @@ workTradeRouter.post('/', requirePerm('work_trade.manage'), async (req, res, nex
       startDate:    z.string(),
       endDate:      z.string().optional(),
       renewalTerms: z.string().optional(),
+      // W-56: per-person target; the property value is only the default.
+      monthlyHoursTarget: z.number().int().positive().optional(),
     }).parse(req.body)
 
     const landlordId = resolveLandlordIdForUser(req.user!)
@@ -104,13 +106,18 @@ workTradeRouter.post('/', requirePerm('work_trade.manage'), async (req, res, nex
       [body.tenantId, landlordId])
     if (!tenantLease) throw new AppError(404, 'Tenant has no lease under this landlord')
 
+    const propDefault = await queryOne<{ work_trade_hours_target: number }>(
+      `SELECT p.work_trade_hours_target FROM properties p
+        JOIN units u ON u.property_id = p.id WHERE u.id = $1`, [body.unitId])
     const agreement = await queryOne<any>(`
       INSERT INTO work_trade_agreements
-        (unit_id, tenant_id, landlord_id, duties, start_date, end_date, renewal_terms)
-      VALUES ($1,$2,$3,$4,$5,$6,$7)
+        (unit_id, tenant_id, landlord_id, duties, start_date, end_date, renewal_terms,
+         monthly_hours_target)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
       RETURNING *`,
       [body.unitId, body.tenantId, landlordId, body.duties || null,
-       body.startDate, body.endDate || null, body.renewalTerms || null]
+       body.startDate, body.endDate || null, body.renewalTerms || null,
+       body.monthlyHoursTarget ?? propDefault?.work_trade_hours_target ?? 80]
     )
 
     res.json({ success: true, data: agreement })
@@ -142,7 +149,7 @@ workTradeRouter.get('/unit/:unitId', async (req, res, next) => {
     const agreement = await queryOne<any>(`
       SELECT wta.*,
         u.first_name as tenant_first, u.last_name as tenant_last, u.email as tenant_email,
-        un.unit_number, p.name as property_name, p.work_trade_hours_target AS target
+        un.unit_number, p.name as property_name, wta.monthly_hours_target AS target
       FROM work_trade_agreements wta
       JOIN tenants t ON t.id = wta.tenant_id
       JOIN users u ON u.id = t.user_id
@@ -161,7 +168,7 @@ workTradeRouter.get('/unit/:unitId', async (req, res, next) => {
 workTradeRouter.get('/:id', async (req, res, next) => {
   try {
     const agreement = await queryOne<any>(`
-      SELECT wta.*, p.work_trade_hours_target AS target,
+      SELECT wta.*, wta.monthly_hours_target AS target,
         un.unit_number, p.name as property_name
       FROM work_trade_agreements wta
       JOIN units un ON un.id = wta.unit_id
@@ -293,7 +300,13 @@ workTradeRouter.get('/', requirePerm('work_trade.view'), async (req, res, next) 
     const agreements = await query<any>(`
       SELECT wta.*,
         u.first_name as tenant_first, u.last_name as tenant_last,
-        un.unit_number, p.id as property_id, p.name as property_name, p.work_trade_hours_target AS target,
+        un.unit_number, p.id as property_id, p.name as property_name,
+        wta.monthly_hours_target AS target,
+        -- W-56: the roster row click-through pulls up the tenant's lease.
+        (SELECT l.id FROM leases l
+          JOIN lease_tenants lt ON lt.lease_id = l.id AND lt.tenant_id = wta.tenant_id
+         WHERE l.unit_id = wta.unit_id AND l.status = 'active'
+         ORDER BY l.start_date DESC LIMIT 1) AS lease_id,
         (SELECT COUNT(*) FROM work_trade_logs wtl
           WHERE wtl.agreement_id=wta.id AND wtl.status='pending') as pending_count,
         (SELECT COALESCE(SUM(l.hours),0) FROM work_trade_logs l
@@ -316,9 +329,11 @@ workTradeRouter.get('/', requirePerm('work_trade.view'), async (req, res, next) 
 
 workTradeRouter.patch('/:id', requirePerm('work_trade.manage'), async (req, res, next) => {
   try {
-    const { status, endDate } = z.object({
+    const { status, endDate, monthlyHoursTarget } = z.object({
       status:  z.enum(['active','paused','ended']).optional(),
       endDate: z.string().optional(),
+      // W-56: per-person target is editable on the agreement.
+      monthlyHoursTarget: z.number().int().positive().optional(),
     }).parse(req.body)
 
     await getAgreementForUser(req.params.id, req.user!)
@@ -327,9 +342,10 @@ workTradeRouter.patch('/:id', requirePerm('work_trade.manage'), async (req, res,
       UPDATE work_trade_agreements SET
         status=COALESCE($1,status),
         end_date=COALESCE($2,end_date),
+        monthly_hours_target=COALESCE($4,monthly_hours_target),
         updated_at=NOW()
       WHERE id=$3 RETURNING *`,
-      [status || null, endDate || null, req.params.id]
+      [status || null, endDate || null, req.params.id, monthlyHoursTarget ?? null]
     )
     res.json({ success: true, data: updated })
   } catch (e) { next(e) }

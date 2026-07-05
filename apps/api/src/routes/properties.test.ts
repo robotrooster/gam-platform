@@ -553,7 +553,7 @@ describe('PATCH /api/properties/:id/manager — PM conflict guard', () => {
       .set('Authorization', `Bearer ${f.landlordToken}`)
       .send({ userId: mgrId })
     expect(res.status).toBe(400)
-    expect(res.body.error).toMatch(/not a property_manager scope holder/)
+    expect(res.body.error).toMatch(/not a property-manager or on-site-manager scope holder/)
   })
 })
 

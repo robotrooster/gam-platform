@@ -23,6 +23,7 @@ import { logger } from '../lib/logger'
 
 export interface EodSettlementResult {
   landlordId:      string
+  propertyId:      string
   businessDay:     string
   status:          'auto_closed' | 'manually_closed' | 'reopened'
   cashSales:       number
@@ -52,6 +53,7 @@ interface GenerateOpts {
 
 export async function generateEodSettlement(
   landlordId:  string,
+  propertyId:  string,  // W-12 (S531): settlements are per property/register
   businessDay: string,  // YYYY-MM-DD (Phoenix-local)
   opts:        GenerateOpts = {},
 ): Promise<EodSettlementResult> {
@@ -79,9 +81,10 @@ export async function generateEodSettlement(
       COUNT(*) FILTER (WHERE status = 'voided') AS voided_count
     FROM pos_transactions
     WHERE landlord_id = $1
+      AND property_id = $3
       AND created_at >= $2::timestamptz
       AND created_at <  $2::timestamptz + INTERVAL '1 day'
-  `, [landlordId, dayStart])
+  `, [landlordId, dayStart, propertyId])
 
   const refundTotals = await queryOne<any>(`
     SELECT
@@ -90,11 +93,13 @@ export async function generateEodSettlement(
       COALESCE(SUM(CASE WHEN refund_method='check'  THEN amount ELSE 0 END), 0) AS check_refunds,
       COALESCE(SUM(CASE WHEN refund_method='charge' THEN amount ELSE 0 END), 0) AS charge_refunds,
       COUNT(*) AS refund_count
-    FROM pos_refunds
-    WHERE landlord_id = $1
-      AND created_at >= $2::timestamptz
-      AND created_at <  $2::timestamptz + INTERVAL '1 day'
-  `, [landlordId, dayStart])
+    FROM pos_refunds r
+    JOIN pos_transactions t ON t.id = r.transaction_id
+    WHERE r.landlord_id = $1
+      AND t.property_id = $3
+      AND r.created_at >= $2::timestamptz
+      AND r.created_at <  $2::timestamptz + INTERVAL '1 day'
+  `, [landlordId, dayStart, propertyId])
 
   const status        = opts.status        ?? 'auto_closed'
   const openingFloat  = opts.openingFloat  ?? 0
@@ -104,7 +109,7 @@ export async function generateEodSettlement(
 
   const row = await queryOne<any>(`
     INSERT INTO pos_eod_settlements (
-      landlord_id, business_day,
+      landlord_id, property_id, business_day,
       cash_sales, card_sales, charge_sales,
       cash_refunds, card_refunds, check_refunds, charge_refunds,
       tax_collected, surcharge_collected, platform_fee_total,
@@ -112,7 +117,7 @@ export async function generateEodSettlement(
       opening_float, cash_drawer_actual,
       status, closed_by, notes
     ) VALUES (
-      $1, $2,
+      $1, $21, $2,
       $3, $4, $5,
       $6, $7, $8, $9,
       $10, $11, $12,
@@ -120,7 +125,7 @@ export async function generateEodSettlement(
       $16, $17,
       $18, $19, $20
     )
-    ON CONFLICT (landlord_id, business_day) DO UPDATE SET
+    ON CONFLICT (landlord_id, property_id, business_day) DO UPDATE SET
       cash_sales          = EXCLUDED.cash_sales,
       card_sales          = EXCLUDED.card_sales,
       charge_sales        = EXCLUDED.charge_sales,
@@ -149,12 +154,14 @@ export async function generateEodSettlement(
     totals.tx_count, refundTotals.refund_count, totals.voided_count,
     openingFloat, drawerActual,
     status, closedBy, notes,
+    propertyId,
   ])
 
   if (!row) throw new AppError(500, 'EOD settlement upsert returned no row')
 
   return {
     landlordId,
+    propertyId,
     businessDay,
     status:          row.status,
     cashSales:       Number(row.cash_sales),
@@ -179,22 +186,29 @@ export async function generateEodForAllActiveLandlords(
   businessDay: string,
 ): Promise<EodSettlementResult[]> {
   const dayStart = `${businessDay} 00:00:00 America/Phoenix`
-  const active = await query<{ landlord_id: string }>(`
-    SELECT DISTINCT landlord_id FROM pos_transactions
-     WHERE created_at >= $1::timestamptz
+  // W-12 (S531): one settlement per (landlord, property) with activity —
+  // each register/location closes its own drawer. Refund-only days sweep
+  // in via the transaction join (a refund's property is its sale's).
+  const active = await query<{ landlord_id: string; property_id: string }>(`
+    SELECT DISTINCT landlord_id, property_id FROM pos_transactions
+     WHERE property_id IS NOT NULL
+       AND created_at >= $1::timestamptz
        AND created_at <  ($1::timestamptz + INTERVAL '1 day')
     UNION
-    SELECT DISTINCT landlord_id FROM pos_refunds
-     WHERE created_at >= $1::timestamptz
-       AND created_at <  ($1::timestamptz + INTERVAL '1 day')
+    SELECT DISTINCT r.landlord_id, t.property_id
+      FROM pos_refunds r
+      JOIN pos_transactions t ON t.id = r.transaction_id
+     WHERE t.property_id IS NOT NULL
+       AND r.created_at >= $1::timestamptz
+       AND r.created_at <  ($1::timestamptz + INTERVAL '1 day')
   `, [dayStart])
 
   const results: EodSettlementResult[] = []
   for (const row of active) {
     try {
-      results.push(await generateEodSettlement(row.landlord_id, businessDay))
+      results.push(await generateEodSettlement(row.landlord_id, row.property_id, businessDay))
     } catch (e) {
-      logger.error({ err: e }, `[pos-eod] landlord=${row.landlord_id} day=${businessDay}`)
+      logger.error({ err: e }, `[pos-eod] landlord=${row.landlord_id} property=${row.property_id} day=${businessDay}`)
     }
   }
   return results

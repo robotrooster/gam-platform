@@ -254,7 +254,7 @@ export function PaymentHistoryOnboardingPage() {
       )}
 
       <div style={{ padding: 24, borderRadius: 10, background: 'var(--bg-1)', border: '1px solid var(--border-0)', marginBottom: 16 }}>
-        <h2 style={{ fontSize: '1.05rem', fontWeight: 700, color: 'var(--text-0)', marginTop: 0, marginBottom: 12 }}>1. Pick the source platform</h2>
+        <h2 style={{ fontSize: '1.05rem', fontWeight: 700, color: 'var(--text-0)', marginTop: 0, marginBottom: 12 }}>1. Pick the Source Platform</h2>
         <p style={{ fontSize: '.82rem', color: 'var(--text-2)', marginTop: 0, marginBottom: 12, lineHeight: 1.5 }}>
           GAM recognizes the standard transaction-history column names from each supported platform.
         </p>
@@ -321,7 +321,7 @@ export function PaymentHistoryOnboardingPage() {
       </div>
 
       <div style={{ padding: 24, borderRadius: 10, background: 'var(--bg-1)', border: '1px solid var(--border-0)', marginBottom: 16 }}>
-        <h2 style={{ fontSize: '1.05rem', fontWeight: 700, color: 'var(--text-0)', marginTop: 0, marginBottom: 12 }}>3. Upload your filled-in CSV</h2>
+        <h2 style={{ fontSize: '1.05rem', fontWeight: 700, color: 'var(--text-0)', marginTop: 0, marginBottom: 12 }}>3. Upload Your Filled-In CSV</h2>
         <input
           ref={fileInputRef}
           type="file"
@@ -338,7 +338,7 @@ export function PaymentHistoryOnboardingPage() {
             <div style={{ display: 'inline-flex', alignItems: 'center', gap: 8, padding: '8px 12px', borderRadius: 8, background: 'var(--bg-0)', border: '1px solid var(--border-0)' }}>
               <FileText size={14} color="var(--text-2)" /> <span style={{ fontSize: '.85rem', color: 'var(--text-0)' }}>{fileName}</span>
             </div>
-            <button onClick={handleReset} className="btn btn-ghost" style={{ fontSize: '.82rem' }}>Replace file</button>
+            <button onClick={handleReset} className="btn btn-ghost" style={{ fontSize: '.82rem' }}>Replace File</button>
             <button onClick={handleValidate} className="btn btn-primary" disabled={validateMut.isLoading} style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
               {validateMut.isLoading ? 'Validating…' : 'Validate'}
             </button>
@@ -360,7 +360,7 @@ export function PaymentHistoryOnboardingPage() {
 
       {summary && punchListRows && (
         <div style={{ padding: 24, borderRadius: 10, background: 'var(--bg-1)', border: '1px solid var(--border-0)', marginBottom: 16 }}>
-          <h2 style={{ fontSize: '1.05rem', fontWeight: 700, color: 'var(--text-0)', marginTop: 0, marginBottom: 12 }}>4. Preview &amp; commit</h2>
+          <h2 style={{ fontSize: '1.05rem', fontWeight: 700, color: 'var(--text-0)', marginTop: 0, marginBottom: 12 }}>4. Preview &amp; Commit</h2>
           <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', marginBottom: 16, fontSize: '.85rem' }}>
             <div style={{ color: 'var(--text-1)' }}><strong>{summary.total}</strong> row(s)</div>
             <div style={{ color: 'var(--text-1)' }}><strong>{summary.ready}</strong> ready to import</div>

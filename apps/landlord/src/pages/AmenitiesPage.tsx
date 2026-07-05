@@ -129,6 +129,8 @@ function AreaModal({ propertyId, onClose, onSaved }: { propertyId: string; onClo
   const [f, setF] = useState({
     name: '', description: '', reservable: true, requiresApproval: true,
     capacity: '', reservationFee: '', weekendFee: '', openTime: '', closeTime: '', maxReservationHours: '', advanceBookingDays: '',
+    // W-44: private-event posture (per area).
+    eventsEnabled: false, eventDepositAmount: '', eventAnnounce: true, eventAutoRelease: true,
   })
   const m = useMutation(
     () => apiPost('/common-areas', {
@@ -140,6 +142,9 @@ function AreaModal({ propertyId, onClose, onSaved }: { propertyId: string; onClo
       openTime: f.openTime || null, closeTime: f.closeTime || null,
       maxReservationHours: f.maxReservationHours ? Number(f.maxReservationHours) : null,
       advanceBookingDays: f.advanceBookingDays ? Number(f.advanceBookingDays) : null,
+      eventsEnabled: f.eventsEnabled,
+      eventDepositAmount: f.eventDepositAmount ? Number(f.eventDepositAmount) : 0,
+      eventAnnounce: f.eventAnnounce, eventAutoRelease: f.eventAutoRelease,
     }),
     { onSuccess: onSaved })
   return (
@@ -159,6 +164,23 @@ function AreaModal({ propertyId, onClose, onSaved }: { propertyId: string; onClo
         <Field label="Max hours / booking"><input className="input" type="number" value={f.maxReservationHours} onChange={e => setF({ ...f, maxReservationHours: e.target.value })} /></Field>
         <Field label="Book ahead (days)"><input className="input" type="number" value={f.advanceBookingDays} onChange={e => setF({ ...f, advanceBookingDays: e.target.value })} /></Field>
       </div>
+      {/* W-44: tenant private events */}
+      <div style={{ borderTop: '1px solid var(--border-0)', marginTop: 12, paddingTop: 10 }}>
+        <label style={{ fontSize: '.8rem', fontWeight: 700 }}>
+          <input type="checkbox" checked={f.eventsEnabled} onChange={e => setF({ ...f, eventsEnabled: e.target.checked })} /> Tenants can book private events
+        </label>
+        {f.eventsEnabled && (
+          <div style={{ marginTop: 8 }}>
+            <Field label="Event deposit ($, non-refundable — 0 for none)">
+              <input className="input" type="number" min={0} value={f.eventDepositAmount} onChange={e => setF({ ...f, eventDepositAmount: e.target.value })} />
+            </Field>
+            <div style={{ display: 'flex', gap: 16, margin: '6px 0' }}>
+              <label style={{ fontSize: '.78rem' }}><input type="checkbox" checked={f.eventAnnounce} onChange={e => setF({ ...f, eventAnnounce: e.target.checked })} /> Announce to the property when paid</label>
+              <label style={{ fontSize: '.78rem' }}><input type="checkbox" checked={f.eventAutoRelease} onChange={e => setF({ ...f, eventAutoRelease: e.target.checked })} /> Auto-release if unpaid at start</label>
+            </div>
+          </div>
+        )}
+      </div>
       {m.isError && <div style={{ color: 'var(--danger,#e25)', fontSize: '.8rem' }}>Could not save.</div>}
       <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 12 }}>
         <button className="btn" onClick={onClose}>Cancel</button>
@@ -169,8 +191,11 @@ function AreaModal({ propertyId, onClose, onSaved }: { propertyId: string; onClo
 }
 
 // ── Landlord hold (private rental / closure / event) ──────────────────
+// W-44 (S531, Nic): SPLIT — maintenance closures are created from the
+// MAINTENANCE tab ("Close Amenity"); this modal keeps only the
+// amenity-side holds (private rental / community event).
 function HoldModal({ area, onClose, onSaved }: { area: Area; onClose: () => void; onSaved: () => void }) {
-  const [f, setF] = useState({ kind: 'maintenance_closure', title: '', startsAt: '', endsAt: '', notifyResidents: true })
+  const [f, setF] = useState({ kind: 'private_rental', title: '', startsAt: '', endsAt: '', notifyResidents: true })
   const m = useMutation(
     () => apiPost(`/common-areas/${area.id}/reservations`, {
       kind: f.kind, title: f.title || undefined,
@@ -182,10 +207,12 @@ function HoldModal({ area, onClose, onSaved }: { area: Area; onClose: () => void
     <Modal title={`Hold — ${area.name}`} onClose={onClose}>
       <Field label="Type">
         <select className="input" value={f.kind} onChange={e => setF({ ...f, kind: e.target.value })}>
-          <option value="maintenance_closure">Closure (maintenance / treatment)</option>
           <option value="private_rental">Private rental</option>
           <option value="event">Community event</option>
         </select>
+        <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 4 }}>
+          Closing an area for maintenance? Use "Close Amenity" on the Maintenance page.
+        </div>
       </Field>
       <Field label="Reason / title"><input className="input" value={f.title} onChange={e => setF({ ...f, title: e.target.value })} placeholder="Chemical treatment" /></Field>
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>

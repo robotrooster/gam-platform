@@ -145,24 +145,32 @@ inspectionsRouter.get('/', async (req, res, next) => {
     let where = '1=1'
     if (req.query.unitId) {
       params.push(req.query.unitId)
-      where += ` AND unit_id = $${params.length}`
+      where += ` AND i.unit_id = $${params.length}`
     }
     if (req.query.tenantId) {
       params.push(req.query.tenantId)
-      where += ` AND tenant_id = $${params.length}`
+      where += ` AND i.tenant_id = $${params.length}`
     }
     if (req.query.leaseId) {
       params.push(req.query.leaseId)
-      where += ` AND lease_id = $${params.length}`
+      where += ` AND i.lease_id = $${params.length}`
     }
+    // S527 W-43: join unit number, property, and tenant name — the list used
+    // to return bare ids and the page rendered UUID fragments as "Unit"/"Tenant".
     const rows = await query<any>(
-      `SELECT id, unit_id, lease_id, tenant_id, landlord_id,
-              inspection_type, status, comparison_inspection_id,
-              scheduled_for, conducted_at, finalized_at,
-              created_at, updated_at
-         FROM unit_inspections
+      `SELECT i.id, i.unit_id, i.lease_id, i.tenant_id, i.landlord_id,
+              i.inspection_type, i.status, i.comparison_inspection_id,
+              i.scheduled_for, i.conducted_at, i.finalized_at,
+              i.created_at, i.updated_at,
+              u.unit_number, p.name AS property_name,
+              tu.first_name AS tenant_first_name, tu.last_name AS tenant_last_name
+         FROM unit_inspections i
+         JOIN units u ON u.id = i.unit_id
+         JOIN properties p ON p.id = u.property_id
+         LEFT JOIN tenants t ON t.id = i.tenant_id
+         LEFT JOIN users tu ON tu.id = t.user_id
         WHERE ${where}
-        ORDER BY created_at DESC
+        ORDER BY i.created_at DESC
         LIMIT 200`,
       params,
     )

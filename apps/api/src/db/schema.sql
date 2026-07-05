@@ -21,7 +21,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict xpzb8Um3P1XUjhTD9i6rMBrGwswolAPqOTdC9RWUSFrdd1j7sM0H0CslY6IasP2
+\restrict R3gQWGybWKhpD2FTB3onw0KUIJNuU7ymEgOWB1fwrQvKyBmpEQVEnhtEAraN5lM
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -2083,7 +2083,11 @@ CREATE TABLE public.common_areas (
     active boolean DEFAULT true NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    weekend_fee numeric(10,2)
+    weekend_fee numeric(10,2),
+    events_enabled boolean DEFAULT false NOT NULL,
+    event_deposit_amount numeric(10,2) DEFAULT 0 NOT NULL,
+    event_announce boolean DEFAULT true NOT NULL,
+    event_auto_release boolean DEFAULT true NOT NULL
 );
 
 
@@ -2492,7 +2496,8 @@ CREATE TABLE public.documents (
     signed_by_landlord boolean DEFAULT false,
     signed_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now(),
-    CONSTRAINT documents_type_check CHECK ((type = ANY (ARRAY['lease'::text, 'addendum'::text, 'move_in_checklist'::text, 'move_out_checklist'::text, 'notice'::text, 'other'::text])))
+    maintenance_request_id uuid,
+    CONSTRAINT documents_type_check CHECK ((type = ANY (ARRAY['lease'::text, 'addendum'::text, 'move_in_checklist'::text, 'move_out_checklist'::text, 'notice'::text, 'receipt'::text, 'other'::text])))
 );
 
 
@@ -3315,6 +3320,7 @@ CREATE TABLE public.lease_documents (
     promote_lease_tenant_id uuid,
     batch_id uuid,
     execution_failed_at timestamp with time zone,
+    renews_lease_id uuid,
     CONSTRAINT lease_documents_addendum_fields_check CHECK ((((document_type = 'addendum_remove'::text) AND (target_lease_tenant_id IS NOT NULL)) OR ((document_type = ANY (ARRAY['original_lease'::text, 'addendum_add'::text, 'addendum_terms'::text, 'sublease_agreement'::text])) AND (target_lease_tenant_id IS NULL) AND (promote_lease_tenant_id IS NULL)))),
     CONSTRAINT lease_documents_document_type_check CHECK ((document_type = ANY (ARRAY['original_lease'::text, 'addendum_add'::text, 'addendum_remove'::text, 'addendum_terms'::text, 'sublease_agreement'::text]))),
     CONSTRAINT lease_documents_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'sent'::text, 'in_progress'::text, 'completed'::text, 'voided'::text, 'execution_failed'::text])))
@@ -3609,13 +3615,14 @@ CREATE TABLE public.leases (
     extraction_extras jsonb,
     supersedes_lease_id uuid,
     import_extra_data jsonb,
+    source_booking_id uuid,
     CONSTRAINT leases_auto_renew_mode_check CHECK (((auto_renew_mode IS NULL) OR (auto_renew_mode = ANY (ARRAY['extend_same_term'::text, 'convert_to_month_to_month'::text])))),
     CONSTRAINT leases_auto_renew_mode_required CHECK (((auto_renew = false) OR (auto_renew_mode IS NOT NULL))),
     CONSTRAINT leases_late_fee_accrual_period_check CHECK ((late_fee_accrual_period = ANY (ARRAY['daily'::text, 'weekly'::text, 'monthly'::text]))),
     CONSTRAINT leases_late_fee_accrual_type_check CHECK ((late_fee_accrual_type = ANY (ARRAY['flat'::text, 'percent_of_rent'::text]))),
     CONSTRAINT leases_late_fee_cap_type_check CHECK ((late_fee_cap_type = ANY (ARRAY['flat'::text, 'percent_of_rent'::text]))),
     CONSTRAINT leases_late_fee_initial_type_check CHECK ((late_fee_initial_type = ANY (ARRAY['flat'::text, 'percent_of_rent'::text]))),
-    CONSTRAINT leases_lease_source_check CHECK ((lease_source = ANY (ARRAY['esigned'::text, 'imported'::text]))),
+    CONSTRAINT leases_lease_source_check CHECK ((lease_source = ANY (ARRAY['esigned'::text, 'imported'::text, 'booking_draft'::text]))),
     CONSTRAINT leases_lease_type_check CHECK ((lease_type = ANY (ARRAY['month_to_month'::text, 'fixed_term'::text, 'nnn_commercial'::text]))),
     CONSTRAINT leases_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'active'::text, 'expired'::text, 'terminated'::text]))),
     CONSTRAINT leases_subleasing_allowed_check CHECK ((subleasing_allowed = ANY (ARRAY['prohibited'::text, 'with_consent'::text, 'allowed'::text])))
@@ -4009,6 +4016,7 @@ CREATE TABLE public.pending_tenant_intents (
     resolved_lease_id uuid,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    unit_id uuid,
     CONSTRAINT pending_tenant_intents_parser_status_check CHECK ((parser_status = ANY (ARRAY['not_uploaded'::text, 'parsing'::text, 'parsed'::text, 'mismatch'::text, 'error'::text, 'resolved'::text])))
 );
 
@@ -4415,6 +4423,7 @@ CREATE TABLE public.pos_discounts (
     code text,
     is_active boolean DEFAULT true NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
+    property_id uuid,
     CONSTRAINT pos_discounts_type_check CHECK ((type = ANY (ARRAY['percent'::text, 'fixed'::text, 'bogo'::text, 'other'::text])))
 );
 
@@ -4450,6 +4459,7 @@ CREATE TABLE public.pos_eod_settlements (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     check_refunds numeric(12,2) DEFAULT 0 NOT NULL,
+    property_id uuid NOT NULL,
     CONSTRAINT pos_eod_settlements_status_check CHECK ((status = ANY (ARRAY['auto_closed'::text, 'manually_closed'::text, 'reopened'::text])))
 );
 
@@ -4581,6 +4591,7 @@ CREATE TABLE public.pos_purchase_orders (
     received_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    property_id uuid,
     CONSTRAINT pos_purchase_orders_status_check CHECK ((status = ANY (ARRAY['draft'::text, 'approved'::text, 'sent'::text, 'received'::text, 'cancelled'::text])))
 );
 
@@ -4867,6 +4878,7 @@ CREATE TABLE public.properties (
     weekly_rate numeric(10,2),
     monthly_rate numeric(10,2),
     short_term_tax_rate numeric(5,2) DEFAULT 0 NOT NULL,
+    weekly_lease_mode boolean DEFAULT false NOT NULL,
     CONSTRAINT properties_booking_deposit_pct_range CHECK (((booking_deposit_pct >= (0)::numeric) AND (booking_deposit_pct <= (100)::numeric))),
     CONSTRAINT properties_booking_slug_format CHECK (((booking_slug IS NULL) OR ((booking_slug ~ '^[a-z0-9][a-z0-9-]{1,60}$'::text) AND (booking_slug !~ '--'::text)))),
     CONSTRAINT properties_deposit_handling_mode_check CHECK ((deposit_handling_mode = ANY (ARRAY['gam_escrow'::text, 'landlord_held'::text]))),
@@ -5005,6 +5017,36 @@ CREATE TABLE public.property_manager_scopes (
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     permissions jsonb DEFAULT '{}'::jsonb NOT NULL,
     direct_deposit_enabled boolean DEFAULT false NOT NULL
+);
+
+
+--
+-- Name: property_unit_subtypes; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.property_unit_subtypes (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    property_id uuid NOT NULL,
+    unit_type text NOT NULL,
+    name text NOT NULL,
+    bedrooms integer,
+    bathrooms numeric(3,1),
+    rv_site_layout text,
+    rv_amp_service text,
+    storage_size text,
+    rent_amount numeric(10,2),
+    security_deposit numeric(10,2),
+    nightly_rate numeric(10,2),
+    weekly_rate numeric(10,2),
+    monthly_rate numeric(10,2),
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT property_unit_subtypes_bathrooms_check CHECK ((bathrooms >= (0)::numeric)),
+    CONSTRAINT property_unit_subtypes_bedrooms_check CHECK ((bedrooms >= 0)),
+    CONSTRAINT property_unit_subtypes_name_check CHECK (((length(TRIM(BOTH FROM name)) >= 1) AND (length(TRIM(BOTH FROM name)) <= 60))),
+    CONSTRAINT property_unit_subtypes_rv_amp_service_check CHECK ((rv_amp_service = ANY (ARRAY['none'::text, '30'::text, '50'::text, 'both'::text]))),
+    CONSTRAINT property_unit_subtypes_rv_site_layout_check CHECK ((rv_site_layout = ANY (ARRAY['none'::text, 'back_in'::text, 'pull_through'::text]))),
+    CONSTRAINT property_unit_subtypes_unit_type_check CHECK ((unit_type = ANY (ARRAY['apartment'::text, 'single_family'::text, 'rv_spot'::text, 'mobile_home'::text, 'storage'::text, 'commercial'::text])))
 );
 
 
@@ -5290,6 +5332,8 @@ CREATE TABLE public.security_deposits (
     balance_due_total numeric(10,2),
     custody_fee_active boolean DEFAULT true NOT NULL,
     CONSTRAINT security_deposits_held_by_check CHECK ((held_by = ANY (ARRAY['gam_escrow'::text, 'landlord'::text]))),
+    CONSTRAINT security_deposits_no_acceleration_chk CHECK (((balance_due_full_at IS NULL) AND (balance_due_total IS NULL))),
+    CONSTRAINT security_deposits_no_advance_chk CHECK (((gam_advance_amount IS NULL) OR (gam_advance_amount = (0)::numeric))),
     CONSTRAINT security_deposits_plan_status_check CHECK (((flex_deposit_plan_status IS NULL) OR (flex_deposit_plan_status = ANY (ARRAY['active'::text, 'completed'::text])))),
     CONSTRAINT security_deposits_portability_status_check CHECK ((portability_status = ANY (ARRAY['none'::text, 'pending_auth'::text, 'authorized'::text, 'carried_forward'::text, 'pending_transfer'::text, 'declined'::text]))),
     CONSTRAINT security_deposits_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'funded'::text, 'partial'::text, 'disbursed'::text, 'claimed'::text])))
@@ -5804,6 +5848,7 @@ CREATE TABLE public.unit_bookings (
     hold_expires_at timestamp with time zone,
     required_site_layout text DEFAULT 'none'::text NOT NULL,
     required_amp_service text DEFAULT 'none'::text NOT NULL,
+    site_reveal_sent_at timestamp with time zone,
     CONSTRAINT unit_bookings_lease_type_check CHECK ((lease_type = ANY (ARRAY['nightly'::text, 'weekly'::text, 'month_to_month'::text, 'long_term'::text, 'lease_hold'::text]))),
     CONSTRAINT unit_bookings_required_amp_service_check CHECK ((required_amp_service = ANY (ARRAY['none'::text, '30'::text, '50'::text, 'both'::text]))),
     CONSTRAINT unit_bookings_required_site_layout_check CHECK ((required_site_layout = ANY (ARRAY['none'::text, 'back_in'::text, 'pull_through'::text]))),
@@ -6015,9 +6060,11 @@ CREATE TABLE public.units (
     rv_site_layout text DEFAULT 'none'::text NOT NULL,
     rv_amp_service text DEFAULT 'none'::text NOT NULL,
     status_before_block text,
+    storage_size text,
+    subtype_id uuid,
     CONSTRAINT units_rv_amp_service_check CHECK ((rv_amp_service = ANY (ARRAY['none'::text, '30'::text, '50'::text, 'both'::text]))),
     CONSTRAINT units_rv_site_layout_check CHECK ((rv_site_layout = ANY (ARRAY['none'::text, 'back_in'::text, 'pull_through'::text]))),
-    CONSTRAINT units_status_check CHECK ((status = ANY (ARRAY['vacant'::text, 'available'::text, 'active'::text, 'direct_pay'::text, 'delinquent'::text, 'suspended'::text]))),
+    CONSTRAINT units_status_check CHECK ((status = ANY (ARRAY['vacant'::text, 'available'::text, 'active'::text, 'delinquent'::text, 'suspended'::text]))),
     CONSTRAINT units_unit_type_check CHECK ((unit_type = ANY (ARRAY['apartment'::text, 'single_family'::text, 'rv_spot'::text, 'mobile_home'::text, 'storage'::text, 'commercial'::text])))
 );
 
@@ -6382,7 +6429,9 @@ CREATE TABLE public.work_trade_agreements (
     status text DEFAULT 'active'::text NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT work_trade_agreements_status_check CHECK ((status = ANY (ARRAY['active'::text, 'paused'::text, 'ended'::text])))
+    monthly_hours_target integer DEFAULT 80 NOT NULL,
+    CONSTRAINT work_trade_agreements_status_check CHECK ((status = ANY (ARRAY['active'::text, 'paused'::text, 'ended'::text]))),
+    CONSTRAINT work_trade_agreements_target_positive CHECK ((monthly_hours_target > 0))
 );
 
 
@@ -7963,7 +8012,7 @@ ALTER TABLE ONLY public.pos_discounts
 --
 
 ALTER TABLE ONLY public.pos_eod_settlements
-    ADD CONSTRAINT pos_eod_settlements_one_per_day UNIQUE (landlord_id, business_day);
+    ADD CONSTRAINT pos_eod_settlements_one_per_day UNIQUE (landlord_id, property_id, business_day);
 
 
 --
@@ -8180,6 +8229,22 @@ ALTER TABLE ONLY public.property_manager_scopes
 
 ALTER TABLE ONLY public.property_manager_scopes
     ADD CONSTRAINT property_manager_scopes_user_id_landlord_id_key UNIQUE (user_id, landlord_id);
+
+
+--
+-- Name: property_unit_subtypes property_unit_subtypes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_unit_subtypes
+    ADD CONSTRAINT property_unit_subtypes_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: property_unit_subtypes property_unit_subtypes_property_id_unit_type_name_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_unit_subtypes
+    ADD CONSTRAINT property_unit_subtypes_property_id_unit_type_name_key UNIQUE (property_id, unit_type, name);
 
 
 --
@@ -9766,6 +9831,13 @@ CREATE INDEX idx_document_batches_landlord ON public.document_batches USING btre
 
 
 --
+-- Name: idx_documents_maintenance_request; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_documents_maintenance_request ON public.documents USING btree (maintenance_request_id) WHERE (maintenance_request_id IS NOT NULL);
+
+
+--
 -- Name: idx_dump_locations_business; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -10354,6 +10426,13 @@ CREATE INDEX idx_leases_end_date_active ON public.leases USING btree (end_date) 
 
 
 --
+-- Name: idx_leases_source_booking; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX idx_leases_source_booking ON public.leases USING btree (source_booking_id) WHERE (source_booking_id IS NOT NULL);
+
+
+--
 -- Name: idx_leases_unit; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -10603,6 +10682,13 @@ CREATE INDEX idx_pending_tenant_intents_landlord ON public.pending_tenant_intent
 --
 
 CREATE INDEX idx_pending_tenant_intents_parser_status ON public.pending_tenant_intents USING btree (parser_status) WHERE (parser_status = ANY (ARRAY['parsing'::text, 'parsed'::text, 'mismatch'::text, 'error'::text]));
+
+
+--
+-- Name: idx_pending_tenant_intents_unit_open; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pending_tenant_intents_unit_open ON public.pending_tenant_intents USING btree (unit_id) WHERE (resolved_at IS NULL);
 
 
 --
@@ -10879,6 +10965,13 @@ CREATE INDEX idx_pos_discounts_landlord ON public.pos_discounts USING btree (lan
 
 
 --
+-- Name: idx_pos_discounts_property; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pos_discounts_property ON public.pos_discounts USING btree (landlord_id, property_id);
+
+
+--
 -- Name: idx_pos_eod_landlord_day; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -10946,6 +11039,13 @@ CREATE INDEX idx_pos_purchase_order_items_po ON public.pos_purchase_order_items 
 --
 
 CREATE INDEX idx_pos_purchase_orders_landlord ON public.pos_purchase_orders USING btree (landlord_id, created_at DESC);
+
+
+--
+-- Name: idx_pos_purchase_orders_property; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pos_purchase_orders_property ON public.pos_purchase_orders USING btree (landlord_id, property_id);
 
 
 --
@@ -11107,6 +11207,13 @@ CREATE INDEX idx_purchase_requests_landlord_status ON public.purchase_requests U
 --
 
 CREATE INDEX idx_purchase_requests_work_order ON public.purchase_requests USING btree (work_order_id) WHERE (work_order_id IS NOT NULL);
+
+
+--
+-- Name: idx_pus_property; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_pus_property ON public.property_unit_subtypes USING btree (property_id);
 
 
 --
@@ -11933,6 +12040,13 @@ CREATE UNIQUE INDEX uniq_business_invoices_checkout_session ON public.business_i
 --
 
 CREATE UNIQUE INDEX uniq_open_renewal_request_per_lease ON public.lease_renewal_requests USING btree (lease_id) WHERE (status = 'requested'::text);
+
+
+--
+-- Name: units_property_unit_number_uniq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX units_property_unit_number_uniq ON public.units USING btree (property_id, lower(btrim(unit_number)));
 
 
 --
@@ -13787,6 +13901,14 @@ ALTER TABLE ONLY public.documents
 
 
 --
+-- Name: documents documents_maintenance_request_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.documents
+    ADD CONSTRAINT documents_maintenance_request_id_fkey FOREIGN KEY (maintenance_request_id) REFERENCES public.maintenance_requests(id) ON DELETE SET NULL;
+
+
+--
 -- Name: documents documents_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -14371,6 +14493,14 @@ ALTER TABLE ONLY public.lease_documents
 
 
 --
+-- Name: lease_documents lease_documents_renews_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_documents
+    ADD CONSTRAINT lease_documents_renews_lease_id_fkey FOREIGN KEY (renews_lease_id) REFERENCES public.leases(id) ON DELETE SET NULL;
+
+
+--
 -- Name: lease_documents lease_documents_target_lease_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -14608,6 +14738,14 @@ ALTER TABLE ONLY public.lease_vehicles
 
 ALTER TABLE ONLY public.leases
     ADD CONSTRAINT leases_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id);
+
+
+--
+-- Name: leases leases_source_booking_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.leases
+    ADD CONSTRAINT leases_source_booking_id_fkey FOREIGN KEY (source_booking_id) REFERENCES public.unit_bookings(id) ON DELETE SET NULL;
 
 
 --
@@ -14955,6 +15093,14 @@ ALTER TABLE ONLY public.pending_tenant_intents
 
 
 --
+-- Name: pending_tenant_intents pending_tenant_intents_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pending_tenant_intents
+    ADD CONSTRAINT pending_tenant_intents_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id) ON DELETE SET NULL;
+
+
+--
 -- Name: platform_claim_promotions platform_claim_promotions_promoted_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -15283,6 +15429,14 @@ ALTER TABLE ONLY public.pos_discounts
 
 
 --
+-- Name: pos_discounts pos_discounts_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_discounts
+    ADD CONSTRAINT pos_discounts_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE CASCADE;
+
+
+--
 -- Name: pos_eod_settlements pos_eod_settlements_closed_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -15296,6 +15450,14 @@ ALTER TABLE ONLY public.pos_eod_settlements
 
 ALTER TABLE ONLY public.pos_eod_settlements
     ADD CONSTRAINT pos_eod_settlements_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: pos_eod_settlements pos_eod_settlements_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_eod_settlements
+    ADD CONSTRAINT pos_eod_settlements_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE CASCADE;
 
 
 --
@@ -15400,6 +15562,14 @@ ALTER TABLE ONLY public.pos_purchase_order_items
 
 ALTER TABLE ONLY public.pos_purchase_orders
     ADD CONSTRAINT pos_purchase_orders_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: pos_purchase_orders pos_purchase_orders_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pos_purchase_orders
+    ADD CONSTRAINT pos_purchase_orders_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE CASCADE;
 
 
 --
@@ -15704,6 +15874,14 @@ ALTER TABLE ONLY public.property_manager_scopes
 
 ALTER TABLE ONLY public.property_manager_scopes
     ADD CONSTRAINT property_manager_scopes_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: property_unit_subtypes property_unit_subtypes_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_unit_subtypes
+    ADD CONSTRAINT property_unit_subtypes_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE CASCADE;
 
 
 --
@@ -16387,6 +16565,14 @@ ALTER TABLE ONLY public.units
 
 
 --
+-- Name: units units_subtype_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.units
+    ADD CONSTRAINT units_subtype_id_fkey FOREIGN KEY (subtype_id) REFERENCES public.property_unit_subtypes(id) ON DELETE SET NULL;
+
+
+--
 -- Name: user_balance_ledger user_balance_ledger_bank_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -16598,5 +16784,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict xpzb8Um3P1XUjhTD9i6rMBrGwswolAPqOTdC9RWUSFrdd1j7sM0H0CslY6IasP2
+\unrestrict R3gQWGybWKhpD2FTB3onw0KUIJNuU7ymEgOWB1fwrQvKyBmpEQVEnhtEAraN5lM
 

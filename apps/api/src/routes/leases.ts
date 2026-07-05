@@ -827,9 +827,15 @@ leasesRouter.patch('/:id', requirePerm('leases.edit'), async (req, res, next) =>
 // Refund creates a payments row owed by landlord; gap creates a
 // payments row owed by tenant + attempts auto-charge.
 // ─────────────────────────────────────────────────────────────
+// W-31 (S529, Nic decision): free-form deductions are DOCUMENTED DAMAGES
+// ONLY — description + at least one evidence document (photo/receipt) per
+// line. Everything else reaches the deposit through the lease's own fee
+// rows or the automatic unpaid-balance sweep.
 const damageLineSchema = z.object({
   description: z.string().min(1),
-  amount: z.number(),
+  amount: z.number().positive(),
+  evidenceDocumentIds: z.array(z.string().uuid()).min(1,
+    'Each damage deduction needs at least one photo or receipt attached'),
 })
 
 leasesRouter.get('/:id/deposit-return', async (req, res, next) => {
@@ -864,6 +870,60 @@ leasesRouter.get('/:id/deposit-return', async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
+// POST /api/leases/:id/non-renewal — W-7 (S531): the "don't renew" arm of
+// the renewal decision form. Arms the natural lease-end path: auto_renew
+// off, so processLeaseEnds expires + vacates at end_date, and every active
+// tenant gets a non-renewal notice now (generic copy — notice-period law
+// varies by state; the landlord owns compliance per the no-state-legal
+// rule). Any open tenant renewal request is declined.
+leasesRouter.post('/:id/non-renewal', requirePerm('leases.edit'), async (req, res, next) => {
+  try {
+    const lease = await queryOne<any>(`
+      SELECT l.*, u.unit_number, p.name AS property_name
+      FROM leases l
+      JOIN units u ON u.id = l.unit_id
+      JOIN properties p ON p.id = u.property_id
+      WHERE l.id=$1`, [req.params.id])
+    if (!lease) throw new AppError(404, 'Lease not found')
+    if (!canManageLandlordResource(req.user, lease.landlord_id)) throw new AppError(403, 'Forbidden')
+    if (lease.status !== 'active') throw new AppError(409, `Lease is ${lease.status}, not active`)
+    if (!lease.end_date) throw new AppError(400, 'Lease has no end date — terminate it instead of non-renewing')
+
+    await query(
+      `UPDATE leases SET auto_renew=FALSE, auto_renew_mode=NULL, updated_at=NOW() WHERE id=$1`,
+      [lease.id])
+    await query(
+      `UPDATE lease_renewal_requests SET status='declined', resolved_at=NOW(), updated_at=NOW()
+       WHERE lease_id=$1 AND status='requested'`, [lease.id])
+
+    // Notify every active tenant on the lease.
+    const roster = await query<any>(`
+      SELECT u.id AS user_id, u.email, u.first_name
+      FROM lease_tenants lt
+      JOIN tenants t ON t.id = lt.tenant_id
+      JOIN users u ON u.id = t.user_id
+      WHERE lt.lease_id=$1 AND lt.status='active'`, [lease.id])
+    const endStr = new Date(lease.end_date).toLocaleDateString()
+    const { createNotification } = await import('../services/notifications')
+    for (const r of roster as any[]) {
+      await createNotification({
+        userId: r.user_id,
+        landlordId: lease.landlord_id,
+        type: 'lease_non_renewal',
+        title: `Lease Non-Renewal Notice — Unit ${lease.unit_number}`,
+        body: `Your lease at ${lease.property_name} ends ${endStr} and will not be renewed. Please plan your move-out by that date.`,
+        data: { leaseId: lease.id, endDate: lease.end_date },
+        actionUrl: '/lease',
+        sendEmail: true,
+        emailTo: r.email,
+        emailSubject: `Lease Non-Renewal Notice — Unit ${lease.unit_number}`,
+      })
+    }
+
+    res.json({ success: true, data: { leaseId: lease.id, endDate: lease.end_date, notified: (roster as any[]).length } })
+  } catch (e) { next(e) }
+})
+
 // POST /api/leases/:id/bill-fee — S180 / A2.
 //
 // Landlord-triggered one-off charge against the tenant on this lease.
@@ -886,9 +946,13 @@ leasesRouter.get('/:id/deposit-return', async (req, res, next) => {
 // Auth: requirePerm('properties.edit') is the financial-control gate
 // matching other landlord billing surfaces. canManageLandlordResource
 // confirms the calling user controls this lease's landlord.
+// W-30 (S529, lease-is-law): the fee to bill IS a lease_fees row on this
+// lease — client sends the row id, the AMOUNT comes from the signed lease,
+// never the request. Only due_timing='other' rows are landlord-billable here
+// (move_in → move-in bundle, monthly_ongoing → invoice cron, move_out →
+// deposit sweep — all automatic paths).
 const billFeeSchema = z.object({
-  feeType:     z.enum(['early_termination_fee', 'other_fee']),
-  amount:      z.number().positive().max(1_000_000),
+  leaseFeeId:  z.string().uuid(),
   description: z.string().max(500).optional(),
   dueDate:     z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
 })
@@ -919,15 +983,24 @@ leasesRouter.post('/:id/bill-fee', requirePerm('leases.bill_fee'), async (req, r
     }
 
     const body = billFeeSchema.parse(req.body)
+    const fee = await queryOne<{ id: string; fee_type: string; amount: string; due_timing: string; description: string | null }>(
+      `SELECT id, fee_type, amount, due_timing, description
+         FROM lease_fees WHERE id = $1 AND lease_id = $2`,
+      [body.leaseFeeId, lease.id],
+    )
+    if (!fee) throw new AppError(404, 'That fee is not part of this lease')
+    if (fee.due_timing !== 'other') {
+      throw new AppError(409, 'That fee bills automatically — only lease fees marked for landlord-initiated billing can be billed here')
+    }
     const { createLeaseFeePayment } = await import('../services/leaseFees')
     const result = await createLeaseFeePayment({
       landlordId:  lease.landlord_id,
       tenantId:    lease.tenant_id,
       leaseId:     lease.id,
       unitId:      lease.unit_id,
-      feeType:     body.feeType,
-      amount:      body.amount,
-      description: body.description,
+      feeType:     fee.fee_type,
+      amount:      Number(fee.amount),
+      description: body.description ?? fee.description ?? undefined,
       dueDate:     body.dueDate,
       source:      'admin',
     })
@@ -935,8 +1008,8 @@ leasesRouter.post('/:id/bill-fee', requirePerm('leases.bill_fee'), async (req, r
       success: true,
       data: {
         payment_id:  result.paymentId,
-        fee_type:    body.feeType,
-        amount:      body.amount,
+        fee_type:    fee.fee_type,
+        amount:      Number(fee.amount),
         due_date:    result.dueDate,
         description: result.description,
       },
@@ -958,7 +1031,6 @@ leasesRouter.post('/:id/deposit-return', requirePerm('leases.deposit_return'), a
 
 const patchSchema = z.object({
   damageLines: z.array(damageLineSchema).optional(),
-  otherDeductions: z.array(damageLineSchema).optional(),
   notes: z.string().optional(),
 })
 
@@ -972,10 +1044,19 @@ leasesRouter.patch('/:id/deposit-return', requirePerm('leases.deposit_return'), 
     const draft = await queryOne<any>('SELECT id FROM deposit_returns WHERE lease_id=$1', [req.params.id])
     if (!draft) throw new AppError(404, 'No draft. POST first to create.')
 
+    // Evidence documents must exist and belong to this landlord.
+    if (body.damageLines?.length) {
+      const ids = body.damageLines.flatMap(l => l.evidenceDocumentIds)
+      const owned = await query<{ id: string }>(
+        'SELECT id FROM documents WHERE id = ANY($1) AND landlord_id = $2',
+        [ids, lease.landlord_id])
+      if (owned.length !== new Set(ids).size) {
+        throw new AppError(400, 'Every damage deduction needs its photo/receipt uploaded first')
+      }
+    }
     const { applyDeductionsToDraft } = await import('../services/depositReturn')
     const updated = await applyDeductionsToDraft(draft.id, {
       damageLines: body.damageLines,
-      otherDeductions: body.otherDeductions,
       notes: body.notes,
     })
     res.json({ success: true, data: updated })

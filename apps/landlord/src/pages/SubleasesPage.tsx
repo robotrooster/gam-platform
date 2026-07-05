@@ -128,7 +128,7 @@ export function SubleasesPage() {
                 <th>Sublessee</th>
                 <th>Term</th>
                 <th>Sub-rent</th>
-                <th>Master share</th>
+                <th>Master Share</th>
                 <th></th>
               </tr>
             </thead>
@@ -199,7 +199,7 @@ export function SubleasesPage() {
       {viewTarget && (
         <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }} onClick={() => setViewTarget(null)}>
           <div className="card" style={{ width: 520, maxWidth: '92vw', maxHeight: '88vh', overflow: 'auto' }} onClick={e => e.stopPropagation()}>
-            <h3 style={{ marginBottom: 4 }}>Sublease details</h3>
+            <h3 style={{ marginBottom: 4 }}>Sublease Details</h3>
             <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginBottom: 14 }}>Read-only</div>
             <fieldset disabled style={{ border: 'none', padding: 0, margin: 0, display: 'grid', gap: 10 }}>
               {([
@@ -270,7 +270,7 @@ export function SubleasesPage() {
       {terminateTarget && (
         <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }} onClick={() => setTerminateTarget(null)}>
           <div className="card" style={{ width: 480, maxWidth: '92vw' }} onClick={e => e.stopPropagation()}>
-            <h3 style={{ marginBottom: 12 }}>Terminate sublease</h3>
+            <h3 style={{ marginBottom: 12 }}>Terminate Sublease</h3>
             <div style={{ fontSize: '.85rem', color: 'var(--text-2)', marginBottom: 14, lineHeight: 1.5 }}>
               Ending the sublease for Unit {terminateTarget.unitNumber}. The sublessor and sublessee will be notified.
             </div>

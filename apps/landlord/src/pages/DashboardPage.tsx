@@ -8,7 +8,6 @@ const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minim
 
 interface DashStats {
   activeUnits: number
-  directPayUnits: number
   vacantUnits: number
   delinquentUnits: number
   suspendedUnits: number
@@ -59,11 +58,10 @@ export function DashboardPage() {
   // Platform fee: authoritative per-property number from the API — $2/billable
   // unit floored at the $10 property minimum (full stop), summed across every
   // property. Same calc the billing cron + Reports use, so this matches the bill.
-  const occupiedUnits = (stats?.activeUnits || 0) + (stats?.directPayUnits || 0)
-  // Full rent roll = every occupied unit (active + direct_pay + delinquent +
-  // suspended). Backs the "Expected Monthly Rent" subtext so the count matches
-  // the units actually summed into that figure.
-  const rentRollUnits = occupiedUnits + (stats?.delinquentUnits || 0) + (stats?.suspendedUnits || 0)
+  // Full rent roll = every occupied unit (active + delinquent + suspended).
+  // Backs the "Expected Monthly Rent" subtext so the count matches the units
+  // actually summed into that figure. (direct_pay retired W-15/S531.)
+  const rentRollUnits = (stats?.activeUnits || 0) + (stats?.delinquentUnits || 0) + (stats?.suspendedUnits || 0)
   const platformFee = stats?.platformFee ?? 0
   const platformFeeByProperty: { propertyId: string; name: string; fee: number }[] =
     (stats as any)?.platformFeeByProperty ?? []
@@ -110,7 +108,9 @@ export function DashboardPage() {
       {/* KPI Grid — 12-col so we can run 3 / 4 / 3 cards per row (spans 4 / 3 / 4). */}
       <div className="kpi-grid" style={{gridTemplateColumns:"repeat(12, 1fr)"}}>
         {/* Row 1 (span 4): rent money trio */}
-        <div className="kpi-card" style={{gridColumn:'span 4'}}>
+        {/* W-2 (S531): clicks through to the rent-roll page, whose total is
+            the same formula as monthlyRentVolume. */}
+        <div className="kpi-card" style={{gridColumn:'span 4',cursor:'pointer'}} onClick={()=>navigate('/rent-roll')}>
           <div className="kpi-label">Expected Monthly Rent</div>
           <div className="kpi-value gold">{fmt(stats?.monthlyRentVolume || 0)}</div>
           <div className="kpi-sub">contracted across {rentRollUnits} occupied units</div>
@@ -120,7 +120,8 @@ export function DashboardPage() {
           <div className="kpi-value green">{fmt(stats?.collectedMtd || 0)}</div>
           <div className="kpi-sub">settled rent payments MTD</div>
         </div>
-        <div className="kpi-card" style={{gridColumn:'span 4',cursor:'pointer'}} onClick={()=>navigate('/reports')}>
+        {/* S527 W-3: outstanding → the who-owes-what list, not Reports. */}
+        <div className="kpi-card" style={{gridColumn:'span 4',cursor:'pointer'}} onClick={()=>navigate('/balances')}>
           <div className="kpi-label">Outstanding</div>
           <div className="kpi-value" style={{color:(stats?.outstanding||0)>0?'var(--amber)':'var(--text-0)'}}>{fmt(stats?.outstanding || 0)}</div>
           <div className="kpi-sub">unpaid invoice balances</div>
@@ -131,12 +132,14 @@ export function DashboardPage() {
           <div className="kpi-value">{stats?.occupancyRate ?? 0}%</div>
           <div className="kpi-sub">{stats?.activeUnits || 0} of {stats?.totalUnits || 0} units active</div>
         </div>
-        <div className="kpi-card" style={{gridColumn:'span 3',cursor:'pointer'}} onClick={()=>navigate('/units')}>
+        {/* S527 W-4: land pre-filtered to active units. */}
+        <div className="kpi-card" style={{gridColumn:'span 3',cursor:'pointer'}} onClick={()=>navigate('/units?status=active')}>
           <div className="kpi-label">Active Units</div>
           <div className="kpi-value green">{stats?.activeUnits || 0}</div>
-          <div className="kpi-sub">{stats?.directPayUnits || 0} direct pay · {stats?.vacantUnits || 0} vacant</div>
+          <div className="kpi-sub">{stats?.vacantUnits || 0} vacant</div>
         </div>
-        <div className="kpi-card" style={{gridColumn:'span 3',cursor:'pointer'}} onClick={()=>navigate('/leases')}>
+        {/* S527 W-5: land pre-filtered to the expiring window. */}
+        <div className="kpi-card" style={{gridColumn:'span 3',cursor:'pointer'}} onClick={()=>navigate('/leases?expiring=60')}>
           <div className="kpi-label">Leases Expiring</div>
           <div className="kpi-value" style={{fontSize:'1.4rem',color:(stats?.leasesExpiring30d||0)>0?'var(--amber)':'var(--text-0)'}}>{stats?.leasesExpiring30d || 0} in 30d</div>
           <div className="kpi-sub">{stats?.leasesExpiring60d || 0} within 60 days</div>
@@ -163,7 +166,7 @@ export function DashboardPage() {
         <div className="kpi-card" style={{gridColumn:'span 4',cursor:'pointer'}} onClick={()=>setShowFeeModal(true)}>
           <div className="kpi-label">Platform Fee / Mo</div>
           <div className="kpi-value">{fmt(platformFee)}</div>
-          <div className="kpi-sub">{occupiedUnits} occupied × $2/unit · $10/property min</div>
+          <div className="kpi-sub">{rentRollUnits} occupied × $2/unit · $10/property min</div>
         </div>
       </div>
 

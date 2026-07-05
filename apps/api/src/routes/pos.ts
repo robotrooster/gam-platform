@@ -434,6 +434,9 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
       assertNonNeg([it.qty, 'Quantity'], [it.price, 'Price'], [it.tax ?? it.tax_rate, 'Tax rate'])
     }
     assertNonNeg([surcharge, 'Surcharge'])
+    // W-12 (S531): propertyId is REQUIRED — every sale belongs to a
+    // property (per-property books, EOD drawers, sales history).
+    if (!propertyId) throw new AppError(400, 'propertyId is required — sales are per-property')
     // Property lock: a scoped worker (cashier) can only ring on a property in
     // their scope. Owners + all_properties bypass. Requires the client to send
     // propertyId on every sale (not just FlexCharge) — see POSPage checkout.
@@ -696,6 +699,11 @@ async function autoDraftPO(landlordId: string, item: any) {
 posRouter.get('/transactions/sales', requirePerm('pos.ring_sale', 'pos.end_of_day'), async (req, res, next) => {
   try {
     const { period = 'today' } = req.query
+    // W-12 (S531): optional ?propertyId= — sales history is viewed per
+    // property; the filter applies to every query below.
+    const salesProp = req.query.propertyId ? String(req.query.propertyId) : null
+    const propFilter = salesProp ? `AND t.property_id = $2` : ''
+    const salesParams: any[] = salesProp ? [req.user!.profileId, salesProp] : [req.user!.profileId]
 
     // S390: dateFilter must qualify `created_at` with the `t.` alias —
     // the topItems and byCategory queries JOIN pos_transaction_items
@@ -715,8 +723,8 @@ posRouter.get('/transactions/sales', requirePerm('pos.ring_sale', 'pos.end_of_da
         COUNT(*) as tx_count,
         SUM(total) as revenue
       FROM pos_transactions t
-      WHERE landlord_id=$1 AND DATE(t.created_at) = CURRENT_DATE
-      GROUP BY hour ORDER BY hour`, [req.user!.profileId])
+      WHERE landlord_id=$1 AND DATE(t.created_at) = CURRENT_DATE ${propFilter}
+      GROUP BY hour ORDER BY hour`, salesParams)
 
     // By day
     const byDay = await query<any>(`
@@ -727,8 +735,8 @@ posRouter.get('/transactions/sales', requirePerm('pos.ring_sale', 'pos.end_of_da
         SUM(CASE WHEN payment_method='card' THEN total ELSE 0 END) as card,
         SUM(CASE WHEN payment_method='charge' THEN total ELSE 0 END) as charge
       FROM pos_transactions t
-      WHERE landlord_id=$1 ${dateFilter}
-      GROUP BY date ORDER BY date DESC`, [req.user!.profileId])
+      WHERE landlord_id=$1 ${dateFilter} ${propFilter}
+      GROUP BY date ORDER BY date DESC`, salesParams)
 
     // Top items
     const topItems = await query<any>(`
@@ -739,9 +747,9 @@ posRouter.get('/transactions/sales', requirePerm('pos.ring_sale', 'pos.end_of_da
         SUM(ti.subtotal) - SUM(ti.qty * ti.cost_price) as gross_profit
       FROM pos_transaction_items ti
       JOIN pos_transactions t ON t.id = ti.transaction_id
-      WHERE t.landlord_id=$1 ${dateFilter}
+      WHERE t.landlord_id=$1 ${dateFilter} ${propFilter}
       GROUP BY ti.item_name, ti.item_category
-      ORDER BY total_revenue DESC LIMIT 10`, [req.user!.profileId])
+      ORDER BY total_revenue DESC LIMIT 10`, salesParams)
 
     // Category breakdown
     const byCategory = await query<any>(`
@@ -750,8 +758,8 @@ posRouter.get('/transactions/sales', requirePerm('pos.ring_sale', 'pos.end_of_da
         SUM(ti.qty) as units_sold
       FROM pos_transaction_items ti
       JOIN pos_transactions t ON t.id = ti.transaction_id
-      WHERE t.landlord_id=$1 ${dateFilter}
-      GROUP BY category ORDER BY revenue DESC`, [req.user!.profileId])
+      WHERE t.landlord_id=$1 ${dateFilter} ${propFilter}
+      GROUP BY category ORDER BY revenue DESC`, salesParams)
 
     // Summary totals
     const summary = await queryOne<any>(`
@@ -766,7 +774,7 @@ posRouter.get('/transactions/sales', requirePerm('pos.ring_sale', 'pos.end_of_da
         SUM(CASE WHEN payment_method='card' THEN total ELSE 0 END) as card_total,
         SUM(CASE WHEN payment_method='charge' THEN total ELSE 0 END) as charge_total
       FROM pos_transactions t
-      WHERE landlord_id=$1 ${dateFilter}`, [req.user!.profileId])
+      WHERE landlord_id=$1 ${dateFilter} ${propFilter}`, salesParams)
 
     res.json({ success: true, data: { summary, byHour, byDay, topItems, byCategory } })
   } catch (e) { next(e) }
@@ -814,12 +822,17 @@ posRouter.patch('/vendors/:id', requirePerm('pos.manage_inventory'), async (req,
 
 posRouter.get('/purchase-orders', requirePerm('pos.manage_inventory'), async (req, res, next) => {
   try {
+    // W-12 (S531): ?propertyId= filters to that receiving property; legacy
+    // NULL rows stay visible everywhere (created before property stamping).
+    const poProp = req.query.propertyId ? String(req.query.propertyId) : null
+    const poParams: any[] = [req.user!.profileId]
+    const poFilter = poProp ? `AND (po.property_id = $${poParams.push(poProp)} OR po.property_id IS NULL)` : ''
     const pos = await query<any>(`
       SELECT po.*, v.name as vendor_name, v.email as vendor_email,
         (SELECT COUNT(*) FROM pos_purchase_order_items WHERE po_id=po.id) as item_count
       FROM pos_purchase_orders po
       JOIN pos_vendors v ON v.id = po.vendor_id
-      WHERE po.landlord_id=$1 ORDER BY po.created_at DESC`, [req.user!.profileId])
+      WHERE po.landlord_id=$1 ${poFilter} ORDER BY po.created_at DESC`, poParams)
 
     for (const po of pos) {
       po.items = await query<any>('SELECT * FROM pos_purchase_order_items WHERE po_id=$1', [po.id])
@@ -875,13 +888,17 @@ posRouter.patch('/purchase-orders/:id', requirePerm('pos.manage_inventory'), asy
 // GET /api/pos/low-stock — items at or below min
 posRouter.get('/low-stock', requirePerm('pos.manage_inventory'), async (req, res, next) => {
   try {
+    // W-12 (S531): ?propertyId= scopes low-stock to that property's items.
+    const lsProp = req.query.propertyId ? String(req.query.propertyId) : null
+    const lsParams: any[] = [req.user!.profileId]
+    const lsFilter = lsProp ? `AND i.property_id = $${lsParams.push(lsProp)}` : ''
     const items = await query<any>(`
       SELECT i.*, v.name as vendor_name
       FROM pos_items i
       LEFT JOIN pos_vendors v ON v.id = i.vendor_id
-      WHERE i.landlord_id=$1 AND i.is_active=TRUE
+      WHERE i.landlord_id=$1 AND i.is_active=TRUE ${lsFilter}
         AND i.stock_qty <= i.stock_min AND i.stock_max < 999
-      ORDER BY (i.stock_qty::float / NULLIF(i.stock_min,0)) ASC`, [req.user!.profileId])
+      ORDER BY (i.stock_qty::float / NULLIF(i.stock_min,0)) ASC`, lsParams)
     res.json({ success: true, data: items })
   } catch (e) { next(e) }
 })
@@ -1151,18 +1168,28 @@ posRouter.delete('/tax-rates/:id', requirePerm('pos.manage_inventory'), async (r
 
 posRouter.get('/discounts', requirePerm('pos.discount', 'pos.manage_inventory'), async (req, res, next) => {
   try {
-    const discounts = await query<any>('SELECT * FROM pos_discounts WHERE landlord_id=$1 AND is_active=TRUE ORDER BY name', [req.user!.profileId])
+    // W-12 (S531): ?propertyId= returns (discounts at that property) UNION
+    // (company-wide NULL rows) — same posture as pos_tax_rates (S217).
+    const dProp = req.query.propertyId ? String(req.query.propertyId) : null
+    const dParams: any[] = [req.user!.profileId]
+    const dFilter = dProp ? `AND (property_id = $${dParams.push(dProp)} OR property_id IS NULL)` : ''
+    const discounts = await query<any>(`SELECT * FROM pos_discounts WHERE landlord_id=$1 AND is_active=TRUE ${dFilter} ORDER BY name`, dParams)
     res.json({ success: true, data: discounts })
   } catch (e) { next(e) }
 })
 
 posRouter.post('/discounts', requirePerm('pos.manage_inventory'), async (req, res, next) => {
   try {
-    const { name, type, value, code } = req.body
+    const { name, type, value, code, propertyId } = req.body
     assertNonNeg([value, 'Discount value'])
-    const d = await queryOne<any>(`INSERT INTO pos_discounts (landlord_id,name,type,value,code)
-      VALUES ($1,$2,$3,$4,$5) RETURNING *`,
-      [req.user!.profileId, name, type, value, code||null])
+    // W-12: NULL propertyId = company-wide; a uuid scopes to one property.
+    if (propertyId) {
+      const owned = await queryOne('SELECT id FROM properties WHERE id=$1 AND landlord_id=$2', [propertyId, req.user!.profileId])
+      if (!owned) throw new AppError(400, 'propertyId does not belong to this landlord')
+    }
+    const d = await queryOne<any>(`INSERT INTO pos_discounts (landlord_id,name,type,value,code,property_id)
+      VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [req.user!.profileId, name, type, value, code||null, propertyId||null])
     res.status(201).json({ success: true, data: d })
   } catch (e) { next(e) }
 })
@@ -1285,6 +1312,10 @@ posRouter.post('/transactions/:id/void', requirePerm('pos.void'), async (req, re
 // GET /api/pos/transactions — full list with status
 posRouter.get('/transactions', requirePerm('pos.ring_sale', 'pos.end_of_day'), async (req, res, next) => {
   try {
+    // W-12 (S531): optional ?propertyId= — history is viewed per property.
+    const txProp = req.query.propertyId ? String(req.query.propertyId) : null
+    const txParams: any[] = [req.user!.profileId]
+    const txPropFilter = txProp ? `AND t.property_id = $${txParams.push(txProp)}` : ''
     const txns = await query<any>(`
       SELECT t.*,
         u.first_name || ' ' || u.last_name AS tenant_name,
@@ -1292,8 +1323,8 @@ posRouter.get('/transactions', requirePerm('pos.ring_sale', 'pos.end_of_day'), a
       FROM pos_transactions t
       LEFT JOIN tenants tn ON tn.id = t.tenant_id
       LEFT JOIN users u ON u.id = tn.user_id
-      WHERE t.landlord_id=$1
-      ORDER BY t.created_at DESC LIMIT 100`, [req.user!.profileId])
+      WHERE t.landlord_id=$1 ${txPropFilter}
+      ORDER BY t.created_at DESC LIMIT 100`, txParams)
     res.json({ success: true, data: txns })
   } catch (e) { next(e) }
 })
@@ -1301,15 +1332,21 @@ posRouter.get('/transactions', requirePerm('pos.ring_sale', 'pos.end_of_day'), a
 // POST /api/pos/purchase-orders — create new PO
 posRouter.post('/purchase-orders', requirePerm('pos.manage_inventory'), async (req, res, next) => {
   try {
-    const { vendorId, notes, expectedDate, items } = req.body
+    const { vendorId, notes, expectedDate, items, propertyId } = req.body
     const vendor = await queryOne<any>('SELECT * FROM pos_vendors WHERE id=$1 AND landlord_id=$2', [vendorId, req.user!.profileId])
     if (!vendor) throw new AppError(404, 'Vendor not found')
+    // W-12 (S531): POs stamp their receiving property when created from a
+    // property context.
+    if (propertyId) {
+      const owned = await queryOne('SELECT id FROM properties WHERE id=$1 AND landlord_id=$2', [propertyId, req.user!.profileId])
+      if (!owned) throw new AppError(400, 'propertyId does not belong to this landlord')
+    }
 
     const poNumber = 'PO-' + Date.now().toString(36).toUpperCase()
     const po = await queryOne<any>(`INSERT INTO pos_purchase_orders
-      (landlord_id,vendor_id,status,po_number,notes,expected_date)
-      VALUES ($1,$2,'draft',$3,$4,$5) RETURNING *`,
-      [req.user!.profileId, vendorId, poNumber, notes||null, expectedDate||null])
+      (landlord_id,vendor_id,status,po_number,notes,expected_date,property_id)
+      VALUES ($1,$2,'draft',$3,$4,$5,$6) RETURNING *`,
+      [req.user!.profileId, vendorId, poNumber, notes||null, expectedDate||null, propertyId||null])
 
     let subtotal = 0
     if (items && items.length > 0) {
@@ -1357,13 +1394,17 @@ posRouter.post('/purchase-orders/:id/items', requirePerm('pos.manage_inventory')
 // here so the surfaced category name matches the rest of pos.ts.
 posRouter.get('/inventory-log', requirePerm('pos.manage_inventory'), async (req, res, next) => {
   try {
+    // W-12 (S531): ?propertyId= filters movement to that property's items.
+    const ilProp = req.query.propertyId ? String(req.query.propertyId) : null
+    const ilParams: any[] = [req.user!.profileId]
+    const ilFilter = ilProp ? `AND i.property_id = $${ilParams.push(ilProp)}` : ''
     const log = await query<any>(`
       SELECT l.*, i.name as item_name, i.icon as item_icon, pc.name AS category
       FROM pos_inventory_log l
       JOIN pos_items i ON i.id = l.item_id
       LEFT JOIN pos_categories pc ON pc.id = i.category_id
-      WHERE l.landlord_id=$1
-      ORDER BY l.created_at DESC LIMIT 200`, [req.user!.profileId])
+      WHERE l.landlord_id=$1 ${ilFilter}
+      ORDER BY l.created_at DESC LIMIT 200`, ilParams)
     res.json({ success: true, data: log })
   } catch (e) { next(e) }
 })
@@ -1374,30 +1415,44 @@ posRouter.get('/inventory-log', requirePerm('pos.manage_inventory'), async (req,
 posRouter.get('/eod', requirePerm('pos.end_of_day', 'pos.ring_sale'), async (req, res, next) => {
   try {
     const limit = Math.min(parseInt(String(req.query.limit || '30'), 10) || 30, 90)
+    // W-12 (S531): settlements are per (landlord, property, day) — the
+    // optional ?propertyId= scopes the list to one register/location.
+    const eodProp = req.query.propertyId ? String(req.query.propertyId) : null
+    const eodParams: any[] = [req.user!.profileId, limit]
+    const eodFilter = eodProp ? `AND e.property_id = $${eodParams.push(eodProp)}` : ''
     const rows = await query<any>(
-      `SELECT * FROM pos_eod_settlements
-        WHERE landlord_id = $1
-        ORDER BY business_day DESC
+      `SELECT e.*, p.name AS property_name FROM pos_eod_settlements e
+        LEFT JOIN properties p ON p.id = e.property_id
+        WHERE e.landlord_id = $1 ${eodFilter}
+        ORDER BY e.business_day DESC
         LIMIT $2`,
-      [req.user!.profileId, limit]
+      eodParams
     )
     res.json({ success: true, data: rows })
   } catch (e) { next(e) }
 })
 
-// GET /api/pos/eod/:date — single settlement by YYYY-MM-DD
+// GET /api/pos/eod/:date — settlements for one YYYY-MM-DD day.
+// W-12 (S531): settlements are per property, so a day can have several —
+// this always returns an ARRAY (one row per property that closed);
+// ?propertyId= narrows to one register's settlement.
 posRouter.get('/eod/:date', requirePerm('pos.end_of_day', 'pos.ring_sale'), async (req, res, next) => {
   try {
     if (!/^\d{4}-\d{2}-\d{2}$/.test(req.params.date)) {
       throw new AppError(400, 'date must be YYYY-MM-DD')
     }
-    const row = await queryOne<any>(
-      `SELECT * FROM pos_eod_settlements
-        WHERE landlord_id = $1 AND business_day = $2`,
-      [req.user!.profileId, req.params.date]
+    const dProp = req.query.propertyId ? String(req.query.propertyId) : null
+    const dParams: any[] = [req.user!.profileId, req.params.date]
+    const dFilter = dProp ? `AND e.property_id = $${dParams.push(dProp)}` : ''
+    const rows = await query<any>(
+      `SELECT e.*, p.name AS property_name FROM pos_eod_settlements e
+        LEFT JOIN properties p ON p.id = e.property_id
+        WHERE e.landlord_id = $1 AND e.business_day = $2 ${dFilter}
+        ORDER BY p.name`,
+      dParams
     )
-    if (!row) throw new AppError(404, 'No settlement for that date')
-    res.json({ success: true, data: row })
+    if (!rows.length) throw new AppError(404, 'No settlement for that date')
+    res.json({ success: true, data: rows })
   } catch (e) { next(e) }
 })
 
@@ -1406,16 +1461,21 @@ posRouter.get('/eod/:date', requirePerm('pos.end_of_day', 'pos.ring_sale'), asyn
 //         openingFloat?: number, notes?: string }
 posRouter.post('/eod/close', requirePerm('pos.end_of_day'), async (req, res, next) => {
   try {
-    const { businessDay, cashDrawerActual, openingFloat, notes } = req.body
+    const { businessDay, cashDrawerActual, openingFloat, notes, propertyId } = req.body
     if (!businessDay || !/^\d{4}-\d{2}-\d{2}$/.test(businessDay)) {
       throw new AppError(400, 'businessDay (YYYY-MM-DD) required')
     }
     if (cashDrawerActual == null || isNaN(Number(cashDrawerActual))) {
       throw new AppError(400, 'cashDrawerActual (number) required')
     }
+    // W-12 (S531): each register/location closes its own drawer.
+    if (!propertyId) throw new AppError(400, 'propertyId required — EOD closes per property')
+    const owned = await queryOne('SELECT id FROM properties WHERE id=$1 AND landlord_id=$2', [propertyId, req.user!.profileId])
+    if (!owned) throw new AppError(400, 'propertyId does not belong to this landlord')
     const { generateEodSettlement } = await import('../services/posEod')
     const result = await generateEodSettlement(
       req.user!.profileId,
+      propertyId,
       businessDay,
       {
         closedBy:         req.user!.userId,
@@ -1434,13 +1494,17 @@ posRouter.post('/eod/close', requirePerm('pos.end_of_day'), async (req, res, nex
 // the row was re-computed after the auto-close window.
 posRouter.post('/eod/regenerate', requirePerm('pos.end_of_day'), async (req, res, next) => {
   try {
-    const { businessDay } = req.body
+    const { businessDay, propertyId } = req.body
     if (!businessDay || !/^\d{4}-\d{2}-\d{2}$/.test(businessDay)) {
       throw new AppError(400, 'businessDay (YYYY-MM-DD) required')
     }
+    if (!propertyId) throw new AppError(400, 'propertyId required — EOD closes per property')
+    const regenOwned = await queryOne('SELECT id FROM properties WHERE id=$1 AND landlord_id=$2', [propertyId, req.user!.profileId])
+    if (!regenOwned) throw new AppError(400, 'propertyId does not belong to this landlord')
     const { generateEodSettlement } = await import('../services/posEod')
     const result = await generateEodSettlement(
       req.user!.profileId,
+      propertyId,
       businessDay,
       { closedBy: req.user!.userId, status: 'manually_closed' }
     )

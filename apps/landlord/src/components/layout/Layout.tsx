@@ -52,6 +52,9 @@ const NAV_ITEMS: Array<{
   { to: '/banking',       icon: Landmark,         label: 'Banking',          section: null,          category: 'banking' },
   { to: '/payments',      icon: CreditCard,       label: 'Payments',         section: null,          category: 'payments' },
   { to: '/balances',      icon: CreditCard,       label: 'Outstanding Balances', section: null,      category: 'balances' },
+  // W-2 (S531): no category → owner-only, matching the API's
+  // canViewLandlordFinances gate on /landlords/:id/rent-roll.
+  { to: '/rent-roll',     icon: ScrollText,       label: 'Rent Roll',        section: null },
   { to: '/reports',       icon: BarChart2,        label: 'Reports',          section: null,          category: 'reports' },
   // Operations
   { to: '/maintenance',   icon: Wrench,           label: 'Maintenance',      section: 'Operations',  category: 'maintenance' },
@@ -59,6 +62,10 @@ const NAV_ITEMS: Array<{
   { to: '/amenities',     icon: CalendarClock,    label: 'Amenities',        section: null,          category: 'amenities' },
   { to: '/documents',     icon: FileText,         label: 'Documents',        section: null,          category: 'documents' },
   { to: '/inventory',     icon: Package,          label: 'Inventory',        section: null,          category: 'inventory' },
+  // W-36 (S531): sub-meter management — meters CRUD is gated on
+  // properties.edit / units.* server-side; 'units' is the closest catalog
+  // category for staff visibility.
+  { to: '/utilities',     icon: Package,          label: 'Utilities',        section: null,          category: 'units' },
   { to: '/work-trade',    icon: HeartHandshake,   label: 'Work Trade',       section: null },
   // Screening
   { to: '/pool',          icon: UserSearch,       label: 'Applicant Pool',   section: 'Screening',   category: 'applicant_pool' },
@@ -68,7 +75,6 @@ const NAV_ITEMS: Array<{
   { to: '/team',          icon: Shield,           label: 'Team',             section: 'Admin' },
   { to: '/pm-invitations', icon: HeartHandshake,  label: 'PM Invitations',   section: null,          category: 'pm_invitations' },
   { to: '/settings',      icon: Settings,         label: 'Settings',         section: null,          category: 'settings' },
-  { to: '/notification-prefs', icon: Settings,    label: 'Notification Prefs', section: null,        category: 'notification_prefs' },
 ]
 
 // category → its catalog permission keys (built once from the shared catalog).
@@ -78,24 +84,45 @@ const CATALOG_KEYS_BY_CATEGORY: Record<string, string[]> = Object.fromEntries(
 
 const OWNER_ROLES = new Set(['admin','super_admin','landlord'])
 
+// The single nav-visibility rule, shared by the sidebar and RoleRedirect
+// (main.tsx) so staff always LAND on a page they can actually see. Owners see
+// everything; staff see an item iff they hold ANY catalog key in its category
+// (plus the S168 banking special case). Items with no category are owner-only.
+export function visibleNavItemsFor(user: { role?: string; permissions?: Record<string, any> | null; directDepositEnabled?: boolean } | null | undefined) {
+  const role = user?.role || 'landlord'
+  const perms = (user?.permissions || {}) as Record<string, boolean | string>
+  const isOwner = OWNER_ROLES.has(role)
+  const directDepositEnabled = (user as any)?.directDepositEnabled === true
+  return NAV_ITEMS.filter(item => {
+    if (LAUNCH_HIDDEN.has(item.to)) return false  // S512 launch hide
+    if (isOwner) return true                       // owners see everything
+    // --- staff: driven purely by catalog permissions ---
+    // S168: /banking for property_manager — only when direct-deposit is on.
+    if (item.to === '/banking' && role === 'property_manager') return directDepositEnabled
+    if (!item.category) return false               // owner-only items (Team, Work Trade)
+    const keys = CATALOG_KEYS_BY_CATEGORY[item.category]
+    return !!keys && keys.some(k => perms[k] === true)
+  })
+}
+
 // S512 LAUNCH: features hidden from the UI for the initial launch. Nav
 // entries are filtered out and their routes redirect (see main.tsx). The
 // pages + backend stay intact — unhide post-launch by emptying this set.
 //   /flex-charge    — Flex Suite hidden at launch (LAUNCH_DECISIONS #7)
 //   /subleases      — unfinished (#16), no seed data
-//   /work-trade     — auto-billing unbuilt (#29)
 //   /pm-invitations — PM-company portal not launching with the trio
+// /work-trade PROMOTED for launch (W-54, Nic S531) — its auto-billing was
+// completed in the S517 rebuild; gets its own walkthrough pass (W-56).
 // Fitness (external SSO link, no route) is hidden via LAUNCH_HIDE_FITNESS.
 export const LAUNCH_HIDDEN = new Set<string>([
   '/flex-charge',
   '/subleases',
-  '/work-trade',
   '/pm-invitations',
 ])
 export const LAUNCH_HIDE_FITNESS = true
 
 const LL_FONTS: Record<string, { imp: string; family: string; display: string }> = {
-  default:     { imp: '', family: "'DM Sans',sans-serif", display: "'Syne',sans-serif" },
+  default:     { imp: '', family: "'Inter',sans-serif", display: "'Space Grotesk',sans-serif" },
   terminator:  { imp: "@font-face{font-family:'Terminator';src:url('/fonts/terminator.ttf') format('truetype');}", family: "'Terminator',sans-serif", display: "'Terminator',sans-serif" },
   matrix:      { imp: "@font-face{font-family:'Matrix';src:url('/fonts/matrix.ttf') format('truetype');}", family: "'Matrix',monospace", display: "'Matrix',monospace" },
   bladerunner: { imp: "@font-face{font-family:'BladeRunner';src:url('/fonts/bladerunner.ttf') format('truetype');}", family: "'BladeRunner',sans-serif", display: "'BladeRunner',sans-serif" },
@@ -233,22 +260,8 @@ export function Layout() {
 
   const handleLogout = () => { logout(); navigate('/login') }
 
-  // Visibility: role admission first; then for worker roles, gate by perm.
-  // Owner roles bypass perm. Item with no perm = role-only (used for
-  // landlord-self pages like /reports, /banking, /settings).
-  const perms = (user?.permissions || {}) as Record<string, boolean | string>
-  const isOwner = OWNER_ROLES.has(role)
-  const directDepositEnabled = (user as any)?.directDepositEnabled === true
-  const visibleItems = NAV_ITEMS.filter(item => {
-    if (LAUNCH_HIDDEN.has(item.to)) return false  // S512 launch hide
-    if (isOwner) return true                       // owners see everything
-    // --- staff: driven purely by catalog permissions ---
-    // S168: /banking for property_manager — only when direct-deposit is on.
-    if (item.to === '/banking' && role === 'property_manager') return directDepositEnabled
-    if (!item.category) return false               // owner-only items (Team, Work Trade)
-    const keys = CATALOG_KEYS_BY_CATEGORY[item.category]
-    return !!keys && keys.some(k => perms[k] === true)
-  })
+  // Visibility rule lives in visibleNavItemsFor (shared with RoleRedirect).
+  const visibleItems = visibleNavItemsFor(user)
 
   // Track section headers without side effects
   const renderedSections = new Set<string>()
@@ -316,7 +329,7 @@ export function Layout() {
             <span style={{ color:'var(--text-3)', fontSize:'.7rem' }}>{user?.email}</span>
           </div>
           <button className="nav-item" onClick={handleLogout} style={{ color:'var(--red)' }}>
-            <LogOut size={16} /> Sign out
+            <LogOut size={16} /> Sign Out
           </button>
         </div>
       </aside>

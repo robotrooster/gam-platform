@@ -31,6 +31,8 @@ const TYPE_ICONS: Record<string, string> = {
   maintenance_updated:  '🔧',
   lease_expiring:       '📋',
   pos_low_stock:        '📦',
+  low_stock:            '📦',
+  service_due:          '🔧',
   tenant_invite_accepted:'👤',
   work_trade_reminder:  '⚡',
   bulk_message:         '📢',
@@ -165,7 +167,9 @@ export function NotificationBell() {
                 <div key={n.id} onClick={e => {
                   e.stopPropagation()
                   if (!n.read) readMut.mutate(n.id)
-                  const route = TYPE_ROUTES[n.type]
+                  // S527 W-1: deep-link to the SPECIFIC item when the
+                  // notification carries one; per-type page as fallback.
+                  const route = n.actionUrl || TYPE_ROUTES[n.type]
                   if (route) { setOpen(false); window.location.href = route }
                 }}
                   style={{ display:'flex', gap:10, padding:'10px 16px', borderBottom:'1px solid var(--border-0)', cursor: n.isRead ? 'default' : 'pointer', background: n.isRead ? 'transparent' : 'rgba(201,162,39,.03)', transition:'background .12s' }}

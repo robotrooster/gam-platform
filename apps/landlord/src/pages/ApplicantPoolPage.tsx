@@ -70,6 +70,8 @@ interface UnitOption {
   unitNumber:   string
   propertyName: string
   status:        string
+  rentAmount?:        number | string | null
+  subtypeRentAmount?: number | string | null
 }
 
 const fmt = (n: any) =>
@@ -203,7 +205,7 @@ export function ApplicantPoolPage() {
 
       <div className="page-header" style={{ marginBottom: 12 }}>
         <div>
-          <h2 className="page-title" style={{ fontSize: '1.05rem' }}>Your reach-outs</h2>
+          <h2 className="page-title" style={{ fontSize: '1.05rem' }}>Your Reach-Outs</h2>
           <p className="page-subtitle" style={{ fontSize: '.78rem' }}>
             Pending replies, interested confirmations, unlocked reports.
           </p>
@@ -215,10 +217,10 @@ export function ApplicantPoolPage() {
           <thead>
             <tr>
               <th>Sent</th>
-              <th>Unit offered</th>
+              <th>Unit Offered</th>
               <th>Candidate</th>
               <th>Status</th>
-              <th>Tenant reply</th>
+              <th>Tenant Reply</th>
             </tr>
           </thead>
           <tbody>
@@ -288,13 +290,18 @@ function ReachOutModal({ entry, onClose }: { entry: PoolEntry; onClose: () => vo
   const [message, setMessage] = useState<string>('')
   const [error,   setError]   = useState<string | null>(null)
 
-  // Only vacant units make sense to offer. The endpoint accepts any
-  // unit owned by the landlord; we filter client-side to keep the
-  // dropdown short and match the reach-out's intent.
+  // W-48 (S529): only units actually AVAILABLE — free of any active lease or
+  // upcoming reservation from today onward, via the shared /units/available
+  // predicate (the old status==='vacant' filter lied: a "vacant" unit can
+  // hold a future lease/booking). The server enforces the same rule on send.
   const { data: units = [], isLoading: unitsLoading } = useQuery<UnitOption[]>(
-    'units-vacant',
-    () => apiGet<UnitOption[]>('/units').then(rows => rows.filter(u => u.status === 'vacant')),
+    'units-available-reachout',
+    () => apiGet<UnitOption[]>('/units/available'),
   )
+  // W-48: monthly rent comes from the landlord's preset unit info (unit
+  // override, else subtype pricing) — shown here, sent automatically, never typed.
+  const selectedUnit = units.find(u => u.id === unitId)
+  const presetRent = selectedUnit != null ? (selectedUnit.rentAmount ?? selectedUnit.subtypeRentAmount) : null
 
   const mut = useMutation(
     () => apiPost(`/background/pool/${entry.id}/reach-out`, {
@@ -345,15 +352,23 @@ function ReachOutModal({ entry, onClose }: { entry: PoolEntry; onClose: () => vo
             disabled={unitsLoading}
           >
             <option value="">Any vacant unit / not specified</option>
-            {units.map(u => (
-              <option key={u.id} value={u.id}>
-                {u.propertyName} — Unit {u.unitNumber}
-              </option>
-            ))}
+            {units.map(u => {
+              const rent = u.rentAmount ?? u.subtypeRentAmount
+              return (
+                <option key={u.id} value={u.id}>
+                  {u.propertyName} — Unit {u.unitNumber}{rent != null ? ` · ${fmt(rent)}/mo` : ''}
+                </option>
+              )
+            })}
           </select>
+          {presetRent != null && (
+            <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 4 }}>
+              Monthly rent {fmt(presetRent)} comes from your unit settings and is included in the reach-out.
+            </div>
+          )}
           {!unitsLoading && units.length === 0 && (
             <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 4 }}>
-              You have no vacant units right now — the reach-out will be sent without a specific unit attached.
+              You have no available units right now — the reach-out will be sent without a specific unit attached.
             </div>
           )}
         </div>

@@ -176,12 +176,12 @@ export async function emailBackgroundDecision(tenantEmail: string, tenantName: s
 
 // ── POOL EMAILS ───────────────────────────────────────────────
 
-export async function emailPoolMatchInterest(tenantEmail: string, tenantName: string, landlordName: string, propertyName: string, unitNumber: string, message: string|null, portalUrl = 'http://localhost:3002/notifications', ctx?: { landlordId?: string; matchRequestId?: string }) {
+export async function emailPoolMatchInterest(tenantEmail: string, tenantName: string, landlordName: string, propertyName: string, unitNumber: string, message: string|null, monthlyRent: number | null = null, portalUrl = 'http://localhost:3002/notifications', ctx?: { landlordId?: string; matchRequestId?: string }) {
   await send(tenantEmail, `A landlord is interested in you — ${propertyName}`,
     base(
       h('You Have a Match!') +
       p(`Hi ${tenantName},`) +
-      p(`<strong style="color:#eef1f8">${landlordName}</strong> has a vacancy at <strong style="color:#eef1f8">${propertyName} Unit ${unitNumber}</strong> and is interested in your profile.`) +
+      p(`<strong style="color:#eef1f8">${landlordName}</strong> has a vacancy at <strong style="color:#eef1f8">${propertyName} Unit ${unitNumber}</strong>${monthlyRent != null ? ` at <strong style="color:#eef1f8">$${monthlyRent.toLocaleString('en-US', { maximumFractionDigits: 0 })}/mo</strong>` : ''} and is interested in your profile.`) +
       (message ? `<div style="margin:12px 0;padding:10px 14px;background:#0a0f14;border-radius:8px;border-left:3px solid #c9a227;font-size:.82rem;color:#b8c4d8;font-style:italic">"</strong>${message}"</div>` : '') +
       p('Log in to your portal to let them know if you are interested.') +
       btn('Respond Now', portalUrl)
@@ -1236,6 +1236,43 @@ export async function emailBusinessCustomerPortalLink(args: {
 // Booking-guest stay assistant — a no-account guest gets a reusable link to
 // their stay's AI assistant (questions about check-in, the unit, balance;
 // requesting late checkout / extra nights). Delivered at booking time.
+// W-20 (S531): the morning-of-check-in site reveal. Guests never learn
+// their site number before this message — the nightly compressor can
+// re-site them freely until it goes out (site_reveal_sent_at pins).
+export async function emailBookingSiteAssignment(args: {
+  to: string
+  guestName: string | null
+  propertyName: string | null
+  unitNumber: string
+  checkIn: string
+  checkInTime?: string | null
+  ctx?: { landlordId?: string; bookingId?: string }
+}) {
+  const greet = args.guestName
+    ? p(`Hi <strong style="color:#eef1f8">${args.guestName}</strong>,`)
+    : ''
+  await send(args.to,
+    `Your site for today${args.propertyName ? ` at ${args.propertyName}` : ''}: ${args.unitNumber}`,
+    base(
+      h('Your site is ready') +
+      greet +
+      p(`Today's the day! Your site${args.propertyName ? ` at <strong style="color:#eef1f8">${args.propertyName}</strong>` : ''} is:`) +
+      `<div style="margin:12px 0;padding:16px;background:#0a0f14;border-radius:8px;border-left:3px solid #c9a227;text-align:center">
+        <div style="font-size:1.6rem;font-weight:800;color:#c9a227">Site ${args.unitNumber}</div>
+        ${args.checkInTime ? `<div style="font-size:.82rem;color:#b8c4d8;margin-top:4px">Check-in from ${args.checkInTime}</div>` : ''}
+      </div>` +
+      p('Head straight there when you arrive — the office can help with anything else.')
+    ),
+    {
+      category: 'booking_site_reveal',
+      landlordId: args.ctx?.landlordId ?? null,
+      relatedEntityType: args.ctx?.bookingId ? 'unit_booking' : null,
+      relatedEntityId: args.ctx?.bookingId ?? null,
+    },
+    'support',
+  )
+}
+
 export async function emailBookingGuestAccess(args: {
   to: string
   guestName: string | null
@@ -1250,9 +1287,10 @@ export async function emailBookingGuestAccess(args: {
   const greet = args.guestName
     ? p(`Hi <strong style="color:#eef1f8">${args.guestName}</strong>,`)
     : ''
-  const where = args.propertyName
-    ? `${args.propertyName}${args.unitNumber ? ` · Unit ${args.unitNumber}` : ''}`
-    : (args.unitNumber ? `Unit ${args.unitNumber}` : 'your stay')
+  // W-20 (S531): NEVER name the site here — the guest learns their site
+  // number from the morning-of-check-in message, so the schedule can
+  // self-compress until then.
+  const where = args.propertyName ?? 'your stay'
   const fmtDate = (d: string) =>
     new Date(d).toLocaleDateString([], { weekday: 'short', month: 'long', day: 'numeric' })
 
@@ -1261,7 +1299,8 @@ export async function emailBookingGuestAccess(args: {
     base(
       h('Your stay assistant') +
       greet +
-      p('Your booking is confirmed. Use the secure link below any time during your stay to ask questions — check-in details, the unit, your balance — or to request things like a late checkout. No account or password needed.') +
+      p('Your booking is confirmed. Use the secure link below any time during your stay to ask questions — check-in details, your balance — or to request things like a late checkout. No account or password needed.') +
+      p(`<span style="color:#b8c4d8">Your site number will be sent to you the morning of check-in.</span>`) +
       `<div style="margin:12px 0;padding:12px 16px;background:#0a0f14;border-radius:8px;border-left:3px solid #c9a227">
         <div style="font-weight:700;color:#eef1f8;margin-bottom:2px">${where}</div>
         <div style="font-size:.82rem;color:#b8c4d8">${fmtDate(args.checkIn)} → ${fmtDate(args.checkOut)}</div>

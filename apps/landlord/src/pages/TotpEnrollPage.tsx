@@ -94,7 +94,7 @@ export function TotpEnrollPage() {
       <div style={{width:'100%',maxWidth:580}}>
         <div className="page-header">
           <div>
-            <h1 className="page-title">Set up two-factor authentication</h1>
+            <h1 className="page-title">Set Up Two-Factor Authentication</h1>
             <p className="page-subtitle">Add an authenticator-app code to every sign-in</p>
           </div>
         </div>

@@ -166,6 +166,10 @@ async function createDocumentRecord(client: any, opts: {
   documentType: LeaseDocumentType,
   targetLeaseTenantId: string | null,
   promoteLeaseTenantId: string | null,
+  // W-7 (S531): set when this original_lease document renews an existing
+  // lease — completion copies the predecessor's deposits + the lease-end
+  // processor hands the unit off instead of vacating.
+  renewsLeaseId?: string | null,
   signers: Array<{ userId: string, role: string, name: string, email: string, phone?: string | null, orderIndex?: number }>
 }): Promise<any> {
   // INSERT lease_documents — includes document_type and addendum-specific FKs
@@ -173,13 +177,15 @@ async function createDocumentRecord(client: any, opts: {
     INSERT INTO lease_documents (
       template_id, landlord_id, unit_id, lease_id,
       title, base_pdf_url,
-      document_type, target_lease_tenant_id, promote_lease_tenant_id
-    ) VALUES ($1,$2,$3,$4, $5,$6, $7,$8,$9)
+      document_type, target_lease_tenant_id, promote_lease_tenant_id,
+      renews_lease_id
+    ) VALUES ($1,$2,$3,$4, $5,$6, $7,$8,$9, $10)
     RETURNING *`,
     [
       opts.templateId, opts.landlordId, opts.unitId, opts.leaseId,
       opts.title, opts.basePdfUrl,
-      opts.documentType, opts.targetLeaseTenantId, opts.promoteLeaseTenantId
+      opts.documentType, opts.targetLeaseTenantId, opts.promoteLeaseTenantId,
+      opts.renewsLeaseId || null
     ]).then((r: any) => r.rows[0])
 
   // INSERT signers
@@ -676,6 +682,30 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
     client
   )
 
+  // W-7 (S531): renewal completion — the deposit carries forward. Copy the
+  // predecessor's refundable move-in deposits onto the new lease AFTER
+  // move-in invoice generation, so they exist for the final move-out
+  // deposit sweep without being re-billed (the tenant already paid them on
+  // the original lease). Also close the loop on the renewal request.
+  if (doc.renews_lease_id) {
+    await client.query(`
+      INSERT INTO lease_fees (lease_id, fee_type, amount, is_refundable, due_timing, description)
+      SELECT $1, fee_type, amount, is_refundable, due_timing,
+             COALESCE(description, '') || ' [carried forward from previous lease]'
+      FROM lease_fees
+      WHERE lease_id=$2 AND due_timing='move_in' AND is_refundable=TRUE
+        AND fee_type NOT IN (SELECT fee_type FROM lease_fees WHERE lease_id=$1)`,
+      [lease.id, doc.renews_lease_id])
+    await client.query(
+      `UPDATE lease_renewal_requests SET status='completed', resolved_at=NOW(), updated_at=NOW()
+       WHERE lease_id=$1 AND status IN ('requested','approved')`, [doc.renews_lease_id])
+    // The old lease should run out its clock, not auto-extend into the
+    // successor's term.
+    await client.query(
+      `UPDATE leases SET auto_renew=FALSE, auto_renew_mode=NULL, updated_at=NOW()
+       WHERE id=$1 AND status='active'`, [doc.renews_lease_id])
+  }
+
   // Credit ledger: emit lease_signed for every tenant signer + a
   // single event for the landlord. Same transaction — if the ledger
   // writes fail, the whole lease materialization rolls back. Imported
@@ -972,6 +1002,47 @@ esignRouter.post('/witnesses/provision', requireAuth, requirePerm('leases.create
   } catch (e) { next(e) }
 })
 
+// W-33 (S529): resolve SIGNERS from the lease, not from hand-typed emails.
+// ?unitId=X → that unit's active lease + all its active tenants;
+// ?propertyId=Y → one group per active lease at the property (the
+// property-wide addendum send fans out one document per group).
+esignRouter.get('/recipients', requireAuth, requirePerm('leases.create'), async (req, res, next) => {
+  try {
+    const { unitId, propertyId } = req.query as { unitId?: string; propertyId?: string }
+    if (!unitId && !propertyId) throw new AppError(400, 'unitId or propertyId required')
+    const landlordId = req.user!.role === 'landlord' ? req.user!.profileId : req.user!.landlordId
+    if (!landlordId) throw new AppError(403, 'Forbidden')
+    const params: any[] = [landlordId]
+    const filter = unitId
+      ? `AND l.unit_id = $${params.push(unitId)}`
+      : `AND u.property_id = $${params.push(propertyId)}`
+    const rows = await query<any>(`
+      SELECT l.id AS lease_id, l.unit_id, u.unit_number, p.id AS property_id, p.name AS property_name,
+             vlat.role, t.id AS tenant_id, t.user_id, us.first_name, us.last_name, us.email
+        FROM leases l
+        JOIN units u ON u.id = l.unit_id
+        JOIN properties p ON p.id = u.property_id
+        JOIN v_lease_active_tenants vlat ON vlat.lease_id = l.id
+        JOIN tenants t ON t.id = vlat.tenant_id
+        JOIN users us ON us.id = t.user_id
+       WHERE l.landlord_id = $1 AND l.status = 'active' ${filter}
+       ORDER BY u.unit_number, vlat.role`, params)
+    // group by lease
+    const groups = new Map<string, any>()
+    for (const r of rows) {
+      if (!groups.has(r.lease_id)) {
+        groups.set(r.lease_id, { leaseId: r.lease_id, unitId: r.unit_id, unitNumber: r.unit_number,
+          propertyId: r.property_id, propertyName: r.property_name, tenants: [] })
+      }
+      groups.get(r.lease_id).tenants.push({
+        tenantId: r.tenant_id, userId: r.user_id, firstName: r.first_name,
+        lastName: r.last_name, email: r.email, role: r.role,
+      })
+    }
+    res.json({ success: true, data: Array.from(groups.values()) })
+  } catch (e) { next(e) }
+})
+
 esignRouter.get('/templates', requireAuth, requirePerm('leases.create'), async (req, res, next) => {
   try {
     const templates = await query<any>(`
@@ -1226,6 +1297,138 @@ esignRouter.post('/documents', requireAuth, requirePerm('leases.create'), async 
       prefillValues: prefillValues || {}
     } as any)
 
+    await client.query('COMMIT')
+    res.status(201).json({ success: true, data: doc })
+  } catch (e) {
+    await client.query('ROLLBACK')
+    next(e)
+  } finally {
+    client.release()
+  }
+})
+
+// W-7 (S531): renewal decision → drafted lease. Creates an original_lease
+// document for the SAME unit + active roster with the renewal form's terms
+// prefilled (per lease-is-law the new terms live in the drafted lease).
+// Carry-over: identity fields, term settings, and the current lease's
+// recurring / move-out lease_fees prefill from the predecessor; refundable
+// move-in deposits are NOT prefilled (they'd re-bill at completion) — they
+// copy forward at execution via renews_lease_id. The draft is left in
+// 'draft' status: the landlord reviews + sends from the E-Sign page
+// (landlord signs first per S28).
+esignRouter.post('/documents/renewal', requireAuth, requirePerm('leases.create'), async (req, res, next) => {
+  const client = await getClient()
+  try {
+    // GAM standard (Nic, S531): THE LEASE IS THE DOCUMENT. This endpoint
+    // collects NO terms — no rent, no dates. It drafts the document with
+    // identity + carry-over facts prefilled; the landlord types the new
+    // rent/dates INTO the drafted lease during their landlord-first
+    // signing pass (the sign flow's field inputs + required-field
+    // validation are the only place terms are entered).
+    const { leaseId, templateId } = req.body
+    if (!leaseId) throw new AppError(400, 'leaseId required')
+    if (!templateId) throw new AppError(400, 'templateId required — pick the lease template to draft from')
+
+    const lease = await queryOne<any>(`
+      SELECT l.*, u.unit_number, p.name AS property_name,
+             p.street1, p.city, p.state, p.zip
+      FROM leases l
+      JOIN units u ON u.id = l.unit_id
+      JOIN properties p ON p.id = u.property_id
+      WHERE l.id=$1`, [leaseId])
+    if (!lease) throw new AppError(404, 'Lease not found')
+    if (!canManageLandlordResource(req.user, lease.landlord_id)) throw new AppError(403, 'Not your lease')
+    if (lease.status !== 'active') throw new AppError(409, `Cannot renew: lease is ${lease.status}, not active`)
+
+    // A second open renewal draft for the same lease is a mistake.
+    const openDraft = await queryOne<any>(`
+      SELECT id FROM lease_documents
+      WHERE renews_lease_id=$1 AND status NOT IN ('completed','voided')`, [leaseId])
+    if (openDraft) throw new AppError(409, 'A renewal draft already exists for this lease — void it first or send it')
+
+    const tmpl = await queryOne<any>(
+      'SELECT * FROM lease_templates WHERE id=$1 AND landlord_id=$2', [templateId, lease.landlord_id])
+    if (!tmpl) throw new AppError(404, 'Template not found')
+    if (!tmpl.base_pdf_url) throw new AppError(400, 'Template has no base PDF')
+    // The new terms are entered in the document, so the template must carry
+    // the fields the completion chain requires.
+    const requiredCols = await query<any>(
+      `SELECT DISTINCT lease_column FROM lease_template_fields
+       WHERE template_id=$1 AND lease_column IN ('rent_amount','start_date')`, [templateId])
+    if ((requiredCols as any[]).length < 2) {
+      throw new AppError(400, 'Template must include Rent Amount and Start Date fields — the new terms are set in the drafted lease itself')
+    }
+
+    // Signers = landlord + the current active roster, same roles.
+    const landlordUser = await queryOne<any>(`
+      SELECT u.id, u.first_name, u.last_name, u.email, u.phone
+      FROM landlords l JOIN users u ON u.id = l.user_id WHERE l.id=$1`, [lease.landlord_id])
+    if (!landlordUser) throw new AppError(500, 'Landlord user not found')
+    const roster = await query<any>(`
+      SELECT lt.role, u.id AS user_id, u.first_name, u.last_name, u.email, u.phone
+      FROM lease_tenants lt
+      JOIN tenants t ON t.id = lt.tenant_id
+      JOIN users u ON u.id = t.user_id
+      WHERE lt.lease_id=$1 AND lt.status='active'
+      ORDER BY CASE lt.role WHEN 'primary' THEN 0 ELSE 1 END`, [leaseId])
+    if ((roster as any[]).length === 0) throw new AppError(409, 'Lease has no active tenants to renew with')
+    const signers = [
+      { userId: landlordUser.id, role: 'landlord', name: `${landlordUser.first_name} ${landlordUser.last_name}`, email: landlordUser.email, phone: landlordUser.phone, orderIndex: 1 },
+      ...(roster as any[]).map((r: any, i: number) => ({
+        userId: r.user_id, role: r.role, name: `${r.first_name} ${r.last_name}`,
+        email: r.email, phone: r.phone, orderIndex: i + 2,
+      })),
+    ]
+
+    // Prefill: identity + carried-over settings ONLY. The new terms
+    // (rent_amount / start_date / end_date / lease_type) stay blank —
+    // the landlord fills them in the document.
+    const primary = (roster as any[])[0]
+    const prefillValues: Record<string, string> = {
+      tenant_name:      `${primary.first_name} ${primary.last_name}`,
+      tenant_email:     primary.email || '',
+      landlord_name:    `${landlordUser.first_name} ${landlordUser.last_name}`,
+      unit_number:      lease.unit_number,
+      property_name:    lease.property_name || '',
+      property_address: [lease.street1, lease.city, lease.state, lease.zip].filter(Boolean).join(', '),
+      rent_due_day:     String(lease.rent_due_day ?? 1),
+      auto_renew:       lease.auto_renew ? 'true' : 'false',
+      notice_days_required:   String(lease.notice_days_required ?? 30),
+      expiration_notice_days: String(lease.expiration_notice_days ?? 60),
+    }
+    if (lease.auto_renew && lease.auto_renew_mode) prefillValues.auto_renew_mode = lease.auto_renew_mode
+    if (lease.late_fee_grace_days != null) prefillValues.late_fee_grace_days = String(lease.late_fee_grace_days)
+
+    // Carry recurring + move-out/other lease_fees forward as prefills (they
+    // bill on their own timing — nothing re-bills at completion). Move-in
+    // fees are excluded: refundable deposits copy at execution instead, and
+    // non-refundable move-in fees don't recur on a renewal.
+    const feeRows = await query<any>(`
+      SELECT fee_type, amount FROM lease_fees
+      WHERE lease_id=$1 AND due_timing != 'move_in'`, [leaseId])
+    for (const f of feeRows as any[]) {
+      prefillValues[f.fee_type] = String(f.amount)
+    }
+
+    await client.query('BEGIN')
+    const doc = await createDocumentRecord(client, {
+      landlordId: lease.landlord_id,
+      templateId,
+      unitId: lease.unit_id,
+      leaseId: null,
+      title: `Lease Renewal — Unit ${lease.unit_number}${lease.property_name ? ' — ' + lease.property_name : ''}`,
+      basePdfUrl: tmpl.base_pdf_url,
+      documentType: 'original_lease',
+      targetLeaseTenantId: null,
+      promoteLeaseTenantId: null,
+      renewsLeaseId: leaseId,
+      signers,
+      prefillValues,
+    } as any)
+    // An open tenant-initiated renewal request is now being acted on.
+    await client.query(
+      `UPDATE lease_renewal_requests SET status='approved', resolved_at=NOW(), updated_at=NOW()
+       WHERE lease_id=$1 AND status='requested'`, [leaseId])
     await client.query('COMMIT')
     res.status(201).json({ success: true, data: doc })
   } catch (e) {

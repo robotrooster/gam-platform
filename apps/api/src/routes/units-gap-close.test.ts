@@ -86,9 +86,17 @@ async function seed(): Promise<Fixture> {
       [aUnitId, aLid])
 
     // Team-role membership lives in property_manager_scopes, not on users.
-    // The route layer trusts the JWT for landlordId, so we sign a token
-    // with landlordId=aLid and don't need any DB row for the PM user.
-    const pmUserId = randomUUID()
+    // The route layer trusts the JWT for landlordId, but the property-scope
+    // read (getScopedPropertyIds) checks the scope ROW — a worker without one
+    // sees nothing. Seed a real PM user + all_properties scope row.
+    const { rows: [{ id: pmUserId }] } = await c.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+       VALUES ($1, 'x', 'property_manager', 'Team', 'Manager', TRUE) RETURNING id`,
+      [`pm-${aLid.slice(0, 8)}@test.dev`])
+    await c.query(
+      `INSERT INTO property_manager_scopes (user_id, landlord_id, property_ids, all_properties)
+       VALUES ($1, $2, '{}', TRUE)`,
+      [pmUserId, aLid])
 
     await c.query('COMMIT')
     const sign = (claims: any) =>
@@ -167,9 +175,19 @@ describe('PATCH /api/units/:id/status', () => {
     const res = await request(buildApp())
       .patch(`/api/units/${f.aUnitId}/status`)
       .set('Authorization', `Bearer ${f.tokenA}`)
-      .send({ status: 'suspended' })
+      .send({ status: 'available' })
     expect(res.status).toBe(200)
-    expect(res.body.data.status).toBe('suspended')
+    expect(res.body.data.status).toBe('available')
+  })
+
+  it("'suspended' can't be set directly (S524: coupled to eviction mode)", async () => {
+    const f = await seed()
+    const res = await request(buildApp())
+      .patch(`/api/units/${f.aUnitId}/status`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ status: 'suspended' })
+    expect(res.status).toBe(400)
+    expect(res.body.error).toMatch(/eviction mode/i)
   })
 
   it('cross-landlord → 403', async () => {

@@ -65,15 +65,19 @@ describe('computeStayTotal', () => {
 
 // ── GET /property/:slug ──────────────────────────────────────
 describe('GET /api/public/property/:slug', () => {
-  it('returns profile + bookable units', async () => {
-    const s = await seedSite()
+  it('returns profile + site TYPES (W-20: no per-unit inventory)', async () => {
+    await seedSite()
     const res = await request(buildApp()).get('/api/public/property/sunny-rv-park')
     expect(res.status).toBe(200)
     expect(res.body.data.property.name).toBe('Test Property')
     expect(res.body.data.property.depositPct).toBe(25)
-    expect(res.body.data.units).toHaveLength(1)
-    expect(res.body.data.units[0].nightlyRate).toBe(100)
-    expect(res.body.data.units[0].stayTypes).toEqual(['nightly', 'weekly'])
+    // Units without a subtype pool into the 'general' type; unit numbers
+    // are never exposed to the public payload.
+    expect(res.body.data.siteTypes).toHaveLength(1)
+    expect(res.body.data.siteTypes[0].id).toBe('general')
+    expect(res.body.data.siteTypes[0].nightlyRate).toBe(100)
+    expect(res.body.data.siteTypes[0].siteCount).toBe(1)
+    expect(JSON.stringify(res.body.data)).not.toMatch(/unitNumber/)
   })
 
   it('unknown slug → 404', async () => {
@@ -93,7 +97,7 @@ describe('GET availability', () => {
   it('free dates → available with price + deposit', async () => {
     const s = await seedSite()
     const res = await request(buildApp())
-      .get(`/api/public/property/sunny-rv-park/availability?unitId=${s.unitId}&checkIn=${plusDays(30)}&checkOut=${plusDays(33)}&stayType=nightly`)
+      .get(`/api/public/property/sunny-rv-park/availability?siteTypeId=general&checkIn=${plusDays(30)}&checkOut=${plusDays(33)}&stayType=nightly`)
     expect(res.status).toBe(200)
     expect(res.body.data.available).toBe(true)
     expect(res.body.data.nights).toBe(3)
@@ -104,7 +108,7 @@ describe('GET availability', () => {
   it('weekly pricing uses weekly_rate', async () => {
     const s = await seedSite()
     const res = await request(buildApp())
-      .get(`/api/public/property/sunny-rv-park/availability?unitId=${s.unitId}&checkIn=${plusDays(30)}&checkOut=${plusDays(37)}&stayType=weekly`)
+      .get(`/api/public/property/sunny-rv-park/availability?siteTypeId=general&checkIn=${plusDays(30)}&checkOut=${plusDays(37)}&stayType=weekly`)
     expect(res.status).toBe(200)
     expect(res.body.data.total).toBe(600)
     expect(res.body.data.depositAmount).toBe(150)
@@ -117,7 +121,7 @@ describe('GET availability', () => {
        VALUES ($1,$2,'nightly',$3,$4,'confirmed')`,
       [s.unitId, s.landlordId, plusDays(30), plusDays(33)])
     const res = await request(buildApp())
-      .get(`/api/public/property/sunny-rv-park/availability?unitId=${s.unitId}&checkIn=${plusDays(31)}&checkOut=${plusDays(34)}&stayType=nightly`)
+      .get(`/api/public/property/sunny-rv-park/availability?siteTypeId=general&checkIn=${plusDays(31)}&checkOut=${plusDays(34)}&stayType=nightly`)
     expect(res.status).toBe(200)
     expect(res.body.data.available).toBe(false)
     expect(res.body.data.unavailableReason).toBe('booked')
@@ -130,14 +134,14 @@ describe('GET availability', () => {
        VALUES ($1,$2,'nightly',$3,$4,'tentative', now() - interval '1 hour')`,
       [s.unitId, s.landlordId, plusDays(30), plusDays(33)])
     const res = await request(buildApp())
-      .get(`/api/public/property/sunny-rv-park/availability?unitId=${s.unitId}&checkIn=${plusDays(30)}&checkOut=${plusDays(33)}&stayType=nightly`)
+      .get(`/api/public/property/sunny-rv-park/availability?siteTypeId=general&checkIn=${plusDays(30)}&checkOut=${plusDays(33)}&stayType=nightly`)
     expect(res.body.data.available).toBe(true)
   })
 
   it('below min stay → unavailable', async () => {
     const s = await seedSite({ minStay: 3 })
     const res = await request(buildApp())
-      .get(`/api/public/property/sunny-rv-park/availability?unitId=${s.unitId}&checkIn=${plusDays(30)}&checkOut=${plusDays(31)}&stayType=nightly`)
+      .get(`/api/public/property/sunny-rv-park/availability?siteTypeId=general&checkIn=${plusDays(30)}&checkOut=${plusDays(31)}&stayType=nightly`)
     expect(res.body.data.available).toBe(false)
     expect(res.body.data.unavailableReason).toMatch(/Minimum stay/)
   })
@@ -145,7 +149,7 @@ describe('GET availability', () => {
   it('past check-in → 400', async () => {
     const s = await seedSite()
     const res = await request(buildApp())
-      .get(`/api/public/property/sunny-rv-park/availability?unitId=${s.unitId}&checkIn=${plusDays(-5)}&checkOut=${plusDays(2)}&stayType=nightly`)
+      .get(`/api/public/property/sunny-rv-park/availability?siteTypeId=general&checkIn=${plusDays(-5)}&checkOut=${plusDays(2)}&stayType=nightly`)
     expect(res.status).toBe(400)
   })
 })

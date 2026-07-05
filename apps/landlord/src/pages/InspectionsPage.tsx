@@ -18,6 +18,10 @@ type InspectionRow = {
   scheduledFor: string | null
   finalizedAt: string | null
   createdAt: string
+  unitNumber: string | null
+  propertyName: string | null
+  tenantFirstName: string | null
+  tenantLastName: string | null
 }
 
 const STATUS_BADGE: Record<string, string> = {
@@ -64,15 +68,13 @@ export function InspectionsPage() {
           </h1>
           <div className="page-sub">Move-in, move-out, turnover, and periodic unit inspections</div>
         </div>
+        {/* W-41: ONE entry point — the old "guided walkthrough" button led
+            to the same form (?walkthrough=1 was never read); the assistant
+            offer lives inside the form. */}
         {can('inspections.create') && (
-          <div style={{ display: 'flex', gap: 8 }}>
-            <Link to="/inspections/new?walkthrough=1" className="btn btn-secondary">
-              Start guided walkthrough
-            </Link>
-            <Link to="/inspections/new" className="btn btn-primary">
-              <Plus size={15} /> New Inspection
-            </Link>
-          </div>
+          <Link to="/inspections/new" className="btn btn-primary">
+            <Plus size={15} /> New Inspection
+          </Link>
         )}
       </div>
 
@@ -129,8 +131,11 @@ export function InspectionsPage() {
                 <tr key={r.id}>
                   <td><strong>{TYPE_LABEL[r.inspectionType] || r.inspectionType}</strong></td>
                   <td><span className={`badge ${STATUS_BADGE[r.status] || 'badge-muted'}`}>{r.status.replace('_', ' ')}</span></td>
-                  <td style={{ fontFamily: 'var(--font-mono)', fontSize: '.78rem' }}>{r.unitId.slice(0, 8)}…</td>
-                  <td style={{ fontFamily: 'var(--font-mono)', fontSize: '.78rem' }}>{r.tenantId?.slice(0, 8) ?? '—'}…</td>
+                  <td>
+                    {r.unitNumber ?? '—'}
+                    {r.propertyName && <span style={{ fontSize: '.72rem', color: 'var(--text-3)' }}> · {r.propertyName}</span>}
+                  </td>
+                  <td>{[r.tenantFirstName, r.tenantLastName].filter(Boolean).join(' ') || '—'}</td>
                   <td>{fmtDate(r.scheduledFor)}</td>
                   <td>{fmtDate(r.finalizedAt)}</td>
                   <td>{r.comparisonInspectionId ? <CheckCircle2 size={14} style={{ color: 'var(--green)' }} /> : '—'}</td>

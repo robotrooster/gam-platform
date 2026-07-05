@@ -135,7 +135,7 @@ export function CameraCapture({
           <div style={{ marginTop: 20, display: 'flex', alignItems: 'center', gap: 16 }}>
             {mode === 'photo' ? (
               <button className="btn btn-primary" onClick={capturePhoto}>
-                <Camera size={16} /> Capture photo
+                <Camera size={16} /> Capture Photo
               </button>
             ) : recording ? (
               <button className="btn btn-primary" onClick={stopRecording} style={{ background: 'var(--red)' }}>
@@ -143,7 +143,7 @@ export function CameraCapture({
               </button>
             ) : (
               <button className="btn btn-primary" onClick={startRecording}>
-                <VideoIcon size={16} /> Start recording
+                <VideoIcon size={16} /> Start Recording
               </button>
             )}
           </div>

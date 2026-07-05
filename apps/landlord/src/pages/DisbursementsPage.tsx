@@ -168,20 +168,22 @@ function BalanceWithdrawSection({ onWithdraw }: { onWithdraw: () => void }) {
         </div>
       )}
 
-      {connectReady && balance > 0 && (
-        <div className="card" style={{ padding: '14px 16px', marginTop: 12, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '.82rem' }}>
-            <Landmark size={14} color="var(--gold)" />
-            <span style={{ fontWeight: 600 }}>Withdraw Now</span>
-            <span style={{ color: 'var(--text-3)', fontSize: '.72rem' }}>
-              · Skip the Friday batch and get the money sooner
-            </span>
-          </div>
-          <button className="btn btn-primary btn-sm" onClick={onWithdraw}>
-            Choose Method
-          </button>
+      {/* W-32 (S531): the strip renders even before Connect KYC / first
+          balance so the on-demand promise has a visible workflow — the
+          button just disables until it's actually usable. */}
+      <div className="card" style={{ padding: '14px 16px', marginTop: 12, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '.82rem' }}>
+          <Landmark size={14} color="var(--gold)" />
+          <span style={{ fontWeight: 600 }}>Withdraw Now</span>
+          <span style={{ color: 'var(--text-3)', fontSize: '.72rem' }}>
+            · Skip the Friday batch — standard ACH free (1–2 days) or instant for 2% (min $5)
+          </span>
         </div>
-      )}
+        <button className="btn btn-primary btn-sm" onClick={onWithdraw} disabled={!connectReady || balance <= 0}
+          title={!connectReady ? 'Link your bank account first' : balance <= 0 ? 'No available balance' : undefined}>
+          Choose Method
+        </button>
+      </div>
     </div>
   )
 }
@@ -251,7 +253,7 @@ function WithdrawNowModal({ onClose }: { onClose: () => void }) {
               </div>
               {method === 'instant' && (
                 <div className="data-row">
-                  <span className="data-key">Instant payout fee</span>
+                  <span className="data-key">Instant fee (2%, min $5)</span>
                   <span className="data-val mono" style={{ color: 'var(--red)' }}>−{fmt(instant?.fee ?? 0)}</span>
                 </div>
               )}
@@ -265,8 +267,8 @@ function WithdrawNowModal({ onClose }: { onClose: () => void }) {
 
             <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginBottom: 14, lineHeight: 1.5 }}>
               {method === 'standard'
-                ? 'Standard ACH typically settles in 1–2 business days.'
-                : 'Instant payouts arrive in minutes. An instant payout fee (1.5%, min $0.50) is deducted from the amount.'}
+                ? 'Standard ACH is free and typically settles in 1–2 business days.'
+                : 'Instant payouts arrive in minutes. A 2% fee (minimum $5) is deducted from the amount — that\'s the all-in cost, nothing else is charged.'}
             </div>
           </>
         )}

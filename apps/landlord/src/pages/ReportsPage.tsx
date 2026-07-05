@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { useQuery } from 'react-query'
 import { apiGet } from '../lib/api'
 import { usePerms } from '../lib/permissions'
@@ -245,6 +246,7 @@ export function ReportsPage() {
 function OverviewTab() {
   const { data: report, isLoading } = useQuery<any>('reports', () => apiGet('/reports/summary'))
   const [openMonth, setOpenMonth] = useState<string | null>(null)
+  const navigate = useNavigate()
 
   return (
     <>
@@ -253,7 +255,8 @@ function OverviewTab() {
           <div className="kpi-grid" style={{gridTemplateColumns:'repeat(4, 1fr)'}}>
             <div className="kpi-card"><div className="kpi-label">Collected MTD</div><div className="kpi-value green">{fmt0(report?.collectedMtd)}</div></div>
             <div className="kpi-card"><div className="kpi-label">Collected YTD</div><div className="kpi-value" style={{color:'var(--gold)'}}>{fmt0(report?.ytdCollected)}</div></div>
-            <div className="kpi-card"><div className="kpi-label">Outstanding Balance</div><div className="kpi-value" style={{color:'var(--amber)'}}>{fmt0(report?.outstanding)}</div></div>
+            {/* S527 W-38: click through to the who-owes-what list (same target as the dashboard KPI). */}
+            <div className="kpi-card" style={{cursor:'pointer'}} onClick={()=>navigate('/balances')}><div className="kpi-label">Outstanding Balance</div><div className="kpi-value" style={{color:'var(--amber)'}}>{fmt0(report?.outstanding)}</div></div>
             <div className="kpi-card"><div className="kpi-label">Occupancy Rate</div><div className="kpi-value">{report?.occupancyRate != null ? `${report.occupancyRate}%` : '—'}</div></div>
           </div>
           <CollectionsCharts ytdMonthly={report?.ytdMonthly ?? []} mtd={Number(report?.collectedMtd || 0)} ytd={Number(report?.ytdCollected || 0)} />
@@ -339,7 +342,7 @@ function ByPropertyTab() {
             <table className="data-table">
               <thead><tr>
                 <th>Property</th><th style={{textAlign:'center'}}>Occ / Total</th><th style={{textAlign:'center'}}>Occ %</th>
-                <th>Collected</th><th>Maint.</th><th>Platform fee</th><th>Net</th><th></th>
+                <th>Collected</th><th>Maint.</th><th>Platform Fee</th><th>Net</th><th></th>
               </tr></thead>
               <tbody>
                 {props.length ? props.map((p: any) => (

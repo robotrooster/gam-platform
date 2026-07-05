@@ -124,14 +124,15 @@ export async function generateMoveInInvoice(
     const nonDepositFees = fees.filter(f => f.fee_type !== 'security_deposit')
     const feesTotal = nonDepositFees.reduce((s, f) => s + Number(f.amount), 0)
 
-    // S246: FlexDeposit branch. When the tenant has enrolled BEFORE
-    // move-in, the deposit line is excluded from the landlord-facing
-    // invoice entirely — landlord sees only rent + non-deposit fees;
-    // their "Security Deposits" page shows "funded" via the GAM
-    // gap-front Transfer. Tenant pays installment 1 alongside rent +
-    // fees in the combined move-in PI; remaining N-1 installments
-    // are scheduled via flex_deposit_installments rows (created at
-    // enroll time before this generator runs).
+    // S246/S527: FlexDeposit branch (CUSTODY model — GAM advances
+    // nothing). When the tenant has enrolled BEFORE move-in, the
+    // deposit line is excluded from the landlord-facing invoice
+    // entirely — landlord sees only rent + non-deposit fees; their
+    // "Security Deposits" page shows the deposit held in GAM custody,
+    // funded as installments collect. Tenant pays installment 1
+    // alongside rent + fees in the combined move-in PI; remaining N-1
+    // installments are scheduled via flex_deposit_installments rows
+    // (created at enroll time before this generator runs).
     let depositAmountForInvoice = fullDepositAmount
     let firstInstallmentAmount = 0
     let flexDepositActive = false
@@ -243,7 +244,8 @@ export async function generateMoveInInvoice(
     // S246: FlexDeposit installment 1 payment row. Tagged
     // entry_description='DEPOSIT' so allocation + audit treats it
     // consistently with the regular deposit. The payments row carries
-    // the installment-1 amount (full deposit minus GAM-fronted gap);
+    // the installment-1 amount (the tenant's first portion of their
+    // own deposit — there is no GAM-fronted gap under custody);
     // landlord doesn't see this row tied to their dashboard because
     // it's NOT linked to the invoice (invoice_id=NULL) — its
     // visibility is tenant-side only.
@@ -266,12 +268,13 @@ export async function generateMoveInInvoice(
 
     if (ownsTx) await client.query('COMMIT')
 
-    // S246: post-commit FlexDeposit settlement. Flips installment 1
-    // to settled + fires the GAM-gap Connect Transfer to landlord
-    // (outside the DB tx — network round-trip). Best-effort: if the
-    // Transfer fails, an admin notification + transfer_error row is
-    // recorded; the deposit row is still marked partial-funded and
-    // a retry path runs in the cron.
+    // S246/S527: post-commit FlexDeposit settlement. Flips installment
+    // 1 to settled and updates the custody counters. NO Connect
+    // Transfer fires — the deposit stays in gam_escrow for the life of
+    // the lease (settleFlexDepositMoveIn returns stripeTransferId:
+    // null); GAM advances nothing, so there is no gap to cover.
+    // Best-effort: on failure an admin notification is recorded and
+    // the cron retry path picks it up.
     if (flexDepositActive && flexDepositSecurityDepositId && flexDepositInstallment1PaymentId && inputs.tenant_id) {
       try {
         const { settleFlexDepositMoveIn } = await import('../services/flexDeposit')

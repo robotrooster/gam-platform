@@ -33,7 +33,9 @@ interface EmailFailureRow {
   createdAt: string
 }
 
-export function NotificationPrefsPage() {
+// W-53 (S531): merged into Settings as a section — the standalone nav item
+// and page are gone; /notification-prefs redirects to /settings.
+export function NotificationPrefsSection() {
   const qc = useQueryClient()
   const { user } = useAuth()
   const { data: prefs = [], isLoading } = useQuery<any[]>('notification-prefs', () =>
@@ -62,13 +64,11 @@ export function NotificationPrefsPage() {
 
   return (
     <div>
-      <div className="page-header">
-        <div>
-          <h1 style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-            <Bell size={22} /> Notification Preferences
-          </h1>
-          <div className="page-sub">Choose how GAM contacts you for each event type</div>
-        </div>
+      <div className="card-header" style={{ marginBottom: 12 }}>
+        <span className="card-title" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <Bell size={16} /> Notification Preferences
+        </span>
+        <span style={{ fontSize: '.75rem', color: 'var(--text-3)' }}>Choose how GAM contacts you for each event type</span>
       </div>
 
       <div className="card" style={{ padding: 12, marginBottom: 16, fontSize: '.82rem', color: 'var(--text-2)' }}>

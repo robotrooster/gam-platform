@@ -4,6 +4,10 @@ import { isFeatureEnabled } from './systemFeatures'
 import { getStripe } from '../lib/stripe'
 import { createRentPlatformCharge } from './stripeConnect'
 import { computeTenantGamOutstandingTotal } from './supersedence'
+// S527: single source for the Stripe ACH-return pass-through (same Stripe
+// fee regardless of product; Consumer ToS § 9.1.4 promises it "per retry at
+// actual cost, no markup" for FlexDeposit exactly as § 4.2 does for FlexPay).
+import { FLEXPAY_ACH_RETURN_FEE as ACH_RETURN_FEE } from './flexpay'
 import {
   getFlexDepositMaxInstallments,
   FLEX_DEPOSIT_CUSTODY_FEE,
@@ -716,7 +720,12 @@ export async function processFlexDepositInstallmentDue(now: Date = new Date()): 
       // settle by applyTenantSupersedence. Excludes this installment
       // itself (status='pending', so it's not in the outstanding list).
       const boost = await computeTenantGamOutstandingTotal(r.tenant_id)
-      const amount = Math.round((baseAmount + boost) * 100) / 100
+      // S527: retry pulls carry the bounced primary attempt's Stripe
+      // ACH-return fee, passed through at cost (ToS § 9.1.4). The
+      // installment amount itself stays fixed — only the pass-through
+      // rides on top. Primary pulls carry nothing extra.
+      const returnFee = r.pull_kind === 'retry' ? ACH_RETURN_FEE : 0
+      const amount = Math.round((baseAmount + returnFee + boost) * 100) / 100
       const intent = await createRentPlatformCharge({
         amount,
         stripeCustomerId:    r.stripe_customer_id,
@@ -728,6 +737,7 @@ export async function processFlexDepositInstallmentDue(now: Date = new Date()): 
           gam_installment_id: r.installment_id,
           gam_deposit_id:     r.security_deposit_id,
           gam_tenant_id:      r.tenant_id,
+          ...(returnFee > 0 ? { gam_ach_return_fee: String(returnFee) } : {}),
         },
       })
 
@@ -742,7 +752,8 @@ export async function processFlexDepositInstallmentDue(now: Date = new Date()): 
         [
           r.landlord_id, r.tenant_id, r.lease_id, r.unit_id,
           amount.toFixed(2), today, intent.id,
-          `FlexDeposit installment ${r.pull_kind} pull (deposit ${r.security_deposit_id})`,
+          `FlexDeposit installment ${r.pull_kind} pull (deposit ${r.security_deposit_id})` +
+            (returnFee > 0 ? ` + ACH-return $${returnFee.toFixed(2)}` : ''),
           boost.toFixed(2),
         ],
       )

@@ -35,6 +35,10 @@ function emailTemplate(title: string, body: string, cta?: { label: string; url: 
 
 export async function createNotification(p: {
   userId: string; landlordId?: string; type: string; title: string; body: string; data?: any
+  // S527 W-1: in-app deep-link — clicking the notification lands on the
+  // SPECIFIC item (e.g. '/leases?open=<id>'), not a generic page. Optional;
+  // the bell falls back to a per-type route when absent.
+  actionUrl?: string
   sendEmail?: boolean; emailTo?: string; emailSubject?: string; emailHtml?: string
   sendSMS?: boolean; smsTo?: string; smsBody?: string
 }) {
@@ -52,8 +56,8 @@ export async function createNotification(p: {
     let notificationId: string | null = null
     if (inAppOk) {
       const ins = await queryOne<{ id: string }>(
-        'INSERT INTO notifications (user_id,landlord_id,type,title,body,data) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id',
-        [p.userId, p.landlordId||null, p.type, p.title, p.body, JSON.stringify(p.data||{})]
+        'INSERT INTO notifications (user_id,landlord_id,type,title,body,data,action_url) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id',
+        [p.userId, p.landlordId||null, p.type, p.title, p.body, JSON.stringify(p.data||{}), p.actionUrl||null]
       )
       notificationId = ins?.id ?? null
     }
@@ -365,12 +369,26 @@ export async function notifyMaintenanceUpdated(o: { tenantUserId:string; tenantE
 // expiration_notice_days, not a fixed 60/30-day cron.
 export async function notifyLeaseExpiring(o: { landlordUserId:string; landlordId:string; landlordEmail:string; landlordPhone?:string; tenantName:string; unitNumber:string; propertyName:string; endDate:string; daysRemaining:number; leaseId:string }) {
   const urgent = o.daysRemaining <= 30
-  await createNotification({ userId:o.landlordUserId, landlordId:o.landlordId, type:'lease_expiring', title:`${urgent?'⚠️ ':''}Lease Expiring in ${o.daysRemaining} Days — Unit ${o.unitNumber}`, body:`${o.tenantName}'s lease expires ${new Date(o.endDate).toLocaleDateString()}. ${urgent?'Take action soon — check your local notice requirements.':'Take action to renew or send non-renewal.'}`, data:{ ...o, urgent }, sendEmail:true, emailTo:o.landlordEmail, emailSubject:`${urgent?'⚠️ URGENT: ':''}Lease Expiring ${o.daysRemaining} Days — Unit ${o.unitNumber}`, emailHtml:emailTemplate(`Lease Expiring in ${o.daysRemaining} Days`, `<b>${o.tenantName}'s</b> lease for Unit ${o.unitNumber} expires <b>${new Date(o.endDate).toLocaleDateString()}</b>.${urgent?'<br><br><b style="color:red">Act soon — check your local notice requirements for non-renewal.</b>':''}`), sendSMS:urgent, smsTo:o.landlordPhone, smsBody:`GAM: Lease expires ${o.daysRemaining} days — ${o.tenantName} Unit ${o.unitNumber}. Login to manage.` })
+  await createNotification({ userId:o.landlordUserId, landlordId:o.landlordId, type:'lease_expiring', title:`${urgent?'⚠️ ':''}Lease Expiring in ${o.daysRemaining} Days — Unit ${o.unitNumber}`, body:`${o.tenantName}'s lease expires ${new Date(o.endDate).toLocaleDateString()}. ${urgent?'Take action soon — check your local notice requirements.':'Take action to renew or send non-renewal.'}`, data:{ ...o, urgent }, actionUrl:`/leases?open=${o.leaseId}`, sendEmail:true, emailTo:o.landlordEmail, emailSubject:`${urgent?'⚠️ URGENT: ':''}Lease Expiring ${o.daysRemaining} Days — Unit ${o.unitNumber}`, emailHtml:emailTemplate(`Lease Expiring in ${o.daysRemaining} Days`, `<b>${o.tenantName}'s</b> lease for Unit ${o.unitNumber} expires <b>${new Date(o.endDate).toLocaleDateString()}</b>.${urgent?'<br><br><b style="color:red">Act soon — check your local notice requirements for non-renewal.</b>':''}`), sendSMS:urgent, smsTo:o.landlordPhone, smsBody:`GAM: Lease expires ${o.daysRemaining} days — ${o.tenantName} Unit ${o.unitNumber}. Login to manage.` })
 }
 
 export async function notifyLowStock(o: { landlordUserId:string; landlordId:string; landlordEmail:string; items:Array<{name:string;stock_qty:number;stock_min:number;vendor_name?:string}> }) {
   const itemList = o.items.map(i=>`${i.name} (${i.stock_qty} left)`).join(', ')
   await createNotification({ userId:o.landlordUserId, landlordId:o.landlordId, type:'pos_low_stock', title:`Low Stock — ${o.items.length} item${o.items.length>1?'s':''}`, body:`Below minimum: ${itemList}`, data:o, sendEmail:true, emailTo:o.landlordEmail, emailSubject:`📦 POS Low Stock Alert`, emailHtml:emailTemplate('Low Stock Alert', `Items below minimum:<br><br>${o.items.map(i=>`• <b>${i.name}</b> — ${i.stock_qty} left (min ${i.stock_min})${i.vendor_name?` · Vendor: ${i.vendor_name}`:''}`).join('<br>')}`) })
+}
+
+// W-46: business-use supplies (parts_inventory), distinct from POS resale
+// stock above — different table, different tab, non-POS copy.
+export async function notifyPartsLowStock(o: { landlordUserId:string; landlordId:string; landlordEmail:string; items:Array<{name:string;quantity:number;min_quantity:number;unit:string}> }) {
+  const itemList = o.items.map(i=>`${i.name} (${i.quantity} left)`).join(', ')
+  await createNotification({ userId:o.landlordUserId, landlordId:o.landlordId, type:'low_stock', title:`Inventory Low — ${o.items.length} item${o.items.length>1?'s':''}`, body:`Below minimum: ${itemList}`, data:o, actionUrl:'/inventory', sendEmail:true, emailTo:o.landlordEmail, emailSubject:`📦 Inventory Low Stock Alert`, emailHtml:emailTemplate('Inventory Low Stock', `Supplies below their minimum quantity:<br><br>${o.items.map(i=>`• <b>${i.name}</b> — ${i.quantity} ${i.unit} left (min ${i.min_quantity})`).join('<br>')}`) })
+}
+
+// W-46: serviceable-asset upkeep (scheduled_maintenance next_due arrived) —
+// work truck oil changes, tool servicing, etc.
+export async function notifyServiceDue(o: { landlordUserId:string; landlordId:string; landlordEmail:string; items:Array<{title:string;next_due:string;property_name?:string}> }) {
+  const itemList = o.items.map(i=>i.title).join(', ')
+  await createNotification({ userId:o.landlordUserId, landlordId:o.landlordId, type:'service_due', title:`Service Due — ${o.items.length} item${o.items.length>1?'s':''}`, body:`Due for service: ${itemList}`, data:o, actionUrl:'/inventory', sendEmail:true, emailTo:o.landlordEmail, emailSubject:`🔧 Equipment Service Due`, emailHtml:emailTemplate('Equipment Service Due', `Scheduled service has come due:<br><br>${o.items.map(i=>`• <b>${i.title}</b> — due ${new Date(i.next_due).toLocaleDateString()}${i.property_name?` · ${i.property_name}`:''}`).join('<br>')}`) })
 }
 
 // ── Inspection workflow ──────────────────────────────────────
@@ -1021,15 +1039,21 @@ export async function notifyAmenityUnavailable(o: {
     [o.propertyId, o.excludeTenantId ?? null]
   )
   const when = fmtWindow(o.startsAt, o.endsAt)
-  // closure → "closed for…"; otherwise the area is occupied/reserved
+  // closure → "closed for…"; event → private-event announcement (W-44);
+  // otherwise the area is occupied/reserved.
   const isClosure = o.kind === 'maintenance_closure'
+  const isEvent = o.kind === 'event'
   const headline = isClosure
     ? `${o.areaName} closed`
-    : `${o.areaName} reserved`
+    : isEvent
+      ? `Private event — ${o.areaName}`
+      : `${o.areaName} reserved`
   const because = o.reason ? ` (${o.reason})` : ''
   const sentence = isClosure
     ? `${o.areaName} at ${o.propertyName} will be closed${because}.`
-    : `${o.areaName} at ${o.propertyName} is reserved and unavailable${because}.`
+    : isEvent
+      ? `${o.areaName} at ${o.propertyName} is booked for a private event${because} and won't be available.`
+      : `${o.areaName} at ${o.propertyName} is reserved and unavailable${because}.`
   for (const r of recipients) {
     await createNotification({
       userId: r.user_id, landlordId: o.landlordId,
@@ -1040,6 +1064,38 @@ export async function notifyAmenityUnavailable(o: {
       sendEmail: true, emailTo: r.email,
       emailSubject: `${headline} — ${when}`,
       emailHtml: emailTemplate(headline, `${sentence}<br><b>${when}</b>`),
+    })
+  }
+  return recipients.length
+}
+
+// W-44 (S531): the flip side of the private-event announcement — the event
+// was cancelled or auto-released (deposit unpaid by start), so the space is
+// open to everyone again.
+export async function notifyAmenityEventReleased(o: {
+  propertyId: string; landlordId: string; propertyName: string;
+  areaName: string; startsAt: string | Date; endsAt: string | Date;
+}): Promise<number> {
+  const recipients = await query<{ user_id: string; email: string }>(
+    `SELECT DISTINCT t.user_id, us.email
+       FROM v_lease_active_tenants vlat
+       JOIN tenants t  ON t.id = vlat.tenant_id
+       JOIN users   us ON us.id = t.user_id
+       JOIN leases  l  ON l.id = vlat.lease_id
+       JOIN units   u  ON u.id = l.unit_id
+      WHERE u.property_id = $1`,
+    [o.propertyId])
+  const when = fmtWindow(o.startsAt, o.endsAt)
+  for (const r of recipients) {
+    await createNotification({
+      userId: r.user_id, landlordId: o.landlordId,
+      type: 'amenity_unavailable',
+      title: `${o.areaName} open again — ${when}`,
+      body: `The private event at ${o.areaName} (${o.propertyName}) was cancelled — the space is open as usual. ${when}.`,
+      data: { ...o },
+      sendEmail: true, emailTo: r.email,
+      emailSubject: `${o.areaName} open again — ${when}`,
+      emailHtml: emailTemplate(`${o.areaName} open again`, `The private event at <b>${o.areaName}</b> was cancelled — the space is open as usual.<br><b>${when}</b>`),
     })
   }
   return recipients.length

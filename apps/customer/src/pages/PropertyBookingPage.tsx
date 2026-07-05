@@ -22,7 +22,9 @@ export function PropertyBookingPage() {
 
   const [site, setSite] = useState<any>(null)
   const [err, setErr] = useState('')
-  const [unitId, setUnitId] = useState('')
+  // W-20 (S531): guests book a SITE TYPE — the system assigns the actual
+  // site and reveals it the morning of check-in.
+  const [siteTypeId, setSiteTypeId] = useState('')
   const [checkIn, setCheckIn] = useState(todayPlus(7))
   const [checkOut, setCheckOut] = useState(todayPlus(10))
   const [avail, setAvail] = useState<any>(null)
@@ -35,14 +37,14 @@ export function PropertyBookingPage() {
     if (!slug) { setErr('No booking site specified.'); return }
     apiGet(`/public/property/${slug}`).then((d: any) => {
       setSite(d)
-      if (d.units?.[0]) setUnitId(d.units[0].id)
+      if (d.siteTypes?.[0]) setSiteTypeId(d.siteTypes[0].id)
     }).catch(e => setErr(e.message || 'Booking site not found'))
   }, [slug])
 
   const checkAvailability = async () => {
     setChecking(true); setAvail(null); setWaitlisted(null)
     try {
-      const d = await apiGet(`/public/property/${slug}/availability?unitId=${unitId}&checkIn=${checkIn}&checkOut=${checkOut}`)
+      const d = await apiGet(`/public/property/${slug}/availability?siteTypeId=${siteTypeId}&checkIn=${checkIn}&checkOut=${checkOut}`)
       setAvail(d)
     } catch (e: any) { setAvail({ available: false, unavailableReason: e.message }) }
     setChecking(false)
@@ -51,7 +53,7 @@ export function PropertyBookingPage() {
   const book = async () => {
     if (!guest.guestName || !guest.guestEmail) { setErr('Name and email are required'); return }
     setBusy(true); setErr('')
-    const r = await rawPost(`/public/property/${slug}/book`, { unitId, checkIn, checkOut, ...guest })
+    const r = await rawPost(`/public/property/${slug}/book`, { siteTypeId, checkIn, checkOut, ...guest })
     setBusy(false)
     if (r.ok && r.data?.checkoutUrl) { window.location.href = r.data.checkoutUrl; return }
     if (r.status === 409 && r.full) { setAvail({ ...avail, available: false, unavailableReason: 'booked' }); return }
@@ -61,7 +63,7 @@ export function PropertyBookingPage() {
   const joinWaitlist = async () => {
     if (!guest.guestName || !guest.guestEmail) { setErr('Name and email are required'); return }
     setBusy(true); setErr('')
-    const r = await rawPost(`/public/property/${slug}/waitlist`, { unitId, checkIn, checkOut, ...guest })
+    const r = await rawPost(`/public/property/${slug}/waitlist`, { siteTypeId, checkIn, checkOut, ...guest })
     setBusy(false)
     if (r.ok) { setWaitlisted(r.data?.position ?? 1); return }
     setErr(r.error || 'Could not join the waitlist')
@@ -81,21 +83,24 @@ export function PropertyBookingPage() {
       {site.property.intro && <p style={{ color: '#b8c4d8' }}>{site.property.intro}</p>}
 
       <div style={card}>
-        <label style={label}>Unit</label>
-        <select style={input} value={unitId} onChange={e => { setUnitId(e.target.value); setAvail(null) }}>
-          {site.units.map((u: any) => (
-            <option key={u.id} value={u.id}>
-              Unit {u.unitNumber}{u.nightlyRate != null ? ` — $${u.nightlyRate}/night` : ''}{u.weeklyRate != null ? ` · $${u.weeklyRate}/week` : ''}
+        <label style={label}>Site type</label>
+        <select style={input} value={siteTypeId} onChange={e => { setSiteTypeId(e.target.value); setAvail(null) }}>
+          {site.siteTypes.map((t: any) => (
+            <option key={t.id} value={t.id}>
+              {t.name}{t.nightlyRate != null ? ` — $${t.nightlyRate}/night` : ''}{t.weeklyRate != null ? ` · $${t.weeklyRate}/week` : ''}
             </option>
           ))}
         </select>
-        {site.units.length === 0 && <div style={{ color: '#8b97b3' }}>No units are available to book right now.</div>}
+        <div style={{ fontSize: 12, color: '#8b97b3', margin: '-4px 0 10px' }}>
+          Your site number is assigned automatically and sent to you the morning of check-in.
+        </div>
+        {site.siteTypes.length === 0 && <div style={{ color: '#8b97b3' }}>No sites are available to book right now.</div>}
 
         <div style={{ display: 'flex', gap: 10 }}>
           <div style={{ flex: 1 }}><label style={label}>Check-in</label><input type="date" style={input} value={checkIn} onChange={e => { setCheckIn(e.target.value); setAvail(null) }} /></div>
           <div style={{ flex: 1 }}><label style={label}>Check-out</label><input type="date" style={input} value={checkOut} onChange={e => { setCheckOut(e.target.value); setAvail(null) }} /></div>
         </div>
-        <button onClick={checkAvailability} disabled={!unitId || checking} style={{ width: '100%', padding: 12, borderRadius: 8, border: 0, background: '#5b8cff', color: '#fff', fontWeight: 700, cursor: 'pointer' }}>
+        <button onClick={checkAvailability} disabled={!siteTypeId || checking} style={{ width: '100%', padding: 12, borderRadius: 8, border: 0, background: '#5b8cff', color: '#fff', fontWeight: 700, cursor: 'pointer' }}>
           {checking ? 'Checking…' : 'Check availability'}
         </button>
       </div>

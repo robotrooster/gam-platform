@@ -159,9 +159,11 @@ export function formatUnitNumber(s: string): string {
     return raw.length < 2 ? raw.padStart(2, '0') : raw
   }
 
-  // Pure letters — title case
+  // Pure letters — title case; acronyms stay upper (S527 fix: "rv12" already
+  // yielded "RV 12" via the letters+digits branch below, but "rv 12" split
+  // into tokens and this branch produced "Rv 12" — inconsistent).
   if (/^[a-zA-Z]+$/.test(raw)) {
-    return cap(raw)
+    return ACRONYMS.has(raw.toLowerCase()) ? raw.toUpperCase() : cap(raw)
   }
 
   // Digits followed by letters (e.g. "1a") — keep tight, uppercase letters

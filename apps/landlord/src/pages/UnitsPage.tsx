@@ -1,14 +1,14 @@
 import { AddUnitModal } from './AddUnitModal'
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
-import { useNavigate, Link } from 'react-router-dom'
+import { useNavigate, Link, useSearchParams } from 'react-router-dom'
 import { apiGet, apiPatch } from '../lib/api'
 import { usePerms } from '../lib/permissions'
 import { Search, AlertTriangle, Shield, DoorOpen } from 'lucide-react'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
 const STATUS_COLORS: Record<string, string> = {
-  active: 'badge-green', direct_pay: 'badge-blue',
+  active: 'badge-green',
   vacant: 'badge-muted', delinquent: 'badge-amber', suspended: 'badge-red'
 }
 
@@ -17,7 +17,12 @@ export function UnitsPage() {
   const navigate = useNavigate()
   const [showAddUnit, setShowAddUnit] = useState(false)
   const [search, setSearch] = useState('')
-  const [filter, setFilter] = useState('all')
+  // S527 W-4: dashboard KPI tiles land pre-filtered via ?status=<unit status>.
+  const [params] = useSearchParams()
+  const [filter, setFilter] = useState(() => {
+    const s = params.get('status')
+    return s && s in STATUS_COLORS ? s : 'all'
+  })
   const { data: units = [], isLoading } = useQuery<any[]>('units', () => apiGet('/units'))
   const { can } = usePerms()
 
@@ -58,7 +63,7 @@ export function UnitsPage() {
           <Search className="search-icon" />
           <input className="search-input" placeholder="Search units, properties, tenants..." value={search} onChange={e => setSearch(e.target.value)} />
         </div>
-        {['all', 'active', 'direct_pay', 'vacant', 'delinquent', 'suspended'].map(s => (
+        {['all', 'active', 'vacant', 'delinquent', 'suspended'].map(s => (
           <button key={s} className={`btn btn-sm ${filter === s ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setFilter(s)}>
             {s === 'all' ? 'All' : s.replace('_', ' ')}
           </button>

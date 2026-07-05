@@ -45,7 +45,7 @@ export function LoginPage() {
             <div style={{color:'var(--text-2)',fontSize:'.875rem'}}>Two-factor authentication</div>
           </div>
           <div className="card" style={{padding:28}}>
-            <h2 style={{marginBottom:16,fontSize:'1.2rem'}}>Enter your code</h2>
+            <h2 style={{marginBottom:16,fontSize:'1.2rem'}}>Enter Your Code</h2>
             <div style={{fontSize:'.85rem',color:'var(--text-2)',marginBottom:16,lineHeight:1.6}}>
               Enter the 6-digit code from your authenticator app, or one of your recovery codes.
             </div>
@@ -93,7 +93,7 @@ export function LoginPage() {
           <div style={{color:'var(--text-2)',fontSize:'.875rem'}}>Landlord Portal — Gold Asset Management</div>
         </div>
         <div className="card" style={{padding:28}}>
-          <h2 style={{marginBottom:24,fontSize:'1.2rem'}}>Sign in</h2>
+          <h2 style={{marginBottom:24,fontSize:'1.2rem'}}>Sign In</h2>
           {err && <div className="alert alert-danger" style={{marginBottom:16}}>{err}</div>}
           <form onSubmit={handleSubmit(onSubmit)}>
             <div className="form-group">

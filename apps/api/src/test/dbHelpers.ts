@@ -280,6 +280,8 @@ export async function cleanupAllSchema(): Promise<void> {
   await db.query(`DELETE FROM depots`)
   await db.query(`DELETE FROM dump_locations`)
   await db.query(`DELETE FROM businesses`)
+  // documents.landlord_id FKs landlords (no cascade) — clear before landlords.
+  await db.query(`DELETE FROM documents`)
   await db.query(`DELETE FROM landlords`)
   await db.query(`DELETE FROM tenants`)
   await db.query(`DELETE FROM users`)

@@ -16,6 +16,7 @@ export function TenantDetailPage() {
   const { id } = useParams()
   const navigate = useNavigate()
   const [showTransfer, setShowTransfer] = useState(false)
+  const [showPaymentDetail, setShowPaymentDetail] = useState(false)
   // S252: per-tenant FlexCharge query removed alongside the legacy
   // panel. New flex_charge_accounts schema is (customer, property)
   // keyed; consult the FlexCharge dashboard (S254) for per-property
@@ -73,7 +74,6 @@ export function TenantDetailPage() {
                 { label: 'Email', val: tenant.email },
                 { label: 'Phone', val: tenant.phone || '--' },
                 { label: 'ACH Verified', val: tenant.achVerified ? 'Verified' : 'Pending', color: tenant.achVerified ? 'var(--green)' : 'var(--amber)' },
-                { label: 'Credit Reporting', val: tenant.creditReportingEnrolled ? 'Active' : '--' },
                 { label: 'Member Since', val: new Date(tenant.accountCreated).toLocaleDateString() },
               ].map(row => (
                 <div key={row.label} className="data-row">
@@ -82,8 +82,13 @@ export function TenantDetailPage() {
                 </div>
               ))}
             </div>
-            <div className="card">
-              <div className="card-title" style={{ marginBottom: 14 }}>Payment Health</div>
+            {/* W-25 (S531): the health card drills into per-payment lateness —
+                aggregate health hides whether "late" meant 2 days or 3 weeks. */}
+            <div className="card" style={{ cursor: 'pointer' }} onClick={() => setShowPaymentDetail(true)} title="See how late each payment actually was">
+              <div className="card-title" style={{ marginBottom: 14, display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
+                <span>Payment Health</span>
+                <span style={{ fontSize: '.68rem', color: 'var(--gold)', fontWeight: 600 }}>View detail →</span>
+              </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginBottom: 16 }}>
                 <div style={{ width: 56, height: 56, borderRadius: '50%', background: onTimeColor + '18', border: '3px solid ' + onTimeColor, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
                   <span style={{ fontFamily: 'var(--font-mono)', fontSize: '.9rem', fontWeight: 800, color: onTimeColor }}>{stats.onTimeRate}%</span>
@@ -177,6 +182,9 @@ export function TenantDetailPage() {
         </div>
       )}
 
+      {showPaymentDetail && (
+        <PaymentTimelinessModal payments={payments || []} tenantName={`${tenant.firstName} ${tenant.lastName}`} onClose={() => setShowPaymentDetail(false)} />
+      )}
       {showTransfer && currentUnit && (
         <TransferTenantModal
           tenantId={id!}
@@ -185,6 +193,82 @@ export function TenantDetailPage() {
           onClose={() => setShowTransfer(false)}
         />
       )}
+    </div>
+  )
+}
+
+// W-25 (S531): per-payment timeliness drill-in. Days late = settled_at vs
+// due_date (day-sliced per the date-serialization rule); unpaid past-due rows
+// show days overdue against today.
+function PaymentTimelinessModal({ payments, tenantName, onClose }: { payments: any[]; tenantName: string; onClose: () => void }) {
+  const day = (d: any) => (d ? String(d).slice(0, 10) : null)
+  const daysBetween = (a: string, b: string) =>
+    Math.round((new Date(b + 'T12:00:00').getTime() - new Date(a + 'T12:00:00').getTime()) / 86400000)
+  const today = (() => { const n = new Date(); return `${n.getFullYear()}-${String(n.getMonth()+1).padStart(2,'0')}-${String(n.getDate()).padStart(2,'0')}` })()
+
+  const rows = payments.map((p: any) => {
+    const due = day(p.dueDate)
+    const settled = day(p.settledAt)
+    let late = 0; let label = ''; let cls = 'badge-muted'
+    if (p.status === 'settled' && due && settled) {
+      late = Math.max(0, daysBetween(due, settled))
+      if (late === 0) { label = 'On time'; cls = 'badge-green' }
+      else { label = `${late} day${late === 1 ? '' : 's'} late`; cls = late <= 7 ? 'badge-amber' : 'badge-red' }
+    } else if (p.status === 'failed') {
+      label = 'Failed'; cls = 'badge-red'
+    } else if (due && due < today) {
+      late = daysBetween(due, today)
+      label = `${late} day${late === 1 ? '' : 's'} overdue`; cls = 'badge-red'
+    } else {
+      label = p.status; cls = 'badge-amber'
+    }
+    return { ...p, due, settled, late, label, cls }
+  })
+  const settledRows = rows.filter(r => r.status === 'settled' && r.due && r.settled)
+  const onTime = settledRows.filter(r => r.late === 0).length
+  const worst = settledRows.reduce((m, r) => Math.max(m, r.late), 0)
+  const avgLate = (() => {
+    const lateOnes = settledRows.filter(r => r.late > 0)
+    if (!lateOnes.length) return 0
+    return Math.round(lateOnes.reduce((s2, r) => s2 + r.late, 0) / lateOnes.length)
+  })()
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" style={{ maxWidth: 640 }} onClick={e => e.stopPropagation()}>
+        <div className="modal-title">Payment Timeliness — {tenantName}</div>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 10, marginBottom: 14 }}>
+          {[
+            { label: 'Paid on time', val: `${onTime} of ${settledRows.length}`, color: 'var(--green)' },
+            { label: 'Avg days late (when late)', val: avgLate ? `${avgLate}d` : '—', color: avgLate > 7 ? 'var(--red)' : 'var(--amber)' },
+            { label: 'Worst', val: worst ? `${worst}d late` : '—', color: worst > 7 ? 'var(--red)' : worst ? 'var(--amber)' : 'var(--text-3)' },
+          ].map(k => (
+            <div key={k.label} style={{ background: 'var(--bg-3)', borderRadius: 10, padding: '10px 12px' }}>
+              <div style={{ fontSize: '.62rem', fontWeight: 700, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 4 }}>{k.label}</div>
+              <div style={{ fontFamily: 'var(--font-mono)', fontSize: '.95rem', fontWeight: 700, color: k.color }}>{k.val}</div>
+            </div>
+          ))}
+        </div>
+        <div style={{ maxHeight: 380, overflowY: 'auto' }}>
+          <table className="data-table">
+            <thead><tr><th>Due</th><th>Paid</th><th>Amount</th><th>Type</th><th>Timeliness</th></tr></thead>
+            <tbody>
+              {rows.map((r: any) => (
+                <tr key={r.id}>
+                  <td className="mono" style={{ fontSize: '.72rem' }}>{r.due ? new Date(r.due + 'T12:00:00').toLocaleDateString() : '—'}</td>
+                  <td className="mono" style={{ fontSize: '.72rem' }}>{r.settled ? new Date(r.settled + 'T12:00:00').toLocaleDateString() : '—'}</td>
+                  <td className="mono">{r.amount != null ? `$${Number(r.amount).toLocaleString('en-US', { minimumFractionDigits: 2 })}` : '—'}</td>
+                  <td style={{ fontSize: '.72rem', textTransform: 'uppercase', color: 'var(--text-3)' }}>{r.type}</td>
+                  <td><span className={`badge ${r.cls}`}>{r.label}</span></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <div className="modal-footer">
+          <button className="btn btn-ghost" onClick={onClose}>Close</button>
+        </div>
+      </div>
     </div>
   )
 }

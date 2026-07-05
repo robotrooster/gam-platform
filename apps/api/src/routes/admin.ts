@@ -72,7 +72,9 @@ adminRouter.get('/infra-readiness', async (_req, res, next) => {
 
     const [biz] = await query<any>(`
       SELECT
-        (SELECT COUNT(*)::int FROM units WHERE status IN ('active','direct_pay')) AS occupied_units,
+        -- Occupied = active + delinquent + suspended (rent-obligation
+        -- principle; direct_pay retired W-15/S531).
+        (SELECT COUNT(*)::int FROM units WHERE status IN ('active','delinquent','suspended')) AS occupied_units,
         (SELECT COALESCE(SUM(amount),0)::numeric
            FROM payments
           WHERE status='settled' AND settled_at >= date_trunc('month', NOW())) AS monthly_volume`)

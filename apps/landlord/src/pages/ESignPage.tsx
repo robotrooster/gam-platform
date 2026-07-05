@@ -401,22 +401,27 @@ function SendDocumentModal({ onClose }) {
   const qc = useQueryClient()
   const { user: authUser } = useAuth()
   const [templateId, setTemplateId] = useState('')
+  // W-33 (S529): recipients resolve from the LEASE, not typed emails.
+  // 'unit' — pick a unit, everyone on its active lease signs.
+  // 'property' — one click sends one document per active lease at the property.
+  // 'manual' — the escape hatch for non-tenant signers (old flow).
+  const [mode, setMode] = useState<'unit'|'property'|'manual'>('unit')
+  const [selectedUnitId, setSelectedUnitId] = useState('')
+  const [selectedPropertyId, setSelectedPropertyId] = useState('')
   const [tenantEmails, setTenantEmails] = useState([''])
   const [tenantNames, setTenantNames] = useState([{ firstName: '', lastName: '' }])
   const [searches, setSearches] = useState([''])
   const [sending, setSending] = useState(false)
+  const [progress, setProgress] = useState('')
   const [error, setError] = useState('')
   const [prefillValues, setPrefillValues] = useState<Record<string,string>>({})
   // S235: witness signer fields. Only surfaced when the picked template
   // has fields assigned to signerRole='witness'; otherwise hidden so the
-  // common no-witness leases stay one-click. Witnesses provision via the
-  // new /esign/witnesses/provision endpoint (no tenant record / no unit
-  // assignment, unlike the tenant invite path).
+  // common no-witness leases stay one-click.
   const [witnessFirst, setWitnessFirst] = useState('')
   const [witnessLast,  setWitnessLast]  = useState('')
   const [witnessEmail, setWitnessEmail] = useState('')
   const { data: templates = [] } = useQuery('esign-templates', () => apiGet('/esign/templates'))
-  // Full template (with fields) — only fetched once a template is picked.
   const { data: fullTemplate } = useQuery<any>(
     ['esign-template', templateId],
     () => apiGet(`/esign/templates/${templateId}`),
@@ -424,8 +429,6 @@ function SendDocumentModal({ onClose }) {
   )
   const templateNeedsWitness: boolean = !!((fullTemplate?.fields || []) as any[])
     .some((f: any) => f.signerRole === 'witness')
-  // Fields bound to a lease_column are the ones the landlord fills at send time.
-  // De-dupe by leaseColumn so the same column on multiple signer roles appears once.
   const uniqueBoundFields: any[] = Array.from(
     new Map(
       ((fullTemplate?.fields || []) as any[])
@@ -436,30 +439,94 @@ function SendDocumentModal({ onClose }) {
   const onTemplateChange = (id: string) => { setTemplateId(id); setPrefillValues({}) }
   const { data: units = [] } = useQuery('units', () => apiGet('/units'))
   const existingTenants = units.filter(u => u.tenantEmail).map(u => ({ email: u.tenantEmail, name: u.tenantFirst + ' ' + u.tenantLast, unit: u.unitNumber, unitId: u.id, propertyName: u.propertyName }))
+  const properties = Array.from(new Map((units as any[]).map(u => [u.propertyId, { id: u.propertyId, name: u.propertyName }])).values())
   const selectedTemplate = templates.find(t => t.id === templateId)
+
+  // Resolved lease signers for the picked unit / property.
+  const recipientsQ = mode === 'unit' && selectedUnitId
+    ? `/esign/recipients?unitId=${selectedUnitId}`
+    : mode === 'property' && selectedPropertyId
+      ? `/esign/recipients?propertyId=${selectedPropertyId}`
+      : null
+  const { data: recipientGroups = [], isLoading: recipientsLoading } = useQuery<any[]>(
+    ['esign-recipients', recipientsQ],
+    () => apiGet<any[]>(recipientsQ!),
+    { enabled: !!recipientsQ }
+  )
+
   const setEmail = (i, val) => { setTenantEmails(prev => prev.map((e,j) => j===i?val:e)); setSearches(prev => prev.map((e,j) => j===i?val:e)) }
   const selectTenant = (i, tenant) => { setTenantEmails(prev => prev.map((e,j) => j===i?tenant.email:e)); setSearches(prev => prev.map((e,j) => j===i?tenant.email:e)) }
+
+  const validateWitness = (): boolean => {
+    if (!templateNeedsWitness) return true
+    if (!witnessEmail.trim()) { setError('This template requires a witness — enter their email'); return false }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(witnessEmail.trim())) { setError('Witness email is invalid'); return false }
+    if (!witnessFirst.trim()) { setError('Witness first name required'); return false }
+    return true
+  }
+
+  // Provision (once) + return the witness signer for a document, or null.
+  const witnessSigner = async (orderIndex: number) => {
+    if (!templateNeedsWitness || !witnessEmail.trim()) return null
+    const wEmail = witnessEmail.trim()
+    const wFirst = witnessFirst.trim() || wEmail.split('@')[0]
+    const wLast  = witnessLast.trim()
+    const provRes: any = await apiPost('/esign/witnesses/provision', { email: wEmail, firstName: wFirst, lastName: wLast })
+    return { role: 'witness', name: (wFirst + ' ' + wLast).trim() || wEmail, email: wEmail, phone: null, orderIndex, userId: provRes.data.userId }
+  }
+
+  // Create + send ONE document for a resolved lease group. Landlord signs
+  // first (orderIndex 1, S29 contract), then the lease's tenants, then any
+  // witness. No invite/provision step — lease tenants already have accounts.
+  const sendForGroup = async (group: any) => {
+    const signers: any[] = [{
+      role: 'landlord',
+      name: (authUser.firstName + ' ' + authUser.lastName).trim(),
+      email: authUser.email, phone: null, orderIndex: 1, userId: authUser.id,
+    }]
+    let order = 2
+    for (const t of group.tenants) {
+      signers.push({
+        role: order === 2 ? 'primary' : 'co_tenant_' + (order - 2),
+        name: `${t.firstName || ''} ${t.lastName || ''}`.trim() || t.email,
+        email: t.email, phone: null, orderIndex: order, userId: t.userId, unitId: group.unitId,
+      })
+      order++
+    }
+    const w = await witnessSigner(order)
+    if (w) signers.push(w)
+    const title = (selectedTemplate ? selectedTemplate.name : 'Document') + ' — Unit ' + group.unitNumber
+    const res = await apiPost('/esign/documents', { templateId, unitId: group.unitId, title, signers, prefillValues })
+    await apiPost('/esign/documents/' + res.data.id + '/send', {})
+  }
+
   const handleSend = async () => {
     if (!templateId) { setError('Please select a template'); return }
     if (!authUser) { setError('Not logged in'); return }
-    const validEmails = tenantEmails.filter(e => e.trim())
-    if (!validEmails.length) { setError('Please enter at least one tenant email'); return }
-    if (templateNeedsWitness) {
-      if (!witnessEmail.trim()) { setError('This template requires a witness — enter their email'); return }
-      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(witnessEmail.trim())) {
-        setError('Witness email is invalid')
-        return
-      }
-      if (!witnessFirst.trim()) { setError('Witness first name required'); return }
+    setError('')
+    if (!validateWitness()) return
+
+    if (mode === 'unit' || mode === 'property') {
+      if (!recipientGroups.length) { setError('No active lease found there — nobody to send to.'); return }
+      setSending(true)
+      try {
+        for (let i = 0; i < recipientGroups.length; i++) {
+          setProgress(recipientGroups.length > 1 ? `Sending ${i + 1} of ${recipientGroups.length}…` : 'Sending…')
+          await sendForGroup(recipientGroups[i])
+        }
+        qc.invalidateQueries('esign-documents')
+        onClose()
+      } catch (e: any) { setError(e.message || 'Failed to send') }
+      setSending(false); setProgress('')
+      return
     }
-    // Pick unitId from first tenant (required by backend for original_lease to build lease)
+
+    // Manual escape hatch — provision each typed email like the old flow.
+    const validEmails = tenantEmails.filter(e => e.trim())
+    if (!validEmails.length) { setError('Please enter at least one email'); return }
     const firstTenant = existingTenants.find(t => t.email === validEmails[0].trim())
-    setSending(true); setError('')
+    setSending(true)
     try {
-      // Phase 1: Provision (or reuse) a user account for each tenant and collect their userId.
-      // Backend /tenants/invite creates users+tenants rows if missing, reuses if present, returns userId.
-      // S29 item 1: Backend (S28) requires landlord at orderIndex 1 — primary tenant gets 2,
-      // co-tenants get 3+. Landlord signer is pushed to the FRONT of the array below.
       const signers = []
       let order = 2
       for (let i = 0; i < validEmails.length; i++) {
@@ -468,58 +535,25 @@ function SendDocumentModal({ onClose }) {
         const nameParts = existing
           ? { firstName: existing.name.split(' ')[0] || 'Tenant', lastName: existing.name.split(' ').slice(1).join(' ') || '' }
           : { firstName: (tenantNames[i]?.firstName || email.split('@')[0]), lastName: (tenantNames[i]?.lastName || '') }
-        // Provision. Needs unitId per invite endpoint contract.
         const inviteRes: any = await apiPost('/tenants/invite', {
-          email,
-          firstName: nameParts.firstName,
-          lastName: nameParts.lastName,
-          phone: null,
-          unitId: firstTenant?.unitId || null,
+          email, firstName: nameParts.firstName, lastName: nameParts.lastName,
+          phone: null, unitId: firstTenant?.unitId || null,
         })
-        const userId = inviteRes.data.userId
         signers.push({
           role: order === 2 ? 'primary' : 'co_tenant_' + (order - 2),
           name: (nameParts.firstName + ' ' + nameParts.lastName).trim() || email,
-          email,
-          phone: null,
-          orderIndex: order,
-          userId,
+          email, phone: null, orderIndex: order, userId: inviteRes.data.userId,
           unitId: existing ? existing.unitId : (firstTenant?.unitId || null),
         })
         order++
       }
-      // S29 item 1: Landlord signs FIRST (orderIndex 1), then tenants in their slots.
       signers.unshift({
         role: 'landlord',
         name: (authUser.firstName + ' ' + authUser.lastName).trim(),
-        email: authUser.email,
-        phone: null,
-        orderIndex: 1,
-        userId: authUser.id,
+        email: authUser.email, phone: null, orderIndex: 1, userId: authUser.id,
       })
-
-      // S235: append witness signer last (after all tenants). Only fires
-      // when the template has witness-role fields and the form has a
-      // valid email. Empty/skipped witness for a template that needs one
-      // is caught above as a validation error before we get here.
-      if (templateNeedsWitness && witnessEmail.trim()) {
-        const wEmail = witnessEmail.trim()
-        const wFirst = witnessFirst.trim() || wEmail.split('@')[0]
-        const wLast  = witnessLast.trim()
-        const provRes: any = await apiPost('/esign/witnesses/provision', {
-          email: wEmail, firstName: wFirst, lastName: wLast,
-        })
-        signers.push({
-          role: 'witness',
-          name: (wFirst + ' ' + wLast).trim() || wEmail,
-          email: wEmail,
-          phone: null,
-          orderIndex: order,
-          userId: provRes.data.userId,
-        })
-        order++
-      }
-
+      const w = await witnessSigner(order)
+      if (w) signers.push(w)
       const unitId = firstTenant ? firstTenant.unitId : null
       const title = selectedTemplate ? selectedTemplate.name + (firstTenant ? ' — Unit ' + firstTenant.unit : '') : 'Lease Agreement'
       const res = await apiPost('/esign/documents', { templateId, unitId, title, signers, prefillValues })
@@ -529,9 +563,17 @@ function SendDocumentModal({ onClose }) {
     } catch(e: any) { setError(e.message || 'Failed to send') }
     setSending(false)
   }
+
+  const totalSigners = recipientGroups.reduce((n: number, g: any) => n + g.tenants.length, 0)
+  const canSend = !!templateId && (
+    mode === 'unit' ? !!selectedUnitId && recipientGroups.length > 0 :
+    mode === 'property' ? !!selectedPropertyId && recipientGroups.length > 0 :
+    tenantEmails.some(e => e.trim())
+  )
+
   return (
     <div className='modal-overlay' onClick={onClose}>
-      <div className='modal' style={{ maxWidth:440 }} onClick={e => e.stopPropagation()}>
+      <div className='modal' style={{ maxWidth:480 }} onClick={e => e.stopPropagation()}>
         <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:20 }}>
           <div className='modal-title' style={{ marginBottom:0 }}>Send Document</div>
           <button className='btn btn-ghost btn-sm' onClick={onClose}><X size={14} /></button>
@@ -543,30 +585,84 @@ function SendDocumentModal({ onClose }) {
             {templates.map(t => <option key={t.id} value={t.id}>{t.name} ({t.fieldCount} fields)</option>)}
           </select>
         </div>
-        <div style={{ marginBottom:16 }}>
-          <label style={{ fontSize:'.72rem', fontWeight:600, color:'var(--text-3)', textTransform:'uppercase', letterSpacing:'.06em', display:'block', marginBottom:6 }}>Tenant Email(s) *</label>
-          {tenantEmails.map((email, i) => {
-            const filtered = searches[i] ? existingTenants.filter(t => t.email.includes(searches[i]) || t.name.toLowerCase().includes(searches[i].toLowerCase())) : []
-            const matched = existingTenants.find(t => t.email === email)
-            return (
-              <div key={i} style={{ marginBottom:8, position:'relative' }}>
-                <div style={{ display:'flex', gap:6 }}>
-                  <input className='input' placeholder='tenant@email.com' value={searches[i]} onChange={e => setEmail(i, e.target.value)} style={{ flex:1, borderColor: matched ? 'var(--green)' : undefined }} />
-                  {tenantEmails.length > 1 && <button className='btn btn-ghost btn-sm' style={{ color:'var(--red)' }} onClick={() => { setTenantEmails(prev => prev.filter((_,j)=>j!==i)); setSearches(prev => prev.filter((_,j)=>j!==i)) }}><X size={12} /></button>}
-                </div>
-                {matched && <div style={{ fontSize:'.68rem', color:'var(--green)', marginTop:3 }}>✓ {matched.name} · Unit {matched.unit} · {matched.propertyName}</div>}
-                {!matched && filtered.length > 0 && searches[i] && (
-                  <div style={{ position:'absolute', top:'100%', left:0, right:0, background:'var(--bg-1)', border:'1px solid var(--border-0)', borderRadius:8, zIndex:50, overflow:'hidden', boxShadow:'0 4px 16px rgba(0,0,0,.3)' }}>
-                    {filtered.slice(0,4).map(t => (
-                      <div key={t.email} onClick={() => selectTenant(i, t)} style={{ padding:'8px 12px', cursor:'pointer', fontSize:'.78rem', borderBottom:'1px solid var(--border-0)' }} onMouseEnter={e => e.currentTarget.style.background='var(--bg-2)'} onMouseLeave={e => e.currentTarget.style.background=''}><div style={{ fontWeight:600, color:'var(--text-0)' }}>{t.name}</div><div style={{ color:'var(--text-3)', fontSize:'.68rem' }}>{t.email} · Unit {t.unit}</div></div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            )
-          })}
-          <button className='btn btn-ghost btn-sm' onClick={() => { setTenantEmails(prev => [...prev,'']); setSearches(prev => [...prev,'']) }}><Plus size={12} /> Add another tenant</button>
+
+        {/* W-33: recipient mode — unit (default) / whole property / manual */}
+        <div style={{ marginBottom:12 }}>
+          <label style={{ fontSize:'.72rem', fontWeight:600, color:'var(--text-3)', textTransform:'uppercase', letterSpacing:'.06em', display:'block', marginBottom:6 }}>Send To *</label>
+          <div style={{ display:'flex', gap:6 }}>
+            {([['unit','A Unit'],['property','Whole Property'],['manual','Specific Emails']] as const).map(([m, label]) => (
+              <button key={m} type='button' className={`btn btn-sm ${mode===m?'btn-primary':'btn-ghost'}`} onClick={() => { setMode(m); setError('') }}>
+                {label}
+              </button>
+            ))}
+          </div>
         </div>
+
+        {mode === 'unit' && (
+          <div style={{ marginBottom:16 }}>
+            <select className='input' style={{ width:'100%' }} value={selectedUnitId} onChange={e => setSelectedUnitId(e.target.value)}>
+              <option value=''>Pick a unit…</option>
+              {(units as any[]).map(u => <option key={u.id} value={u.id}>{u.unitNumber} · {u.propertyName}</option>)}
+            </select>
+            {selectedUnitId && !recipientsLoading && (
+              recipientGroups.length ? (
+                <div style={{ fontSize:'.74rem', color:'var(--green)', marginTop:6, lineHeight:1.6 }}>
+                  {recipientGroups[0].tenants.map((t: any) => (
+                    <div key={t.userId}>✓ {`${t.firstName||''} ${t.lastName||''}`.trim()} · {t.email}{t.role==='primary' ? '' : ' (co-tenant)'}</div>
+                  ))}
+                  <div style={{ color:'var(--text-3)' }}>Everyone on this unit's lease signs.</div>
+                </div>
+              ) : (
+                <div style={{ fontSize:'.72rem', color:'var(--amber)', marginTop:6 }}>No active lease on that unit — use Specific Emails if you need to send anyway.</div>
+              )
+            )}
+          </div>
+        )}
+
+        {mode === 'property' && (
+          <div style={{ marginBottom:16 }}>
+            <select className='input' style={{ width:'100%' }} value={selectedPropertyId} onChange={e => setSelectedPropertyId(e.target.value)}>
+              <option value=''>Pick a property…</option>
+              {properties.map((p: any) => <option key={p.id} value={p.id}>{p.name}</option>)}
+            </select>
+            {selectedPropertyId && !recipientsLoading && (
+              recipientGroups.length ? (
+                <div style={{ fontSize:'.74rem', color:'var(--green)', marginTop:6 }}>
+                  ✓ {recipientGroups.length} lease{recipientGroups.length===1?'':'s'} · {totalSigners} tenant signer{totalSigners===1?'':'s'} — each lease gets its own document to sign.
+                </div>
+              ) : (
+                <div style={{ fontSize:'.72rem', color:'var(--amber)', marginTop:6 }}>No active leases at that property.</div>
+              )
+            )}
+          </div>
+        )}
+
+        {mode === 'manual' && (
+          <div style={{ marginBottom:16 }}>
+            {tenantEmails.map((email, i) => {
+              const filtered = searches[i] ? existingTenants.filter(t => t.email.includes(searches[i]) || t.name.toLowerCase().includes(searches[i].toLowerCase())) : []
+              const matched = existingTenants.find(t => t.email === email)
+              return (
+                <div key={i} style={{ marginBottom:8, position:'relative' }}>
+                  <div style={{ display:'flex', gap:6 }}>
+                    <input className='input' placeholder='someone@email.com' value={searches[i]} onChange={e => setEmail(i, e.target.value)} style={{ flex:1, borderColor: matched ? 'var(--green)' : undefined }} />
+                    {tenantEmails.length > 1 && <button className='btn btn-ghost btn-sm' style={{ color:'var(--red)' }} onClick={() => { setTenantEmails(prev => prev.filter((_,j)=>j!==i)); setSearches(prev => prev.filter((_,j)=>j!==i)) }}><X size={12} /></button>}
+                  </div>
+                  {matched && <div style={{ fontSize:'.68rem', color:'var(--green)', marginTop:3 }}>✓ {matched.name} · Unit {matched.unit} · {matched.propertyName}</div>}
+                  {!matched && filtered.length > 0 && searches[i] && (
+                    <div style={{ position:'absolute', top:'100%', left:0, right:0, background:'var(--bg-1)', border:'1px solid var(--border-0)', borderRadius:8, zIndex:50, overflow:'hidden', boxShadow:'0 4px 16px rgba(0,0,0,.3)' }}>
+                      {filtered.slice(0,4).map(t => (
+                        <div key={t.email} onClick={() => selectTenant(i, t)} style={{ padding:'8px 12px', cursor:'pointer', fontSize:'.78rem', borderBottom:'1px solid var(--border-0)' }} onMouseEnter={e => e.currentTarget.style.background='var(--bg-2)'} onMouseLeave={e => e.currentTarget.style.background=''}><div style={{ fontWeight:600, color:'var(--text-0)' }}>{t.name}</div><div style={{ color:'var(--text-3)', fontSize:'.68rem' }}>{t.email} · Unit {t.unit}</div></div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )
+            })}
+            <button className='btn btn-ghost btn-sm' onClick={() => { setTenantEmails(prev => [...prev,'']); setSearches(prev => [...prev,'']) }}><Plus size={12} /> Add Another Signer</button>
+          </div>
+        )}
+
         {templateNeedsWitness && (
           <div style={{ marginBottom:16, padding:'12px 14px', background:'rgba(245,158,11,.08)', border:'1px solid rgba(245,158,11,.25)', borderRadius:10 }}>
             <label style={{ fontSize:'.72rem', fontWeight:600, color:'var(--text-3)', textTransform:'uppercase', letterSpacing:'.06em', display:'block', marginBottom:6 }}>Witness *</label>
@@ -599,21 +695,13 @@ function SendDocumentModal({ onClose }) {
             </div>
           </div>
         )}
-        {templateId && tenantEmails.some(e => e.trim()) && (
-          <div style={{ padding:'10px 14px', background:'var(--bg-2)', border:'1px solid var(--border-0)', borderRadius:10, marginBottom:16, fontSize:'.75rem', color:'var(--text-2)', lineHeight:1.8 }}>
-            <div><strong>Template:</strong> {selectedTemplate && selectedTemplate.name}</div>
-            <div><strong>Signing order:</strong> {[
-              'Landlord',
-              ...tenantEmails.filter(e=>e).map((_,i) => i === 0 ? 'Primary tenant' : 'Co-tenant ' + i),
-              ...(templateNeedsWitness && witnessEmail.trim() ? ['Witness'] : []),
-            ].join(' → ')}</div>
-            <div style={{ marginTop:6, fontSize:'.68rem', color:'var(--text-3)' }}>Each signer receives a signing request + portal invite email.</div>
-          </div>
-        )}
         {error && <div style={{ color:'var(--red)', fontSize:'.75rem', marginBottom:10 }}>{error}</div>}
+        {progress && <div style={{ color:'var(--gold)', fontSize:'.75rem', marginBottom:10 }}>{progress}</div>}
         <div className='modal-footer'>
           <button className='btn btn-ghost' onClick={onClose}>Cancel</button>
-          <button className='btn btn-primary' disabled={sending || !templateId || !tenantEmails.some(e=>e.trim())} onClick={handleSend}>{sending ? <span className='spinner' /> : <><Send size={14} /> Send for Signing</>}</button>
+          <button className='btn btn-primary' disabled={sending || !canSend} onClick={handleSend}>
+            {sending ? <span className='spinner' /> : <><Send size={14} /> {mode === 'property' && recipientGroups.length > 1 ? `Send to ${recipientGroups.length} Leases` : 'Send for Signing'}</>}
+          </button>
         </div>
       </div>
     </div>

@@ -14,7 +14,6 @@ const UNIT_TYPE_LABELS: Record<string,string> = {
   residential:'🏠 Residential', rv_spot:'🚐 RV Spot', storage:'📦 Storage',
   parking:'🅿️ Parking', short_term_cabin:'🏕️ Short-Term Cabin'
 }
-const SCHEDULE_BOOKING_TYPES = ['nightly','weekly','month_to_month','long_term']
 const LEASE_TYPE_LABELS: Record<string,string> = {
   nightly:'Nightly', weekly:'Weekly', month_to_month:'Month-to-Month', long_term:'Long Term'
 }
@@ -41,6 +40,20 @@ function getDaysInRange(from: string, to: string) {
 // (check_in = "2026-06-20T00:00:00.000Z"); slicing keeps the date math (which
 // appends T12:00:00) from producing an Invalid Date.
 const dayOnly = (s: any) => String(s ?? '').slice(0, 10)
+
+// W-22: which unit types rent by the stay (rates/min-stay/bookability apply).
+// Storage + commercial rent by lease only.
+const STAY_CAPABLE_TYPES = ['rv_spot', 'apartment', 'single_family', 'mobile_home', 'residential']
+// W-24: amenity chip presets per unit type; anything custom via "Add your own".
+const AMENITY_PRESETS: Record<string, string[]> = {
+  rv_spot: ['Water hookup', 'Sewer hookup', 'Electric 30A', 'Electric 50A', 'WiFi', 'Cable TV', 'Picnic table', 'Fire pit', 'Shade', 'Concrete pad'],
+  apartment: ['WiFi', 'Washer/Dryer', 'Dishwasher', 'A/C', 'Heating', 'Parking', 'Balcony', 'Furnished', 'Pets allowed'],
+  single_family: ['WiFi', 'Washer/Dryer', 'Dishwasher', 'A/C', 'Heating', 'Garage', 'Yard', 'Furnished', 'Pets allowed'],
+  mobile_home: ['WiFi', 'Washer/Dryer', 'A/C', 'Heating', 'Parking', 'Furnished', 'Pets allowed', 'Deck'],
+  storage: ['Climate controlled', 'Drive-up access', '24/7 access', 'Lighting', 'Power outlet'],
+  commercial: ['Restroom', 'HVAC', 'Signage', 'Parking', 'Loading dock', 'ADA accessible'],
+  default: ['WiFi', 'Parking', 'A/C', 'Heating'],
+}
 
 function addDays(dateStr: string, days: number) {
   const d = new Date(dayOnly(dateStr) + 'T12:00:00')
@@ -240,7 +253,12 @@ export function SchedulePage() {
   const [bookingModal, setBookingModal] = useState<{show:boolean; unit:any; prefillDate?:string}>({show:false, unit:null})
   const [typeModal, setTypeModal] = useState<{show:boolean; unit:any}>({show:false, unit:null})
   const [newBooking, setNewBooking] = useState({ guestName:'', guestEmail:'', guestPhone:'', leaseType:'nightly', checkIn:'', checkOut:'', totalAmount:'', notes:'' })
+  // Per-unit "+ Book" modal guest name (S526: split first/last like the
+  // New Reservation flow; the two modals never open at the same time).
+  const [bookFirst, setBookFirst] = useState('')
+  const [bookLast, setBookLast]   = useState('')
   const [typeForm, setTypeForm] = useState<any>({})
+  const [customAmenity, setCustomAmenity] = useState('')
   const [newResvOpen, setNewResvOpen] = useState(false)
   const [detailBooking, setDetailBooking] = useState<any>(null)
   // Edit mode for an existing reservation (the detail panel). null = view-only.
@@ -345,6 +363,25 @@ export function SchedulePage() {
     { enabled: view === 'history', staleTime: 15000 }
   )
 
+  // W-19 (S529): filter-first unit list for the edit-reservation panel — only
+  // units the server would actually accept: free for the edited dates (the
+  // booking itself excluded) AND matching the stay's RV requirements. Same
+  // shared predicate the 409 guards enforce (/units/available).
+  const editAvailQuery = editForm && detailBooking && !detailBooking.isLease
+    && editForm.checkIn && editForm.checkOut && editForm.checkOut > editForm.checkIn
+    ? `/units/available?${new URLSearchParams({
+        checkIn: editForm.checkIn, checkOut: editForm.checkOut,
+        excludeBookingId: detailBooking.id,
+        requiredSiteLayout: editForm.requiredSiteLayout || 'none',
+        requiredAmpService: editForm.requiredAmpService || 'none',
+      })}`
+    : null
+  const { data: editAvailableUnits } = useQuery(
+    ['units-available', editAvailQuery],
+    () => apiGet<any[]>(editAvailQuery!),
+    { enabled: !!editAvailQuery, keepPreviousData: true, staleTime: 15000 }
+  )
+
   // ── Reservations tab data + mutations (ported from BookingsPage) ──
   const resvQueryString = useMemo(() => {
     const p: string[] = []
@@ -375,7 +412,9 @@ export function SchedulePage() {
   const { data: changeRequests = [] } = useQuery<ChangeRequest[]>(
     ['booking-change-requests'],
     () => apiGet<ChangeRequest[]>('/bookings/change-requests'),
-    { enabled: view === 'reservations' || view === 'requests', staleTime: 30000 },
+    // Endpoint is perm-gated (S526): don't fire it for a user who only holds
+    // bookings.view — they'd 403 while on the Reservations tab.
+    { enabled: (view === 'reservations' || view === 'requests') && can('bookings.change_requests'), staleTime: 30000 },
   )
   const resolveMut = useMutation(
     ({ id, status }: { id: string; status: 'approved' | 'declined' }) =>
@@ -439,9 +478,31 @@ export function SchedulePage() {
   const leases: any[] = schedule?.leases || []
   const days = getDaysInRange(fromDate, toDate)
 
+  // S526 (Nic): the create form is contact + dates ONLY. No total input (the
+  // backend prices authoritatively from unit/property rates — nobody pays on
+  // this screen), no fee, no lease-type dropdown: the billing type is implied
+  // by stay length (≥30 monthly, ≥7 weekly, else nightly), clamped to the
+  // unit's allowed list.
+  const closeBookModal = () => {
+    setBookingModal({show:false,unit:null})
+    setBookFirst(''); setBookLast('')
+    setNewBooking({ guestName:'', guestEmail:'', guestPhone:'', leaseType:'nightly', checkIn:'', checkOut:'', totalAmount:'', notes:'' })
+  }
   const createBookingMut = useMutation(
-    () => apiPost(`/units/${bookingModal.unit?.id}/bookings`, { ...newBooking, totalAmount: Number(newBooking.totalAmount) }),
-    { onSuccess: () => { qc.invalidateQueries('schedule'); setBookingModal({show:false,unit:null}); setNewBooking({ guestName:'', guestEmail:'', guestPhone:'', leaseType:'nightly', checkIn:'', checkOut:'', totalAmount:'', notes:'' }) } }
+    () => {
+      const nights = Math.round((new Date(newBooking.checkOut+'T12:00:00').getTime() - new Date(newBooking.checkIn+'T12:00:00').getTime())/86400000)
+      let leaseType = nights >= 30 ? 'month_to_month' : nights >= 7 ? 'weekly' : 'nightly'
+      const allowed = bookingModal.unit?.leaseTypesAllowed
+      if (allowed?.length && !allowed.includes(leaseType)) leaseType = allowed[0]
+      return apiPost(`/units/${bookingModal.unit?.id}/bookings`, {
+        guestName: `${bookFirst.trim()} ${bookLast.trim()}`.trim(),
+        guestEmail: newBooking.guestEmail.trim(),
+        guestPhone: newBooking.guestPhone.trim(),
+        leaseType, checkIn: newBooking.checkIn, checkOut: newBooking.checkOut,
+        source: 'direct',
+      })
+    },
+    { onSuccess: () => { qc.invalidateQueries('schedule'); qc.invalidateQueries('schedule-history'); closeBookModal() } }
   )
 
   // "New Reservation" flow: dates → contact → pick an available unit (the pick
@@ -581,7 +642,10 @@ export function SchedulePage() {
     setEditError('')
     setEditForm({
       guestName: d.guestName || '', guestEmail: d.guestEmail || '', guestPhone: d.guestPhone || '',
-      checkIn: d.checkIn, checkOut: d.checkOut, unitId: d.unitId, notes: d.notes || '',
+      // dayOnly: d.checkIn/checkOut arrive as full ISO timestamps (S526 rule) —
+      // raw they leave the type="date" inputs blank and fail the
+      // /units/available date validation.
+      checkIn: dayOnly(d.checkIn), checkOut: dayOnly(d.checkOut), unitId: d.unitId, notes: d.notes || '',
       requiredSiteLayout: d.requiredSiteLayout || 'none',
       requiredAmpService: d.requiredAmpService || 'none',
     })
@@ -634,7 +698,7 @@ export function SchedulePage() {
   // (prefix) and shifts every bar one day. dayOnly() normalizes both sides.
   const getBookingForDate = (unitId: string, date: string) => {
     return bookings.find(b => b.unitId === unitId && date >= dayOnly(b.checkIn) && date < dayOnly(b.checkOut)) ||
-           leases.find(l => l.unitId === unitId && date >= dayOnly(l.startDate) && date <= dayOnly(l.endDate))
+           leases.find(l => l.unitId === unitId && date >= dayOnly(l.startDate) && (!l.endDate || date <= dayOnly(l.endDate)))
   }
 
   const filteredUnits = filterType === 'all' ? units : units.filter(u => u.unitType === filterType)
@@ -694,22 +758,24 @@ export function SchedulePage() {
       minStayNights: unit.minStayNights || 1,
       checkInTime: unit.checkInTime?.slice(0,5) || '15:00',
       checkOutTime: unit.checkOutTime?.slice(0,5) || '11:00',
-      amenities: (unit.amenities||[]).join(', '),
+      amenities: unit.amenities || [],   // W-24: text[] end to end (the old comma-string broke the text[] save)
       unitDescription: unit.unitDescription || '',
       isBookable: unit.isBookable || false,
       rvSiteLayout: unit.rvSiteLayout || 'none',
       rvAmpService: unit.rvAmpService || 'none',
     })
+    setCustomAmenity('')
     setTypeModal({show:true, unit})
   }
 
   const openBookingModal = (unit: any, prefillDate?: string) => {
-    setNewBooking(b => ({
-      ...b,
+    setBookFirst(''); setBookLast('')
+    setNewBooking({
+      guestName:'', guestEmail:'', guestPhone:'', totalAmount:'', notes:'',
       leaseType: unit.leaseTypesAllowed?.[0] || 'nightly',
       checkIn: prefillDate || '',
       checkOut: prefillDate ? addDays(prefillDate, 1) : '',
-    }))
+    })
     setBookingModal({show:true, unit, prefillDate})
   }
 
@@ -735,7 +801,7 @@ export function SchedulePage() {
       existing.id !== b.id && existing.unitId === tUnitId &&
       rangeDays.some(d => d >= dayOnly(existing.checkIn) && d < dayOnly(existing.checkOut)))
     const hasLeaseConflict = leases.some(l =>
-      l.unitId === tUnitId && rangeDays.some(d => d >= dayOnly(l.startDate) && d <= dayOnly(l.endDate)))
+      l.unitId === tUnitId && rangeDays.some(d => d >= dayOnly(l.startDate) && (!l.endDate || d <= dayOnly(l.endDate))))
     if (hasBookingConflict || hasLeaseConflict) { alert('That unit is already occupied for those dates.'); return }
     if (!sameUnit) {
       const reasons = rvMismatchReasons(b.requiredSiteLayout, b.requiredAmpService, targetUnit)
@@ -813,12 +879,12 @@ export function SchedulePage() {
 
   // Per-user tab gating: staff see only the sub-tabs they hold; owners see all.
   const SCHEDULE_TABS = ([
-    { key: 'timeline',     perm: 'schedule.tab.timeline' },
-    { key: 'list',         perm: 'schedule.tab.list' },
-    { key: 'units',        perm: 'schedule.tab.units' },
-    { key: 'history',      perm: 'schedule.tab.history' },
-    { key: 'reservations', perm: 'bookings.view' },
-    { key: 'requests',     perm: 'bookings.change_requests' },
+    { key: 'timeline',     perm: 'schedule.tab.timeline', label: 'Timeline' },
+    { key: 'list',         perm: 'schedule.tab.list', label: 'List' },
+    { key: 'units',        perm: 'schedule.tab.units', label: 'Units' },
+    { key: 'history',      perm: 'schedule.tab.history', label: 'History' },
+    { key: 'reservations', perm: 'bookings.view', label: 'Reservations' },
+    { key: 'requests',     perm: 'bookings.change_requests', label: 'Requests' },
     { key: 'booking_page', perm: 'booking_sites.view', label: 'Booking Page' },
   ] as { key: string; perm: string; label?: string }[]).filter(t => can(t.perm))
   // If the active view isn't visible to this user, snap to their first tab.
@@ -834,7 +900,7 @@ export function SchedulePage() {
       <div style={{display:'flex',gap:8,alignItems:'center',marginBottom:12,flexWrap:'wrap'}}>
         {/* View toggle */}
         {SCHEDULE_TABS.map(({ key: v, label }) => (
-          <button key={v} className={`tab-btn ${view===v?'active':''}`} onClick={()=>setView(v as any)} style={{textTransform: label ? 'none' : 'capitalize',fontSize:'.78rem'}}>{label ?? v}</button>
+          <button key={v} className={`tab-btn ${view===v?'active':''}`} onClick={()=>setView(v as any)} style={{fontSize:'.78rem'}}>{label ?? v}</button>
         ))}
 
         {/* Reservation search */}
@@ -937,7 +1003,10 @@ export function SchedulePage() {
             <tbody>
               {filteredUnits.map(unit => (
                 <tr key={unit.id} style={{height:72,maxHeight:72}}>
-                  <td style={{padding:'6px 12px',borderBottom:'1px solid var(--border-1)',position:'sticky',left:0,background:'var(--bg-2)',zIndex:1,height:72,boxSizing:'border-box',overflow:'hidden'}}>
+                  {/* zIndex 3: must beat the day-cell bars (zIndex 1–2). When the grid
+                      is scrolled, past day-cells slide UNDER this sticky column — at
+                      zIndex 1 the bars painted over the unit info (S526 glitch). */}
+                  <td style={{padding:'6px 12px',borderBottom:'1px solid var(--border-1)',position:'sticky',left:0,background:'var(--bg-2)',zIndex:3,height:72,boxSizing:'border-box',overflow:'hidden'}}>
                     <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:8}}>
                       <div>
                         <div style={{fontWeight:600,fontSize:'.82rem'}}>{unit.unitNumber}</div>
@@ -955,11 +1024,14 @@ export function SchedulePage() {
                     const isBooked = !!booking
                     const isLease = !!(booking && booking.startDate)
                     const isStart = booking && (dayOnly(booking.checkIn) === d || dayOnly(booking.startDate) === d)
-                    // Last cell of this reservation within the grid (one day before
-                    // check-out / lease end), so the bar rounds only at its true ends.
+                    // Last cell of this reservation within the grid, so the bar
+                    // rounds only at its true ends. S527 W-21: conventions differ —
+                    // check-out is EXCLUSIVE (last painted night = checkOut-1) but
+                    // lease end_date is INCLUSIVE (bar paints through endDate), so
+                    // leases round ON endDate, not one day early.
                     const isEnd = booking && (
                       (booking.checkOut && addDays(d,1) === dayOnly(booking.checkOut)) ||
-                      (booking.endDate && addDays(d,1) === dayOnly(booking.endDate)) ||
+                      (booking.endDate && d === dayOnly(booking.endDate)) ||
                       d === days[days.length-1]
                     )
                     const isDragTarget = !!(preview && preview.unitId === unit.id && d >= preview.checkIn && d < preview.checkOut)
@@ -1046,7 +1118,8 @@ export function SchedulePage() {
                                   borderRadius:`${isStart?6:0}px ${isEnd?6:0}px ${isEnd?6:0}px ${isStart?6:0}px`,
                                   height:26,
                                   display:'flex', alignItems:'center', justifyContent:'flex-start',
-                                  fontSize:'.62rem', color: (isGhostCell && isDragTarget) ? '#000' : '#fff', overflow:'visible',
+                                  // S527 W-17: names readable at a glance.
+                                  fontSize:'.72rem', fontWeight:700, color: (isGhostCell && isDragTarget) ? '#000' : '#fff', overflow:'visible',
                                   whiteSpace:'nowrap', paddingLeft: isStart?7:0,
                                   opacity: (isGhostCell && !isDragTarget) ? 0.2 : 0.92,
                                   cursor: isLease ? 'default' : 'grab',
@@ -1059,7 +1132,10 @@ export function SchedulePage() {
                                   + (needsAck ? ' — Property-rules acknowledgment pending' : '')
                                 }
                               >
-                                {isStart && (!isGhostCell || isDragTarget) ? `${isLease?'🔒 ':''}${(booking.guestName||booking.firstName||'●').slice(0,8)}` : ''}
+                                {/* S527 W-17: label on the bar's first VISIBLE cell — bars that
+                                    began before the grid (long leases) were nameless because the
+                                    label only painted on the true start cell, off-screen left. */}
+                                {(isStart || d === days[0]) && (!isGhostCell || isDragTarget) ? `${isLease?'🔒 ':''}${(booking.guestName || [booking.firstName, booking.lastName].filter(Boolean).join(' ') || '●').slice(0,16)}` : ''}
                                 {needsAck && isStart && (
                                   <span
                                     style={{
@@ -1119,36 +1195,56 @@ export function SchedulePage() {
       )}
 
       {/* ── LIST VIEW ── */}
-      {!isLoading && view==='list' && (
+      {!isLoading && view==='list' && (() => {
+        // S527 W-23: next incoming at the top; longer-term / already-arrived
+        // below a divider. (Dates dayOnly-sliced per the ISO-timestamp rule —
+        // the old rows built Invalid Dates.)
+        const todayStr = today
+        const live = bookings.filter(b => !['cancelled','no_show'].includes(b.status))
+        const arriving = live
+          .filter(b => dayOnly(b.checkIn) > todayStr && b.status !== 'checked_out')
+          .sort((a, b) => dayOnly(a.checkIn).localeCompare(dayOnly(b.checkIn)))
+        const inHouse = live
+          .filter(b => dayOnly(b.checkIn) <= todayStr && dayOnly(b.checkOut) > todayStr && b.status !== 'checked_out')
+          .sort((a, b) => dayOnly(a.checkOut).localeCompare(dayOnly(b.checkOut)))
+        const past = bookings.filter(b => !arriving.includes(b) && !inHouse.includes(b))
+        const divider = (label: string) => (
+          <div style={{display:'flex',alignItems:'center',gap:10,margin:'6px 0 -2px'}}>
+            <span style={{fontSize:'.7rem',fontWeight:700,color:'var(--text-3)',textTransform:'uppercase',letterSpacing:'.08em'}}>{label}</span>
+            <div style={{flex:1,height:1,background:'var(--border-0)'}} />
+          </div>
+        )
+        const bookingCard = (b: any) => (
+          <div key={b.id} className="card" style={{display:'flex',alignItems:'center',gap:16}}>
+            <div style={{width:4,background:'var(--green)',borderRadius:2,alignSelf:'stretch'}} />
+            <div style={{flex:1}}>
+              <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:4}}>
+                <span style={{fontWeight:600,fontSize:'.88rem'}}>{b.unitNumber}</span>
+                <span style={{fontSize:'.72rem',color:'var(--text-3)'}}>{b.propertyName}</span>
+                <span className="badge badge-green" style={{fontSize:'.65rem'}}>{b.leaseType}</span>
+                <span className={`badge ${STATUS_COLORS[b.status]||'badge-muted'}`} style={{fontSize:'.65rem'}}>{b.status}</span>
+              </div>
+              <div style={{fontSize:'.82rem',color:'var(--text-2)'}}>
+                {b.guestName||'Guest'} · {new Date(dayOnly(b.checkIn)+'T12:00:00').toLocaleDateString()} — {new Date(dayOnly(b.checkOut)+'T12:00:00').toLocaleDateString()} ({b.nights} nights)
+              </div>
+              {b.guestEmail && <div style={{fontSize:'.75rem',color:'var(--text-3)'}}>{b.guestEmail} · {b.guestPhone||''}</div>}
+            </div>
+            <div style={{textAlign:'right',display:'flex',flexDirection:'column',alignItems:'flex-end',gap:6}}>
+              <div style={{fontWeight:700,color:'var(--gold)'}}>{fmt(b.totalAmount)}</div>
+              {can('guest_access') && !['cancelled','checked_out','no_show'].includes(b.status) && (
+                <button className="btn btn-ghost btn-sm" style={{fontSize:'.68rem',padding:'3px 8px',whiteSpace:'nowrap'}}
+                  onClick={()=>openGuestAccess(b)}>Guest link</button>
+              )}
+            </div>
+          </div>
+        )
+        return (
         <div style={{display:'grid',gap:12}}>
           {bookings.length===0 && leases.length===0 && <div className="card" style={{textAlign:'center',padding:48,color:'var(--text-3)'}}>No bookings or leases in this date range.</div>}
-          {bookings.map(b => (
-            <div key={b.id} className="card" style={{display:'flex',alignItems:'center',gap:16}}>
-              <div style={{width:4,background:'var(--green)',borderRadius:2,alignSelf:'stretch'}} />
-              <div style={{flex:1}}>
-                <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:4}}>
-                  <span style={{fontWeight:600,fontSize:'.88rem'}}>{b.unitNumber}</span>
-                  <span style={{fontSize:'.72rem',color:'var(--text-3)'}}>{b.propertyName}</span>
-                  <span className="badge badge-green" style={{fontSize:'.65rem'}}>{b.leaseType}</span>
-                  <span className={`badge ${STATUS_COLORS[b.status]||'badge-muted'}`} style={{fontSize:'.65rem'}}>{b.status}</span>
-                </div>
-                <div style={{fontSize:'.82rem',color:'var(--text-2)'}}>
-                  {b.guestName||'Guest'} · {new Date(b.checkIn+'T12:00:00').toLocaleDateString()} — {new Date(b.checkOut+'T12:00:00').toLocaleDateString()} ({b.nights} nights)
-                </div>
-                {b.guestEmail && <div style={{fontSize:'.75rem',color:'var(--text-3)'}}>{b.guestEmail} · {b.guestPhone||''}</div>}
-              </div>
-              <div style={{textAlign:'right',display:'flex',flexDirection:'column',alignItems:'flex-end',gap:6}}>
-                <div>
-                  <div style={{fontWeight:700,color:'var(--gold)'}}>{fmt(b.totalAmount)}</div>
-                  <div style={{fontSize:'.72rem',color:'var(--text-3)'}}>Fee: {fmt(b.platformFee)}</div>
-                </div>
-                {can('guest_access') && !['cancelled','checked_out','no_show'].includes(b.status) && (
-                  <button className="btn btn-ghost btn-sm" style={{fontSize:'.68rem',padding:'3px 8px',whiteSpace:'nowrap'}}
-                    onClick={()=>openGuestAccess(b)}>Guest link</button>
-                )}
-              </div>
-            </div>
-          ))}
+          {arriving.length > 0 && divider(`Arriving soon (${arriving.length})`)}
+          {arriving.map(bookingCard)}
+          {(inHouse.length > 0 || leases.length > 0) && divider(`Currently here (${inHouse.length + leases.length})`)}
+          {inHouse.map(bookingCard)}
           {leases.map(l => (
             <div key={l.id} className="card" style={{display:'flex',alignItems:'center',gap:16}}>
               <div style={{width:4,background:'var(--blue)',borderRadius:2,alignSelf:'stretch'}} />
@@ -1159,7 +1255,7 @@ export function SchedulePage() {
                   <span className="badge badge-blue" style={{fontSize:'.65rem'}}>lease</span>
                 </div>
                 <div style={{fontSize:'.82rem',color:'var(--text-2)'}}>
-                  {l.firstName} {l.lastName} · {new Date(l.startDate+'T12:00:00').toLocaleDateString()} — {new Date(l.endDate+'T12:00:00').toLocaleDateString()}
+                  {l.firstName} {l.lastName} · {new Date(dayOnly(l.startDate)+'T12:00:00').toLocaleDateString()} — {l.endDate ? new Date(dayOnly(l.endDate)+'T12:00:00').toLocaleDateString() : 'ongoing'}
                 </div>
               </div>
               <div style={{textAlign:'right'}}>
@@ -1167,8 +1263,11 @@ export function SchedulePage() {
               </div>
             </div>
           ))}
+          {past.length > 0 && divider(`Past / cancelled (${past.length})`)}
+          {past.map(bookingCard)}
         </div>
-      )}
+        )
+      })()}
 
       {/* ── UNITS VIEW ── */}
       {!isLoading && view==='units' && (
@@ -1325,7 +1424,7 @@ export function SchedulePage() {
                     <th>Total</th>
                     <th>Source</th>
                     <th>Ack</th>
-                    <th>Stay link</th>
+                    <th>Stay Link</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -1544,10 +1643,17 @@ export function SchedulePage() {
       {detailBooking && (() => {
         const d = detailBooking
         const isLease = !!d.isLease
-        const start = isLease ? d.startDate : d.checkIn
-        const end = isLease ? d.endDate : d.checkOut
+        // S527 W-18: dates arrive as full ISO timestamps — dayOnly-slice BEFORE
+        // any display or math (the old `new Date(iso + 'T12:00:00')` built an
+        // Invalid Date and rendered "NaN nights").
+        const start = dayOnly(isLease ? d.startDate : d.checkIn)
+        const end = (isLease ? d.endDate : d.checkOut) ? dayOnly(isLease ? d.endDate : d.checkOut) : null
         const nights = (start && end) ? Math.max(0, Math.round((new Date(end+'T12:00:00').getTime()-new Date(start+'T12:00:00').getTime())/86400000)) : (d.nights||0)
+        const fmtDay = (s: string | null) => s ? new Date(s+'T12:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : null
         const name = isLease ? `${d.firstName||''} ${d.lastName||''}`.trim() : (d.guestName || 'Guest')
+        // W-18: payment state — paid in full, deposit-only (show balance), or unpaid.
+        const total = d.totalAmount != null ? Number(d.totalAmount) : null
+        const depositPaid = !isLease && !!d.depositPaidAt && d.depositAmount != null ? Number(d.depositAmount) : null
         const closeDetail = () => { setDetailBooking(null); setEditForm(null); setEditError('') }
         const isEditing = !isLease && !!editForm
         // Live re-price preview while editing (unit rate → property default).
@@ -1558,7 +1664,11 @@ export function SchedulePage() {
           { nightly: eu.nightlyRate ?? eu.propertyNightlyRate, weekly: eu.weeklyRate ?? eu.propertyWeeklyRate, monthly: eu.monthlyRate ?? eu.propertyMonthlyRate },
           Number(eu.propertyTaxRate || 0), eNights) : null
         const editValid = isEditing && eNights > 0 && !!editForm!.guestName.trim()
-        const unitOptions = units.filter((u:any)=> u.isBookable || u.id===editForm?.unitId)
+        // W-19: filter-first — options are the server's available+compatible
+        // list; the current unit always stays so the selection can't vanish
+        // (the mismatch warning below covers it if it no longer qualifies).
+        const availIds = editAvailableUnits ? new Set((editAvailableUnits as any[]).filter((u:any)=>u.isBookable).map((u:any)=>u.id)) : null
+        const unitOptions = units.filter((u:any)=> (availIds ? availIds.has(u.id) : u.isBookable) || u.id===editForm?.unitId)
         const editReasons = isEditing ? rvMismatchReasons(editForm!.requiredSiteLayout, editForm!.requiredAmpService, eu) : []
         return (
         <div className="modal-overlay" onClick={closeDetail}>
@@ -1612,12 +1722,24 @@ export function SchedulePage() {
                   </div>
                 </div>
               ) : (<>
+              {/* S527 W-18/W-55: ONE window shape for every bar type — same
+                  fields for leases and stays; clean day-only dates. */}
               <div style={{display:'grid',gridTemplateColumns:'auto 1fr',gap:'8px 14px',fontSize:'.84rem'}}>
                 <div style={{color:'var(--text-3)'}}>Unit</div><div>{d.unitNumber} · {d.propertyName}</div>
-                <div style={{color:'var(--text-3)'}}>{isLease?'Term':'Stay'}</div><div>{start} → {end} <span style={{color:'var(--text-3)'}}>({nights} night{nights===1?'':'s'})</span></div>
-                {!isLease && d.guestEmail && <><div style={{color:'var(--text-3)'}}>Email</div><div>{d.guestEmail}</div></>}
-                {!isLease && d.guestPhone && <><div style={{color:'var(--text-3)'}}>Phone</div><div>{d.guestPhone}</div></>}
-                {!isLease && d.totalAmount!=null && <><div style={{color:'var(--text-3)'}}>Total</div><div style={{color:'var(--gold)',fontWeight:600}}>{fmt(d.totalAmount)}</div></>}
+                <div style={{color:'var(--text-3)'}}>{isLease?'Term':'Stay'}</div><div>{fmtDay(start)} → {end ? fmtDay(end) : 'ongoing'} {end ? <span style={{color:'var(--text-3)'}}>({nights} night{nights===1?'':'s'})</span> : null}</div>
+                {(d.guestEmail || d.email) && <><div style={{color:'var(--text-3)'}}>Email</div><div>{d.guestEmail || d.email}</div></>}
+                {(d.guestPhone || d.phone) && <><div style={{color:'var(--text-3)'}}>Phone</div><div>{d.guestPhone || d.phone}</div></>}
+                {isLease && d.rentAmount != null && <><div style={{color:'var(--text-3)'}}>Rent</div><div style={{color:'var(--gold)',fontWeight:600}}>{fmt(d.rentAmount)}/mo</div></>}
+                {!isLease && total != null && (
+                  <><div style={{color:'var(--text-3)'}}>Payment</div>
+                  <div>
+                    {depositPaid != null ? (
+                      <>Deposit <strong>{fmt(depositPaid)}</strong> paid · <span style={{color:'var(--amber)',fontWeight:600}}>balance due {fmt(Math.max(0, total - depositPaid))}</span></>
+                    ) : (
+                      <>Total <span style={{color:'var(--gold)',fontWeight:600}}>{fmt(total)}</span> <span style={{color:'var(--text-3)'}}>· no payment recorded</span></>
+                    )}
+                  </div></>
+                )}
                 <div style={{color:'var(--text-3)'}}>Status</div><div style={{textTransform:'capitalize'}}>{(d.status||'').replace('_',' ')}</div>
                 {d.notes && <><div style={{color:'var(--text-3)'}}>Notes</div><div>{d.notes}</div></>}
               </div>
@@ -1715,7 +1837,6 @@ export function SchedulePage() {
                 ) : (
                   <div style={{display:'grid',gap:8,maxHeight:260,overflowY:'auto'}}>
                     {availableUnits.map((u:any)=>{
-                      const price = stayPriceForUnit(u)
                       const reasons = rvMismatchReasons(resvLayout, resvAmp, u)
                       const mismatch = reasons.length > 0
                       const pickUnit = () => {
@@ -1738,15 +1859,9 @@ export function SchedulePage() {
                             <div style={{fontSize:'.72rem',color:TYPE_COLORS[u.unitType]||'var(--text-3)'}}>{UNIT_TYPE_LABELS[u.unitType]||u.unitType} · {u.propertyName}{rvTags ? ` · ${rvTags}` : ''}</div>
                             {mismatch && <div style={{fontSize:'.68rem',color:'var(--amber)',marginTop:2}}>⚠ {reasons.join('; ')}</div>}
                           </div>
-                          <div style={{display:'flex',alignItems:'center',gap:14}}>
-                            <div style={{textAlign:'right'}}>
-                              <div style={{fontSize:'.95rem',fontWeight:700,color:'var(--gold)'}}>{price.total>0?fmt(price.total):'—'}</div>
-                              <div style={{fontSize:'.66rem',color:'var(--text-3)'}}>
-                                {price.total>0 ? (price.tax>0 ? `${fmt(price.base)} + ${fmt(price.tax)} tax` : `${resvNights} night${resvNights===1?'':'s'} · no tax`) : 'no rate set'}
-                              </div>
-                            </div>
-                            <span className="btn btn-primary btn-sm" style={{pointerEvents:'none'}}>Reserve →</span>
-                          </div>
+                          {/* S526 (Nic): no pricing here — nobody pays on this
+                              screen; the backend prices from the unit's rates. */}
+                          <span className="btn btn-primary btn-sm" style={{pointerEvents:'none'}}>Reserve →</span>
                         </div>
                       )
                     })}
@@ -1776,6 +1891,9 @@ export function SchedulePage() {
                   {UNIT_TYPES.map(t=><option key={t} value={t}>{UNIT_TYPE_LABELS[t]}</option>)}
                 </select>
               </div>
+              {/* W-22: type-appropriate configuration — every field below is
+                  gated by what the unit IS. Storage/commercial never rent by
+                  the night: no rates, no stay knobs, no bookability. */}
               {typeForm.unitType==='rv_spot' && (
                 <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
                   <div>
@@ -1792,22 +1910,58 @@ export function SchedulePage() {
                   </div>
                 </div>
               )}
-              <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:10}}>
-                <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Nightly Rate</div><input className="form-input" type="number" style={{width:'100%'}} placeholder="0.00" value={typeForm.nightlyRate} onChange={e=>setTypeForm((s:any)=>({...s,nightlyRate:e.target.value}))} /></div>
-                <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Weekly Rate</div><input className="form-input" type="number" style={{width:'100%'}} placeholder="0.00" value={typeForm.weeklyRate} onChange={e=>setTypeForm((s:any)=>({...s,weeklyRate:e.target.value}))} /></div>
-                <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Monthly Rate</div><input className="form-input" type="number" style={{width:'100%'}} placeholder="0.00" value={typeForm.monthlyRate} onChange={e=>setTypeForm((s:any)=>({...s,monthlyRate:e.target.value}))} /></div>
+              {STAY_CAPABLE_TYPES.includes(typeForm.unitType) ? (
+                <>
+                  <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:10}}>
+                    <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Nightly Rate</div><input className="form-input" type="number" style={{width:'100%'}} placeholder="0.00" value={typeForm.nightlyRate} onChange={e=>setTypeForm((s:any)=>({...s,nightlyRate:e.target.value}))} /></div>
+                    <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Weekly Rate</div><input className="form-input" type="number" style={{width:'100%'}} placeholder="0.00" value={typeForm.weeklyRate} onChange={e=>setTypeForm((s:any)=>({...s,weeklyRate:e.target.value}))} /></div>
+                    <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Monthly Rate</div><input className="form-input" type="number" style={{width:'100%'}} placeholder="0.00" value={typeForm.monthlyRate} onChange={e=>setTypeForm((s:any)=>({...s,monthlyRate:e.target.value}))} /></div>
+                  </div>
+                  <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:10}}>
+                    <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Min Stay (nights)</div><input className="form-input" type="number" style={{width:'100%'}} value={typeForm.minStayNights} onChange={e=>setTypeForm((s:any)=>({...s,minStayNights:Number(e.target.value)}))} /></div>
+                    <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Check-in Time</div><input className="form-input" type="time" style={{width:'100%'}} value={typeForm.checkInTime} onChange={e=>setTypeForm((s:any)=>({...s,checkInTime:e.target.value}))} /></div>
+                    <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Check-out Time</div><input className="form-input" type="time" style={{width:'100%'}} value={typeForm.checkOutTime} onChange={e=>setTypeForm((s:any)=>({...s,checkOutTime:e.target.value}))} /></div>
+                  </div>
+                </>
+              ) : (
+                <div style={{fontSize:'.76rem',color:'var(--text-3)',background:'var(--bg-2)',border:'1px solid var(--border-1)',borderRadius:8,padding:'10px 12px'}}>
+                  {UNIT_TYPE_LABELS[typeForm.unitType] || 'This unit type'} rents by lease only — no nightly or weekly configuration applies. Rent and deposit are set on the unit itself.
+                </div>
+              )}
+              {/* W-24: amenities are toggle chips (per unit type), with a
+                  small add-your-own affordance for anything custom. */}
+              <div>
+                <div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:6}}>Amenities</div>
+                <div style={{display:'flex',flexWrap:'wrap',gap:6}}>
+                  {Array.from(new Set([...(AMENITY_PRESETS[typeForm.unitType] || AMENITY_PRESETS.default), ...(typeForm.amenities||[])])).map((a:string)=>{
+                    const on = (typeForm.amenities||[]).includes(a)
+                    return (
+                      <button key={a} type="button"
+                        onClick={()=>setTypeForm((s:any)=>({...s,amenities: on ? s.amenities.filter((x:string)=>x!==a) : [...(s.amenities||[]), a]}))}
+                        style={{fontSize:'.72rem',padding:'4px 10px',borderRadius:14,cursor:'pointer',
+                          border:`1px solid ${on?'var(--gold)':'var(--border-1)'}`,
+                          background:on?'var(--gold-bg)':'var(--bg-2)',
+                          color:on?'var(--gold)':'var(--text-2)'}}>
+                        {on?'✓ ':''}{a}
+                      </button>
+                    )
+                  })}
+                </div>
+                <div style={{display:'flex',gap:6,marginTop:8}}>
+                  <input className="form-input" style={{flex:1,fontSize:'.78rem'}} placeholder="Add your own…" value={customAmenity}
+                    onChange={e=>setCustomAmenity(e.target.value)}
+                    onKeyDown={e=>{ if(e.key==='Enter' && customAmenity.trim()){ setTypeForm((s:any)=>({...s,amenities:[...new Set([...(s.amenities||[]), customAmenity.trim()])]})); setCustomAmenity('') } }} />
+                  <button type="button" className="btn btn-ghost btn-sm" disabled={!customAmenity.trim()}
+                    onClick={()=>{ setTypeForm((s:any)=>({...s,amenities:[...new Set([...(s.amenities||[]), customAmenity.trim()])]})); setCustomAmenity('') }}>Add</button>
+                </div>
               </div>
-              <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:10}}>
-                <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Min Stay (nights)</div><input className="form-input" type="number" style={{width:'100%'}} value={typeForm.minStayNights} onChange={e=>setTypeForm((s:any)=>({...s,minStayNights:Number(e.target.value)}))} /></div>
-                <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Check-in Time</div><input className="form-input" type="time" style={{width:'100%'}} value={typeForm.checkInTime} onChange={e=>setTypeForm((s:any)=>({...s,checkInTime:e.target.value}))} /></div>
-                <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Check-out Time</div><input className="form-input" type="time" style={{width:'100%'}} value={typeForm.checkOutTime} onChange={e=>setTypeForm((s:any)=>({...s,checkOutTime:e.target.value}))} /></div>
-              </div>
-              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Amenities (comma separated)</div><input className="form-input" style={{width:'100%'}} placeholder="Water hookup, Electric 30amp, WiFi" value={typeForm.amenities} onChange={e=>setTypeForm((s:any)=>({...s,amenities:e.target.value}))} /></div>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Description</div><textarea className="form-input" style={{width:'100%',minHeight:70,resize:'vertical'}} placeholder="Pull-through site, full hookups..." value={typeForm.unitDescription} onChange={e=>setTypeForm((s:any)=>({...s,unitDescription:e.target.value}))} /></div>
-              <div style={{display:'flex',alignItems:'center',gap:8}}>
-                <input type="checkbox" id="ib" checked={typeForm.isBookable} onChange={e=>setTypeForm((s:any)=>({...s,isBookable:e.target.checked}))} />
-                <label htmlFor="ib" style={{fontSize:'.82rem'}}>Allow short-term reservations on this unit</label>
-              </div>
+              {STAY_CAPABLE_TYPES.includes(typeForm.unitType) && (
+                <div style={{display:'flex',alignItems:'center',gap:8}}>
+                  <input type="checkbox" id="ib" checked={typeForm.isBookable} onChange={e=>setTypeForm((s:any)=>({...s,isBookable:e.target.checked}))} />
+                  <label htmlFor="ib" style={{fontSize:'.82rem'}}>Allow short-term reservations on this unit</label>
+                </div>
+              )}
               <button className="btn btn-primary" onClick={()=>updateTypeMut.mutate()} disabled={updateTypeMut.isLoading}>
                 {updateTypeMut.isLoading?'Saving...':'Save Configuration'}
               </button>
@@ -1816,39 +1970,45 @@ export function SchedulePage() {
         </div>
       )}
 
-      {/* ── NEW BOOKING MODAL ── */}
-      {bookingModal.show && (
-        <div className="modal-overlay" onClick={()=>setBookingModal({show:false,unit:null})}>
+      {/* ── NEW BOOKING MODAL (per-unit + Book) ──
+          S526 (Nic): contact + dates only. No total (they don't pay here — the
+          backend prices from the unit/property rates), no fee, no lease-type
+          dropdown (implied by stay length). */}
+      {bookingModal.show && (() => {
+        const bkNights = (newBooking.checkIn && newBooking.checkOut && newBooking.checkOut > newBooking.checkIn)
+          ? Math.round((new Date(newBooking.checkOut+'T12:00:00').getTime() - new Date(newBooking.checkIn+'T12:00:00').getTime())/86400000)
+          : 0
+        const bkEmailValid = /.+@.+\..+/.test(newBooking.guestEmail.trim())
+        const bkReady = bkNights > 0 && !!bookFirst.trim() && !!bookLast.trim() && bkEmailValid && !!newBooking.guestPhone.trim()
+        return (
+        <div className="modal-overlay" onClick={closeBookModal}>
           <div className="modal" style={{maxWidth:480}} onClick={e=>e.stopPropagation()}>
             <div className="modal-header">
               <span className="modal-title">New Reservation — {bookingModal.unit?.unitNumber}</span>
-              <button className="btn btn-ghost btn-sm" onClick={()=>setBookingModal({show:false,unit:null})}>✕</button>
+              <button className="btn btn-ghost btn-sm" onClick={closeBookModal}>✕</button>
             </div>
             <div style={{padding:'0 24px 24px',display:'grid',gap:12}}>
               <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
-                <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Guest Name</div><input className="form-input" style={{width:'100%'}} value={newBooking.guestName} onChange={e=>setNewBooking(s=>({...s,guestName:e.target.value}))} /></div>
-                <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Guest Email</div><input className="form-input" type="email" style={{width:'100%'}} value={newBooking.guestEmail} onChange={e=>setNewBooking(s=>({...s,guestEmail:e.target.value}))} /></div>
-                <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Phone</div><input className="form-input" style={{width:'100%'}} value={newBooking.guestPhone} onChange={e=>setNewBooking(s=>({...s,guestPhone:e.target.value}))} /></div>
-                <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Lease Type</div>
-                  <select className="form-select" style={{width:'100%'}} value={newBooking.leaseType} onChange={e=>setNewBooking(s=>({...s,leaseType:e.target.value}))}>
-                    {(bookingModal.unit?.leaseTypesAllowed||SCHEDULE_BOOKING_TYPES).map((lt:string)=><option key={lt} value={lt}>{LEASE_TYPE_LABELS[lt]||lt}</option>)}
-                  </select>
-                </div>
+                <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>First name</div><input className="form-input" style={{width:'100%'}} value={bookFirst} onChange={e=>setBookFirst(e.target.value)} /></div>
+                <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Last name</div><input className="form-input" style={{width:'100%'}} value={bookLast} onChange={e=>setBookLast(e.target.value)} /></div>
+                <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Email</div><input className="form-input" type="email" style={{width:'100%'}} value={newBooking.guestEmail} onChange={e=>setNewBooking(s=>({...s,guestEmail:e.target.value}))} /></div>
+                <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Phone</div><input className="form-input" type="tel" style={{width:'100%'}} value={newBooking.guestPhone} onChange={e=>setNewBooking(s=>({...s,guestPhone:e.target.value}))} /></div>
                 <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Check-in</div><input className="form-input" type="date" style={{width:'100%'}} value={newBooking.checkIn} onChange={e=>setNewBooking(s=>({...s,checkIn:e.target.value}))} /></div>
                 <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Check-out</div><input className="form-input" type="date" style={{width:'100%'}} value={newBooking.checkOut} onChange={e=>setNewBooking(s=>({...s,checkOut:e.target.value}))} /></div>
-                <div style={{gridColumn:'1/-1'}}><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Total Amount</div><input className="form-input" type="number" style={{width:'100%'}} placeholder="0.00" value={newBooking.totalAmount} onChange={e=>setNewBooking(s=>({...s,totalAmount:e.target.value}))} /></div>
-                <div style={{gridColumn:'1/-1'}}><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Notes</div><input className="form-input" style={{width:'100%'}} value={newBooking.notes} onChange={e=>setNewBooking(s=>({...s,notes:e.target.value}))} /></div>
               </div>
-              <div style={{fontSize:'.75rem',color:'var(--text-3)',background:'var(--bg-3)',borderRadius:6,padding:'8px 10px'}}>
-                Platform fee: 5% of total · Net to you: {fmt(Number(newBooking.totalAmount||0)*0.95)}
-              </div>
-              <button className="btn btn-primary" onClick={()=>createBookingMut.mutate()} disabled={!newBooking.checkIn||!newBooking.checkOut||createBookingMut.isLoading}>
+              {bkNights > 0 && (
+                <div style={{fontSize:'.72rem',color:'var(--text-3)'}}>
+                  {bkNights} night{bkNights===1?'':'s'} · billed {bkNights>=30?'monthly':bkNights>=7?'weekly':'nightly'}
+                </div>
+              )}
+              <button className="btn btn-primary" onClick={()=>createBookingMut.mutate()} disabled={!bkReady||createBookingMut.isLoading}>
                 {createBookingMut.isLoading?'Creating...':'Create Reservation'}
               </button>
             </div>
           </div>
         </div>
-      )}
+        )
+      })()}
 
       {/* Guest access — link the guest opens to reach their stay assistant */}
       {guestAccess.show && (

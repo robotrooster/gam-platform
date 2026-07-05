@@ -514,7 +514,7 @@ function RescheduleModal({
   return (
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }} onClick={onClose}>
       <div className="card" style={{ width: 420, maxWidth: '92vw' }} onClick={e => e.stopPropagation()}>
-        <h3 style={{ marginBottom: 12 }}>Reschedule inspection</h3>
+        <h3 style={{ marginBottom: 12 }}>Reschedule Inspection</h3>
         <div style={{ fontSize: '.78rem', color: 'var(--text-3)', marginBottom: 12 }}>
           Reminder will re-arm against the new time (24h-before notification).
         </div>

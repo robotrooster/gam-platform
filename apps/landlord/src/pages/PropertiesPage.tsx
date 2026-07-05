@@ -6,7 +6,7 @@ import { Building2, Plus, MapPin, DoorOpen, Users, DollarSign, X, Check, Edit2, 
 import { AddUnitModal } from './AddUnitModal'
 import { usePerms } from '../lib/permissions'
 import { LawWarningBanner, type LawFlag } from '../components/LawWarningBanner'
-import { UNIT_TYPES, UNIT_TYPE_LABEL, UNIT_TYPE_PREFIX, UNIT_TYPE_ICON, UNIT_TYPE_HAS_BEDROOMS, UnitType, FEE_PAYER_VALUES, type FeePayer } from '@gam/shared'
+import { UNIT_TYPES, UNIT_TYPE_LABEL, UNIT_TYPE_PREFIX, UNIT_TYPE_ICON, FEE_PAYER_VALUES, type FeePayer } from '@gam/shared'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
 const PROPERTY_TYPES = [
@@ -128,9 +128,11 @@ function FeePayerToggle({
 
 function AddEditModal({ property, onClose }: { property?: any; onClose: () => void }) {
   const qc = useQueryClient()
+  const navigate = useNavigate()
   const isEdit = !!property
-  const [step, setStep] = useState<1|2>(1)
-  const [createdPropId, setCreatedPropId] = useState<string|null>(null)
+  // S527: the bulk "Create Units" step 2 is GONE (Nic: one door for units).
+  // Creating a property lands on its detail page — subtypes + Add Unit
+  // (with quantity) live there.
   const [form, setForm] = useState({
     name:        property?.name || '',
     street1:     property?.street1 || '',
@@ -147,6 +149,9 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
     // against the property record work correctly. Form-state keys
     // remain snake_case because the PATCH body expects them that way.
     requiresBookingAcknowledgment: property?.requiresBookingAcknowledgment ?? false,
+    // S526: weekly-lease jurisdictions — auto-drafts a lease at 7+ day stays
+    // instead of 30+ (see services/bookingLeaseDraft.ts).
+    weeklyLeaseMode: property?.weeklyLeaseMode ?? false,
     // S247: per-property subleasing toggle. Drives the master switch
     // on whether tenants at this property can request subleases at
     // all. AND'd with leases.subleasingAllowed in the request route.
@@ -157,31 +162,12 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
     // a separate landlord-side feature; for now the landlord points
     // GAM at a hosted PDF (e.g., their own S3 / Dropbox link).
     subleaseAgreementTemplateUrl: property?.subleaseAgreementTemplateUrl ?? '',
-    // S309: per-property FlexCharge enablement gate. Default OFF
-    // (opt-in). When ON, the property appears in the FlexCharge create-
-    // account property dropdown and createFlexChargeAccount accepts
-    // requests against it. Existing accounts at the property continue
-    // to function regardless of this flag.
-    flexchargeEnabled: property?.flexchargeEnabled ?? false,
-    // S223: property-level late-fee policy. Defines defaults for new
-    // leases at this property; existing leases keep their current
-    // late-fee config. Edit-only — create flow uses schema defaults
-    // (enabled=true, grace=5, amount=15.00, type='flat') so landlord
-    // doesn't have to make a policy decision at property creation.
-    lateFeeEnabled:        property?.lateFeeEnabled        ?? true,
-    lateFeeGraceDays:     property?.lateFeeGraceDays != null ? String(property.lateFeeGraceDays) : '5',
-    lateFeeInitialAmount: property?.lateFeeInitialAmount != null ? String(property.lateFeeInitialAmount) : '15.00',
-    lateFeeInitialType:   (property?.lateFeeInitialType ?? 'flat') as 'flat' | 'percent_of_rent',
-    // S226: recurring accrual + cap. UI toggles derive their initial
-    // value from whether the property has the columns set. Toggling
-    // off sends null for the whole group on PATCH.
-    lateFeeAccrualEnabled: property?.lateFeeAccrualAmount != null && property?.lateFeeAccrualType != null && property?.lateFeeAccrualPeriod != null,
-    lateFeeAccrualAmount:  property?.lateFeeAccrualAmount != null ? String(property.lateFeeAccrualAmount) : '5.00',
-    lateFeeAccrualType:    (property?.lateFeeAccrualType ?? 'flat') as 'flat' | 'percent_of_rent',
-    lateFeeAccrualPeriod:  (property?.lateFeeAccrualPeriod ?? 'daily') as 'daily' | 'weekly' | 'monthly',
-    lateFeeCapEnabled:     property?.lateFeeCapAmount != null && property?.lateFeeCapType != null,
-    lateFeeCapAmount:      property?.lateFeeCapAmount != null ? String(property.lateFeeCapAmount) : '50.00',
-    lateFeeCapType:        (property?.lateFeeCapType ?? 'flat') as 'flat' | 'percent_of_rent',
+    // S526 (Nic): the FlexCharge toggle (S309) and the property-level
+    // late-fee policy surface (S223/S226) are REMOVED from this form.
+    // FlexCharge is not a launch feature; late fees are charged strictly
+    // per each tenant's signed lease — no landlord-settable knob may exist
+    // anywhere that could conflict with the lease. The backend columns and
+    // lease-side late-fee engine stay intact.
     // 16a: allocation rule — required at property creation.
     // S172: three independent fee_payer toggles + payout bank account are
     // editable in both create and edit modes; manager-fee math
@@ -226,7 +212,6 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
   const MAPBOX_TOKEN = (import.meta as any).env?.VITE_MAPBOX_TOKEN || ''
   const addrTimer = useRef<any>(null)
   // Step 2: unit groups — one per selected type
-  const [batches, setBatches] = useState<Array<{ id: string; type: string; count: string; prefix: string; rentAmount: string; securityDeposit: string; bedrooms: string }>>([])  
 
   // S66: active bank accounts for the current user, used by the routing
   // dropdown below. Only active accounts shown — archived rows still exist
@@ -287,31 +272,11 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
           return
         }
         const pid = res?.data?.id || res?.id
-        if (pid && form.unitTypes.length > 0) {
-          setCreatedPropId(pid)
-          // Init unit groups
-          const groups: Record<string, any> = {}
-          form.unitTypes.forEach((t: string) => {
-            const ut = UNIT_TYPE_OPTIONS.find(u => u.value === t)
-            groups[t] = { count: '', prefix: ut?.prefix || 'UNIT', rentAmount: '', securityDeposit: '' }
-          })
-          // Init one batch per selected type
-          const initBatches = form.unitTypes.map((t: string) => {
-            const ut = UNIT_TYPE_OPTIONS.find((u: any) => u.value === t)
-            return { id: Math.random().toString(36).slice(2), type: t, count: '', prefix: ut?.prefix || 'UNIT', rentAmount: '', securityDeposit: '', bedrooms: '' }
-          })
-          setBatches(initBatches)
-          setStep(2)
-        } else {
-          onClose()
-        }
+        onClose()
+        // Land on the new property — define subtypes and add units there.
+        if (pid) navigate(`/properties/${pid}`)
       }
     }
-  )
-
-  const bulkMut = useMutation(
-    (data: any) => apiPost(`/properties/${createdPropId}/units/bulk`, data),
-    { onSuccess: () => { qc.invalidateQueries('properties'); qc.invalidateQueries('units'); onClose() } }
   )
 
   const set = (k: string, v: any) => { setForm(f => ({ ...f, [k]: v })); setErrors(e => ({ ...e, [k]: '' })) }
@@ -353,22 +318,6 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
     const num = (s: string) => s === '' ? null : parseFloat(s)
     const payload = {
       ...form,
-      // S223: late-fee fields are strings in form state (input values);
-      // PATCH expects numbers. Skip when not in edit mode — create flow
-      // uses schema defaults.
-      lateFeeGraceDays:     isEdit ? (form.lateFeeGraceDays     === '' ? null : parseInt(form.lateFeeGraceDays, 10))   : undefined,
-      lateFeeInitialAmount: isEdit ? (form.lateFeeInitialAmount === '' ? null : parseFloat(form.lateFeeInitialAmount)) : undefined,
-      lateFeeEnabled:        isEdit ? form.lateFeeEnabled        : undefined,
-      lateFeeInitialType:   isEdit ? form.lateFeeInitialType   : undefined,
-      // S226: accrual/cap. Toggle off → send null for the whole group
-      // (clears the columns); toggle on → send parsed values. Create
-      // mode skips entirely (schema defaults: all null = no accrual,
-      // no cap).
-      lateFeeAccrualAmount: isEdit ? (form.lateFeeAccrualEnabled ? (form.lateFeeAccrualAmount === '' ? null : parseFloat(form.lateFeeAccrualAmount)) : null) : undefined,
-      lateFeeAccrualType:   isEdit ? (form.lateFeeAccrualEnabled ? form.lateFeeAccrualType   : null) : undefined,
-      lateFeeAccrualPeriod: isEdit ? (form.lateFeeAccrualEnabled ? form.lateFeeAccrualPeriod : null) : undefined,
-      lateFeeCapAmount:     isEdit ? (form.lateFeeCapEnabled ? (form.lateFeeCapAmount === '' ? null : parseFloat(form.lateFeeCapAmount)) : null) : undefined,
-      lateFeeCapType:       isEdit ? (form.lateFeeCapEnabled ? form.lateFeeCapType : null) : undefined,
       allocationRule: {
         achFeePayer:       ar.achFeePayer,
         cardFeePayer:      ar.cardFeePayer,
@@ -387,30 +336,6 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
     propMut.mutate(payload)
   }
 
-  const submitStep2 = () => {
-    const groups = batches
-      .filter(b => b.count && parseInt(b.count) > 0)
-      .map(b => ({
-        type: b.type,
-        count: parseInt(b.count),
-        prefix: b.prefix,
-        rentAmount: b.rentAmount ? parseFloat(b.rentAmount) : null,
-        securityDeposit: b.securityDeposit ? parseFloat(b.securityDeposit) : null,
-        bedrooms: b.bedrooms ? parseInt(b.bedrooms) : null,
-      }))
-    if (!groups.length) { onClose(); return }
-    bulkMut.mutate({ unitGroups: groups })
-  }
-
-  const addBatch = (type: string) => {
-    const ut = UNIT_TYPE_OPTIONS.find(u => u.value === type)
-    setBatches(b => [...b, { id: Math.random().toString(36).slice(2), type, count: '', prefix: ut?.prefix || 'UNIT', rentAmount: '', securityDeposit: '', bedrooms: '' }])
-  }
-
-  const removeBatch = (id: string) => setBatches(b => b.filter(x => x.id !== id))
-
-  const setBatch = (id: string, k: string, v: string) => setBatches(b => b.map(x => x.id === id ? { ...x, [k]: v } : x))
-
   const lbl = { fontSize: '.72rem' as const, fontWeight: 600 as const, color: 'var(--text-3)', textTransform: 'uppercase' as const, letterSpacing: '.06em', display: 'block' as const, marginBottom: 5 }
 
   return (
@@ -418,24 +343,12 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
       <div className="modal" style={{ maxWidth: 680, width: '95vw' }} onClick={e => e.stopPropagation()}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
           <div className="modal-title" style={{ marginBottom: 0 }}>
-            {isEdit ? 'Edit Property' : step === 1 ? 'Add Property' : 'Create Units'}
+            {isEdit ? 'Edit Property' : 'Add Property'}
           </div>
           <button className="btn btn-ghost btn-sm" onClick={onClose} style={{ padding: 6 }}><X size={15} /></button>
         </div>
 
-        {!isEdit && (
-          <div style={{ display: 'flex', gap: 6, marginBottom: 20 }}>
-            {['Property Details', 'Create Units'].map((s, i) => (
-              <div key={s} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                <div style={{ width: 20, height: 20, borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '.65rem', fontWeight: 700, background: step > i+1 ? 'var(--green)' : step === i+1 ? 'var(--gold)' : 'var(--bg-3)', color: step >= i+1 ? '#000' : 'var(--text-3)' }}>{i+1}</div>
-                <span style={{ fontSize: '.72rem', color: step === i+1 ? 'var(--text-0)' : 'var(--text-3)', fontWeight: step === i+1 ? 600 : 400 }}>{s}</span>
-                {i < 1 && <div style={{ width: 20, height: 1, background: 'var(--border-0)', margin: '0 2px' }} />}
-              </div>
-            ))}
-          </div>
-        )}
-
-        {step === 1 && <>
+        <>
           {/* Unit Types — full width up top */}
           {!isEdit && (
             <div style={{ marginBottom: 12 }}>
@@ -454,18 +367,17 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
             </div>
           )}
 
-          {/* Two-column grid: address on left, meta on right */}
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14, marginBottom: 12 }}>
+          {/* S526 layout fix: stacked full-width rows (the old two-column grid
+              crammed the amenity chips beside the address fields). */}
+          <div style={{ marginBottom: 12 }}>
+            <div style={{ marginBottom: 10 }}>
+              <label style={lbl}>Property Name *</label>
+              <input className="input" placeholder="Oak Street Apartments" value={form.name} onChange={e => set('name', e.target.value)} style={{ width: '100%' }} autoFocus />
+              {errors.name && <div style={{ color: 'var(--red)', fontSize: '.7rem', marginTop: 3 }}>{errors.name}</div>}
+            </div>
 
-            {/* LEFT: Name, Street, Suite */}
-            <div>
-              <div style={{ marginBottom: 10 }}>
-                <label style={lbl}>Property Name *</label>
-                <input className="input" placeholder="Oak Street Apartments" value={form.name} onChange={e => set('name', e.target.value)} style={{ width: '100%' }} autoFocus />
-                {errors.name && <div style={{ color: 'var(--red)', fontSize: '.7rem', marginTop: 3 }}>{errors.name}</div>}
-              </div>
-
-              <div style={{ marginBottom: 10, position: 'relative' }}>
+            <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: 10, marginBottom: 10 }}>
+              <div style={{ position: 'relative' }}>
                 <label style={lbl}>Street Address * {addrVerified && <span style={{ color: 'var(--green)', fontWeight: 400, textTransform: 'none' }}>✓ Verified</span>}</label>
                 <input className="input" placeholder="4821 W Oak St" value={form.street1}
                   onChange={e => { const v = e.target.value; set('street1', v); setAddrVerified(false); clearTimeout(addrTimer.current); addrTimer.current = setTimeout(() => searchAddr(v), 300) }}
@@ -485,47 +397,42 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
                 )}
                 {errors.street1 && <div style={{ color: 'var(--red)', fontSize: '.7rem', marginTop: 3 }}>{errors.street1}</div>}
               </div>
-
               <div>
                 <label style={lbl}>Suite / Unit / Lot</label>
                 <input className="input" placeholder="Suite 100" value={form.street2} onChange={e => set('street2', e.target.value)} style={{ width: '100%' }} />
               </div>
             </div>
 
-            {/* RIGHT: City/State/Zip + Amenities */}
-            <div>
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 56px 80px', gap: 8, marginBottom: 10 }}>
-                <div>
-                  <label style={lbl}>City *</label>
-                  <input className="input" placeholder="Phoenix" value={form.city} onChange={e => set('city', e.target.value)} style={{ width: '100%' }} />
-                  {errors.city && <div style={{ color: 'var(--red)', fontSize: '.7rem', marginTop: 3 }}>{errors.city}</div>}
-                </div>
-                <div>
-                  <label style={lbl}>State</label>
-                  <input className="input" placeholder="State" value={form.state} onChange={e => set('state', e.target.value)} style={{ width: '100%' }} />
-                </div>
-                <div>
-                  <label style={lbl}>ZIP *</label>
-                  <input className="input" placeholder="85031" value={form.zip} onChange={e => set('zip', e.target.value)} style={{ width: '100%' }} />
-                  {errors.zip && <div style={{ color: 'var(--red)', fontSize: '.7rem', marginTop: 3 }}>{errors.zip}</div>}
-                </div>
-              </div>
-
+            <div style={{ display: 'grid', gridTemplateColumns: '2fr 80px 110px', gap: 10, marginBottom: 10 }}>
               <div>
-                <label style={lbl}>Amenities</label>
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
-                  {AMENITIES.map(a => {
-                    const on = form.amenities.includes(a)
-                    return (
-                      <button key={a} type="button" onClick={() => toggleAmenity(a)} style={{ padding: '3px 9px', borderRadius: 20, fontSize: '.7rem', fontWeight: 600, cursor: 'pointer', transition: 'all .12s', border: `1px solid ${on ? 'rgba(201,162,39,.4)' : 'var(--border-0)'}`, background: on ? 'rgba(201,162,39,.1)' : 'var(--bg-2)', color: on ? 'var(--gold)' : 'var(--text-3)' }}>
-                        {on && '✓ '}{a}
-                      </button>
-                    )
-                  })}
-                </div>
+                <label style={lbl}>City *</label>
+                <input className="input" placeholder="Phoenix" value={form.city} onChange={e => set('city', e.target.value)} style={{ width: '100%' }} />
+                {errors.city && <div style={{ color: 'var(--red)', fontSize: '.7rem', marginTop: 3 }}>{errors.city}</div>}
+              </div>
+              <div>
+                <label style={lbl}>State</label>
+                <input className="input" placeholder="State" value={form.state} onChange={e => set('state', e.target.value)} style={{ width: '100%' }} />
+              </div>
+              <div>
+                <label style={lbl}>ZIP *</label>
+                <input className="input" placeholder="85031" value={form.zip} onChange={e => set('zip', e.target.value)} style={{ width: '100%' }} />
+                {errors.zip && <div style={{ color: 'var(--red)', fontSize: '.7rem', marginTop: 3 }}>{errors.zip}</div>}
               </div>
             </div>
 
+            <div>
+              <label style={lbl}>Amenities</label>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
+                {AMENITIES.map(a => {
+                  const on = form.amenities.includes(a)
+                  return (
+                    <button key={a} type="button" onClick={() => toggleAmenity(a)} style={{ padding: '3px 9px', borderRadius: 20, fontSize: '.7rem', fontWeight: 600, cursor: 'pointer', transition: 'all .12s', border: `1px solid ${on ? 'rgba(201,162,39,.4)' : 'var(--border-0)'}`, background: on ? 'rgba(201,162,39,.1)' : 'var(--bg-2)', color: on ? 'var(--gold)' : 'var(--text-3)' }}>
+                      {on && '✓ '}{a}
+                    </button>
+                  )
+                })}
+              </div>
+            </div>
           </div>
 
           {/* S179 / B3: per-property booking acknowledgment toggle.
@@ -560,6 +467,36 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
                   Every reservation on this property will track whether the guest signed the property
                   rules. Staff mark each reservation acknowledged after the signature is on file. Useful
                   for RV parks and short-stay properties where house rules need explicit sign-off.
+                </div>
+              </div>
+            </label>
+
+            {/* S526: weekly-lease mode. Long stays auto-draft a lease for
+                review — 30+ days by default; this drops the threshold to 7+
+                for jurisdictions where weekly leases are the norm. */}
+            <label style={{
+              display:        'flex',
+              alignItems:     'flex-start',
+              gap:            10,
+              padding:        12,
+              marginTop:      8,
+              borderRadius:   8,
+              border:         `1px solid ${form.weeklyLeaseMode ? 'var(--gold)' : 'var(--border-0)'}`,
+              background:     form.weeklyLeaseMode ? 'rgba(201,162,39,.06)' : 'var(--bg-2)',
+              cursor:         'pointer',
+              fontSize:       '.78rem',
+            }}>
+              <input
+                type="checkbox"
+                checked={form.weeklyLeaseMode}
+                onChange={e => setForm(f => ({ ...f, weeklyLeaseMode: e.target.checked }))}
+                style={{ marginTop: 3 }}
+              />
+              <div>
+                <div style={{ fontWeight: 600, color: 'var(--text-1)' }}>Weekly leases</div>
+                <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 3, lineHeight: 1.5 }}>
+                  Stays of 30+ days automatically draft a lease for your review. Turn this on where you
+                  run weekly leases — the draft threshold drops to 7+ days instead.
                 </div>
               </div>
             </label>
@@ -625,224 +562,6 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
               </div>
             )}
           </div>
-
-          {/* S309: per-property FlexCharge enablement gate. Default
-              OFF (opt-in). When OFF, this property does not appear in
-              the FlexCharge create-account property dropdown and the
-              backend rejects new account creation here with a 403.
-              Existing accounts (if any) continue to function. */}
-          <div style={{ marginBottom: 14, paddingTop: 10, borderTop: '1px solid var(--border-0)' }}>
-            <div style={{ fontSize: '.78rem', fontWeight: 600, marginBottom: 4, color: 'var(--text-2)' }}>
-              FlexCharge
-            </div>
-            <label style={{
-              display:        'flex',
-              alignItems:     'flex-start',
-              gap:            10,
-              padding:        12,
-              borderRadius:   8,
-              border:         `1px solid ${form.flexchargeEnabled ? 'var(--gold)' : 'var(--border-0)'}`,
-              background:     form.flexchargeEnabled ? 'rgba(201,162,39,.06)' : 'var(--bg-2)',
-              cursor:         'pointer',
-              fontSize:       '.78rem',
-            }}>
-              <input
-                type="checkbox"
-                checked={form.flexchargeEnabled}
-                onChange={e => setForm(f => ({ ...f, flexchargeEnabled: e.target.checked }))}
-                style={{ marginTop: 3 }}
-              />
-              <div>
-                <div style={{ fontWeight: 600, color: 'var(--text-1)' }}>Offer FlexCharge at this property</div>
-                <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 3, lineHeight: 1.5 }}>
-                  Enable a rolling charge account for tenants and POS customers at this property — typical at RV parks,
-                  extended-stay properties, and on-site stores where the account holder runs a tab for property-store
-                  purchases, utilities, services, etc. <strong>You are the creditor on FlexCharge</strong> — you set
-                  the credit limit, any finance charges, and the payment cadence; GAM provides the accounting software
-                  only. You are responsible for TILA, ECOA, FCRA, FDCPA, and state lending/usury-law compliance.
-                  Review the FlexCharge Business Account Agreement before enabling, and consult counsel in your state
-                  if you have not previously offered consumer credit.
-                </div>
-              </div>
-            </label>
-          </div>
-
-          {/* S223: property-level late-fee policy. Edit-only —
-              new properties pick up schema defaults
-              (enabled=true / grace=5 / amount=$15 / type='flat'). The
-              inline notice spells out Option B semantics: existing
-              leases keep their current late-fee config; this is a
-              forward-looking template, not a propagating change. */}
-          {isEdit && (
-            <div style={{ marginBottom: 14, paddingTop: 10, borderTop: '1px solid var(--border-0)' }}>
-              <div style={{ fontSize: '.78rem', fontWeight: 600, marginBottom: 4, color: 'var(--text-2)' }}>
-                Late-fee policy
-              </div>
-              <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginBottom: 10, lineHeight: 1.5 }}>
-                These settings define this property's default late-fee policy for new leases.
-                Existing leases keep their current late-fee configuration — changes here do not
-                propagate retroactively.
-              </div>
-              <label style={{
-                display:        'flex',
-                alignItems:     'flex-start',
-                gap:            10,
-                padding:        12,
-                borderRadius:   8,
-                border:         `1px solid ${form.lateFeeEnabled ? 'var(--gold)' : 'var(--border-0)'}`,
-                background:     form.lateFeeEnabled ? 'rgba(201,162,39,.06)' : 'var(--bg-2)',
-                cursor:         'pointer',
-                fontSize:       '.78rem',
-                marginBottom:   10,
-              }}>
-                <input
-                  type="checkbox"
-                  checked={form.lateFeeEnabled}
-                  onChange={e => setForm(f => ({ ...f, lateFeeEnabled: e.target.checked }))}
-                  style={{ marginTop: 3 }}
-                />
-                <div>
-                  <div style={{ fontWeight: 600, color: 'var(--text-1)' }}>Late fees enabled</div>
-                  <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 3 }}>
-                    Off = no late fees ever assessed at this property regardless of lease config.
-                  </div>
-                </div>
-              </label>
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10, opacity: form.lateFeeEnabled ? 1 : 0.5 }}>
-                <div>
-                  <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginBottom: 4 }}>Grace period (days)</div>
-                  <input
-                    type="number"
-                    min="0"
-                    value={form.lateFeeGraceDays}
-                    disabled={!form.lateFeeEnabled}
-                    onChange={e => setForm(f => ({ ...f, lateFeeGraceDays: e.target.value }))}
-                    style={{ width: '100%', padding: '6px 10px', borderRadius: 8, border: '1px solid var(--border-0)', background: 'var(--bg-2)', fontSize: '.85rem', boxSizing: 'border-box' }}
-                  />
-                </div>
-                <div>
-                  <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginBottom: 4 }}>Initial fee</div>
-                  <input
-                    type="number"
-                    min="0"
-                    step="0.01"
-                    value={form.lateFeeInitialAmount}
-                    disabled={!form.lateFeeEnabled}
-                    onChange={e => setForm(f => ({ ...f, lateFeeInitialAmount: e.target.value }))}
-                    style={{ width: '100%', padding: '6px 10px', borderRadius: 8, border: '1px solid var(--border-0)', background: 'var(--bg-2)', fontSize: '.85rem', boxSizing: 'border-box' }}
-                  />
-                </div>
-                <div>
-                  <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginBottom: 4 }}>Fee type</div>
-                  <select
-                    value={form.lateFeeInitialType}
-                    disabled={!form.lateFeeEnabled}
-                    onChange={e => setForm(f => ({ ...f, lateFeeInitialType: e.target.value as 'flat' | 'percent_of_rent' }))}
-                    style={{ width: '100%', padding: '6px 10px', borderRadius: 8, border: '1px solid var(--border-0)', background: 'var(--bg-2)', fontSize: '.85rem', boxSizing: 'border-box', color: 'var(--text-0)' }}
-                  >
-                    <option value="flat">Flat $</option>
-                    <option value="percent_of_rent">% of rent</option>
-                  </select>
-                </div>
-              </div>
-
-              {/* S226: recurring accrual toggle + 3 inputs. Disabled when
-                  the parent late-fee toggle is off — accrual without a
-                  parent fee makes no sense. */}
-              <div style={{ marginTop: 14, opacity: form.lateFeeEnabled ? 1 : 0.4 }}>
-                <label style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: form.lateFeeEnabled ? 'pointer' : 'not-allowed', marginBottom: 8 }}>
-                  <input
-                    type="checkbox"
-                    checked={form.lateFeeAccrualEnabled}
-                    disabled={!form.lateFeeEnabled}
-                    onChange={e => setForm(f => ({ ...f, lateFeeAccrualEnabled: e.target.checked }))}
-                  />
-                  <span style={{ fontSize: '.78rem', color: 'var(--text-1)', fontWeight: 600 }}>Recurring accrual</span>
-                  <span style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>(continues to add up after the initial fee)</span>
-                </label>
-                {form.lateFeeAccrualEnabled && form.lateFeeEnabled && (
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 }}>
-                    <div>
-                      <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginBottom: 4 }}>Amount per period</div>
-                      <input
-                        type="number"
-                        min="0"
-                        step="0.01"
-                        value={form.lateFeeAccrualAmount}
-                        onChange={e => setForm(f => ({ ...f, lateFeeAccrualAmount: e.target.value }))}
-                        style={{ width: '100%', padding: '6px 10px', borderRadius: 8, border: '1px solid var(--border-0)', background: 'var(--bg-2)', fontSize: '.85rem', boxSizing: 'border-box' }}
-                      />
-                    </div>
-                    <div>
-                      <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginBottom: 4 }}>Type</div>
-                      <select
-                        value={form.lateFeeAccrualType}
-                        onChange={e => setForm(f => ({ ...f, lateFeeAccrualType: e.target.value as 'flat' | 'percent_of_rent' }))}
-                        style={{ width: '100%', padding: '6px 10px', borderRadius: 8, border: '1px solid var(--border-0)', background: 'var(--bg-2)', fontSize: '.85rem', boxSizing: 'border-box', color: 'var(--text-0)' }}
-                      >
-                        <option value="flat">Flat $</option>
-                        <option value="percent_of_rent">% of rent</option>
-                      </select>
-                    </div>
-                    <div>
-                      <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginBottom: 4 }}>Period</div>
-                      <select
-                        value={form.lateFeeAccrualPeriod}
-                        onChange={e => setForm(f => ({ ...f, lateFeeAccrualPeriod: e.target.value as 'daily' | 'weekly' | 'monthly' }))}
-                        style={{ width: '100%', padding: '6px 10px', borderRadius: 8, border: '1px solid var(--border-0)', background: 'var(--bg-2)', fontSize: '.85rem', boxSizing: 'border-box', color: 'var(--text-0)' }}
-                      >
-                        <option value="daily">Daily</option>
-                        <option value="weekly">Weekly</option>
-                        <option value="monthly">Monthly</option>
-                      </select>
-                    </div>
-                  </div>
-                )}
-              </div>
-
-              {/* S226: maximum cap toggle + 2 inputs. Cap-edge writes a
-                  partial row of exactly the remaining amount, then stops
-                  (locked decision per S26b). Independent of accrual. */}
-              <div style={{ marginTop: 14, opacity: form.lateFeeEnabled ? 1 : 0.4 }}>
-                <label style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: form.lateFeeEnabled ? 'pointer' : 'not-allowed', marginBottom: 8 }}>
-                  <input
-                    type="checkbox"
-                    checked={form.lateFeeCapEnabled}
-                    disabled={!form.lateFeeEnabled}
-                    onChange={e => setForm(f => ({ ...f, lateFeeCapEnabled: e.target.checked }))}
-                  />
-                  <span style={{ fontSize: '.78rem', color: 'var(--text-1)', fontWeight: 600 }}>Maximum cap</span>
-                  <span style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>(total late fees per invoice cannot exceed this)</span>
-                </label>
-                {form.lateFeeCapEnabled && form.lateFeeEnabled && (
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-                    <div>
-                      <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginBottom: 4 }}>Cap amount</div>
-                      <input
-                        type="number"
-                        min="0"
-                        step="0.01"
-                        value={form.lateFeeCapAmount}
-                        onChange={e => setForm(f => ({ ...f, lateFeeCapAmount: e.target.value }))}
-                        style={{ width: '100%', padding: '6px 10px', borderRadius: 8, border: '1px solid var(--border-0)', background: 'var(--bg-2)', fontSize: '.85rem', boxSizing: 'border-box' }}
-                      />
-                    </div>
-                    <div>
-                      <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginBottom: 4 }}>Cap type</div>
-                      <select
-                        value={form.lateFeeCapType}
-                        onChange={e => setForm(f => ({ ...f, lateFeeCapType: e.target.value as 'flat' | 'percent_of_rent' }))}
-                        style={{ width: '100%', padding: '6px 10px', borderRadius: 8, border: '1px solid var(--border-0)', background: 'var(--bg-2)', fontSize: '.85rem', boxSizing: 'border-box', color: 'var(--text-0)' }}
-                      >
-                        <option value="flat">Flat $</option>
-                        <option value="percent_of_rent">% of rent</option>
-                      </select>
-                    </div>
-                  </div>
-                )}
-              </div>
-            </div>
-          )}
 
           {/* 16a allocation rule.
               S172: ACH / card / platform fee_payer toggles + payout bank
@@ -939,103 +658,18 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
           <div className="modal-footer">
             {stateLawWarnings.length > 0 ? (
               <button className="btn btn-primary" onClick={onClose}>
-                <Check size={14} /> Got it, close
+                <Check size={14} /> Got It
               </button>
             ) : (
               <>
                 <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
                 <button className="btn btn-primary" onClick={submitStep1} disabled={propMut.isLoading}>
-                  {propMut.isLoading ? <span className="spinner" /> : <><Check size={14} /> {isEdit ? 'Save Changes' : form.unitTypes.length > 0 ? 'Next: Create Units →' : 'Add Property'}</>}
+                  {propMut.isLoading ? <span className="spinner" /> : <><Check size={14} /> {isEdit ? 'Save Changes' : 'Add Property'}</>}
                 </button>
               </>
             )}
           </div>
-        </>}
-
-        {step === 2 && <>
-          <div style={{ fontSize: '.82rem', color: 'var(--text-3)', marginBottom: 16 }}>
-            Add batches for each unit type. Each batch can have a different price — e.g. 20 storage units at $100/mo and 30 at $150/mo. Unit numbers auto-assigned; fill in details per unit later.
-          </div>
-
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-            {form.unitTypes.map((type: string) => {
-              const ut = UNIT_TYPE_OPTIONS.find((u: any) => u.value === type)!
-              const typeBatches = batches.filter(b => b.type === type)
-              const showBeds = UNIT_TYPE_HAS_BEDROOMS[type as UnitType] ?? false
-              return (
-                <div key={type} style={{ padding: 14, background: 'var(--bg-2)', border: '1px solid var(--border-0)', borderRadius: 10 }}>
-                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                      <span style={{ fontSize: '1.1rem' }}>{ut.icon}</span>
-                      <span style={{ fontWeight: 700, color: 'var(--text-0)', fontSize: '.88rem' }}>{ut.label}</span>
-                    </div>
-                    <button className="btn btn-ghost btn-sm" type="button" onClick={() => addBatch(type)} style={{ fontSize: '.72rem' }}>+ Add Batch</button>
-                  </div>
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                    {typeBatches.map((b, bi) => (
-                      <div key={b.id} style={{ padding: '10px 12px', background: 'var(--bg-1)', border: '1px solid var(--border-0)', borderRadius: 8 }}>
-                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
-                          <span style={{ fontSize: '.7rem', color: 'var(--text-3)', fontWeight: 600 }}>Batch {bi + 1}</span>
-                          {typeBatches.length > 1 && <button type="button" onClick={() => removeBatch(b.id)} style={{ background: 'none', border: 'none', color: 'var(--red)', cursor: 'pointer', fontSize: '.75rem' }}>✕ Remove</button>}
-                        </div>
-                        <div style={{ display: 'grid', gridTemplateColumns: showBeds ? '70px 70px 70px 1fr 1fr' : '70px 70px 1fr 1fr', gap: 8 }}>
-                          <div>
-                            <label style={lbl}>Count *</label>
-                            <input className="input" type="number" min="1" placeholder="0" value={b.count} onChange={e => setBatch(b.id, 'count', e.target.value)} style={{ width: '100%' }} />
-                          </div>
-                          <div>
-                            <label style={lbl}>Prefix</label>
-                            <input className="input" placeholder={ut.prefix} value={b.prefix} onChange={e => setBatch(b.id, 'prefix', e.target.value)} style={{ width: '100%' }} />
-                          </div>
-                          {showBeds && (
-                            <div>
-                              <label style={lbl}>Beds</label>
-                              <select className="input" value={b.bedrooms} onChange={e => setBatch(b.id, 'bedrooms', e.target.value)} style={{ width: '100%' }}>
-                                <option value="">—</option>
-                                {[0,1,2,3,4,5].map(n => <option key={n} value={n}>{n === 0 ? 'Studio' : n}</option>)}
-                              </select>
-                            </div>
-                          )}
-                          <div>
-                            <label style={lbl}>Rent/mo</label>
-                            <input className="input" type="number" placeholder="0.00" value={b.rentAmount} onChange={e => setBatch(b.id, 'rentAmount', e.target.value)} style={{ width: '100%' }} />
-                          </div>
-                          <div>
-                            <label style={lbl}>Deposit</label>
-                            <input className="input" type="number" placeholder="0.00" value={b.securityDeposit} onChange={e => setBatch(b.id, 'securityDeposit', e.target.value)} style={{ width: '100%' }} />
-                          </div>
-                        </div>
-                        {b.count && parseInt(b.count) > 0 && (
-                          <div style={{ marginTop: 6, fontSize: '.68rem', color: 'var(--text-3)' }}>
-                            Creates: {Array.from({ length: Math.min(parseInt(b.count), 3) }, (_, i) => `${b.prefix}-${String(i+1).padStart(2,'0')}`).join(', ')}{parseInt(b.count) > 3 ? ` … ${b.prefix}-${String(parseInt(b.count)).padStart(2,'0')}` : ''} ({b.count} units)
-                          </div>
-                        )}
-                      </div>
-                    ))}
-                    {typeBatches.length === 0 && (
-                      <div style={{ padding: '10px', textAlign: 'center', color: 'var(--text-3)', fontSize: '.78rem', border: '1px dashed var(--border-0)', borderRadius: 8 }}>
-                        Click "Add Batch" to add units of this type
-                      </div>
-                    )}
-                  </div>
-                </div>
-              )
-            })}
-          </div>
-
-          {bulkMut.isError && (
-            <div style={{ color: 'var(--red)', fontSize: '.75rem', background: 'rgba(255,71,87,.08)', border: '1px solid rgba(255,71,87,.2)', borderRadius: 8, padding: '8px 12px', marginTop: 12 }}>
-              Failed to create units. Please try again.
-            </div>
-          )}
-
-          <div className="modal-footer" style={{ marginTop: 16 }}>
-            <button className="btn btn-ghost" onClick={onClose}>Skip — Add Units Later</button>
-            <button className="btn btn-primary" onClick={submitStep2} disabled={bulkMut.isLoading}>
-              {bulkMut.isLoading ? <span className="spinner" /> : <><Check size={14} /> Create Units</>}
-            </button>
-          </div>
-        </>}
+        </>
       </div>
     </div>
   )

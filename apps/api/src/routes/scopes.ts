@@ -39,6 +39,9 @@ const osScopeSchema = z.object({
   propertyIds:   z.array(z.string().uuid()).default([]),
   unitIds:       z.array(z.string().uuid()).default([]),
   allProperties: z.boolean().default(false),  // S187
+  // W-52 (S529): invite-time permission grants (a preset's keys). Applied to
+  // the scope row on accept so the person lands with the right access.
+  permissions:   z.record(z.boolean()).default({}),
 })
 
 const mwScopeSchema = z.object({
@@ -103,10 +106,10 @@ async function insertScopeRow(
     case 'onsite_manager': {
       const { rows } = await client.query(
         `INSERT INTO onsite_manager_scopes
-           (user_id, landlord_id, property_ids, unit_ids, all_properties)
-         VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+           (user_id, landlord_id, property_ids, unit_ids, all_properties, permissions)
+         VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
         [userId, landlordId, payload.propertyIds, payload.unitIds,
-         payload.allProperties])
+         payload.allProperties, JSON.stringify(payload.permissions || {})])
       return rows[0]
     }
     case 'maintenance': {
@@ -380,6 +383,12 @@ scopesRouter.post('/:roleType/invite', requirePerm('team.invite'), async (req, r
     }).parse(req.body)
     const scope = validateScopePayload(role, body.scope)
 
+    // W-10 (S529): staff are PERMANENTLY locked to the property they are
+    // added to — so the property must be chosen at invite time.
+    if (role === 'onsite_manager' && !scope.propertyIds.length && !scope.allProperties) {
+      throw new AppError(400, 'Pick the property this staff member belongs to — it is fixed once they are added')
+    }
+
     // Onsite manager uniqueness: one landlord per user, platform-wide
     if (role === 'onsite_manager') {
       const existing = await queryOne<any>(
@@ -496,13 +505,29 @@ scopesRouter.patch('/:roleType/:userId', requirePerm('team.manage_permissions'),
           [scope.propertyIds, scope.unitIds, scope.allProperties,
            scope.maintApprovalCeilingCents, req.params.userId, landlordId])
         break
-      case 'onsite_manager':
+      case 'onsite_manager': {
+        // W-10 (S529, Nic decision): the property binding is PERMANENT —
+        // fixed when the person is added, never edited after. Moving someone
+        // means removing them and re-inviting at the new property. Legacy
+        // rows with no property yet get one first-set.
+        const existing = await queryOne<any>(
+          `SELECT property_ids FROM onsite_manager_scopes
+            WHERE user_id = $1 AND landlord_id = $2`,
+          [req.params.userId, landlordId])
+        if (!existing) throw new AppError(404, 'Scope row not found')
+        const cur: string[] = existing.property_ids || []
+        const changed = cur.length &&
+          (cur.length !== scope.propertyIds.length || cur.some((id: string) => !scope.propertyIds.includes(id)))
+        if (changed) {
+          throw new AppError(409, 'Property assignment is permanent. To move this person to another property, remove them and re-invite them there.')
+        }
         updated = await queryOne<any>(
           `UPDATE onsite_manager_scopes SET
              property_ids = $1, unit_ids = $2, updated_at = NOW()
            WHERE user_id = $3 AND landlord_id = $4 RETURNING *`,
-          [scope.propertyIds, scope.unitIds, req.params.userId, landlordId])
+          [cur.length ? cur : scope.propertyIds, scope.unitIds, req.params.userId, landlordId])
         break
+      }
       case 'maintenance':
         updated = await queryOne<any>(
           `UPDATE maintenance_worker_scopes SET

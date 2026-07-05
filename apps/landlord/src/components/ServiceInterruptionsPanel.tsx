@@ -126,7 +126,7 @@ function PostModal({ propertyId, onClose, onPosted }: { propertyId: string; onCl
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.6)', display: 'grid', placeItems: 'center', zIndex: 50 }} onClick={onClose}>
       <div className="card" style={{ width: 480, maxWidth: '92vw', maxHeight: '88vh', overflow: 'auto', padding: 20 }} onClick={e => e.stopPropagation()}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
-          <h2 style={{ fontSize: '1.1rem' }}>Post outage notice</h2>
+          <h2 style={{ fontSize: '1.1rem' }}>Post Outage Notice</h2>
           <button className="btn btn-sm" onClick={onClose}><X size={15} /></button>
         </div>
 

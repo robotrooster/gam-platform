@@ -253,6 +253,7 @@ describe('POST /api/pos/transactions — happy paths', () => {
       .post('/api/pos/transactions')
       .set('Authorization', `Bearer ${f.landlordToken}`)
       .send({
+        propertyId: f.propertyId,
         items: [{ id: itemId, name: 'Item', qty: 2, price: 10, tax_rate: 0.08, category: 'Test Cat' }],
         paymentMethod: 'cash',
         changeGiven: 0,
@@ -300,6 +301,7 @@ describe('POST /api/pos/transactions — happy paths', () => {
       .post('/api/pos/transactions')
       .set('Authorization', `Bearer ${f.landlordToken}`)
       .send({
+        propertyId: f.propertyId,
         items: [{ id: itemId, name: 'I', qty: 1, price: 25 }],
         paymentMethod: 'card',
         stripePaymentIntentId: 'pi_terminal_xyz',
@@ -322,6 +324,7 @@ describe('POST /api/pos/transactions — happy paths', () => {
       .post('/api/pos/transactions')
       .set('Authorization', `Bearer ${f.landlordToken}`)
       .send({
+        propertyId: f.propertyId,
         items: [{ name: 'Misc walk-up', qty: 1, price: 15, tax_rate: 0.07 }],
         paymentMethod: 'cash',
       })
@@ -348,6 +351,7 @@ describe('POST /api/pos/transactions — happy paths', () => {
       .post('/api/pos/transactions')
       .set('Authorization', `Bearer ${f.landlordToken}`)
       .send({
+        propertyId: f.propertyId,
         items: [
           { id: itemId, name: 'Catalog',  qty: 1, price: 10 },
           { name: 'Walk-up', qty: 2, price: 5, tax_rate: 0.10 },
@@ -377,6 +381,7 @@ describe('POST /api/pos/transactions — happy paths', () => {
       .post('/api/pos/transactions')
       .set('Authorization', `Bearer ${f.landlordToken}`)
       .send({
+        propertyId: f.propertyId,
         items: [{ id: itemId, name: 'I', qty: 2, price: 10 }],
         paymentMethod: 'cash',
       })
@@ -411,6 +416,7 @@ describe('POST /api/pos/transactions — happy paths', () => {
       .post('/api/pos/transactions')
       .set('Authorization', `Bearer ${f.landlordToken}`)
       .send({
+        propertyId: f.propertyId,
         items: [{ id: itemId, name: 'I', qty: 3, price: 5 }],
         paymentMethod: 'cash',
       })
@@ -459,7 +465,7 @@ describe('POST /api/pos/transactions — FlexCharge gate (S254)', () => {
     expect(arg.amount).toBe(50)
   })
 
-  it('propertyId required for FlexCharge → 400', async () => {
+  it('propertyId required on every sale → 400 (W-12; generic guard now fires before the FlexCharge one)', async () => {
     const f = await seedPosFixture()
     const itemId = await seedPosItem(f, { sellPrice: 10, chargeEligible: true })
     const res = await request(buildApp())
@@ -471,7 +477,7 @@ describe('POST /api/pos/transactions — FlexCharge gate (S254)', () => {
         tenantId: randomUUID(),
       })
     expect(res.status).toBe(400)
-    expect(res.body.error).toMatch(/propertyId required/i)
+    expect(res.body.error).toMatch(/propertyId is required/i)
   })
 
   it('XOR: tenantId AND posCustomerId both set → 400', async () => {
@@ -588,7 +594,7 @@ describe('POST /api/pos/transactions — guards + idempotency', () => {
     const res = await request(buildApp())
       .post('/api/pos/transactions')
       .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ items: [], paymentMethod: 'cash' })
+      .send({ items: [], paymentMethod: 'cash', propertyId: f.propertyId })
     expect(res.status).toBe(400)
     expect(res.body.error).toMatch(/items array required/i)
   })
@@ -631,6 +637,7 @@ describe('POST /api/pos/transactions — guards + idempotency', () => {
       .post('/api/pos/transactions')
       .set('Authorization', `Bearer ${f.landlordToken}`)
       .send({
+        propertyId: f.propertyId,
         items: [{ id: victimItemId, name: 'Stolen', qty: 5, price: 10 }],
         paymentMethod: 'cash',
       })
@@ -660,6 +667,7 @@ describe('POST /api/pos/transactions — guards + idempotency', () => {
       items: [{ id: itemId, name: 'I', qty: 1, price: 20 }],
       paymentMethod: 'card',
       stripePaymentIntentId: 'pi_dup',
+      propertyId: f.propertyId,
     }
 
     const first = await request(buildApp())
@@ -696,6 +704,7 @@ describe('POST /api/pos/transactions — guards + idempotency', () => {
       .post('/api/pos/transactions')
       .set('Authorization', `Bearer ${f.landlordToken}`)
       .send({
+        propertyId: f.propertyId,
         items: [{ id: itemId, name: 'I', qty: 1, price: 10 }],
         paymentMethod: 'card',
         stripePaymentIntentId: 'pi_pending',
@@ -719,6 +728,7 @@ describe('POST /api/pos/transactions — guards + idempotency', () => {
       .post('/api/pos/transactions')
       .set('Authorization', `Bearer ${f.landlordToken}`)
       .send({
+        propertyId: f.propertyId,
         items: [{ id: itemId, name: 'I', qty: 1, price: 10 }],
         paymentMethod: 'card',
         stripePaymentIntentId: 'pi_wrong_amt',
@@ -742,6 +752,7 @@ describe('POST /api/pos/transactions — guards + idempotency', () => {
       .post('/api/pos/transactions')
       .set('Authorization', `Bearer ${f.landlordToken}`)
       .send({
+        propertyId: f.propertyId,
         items: [{ id: itemId, name: 'I', qty: 1, price: 10 }],
         paymentMethod: 'card',
         stripePaymentIntentId: 'pi_wrong_purpose',
@@ -765,6 +776,7 @@ describe('POST /api/pos/transactions — guards + idempotency', () => {
       .post('/api/pos/transactions')
       .set('Authorization', `Bearer ${f.landlordToken}`)
       .send({
+        propertyId: f.propertyId,
         items: [{ id: itemId, name: 'I', qty: 1, price: 10 }],
         paymentMethod: 'card',
         stripePaymentIntentId: 'pi_wrong_landlord',
@@ -1081,12 +1093,12 @@ async function seedTxOnDay(
 ): Promise<string> {
   const r = await db.query<{ id: string }>(
     `INSERT INTO pos_transactions
-       (landlord_id, cashier_id, payment_method, subtotal, tax_amount, surcharge, total, status, created_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, ($9 || ' 12:00:00 America/Phoenix')::timestamptz)
+       (landlord_id, cashier_id, payment_method, subtotal, tax_amount, surcharge, total, status, created_at, property_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, ($9 || ' 12:00:00 America/Phoenix')::timestamptz, $10)
      RETURNING id`,
     [f.landlordId, f.landlordUserId, opts.paymentMethod ?? 'cash',
      opts.total ?? 0, opts.taxAmount ?? 0, opts.surcharge ?? 0,
-     opts.total ?? 0, opts.status ?? 'completed', isoDate])
+     opts.total ?? 0, opts.status ?? 'completed', isoDate, f.propertyId])
   return r.rows[0].id
 }
 
@@ -1110,7 +1122,7 @@ describe('GET /api/pos/eod — list recent settlements', () => {
     // Seed three settlements on three different days, oldest first
     for (const day of ['2026-05-20', '2026-05-21', '2026-05-22']) {
       const { generateEodSettlement } = await import('../services/posEod')
-      await generateEodSettlement(f.landlordId, day, { status: 'auto_closed' })
+      await generateEodSettlement(f.landlordId, f.propertyId, day, { status: 'auto_closed' })
     }
     const res = await request(buildApp())
       .get('/api/pos/eod')
@@ -1125,7 +1137,7 @@ describe('GET /api/pos/eod — list recent settlements', () => {
   it('limit query param accepted; max cap 90', async () => {
     const f = await seedPosFixture()
     const { generateEodSettlement } = await import('../services/posEod')
-    await generateEodSettlement(f.landlordId, '2026-05-22', { status: 'auto_closed' })
+    await generateEodSettlement(f.landlordId, f.propertyId, '2026-05-22', { status: 'auto_closed' })
     // limit=200 should clamp to 90 (verified by route at line 1193)
     const res = await request(buildApp())
       .get('/api/pos/eod?limit=200')
@@ -1158,13 +1170,16 @@ describe('GET /api/pos/eod/:date — single settlement', () => {
   it('happy: returns the settlement row', async () => {
     const f = await seedPosFixture()
     const { generateEodSettlement } = await import('../services/posEod')
-    await generateEodSettlement(f.landlordId, '2026-05-22', { status: 'auto_closed' })
+    await generateEodSettlement(f.landlordId, f.propertyId, '2026-05-22', { status: 'auto_closed' })
     const res = await request(buildApp())
       .get('/api/pos/eod/2026-05-22')
       .set('Authorization', `Bearer ${f.landlordToken}`)
     expect(res.status).toBe(200)
-    expect(res.body.data.business_day.slice(0, 10)).toBe('2026-05-22')
-    expect(res.body.data.status).toBe('auto_closed')
+    // W-12: per-property settlements → the day endpoint returns an array
+    expect(res.body.data.length).toBe(1)
+    expect(res.body.data[0].business_day.slice(0, 10)).toBe('2026-05-22')
+    expect(res.body.data[0].status).toBe('auto_closed')
+    expect(res.body.data[0].property_id).toBe(f.propertyId)
   })
 })
 
@@ -1174,7 +1189,7 @@ describe('POST /api/pos/eod/close — manual close with drawer count', () => {
     const res = await request(buildApp())
       .post('/api/pos/eod/close')
       .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ cashDrawerActual: 100 })
+      .send({ propertyId: f.propertyId, cashDrawerActual: 100 })
     expect(res.status).toBe(400)
     expect(res.body.error).toMatch(/businessDay/i)
   })
@@ -1184,7 +1199,7 @@ describe('POST /api/pos/eod/close — manual close with drawer count', () => {
     const res = await request(buildApp())
       .post('/api/pos/eod/close')
       .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ businessDay: '2026-05-22' })
+      .send({ propertyId: f.propertyId, businessDay: '2026-05-22' })
     expect(res.status).toBe(400)
     expect(res.body.error).toMatch(/cashDrawerActual/i)
   })
@@ -1205,6 +1220,7 @@ describe('POST /api/pos/eod/close — manual close with drawer count', () => {
       .post('/api/pos/eod/close')
       .set('Authorization', `Bearer ${f.landlordToken}`)
       .send({
+        propertyId: f.propertyId,
         businessDay: '2026-05-22',
         cashDrawerActual: 175,
         openingFloat: 100,
@@ -1236,7 +1252,7 @@ describe('POST /api/pos/eod/close — manual close with drawer count', () => {
     await request(buildApp())
       .post('/api/pos/eod/close')
       .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ businessDay: '2026-05-22', cashDrawerActual: 50, openingFloat: 0 })
+      .send({ propertyId: f.propertyId, businessDay: '2026-05-22', cashDrawerActual: 50, openingFloat: 0 })
 
     // Late-arriving sale on same day
     await seedTxOnDay(f, '2026-05-22', { paymentMethod: 'cash', total: 30 })
@@ -1244,7 +1260,7 @@ describe('POST /api/pos/eod/close — manual close with drawer count', () => {
     const res = await request(buildApp())
       .post('/api/pos/eod/close')
       .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ businessDay: '2026-05-22', cashDrawerActual: 80, openingFloat: 0 })
+      .send({ propertyId: f.propertyId, businessDay: '2026-05-22', cashDrawerActual: 80, openingFloat: 0 })
     expect(res.status).toBe(200)
     expect(res.body.data.cashSales).toBe(80)
     expect(res.body.data.txCount).toBe(2)
@@ -1263,7 +1279,7 @@ describe('POST /api/pos/eod/close — manual close with drawer count', () => {
     const res = await request(buildApp())
       .post('/api/pos/eod/close')
       .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ businessDay: '2026-05-22', cashDrawerActual: 100, openingFloat: 0 })
+      .send({ propertyId: f.propertyId, businessDay: '2026-05-22', cashDrawerActual: 100, openingFloat: 0 })
     expect(res.status).toBe(200)
     expect(res.body.data.cashSales).toBe(100)  // only the 22nd
     expect(res.body.data.txCount).toBe(1)
@@ -1276,7 +1292,7 @@ describe('POST /api/pos/eod/regenerate — re-derive + reopened', () => {
     const res = await request(buildApp())
       .post('/api/pos/eod/regenerate')
       .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({})
+      .send({ propertyId: f.propertyId,})
     expect(res.status).toBe(400)
   })
 
@@ -1287,7 +1303,7 @@ describe('POST /api/pos/eod/regenerate — re-derive + reopened', () => {
     await request(buildApp())
       .post('/api/pos/eod/close')
       .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ businessDay: '2026-05-22', cashDrawerActual: 50, openingFloat: 0 })
+      .send({ propertyId: f.propertyId, businessDay: '2026-05-22', cashDrawerActual: 50, openingFloat: 0 })
 
     // Late refund added after the close
     await seedRefundOnDay(f, '2026-05-22', (await db.query<{ id: string }>(
@@ -1297,7 +1313,7 @@ describe('POST /api/pos/eod/regenerate — re-derive + reopened', () => {
     const res = await request(buildApp())
       .post('/api/pos/eod/regenerate')
       .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ businessDay: '2026-05-22' })
+      .send({ propertyId: f.propertyId, businessDay: '2026-05-22' })
     expect(res.status).toBe(200)
     expect(res.body.data.status).toBe('reopened')
     expect(res.body.data.cashRefunds).toBe(10)

@@ -1,3 +1,16 @@
+# ⛔ ARCHIVED — DO NOT USE (superseded S514)
+
+> **This template implements the retired ADVANCE model** (GAM fronts the
+> deposit at move-in). FlexDeposit is a **CUSTODY** service as of S512/S514 —
+> GAM advances nothing. The live agreement is
+> `FLEXDEPOSIT_CUSTODY_AGREEMENT.md` (v2.0.0), served by
+> `apps/api/src/services/flexsuiteAcceptance.ts`. This file is kept only as
+> the historical v1.0.0 text for tenants who accepted it before the
+> re-acceptance migration. Never serve it to new enrollments; never copy its
+> terms forward.
+
+---
+
 # FlexDeposit Service-Level Agreement
 
 **Gold Asset Management**

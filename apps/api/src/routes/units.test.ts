@@ -122,7 +122,7 @@ describe('GET /api/units/:id', () => {
 })
 
 describe('POST /api/units/:id/bookings — create', () => {
-  it('happy path: returns 201; nights computed; platform_fee 5%', async () => {
+  it('happy path: returns 201; nights computed; platform_fee 0 (S526: no fee on reservations)', async () => {
     const f = await seedUnitsFixture()
     const res = await request(buildApp())
       .post(`/api/units/${f.unitId}/bookings`)
@@ -135,7 +135,7 @@ describe('POST /api/units/:id/bookings — create', () => {
       })
     expect(res.status).toBe(201)
     expect(res.body.data.nights).toBe(4)
-    expect(Number(res.body.data.platform_fee)).toBe(20)  // 5% of 400
+    expect(Number(res.body.data.platform_fee)).toBe(0)  // S526: reservations carry no platform fee
     expect(res.body.data.landlord_id).toBe(f.landlordId)
     expect(res.body.data.source).toBe('direct')  // default
   })
@@ -180,6 +180,82 @@ describe('POST /api/units/:id/bookings — create', () => {
     expect(res.status).toBe(409)
     expect(res.body.error).toMatch(/already booked/)
   })
+
+  // S527: active leases block reservations too — pre-fix only other bookings
+  // were checked, so a leased unit accepted overlapping short stays.
+  const insertLease = (f: any, status: string, start: string, end: string | null) =>
+    db.query<{ id: string }>(
+      `INSERT INTO leases (unit_id, landlord_id, rent_amount, lease_type, status, start_date, end_date)
+       VALUES ($1, $2, 1000, 'fixed_term', $3, $4, $5) RETURNING id`,
+      [f.unitId, f.landlordId, status, start, end])
+
+  it('S527: overlap with ACTIVE lease → 409', async () => {
+    const f = await seedUnitsFixture()
+    await insertLease(f, 'active', '2026-01-01', '2026-12-31')
+    const res = await request(buildApp())
+      .post(`/api/units/${f.unitId}/bookings`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ leaseType: 'nightly', checkIn: '2026-07-01', checkOut: '2026-07-05' })
+    expect(res.status).toBe(409)
+    expect(res.body.error).toMatch(/active lease/)
+  })
+
+  it('S527: open-ended active lease (NULL end_date) blocks indefinitely', async () => {
+    const f = await seedUnitsFixture()
+    await insertLease(f, 'active', '2026-01-01', null)
+    const res = await request(buildApp())
+      .post(`/api/units/${f.unitId}/bookings`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ leaseType: 'nightly', checkIn: '2030-07-01', checkOut: '2030-07-05' })
+    expect(res.status).toBe(409)
+  })
+
+  it('S527: same-day turnover allowed — check-in ON the lease end date → 201', async () => {
+    const f = await seedUnitsFixture()
+    await insertLease(f, 'active', '2026-01-01', '2026-07-01')
+    const res = await request(buildApp())
+      .post(`/api/units/${f.unitId}/bookings`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ leaseType: 'nightly', checkIn: '2026-07-01', checkOut: '2026-07-05' })
+    expect(res.status).toBe(201)
+  })
+
+  it('S527: pending lease does NOT block', async () => {
+    const f = await seedUnitsFixture()
+    await insertLease(f, 'pending', '2026-01-01', '2026-12-31')
+    const res = await request(buildApp())
+      .post(`/api/units/${f.unitId}/bookings`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ leaseType: 'nightly', checkIn: '2026-07-01', checkOut: '2026-07-05' })
+    expect(res.status).toBe(201)
+  })
+
+  it('S527: PATCH move onto lease-covered dates → 409; own booking-draft lease exempt', async () => {
+    const f = await seedUnitsFixture()
+    const c = await request(buildApp())
+      .post(`/api/units/${f.unitId}/bookings`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ leaseType: 'nightly', checkIn: '2026-06-01', checkOut: '2026-06-05' })
+    const bookingId = c.body.data.id
+
+    // Active lease later in the year: extending into it must 409…
+    await insertLease(f, 'active', '2026-07-01', '2026-12-31')
+    const blocked = await request(buildApp())
+      .patch(`/api/units/${f.unitId}/bookings/${bookingId}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ checkOut: '2026-07-03' })
+    expect(blocked.status).toBe(409)
+    expect(blocked.body.error).toMatch(/active lease/)
+
+    // …but a lease drafted FROM this booking (later activated) is exempt.
+    await db.query(`UPDATE leases SET source_booking_id=$1, lease_source='booking_draft' WHERE unit_id=$2 AND status='active'`,
+      [bookingId, f.unitId])
+    const allowed = await request(buildApp())
+      .patch(`/api/units/${f.unitId}/bookings/${bookingId}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ checkOut: '2026-07-03' })
+    expect(allowed.status).toBe(200)
+  })
 })
 
 describe('PATCH /api/units/:id/bookings/:bookingId — update', () => {
@@ -197,6 +273,76 @@ describe('PATCH /api/units/:id/bookings/:bookingId — update', () => {
       .send({ checkOut: '2026-07-08' })
     expect(res.status).toBe(200)
     expect(res.body.data.nights).toBe(7)  // 07-01 to 07-08
+  })
+
+  it('W-20 extension protection: boots the following unrevealed reservation; falls back to MOVING THE EXTENDING GUEST; 409s when neither works', async () => {
+    const f = await seedUnitsFixture()
+    // A second bookable site at the property.
+    const u2 = (await db.query<{ id: string }>(
+      `INSERT INTO units (property_id, landlord_id, unit_number, rent_amount, is_bookable, lease_types_allowed)
+       VALUES ($1, $2, 'RV 99', 900, TRUE, ARRAY['nightly','weekly']) RETURNING id`,
+      [f.propertyId, f.landlordId])).rows[0].id
+    await db.query(`UPDATE units SET is_bookable=TRUE WHERE id=$1`, [f.unitId])
+
+    // Sitting guest on unit 1; incoming back-to-back on unit 1.
+    const sit = await request(buildApp())
+      .post(`/api/units/${f.unitId}/bookings`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ leaseType: 'nightly', checkIn: '2026-08-01', checkOut: '2026-08-05' })
+    const inc = await request(buildApp())
+      .post(`/api/units/${f.unitId}/bookings`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ leaseType: 'nightly', checkIn: '2026-08-05', checkOut: '2026-08-09', guestName: 'Incoming' })
+    const sitId = sit.body.data.id, incId = inc.body.data.id
+
+    // 1. Extend into the incoming stay → incoming gets booted to RV 99.
+    const ext1 = await request(buildApp())
+      .patch(`/api/units/${f.unitId}/bookings/${sitId}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ checkOut: '2026-08-07' })
+    expect(ext1.status).toBe(200)
+    expect(ext1.body.extendedGuestMovedTo).toBeNull()
+    const incUnit = await db.query(`SELECT unit_id FROM unit_bookings WHERE id=$1`, [incId])
+    expect(incUnit.rows[0].unit_id).toBe(u2)
+
+    // 2. Pin the incoming guest (revealed) back on unit 1 and fill RV 99 so
+    //    the incoming can't move — the EXTENDING guest moves instead.
+    await db.query(`UPDATE unit_bookings SET unit_id=$1, site_reveal_sent_at=now() WHERE id=$2`, [f.unitId, incId])
+    await db.query(`UPDATE unit_bookings SET check_out='2026-08-05' WHERE id=$1`, [sitId])
+    const ext2 = await request(buildApp())
+      .patch(`/api/units/${f.unitId}/bookings/${sitId}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ checkOut: '2026-08-07' })
+    expect(ext2.status).toBe(200)
+    expect(ext2.body.extendedGuestMovedTo?.unitNumber).toBe('RV 99')
+    const sitUnit = await db.query(`SELECT unit_id FROM unit_bookings WHERE id=$1`, [sitId])
+    expect(sitUnit.rows[0].unit_id).toBe(u2)
+
+    // 3. Nothing open anywhere → 409 with both reasons.
+    //    (RV 99 now holds the extended sitting guest; add a revealed block on
+    //    it for a fresh extension attempt from a third booking on unit 1.)
+    const third = await request(buildApp())
+      .post(`/api/units/${f.unitId}/bookings`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ leaseType: 'nightly', checkIn: '2026-08-09', checkOut: '2026-08-12' })
+    const thirdId = third.body.data.id
+    // Incoming (revealed) sits 08-05→08-09 on unit 1; extend third backward? Use forward:
+    // occupy RV 99 across the third booking's would-be extension window.
+    await db.query(
+      `INSERT INTO unit_bookings (unit_id, landlord_id, lease_type, check_in, check_out, status, site_reveal_sent_at)
+       VALUES ($1, $2, 'nightly', '2026-08-10', '2026-08-20', 'confirmed', now())`,
+      [u2, f.landlordId])
+    // A revealed incoming on unit 1 right after the third booking:
+    await db.query(
+      `INSERT INTO unit_bookings (unit_id, landlord_id, lease_type, check_in, check_out, status, site_reveal_sent_at)
+       VALUES ($1, $2, 'nightly', '2026-08-12', '2026-08-16', 'confirmed', now())`,
+      [f.unitId, f.landlordId])
+    const ext3 = await request(buildApp())
+      .patch(`/api/units/${f.unitId}/bookings/${thirdId}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ checkOut: '2026-08-14' })
+    expect(ext3.status).toBe(409)
+    expect(ext3.body.error).toMatch(/no open site fits the extended stay/i)
   })
 
   it('unit swap to cross-landlord unit → 404 "Target unit not found"', async () => {

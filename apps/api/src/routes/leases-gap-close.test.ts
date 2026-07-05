@@ -405,11 +405,17 @@ describe('PATCH /:id/deposit-return', () => {
       `INSERT INTO deposit_returns (lease_id, tenant_id, landlord_id, total_deposit, total_deductions, refund_amount, status)
        VALUES ($1, $2, $3, 1000, 200, 800, 'draft') RETURNING id`,
       [f.leaseAId, f.tenantAId, f.landlordAId])
+    // W-31: damage lines require owned evidence documents.
+    const ev = await db.query<{ id: string }>(
+      `INSERT INTO documents (landlord_id, type, name, url) VALUES ($1, 'receipt', 'Wall hole photo', '/uploads/docs/x.jpg') RETURNING id`,
+      [f.landlordAId],
+    )
+    const evidenceId = ev.rows[0].id
     const res = await request(buildApp())
       .patch(`/api/leases/${f.leaseAId}/deposit-return`)
       .set('Authorization', `Bearer ${f.tokenA}`)
       .send({
-        damageLines: [{ description: 'Wall hole', amount: 200 }],
+        damageLines: [{ description: 'Wall hole', amount: 200, evidenceDocumentIds: [evidenceId] }],
         notes: 'See photos',
       })
     expect(res.status).toBe(200)
@@ -417,7 +423,7 @@ describe('PATCH /:id/deposit-return', () => {
     expect(applyDeductionsToDraftMock).toHaveBeenCalledWith(
       draft.rows[0].id,
       expect.objectContaining({
-        damageLines: [{ description: 'Wall hole', amount: 200 }],
+        damageLines: [{ description: 'Wall hole', amount: 200, evidenceDocumentIds: [evidenceId] }],
         notes: 'See photos',
       })
     )

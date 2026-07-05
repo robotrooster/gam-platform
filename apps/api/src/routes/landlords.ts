@@ -276,18 +276,18 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
     const [stats] = await query<any>(`
       SELECT
         COUNT(*) FILTER (WHERE u.status='active')::int AS active_units,
-        COUNT(*) FILTER (WHERE u.status='direct_pay')::int AS direct_pay_units,
         COUNT(*) FILTER (WHERE u.status='vacant')::int AS vacant_units,
         COUNT(*) FILTER (WHERE u.status='delinquent')::int AS delinquent_units,
         COUNT(*) FILTER (WHERE u.status='suspended')::int AS suspended_units,
         COUNT(*) FILTER (WHERE u.payment_block=TRUE)::int AS eviction_mode_units,
         COUNT(u.id)::int AS total_units,
         -- Expected Monthly Rent = full rent roll across ALL occupied units
-        -- (active + direct_pay + delinquent + suspended), NOT active-only.
+        -- (active + delinquent + suspended), NOT active-only.
         -- Delinquent/suspended units are occupied and still owe rent, and their
         -- payments appear in income — counting only 'active' made Expected read
         -- LOWER than the income reports. 'vacant'/'available' are empty → excluded.
-        COALESCE(SUM(CASE WHEN u.status IN ('active','direct_pay','delinquent','suspended') THEN u.rent_amount ELSE 0 END),0) AS monthly_rent_volume,
+        -- (direct_pay retired W-15/S531.)
+        COALESCE(SUM(CASE WHEN u.status IN ('active','delinquent','suspended') THEN u.rent_amount ELSE 0 END),0) AS monthly_rent_volume,
         COUNT(DISTINCT p.id)::int AS property_count
       FROM units u
       JOIN properties p ON p.id = u.property_id
@@ -385,6 +385,44 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
     const occupancyRate = totalUnits > 0 ? Math.round(100 * (stats?.active_units || 0) / totalUnits) : 0
 
     res.json({ success: true, data: { ...stats, upcoming_disbursement: upcoming, trend, maintenance, bg_pending: bgPending?.count||0, otp_units: otpStats?.otp_units||0, projected_otp_disbursement: otpStats?.projected_otp_disbursement||0, platformFee, platformFeeByProperty, collected_mtd: collectedRow?.collected_mtd||0, outstanding: outstandingRow?.outstanding||0, leases_expiring_30d: expiring?.leases_expiring_30d||0, leases_expiring_60d: expiring?.leases_expiring_60d||0, occupancy_rate: occupancyRate } })
+  } catch (e) { next(e) }
+})
+
+// GET /api/landlords/:id/rent-roll — W-2 (S531). The Expected Monthly Rent
+// KPI's click-through page. One row per OCCUPIED unit (active + delinquent +
+// suspended — rent-obligation principle: rent owed is per lease, so
+// non-paying and evicting units stay on the roll). The total is the SAME
+// formula as monthly_rent_volume in /:id/dashboard (SUM of u.rent_amount
+// over occupied statuses), so the KPI and this page can never disagree.
+// Financial view — same gate as the dashboard rollup.
+landlordsRouter.get('/:id/rent-roll', async (req, res, next) => {
+  try {
+    const id = req.params.id === 'me' ? req.user!.profileId : req.params.id
+    if (!canViewLandlordFinances(req.user, id)) {
+      throw new AppError(403, 'Forbidden')
+    }
+    const rows = await query<any>(`
+      SELECT u.id AS unit_id, u.unit_number, u.status, u.rent_amount,
+        p.id AS property_id, p.name AS property_name,
+        l.id AS lease_id, l.start_date, l.end_date, l.lease_type,
+        vuo.primary_first_name AS tenant_first,
+        vuo.primary_last_name AS tenant_last,
+        vuo.tenant_count
+      FROM units u
+      JOIN properties p ON p.id = u.property_id
+      -- LATERAL + LIMIT 1: nothing enforces one active lease per unit at the
+      -- schema layer, and a stray duplicate would double-count the roll.
+      LEFT JOIN LATERAL (
+        SELECT id, start_date, end_date, lease_type FROM leases
+        WHERE unit_id = u.id AND status = 'active'
+        ORDER BY start_date DESC LIMIT 1
+      ) l ON TRUE
+      LEFT JOIN v_unit_occupancy vuo ON vuo.unit_id = u.id
+      WHERE u.landlord_id = $1
+        AND u.status IN ('active','delinquent','suspended')
+      ORDER BY p.name, u.unit_number`, [id])
+    const total = rows.reduce((s: number, r: any) => s + Number(r.rent_amount || 0), 0)
+    res.json({ success: true, data: { rows, total: Math.round(total * 100) / 100 } })
   } catch (e) { next(e) }
 })
 
@@ -665,8 +703,9 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
         type: 'expiring_soon',
         title: 'Lease expiring: ' + unitLabel,
         subtitle: (l.days_remaining != null ? l.days_remaining + ' days' : 'Soon')
-          + ' remaining — ' + tenantName,
-        href: '/leases?open=' + l.id,
+          + ' remaining — ' + tenantName + '. Decide: renew or not.',
+        // W-7 (S531): opens the renewal decision form, not the lease editor.
+        href: '/leases?renew=' + l.id,
       }
     })
 
@@ -1057,11 +1096,14 @@ type CsvRow = {
 // builds a real lease from it. Activation email fires only at lease creation.
 
 // POST /api/landlords/me/onboard-tenant-pending
-// Body: { firstName, lastName, email, phone }
+// Body: { firstName, lastName, email, phone, unitId? }
+// W-27 (S531): unitId optionally binds the spot the incoming tenant already
+// occupies — that unit is excluded from guest booking until the intent
+// resolves (migration protection for permanent RV tenants).
 landlordsRouter.post('/me/onboard-tenant-pending', requirePerm('tenants.create'), async (req, res, next) => {
   const client = await getClient()
   try {
-    const { firstName, lastName, email, phone } = req.body
+    const { firstName, lastName, email, phone, unitId } = req.body
 
     if (!firstName || !lastName || !email || !phone) {
       throw new AppError(400, 'firstName, lastName, email, phone required')
@@ -1118,6 +1160,17 @@ landlordsRouter.post('/me/onboard-tenant-pending', requirePerm('tenants.create')
       }
     }
 
+    // W-27: validate the bound unit belongs to this landlord and isn't
+    // already held by another open intent.
+    if (unitId) {
+      const owned = await queryOne<any>(
+        'SELECT id FROM units WHERE id=$1 AND landlord_id=$2', [unitId, landlordId])
+      if (!owned) throw new AppError(400, 'unitId does not belong to this landlord')
+      const held = await queryOne<any>(
+        'SELECT id FROM pending_tenant_intents WHERE unit_id=$1 AND resolved_at IS NULL', [unitId])
+      if (held) throw new AppError(409, 'That unit is already held by another pending tenant')
+    }
+
     await client.query('BEGIN')
 
     // 1. User row (create or reuse). NO email_verify_token — that's set when the
@@ -1155,10 +1208,10 @@ landlordsRouter.post('/me/onboard-tenant-pending', requirePerm('tenants.create')
     // 3. Intent row. UNIQUE(tenant_id) protects against races; on conflict we
     // already returned 409 above, so this insert should always succeed here.
     const intent = await client.query(
-      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status)
-       VALUES ($1, $2, 'not_uploaded')
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, unit_id)
+       VALUES ($1, $2, 'not_uploaded', $3)
        RETURNING id, parser_status, created_at`,
-      [landlordId, tenantId]
+      [landlordId, tenantId, unitId || null]
     )
 
     await client.query('COMMIT')
@@ -1385,10 +1438,15 @@ landlordsRouter.get('/me/pending-tenants', requirePerm('tenants.create'), async 
          u.email,
          u.first_name,
          u.last_name,
-         u.phone
+         u.phone,
+         un.id                   AS held_unit_id,
+         un.unit_number          AS held_unit_number,
+         pr.name                 AS held_property_name
        FROM pending_tenant_intents pti
        JOIN tenants t  ON t.id = pti.tenant_id
        JOIN users   u  ON u.id = t.user_id
+       LEFT JOIN units un ON un.id = pti.unit_id
+       LEFT JOIN properties pr ON pr.id = un.property_id
        WHERE pti.landlord_id = $1
          AND pti.resolved_at IS NULL
        ORDER BY pti.created_at DESC`,

@@ -509,17 +509,15 @@ live tenant behavior. Build the test battery before flipping flags.
 - Allocation engine subtraction from `allocation_owner_share`.
 - FlexCharge merchant Transfer post-commit firing.
 
-### FlexDeposit acceleration (S260)
+### FlexDeposit live-Stripe verification (custody model — S527 rewrite of the S260 entry; acceleration is RETIRED, no debt/no recourse)
 
-- 2-strike machinery: installment defaults → consecutive-default
-  check → acceleration fires.
-- Primary pull (rent_due−5) → retry pull (rent_due−1) →
-  installment defaulted on 2nd failure.
-- `accelerateFlexDepositPlan` → settled/failed webhook routes.
-- S262 manual retry from `in_default` state
-  (`retryFlexDepositAcceleration`).
-- Lease-end disbursement when plan still in_default
-  (collected_amount < total_amount edge case).
+- Installment primary pull → retry pull → 'missed' on 2nd failure
+  (no acceleration, plan stays active, deposit simply under-funded).
+- S527: retry pulls carry the ACH-return pass-through fee — verify
+  the fee rides the retry PI and never inflates custody collected_amount.
+- Monthly $3 custody fee pull + supersedence boost.
+- Lease-end disbursement when collected_amount < total_amount
+  (landlord claim capped at collected).
 
 ### FlexCharge end-to-end (S252-S259)
 

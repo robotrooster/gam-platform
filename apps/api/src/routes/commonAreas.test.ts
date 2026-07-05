@@ -270,3 +270,72 @@ describe('reservation fee charging (#4)', () => {
     expect((await feePayments(f.t1)).rows).toHaveLength(1) // still owed
   })
 })
+
+// ── W-44 (S531): tenant private events ────────────────────────────────
+import { processTenantEvents } from '../jobs/scheduler'
+
+describe('W-44 private events', () => {
+  it('event booking uses the event deposit and defers the announcement until paid', async () => {
+    const f = await fixture()
+    const area = await makeArea(f.llToken, f.propertyId, {
+      requiresApproval: false, eventsEnabled: true, eventDepositAmount: 50,
+    })
+    const res = await request(app).post(`/api/common-areas/${area.body.data.id}/request`)
+      .set('Authorization', `Bearer ${f.t1Token}`)
+      .send({ kind: 'event', title: 'Birthday bash', startsAt: PLUS(48), endsAt: PLUS(52) })
+    expect(res.status).toBe(201)
+    const r = await db.query(
+      `SELECT kind, fee_amount, status, residents_notified_at FROM common_area_reservations WHERE id=$1`,
+      [res.body.data.id])
+    expect(r.rows[0].kind).toBe('event')
+    expect(Number(r.rows[0].fee_amount)).toBe(50)
+    expect(r.rows[0].status).toBe('approved')
+    // Deposit unpaid → announcement deferred (no resident alert yet).
+    expect(r.rows[0].residents_notified_at).toBeNull()
+    expect(await notifCount('amenity_unavailable')).toBe(0)
+
+    // Settle the deposit → the hourly sweep announces to the OTHER resident.
+    await db.query(
+      `UPDATE payments SET status='settled', settled_at=now()
+        WHERE id=(SELECT fee_payment_id FROM common_area_reservations WHERE id=$1)`,
+      [res.body.data.id])
+    await processTenantEvents()
+    const after = await db.query(
+      `SELECT residents_notified_at FROM common_area_reservations WHERE id=$1`, [res.body.data.id])
+    expect(after.rows[0].residents_notified_at).not.toBeNull()
+    expect(await notifCount('amenity_unavailable', f.t2User)).toBe(1)
+  })
+
+  it('events are rejected on areas without events_enabled', async () => {
+    const f = await fixture()
+    const area = await makeArea(f.llToken, f.propertyId, { requiresApproval: false })
+    const res = await request(app).post(`/api/common-areas/${area.body.data.id}/request`)
+      .set('Authorization', `Bearer ${f.t1Token}`)
+      .send({ kind: 'event', startsAt: PLUS(48), endsAt: PLUS(52) })
+    expect(res.status).toBe(400)
+    expect(res.body.error).toMatch(/does not host private events/i)
+  })
+
+  it('auto-releases an unpaid event at start time (space becomes not private)', async () => {
+    const f = await fixture()
+    const area = await makeArea(f.llToken, f.propertyId, {
+      requiresApproval: false, eventsEnabled: true, eventDepositAmount: 50,
+    })
+    const res = await request(app).post(`/api/common-areas/${area.body.data.id}/request`)
+      .set('Authorization', `Bearer ${f.t1Token}`)
+      .send({ kind: 'event', startsAt: PLUS(1), endsAt: PLUS(5) })
+    expect(res.status).toBe(201)
+    // Time-travel: pull the start into the past; deposit still pending.
+    await db.query(
+      `UPDATE common_area_reservations SET starts_at = now() - interval '1 minute' WHERE id=$1`,
+      [res.body.data.id])
+    await processTenantEvents()
+    const r = await db.query(
+      `SELECT status, fee_voided, fee_payment_id, decision_note FROM common_area_reservations WHERE id=$1`,
+      [res.body.data.id])
+    expect(r.rows[0].status).toBe('cancelled')
+    expect(r.rows[0].fee_voided).toBe(true)
+    expect(r.rows[0].fee_payment_id).toBeNull()
+    expect(r.rows[0].decision_note).toMatch(/deposit unpaid/i)
+  })
+})

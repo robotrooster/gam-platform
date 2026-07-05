@@ -7,6 +7,7 @@ import {
   computeStayTotal, bookStay, joinWaitlist, getWaitlistClaim, claimWaitlistSpot, UnitFullError,
 } from '../services/propertyBooking'
 import { computeStayPrice } from '@gam/shared'
+import { rankUnitsBestFit } from '../services/scheduleCompression'
 
 // Re-exported for tests that import the legacy pure pricing helper from the
 // route. (Pricing now auto-tiers via the shared computeStayPrice — see below.)
@@ -53,15 +54,65 @@ async function resolveProperty(slug: string): Promise<PropertyRow> {
 /** Units that the public can book: bookable + allow a short-term stay type. */
 async function bookableUnits(propertyId: string) {
   return query<any>(
-    `SELECT id, unit_number, nightly_rate, weekly_rate, monthly_rate,
-            min_stay_nights, max_stay_nights, check_in_time, check_out_time,
-            lease_types_allowed
-       FROM units
-      WHERE property_id = $1
-        AND is_bookable = TRUE
-        AND (lease_types_allowed && ARRAY['nightly','weekly']::text[])
-      ORDER BY unit_number`,
+    `SELECT u.id, u.unit_number, u.nightly_rate, u.weekly_rate, u.monthly_rate,
+            u.min_stay_nights, u.max_stay_nights, u.check_in_time, u.check_out_time,
+            u.lease_types_allowed, u.subtype_id,
+            s.name AS subtype_name, s.rv_site_layout AS subtype_layout,
+            s.rv_amp_service AS subtype_amp,
+            s.nightly_rate AS subtype_nightly, s.weekly_rate AS subtype_weekly,
+            s.monthly_rate AS subtype_monthly
+       FROM units u
+       LEFT JOIN property_unit_subtypes s ON s.id = u.subtype_id
+      WHERE u.property_id = $1
+        AND u.is_bookable = TRUE
+        AND (u.lease_types_allowed && ARRAY['nightly','weekly']::text[])
+      ORDER BY u.unit_number`,
     [propertyId])
+}
+
+// W-20 (S531, Nic): guests book a SITE TYPE, not a specific unit — the
+// system assigns the actual site internally and reveals it the morning of
+// check-in (so the schedule can self-compress). Types = the property's
+// unit subtypes; units without a subtype pool into a "general" type with
+// no site requirements.
+interface SiteType {
+  id: string            // subtype uuid, or 'general'
+  name: string
+  requiredLayout: string | null
+  requiredAmp: string | null
+  units: any[]          // candidate units, unit_number order
+}
+function groupSiteTypes(units: any[]): SiteType[] {
+  const byType = new Map<string, SiteType>()
+  for (const u of units) {
+    const key = u.subtype_id ?? 'general'
+    let t = byType.get(key)
+    if (!t) {
+      t = {
+        id: key,
+        name: u.subtype_id ? u.subtype_name : 'RV Site',
+        requiredLayout: u.subtype_id ? (u.subtype_layout ?? null) : null,
+        requiredAmp: u.subtype_id ? (u.subtype_amp ?? null) : null,
+        units: [],
+      }
+      byType.set(key, t)
+    }
+    t.units.push(u)
+  }
+  return [...byType.values()]
+}
+function resolveSiteType(units: any[], siteTypeId: string): SiteType {
+  const t = groupSiteTypes(units).find(x => x.id === siteTypeId)
+  if (!t) throw new AppError(404, 'Site type not found')
+  return t
+}
+/** Representative rates for a type: subtype rates, else the first unit's. */
+function typeRates(t: SiteType) {
+  const u = t.units[0]
+  return {
+    nightly: (u.subtype_nightly ?? u.nightly_rate) != null ? Number(u.subtype_nightly ?? u.nightly_rate) : null,
+    weekly:  (u.subtype_weekly ?? u.weekly_rate) != null ? Number(u.subtype_weekly ?? u.weekly_rate) : null,
+  }
 }
 
 // ── GET /api/public/property/:slug — site profile + bookable units ──
@@ -69,6 +120,22 @@ publicPropertyBookingRouter.get('/property/:slug', async (req, res, next) => {
   try {
     const prop = await resolveProperty(req.params.slug)
     const units = await bookableUnits(prop.id)
+    // W-20: expose site TYPES only — never the unit inventory. The guest
+    // learns their actual site the morning of check-in.
+    const siteTypes = groupSiteTypes(units).map(t => {
+      const rates = typeRates(t)
+      return {
+        id: t.id,
+        name: t.name,
+        siteCount: t.units.length,
+        nightlyRate: rates.nightly,
+        weeklyRate: rates.weekly,
+        minStayNights: t.units[0].min_stay_nights,
+        maxStayNights: t.units[0].max_stay_nights,
+        checkInTime: t.units[0].check_in_time,
+        checkOutTime: t.units[0].check_out_time,
+      }
+    })
     res.json({
       success: true,
       data: {
@@ -79,17 +146,7 @@ publicPropertyBookingRouter.get('/property/:slug', async (req, res, next) => {
           intro: prop.booking_intro,
           depositPct: Number(prop.booking_deposit_pct),
         },
-        units: units.map(u => ({
-          id: u.id,
-          unitNumber: u.unit_number,
-          nightlyRate: u.nightly_rate != null ? Number(u.nightly_rate) : null,
-          weeklyRate: u.weekly_rate != null ? Number(u.weekly_rate) : null,
-          minStayNights: u.min_stay_nights,
-          maxStayNights: u.max_stay_nights,
-          checkInTime: u.check_in_time,
-          checkOutTime: u.check_out_time,
-          stayTypes: (u.lease_types_allowed || []).filter((t: string) => t === 'nightly' || t === 'weekly'),
-        })),
+        siteTypes,
       },
     })
   } catch (e) { next(e) }
@@ -100,7 +157,7 @@ publicPropertyBookingRouter.get('/property/:slug', async (req, res, next) => {
 publicPropertyBookingRouter.get('/property/:slug/availability', async (req, res, next) => {
   try {
     const q = z.object({
-      unitId:   z.string().uuid(),
+      siteTypeId: z.string(),
       checkIn:  z.string(),
       checkOut: z.string(),
       stayType: z.enum(['nightly', 'weekly']).default('nightly'),
@@ -115,48 +172,47 @@ publicPropertyBookingRouter.get('/property/:slug/availability', async (req, res,
     if (nights <= 0) throw new AppError(400, 'Check-out must be after check-in')
     if (ci < DateTime.now().startOf('day')) throw new AppError(400, 'Check-in is in the past')
 
-    const unit = await queryOne<any>(
-      `SELECT id, nightly_rate, weekly_rate, monthly_rate, min_stay_nights, max_stay_nights, is_bookable
-         FROM units WHERE id = $1 AND property_id = $2`,
-      [q.unitId, prop.id])
-    if (!unit || !unit.is_bookable) throw new AppError(404, 'Unit not bookable')
-
-    // Date-range overlap vs live bookings — ignore cancelled and abandoned
-    // unpaid holds (tentative past hold_expires_at).
-    const conflict = await queryOne<{ id: string }>(
-      `SELECT id FROM unit_bookings
-        WHERE unit_id = $1
-          AND status <> 'cancelled'
-          AND NOT (status = 'tentative' AND hold_expires_at IS NOT NULL AND hold_expires_at < now())
-          AND check_in < $2::date AND check_out > $3::date
-        LIMIT 1`,
-      [q.unitId, q.checkOut, q.checkIn])
+    // W-20: availability = ANY unit of the requested site type free for the
+    // window (guests never see per-unit inventory).
+    const siteType = resolveSiteType(await bookableUnits(prop.id), q.siteTypeId)
+    let freeUnit: any = null
+    for (const u of siteType.units) {
+      const conflict = await queryOne<{ id: string }>(
+        `SELECT id FROM unit_bookings
+          WHERE unit_id = $1
+            AND status <> 'cancelled'
+            AND NOT (status = 'tentative' AND hold_expires_at IS NOT NULL AND hold_expires_at < now())
+            AND check_in < $2::date AND check_out > $3::date
+          LIMIT 1`,
+        [u.id, q.checkOut, q.checkIn])
+      if (!conflict) { freeUnit = u; break }
+    }
 
     // Auto-tiered pricing (guest does not pick a billing type — Nic 2026-06-27):
     // length decides nightly/weekly/monthly, prorated, with short-term lodging
-    // tax (property-level rate the landlord sets for their city/state) on stays
-    // under 30 nights. Rates pull from the UNIT, property rate as the default.
+    // tax on stays under 30 nights. Rates: subtype, else unit, else property.
+    const rep = freeUnit ?? siteType.units[0]
     const price = computeStayPrice(
-      { nightly: unit.nightly_rate ?? prop.nightly_rate,
-        weekly:  unit.weekly_rate  ?? prop.weekly_rate,
-        monthly: unit.monthly_rate ?? prop.monthly_rate },
+      { nightly: rep.subtype_nightly ?? rep.nightly_rate ?? prop.nightly_rate,
+        weekly:  rep.subtype_weekly  ?? rep.weekly_rate  ?? prop.weekly_rate,
+        monthly: rep.subtype_monthly ?? rep.monthly_rate ?? prop.monthly_rate },
       Number(prop.short_term_tax_rate || 0), nights)
     const total = price.total > 0 ? price.total : null
     const depositPct = Number(prop.booking_deposit_pct)
     const depositAmount = total != null ? Math.round(total * (depositPct / 100) * 100) / 100 : null
 
-    const minStay = unit.min_stay_nights
-    const maxStay = unit.max_stay_nights
+    const minStay = rep.min_stay_nights
+    const maxStay = rep.max_stay_nights
     const stayTooShort = minStay != null && nights < minStay
     const stayTooLong  = maxStay != null && nights > maxStay
 
-    const available = !conflict && !stayTooShort && !stayTooLong && total != null
+    const available = !!freeUnit && !stayTooShort && !stayTooLong && total != null
 
     res.json({
       success: true,
       data: {
         available,
-        unavailableReason: conflict ? 'booked'
+        unavailableReason: !freeUnit ? 'booked'
           : stayTooShort ? `Minimum stay is ${minStay} nights`
           : stayTooLong ? `Maximum stay is ${maxStay} nights`
           : total == null ? 'rate_unavailable'
@@ -170,7 +226,7 @@ publicPropertyBookingRouter.get('/property/:slug/availability', async (req, res,
 
 // Guest-supplied booking details (the guest is not a GAM user).
 const guestBody = z.object({
-  unitId:    z.string().uuid(),
+  siteTypeId: z.string(),
   guestName: z.string().min(1),
   guestEmail: z.string().email(),
   guestPhone: z.string().optional(),
@@ -183,12 +239,32 @@ const guestBody = z.object({
 publicPropertyBookingRouter.post('/property/:slug/book', async (req, res, next) => {
   try {
     const b = guestBody.parse(req.body)
-    const r = await bookStay({ slug: req.params.slug, ...b })
-    res.json({ success: true, data: r })
-  } catch (e) {
-    if (e instanceof UnitFullError) {
-      return res.status(409).json({ success: false, full: true, error: e.message })
+    // W-20 (Nic): the system picks the site BEST-FIT — the stay slots into
+    // the snuggest compatible gap between existing reservations, so
+    // wide-open sites stay free for longer stays (same objective as the
+    // nightly packer). The per-unit advisory lock inside bookStay stays the
+    // race guard; UnitFullError just advances to the next candidate.
+    const prop = await resolveProperty(req.params.slug)
+    const siteType = resolveSiteType(await bookableUnits(prop.id), b.siteTypeId)
+    const ranked = await rankUnitsBestFit(
+      siteType.units.map((u: any) => u.id),
+      { checkIn: b.checkIn, checkOut: b.checkOut })
+    let lastFull: UnitFullError | null = null
+    for (const unitId of ranked) {
+      try {
+        const r = await bookStay({
+          slug: req.params.slug, ...b, unitId,
+          requiredSiteLayout: siteType.requiredLayout ?? 'none',
+          requiredAmpService: siteType.requiredAmp ?? 'none',
+        })
+        return res.json({ success: true, data: r })
+      } catch (e) {
+        if (e instanceof UnitFullError) { lastFull = e; continue }
+        throw e
+      }
     }
+    return res.status(409).json({ success: false, full: true, error: lastFull?.message || 'Those dates are full' })
+  } catch (e) {
     next(e)
   }
 })
@@ -197,7 +273,12 @@ publicPropertyBookingRouter.post('/property/:slug/book', async (req, res, next) 
 publicPropertyBookingRouter.post('/property/:slug/waitlist', async (req, res, next) => {
   try {
     const b = guestBody.parse(req.body)
-    const r = await joinWaitlist({ slug: req.params.slug, ...b })
+    // Waitlist rows are per-unit under the hood — anchor on the type's
+    // first candidate. The nightly compressor keeps the pool packed, so
+    // "that unit frees up" ≈ "the type frees up".
+    const prop = await resolveProperty(req.params.slug)
+    const siteType = resolveSiteType(await bookableUnits(prop.id), b.siteTypeId)
+    const r = await joinWaitlist({ slug: req.params.slug, ...b, unitId: siteType.units[0].id })
     res.json({ success: true, data: r })
   } catch (e) { next(e) }
 })
@@ -212,7 +293,8 @@ publicPropertyBookingRouter.get('/property/:slug/claim/:token', async (req, res,
       success: true,
       data: {
         propertyName: w.property_name,
-        unitNumber: w.unit_number,
+        // W-20: no site number pre-check-in — the claim is for a site TYPE;
+        // the actual site arrives the morning of check-in.
         checkIn: w.check_in, checkOut: w.check_out,
         guestName: w.guest_name,
         claimExpiresAt: w.claim_expires_at,

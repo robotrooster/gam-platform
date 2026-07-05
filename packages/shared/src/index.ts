@@ -1138,6 +1138,7 @@ export const PERMISSION_CATALOG: PermissionGroup[] = [
     category: 'documents', label: 'Documents',
     sections: [{ label: 'Access', items: [
       { key: 'documents.view', label: 'View documents' },
+      { key: 'documents.upload', label: 'Upload documents' },
     ]}],
   },
   {
@@ -1426,13 +1427,14 @@ export const ROLE_PERMISSIONS: Record<string, string[]> = {
 
 // Unit status values.
 // Single source of truth for units.status CHECK constraint.
-export const UNIT_STATUSES = ['vacant', 'available', 'active', 'direct_pay', 'delinquent', 'suspended'] as const
+// direct_pay retired W-15/S531 (migration 20260704150000) — off-platform
+// payment isn't a unit state GAM tracks; rows were merged into 'active'.
+export const UNIT_STATUSES = ['vacant', 'available', 'active', 'delinquent', 'suspended'] as const
 export type UnitStatus = typeof UNIT_STATUSES[number]
 export const UNIT_STATUS_LABEL: Record<UnitStatus, string> = {
   vacant:     'Vacant',
   available:  'Available',
   active:     'Active',
-  direct_pay: 'Direct Pay',
   delinquent: 'Delinquent',
   suspended:  'Suspended',
 }
@@ -1473,6 +1475,41 @@ export const UNIT_TYPE_HAS_BEDROOMS: Record<UnitType, boolean> = {
   mobile_home:   true,
   storage:       false,
   commercial:    false,
+}
+
+// ---------- Owner-defined unit subtypes (S527 — replaces S526 subtype_key model) ----------
+// property_unit_subtypes rows: a subtype is the OWNER's own named class of
+// unit on a property ("Studio", "Riverfront pull-through", "10x10") carrying
+// the type-relevant facts plus creation-time pricing. Blank per landlord
+// until they add them — nothing pre-baked. Add Unit picks one and prefills;
+// the unit stores its own copy (unit copy stays authoritative).
+export interface PropertyUnitSubtype {
+  id?: string
+  propertyId?: string
+  unitType: UnitType
+  name: string
+  bedrooms?: number | null
+  bathrooms?: number | string | null
+  rvSiteLayout?: string | null
+  rvAmpService?: string | null
+  storageSize?: string | null
+  rentAmount: number | string | null
+  securityDeposit: number | string | null
+  nightlyRate: number | string | null
+  weeklyRate: number | string | null
+  monthlyRate: number | string | null
+}
+
+// Human summary of a subtype's facts for chips/rows, e.g.
+// "Pull-through · 50 amp", "2 bed · 1 bath", "10x10". Empty when no facts.
+export function unitSubtypeFactsLabel(s: PropertyUnitSubtype): string {
+  const parts: string[] = []
+  if (s.bedrooms != null) parts.push(s.bedrooms === 0 ? 'Studio' : `${s.bedrooms} bed`)
+  if (s.bathrooms != null && s.bathrooms !== '') parts.push(`${s.bathrooms} bath`)
+  if (s.rvSiteLayout && s.rvSiteLayout !== 'none') parts.push(s.rvSiteLayout === 'pull_through' ? 'Pull-through' : 'Back-in')
+  if (s.rvAmpService && s.rvAmpService !== 'none') parts.push(s.rvAmpService === 'both' ? '30/50 amp' : `${s.rvAmpService} amp`)
+  if (s.storageSize?.trim()) parts.push(s.storageSize.trim())
+  return parts.join(' · ')
 }
 
 // Single source of truth for units.rv_site_layout / unit_bookings.required_site_layout
@@ -1597,7 +1634,7 @@ export enum DepositStatus {
 // Single source of truth for documents.type CHECK constraint.
 // Pattern: as-const array + derived union + Record<T,...> label map.
 // Adding a value: edit the array, compiler forces the label map update.
-export const DOCUMENT_CATEGORIES = ['lease', 'addendum', 'move_in_checklist', 'move_out_checklist', 'notice', 'other'] as const
+export const DOCUMENT_CATEGORIES = ['lease', 'addendum', 'move_in_checklist', 'move_out_checklist', 'notice', 'receipt', 'other'] as const
 export type DocumentCategory = typeof DOCUMENT_CATEGORIES[number]
 export const DOCUMENT_CATEGORY_LABEL: Record<DocumentCategory, string> = {
   lease:              'Lease',
@@ -1605,6 +1642,7 @@ export const DOCUMENT_CATEGORY_LABEL: Record<DocumentCategory, string> = {
   move_in_checklist:  'Move-In Checklist',
   move_out_checklist: 'Move-Out Checklist',
   notice:             'Notice',
+  receipt:            'Receipt',
   other:              'Other',
 }
 
@@ -2832,6 +2870,16 @@ export const LAUNCH_PLATFORM_FEE = {
   VACANT_UNIT:       0.00,
 } as const
 
+// W-32 (S531, Nic-set): user-facing INSTANT withdrawal fee — 2% of the
+// withdrawn amount, $5 minimum, all-in. Stripe's instant-payout cost
+// (1.5%, min $0.50) comes out of this; GAM nets the spread via an
+// account-debit transfer at payout time (routes/withdrawals.ts). Standard
+// on-demand withdrawals stay free.
+export const INSTANT_WITHDRAWAL_FEE = {
+  PCT:     0.02,
+  MIN_USD: 5.00,
+} as const
+
 /**
  * Monthly GAM platform fee for one property under the live model:
  * $2 × occupied units, floored at the $10 PER-PROPERTY MINIMUM — full stop.
@@ -3977,3 +4025,22 @@ export type PropertyTaxProvisionParams =
   | PropertyTaxAppealParams
   | PropertyTaxPaymentParams
   | PropertyTaxDelinquencyParams
+
+// ── W-9: date-picker auto-close ──────────────────────────────────────────────
+// Every date field in the portals is a native <input type="date|datetime-local">.
+// Some native calendar popovers (Safari date; datetime-local pickers) stay open
+// after a day is clicked, forcing an annoying extra click-off. Blurring the
+// input when its value commits dismisses the popover in every browser.
+// Call once at portal startup (main.tsx) — one global capture listener.
+const DATE_PICKER_INPUT_TYPES = ['date', 'datetime-local', 'month', 'week', 'time']
+export function installDatePickerAutoClose(): void {
+  if (typeof document === 'undefined') return
+  document.addEventListener(
+    'change',
+    (e) => {
+      const t = e.target as HTMLInputElement | null
+      if (t && t.tagName === 'INPUT' && DATE_PICKER_INPUT_TYPES.includes(t.type)) t.blur()
+    },
+    true
+  )
+}

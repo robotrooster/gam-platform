@@ -10,14 +10,18 @@
  */
 import { queryOne } from '../db'
 
-export type LeaseFeeType = 'early_termination_fee' | 'other_fee'
+// W-30: any lease_fees fee_type can be billed when its row carries
+// due_timing='other' — the row (already DB-CHECK-validated) is the source of
+// truth, so the param is a plain string. The old narrow alias stays for the
+// agent tool's arg surface.
+export type LeaseFeeType = string
 
 export async function createLeaseFeePayment(p: {
   landlordId: string
   tenantId: string | null
   leaseId: string
   unitId: string
-  feeType: LeaseFeeType
+  feeType: string
   amount: number
   description?: string
   dueDate?: string
@@ -25,7 +29,7 @@ export async function createLeaseFeePayment(p: {
 }): Promise<{ paymentId: string; dueDate: string; description: string }> {
   const dueDate = p.dueDate ?? new Date().toISOString().slice(0, 10)
   const description =
-    p.description ?? (p.feeType === 'early_termination_fee' ? 'Early termination fee' : 'Landlord-billed fee')
+    p.description ?? p.feeType.replace(/_/g, ' ').replace(/^\w/, (c) => c.toUpperCase())
   const inserted = await queryOne<{ id: string }>(
     `INSERT INTO payments (
        landlord_id, tenant_id, lease_id, unit_id,

@@ -5,7 +5,7 @@ import { BrowserRouter, Routes, Route, Navigate, NavLink, Outlet, useNavigate } 
 import { QueryClient, QueryClientProvider, useQuery, useMutation, useQueryClient } from 'react-query'
 import axios from 'axios'
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
-import { formatCurrency, getReservePhase, RESERVE_CONFIG, applyCamelizeInterceptor } from '@gam/shared'
+import { formatCurrency, getReservePhase, RESERVE_CONFIG, applyCamelizeInterceptor, installDatePickerAutoClose } from '@gam/shared'
 
 const API = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
 const BOOKS_URL = (import.meta as any).env?.VITE_BOOKS_APP_URL || 'http://localhost:3006'
@@ -3399,7 +3399,16 @@ function Root(){
   )
 }
 
-ReactDOM.createRoot(document.getElementById('root')!).render(
+installDatePickerAutoClose()
+
+// HMR guard: when Vite re-executes this entry module, calling createRoot on
+// the same container again STACKS a second mounted app under the first
+// (duplicate dashboards/login screens, dead nav). Reuse the one root and
+// just re-render into it — idempotent across hot updates.
+const rootEl = document.getElementById('root')!
+const appRoot: ReturnType<typeof ReactDOM.createRoot> =
+  (window as any).__gam_app_root ?? ((window as any).__gam_app_root = ReactDOM.createRoot(rootEl))
+appRoot.render(
   <React.StrictMode>
     <SentryErrorBoundary fallback={<div style={{ padding: 40, textAlign: 'center', color: 'var(--text-0)' }}>
       <div style={{ fontSize: '1.1rem', fontWeight: 600, marginBottom: 8 }}>Something went wrong</div>

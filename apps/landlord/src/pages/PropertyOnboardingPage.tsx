@@ -1,8 +1,8 @@
 import { useState, useRef, useMemo } from 'react'
 import { useMutation } from 'react-query'
 import { useNavigate } from 'react-router-dom'
-import { Upload, Download, FileText, AlertCircle, CheckCircle2, AlertTriangle, X } from 'lucide-react'
-import { api, apiPost } from '../lib/api'
+import { Upload, FileText, AlertCircle, CheckCircle2, AlertTriangle, X } from 'lucide-react'
+import { apiPost } from '../lib/api'
 
 type CsvIssue = { severity: 'block' | 'warn'; field?: string; message: string }
 type PropertyCsvRow = {
@@ -62,15 +62,15 @@ const FIELD_TO_ISSUE_KEY: Record<string, string> = {
 }
 
 const PLATFORM_OPTIONS = [
-  { value: 'generic',     label: 'Generic (GAM template)', enabled: true },
-  { value: 'buildium',    label: 'Buildium',               enabled: true },
-  { value: 'appfolio',    label: 'AppFolio',               enabled: true },
-  { value: 'doorloop',    label: 'DoorLoop',               enabled: true },
-  { value: 'yardi',       label: 'Yardi',                  enabled: true },
-  { value: 'rentmanager', label: 'RentManager',            enabled: true },
-  { value: 'propertyware',label: 'Propertyware',           enabled: true },
-  { value: 'rentec',      label: 'Rentec Direct',          enabled: true },
-  { value: 'tenantcloud', label: 'TenantCloud',            enabled: true },
+  { value: 'buildium',    label: 'Buildium',                     enabled: true },
+  { value: 'appfolio',    label: 'AppFolio',                     enabled: true },
+  { value: 'doorloop',    label: 'DoorLoop',                     enabled: true },
+  { value: 'yardi',       label: 'Yardi',                        enabled: true },
+  { value: 'rentmanager', label: 'RentManager',                  enabled: true },
+  { value: 'propertyware',label: 'Propertyware',                 enabled: true },
+  { value: 'rentec',      label: 'Rentec Direct',                enabled: true },
+  { value: 'tenantcloud', label: 'TenantCloud',                  enabled: true },
+  { value: 'generic',     label: 'Other platform (not listed)',  enabled: true },
 ]
 
 export function PropertyOnboardingPage() {
@@ -173,20 +173,6 @@ export function PropertyOnboardingPage() {
     })
   }
 
-  const handleDownloadTemplate = async () => {
-    try {
-      const res = await api.get(`/landlords/me/onboard-properties-csv/template?source=${source}`, { responseType: 'blob' })
-      const url = URL.createObjectURL(new Blob([res.data], { type: 'text/csv' }))
-      const a = document.createElement('a')
-      a.href = url
-      a.download = source === 'generic' ? 'gam-property-template.csv' : `gam-property-template-${source}.csv`
-      a.click()
-      URL.revokeObjectURL(url)
-    } catch (e: any) {
-      setErrorMsg(e?.response?.data?.message || 'Could not download template.')
-    }
-  }
-
   const handleReset = () => {
     setFileName('')
     setCsvText('')
@@ -272,7 +258,7 @@ export function PropertyOnboardingPage() {
       )}
 
       <div style={{ padding: 24, borderRadius: 10, background: 'var(--bg-1)', border: '1px solid var(--border-0)', marginBottom: 16 }}>
-        <h2 style={{ fontSize: '1.05rem', fontWeight: 700, color: 'var(--text-0)', marginTop: 0, marginBottom: 12 }}>1. Pick the source platform</h2>
+        <h2 style={{ fontSize: '1.05rem', fontWeight: 700, color: 'var(--text-0)', marginTop: 0, marginBottom: 12 }}>1. Pick the Source Platform</h2>
         <p style={{ fontSize: '.82rem', color: 'var(--text-2)', marginTop: 0, marginBottom: 12, lineHeight: 1.5 }}>
           GAM recognizes the standard export column names from each supported platform. Pick yours
           and we'll auto-map the columns; the preview step lets you correct anything that didn't land cleanly.
@@ -315,11 +301,11 @@ export function PropertyOnboardingPage() {
 
       <div style={{ padding: 24, borderRadius: 10, background: 'var(--bg-1)', border: '1px solid var(--border-0)', marginBottom: 16 }}>
         <h2 style={{ fontSize: '1.05rem', fontWeight: 700, color: 'var(--text-0)', marginTop: 0, marginBottom: 12 }}>
-          2. {source === 'generic' ? 'Get the template' : 'Export from your platform'}
+          2. Export from your current platform
         </h2>
         {source === 'generic' ? (
           <p style={{ fontSize: '.82rem', color: 'var(--text-2)', marginTop: 0, marginBottom: 12, lineHeight: 1.5 }}>
-            Download the GAM template, fill in your properties + units, then upload it below. One row per unit. For a property with multiple units, repeat the property fields on each unit's row.
+            Export your property/unit list from your current platform and upload it below — GAM auto-detects common column names, and the preview step lets you correct anything that didn't map cleanly.
           </p>
         ) : (
           <p style={{ fontSize: '.82rem', color: 'var(--text-2)', marginTop: 0, marginBottom: 12, lineHeight: 1.5 }}>
@@ -331,16 +317,18 @@ export function PropertyOnboardingPage() {
             {source === 'propertyware' && 'Export from Propertyware: Reports > Property List + Unit List.'}
             {source === 'rentec' && 'Export from Rentec Direct: Properties > Export.'}
             {source === 'tenantcloud' && 'Export from TenantCloud: Properties > Export to CSV.'}
-            {' '}Upload the CSV below — GAM recognizes the platform's standard column names. The download button gives you the column reference if you need it.
+            {' '}Upload the CSV below — GAM recognizes the platform's standard column names.
           </p>
         )}
-        <button onClick={handleDownloadTemplate} className="btn btn-ghost" style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
-          <Download size={14} /> {source === 'generic' ? 'Download template' : 'Download column reference'}
-        </button>
+        <div style={{ padding: '10px 12px', borderRadius: 7, background: 'var(--bg-2)', borderLeft: '3px solid var(--gold)', fontSize: '.78rem', color: 'var(--text-1)', lineHeight: 1.5 }}>
+          On paper, or no export handy? We'll do it for you — email{' '}
+          <a href="mailto:sales@goldassetmanagement.com" style={{ color: 'var(--gold)' }}>sales@goldassetmanagement.com</a>
+          {' '}with whatever you have (spreadsheets, scans, photos) and GAM imports your portfolio white-glove.
+        </div>
       </div>
 
       <div style={{ padding: 24, borderRadius: 10, background: 'var(--bg-1)', border: '1px solid var(--border-0)', marginBottom: 16 }}>
-        <h2 style={{ fontSize: '1.05rem', fontWeight: 700, color: 'var(--text-0)', marginTop: 0, marginBottom: 12 }}>3. Upload your filled-in CSV</h2>
+        <h2 style={{ fontSize: '1.05rem', fontWeight: 700, color: 'var(--text-0)', marginTop: 0, marginBottom: 12 }}>3. Upload Your Export</h2>
         <input
           ref={fileInputRef}
           type="file"
@@ -357,7 +345,7 @@ export function PropertyOnboardingPage() {
             <div style={{ display: 'inline-flex', alignItems: 'center', gap: 8, padding: '8px 12px', borderRadius: 8, background: 'var(--bg-0)', border: '1px solid var(--border-0)' }}>
               <FileText size={14} color="var(--text-2)" /> <span style={{ fontSize: '.85rem', color: 'var(--text-0)' }}>{fileName}</span>
             </div>
-            <button onClick={handleReset} className="btn btn-ghost" style={{ fontSize: '.82rem' }}>Replace file</button>
+            <button onClick={handleReset} className="btn btn-ghost" style={{ fontSize: '.82rem' }}>Replace File</button>
             <button onClick={handleValidate} className="btn btn-primary" disabled={validateMut.isLoading} style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
               {validateMut.isLoading ? 'Validating…' : 'Validate'}
             </button>
@@ -379,7 +367,7 @@ export function PropertyOnboardingPage() {
 
       {summary && punchListRows && (
         <div style={{ padding: 24, borderRadius: 10, background: 'var(--bg-1)', border: '1px solid var(--border-0)', marginBottom: 16 }}>
-          <h2 style={{ fontSize: '1.05rem', fontWeight: 700, color: 'var(--text-0)', marginTop: 0, marginBottom: 12 }}>4. Preview &amp; commit</h2>
+          <h2 style={{ fontSize: '1.05rem', fontWeight: 700, color: 'var(--text-0)', marginTop: 0, marginBottom: 12 }}>4. Preview &amp; Commit</h2>
           <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', marginBottom: 16, fontSize: '.85rem' }}>
             <div style={{ color: 'var(--text-1)' }}><strong>{summary.total}</strong> row(s)</div>
             <div style={{ color: 'var(--text-1)' }}><strong>{summary.newProperties}</strong> new propert{summary.newProperties === 1 ? 'y' : 'ies'}</div>

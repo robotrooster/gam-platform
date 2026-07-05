@@ -204,6 +204,89 @@ describe('GET /:id/eligible-managers', () => {
     expect(res.body.data.owner.role).toBe('self')
     expect(res.body.data.managers).toHaveLength(1)
     expect(res.body.data.managers[0].first_name).toBe('Pat')
+    expect(res.body.data.managers[0].staff_role).toBe('property_manager')
+  })
+
+  it('S527: onsite_manager scope holders are eligible too', async () => {
+    const f = await seed()
+    const omUser = await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+       VALUES ($1, 'x', 'onsite_manager', 'Ozzy', 'Onsite', TRUE) RETURNING id`,
+      [`om-${randomUUID()}@t.dev`])
+    await db.query(
+      `INSERT INTO onsite_manager_scopes (user_id, landlord_id, all_properties, property_ids, unit_ids)
+       VALUES ($1, $2, FALSE, ARRAY[$3]::uuid[], ARRAY[]::uuid[])`,
+      [omUser.rows[0].id, f.landlordAId, f.propertyAId])
+
+    const res = await request(buildApp())
+      .get(`/api/properties/${f.propertyAId}/eligible-managers`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.managers).toHaveLength(1)
+    expect(res.body.data.managers[0].first_name).toBe('Ozzy')
+    expect(res.body.data.managers[0].staff_role).toBe('onsite_manager')
+  })
+
+  it('S527: user holding BOTH scopes dedups to property_manager', async () => {
+    const f = await seed()
+    const dualUser = await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+       VALUES ($1, 'x', 'property_manager', 'Dee', 'Dual', TRUE) RETURNING id`,
+      [`dual-${randomUUID()}@t.dev`])
+    await db.query(
+      `INSERT INTO property_manager_scopes (user_id, landlord_id, all_properties, property_ids, unit_ids)
+       VALUES ($1, $2, TRUE, ARRAY[]::uuid[], ARRAY[]::uuid[])`,
+      [dualUser.rows[0].id, f.landlordAId])
+    await db.query(
+      `INSERT INTO onsite_manager_scopes (user_id, landlord_id, all_properties, property_ids, unit_ids)
+       VALUES ($1, $2, FALSE, ARRAY[$3]::uuid[], ARRAY[]::uuid[])`,
+      [dualUser.rows[0].id, f.landlordAId, f.propertyAId])
+
+    const res = await request(buildApp())
+      .get(`/api/properties/${f.propertyAId}/eligible-managers`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.managers).toHaveLength(1)
+    expect(res.body.data.managers[0].staff_role).toBe('property_manager')
+  })
+})
+
+// ───────────────────────────────────────────────────────────────────
+// PATCH /:id/manager — S527: onsite managers assignable
+// ───────────────────────────────────────────────────────────────────
+
+describe('PATCH /:id/manager', () => {
+  it('S527: assigning an onsite_manager scope holder succeeds', async () => {
+    const f = await seed()
+    const omUser = await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+       VALUES ($1, 'x', 'onsite_manager', 'Ozzy', 'Onsite', TRUE) RETURNING id`,
+      [`om-${randomUUID()}@t.dev`])
+    await db.query(
+      `INSERT INTO onsite_manager_scopes (user_id, landlord_id, all_properties, property_ids, unit_ids)
+       VALUES ($1, $2, FALSE, ARRAY[$3]::uuid[], ARRAY[]::uuid[])`,
+      [omUser.rows[0].id, f.landlordAId, f.propertyAId])
+
+    const res = await request(buildApp())
+      .patch(`/api/properties/${f.propertyAId}/manager`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ userId: omUser.rows[0].id })
+    expect(res.status).toBe(200)
+    expect(res.body.data.managed_by_user_id).toBe(omUser.rows[0].id)
+  })
+
+  it('unscoped user → 400', async () => {
+    const f = await seed()
+    const stranger = await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+       VALUES ($1, 'x', 'onsite_manager', 'Sal', 'Stranger', TRUE) RETURNING id`,
+      [`stranger-${randomUUID()}@t.dev`])
+
+    const res = await request(buildApp())
+      .patch(`/api/properties/${f.propertyAId}/manager`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ userId: stranger.rows[0].id })
+    expect(res.status).toBe(400)
   })
 })
 
@@ -401,49 +484,82 @@ describe('GET /applications', () => {
 })
 
 // ───────────────────────────────────────────────────────────────────
-// POST /:id/units/bulk
+// Owner-defined unit subtypes (S527 — replaced POST /:id/units/bulk,
+// which is removed; batch creation moved to POST /api/units quantity)
 // ───────────────────────────────────────────────────────────────────
 
-describe('POST /:id/units/bulk', () => {
+describe('unit-subtypes CRUD (S527)', () => {
   it('unknown property → 404', async () => {
     const f = await seed()
     const res = await request(buildApp())
-      .post(`/api/properties/${randomUUID()}/units/bulk`)
+      .post(`/api/properties/${randomUUID()}/unit-subtypes`)
       .set('Authorization', `Bearer ${f.tokenA}`)
-      .send({ unitGroups: [{ type: 'rv_spot', count: 5 }] })
+      .send({ unitType: 'rv_spot', name: 'Riverfront' })
     expect(res.status).toBe(404)
   })
 
   it('cross-landlord → 403', async () => {
     const f = await seed()
     const res = await request(buildApp())
-      .post(`/api/properties/${f.propertyBId}/units/bulk`)
+      .post(`/api/properties/${f.propertyBId}/unit-subtypes`)
       .set('Authorization', `Bearer ${f.tokenA}`)
-      .send({ unitGroups: [{ type: 'rv_spot', count: 5 }] })
+      .send({ unitType: 'rv_spot', name: 'Riverfront' })
     expect(res.status).toBe(403)
   })
 
-  it('missing unitGroups → 400', async () => {
+  it('missing name → 400', async () => {
     const f = await seed()
     const res = await request(buildApp())
-      .post(`/api/properties/${f.propertyAId}/units/bulk`)
+      .post(`/api/properties/${f.propertyAId}/unit-subtypes`)
       .set('Authorization', `Bearer ${f.tokenA}`)
-      .send({})
+      .send({ unitType: 'rv_spot' })
     expect(res.status).toBe(400)
   })
 
-  it('happy: bulk-creates N units with prefix + sequential numbering', async () => {
+  it('happy: create → list → delete; irrelevant facts nulled by type', async () => {
     const f = await seed()
-    const res = await request(buildApp())
-      .post(`/api/properties/${f.propertyAId}/units/bulk`)
+    const app = buildApp()
+    // bedrooms sent on an RV subtype must be nulled server-side.
+    const created = await request(app)
+      .post(`/api/properties/${f.propertyAId}/unit-subtypes`)
       .set('Authorization', `Bearer ${f.tokenA}`)
-      .send({ unitGroups: [{ type: 'rv_spot', count: 3, prefix: 'RV', rentAmount: 500 }] })
-    expect(res.status).toBe(201)
-    expect(res.body.data.created).toBe(3)
-    expect(res.body.data.units).toHaveLength(3)
-    // Confirm sequential numbering (01/02/03) regardless of case-of-prefix.
-    const nums = res.body.data.units.map((u: any) => u.unit_number).sort()
-    expect(nums[0]).toMatch(/01$/)
-    expect(nums[2]).toMatch(/03$/)
+      .send({ unitType: 'rv_spot', name: 'Riverfront pull-through', bedrooms: 2,
+              rvSiteLayout: 'pull_through', rvAmpService: '50',
+              rentAmount: 500, nightlyRate: 60 })
+    expect(created.status).toBe(200)
+    expect(created.body.data.bedrooms).toBeNull()
+    expect(created.body.data.rv_site_layout).toBe('pull_through')
+
+    const list = await request(app)
+      .get(`/api/properties/${f.propertyAId}/unit-subtypes`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+    expect(list.status).toBe(200)
+    expect(list.body.data).toHaveLength(1)
+    expect(list.body.data[0].name).toBe('Riverfront pull-through')
+
+    const del = await request(app)
+      .delete(`/api/properties/${f.propertyAId}/unit-subtypes/${created.body.data.id}`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+    expect(del.status).toBe(200)
+    const after = await request(app)
+      .get(`/api/properties/${f.propertyAId}/unit-subtypes`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+    expect(after.body.data).toHaveLength(0)
+  })
+
+  it('upsert: same (type, name) updates in place, no duplicate', async () => {
+    const f = await seed()
+    const app = buildApp()
+    await request(app).post(`/api/properties/${f.propertyAId}/unit-subtypes`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ unitType: 'apartment', name: 'Studio', bedrooms: 0, rentAmount: 600 })
+    const res = await request(app).post(`/api/properties/${f.propertyAId}/unit-subtypes`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ unitType: 'apartment', name: 'Studio', bedrooms: 0, rentAmount: 650 })
+    expect(res.status).toBe(200)
+    const list = await request(app).get(`/api/properties/${f.propertyAId}/unit-subtypes`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+    expect(list.body.data).toHaveLength(1)
+    expect(Number(list.body.data[0].rent_amount)).toBe(650)
   })
 })

@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
-import { useSearchParams } from 'react-router-dom'
+import { useSearchParams, useNavigate } from 'react-router-dom'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
 import { usePerms } from '../lib/permissions'
 import { EntryRequestsPage } from './EntryRequestsPage'
@@ -129,6 +129,7 @@ function RequestDetailModal({ request: r, onClose }: { request: any; onClose: ()
                 </a>
               ))}
             </div>
+            <ReceiptsSection requestId={req.id} canUpload={can('maintenance.update')} />
           </div>
 
           {/* Management */}
@@ -163,29 +164,6 @@ function RequestDetailModal({ request: r, onClose }: { request: any; onClose: ()
                   <Check size={12} />
                 </button>
               </div>
-            </div>
-            )}
-
-            {/* Man Hours */}
-            {can('maintenance.update') && (
-            <div style={{ marginBottom: 10 }}>
-              <label style={{ fontSize: '.68rem', color: 'var(--text-3)', display: 'block', marginBottom: 3 }}>Man Hours</label>
-              <div style={{ display: 'flex', gap: 6 }}>
-                <input className="input" type="number" step="0.5" min="0" placeholder="0.0"
-                  defaultValue={req.manHours || ''}
-                  onChange={e => setEditCost(e.target.value)}
-                  id={`man-hours-${r.id}`}
-                  style={{ width: '100%', fontSize: '.78rem' }} />
-                <button className="btn btn-ghost btn-sm" onClick={() => {
-                  const val = (document.getElementById(`man-hours-${r.id}`) as HTMLInputElement)?.value
-                  if (val) updateMut.mutate({ manHours: parseFloat(val) })
-                }}><Check size={12} /></button>
-              </div>
-              {req.manHours && req.actualCost && (
-                <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginTop: 3 }}>
-                  Cost/hr: {fmt(req.actualCost / req.manHours)}
-                </div>
-              )}
             </div>
             )}
 
@@ -357,6 +335,9 @@ export function MaintenancePage() {
   const [showAdd, setShowAdd] = useState(false)
   const [selectedRequest, setSelectedRequest] = useState<any>(null)
   const [searchParams, setSearchParams] = useSearchParams()
+  // W-44 (S531): maintenance closures on amenities are created HERE (split
+  // from the Amenities hold modal — issue-holds belong to Maintenance).
+  const [showCloseAmenity, setShowCloseAmenity] = useState(false)
   const [filterStatus, setFilterStatus] = useState('all')
   const [filterPriority, setFilterPriority] = useState('all')
   const [showCostBreakdown, setShowCostBreakdown] = useState(false)
@@ -434,11 +415,18 @@ export function MaintenancePage() {
             {emergencies.length > 0 && <span style={{ color: 'var(--red)', marginLeft: 8 }}>· {emergencies.length} emergency</span>}
           </p>
         </div>
+        <div style={{ display: 'flex', gap: 8 }}>
+        {can('amenities.hold') && (
+          <button className="btn btn-primary" onClick={() => setShowCloseAmenity(true)}>
+            <Lock size={14} /> Close Amenity
+          </button>
+        )}
         {can('maintenance.create') && (
           <button className="btn btn-primary" onClick={() => setShowAdd(true)}>
             <Plus size={15} /> Log Request
           </button>
         )}
+        </div>
       </div>
 
       {/* Emergency alert */}
@@ -538,6 +526,7 @@ export function MaintenancePage() {
       </div>
 
       {/* Add request modal */}
+      {showCloseAmenity && <CloseAmenityModal onClose={() => setShowCloseAmenity(false)} />}
       {showAdd && (
         <div className="modal-overlay" onClick={() => setShowAdd(false)}>
           <div className="modal" style={{ maxWidth: 480 }} onClick={e => e.stopPropagation()}>
@@ -589,6 +578,110 @@ export function MaintenancePage() {
         }
       }} />}
       {showCostBreakdown && <CostBreakdownModal requests={(requests as any[])} onClose={() => setShowCostBreakdown(false)} />}
+    </div>
+  )
+}
+
+// W-8 (S529): receipts on a request — uploaded here, stored as documents
+// rows auto-linked to the request's unit (they appear on the Documents tab
+// too). No manual linking where the source is known.
+function ReceiptsSection({ requestId, canUpload }: { requestId: string; canUpload: boolean }) {
+  const qc = useQueryClient()
+  const navigate = useNavigate()
+  const [error, setError] = useState<string | null>(null)
+  const { data: receipts = [] } = useQuery<any[]>(['maint-receipts', requestId], () => apiGet(`/maintenance/${requestId}/receipts`))
+  const upload = async (file: File) => {
+    setError(null)
+    const fd = new FormData()
+    fd.append('file', file)
+    const API_BASE = (import.meta as any).env.VITE_API_URL || 'http://localhost:4000'
+    const res = await fetch(`${API_BASE}/api/maintenance/${requestId}/receipts`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + (localStorage.getItem('gam_token') || '') },
+      body: fd,
+    })
+    if (!res.ok) { const j = await res.json().catch(() => ({})); setError(j?.error || 'Upload failed'); return }
+    qc.invalidateQueries(['maint-receipts', requestId])
+    qc.invalidateQueries('documents')
+  }
+  return (
+    <div style={{ marginTop: 10 }}>
+      <div style={{ fontSize: '.65rem', color: 'var(--text-3)', marginBottom: 4, textTransform: 'uppercase', letterSpacing: '.06em', fontWeight: 700 }}>Receipts</div>
+      <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+        {receipts.map((r: any) => (
+          <button key={r.id} type="button"
+            onClick={() => navigate(`/view?src=${encodeURIComponent(`/documents/${r.id}/file`)}&title=${encodeURIComponent(r.name || 'Receipt')}`)}
+            style={{ fontSize: '.68rem', color: 'var(--gold)', background: 'rgba(201,162,39,.08)', border: '1px solid rgba(201,162,39,.2)', borderRadius: 6, padding: '3px 8px', cursor: 'pointer' }}>
+            {r.name || 'Receipt'}
+          </button>
+        ))}
+        {canUpload && (
+          <label style={{ fontSize: '.68rem', color: 'var(--text-2)', border: '1px dashed var(--border-2)', borderRadius: 6, padding: '3px 8px', cursor: 'pointer' }}>
+            + Add receipt
+            <input type="file" accept=".pdf,.jpg,.jpeg,.png,.webp,.heic" style={{ display: 'none' }}
+              onChange={e => { const f = e.target.files?.[0]; if (f) upload(f); e.target.value = '' }} />
+          </label>
+        )}
+        {!receipts.length && !canUpload && <span style={{ fontSize: '.68rem', color: 'var(--text-3)' }}>None</span>}
+      </div>
+      {error && <div style={{ fontSize: '.68rem', color: 'var(--red)', marginTop: 3 }}>{error}</div>}
+    </div>
+  )
+}
+
+// W-44 (S531): create a maintenance_closure hold on a common area — the
+// Maintenance-tab home for "close the pool for chemical treatment".
+function CloseAmenityModal({ onClose }: { onClose: () => void }) {
+  const { data: properties = [] } = useQuery<any[]>('properties', () => apiGet('/properties'))
+  const [propertyId, setPropertyId] = useState('')
+  const { data: areas = [] } = useQuery<any[]>(
+    ['common-areas', propertyId],
+    () => apiGet(`/common-areas?propertyId=${propertyId}`),
+    { enabled: !!propertyId }
+  )
+  const [f, setF] = useState({ areaId: '', title: '', startsAt: '', endsAt: '', notifyResidents: true })
+  const m = useMutation(
+    () => apiPost(`/common-areas/${f.areaId}/reservations`, {
+      kind: 'maintenance_closure', title: f.title || undefined,
+      startsAt: new Date(f.startsAt).toISOString(), endsAt: new Date(f.endsAt).toISOString(),
+      notifyResidents: f.notifyResidents,
+    }),
+    { onSuccess: onClose })
+  const lbl2: React.CSSProperties = { fontSize: '.75rem', color: 'var(--text-3)', marginBottom: 4, display: 'block' }
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" style={{ maxWidth: 440 }} onClick={e => e.stopPropagation()}>
+        <div className="modal-title">Close Amenity for Maintenance</div>
+        <div style={{ display: 'grid', gap: 10 }}>
+          <div><span style={lbl2}>Property</span>
+            <select className="form-select" value={propertyId} onChange={e => { setPropertyId(e.target.value); setF(x => ({ ...x, areaId: '' })) }} style={{ width: '100%' }}>
+              <option value="" disabled>Select a property…</option>
+              {(properties as any[]).map((p: any) => <option key={p.id} value={p.id}>{p.name}</option>)}
+            </select>
+          </div>
+          <div><span style={lbl2}>Amenity</span>
+            <select className="form-select" value={f.areaId} onChange={e => setF(x => ({ ...x, areaId: e.target.value }))} style={{ width: '100%' }} disabled={!propertyId}>
+              <option value="" disabled>Select an amenity…</option>
+              {(areas as any[]).filter((a: any) => a.active).map((a: any) => <option key={a.id} value={a.id}>{a.name}</option>)}
+            </select>
+          </div>
+          <div><span style={lbl2}>Reason</span><input className="form-input" placeholder="Chemical treatment" value={f.title} onChange={e => setF(x => ({ ...x, title: e.target.value }))} style={{ width: '100%' }} /></div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+            <div><span style={lbl2}>Starts</span><input className="form-input" type="datetime-local" value={f.startsAt} onChange={e => setF(x => ({ ...x, startsAt: e.target.value }))} style={{ width: '100%' }} /></div>
+            <div><span style={lbl2}>Ends</span><input className="form-input" type="datetime-local" value={f.endsAt} onChange={e => setF(x => ({ ...x, endsAt: e.target.value }))} style={{ width: '100%' }} /></div>
+          </div>
+          <label style={{ fontSize: '.8rem' }}>
+            <input type="checkbox" checked={f.notifyResidents} onChange={e => setF(x => ({ ...x, notifyResidents: e.target.checked }))} /> Notify residents
+          </label>
+        </div>
+        {m.isError && <div style={{ color: 'var(--red)', fontSize: '.78rem', marginTop: 8 }}>Could not create the closure (time conflict?).</div>}
+        <div className="modal-footer">
+          <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+          <button className="btn btn-primary" disabled={!f.areaId || !f.startsAt || !f.endsAt || m.isLoading} onClick={() => m.mutate()}>
+            {m.isLoading ? 'Closing…' : 'Close Amenity'}
+          </button>
+        </div>
+      </div>
     </div>
   )
 }

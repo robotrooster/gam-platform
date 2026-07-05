@@ -72,6 +72,26 @@ export async function checkLeaseExpiryNotices() {
 
 // ── LEASE END PROCESSOR ─────────────────────────────────────
 // When end_date hits: auto-renew per landlord config, or expire + vacate
+// W-7 (S531): flip fully-signed pending leases (typically renewals drafted
+// via the renewal-decision flow, future-dated at creation) to active when
+// their start date arrives, and mark the unit occupied. Runs in the 2am
+// cron BEFORE processLeaseEnds so a renewal starting the day after the old
+// lease ends activates before/despite the old lease's expiry handling.
+export async function activatePendingLeases() {
+  try {
+    const due = await query<any>(`
+      SELECT id, unit_id FROM leases
+      WHERE status='pending'
+        AND signed_by_landlord=TRUE AND signed_by_tenant=TRUE
+        AND start_date <= CURRENT_DATE`)
+    for (const l of due) {
+      await query(`UPDATE leases SET status='active', updated_at=NOW() WHERE id=$1`, [l.id])
+      await query(`UPDATE units SET status='active', updated_at=NOW() WHERE id=$1`, [l.unit_id])
+      logger.info(`[LeaseActivate] pending lease ${l.id} reached start date — now active (unit ${l.unit_id})`)
+    }
+  } catch(e) { logger.error({ err: e }, '[SCHEDULER] activate pending leases') }
+}
+
 export async function processLeaseEnds() {
   try {
     const ended = await query<any>(`
@@ -115,13 +135,34 @@ export async function processLeaseEnds() {
         `, [lease.id])
         logger.info(`[LeaseEnd] Converted lease ${lease.id} to month-to-month (auto_renew: convert)`)
       } else {
-        // No auto-renew: expire the lease, cascade to lease_tenants, vacate the unit
+        // No auto-renew: expire the lease, cascade to lease_tenants, vacate the unit.
+        // W-7 (S531): unless a signed successor lease is queued on this unit
+        // (a renewal drafted via the renewal-decision flow) — then this is a
+        // HANDOFF, not a move-out: the unit stays occupied and no
+        // deposit-return draft is created (the deposit carried forward onto
+        // the successor at renewal completion).
+        const successor = await queryOne<any>(`
+          SELECT id FROM leases
+          WHERE unit_id=$1 AND status IN ('pending','active') AND id != $2
+            AND start_date > $3
+            AND signed_by_landlord=TRUE AND signed_by_tenant=TRUE
+          ORDER BY start_date ASC LIMIT 1`,
+          [lease.unit_id, lease.id, lease.start_date])
         await query(`UPDATE leases SET status='expired', terminated_at=NOW() WHERE id=$1`, [lease.id])
         await query(`
           UPDATE lease_tenants
           SET status='removed', removed_at=NOW(), removed_reason='lease_ended', updated_at=NOW()
           WHERE lease_id=$1 AND status IN ('active','pending_add','pending_remove')
         `, [lease.id])
+        if (successor) {
+          logger.info(`[LeaseEnd] Expired lease ${lease.id}; unit ${lease.unit_id} hands off to successor lease ${successor.id} — no vacate, no deposit-return draft`)
+          try {
+            await emitLeaseLifecycleEvent('renewed', lease.id, lease.landlord_id)
+          } catch (e) {
+            logger.error({ err: e }, '[LeaseEnd][credit-emit] renewed (handoff)')
+          }
+          continue
+        }
         await query(`UPDATE units SET status='vacant', updated_at=NOW() WHERE id=$1`, [lease.unit_id])
         logger.info(`[LeaseEnd] Expired lease ${lease.id}, vacated unit ${lease.unit_id}`)
 
@@ -415,6 +456,188 @@ async function checkLowStock() {
       }
     }
   } catch(e) { logger.error({ err: e }, '[SCHEDULER] low stock') }
+}
+
+// W-46: business-use supplies (parts_inventory) low-stock sweep. Separate
+// from the POS sweep above — parts_inventory has no property_id, so alerts
+// are landlord-wide only. min_quantity > 0 makes targets opt-in: items
+// without a set minimum never nag.
+async function checkPartsLowStock() {
+  try {
+    const groups = await query<{ landlord_id: string }>(
+      `SELECT DISTINCT landlord_id FROM parts_inventory
+        WHERE min_quantity > 0 AND quantity <= min_quantity`,
+    )
+    for (const g of groups) {
+      const low = await query<any>(
+        `SELECT name, quantity, min_quantity, unit FROM parts_inventory
+          WHERE landlord_id = $1 AND min_quantity > 0 AND quantity <= min_quantity
+          ORDER BY name ASC`,
+        [g.landlord_id],
+      )
+      if (low.length === 0) continue
+      const landlord = await queryOne<{ id: string; email: string }>(
+        `SELECT u.id, u.email FROM landlords l JOIN users u ON u.id = l.user_id WHERE l.id = $1`,
+        [g.landlord_id],
+      )
+      if (landlord) {
+        const { notifyPartsLowStock } = await import('../services/notifications')
+        await notifyPartsLowStock({ landlordUserId: landlord.id, landlordId: g.landlord_id, landlordEmail: landlord.email, items: low })
+      }
+    }
+  } catch(e) { logger.error({ err: e }, '[SCHEDULER] parts low stock') }
+}
+
+// W-46: serviceable-asset upkeep reminders — scheduled_maintenance rows
+// whose next_due has arrived. Fires daily until marked complete (which
+// advances next_due by the recurrence), same nag posture as low-stock.
+async function checkServiceDue() {
+  try {
+    const groups = await query<{ landlord_id: string }>(
+      `SELECT DISTINCT landlord_id FROM scheduled_maintenance
+        WHERE next_due IS NOT NULL AND next_due <= CURRENT_DATE`,
+    )
+    for (const g of groups) {
+      const due = await query<any>(
+        `SELECT sm.title, sm.next_due, p.name as property_name
+           FROM scheduled_maintenance sm
+           LEFT JOIN properties p ON p.id = sm.property_id
+          WHERE sm.landlord_id = $1 AND sm.next_due IS NOT NULL AND sm.next_due <= CURRENT_DATE
+          ORDER BY sm.next_due ASC`,
+        [g.landlord_id],
+      )
+      if (due.length === 0) continue
+      const landlord = await queryOne<{ id: string; email: string }>(
+        `SELECT u.id, u.email FROM landlords l JOIN users u ON u.id = l.user_id WHERE l.id = $1`,
+        [g.landlord_id],
+      )
+      if (landlord) {
+        const { notifyServiceDue } = await import('../services/notifications')
+        await notifyServiceDue({ landlordUserId: landlord.id, landlordId: g.landlord_id, landlordEmail: landlord.email, items: due })
+      }
+    }
+  } catch(e) { logger.error({ err: e }, '[SCHEDULER] service due') }
+}
+
+// W-20 (S531): site reveal — the guest learns their site AN HOUR BEFORE
+// the check-in time (Nic: a previous-day extension can re-site the
+// incoming guest with zero visible movement, because nothing is promised
+// until this message). Runs every 15 minutes; reveals confirmed same-day
+// arrivals whose (check_in_time − 1h) has passed in the property's
+// timezone (check_in_time default 15:00). The stamp is THE movement
+// fence. Tentative (unpaid) holds are never revealed.
+export async function revealTodaysSites() {
+  try {
+    const due = await query<any>(`
+      SELECT b.id, b.guest_name, b.guest_email, b.landlord_id,
+             u.unit_number, u.check_in_time, p.name AS property_name
+        FROM unit_bookings b
+        JOIN units u ON u.id = b.unit_id
+        JOIN properties p ON p.id = u.property_id
+       WHERE b.status = 'confirmed'
+         AND b.check_in = (now() AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::date
+         AND b.site_reveal_sent_at IS NULL
+         AND b.guest_email IS NOT NULL
+         AND (now() AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::time
+             >= COALESCE(u.check_in_time, '15:00'::time) - INTERVAL '1 hour'`)
+    for (const b of due) {
+      try {
+        const { emailBookingSiteAssignment } = await import('../services/email')
+        await emailBookingSiteAssignment({
+          to: b.guest_email,
+          guestName: b.guest_name,
+          propertyName: b.property_name,
+          unitNumber: b.unit_number,
+          checkIn: new Date().toISOString().slice(0, 10),
+          checkInTime: b.check_in_time,
+          ctx: { landlordId: b.landlord_id, bookingId: b.id },
+        })
+        await query(`UPDATE unit_bookings SET site_reveal_sent_at = NOW() WHERE id = $1`, [b.id])
+        logger.info(`[site-reveal] booking=${b.id} site=${b.unit_number}`)
+      } catch (e) {
+        logger.error({ err: e }, `[site-reveal] booking=${b.id} — will retry next run`)
+      }
+    }
+  } catch(e) { logger.error({ err: e }, '[SCHEDULER] site reveal') }
+}
+
+// W-44 (S531): tenant private events — hourly sweep, two passes.
+//   1. ANNOUNCE: deposit settled → mass property announcement (deferred
+//      from approval time; fireAmenityAlert skips deposit-events).
+//   2. AUTO-RELEASE: event start arrived with the deposit unpaid → the
+//      space becomes NOT private (cancel + void the unpaid deposit +
+//      tell the tenant), when the area's event_auto_release is on.
+export async function processTenantEvents() {
+  try {
+    // Pass 1 — announce paid events that haven't been announced.
+    const toAnnounce = await query<any>(`
+      SELECT car.id, car.property_id, car.landlord_id, car.title, car.kind,
+             car.starts_at, car.ends_at, car.reserved_by_tenant_id,
+             ca.name AS area_name, p.name AS property_name
+        FROM common_area_reservations car
+        JOIN common_areas ca ON ca.id = car.common_area_id
+        JOIN properties p ON p.id = car.property_id
+        JOIN payments pay ON pay.id = car.fee_payment_id
+       WHERE car.kind = 'event'
+         AND car.reserved_by_tenant_id IS NOT NULL
+         AND car.status = 'approved'
+         AND car.notify_residents = TRUE
+         AND car.residents_notified_at IS NULL
+         AND car.fee_amount > 0
+         AND pay.status = 'settled'`)
+    for (const r of toAnnounce) {
+      try {
+        const { notifyAmenityUnavailable } = await import('../services/notifications')
+        await notifyAmenityUnavailable({
+          propertyId: r.property_id, landlordId: r.landlord_id, propertyName: r.property_name,
+          areaName: r.area_name, kind: 'event', reason: r.title,
+          startsAt: r.starts_at, endsAt: r.ends_at, excludeTenantId: r.reserved_by_tenant_id,
+        })
+        await query(`UPDATE common_area_reservations SET residents_notified_at = now() WHERE id = $1`, [r.id])
+        logger.info(`[events] announced private event ${r.id} (${r.area_name})`)
+      } catch (e) { logger.error({ err: e }, `[events] announce ${r.id}`) }
+    }
+
+    // Pass 2 — release events whose start arrived with the deposit unpaid.
+    const toRelease = await query<any>(`
+      SELECT car.id, car.fee_payment_id, car.reserved_by_tenant_id,
+             car.landlord_id, car.starts_at, car.ends_at,
+             ca.name AS area_name, tu.id AS tenant_user_id, tu.email AS tenant_email
+        FROM common_area_reservations car
+        JOIN common_areas ca ON ca.id = car.common_area_id
+        JOIN tenants t ON t.id = car.reserved_by_tenant_id
+        JOIN users tu ON tu.id = t.user_id
+        LEFT JOIN payments pay ON pay.id = car.fee_payment_id
+       WHERE car.kind = 'event'
+         AND car.reserved_by_tenant_id IS NOT NULL
+         AND car.status = 'approved'
+         AND car.fee_amount > 0
+         AND car.starts_at <= now()
+         AND ca.event_auto_release = TRUE
+         AND (pay.id IS NULL OR pay.status NOT IN ('settled','processing'))`)
+    for (const r of toRelease) {
+      try {
+        await query(
+          `UPDATE common_area_reservations
+              SET status='cancelled', decision_note='Auto-released: event deposit unpaid by start time', updated_at=now()
+            WHERE id = $1`, [r.id])
+        if (r.fee_payment_id) {
+          await query(`DELETE FROM payments WHERE id = $1 AND status IN ('pending','failed')`, [r.fee_payment_id])
+          await query(`UPDATE common_area_reservations SET fee_voided = true, fee_payment_id = NULL WHERE id = $1`, [r.id])
+        }
+        const { createNotification } = await import('../services/notifications')
+        await createNotification({
+          userId: r.tenant_user_id, landlordId: r.landlord_id,
+          type: 'amenity_unavailable',
+          title: `Event released — ${r.area_name}`,
+          body: `Your private event at ${r.area_name} was released because the deposit wasn't paid by the start time. The space is open to everyone as usual.`,
+          data: { reservationId: r.id },
+          sendEmail: true, emailTo: r.tenant_email,
+        })
+        logger.info(`[events] auto-released unpaid event ${r.id} (${r.area_name})`)
+      } catch (e) { logger.error({ err: e }, `[events] release ${r.id}`) }
+    }
+  } catch(e) { logger.error({ err: e }, '[SCHEDULER] tenant events') }
 }
 
 // ── EMAIL_SEND_LOG PRUNE ────────────────────────────────────
@@ -1039,12 +1262,38 @@ export function schedulerInit() {
   cron.schedule('0 3 * * *', processBackgroundCheckExpiry)
 
   // ── LEASE END PROCESSOR ─────────────────────────────────────
-  // Daily at 2am — process leases that hit end_date (auto-renew or expire)
-  cron.schedule('0 2 * * *', processLeaseEnds)
+  // Daily at 2am — activate signed pending leases whose start date arrived
+  // (W-7 renewals), THEN process leases that hit end_date.
+  cron.schedule('0 2 * * *', async () => {
+    await activatePendingLeases()
+    await processLeaseEnds()
+  })
 
   // ── LOW STOCK CHECK ─────────────────────────────────────────
   // Daily at 9am — notify landlords of low-stock POS items
   cron.schedule('0 9 * * *', checkLowStock)
+
+  // W-46: same 9am slot — business-supplies low stock + equipment
+  // service-due reminders (both land on /inventory)
+  cron.schedule('0 9 * * *', checkPartsLowStock)
+  cron.schedule('0 9 * * *', checkServiceDue)
+
+  // W-20 (S531): schedule self-compression — nightly at 3:30am (after the
+  // 2am lease-end processor so handoffs/expiries settle first). The site
+  // reveal runs every 15 minutes and fires 1 HOUR BEFORE each unit's
+  // check-in time (property-timezone aware).
+  cron.schedule('30 3 * * *', async () => {
+    try {
+      const { compressAllSchedules } = await import('../services/scheduleCompression')
+      const moved = await compressAllSchedules()
+      if (moved > 0) logger.info(`[compress] nightly pass moved ${moved} booking(s)`)
+    } catch (e) { logger.error({ err: e }, '[SCHEDULER] schedule compression') }
+  })
+  cron.schedule('*/15 * * * *', revealTodaysSites)
+
+  // W-44 (S531): hourly private-event sweep — announce paid events,
+  // auto-release unpaid ones at start time.
+  cron.schedule('15 * * * *', processTenantEvents)
 
   // S103/S104/S121: daily 4am Phoenix prune + reconciliation block. Sits
   // between the 3:30am POS EOD and the 7am invoice-gen runs — light load,

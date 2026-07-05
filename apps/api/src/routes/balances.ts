@@ -1,6 +1,6 @@
 import { Router } from 'express'
 import { query } from '../db'
-import { requireAuth, requirePerm } from '../middleware/auth'
+import { requireAuth, requirePerm, getScopedPropertyIds } from '../middleware/auth'
 
 // Front-desk "who owes" surface. A read-only list of tenants with an unpaid
 // balance + their contact info, so a front-counter person knows who to call.
@@ -11,9 +11,13 @@ balancesRouter.use(requireAuth)
 
 // GET /api/balances — grouped per tenant + unit. Owners bypass requirePerm;
 // staff need the balances.view grant (part of the Front Desk preset).
+// Property-scoped: a worker with a property-locked scope row only sees
+// balances at their assigned properties (invoices with no unit have no
+// property, so scoped workers don't see them either).
 balancesRouter.get('/', requirePerm('balances.view'), async (req, res, next) => {
   try {
-    const landlordId = req.user!.profileId
+    const landlordId = req.user!.role === 'landlord' ? req.user!.profileId : req.user!.landlordId ?? req.user!.profileId
+    const scopedIds = await getScopedPropertyIds(req.user)
     const rows = await query<any>(`
       SELECT
         t.id                                        AS tenant_id,
@@ -37,11 +41,12 @@ balancesRouter.get('/', requirePerm('balances.view'), async (req, res, next) => 
       ) pd ON pd.invoice_id = i.id
       WHERE i.landlord_id = $1
         AND i.status IN ('pending', 'partial')
+        AND ($2::uuid[] IS NULL OR u.property_id = ANY($2::uuid[]))
       GROUP BY t.id, tu.first_name, tu.last_name, tu.phone, tu.email,
                u.unit_number, pr.id, pr.name
       HAVING SUM(i.total_amount - COALESCE(pd.paid, 0)) > 0
       ORDER BY balance DESC
-    `, [landlordId])
+    `, [landlordId, scopedIds])
     res.json({ success: true, data: rows })
   } catch (e) { next(e) }
 })

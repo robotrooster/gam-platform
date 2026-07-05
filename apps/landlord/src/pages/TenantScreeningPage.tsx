@@ -243,7 +243,7 @@ function ScreeningResult({ tenantId, onClear }: { tenantId: string; onClear: () 
         <div style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>
           Subject: {data.subjectId ? <span style={{ fontFamily: 'var(--font-mono)' }}>{data.subjectId}</span> : <em>no record yet</em>}
         </div>
-        <button className="btn btn-ghost btn-sm" onClick={onClear}>Pick a different tenant</button>
+        <button className="btn btn-ghost btn-sm" onClick={onClear}>Pick a Different Tenant</button>
       </div>
 
       <div className="grid3" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12, marginBottom: 16 }}>

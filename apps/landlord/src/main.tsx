@@ -1,10 +1,11 @@
 import { SentryErrorBoundary } from './lib/sentry'
+import { installDatePickerAutoClose } from '@gam/shared'
 import React from 'react'
 import ReactDOM from 'react-dom/client'
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from 'react-query'
 import { AuthProvider, useAuth } from './context/AuthContext'
-import { Layout, LAUNCH_HIDDEN } from './components/layout/Layout'
+import { Layout, LAUNCH_HIDDEN, visibleNavItemsFor } from './components/layout/Layout'
 import { LoginPage }       from './pages/LoginPage'
 import { RegisterPage }    from './pages/RegisterPage'
 import { AcceptInvitePage } from './pages/AcceptInvitePage'
@@ -19,6 +20,8 @@ import { TenantDetailPage } from './pages/TenantDetailPage'
 import { PendingTenantsPage } from './pages/PendingTenantsPage'
 import { PaymentsPage }    from './pages/PaymentsPage'
 import { BalancesPage }    from './pages/BalancesPage'
+import { RentRollPage }    from './pages/RentRollPage'
+import { UtilityMetersPage } from './pages/UtilityMetersPage'
 import { DisbursementsPage } from './pages/DisbursementsPage'
 import { BankingPage }      from './pages/BankingPage'
 import { MaintenancePage } from './pages/MaintenancePage'
@@ -36,6 +39,7 @@ import { SettingsPage } from './pages/SettingsPage'
 import { TotpEnrollPage } from './pages/TotpEnrollPage'
 import { ApplicantPoolPage } from './pages/ApplicantPoolPage'
 import { LeasesPage } from "./pages/LeasesPage"
+import { PdfViewerPage } from "./pages/PdfViewerPage"
 import { SubleasesPage } from "./pages/SubleasesPage"
 import { TeamPage } from './pages/TeamPage'
 import { StaffPermissionsPage } from './pages/StaffPermissionsPage'
@@ -53,7 +57,6 @@ import { EntryRequestsPage } from './pages/EntryRequestsPage'
 import { NewEntryRequestPage } from './pages/NewEntryRequestPage'
 import { EntryRequestDetailPage } from './pages/EntryRequestDetailPage'
 import { TenantScreeningPage } from './pages/TenantScreeningPage'
-import { NotificationPrefsPage } from './pages/NotificationPrefsPage'
 import { NotificationsPage } from './pages/NotificationsPage'
 import { DepositReturnPage } from './pages/DepositReturnPage'
 import { LeaseTerminationPage } from './pages/LeaseTerminationPage'
@@ -78,9 +81,33 @@ class ErrorBoundary extends React.Component<{children: React.ReactNode}, {error:
 function RoleRedirect() {
   const { user } = useAuth()
   if (!user) return <Navigate to="/login" replace />
-  if (user.role === 'onsite_manager' || user.role === 'maintenance') return <Navigate to="/pos" replace />
+  // Staff land on the FIRST page their permission set actually grants — the
+  // same visibility rule as the sidebar (was: hardcoded /pos, which dumped a
+  // front-desk user with no POS access on an empty register). Zero grants →
+  // /welcome explains what's missing.
+  if (user.role === 'onsite_manager' || user.role === 'maintenance' || user.role === 'property_manager') {
+    const first = visibleNavItemsFor(user)[0]
+    return <Navigate to={first ? first.to : '/welcome'} replace />
+  }
   if (user.onboardingComplete === false) return <Navigate to="/onboarding" replace />
   return <Navigate to="/dashboard" replace />
+}
+
+// Landing for a staff account with no permissions granted yet. Zero perms =
+// zero nav items, so every other page would be blank or 403 — this one says why.
+function NoAccessPage() {
+  const { user } = useAuth()
+  return (
+    <div className="card" style={{ padding: 40, textAlign: 'center', maxWidth: 560, margin: '60px auto' }}>
+      <div style={{ fontSize: '1.05rem', fontWeight: 600, marginBottom: 8 }}>
+        Welcome{user?.firstName ? `, ${user.firstName}` : ''} — your account is active
+      </div>
+      <div style={{ fontSize: '.85rem', color: 'var(--text-3)', lineHeight: 1.6 }}>
+        No pages have been enabled for you yet. Ask the property owner to grant
+        your permissions, then sign out and back in to pick them up.
+      </div>
+    </div>
+  )
 }
 
 const qc = new QueryClient({ defaultOptions: { queries: { retry: 1, staleTime: 300000, refetchOnWindowFocus: false, refetchOnMount: false } } })
@@ -103,6 +130,7 @@ export default function App() {
             <Route path="/shelf/:id" element={<ShelfLabelPage />} />
             <Route path="/" element={<PrivateRoute><ErrorBoundary><Layout /></ErrorBoundary></PrivateRoute>}>
               <Route index element={<RoleRedirect />} />
+              <Route path="welcome"        element={<NoAccessPage />} />
               <Route path="dashboard"      element={<DashboardPage />} />
               <Route path="onboarding"     element={<OnboardingPage />} />
               <Route path="properties"     element={<PropertiesPage />} />
@@ -118,6 +146,7 @@ export default function App() {
               <Route path="tenant-onboarding/pending" element={<PendingTenantsPage />} />
               <Route path="documents"      element={<DocumentsPage />} />
               <Route path="leases"         element={<LeasesPage />} />
+              <Route path="view"           element={<PdfViewerPage />} />
               <Route path="subleases"       element={LAUNCH_HIDDEN.has('/subleases') ? <Navigate to="/dashboard" replace /> : <SubleasesPage />} />
               <Route path="esign"          element={<ESignPage />} />
               <Route path="background"     element={<BackgroundChecksPage />} />
@@ -128,6 +157,8 @@ export default function App() {
               <Route path="sign/:token"    element={<SignPage />} />
               <Route path="payments"       element={<PaymentsPage />} />
               <Route path="balances"       element={<BalancesPage />} />
+              <Route path="rent-roll"      element={<RentRollPage />} />
+              <Route path="utilities"      element={<UtilityMetersPage />} />
               <Route path="disbursements"  element={<DisbursementsPage />} />
               <Route path="banking"        element={<BankingPage />} />
               <Route path="maintenance"    element={<MaintenancePage />} />
@@ -147,7 +178,8 @@ export default function App() {
               <Route path="entry-requests/new" element={<NewEntryRequestPage />} />
               <Route path="entry-requests/:id" element={<EntryRequestDetailPage />} />
               <Route path="screening"          element={<TenantScreeningPage />} />
-              <Route path="notification-prefs" element={<NotificationPrefsPage />} />
+              {/* W-53 (S531): prefs merged into Settings; deep links redirect */}
+              <Route path="notification-prefs" element={<Navigate to="/settings" replace />} />
               <Route path="bookings"           element={<Navigate to="/schedule" replace />} />
               <Route path="booking-sites"      element={<Navigate to="/schedule" replace />} />
               <Route path="notifications"     element={<NotificationsPage />} />
@@ -162,7 +194,16 @@ export default function App() {
   )
 }
 
-ReactDOM.createRoot(document.getElementById('root')!).render(
+installDatePickerAutoClose()
+
+// HMR guard: when Vite re-executes this entry module, calling createRoot on
+// the same container again STACKS a second mounted app under the first
+// (duplicate dashboards/login screens, dead nav). Reuse the one root and
+// just re-render into it — idempotent across hot updates.
+const rootEl = document.getElementById('root')!
+const appRoot: ReturnType<typeof ReactDOM.createRoot> =
+  (window as any).__gam_app_root ?? ((window as any).__gam_app_root = ReactDOM.createRoot(rootEl))
+appRoot.render(
   <SentryErrorBoundary fallback={<div style={{ padding: 40, textAlign: 'center', color: 'var(--text-0)' }}>
     <div style={{ fontSize: '1.1rem', fontWeight: 600, marginBottom: 8 }}>Something went wrong</div>
     <div style={{ fontSize: '.82rem', color: 'var(--text-3)', marginBottom: 16 }}>The error has been reported. Reload the page to try again.</div>

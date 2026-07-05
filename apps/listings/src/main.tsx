@@ -236,7 +236,14 @@ function App() {
   )
 }
 
-ReactDOM.createRoot(document.getElementById('root')!).render(
+// HMR guard: when Vite re-executes this entry module, calling createRoot on
+// the same container again STACKS a second mounted app under the first
+// (duplicate screens, dead nav). Reuse the one root and just re-render into
+// it — idempotent across hot updates.
+const rootEl = document.getElementById('root')!
+const appRoot: ReturnType<typeof ReactDOM.createRoot> =
+  (window as any).__gam_app_root ?? ((window as any).__gam_app_root = ReactDOM.createRoot(rootEl))
+appRoot.render(
   <React.StrictMode>
     <SentryErrorBoundary fallback={<div style={{ padding: 40, textAlign: 'center' }}>
       <div style={{ fontSize: '1.1rem', fontWeight: 600, marginBottom: 8 }}>Something went wrong</div>

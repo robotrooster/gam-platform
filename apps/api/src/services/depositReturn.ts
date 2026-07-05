@@ -41,6 +41,9 @@ import { logger } from '../lib/logger'
 export interface DamageLine {
   description: string
   amount: number
+  // W-31: documents ids proving the damage (photo/receipt). Required ≥1 by
+  // the route schema; stored verbatim in the damage_lines jsonb.
+  evidenceDocumentIds?: string[]
 }
 
 export interface DepositReturnDraftInput {
