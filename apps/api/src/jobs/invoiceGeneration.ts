@@ -6,6 +6,7 @@ import { logger } from '../lib/logger'
 import {
   loadWorkTradeCreditContext, workTradeFraction, distributeWorkTradeCredit, round2,
 } from '../services/workTradeCredit'
+import { ensureBillsForUnit } from '../services/utilityBilling'
 
 // ============================================================
 // S26a: Invoice generator (replaces S25 rentGeneration)
@@ -183,6 +184,65 @@ async function runGeneration(
     )
 
     for (const dueDate of dueDates) {
+      // S534 (Nic): two things hold a unit's invoice — and they hold the
+      // WHOLE invoice (rent included), never a partial send:
+      //   1. a missing ORIGINAL read on a tenant-responsible submeter
+      //      serving this unit (a due, not-yet-completed run cycle where
+      //      that meter was never read). Releases when the read lands or
+      //      the landlord force-completes the run.
+      //   2. an UNRESOLVED FLAG on such a meter's reading (needs_review —
+      //      probable typo / rollover-vs-swap). Releases when the
+      //      verification re-read or the landlord's review resolves it;
+      //      force-completing the run does NOT clear a flag.
+      // The daily cron retries, so the invoice generates dated its
+      // original due date the moment the hold clears. Other units are
+      // untouched, and a clean unit's unfinished VERIFICATION never
+      // blocks — ensureBillsForUnit below bills from original reads.
+      // RUBS masters never block (separate system — their bills ride
+      // the next invoice whenever the master gets read).
+      const readHold = await queryOne<{ meter_id: string }>(
+        `SELECT m.id AS meter_id
+           FROM utility_reading_runs r
+           JOIN utility_meters m ON m.property_id = r.property_id
+                                AND m.billing_method = 'submeter'
+           JOIN utility_meter_units mu ON mu.meter_id = m.id AND mu.unit_id = $2
+           JOIN lease_utility_responsibilities lur
+             ON lur.lease_id = $1
+            AND lur.utility_type = m.utility_type
+            AND lur.tenant_responsible
+          WHERE r.status <> 'completed'
+            AND r.billing_cycle_month <= date_trunc('month', $3::date)::date
+            AND NOT EXISTS (
+              SELECT 1 FROM utility_meter_readings rd
+               WHERE rd.meter_id = m.id
+                 AND rd.billing_cycle_month = r.billing_cycle_month)
+          LIMIT 1`,
+        [lease.id, lease.unit_id, dueDate]
+      )
+      const flagHold = readHold ? null : await queryOne<{ meter_id: string }>(
+        `SELECT m.id AS meter_id
+           FROM utility_meters m
+           JOIN utility_meter_units mu ON mu.meter_id = m.id AND mu.unit_id = $2
+           JOIN lease_utility_responsibilities lur
+             ON lur.lease_id = $1
+            AND lur.utility_type = m.utility_type
+            AND lur.tenant_responsible
+           JOIN utility_meter_readings rd ON rd.meter_id = m.id
+          WHERE m.billing_method = 'submeter'
+            AND rd.needs_review
+            AND rd.billing_cycle_month <= date_trunc('month', $3::date)::date
+          LIMIT 1`,
+        [lease.id, lease.unit_id, dueDate]
+      )
+      if (readHold || flagHold) continue
+
+      // S534: per-unit billing readiness — generate any bills this
+      // unit's readings support before pulling them below. Write-path
+      // only; the dry run just counts bills that already exist.
+      if (!opts.dryRun) {
+        await ensureBillsForUnit(lease.unit_id, dueDate)
+      }
+
       // S247: sublease-active branch. When a sublease covers this
       // (unit, due_date), the invoice is generated for the sublessee
       // at sub_monthly_amount instead of the primary master tenant
@@ -216,13 +276,38 @@ async function runGeneration(
         id: string
         charge_amount: string
       }>(
-        `SELECT id, charge_amount
-           FROM utility_bills
-          WHERE lease_id = $1
-            AND payment_id IS NULL
-            AND status IN ('unbilled','billed')
-            AND billing_cycle_month <= date_trunc('month', $2::date)::date
-          ORDER BY billing_cycle_month ASC, id ASC`,
+        `SELECT ub.id, (ub.charge_amount + ub.tax_amount) AS charge_amount,
+                ub.utility_type, ub.usage_amount, ub.reading_start, ub.reading_end,
+                m.digits
+           FROM utility_bills ub
+           JOIN utility_meters m ON m.id = ub.meter_id
+          WHERE ub.lease_id = $1
+            AND ub.payment_id IS NULL
+            AND ub.status IN ('unbilled','billed')
+            AND ub.billing_cycle_month <= date_trunc('month', $2::date)::date
+          ORDER BY ub.billing_cycle_month ASC, ub.id ASC`,
+        [lease.id, dueDate]
+      )
+
+      // S533: propane fill installments not yet billed whose cycle has
+      // arrived. #1 billed immediately at the fill (payment_id set), so
+      // this only picks up the split remainder. Same straggler semantics
+      // as utility bills. Fixed contractual amounts — deliberately NOT
+      // run through the work-trade credit distribution.
+      const propaneInstallments = await query<{
+        id: string
+        amount: string
+        installment_number: number
+        installment_count: number
+        gallons: string
+      }>(
+        `SELECT i.id, i.amount, i.installment_number, f.installment_count, f.gallons
+           FROM propane_fill_installments i
+           JOIN propane_fills f ON f.id = i.fill_id
+          WHERE f.lease_id = $1
+            AND i.payment_id IS NULL
+            AND i.billing_cycle_month <= date_trunc('month', $2::date)::date
+          ORDER BY i.billing_cycle_month ASC, i.installment_number ASC`,
         [lease.id, dueDate]
       )
 
@@ -237,7 +322,7 @@ async function runGeneration(
         invoicesInserted++
         rentsInserted++
         feesInserted += fees.length
-        utilitiesInserted += utilityBills.length
+        utilitiesInserted += utilityBills.length + propaneInstallments.length
         continue
       }
 
@@ -252,9 +337,13 @@ async function runGeneration(
         const rentAmountNum = Number(effectiveRentAmount)
         const feesTotalNum = fees.reduce((s, f) => s + Number(f.amount), 0)
         const utilitiesTotalNum = utilityBills.reduce((s, b) => s + Number(b.charge_amount), 0)
+        // Propane installments ride the invoice at face value (fixed
+        // contractual split amounts — exempt from work-trade credit and
+        // late fees) but count into the utilities subtotal + total.
+        const propaneTotalNum = propaneInstallments.reduce((s, p) => s + Number(p.amount), 0)
         const billableTotalNum = round2(rentAmountNum + feesTotalNum + utilitiesTotalNum)
         const subtotalFeesStr      = feesTotalNum.toFixed(2)
-        const subtotalUtilitiesStr = utilitiesTotalNum.toFixed(2)
+        const subtotalUtilitiesStr = round2(utilitiesTotalNum + propaneTotalNum).toFixed(2)
 
         // S517 — work-trade credit (Landlord #29). When the master tenant on
         // this unit has an active work-trade agreement, verified hours from
@@ -278,6 +367,7 @@ async function runGeneration(
           dist.rentNet
           + dist.utilityNets.reduce((s, u) => s + u, 0)
           + dist.feeNets.reduce((s, f) => s + f, 0)
+          + propaneTotalNum
         )
         // A row fully covered by the trade is charged $0 and recorded as
         // already-settled (covered by labor, not cash) only when work-trade
@@ -364,6 +454,15 @@ async function runGeneration(
         for (let i = 0; i < utilityBills.length; i++) {
           const ub = utilityBills[i]
           const net = dist.utilityNets[i]
+          // S533: the invoice line carries begin/end reads + usage — the
+          // tenant sees exactly what produced the charge (the blind rule
+          // only ever applied to the READER's entry flow).
+          const UNIT_LABEL: Record<string, string> = { electric: 'kWh', water: 'gal', sewer: 'gal', gas: 'therms' }
+          const pad = (v: any) => v == null ? null : String(Math.trunc(Number(v))).padStart(Number((ub as any).digits) || 6, '0')
+          const readNote = (ub as any).reading_start != null && (ub as any).reading_end != null
+            ? `${((ub as any).utility_type || 'utility')[0].toUpperCase() + ((ub as any).utility_type || 'utility').slice(1)} meter ${pad((ub as any).reading_start)} → ${pad((ub as any).reading_end)} · ${Number((ub as any).usage_amount || 0).toLocaleString()} ${UNIT_LABEL[(ub as any).utility_type] || 'units'}`
+            : null
+          const combinedNote = [readNote, rowNote(net)].filter(Boolean).join(' — ') || null
           const utilityPayment = await client.query<{ id: string }>(
             `INSERT INTO payments (
                invoice_id, unit_id, lease_id, tenant_id, landlord_id,
@@ -374,7 +473,7 @@ async function runGeneration(
              RETURNING id`,
             [
               invoiceId, lease.unit_id, lease.id, effectiveTenantId, lease.landlord_id,
-              net.toFixed(2), dueDate, rowStatus(net), rowNote(net),
+              net.toFixed(2), dueDate, rowStatus(net), combinedNote,
             ]
           )
           await client.query(
@@ -385,6 +484,29 @@ async function runGeneration(
                     updated_at = NOW()
               WHERE id = $2`,
             [utilityPayment.rows[0].id, ub.id]
+          )
+          utilitiesInserted++
+        }
+
+        // S533: propane installment children at face value (fixed split
+        // amounts). Once on the invoice they ride its NORMAL late-fee
+        // rules (Nic). payment_id stamped so the next run doesn't re-bill.
+        for (const pi of propaneInstallments) {
+          const propanePayment = await client.query<{ id: string }>(
+            `INSERT INTO payments (
+               invoice_id, unit_id, lease_id, tenant_id, landlord_id,
+               type, amount, status, due_date, entry_description, notes
+             ) VALUES ($1, $2, $3, $4, $5, 'utility', $6, 'pending', $7, 'PROPANE', $8)
+             RETURNING id`,
+            [
+              invoiceId, lease.unit_id, lease.id, effectiveTenantId, lease.landlord_id,
+              Number(pi.amount).toFixed(2), dueDate,
+              `Propane fill ${pi.gallons} gal — payment ${pi.installment_number} of ${pi.installment_count}`,
+            ]
+          )
+          await client.query(
+            `UPDATE propane_fill_installments SET payment_id = $1 WHERE id = $2`,
+            [propanePayment.rows[0].id, pi.id]
           )
           utilitiesInserted++
         }

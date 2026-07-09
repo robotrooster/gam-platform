@@ -662,7 +662,12 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
           THEN 'expiring_soon'
           ELSE NULL
         END AS issue_type,
-        EXTRACT(DAY FROM l.end_date::timestamp - NOW())::int AS days_remaining
+        EXTRACT(DAY FROM l.end_date::timestamp - NOW())::int AS days_remaining,
+        EXISTS (
+          SELECT 1 FROM lease_documents d
+           WHERE d.renews_lease_id = l.id
+             AND d.status NOT IN ('completed','voided')
+        ) AS renewal_in_progress
       FROM leases l
       JOIN units u ON u.id = l.unit_id
       JOIN properties p ON p.id = u.property_id
@@ -701,10 +706,14 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
       return {
         id: l.id,
         type: 'expiring_soon',
-        title: 'Lease expiring: ' + unitLabel,
+        title: (l.renewal_in_progress ? 'Renewal in progress: ' : 'Lease expiring: ') + unitLabel,
         subtitle: (l.days_remaining != null ? l.days_remaining + ' days' : 'Soon')
-          + ' remaining — ' + tenantName + '. Decide: renew or not.',
+          + ' remaining — ' + tenantName + '. '
+          + (l.renewal_in_progress
+              ? 'Renewal lease drafted — open it to finish signing.'
+              : 'Decide: renew or not.'),
         // W-7 (S531): opens the renewal decision form, not the lease editor.
+        // S534: the same form opens the in-flight draft directly when one exists.
         href: '/leases?renew=' + l.id,
       }
     })
@@ -1428,6 +1437,7 @@ landlordsRouter.get('/me/pending-tenants', requirePerm('tenants.create'), async 
          pti.tenant_id,
          pti.parser_status,
          pti.imported_pdf_url,
+         pti.parser_output,
          pti.parser_flags,
          pti.parser_error,
          pti.parser_started_at,
@@ -1465,6 +1475,7 @@ landlordsRouter.get('/me/pending-tenants', requirePerm('tenants.create'), async 
         phone: r.phone,
         parserStatus: r.parser_status,
         importedPdfUrl: r.imported_pdf_url,
+        parserOutput: r.parser_output,         // JSONB ParserOutput, may be null (S534: review-modal highlights)
         parserFlags: r.parser_flags,           // JSONB array, may be null
         parserError: r.parser_error,
         parserStartedAt: r.parser_started_at,

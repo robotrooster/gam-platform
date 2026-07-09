@@ -68,6 +68,7 @@ import { disbursementsRouter } from './routes/disbursements'
 import { maintenanceRouter }  from './routes/maintenance'
 import { documentsRouter }    from './routes/documents'
 import { utilityRouter }      from './routes/utility'
+import { propaneRouter }      from './routes/propane'
 import { adminRouter }        from './routes/admin'
 import { webhooksRouter }     from './routes/webhooks'
 import { stripeRouter }       from './routes/stripe'
@@ -111,7 +112,6 @@ validateEnv()
 const app  = express()
 const uploadsDir = path.join(process.cwd(), 'uploads')
 if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true })
-app.use('/uploads', express.static(uploadsDir))
 const PORT = process.env.PORT || 4000
 
 // ── MIDDLEWARE ──────────────────────────────────────────────
@@ -152,6 +152,22 @@ app.use(cors({
   },
   credentials: true,
 }))
+
+// S534: static uploads must mount AFTER the CORS middleware — pre-fix it
+// sat before cors(), so cross-origin fetches from the portals (e.g.
+// pdf.js loading a template's base PDF at /uploads/public/...) failed
+// silently and the e-sign document rendered as a blank page.
+// S535: only genuinely-public subdirectories are served statically.
+// The old catch-all `app.use('/uploads', ...)` exposed tenant PII
+// (id-documents, executed lease PDFs, inspections, docs) to anyone
+// who knew a filename. Those all have authorized per-file routes
+// (/api/esign/files, /api/background/id-files, /api/documents/:id/file,
+// /api/inspections/photo-files|video-files, /api/tenants/avatar-files,
+// /api/leases/:id/addendum-pdf) — never re-add a catch-all mount here.
+//   unit-photos → property marketing images rendered in <img> tags
+//   public      → demo/template assets (blank demo lease + notice PDFs)
+app.use('/uploads/unit-photos', express.static(path.join(uploadsDir, 'unit-photos')))
+app.use('/uploads/public',      express.static(path.join(uploadsDir, 'public')))
 
 // Stripe webhooks need raw body — must be before express.json()
 app.use('/webhooks/stripe', express.raw({ type: 'application/json' }))
@@ -260,6 +276,7 @@ app.use('/api/disbursements', disbursementsRouter)
 app.use('/api/maintenance',   maintenanceRouter)
 app.use('/api/documents',     documentsRouter)
 app.use('/api/utility',       utilityRouter)
+app.use('/api/propane',       propaneRouter)
 app.use('/api/admin',         adminRouter)
 app.use('/api/work-trade',    workTradeRouter)
 app.use('/api/stripe',        stripeRouter)

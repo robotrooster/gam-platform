@@ -287,6 +287,16 @@ paymentsRouter.post('/:id/pay', async (req: any, res, next) => {
     if (pmt.payment_block) {
       throw new AppError(409, 'This unit is in eviction mode — payments to the landlord are paused. Accepting one could reset the eviction timeline. Contact the landlord.')
     }
+    // S533/S534 payment priority (Nic): ACCELERATED propane outranks rent
+    // but NEVER interrupts the charge — the ACH pulls in full and settle-
+    // time redistribution (services/propaneRedistribution.ts, webhook)
+    // applies the funds propane-first, splitting the rent row. There is
+    // deliberately NO pay-time disclosure (S534): warning the tenant
+    // before/at confirmation invites backing out mid-flow and stranding
+    // failed ACH pulls. The tenant is informed AFTER the money moves, by
+    // the settle-time 'propane_priority_applied' notification in
+    // webhooks.ts. (GAM balances outrank both — supersedence skims at
+    // its own layer.)
     if (pmt.status === 'settled') {
       throw new AppError(409, 'Payment already settled')
     }

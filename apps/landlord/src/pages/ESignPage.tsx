@@ -442,6 +442,26 @@ function SendDocumentModal({ onClose }) {
   const properties = Array.from(new Map((units as any[]).map(u => [u.propertyId, { id: u.propertyId, name: u.propertyName }])).values())
   const selectedTemplate = templates.find(t => t.id === templateId)
 
+  // S535 auto-pull: picking a unit selects the template written for its
+  // type (newest exact-type match, else universal) unless the current
+  // pick is already compatible. Changeable in the picker either way.
+  useEffect(() => {
+    if (mode !== 'unit' || !selectedUnitId) return
+    const u = (units as any[]).find((x:any) => x.id === selectedUnitId)
+    if (!u?.unitType) return
+    const fits = (t:any) => (!t.unitType || t.unitType === u.unitType) && (!t.propertyId || t.propertyId === u.propertyId)
+    const current: any = templates.find((t:any) => t.id === templateId)
+    if (current && fits(current)) return
+    // Most specific first: locked to this property + exact type → exact
+    // type → property-locked any-type → fully universal.
+    const pool = (templates as any[]).filter(fits)
+    const pick = pool.find((t:any) => t.propertyId === u.propertyId && t.unitType === u.unitType)
+      ?? pool.find((t:any) => t.unitType === u.unitType)
+      ?? pool.find((t:any) => t.propertyId === u.propertyId)
+      ?? pool.find((t:any) => !t.unitType && !t.propertyId)
+    if (pick) setTemplateId(pick.id)
+  }, [selectedUnitId, mode])
+
   // Resolved lease signers for the picked unit / property.
   const recipientsQ = mode === 'unit' && selectedUnitId
     ? `/esign/recipients?unitId=${selectedUnitId}`
@@ -716,6 +736,13 @@ export function ESignPage() {
   const [showSend, setShowSend] = useState(false)
   const [showNewTemplate, setShowNewTemplate] = useState(false)
   const [newTmplName, setNewTmplName] = useState('')
+  // S535: templates are per unit type ('' = universal)
+  const [newTmplUnitType, setNewTmplUnitType] = useState('')
+  // S535: optional PROPERTY lock — auto-set when the uploaded PDF's text
+  // names exactly one of the landlord's properties.
+  const [newTmplPropertyId, setNewTmplPropertyId] = useState('')
+  const [detectedPropertyName, setDetectedPropertyName] = useState<string | null>(null)
+  const { data: tmplProperties = [] } = useQuery<any[]>('properties', () => apiGet('/properties'))
   const [newTmplPdf, setNewTmplPdf] = useState('')
   const [tmplUploading, setTmplUploading] = useState(false)
   const [tmplUploadedName, setTmplUploadedName] = useState('')
@@ -730,7 +757,7 @@ export function ESignPage() {
   )
 
   const createTemplateMut = useMutation(
-    () => apiPost('/esign/templates', { name: newTmplName, pageCount: tmplPageCount, basePdfUrl: newTmplPdf||null }),
+    () => apiPost('/esign/templates', { name: newTmplName, pageCount: tmplPageCount, basePdfUrl: newTmplPdf||null, unitType: newTmplUnitType === 'all' ? null : newTmplUnitType || null, propertyId: newTmplPropertyId || null }),
     { onSuccess: async (res: any) => {
       qc.invalidateQueries('esign-templates')
       setShowNewTemplate(false)
@@ -841,7 +868,7 @@ export function ESignPage() {
                   <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start', marginBottom:10 }}>
                     <div>
                       <div style={{ fontWeight:700, color:'var(--text-0)', marginBottom:2 }}>{t.name}</div>
-                      <div style={{ fontSize:'.72rem', color:'var(--text-3)' }}>{t.fieldCount} fields · {t.pageCount} pages</div>
+                      <div style={{ fontSize:'.72rem', color:'var(--text-3)' }}>{t.fieldCount} fields · {t.pageCount} pages · {t.unitType ? t.unitType.replace('_',' ') : 'any unit type'} · {t.propertyName || 'any property'}</div>
                     </div>
                     <FileText size={18} style={{ color:'var(--text-3)' }} />
                   </div>
@@ -879,6 +906,32 @@ export function ESignPage() {
               <label style={{ fontSize:'.72rem', fontWeight:600, color:'var(--text-3)', textTransform:'uppercase' as const, letterSpacing:'.06em', display:'block', marginBottom:5 }}>Template Name *</label>
               <input className="input" placeholder="Standard 12-Month Lease" value={newTmplName} onChange={e => setNewTmplName(e.target.value)} style={{ width:'100%' }} autoFocus />
             </div>
+            <div style={{ marginBottom:12 }}>
+              <label style={{ fontSize:'.72rem', fontWeight:600, color:'var(--text-3)', textTransform:'uppercase' as const, letterSpacing:'.06em', display:'block', marginBottom:5 }}>Unit Type</label>
+              <select className="form-select" value={newTmplUnitType} onChange={e => setNewTmplUnitType(e.target.value)} style={{ width:'100%' }}>
+                <option value="" disabled>Select unit type…</option>
+                <option value="all">All unit types (universal)</option>
+                <option value="apartment">Apartment</option>
+                <option value="single_family">Single family</option>
+                <option value="rv_spot">RV spot</option>
+                <option value="mobile_home">Mobile home</option>
+                <option value="storage">Storage</option>
+                <option value="commercial">Commercial</option>
+              </select>
+              <div style={{ fontSize:'.65rem', color:'var(--text-3)', marginTop:3 }}>Drafting only offers this template for matching units — an RV lease is not an apartment lease.</div>
+            </div>
+            <div style={{ marginBottom:12 }}>
+              <label style={{ fontSize:'.72rem', fontWeight:600, color:'var(--text-3)', textTransform:'uppercase' as const, letterSpacing:'.06em', display:'block', marginBottom:5 }}>Property Lock</label>
+              <select className="form-select" value={newTmplPropertyId} onChange={e => setNewTmplPropertyId(e.target.value)} style={{ width:'100%' }}>
+                <option value="">Any property (unlocked)</option>
+                {(tmplProperties as any[]).map((pr:any) => <option key={pr.id} value={pr.id}>{pr.name}</option>)}
+              </select>
+              {detectedPropertyName && newTmplPropertyId ? (
+                <div style={{ fontSize:'.65rem', color:'var(--green)', marginTop:3 }}>✓ Detected &quot;{detectedPropertyName}&quot; in the document&apos;s text — locked automatically (change above if wrong).</div>
+              ) : (
+                <div style={{ fontSize:'.65rem', color:'var(--text-3)', marginTop:3 }}>Lease forms name their property — locking prevents sending the wrong property&apos;s form.</div>
+              )}
+            </div>
 <div style={{ marginBottom:16 }}>
               <label style={{ fontSize:'.72rem', fontWeight:600, color:'var(--text-3)', textTransform:'uppercase' as const, letterSpacing:'.06em', display:'block', marginBottom:5 }}>Base PDF URL (optional)</label>
               <div style={{ display:'flex', gap:8, alignItems:'center' }}>
@@ -896,7 +949,14 @@ export function ESignPage() {
                         method: 'POST', headers: { Authorization: `Bearer ${token}` }, body: formData
                       })
                       const data = await res.json()
-                      if (data.success) { setNewTmplPdf(data.data.url); setTmplUploadedName(data.data.filename); setTmplPageCount(data.data.pageCount || 1) }
+                      if (data.success) {
+                        setNewTmplPdf(data.data.url); setTmplUploadedName(data.data.filename); setTmplPageCount(data.data.pageCount || 1)
+                        // S535: PDF text named exactly one property → lock suggestion.
+                        if (data.data.detectedProperty) {
+                          setNewTmplPropertyId(data.data.detectedProperty.propertyId)
+                          setDetectedPropertyName(data.data.detectedProperty.propertyName)
+                        } else { setDetectedPropertyName(null) }
+                      }
                     } catch(err) { alert('Upload failed') }
                     setTmplUploading(false)
                   }} />
@@ -907,7 +967,7 @@ export function ESignPage() {
             </div>
             <div className="modal-footer">
               <button className="btn btn-ghost" onClick={() => setShowNewTemplate(false)}>Cancel</button>
-              <button className="btn btn-primary" disabled={!newTmplName || !newTmplPdf || createTemplateMut.isLoading} onClick={() => createTemplateMut.mutate()}>
+              <button className="btn btn-primary" disabled={!newTmplName || !newTmplPdf || !newTmplUnitType || createTemplateMut.isLoading} onClick={() => createTemplateMut.mutate()}>
                 {createTemplateMut.isLoading ? <span className="spinner" /> : 'Create & Edit Fields'}
               </button>
             </div>

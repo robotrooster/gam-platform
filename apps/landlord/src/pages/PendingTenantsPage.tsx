@@ -3,7 +3,7 @@ import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useNavigate } from 'react-router-dom'
 import {
   ArrowLeft, Upload, Eye, Trash2, AlertCircle, AlertTriangle, CheckCircle2,
-  Loader, Inbox, ChevronDown, ChevronUp, X,
+  Loader, Inbox, X,
 } from 'lucide-react'
 import { api, apiGet, apiDelete } from '../lib/api'
 import { ConfirmIntentModal } from './ConfirmIntentModal'
@@ -25,6 +25,7 @@ type PendingIntent = {
   phone: string | null
   parserStatus: ParserStatus
   importedPdfUrl: string | null
+  parserOutput: any | null
   parserFlags: ParserFlag[] | null
   parserError: string | null
   parserStartedAt: string | null
@@ -338,17 +339,199 @@ function FlagsDetail({ intent }: { intent: PendingIntent }) {
 }
 
 
+// ========== Review modal (S534, Nic) ==========
+// Flags and the DOCUMENT visible at the same time: parsed fields + flags
+// in a left rail, the lease PDF on the right with highlight overlays
+// drawn over every stretch of text the parser extracted a value from
+// (gold = parsed clean, amber = flagged). Highlights are located by
+// searching each page's pdf.js text layer for the field's rawText — the
+// parser stores what it read, not where, so this is a text match; fields
+// it NEVER found (field_missing flags) have nothing to highlight and are
+// called out in the left rail instead.
+type HighlightTarget = { path: string; label: string; raw: string; value: any; confidence: number; flagged: boolean }
+
+const FIELD_LABELS: Record<string, string> = {
+  firstName: 'First name', lastName: 'Last name', email: 'Email', phone: 'Phone',
+  dateOfBirth: 'Date of birth', mailingAddress: 'Mailing address',
+  propertyName: 'Property', unitNumber: 'Unit', propertyAddress: 'Property address', unitType: 'Unit type',
+  leaseType: 'Lease type', leaseStart: 'Lease start', leaseEnd: 'Lease end',
+  monthlyRent: 'Monthly rent', securityDeposit: 'Security deposit',
+  lateFeeAmount: 'Late fee', lateFeeGraceDays: 'Late-fee grace days',
+  autoRenew: 'Auto-renew', autoRenewMode: 'Auto-renew mode',
+  noticeDaysRequired: 'Notice days', subleasingAllowed: 'Subleasing',
+}
+
+function collectTargets(intent: PendingIntent): HighlightTarget[] {
+  const out: HighlightTarget[] = []
+  const flags = intent.parserFlags || []
+  const walk = (obj: any, prefix: string) => {
+    if (!obj || typeof obj !== 'object') return
+    for (const [key, v] of Object.entries(obj)) {
+      if (v && typeof v === 'object' && 'value' in (v as any) && 'confidence' in (v as any)) {
+        const f = v as any
+        const path = `${prefix}.${key}`
+        out.push({
+          path, label: FIELD_LABELS[key] || key,
+          raw: typeof f.rawText === 'string' ? f.rawText.trim() : '',
+          value: f.value, confidence: Number(f.confidence) || 0,
+          flagged: flags.some(fl => fl.field === path),
+        })
+      }
+    }
+  }
+  const po = intent.parserOutput
+  if (po) {
+    walk(po.tenants?.[0], 'tenants.0')
+    walk(po.unit, 'unit')
+    walk(po.lease, 'lease')
+  }
+  return out
+}
+
+function ReviewIntentModal({ intent, onClose, onConfirm }: {
+  intent: PendingIntent
+  onClose: () => void
+  onConfirm: () => void
+}) {
+  const pdfContainerRef = useRef<HTMLDivElement>(null)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const targets = collectTargets(intent)
+  const fullName = `${intent.firstName} ${intent.lastName}`.trim() || intent.email
+
+  useEffect(() => {
+    let cancelled = false
+    const load = async () => {
+      try {
+        if (!(window as any).pdfjsLib) {
+          await new Promise<void>((resolve, reject) => {
+            const s = document.createElement('script')
+            s.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js'
+            s.onload = () => {
+              ;(window as any).pdfjsLib.GlobalWorkerOptions.workerSrc =
+                'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'
+              resolve()
+            }
+            s.onerror = () => reject(new Error('Failed to load pdf.js from CDN'))
+            document.head.appendChild(s)
+          })
+        }
+        const pdf = await (window as any).pdfjsLib.getDocument({
+          url: `${API_URL}/api/landlords/me/pending-tenants/${intent.intentId}/document`,
+          httpHeaders: { Authorization: 'Bearer ' + (localStorage.getItem('gam_token') || '') },
+        }).promise
+        if (cancelled || !pdfContainerRef.current) return
+        const container = pdfContainerRef.current
+        container.innerHTML = ''
+        const width = container.clientWidth - 16
+        for (let n = 1; n <= pdf.numPages; n++) {
+          const p = await pdf.getPage(n)
+          const base = p.getViewport({ scale: 1 })
+          const scale = Math.min(width / base.width, 2)
+          const vp = p.getViewport({ scale })
+          const wrap = document.createElement('div')
+          Object.assign(wrap.style, { position: 'relative', width: `${vp.width}px`, margin: '0 auto 12px' })
+          const canvas = document.createElement('canvas')
+          canvas.width = vp.width
+          canvas.height = vp.height
+          Object.assign(canvas.style, { display: 'block', background: '#fff', borderRadius: '6px' })
+          wrap.appendChild(canvas)
+          container.appendChild(wrap)
+          await p.render({ canvasContext: canvas.getContext('2d')!, viewport: vp }).promise
+          if (cancelled) return
+          // Highlight overlays: any text item that appears inside a
+          // target's rawText (or vice versa) gets that target's box.
+          const tc = await p.getTextContent()
+          for (const item of tc.items as any[]) {
+            const s = (item.str || '').trim()
+            if (s.length < 4) continue
+            const hit = targets.find(t => t.raw.length >= 4 && (t.raw.includes(s) || s.includes(t.raw)))
+            if (!hit) continue
+            const [hx, hy] = vp.convertToViewportPoint(item.transform[4], item.transform[5])
+            const h = (item.height || 10) * scale
+            const w = (item.width || 40) * scale
+            const el = document.createElement('div')
+            el.title = `${hit.label}: ${hit.value}${hit.flagged ? ' — flagged, verify against the document' : ''}`
+            Object.assign(el.style, {
+              position: 'absolute', left: `${hx - 2}px`, top: `${hy - h - 3}px`,
+              width: `${w + 5}px`, height: `${h + 6}px`, borderRadius: '3px',
+              background: hit.flagged ? 'rgba(245,158,11,.30)' : 'rgba(201,162,39,.20)',
+              border: `1.5px solid ${hit.flagged ? COLOR_WARNING : 'var(--gold, #c9a227)'}`,
+            })
+            wrap.appendChild(el)
+          }
+        }
+      } catch (e: any) {
+        if (!cancelled) setLoadError(e?.message || 'Failed to load the document')
+      }
+    }
+    load()
+    return () => { cancelled = true }
+  }, [intent.intentId])
+
+  const confDot = (c: number) => c >= 0.85 ? COLOR_SUCCESS : c >= 0.7 ? COLOR_WARNING : COLOR_DANGER
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" style={{ maxWidth: 1180, width: '96vw', height: '90vh', display: 'flex', flexDirection: 'column' }} onClick={e => e.stopPropagation()}>
+        <div className="modal-title" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <span>Review parsed lease — {fullName}</span>
+          <button onClick={onClose} className="btn btn-ghost btn-sm" aria-label="Close"><X size={16} /></button>
+        </div>
+        <div style={{ flex: 1, display: 'flex', gap: 14, minHeight: 0 }}>
+          {/* Left rail: parsed fields + flags */}
+          <div style={{ flex: '0 0 340px', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 12, paddingRight: 4 }}>
+            <div style={{ fontSize: '.72rem', color: 'var(--text-3)', lineHeight: 1.5 }}>
+              Highlights on the document show where each value was read —
+              <span style={{ color: 'var(--gold, #c9a227)' }}> gold</span> parsed clean,
+              <span style={{ color: COLOR_WARNING }}> amber</span> flagged. Hover a highlight for the field.
+            </div>
+            <div style={{ background: 'var(--bg-2)', borderRadius: 8, border: '1px solid var(--border-0)', padding: 12 }}>
+              <div style={{ fontWeight: 600, fontSize: '.84rem', color: 'var(--text-0)', marginBottom: 8 }}>Parsed fields</div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                {targets.map(t => (
+                  <div key={t.path} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '.78rem' }}>
+                    <span title={`Confidence ${(t.confidence * 100).toFixed(0)}%`} style={{ width: 8, height: 8, borderRadius: '50%', background: confDot(t.confidence), flexShrink: 0 }} />
+                    <span style={{ color: 'var(--text-3)', flex: '0 0 110px' }}>{t.label}</span>
+                    <span style={{ color: 'var(--text-0)', fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{String(t.value)}</span>
+                    {t.flagged && <AlertTriangle size={11} style={{ color: COLOR_WARNING, flexShrink: 0 }} />}
+                  </div>
+                ))}
+                {targets.length === 0 && (
+                  <div style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>No parsed output stored for this intent.</div>
+                )}
+              </div>
+            </div>
+            <FlagsDetail intent={intent} />
+          </div>
+          {/* Right: document with highlights */}
+          <div ref={pdfContainerRef} style={{ flex: 1, overflowY: 'auto', background: 'var(--bg-2)', borderRadius: 10, padding: 8 }}>
+            {loadError && (
+              <div style={{ padding: 24, textAlign: 'center', color: 'var(--text-2)' }}>
+                <AlertCircle size={20} style={{ color: COLOR_DANGER }} />
+                <div style={{ marginTop: 8, fontSize: '.84rem' }}>{loadError}</div>
+              </div>
+            )}
+          </div>
+        </div>
+        <div className="modal-footer" style={{ marginTop: 12 }}>
+          <button className="btn btn-ghost" onClick={onClose}>Close</button>
+          <button className="btn btn-primary" onClick={onConfirm}>Confirm and Build Lease</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+
 // ========== Single intent row ==========
 function IntentCard({
-  intent, expanded, onToggle, onUpload, onView, onDelete, onConfirm, uploading,
+  intent, onToggle, onUpload, onView, onDelete, uploading,
 }: {
   intent: PendingIntent
-  expanded: boolean
   onToggle: () => void
   onUpload: () => void
   onView: () => void
   onDelete: () => void
-  onConfirm: () => void
   uploading: boolean
 }) {
   const fullName = `${intent.firstName} ${intent.lastName}`.trim() || '(no name)'
@@ -407,11 +590,11 @@ function IntentCard({
             </button>
           )}
           {canOpen && (
+            // S534: opens the side-by-side review (flags + highlighted
+            // document together) instead of the old inline expansion.
             <button onClick={onToggle} className="btn btn-primary btn-sm">
-              {expanded
-                ? <ChevronUp size={14} style={{ marginRight: 4 }} />
-                : <ChevronDown size={14} style={{ marginRight: 4 }} />}
-              {expanded ? 'Close' : 'Open'}
+              <Eye size={14} style={{ marginRight: 4 }} />
+              Review
             </button>
           )}
           {!isBusy && (
@@ -422,8 +605,8 @@ function IntentCard({
         </div>
       </div>
 
-      {/* Inline error preview when not expanded — landlord sees what went wrong without opening. */}
-      {status === 'error' && !expanded && intent.parserError && (
+      {/* Inline error preview — landlord sees what went wrong without opening. */}
+      {status === 'error' && intent.parserError && (
         <div style={{
           marginTop: 12, padding: 10, background: 'var(--bg-2)',
           borderLeft: `3px solid ${COLOR_DANGER}`, borderRadius: 6,
@@ -433,23 +616,6 @@ function IntentCard({
         </div>
       )}
 
-      {/* Expanded detail */}
-      {expanded && (
-        <div style={{ marginTop: 16, paddingTop: 16, borderTop: '1px solid var(--border-0)' }}>
-          <FlagsDetail intent={intent} />
-          <div style={{
-            marginTop: 16, display: 'flex', alignItems: 'center',
-            justifyContent: 'flex-end', gap: 12,
-          }}>
-            <button
-              className="btn btn-primary btn-sm"
-              onClick={onConfirm}
-            >
-              Confirm and Build Lease
-            </button>
-          </div>
-        </div>
-      )}
     </div>
   )
 }
@@ -459,7 +625,7 @@ function IntentCard({
 export function PendingTenantsPage() {
   const navigate = useNavigate()
   const qc = useQueryClient()
-  const [expandedId, setExpandedId] = useState<string | null>(null)
+  const [reviewIntentId, setReviewIntentId] = useState<string | null>(null)
   const [viewingPdf, setViewingPdf] = useState<{ intentId: string; name: string } | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<PendingIntent | null>(null)
   const [uploadingId, setUploadingId] = useState<string | null>(null)
@@ -490,7 +656,7 @@ export function PendingTenantsPage() {
         qc.invalidateQueries('pending-tenants')
         qc.invalidateQueries('pending-tenants-count')
         setDeleteTarget(null)
-        if (expandedId === deleteTarget?.intentId) setExpandedId(null)
+        if (reviewIntentId === deleteTarget?.intentId) setReviewIntentId(null)
       },
       onError: (e: any) => {
         setUploadError(e?.response?.data?.message || 'Delete failed')
@@ -629,15 +795,13 @@ export function PendingTenantsPage() {
             <IntentCard
               key={intent.intentId}
               intent={intent}
-              expanded={expandedId === intent.intentId}
-              onToggle={() => setExpandedId(expandedId === intent.intentId ? null : intent.intentId)}
+              onToggle={() => setReviewIntentId(intent.intentId)}
               onUpload={() => handleFilePick(intent.intentId)}
               onView={() => setViewingPdf({
                 intentId: intent.intentId,
                 name: `${intent.firstName} ${intent.lastName}`.trim() || intent.email,
               })}
               onDelete={() => setDeleteTarget(intent)}
-              onConfirm={() => setConfirmingId(intent.intentId)}
               uploading={uploadingId === intent.intentId}
             />
           ))}
@@ -651,13 +815,23 @@ export function PendingTenantsPage() {
           onClose={() => setViewingPdf(null)}
         />
       )}
+      {reviewIntentId && (() => {
+        const ri = intents.find(i => i.intentId === reviewIntentId)
+        return ri ? (
+          <ReviewIntentModal
+            intent={ri}
+            onClose={() => setReviewIntentId(null)}
+            onConfirm={() => { setReviewIntentId(null); setConfirmingId(ri.intentId) }}
+          />
+        ) : null
+      })()}
       {confirmingId && (
         <ConfirmIntentModal
           intentId={confirmingId}
           onClose={() => setConfirmingId(null)}
           onResolved={(result: { leaseId: string; tenantId: string; userId: string; email: string; activationUrl: string }) => {
             setConfirmingId(null)
-            setExpandedId(null)
+            setReviewIntentId(null)
             setResolvedToast(`Lease built for ${result.email}.`)
             qc.invalidateQueries('pending-tenants')
             qc.invalidateQueries('pending-tenants-count')

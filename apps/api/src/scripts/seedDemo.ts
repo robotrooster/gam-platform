@@ -158,7 +158,7 @@ async function main() {
     const rvDefaults = { unit_type: 'rv_spot', bedrooms: 0, bathrooms: 0, is_bookable: true, lease_types_allowed: '{nightly,weekly,month_to_month,long_term}' }
     const rv: Record<string, string> = {}
     for (let i = 1; i <= 5; i++) rv[`P${i}`] = await unit(sunset, `RV ${String(i).padStart(2, '0')}`, { ...rvDefaults, rv_site_layout: 'pull_through', rv_amp_service: '50', rent_amount: 900, security_deposit: 300, nightly_rate: 65, weekly_rate: 360, monthly_rate: 950, subtype_id: stPull })
-    for (let i = 6; i <= 8; i++) rv[`B${i}`] = await unit(sunset, `RV ${String(i).padStart(2, '0')}`, { ...rvDefaults, rv_site_layout: 'back_in', rv_amp_service: '30', rent_amount: 800, security_deposit: 300, nightly_rate: 48, weekly_rate: 290, monthly_rate: 850, subtype_id: stBack })
+    for (let i = 6; i <= 10; i++) rv[`B${i}`] = await unit(sunset, `RV ${String(i).padStart(2, '0')}`, { ...rvDefaults, rv_site_layout: 'back_in', rv_amp_service: '30', rent_amount: 800, security_deposit: 300, nightly_rate: 48, weekly_rate: 290, monthly_rate: 850, subtype_id: stBack })
     const stor1 = await unit(sunset, 'Storage 01', { unit_type: 'storage', bedrooms: 0, bathrooms: 0, rent_amount: 150, security_deposit: 100, storage_size: '10x20' })
     await unit(sunset, 'Storage 02', { unit_type: 'storage', bedrooms: 0, bathrooms: 0, rent_amount: 150, security_deposit: 100, storage_size: '10x20' })
 
@@ -325,24 +325,51 @@ async function main() {
     await wtLog(1,  7.0, 'Mowed all common areas, edged along Row A', 'pending')
     await wtLog(0,  3.5, 'Morning pool skim + chemical check assist', 'pending')
 
-    // ── UTILITY SUB-METER (W-36, S531) ─────────────────────────────
-    // RV spots are always sub-metered for electric (Nic). One demo meter
-    // on Grace's pedestal with a prior + current cycle reading so
-    // Generate Bills produces a real bill (usage 250 × $0.14 + $0 base).
+    // ── UTILITY SUB-METERS + READING RUN (S532) ────────────────────
+    // RV spots are always sub-metered for electric (Nic). One pedestal
+    // meter per spot, assigned 1:1 — utilityBilling bills full usage to
+    // EVERY unit on a submeter, so a shared submeter double-bills.
+    // Grace's spot keeps the original "Pedestal Row A" label.
+    //
+    // Demo state matches the end-of-month reading-run workflow: every
+    // meter has ONLY a prior-cycle baseline (dated month-end), and an
+    // OPEN run for the current cycle — the walkthrough enters current
+    // readings through the guided walk, which auto-bills leased spots
+    // (Grace: enter 1250 → 250 kWh × $0.14 = $35.00 on her next invoice).
     await c.query(
       `INSERT INTO lease_utility_responsibilities (lease_id, utility_type, tenant_responsible)
        VALUES ($1, 'electric', TRUE) ON CONFLICT DO NOTHING`, [lGrace])
-    const demoMeter = await c.query(
-      `INSERT INTO utility_meters (property_id, utility_type, label, billing_method, rate_per_unit, base_fee)
-       VALUES ($1, 'electric', 'Pedestal Row A', 'submeter', 0.14, 0) RETURNING id`, [sunset])
-    const DM = demoMeter.rows[0].id
-    await c.query(`INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1, $2)`, [DM, rv['B8']])
     const cycleNow = new Date(); cycleNow.setDate(1)
     const cyclePrev = new Date(cycleNow); cyclePrev.setMonth(cyclePrev.getMonth() - 1)
     const iso = (d: Date) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-01`
+    const prevMonthEnd = (() => { const d = new Date(cycleNow); d.setDate(0)
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}` })()
+    const pedestal = async (label: string, unitId: string, baseline: number) => {
+      const m = await c.query(
+        `INSERT INTO utility_meters (property_id, utility_type, label, billing_method, rate_per_unit, base_fee)
+         VALUES ($1, 'electric', $2, 'submeter', 0.14, 0) RETURNING id`, [sunset, label])
+      await c.query(`INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1, $2)`, [m.rows[0].id, unitId])
+      await c.query(
+        `INSERT INTO utility_meter_readings (meter_id, reading_date, reading_value, billing_cycle_month, created_by_user_id)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [m.rows[0].id, prevMonthEnd, baseline, iso(cyclePrev), OWNER])
+    }
+    await pedestal('Pedestal Row A',  rv['B8'],  1000)
+    await pedestal('Pedestal RV 01',  rv['P1'],  4210)
+    await pedestal('Pedestal RV 02',  rv['P2'],  2840)
+    await pedestal('Pedestal RV 03',  rv['P3'],  1520)
+    await pedestal('Pedestal RV 04',  rv['P4'],  3105)
+    await pedestal('Pedestal RV 05',  rv['P5'],  5230)
+    await pedestal('Pedestal RV 06',  rv['B6'],   980)
+    await pedestal('Pedestal RV 07',  rv['B7'],  2444)
+    await pedestal('Pedestal RV 09',  rv['B9'],     0)
+    await pedestal('Pedestal RV 10',  rv['B10'],    0)
+    // Open reading run for the current cycle (the walkthrough's prompt).
     await c.query(
-      `INSERT INTO utility_meter_readings (meter_id, reading_date, reading_value, billing_cycle_month)
-       VALUES ($1, $2, 1000, $2), ($1, $3, 1250, $3)`, [DM, iso(cyclePrev), iso(cycleNow)])
+      `INSERT INTO utility_reading_runs (property_id, landlord_id, billing_cycle_month, opened_on)
+       VALUES ($1, $2, $3, CURRENT_DATE)
+       ON CONFLICT (property_id, billing_cycle_month) DO NOTHING`,
+      [sunset, LL, iso(cycleNow)])
     for (let n = 1; n <= 4; n++) {
       await c.query(
         `INSERT INTO flex_deposit_installments
@@ -451,8 +478,8 @@ async function main() {
     // ── DOCUMENTS ────────────────────────────────────────────────────
     await c.query(
       `INSERT INTO documents (landlord_id, type, name, url) VALUES
-       ($1, 'lease', 'Standard RV Site Lease (blank)', '/uploads/docs/demo-lease.pdf'),
-       ($1, 'notice', 'Pool Maintenance Notice — July', '/uploads/docs/demo-notice.pdf')`, [LL])
+       ($1, 'lease', 'Standard RV Site Lease (blank)', '/uploads/public/demo-lease.pdf'),
+       ($1, 'notice', 'Pool Maintenance Notice — July', '/uploads/public/demo-notice.pdf')`, [LL])
 
     // ── E-SIGN LEASE TEMPLATE (W-7, S531) ────────────────────────────
     // One usable template so the renewal-decision flow (and any e-sign
@@ -465,7 +492,7 @@ async function main() {
       `SELECT id FROM lease_templates WHERE landlord_id = $1 AND name = 'Standard Residential Lease'`, [LL])
     const tmplRes = existingTmpl.rows.length ? existingTmpl : await c.query(
       `INSERT INTO lease_templates (landlord_id, name, description, base_pdf_url, page_count)
-       VALUES ($1, 'Standard Residential Lease', 'Demo lease template', '/uploads/docs/demo-lease.pdf', 1)
+       VALUES ($1, 'Standard Residential Lease', 'Demo lease template', '/uploads/public/demo-lease.pdf', 1)
        RETURNING id`, [LL])
     const TMPL = tmplRes.rows[0].id
     if (!existingTmpl.rows.length) await c.query(

@@ -508,6 +508,60 @@ propertiesRouter.patch('/:id/agent-permissions', requirePerm('properties.edit'),
 // S81: gated by properties.edit sub-permission. Property managers with the
 // perm can rename / change addresses on properties within their scope.
 // Onsite managers and maintenance never reach here (no perm key).
+// ── S535: per-UNIT-TYPE late-fee overrides ───────────────────────────
+// Late fees are property-level policy; a landlord may vary them by unit
+// CLASS (RV spot vs apartment vs storage — never by tenant). An
+// override row replaces the property default wholesale for its type;
+// resolution lives in services/lateFeePolicy.ts and stamps into every
+// drafted lease at creation.
+propertiesRouter.get('/:id/late-fee-overrides', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const prop = await queryOne<any>('SELECT id, landlord_id FROM properties WHERE id=$1', [req.params.id])
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canManageLandlordResource(req.user, prop.landlord_id, ['property_manager'])) throw new AppError(403, 'Forbidden')
+    const rows = await query<any>(
+      `SELECT * FROM property_unit_type_late_fees WHERE property_id=$1 ORDER BY unit_type`, [req.params.id])
+    res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
+propertiesRouter.put('/:id/late-fee-overrides', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const body = z.object({
+      unitType:      z.enum(UNIT_TYPES as unknown as [string, ...string[]]),
+      graceDays:     z.number().int().min(0).max(60),
+      initialAmount: z.number().min(0),
+      initialType:   z.enum(['flat', 'percent_of_rent']),
+    }).parse(req.body)
+    const prop = await queryOne<any>('SELECT id, landlord_id FROM properties WHERE id=$1', [req.params.id])
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canManageLandlordResource(req.user, prop.landlord_id, ['property_manager'])) throw new AppError(403, 'Forbidden')
+    const row = await queryOne<any>(`
+      INSERT INTO property_unit_type_late_fees
+        (property_id, unit_type, late_fee_grace_days, late_fee_initial_amount, late_fee_initial_type)
+      VALUES ($1, $2, $3, $4, $5)
+      ON CONFLICT (property_id, unit_type) DO UPDATE SET
+        late_fee_grace_days = EXCLUDED.late_fee_grace_days,
+        late_fee_initial_amount = EXCLUDED.late_fee_initial_amount,
+        late_fee_initial_type = EXCLUDED.late_fee_initial_type,
+        updated_at = NOW()
+      RETURNING *`,
+      [req.params.id, body.unitType, body.graceDays, body.initialAmount.toFixed(2), body.initialType])
+    res.json({ success: true, data: row })
+  } catch (e) { next(e) }
+})
+
+propertiesRouter.delete('/:id/late-fee-overrides/:unitType', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const prop = await queryOne<any>('SELECT id, landlord_id FROM properties WHERE id=$1', [req.params.id])
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canManageLandlordResource(req.user, prop.landlord_id, ['property_manager'])) throw new AppError(403, 'Forbidden')
+    await query(`DELETE FROM property_unit_type_late_fees WHERE property_id=$1 AND unit_type=$2`,
+      [req.params.id, req.params.unitType])
+    res.json({ success: true })
+  } catch (e) { next(e) }
+})
+
 propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, next) => {
   try {
     const raw = req.body as any

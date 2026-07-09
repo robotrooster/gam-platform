@@ -2258,3 +2258,503 @@ describe('POST /sign/:documentId — sublease_agreement completion', () => {
 })
 
 
+
+// ─── S534: renewal completion — deposit carry, delta top-up, custody rebind ───
+//
+// The deposit is ONE continuous custody across a renewal: the carried
+// amount is never re-billed; the security_deposits row (money, status,
+// statutory interest accrual chain) rebinds to the successor lease so
+// deposit-return and the monthly interest cron keep working; a HIGHER
+// deposit typed into the renewal doc bills only the difference.
+
+describe('renewal completion (renews_lease_id) — deposit chain', () => {
+  async function seedPredecessor(f: SeedFixture) {
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      const leaseId = await seedLease(client, {
+        unitId: f.unitId, landlordId: f.landlordId, status: 'active', startDate: '2025-08-01',
+      })
+      await client.query(`UPDATE leases SET end_date='2026-07-31' WHERE id=$1`, [leaseId])
+      await seedLeaseTenant(client, { leaseId, tenantId: f.tenantId })
+      await client.query(
+        `INSERT INTO lease_fees (lease_id, fee_type, amount, is_refundable, due_timing)
+         VALUES ($1, 'security_deposit', 1000, TRUE, 'move_in')`, [leaseId])
+      const sd = await client.query<{ id: string }>(
+        `INSERT INTO security_deposits
+           (unit_id, lease_id, tenant_id, total_amount, collected_amount, status,
+            held_by, flex_deposit_enabled, interest_accrued)
+         VALUES ($1, $2, $3, 1000, 1000, 'funded', 'gam_escrow', FALSE, 12.34)
+         RETURNING id`, [f.unitId, leaseId, f.tenantId])
+      await client.query('COMMIT')
+      return { leaseId, sdId: sd.rows[0].id }
+    } catch (e) { await client.query('ROLLBACK'); throw e }
+    finally { client.release() }
+  }
+
+  async function completeRenewal(f: SeedFixture, predecessorId: string, depositValue: string) {
+    const { documentId } = await seedCompleteableDoc(f, {
+      fields: defaultLeaseFields({
+        start_date: '2026-08-01', end_date: '2027-07-31', security_deposit: depositValue,
+      }),
+    })
+    await db.query(
+      `UPDATE lease_documents SET renews_lease_id=$2 WHERE id=$1`, [documentId, predecessorId])
+    const res = await request(buildApp())
+      .post(`/api/esign/sign/${documentId}`)
+      .set('Authorization', `Bearer ${f.tenantToken}`)
+      .send({ fieldValues: [] })
+    expect(res.status).toBe(200)
+    expect(res.body.data.completed).toBe(true)
+    const newLease = await db.query<{ id: string }>(
+      `SELECT id FROM leases WHERE unit_id=$1 AND id<>$2`, [f.unitId, predecessorId])
+    expect(newLease.rows).toHaveLength(1)
+    return newLease.rows[0].id
+  }
+
+  it('doc deposit == carried → one tagged carried row, no billable deposit, custody rebinds with interest intact', async () => {
+    const f = await seedFixture()
+    const { leaseId: oldLease, sdId } = await seedPredecessor(f)
+    const newLeaseId = await completeRenewal(f, oldLease, '1000.00')
+
+    const fees = await db.query<{ amount: string; description: string | null }>(
+      `SELECT amount, description FROM lease_fees
+        WHERE lease_id=$1 AND fee_type='security_deposit' AND due_timing='move_in'`, [newLeaseId])
+    expect(fees.rows).toHaveLength(1)
+    expect(Number(fees.rows[0].amount)).toBe(1000)
+    expect(fees.rows[0].description).toMatch(/carried forward from previous lease/)
+
+    // The SAME custody row (same id → same accrual chain) now points at
+    // the successor: interest clock continuous from original receipt.
+    const sd = await db.query<{ lease_id: string; status: string; total_amount: string; interest_accrued: string }>(
+      `SELECT lease_id, status, total_amount, interest_accrued FROM security_deposits WHERE id=$1`, [sdId])
+    expect(sd.rows[0].lease_id).toBe(newLeaseId)
+    expect(sd.rows[0].status).toBe('funded')
+    expect(Number(sd.rows[0].total_amount)).toBe(1000)
+    expect(Number(sd.rows[0].interest_accrued)).toBeCloseTo(12.34, 2)
+  })
+
+  it('doc deposit > carried → bills ONLY the difference as a tagged top-up; custody target raised', async () => {
+    const f = await seedFixture()
+    const { leaseId: oldLease, sdId } = await seedPredecessor(f)
+    const newLeaseId = await completeRenewal(f, oldLease, '1250.00')
+
+    const fees = await db.query<{ amount: string; description: string | null }>(
+      `SELECT amount, description FROM lease_fees
+        WHERE lease_id=$1 AND fee_type='security_deposit' AND due_timing='move_in'
+        ORDER BY amount`, [newLeaseId])
+    expect(fees.rows).toHaveLength(2)
+    expect(Number(fees.rows[0].amount)).toBe(250)   // the ONLY billable piece
+    expect(fees.rows[0].description).toMatch(/\[deposit top-up on renewal\]/)
+    expect(Number(fees.rows[1].amount)).toBe(1000)  // carried, never re-billed
+    expect(fees.rows[1].description).toMatch(/carried forward from previous lease/)
+
+    const sd = await db.query<{ lease_id: string; status: string; total_amount: string; collected_amount: string; interest_accrued: string }>(
+      `SELECT lease_id, status, total_amount, collected_amount, interest_accrued
+         FROM security_deposits WHERE id=$1`, [sdId])
+    expect(sd.rows[0].lease_id).toBe(newLeaseId)
+    expect(Number(sd.rows[0].total_amount)).toBe(1250)   // raised by the delta
+    expect(Number(sd.rows[0].collected_amount)).toBe(1000)
+    expect(sd.rows[0].status).toBe('partial')            // reopened until the top-up settles
+    expect(Number(sd.rows[0].interest_accrued)).toBeCloseTo(12.34, 2)
+  })
+
+  it('doc deposit < carried → nothing bills, carried amount stands (manual partial return is the reduce path)', async () => {
+    const f = await seedFixture()
+    const { leaseId: oldLease, sdId } = await seedPredecessor(f)
+    const newLeaseId = await completeRenewal(f, oldLease, '600.00')
+
+    const fees = await db.query<{ amount: string; description: string | null }>(
+      `SELECT amount, description FROM lease_fees
+        WHERE lease_id=$1 AND fee_type='security_deposit' AND due_timing='move_in'`, [newLeaseId])
+    expect(fees.rows).toHaveLength(1)
+    expect(Number(fees.rows[0].amount)).toBe(1000)
+    expect(fees.rows[0].description).toMatch(/carried forward/)
+
+    const sd = await db.query<{ lease_id: string; total_amount: string; status: string }>(
+      `SELECT lease_id, total_amount, status FROM security_deposits WHERE id=$1`, [sdId])
+    expect(sd.rows[0].lease_id).toBe(newLeaseId)
+    expect(Number(sd.rows[0].total_amount)).toBe(1000)
+    expect(sd.rows[0].status).toBe('funded')
+  })
+})
+
+// ─── S535: cross-template renewal — gate move + prefill coverage ────────────
+//
+// A renewal may target a DIFFERENT template than the lease was executed
+// on ("change in form"). Landlord-role tagged fields no longer block
+// /send (the landlord types terms during their first-signer pass); the
+// lock-before-tenant invariant is enforced at the landlord's sign
+// submit. And the renewal draft prefills every column derivable from
+// the predecessor so an updated form populates automatically.
+
+describe('S535 cross-template renewal', () => {
+  it('send allows an unfilled landlord-role tagged field; landlord sign enforces it; filled sign passes', async () => {
+    const f = await seedFixture()
+    const { documentId } = await seedDoc(f, { status: 'pending' })
+    await seedDocFields(documentId, defaultLeaseFields())
+    // A landlord-role tagged field the predecessor couldn't derive.
+    const empty = await db.query<{ id: string }>(
+      `INSERT INTO lease_document_fields
+         (document_id, field_type, signer_role, lease_column, value, required)
+       VALUES ($1, 'text', 'landlord', 'late_fee_initial_flat', NULL, FALSE)
+       RETURNING id`, [documentId])
+    const emptyFieldId = empty.rows[0].id
+
+    // Send passes with the landlord-role field empty (pre-S535: 400).
+    const sent = await request(buildApp())
+      .post(`/api/esign/documents/${documentId}/send`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({})
+    expect(sent.status).toBe(200)
+
+    // Landlord signing WITHOUT the value → blocked with the field named.
+    const blocked = await request(buildApp())
+      .post(`/api/esign/sign/${documentId}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ fieldValues: [] })
+    expect(blocked.status).toBe(400)
+    expect(blocked.body.error).toMatch(/Fill these lease terms before signing/)
+    expect(blocked.body.error).toMatch(/Late fee/i)
+
+    // Landlord signing WITH the value → proceeds.
+    const ok = await request(buildApp())
+      .post(`/api/esign/sign/${documentId}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ fieldValues: [{ fieldId: emptyFieldId, value: '50' }] })
+    expect(ok.status).toBe(200)
+    const signer = await db.query<{ status: string }>(
+      `SELECT status FROM lease_document_signers WHERE document_id=$1 AND role='landlord'`, [documentId])
+    expect(signer.rows[0].status).toBe('signed')
+  })
+
+  it('renewal draft prefills a NEW template\'s bound fields from the predecessor (terms, fees, utilities, deposits)', async () => {
+    const f = await seedFixture()
+    // Disable the property's late-fee policy: this test covers the
+    // FALLBACK path (predecessor-derived late terms when no property
+    // policy exists). The override path has its own test below.
+    await db.query(`UPDATE properties SET late_fee_enabled=FALSE WHERE id=$1`, [f.propertyId])
+    // Predecessor lease with a rich term set.
+    const client = await db.connect()
+    let oldLease: string
+    try {
+      await client.query('BEGIN')
+      oldLease = await seedLease(client, {
+        unitId: f.unitId, landlordId: f.landlordId, status: 'active', startDate: '2025-08-01',
+      })
+      await client.query(`
+        UPDATE leases SET end_date='2026-07-31', lease_type='fixed_term',
+               late_fee_initial_amount=50, late_fee_initial_type='flat',
+               late_fee_grace_days=3
+         WHERE id=$1`, [oldLease])
+      await seedLeaseTenant(client, { leaseId: oldLease, tenantId: f.tenantId })
+      await client.query(`
+        INSERT INTO lease_fees (lease_id, fee_type, amount, is_refundable, due_timing) VALUES
+          ($1, 'security_deposit', 1000, TRUE, 'move_in'),
+          ($1, 'pet_deposit', 300, TRUE, 'move_in'),
+          ($1, 'pet_rent', 25, FALSE, 'monthly_ongoing')`, [oldLease])
+      await client.query(`
+        INSERT INTO lease_utility_responsibilities (lease_id, utility_type, tenant_responsible)
+        VALUES ($1, 'electric', TRUE), ($1, 'water', FALSE)`, [oldLease])
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e }
+    finally { client.release() }
+
+    // A brand-NEW template ("updated form") binding a wider field set.
+    const tmpl = await db.query<{ id: string }>(
+      `INSERT INTO lease_templates (landlord_id, name, base_pdf_url, page_count)
+       VALUES ($1, 'Updated Form 2026', '/api/esign/files/updated-form.pdf', 1)
+       RETURNING id`, [f.landlordId])
+    const templateId = tmpl.rows[0].id
+    const cols = ['rent_amount', 'start_date', 'end_date', 'lease_type',
+      'late_fee_initial_flat', 'late_fee_grace_days', 'security_deposit',
+      'pet_deposit', 'pet_rent', 'utility_electric_responsibility',
+      'utility_water_responsibility', 'tenant_name']
+    for (let i = 0; i < cols.length; i++) {
+      await db.query(`
+        INSERT INTO lease_template_fields
+          (template_id, field_type, signer_role, label, lease_column, page, x, y, width, height, required)
+        VALUES ($1, 'text', 'landlord', $2, $2, 1, 72, $3, 140, 24, FALSE)`,
+        [templateId, cols[i], 100 + i * 30])
+    }
+
+    const drafted = await request(buildApp())
+      .post('/api/esign/documents/renewal')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ leaseId: oldLease, templateId })
+    expect(drafted.status).toBe(201)
+    const docId = drafted.body.data.id
+
+    const vals = await db.query<{ lease_column: string; value: string | null }>(
+      `SELECT lease_column, value FROM lease_document_fields WHERE document_id=$1`, [docId])
+    const byCol: Record<string, string | null> = {}
+    for (const r of vals.rows) byCol[r.lease_column] = r.value
+
+    expect(Number(byCol.rent_amount)).toBe(1000)          // current rent default
+    expect(byCol.start_date).toBe('8/1/2026')             // day after old end
+    expect(byCol.end_date).toBe('7/31/2027')              // same duration
+    expect(byCol.lease_type).toBe('fixed_term')
+    expect(byCol.late_fee_initial_flat).toBe('N/A')  // S535: late fees never carry from the lease
+    expect(byCol.late_fee_grace_days).toBe('N/A')
+    expect(Number(byCol.security_deposit)).toBe(1000)     // carried, per type
+    expect(Number(byCol.pet_deposit)).toBe(300)           // carried, per type
+    expect(Number(byCol.pet_rent)).toBe(25)
+    expect(byCol.utility_electric_responsibility).toBe('tenant')
+    expect(byCol.utility_water_responsibility).toBe('landlord')
+    expect(byCol.tenant_name).toBeTruthy()
+  })
+})
+
+// ─── S535: '-' end date = month-to-month ─────────────────────────────
+describe("S535 '-' end date convention", () => {
+  it("completion maps end_date '-' to NULL end date + month_to_month, whatever lease_type says", async () => {
+    const f = await seedFixture()
+    const { documentId } = await seedCompleteableDoc(f, {
+      fields: defaultLeaseFields({ end_date: '-', lease_type: 'fixed_term' }),
+    })
+    const res = await request(buildApp())
+      .post(`/api/esign/sign/${documentId}`)
+      .set('Authorization', `Bearer ${f.tenantToken}`)
+      .send({ fieldValues: [] })
+    expect(res.status).toBe(200)
+    expect(res.body.data.completed).toBe(true)
+
+    const lease = await db.query<{ end_date: string | null; lease_type: string }>(
+      `SELECT end_date, lease_type FROM leases WHERE unit_id=$1`, [f.unitId])
+    expect(lease.rows).toHaveLength(1)
+    expect(lease.rows[0].end_date).toBeNull()
+    expect(lease.rows[0].lease_type).toBe('month_to_month')
+  })
+})
+
+// ─── S535: property-level late fees override per-lease values ────────
+describe('S535 property late-fee policy stamping', () => {
+  it("no per-unit-type row → late-fee fields stamp 'N/A' (no property-wide default, no predecessor carry)", async () => {
+    const f = await seedFixture()
+    await db.query(`
+      UPDATE properties SET late_fee_enabled=TRUE, late_fee_initial_amount=75,
+             late_fee_initial_type='flat', late_fee_grace_days=2 WHERE id=$1`, [f.propertyId])
+
+    const client = await db.connect()
+    let oldLease: string
+    try {
+      await client.query('BEGIN')
+      oldLease = await seedLease(client, {
+        unitId: f.unitId, landlordId: f.landlordId, status: 'active', startDate: '2025-08-01',
+      })
+      // Predecessor carries DIFFERENT late terms — the property policy must win.
+      await client.query(`
+        UPDATE leases SET end_date='2026-07-31', late_fee_enabled=TRUE,
+               late_fee_initial_amount=50, late_fee_initial_type='flat', late_fee_grace_days=3
+         WHERE id=$1`, [oldLease])
+      await seedLeaseTenant(client, { leaseId: oldLease, tenantId: f.tenantId })
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e }
+    finally { client.release() }
+
+    const tmpl = await db.query<{ id: string }>(
+      `INSERT INTO lease_templates (landlord_id, name, base_pdf_url, page_count)
+       VALUES ($1, 'Policy Form', '/api/esign/files/policy-form.pdf', 1) RETURNING id`, [f.landlordId])
+    for (const col of ['rent_amount', 'start_date', 'late_fee_initial_flat', 'late_fee_grace_days']) {
+      await db.query(`
+        INSERT INTO lease_template_fields
+          (template_id, field_type, signer_role, label, lease_column, page, x, y, width, height, required)
+        VALUES ($1, 'text', 'landlord', $2, $2, 1, 72, 100, 140, 24, FALSE)`, [tmpl.rows[0].id, col])
+    }
+
+    const drafted = await request(buildApp())
+      .post('/api/esign/documents/renewal')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ leaseId: oldLease, templateId: tmpl.rows[0].id })
+    expect(drafted.status).toBe(201)
+
+    const vals = await db.query<{ lease_column: string; value: string | null }>(
+      `SELECT lease_column, value FROM lease_document_fields WHERE document_id=$1
+        AND lease_column IN ('late_fee_initial_flat','late_fee_grace_days')`, [drafted.body.data.id])
+    const byCol: Record<string, string | null> = {}
+    for (const r of vals.rows) byCol[r.lease_column] = r.value
+    // S535: the property-wide default (75/2) does NOT apply, and the
+    // predecessor's per-lease values (50/3) do NOT carry — without a
+    // (property, unit_type) row this class has NO late fee.
+    expect(byCol.late_fee_initial_flat).toBe('N/A')
+    expect(byCol.late_fee_grace_days).toBe('N/A')
+  })
+
+  it('a per-UNIT-TYPE override beats the property default at stamping', async () => {
+    const f = await seedFixture()
+    await db.query(`UPDATE units SET unit_type='rv_spot' WHERE id=$1`, [f.unitId])
+    await db.query(`
+      UPDATE properties SET late_fee_enabled=TRUE, late_fee_initial_amount=75,
+             late_fee_initial_type='flat', late_fee_grace_days=2 WHERE id=$1`, [f.propertyId])
+    await db.query(`
+      INSERT INTO property_unit_type_late_fees
+        (property_id, unit_type, late_fee_grace_days, late_fee_initial_amount, late_fee_initial_type)
+      VALUES ($1, 'rv_spot', 7, 20, 'flat')`, [f.propertyId])
+
+    const client = await db.connect()
+    let oldLease: string
+    try {
+      await client.query('BEGIN')
+      oldLease = await seedLease(client, { unitId: f.unitId, landlordId: f.landlordId, status: 'active', startDate: '2025-08-01' })
+      await client.query(`UPDATE leases SET end_date='2026-07-31' WHERE id=$1`, [oldLease])
+      await seedLeaseTenant(client, { leaseId: oldLease, tenantId: f.tenantId })
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e }
+    finally { client.release() }
+
+    const tmpl = await db.query<{ id: string }>(
+      `INSERT INTO lease_templates (landlord_id, name, base_pdf_url, page_count)
+       VALUES ($1, 'RV Policy Form', '/api/esign/files/rv.pdf', 1) RETURNING id`, [f.landlordId])
+    for (const col of ['rent_amount', 'start_date', 'late_fee_initial_flat', 'late_fee_grace_days']) {
+      await db.query(`
+        INSERT INTO lease_template_fields
+          (template_id, field_type, signer_role, label, lease_column, page, x, y, width, height, required)
+        VALUES ($1, 'text', 'landlord', $2, $2, 1, 72, 100, 140, 24, FALSE)`, [tmpl.rows[0].id, col])
+    }
+
+    const drafted = await request(buildApp())
+      .post('/api/esign/documents/renewal')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ leaseId: oldLease, templateId: tmpl.rows[0].id })
+    expect(drafted.status).toBe(201)
+
+    const vals = await db.query<{ lease_column: string; value: string | null }>(
+      `SELECT lease_column, value FROM lease_document_fields WHERE document_id=$1
+        AND lease_column IN ('late_fee_initial_flat','late_fee_grace_days')`, [drafted.body.data.id])
+    const byCol: Record<string, string | null> = {}
+    for (const r of vals.rows) byCol[r.lease_column] = r.value
+    expect(Number(byCol.late_fee_initial_flat)).toBe(20)  // rv_spot override, not the $75 default
+    expect(Number(byCol.late_fee_grace_days)).toBe(7)
+  })
+
+  it("refuses drafting when the policy can't PRINT on the document (template missing late-fee fields)", async () => {
+    const f = await seedFixture()
+    await db.query(`UPDATE units SET unit_type='rv_spot' WHERE id=$1`, [f.unitId])
+    await db.query(`UPDATE properties SET late_fee_enabled=TRUE WHERE id=$1`, [f.propertyId])
+    await db.query(`
+      INSERT INTO property_unit_type_late_fees
+        (property_id, unit_type, late_fee_grace_days, late_fee_initial_amount, late_fee_initial_type)
+      VALUES ($1, 'rv_spot', 7, 20, 'flat')`, [f.propertyId])
+
+    const client = await db.connect()
+    let oldLease: string
+    try {
+      await client.query('BEGIN')
+      oldLease = await seedLease(client, { unitId: f.unitId, landlordId: f.landlordId, status: 'active', startDate: '2025-08-01' })
+      await client.query(`UPDATE leases SET end_date='2026-07-31' WHERE id=$1`, [oldLease])
+      await seedLeaseTenant(client, { leaseId: oldLease, tenantId: f.tenantId })
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e }
+    finally { client.release() }
+
+    // Template binds ONLY rent + start — no late-fee fields at all.
+    const tmpl = await db.query<{ id: string }>(
+      `INSERT INTO lease_templates (landlord_id, name, base_pdf_url, page_count)
+       VALUES ($1, 'No-Fee-Fields Form', '/api/esign/files/nf.pdf', 1) RETURNING id`, [f.landlordId])
+    for (const col of ['rent_amount', 'start_date']) {
+      await db.query(`
+        INSERT INTO lease_template_fields
+          (template_id, field_type, signer_role, label, lease_column, page, x, y, width, height, required)
+        VALUES ($1, 'text', 'landlord', $2, $2, 1, 72, 100, 140, 24, FALSE)`, [tmpl.rows[0].id, col])
+    }
+
+    const blocked = await request(buildApp())
+      .post('/api/esign/documents/renewal')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ leaseId: oldLease, templateId: tmpl.rows[0].id })
+    expect(blocked.status).toBe(400)
+    expect(blocked.body.error).toMatch(/must appear IN the lease document/i)
+    expect(blocked.body.error).toMatch(/Late fee/i)
+  })
+})
+
+// ─── S535: templates are per unit type ───────────────────────────────
+describe('S535 template unit-type pairing', () => {
+  it('refuses drafting a renewal on a template for a different unit type; universal always fits', async () => {
+    const f = await seedFixture()
+    await db.query(`UPDATE units SET unit_type='apartment' WHERE id=$1`, [f.unitId])
+    const client = await db.connect()
+    let oldLease: string
+    try {
+      await client.query('BEGIN')
+      oldLease = await seedLease(client, { unitId: f.unitId, landlordId: f.landlordId, status: 'active', startDate: '2025-08-01' })
+      await client.query(`UPDATE leases SET end_date='2026-07-31' WHERE id=$1`, [oldLease])
+      await seedLeaseTenant(client, { leaseId: oldLease, tenantId: f.tenantId })
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e }
+    finally { client.release() }
+
+    const mkTemplate = async (unitType: string | null) => {
+      const t = await db.query<{ id: string }>(
+        `INSERT INTO lease_templates (landlord_id, name, base_pdf_url, page_count, unit_type)
+         VALUES ($1, $2, '/api/esign/files/t.pdf', 1, $3) RETURNING id`,
+        [f.landlordId, `T-${unitType ?? 'universal'}`, unitType])
+      for (const col of ['rent_amount', 'start_date']) {
+        await db.query(`
+          INSERT INTO lease_template_fields
+            (template_id, field_type, signer_role, label, lease_column, page, x, y, width, height, required)
+          VALUES ($1, 'text', 'landlord', $2, $2, 1, 72, 100, 140, 24, FALSE)`, [t.rows[0].id, col])
+      }
+      return t.rows[0].id
+    }
+
+    const rvTemplate = await mkTemplate('rv_spot')
+    const mismatch = await request(buildApp())
+      .post('/api/esign/documents/renewal')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ leaseId: oldLease, templateId: rvTemplate })
+    expect(mismatch.status).toBe(400)
+    expect(mismatch.body.error).toMatch(/rv spot.*apartment|for rv spot units/i)
+
+    const universal = await mkTemplate(null)
+    const ok = await request(buildApp())
+      .post('/api/esign/documents/renewal')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ leaseId: oldLease, templateId: universal })
+    expect(ok.status).toBe(201)
+  })
+
+  it('refuses drafting on a template locked to a DIFFERENT property; own-property lock passes', async () => {
+    const f = await seedFixture()
+    const client = await db.connect()
+    let oldLease: string, otherPropertyId: string
+    try {
+      await client.query('BEGIN')
+      oldLease = await seedLease(client, { unitId: f.unitId, landlordId: f.landlordId, status: 'active', startDate: '2025-08-01' })
+      await client.query(`UPDATE leases SET end_date='2026-07-31' WHERE id=$1`, [oldLease])
+      await seedLeaseTenant(client, { leaseId: oldLease, tenantId: f.tenantId })
+      otherPropertyId = await seedProperty(client, { landlordId: f.landlordId, ownerUserId: f.landlordUserId, managedByUserId: f.landlordUserId })
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e }
+    finally { client.release() }
+
+    const mk = async (propertyId: string | null) => {
+      const t = await db.query<{ id: string }>(
+        `INSERT INTO lease_templates (landlord_id, name, base_pdf_url, page_count, property_id)
+         VALUES ($1, $2, '/api/esign/files/t.pdf', 1, $3) RETURNING id`,
+        [f.landlordId, `PT-${propertyId ?? 'unlocked'}`, propertyId])
+      for (const col of ['rent_amount', 'start_date']) {
+        await db.query(`
+          INSERT INTO lease_template_fields
+            (template_id, field_type, signer_role, label, lease_column, page, x, y, width, height, required)
+          VALUES ($1, 'text', 'landlord', $2, $2, 1, 72, 100, 140, 24, FALSE)`, [t.rows[0].id, col])
+      }
+      return t.rows[0].id
+    }
+
+    const wrongLock = await mk(otherPropertyId)
+    const blocked = await request(buildApp())
+      .post('/api/esign/documents/renewal')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ leaseId: oldLease, templateId: wrongLock })
+    expect(blocked.status).toBe(400)
+    expect(blocked.body.error).toMatch(/locked to another property/i)
+
+    const rightLock = await mk(f.propertyId)
+    const ok = await request(buildApp())
+      .post('/api/esign/documents/renewal')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ leaseId: oldLease, templateId: rightLock })
+    expect(ok.status).toBe(201)
+  })
+})

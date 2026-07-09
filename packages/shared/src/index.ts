@@ -2079,7 +2079,13 @@ export const WRITABLE_LEASE_COLUMN_SPECS: Record<WritableLeaseColumn, WritableLe
     },
   },
   end_date: {
-    parse: (v) => ({ end_date: v.end_date || null }),
+    // S535 (Nic): '-' in the end-date field means MONTH-TO-MONTH — the
+    // completeness gate requires every tagged field filled on a signed
+    // document, so the dash is the explicit "no end date" entry.
+    parse: (v) => {
+      const raw = (v.end_date || '').trim()
+      return { end_date: !raw || raw === '-' ? null : raw }
+    },
   },
   // S196: security_deposit removed from WRITABLE specs. The fee_row
   // pipeline (FEE_ROW_SPECS) now handles it as a lease_fees row.
@@ -2087,7 +2093,15 @@ export const WRITABLE_LEASE_COLUMN_SPECS: Record<WritableLeaseColumn, WritableLe
     parse: (v) => ({ rent_due_day: parseInt(v.rent_due_day || '1') }),
   },
   lease_type: {
-    parse: (v) => ({ lease_type: v.lease_type || 'fixed_term' }),
+    // S535 (Nic): no end date ('' or '-') ⇒ the lease IS month-to-month,
+    // whatever the lease-type field says — a fixed term without an end
+    // date is incoherent, and the dash convention exists precisely so
+    // blank-end leases resolve predictably.
+    parse: (v) => {
+      const rawEnd = (v.end_date || '').trim()
+      if (!rawEnd || rawEnd === '-') return { lease_type: 'month_to_month' }
+      return { lease_type: v.lease_type || 'fixed_term' }
+    },
   },
   auto_renew: {
     parse: (v) => ({ auto_renew: v.auto_renew === 'true' || v.auto_renew === 'yes' }),
@@ -2105,58 +2119,62 @@ export const WRITABLE_LEASE_COLUMN_SPECS: Record<WritableLeaseColumn, WritableLe
     parse: (v) => ({ expiration_notice_days: parseInt(v.expiration_notice_days || '60') }),
   },
   late_fee_grace_days: {
-    parse: (v): Record<string, WritableLeaseColumnSqlValue> => ({ late_fee_grace_days: parseInt(v.late_fee_grace_days || '5') }),
+    // S535: 'N/A' / '-' / blank = no late-fee policy for this unit class.
+    parse: (v): Record<string, WritableLeaseColumnSqlValue> => {
+      const n = parseInt(v.late_fee_grace_days || '')
+      return Number.isFinite(n) ? { late_fee_grace_days: n } : {}
+    },
   },
   // Late fee granular tags → each writes an amount column + its sibling
   // type/period columns on leases. Property-level config is the billing
   // source of truth; these columns are the legal snapshot of the signed PDF.
   late_fee_initial_flat: {
-    parse: (v): Record<string, WritableLeaseColumnSqlValue> => v.late_fee_initial_flat != null
+    parse: (v): Record<string, WritableLeaseColumnSqlValue> => v.late_fee_initial_flat != null && Number.isFinite(Number(v.late_fee_initial_flat))
       ? { late_fee_initial_amount: v.late_fee_initial_flat, late_fee_initial_type: 'flat' }
       : {},
   },
   late_fee_initial_percent: {
-    parse: (v): Record<string, WritableLeaseColumnSqlValue> => v.late_fee_initial_percent != null
+    parse: (v): Record<string, WritableLeaseColumnSqlValue> => v.late_fee_initial_percent != null && Number.isFinite(Number(v.late_fee_initial_percent))
       ? { late_fee_initial_amount: v.late_fee_initial_percent, late_fee_initial_type: 'percent_of_rent' }
       : {},
   },
   late_fee_accrual_flat_daily: {
-    parse: (v): Record<string, WritableLeaseColumnSqlValue> => v.late_fee_accrual_flat_daily != null
+    parse: (v): Record<string, WritableLeaseColumnSqlValue> => v.late_fee_accrual_flat_daily != null && Number.isFinite(Number(v.late_fee_accrual_flat_daily))
       ? { late_fee_accrual_amount: v.late_fee_accrual_flat_daily, late_fee_accrual_type: 'flat', late_fee_accrual_period: 'daily' }
       : {},
   },
   late_fee_accrual_flat_weekly: {
-    parse: (v): Record<string, WritableLeaseColumnSqlValue> => v.late_fee_accrual_flat_weekly != null
+    parse: (v): Record<string, WritableLeaseColumnSqlValue> => v.late_fee_accrual_flat_weekly != null && Number.isFinite(Number(v.late_fee_accrual_flat_weekly))
       ? { late_fee_accrual_amount: v.late_fee_accrual_flat_weekly, late_fee_accrual_type: 'flat', late_fee_accrual_period: 'weekly' }
       : {},
   },
   late_fee_accrual_flat_monthly: {
-    parse: (v): Record<string, WritableLeaseColumnSqlValue> => v.late_fee_accrual_flat_monthly != null
+    parse: (v): Record<string, WritableLeaseColumnSqlValue> => v.late_fee_accrual_flat_monthly != null && Number.isFinite(Number(v.late_fee_accrual_flat_monthly))
       ? { late_fee_accrual_amount: v.late_fee_accrual_flat_monthly, late_fee_accrual_type: 'flat', late_fee_accrual_period: 'monthly' }
       : {},
   },
   late_fee_accrual_percent_daily: {
-    parse: (v): Record<string, WritableLeaseColumnSqlValue> => v.late_fee_accrual_percent_daily != null
+    parse: (v): Record<string, WritableLeaseColumnSqlValue> => v.late_fee_accrual_percent_daily != null && Number.isFinite(Number(v.late_fee_accrual_percent_daily))
       ? { late_fee_accrual_amount: v.late_fee_accrual_percent_daily, late_fee_accrual_type: 'percent_of_rent', late_fee_accrual_period: 'daily' }
       : {},
   },
   late_fee_accrual_percent_weekly: {
-    parse: (v): Record<string, WritableLeaseColumnSqlValue> => v.late_fee_accrual_percent_weekly != null
+    parse: (v): Record<string, WritableLeaseColumnSqlValue> => v.late_fee_accrual_percent_weekly != null && Number.isFinite(Number(v.late_fee_accrual_percent_weekly))
       ? { late_fee_accrual_amount: v.late_fee_accrual_percent_weekly, late_fee_accrual_type: 'percent_of_rent', late_fee_accrual_period: 'weekly' }
       : {},
   },
   late_fee_accrual_percent_monthly: {
-    parse: (v): Record<string, WritableLeaseColumnSqlValue> => v.late_fee_accrual_percent_monthly != null
+    parse: (v): Record<string, WritableLeaseColumnSqlValue> => v.late_fee_accrual_percent_monthly != null && Number.isFinite(Number(v.late_fee_accrual_percent_monthly))
       ? { late_fee_accrual_amount: v.late_fee_accrual_percent_monthly, late_fee_accrual_type: 'percent_of_rent', late_fee_accrual_period: 'monthly' }
       : {},
   },
   late_fee_cap_flat: {
-    parse: (v): Record<string, WritableLeaseColumnSqlValue> => v.late_fee_cap_flat != null
+    parse: (v): Record<string, WritableLeaseColumnSqlValue> => v.late_fee_cap_flat != null && Number.isFinite(Number(v.late_fee_cap_flat))
       ? { late_fee_cap_amount: v.late_fee_cap_flat, late_fee_cap_type: 'flat' }
       : {},
   },
   late_fee_cap_percent: {
-    parse: (v): Record<string, WritableLeaseColumnSqlValue> => v.late_fee_cap_percent != null
+    parse: (v): Record<string, WritableLeaseColumnSqlValue> => v.late_fee_cap_percent != null && Number.isFinite(Number(v.late_fee_cap_percent))
       ? { late_fee_cap_amount: v.late_fee_cap_percent, late_fee_cap_type: 'percent_of_rent' }
       : {},
   },
@@ -2686,6 +2704,7 @@ export type AchEntryDescription =
   | 'DEPOSIT'
   | 'UTILITY'
   | 'ONTIMEPAY'
+  | 'PROPANE'
 
 export interface Disbursement {
   id: string
@@ -3045,7 +3064,7 @@ export const PAYMENT_TYPES = ['rent', 'fee', 'deposit', 'utility', 'float_fee', 
 export type PaymentType = typeof PAYMENT_TYPES[number]
 
 // NACHA CCD/PPD entry description field — uppercase, max 10 chars per spec.
-export const PAYMENT_ENTRY_DESCRIPTIONS = ['RENT', 'SUBSCRIP', 'DEPOSIT', 'UTILITY', 'ONTIMEPAY', 'LATEFEE'] as const
+export const PAYMENT_ENTRY_DESCRIPTIONS = ['RENT', 'SUBSCRIP', 'DEPOSIT', 'UTILITY', 'ONTIMEPAY', 'LATEFEE', 'PROPANE'] as const
 export type PaymentEntryDescription = typeof PAYMENT_ENTRY_DESCRIPTIONS[number]
 
 export const DISBURSEMENT_STATUSES = ['pending', 'processing', 'settled', 'failed'] as const
@@ -4043,4 +4062,74 @@ export function installDatePickerAutoClose(): void {
     },
     true
   )
+}
+
+// ── Utility meter reads (S533) ───────────────────────────────────────────────
+// Meter reads are odometer values entered with leading zeros (a cycled-over
+// 6-digit meter reads 000133). The digit WIDTH is a per-meter landlord
+// setting (utility_meters.digits — water meters are often 4, some are 7+);
+// these options are the ONE definition the meter form, the API clamp, the
+// walk input, and the migration CHECK all share.
+//
+// Rollover is AUTOMATIC (Nic, S533): a read below the previous one bills
+// wrap-around usage = (10^digits − prior) + current, e.g. 999822 → 000138
+// = 316 — no double-check, RV parks roll meters constantly. The one guard:
+// a wrap that exceeds HALF the meter's range is almost certainly a typo or
+// a meter swap, not a rollover — those flag for the landlord double-check
+// instead of auto-billing a monster charge.
+export const METER_READING_DIGIT_OPTIONS = [4, 5, 6, 7, 8] as const
+export type MeterReadingDigits = typeof METER_READING_DIGIT_OPTIONS[number]
+export const METER_READING_DEFAULT_DIGITS = 6
+export const meterReadingModulus = (digits: number) => 10 ** digits
+
+// Suspicious-usage thresholds per utility type (Nic, S533) — INDIVIDUAL
+// SUB-METERS ONLY. A submeter whose computed monthly usage (wrap-aware)
+// exceeds its type's threshold is silently flagged for the landlord
+// double-check and does NOT bill until confirmed — a misread that
+// slipped past the rollover guard could otherwise put a huge charge on
+// a tenant's invoice. Numbers are Nic's first guesses ("kwh ive never
+// seen over 1500 so over 5k"; water unsure) — tune freely, they only
+// gate the review flag, not the billing math. null = never flag.
+export const METER_USAGE_ALERT_THRESHOLDS: Record<string, number | null> = {
+  electric: 5000,   // kWh
+  water: 10000,     // gallons
+  gas: 1000,        // therms
+  sewer: 10000,     // gallons (mirrors water)
+  trash: null,
+}
+
+// Double-check verification phase (Nic, S533): after the main walk, the
+// system generates a blind re-read list — every suspicious meter plus
+// random clean ones so the list always has at least MIN entries and the
+// reader can't tell which are the suspects. A re-read within TOLERANCE
+// units of the first read means the meter just moved between reads: the
+// first read stands for billing and the drift bills next cycle.
+export const METER_DOUBLE_CHECK_MIN = 6
+export const METER_DOUBLE_CHECK_TOLERANCE = 2
+
+// ── Propane tank fills (Nic, S533) ───────────────────────────────────────────
+// RV gas is propane TANK FILLS, not metered usage (natural gas on
+// single-family is direct-billed by the utility; a metered-gas billback
+// waits for a real use case). Fills bill in gallons at a per-fill price
+// (PPG fluctuates and is deliberately NOT linked to POS propane pricing —
+// big tanks get better rates at the landlord's discretion).
+//
+// Split-payment rules (Nic): the ONLY split options are 2 or 4 payments.
+// The gallon thresholds are LANDLORD-SET per property (S534 —
+// properties.propane_split_min_gallons / propane_split_four_min_gallons);
+// the constants below are just the new-property defaults. First payment
+// is due immediately at the fill (standalone — outside the invoice
+// late-fee mechanism); the rest ride consecutive monthly invoices and
+// are subject to the invoice's NORMAL late-fee rules when it isn't paid
+// in full (Nic). Landlords opt in per property.
+export const PROPANE_SPLIT_MIN_GALLONS = 40
+export const PROPANE_SPLIT_FOUR_MIN_GALLONS = 100
+export function propaneSplitOptions(
+  gallons: number,
+  minGallons: number = PROPANE_SPLIT_MIN_GALLONS,
+  fourMinGallons: number = PROPANE_SPLIT_FOUR_MIN_GALLONS,
+): number[] {
+  if (gallons < minGallons) return [1]
+  if (gallons < Math.max(fourMinGallons, minGallons)) return [1, 2]
+  return [1, 2, 4]
 }

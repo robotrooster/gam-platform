@@ -11,6 +11,7 @@ import { usePerms } from '../lib/permissions'
 // creates them; nothing pre-baked.
 import { UnitSubtypesSection } from './UnitSubtypesSection'
 import { PropertyAgentPermissionsSection } from './PropertyAgentPermissionsSection'
+import { PropertyLateFeeSection } from './PropertyLateFeeSection'
 import { LawWarningBanner } from '../components/LawWarningBanner'
 import { LAUNCH_HIDDEN } from '../components/layout/Layout'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
@@ -103,6 +104,11 @@ export function PropertyDetailPage() {
             company is set — that takes priority in the responsible-party
             resolver. */}
       {!property.pmCompanyId && <PropertyManagerCard propertyId={property.id} />}
+
+      {/* S535 (Nic): property-level late-fee policy — the ONE place late
+            fees are set; stamped (locked) into every drafted lease so
+            terms are identical for all tenants. */}
+      <PropertyLateFeeSection property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
 
       {/* Occupancy bar */}
       <div style={{ marginBottom:24 }}>

@@ -4,10 +4,12 @@ import { cascadeLeaseTenantsOnVoid } from '../lib/leaseDocCascade'
 import {
   LeaseDocumentType,
   UnitType,
+  UNIT_TYPES,
   LeaseColumn,
   LeaseColumnVals,
   LEASE_COLUMN_CATEGORY,
   LEASE_COLUMN_LABEL,
+  LEASE_COLUMN_VALUE_BEARING_CATEGORIES,
   WRITABLE_LEASE_COLUMN_SPECS,
   FEE_ROW_SPECS,
   UTILITY_ROW_SPECS,
@@ -19,6 +21,8 @@ import { requireAuth, requirePerm } from '../middleware/auth'
 import { canManageLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
 import { stampPdf } from '../services/pdfStamp'
+import { resolveLateFeePolicyForUnit, lateFeePolicyToPrefills } from '../services/lateFeePolicy'
+import { detectPropertyFromPdf } from '../services/templatePropertyDetect'
 import { createAdminNotification } from '../services/adminNotifications'
 import { emailSigningRequest, emailSigningCompleted } from '../services/email'
 import { createNotification } from '../services/notifications'
@@ -196,6 +200,60 @@ async function createDocumentRecord(client: any, opts: {
         (document_id, user_id, role, name, email, phone, order_index, token)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
       [doc.id, s.userId, s.role, s.name, s.email, s.phone || null, s.orderIndex || 1, token])
+  }
+
+  // S535 (Nic): PROPERTY-LEVEL late fees — anti-discrimination. When the
+  // property has a late-fee policy, it OVERRIDES any caller-supplied
+  // late-fee prefills so every document drafted at the property carries
+  // identical late terms. The signed lease snapshot remains the billing
+  // source (lease-is-law — you bill what the tenant signed); this choke
+  // point is where uniformity is enforced going forward. The fields lock
+  // in the signing UI — the landlord changes the POLICY on the property,
+  // never the individual lease.
+  if (opts.unitId) {
+    // S535: late fees resolve per (property, UNIT TYPE) row ONLY — no
+    // property-wide default, no per-lease values, no carry-over from a
+    // predecessor. Every bound late-fee field is baselined to 'N/A'
+    // (= this class has no late fee) and the resolved policy overlays
+    // when one exists. The unit's type pulls the fee policy the same
+    // way it pulls the template.
+    const pv: Record<string, string> = (opts as any).prefillValues = (opts as any).prefillValues || {}
+    for (const k of Object.keys(pv)) if (k.startsWith('late_fee_')) delete pv[k]
+    for (const tag of ['late_fee_grace_days', 'late_fee_initial_flat', 'late_fee_initial_percent',
+      'late_fee_accrual_flat_daily', 'late_fee_accrual_flat_weekly', 'late_fee_accrual_flat_monthly',
+      'late_fee_accrual_percent_daily', 'late_fee_accrual_percent_weekly', 'late_fee_accrual_percent_monthly',
+      'late_fee_cap_flat', 'late_fee_cap_percent']) {
+      pv[tag] = 'N/A'
+    }
+    const plf = await resolveLateFeePolicyForUnit(opts.unitId, client)
+    if (plf) {
+      const policyPrefills = lateFeePolicyToPrefills(plf)
+      // S535 (Nic): the late fee must appear IN the lease document —
+      // court enforcement goes by the signed document, never by how
+      // the software is configured. If the policy produces values the
+      // chosen template can't display, drafting REFUSES rather than
+      // silently producing an unenforceable (or fee-less) lease.
+      if (opts.documentType === 'original_lease') {
+        const policyTags = Object.keys(policyPrefills)
+        const bound = opts.templateId
+          ? await client.query(
+              `SELECT lease_column FROM lease_template_fields
+                WHERE template_id = $1 AND lease_column = ANY($2)`,
+              [opts.templateId, policyTags]).then((r: any) => new Set(r.rows.map((x: any) => x.lease_column)))
+          : new Set<string>()
+        const missing = policyTags.filter(t => !bound.has(t))
+        if (missing.length > 0) {
+          const labels = missing.map(t => LEASE_COLUMN_LABEL[t as LeaseColumn] || t).join(', ')
+          const typeLabel = plf.unit_type ? String(plf.unit_type).replace('_', ' ') : 'this unit type'
+          throw new AppError(400,
+            `The ${typeLabel} late-fee policy must appear IN the lease document — courts enforce the document, not software settings. ` +
+            (opts.templateId
+              ? `This template is missing: ${labels}. Add those fields in the template editor, or remove the late-fee policy for ${typeLabel}.`
+              : `Use a template with late-fee fields (${labels}).`))
+        }
+      }
+      Object.assign(pv, policyPrefills)
+    }
   }
 
   // Copy template fields — match by signer_role, prune unused role slots
@@ -610,6 +668,46 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
     const parsed = spec.parse(vals)
     if (!parsed) continue
 
+    // S534: on a RENEWAL the deposit printed in the document is the
+    // CARRIED deposit — the tenant already paid it on the predecessor
+    // lease and the money never moves. NEVER re-bill the carried amount;
+    // the renews_lease_id carry-forward INSERT (after invoice generation)
+    // copies the predecessor's rows instead. The double-count guard:
+    //   doc value == carried → nothing bills (pure carry)
+    //   doc value >  carried → bill ONLY the difference as a tagged
+    //     top-up row, and raise the custody target so the settlement
+    //     helper records the pull (a 'funded' row flips to 'partial'
+    //     until the top-up lands)
+    //   doc value <  carried → no automatic refund; the landlord
+    //     processes a partial return from the deposit tools (the sign
+    //     flow's overlay says exactly this before they enter a number)
+    if (doc.renews_lease_id && parsed.due_timing === 'move_in' && parsed.is_refundable) {
+      const carried = await client.query(
+        `SELECT COALESCE(SUM(amount), 0)::numeric AS total FROM lease_fees
+          WHERE lease_id=$1 AND fee_type=$2 AND due_timing='move_in' AND is_refundable=TRUE`,
+        [doc.renews_lease_id, parsed.fee_type],
+      ).then((r: any) => Number(r.rows[0]?.total || 0))
+      const delta = Math.round((Number(parsed.amount) - carried) * 100) / 100
+      if (delta > 0) {
+        await client.query(
+          `INSERT INTO lease_fees (
+             lease_id, fee_type, amount, is_refundable, due_timing, description, is_override
+           ) VALUES ($1, $2, $3, TRUE, 'move_in', $4, FALSE)`,
+          [lease.id, parsed.fee_type, delta.toFixed(2),
+           `[deposit top-up on renewal] $${carried.toFixed(2)} carried + $${delta.toFixed(2)} newly billed`],
+        )
+        await client.query(
+          `UPDATE security_deposits
+              SET total_amount = total_amount + $2::numeric,
+                  status = CASE WHEN status = 'funded' THEN 'partial' ELSE status END,
+                  updated_at = NOW()
+            WHERE lease_id = $1 AND flex_deposit_enabled = FALSE`,
+          [doc.renews_lease_id, delta.toFixed(2)],
+        )
+      }
+      continue
+    }
+
     // Determine override flag: TRUE when no schedule row exists OR
     // amount / timing / refundable differs.
     const sched = scheduleByType[parsed.fee_type]
@@ -688,13 +786,39 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
   // deposit sweep without being re-billed (the tenant already paid them on
   // the original lease). Also close the loop on the renewal request.
   if (doc.renews_lease_id) {
+    // S534: a same-type "deposit top-up" row (delta billing when the
+    // landlord raised the deposit in the renewal doc) must NOT block the
+    // carry-forward copy — only a previously-carried row of the same
+    // fee_type does (idempotency on retries).
     await client.query(`
       INSERT INTO lease_fees (lease_id, fee_type, amount, is_refundable, due_timing, description)
       SELECT $1, fee_type, amount, is_refundable, due_timing,
              COALESCE(description, '') || ' [carried forward from previous lease]'
       FROM lease_fees
       WHERE lease_id=$2 AND due_timing='move_in' AND is_refundable=TRUE
-        AND fee_type NOT IN (SELECT fee_type FROM lease_fees WHERE lease_id=$1)`,
+        AND fee_type NOT IN (
+          SELECT fee_type FROM lease_fees
+           WHERE lease_id=$1
+             AND COALESCE(description, '') NOT LIKE '%[deposit top-up%')`,
+      [lease.id, doc.renews_lease_id])
+    // S534: REBIND the custody record to the successor lease. The
+    // security_deposits row carries the money, the funded/partial
+    // status, and the statutory interest accrual chain — deposit-return
+    // and the monthly interest cron both look it up BY lease_id, so
+    // leaving it on the expiring predecessor would (a) lose the
+    // accrued interest + collected amount at the renewed lease's
+    // move-out and (b) orphan the accrual clock. Rebinding the SAME row
+    // keeps the interest clock continuous from original receipt — the
+    // real-world standard (a renewal is a continuing tenancy; the
+    // deposit is never returned/re-collected, so accrual never resets).
+    // FlexDeposit custody rows are excluded — their lease linkage is
+    // managed by the FlexDeposit forwarding flow.
+    await client.query(`
+      UPDATE security_deposits
+         SET lease_id = $1, updated_at = NOW()
+       WHERE lease_id = $2
+         AND flex_deposit_enabled = FALSE
+         AND status IN ('pending', 'partial', 'funded', 'claimed')`,
       [lease.id, doc.renews_lease_id])
     await client.query(
       `UPDATE lease_renewal_requests SET status='completed', resolved_at=NOW(), updated_at=NOW()
@@ -1045,24 +1169,46 @@ esignRouter.get('/recipients', requireAuth, requirePerm('leases.create'), async 
 
 esignRouter.get('/templates', requireAuth, requirePerm('leases.create'), async (req, res, next) => {
   try {
+    // S535: ?unitType=<type> narrows to templates COMPATIBLE with that
+    // unit type (its own type + universal NULL templates).
+    const unitTypeFilter = typeof req.query.unitType === 'string' && (UNIT_TYPES as readonly string[]).includes(req.query.unitType)
+      ? req.query.unitType : null
+    // S535: ?propertyId narrows to templates usable AT that property
+    // (locked to it + unlocked NULL templates).
+    const propertyFilter = typeof req.query.propertyId === 'string' && req.query.propertyId ? req.query.propertyId : null
     const templates = await query<any>(`
-      SELECT t.*, COUNT(f.id)::int as field_count
+      SELECT t.*, COUNT(f.id)::int as field_count, p.name AS property_name
       FROM lease_templates t
       LEFT JOIN lease_template_fields f ON f.template_id = t.id
+      LEFT JOIN properties p ON p.id = t.property_id
       WHERE t.landlord_id = $1 AND t.is_active = TRUE
-      GROUP BY t.id ORDER BY t.created_at DESC`, [req.user!.profileId])
+        AND ($2::text IS NULL OR t.unit_type IS NULL OR t.unit_type = $2)
+        AND ($3::uuid IS NULL OR t.property_id IS NULL OR t.property_id = $3)
+      GROUP BY t.id, p.name ORDER BY t.created_at DESC`, [req.user!.profileId, unitTypeFilter, propertyFilter])
     res.json({ success: true, data: templates })
   } catch (e) { next(e) }
 })
 
 esignRouter.post('/templates', requireAuth, requirePerm('esign.template_manage'), async (req, res, next) => {
   try {
-    const { name, description, basePdfUrl, pageCount } = req.body
+    const { name, description, basePdfUrl, pageCount, unitType, propertyId } = req.body
     if (!name) throw new AppError(400, 'Template name required')
+    // S535: templates are per unit TYPE (null = universal) — an RV spot
+    // lease isn't an apartment lease. Drafting validates the pairing.
+    if (unitType != null && !(UNIT_TYPES as readonly string[]).includes(unitType)) {
+      throw new AppError(400, `unitType must be one of ${UNIT_TYPES.join(', ')} or null`)
+    }
+    // S535: optional PROPERTY lock (null = any property) — the form
+    // carries a property's name/address, so it belongs to that property.
+    if (propertyId) {
+      const prop = await queryOne<any>(
+        'SELECT id FROM properties WHERE id=$1 AND landlord_id=$2', [propertyId, req.user!.profileId])
+      if (!prop) throw new AppError(404, 'Property not found')
+    }
     const t = await queryOne<any>(`
-      INSERT INTO lease_templates (landlord_id, name, description, base_pdf_url, page_count)
-      VALUES ($1,$2,$3,$4,$5) RETURNING *`,
-      [req.user!.profileId, name, description||null, basePdfUrl||null, pageCount||1])
+      INSERT INTO lease_templates (landlord_id, name, description, base_pdf_url, page_count, unit_type, property_id)
+      VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+      [req.user!.profileId, name, description||null, basePdfUrl||null, pageCount||1, unitType||null, propertyId||null])
     res.status(201).json({ success: true, data: t })
   } catch (e) { next(e) }
 })
@@ -1078,13 +1224,18 @@ esignRouter.get('/templates/:id', requireAuth, requirePerm('leases.create'), asy
 
 esignRouter.patch('/templates/:id', requireAuth, requirePerm('esign.template_manage'), async (req, res, next) => {
   try {
-    const { name, description, basePdfUrl, pageCount, isActive } = req.body
+    const { name, description, basePdfUrl, pageCount, isActive, unitType } = req.body
     const t = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
     if (!t) throw new AppError(404, 'Template not found')
+    if (unitType !== undefined && unitType !== null && !(UNIT_TYPES as readonly string[]).includes(unitType)) {
+      throw new AppError(400, `unitType must be one of ${UNIT_TYPES.join(', ')} or null`)
+    }
     const updated = await queryOne<any>(`
-      UPDATE lease_templates SET name=$1, description=$2, base_pdf_url=$3, page_count=$4, is_active=$5, updated_at=NOW()
-      WHERE id=$6 RETURNING *`,
-      [name??t.name, description??t.description, basePdfUrl??t.base_pdf_url, pageCount??t.page_count, isActive??t.is_active, t.id])
+      UPDATE lease_templates SET name=$1, description=$2, base_pdf_url=$3, page_count=$4, is_active=$5,
+             unit_type=$6, updated_at=NOW()
+      WHERE id=$7 RETURNING *`,
+      [name??t.name, description??t.description, basePdfUrl??t.base_pdf_url, pageCount??t.page_count, isActive??t.is_active,
+       unitType===undefined ? t.unit_type : unitType, t.id])
     res.json({ success: true, data: updated })
   } catch (e) { next(e) }
 })
@@ -1269,10 +1420,14 @@ esignRouter.post('/documents', requireAuth, requirePerm('leases.create'), async 
 
     // Resolve PDF source — template default falls through if no explicit basePdfUrl
     let pdfUrl = basePdfUrl
+    let tmplUnitType: string | null = null
+    let tmplPropertyId: string | null = null
     if (templateId) {
       const tmpl = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id=$2', [templateId, req.user!.profileId])
       if (!tmpl) throw new AppError(404, 'Template not found')
       pdfUrl = pdfUrl || tmpl.base_pdf_url
+      tmplUnitType = tmpl.unit_type || null
+      tmplPropertyId = tmpl.property_id || null
     }
 
     // Unit resolver — if the template binds unit_number and the landlord filled
@@ -1280,6 +1435,21 @@ esignRouter.post('/documents', requireAuth, requirePerm('leases.create'), async 
     // success, override any unitId that came from the tenant-lookup fallback.
     const resolvedUnitId = await resolveUnitFromPrefill(req.user!.profileId, prefillValues || {})
     const finalUnitId = resolvedUnitId || unitId || null
+
+    // S535: templates are per unit type and may be property-locked —
+    // refuse incompatible pairings (NULLs fit everything).
+    if ((tmplUnitType || tmplPropertyId) && finalUnitId) {
+      const u = await queryOne<{ unit_type: string | null; property_id: string }>(
+        'SELECT unit_type, property_id FROM units WHERE id=$1', [finalUnitId])
+      if (tmplUnitType && u?.unit_type && u.unit_type !== tmplUnitType) {
+        throw new AppError(400,
+          `This template is for ${tmplUnitType.replace('_', ' ')} units — the selected unit is ${u.unit_type.replace('_', ' ')}. Pick a matching or universal template.`)
+      }
+      if (tmplPropertyId && u && u.property_id !== tmplPropertyId) {
+        throw new AppError(400,
+          'This template is locked to a different property than the selected unit. Pick that property\'s template or an unlocked one.')
+      }
+    }
 
     await client.query('BEGIN')
 
@@ -1307,6 +1477,42 @@ esignRouter.post('/documents', requireAuth, requirePerm('leases.create'), async 
   }
 })
 
+// S534 (Nic): one-minute renewal support. One fetch gives the decision
+// modal everything it needs: any OPEN renewal draft for the lease (so a
+// second visit OPENS the draft instead of dead-ending on the duplicate-
+// draft 409 — the "buried resolve" complaint), plus the template the
+// current lease was executed from (preselected so renewing reuses the
+// same template by default).
+esignRouter.get('/documents/renewal-context/:leaseId', requireAuth, requirePerm('leases.create'), async (req, res, next) => {
+  try {
+    const lease = await queryOne<any>(
+      `SELECT id, landlord_id FROM leases WHERE id = $1`, [req.params.leaseId])
+    if (!lease) throw new AppError(404, 'Lease not found')
+    if (!canManageLandlordResource(req.user, lease.landlord_id)) throw new AppError(403, 'Not your lease')
+
+    const openDraft = await queryOne<any>(`
+      SELECT d.id, d.status, d.title,
+             (SELECT s.status FROM lease_document_signers s
+               WHERE s.document_id = d.id AND s.role = 'landlord'
+               ORDER BY s.order_index LIMIT 1) AS landlord_signer_status
+        FROM lease_documents d
+       WHERE d.renews_lease_id = $1 AND d.status NOT IN ('completed','voided')
+       ORDER BY d.created_at DESC LIMIT 1`, [lease.id])
+    const prior = await queryOne<any>(`
+      SELECT d.template_id, t.name AS template_name
+        FROM lease_documents d
+        JOIN lease_templates t ON t.id = d.template_id
+       WHERE d.lease_id = $1 AND d.status = 'completed' AND d.template_id IS NOT NULL
+       ORDER BY d.completed_at DESC NULLS LAST, d.created_at DESC LIMIT 1`, [lease.id])
+
+    res.json({ success: true, data: {
+      openDraft: openDraft || null,
+      priorTemplateId: prior?.template_id ?? null,
+      priorTemplateName: prior?.template_name ?? null,
+    }})
+  } catch (e) { next(e) }
+})
+
 // W-7 (S531): renewal decision → drafted lease. Creates an original_lease
 // document for the SAME unit + active roster with the renewal form's terms
 // prefilled (per lease-is-law the new terms live in the drafted lease).
@@ -1330,7 +1536,7 @@ esignRouter.post('/documents/renewal', requireAuth, requirePerm('leases.create')
     if (!templateId) throw new AppError(400, 'templateId required — pick the lease template to draft from')
 
     const lease = await queryOne<any>(`
-      SELECT l.*, u.unit_number, p.name AS property_name,
+      SELECT l.*, u.unit_number, u.unit_type, u.property_id, p.name AS property_name,
              p.street1, p.city, p.state, p.zip
       FROM leases l
       JOIN units u ON u.id = l.unit_id
@@ -1350,6 +1556,19 @@ esignRouter.post('/documents/renewal', requireAuth, requirePerm('leases.create')
       'SELECT * FROM lease_templates WHERE id=$1 AND landlord_id=$2', [templateId, lease.landlord_id])
     if (!tmpl) throw new AppError(404, 'Template not found')
     if (!tmpl.base_pdf_url) throw new AppError(400, 'Template has no base PDF')
+    // S535: templates are per unit type — refuse an incompatible pairing
+    // (universal NULL templates fit every unit).
+    if (tmpl.unit_type && lease.unit_type && tmpl.unit_type !== lease.unit_type) {
+      throw new AppError(400,
+        `Template "${tmpl.name}" is for ${tmpl.unit_type.replace('_', ' ')} units — this unit is ${String(lease.unit_type).replace('_', ' ')}. Pick a matching or universal template.`)
+    }
+    // S535: property-locked templates only draft at THEIR property —
+    // the form's own text names the property, so the wrong pairing is
+    // always a mistake.
+    if (tmpl.property_id && tmpl.property_id !== lease.property_id) {
+      throw new AppError(400,
+        `Template "${tmpl.name}" is locked to another property — this unit is at ${lease.property_name}. Pick that property's template or an unlocked one.`)
+    }
     // The new terms are entered in the document, so the template must carry
     // the fields the completion chain requires.
     const requiredCols = await query<any>(
@@ -1397,7 +1616,74 @@ esignRouter.post('/documents/renewal', requireAuth, requirePerm('leases.create')
       expiration_notice_days: String(lease.expiration_notice_days ?? 60),
     }
     if (lease.auto_renew && lease.auto_renew_mode) prefillValues.auto_renew_mode = lease.auto_renew_mode
-    if (lease.late_fee_grace_days != null) prefillValues.late_fee_grace_days = String(lease.late_fee_grace_days)
+
+    // S535 (Nic): CROSS-TEMPLATE renewal — the landlord may renew onto an
+    // entirely different/updated template ("change in form"). Prefill
+    // EVERY lease column derivable from the predecessor so a new form's
+    // bound fields populate automatically; anything underivable (e.g.
+    // custom_text, a fee the old lease never had) is typed by the
+    // landlord during their signing pass — the tagged-field completeness
+    // gate moved from /send to the landlord's sign submit.
+    if (lease.lease_type) prefillValues.lease_type = lease.lease_type
+    // S535: late fees deliberately NOT carried from the predecessor —
+    // they stamp from the CURRENT (property, unit type) policy inside
+    // createDocumentRecord ('N/A' when the class has no policy row).
+    // Utility responsibilities → 'tenant' / 'landlord' (UTILITY_ROW_SPECS
+    // treats 'tenant' as tenant_responsible=TRUE).
+    const utilRows = await query<{ utility_type: string; tenant_responsible: boolean }>(
+      `SELECT utility_type, tenant_responsible FROM lease_utility_responsibilities WHERE lease_id=$1`, [leaseId])
+    const UTIL_TAG: Record<string, string> = {
+      water: 'utility_water_responsibility', gas: 'utility_gas_responsibility',
+      electric: 'utility_electric_responsibility', sewer: 'utility_sewer_responsibility',
+      trash: 'utility_trash_responsibility',
+    }
+    for (const u of utilRows as any[]) {
+      const tag = UTIL_TAG[u.utility_type]
+      if (tag) prefillValues[tag] = u.tenant_responsible ? 'tenant' : 'landlord'
+    }
+
+    // S534 (Nic): the renewal defaults to the predecessor's terms — the
+    // landlord quick-edits what changed in the doc and signs. Rent
+    // defaults to the CURRENT rent (raise it in the doc if it changes);
+    // this also satisfies the send route's all-tagged-fields-have-values
+    // check so draft → auto-send → sign flows without a stop.
+    prefillValues.rent_amount = Number(lease.rent_amount).toFixed(2)
+
+    // Term mirrors the predecessor — new start = the day after the old
+    // end, same duration (a 1-year lease renews as 1 year). Prefills are
+    // defaults, not law: the landlord edits them in the doc like any
+    // field. Month-to-month predecessors (no end date) get no date
+    // defaults.
+    if (lease.start_date && lease.end_date) {
+      const oldStart = new Date(lease.start_date)
+      const oldEnd   = new Date(lease.end_date)
+      const newStart = new Date(oldEnd); newStart.setDate(newStart.getDate() + 1)
+      const newEnd   = new Date(newStart.getTime() + (oldEnd.getTime() - oldStart.getTime()))
+      prefillValues.start_date = newStart.toLocaleDateString('en-US')
+      prefillValues.end_date   = newEnd.toLocaleDateString('en-US')
+    } else if (!lease.end_date) {
+      // S535 (Nic): month-to-month predecessor — '-' is the explicit
+      // "no end date" entry (execution maps it to end_date NULL +
+      // lease_type month_to_month). Start date is the landlord's call.
+      prefillValues.end_date = '-'
+    }
+
+    // S534/S535 (Nic): show the CARRIED deposits on the renewal document,
+    // per fee_type (security_deposit, pet_deposit, key_deposit, …) so a
+    // template binding any deposit field populates with its own carried
+    // amount. Custody never moves on a renewal (the fee rows copy forward
+    // at execution, tagged, AFTER the move-in invoice); the per-type
+    // delta guard in buildLeaseFromDocument means these values can never
+    // double-charge — only an INCREASE bills, and only the difference.
+    const depositRows = await query<{ fee_type: string; total: string }>(`
+      SELECT fee_type, SUM(amount)::text AS total FROM lease_fees
+       WHERE lease_id=$1 AND due_timing='move_in' AND is_refundable=TRUE
+       GROUP BY fee_type`, [leaseId])
+    for (const d of depositRows as any[]) {
+      const total = Number(d.total || 0)
+      if (total > 0) prefillValues[d.fee_type] = total.toFixed(2).replace(/\.00$/, '')
+    }
+    if (!prefillValues.security_deposit) prefillValues.security_deposit = 'N/A'
 
     // Carry recurring + move-out/other lease_fees forward as prefills (they
     // bill on their own timing — nothing re-bills at completion). Move-in
@@ -2035,7 +2321,8 @@ esignRouter.post('/documents/:id/send', requireAuth, requirePerm('esign.send'), 
       const endVal   = (vals as any[]).find(v => v.lease_column === 'end_date')?.value
       if (startVal) {
         const allTenantIds = [primary.tenantId, ...coTenants.map(c => c.tenantId)]
-        const ov = await canTenantsSignNewLease(allTenantIds, doc.unit_id, startVal, endVal || null)
+        // S535: '-' end date = month-to-month (no end date) — never cast it as a date.
+        const ov = await canTenantsSignNewLease(allTenantIds, doc.unit_id, startVal, endVal && endVal.trim() !== '-' ? endVal : null)
         if (!ov.ok) throw new AppError(409, `Cannot send: ${ov.reason}`)
       }
     }
@@ -2062,16 +2349,20 @@ esignRouter.post('/documents/:id/send', requireAuth, requirePerm('esign.send'), 
     }
 
     // ────────────────────────────────────────────────────────────────────────
-    // S28: Every tagged value-bearing field must be filled before send.
-    // Categories writable / fee_row / utility_row carry contractual data
-    // entered by the landlord. Identity fills from system data at render
-    // time; signature fills at sign time — both exempt.
+    // S28 → S535: tagged value-bearing fields must be filled before the
+    // TENANT sees the document — but the landlord signs FIRST and types
+    // terms INTO the doc (lease-is-law), so landlord-role tagged fields
+    // may legitimately be empty at send (e.g. a cross-template renewal
+    // binding a field the predecessor can't derive). Those are enforced
+    // at the landlord's sign submit instead (POST /sign). Non-landlord
+    // tagged fields still must arrive filled here.
     // ────────────────────────────────────────────────────────────────────────
-    const fieldRows = await query<{ lease_column: LeaseColumn | null; value: string | null }>(
-      'SELECT lease_column, value FROM lease_document_fields WHERE document_id=$1',
+    const fieldRows = await query<{ lease_column: LeaseColumn | null; value: string | null; signer_role: string | null }>(
+      'SELECT lease_column, value, signer_role FROM lease_document_fields WHERE document_id=$1',
       [doc.id]
     )
-    const violations = validateLeaseDocumentForSend(fieldRows as any)
+    const violations = validateLeaseDocumentForSend(
+      (fieldRows as any[]).filter(r => r.signer_role !== 'landlord') as any)
     if (violations.length > 0) {
       const labels = violations.map(v => LEASE_COLUMN_LABEL[v.lease_column])
       throw new AppError(
@@ -2194,6 +2485,20 @@ esignRouter.get('/sign/:documentId', requireAuth, async (req, res, next) => {
         : `SELECT * FROM lease_document_fields WHERE document_id=$1 AND signer_role=$2 ORDER BY page, y`,
       readOnly ? [doc.id] : [doc.id, signer.role])
 
+    // S535: value-bearing tagged fields (writable / fee_row / utility_row)
+    // are ALWAYS required for the landlord's pass — the sign submit
+    // enforces completeness regardless of the template's required flag,
+    // so the UI counter and Next Field must agree ("N/A" / "0" are valid
+    // entries for fields that don't apply). Presentation-level only.
+    if (!readOnly && signer.role === 'landlord') {
+      for (const f of fields as any[]) {
+        if (f.lease_column
+            && LEASE_COLUMN_VALUE_BEARING_CATEGORIES.includes(LEASE_COLUMN_CATEGORY[f.lease_column as LeaseColumn])) {
+          f.required = true
+        }
+      }
+    }
+
     if (!readOnly && signer.status === 'sent') {
       await query("UPDATE lease_document_signers SET status='viewed', viewed_at=NOW() WHERE id=$1", [signer.id])
     }
@@ -2253,7 +2558,49 @@ esignRouter.get('/sign/:documentId', requireAuth, async (req, res, next) => {
       }
     }
 
-    res.json({ success: true, data: { signer, document: doc, fields, deposit_interest_context, readOnly } })
+    // S534: on a renewal doc, tell the signing UI what deposit is
+    // already held so the deposit field shows the double-count overlay
+    // (equal carries · higher bills only the difference · lower needs a
+    // manual partial return).
+    let carried_deposit: number | null = null
+    let carried_rent: number | null = null
+    if (doc.renews_lease_id) {
+      // Scoped to the security_deposit fee_type — the overlay sits on
+      // that field and the delta guard compares per type (S535).
+      const cd = await queryOne<{ total: string }>(
+        `SELECT COALESCE(SUM(amount), 0)::text AS total FROM lease_fees
+          WHERE lease_id=$1 AND fee_type='security_deposit'
+            AND due_timing='move_in' AND is_refundable=TRUE`,
+        [doc.renews_lease_id])
+      carried_deposit = Number(cd?.total || 0)
+      // S535: the predecessor's rent powers the increase presets
+      // (+3/5/10%, flat $) on the rent field in the signing pass.
+      const cr = await queryOne<{ rent_amount: string }>(
+        `SELECT rent_amount::text AS rent_amount FROM leases WHERE id=$1`,
+        [doc.renews_lease_id])
+      carried_rent = Number(cr?.rent_amount || 0)
+    }
+
+    // S535: property late-fee POLICY for the signing UI — when set, the
+    // doc's late-fee fields render locked (uniform terms per property,
+    // fair-housing) and clicking one explains the policy + the exact
+    // day the fee starts given this lease's due day and grace period.
+    let property_late_fee: any = null
+    if (doc.unit_id) {
+      // S535: per-(property, unit type) resolution — no property default.
+      // When no policy row exists for this class, return a none-marker so
+      // the signing UI still locks the fields and explains the absence.
+      property_late_fee = await resolveLateFeePolicyForUnit(doc.unit_id)
+      if (!property_late_fee) {
+        const u = await queryOne<any>(
+          `SELECT u.unit_type, p.name AS property_name
+             FROM units u JOIN properties p ON p.id = u.property_id
+            WHERE u.id = $1`, [doc.unit_id])
+        if (u) property_late_fee = { none: true, unit_type: u.unit_type, property_name: u.property_name }
+      }
+    }
+
+    res.json({ success: true, data: { signer, document: doc, fields, deposit_interest_context, carried_deposit, carried_rent, property_late_fee, readOnly } })
   } catch (e) { next(e) }
 })
 
@@ -2306,7 +2653,8 @@ esignRouter.post('/sign/:documentId', requireAuth, async (req, res, next) => {
       const endVal   = (vals as any[]).find(v => v.lease_column === 'end_date')?.value
       if (startVal) {
         const allTenantIds = [primary.tenantId, ...coTenants.map(c => c.tenantId)]
-        const ov = await canTenantsSignNewLease(allTenantIds, doc.unit_id, startVal, endVal || null)
+        // S535: '-' end date = month-to-month (no end date) — never cast it as a date.
+        const ov = await canTenantsSignNewLease(allTenantIds, doc.unit_id, startVal, endVal && endVal.trim() !== '-' ? endVal : null)
         if (!ov.ok) throw new AppError(409, ov.reason || 'Lease overlap detected')
       }
     }
@@ -2359,6 +2707,23 @@ esignRouter.post('/sign/:documentId', requireAuth, async (req, res, next) => {
           AND signer_role=$5
           AND (signed_at IS NULL OR signer_id=$2)`,
         [fv.value, signer.id, fv.fieldId, doc.id, signer.role])
+    }
+
+    // S535: the LANDLORD-first signing pass is where lease terms are
+    // typed into the doc (send no longer requires landlord-role tagged
+    // fields to be prefilled — cross-template renewals may bind fields
+    // the predecessor can't derive). The lock-before-tenant invariant
+    // (S28) is enforced HERE: after the landlord's values land, every
+    // tagged value-bearing field must be filled or the sign rolls back.
+    if (signer.role === 'landlord') {
+      const taggedRows = await client.query(
+        `SELECT lease_column, value FROM lease_document_fields WHERE document_id=$1`,
+        [doc.id])
+      const unfilled = validateLeaseDocumentForSend(taggedRows.rows as any)
+      if (unfilled.length > 0) {
+        const labels = unfilled.map(v => LEASE_COLUMN_LABEL[v.lease_column])
+        throw new AppError(400, `Fill these lease terms before signing: ${labels.join(', ')}`)
+      }
     }
 
     await client.query(`
@@ -2711,7 +3076,12 @@ esignRouter.post('/upload', requireAuth, requirePerm('leases.create'), upload.si
       const matches = fileBuffer.match(/\/Type\s*\/Page[^s]/g)
       if (matches) pageCount = matches.length
     } catch(e) { /* fallback to 1 */ }
-    res.json({ success: true, data: { url: fileUrl, filename: req.file.originalname, size: req.file.size, pageCount } })
+    // S535: read the PDF's text for the landlord's property name/address —
+    // lease forms usually carry it, and a unique match auto-locks the
+    // template to that property in the create modal. Best-effort.
+    const detectedProperty = await detectPropertyFromPdf(
+      req.user!.profileId, fs.readFileSync(req.file.path))
+    res.json({ success: true, data: { url: fileUrl, filename: req.file.originalname, size: req.file.size, pageCount, detectedProperty } })
   } catch (e) { next(e) }
 })
 

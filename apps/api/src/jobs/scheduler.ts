@@ -807,6 +807,20 @@ export function schedulerInit() {
   // Daily at 8am — notify landlord when lease approaches end_date
   cron.schedule('0 8 * * *', checkLeaseExpiryNotices)
 
+  // Utility reading runs — daily 7am Phoenix; self-gates to the last
+  // business day of the month (weekends + US federal holidays walked
+  // backward). Opens a run per property with readable meters and
+  // prompts the landlord + property staff to start reading.
+  cron.schedule('0 7 * * *', async () => {
+    try {
+      const { openDueReadingRuns } = await import('../services/utilityReadingRuns')
+      const r = await openDueReadingRuns()
+      if (r.opened > 0) logger.info(r, '[reading-runs]')
+    } catch (e) {
+      logger.error({ err: e }, '[reading-runs] fatal')
+    }
+  }, { timezone: 'America/Phoenix' })
+
   // 16a Step 3: auto-Friday payout queue. Fires Mon-Fri 9am Phoenix; engine
   // self-gates to only run on the auto-payout day (Friday, shifted forward
   // over US federal holidays).

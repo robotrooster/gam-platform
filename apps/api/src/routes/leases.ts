@@ -60,16 +60,53 @@ async function isTenantOnLease(leaseId: string, tenantProfileId: string): Promis
 }
 
 // ─────────────────────────────────────────────────────────────
-// GET /api/leases/:id/pdf — the lease agreement rendered as a PDF.
-// Generated on-demand from the structured lease terms (services/leasePdf)
-// so EVERY lease — e-signed, manually created, or imported — is viewable
-// in the in-browser pdf.js viewer on both the tenant and landlord sides.
+// GET /api/leases/:id/pdf — the lease agreement as a PDF.
+// S534 (Nic): THE LEASE IS THE DOCUMENT — clicking a lease shows the
+// real thing when it exists, in priority order:
+//   1. the executed e-sign PDF (the actual signed document)
+//   2. the imported original PDF (parser-onboarded leases)
+//   3. fallback: rendered on-demand from the structured terms
+//      (services/leasePdf) so every lease is still viewable.
 // Auth: tenant on the lease, or landlord/team with access to the lease.
 // ─────────────────────────────────────────────────────────────
+const LEASE_UPLOAD_DIR = path.join(process.cwd(), 'uploads', 'leases')
+
+// S534 (Nic): the lease view is the CURRENT contract — the signed lease
+// followed by every recorded addendum, one continuous PDF. Addendum
+// files live in uploads/leases with filenames recorded on the
+// lease_addendum_recorded credit events.
+async function appendLeaseAddendums(leaseId: string, mainBytes: Uint8Array): Promise<Uint8Array> {
+  const rows = await query<{ filename: string | null }>(`
+    SELECT ev.event_data->>'pdf_filename' AS filename
+      FROM credit_events ev
+      JOIN credit_subjects cs ON cs.id = ev.subject_id
+     WHERE cs.subject_type = 'tenant'
+       AND ev.event_type = 'lease_addendum_recorded'
+       AND ev.event_data->>'lease_id' = $1
+     ORDER BY ev.occurred_at ASC`, [leaseId])
+  const files = rows.map(r => r.filename).filter(Boolean) as string[]
+  if (files.length === 0) return mainBytes
+
+  const { PDFDocument } = await import('pdf-lib')
+  const merged = await PDFDocument.load(mainBytes)
+  for (const fn of files) {
+    const fp = resolveUploadPath(LEASE_UPLOAD_DIR, fn)
+    if (!fp || !fs.existsSync(fp)) continue
+    try {
+      const addendum = await PDFDocument.load(fs.readFileSync(fp))
+      const pages = await merged.copyPages(addendum, addendum.getPageIndices())
+      pages.forEach(p => merged.addPage(p))
+    } catch (e) {
+      logger.warn({ leaseId, filename: fn, err: e }, '[leases] addendum merge skipped — unreadable PDF')
+    }
+  }
+  return merged.save()
+}
+
 leasesRouter.get('/:id/pdf', async (req, res, next) => {
   try {
-    const lease = await queryOne<{ id: string; landlord_id: string }>(
-      'SELECT id, landlord_id FROM leases WHERE id = $1', [req.params.id])
+    const lease = await queryOne<{ id: string; landlord_id: string; imported_pdf_url: string | null }>(
+      'SELECT id, landlord_id, imported_pdf_url FROM leases WHERE id = $1', [req.params.id])
     if (!lease) throw new AppError(404, 'Lease not found')
 
     const u = req.user!
@@ -78,8 +115,35 @@ leasesRouter.get('/:id/pdf', async (req, res, next) => {
       : canAccessLandlordResource(u, lease.landlord_id)
     if (!allowed) throw new AppError(403, 'Forbidden')
 
-    const { generateLeasePdfBytes } = await import('../services/leasePdf')
-    const bytes = await generateLeasePdfBytes(lease.id)
+    // Resolve the base document:
+    // 1. Executed e-sign document ('/api/esign/files/<filename>' with the
+    //    file in the same uploads/leases dir the addendums use).
+    let baseBytes: Uint8Array | null = null
+    const executed = await queryOne<{ executed_pdf_url: string }>(`
+      SELECT executed_pdf_url FROM lease_documents
+       WHERE lease_id = $1 AND status = 'completed' AND executed_pdf_url IS NOT NULL
+       ORDER BY completed_at DESC NULLS LAST, created_at DESC
+       LIMIT 1`, [lease.id])
+    const executedFilename = executed?.executed_pdf_url?.split('/').pop()
+    if (executedFilename) {
+      const filePath = resolveUploadPath(LEASE_UPLOAD_DIR, executedFilename)
+      if (filePath && fs.existsSync(filePath)) baseBytes = fs.readFileSync(filePath)
+    }
+
+    // 2. Imported original (S395: stores the bare multer filename).
+    if (!baseBytes && lease.imported_pdf_url) {
+      const importedFilename = lease.imported_pdf_url.split('/').pop()!
+      const filePath = resolveUploadPath(LEASE_UPLOAD_DIR, importedFilename)
+      if (filePath && fs.existsSync(filePath)) baseBytes = fs.readFileSync(filePath)
+    }
+
+    // 3. Generated terms rendering.
+    if (!baseBytes) {
+      const { generateLeasePdfBytes } = await import('../services/leasePdf')
+      baseBytes = await generateLeasePdfBytes(lease.id)
+    }
+
+    const bytes = await appendLeaseAddendums(lease.id, baseBytes)
     res.setHeader('Content-Type', 'application/pdf')
     res.setHeader('Content-Disposition', 'inline; filename="lease-agreement.pdf"')
     res.send(Buffer.from(bytes))
@@ -172,7 +236,7 @@ leasesRouter.get('/', async (req, res, next) => {
               AND lf.fee_type = 'security_deposit'
               AND lf.due_timing = 'move_in'
             LIMIT 1) AS security_deposit,
-          u.unit_number, p.name AS property_name
+          u.unit_number, u.unit_type, p.id AS property_id, p.name AS property_name
         FROM leases l
         JOIN units u ON u.id = l.unit_id
         JOIN properties p ON p.id = u.property_id
@@ -187,7 +251,7 @@ leasesRouter.get('/', async (req, res, next) => {
               AND lf.fee_type = 'security_deposit'
               AND lf.due_timing = 'move_in'
             LIMIT 1) AS security_deposit,
-          u.unit_number, p.name AS property_name
+          u.unit_number, u.unit_type, p.id AS property_id, p.name AS property_name
         FROM leases l
         JOIN units u ON u.id = l.unit_id
         JOIN properties p ON p.id = u.property_id
@@ -195,7 +259,7 @@ leasesRouter.get('/', async (req, res, next) => {
         ORDER BY l.start_date DESC`, [req.user!.landlordId])
     } else if (role === 'tenant') {
       rows = await query<any>(`
-        SELECT DISTINCT l.*, u.unit_number, p.name AS property_name
+        SELECT DISTINCT l.*, u.unit_number, u.unit_type, p.id AS property_id, p.name AS property_name
         FROM leases l
         JOIN units u ON u.id = l.unit_id
         JOIN properties p ON p.id = u.property_id
@@ -211,7 +275,7 @@ leasesRouter.get('/', async (req, res, next) => {
               AND lf.fee_type = 'security_deposit'
               AND lf.due_timing = 'move_in'
             LIMIT 1) AS security_deposit,
-          u.unit_number, p.name AS property_name
+          u.unit_number, u.unit_type, p.id AS property_id, p.name AS property_name
         FROM leases l
         JOIN units u ON u.id = l.unit_id
         JOIN properties p ON p.id = u.property_id
@@ -879,7 +943,7 @@ leasesRouter.get('/:id/deposit-return', async (req, res, next) => {
 leasesRouter.post('/:id/non-renewal', requirePerm('leases.edit'), async (req, res, next) => {
   try {
     const lease = await queryOne<any>(`
-      SELECT l.*, u.unit_number, p.name AS property_name
+      SELECT l.*, u.unit_number, u.unit_type, p.id AS property_id, p.name AS property_name
       FROM leases l
       JOIN units u ON u.id = l.unit_id
       JOIN properties p ON p.id = u.property_id

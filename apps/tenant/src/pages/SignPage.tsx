@@ -221,6 +221,11 @@ function SignatureSetup({ name, initials, onComplete }: { name:string; initials:
 
 type Stage = 'signing'|'review'|'done'|'declined'
 
+// S534: a 'date' field is auto-stampable only when it records WHEN the
+// signer signed. Term dates (lease start/end) are deliberate inputs.
+const isDateSignedField = (f: any) =>
+  f.leaseColumn === 'date_signed' || (!f.leaseColumn && /date\s*signed|signed\s*date/i.test(f.label || ''))
+
 export function SignPage() {
   const { documentId } = useParams<{ documentId:string }>()
   const navigate = useNavigate()
@@ -289,9 +294,14 @@ export function SignPage() {
 
   const clearDraft = () => { try { localStorage.removeItem(draftKey) } catch {} }
 
+  // S535: surface API sign failures (mirrors landlord SignPage) — a
+  // {success:false} response previously showed the success screen.
   const submitMut = useMutation(
-    () => authFetch('/esign/sign/'+documentId, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ fieldValues: Object.entries(fieldValues).map(([fieldId,value])=>({fieldId,value})) }) }).then(r=>r.json()),
-    { onSuccess:(res:any)=>{ clearDraft(); setAllDone(res.completed); setStage('done') } }
+    () => authFetch('/esign/sign/'+documentId, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ fieldValues: Object.entries(fieldValues).map(([fieldId,value])=>({fieldId,value})) }) })
+      .then(r=>r.json())
+      .then((r:any)=>{ if(!r.success) throw new Error(r.error || 'Signing failed'); return r }),
+    { onSuccess:(res:any)=>{ clearDraft(); setAllDone(res.data?.completed ?? res.completed); setStage('done') },
+      onError:(e:any)=>{ setStage('signing'); alert(e?.message || 'Signing failed — try again.') } }
   )
   // S234: decline path. The tenant can refuse a sent doc with a reason.
   // Backend voids the document on success — no path back.
@@ -353,7 +363,12 @@ export function SignPage() {
     if (!data?.fields) return
     const today = new Date().toLocaleDateString()
     const updates: Record<string,string> = {}
-    data.fields.filter((f:any)=>f.fieldType==='date').forEach((f:any)=>{ updates[f.id]=today })
+    // S534 (mirrors landlord SignPage): show draft-time prefills, and
+    // auto-date ONLY signature-date fields — term dates are deliberate.
+    data.fields.forEach((f:any)=>{ if (f.value) updates[f.id] = f.value })
+    data.fields
+      .filter((f:any)=>f.fieldType==='date' && !updates[f.id] && isDateSignedField(f))
+      .forEach((f:any)=>{ updates[f.id]=today })
     if (Object.keys(updates).length) setFieldValues(prev=>({...prev,...updates}))
   }, [data])
 
@@ -400,7 +415,7 @@ export function SignPage() {
       setTimeout(()=>jumpToNext(field.id), 150)
       return
     }
-    if (field.fieldType==='date') {
+    if (field.fieldType==='date' && isDateSignedField(field)) {
       setFieldValues(p=>({...p,[field.id]:new Date().toLocaleDateString()}))
       setTimeout(()=>jumpToNext(field.id), 150)
       return
@@ -490,7 +505,7 @@ export function SignPage() {
       <div style={{ position:'sticky', top:0, zIndex:100, background:'var(--bg-1,#0f1319)', borderBottom:'1px solid var(--border-0)', padding:'10px 0', marginBottom:12, display:'flex', alignItems:'center', justifyContent:'space-between', gap:10 }}>
         <div>
           <div style={{ fontWeight:700, color:'var(--text-0)', fontSize:'.95rem' }}>{doc.title}</div>
-          <div style={{ fontSize:'.72rem', color:'var(--text-3)' }}>Signing as <strong style={{ color:'var(--gold,#c9a227)' }}>{signer.name}</strong> · {Object.keys(fieldValues).filter(k=>fieldValues[k]).length}/{requiredFields.length} fields complete</div>
+          <div style={{ fontSize:'.72rem', color:'var(--text-3)' }}>Signing as <strong style={{ color:'var(--gold,#c9a227)' }}>{signer.name}</strong> · {requiredFields.length-unfilledRequired.length}/{requiredFields.length} required fields complete</div>
         </div>
         <div style={{ display:'flex', gap:8, flexShrink:0 }}>
           {pdfPageCount>1 && <>
@@ -530,7 +545,9 @@ export function SignPage() {
             const color = colors[f.fieldType]||'#c9a227'
             return (
               <div key={f.id} id={'field-'+f.id}
-                onClick={()=>!val&&handleFieldClick(f)}
+                // S534: filled fields stay clickable so prefilled defaults
+                // can be corrected before submitting.
+                onClick={()=>handleFieldClick(f)}
                 style={{
                   position:'absolute', left:f.x*s, top:f.y*s, width:f.width*s, height:f.height*s,
                   border:`2px solid ${val?'#22c55e':isNext?color:'#aaa'}`,
@@ -585,6 +602,10 @@ export function SignPage() {
             {activeField.fieldType==='text' && (
               <input defaultValue={fieldValues[activeField.id]||''} onChange={e=>setFieldValues(p=>({...p,[activeField.id]:e.target.value}))}
                 placeholder={activeField.label||'Enter text'} style={{ width:'100%', padding:'9px 12px', border:'1px solid #e5e7eb', borderRadius:8, fontSize:'.9rem', outline:'none', boxSizing:'border-box' as const, marginBottom:14 }}/>
+            )}
+            {activeField.fieldType==='date' && (
+              <input type="date" onChange={e=>{ const v = e.target.value ? new Date(e.target.value + 'T12:00:00').toLocaleDateString() : ''; setFieldValues(p=>({...p,[activeField.id]:v})) }}
+                style={{ width:'100%', padding:'9px 12px', border:'1px solid #e5e7eb', borderRadius:8, fontSize:'.9rem', outline:'none', boxSizing:'border-box' as const, marginBottom:14 }}/>
             )}
             <div style={{ display:'flex', gap:8 }}>
               <button onClick={()=>setActiveField(null)} style={{ flex:1, padding:'10px', borderRadius:8, border:'1px solid #e5e7eb', background:'white', cursor:'pointer' }}>Cancel</button>

@@ -62,10 +62,26 @@ export function LeasesPage() {
     }
   }
 
-  // Row click: needs-review → editable (confirm import); otherwise view-only.
-  // Staff without leases.edit never get the editable confirm path — the
-  // needs-review row opens read-only for them too.
+  // Row click (S534, Nic): the lease IS the document — clicking a lease
+  // opens its PDF (executed e-sign doc, else imported original, else the
+  // generated terms rendering). The one exception: a needs-review import
+  // opens the editable confirm form for staff who can edit — that row is
+  // flagged for action, not reading. Lease details moved to the Details
+  // row button.
   const openLease = (l: any) => {
+    if (l.needsReview && can('leases.edit')) {
+      setViewOnly(false)
+      setEditingLeaseId(l.id)
+      setModalOpen(true)
+      return
+    }
+    if (can('leases.view_pdf')) {
+      navigate(`/view?src=${encodeURIComponent(`/leases/${l.id}/pdf`)}&title=${encodeURIComponent(`Lease — ${l.unitNumber || ''}`)}`)
+      return
+    }
+    openDetails(l)
+  }
+  const openDetails = (l: any) => {
     setViewOnly(!l.needsReview || !can('leases.edit'))
     setEditingLeaseId(l.id)
     setModalOpen(true)
@@ -82,17 +98,25 @@ export function LeasesPage() {
 
   const needsReviewCount = (leases as any[]).filter(l => l.needsReview).length
 
+  // S534 (Nic): this view is CURRENT info only — one glance at what's in
+  // force (active + pending). Expired/terminated history stays reachable
+  // behind the toggle, not mixed into the default list.
+  const [showHistory, setShowHistory] = useState(false)
+  const currentLeases = (leases as any[]).filter(l => l.status === 'active' || l.status === 'pending')
+  const historyCount = (leases as any[]).length - currentLeases.length
+  const baseLeases = showHistory ? (leases as any[]) : currentLeases
+
   // S527 W-5: ?expiring=<days> (dashboard KPI deep-link) narrows the table to
   // active leases ending within the window.
   const expiringDays = parseInt(searchParams.get('expiring') || '') || null
   const visibleLeases = expiringDays
-    ? (leases as any[]).filter(l => {
+    ? baseLeases.filter(l => {
         if (l.status !== 'active' || !l.endDate) return false
         const end = new Date(String(l.endDate).slice(0, 10) + 'T12:00:00')
         const days = Math.ceil((end.getTime() - Date.now()) / 86400000)
         return days >= 0 && days <= expiringDays
       })
-    : (leases as any[])
+    : baseLeases
 
   return (
     <div>
@@ -101,9 +125,16 @@ export function LeasesPage() {
           <h1 className="page-title">Leases</h1>
           <p className="page-subtitle">Active and historical lease agreements</p>
         </div>
-        <Link to="/tenant-onboarding" className="btn btn-primary" style={{ textDecoration: 'none' }}>
-          <UserPlus size={14} /> Start Tenant Onboarding
-        </Link>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          {historyCount > 0 && (
+            <button className="btn btn-primary btn-sm" onClick={() => setShowHistory(v => !v)}>
+              {showHistory ? 'Current leases only' : `History (${historyCount})`}
+            </button>
+          )}
+          <Link to="/tenant-onboarding" className="btn btn-primary" style={{ textDecoration: 'none' }}>
+            <UserPlus size={14} /> Start Tenant Onboarding
+          </Link>
+        </div>
       </div>
 
       {needsReviewCount > 0 && (
@@ -234,16 +265,14 @@ export function LeasesPage() {
                     </td>
                     <td onClick={e => e.stopPropagation()}>
                       <div style={{ display: 'flex', gap: 6 }}>
-                        {can('leases.view_pdf') && (
-                          <button
-                            className="btn btn-ghost btn-sm"
-                            title="View the lease agreement (PDF)"
-                            onClick={() => navigate(`/view?src=${encodeURIComponent(`/leases/${l.id}/pdf`)}&title=${encodeURIComponent(`Lease — ${l.unitNumber || ''}`)}`)}
-                            style={{ padding: '3px 8px' }}
-                          >
-                            <Eye size={12} /> View
-                          </button>
-                        )}
+                        <button
+                          className="btn btn-ghost btn-sm"
+                          title="Lease details (terms, fees, addendum history)"
+                          onClick={() => openDetails(l)}
+                          style={{ padding: '3px 8px' }}
+                        >
+                          <Eye size={12} /> Details
+                        </button>
                         {can('leases.bill_fee') && l.status === 'active' && (
                           <button
                             className="btn btn-ghost btn-sm"

@@ -161,6 +161,10 @@ export function PayNowModal({
         paymentMethodType: selectedMethod.type,
       })
       const status = (res as any)?.data?.status
+      // S534 (Nic): no propane-priority disclosure here — warning the
+      // tenant mid-payment invites backing out and stranding failed ACH
+      // pulls. The settle-time notification (webhooks.ts,
+      // propane_priority_applied) informs them after the money moves.
       setSuccess(
         selectedMethod.type === 'card'
           ? status === 'succeeded' || !status

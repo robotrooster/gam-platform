@@ -459,7 +459,56 @@ separate payment rows (Bob's $50 late fee renders as its own LATEFEE line
 with a type badge), never lumped into one pull. Invoices additionally carry
 per-category subtotals. No change needed.
 
-**W-36 · Utility sub-meter workflow — ✅ FOUND + BUILT (S531)** — Audit:
+**W-36 · Utility sub-meter workflow — 🔁 CORRECTED (S532)** — Nic's
+correction pass: the S531 manual page (Record Reading modal + cycle picker +
+Generate Bills + Send to Tenant) was NOT the designed workflow and was
+removed. The real design — an END-OF-MONTH READING RUN — is now built:
+- A run opens automatically per property on the LAST BUSINESS DAY of the
+  month (walked backward past weekends + US federal holidays; Nic's rule),
+  via daily 7am scheduler tick. Prompt (notification + email) goes to the
+  landlord + property staff whose permission toggles cover properties.edit.
+- Landlord /utilities shows the run banner ("Meter readings due — July 2026
+  · 0 of 10 read") → guided walk, BLIND LINEAR ENTRY (Nic's spec, same
+  session): one step per UNIT with a typed input per applicable utility
+  (RV 01 electric, RV 01 water, …); RUBS masters get their own steps at
+  the end. NO prior reading shown anywhere (bias prevention — values are
+  also stripped from the API payload and from the below-prior error copy);
+  input is text/inputMode=decimal (typeable only, mouse scroll can't change
+  it, non-numeric keystrokes rejected); the ONLY button is "Next" — it
+  saves automatically and advances. No Skip, no Finish early, no Save wording.
+- NO GIVEAWAYS for bad readings (Nic, same session): a below-previous value
+  is accepted with a normal 201 — indistinguishable from a good entry — and
+  silently flagged (utility_meter_readings.needs_review, migration 140000).
+- DOUBLE-CHECK = SECOND PHYSICAL READ (Nic redesign, S533 — supersedes the
+  landlord-modal-first shape): flags NEVER interrupt the walk. When the
+  main walk finishes, the system builds a blind VERIFICATION list — every
+  suspicious submeter + RANDOM clean ones to ≥6/month (reader can't tell
+  which are suspects; utility_reading_double_checks, migration 130000 +
+  'double_check' run status). Reader re-reads those blind; reconciliation
+  is automatic: re-read within 1-2 units → FIRST read stands for billing
+  (drift bills next cycle, second read silently ignored); bigger diff →
+  re-read replaces. Rollovers auto-bill (wrap = 10^digits − prior +
+  current; per-meter digits 4-8, migration 110000); suspicious-high usage
+  (thresholds in shared: electric 5k kWh, water 10k gal — Nic's first
+  guesses) verified by the re-read just bills. Billing fires at
+  verification completion. ONLY escalation left for the landlord queue: a
+  re-read-confirmed below-previous value (rollover vs meter-swap = money
+  decision). /complete stays as the backend-only stuck-run escape hatch.
+- When the last meter is read the run auto-completes: bills generate via
+  the S90 engine + auto-finalize to 'billed'; the S178 invoice cron folds
+  them into each tenant's next monthly invoice. NO manual generate/finalize
+  buttons anywhere. (Backend keeps a POST /reading-runs/:id/complete escape
+  hatch for a permanently dead meter — no UI surface, flagged to Nic.)
+- Meter setup (add/edit/assign) kept; Nic: needs read-only-vs-edit
+  permission split — details deferred to the staff-permissions pass.
+- New: utility_reading_runs migration, services/utilityReadingRuns.ts,
+  5 run routes in utility.ts, scheduler tick, run-opened notification,
+  ReadingWalkModal. Tests: utilityReadingRuns.test.ts 11/11 (incl. holiday
+  walk-back + auto-complete billing $35 integration), utility.test.ts 35/35.
+- Demo: 10 RV spots each on own pedestal submeter (Row A label kept for
+  Grace), June 30 baselines, July run OPEN 0/10 — enter 1250 on Row A during
+  the walk to produce Grace's 250 kWh → $35.00. Mirrored in seedDemo.
+Original S531 entry (superseded): Audit:
 backend was COMPLETE (5 tables + 11 routes: meters CRUD, readings, per-unit
 assignment, bill generation, finalize) but the landlord UI was never built
 and the tenant bills page had no nav link. **Nic: build now — "RV spots are

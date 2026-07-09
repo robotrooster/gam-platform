@@ -1,3 +1,4 @@
+import { meterReadingModulus } from '@gam/shared'
 import { query, queryOne, getClient } from '../db'
 import { AppError } from '../middleware/errorHandler'
 
@@ -59,6 +60,14 @@ export async function generateBillsForMeter(
       reason: 'master_bill_to_landlord — landlord absorbs, no tenant bills' }
   }
 
+  // S533: landlord-configured tax rate for this utility at this property
+  // (no row = 0). Snapshotted per bill; shown as a separate amount.
+  const taxRow = await queryOne<{ tax_rate_pct: string }>(`
+    SELECT tax_rate_pct FROM property_utility_tax_rates
+     WHERE property_id = $1 AND utility_type = $2
+  `, [meter.property_id, meter.utility_type])
+  const taxRatePct = Number(taxRow?.tax_rate_pct || 0)
+
   // Resolve which units this meter serves.
   // submeter: utility_meter_units row(s) — usually one. RUBS: many.
   const units = await query<any>(`
@@ -75,7 +84,7 @@ export async function generateBillsForMeter(
 
   // Get the cycle reading. Both submeter and RUBS need this.
   const cycleReading = await queryOne<any>(`
-    SELECT reading_value
+    SELECT reading_value, is_rollover, needs_review
       FROM utility_meter_readings
      WHERE meter_id = $1 AND billing_cycle_month = $2
      ORDER BY reading_date DESC LIMIT 1
@@ -90,6 +99,13 @@ export async function generateBillsForMeter(
   let unitsSkipped = 0
 
   if (meter.billing_method === 'submeter') {
+    // A reading flagged for the landlord double-check (below-previous
+    // outlier or suspicious-high usage, S533) never bills until the
+    // review resolves it — resolve-review re-runs this meter's cycle.
+    if (cycleReading.needs_review) {
+      return { meterId, cycleMonth: cycleIso, billsCreated: 0, unitsSkipped: units.length,
+        reason: 'reading awaiting double-check — no bill until resolved' }
+    }
     // Single unit per submeter (by convention). Usage = cycle - prior cycle.
     const priorReading = await queryOne<any>(`
       SELECT reading_value
@@ -101,12 +117,36 @@ export async function generateBillsForMeter(
       return { meterId, cycleMonth: cycleIso, billsCreated: 0, unitsSkipped: units.length,
         reason: 'no prior reading — first cycle baseline, no bill produced' }
     }
-    const usage = Number(cycleReading.reading_value) - Number(priorReading.reading_value)
+    let usage = Number(cycleReading.reading_value) - Number(priorReading.reading_value)
+    if (usage < 0 && cycleReading.is_rollover) {
+      // Odometer rollover (S533, automatic): usage wraps past the meter's
+      // digit capacity = (10^digits − prior) + current, e.g. a 6-digit
+      // 999822 → 000138 = 316. is_rollover is stamped at entry time when
+      // the wrap is plausible (< half the meter's range) or by the
+      // landlord's double-check confirmation for the flagged outliers.
+      usage = (meterReadingModulus(meter.digits) - Number(priorReading.reading_value)) + Number(cycleReading.reading_value)
+    }
     if (usage < 0) {
       return { meterId, cycleMonth: cycleIso, billsCreated: 0, unitsSkipped: units.length,
-        reason: `negative usage (${usage}) — re-check readings before generating` }
+        reason: `negative usage (${usage}) — awaiting reading double-check` }
     }
+    // S533: sewer rides the water meter — there is no sewer meter in
+    // the field, and the tenant sees ONE line item. A water submeter
+    // with sewer_rate_per_unit bills usage × (water rate + sewer rate)
+    // + base fee on a single bill; the tax amount sums each portion ×
+    // its own per-type landlord tax rate. Both rates snapshot on the
+    // bill for the audit trail.
+    const sewerRate = meter.utility_type === 'water' ? Number(meter.sewer_rate_per_unit || 0) : 0
+    const sewerTaxRatePct = sewerRate > 0
+      ? Number((await queryOne<{ tax_rate_pct: string }>(`
+          SELECT tax_rate_pct FROM property_utility_tax_rates
+           WHERE property_id = $1 AND utility_type = 'sewer'
+        `, [meter.property_id]))?.tax_rate_pct || 0)
+      : 0
     for (const unit of units) {
+      const baseCharge = usage * Number(meter.rate_per_unit || 0) + Number(meter.base_fee || 0)
+      const sewerCharge = usage * sewerRate
+      const taxAmount = Math.round(baseCharge * taxRatePct + sewerCharge * sewerTaxRatePct) / 100
       const inserted = await tryInsertBill({
         meterId, unitId: unit.unit_id, landlordId,
         utilityType: meter.utility_type,
@@ -116,7 +156,12 @@ export async function generateBillsForMeter(
         allocationBasis: null,
         ratePerUnit: Number(meter.rate_per_unit || 0),
         baseFeeShare: Number(meter.base_fee || 0),
-        chargeAmount: usage * Number(meter.rate_per_unit || 0) + Number(meter.base_fee || 0),
+        chargeAmount: baseCharge + sewerCharge,
+        taxRatePct,
+        taxAmount,
+        sewerRatePerUnit: sewerRate > 0 ? sewerRate : null,
+        readingStart: Number(priorReading.reading_value),
+        readingEnd: Number(cycleReading.reading_value),
       })
       if (inserted) billsCreated++
       else unitsSkipped++
@@ -173,6 +218,7 @@ export async function generateBillsForMeter(
       ratePerUnit,
       baseFeeShare: round2(totalBaseFee * share),
       chargeAmount: round2(totalCharge * share),
+      taxRatePct,
     })
     if (inserted) billsCreated++
     else unitsSkipped++
@@ -193,6 +239,15 @@ interface InsertBillArgs {
   ratePerUnit: number
   baseFeeShare: number
   chargeAmount: number
+  taxRatePct: number
+  /** Pre-computed tax (e.g. water+sewer portions at their own rates).
+      Falls back to chargeAmount × taxRatePct when omitted. */
+  taxAmount?: number
+  /** Snapshot of the water meter's sewer rate folded into the charge. */
+  sewerRatePerUnit?: number | null
+  /** Begin/end odometer reads for tenant-invoice transparency (submeter only). */
+  readingStart?: number | null
+  readingEnd?: number | null
 }
 
 // Returns true if a bill was inserted, false if skipped (unit not occupied,
@@ -221,12 +276,20 @@ async function tryInsertBill(args: InsertBillArgs): Promise<boolean> {
       INSERT INTO utility_bills
         (meter_id, unit_id, tenant_id, lease_id, landlord_id,
          billing_cycle_month, usage_amount, allocation_method,
-         allocation_basis, rate_per_unit, base_fee_share, charge_amount)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+         allocation_basis, rate_per_unit, base_fee_share, charge_amount,
+         tax_rate_pct, tax_amount, utility_type, sewer_rate_per_unit,
+         reading_start, reading_end)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
     `, [
       args.meterId, args.unitId, lt.tenant_id, lt.lease_id, args.landlordId,
       args.cycleMonth, args.usageAmount, args.allocationMethod,
       args.allocationBasis, args.ratePerUnit, args.baseFeeShare, args.chargeAmount,
+      args.taxRatePct,
+      (args.taxAmount ?? Math.round(args.chargeAmount * args.taxRatePct) / 100).toFixed(2),
+      args.utilityType,
+      args.sewerRatePerUnit ?? null,
+      args.readingStart ?? null,
+      args.readingEnd ?? null,
     ])
     return true
   } catch (e: any) {
@@ -263,6 +326,47 @@ export async function generateBillsForProperty(
     results.push(await generateBillsForMeter(m.id, cycleMonth))
   }
   return results
+}
+
+// S534 (Nic): billing is per-UNIT, not batched to run completion. As
+// soon as a unit's meters have their cycle readings, the unit is clear
+// to bill on its lease's invoice date — the invoice cron calls this
+// right before pulling utility bills, so one unread meter elsewhere on
+// the property (or an unfinished verification walk) never holds a
+// unit's charges. Generates any missing bills for every (meter, cycle)
+// pair serving the unit with a recorded reading on/before the invoice
+// cycle, looking back two cycles for late readings. Idempotent — the
+// UNIQUE bill constraint and generateBillsForMeter's own gates
+// (needs_review, first-cycle baseline, tenant responsibility) all
+// still apply; a flagged reading's bill simply rides the next invoice
+// once verification/resolution clears it.
+export async function ensureBillsForUnit(
+  unitId: string,
+  throughDate: string,  // ISO date; cycles ≤ its month are considered
+): Promise<number> {
+  const pending = await query<{ meter_id: string; cycle: string }>(`
+    SELECT DISTINCT rd.meter_id, to_char(rd.billing_cycle_month, 'YYYY-MM-DD') AS cycle
+      FROM utility_meter_units mu
+      JOIN utility_meters m ON m.id = mu.meter_id
+                           AND m.billing_method IN ('submeter','rubs')
+      JOIN utility_meter_readings rd ON rd.meter_id = mu.meter_id
+     WHERE mu.unit_id = $1
+       AND rd.billing_cycle_month <= date_trunc('month', $2::date)::date
+       AND rd.billing_cycle_month >= (date_trunc('month', $2::date) - interval '2 months')::date
+       AND NOT rd.needs_review
+       AND NOT EXISTS (
+         SELECT 1 FROM utility_bills ub
+          WHERE ub.meter_id = rd.meter_id
+            AND ub.unit_id = mu.unit_id
+            AND ub.billing_cycle_month = rd.billing_cycle_month)
+  `, [unitId, throughDate])
+
+  let created = 0
+  for (const p of pending) {
+    const r = await generateBillsForMeter(p.meter_id, new Date(p.cycle + 'T00:00:00Z'))
+    created += r.billsCreated
+  }
+  return created
 }
 
 // Helper: every meter for every property under a landlord. Used by an

@@ -74,6 +74,13 @@ export async function cleanupAllSchema(): Promise<void> {
   // cleanupAllSchema on leases/users delete.
   await db.query(`DELETE FROM flexpay_advances`)
   await db.query(`DELETE FROM utility_bills`)
+  // S533: propane installments FK payments (NO ACTION) — clear the
+  // child before payments get wiped; fills cascade from installments'
+  // parent delete order (fills → installments is CASCADE, but the
+  // payments FK on installments blocks payments cleanup).
+  await db.query(`DELETE FROM propane_fill_installments`)
+  await db.query(`DELETE FROM propane_fills`)
+  await db.query(`DELETE FROM property_utility_tax_rates`)
   await db.query(`DELETE FROM utility_meters`)
   await db.query(`DELETE FROM deposit_returns`)
   // S331: FlexSuite acceptance audit + FlexDeposit installment plan
@@ -674,19 +681,21 @@ export async function seedUtilityBill(
     paymentId?: string | null
     billingCycleMonth?: string
     status?: 'unbilled' | 'billed' | 'paid' | 'disputed' | 'void'
+    utilityType?: 'water' | 'gas' | 'electric' | 'sewer' | 'trash'
   }
 ): Promise<string> {
   const res = await client.query<{ id: string }>(
     `INSERT INTO utility_bills
        (meter_id, unit_id, tenant_id, lease_id, landlord_id,
-        billing_cycle_month, charge_amount, payment_id, status)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
+        billing_cycle_month, charge_amount, payment_id, status, utility_type)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id`,
     [params.meterId, params.unitId, params.tenantId,
      params.leaseId, params.landlordId,
      params.billingCycleMonth ?? '2026-05-01',
      params.chargeAmount,
      params.paymentId ?? null,
-     params.status ?? 'billed']
+     params.status ?? 'billed',
+     params.utilityType ?? 'water']
   )
   return res.rows[0].id
 }

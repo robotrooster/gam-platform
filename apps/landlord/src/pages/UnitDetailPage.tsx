@@ -1,7 +1,7 @@
 import { useState, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
-import { apiGet, apiPost, apiPatch } from '../lib/api'
+import { apiGet, apiPost, apiPatch, apiDelete } from '../lib/api'
 import { usePerms } from '../lib/permissions'
 import { ArrowLeft, Shield, AlertTriangle, Camera, Trash2, ExternalLink } from 'lucide-react'
 import { UNIT_TYPE_LABEL, UNIT_TYPE_HAS_BEDROOMS, type UnitType } from '@gam/shared'
@@ -341,6 +341,10 @@ export function UnitDetailPage() {
         </div>
       </div>
 
+      {/* S533 (Nic): meters live on the UNIT — this card is the only
+          meter config surface (the utilities page has no meters list). */}
+      {unit && <UnitMetersCard unitId={unit.id} propertyId={unit.propertyId} unitNumber={unit.unitNumber} />}
+
       {activateModal && (
         <div className="modal-overlay" onClick={() => setActivateModal(false)}>
           <div className="modal" style={{ maxWidth: 520 }} onClick={e => e.stopPropagation()}>
@@ -465,6 +469,88 @@ export function UnitDetailPage() {
               </>
             )}
           </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+
+// ── UNIT METERS (S533) ───────────────────────────────────────────────
+// Sub-meters belong to the unit: add/edit/remove them here. Readings
+// happen through the monthly reading run; billing is automatic.
+function UnitMetersCard({ unitId, propertyId, unitNumber }: { unitId: string; propertyId: string; unitNumber: string }) {
+  const qc = useQueryClient()
+  const { data: meters = [] } = useQuery<any[]>(
+    ['utility-meters', propertyId],
+    () => apiGet(`/utility/meters?propertyId=${propertyId}`),
+    { enabled: !!propertyId }
+  )
+  const mine = (meters as any[]).filter((m: any) => (m.assignedUnitIds || []).includes(unitId) && m.billingMethod === 'submeter')
+  const [adding, setAdding] = useState(false)
+  const [draft, setDraft] = useState({ utilityType: 'electric', rate: '', digits: '6', sewerRate: '' })
+
+  const invalidate = () => qc.invalidateQueries(['utility-meters', propertyId])
+  const addMut = useMutation(
+    async () => {
+      const r: any = await apiPost('/utility/meters', {
+        propertyId, utilityType: draft.utilityType,
+        label: `${unitNumber} ${draft.utilityType}`,
+        billingMethod: 'submeter',
+        ratePerUnit: draft.rate === '' ? null : Number(draft.rate),
+        baseFee: 0, digits: Number(draft.digits) || 6,
+        ...(draft.utilityType === 'water' && draft.sewerRate !== '' ? { sewerRatePerUnit: Number(draft.sewerRate) } : {}),
+      })
+      await apiPost(`/utility/meters/${r.data.id}/units`, { unitId })
+    },
+    { onSuccess: () => { invalidate(); setAdding(false); setDraft({ utilityType: 'electric', rate: '', digits: '6', sewerRate: '' }) },
+      onError: (e: any) => alert(e?.response?.data?.error || 'Could not add meter') }
+  )
+  const delMut = useMutation((id: string) => apiDelete(`/utility/meters/${id}`), {
+    onSuccess: invalidate,
+    onError: (e: any) => alert(e?.response?.data?.error || 'Could not remove meter'),
+  })
+  const ICONS: Record<string, string> = { water: '💧', electric: '⚡', sewer: '🚰', trash: '🗑️' }
+
+  return (
+    <div className="card" style={{ marginTop: 16 }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
+        <h3 style={{ fontSize: '.9rem', margin: 0 }}>Sub-meters</h3>
+        <button className="btn btn-primary btn-sm" onClick={() => setAdding(a => !a)}>{adding ? 'Close' : 'Add Meter'}</button>
+      </div>
+      {mine.length === 0 && !adding && (
+        <div style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>
+          No sub-meters on this unit. Metered utilities bill the tenant through the monthly reading run; sewer bills off the water reading as part of the same line item.
+        </div>
+      )}
+      {mine.map((m: any) => (
+        <div key={m.id} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '8px 12px', borderRadius: 8, background: 'var(--bg-2)', marginBottom: 6 }}>
+          <span style={{ fontSize: '.82rem', fontWeight: 600, minWidth: 110, textTransform: 'capitalize' }}>{ICONS[m.utilityType]} {m.utilityType}</span>
+          <span className="mono" style={{ fontSize: '.75rem', color: 'var(--text-3)' }}>{m.digits}-digit</span>
+          <span className="mono" style={{ fontSize: '.78rem' }}>
+            {m.ratePerUnit != null ? `$${Number(m.ratePerUnit)}/unit` : 'no rate'}
+            {m.utilityType === 'water' && m.sewerRatePerUnit != null && ` + sewer $${Number(m.sewerRatePerUnit)}/unit`}
+          </span>
+          <span style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>{m.lastReadingCycle ? `last read ${String(m.lastReadingCycle).slice(0, 7)}` : 'never read'}</span>
+          <button className="btn btn-ghost btn-sm" style={{ marginLeft: 'auto', color: 'var(--red)' }}
+            onClick={() => { if (window.confirm(`Remove the ${m.utilityType} meter? Its readings go with it.`)) delMut.mutate(m.id) }}>Remove</button>
+        </div>
+      ))}
+      {adding && (
+        <div style={{ display: 'flex', gap: 10, alignItems: 'center', padding: '10px 12px', borderRadius: 8, background: 'var(--bg-2)' }}>
+          <select className="input" value={draft.utilityType} onChange={e => setDraft(d => ({ ...d, utilityType: e.target.value }))} style={{ width: 120 }}>
+            {['electric', 'water'].filter(t => !mine.some((m: any) => m.utilityType === t)).map(t => <option key={t} value={t}>{ICONS[t]} {t}</option>)}
+          </select>
+          <input className="input" type="text" inputMode="decimal" placeholder="$/unit e.g. 0.14" value={draft.rate}
+            onChange={e => { const v = e.target.value; if (v === '' || /^\d*\.?\d*$/.test(v)) setDraft(d => ({ ...d, rate: v })) }} style={{ width: 140 }} />
+          <select className="input" value={draft.digits} onChange={e => setDraft(d => ({ ...d, digits: e.target.value }))} style={{ width: 110 }}>
+            {[4, 5, 6, 7, 8].map(d => <option key={d} value={String(d)}>{d}-digit</option>)}
+          </select>
+          {draft.utilityType === 'water' && (
+            <input className="input" type="text" inputMode="decimal" placeholder="sewer $/gal (optional)" value={draft.sewerRate}
+              onChange={e => { const v = e.target.value; if (v === '' || /^\d*\.?\d*$/.test(v)) setDraft(d => ({ ...d, sewerRate: v })) }} style={{ width: 170 }} />
+          )}
+          <button className="btn btn-primary btn-sm" disabled={addMut.isLoading} onClick={() => addMut.mutate()}>Add</button>
         </div>
       )}
     </div>

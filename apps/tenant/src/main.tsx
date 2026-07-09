@@ -363,7 +363,6 @@ function Layout() {
             <NavLink to="/walkthroughs" className={({isActive})=>`ni${isActive?' active':''}`}>🎥 My walkthroughs</NavLink>
             <NavLink to="/entry-requests" className={({isActive})=>`ni${isActive?' active':''}`}>🚪 Entry Requests</NavLink>
             <NavLink to="/amenities" className={({isActive})=>`ni${isActive?' active':''}`}>🎉 Amenities</NavLink>
-            <NavLink to="/utilities" className={({isActive})=>`ni${isActive?' active':''}`}>💡 Utilities</NavLink>
             {!LAUNCH_HIDDEN.has('/credit') && <NavLink to="/credit" className={({isActive})=>`ni${isActive?' active':''}`}>📊 My Record</NavLink>}
             {!LAUNCH_HIDDEN.has('/my-disputes') && <NavLink to="/my-disputes" className={({isActive})=>`ni${isActive?' active':''}`}>⚖️ My Disputes</NavLink>}
             <LeaseNavLink/>
@@ -3100,15 +3099,6 @@ function DocumentsPage() {
   )
 }
 
-// UtilitiesPage moved to ./pages/UtilitiesPage.tsx in S171 — column shape
-// fixed against the real GET /utility/bills wire response and the missing
-// Pay button wired against /api/utility/bills/:id/pay (S122 destination
-// charge route). Reuses the shared payShared.tsx Pay flow.
-import { UtilitiesPage as UtilitiesPageImpl } from './pages/UtilitiesPage'
-function UtilitiesPage() {
-  return <UtilitiesPageImpl />
-}
-
 // ── LOGIN ─────────────────────────────────────────────────────
 function LoginPage() {
   const { login, loginWithTotp } = useAuth(); const navigate = useNavigate()
@@ -3483,7 +3473,6 @@ function App() {
           <Route path="services"         element={LAUNCH_HIDDEN.has('/services') ? <Navigate to="/home" replace /> : <ServicesPage />} />
           <Route path="documents"        element={<DocumentsPage />} />
           <Route path="support"          element={<SupportPage />} />
-          <Route path="utilities"        element={<UtilitiesPage />} />
           <Route path="inspections"      element={<TenantInspectionsPage />} />
           <Route path="inspections/:id"  element={<TenantInspectionDetailPage />} />
           <Route path="walkthroughs"     element={<TenantMyWalkthroughsPage />} />

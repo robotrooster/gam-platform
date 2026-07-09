@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { ArrowLeft } from 'lucide-react'
 
@@ -9,28 +9,71 @@ const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:4000'
 // "View" appeared dead. This route fetches the document with the Bearer
 // token and renders it inline; Back returns to the list you came from.
 // Usage: navigate(`/view?src=${encodeURIComponent('/leases/<id>/pdf')}&title=Lease`)
+//
+// S534 (Nic): render with pdf.js canvases instead of a native <iframe>.
+// Safari does not reliably render PDF blob URLs inside iframes — the page
+// showed nothing at all in Nic's browser while working in Chrome. Same
+// CDN pdf.js pattern as the sign pages; all pages render stacked for
+// continuous scroll.
 export function PdfViewerPage() {
   const [params] = useSearchParams()
   const navigate = useNavigate()
   const src = params.get('src') || ''
   const title = params.get('title') || 'Document'
-  const [blobUrl, setBlobUrl] = useState<string | null>(null)
+  const containerRef = useRef<HTMLDivElement>(null)
   const [error, setError] = useState<string | null>(null)
+  const [loading, setLoading] = useState(true)
 
   useEffect(() => {
-    let revoke: string | null = null
-    if (!src.startsWith('/')) { setError('Invalid document path'); return }
-    fetch(`${API_BASE}/api${src}`, {
-      headers: { Authorization: 'Bearer ' + (localStorage.getItem('gam_token') || '') },
-    })
-      .then(async res => {
-        if (!res.ok) throw new Error(`status ${res.status}`)
-        const url = URL.createObjectURL(await res.blob())
-        revoke = url
-        setBlobUrl(url)
-      })
-      .catch(e => setError(`Could not load the document (${e.message}).`))
-    return () => { if (revoke) URL.revokeObjectURL(revoke) }
+    let cancelled = false
+    const load = async () => {
+      if (!src.startsWith('/')) { setError('Invalid document path'); return }
+      try {
+        if (!(window as any).pdfjsLib) {
+          await new Promise<void>((resolve, reject) => {
+            const s = document.createElement('script')
+            s.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js'
+            s.onload = () => {
+              ;(window as any).pdfjsLib.GlobalWorkerOptions.workerSrc =
+                'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'
+              resolve()
+            }
+            s.onerror = () => reject(new Error('Failed to load the PDF renderer'))
+            document.head.appendChild(s)
+          })
+        }
+        const pdf = await (window as any).pdfjsLib.getDocument({
+          url: `${API_BASE}/api${src}`,
+          httpHeaders: { Authorization: 'Bearer ' + (localStorage.getItem('gam_token') || '') },
+        }).promise
+        if (cancelled || !containerRef.current) return
+        const container = containerRef.current
+        container.innerHTML = ''
+        const width = container.clientWidth - 24 // padding allowance
+        for (let n = 1; n <= pdf.numPages; n++) {
+          const p = await pdf.getPage(n)
+          const baseVp = p.getViewport({ scale: 1 })
+          const scale = Math.min(width / baseVp.width, 2)
+          const vp = p.getViewport({ scale: scale * (window.devicePixelRatio || 1) })
+          const canvas = document.createElement('canvas')
+          canvas.width = vp.width
+          canvas.height = vp.height
+          canvas.style.width = `${vp.width / (window.devicePixelRatio || 1)}px`
+          canvas.style.display = 'block'
+          canvas.style.margin = '0 auto 12px'
+          canvas.style.background = '#fff'
+          canvas.style.borderRadius = '6px'
+          container.appendChild(canvas)
+          await p.render({ canvasContext: canvas.getContext('2d')!, viewport: vp }).promise
+          if (cancelled) return
+        }
+        setLoading(false)
+      } catch (e: any) {
+        if (!cancelled) setError(`Could not load the document (${e?.message || 'unknown error'}).`)
+      }
+    }
+    load()
+    return () => { cancelled = true }
   }, [src])
 
   return (
@@ -43,10 +86,13 @@ export function PdfViewerPage() {
       </div>
       {error ? (
         <div className="card" style={{ padding: 32, textAlign: 'center', color: 'var(--text-3)' }}>{error}</div>
-      ) : !blobUrl ? (
-        <div className="card" style={{ padding: 32, textAlign: 'center', color: 'var(--text-3)' }}>Loading…</div>
       ) : (
-        <iframe src={blobUrl} title={title} style={{ flex: 1, width: '100%', border: '1px solid var(--border-0)', borderRadius: 12, background: '#fff' }} />
+        <div style={{ flex: 1, overflow: 'auto', border: '1px solid var(--border-0)', borderRadius: 12, background: 'var(--bg-2)', padding: 12, position: 'relative' }}>
+          {loading && (
+            <div style={{ padding: 32, textAlign: 'center', color: 'var(--text-3)' }}>Loading…</div>
+          )}
+          <div ref={containerRef} />
+        </div>
       )}
     </div>
   )

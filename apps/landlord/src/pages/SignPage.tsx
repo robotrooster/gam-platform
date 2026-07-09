@@ -2,6 +2,7 @@ import { useState, useRef, useEffect, useCallback } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation } from 'react-query'
 import { Check, AlertCircle, ChevronLeft, ChevronRight, Upload, PenTool, ArrowRight } from 'lucide-react'
+import { LEASE_COLUMN_CATEGORY } from '@gam/shared'
 
 const API = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
 const tok = () => localStorage.getItem('gam_token')
@@ -214,6 +215,11 @@ function SignatureSetup({ name, initials, onComplete }: { name:string; initials:
 
 type Stage = 'signing'|'review'|'done'
 
+// S534: a 'date' field is auto-stampable only when it records WHEN the
+// signer signed. Term dates (lease start/end) are deliberate inputs.
+const isDateSignedField = (f: any) =>
+  f.leaseColumn === 'date_signed' || (!f.leaseColumn && /date\s*signed|signed\s*date/i.test(f.label || ''))
+
 export function SignPage() {
   const { token } = useParams<{ token:string }>()
   const navigate = useNavigate()
@@ -237,9 +243,15 @@ export function SignPage() {
     () => authFetch('/esign/sign/'+token).then(r=>r.json()).then(r=>{ if(!r.success)throw new Error(r.error); return r.data }),
     { retry:false }
   )
+  // S535: surface API sign failures — pre-fix a {success:false} response
+  // flowed into onSuccess and showed the success screen on a FAILED sign
+  // (e.g. the landlord-pass lease-term completeness 400).
   const submitMut = useMutation(
-    () => authFetch('/esign/sign/'+token, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ fieldValues: Object.entries(fieldValues).map(([fieldId,value])=>({fieldId,value})) }) }).then(r=>r.json()),
-    { onSuccess:(res:any)=>{ setAllDone(res.completed); setStage('done') } }
+    () => authFetch('/esign/sign/'+token, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ fieldValues: Object.entries(fieldValues).map(([fieldId,value])=>({fieldId,value})) }) })
+      .then(r=>r.json())
+      .then((r:any)=>{ if(!r.success) throw new Error(r.error || 'Signing failed'); return r }),
+    { onSuccess:(res:any)=>{ setAllDone(res.data?.completed ?? res.completed); setStage('done') },
+      onError:(e:any)=>{ setStage('signing'); alert(e?.message || 'Signing failed — try again.') } }
   )
 
   const renderPageImperative = useCallback(async (pdf:any, pageNum:number) => {
@@ -281,7 +293,16 @@ export function SignPage() {
     if (!data?.fields) return
     const today = new Date().toLocaleDateString()
     const updates: Record<string,string> = {}
-    data.fields.filter((f:any)=>f.fieldType==='date').forEach((f:any)=>{ updates[f.id]=today })
+    // S534 (Nic): load draft-time PREFILLED values (identity + carry-over
+    // facts stamped at document creation) so they display and count —
+    // pre-fix they rendered as empty fields the signer had to re-type.
+    data.fields.forEach((f:any)=>{ if (f.value) updates[f.id] = f.value })
+    // Auto-date ONLY the signature-date fields. Pre-fix EVERY date field
+    // auto-filled with today — including Lease Start / Lease End on a
+    // renewal, which let the landlord sign without ever choosing dates.
+    data.fields
+      .filter((f:any)=>f.fieldType==='date' && !updates[f.id] && isDateSignedField(f))
+      .forEach((f:any)=>{ updates[f.id]=today })
     if (Object.keys(updates).length) setFieldValues(prev=>({...prev,...updates}))
   }, [data])
 
@@ -327,11 +348,14 @@ export function SignPage() {
       setTimeout(()=>jumpToNext(field.id), 150)
       return
     }
-    if (field.fieldType==='date') {
+    if (field.fieldType==='date' && isDateSignedField(field)) {
+      // Signature-date: stamping today IS the intent.
       setFieldValues(p=>({...p,[field.id]:new Date().toLocaleDateString()}))
       setTimeout(()=>jumpToNext(field.id), 150)
       return
     }
+    // Term dates (lease start/end) and everything else open the editor —
+    // the signer chooses the value deliberately (S534).
     setActiveField(field)
   }
 
@@ -402,7 +426,7 @@ export function SignPage() {
       <div style={{ position:'sticky', top:0, zIndex:100, background:'var(--bg-1,#0f1319)', borderBottom:'1px solid var(--border-0)', padding:'10px 0', marginBottom:12, display:'flex', alignItems:'center', justifyContent:'space-between', gap:10 }}>
         <div>
           <div style={{ fontWeight:700, color:'var(--text-0)', fontSize:'.95rem' }}>{doc.title}</div>
-          <div style={{ fontSize:'.72rem', color:'var(--text-3)' }}>Signing as <strong style={{ color:'var(--gold,#c9a227)' }}>{signer.name}</strong> · {Object.keys(fieldValues).filter(k=>fieldValues[k]).length}/{requiredFields.length} fields complete</div>
+          <div style={{ fontSize:'.72rem', color:'var(--text-3)' }}>Signing as <strong style={{ color:'var(--gold,#c9a227)' }}>{signer.name}</strong> · {requiredFields.length-unfilledRequired.length}/{requiredFields.length} required fields complete</div>
         </div>
         <div style={{ display:'flex', gap:8, flexShrink:0 }}>
           {pdfPageCount>1 && <>
@@ -426,16 +450,32 @@ export function SignPage() {
             const s = scaleRef.current
             const val = fieldValues[f.id]||''
             const isNext = nextField?.id===f.id
+            // S535 (Nic): IDENTITY fields (tenant, unit, property) are
+            // system records stamped from the linked unit/tenant — never
+            // free-typed on the document. A prefilled identity field is
+            // locked; fixing a wrong name/unit happens on the record,
+            // not the lease. LATE-FEE fields lock when the property has
+            // a late-fee POLICY (identical terms for every tenant —
+            // fair-housing); clicking one opens the policy explainer.
+            // Only VALUED late-fee fields lock — a doc drafted before the
+            // policy existed has empty ones the landlord must still fill.
+            const isPolicyLateFee = !!data.propertyLateFee && !!f.leaseColumn && String(f.leaseColumn).startsWith('late_fee_') && !!val
+            const locked = !!val && f.leaseColumn && LEASE_COLUMN_CATEGORY[f.leaseColumn as keyof typeof LEASE_COLUMN_CATEGORY] === 'identity'
             const colors: Record<string,string> = { signature:'#c9a227', initials:'#4a9eff', date:'#22c55e', text:'#a78bfa', checkbox:'#f59e0b', radio_group:'#ec4899' }
             const color = colors[f.fieldType]||'#c9a227'
             return (
               <div key={f.id} id={'field-'+f.id}
-                onClick={()=>!val&&handleFieldClick(f)}
+                // S534: filled fields stay CLICKABLE — renewal prefills are
+                // defaults the landlord must be able to quick-edit.
+                // S535: policy late-fee fields always open (the click shows
+                // the read-only policy explainer, not an editor).
+                onClick={()=>{ if (isPolicyLateFee) { setActiveField(f); return } if (!locked) handleFieldClick(f) }}
+                title={locked?'Linked to the unit/tenant record — edit the record, not the document':isPolicyLateFee?'Set by the property late-fee policy — click for details':undefined}
                 style={{
                   position:'absolute', left:f.x*s, top:f.y*s, width:f.width*s, height:f.height*s,
                   border:`2px solid ${val?'#22c55e':isNext?color:'#aaa'}`,
                   borderRadius:6, background:val?'rgba(34,197,94,.12)':isNext?`${color}20`:'rgba(180,180,180,.08)',
-                  cursor:val?'default':'pointer', display:'flex', alignItems:'center', justifyContent:'center',
+                  cursor:locked?'not-allowed':val?'default':'pointer', display:'flex', alignItems:'center', justifyContent:'center',
                   overflow:'hidden', boxSizing:'border-box' as const,
                   boxShadow:isNext&&!val?`0 0 0 3px ${color}55`:'', zIndex:val?4:isNext?6:5
                 }}>
@@ -462,10 +502,118 @@ export function SignPage() {
         <SignatureChooser name={signer.name} type={activeField.fieldType} onSelect={handleSave} onClose={()=>setActiveField(null)}/>
       )}
 
-      {activeField && activeField.fieldType!=='signature' && activeField.fieldType!=='initials' && (
+      {/* S535 (Nic): property late-fee POLICY explainer — read-only. The
+          document's late-fee fields are stamped from the property policy
+          so every tenant gets identical terms; the popup states exactly
+          which day the fee starts given this lease's due day + grace. */}
+      {activeField && data.propertyLateFee && String(activeField.leaseColumn||'').startsWith('late_fee_') && !!fieldValues[activeField.id] && (() => {
+        const plf = data.propertyLateFee
+        // S535: no policy row for this unit class → the lease has NO late
+        // fees ('N/A') and the fields stay locked; the fix is a policy
+        // row on the property, never a hand-typed value here.
+        if (plf.none) {
+          return (
+            <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,.6)', zIndex:1000, display:'flex', alignItems:'center', justifyContent:'center', padding:20 }}>
+              <div style={{ background:'white', borderRadius:16, padding:24, maxWidth:400, width:'100%' }}>
+                <div style={{ fontWeight:700, color:'#1a1a1a', marginBottom:12 }}>No Late-Fee Policy — {plf.propertyName}{plf.unitType ? ` · ${String(plf.unitType).replace('_',' ')} units` : ''}</div>
+                <div style={{ background:'#fef3c7', border:'1px solid #d97706', borderRadius:8, padding:'10px 12px', marginBottom:14, fontSize:'.8rem', color:'#78350f', lineHeight:1.55 }}>
+                  No late-fee policy is set for this unit type, so this lease has <strong>no late fees</strong> ("N/A").
+                  Late fees are never typed per lease — set a policy for {plf.unitType ? String(plf.unitType).replace('_',' ') : 'this'} units
+                  on the property page and it applies to all future leases of that type.
+                </div>
+                <button onClick={()=>setActiveField(null)} style={{ width:'100%', padding:'10px', borderRadius:8, border:'none', background:'#c9a227', color:'white', fontWeight:700, cursor:'pointer' }}>Close</button>
+              </div>
+            </div>
+          )
+        }
+        const dueDayField = allFields.find((x:any)=>x.leaseColumn==='rent_due_day')
+        const dueDay = Number((dueDayField && (fieldValues[dueDayField.id] || dueDayField.value)) || 1)
+        const grace = Number(plf.lateFeeGraceDays ?? 5)
+        const startDay = dueDay + grace
+        const ord = (n:number) => n + (n%10===1&&n%100!==11?'st':n%10===2&&n%100!==12?'nd':n%10===3&&n%100!==13?'rd':'th')
+        const fee = plf.lateFeeInitialType === 'percent_of_rent'
+          ? `${Number(plf.lateFeeInitialAmount)}% of rent`
+          : `$${Number(plf.lateFeeInitialAmount).toFixed(2)}`
+        return (
+          <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,.6)', zIndex:1000, display:'flex', alignItems:'center', justifyContent:'center', padding:20 }}>
+            <div style={{ background:'white', borderRadius:16, padding:24, maxWidth:400, width:'100%' }}>
+              <div style={{ fontWeight:700, color:'#1a1a1a', marginBottom:12 }}>Late Fee Policy — {plf.propertyName}{plf.unitType ? ` · ${String(plf.unitType).replace('_',' ')} units` : ''}</div>
+              <div style={{ background:'#fef3c7', border:'1px solid #d97706', borderRadius:8, padding:'10px 12px', marginBottom:12, fontSize:'.78rem', color:'#78350f', lineHeight:1.55 }}>
+                Late fees are set per <strong>unit type</strong> at the property so every tenant of a
+                class has identical terms (fair-housing). This document reflects that policy — to change
+                it, edit the property&apos;s Late Fee Policy; changes apply to future leases of this type.
+              </div>
+              <div style={{ fontSize:'.82rem', color:'#1a1a1a', lineHeight:1.7, marginBottom:12 }}>
+                Initial fee: <strong>{fee}</strong> · Grace period: <strong>{grace} day{grace===1?'':'s'}</strong>
+                {plf.lateFeeAccrualAmount != null && plf.lateFeeAccrualPeriod && (
+                  <> · Accrues {plf.lateFeeAccrualType==='percent_of_rent' ? `${Number(plf.lateFeeAccrualAmount)}%` : `$${Number(plf.lateFeeAccrualAmount).toFixed(2)}`} {plf.lateFeeAccrualPeriod}</>
+                )}
+              </div>
+              <div style={{ background:'#f4f7f4', border:'1px solid #22c55e', borderRadius:8, padding:'10px 12px', marginBottom:14, fontSize:'.8rem', color:'#14532d', lineHeight:1.55 }}>
+                Rent is due on the <strong>{ord(dueDay)}</strong>. With the {grace}-day grace period, the late
+                fee starts on the <strong>{ord(startDay)}</strong> of each month — the {ord(startDay-1)} is the
+                last day to pay without a fee.
+              </div>
+              <button onClick={()=>setActiveField(null)} style={{ width:'100%', padding:'10px', borderRadius:8, border:'none', background:'#c9a227', color:'white', fontWeight:700, cursor:'pointer' }}>Close</button>
+            </div>
+          </div>
+        )
+      })()}
+
+      {activeField && activeField.fieldType!=='signature' && activeField.fieldType!=='initials' && !(data.propertyLateFee && String(activeField.leaseColumn||'').startsWith('late_fee_') && !!fieldValues[activeField.id]) && (
         <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,.6)', zIndex:1000, display:'flex', alignItems:'center', justifyContent:'center', padding:20 }}>
           <div style={{ background:'white', borderRadius:16, padding:24, maxWidth:360, width:'100%' }}>
             <div style={{ fontWeight:700, color:'#1a1a1a', marginBottom:14 }}>{activeField.label||activeField.fieldType}</div>
+            {/* S535 (Nic): renewal rent-increase quick presets — one click
+                recalculates from the current rent; the input below stays
+                for any flat custom amount. */}
+            {activeField.leaseColumn === 'rent_amount' && Number(data.carriedRent) > 0 && (
+              <div style={{ marginBottom:14 }}>
+                <div style={{ fontSize:'.72rem', color:'#999', marginBottom:8 }}>
+                  Current rent ${Number(data.carriedRent).toFixed(2)} — quick presets, or type a flat amount below:
+                </div>
+                <div style={{ display:'flex', gap:6, flexWrap:'wrap' as const }}>
+                  {[['Keep', 0], ['+3%', 3], ['+5%', 5], ['+10%', 10]].map(([label, pct]) => {
+                    const amt = (Number(data.carriedRent) * (1 + (pct as number) / 100))
+                    return (
+                      <button key={String(label)}
+                        onClick={()=>{ setFieldValues(p=>({...p,[activeField.id]:amt.toFixed(2)})); const id=activeField.id; setActiveField(null); setTimeout(()=>jumpToNext(id),150) }}
+                        style={{ padding:'8px 12px', borderRadius:8, border:'1.5px solid #c9a227', background:'#fdf8ec', color:'#78350f', fontWeight:700, fontSize:'.8rem', cursor:'pointer' }}>
+                        {label} · ${amt.toFixed(2)}
+                      </button>
+                    )
+                  })}
+                </div>
+              </div>
+            )}
+            {/* S535 (Nic): '-' = month-to-month. The completeness gate
+                requires a value in every term field on a signed document,
+                so the dash is the explicit no-end-date entry. */}
+            {activeField.leaseColumn === 'end_date' && (
+              <div style={{ marginBottom:14 }}>
+                <button
+                  onClick={()=>{ setFieldValues(p=>({...p,[activeField.id]:'-'})); const id=activeField.id; setActiveField(null); setTimeout(()=>jumpToNext(id),150) }}
+                  style={{ width:'100%', padding:'10px', borderRadius:8, border:'1.5px solid #c9a227', background:'#fdf8ec', color:'#78350f', fontWeight:700, fontSize:'.82rem', cursor:'pointer', marginBottom:8 }}>
+                  Month-to-month — no end date (enters &quot;-&quot;)
+                </button>
+                <div style={{ background:'#fef3c7', border:'1px solid #d97706', borderRadius:8, padding:'8px 12px', fontSize:'.74rem', color:'#78350f', lineHeight:1.5 }}>
+                  A <strong>&quot;-&quot;</strong> in the end date means the lease runs month-to-month with no fixed end. Pick a date below for a fixed term.
+                </div>
+              </div>
+            )}
+            {/* S534 (Nic): double-count guard overlay — the deposit on a
+                renewal is already held; the number typed here can never
+                re-bill the carried amount. */}
+            {activeField.leaseColumn === 'security_deposit' && Number(data.carriedDeposit) > 0 && (
+              <div style={{ background:'#fef3c7', border:'1px solid #d97706', borderRadius:8, padding:'10px 12px', marginBottom:14, fontSize:'.78rem', color:'#78350f', lineHeight:1.5 }}>
+                <strong>${Number(data.carriedDeposit).toFixed(2)} is already held from the current lease</strong> and
+                carries forward — it is never re-billed.
+                Keep it at ${Number(data.carriedDeposit).toFixed(2)} to carry it unchanged.
+                Enter a <strong>higher</strong> amount and the tenant is billed only the difference.
+                A <strong>lower</strong> amount is not refunded automatically — process a partial
+                return from the lease&apos;s Move-out tools.
+              </div>
+            )}
             {activeField.fieldType==='checkbox' && (
               <label style={{ display:'flex', alignItems:'center', gap:10, cursor:'pointer', padding:'11px', border:'1px solid #e5e7eb', borderRadius:8, marginBottom:14 }}>
                 <input type="checkbox" defaultChecked={fieldValues[activeField.id]==='checked'} onChange={e=>setFieldValues(p=>({...p,[activeField.id]:e.target.checked?'checked':''}))} style={{ width:20, height:20 }}/>
@@ -485,6 +633,12 @@ export function SignPage() {
             {activeField.fieldType==='text' && (
               <input defaultValue={fieldValues[activeField.id]||''} onChange={e=>setFieldValues(p=>({...p,[activeField.id]:e.target.value}))}
                 placeholder={activeField.label||'Enter text'} style={{ width:'100%', padding:'9px 12px', border:'1px solid #e5e7eb', borderRadius:8, fontSize:'.9rem', outline:'none', boxSizing:'border-box' as const, marginBottom:14 }}/>
+            )}
+            {activeField.fieldType==='date' && (
+              // S534: term dates (lease start/end) are picked deliberately —
+              // stored as the locale string the stamped PDF prints.
+              <input type="date" onChange={e=>{ const v = e.target.value ? new Date(e.target.value + 'T12:00:00').toLocaleDateString() : ''; setFieldValues(p=>({...p,[activeField.id]:v})) }}
+                style={{ width:'100%', padding:'9px 12px', border:'1px solid #e5e7eb', borderRadius:8, fontSize:'.9rem', outline:'none', boxSizing:'border-box' as const, marginBottom:14 }}/>
             )}
             <div style={{ display:'flex', gap:8 }}>
               <button onClick={()=>setActiveField(null)} style={{ flex:1, padding:'10px', borderRadius:8, border:'1px solid #e5e7eb', background:'white', cursor:'pointer' }}>Cancel</button>

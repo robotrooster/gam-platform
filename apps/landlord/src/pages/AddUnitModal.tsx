@@ -6,6 +6,7 @@ import { X, Building2, DoorOpen, DollarSign, ChevronRight, ChevronLeft, Check } 
 import {
   UNIT_TYPES, UnitType, UNIT_TYPE_LABEL, UNIT_TYPE_ICON, UNIT_TYPE_HAS_BEDROOMS,
   PropertyUnitSubtype, unitSubtypeFactsLabel,
+  METER_READING_DIGIT_OPTIONS, METER_READING_DEFAULT_DIGITS,
 } from '@gam/shared'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
@@ -43,6 +44,15 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
     weeklyRate:       '',
     status:           'vacant',
   })
+  // S533 (Nic): meters are configured HERE, in the unit add area — there
+  // is no meters list elsewhere. Each checked utility creates a 1:1
+  // submeter per created unit (batches included).
+  // Sewer is NOT a meter — it bills off the water reading at a second
+  // rate (one line item on the invoice). Water row carries it.
+  const [meters, setMeters] = useState<Record<string, { on: boolean; rate: string; digits: string; sewerRate: string }>>({
+    electric: { on: false, rate: '', digits: String(METER_READING_DEFAULT_DIGITS), sewerRate: '' },
+    water:    { on: false, rate: '', digits: String(METER_READING_DEFAULT_DIGITS), sewerRate: '' },
+  })
   const [errors, setErrors] = useState<Record<string, string>>({})
   const [prefilledFrom, setPrefilledFrom] = useState<string | null>(null)
 
@@ -57,10 +67,34 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
   const createMut = useMutation(
     (data: any) => apiPost('/units', data),
     {
-      onSuccess: (res: any) => {
+      onSuccess: async (res: any) => {
+        // Create the configured submeters for every created unit
+        // (batch adds included) — 1:1 assignment, label "<unit> <utility>".
+        const createdUnits: any[] = res.data?.id ? [res.data] : (res.data?.units || [])
+        for (const u of createdUnits) {
+          for (const [utility, m] of Object.entries(meters)) {
+            if (!m.on) continue
+            try {
+              const meterRes: any = await apiPost('/utility/meters', {
+                propertyId: form.propertyId,
+                utilityType: utility,
+                label: `${u.unitNumber ?? u.unit_number} ${utility}`,
+                billingMethod: 'submeter',
+                ratePerUnit: m.rate === '' ? null : Number(m.rate),
+                baseFee: 0,
+                digits: Number(m.digits) || METER_READING_DEFAULT_DIGITS,
+                ...(utility === 'water' && m.sewerRate !== '' ? { sewerRatePerUnit: Number(m.sewerRate) } : {}),
+              })
+              await apiPost(`/utility/meters/${meterRes.data.id}/units`, { unitId: u.id })
+            } catch (e: any) {
+              alert(e?.response?.data?.error || `Could not create the ${utility} meter for ${u.unitNumber ?? u.unit_number}`)
+            }
+          }
+        }
         qc.invalidateQueries('units')
         qc.invalidateQueries('schedule')
         qc.invalidateQueries(['property', form.propertyId])
+        qc.invalidateQueries('utility-meters')
         onClose()
         // Single unit → its page; a batch → the property the units landed on.
         if (res.data?.id) navigate(`/units/${res.data.id}`)
@@ -407,6 +441,43 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
                   >
                     <div style={{ fontSize: '.78rem', fontWeight: 600, color: form.status === s.value ? s.color : 'var(--text-1)' }}>{s.label}</div>
                     <div style={{ fontSize: '.65rem', color: 'var(--text-3)', marginTop: 2 }}>{s.desc}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div style={{ marginTop: 4 }}>
+              <label style={labelStyle}>Sub-metered utilities</label>
+              <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginBottom: 8 }}>
+                Check what this unit has its own meter for — readings bill the tenant through the monthly reading run. Sewer bills off the water reading (one line item); propane is a tank fill on the Utilities page.
+              </div>
+              <div style={{ display: 'grid', gap: 6 }}>
+                {(['electric', 'water'] as const).map(t => (
+                  <div key={t} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 12px', borderRadius: 8, background: 'var(--bg-2)', flexWrap: 'wrap' }}>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '.8rem', fontWeight: 600, cursor: 'pointer', minWidth: 110 }}>
+                      <input type="checkbox" checked={meters[t].on}
+                        onChange={e => setMeters(prev => ({ ...prev, [t]: { ...prev[t], on: e.target.checked } }))} />
+                      {t === 'electric' ? '⚡ Electric' : '💧 Water'}
+                    </label>
+                    {meters[t].on && (
+                      <>
+                        <input className="input" type="text" inputMode="decimal" placeholder={t === 'electric' ? '$/kWh e.g. 0.14' : 'water $/gal'}
+                          value={meters[t].rate}
+                          onChange={e => { const v = e.target.value; if (v === '' || /^\d*\.?\d*$/.test(v)) setMeters(prev => ({ ...prev, [t]: { ...prev[t], rate: v } })) }}
+                          style={{ width: 130 }} />
+                        <select className="input" value={meters[t].digits}
+                          onChange={e => setMeters(prev => ({ ...prev, [t]: { ...prev[t], digits: e.target.value } }))}
+                          style={{ width: 120 }}>
+                          {METER_READING_DIGIT_OPTIONS.map(d => <option key={d} value={String(d)}>{d}-digit</option>)}
+                        </select>
+                        {t === 'water' && (
+                          <input className="input" type="text" inputMode="decimal" placeholder="sewer $/gal (optional)"
+                            value={meters[t].sewerRate}
+                            onChange={e => { const v = e.target.value; if (v === '' || /^\d*\.?\d*$/.test(v)) setMeters(prev => ({ ...prev, [t]: { ...prev[t], sewerRate: v } })) }}
+                            style={{ width: 170 }} />
+                        )}
+                      </>
+                    )}
                   </div>
                 ))}
               </div>

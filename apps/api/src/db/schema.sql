@@ -21,7 +21,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict R3gQWGybWKhpD2FTB3onw0KUIJNuU7ymEgOWB1fwrQvKyBmpEQVEnhtEAraN5lM
+\restrict FtIjsszd26h8kC1uECBBitZXR6yAEOLc0fRgSJ1aoQApF1tJcuJGSPEAp7XrOJJ
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -3461,7 +3461,10 @@ CREATE TABLE public.lease_templates (
     page_count integer DEFAULT 1,
     is_active boolean DEFAULT true NOT NULL,
     created_at timestamp with time zone DEFAULT now(),
-    updated_at timestamp with time zone DEFAULT now()
+    updated_at timestamp with time zone DEFAULT now(),
+    unit_type text,
+    property_id uuid,
+    CONSTRAINT lease_templates_unit_type_check CHECK (((unit_type IS NULL) OR (unit_type = ANY (ARRAY['apartment'::text, 'single_family'::text, 'rv_spot'::text, 'mobile_home'::text, 'storage'::text, 'commercial'::text]))))
 );
 
 
@@ -3902,7 +3905,8 @@ CREATE TABLE public.payments (
     import_source text,
     imported_at timestamp with time zone,
     import_extra_data jsonb,
-    CONSTRAINT payments_entry_description_check CHECK ((entry_description = ANY (ARRAY['RENT'::text, 'SUBSCRIP'::text, 'DEPOSIT'::text, 'UTILITY'::text, 'ONTIMEPAY'::text, 'LATEFEE'::text, 'FLEXPAY'::text]))),
+    is_remainder boolean DEFAULT false NOT NULL,
+    CONSTRAINT payments_entry_description_check CHECK ((entry_description = ANY (ARRAY['RENT'::text, 'SUBSCRIP'::text, 'DEPOSIT'::text, 'UTILITY'::text, 'ONTIMEPAY'::text, 'LATEFEE'::text, 'FLEXPAY'::text, 'PROPANE'::text]))),
     CONSTRAINT payments_gam_supersedence_amount_nonneg CHECK ((gam_supersedence_amount >= (0)::numeric)),
     CONSTRAINT payments_retry_count_check CHECK (((retry_count >= 0) AND (retry_count <= 2))),
     CONSTRAINT payments_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'processing'::text, 'settled'::text, 'failed'::text, 'returned'::text, 'paid_via_deposit'::text]))),
@@ -4829,6 +4833,48 @@ CREATE TABLE public.pos_vendors (
 
 
 --
+-- Name: propane_fill_installments; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.propane_fill_installments (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    fill_id uuid NOT NULL,
+    installment_number integer NOT NULL,
+    amount numeric(10,2) NOT NULL,
+    billing_cycle_month date NOT NULL,
+    payment_id uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    accelerated boolean DEFAULT false NOT NULL
+);
+
+
+--
+-- Name: propane_fills; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.propane_fills (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    property_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    unit_id uuid NOT NULL,
+    lease_id uuid NOT NULL,
+    tenant_id uuid NOT NULL,
+    fill_date date DEFAULT CURRENT_DATE NOT NULL,
+    gallons numeric(8,2) NOT NULL,
+    price_per_gallon numeric(8,4) NOT NULL,
+    total_amount numeric(10,2) NOT NULL,
+    installment_count integer NOT NULL,
+    created_by_user_id uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    tax_rate_pct numeric(6,4) DEFAULT 0 NOT NULL,
+    tax_amount numeric(10,2) DEFAULT 0 NOT NULL,
+    CONSTRAINT propane_fills_gallons_check CHECK ((gallons > (0)::numeric)),
+    CONSTRAINT propane_fills_installment_count_check CHECK ((installment_count = ANY (ARRAY[1, 2, 4]))),
+    CONSTRAINT propane_fills_price_per_gallon_check CHECK ((price_per_gallon >= (0)::numeric))
+);
+
+
+--
 -- Name: properties; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -4879,6 +4925,9 @@ CREATE TABLE public.properties (
     monthly_rate numeric(10,2),
     short_term_tax_rate numeric(5,2) DEFAULT 0 NOT NULL,
     weekly_lease_mode boolean DEFAULT false NOT NULL,
+    propane_allow_installments boolean DEFAULT false NOT NULL,
+    propane_split_min_gallons integer DEFAULT 40 NOT NULL,
+    propane_split_four_min_gallons integer DEFAULT 100 NOT NULL,
     CONSTRAINT properties_booking_deposit_pct_range CHECK (((booking_deposit_pct >= (0)::numeric) AND (booking_deposit_pct <= (100)::numeric))),
     CONSTRAINT properties_booking_slug_format CHECK (((booking_slug IS NULL) OR ((booking_slug ~ '^[a-z0-9][a-z0-9-]{1,60}$'::text) AND (booking_slug !~ '--'::text)))),
     CONSTRAINT properties_deposit_handling_mode_check CHECK ((deposit_handling_mode = ANY (ARRAY['gam_escrow'::text, 'landlord_held'::text]))),
@@ -4888,6 +4937,8 @@ CREATE TABLE public.properties (
     CONSTRAINT properties_late_fee_accrual_type_check CHECK ((late_fee_accrual_type = ANY (ARRAY['flat'::text, 'percent_of_rent'::text]))),
     CONSTRAINT properties_late_fee_cap_type_check CHECK ((late_fee_cap_type = ANY (ARRAY['flat'::text, 'percent_of_rent'::text]))),
     CONSTRAINT properties_late_fee_initial_type_check CHECK ((late_fee_initial_type = ANY (ARRAY['flat'::text, 'percent_of_rent'::text]))),
+    CONSTRAINT properties_propane_split_four_gte_min_check CHECK ((propane_split_four_min_gallons >= propane_split_min_gallons)),
+    CONSTRAINT properties_propane_split_min_gallons_check CHECK ((propane_split_min_gallons > 0)),
     CONSTRAINT properties_public_booking_enabled_needs_slug CHECK (((public_booking_enabled = false) OR (booking_slug IS NOT NULL))),
     CONSTRAINT properties_review_status_check CHECK ((review_status = ANY (ARRAY['active'::text, 'pending_review'::text, 'rejected'::text]))),
     CONSTRAINT properties_short_term_tax_rate_range CHECK (((short_term_tax_rate >= (0)::numeric) AND (short_term_tax_rate <= (100)::numeric))),
@@ -5047,6 +5098,52 @@ CREATE TABLE public.property_unit_subtypes (
     CONSTRAINT property_unit_subtypes_rv_amp_service_check CHECK ((rv_amp_service = ANY (ARRAY['none'::text, '30'::text, '50'::text, 'both'::text]))),
     CONSTRAINT property_unit_subtypes_rv_site_layout_check CHECK ((rv_site_layout = ANY (ARRAY['none'::text, 'back_in'::text, 'pull_through'::text]))),
     CONSTRAINT property_unit_subtypes_unit_type_check CHECK ((unit_type = ANY (ARRAY['apartment'::text, 'single_family'::text, 'rv_spot'::text, 'mobile_home'::text, 'storage'::text, 'commercial'::text])))
+);
+
+
+--
+-- Name: property_unit_type_late_fees; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.property_unit_type_late_fees (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    property_id uuid NOT NULL,
+    unit_type text NOT NULL,
+    late_fee_grace_days integer DEFAULT 5 NOT NULL,
+    late_fee_initial_amount numeric(10,2) NOT NULL,
+    late_fee_initial_type text NOT NULL,
+    late_fee_accrual_amount numeric(10,2),
+    late_fee_accrual_type text,
+    late_fee_accrual_period text,
+    late_fee_cap_amount numeric(10,2),
+    late_fee_cap_type text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT property_unit_type_late_fees_late_fee_accrual_amount_check CHECK (((late_fee_accrual_amount IS NULL) OR (late_fee_accrual_amount >= (0)::numeric))),
+    CONSTRAINT property_unit_type_late_fees_late_fee_accrual_period_check CHECK (((late_fee_accrual_period IS NULL) OR (late_fee_accrual_period = ANY (ARRAY['daily'::text, 'weekly'::text, 'monthly'::text])))),
+    CONSTRAINT property_unit_type_late_fees_late_fee_accrual_type_check CHECK (((late_fee_accrual_type IS NULL) OR (late_fee_accrual_type = ANY (ARRAY['flat'::text, 'percent_of_rent'::text])))),
+    CONSTRAINT property_unit_type_late_fees_late_fee_cap_amount_check CHECK (((late_fee_cap_amount IS NULL) OR (late_fee_cap_amount >= (0)::numeric))),
+    CONSTRAINT property_unit_type_late_fees_late_fee_cap_type_check CHECK (((late_fee_cap_type IS NULL) OR (late_fee_cap_type = ANY (ARRAY['flat'::text, 'percent_of_rent'::text])))),
+    CONSTRAINT property_unit_type_late_fees_late_fee_grace_days_check CHECK ((late_fee_grace_days >= 0)),
+    CONSTRAINT property_unit_type_late_fees_late_fee_initial_amount_check CHECK ((late_fee_initial_amount >= (0)::numeric)),
+    CONSTRAINT property_unit_type_late_fees_late_fee_initial_type_check CHECK ((late_fee_initial_type = ANY (ARRAY['flat'::text, 'percent_of_rent'::text]))),
+    CONSTRAINT property_unit_type_late_fees_unit_type_check CHECK ((unit_type = ANY (ARRAY['apartment'::text, 'single_family'::text, 'rv_spot'::text, 'mobile_home'::text, 'storage'::text, 'commercial'::text])))
+);
+
+
+--
+-- Name: property_utility_tax_rates; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.property_utility_tax_rates (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    property_id uuid NOT NULL,
+    utility_type text NOT NULL,
+    tax_rate_pct numeric(6,4) NOT NULL,
+    label text,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT property_utility_tax_rates_tax_rate_pct_check CHECK (((tax_rate_pct >= (0)::numeric) AND (tax_rate_pct <= (100)::numeric))),
+    CONSTRAINT property_utility_tax_rates_utility_type_check CHECK ((utility_type = ANY (ARRAY['water'::text, 'gas'::text, 'electric'::text, 'sewer'::text, 'trash'::text, 'propane'::text])))
 );
 
 
@@ -6244,7 +6341,14 @@ CREATE TABLE public.utility_bills (
     notes text,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT utility_bills_status_check CHECK ((status = ANY (ARRAY['unbilled'::text, 'billed'::text, 'paid'::text, 'disputed'::text, 'void'::text])))
+    tax_rate_pct numeric(6,4) DEFAULT 0 NOT NULL,
+    tax_amount numeric(10,2) DEFAULT 0 NOT NULL,
+    utility_type text NOT NULL,
+    sewer_rate_per_unit numeric,
+    reading_start numeric,
+    reading_end numeric,
+    CONSTRAINT utility_bills_status_check CHECK ((status = ANY (ARRAY['unbilled'::text, 'billed'::text, 'paid'::text, 'disputed'::text, 'void'::text]))),
+    CONSTRAINT utility_bills_utility_type_check CHECK ((utility_type = ANY (ARRAY['water'::text, 'gas'::text, 'electric'::text, 'sewer'::text, 'trash'::text])))
 );
 
 
@@ -6259,7 +6363,10 @@ CREATE TABLE public.utility_meter_readings (
     reading_value numeric NOT NULL,
     billing_cycle_month date NOT NULL,
     created_by_user_id uuid NOT NULL,
-    created_at timestamp with time zone DEFAULT now()
+    created_at timestamp with time zone DEFAULT now(),
+    needs_review boolean DEFAULT false NOT NULL,
+    review_note text,
+    is_rollover boolean DEFAULT false NOT NULL
 );
 
 
@@ -6289,10 +6396,52 @@ CREATE TABLE public.utility_meters (
     rubs_allocation_method text,
     created_at timestamp with time zone DEFAULT now(),
     updated_at timestamp with time zone DEFAULT now(),
+    digits integer DEFAULT 6 NOT NULL,
+    sewer_rate_per_unit numeric,
     CONSTRAINT utility_meters_billing_method_check CHECK ((billing_method = ANY (ARRAY['submeter'::text, 'rubs'::text, 'master_bill_to_landlord'::text]))),
     CONSTRAINT utility_meters_check CHECK ((((billing_method = 'rubs'::text) AND (rubs_allocation_method IS NOT NULL)) OR ((billing_method <> 'rubs'::text) AND (rubs_allocation_method IS NULL)))),
+    CONSTRAINT utility_meters_digits_check CHECK ((digits = ANY (ARRAY[4, 5, 6, 7, 8]))),
     CONSTRAINT utility_meters_rubs_allocation_method_check CHECK ((rubs_allocation_method = ANY (ARRAY['occupant_count'::text, 'sqft'::text, 'bedrooms'::text, 'equal_split'::text]))),
     CONSTRAINT utility_meters_utility_type_check CHECK ((utility_type = ANY (ARRAY['water'::text, 'gas'::text, 'electric'::text, 'sewer'::text, 'trash'::text])))
+);
+
+
+--
+-- Name: utility_reading_double_checks; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.utility_reading_double_checks (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    run_id uuid NOT NULL,
+    meter_id uuid NOT NULL,
+    first_value numeric NOT NULL,
+    is_suspicious boolean NOT NULL,
+    second_value numeric,
+    outcome text,
+    entered_by_user_id uuid,
+    entered_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT utility_reading_double_checks_outcome_check CHECK ((outcome = ANY (ARRAY['verified'::text, 'replaced'::text, 'escalated'::text])))
+);
+
+
+--
+-- Name: utility_reading_runs; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.utility_reading_runs (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    property_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    billing_cycle_month date NOT NULL,
+    opened_on date NOT NULL,
+    status text DEFAULT 'open'::text NOT NULL,
+    completed_at timestamp with time zone,
+    completed_by_user_id uuid,
+    bills_created integer,
+    billed_total numeric(12,2),
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT utility_reading_runs_status_check CHECK ((status = ANY (ARRAY['open'::text, 'double_check'::text, 'completed'::text])))
 );
 
 
@@ -8160,6 +8309,30 @@ ALTER TABLE ONLY public.pos_vendors
 
 
 --
+-- Name: propane_fill_installments propane_fill_installments_fill_id_installment_number_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.propane_fill_installments
+    ADD CONSTRAINT propane_fill_installments_fill_id_installment_number_key UNIQUE (fill_id, installment_number);
+
+
+--
+-- Name: propane_fill_installments propane_fill_installments_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.propane_fill_installments
+    ADD CONSTRAINT propane_fill_installments_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: propane_fills propane_fills_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.propane_fills
+    ADD CONSTRAINT propane_fills_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: properties properties_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -8245,6 +8418,38 @@ ALTER TABLE ONLY public.property_unit_subtypes
 
 ALTER TABLE ONLY public.property_unit_subtypes
     ADD CONSTRAINT property_unit_subtypes_property_id_unit_type_name_key UNIQUE (property_id, unit_type, name);
+
+
+--
+-- Name: property_unit_type_late_fees property_unit_type_late_fees_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_unit_type_late_fees
+    ADD CONSTRAINT property_unit_type_late_fees_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: property_unit_type_late_fees property_unit_type_late_fees_property_id_unit_type_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_unit_type_late_fees
+    ADD CONSTRAINT property_unit_type_late_fees_property_id_unit_type_key UNIQUE (property_id, unit_type);
+
+
+--
+-- Name: property_utility_tax_rates property_utility_tax_rates_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_utility_tax_rates
+    ADD CONSTRAINT property_utility_tax_rates_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: property_utility_tax_rates property_utility_tax_rates_property_id_utility_type_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_utility_tax_rates
+    ADD CONSTRAINT property_utility_tax_rates_property_id_utility_type_key UNIQUE (property_id, utility_type);
 
 
 --
@@ -8692,7 +8897,7 @@ ALTER TABLE ONLY public.users
 --
 
 ALTER TABLE ONLY public.utility_bills
-    ADD CONSTRAINT utility_bills_one_per_meter_unit_cycle UNIQUE (meter_id, unit_id, billing_cycle_month);
+    ADD CONSTRAINT utility_bills_one_per_meter_unit_cycle UNIQUE (meter_id, unit_id, billing_cycle_month, utility_type);
 
 
 --
@@ -8733,6 +8938,38 @@ ALTER TABLE ONLY public.utility_meter_units
 
 ALTER TABLE ONLY public.utility_meters
     ADD CONSTRAINT utility_meters_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: utility_reading_double_checks utility_reading_double_checks_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_reading_double_checks
+    ADD CONSTRAINT utility_reading_double_checks_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: utility_reading_double_checks utility_reading_double_checks_run_id_meter_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_reading_double_checks
+    ADD CONSTRAINT utility_reading_double_checks_run_id_meter_id_key UNIQUE (run_id, meter_id);
+
+
+--
+-- Name: utility_reading_runs utility_reading_runs_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_reading_runs
+    ADD CONSTRAINT utility_reading_runs_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: utility_reading_runs utility_reading_runs_property_id_billing_cycle_month_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_reading_runs
+    ADD CONSTRAINT utility_reading_runs_property_id_billing_cycle_month_key UNIQUE (property_id, billing_cycle_month);
 
 
 --
@@ -10370,6 +10607,13 @@ CREATE INDEX idx_lease_templates_landlord ON public.lease_templates USING btree 
 
 
 --
+-- Name: idx_lease_templates_property; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_lease_templates_property ON public.lease_templates USING btree (property_id) WHERE (property_id IS NOT NULL);
+
+
+--
 -- Name: idx_lease_termination_requests_lease; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -11147,6 +11391,27 @@ CREATE INDEX idx_pos_vendors_landlord ON public.pos_vendors USING btree (landlor
 
 
 --
+-- Name: idx_propane_fills_property; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_propane_fills_property ON public.propane_fills USING btree (property_id, fill_date DESC);
+
+
+--
+-- Name: idx_propane_fills_unit; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_propane_fills_unit ON public.propane_fills USING btree (unit_id);
+
+
+--
+-- Name: idx_propane_installments_unbilled; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_propane_installments_unbilled ON public.propane_fill_installments USING btree (billing_cycle_month) WHERE (payment_id IS NULL);
+
+
+--
 -- Name: idx_properties_landlord; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -11214,6 +11479,13 @@ CREATE INDEX idx_purchase_requests_work_order ON public.purchase_requests USING 
 --
 
 CREATE INDEX idx_pus_property ON public.property_unit_subtypes USING btree (property_id);
+
+
+--
+-- Name: idx_put_late_fees_property; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_put_late_fees_property ON public.property_unit_type_late_fees USING btree (property_id);
 
 
 --
@@ -11784,6 +12056,13 @@ CREATE INDEX idx_utility_meter_readings_meter_id ON public.utility_meter_reading
 
 
 --
+-- Name: idx_utility_meter_readings_needs_review; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_utility_meter_readings_needs_review ON public.utility_meter_readings USING btree (meter_id) WHERE needs_review;
+
+
+--
 -- Name: idx_utility_meter_units_unit_id; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -11795,6 +12074,27 @@ CREATE INDEX idx_utility_meter_units_unit_id ON public.utility_meter_units USING
 --
 
 CREATE INDEX idx_utility_meters_property_id ON public.utility_meters USING btree (property_id);
+
+
+--
+-- Name: idx_utility_reading_double_checks_run; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_utility_reading_double_checks_run ON public.utility_reading_double_checks USING btree (run_id);
+
+
+--
+-- Name: idx_utility_reading_runs_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_utility_reading_runs_landlord ON public.utility_reading_runs USING btree (landlord_id, status);
+
+
+--
+-- Name: idx_utility_reading_runs_open; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_utility_reading_runs_open ON public.utility_reading_runs USING btree (property_id) WHERE (status = 'open'::text);
 
 
 --
@@ -12102,21 +12402,14 @@ CREATE UNIQUE INDEX ux_payments_late_fee_idempotent ON public.payments USING btr
 -- Name: ux_payments_rent_idempotent; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE UNIQUE INDEX ux_payments_rent_idempotent ON public.payments USING btree (lease_id, due_date) WHERE ((type = 'rent'::text) AND (status = ANY (ARRAY['pending'::text, 'processing'::text, 'settled'::text])));
+CREATE UNIQUE INDEX ux_payments_rent_idempotent ON public.payments USING btree (lease_id, due_date) WHERE ((type = 'rent'::text) AND (status = ANY (ARRAY['pending'::text, 'processing'::text, 'settled'::text])) AND (NOT is_remainder));
 
 
 --
 -- Name: ux_payments_unit_rent_due_date_active; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE UNIQUE INDEX ux_payments_unit_rent_due_date_active ON public.payments USING btree (unit_id, due_date) WHERE ((type = 'rent'::text) AND (status <> ALL (ARRAY['failed'::text, 'returned'::text])));
-
-
---
--- Name: INDEX ux_payments_unit_rent_due_date_active; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON INDEX public.ux_payments_unit_rent_due_date_active IS 'S414/S407: prevents duplicate active rent payment rows for the same (unit, month). Failed and returned rows excluded so retry flows can insert fresh rows after a payment failure. Other payment types (fee, deposit, late_fee, etc.) are unconstrained — move-in invoices legitimately create multiple fee rows per (unit, due_date).';
+CREATE UNIQUE INDEX ux_payments_unit_rent_due_date_active ON public.payments USING btree (unit_id, due_date) WHERE ((type = 'rent'::text) AND (status <> ALL (ARRAY['failed'::text, 'returned'::text])) AND (NOT is_remainder));
 
 
 --
@@ -14605,6 +14898,14 @@ ALTER TABLE ONLY public.lease_templates
 
 
 --
+-- Name: lease_templates lease_templates_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_templates
+    ADD CONSTRAINT lease_templates_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE SET NULL;
+
+
+--
 -- Name: lease_tenants lease_tenants_add_document_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -15757,6 +16058,70 @@ ALTER TABLE ONLY public.pos_vendors
 
 
 --
+-- Name: propane_fill_installments propane_fill_installments_fill_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.propane_fill_installments
+    ADD CONSTRAINT propane_fill_installments_fill_id_fkey FOREIGN KEY (fill_id) REFERENCES public.propane_fills(id) ON DELETE CASCADE;
+
+
+--
+-- Name: propane_fill_installments propane_fill_installments_payment_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.propane_fill_installments
+    ADD CONSTRAINT propane_fill_installments_payment_id_fkey FOREIGN KEY (payment_id) REFERENCES public.payments(id);
+
+
+--
+-- Name: propane_fills propane_fills_created_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.propane_fills
+    ADD CONSTRAINT propane_fills_created_by_user_id_fkey FOREIGN KEY (created_by_user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: propane_fills propane_fills_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.propane_fills
+    ADD CONSTRAINT propane_fills_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: propane_fills propane_fills_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.propane_fills
+    ADD CONSTRAINT propane_fills_lease_id_fkey FOREIGN KEY (lease_id) REFERENCES public.leases(id);
+
+
+--
+-- Name: propane_fills propane_fills_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.propane_fills
+    ADD CONSTRAINT propane_fills_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE CASCADE;
+
+
+--
+-- Name: propane_fills propane_fills_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.propane_fills
+    ADD CONSTRAINT propane_fills_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id);
+
+
+--
+-- Name: propane_fills propane_fills_unit_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.propane_fills
+    ADD CONSTRAINT propane_fills_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id) ON DELETE CASCADE;
+
+
+--
 -- Name: properties properties_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -15882,6 +16247,22 @@ ALTER TABLE ONLY public.property_manager_scopes
 
 ALTER TABLE ONLY public.property_unit_subtypes
     ADD CONSTRAINT property_unit_subtypes_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE CASCADE;
+
+
+--
+-- Name: property_unit_type_late_fees property_unit_type_late_fees_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_unit_type_late_fees
+    ADD CONSTRAINT property_unit_type_late_fees_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE CASCADE;
+
+
+--
+-- Name: property_utility_tax_rates property_utility_tax_rates_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_utility_tax_rates
+    ADD CONSTRAINT property_utility_tax_rates_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE CASCADE;
 
 
 --
@@ -16709,6 +17090,54 @@ ALTER TABLE ONLY public.utility_meters
 
 
 --
+-- Name: utility_reading_double_checks utility_reading_double_checks_entered_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_reading_double_checks
+    ADD CONSTRAINT utility_reading_double_checks_entered_by_user_id_fkey FOREIGN KEY (entered_by_user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: utility_reading_double_checks utility_reading_double_checks_meter_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_reading_double_checks
+    ADD CONSTRAINT utility_reading_double_checks_meter_id_fkey FOREIGN KEY (meter_id) REFERENCES public.utility_meters(id) ON DELETE CASCADE;
+
+
+--
+-- Name: utility_reading_double_checks utility_reading_double_checks_run_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_reading_double_checks
+    ADD CONSTRAINT utility_reading_double_checks_run_id_fkey FOREIGN KEY (run_id) REFERENCES public.utility_reading_runs(id) ON DELETE CASCADE;
+
+
+--
+-- Name: utility_reading_runs utility_reading_runs_completed_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_reading_runs
+    ADD CONSTRAINT utility_reading_runs_completed_by_user_id_fkey FOREIGN KEY (completed_by_user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: utility_reading_runs utility_reading_runs_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_reading_runs
+    ADD CONSTRAINT utility_reading_runs_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: utility_reading_runs utility_reading_runs_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.utility_reading_runs
+    ADD CONSTRAINT utility_reading_runs_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE CASCADE;
+
+
+--
 -- Name: vehicles vehicles_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -16784,5 +17213,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict R3gQWGybWKhpD2FTB3onw0KUIJNuU7ymEgOWB1fwrQvKyBmpEQVEnhtEAraN5lM
+\unrestrict FtIjsszd26h8kC1uECBBitZXR6yAEOLc0fRgSJ1aoQApF1tJcuJGSPEAp7XrOJJ
 
