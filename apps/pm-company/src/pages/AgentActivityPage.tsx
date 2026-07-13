@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { useQuery } from 'react-query'
+import { humanize } from '@gam/shared'
 import { Bot, MessageCircle, AlertTriangle, Zap, Wrench as WrenchIcon } from 'lucide-react'
 import { useAuth } from '../context/AuthContext'
 import { apiGet } from '../lib/api'
@@ -53,7 +54,7 @@ const OUTCOME_LABEL: Record<string, string> = {
 }
 
 function fmtOutcome(o: string): string {
-  return OUTCOME_LABEL[o] ?? o.replace(/_/g, ' ')
+  return OUTCOME_LABEL[o] ?? humanize(o)
 }
 
 function fmtTime(iso: string): string {

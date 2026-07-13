@@ -53,7 +53,9 @@ function dec(n: string | number | null | undefined): number {
 
 const createSchema = z.object({
   customerId: z.string().uuid().nullable().optional(),
-  paymentMethod: z.enum(['cash', 'card_recorded']),
+  paymentMethod: z.enum(['cash', 'card_recorded', 'stripe_terminal']),
+  // stripe_terminal only: the captured PaymentIntent backing this sale.
+  stripePaymentIntentId: z.string().min(1).optional(),
   amountTendered: z.number().min(0).optional(),
   // S512: optional customer gratuity, tracked separately from the sale.
   tipAmount: z.number().min(0).max(100000).optional(),
@@ -195,6 +197,29 @@ businessPosRouter.post('/transactions', requireAuth, async (req, res, next) => {
       const thisSaleNumber = isFirstSale ? 1 : seq.next_number - 1
       const receiptNumber = fmtReceipt(thisSaleNumber)
 
+      let cardSurcharge = 0
+      // S536: a stripe_terminal sale must PROVE its payment — the PI
+      // must exist on this business's Connect account, carry our
+      // metadata, be captured (succeeded), and match the computed
+      // total to the cent. Without this, a crafted request could
+      // record a "paid" card sale that never charged anyone. (Stripe
+      // round-trip inside the lock window is accepted v1 latency.)
+      if (body.paymentMethod === 'stripe_terminal') {
+        if (!body.stripePaymentIntentId) throw new AppError(400, 'stripePaymentIntentId is required for terminal sales')
+        const { retrieveBusinessPI } = await import('../services/posTerminal')
+        const pi = await retrieveBusinessPI(body.stripePaymentIntentId)
+        if (pi.metadata?.gam_business_id !== businessId) throw new AppError(404, 'Payment not found')
+        if (pi.status !== 'succeeded') throw new AppError(409, `Payment is ${pi.status} — complete the card payment on the reader first`)
+        const { PLATFORM_FEES: VF } = await import('@gam/shared')
+        const baseCents = Math.round(totalAmount * 100)
+        const feeCents = Math.round(baseCents * VF.BUSINESS_TERMINAL_APP_FEE_PCT) + VF.BUSINESS_TERMINAL_APP_FEE_FIXED_CENTS
+        if (pi.amount === baseCents + feeCents) {
+          cardSurcharge = feeCents / 100  // customer-paid card fee, shown on the receipt
+        } else if (pi.amount !== baseCents) {
+          throw new AppError(409, 'Payment amount does not match the sale total — start the sale over')
+        }
+      }
+
       // Insert transaction.
       const { rows: [txn] } = await client.query<any>(
         `INSERT INTO business_pos_transactions
@@ -202,8 +227,8 @@ businessPosRouter.post('/transactions', requireAuth, async (req, res, next) => {
             subtotal, tax_amount, tip_amount, total_amount,
             discount_code_id, discount_amount,
             payment_method, amount_tendered, change_due,
-            notes, cashier_user_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+            notes, cashier_user_id, stripe_payment_intent_id, card_surcharge)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
          RETURNING *`,
         [businessId, receiptNumber, body.customerId ?? null,
          subtotal, taxAmount, tipAmount, totalAmount,
@@ -212,7 +237,9 @@ businessPosRouter.post('/transactions', requireAuth, async (req, res, next) => {
          body.amountTendered ?? null,
          changeDue,
          body.notes ?? null,
-         req.user!.userId])
+         req.user!.userId,
+         body.paymentMethod === 'stripe_terminal' ? body.stripePaymentIntentId ?? null : null,
+         cardSurcharge])
 
       // Insert lines + decrement stock + audit adjustments.
       const lines: any[] = []
@@ -391,6 +418,272 @@ businessPosRouter.get('/transactions/:id/pdf', requireAuth, async (req, res, nex
     res.setHeader('Content-Type', 'application/pdf')
     res.setHeader('Content-Disposition', `inline; filename="${txn.receipt_number}.pdf"`)
     res.send(buffer)
+  } catch (e) { next(e) }
+})
+
+// ═══════════════════════════════════════════════════════════════
+//  S536 (Nic) — Stripe Terminal for businesses. "The payment
+//  acceptance screen is linked to a reader the POS user sets up in
+//  settings; swiping or tapping completes the transaction." Direct
+//  charges on the business's Connect account (business pays Stripe's
+//  card-present cost); GAM's markup rides as application_fee_amount
+//  (shared PLATFORM_FEES.BUSINESS_TERMINAL_APP_FEE_*) — GAM cannot
+//  lose money on a sale. Mirrors the property flow in routes/pos.ts.
+// ═══════════════════════════════════════════════════════════════
+
+async function getBusinessConnectId(businessId: string): Promise<string> {
+  const row = await queryOne<{ stripe_connect_account_id: string | null; connect_payouts_enabled: boolean }>(
+    `SELECT stripe_connect_account_id, connect_payouts_enabled FROM businesses WHERE id = $1`,
+    [businessId])
+  if (!row?.stripe_connect_account_id || !row.connect_payouts_enabled) {
+    throw new AppError(409, 'Card readers need a completed Stripe payout setup — finish onboarding in the Business portal first')
+  }
+  return row.stripe_connect_account_id
+}
+
+// GET /cash-report?date=YYYY-MM-DD — S536 (Nic): end-of-day drawer
+// reconciliation. Expected cash = the day's cash sales minus cash
+// refunds issued that day; the operator counts the drawer against it.
+// This is the standard control for the one thing software can't see:
+// payments taken outside the system but rung as cash.
+businessPosRouter.get('/cash-report', requireAuth, async (req, res, next) => {
+  try {
+    const businessId = await requireUse(req)
+    const date = typeof req.query.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(req.query.date)
+      ? req.query.date
+      : new Date().toLocaleDateString('en-CA', { timeZone: 'America/Phoenix' })
+    const [row] = await query<any>(
+      `SELECT
+         COUNT(*) FILTER (WHERE payment_method = 'cash')::int                                   AS cash_sales,
+         COALESCE(SUM(total_amount) FILTER (WHERE payment_method = 'cash'), 0)::float           AS cash_collected,
+         COUNT(*) FILTER (WHERE payment_method = 'stripe_terminal')::int                        AS card_sales,
+         COALESCE(SUM(total_amount + card_surcharge) FILTER (WHERE payment_method = 'stripe_terminal'), 0)::float AS card_collected,
+         COUNT(*) FILTER (WHERE payment_method = 'card_recorded')::int                          AS recorded_card_sales,
+         COALESCE(SUM(total_amount) FILTER (WHERE payment_method = 'card_recorded'), 0)::float  AS recorded_card_collected
+       FROM business_pos_transactions
+      WHERE business_id = $1
+        AND (created_at AT TIME ZONE 'America/Phoenix')::date = $2::date
+        AND status != 'voided'`,
+      [businessId, date])
+    const [ref] = await query<any>(
+      `SELECT COALESCE(SUM(refunded_amount), 0)::float AS cash_refunded
+         FROM business_pos_transactions
+        WHERE business_id = $1
+          AND payment_method = 'cash'
+          AND refunded_at IS NOT NULL
+          AND (refunded_at AT TIME ZONE 'America/Phoenix')::date = $2::date`,
+      [businessId, date])
+    const cashRefunded = Number(ref?.cash_refunded ?? 0)
+    res.json({ success: true, data: {
+      date,
+      cashSales:      row?.cash_sales ?? 0,
+      cashCollected:  Number(row?.cash_collected ?? 0),
+      cashRefunded,
+      expectedDrawer: Math.round((Number(row?.cash_collected ?? 0) - cashRefunded) * 100) / 100,
+      cardSales:      row?.card_sales ?? 0,
+      cardCollected:  Number(row?.card_collected ?? 0),
+      recordedCardSales:     row?.recorded_card_sales ?? 0,
+      recordedCardCollected: Number(row?.recorded_card_collected ?? 0),
+    } })
+  } catch (e) { next(e) }
+})
+
+// GET /register-config — register-facing settings readable by ANY
+// pos.use-permitted user (staff included; /businesses/me is owner-only).
+businessPosRouter.get('/register-config', requireAuth, async (req, res, next) => {
+  try {
+    const businessId = await requireUse(req)
+    const row = await queryOne<any>(
+      `SELECT tips_enabled, card_fees_paid_by, enabled_features FROM businesses WHERE id = $1`, [businessId])
+    res.json({ success: true, data: {
+      tipsEnabled: row?.tips_enabled ?? true,
+      cardFeesPaidBy: row?.card_fees_paid_by ?? 'business',
+      discountsEnabled: (row?.enabled_features ?? []).includes('discounts'),
+    } })
+  } catch (e) { next(e) }
+})
+
+businessPosRouter.post('/terminal/connection-token', requireAuth, async (req, res, next) => {
+  try {
+    const businessId = await requireUse(req)
+    const { createConnectionToken } = await import('../services/posTerminal')
+    const secret = await createConnectionToken(await getBusinessConnectId(businessId))
+    res.json({ success: true, data: { secret } })
+  } catch (e) { next(e) }
+})
+
+businessPosRouter.post('/terminal/readers', requireAuth, async (req, res, next) => {
+  try {
+    const businessId = await requireUse(req)
+    const { registrationCode, nickname, label } = req.body
+    if (!registrationCode) throw new AppError(400, 'registrationCode is required (shown on the reader screen)')
+    if (!nickname) throw new AppError(400, 'nickname is required')
+    const { registerBusinessReader } = await import('../services/posTerminal')
+    const row = await registerBusinessReader({
+      businessId,
+      businessConnectAccountId: await getBusinessConnectId(businessId),
+      registrationCode: String(registrationCode).trim(),
+      nickname:         String(nickname).trim(),
+      label:            label ? String(label).trim() : undefined,
+    })
+    res.status(201).json({ success: true, data: row })
+  } catch (e) { next(e) }
+})
+
+businessPosRouter.get('/terminal/readers', requireAuth, async (req, res, next) => {
+  try {
+    const businessId = await requireUse(req)
+    const { listBusinessReaders } = await import('../services/posTerminal')
+    res.json({ success: true, data: await listBusinessReaders(businessId) })
+  } catch (e) { next(e) }
+})
+
+businessPosRouter.delete('/terminal/readers/:id', requireAuth, async (req, res, next) => {
+  try {
+    const businessId = await requireUse(req)
+    const { archiveBusinessReader } = await import('../services/posTerminal')
+    res.json({ success: true, data: await archiveBusinessReader(businessId, req.params.id) })
+  } catch (e) { next(e) }
+})
+
+// Create PI + push it to the reader in one call — the register's
+// "Card" button becomes: call this, poll status, done when captured.
+businessPosRouter.post('/terminal/charge', requireAuth, async (req, res, next) => {
+  try {
+    const businessId = await requireUse(req)
+    const { amountCents, stripeReaderId } = req.body
+    if (!Number.isInteger(amountCents) || amountCents <= 0) throw new AppError(400, 'amountCents must be a positive integer')
+    if (!stripeReaderId) throw new AppError(400, 'stripeReaderId is required')
+    const { assertBusinessReader, createBusinessCardPresentPaymentIntent, processBusinessPIOnReader } =
+      await import('../services/posTerminal')
+    await assertBusinessReader(businessId, stripeReaderId)
+    const connectId = await getBusinessConnectId(businessId)
+    const { PLATFORM_FEES } = await import('@gam/shared')
+    const fee = Math.round(amountCents * PLATFORM_FEES.BUSINESS_TERMINAL_APP_FEE_PCT)
+      + PLATFORM_FEES.BUSINESS_TERMINAL_APP_FEE_FIXED_CENTS
+    // S536 (Nic): card_fees_paid_by toggle auto-applies to EVERY card
+    // transaction — 'customer' adds the fee on top as a surcharge;
+    // 'business' nets it out of the gross (default).
+    const biz = await queryOne<{ card_fees_paid_by: string }>(
+      `SELECT card_fees_paid_by FROM businesses WHERE id = $1`, [businessId])
+    const customerPays = biz?.card_fees_paid_by === 'customer'
+    const chargeCents = customerPays ? amountCents + fee : amountCents
+    const intent = await createBusinessCardPresentPaymentIntent({
+      businessConnectAccountId: connectId,
+      businessId,
+      amountCents: chargeCents,
+      applicationFeeCents: fee,
+      description: 'POS sale',
+    })
+    await processBusinessPIOnReader({ stripeReaderId, paymentIntentId: intent.id })
+    res.status(201).json({ success: true, data: { paymentIntentId: intent.id, status: intent.status, chargedCents: chargeCents, surchargeCents: customerPays ? fee : 0 } })
+  } catch (e) { next(e) }
+})
+
+// Poll: the reader prompts the customer asynchronously; the register
+// polls until requires_capture, then we capture — tap/swipe completes
+// the sale with no second workflow.
+businessPosRouter.get('/terminal/payment-intents/:id', requireAuth, async (req, res, next) => {
+  try {
+    const businessId = await requireUse(req)
+    const { retrieveBusinessPI, captureBusinessPI } = await import('../services/posTerminal')
+    let intent = await retrieveBusinessPI(req.params.id)
+    if (intent.metadata?.gam_business_id !== businessId) throw new AppError(404, 'Payment not found')
+    if (intent.status === 'requires_capture') {
+      intent = await captureBusinessPI(intent.id)
+    }
+    res.json({ success: true, data: { id: intent.id, status: intent.status, amount: intent.amount } })
+  } catch (e) { next(e) }
+})
+
+businessPosRouter.post('/terminal/payment-intents/:id/cancel', requireAuth, async (req, res, next) => {
+  try {
+    const businessId = await requireUse(req)
+    const { retrieveBusinessPI, cancelBusinessPI } = await import('../services/posTerminal')
+    const intent = await retrieveBusinessPI(req.params.id)
+    if (intent.metadata?.gam_business_id !== businessId) throw new AppError(404, 'Payment not found')
+    const canceled = await cancelBusinessPI(intent.id)
+    res.json({ success: true, data: { id: canceled.id, status: canceled.status } })
+  } catch (e) { next(e) }
+})
+
+// ═══════════════════════════════════════════════════════════════
+//  POST /transactions/:id/email-receipt — S536 (Nic): receipts go out
+//  by email (PDF attached); in-product printing is retired. Recipient
+//  is the request's email, falling back to the transaction customer's
+//  email. Same data assembly as GET /:id/pdf above.
+// ═══════════════════════════════════════════════════════════════
+
+const emailReceiptSchema = z.object({ email: z.string().email().optional() })
+
+businessPosRouter.post('/transactions/:id/email-receipt', requireAuth, async (req, res, next) => {
+  try {
+    const businessId = await requireUse(req)
+    const body = emailReceiptSchema.parse(req.body ?? {})
+    const txn = await queryOne<any>(
+      `SELECT t.*,
+              b.name AS biz_name, b.email AS biz_email, b.phone AS biz_phone,
+              b.street1 AS biz_street1, b.street2 AS biz_street2,
+              b.city AS biz_city, b.state AS biz_state, b.zip AS biz_zip,
+              c.first_name AS customer_first_name,
+              c.last_name AS customer_last_name,
+              c.company_name AS customer_company_name,
+              c.email AS customer_email, c.phone AS customer_phone,
+              c.street1 AS customer_street1, c.city AS customer_city,
+              c.state AS customer_state, c.zip AS customer_zip
+         FROM business_pos_transactions t
+         JOIN businesses b ON b.id = t.business_id
+         LEFT JOIN business_customers c ON c.id = t.customer_id
+        WHERE t.id = $1 AND t.business_id = $2`,
+      [req.params.id, businessId])
+    if (!txn) throw new AppError(404, 'Transaction not found')
+
+    const to = body.email || txn.customer_email
+    if (!to) throw new AppError(400, 'No email on file for this customer — enter one to send the receipt')
+
+    const lines = await query<any>(
+      `SELECT name_snapshot AS description, quantity, unit_price, line_total
+         FROM business_pos_transaction_lines
+        WHERE transaction_id = $1 ORDER BY sort_order ASC`, [txn.id])
+
+    const { renderPosReceiptPdf } = await import('../services/businessPdf')
+    const buffer = await renderPosReceiptPdf({
+      business: {
+        name: txn.biz_name, email: txn.biz_email, phone: txn.biz_phone,
+        street1: txn.biz_street1, street2: txn.biz_street2,
+        city: txn.biz_city, state: txn.biz_state, zip: txn.biz_zip,
+      },
+      customer: txn.customer_first_name || txn.customer_company_name ? {
+        firstName: txn.customer_first_name, lastName: txn.customer_last_name,
+        companyName: txn.customer_company_name,
+        email: txn.customer_email, phone: txn.customer_phone,
+        street1: txn.customer_street1, city: txn.customer_city,
+        state: txn.customer_state, zip: txn.customer_zip,
+      } : null,
+      receiptNumber: txn.receipt_number,
+      createdAt: txn.created_at,
+      status: txn.status,
+      paymentMethod: txn.payment_method,
+      amountTendered: txn.amount_tendered !== null ? Number(txn.amount_tendered) : null,
+      changeDue:      txn.change_due      !== null ? Number(txn.change_due)      : null,
+      refundReason: txn.refund_reason,
+      lines: lines.map(l => ({
+        description: l.description,
+        quantity:    Number(l.quantity),
+        unitPrice:   Number(l.unit_price),
+        lineTotal:   Number(l.line_total),
+      })),
+      subtotal:       Number(txn.subtotal),
+      discountAmount: Number(txn.discount_amount),
+      taxAmount:      Number(txn.tax_amount),
+      tipAmount:      Number(txn.tip_amount),
+      totalAmount:    Number(txn.total_amount),
+    })
+
+    const { emailPosReceipt } = await import('../services/email')
+    await emailPosReceipt(to, txn.biz_name, txn.receipt_number, Number(txn.total_amount), buffer,
+      { relatedEntityType: 'business_pos_transaction', relatedEntityId: txn.id })
+    res.json({ success: true, data: { sentTo: to } })
   } catch (e) { next(e) }
 })
 

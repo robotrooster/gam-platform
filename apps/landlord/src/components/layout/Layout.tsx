@@ -3,6 +3,7 @@ import { NotificationBell } from '../NotificationBell'
 import { ChatWidget } from '../ChatWidget'
 import { apiGet } from '../../lib/api'
 import { Outlet, NavLink, useNavigate, useLocation } from 'react-router-dom'
+import { DialogHost } from '../dialogs'
 import { useQuery } from 'react-query'
 import { useAuth } from '../../context/AuthContext'
 import { PERMISSION_CATALOG } from '@gam/shared'
@@ -145,12 +146,26 @@ function PendingSignBanner() {
     { refetchInterval: 30000 }
   )
   if (!(pending as any[]).length) return null
+  // S535 (Nic): landlord signs FIRST — the old copy hardcoded "Tenant has
+  // signed", which is backwards for every landlord-first document, and the
+  // click navigated to pending[0].token (a field the endpoint never
+  // returned → /sign/undefined). Copy now reflects the actual signer
+  // state; renewals get their own phrasing.
+  // S535 (Nic): a tenant NEVER signs first — enforced server-side at the
+  // send route AND the sign route, so there is no "tenant already signed"
+  // state to phrase. The landlord's pending signature is always the
+  // document's first.
+  const doc = (pending as any[])[0]
+  const isRenewal = (doc.title || '').startsWith('Lease Renewal')
+  const subtitle = isRenewal
+    ? `${doc.title} · Upcoming lease for your renewal — sign now and send to the tenant`
+    : `${doc.title} · You sign first — then it goes to the tenant`
   return (
-    <div onClick={() => navigate('/sign/' + (pending as any[])[0].token)}
+    <div onClick={() => navigate('/sign/' + doc.documentId)}
       style={{ background:'rgba(201,162,39,.1)', border:'1px solid rgba(201,162,39,.3)', borderRadius:10, padding:'12px 16px', marginBottom:16, cursor:'pointer', display:'flex', alignItems:'center', justifyContent:'space-between' }}>
       <div>
         <div style={{ fontWeight:700, color:'var(--gold)', fontSize:'.88rem' }}>📋 Document Awaiting Your Signature</div>
-        <div style={{ fontSize:'.75rem', color:'var(--text-2)', marginTop:2 }}>{(pending as any[])[0].title} · Tenant has signed</div>
+        <div style={{ fontSize:'.75rem', color:'var(--text-2)', marginTop:2 }}>{subtitle}</div>
       </div>
       <div style={{ fontSize:'.78rem', fontWeight:700, color:'var(--gold)', flexShrink:0 }}>Sign Now →</div>
     </div>
@@ -347,6 +362,7 @@ export function Layout() {
         <div className={"page-content" + (fullBleed ? " page-content-wide" : "")}>
           <TotpNudge />
           <Outlet />
+          <DialogHost />
         </div>
       </div>
       <ChatWidget />

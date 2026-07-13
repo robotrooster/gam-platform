@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { CalendarClock, Plus, Building2, Check, X, Ban } from 'lucide-react'
+import { humanize } from '@gam/shared'
 import { apiGet, apiPost } from '../lib/api'
 import { usePerms } from '../lib/permissions'
 
@@ -253,7 +254,7 @@ function ReservationsModal({ area, onClose }: { area: Area; onClose: () => void 
           <div key={r.id} className="card" style={{ padding: 12, display: 'flex', justifyContent: 'space-between', gap: 10, alignItems: 'center' }}>
             <div>
               <div style={{ fontWeight: 600 }}>
-                {r.title || KIND_LABEL[r.kind]} <span className={`badge ${STATUS_BADGE[r.status]}`}>{r.status}</span>
+                {r.title || KIND_LABEL[r.kind]} <span className={`badge ${STATUS_BADGE[r.status]}`}>{humanize(r.status)}</span>
                 <span className="badge badge-muted" style={{ marginLeft: 4 }}>{KIND_LABEL[r.kind]}</span>
               </div>
               <div style={{ fontSize: '.78rem', color: 'var(--text-3)', marginTop: 2 }}>

@@ -3,7 +3,8 @@ import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { Search, FileSignature, CheckCircle2, AlertTriangle, MessageSquare, Check, X, QrCode, Copy, Mail, Ban } from 'lucide-react'
 import { apiGet, apiPost, apiPatch, apiDelete } from '../lib/api'
 import { usePerms } from '../lib/permissions'
-import { UNIT_TYPES, computeStayPrice, RV_SITE_LAYOUTS, RV_SITE_LAYOUT_LABEL, isSiteLayoutMismatch, RV_AMP_SERVICES, RV_AMP_SERVICE_LABEL, isAmpServiceMismatch, BOOKING_CHANGE_REQUEST_TYPE_LABEL, type BookingChangeRequestType } from '@gam/shared'
+import { UNIT_TYPES, UNIT_TYPE_LABEL, humanize, computeStayPrice, RV_SITE_LAYOUTS, RV_SITE_LAYOUT_LABEL, isSiteLayoutMismatch, RV_AMP_SERVICES, RV_AMP_SERVICE_LABEL, isAmpServiceMismatch, BOOKING_CHANGE_REQUEST_TYPE_LABEL, type BookingChangeRequestType } from '@gam/shared'
+import { toast, appConfirm, appPrompt } from '../components/dialogs'
 
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
@@ -589,7 +590,7 @@ export function SchedulePage() {
       }),
     {
       onSuccess: () => { qc.invalidateQueries('schedule') },
-      onError: () => { alert('Cannot move reservation — date conflict on that unit.') }
+      onError: () => { toast.error('Cannot move reservation — date conflict on that unit.') }
     }
   )
 
@@ -597,7 +598,7 @@ export function SchedulePage() {
     (b: any) => apiPatch(`/units/${b.unitId}/bookings/${b.id}`, { status: 'cancelled' }),
     {
       onSuccess: () => { qc.invalidateQueries('schedule'); qc.invalidateQueries('schedule-history'); setDetailBooking(null) },
-      onError: () => alert('Could not cancel the reservation.'),
+      onError: () => toast.error('Could not cancel the reservation.'),
     }
   )
 
@@ -658,14 +659,14 @@ export function SchedulePage() {
     try {
       const resp = await apiPost<{ url: string }>(`/units/${b.unitId}/bookings/${b.id}/guest-access`, { delivery: 'qr' })
       url = resp.data.url
-    } catch { alert('Could not generate the stay link.'); return }
+    } catch { toast.error('Could not generate the stay link.'); return }
     // Clipboard API is blocked outside https/localhost (and some Safari modes);
     // fall back to a prompt the user can copy from.
     try {
       await navigator.clipboard.writeText(url)
-      alert('Stay link copied:\n\n' + url)
+      toast('Stay link copied: ' + url)
     } catch {
-      window.prompt('Copy the stay link to text or email the guest:', url)
+      await appPrompt('Copy the stay link to text or email the guest:', { title: 'Stay link', defaultValue: url })
     }
   }
 
@@ -792,9 +793,9 @@ export function SchedulePage() {
     const targetUnit = units.find(u => u.id === tUnitId)
     if (!targetUnit) return
     const sameUnit = b.unitId === tUnitId
-    if (!sameUnit && !targetUnit.isBookable) { alert('That unit isn’t set up for bookings.'); return }
+    if (!sameUnit && !targetUnit.isBookable) { toast.error('That unit isn’t set up for bookings.'); return }
     if (!sameUnit && targetUnit.leaseTypesAllowed?.length && !targetUnit.leaseTypesAllowed.includes(b.leaseType)) {
-      alert(`That unit does not allow ${b.leaseType} bookings.`); return
+      toast.error(`That unit does not allow ${(LEASE_TYPE_LABELS[b.leaseType] || humanize(b.leaseType)).toLowerCase()} bookings.`); return
     }
     const rangeDays = getDaysInRange(newCheckIn, addDays(newCheckOut, -1))
     const hasBookingConflict = bookings.some(existing =>
@@ -802,12 +803,14 @@ export function SchedulePage() {
       rangeDays.some(d => d >= dayOnly(existing.checkIn) && d < dayOnly(existing.checkOut)))
     const hasLeaseConflict = leases.some(l =>
       l.unitId === tUnitId && rangeDays.some(d => d >= dayOnly(l.startDate) && (!l.endDate || d <= dayOnly(l.endDate))))
-    if (hasBookingConflict || hasLeaseConflict) { alert('That unit is already occupied for those dates.'); return }
-    if (!sameUnit) {
-      const reasons = rvMismatchReasons(b.requiredSiteLayout, b.requiredAmpService, targetUnit)
-      if (reasons.length && !confirm(`Unit ${targetUnit.unitNumber} doesn't match this reservation:\n· ${reasons.join('\n· ')}\n\nMove it anyway?`)) return
+    if (hasBookingConflict || hasLeaseConflict) { toast.error('That unit is already occupied for those dates.'); return }
+    const doMove = () => moveBookingMut.mutate({ bookingId: b.id, unitId: tUnitId, checkIn: newCheckIn, checkOut: newCheckOut })
+    const mismatchReasons = sameUnit ? [] : rvMismatchReasons(b.requiredSiteLayout, b.requiredAmpService, targetUnit)
+    if (mismatchReasons.length) {
+      appConfirm(`Unit ${targetUnit.unitNumber} doesn't match this reservation:\n· ${mismatchReasons.join('\n· ')}\n\nMove it anyway?`, { confirmLabel: 'Move it' }).then(ok => { if (ok) doMove() })
+    } else {
+      doMove()
     }
-    moveBookingMut.mutate({ bookingId: b.id, unitId: tUnitId, checkIn: newCheckIn, checkOut: newCheckOut })
   }
 
   // Begin a drag. `grabbedDate` = the day-cell the drag started on, so a MOVE
@@ -1010,7 +1013,7 @@ export function SchedulePage() {
                     <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:8}}>
                       <div>
                         <div style={{fontWeight:600,fontSize:'.82rem'}}>{unit.unitNumber}</div>
-                        <div style={{fontSize:'.68rem',color:TYPE_COLORS[unit.unitType]||'var(--text-3)'}}>{UNIT_TYPE_LABELS[unit.unitType]||unit.unitType}</div>
+                        <div style={{fontSize:'.68rem',color:TYPE_COLORS[unit.unitType]||'var(--text-3)'}}>{UNIT_TYPE_LABELS[unit.unitType]||humanize(unit.unitType)}</div>
                         <div style={{fontSize:'.65rem',color:'var(--text-3)'}}>{unit.propertyName}</div>
                       </div>
                       <div style={{display:'flex',gap:4}}>
@@ -1221,8 +1224,8 @@ export function SchedulePage() {
               <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:4}}>
                 <span style={{fontWeight:600,fontSize:'.88rem'}}>{b.unitNumber}</span>
                 <span style={{fontSize:'.72rem',color:'var(--text-3)'}}>{b.propertyName}</span>
-                <span className="badge badge-green" style={{fontSize:'.65rem'}}>{b.leaseType}</span>
-                <span className={`badge ${STATUS_COLORS[b.status]||'badge-muted'}`} style={{fontSize:'.65rem'}}>{b.status}</span>
+                <span className="badge badge-green" style={{fontSize:'.65rem'}}>{LEASE_TYPE_LABELS[b.leaseType] || humanize(b.leaseType)}</span>
+                <span className={`badge ${STATUS_COLORS[b.status]||'badge-muted'}`} style={{fontSize:'.65rem'}}>{humanize(b.status)}</span>
               </div>
               <div style={{fontSize:'.82rem',color:'var(--text-2)'}}>
                 {b.guestName||'Guest'} · {new Date(dayOnly(b.checkIn)+'T12:00:00').toLocaleDateString()} — {new Date(dayOnly(b.checkOut)+'T12:00:00').toLocaleDateString()} ({b.nights} nights)
@@ -1277,11 +1280,11 @@ export function SchedulePage() {
               <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:10}}>
                 <div>
                   <div style={{fontWeight:700,fontSize:'.95rem'}}>{unit.unitNumber}</div>
-                  <div style={{fontSize:'.72rem',color:TYPE_COLORS[unit.unitType]||'var(--text-3)',marginTop:2}}>{UNIT_TYPE_LABELS[unit.unitType]||unit.unitType}</div>
+                  <div style={{fontSize:'.72rem',color:TYPE_COLORS[unit.unitType]||'var(--text-3)',marginTop:2}}>{UNIT_TYPE_LABELS[unit.unitType]||humanize(unit.unitType)}</div>
                   <div style={{fontSize:'.7rem',color:'var(--text-3)'}}>{unit.propertyName}</div>
                 </div>
                 <div style={{display:'flex',gap:4,flexDirection:'column',alignItems:'flex-end'}}>
-                  <span className={`badge ${unit.status==='active'?'badge-green':unit.status==='vacant'?'badge-muted':'badge-amber'}`}>{unit.status}</span>
+                  <span className={`badge ${unit.status==='active'?'badge-green':unit.status==='vacant'?'badge-muted':'badge-amber'}`}>{humanize(unit.status)}</span>
                   {unit.isBookable && <span className="badge badge-green" style={{fontSize:'.6rem'}}>Bookable</span>}
                 </div>
               </div>
@@ -1294,7 +1297,7 @@ export function SchedulePage() {
               {unit.leaseTypesAllowed?.length > 0 && (
                 <div style={{display:'flex',gap:4,flexWrap:'wrap',marginBottom:10}}>
                   {unit.leaseTypesAllowed.map((lt:string) => (
-                    <span key={lt} style={{fontSize:'.62rem',background:'var(--bg-3)',border:'1px solid var(--border-1)',borderRadius:3,padding:'1px 5px',color:'var(--text-3)'}}>{LEASE_TYPE_LABELS[lt]||lt}</span>
+                    <span key={lt} style={{fontSize:'.62rem',background:'var(--bg-3)',border:'1px solid var(--border-1)',borderRadius:3,padding:'1px 5px',color:'var(--text-3)'}}>{LEASE_TYPE_LABELS[lt]||humanize(lt)}</span>
                   ))}
                 </div>
               )}
@@ -1430,7 +1433,7 @@ export function SchedulePage() {
                 <tbody>
                   {resvList.map(b => (
                     <tr key={b.id}>
-                      <td><span className={`badge ${RESV_STATUS_BADGE[b.status] || 'badge-muted'}`}>{b.status.replace('_', ' ')}</span></td>
+                      <td><span className={`badge ${RESV_STATUS_BADGE[b.status] || 'badge-muted'}`}>{humanize(b.status)}</span></td>
                       <td>
                         <div style={{ color: 'var(--text-0)', fontWeight: 600 }}>{b.guestName || '—'}</div>
                         <div style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>{b.guestEmail || ''}</div>
@@ -1446,8 +1449,8 @@ export function SchedulePage() {
                       <td className="mono">{b.nights}</td>
                       <td className="mono" style={{ color: 'var(--text-0)' }}>{fmt(b.totalAmount)}</td>
                       <td>
-                        <span style={{ fontSize: '.72rem', color: 'var(--text-2)', textTransform: 'capitalize' }}>
-                          {b.source.replace('_', '.')}
+                        <span style={{ fontSize: '.72rem', color: 'var(--text-2)' }}>
+                          {humanize(b.source)}
                         </span>
                       </td>
                       <td>
@@ -1740,7 +1743,7 @@ export function SchedulePage() {
                     )}
                   </div></>
                 )}
-                <div style={{color:'var(--text-3)'}}>Status</div><div style={{textTransform:'capitalize'}}>{(d.status||'').replace('_',' ')}</div>
+                <div style={{color:'var(--text-3)'}}>Status</div><div>{humanize(d.status)}</div>
                 {d.notes && <><div style={{color:'var(--text-3)'}}>Notes</div><div>{d.notes}</div></>}
               </div>
               {isLease ? (
@@ -1752,7 +1755,7 @@ export function SchedulePage() {
                   {can('schedule.edit_reservation') && (
                     <button className="btn btn-sm" style={{marginLeft:'auto',color:'var(--red,#ff6b81)',borderColor:'var(--red,#ff6b81)'}}
                       disabled={cancelBookingMut.isLoading || d.status==='cancelled'}
-                      onClick={()=>{ if(confirm('Cancel this reservation?')) cancelBookingMut.mutate(d) }}>
+                      onClick={()=>{ appConfirm('Cancel this reservation?', { danger: true, confirmLabel: 'Cancel reservation' }).then(ok => { if (ok) cancelBookingMut.mutate(d) }) }}>
                       {cancelBookingMut.isLoading?'Cancelling…':'Cancel reservation'}
                     </button>
                   )}
@@ -1839,9 +1842,9 @@ export function SchedulePage() {
                     {availableUnits.map((u:any)=>{
                       const reasons = rvMismatchReasons(resvLayout, resvAmp, u)
                       const mismatch = reasons.length > 0
-                      const pickUnit = () => {
+                      const pickUnit = async () => {
                         if (createResvMut.isLoading) return
-                        if (mismatch && !confirm(`Unit ${u.unitNumber} doesn't match:\n· ${reasons.join('\n· ')}\n\nReserve it anyway?`)) return
+                        if (mismatch && !(await appConfirm(`Unit ${u.unitNumber} doesn't match:\n· ${reasons.join('\n· ')}\n\nReserve it anyway?`, { confirmLabel: 'Reserve it' }))) return
                         setResvError(''); createResvMut.mutate(u)
                       }
                       const rvTags = u.unitType==='rv_spot'
@@ -1856,7 +1859,7 @@ export function SchedulePage() {
                           onMouseLeave={e=>(e.currentTarget.style.borderColor=mismatch?'var(--amber)':'var(--border-1)')}>
                           <div>
                             <div style={{fontWeight:700,fontSize:'.9rem'}}>Unit {u.unitNumber}</div>
-                            <div style={{fontSize:'.72rem',color:TYPE_COLORS[u.unitType]||'var(--text-3)'}}>{UNIT_TYPE_LABELS[u.unitType]||u.unitType} · {u.propertyName}{rvTags ? ` · ${rvTags}` : ''}</div>
+                            <div style={{fontSize:'.72rem',color:TYPE_COLORS[u.unitType]||'var(--text-3)'}}>{UNIT_TYPE_LABELS[u.unitType]||humanize(u.unitType)} · {u.propertyName}{rvTags ? ` · ${rvTags}` : ''}</div>
                             {mismatch && <div style={{fontSize:'.68rem',color:'var(--amber)',marginTop:2}}>⚠ {reasons.join('; ')}</div>}
                           </div>
                           {/* S526 (Nic): no pricing here — nobody pays on this
@@ -1888,7 +1891,7 @@ export function SchedulePage() {
               <div>
                 <div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Unit Type</div>
                 <select className="form-select" style={{width:'100%'}} value={typeForm.unitType} onChange={e=>setTypeForm((s:any)=>({...s,unitType:e.target.value}))}>
-                  {UNIT_TYPES.map(t=><option key={t} value={t}>{UNIT_TYPE_LABELS[t]}</option>)}
+                  {UNIT_TYPES.map(t=><option key={t} value={t}>{UNIT_TYPE_LABELS[t] || UNIT_TYPE_LABEL[t]}</option>)}
                 </select>
               </div>
               {/* W-22: type-appropriate configuration — every field below is
@@ -1925,7 +1928,7 @@ export function SchedulePage() {
                 </>
               ) : (
                 <div style={{fontSize:'.76rem',color:'var(--text-3)',background:'var(--bg-2)',border:'1px solid var(--border-1)',borderRadius:8,padding:'10px 12px'}}>
-                  {UNIT_TYPE_LABELS[typeForm.unitType] || 'This unit type'} rents by lease only — no nightly or weekly configuration applies. Rent and deposit are set on the unit itself.
+                  {UNIT_TYPE_LABELS[typeForm.unitType] || humanize(typeForm.unitType) || 'This unit type'} rents by lease only — no nightly or weekly configuration applies. Rent and deposit are set on the unit itself.
                 </div>
               )}
               {/* W-24: amenities are toggle chips (per unit type), with a

@@ -1,4 +1,4 @@
-// S534: regenerate uploads/public/demo-lease.pdf as a REAL lease form.
+// S534: regenerate uploads/leases/demo-lease.pdf as a REAL lease form.
 // The demo template's base PDF was a blank 1.2KB stub, so the e-sign
 // signing view rendered an empty white page with floating inputs —
 // "open and sign doesn't render anything" (Nic). This draws a lease
@@ -70,7 +70,7 @@ async function main() {
   blank(300, 680, 120, 24, 'DATE')
 
   const bytes = await doc.save()
-  const out = path.join(process.cwd(), 'uploads', 'public', 'demo-lease.pdf')
+  const out = path.join(process.cwd(), 'uploads', 'leases', 'demo-lease.pdf')
   fs.mkdirSync(path.dirname(out), { recursive: true })
   fs.writeFileSync(out, bytes)
   console.log('Wrote', out, bytes.length, 'bytes')

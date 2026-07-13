@@ -29,7 +29,7 @@ import jwt from 'jsonwebtoken'
 import { randomUUID } from 'crypto'
 import { db } from '../db'
 import {
-  cleanupAllSchema, seedLandlord, seedProperty, seedUnit,
+  cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedLateFeeDecision,
 } from '../test/dbHelpers'
 import { unitsRouter } from './units'
 import { errorHandler } from '../middleware/errorHandler'
@@ -84,6 +84,11 @@ async function seedUnitsFixture(): Promise<UnitsFixture> {
 describe('POST /api/units — create', () => {
   it('happy path: inserts unit + returns 201 with derived fields', async () => {
     const f = await seedUnitsFixture()
+    // S537: unit creation gates on an explicit late-fee decision for the
+    // class (no unitType in the body → defaults to apartment).
+    const c = await db.connect()
+    try { await seedLateFeeDecision(c, { propertyId: f.propertyId, unitType: 'apartment' }) }
+    finally { c.release() }
     const res = await request(buildApp())
       .post('/api/units')
       .set('Authorization', `Bearer ${f.landlordToken}`)

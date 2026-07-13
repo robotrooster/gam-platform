@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useQuery } from 'react-query'
+import { humanize } from '@gam/shared'
 import { apiGet } from '../lib/api'
 import { usePerms } from '../lib/permissions'
 import { X, Printer, Download } from 'lucide-react'
@@ -466,7 +467,7 @@ function PropertyDetailModal({ propertyId, name, year, month, onClose }: {
                           <td className="mono" style={{ color: 'var(--text-3)' }}>{(p.dueDate || '').slice(0, 10)}</td>
                           <td className="mono">{p.unitNumber ? `#${p.unitNumber}` : '—'}</td>
                           <td style={{ color: 'var(--text-2)' }}>{p.tenantName || '—'}</td>
-                          <td style={{ color: 'var(--text-3)' }}>{p.type}</td>
+                          <td style={{ color: 'var(--text-3)' }}>{humanize(p.type)}</td>
                           <td><StatusPill status={p.status} /></td>
                           <td className="mono" style={{ color: 'var(--text-0)' }}>{fmt(p.amount)}</td>
                         </tr>
@@ -667,7 +668,7 @@ function OwnerStatementTab() {
                       <td className="mono" style={{ color: 'var(--text-3)' }}>{(p.dueDate || '').slice(0, 10)}</td>
                       <td style={{ color: 'var(--text-1)' }}>{p.propertyName}{p.unitNumber ? ` · #${p.unitNumber}` : ''}</td>
                       <td style={{ color: 'var(--text-2)' }}>{[p.tenantFirst, p.tenantLast].filter(Boolean).join(' ') || '—'}</td>
-                      <td style={{ color: 'var(--text-3)' }}>{p.type}</td>
+                      <td style={{ color: 'var(--text-3)' }}>{humanize(p.type)}</td>
                       <td><StatusPill status={p.status} /></td>
                       <td className="mono" style={{ color: 'var(--text-0)' }}>{fmt(p.amount)}</td>
                     </tr>
@@ -706,7 +707,7 @@ function StatusPill({ status }: { status: string }) {
     pending: 'var(--text-3)', partial: 'var(--amber)',
   }
   const c = map[status] || 'var(--text-3)'
-  return <span style={{ fontSize: '.7rem', color: c, fontWeight: 600, textTransform: 'capitalize' }}>{status}</span>
+  return <span style={{ fontSize: '.7rem', color: c, fontWeight: 600, textTransform: 'capitalize' }}>{humanize(status)}</span>
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -808,8 +809,8 @@ function MonthlyPLModal({ month, onClose }: { month: string; onClose: () => void
                             {r.tenantName || 'Tenant'}
                             <span style={{ color: 'var(--text-3)' }}>
                               {r.unitNumber ? ` · ${r.propertyName ? r.propertyName + ' ' : ''}#${r.unitNumber}` : ''}
-                              {` · ${r.type}`}
-                              {` · ${r.method}`}
+                              {` · ${humanize(r.type)}`}
+                              {` · ${humanize(r.method)}`}
                               {` · ${timeLabel(r.settledAt)}`}
                             </span>
                           </span>

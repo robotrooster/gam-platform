@@ -845,3 +845,95 @@ seeded for the walk (Grace: groundskeeping agreement, 15.5h approved +
   stopPropagations so inline editing doesn't trigger the row. Verified
   live: Grace's row opens her lease modal.
 (Nic continues the walk — further items log here.)
+
+---
+
+## S535–S536 walk (POS/business focus — items fixed same-session)
+
+**W-57 · Landlord dashboard → pending-signature banner** — ✅ FIXED: copy
+hardcoded "Tenant has signed" (backwards under landlord-first) and Sign Now
+navigated to /sign/undefined (endpoint never returned `token`). Now
+state-aware copy (renewals: "Upcoming lease for your renewal — sign now and
+send to the tenant") + navigates by documentId. "Tenant signed first" copy
+branch deleted entirely — that state is impossible now.
+
+**W-58 · E-sign signing order** — ✅ FIXED (Nic-locked): a tenant NEVER signs
+first. Four layers: creation order, send-gate (landlord strictly first, no
+shared order slot), per-signer turn check at submit, and a blanket rule
+rejecting any tenant-role signature while any landlord signature is missing.
+Subleases exempt by design (no landlord signer).
+
+**W-59 · Renewals are their own flow** — ✅ FIXED: excluded from the 24h
+auto-void. Deadline = 1 day before the current lease ends (no unit lapse);
+month-to-month = end of the month AFTER the renewal is created (30-day
+notice), e.g. created Jul 10 → signed by Aug 30 or voids. Landlord reminded
+each morning until signed; tenant reminded 2×/day (9a/4p) after. Landlord
+reminder links now go to the landlord portal (were tenant-portal links).
+
+**W-60 · Dashboard eviction alert** — ✅ FIXED: lands on /units filtered to
+the eviction unit (maps to the suspended status filter) instead of All.
+
+**W-61 · Leases "N need review" vs filtered table** — ✅ FIXED: banner is now
+click-to-filter (shows exactly the counted rows; clears ?expiring); count
+covers current leases only so it always matches the table.
+
+**W-62 · Needs-review alert on main dashboard** — ✅ ADDED: third alert with
+the eviction/delinquent pair → /leases?review=1.
+
+**W-63 · POS registers (landlord tab + POS portal, kept in sync)** —
+✅ FIXED: cart hard-capped at stock (updater-level clamp beats rapid
+clicks); quantity typeable (40 gallons ≠ 40 clicks); ALL item icons removed
+(tiles, carts, receipts, dropdowns, pickers, shelf labels — the ~130-emoji
+picker deleted).
+
+**W-64 · POS subtabs** — ✅ FIXED (option 1): Register · History · Inventory ·
+Settings; Items/Categories/Tax Rates/Discounts/Vendors/Orders/Readers moved
+under Settings (permission gating unchanged; Settings hides when empty).
+
+**W-65 · Receipts + tips + POS-portal inventory** — ✅ FIXED: print retired —
+receipts EMAIL with PDF attached (in-app modal, no browser prompt); SMS
+receipts blocked on the no-SMS rule (below). Tips = per-business Settings
+toggle (default on). POS portal "Inventory" nav now opens POS stock (was
+the general property-supplies system).
+
+**W-66 · Business money flow + pricing (Nic-locked)** — ✅ BUILT: ALL money
+flows through GAM (platform destination charges; GAM merchant of record);
+businesses batch out in the same Friday auto-payout sweep as landlords.
+Reader-driven card payments (pair Stripe Terminal in Settings; tap/swipe
+completes the sale; server verifies the captured PI to the cent — recorded
+card option hidden once a reader exists). Pricing: POS register FREE;
+invoicing $10/mo usage-based (any month ≥1 invoice sent; account-debited on
+the 1st, retried until Connect-ready). Card fees: terminal 2.9%+10¢, hosted
+invoice 3.25%+30¢ (was 0 — GAM was eating processing cost on every hosted
+payment). Per-business card_fees_paid_by toggle (business nets from gross /
+customer auto-surcharged; server-enforced; surcharge on receipts). Tap to
+Pay (no device) deferred — needs a native app shell (backend carries over).
+
+**W-67 · SMS** — ✅ RIPPED OUT platform-wide (Nic-locked): email or in-app
+only. Stub sender deleted, prefs columns dropped by migration, all UI
+toggles/badges removed, agent tool updated. Never reintroduce.
+
+**W-68 · POS customers** — ✅ BUILT: Customers tab beside History (search,
+quick-add, click-any-row-to-edit); typeable customer picker at checkout
+(replaces dropdown) with inline "＋ New customer" (name + optional
+phone/email; address now optional platform-wide); staff can create+edit
+(front counter reality) — delete is owner-only via in-app confirm modal;
+"Archive" language gone. Master copy guaranteed: no hard delete exists
+anywhere; "deleted" = hidden from business view, GAM retains forever. Daily
+cash report in History (expected drawer vs counted → over/short) = the
+control for card-rung-as-cash. CSV import (≤1000 rows) already existed in
+the business portal.
+
+**W-69 · POS header sign-out** — ✅ FIXED: bare Sign out button removed;
+account name is the clickable menu (sign out lives inside).
+
+**W-70 · No native browser dialogs (STANDING RULE, Nic-locked)** — ✅ FIXED
+(S537): ZERO native alert/confirm/prompt remain in the landlord + tenant
+portals (44 call sites swept across 18 files). Shared in-app primitives in
+components/dialogs.tsx (both apps): toast()/toast.error() bottom-center
+stack, appConfirm() promise-based confirm modal (danger variant for
+destructive actions), appPrompt() input modal (PM-invite reason, POS stock
+adjust, FlexCharge limit, stay-link copy fallback). DialogHost mounted once
+per app layout. Register surfaces were already swept in S536. Verified:
+both apps compile, SchedulePage (11 sites) loads clean, grep returns only
+comments.

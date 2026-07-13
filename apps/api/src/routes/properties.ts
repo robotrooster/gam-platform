@@ -7,6 +7,7 @@ import { normalizeAddress } from '../lib/address'
 import { formatPropertyInput, formatName, formatStreet, formatStreet2, formatCity, formatState, formatZip } from '../lib/format'
 import { db, query, queryOne, getClient } from '../db'
 import { requireAuth, requireLandlord, requirePerm } from '../middleware/auth'
+import { resolveUploadPath } from '../lib/uploadPaths'
 import { canAccessLandlordResource, canManageLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
 import {
@@ -527,26 +528,69 @@ propertiesRouter.get('/:id/late-fee-overrides', requirePerm('properties.edit'), 
 
 propertiesRouter.put('/:id/late-fee-overrides', requirePerm('properties.edit'), async (req, res, next) => {
   try {
-    const body = z.object({
-      unitType:      z.enum(UNIT_TYPES as unknown as [string, ...string[]]),
-      graceDays:     z.number().int().min(0).max(60),
-      initialAmount: z.number().min(0),
-      initialType:   z.enum(['flat', 'percent_of_rent']),
-    }).parse(req.body)
+    // S537: a row is an explicit DECISION — either fee terms or
+    // noLateFee=true ("this class has no late fee"). Both shapes satisfy
+    // the onboarding gate; absence of a row means UNDECIDED and gates.
+    const body = z.discriminatedUnion('noLateFee', [
+      z.object({
+        noLateFee:     z.literal(true),
+        unitType:      z.enum(UNIT_TYPES as unknown as [string, ...string[]]),
+      }),
+      z.object({
+        noLateFee:     z.literal(false).default(false),
+        unitType:      z.enum(UNIT_TYPES as unknown as [string, ...string[]]),
+        graceDays:     z.number().int().min(0).max(60),
+        initialAmount: z.number().min(0),
+        initialType:   z.enum(['flat', 'percent_of_rent']),
+        // S537: accrual + cap are part of the class decision (Nic's own
+        // policy is $25 initial + $5/day). All-or-nothing per group.
+        accrualAmount: z.number().min(0).nullish(),
+        accrualType:   z.enum(['flat', 'percent_of_rent']).nullish(),
+        accrualPeriod: z.enum(['daily', 'weekly', 'monthly']).nullish(),
+        capAmount:     z.number().min(0).nullish(),
+        capType:       z.enum(['flat', 'percent_of_rent']).nullish(),
+      }),
+    ]).parse({ noLateFee: false, ...req.body })
+    // zod discriminatedUnion can't carry refinements — enforce the
+    // all-or-nothing groups imperatively.
+    if (!body.noLateFee) {
+      const accSet = [body.accrualAmount != null, body.accrualType != null, body.accrualPeriod != null]
+      if (new Set(accSet).size > 1) {
+        throw new AppError(400, 'accrualAmount, accrualType and accrualPeriod must be set together')
+      }
+      if ((body.capAmount != null) !== (body.capType != null)) {
+        throw new AppError(400, 'capAmount and capType must be set together')
+      }
+    }
     const prop = await queryOne<any>('SELECT id, landlord_id FROM properties WHERE id=$1', [req.params.id])
     if (!prop) throw new AppError(404, 'Property not found')
     if (!canManageLandlordResource(req.user, prop.landlord_id, ['property_manager'])) throw new AppError(403, 'Forbidden')
+    const vals = body.noLateFee
+      ? { grace: null, amount: null, type: null, accA: null, accT: null, accP: null, capA: null, capT: null }
+      : { grace: body.graceDays, amount: body.initialAmount.toFixed(2), type: body.initialType,
+          accA: body.accrualAmount != null ? body.accrualAmount.toFixed(2) : null,
+          accT: body.accrualType ?? null, accP: body.accrualPeriod ?? null,
+          capA: body.capAmount != null ? body.capAmount.toFixed(2) : null,
+          capT: body.capType ?? null }
     const row = await queryOne<any>(`
       INSERT INTO property_unit_type_late_fees
-        (property_id, unit_type, late_fee_grace_days, late_fee_initial_amount, late_fee_initial_type)
-      VALUES ($1, $2, $3, $4, $5)
+        (property_id, unit_type, no_late_fee, late_fee_grace_days, late_fee_initial_amount, late_fee_initial_type,
+         late_fee_accrual_amount, late_fee_accrual_type, late_fee_accrual_period, late_fee_cap_amount, late_fee_cap_type)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
       ON CONFLICT (property_id, unit_type) DO UPDATE SET
+        no_late_fee = EXCLUDED.no_late_fee,
         late_fee_grace_days = EXCLUDED.late_fee_grace_days,
         late_fee_initial_amount = EXCLUDED.late_fee_initial_amount,
         late_fee_initial_type = EXCLUDED.late_fee_initial_type,
+        late_fee_accrual_amount = EXCLUDED.late_fee_accrual_amount,
+        late_fee_accrual_type   = EXCLUDED.late_fee_accrual_type,
+        late_fee_accrual_period = EXCLUDED.late_fee_accrual_period,
+        late_fee_cap_amount     = EXCLUDED.late_fee_cap_amount,
+        late_fee_cap_type       = EXCLUDED.late_fee_cap_type,
         updated_at = NOW()
       RETURNING *`,
-      [req.params.id, body.unitType, body.graceDays, body.initialAmount.toFixed(2), body.initialType])
+      [req.params.id, body.unitType, body.noLateFee, vals.grace, vals.amount, vals.type,
+       vals.accA, vals.accT, vals.accP, vals.capA, vals.capT])
     res.json({ success: true, data: row })
   } catch (e) { next(e) }
 })
@@ -556,6 +600,17 @@ propertiesRouter.delete('/:id/late-fee-overrides/:unitType', requirePerm('proper
     const prop = await queryOne<any>('SELECT id, landlord_id FROM properties WHERE id=$1', [req.params.id])
     if (!prop) throw new AppError(404, 'Property not found')
     if (!canManageLandlordResource(req.user, prop.landlord_id, ['property_manager'])) throw new AppError(403, 'Forbidden')
+    // S537: deleting a decision returns the class to UNDECIDED, which the
+    // gate forbids while units of the class exist — change the decision
+    // instead. Delete only cleans up classes with no units.
+    const inUse = await queryOne<any>(
+      `SELECT 1 FROM units WHERE property_id=$1 AND unit_type=$2 LIMIT 1`,
+      [req.params.id, req.params.unitType])
+    if (inUse) {
+      throw new AppError(409,
+        `Units of this type exist at the property — a late-fee decision must stay in place. ` +
+        `Edit the terms or switch it to "no late fee" instead of removing it.`)
+    }
     await query(`DELETE FROM property_unit_type_late_fees WHERE property_id=$1 AND unit_type=$2`,
       [req.params.id, req.params.unitType])
     res.json({ success: true })
@@ -647,6 +702,11 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
     // for long stays from 30 days to 7 (services/bookingLeaseDraft.ts).
     const weeklyLeaseMode =
       typeof raw.weeklyLeaseMode === 'boolean' ? raw.weeklyLeaseMode : undefined
+    // S537 (Nic): partial payments reset the eviction clock — a landlord
+    // preparing to act can refuse anything under the full outstanding
+    // balance. Tenant portal's Pay Now enforces it server-side.
+    const acceptPartialPayments =
+      typeof raw.acceptPartialPayments === 'boolean' ? raw.acceptPartialPayments : undefined
 
     let updated = await queryOne<any>(`
       UPDATE properties SET
@@ -665,6 +725,7 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
         subleasing_allowed      = COALESCE($13, subleasing_allowed),
         flexcharge_enabled      = COALESCE($14, flexcharge_enabled),
         weekly_lease_mode       = COALESCE($15, weekly_lease_mode),
+        accept_partial_payments = COALESCE($17, accept_partial_payments),
         updated_at  = NOW()
       WHERE id=$16 RETURNING *`,
       [name||null, street1||null, street2||null, city||null, state||null,
@@ -677,7 +738,8 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
        subleasingAllowed === undefined ? null : subleasingAllowed,
        flexchargeEnabled === undefined ? null : flexchargeEnabled,
        weeklyLeaseMode === undefined ? null : weeklyLeaseMode,
-       req.params.id]
+       req.params.id,
+       acceptPartialPayments === undefined ? null : acceptPartialPayments]
     )
 
     // S226: separate dynamic UPDATE for accrual + cap. The COALESCE
@@ -1123,13 +1185,11 @@ const uploadDir = path.join(process.cwd(), 'uploads', 'unit-photos')
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true })
 
 // S399 fix: force safe extension from MIME instead of taking
-// path.extname(originalname). Pre-fix, an attacker could upload bytes
-// with MIME=image/jpeg + originalname=evil.html — saved as .html and
-// served via express.static('/uploads') as text/html → XSS. Fourth
-// instance of this pattern (S380 avatar + S394 esign upload + S395
-// pending-tenants + this). Aligned with S398 Nic decision posture:
-// always pin the served content-type to image, here via the on-disk
-// extension since /uploads is a static-served path.
+// path.extname(originalname) — XSS extension-mismatch class (S380
+// avatar + S394 esign upload + S395 pending-tenants + this). S535:
+// photos are no longer static-served; GET /unit-photo-files/:filename
+// below pins the Content-Type from this whitelist, so the on-disk
+// extension can never drive text/html.
 const MIME_TO_EXT: Record<string, string> = {
   'image/jpeg': '.jpg',
   'image/png':  '.png',
@@ -1148,9 +1208,22 @@ const upload = multer({ storage, limits: { fileSize: 10 * 1024 * 1024 }, fileFil
   else cb(new Error('Images only'))
 }})
 
-// GET /api/properties/listings — public, no auth needed
-publicPropertiesRouter.get('/listings', async (req, res, next) => {
+// GET /api/public/properties/listings — S535 (Nic-locked): listings are
+// NOT public. Viewing requires sign-in, and tenant-role callers must
+// have an approved background check ("accepted to the platform").
+// Landlord/staff/admin roles pass on auth alone. The /api/public prefix
+// is kept so the listings app URL doesn't move; rename when that
+// surface gets its real sign-in flow.
+publicPropertiesRouter.get('/listings', requireAuth, async (req: any, res, next) => {
   try {
+    const u = req.user!
+    if (u.role === 'tenant') {
+      const t = await queryOne<{ background_check_status: string }>(
+        'SELECT background_check_status FROM tenants WHERE id=$1', [u.profileId])
+      if (t?.background_check_status !== 'approved') {
+        throw new AppError(403, 'Listings require an approved background check')
+      }
+    }
     const { rows } = await db.query(`
       SELECT
         u.id, u.unit_number, u.bedrooms, u.bathrooms, u.sqft,
@@ -1180,8 +1253,11 @@ publicPropertiesRouter.get('/listings', async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
-// GET /api/properties/listings/all — includes units with < 5 photos (for landlord preview)
-publicPropertiesRouter.get('/listings/preview', async (req, res, next) => {
+// GET /api/properties/listings/preview — includes units with < 5 photos
+// (landlord preview). S535: moved off the public router — it always read
+// req.user!.profileId, so an anonymous hit was a latent 500; it belongs
+// behind landlord auth.
+propertiesRouter.get('/listings/preview', requireLandlord, async (req, res, next) => {
   try {
     const { rows } = await db.query(`
       SELECT
@@ -1202,6 +1278,26 @@ publicPropertiesRouter.get('/listings/preview', async (req, res, next) => {
       ORDER BY p.name, u.unit_number
     `, [req.user!.profileId])
     res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
+// GET /api/properties/unit-photo-files/:filename — serve a unit photo.
+// S535 (Nic-locked): NOTHING is revealed without login — the static
+// /uploads/unit-photos mount is gone. Any authenticated platform user
+// may fetch photos (landlord staff today; approved applicants when the
+// listings surface launches). Content-Type pinned from the extension
+// whitelist per the S398/S409 posture.
+const EXT_TO_MIME: Record<string, string> = {
+  '.jpg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp', '.gif': 'image/gif',
+}
+propertiesRouter.get('/unit-photo-files/:filename', async (req, res, next) => {
+  try {
+    const fp = resolveUploadPath(uploadDir, req.params.filename)
+    if (!fp) throw new AppError(400, 'Invalid filename')
+    if (!fs.existsSync(fp)) throw new AppError(404, 'Not found')
+    res.setHeader('Content-Type', EXT_TO_MIME[path.extname(fp).toLowerCase()] ?? 'image/jpeg')
+    res.setHeader('X-Content-Type-Options', 'nosniff')
+    res.sendFile(fp)
   } catch (e) { next(e) }
 })
 
@@ -1243,7 +1339,7 @@ propertiesRouter.post('/units/:id/photos', requirePerm('units.edit_listing'), up
     let sortOrder = +existing[0].count
     const inserted = []
     for (const file of files) {
-      const url = `/uploads/unit-photos/${file.filename}`
+      const url = `/api/properties/unit-photo-files/${file.filename}`
       const { rows: [photo] } = await db.query(
         'INSERT INTO unit_photos (unit_id, landlord_id, url, sort_order) VALUES ($1,$2,$3,$4) RETURNING *',
         [req.params.id, unit.landlord_id, url, sortOrder++]
@@ -1265,8 +1361,11 @@ propertiesRouter.delete('/units/:id/photos/:photoId', requirePerm('units.edit_li
     if (!canManageLandlordResource(req.user, photo.landlord_id)) {
       throw new AppError(403, 'Forbidden')
     }
-    const filePath = path.join(process.cwd(), photo.url)
-    if (fs.existsSync(filePath)) fs.unlinkSync(filePath)
+    // photo.url is '/api/properties/unit-photo-files/<f>' (S535) or the
+    // legacy '/uploads/unit-photos/<f>' — resolveUploadPath basenames
+    // either form into the photos dir (and blocks traversal).
+    const filePath = resolveUploadPath(uploadDir, photo.url)
+    if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath)
     await db.query('DELETE FROM unit_photos WHERE id=$1', [photo.id])
     res.json({ success: true })
   } catch (e) { next(e) }

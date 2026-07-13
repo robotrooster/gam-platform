@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useParams, useNavigate } from 'react-router-dom'
 import { ArrowLeft, Plus, Trash2, AlertTriangle, CheckCircle2, DollarSign } from 'lucide-react'
+import { humanize } from '@gam/shared'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
 
 // W-31 (Nic decision): free-form deductions are DOCUMENTED DAMAGES only —
@@ -146,7 +147,7 @@ export function DepositReturnPage() {
         <div className="card" style={{ padding: 16, marginBottom: 16, background: 'rgba(34,197,94,.06)', borderColor: 'rgba(34,197,94,.25)' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6 }}>
             <CheckCircle2 size={18} style={{ color: 'var(--green)' }} />
-            <strong style={{ color: 'var(--green)' }}>Finalized — status: {data.status?.replace('_', ' ')}</strong>
+            <strong style={{ color: 'var(--green)' }}>Finalized — status: {humanize(data.status)}</strong>
           </div>
           <div style={{ fontSize: '.85rem', color: 'var(--text-2)' }}>
             {data.status === 'sent_refund' && `Refund of ${fmt(refund)} created. Will pay out via the next disbursement.`}

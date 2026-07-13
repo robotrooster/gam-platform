@@ -115,7 +115,7 @@ async function seedTFixture(): Promise<TFixture> {
     // Force property name + unit number to known values so CSV rows can match
     const propertyName = `CSV-Prop-${randomUUID().slice(0, 6)}`
     await client.query(`UPDATE properties SET name=$1 WHERE id=$2`, [propertyName, propertyId])
-    const unitId = await seedUnit(client, { propertyId, landlordId })
+    const unitId = await seedUnit(client, { propertyId, landlordId, withLateFeeDecision: true })
     const unitNumber = '101'
     await client.query(`UPDATE units SET unit_number=$1 WHERE id=$2`, [unitNumber, unitId])
     await client.query('COMMIT')

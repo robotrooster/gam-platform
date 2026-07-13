@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useParams, useNavigate } from 'react-router-dom'
 import { DoorOpen, ArrowLeft, CheckCircle2, XCircle, Clock, AlertTriangle } from 'lucide-react'
+import { humanize } from '@gam/shared'
 import { apiGet, apiPost } from '../lib/api'
 
 type Detail = {
@@ -114,7 +115,7 @@ export function EntryRequestDetailPage() {
 
       <div className="card" style={{ padding: 16, marginBottom: 16 }}>
         <Row label="Reason"><strong style={{ color: 'var(--text-0)' }}>{r.reason}</strong></Row>
-        <Row label="Category">{r.reasonCategory}</Row>
+        <Row label="Category">{humanize(r.reasonCategory)}</Row>
         <Row label="Tenant"><span style={{ fontFamily: 'var(--font-mono)' }}>{r.tenantId}</span></Row>
         <Row label="Unit"><span style={{ fontFamily: 'var(--font-mono)' }}>{r.unitId}</span></Row>
         <Row label="Notice given">{fmtDateTime(r.noticeGivenAt)}</Row>

@@ -3,7 +3,7 @@ import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useSearchParams, useNavigate, Link } from 'react-router-dom'
 import { apiGet, apiPost } from '../lib/api'
 import { UserPlus, AlertTriangle, DollarSign, FileText, Eye, X } from 'lucide-react'
-import { LEASE_TYPE_LABEL, LeaseStatus } from '@gam/shared'
+import { LEASE_TYPE_LABEL, LeaseStatus, humanize } from '@gam/shared'
 import { LeaseFormModal } from './LeaseFormModal'
 import { LeaseOverviewModal } from './LeaseOverviewModal'
 import { RenewalDecisionModal } from './RenewalDecisionModal'
@@ -96,27 +96,35 @@ export function LeasesPage() {
     }
   }
 
-  const needsReviewCount = (leases as any[]).filter(l => l.needsReview).length
-
   // S534 (Nic): this view is CURRENT info only — one glance at what's in
   // force (active + pending). Expired/terminated history stays reachable
   // behind the toggle, not mixed into the default list.
   const [showHistory, setShowHistory] = useState(false)
   const currentLeases = (leases as any[]).filter(l => l.status === 'active' || l.status === 'pending')
+  // S536: count over CURRENT leases (matches the dashboard alert and the
+  // default table) — a needs_review flag on an expired lease shouldn't
+  // inflate a banner above rows that aren't shown.
+  const needsReviewCount = currentLeases.filter(l => l.needsReview).length
   const historyCount = (leases as any[]).length - currentLeases.length
   const baseLeases = showHistory ? (leases as any[]) : currentLeases
 
   // S527 W-5: ?expiring=<days> (dashboard KPI deep-link) narrows the table to
   // active leases ending within the window.
+  // S536 (Nic): ?review=1 (the needs-review banner) narrows to exactly the
+  // rows the banner is counting — a count that disagrees with the filtered
+  // list reads as a bug. review wins over expiring.
   const expiringDays = parseInt(searchParams.get('expiring') || '') || null
-  const visibleLeases = expiringDays
-    ? baseLeases.filter(l => {
-        if (l.status !== 'active' || !l.endDate) return false
-        const end = new Date(String(l.endDate).slice(0, 10) + 'T12:00:00')
-        const days = Math.ceil((end.getTime() - Date.now()) / 86400000)
-        return days >= 0 && days <= expiringDays
-      })
-    : baseLeases
+  const reviewOnly = searchParams.get('review') === '1'
+  const visibleLeases = reviewOnly
+    ? baseLeases.filter(l => l.needsReview)
+    : expiringDays
+      ? baseLeases.filter(l => {
+          if (l.status !== 'active' || !l.endDate) return false
+          const end = new Date(String(l.endDate).slice(0, 10) + 'T12:00:00')
+          const days = Math.ceil((end.getTime() - Date.now()) / 86400000)
+          return days >= 0 && days <= expiringDays
+        })
+      : baseLeases
 
   return (
     <div>
@@ -138,7 +146,12 @@ export function LeasesPage() {
       </div>
 
       {needsReviewCount > 0 && (
-        <div style={{
+        <div
+          onClick={() => {
+            if (reviewOnly) { searchParams.delete('review') } else { searchParams.set('review', '1'); searchParams.delete('expiring') }
+            setSearchParams(searchParams)
+          }}
+          style={{
           background: 'rgba(245,158,11,.08)',
           border: '1px solid var(--amber)',
           borderRadius: 10,
@@ -149,12 +162,16 @@ export function LeasesPage() {
           alignItems: 'center',
           fontSize: '.82rem',
           color: 'var(--text-1)',
+          cursor: 'pointer',
         }}>
           <AlertTriangle size={16} style={{ color: 'var(--amber)', flexShrink: 0 }} />
           <div>
             <strong style={{ color: 'var(--amber)' }}>{needsReviewCount} lease{needsReviewCount === 1 ? '' : 's'} need review.</strong>
             {' '}These were imported with default values. Click a row to review and confirm.
           </div>
+          <span style={{ marginLeft: 'auto', fontSize: '.78rem', fontWeight: 600, color: 'var(--amber)', flexShrink: 0 }}>
+            {reviewOnly ? 'Show all leases' : 'View →'}
+          </span>
         </div>
       )}
 
@@ -260,7 +277,7 @@ export function LeasesPage() {
                     <td className="mono" style={{ color: 'var(--text-0)' }}>{fmt(l.rentAmount)}</td>
                     <td>
                       <span className={'badge ' + (STATUS_MAP[l.status as LeaseStatus] || 'badge-muted')}>
-                        {l.status?.replace('_', ' ') || '—'}
+                        {humanize(l.status) || '—'}
                       </span>
                     </td>
                     <td onClick={e => e.stopPropagation()}>
@@ -430,7 +447,7 @@ function BillFeeModal({ lease, onClose }: { lease: any; onClose: () => void }) {
               <option value="">— pick a fee —</option>
               {billableFees.map((f: any) => (
                 <option key={f.id} value={f.id}>
-                  {String(f.feeType).replace(/_/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase())} — ${Number(f.amount).toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                  {humanize(f.feeType)} — ${Number(f.amount).toLocaleString('en-US', { minimumFractionDigits: 2 })}
                 </option>
               ))}
             </select>

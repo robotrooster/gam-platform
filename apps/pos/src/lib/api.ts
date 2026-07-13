@@ -38,3 +38,12 @@ export const apiDel  = (url: string) => api.delete(url).then(r => r.data)
 
 export const apiPut = <T = any>(url: string, body?: any) => api.put<{ success: boolean; data: T }>(url, body).then(r => r.data.data)
 export const apiDelete = <T = any>(url: string) => api.delete<{ success: boolean; data: T }>(url).then(r => r.data)
+
+// S536 (ported from apps/business/src/lib/api.ts): PDF endpoints return
+// binary; fetch with auth and open in a new tab via blob URL.
+export async function openPdfInNewTab(url: string): Promise<void> {
+  const r = await api.get(url, { responseType: 'blob' })
+  const blobUrl = URL.createObjectURL(r.data as Blob)
+  window.open(blobUrl, '_blank', 'noopener,noreferrer')
+  setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000)
+}

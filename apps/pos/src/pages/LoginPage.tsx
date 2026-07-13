@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
 
 export function LoginPage() {
@@ -50,6 +50,9 @@ export function LoginPage() {
             onClick={submit} disabled={loading||!email||!password}>
             {loading ? 'Signing in…' : 'Sign In'}
           </button>
+          <div style={{textAlign:'center',marginTop:16,fontSize:'.8rem',color:'var(--text-3)'}}>
+            New here? <Link to="/signup" style={{color:'var(--gold)'}}>Create an account</Link>
+          </div>
         </div>
 
         <div style={{textAlign:'center',marginTop:20,fontSize:'.75rem',color:'var(--text-3)'}}>

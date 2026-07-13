@@ -96,8 +96,10 @@ describe('send() behavior (exercised via emailInvitation)', () => {
   it('sender selection: emailInvitation uses "support" sender (process.env.EMAIL_FROM_SUPPORT or fallback)', async () => {
     await email.emailInvitation('sup@example.com', 'X', 'property_manager', 'u')
     const call = (resendSendMock.mock.calls[0] as any[])[0]
-    // Default behavior: EMAIL_FROM_SUPPORT or fallback contains "GAM Platform"
-    expect(call.from).toMatch(/GAM Platform|onboarding@resend\.dev/)
+    // The support sender: EMAIL_FROM_SUPPORT when configured (S536: the
+    // real .env now sets "GAM Support <support@goldassetmanagement.com>"),
+    // else the noreply/onboarding fallback chain.
+    expect(call.from).toMatch(/GAM Support|GAM Platform|onboarding@resend\.dev/)
   })
 
   it('subject + html shape verified via emailInvitation', async () => {

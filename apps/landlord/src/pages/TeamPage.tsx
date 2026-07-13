@@ -7,6 +7,7 @@ import {
   LandlordAssignableRole,
   BOOKKEEPER_ACCESS_LEVELS,
   PERMISSION_PRESETS,
+  humanize,
 } from '@gam/shared'
 
 // S526: the old expandable-row permission grid (SUB_PERMISSIONS_BY_ROLE
@@ -124,7 +125,7 @@ export function TeamPage() {
                             onChange={e => updateBookkeeperLevel.mutate({ userId: m.userId, accessLevel: e.target.value })}
                             disabled={updateBookkeeperLevel.isLoading}
                             style={{ background: 'var(--bg-2)', border: '1px solid var(--border-1)', borderRadius: 6, color: 'var(--text-0)', padding: '4px 8px', fontSize: '.78rem' }}>
-                            {BOOKKEEPER_ACCESS_LEVELS.map(lv => <option key={lv} value={lv}>{lv}</option>)}
+                            {BOOKKEEPER_ACCESS_LEVELS.map(lv => <option key={lv} value={lv}>{humanize(lv)}</option>)}
                           </select>
                         ) : `${enabledCount} permission${enabledCount === 1 ? '' : 's'} granted`}
                       </td>

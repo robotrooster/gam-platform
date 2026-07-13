@@ -1,8 +1,17 @@
 #!/bin/bash
 set -e
 
+# S535: when com.gam.marketing (launchd) is loaded, :3004 is the LIVE
+# public marketing site (apex goldassetmanagement.com via the Cloudflare
+# tunnel) — killing it takes the site down and KeepAlive fights back.
+# Skip 3004 + dev-marketing in that case.
+MARKETING_LIVE=0
+launchctl list 2>/dev/null | grep -q "com.gam.marketing" && MARKETING_LIVE=1
+[ "$MARKETING_LIVE" = "1" ] && echo "com.gam.marketing is live on :3004 — leaving it alone (no dev marketing)."
+
 echo "Killing existing processes on all GAM ports..."
 for port in 3001 3002 3003 3004 3005 3006 3007 3008 3009 3011 3012 3013 3014 4000 4001; do
+  [ "$port" = "3004" ] && [ "$MARKETING_LIVE" = "1" ] && continue
   pid=$(lsof -ti tcp:$port 2>/dev/null) || true
   [ -n "$pid" ] && kill -9 $pid 2>/dev/null && echo "  Killed :$port (pid $pid)" || true
 done
@@ -46,7 +55,7 @@ sleep 3
 nohup npm run dev --workspace=apps/landlord   > /tmp/gam-landlord.log   2>&1 & echo "  Landlord  → :3001"
 nohup npm run dev --workspace=apps/tenant     > /tmp/gam-tenant.log     2>&1 & echo "  Tenant    → :3002"
 nohup npm run dev --workspace=apps/admin      > /tmp/gam-admin.log      2>&1 & echo "  Admin     → :3003"
-nohup npm run dev --workspace=apps/marketing  > /tmp/gam-marketing.log  2>&1 & echo "  Marketing → :3004"
+[ "$MARKETING_LIVE" = "0" ] && nohup npm run dev --workspace=apps/marketing  > /tmp/gam-marketing.log  2>&1 & echo "  Marketing → :3004"
 nohup npm run dev --workspace=apps/pos        > /tmp/gam-pos.log        2>&1 & echo "  POS       → :3005"
 nohup npm run dev --workspace=apps/books      > /tmp/gam-books.log      2>&1 & echo "  Books     → :3006"
 nohup npm run dev --workspace=apps/property-intel > /tmp/gam-property-intel.log 2>&1 & echo "  PropIntel → :3007"

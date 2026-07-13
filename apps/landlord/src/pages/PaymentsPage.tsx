@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useQuery } from 'react-query'
+import { humanize } from '@gam/shared'
 import { apiGet } from '../lib/api'
 import { usePerms } from '../lib/permissions'
 import { X, AlertTriangle, CheckCircle, Clock, XCircle } from 'lucide-react'
@@ -93,7 +94,7 @@ function PaymentDetailModal({ payment: p, onClose }: { payment: any; onClose: ()
               {p.status}{isPartial(p) && <span style={{ color: 'var(--amber)', fontWeight: 700 }}> · partial</span>}
             </div>
             <div style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>
-              {isPartial(p) ? `${fmt(netToBank(p))} net to bank` : fmt(p.amount)} · {p.type?.replace('_', ' ')}
+              {isPartial(p) ? `${fmt(netToBank(p))} net to bank` : fmt(p.amount)} · {humanize(p.type)}
             </div>
           </div>
           {p.zeroToleranceFlag && (
@@ -121,7 +122,7 @@ function PaymentDetailModal({ payment: p, onClose }: { payment: any; onClose: ()
           ) : (
             row('Amount', fmt(p.amount), { mono: true, color: 'var(--text-0)' })
           )}
-          {row('Type', p.type?.replace('_', ' '))}
+          {row('Type', humanize(p.type))}
           {row('Entry Description', p.entryDescription, { mono: true })}
           {row('Due Date', p.dueDate ? new Date(p.dueDate).toLocaleDateString() : null, { mono: true })}
           {row('Processed', p.processedAt ? new Date(p.processedAt).toLocaleString() : null, { mono: true })}
@@ -244,7 +245,7 @@ export function PaymentsPage() {
                   <td className="mono">{p.dueDate ? new Date(p.dueDate).toLocaleDateString() : '—'}</td>
                   <td className="mono">{p.unitNumber || '—'}</td>
                   <td style={{ fontSize: '.8rem' }}>{(p.tenantFirst || p.tenantLast) ? `${p.tenantFirst ?? ''} ${p.tenantLast ?? ''}`.trim() : '—'}</td>
-                  <td><span className="badge badge-muted">{p.type}</span></td>
+                  <td><span className="badge badge-muted">{humanize(p.type)}</span></td>
                   <td className="mono" style={{ color: 'var(--text-0)' }}>
                     {/* S262: when supersedence diverted part of the gross,
                         show the NET (what landed in the landlord's bank)
@@ -260,7 +261,7 @@ export function PaymentsPage() {
                     ) : fmt(p.amount)}
                   </td>
                   <td>
-                    <span className={'badge ' + (STATUS_MAP[p.status] || 'badge-muted')}>{p.status}</span>
+                    <span className={'badge ' + (STATUS_MAP[p.status] || 'badge-muted')}>{humanize(p.status)}</span>
                     {partial && (
                       <span className="badge badge-amber" style={{ marginLeft: 6 }}>partial</span>
                     )}

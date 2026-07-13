@@ -11,8 +11,8 @@
  *     generation deterministic; tested would be ceremony)
  *   - Unit photos upload (multer disk write; needs file-system
  *     fixtures)
- *   - /listings public (no-auth, multi-table JOIN; covered by
- *     /:id/eligible-managers + GET /:id for scope semantics)
+ *   - /listings (S535: requireAuth + tenant bg-check gate; multi-table
+ *     JOIN covered by /:id/eligible-managers + GET /:id for scope)
  *   - /apply public — straightforward INSERT
  *   - /applications listing — mechanical SELECT
  *   - /:id/eligible-managers — joins + filtering; OK to skip

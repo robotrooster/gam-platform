@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
+import { appConfirm } from '../components/dialogs'
 import { Modal } from '../components/Modal'
 import {
   BUSINESS_STAFF_ROLES, BUSINESS_STAFF_ROLE_LABEL,
@@ -249,7 +250,7 @@ function PermissionsModal({
   }
 
   const resetToDefault = async () => {
-    if (!window.confirm(`Reset ${staff.firstName}'s permissions to the ${BUSINESS_STAFF_ROLE_LABEL[staff.staffRole]} role defaults?`)) return
+    if (!(await appConfirm(`Reset ${staff.firstName}'s permissions to the ${BUSINESS_STAFF_ROLE_LABEL[staff.staffRole]} role defaults?`, { danger: true, confirmLabel: 'Reset' }))) return
     setErr(null); setBusy(true)
     try {
       await apiPatch(`/business-users/${staff.id}`, { resetToRoleDefault: true })

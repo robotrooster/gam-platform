@@ -1,7 +1,9 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
+import { humanize } from '@gam/shared'
 import { useAuth } from '../context/AuthContext'
 import { apiGet, apiPost, apiDelete } from '../lib/api'
+import { appConfirm } from '../components/dialogs'
 import { Plus, X } from 'lucide-react'
 
 interface Staff {
@@ -126,8 +128,8 @@ export function StaffPage() {
                 <tr key={s.id} style={{ borderTop: '1px solid var(--border-0)' }}>
                   <Td><strong>{s.firstName} {s.lastName}</strong></Td>
                   <Td>{s.email}</Td>
-                  <Td>{s.role}</Td>
-                  <Td>{s.status}</Td>
+                  <Td>{humanize(s.role)}</Td>
+                  <Td>{humanize(s.status)}</Td>
                   <Td>{s.joinedAt ? new Date(s.joinedAt).toLocaleDateString() : '—'}</Td>
                 </tr>
               ))}
@@ -153,13 +155,13 @@ export function StaffPage() {
               {(invitesQ.data ?? []).filter(i => i.status === 'pending').map(i => (
                 <tr key={i.id} style={{ borderTop: '1px solid var(--border-0)' }}>
                   <Td>{i.email}</Td>
-                  <Td>{i.role}</Td>
+                  <Td>{humanize(i.role)}</Td>
                   <Td>{new Date(i.createdAt).toLocaleDateString()}</Td>
                   <Td>{new Date(i.expiresAt).toLocaleString()}</Td>
                   <Td>
                     <button className="btn btn-ghost btn-sm"
                             disabled={revokeMut.isLoading}
-                            onClick={() => { if (window.confirm('Revoke this invitation?')) revokeMut.mutate(i.id) }}>
+                            onClick={() => { appConfirm('Revoke this invitation?', { danger: true, confirmLabel: 'Revoke' }).then(ok => { if (ok) revokeMut.mutate(i.id) }) }}>
                       Revoke
                     </button>
                   </Td>

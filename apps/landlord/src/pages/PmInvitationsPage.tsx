@@ -18,6 +18,7 @@ import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost } from '../lib/api'
 import { usePerms } from '../lib/permissions'
+import { appPrompt } from '../components/dialogs'
 
 type InviteStatus = 'pending' | 'accepted' | 'rejected' | 'expired' | 'revoked'
 type InviteDirection = 'owner_to_pm' | 'pm_to_owner'
@@ -148,8 +149,9 @@ export function PmInvitationsPage() {
                 <button
                   className="btn btn-danger btn-sm"
                   disabled={rejectMut.isLoading}
-                  onClick={() => {
-                    const reason = prompt('Reject this invitation? (Optional reason)') ?? ''
+                  onClick={async () => {
+                    const reason = await appPrompt('Optional reason — leave blank to reject without one.', { title: 'Reject this invitation?' })
+                    if (reason === null) return
                     rejectMut.mutate({ id: inv.id, reason })
                   }}>
                   Reject

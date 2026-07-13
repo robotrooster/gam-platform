@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
 import { Modal } from '../components/Modal'
-import { humanizeServiceType as humanizeService } from '@gam/shared'
+import { humanize, humanizeServiceType as humanizeService } from '@gam/shared'
 import {
   Plus, Calendar, ChevronRight, ArrowLeft, Check, X, Clock,
   List, CalendarDays, ChevronLeft, Copy, RefreshCw,
@@ -182,7 +182,7 @@ export function AppointmentsPage() {
                 cursor: 'pointer',
                 textTransform: 'capitalize' as const,
               }}>
-              {s ? s.replace('_', ' ') : 'all'}
+              {s ? humanize(s) : 'All'}
             </button>
           ))}
         </div>
@@ -194,7 +194,7 @@ export function AppointmentsPage() {
         <div style={{ color: 'var(--text-2)' }}>Loading…</div>
       ) : rows.length === 0 ? (
         <div style={emptyStyle}>
-          {statusFilter ? `No ${statusFilter.replace('_', ' ')} appointments.` : 'No appointments yet.'}
+          {statusFilter ? `No ${humanize(statusFilter).toLowerCase()} appointments.` : 'No appointments yet.'}
         </div>
       ) : (
         <>

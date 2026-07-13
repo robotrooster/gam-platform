@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
+import { humanizeServiceType } from '@gam/shared'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
+import { appPrompt } from '../components/dialogs'
 import { Play, CheckCircle2, ChevronRight, ArrowLeft, Plus, MapPin, Smartphone, ChevronUp, ChevronDown } from 'lucide-react'
 
 // ─────────────────────────────────────────────────────────────
@@ -213,7 +215,7 @@ export function RoutesPage() {
 
   const onStopSkip = async (stopId: string) => {
     if (!selectedId) return
-    const reason = window.prompt('Reason for skipping this stop?')
+    const reason = await appPrompt('Reason for skipping this stop?', { title: 'Skip stop' })
     if (!reason) return
     setStopActioning(stopId); setErr(null)
     try {
@@ -611,7 +613,7 @@ function StopCard({ stop, routeStatus, actioning, onComplete, onSkip, reorder }:
           )}
           {stop.serviceType && (
             <div style={{ fontSize: 12, color: 'var(--text-3)', marginTop: 2 }}>
-              {stop.serviceType}
+              {humanizeServiceType(stop.serviceType)}
             </div>
           )}
           {stop.appointmentNotes && (
@@ -769,7 +771,7 @@ function AddStopModal({ routeId, onClose, onAdded }: {
                   <div style={{ flex: 1 }}>
                     <div style={{ fontWeight: 600 }}>{name}</div>
                     {addr && <div style={{ fontSize: 12, color: 'var(--text-2)' }}>{addr}</div>}
-                    {a.serviceType && <div style={{ fontSize: 12, color: 'var(--text-3)' }}>{a.serviceType}</div>}
+                    {a.serviceType && <div style={{ fontSize: 12, color: 'var(--text-3)' }}>{humanizeServiceType(a.serviceType)}</div>}
                     {!a.geocoded && (
                       <div style={{ fontSize: 11, color: 'var(--amber)' }}>
                         No coordinates — geocode on the Customers page first

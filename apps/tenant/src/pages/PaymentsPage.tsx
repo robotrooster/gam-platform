@@ -1,20 +1,18 @@
 /**
- * Tenant /payments page — S169 (ACH) + S170 (card) + S171 (extracted).
+ * Tenant /payments page — S537 FIFO Pay Now (supersedes the S169-171
+ * per-row flow).
  *
- * S169 wired the missing rent Pay flow against backend
- * POST /api/payments/:id/pay (S117 destination charges + tenant-payer
- * surcharge passthrough). S170 added the card path. S171 extracted
- * the modal + picker plumbing into pages/payShared.tsx so the same
- * machinery powers /utilities and any future tenant pay surfaces.
- *
- * This page now owns only:
- *   - the rent payments history table
- *   - Pay Now buttons on `pending` / `failed` rows
- *   - composing the PayTarget for the shared PayNowModal
+ * The outstanding ledger is READ-ONLY: the tenant never picks which
+ * charge a payment lands on. ONE Pay Now covers the balance oldest-first
+ * (POST /api/payments/pay-balance): any amount — partial, full, or
+ * ahead — unless the property rejects partials (eviction-clock
+ * protection), in which case the amount locks to the full balance.
+ * Pay-ahead remainder becomes a prepaid credit consumed by the next
+ * invoice automatically.
  */
 import { useState } from 'react'
 import { useQuery, useQueryClient } from 'react-query'
-import { formatCurrency } from '@gam/shared'
+import { formatCurrency, humanize } from '@gam/shared'
 import { apiGet } from '../lib/api'
 import {
   AddPaymentMethodModal,
@@ -47,24 +45,39 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
     'payments',
     () => apiGet<Payment[]>('/tenants/payments'),
   )
+  const { data: balanceCtx } = useQuery<{
+    totalOutstanding: number
+    acceptPartialPayments: boolean
+    paymentBlocked: boolean
+    rows: { id: string; amount: number; due_date: string; type: string; entry_description: string }[]
+  }>('balance-context', () => apiGet('/payments/balance-context'))
   const { data: methods = [], isLoading: methodsLoading } = useTenantPaymentMethods()
 
-  const [payTarget, setPayTarget] = useState<{ payment: Payment; target: PayTarget } | null>(null)
+  const [payTarget, setPayTarget] = useState<{ target: PayTarget } | null>(null)
   const [addMethodOpen, setAddMethodOpen] = useState<'ach' | 'card' | null>(null)
+  const [payAmount, setPayAmount] = useState<string>('')
 
   const refetchAll = () => {
     qc.invalidateQueries('payments')
+    qc.invalidateQueries('balance-context')
     qc.invalidateQueries('tenant-payment-methods')
   }
 
-  const openPay = (p: Payment) => {
+  const total = balanceCtx?.totalOutstanding ?? 0
+  const mustPayFull = balanceCtx ? !balanceCtx.acceptPartialPayments : false
+  const effectiveAmount = mustPayFull ? total : (payAmount === '' ? total : Number(payAmount))
+
+  const openPayBalance = () => {
+    if (!(effectiveAmount > 0)) return
     setPayTarget({
-      payment: p,
       target: {
-        amount:    p.amount,
-        endpoint:  `/payments/${p.id}/pay`,
-        subheader: `${p.entryDescription} · due ${new Date(p.dueDate).toLocaleDateString()}`,
+        amount:    Math.round(effectiveAmount * 100) / 100,
+        endpoint:  '/payments/pay-balance',
+        subheader: effectiveAmount > total + 0.005
+          ? `$${total.toFixed(2)} balance + $${(effectiveAmount - total).toFixed(2)} paid ahead`
+          : `applied to your oldest balance first`,
         kind:      'rent',
+        sendAmountInBody: true,
       },
     })
   }
@@ -90,6 +103,46 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
 
       <SavedMethodsCard methods={methods} loading={methodsLoading} />
 
+      {/* S537: THE payment surface — one button, FIFO application. */}
+      {balanceCtx && total > 0 && !balanceCtx.paymentBlocked && (
+        <div className="card" style={{ padding: 16, marginTop: 16 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
+            <div>
+              <div style={{ fontSize: '.72rem', fontWeight: 700, color: 'var(--t3)', textTransform: 'uppercase', letterSpacing: '.08em', marginBottom: 4 }}>
+                Outstanding balance
+              </div>
+              <div style={{ fontFamily: 'var(--font-mono)', fontWeight: 700, fontSize: '1.4rem', color: 'var(--t0)' }}>
+                {formatCurrency(total)}
+              </div>
+              <div style={{ fontSize: '.74rem', color: 'var(--t3)', marginTop: 4 }}>
+                Payments apply to your oldest balance first.
+                {mustPayFull
+                  ? ' This property requires the full balance.'
+                  : ' Pay any amount — paying extra credits your next bill.'}
+              </div>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'flex-end', gap: 8 }}>
+              {!mustPayFull && (
+                <div>
+                  <span style={{ fontSize: '.68rem', color: 'var(--t3)', display: 'block', marginBottom: 4 }}>Amount</span>
+                  <input className="inp mono" inputMode="decimal" value={payAmount} placeholder={total.toFixed(2)}
+                    onChange={e => { const v = e.target.value; if (v === '' || /^\d*\.?\d*$/.test(v)) setPayAmount(v) }}
+                    style={{ width: 110 }} />
+                </div>
+              )}
+              <button className="btn btn-p" onClick={openPayBalance} disabled={!(effectiveAmount > 0)}>
+                Pay now
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {balanceCtx?.paymentBlocked && (
+        <div className="card" style={{ padding: 14, marginTop: 16, fontSize: '.8rem', color: 'var(--t1)' }}>
+          Payments to your landlord are currently paused for this unit. Contact your landlord.
+        </div>
+      )}
+
       <SecurityDepositCard />
 
       <div className="card" style={{ padding: 0, overflowX: 'auto', marginTop: 16 }}>
@@ -104,20 +157,18 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
                 <th>Amount</th>
                 <th>Status</th>
                 <th>Method</th>
-                <th></th>
               </tr>
             </thead>
             <tbody>
               {payments.length ? (
                 payments.map((p) => {
-                  const canPay = p.status === 'pending' || p.status === 'failed'
                   return (
                     <tr key={p.id}>
                       <td className="mono" style={{ fontSize: '.75rem' }}>
                         {new Date(p.dueDate).toLocaleDateString()}
                       </td>
                       <td>
-                        <span className="badge b-muted">{p.type.replace('_', ' ')}</span>
+                        <span className="badge b-muted">{humanize(p.type)}</span>
                       </td>
                       <td className="mono" style={{ color: 'var(--t0)', fontWeight: 600 }}>
                         {formatCurrency(p.amount)}
@@ -130,19 +181,13 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
                       <td style={{ fontSize: '.75rem', color: 'var(--t3)' }}>
                         {p.entryDescription}
                       </td>
-                      <td style={{ textAlign: 'right' }}>
-                        {canPay ? (
-                          <button className="btn btn-p btn-sm" onClick={() => openPay(p)}>
-                            Pay now
-                          </button>
-                        ) : null}
-                      </td>
+
                     </tr>
                   )
                 })
               ) : (
                 <tr>
-                  <td colSpan={6} style={{ textAlign: 'center', color: 'var(--t3)', padding: 32 }}>
+                  <td colSpan={5} style={{ textAlign: 'center', color: 'var(--t3)', padding: 32 }}>
                     No payment history yet.
                   </td>
                 </tr>

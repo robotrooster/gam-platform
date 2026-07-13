@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
+import { appConfirm } from '../components/dialogs'
 import { Modal } from '../components/Modal'
 import {
   Plus, ChevronRight, ArrowLeft, Pause, Play, X as XIcon, Zap,
@@ -492,7 +493,7 @@ function Detail({ id, onBack }: { id: string; onBack: () => void }) {
   useEffect(() => { reload() }, [id])
 
   const action = async (path: string, confirmMsg?: string) => {
-    if (confirmMsg && !window.confirm(confirmMsg)) return
+    if (confirmMsg && !(await appConfirm(confirmMsg, { confirmLabel: 'Continue' }))) return
     setErr(null); setBusy(true)
     try {
       await apiPost(`/business-recurring-invoices/${id}/${path}`)

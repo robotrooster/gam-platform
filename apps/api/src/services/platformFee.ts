@@ -1,4 +1,10 @@
 import { query, queryOne } from '../db'
+import { NIGHTS_AGGREGATION_UNIT_TYPES } from '@gam/shared'
+
+// SQL literal list of the nights/30-aggregation unit types ('rv_spot').
+// Short-stays on every OTHER type bill str_fee_pct of revenue instead.
+// Compile-time constants from the shared catalog — safe to inline.
+const AGG_TYPES_SQL = NIGHTS_AGGREGATION_UNIT_TYPES.map(t => `'${t}'`).join(',')
 
 // Single source of truth for GAM's per-occupied-unit platform fee as it appears
 // in any landlord-facing surface (Dashboard, Reports, property accounts). It
@@ -65,14 +71,16 @@ export async function platformFeesByProperty(
   // the launch model ($2/billable unit, $10/property minimum).
   const cfg = await queryOne<any>(`
     SELECT COALESCE(o.rate_per_unit, pfc.rate_per_unit)       AS rate,
-           COALESCE(o.min_per_property, pfc.min_per_property) AS min
+           COALESCE(o.min_per_property, pfc.min_per_property) AS min,
+           COALESCE(o.str_fee_pct, pfc.str_fee_pct)           AS str_pct
       FROM platform_fee_config pfc
       LEFT JOIN landlord_platform_fee_overrides o
              ON o.landlord_id = $1 AND o.effective_until IS NULL
      WHERE pfc.effective_until IS NULL
      LIMIT 1`, [landlordId])
-  const rate = parseFloat(cfg?.rate ?? '2')
-  const min  = parseFloat(cfg?.min ?? '10')
+  const rate   = parseFloat(cfg?.rate ?? '2')
+  const min    = parseFloat(cfg?.min ?? '10')
+  const strPct = parseFloat(cfg?.str_pct ?? '0.05')
 
   // Per (property, month) billable for the live-estimate fallback. Only months
   // in which the property already existed (created_at) are billed.
@@ -88,10 +96,23 @@ export async function platformFeesByProperty(
               - GREATEST(b.check_in, m.month)::date, 0))
          FROM unit_bookings b JOIN units u ON u.id = b.unit_id
         WHERE u.property_id = p.id
+          AND u.unit_type IN (${AGG_TYPES_SQL})
           AND b.lease_type IN ('nightly','weekly')
           AND b.status NOT IN ('cancelled','no_show')
           AND b.check_in  < m.month + INTERVAL '1 month'
-          AND b.check_out > m.month), 0)::int AS nights
+          AND b.check_out > m.month), 0)::int AS nights,
+      COALESCE((SELECT SUM(COALESCE(b.total_amount, 0)
+            * GREATEST(
+                LEAST(b.check_out, m.month + INTERVAL '1 month')::date
+                  - GREATEST(b.check_in, m.month)::date, 0)::numeric
+            / GREATEST((b.check_out - b.check_in), 1)::numeric)
+         FROM unit_bookings b JOIN units u ON u.id = b.unit_id
+        WHERE u.property_id = p.id
+          AND u.unit_type NOT IN (${AGG_TYPES_SQL})
+          AND b.lease_type IN ('nightly','weekly')
+          AND b.status NOT IN ('cancelled','no_show')
+          AND b.check_in  < m.month + INTERVAL '1 month'
+          AND b.check_out > m.month), 0) AS str_revenue
       FROM properties p
       CROSS JOIN unnest($2::date[]) AS m(month)
      WHERE p.landlord_id = $1 ${propFilter}
@@ -111,7 +132,10 @@ export async function platformFeesByProperty(
     const key = `${r.property_id}|${r.m}`
     if (billed.has(key)) continue
     const billable = parseInt(r.long_term, 10) + Math.ceil(parseInt(r.nights, 10) / 30)
-    const fee = round2(Math.max(rate * billable, min))
+    // S538: short-stays on non-rv_spot types bill str_pct of pro-rated
+    // revenue instead of nights/30; the fee folds UNDER the property min.
+    const strFee = round2(strPct * parseFloat(r.str_revenue ?? '0'))
+    const fee = round2(Math.max(rate * billable + strFee, min))
     fees.set(r.property_id, round2((fees.get(r.property_id) ?? 0) + fee))
   }
   return fees

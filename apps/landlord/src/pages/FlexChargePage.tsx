@@ -15,6 +15,8 @@ import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { CreditCard, Plus } from 'lucide-react'
 import { apiGet, apiPost, apiPatch, apiDel } from '../lib/api'
+import { humanize } from '@gam/shared'
+import { appPrompt } from '../components/dialogs'
 
 interface AccountRow {
   id:                  string
@@ -166,7 +168,7 @@ export function FlexChargePage() {
                     <td className="mono">{fmt(a.creditLimit)}</td>
                     <td className="mono" style={{ fontWeight: 600, color: 'var(--gold)' }}>{fmt(a.balance)}</td>
                     <td>
-                      <span className={`badge ${a.status === 'active' ? 'badge-green' : a.status === 'suspended' ? 'badge-amber' : 'badge-red'}`}>{a.status}</span>
+                      <span className={`badge ${a.status === 'active' ? 'badge-green' : a.status === 'suspended' ? 'badge-amber' : 'badge-red'}`}>{humanize(a.status)}</span>
                       {a.status === 'disqualified' && a.disqualifiedReason && (
                         <div style={{ fontSize: '.65rem', color: 'var(--red)', marginTop: 2 }}>
                           {a.disqualifiedReason === 'tenant_dispute' ? 'customer dispute' : a.disqualifiedReason}
@@ -302,7 +304,7 @@ function AccountActions({ account, qc }: { account: AccountRow; qc: any }) {
     { onSuccess: () => qc.invalidateQueries('flex-charge-accounts') },
   )
   const editLimit = async () => {
-    const v = window.prompt('New credit limit:', account.creditLimit)
+    const v = await appPrompt('New credit limit:', { title: 'FlexCharge limit', defaultValue: String(account.creditLimit ?? '') })
     if (!v) return
     const n = parseFloat(v)
     if (!Number.isFinite(n) || n < 0) return
@@ -360,7 +362,7 @@ function StatementHistoryModal({ account, onClose }: { account: AccountRow; onCl
       s === 'billed' ? 'badge-amber' :
       s === 'voided' ? 'badge-muted' :
       'badge-muted'
-    return <span className={`badge ${cls}`}>{s}</span>
+    return <span className={`badge ${cls}`}>{humanize(s)}</span>
   }
   const fmtMonth = (d: string) => {
     const [y, m] = d.split('-')

@@ -40,8 +40,48 @@ else
   exit 1
 fi
 
-# Off-Mac copy (DR) — only if a destination is configured. A backup that lives
-# only on the same Mac as the database is not disaster recovery.
+# S535: off-Mac copy via iCloud Drive — zero-cost DR that covers the
+# correlated-failure cases local disks can't (fire, theft, surge take the
+# Mac AND an external drive together). The Studio is already signed into
+# iCloud; dumps are ~25MB so the free 5GB tier holds months of nightlies.
+ICLOUD_DIR="$HOME/Library/Mobile Documents/com~apple~CloudDocs/GAMBackups/db"
+if [ -d "$HOME/Library/Mobile Documents/com~apple~CloudDocs" ]; then
+  mkdir -p "$ICLOUD_DIR"
+  if cp "$OUT" "$ICLOUD_DIR/"; then
+    echo "[backup] ✓ off-Mac copy → iCloud Drive/GAMBackups/db"
+  else
+    echo "[backup] ✗ iCloud copy FAILED" >&2
+  fi
+  find "$ICLOUD_DIR" -name 'gam-*.dump' -type f -mtime +"$KEEP_DAYS" -print -delete 2>/dev/null
+else
+  echo "[backup] ! iCloud Drive not available — local copy only" >&2
+fi
+
+# S535: uploads/ mirror — signed lease PDFs, tenant ID scans, inspection
+# media. These are NOT in Postgres and NOT recreatable; a DB-only backup
+# would restore a platform whose lease rows point at missing files.
+UPLOADS_SRC="$HOME/gam/apps/api/uploads"
+if [ -d "$UPLOADS_SRC" ]; then
+  mkdir -p "$DEST/uploads"
+  rsync -a --delete "$UPLOADS_SRC/" "$DEST/uploads/" \
+    && echo "[backup] ✓ uploads mirror → $DEST/uploads ($(du -sh "$DEST/uploads" | cut -f1))" \
+    || echo "[backup] ✗ uploads local mirror FAILED" >&2
+  # S536: under launchd, rsync into iCloud's dir fails with "Operation
+  # not permitted" (worked fine from an interactive shell). Single-file
+  # copies DO work (the DB dump above proves it nightly), so ship the
+  # uploads as one compressed tarball instead of a mirror.
+  if [ -d "$HOME/Library/Mobile Documents/com~apple~CloudDocs" ]; then
+    UP_TAR="$DEST/uploads-$TS.tgz"
+    if tar -czf "$UP_TAR" -C "$UPLOADS_SRC" . && cp "$UP_TAR" "$ICLOUD_DIR/"; then
+      echo "[backup] ✓ uploads tarball → iCloud ($(du -h "$UP_TAR" | cut -f1))"
+    else
+      echo "[backup] ✗ uploads iCloud tarball FAILED" >&2
+    fi
+    find "$DEST" "$ICLOUD_DIR" -name 'uploads-*.tgz' -type f -mtime +"$KEEP_DAYS" -print -delete 2>/dev/null
+  fi
+fi
+
+# Optional additional off-Mac copy (rclone/aws) — only if configured.
 if [ -n "${GAM_BACKUP_S3_URI:-}" ]; then
   if command -v rclone >/dev/null 2>&1; then
     rclone copy "$OUT" "$GAM_BACKUP_S3_URI" && echo "[backup] ✓ copied off-Mac via rclone → $GAM_BACKUP_S3_URI"

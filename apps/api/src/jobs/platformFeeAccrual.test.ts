@@ -226,9 +226,11 @@ describe('processPlatformFeeAccrual', () => {
          VALUES ($1, 'tenant', 'tenant', 'landlord')`,
         [propertyId]
       )
-      // Vacant unit — does NOT count toward long-term aggregation. The
-      // unit_bookings row attaches to it for the short-stay path.
-      unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 0 })
+      // Vacant RV spot — does NOT count toward long-term aggregation. The
+      // unit_bookings row attaches to it for the short-stay path. (S538:
+      // rv_spot keeps nights/30; apartment/single_family would route to
+      // the STR-percentage path instead.)
+      unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 0, unitType: 'rv_spot' })
       await client.query(
         `INSERT INTO unit_bookings
            (unit_id, landlord_id, lease_type, status,
@@ -283,7 +285,7 @@ describe('processPlatformFeeAccrual', () => {
          VALUES ($1, 'tenant', 'tenant', 'landlord')`,
         [propertyId]
       )
-      unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 0 })
+      unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 0, unitType: 'rv_spot' })
       await client.query(
         `INSERT INTO unit_bookings
            (unit_id, landlord_id, lease_type, status,
@@ -310,6 +312,177 @@ describe('processPlatformFeeAccrual', () => {
       short_stay_nights: 0,
       total_billable:    0,
       total_amount:      '10.00',  // pure minimum, no usage
+    })
+  })
+
+  // ── S538 STR pricing: the nights/30 aggregation is ONLY for rv_spot
+  //    (space-only). Short-stays on ANY other unit type bill 5% of
+  //    pro-rated revenue instead ──────────────────────────────────────────
+
+  async function seedStrProperty(): Promise<{ propertyId: string; landlordId: string }> {
+    const client = await getClient()
+    try {
+      const { userId: ownerUserId, landlordId } = await seedLandlord(client)
+      const propertyId = await seedProperty(client, {
+        landlordId, ownerUserId, managedByUserId: ownerUserId,
+      })
+      await client.query(
+        `INSERT INTO property_allocation_rules
+           (property_id, ach_fee_payer, card_fee_payer, platform_fee_payer)
+         VALUES ($1, 'tenant', 'tenant', 'landlord')`,
+        [propertyId]
+      )
+      return { propertyId, landlordId }
+    } finally {
+      client.release()
+    }
+  }
+
+  it('STR: apartment booking bills 5% of month-pro-rated revenue, contributes ZERO nights', async () => {
+    // Booking: $1000 total, 2026-04-25 → 2026-05-12 (17 nights, 11 in May).
+    // str_revenue = 1000 × 11/17 = 647.06; fee = 5% = 32.35.
+    // No long-term units, no non-STR nights → total = MAX(0 + 32.35, 10).
+    const { propertyId, landlordId } = await seedStrProperty()
+    const client = await getClient()
+    try {
+      const unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 0, unitType: 'apartment' })
+      await client.query(
+        `INSERT INTO unit_bookings
+           (unit_id, landlord_id, lease_type, status,
+            check_in, check_out, nights, total_amount)
+         VALUES ($1, $2, 'nightly', 'confirmed',
+                 '2026-04-25', '2026-05-12', 17, 1000.00)`,
+        [unitId, landlordId]
+      )
+    } finally {
+      client.release()
+    }
+
+    const result = await processPlatformFeeAccrual(new Date('2026-05-01T08:00:00Z'))
+    expect(result.feesAccrued).toBe(1)
+
+    const accrual = await db.query<any>(
+      `SELECT short_stay_nights, short_stay_equivalent, total_billable,
+              str_revenue::text, str_fee_amount::text, total_amount::text
+         FROM platform_fee_accruals WHERE property_id=$1`,
+      [propertyId]
+    )
+    expect(accrual.rows[0]).toMatchObject({
+      short_stay_nights:     0,        // STR nights never hit the /30 pool
+      short_stay_equivalent: 0,
+      total_billable:        0,
+      str_revenue:           '647.06', // 1000 × 11/17
+      str_fee_amount:        '32.35',  // 5%
+      total_amount:          '32.35',  // clears the $10 min
+    })
+  })
+
+  it('STR: small booking folds UNDER the $10 property minimum (no stacking on the floor)', async () => {
+    // $100 booking fully inside May → str fee $5. total = MAX(0 + 5, 10) = $10.
+    const { propertyId, landlordId } = await seedStrProperty()
+    const client = await getClient()
+    try {
+      const unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 0, unitType: 'single_family' })
+      await client.query(
+        `INSERT INTO unit_bookings
+           (unit_id, landlord_id, lease_type, status,
+            check_in, check_out, nights, total_amount)
+         VALUES ($1, $2, 'nightly', 'confirmed',
+                 '2026-05-05', '2026-05-10', 5, 100.00)`,
+        [unitId, landlordId]
+      )
+    } finally {
+      client.release()
+    }
+
+    const result = await processPlatformFeeAccrual(new Date('2026-05-01T08:00:00Z'))
+    expect(result.feesAccrued).toBe(1)
+
+    const accrual = await db.query<any>(
+      `SELECT str_revenue::text, str_fee_amount::text, total_amount::text
+         FROM platform_fee_accruals WHERE property_id=$1`,
+      [propertyId]
+    )
+    expect(accrual.rows[0]).toMatchObject({
+      str_revenue:    '100.00',
+      str_fee_amount: '5.00',
+      total_amount:   '10.00',  // MAX(5, min 10)
+    })
+  })
+
+  it('STR: mobile_home short-stay bills 5% too (aggregation is rv_spot-ONLY)', async () => {
+    // Nic: mobile homes aren't generally bookable short-term, but if a
+    // landlord does it, it's a coordinated stay → 5%, never nights/30.
+    // $400 booking fully in May → $20 fee; no nights in the /30 pool.
+    const { propertyId, landlordId } = await seedStrProperty()
+    const client = await getClient()
+    try {
+      const unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 0, unitType: 'mobile_home' })
+      await client.query(
+        `INSERT INTO unit_bookings
+           (unit_id, landlord_id, lease_type, status,
+            check_in, check_out, nights, total_amount)
+         VALUES ($1, $2, 'nightly', 'confirmed',
+                 '2026-05-02', '2026-05-12', 10, 400.00)`,
+        [unitId, landlordId]
+      )
+    } finally {
+      client.release()
+    }
+
+    const result = await processPlatformFeeAccrual(new Date('2026-05-01T08:00:00Z'))
+    expect(result.feesAccrued).toBe(1)
+
+    const accrual = await db.query<any>(
+      `SELECT short_stay_nights, str_revenue::text, str_fee_amount::text, total_amount::text
+         FROM platform_fee_accruals WHERE property_id=$1`,
+      [propertyId]
+    )
+    expect(accrual.rows[0]).toMatchObject({
+      short_stay_nights: 0,
+      str_revenue:       '400.00',
+      str_fee_amount:    '20.00',
+      total_amount:      '20.00',
+    })
+  })
+
+  it('STR + RV mixed property: rv_spot keeps nights/30, apartment adds 5%, both sum', async () => {
+    // RV booking: 10 May nights → CEIL(10/30)=1 billable × $2 = $2.
+    // Apartment booking: $500 fully in May → 5% = $25.
+    // total = MAX(2 + 25, 10) = $27.
+    const { propertyId, landlordId } = await seedStrProperty()
+    const client = await getClient()
+    try {
+      const rvId = await seedUnit(client, { propertyId, landlordId, rentAmount: 0, unitType: 'rv_spot' })
+      const aptId = await seedUnit(client, { propertyId, landlordId, rentAmount: 0, unitType: 'apartment' })
+      await client.query(
+        `INSERT INTO unit_bookings
+           (unit_id, landlord_id, lease_type, status,
+            check_in, check_out, nights, total_amount)
+         VALUES ($1, $3, 'nightly', 'confirmed', '2026-05-01', '2026-05-11', 10, 440.00),
+                ($2, $3, 'nightly', 'confirmed', '2026-05-10', '2026-05-20', 10, 500.00)`,
+        [rvId, aptId, landlordId]
+      )
+    } finally {
+      client.release()
+    }
+
+    const result = await processPlatformFeeAccrual(new Date('2026-05-01T08:00:00Z'))
+    expect(result.feesAccrued).toBe(1)
+
+    const accrual = await db.query<any>(
+      `SELECT short_stay_nights, short_stay_equivalent, total_billable,
+              str_revenue::text, str_fee_amount::text, total_amount::text
+         FROM platform_fee_accruals WHERE property_id=$1`,
+      [propertyId]
+    )
+    expect(accrual.rows[0]).toMatchObject({
+      short_stay_nights:     10,       // RV nights only
+      short_stay_equivalent: 1,
+      total_billable:        1,
+      str_revenue:           '500.00', // apartment booking only
+      str_fee_amount:        '25.00',
+      total_amount:          '27.00',  // 1×$2 + $25, clears the min
     })
   })
 })

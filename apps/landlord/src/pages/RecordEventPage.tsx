@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react'
 import { useQuery, useMutation } from 'react-query'
 import { Gavel, Search, AlertTriangle } from 'lucide-react'
+import { humanize } from '@gam/shared'
 import { apiGet, apiPost } from '../lib/api'
 
 type Tenant = { id: string; firstName: string; lastName: string; email: string }
@@ -182,7 +183,7 @@ export function RecordEventPage() {
           <Field label="Violation type">
             <select value={violationType} onChange={e => setViolationType(e.target.value)} className="input">
               {VIOLATION_TYPES.map(v => (
-                <option key={v} value={v}>{v.replace(/_/g, ' ')}</option>
+                <option key={v} value={v}>{humanize(v)}</option>
               ))}
             </select>
           </Field>

@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
+import { appConfirm } from '../components/dialogs'
 import { Pencil, Archive } from 'lucide-react'
 import { Modal } from '../components/Modal'
 import { iconBtnStyle, cancelBtnStyle, saveBtnStyle } from './CustomersPage'
@@ -85,7 +86,7 @@ export function DepotsPage() {
   }
 
   const onArchive = async (r: DepotRow) => {
-    if (!window.confirm(`Archive ${r.name}? Vehicles still assigned to this depot will need a new home depot.`)) return
+    if (!(await appConfirm(`Archive ${r.name}? Vehicles still assigned to this depot will need a new home depot.`, { danger: true, confirmLabel: 'Archive' }))) return
     setArchiving(r.id); setErr(null)
     try {
       await apiPost(`/depots/${r.id}/archive`)

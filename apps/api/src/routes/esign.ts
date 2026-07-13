@@ -1664,7 +1664,15 @@ esignRouter.post('/documents/renewal', requireAuth, requirePerm('leases.create')
     } else if (!lease.end_date) {
       // S535 (Nic): month-to-month predecessor — '-' is the explicit
       // "no end date" entry (execution maps it to end_date NULL +
-      // lease_type month_to_month). Start date is the landlord's call.
+      // lease_type month_to_month).
+      // S536 (Nic): the renewal takes effect at the end of NEXT month —
+      // MTM changes need 30 days' notice, so one drafted today runs from
+      // the first of the month after next (drafted Jul 10 → effective
+      // Sep 1; signing deadline Aug 30 via the scheduler's 1-day-prior
+      // rule). Default only — the landlord edits it in the doc.
+      const mtmNow = new Date()
+      const mtmEffect = new Date(mtmNow.getFullYear(), mtmNow.getMonth() + 2, 1)
+      prefillValues.start_date = mtmEffect.toLocaleDateString('en-US')
       prefillValues.end_date = '-'
     }
 
@@ -2347,6 +2355,14 @@ esignRouter.post('/documents/:id/send', requireAuth, requirePerm('esign.send'), 
         'Landlord must be the first signer. Reorder signers so the landlord signs first.'
       )
     }
+    // S535 (Nic): a tied order_index would let a tenant sign in parallel
+    // with the landlord — the landlord's slot must be strictly first.
+    const tenantAtOrBeforeLandlord = sortedSigners.some(
+      (sg: any) => sg.role !== 'landlord' && (sg.order_index ?? 0) <= (firstByOrder.order_index ?? 0)
+    )
+    if (tenantAtOrBeforeLandlord) {
+      throw new AppError(400, 'The landlord must sign before all other signers — no signer may share the landlord\'s signing position.')
+    }
 
     // ────────────────────────────────────────────────────────────────────────
     // S28 → S535: tagged value-bearing fields must be filled before the
@@ -2619,6 +2635,37 @@ esignRouter.post('/sign/:documentId', requireAuth, async (req, res, next) => {
     const signer = signerRes.rows[0]
     if (!signer) throw new AppError(403, 'You are not a signer on this document')
     if (signer.status === 'signed') throw new AppError(400, 'Already signed')
+
+    // S535: hard turn enforcement. Order was previously enforced only by
+    // the invite relay (next signer emailed after the previous one signs)
+    // — the submit route itself never checked, so a signer who knew the
+    // documentId could sign out of order via the API and (worst case) a
+    // tenant could accept a lease whose landlord-typed terms weren't
+    // locked in yet (the exact S28 landlord-first failure mode).
+    const priorUnsigned = await client.query(
+      `SELECT 1 FROM lease_document_signers
+        WHERE document_id=$1 AND order_index < $2 AND status != 'signed'
+        LIMIT 1`,
+      [signer.document_id, signer.order_index])
+    if (priorUnsigned.rows.length > 0) {
+      throw new AppError(403, 'Not your turn to sign yet — an earlier signer has not completed')
+    }
+
+    // S535 (Nic): a tenant NEVER signs before the landlord — blanket rule
+    // on top of the order_index turn check above, which a tied
+    // order_index could slip past. Any unsigned landlord-role signer on
+    // the document blocks every tenant-role signature. Sublease
+    // agreements are naturally unaffected (no landlord signer row).
+    if (isTenantRole(signer.role)) {
+      const unsignedLandlord = await client.query(
+        `SELECT 1 FROM lease_document_signers
+          WHERE document_id=$1 AND role='landlord' AND status != 'signed'
+          LIMIT 1`,
+        [signer.document_id])
+      if (unsignedLandlord.rows.length > 0) {
+        throw new AppError(403, 'The landlord signs first — you will be notified when the document is ready for your signature')
+      }
+    }
 
     // Platform block check on tenant roles. checkPlatformBlock uses the
     // non-transactional query() — acceptable because tenant.platform_status
@@ -3087,37 +3134,56 @@ esignRouter.post('/upload', requireAuth, requirePerm('leases.create'), upload.si
 
 esignRouter.get('/files/:filename', requireAuth, async (req: any, res: any, next: any) => {
   try {
-    const filePath = resolveUploadPath(uploadDir, req.params.filename)
+    // Files live in uploads/leases (uploads + executed PDFs) OR
+    // uploads/subleases (generated sublease agreements — see
+    // services/subleaseDocuments.ts, which stores fileUrl as
+    // '/api/esign/files/<filename>' but writes the bytes to the
+    // subleases dir). Pre-S535 the subleases lookup was missing, so
+    // every generated sublease agreement 404'd here before the auth
+    // check ever ran.
+    let filePath = resolveUploadPath(uploadDir, req.params.filename)
     if (!filePath) throw new AppError(400, 'Invalid filename')
-    if (!fs.existsSync(filePath)) throw new AppError(404, 'File not found')
+    if (!fs.existsSync(filePath)) {
+      const subleasePath = resolveUploadPath(
+        path.join(process.cwd(), 'uploads', 'subleases'), req.params.filename)
+      if (subleasePath && fs.existsSync(subleasePath)) filePath = subleasePath
+      else throw new AppError(404, 'File not found')
+    }
 
-    // Authorization: caller must be the landlord on the document OR a signer.
-    // Match the requested filename against either base_pdf_url or executed_pdf_url
-    // (URLs are stored as '/api/esign/files/<filename>' so we match on suffix).
+    // Authorization (S535 rework): the caller must be the owning landlord
+    // (or their team member — staff carry req.user.landlordId), OR a
+    // signer on a document using this file. Files are matched against
+    // lease_documents base/executed URLs AND lease_templates.base_pdf_url
+    // — template PDFs previously had no auth path at all, so the
+    // template-gallery preview of an uploaded template could never
+    // render. Also fixed here: the old LIMIT 1 lookup checked only the
+    // FIRST document row sharing a base_pdf_url, so a legitimate signer
+    // on the second+ document drafted from the same template 403'd.
     const userId = req.user!.userId
     const profileId = req.user!.profileId
     const role = req.user!.role
     const filename = req.params.filename
     const urlSuffix = '/api/esign/files/' + filename
+    const scopeLandlordId =
+      role === 'landlord' ? profileId : (req.user!.landlordId ?? null)
 
-    const doc = await queryOne<any>(`
-      SELECT id, landlord_id
-      FROM lease_documents
-      WHERE base_pdf_url = $1 OR executed_pdf_url = $1
+    const exists = await queryOne<any>(`
+      SELECT 1 FROM lease_documents WHERE base_pdf_url = $1 OR executed_pdf_url = $1
+      UNION ALL
+      SELECT 1 FROM lease_templates WHERE base_pdf_url = $1
       LIMIT 1`, [urlSuffix])
+    if (!exists) throw new AppError(404, 'File not found')
 
-    if (!doc) throw new AppError(404, 'File not found')
-
-    let authorized = false
-    if (role === 'landlord' && profileId && doc.landlord_id === profileId) {
-      authorized = true
-    }
-    if (!authorized) {
-      const signer = await queryOne<any>(
-        'SELECT 1 FROM lease_document_signers WHERE document_id=$1 AND user_id=$2 LIMIT 1',
-        [doc.id, userId])
-      if (signer) authorized = true
-    }
+    const authorized = await queryOne<any>(`
+      SELECT 1 FROM lease_documents d
+       WHERE (d.base_pdf_url = $1 OR d.executed_pdf_url = $1)
+         AND (($2::uuid IS NOT NULL AND d.landlord_id = $2)
+              OR EXISTS (SELECT 1 FROM lease_document_signers s
+                          WHERE s.document_id = d.id AND s.user_id = $3))
+      UNION ALL
+      SELECT 1 FROM lease_templates t
+       WHERE t.base_pdf_url = $1 AND $2::uuid IS NOT NULL AND t.landlord_id = $2
+      LIMIT 1`, [urlSuffix, scopeLandlordId, userId])
     if (!authorized) throw new AppError(403, 'Not authorized to view this file')
 
     res.sendFile(filePath)

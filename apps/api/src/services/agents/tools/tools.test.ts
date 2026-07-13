@@ -358,17 +358,17 @@ describe('read tools scope to the actor', () => {
   describe('update_notification_preference (scoped to actor.userId)', () => {
     it('updates an existing type, keeping unspecified channels', async () => {
       ;(query as any)
-        .mockResolvedValueOnce([{ type: 'rent_due', email_enabled: true, sms_enabled: false, in_app_enabled: true }])
+        .mockResolvedValueOnce([{ type: 'rent_due', email_enabled: true, in_app_enabled: true }])
         .mockResolvedValueOnce([]) // the UPDATE
       const res: any = await updateNotificationPreference.execute({ type: 'rent_due', emailEnabled: false }, TENANT_ACTOR)
       expect((query as any).mock.calls[0][1]).toEqual(['u1']) // read scoped to userId
       const updateParams = (query as any).mock.calls[1][1]
       expect(updateParams[0]).toBe('u1') // update scoped to userId
-      expect(res).toMatchObject({ ok: true, email: false, sms: false, inApp: true })
+      expect(res).toMatchObject({ ok: true, email: false, inApp: true })
     })
 
     it('lists current types when the requested type is unknown', async () => {
-      ;(query as any).mockResolvedValueOnce([{ type: 'rent_due', email_enabled: true, sms_enabled: false, in_app_enabled: true }])
+      ;(query as any).mockResolvedValueOnce([{ type: 'rent_due', email_enabled: true, in_app_enabled: true }])
       const res: any = await updateNotificationPreference.execute({ type: 'nonexistent' }, TENANT_ACTOR)
       expect(res.needsType).toBe(true)
       expect(res.types[0].type).toBe('rent_due')

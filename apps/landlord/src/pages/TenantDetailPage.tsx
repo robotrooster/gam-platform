@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery } from 'react-query'
+import { humanize } from '@gam/shared'
 import { apiGet } from '../lib/api'
 import { ArrowLeft } from 'lucide-react'
 import { TransferTenantModal } from './TransferTenantModal'
@@ -149,7 +150,7 @@ export function TenantDetailPage() {
                       <td style={{ fontSize: '.78rem' }}>{p.propertyName}</td>
                       <td className="mono">{p.unitNumber}</td>
                       <td className="mono">{fmt(p.amount)}</td>
-                      <td><span className={`badge ${p.status === 'settled' ? 'badge-green' : p.status === 'failed' ? 'badge-red' : 'badge-amber'}`}>{p.status}</span></td>
+                      <td><span className={`badge ${p.status === 'settled' ? 'badge-green' : p.status === 'failed' ? 'badge-red' : 'badge-amber'}`}>{humanize(p.status)}</span></td>
                     </tr>
                   ))}
                 </tbody>
@@ -170,8 +171,8 @@ export function TenantDetailPage() {
                       <td className="mono" style={{ fontSize: '.72rem' }}>{new Date(m.createdAt).toLocaleDateString()}</td>
                       <td className="mono">{m.unitNumber}</td>
                       <td style={{ fontSize: '.78rem' }}>{m.title}</td>
-                      <td><span className={`badge ${m.priority === 'emergency' ? 'badge-red' : m.priority === 'high' ? 'badge-amber' : 'badge-blue'}`}>{m.priority}</span></td>
-                      <td><span className={`badge ${m.status === 'completed' ? 'badge-green' : 'badge-amber'}`}>{m.status?.replace('_', ' ')}</span></td>
+                      <td><span className={`badge ${m.priority === 'emergency' ? 'badge-red' : m.priority === 'high' ? 'badge-amber' : 'badge-blue'}`}>{humanize(m.priority)}</span></td>
+                      <td><span className={`badge ${m.status === 'completed' ? 'badge-green' : 'badge-amber'}`}>{humanize(m.status)}</span></td>
                       <td className="mono">{m.actualCost ? fmt(m.actualCost) : '--'}</td>
                     </tr>
                   ))}
@@ -258,7 +259,7 @@ function PaymentTimelinessModal({ payments, tenantName, onClose }: { payments: a
                   <td className="mono" style={{ fontSize: '.72rem' }}>{r.due ? new Date(r.due + 'T12:00:00').toLocaleDateString() : '—'}</td>
                   <td className="mono" style={{ fontSize: '.72rem' }}>{r.settled ? new Date(r.settled + 'T12:00:00').toLocaleDateString() : '—'}</td>
                   <td className="mono">{r.amount != null ? `$${Number(r.amount).toLocaleString('en-US', { minimumFractionDigits: 2 })}` : '—'}</td>
-                  <td style={{ fontSize: '.72rem', textTransform: 'uppercase', color: 'var(--text-3)' }}>{r.type}</td>
+                  <td style={{ fontSize: '.72rem', textTransform: 'uppercase', color: 'var(--text-3)' }}>{humanize(r.type)}</td>
                   <td><span className={`badge ${r.cls}`}>{r.label}</span></td>
                 </tr>
               ))}

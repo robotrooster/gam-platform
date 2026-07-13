@@ -4,7 +4,8 @@ import ReactDOM from 'react-dom/client'
 import { BrowserRouter, Routes, Route, Navigate, NavLink, Outlet, useNavigate } from 'react-router-dom'
 import { QueryClient, QueryClientProvider, useQuery, useQueryClient } from 'react-query'
 import axios from 'axios'
-import { formatCurrency, applyCamelizeInterceptor } from '@gam/shared'
+import { formatCurrency, applyCamelizeInterceptor, humanize } from '@gam/shared'
+import { toast, appConfirm, DialogHost } from './components/dialogs'
 
 const API = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
 const ADMIN_URL = (import.meta as any).env?.VITE_ADMIN_APP_URL || 'http://localhost:3003'
@@ -304,8 +305,8 @@ function ChartOfAccounts(){
     try{
       const r=await post('/books/accounts/seed')
       qc.invalidateQueries('acct')
-      alert((r.data as any).message)
-    }catch(e:any){alert(e.response?.data?.error||'Seed failed')}
+      toast((r.data as any).message)
+    }catch(e:any){toast.error(e.response?.data?.error||'Seed failed')}
     finally{setSeeding(false)}
   }
 
@@ -321,7 +322,7 @@ function ChartOfAccounts(){
   }
 
   const deactivate=async(id:string)=>{
-    if(!confirm('Deactivate this account?'))return
+    if(!(await appConfirm('Deactivate this account?', { danger: true, confirmLabel: 'Deactivate' })))return
     await patch(`/books/accounts/${id}`,{active:false})
     qc.invalidateQueries('acct')
   }
@@ -511,7 +512,7 @@ function Employees(){
               </div>
               <div><label>Filing Status</label>
                 <select value={form.filingStatus} onChange={f('filingStatus')}>
-                  {FILE_STATUS.map(s=><option key={s} value={s}>{s.replace(/_/g,' ')}</option>)}
+                  {FILE_STATUS.map(s=><option key={s} value={s}>{humanize(s)}</option>)}
                 </select>
               </div>
             </div>
@@ -591,7 +592,7 @@ function Contractors(){
                     <div style={{fontSize:'.65rem',color:'var(--t3)'}}>{c.email||''}</div>
                   </td>
                   <td style={{fontSize:'.75rem'}}>{c.trade||'—'}</td>
-                  <td><span className="badge bmu">{c.entityType?.replace('_',' ')||'—'}</span></td>
+                  <td><span className="badge bmu">{c.entityType?humanize(c.entityType):'—'}</span></td>
                   <td className="mono">{c.payRate?formatCurrency(c.payRate)+'/'+c.payUnit:'—'}</td>
                   <td className="mono" style={{color:+c.ytdPaid>=600?'var(--amber)':'var(--t1)'}}>{formatCurrency(c.ytdPaid)}</td>
                   <td>
@@ -614,7 +615,7 @@ function Contractors(){
           <form onSubmit={add}>
             <div className="frow"><label>Entity Type</label>
               <select value={form.entityType} onChange={f('entityType')}>
-                {ENTITY_TYPES.map(t=><option key={t} value={t}>{t.replace('_',' ').toUpperCase()}</option>)}
+                {ENTITY_TYPES.map(t=><option key={t} value={t}>{humanize(t).toUpperCase()}</option>)}
               </select>
             </div>
             {form.entityType==='individual'&&<div className="frow2">
@@ -710,8 +711,8 @@ function Vendors(){
                 <tr key={v.id}>
                   <td><div style={{fontWeight:600,color:'var(--t0)'}}>{v.name}</div></td>
                   <td><div style={{fontSize:'.75rem'}}>{v.contactName||'—'}</div><div style={{fontSize:'.65rem',color:'var(--t3)'}}>{v.email||''}</div></td>
-                  <td>{v.category?<span className="badge bmu">{v.category}</span>:<span style={{color:'var(--t3)'}}>—</span>}</td>
-                  <td style={{fontSize:'.75rem',color:'var(--t2)'}}>{v.paymentTerms?.replace('_',' ')||'—'}</td>
+                  <td>{v.category?<span className="badge bmu">{humanize(v.category)}</span>:<span style={{color:'var(--t3)'}}>—</span>}</td>
+                  <td style={{fontSize:'.75rem',color:'var(--t2)'}}>{v.paymentTerms?humanize(v.paymentTerms):'—'}</td>
                   <td className="mono" style={{color:+v.apBalance>0?'var(--red)':'var(--t3)'}}>{+v.apBalance>0?formatCurrency(v.apBalance):'—'}</td>
                   <td className="mono">{formatCurrency(v.ytdPaid)}</td>
                   <td className="mono" style={{fontSize:'.72rem',color:'var(--t3)'}}>{v.accountNumber||'—'}</td>
@@ -741,7 +742,7 @@ function Vendors(){
               </div>
               <div><label>Payment Terms</label>
                 <select value={form.paymentTerms} onChange={f('paymentTerms')}>
-                  {PAY_TERMS.map(t=><option key={t} value={t}>{t.replace('_',' ')}</option>)}
+                  {PAY_TERMS.map(t=><option key={t} value={t}>{humanize(t)}</option>)}
                 </select>
               </div>
             </div>
@@ -804,7 +805,7 @@ function RunPayroll(){
   }
 
   const approve=async()=>{
-    if(!confirm('Approve this payroll run? YTD totals will be updated for all employees.'))return
+    if(!(await appConfirm('Approve this payroll run? YTD totals will be updated for all employees.', { confirmLabel: 'Approve' })))return
     setApproving(true);setErr('')
     try{
       await post(`/books/payroll/runs/${draftRun.id}/approve`)
@@ -816,7 +817,7 @@ function RunPayroll(){
   }
 
   const voidRun=async()=>{
-    if(!confirm('Void this draft run?'))return
+    if(!(await appConfirm('Void this draft run?', { danger: true, confirmLabel: 'Void' })))return
     await post(`/books/payroll/runs/${draftRun.id}/void`)
     setDraftRun(null);setStep('setup')
     qc.invalidateQueries('payroll-runs')
@@ -986,7 +987,7 @@ function PayHistory(){
   const qc=useQueryClient()
 
   const voidRun=async(id:string)=>{
-    if(!confirm('Void this approved run? YTD totals will be reversed.'))return
+    if(!(await appConfirm('Void this approved run? YTD totals will be reversed.', { danger: true, confirmLabel: 'Void' })))return
     await post(`/books/payroll/runs/${id}/void`)
     qc.invalidateQueries('payroll-runs')
     qc.invalidateQueries('emp')
@@ -1101,7 +1102,7 @@ function JournalEntries(){
   }
 
   const voidEntry=async(id:string)=>{
-    if(!confirm('Void this journal entry? Account balances will be reversed.'))return
+    if(!(await appConfirm('Void this journal entry? Account balances will be reversed.', { danger: true, confirmLabel: 'Void' })))return
     await post('/books/journal/'+id+'/void')
     qc.invalidateQueries('journal');qc.invalidateQueries('acct')
     setSelectedEntry(null)
@@ -1150,7 +1151,7 @@ function JournalEntries(){
               <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:16}}>
                 <div>
                   <div style={{fontFamily:'var(--font-d)',fontWeight:700,color:'var(--t0)',marginBottom:4}}>Entry #{entryDetail.entryNumber}</div>
-                  <div style={{fontSize:'.72rem',color:'var(--t3)'}}>{new Date(entryDetail.date+'T12:00:00').toLocaleDateString()} · {entryDetail.type}</div>
+                  <div style={{fontSize:'.72rem',color:'var(--t3)'}}>{new Date(entryDetail.date+'T12:00:00').toLocaleDateString()} · {humanize(entryDetail.type)}</div>
                   <div style={{fontSize:'.82rem',color:'var(--t1)',marginTop:4}}>{entryDetail.description}</div>
                   {entryDetail.reference&&<div style={{fontSize:'.7rem',color:'var(--t3)',marginTop:2}}>Ref: {entryDetail.reference}</div>}
                 </div>
@@ -1762,7 +1763,7 @@ function TaxCenter(){
                         {d.formCode}
                       </span>
                       <span className="badge bmu" style={{fontSize:'.62rem'}}>{stateLabel}</span>
-                      <span className="badge bmu" style={{fontSize:'.62rem',textTransform:'capitalize'}}>{d.category}</span>
+                      <span className="badge bmu" style={{fontSize:'.62rem',textTransform:'capitalize'}}>{humanize(d.category)}</span>
                       {isPortal && (
                         <span className="badge ba" style={{fontSize:'.62rem'}}>Online portal</span>
                       )}
@@ -1824,7 +1825,7 @@ function TaxCenter(){
               {(contractors as any[]).map((c:any)=>(
                 <tr key={c.id}>
                   <td style={{fontWeight:600,color:'var(--t0)'}}>{c.businessName||[c.firstName,c.lastName].filter(Boolean).join(' ')}</td>
-                  <td><span className="badge bmu">{c.entityType}</span></td>
+                  <td><span className="badge bmu">{humanize(c.entityType)}</span></td>
                   <td className="mono" style={{color:'var(--amber)',fontWeight:600}}>{formatCurrency(c.ytdPaid)}</td>
                   <td>{c.w9OnFile?<span className="badge bg2">✓ On File</span>:<span className="badge br">Missing</span>}</td>
                   <td><span className={c.w9OnFile?'badge bg2':'badge ba'}>{c.w9OnFile?'Ready to File':'Needs W-9'}</span></td>
@@ -2117,7 +2118,7 @@ function MyClients(){
   }
 
   const revoke=async(bookkeeperUserId:string,landlordId:string)=>{
-    if(!confirm('Revoke this bookkeeper access?'))return
+    if(!(await appConfirm('Revoke this bookkeeper access?', { danger: true, confirmLabel: 'Revoke' })))return
     await del('/books/bookkeeper/revoke')
     // Note: delete with body — use post pattern
     await api.delete('/books/bookkeeper/revoke',{data:{bookkeeperUserId,landlordId}})
@@ -2310,7 +2311,7 @@ function Root(){
     <QueryClientProvider client={qc}>
       <AuthProvider>
         <style dangerouslySetInnerHTML={{__html:css}}/>
-        <BrowserRouter><App/></BrowserRouter>
+        <BrowserRouter><App/><DialogHost/></BrowserRouter>
       </AuthProvider>
     </QueryClientProvider>
   )

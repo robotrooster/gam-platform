@@ -1,14 +1,38 @@
-import { useState, useRef } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPatch, apiDelete } from '../lib/api'
 import { usePerms } from '../lib/permissions'
 import { ArrowLeft, Shield, AlertTriangle, Camera, Trash2, ExternalLink } from 'lucide-react'
-import { UNIT_TYPE_LABEL, UNIT_TYPE_HAS_BEDROOMS, type UnitType } from '@gam/shared'
+import { UNIT_TYPE_LABEL, UNIT_TYPE_HAS_BEDROOMS, humanize, type UnitType } from '@gam/shared'
+import { toast, appConfirm } from '../components/dialogs'
 
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 const API_URL = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
 const LISTINGS_URL = (import.meta as any).env?.VITE_LISTINGS_APP_URL || 'http://localhost:3008'
+
+// S535: photos are no longer static-served — /api/properties/
+// unit-photo-files/:filename requires the Bearer token, which an <img>
+// tag can't carry. Fetch with auth, render via a blob object-URL.
+function AuthImg({ url }: { url: string }) {
+  const [src, setSrc] = useState<string | null>(null)
+  useEffect(() => {
+    let objectUrl: string | null = null
+    let cancelled = false
+    const token = localStorage.getItem('gam_token') || ''
+    fetch(`${API_URL}${url}`, { headers: { Authorization: 'Bearer ' + token } })
+      .then(r => r.ok ? r.blob() : null)
+      .then(b => {
+        if (!b || cancelled) return
+        objectUrl = URL.createObjectURL(b)
+        setSrc(objectUrl)
+      })
+      .catch(() => {})
+    return () => { cancelled = true; if (objectUrl) URL.revokeObjectURL(objectUrl) }
+  }, [url])
+  if (!src) return <div style={{ width: '100%', height: '100%', background: 'var(--bg-2)' }} />
+  return <img src={src} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+}
 
 export function UnitDetailPage() {
   const { id } = useParams()
@@ -164,7 +188,7 @@ export function UnitDetailPage() {
       <div className="grid-2">
         <div className="card">
           <div className="card-title" style={{ marginBottom: 16 }}>Unit Details</div>
-          <div className="data-row"><span className="data-key">Status</span><span className={'badge badge-' + (unit.status === 'active' ? 'green' : unit.status === 'vacant' ? 'muted' : 'amber')}>{unit.status}</span></div>
+          <div className="data-row"><span className="data-key">Status</span><span className={'badge badge-' + (unit.status === 'active' ? 'green' : unit.status === 'vacant' ? 'muted' : 'amber')}>{humanize(unit.status)}</span></div>
           <div className="data-row"><span className="data-key">Type</span><span className="data-val">{UNIT_TYPE_LABEL[unit.unitType as UnitType] ?? unit.unitType}</span></div>
           <div className="data-row"><span className="data-key">Rent</span><span className="data-val mono">{fmt(unit.rentAmount)}/mo</span></div>
           <div className="data-row"><span className="data-key">Deposit</span><span className="data-val mono">{fmt(unit.securityDeposit)}</span></div>
@@ -314,7 +338,7 @@ export function UnitDetailPage() {
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(120px, 1fr))', gap: 8 }}>
               {(photos as any[]).map((p: any) => (
                 <div key={p.id} style={{ position: 'relative', borderRadius: 8, overflow: 'hidden', aspectRatio: '4/3', background: 'var(--bg-2)' }}>
-                  <img src={`${API_URL}${p.url}`} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                  <AuthImg url={p.url} />
                   <button onClick={() => deletePhoto(p.id)} style={{ position: 'absolute', top: 4, right: 4, background: 'rgba(0,0,0,.6)', border: 'none', borderRadius: '50%', width: 24, height: 24, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', color: '#fff' }}>
                     <Trash2 size={12} />
                   </button>
@@ -504,11 +528,11 @@ function UnitMetersCard({ unitId, propertyId, unitNumber }: { unitId: string; pr
       await apiPost(`/utility/meters/${r.data.id}/units`, { unitId })
     },
     { onSuccess: () => { invalidate(); setAdding(false); setDraft({ utilityType: 'electric', rate: '', digits: '6', sewerRate: '' }) },
-      onError: (e: any) => alert(e?.response?.data?.error || 'Could not add meter') }
+      onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not add meter') }
   )
   const delMut = useMutation((id: string) => apiDelete(`/utility/meters/${id}`), {
     onSuccess: invalidate,
-    onError: (e: any) => alert(e?.response?.data?.error || 'Could not remove meter'),
+    onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not remove meter'),
   })
   const ICONS: Record<string, string> = { water: '💧', electric: '⚡', sewer: '🚰', trash: '🗑️' }
 
@@ -533,7 +557,7 @@ function UnitMetersCard({ unitId, propertyId, unitNumber }: { unitId: string; pr
           </span>
           <span style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>{m.lastReadingCycle ? `last read ${String(m.lastReadingCycle).slice(0, 7)}` : 'never read'}</span>
           <button className="btn btn-ghost btn-sm" style={{ marginLeft: 'auto', color: 'var(--red)' }}
-            onClick={() => { if (window.confirm(`Remove the ${m.utilityType} meter? Its readings go with it.`)) delMut.mutate(m.id) }}>Remove</button>
+            onClick={() => { appConfirm(`Remove the ${m.utilityType} meter? Its readings go with it.`, { danger: true, confirmLabel: 'Remove' }).then(ok => { if (ok) delMut.mutate(m.id) }) }}>Remove</button>
         </div>
       ))}
       {adding && (

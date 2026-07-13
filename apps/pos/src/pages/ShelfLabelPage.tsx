@@ -30,7 +30,6 @@ export function ShelfLabelPage() {
       <div style={{ width: '100%', maxWidth: 400, textAlign: 'center' }}>
 
         {/* Icon */}
-        <div style={{ fontSize: '5rem', marginBottom: 16, lineHeight: 1 }}>{item.icon}</div>
 
         {/* Name */}
         <div style={{ fontFamily: 'system-ui', fontSize: '2rem', fontWeight: 900, color: '#eef1f8', marginBottom: 8, lineHeight: 1.2 }}>

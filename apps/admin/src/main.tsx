@@ -5,7 +5,8 @@ import { BrowserRouter, Routes, Route, Navigate, NavLink, Outlet, useNavigate } 
 import { QueryClient, QueryClientProvider, useQuery, useMutation, useQueryClient } from 'react-query'
 import axios from 'axios'
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
-import { formatCurrency, getReservePhase, RESERVE_CONFIG, applyCamelizeInterceptor, installDatePickerAutoClose } from '@gam/shared'
+import { formatCurrency, getReservePhase, RESERVE_CONFIG, applyCamelizeInterceptor, installDatePickerAutoClose, humanize } from '@gam/shared'
+import { toast, appConfirm, DialogHost } from './components/dialogs'
 
 const API = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
 const BOOKS_URL = (import.meta as any).env?.VITE_BOOKS_APP_URL || 'http://localhost:3006'
@@ -800,7 +801,7 @@ function Units(){
                     <td style={{fontSize:'.75rem'}}>{u.propertyName}</td>
                     <td style={{fontSize:'.75rem'}}>{u.tenantFirst?`${u.tenantFirst} ${u.tenantLast}`:<span style={{color:'var(--t3)'}}>Vacant</span>}</td>
                     <td className="mono">{formatCurrency(u.rentAmount)}</td>
-                    <td><span className={`badge ${u.status==='active'?'bg2':u.status==='delinquent'?'ba':u.status==='suspended'?'br':'bmu'}`}>{u.status.replace('_',' ')}</span></td>
+                    <td><span className={`badge ${u.status==='active'?'bg2':u.status==='delinquent'?'ba':u.status==='suspended'?'br':'bmu'}`}>{humanize(u.status)}</span></td>
                     <td>{u.achVerified?<span className="badge bg2">✓</span>:<span className="badge ba">Pending</span>}</td>
                   </tr>
                 ))}
@@ -818,7 +819,7 @@ function Units(){
                 {selected.street1&&<div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:2}}>{selected.street1}, {selected.city}</div>}
               </div>
               <div className="ct">Unit Info</div>
-              <div className="dr"><span className="dk">Status</span><span className={`badge ${selected.status==='active'?'bg2':selected.status==='delinquent'?'ba':selected.status==='suspended'?'br':'bmu'}`}>{selected.status.replace('_',' ')}</span></div>
+              <div className="dr"><span className="dk">Status</span><span className={`badge ${selected.status==='active'?'bg2':selected.status==='delinquent'?'ba':selected.status==='suspended'?'br':'bmu'}`}>{humanize(selected.status)}</span></div>
               <div className="dr"><span className="dk">Rent</span><span className="dv mono">{formatCurrency(selected.rentAmount)}/mo</span></div>
               <div className="dr"><span className="dk">Deposit</span><span className="dv mono">{formatCurrency(selected.securityDeposit||0)}</span></div>
               <div className="dr"><span className="dk">Bedrooms</span><span className="dv">{selected.bedrooms||'—'}</span></div>
@@ -884,7 +885,7 @@ function NachaMonitor(){
               {logs.length?logs.map((l:any)=>(
                 <tr key={l.id} style={{background:l.zeroToleranceFlag?'rgba(239,68,68,.04)':''}}>
                   <td className="mono" style={{fontSize:'.7rem',color:'var(--t3)'}}>{new Date(l.createdAt).toLocaleString()}</td>
-                  <td><span className={`badge ${l.eventType==='zero_tolerance_block'?'br':l.eventType==='velocity_flag'?'ba':'bmu'}`}>{l.eventType.replace(/_/g,' ')}</span></td>
+                  <td><span className={`badge ${l.eventType==='zero_tolerance_block'?'br':l.eventType==='velocity_flag'?'ba':'bmu'}`}>{humanize(l.eventType)}</span></td>
                   <td style={{fontSize:'.75rem'}}>{l.firstName?`${l.firstName} ${l.lastName}`:'—'}</td>
                   <td className="mono">{l.amount?formatCurrency(l.amount):'—'}</td>
                   <td>{l.returnCode?<span className={`badge ${['R05','R07','R10','R29'].includes(l.returnCode)?'br':'ba'}`}>{l.returnCode}</span>:<span style={{color:'var(--t3)'}}>—</span>}</td>
@@ -922,9 +923,9 @@ function Payments(){
                   <td className="mono" style={{fontSize:'.72rem'}}>{new Date(p.dueDate).toLocaleDateString()}</td>
                   <td style={{fontSize:'.75rem'}}><span style={{color:'var(--t3)'}}>{p.propertyName||'—'}</span>{p.propertyName&&' · '}<span className="mono">{p.unitNumber||'—'}</span></td>
                   <td style={{fontSize:'.75rem'}}>{p.tenantFirst?`${p.tenantFirst} ${p.tenantLast}`:<span style={{color:'var(--t3)'}}>—</span>}</td>
-                  <td><span className="badge bmu">{p.type}</span></td>
+                  <td><span className="badge bmu">{humanize(p.type)}</span></td>
                   <td className="mono" style={{color:'var(--t0)',fontWeight:600}}>{formatCurrency(p.amount)}</td>
-                  <td><span className={`badge ${ST[p.status]||'bmu'}`}>{p.status}</span></td>
+                  <td><span className={`badge ${ST[p.status]||'bmu'}`}>{humanize(p.status)}</span></td>
                   <td>{p.returnCode?<span className={`badge ${p.zeroToleranceFlag?'br':'ba'}`}>{p.returnCode}</span>:<span style={{color:'var(--t3)'}}>—</span>}</td>
                 </tr>
               )):<tr><td colSpan={7} style={{textAlign:'center',color:'var(--t3)',padding:32}}>{pSearch?'No payments match your search.':'No payments yet.'}</td></tr>}
@@ -943,10 +944,10 @@ function Payments(){
             <div className="dr"><span className="dk">Unit</span><span className="dv mono">{selected.unitNumber||'—'}</span></div>
             <div className="dr"><span className="dk">Tenant</span><span className="dv">{selected.tenantFirst?`${selected.tenantFirst} ${selected.tenantLast}`:'—'}</span></div>
             {selected.tenantEmail&&<div className="dr"><span className="dk">Email</span><span className="dv" style={{fontSize:'.75rem'}}>{selected.tenantEmail}</span></div>}
-            <div className="dr"><span className="dk">Type</span><span className="dv">{selected.type}</span></div>
+            <div className="dr"><span className="dk">Type</span><span className="dv">{humanize(selected.type)}</span></div>
             <div className="dr"><span className="dk">Amount</span><span className="dv mono" style={{color:'var(--gold)',fontWeight:700}}>{formatCurrency(selected.amount)}</span></div>
             <div className="dr"><span className="dk">Due Date</span><span className="dv mono">{new Date(selected.dueDate).toLocaleDateString()}</span></div>
-            <div className="dr"><span className="dk">Status</span><span className={`badge ${ST[selected.status]||'bmu'}`}>{selected.status}</span></div>
+            <div className="dr"><span className="dk">Status</span><span className={`badge ${ST[selected.status]||'bmu'}`}>{humanize(selected.status)}</span></div>
             {selected.entryDescription&&<div className="dr"><span className="dk">Entry</span><span className="dv mono" style={{fontSize:'.72rem'}}>{selected.entryDescription}</span></div>}
             {selected.returnCode&&<div className="dr"><span className="dk">Return Code</span><span className={`badge ${selected.zeroToleranceFlag?'br':'ba'}`}>{selected.returnCode}</span></div>}
             {selected.zeroToleranceFlag&&<div className="alert ae" style={{marginTop:12}}>🚫 Zero-tolerance return — ACH suspended</div>}
@@ -978,7 +979,7 @@ function Disbursements(){
                   <td className="mono" style={{fontSize:'.75rem'}}>{new Date(d.targetDate).toLocaleDateString()}</td>
                   <td className="mono" style={{color:'var(--green)',fontWeight:700}}>{formatCurrency(d.amount)}</td>
                   <td className="mono">{d.unitCount}</td>
-                  <td><span className={`badge ${d.status==='settled'?'bg2':d.status==='pending'?'ba':'br'}`}>{d.status}</span></td>
+                  <td><span className={`badge ${d.status==='settled'?'bg2':d.status==='pending'?'ba':'br'}`}>{humanize(d.status)}</span></td>
                   <td>{d.fromReserve?<span className="badge bgold">Reserve {formatCurrency(d.reserveAmount)}</span>:<span style={{color:'var(--t3)'}}>—</span>}</td>
                   <td className="mono" style={{fontSize:'.72rem',color:'var(--t3)'}}>{d.settledAt?new Date(d.settledAt).toLocaleDateString():'—'}</td>
                 </tr>
@@ -1047,7 +1048,7 @@ function ConnectAccounts() {
   }
 
   const runBackfill = async () => {
-    if (!window.confirm('Run live Stripe lookup for every Connect account that isn’t already flagged ready? This may take a few seconds per account.')) return
+    if (!(await appConfirm('Run live Stripe lookup for every Connect account that isn’t already flagged ready? This may take a few seconds per account.', { confirmLabel: 'Run backfill' }))) return
     setErrMsg(null); setOkMsg(null)
     try {
       const r = await api.post<{ success: boolean; data: any }>('/admin/connect-readiness/backfill')
@@ -1102,7 +1103,7 @@ function ConnectAccounts() {
                 return (
                   <tr key={k}>
                     <td style={{ fontSize: '.72rem', textTransform: 'uppercase', letterSpacing: '.04em', color: 'var(--t3)' }}>
-                      {a.entityType}
+                      {humanize(a.entityType)}
                     </td>
                     <td style={{ fontSize: '.78rem', fontWeight: 600 }}>{a.displayName}</td>
                     <td style={{ fontSize: '.74rem', color: 'var(--t2)' }}>{a.email || '—'}</td>
@@ -1178,7 +1179,7 @@ function LandlordBankingNudgesSection() {
                   <div style={{ fontSize: '.7rem', color: 'var(--t3)' }}>{n.landlordEmail}</div>
                 </td>
                 <td>
-                  <span className={`badge ${n.status === 'sent' ? 'bg2' : 'br'}`}>{n.status}</span>
+                  <span className={`badge ${n.status === 'sent' ? 'bg2' : 'br'}`}>{humanize(n.status)}</span>
                   {n.errorMessage && (
                     <div style={{ fontSize: '.68rem', color: 'var(--red)', marginTop: 2 }}>{n.errorMessage}</div>
                   )}
@@ -1400,7 +1401,7 @@ function Maintenance(){
                   <td className="mono">{r.unitNumber}</td>
                   <td style={{color:'var(--t0)',fontSize:'.78rem'}}>{r.title}</td>
                   <td><span className={`badge ${PRI[r.priority]}`}>{r.priority}</span></td>
-                  <td><span className={`badge ${ST[r.status]}`}>{r.status.replace('_',' ')}</span></td>
+                  <td><span className={`badge ${ST[r.status]}`}>{humanize(r.status)}</span></td>
                   <td style={{fontSize:'.75rem'}}>{r.contractorName||<span style={{color:'var(--t3)'}}>Unassigned</span>}</td>
                   <td className="mono">{r.actualCost?formatCurrency(r.actualCost):'—'}</td>
                 </tr>
@@ -1439,7 +1440,7 @@ function BulletinBoard(){
     try{
       const res=await get<any>('/admin/bulletin/'+postId+'/reveal')
       setRevealedIds(r=>({...r,[postId]:res}))
-    }catch(e:any){alert('Could not reveal: '+e.message)}
+    }catch(e:any){toast.error('Could not reveal: '+e.message)}
     finally{setRevealLoading(null)}
   }
 
@@ -1449,7 +1450,7 @@ function BulletinBoard(){
   }
 
   const removePost=async(postId:string)=>{
-    if(!confirm('Remove this post from the bulletin board?'))return
+    if(!(await appConfirm('Remove this post from the bulletin board?', { danger: true, confirmLabel: 'Remove' })))return
     await post('/admin/bulletin/'+postId+'/remove',{})
     refetch()
   }
@@ -1791,7 +1792,7 @@ function PlatformStatusCard({
         <div style={{marginTop:8,display:'flex',gap:6,flexWrap:'wrap'}}>
           {!verified?
             <button className="btn bgold bsm" disabled={busy} onClick={()=>verifyMut.mutate({platform_key:s.platformKey,import_type:s.importType})}>Mark verified</button>
-          : <button className="btn bd bsm" disabled={busy} onClick={()=>{if(confirm(`Revert ${s.platformKey}/${s.importType} to unverified? Future uploads will resume escalating to review.`)){unverifyMut.mutate({platform_key:s.platformKey,import_type:s.importType})}}}>Unverify</button>}
+          : <button className="btn bd bsm" disabled={busy} onClick={()=>{appConfirm(`Revert ${s.platformKey}/${s.importType} to unverified? Future uploads will resume escalating to review.`, { confirmLabel: 'Unverify' }).then(ok=>{if(ok)unverifyMut.mutate({platform_key:s.platformKey,import_type:s.importType})})}}>Unverify</button>}
           <button
             className="btn bd bsm"
             onClick={()=>setEditingNotes(true)}>
@@ -1903,7 +1904,7 @@ function CsvImports(){
                         <button
                           className="btn bgold bsm"
                           disabled={promoteClaim.isLoading}
-                          onClick={()=>{if(confirm(`Promote "${c.normalizedName}"? This drops it from the candidates list. Building the actual mapping happens in a code session.`)){promoteClaim.mutate(c.normalizedName)}}}
+                          onClick={()=>{appConfirm(`Promote "${c.normalizedName}"? This drops it from the candidates list. Building the actual mapping happens in a code session.`, { confirmLabel: 'Promote' }).then(ok=>{if(ok)promoteClaim.mutate(c.normalizedName)})}}
                         >Promote</button>
                       : <span style={{fontSize:'.7rem',color:'var(--t3)'}}>super_admin only</span>}
                     </td>
@@ -2529,6 +2530,7 @@ function App(){
           <Route path="security"      element={<SecurityPage/>}/>
         </Route>
       </Routes>
+      <DialogHost />
     </BrowserRouter>
   )
 }
@@ -2760,7 +2762,7 @@ function Disputes(){
             className={`btn ${status === s ? 'bp' : 'bg'} bsm`}
             onClick={()=>{ setStatus(s); setSelected(null) }}
           >
-            {s.replace('_',' ')}
+            {humanize(s)}
           </button>
         ))}
       </div>
@@ -2781,13 +2783,13 @@ function Disputes(){
                     style={{cursor:'pointer', background: selected?.id===d.id?'rgba(201,162,39,.05)':''}}
                     onClick={()=>setSelected(d)}
                   >
-                    <td><span className={`badge ${disputeStatusBadge(d.status)}`}>{d.status.replace('_',' ')}</span></td>
+                    <td><span className={`badge ${disputeStatusBadge(d.status)}`}>{humanize(d.status)}</span></td>
                     <td style={{fontSize:'.78rem'}}>
                       <div style={{color:'var(--t0)',fontWeight:600}}>{d.disputingSubjectType}</div>
                       <div className="mono" style={{fontSize:'.65rem',color:'var(--t3)'}}>{d.disputingSubjectRefId?.slice(0,8)}…</div>
                     </td>
                     <td style={{fontSize:'.78rem',color:'var(--t0)'}}>{DISPUTE_EVENT_LABEL[d.disputedEventType] || d.disputedEventType}</td>
-                    <td style={{fontSize:'.78rem'}}>{d.reason.replace('_',' ')}</td>
+                    <td style={{fontSize:'.78rem'}}>{humanize(d.reason)}</td>
                     <td>
                       {d.evidenceCount > 0
                         ? <span className="badge bb">{d.evidenceCount}</span>
@@ -2811,7 +2813,7 @@ function Disputes(){
             <div className="card">
               <div style={{marginBottom:14,paddingBottom:12,borderBottom:'1px solid var(--b0)'}}>
                 <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:6}}>
-                  <span className={`badge ${disputeStatusBadge(detail.status)}`}>{detail.status.replace('_',' ')}</span>
+                  <span className={`badge ${disputeStatusBadge(detail.status)}`}>{humanize(detail.status)}</span>
                   <span style={{fontSize:'.7rem',color:'var(--t3)'}}>filed {new Date(detail.createdAt).toLocaleString()}</span>
                 </div>
                 <div style={{fontFamily:'var(--font-d)',fontWeight:800,fontSize:'1.05rem',color:'var(--t0)'}}>
@@ -2850,7 +2852,7 @@ function Disputes(){
               )}
 
               <div className="ct" style={{marginTop:12}}>Tenant's stated reason</div>
-              <div style={{fontSize:'.82rem',color:'var(--t1)'}}>{detail.reason.replace('_',' ')}</div>
+              <div style={{fontSize:'.82rem',color:'var(--t1)'}}>{humanize(detail.reason)}</div>
               {detail.notes && (
                 <div style={{fontSize:'.78rem',color:'var(--t2)',marginTop:6,fontStyle:'italic'}}>
                   "{detail.notes}"
@@ -2893,7 +2895,7 @@ function Disputes(){
                           onClick={()=>setOutcome(o)}
                           type="button"
                         >
-                          {o === 'corrected' ? 'Corrected (replace event)' : o.replace('_',' ')}
+                          {o === 'corrected' ? 'Corrected (replace event)' : humanize(o)}
                         </button>
                       ))}
                     </div>
@@ -2969,7 +2971,7 @@ function Disputes(){
                   <div style={{display:'flex',gap:8,justifyContent:'flex-end'}}>
                     <button className="btn bg" onClick={()=>setSelected(null)} type="button">Cancel</button>
                     <button className="btn bp" onClick={onResolve} disabled={resolveMut.isLoading} type="button">
-                      {resolveMut.isLoading ? 'Resolving…' : `Resolve as ${outcome.replace('_',' ')}`}
+                      {resolveMut.isLoading ? 'Resolving…' : `Resolve as ${humanize(outcome)}`}
                     </button>
                   </div>
                 </div>
@@ -2977,7 +2979,7 @@ function Disputes(){
 
               {detail.status?.startsWith('resolved_') && (
                 <div style={{marginTop:18,paddingTop:14,borderTop:'1px solid var(--b0)',fontSize:'.78rem',color:'var(--t2)'}}>
-                  Resolved on {detail.resolvedAt ? new Date(detail.resolvedAt).toLocaleString() : '—'} as <strong>{detail.status.replace('resolved_','')}</strong>.
+                  Resolved on {detail.resolvedAt ? new Date(detail.resolvedAt).toLocaleString() : '—'} as <strong>{humanize(detail.status.replace('resolved_',''))}</strong>.
                 </div>
               )}
             </div>
@@ -3021,7 +3023,7 @@ function PropertyReviews(){
                     <td style={{fontSize:'.72rem',color:'var(--t3)'}}>{fmtDate(f.detectedAt)}</td>
                     <td><div style={{fontWeight:600}}>{f.newName}</div><div style={{fontSize:'.7rem',color:'var(--t3)'}}>{f.newStreet1}, {f.newCity}</div></td>
                     <td><div style={{fontWeight:600}}>{f.origName}</div><div style={{fontSize:'.7rem',color:'var(--t3)'}}>{f.origLandlordFirst} {f.origLandlordLast}</div></td>
-                    <td><span style={{fontSize:'.7rem',padding:'2px 8px',borderRadius:4,background:f.resolvedAt?'var(--b1)':'var(--gold)',color:f.resolvedAt?'var(--t3)':'#000'}}>{f.resolvedAt?f.resolution:'pending'}</span></td>
+                    <td><span style={{fontSize:'.7rem',padding:'2px 8px',borderRadius:4,background:f.resolvedAt?'var(--b1)':'var(--gold)',color:f.resolvedAt?'var(--t3)':'#000'}}>{f.resolvedAt?humanize(f.resolution):'Pending'}</span></td>
                   </tr>
                 ))}
               </tbody>
@@ -3069,7 +3071,7 @@ function PropertyReviews(){
             </>:<>
               <div style={{padding:14,background:'var(--b1)',borderRadius:8}}>
                 <div style={{fontSize:'.7rem',color:'var(--t3)',marginBottom:4}}>Resolved {fmtDate(selected.resolvedAt)}</div>
-                <div style={{fontSize:'.85rem',fontWeight:600,marginBottom:6}}>{selected.resolution}</div>
+                <div style={{fontSize:'.85rem',fontWeight:600,marginBottom:6}}>{humanize(selected.resolution)}</div>
                 {selected.notes&&<div style={{fontSize:'.78rem',color:'var(--t1)'}}>{selected.notes}</div>}
               </div>
             </>}
@@ -3146,7 +3148,7 @@ function Subleases(){
               cursor:'pointer',
               textTransform:'capitalize',
             }}>
-            {s.replace('_',' ')} ({counts[s]})
+            {humanize(s)} ({counts[s]})
           </button>
         ))}
       </div>
@@ -3207,7 +3209,7 @@ function Subleases(){
                           r.status === 'pending_invite' ? '#60a5fa' :
                           'var(--t3)',
                       }}>
-                        {r.status === 'pending_invite' ? 'awaiting accept' : r.status}
+                        {r.status === 'pending_invite' ? 'Awaiting accept' : humanize(r.status)}
                       </span>
                       {r.terminatedReason && (
                         <div style={{fontSize:'.65rem',color:'var(--red)',marginTop:2}}>

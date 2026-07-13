@@ -228,7 +228,10 @@ describe('POST /api/landlords/me/onboard-properties-csv/validate', () => {
       .send({ csv, source: 'buildium' })
 
     expect(res.status).toBe(200)
-    expect(res.body.data.summary.blockers).toBe(0)
+    // S537: Buildium's export carries no unit-type column → the only
+    // blocker is the unit-type decision the landlord makes in the wizard.
+    const blockFields = res.body.data.rows[0].issues.filter((i: any) => i.severity === 'block').map((i: any) => i.field)
+    expect(blockFields).toEqual(['unit_type'])
     expect(res.body.data.rows[0].propertyName).toBe('Sunset')
     expect(res.body.data.rows[0].rentAmount).toBe('1850')
   })
@@ -247,10 +250,10 @@ describe('POST /api/landlords/me/onboard-properties-csv/commit', () => {
   it('atomically creates property + units + default allocation rule', async () => {
     const { landlordId, token } = await seedLandlordWithToken()
     const csv = [
-      'property_name,street1,city,state,zip,unit_number,bedrooms,bathrooms,rent_amount,security_deposit',
-      'Sunset Apartments,100 Main St,Phoenix,AZ,85001,4B,2,1.5,1850,1850',
-      'Sunset Apartments,100 Main St,Phoenix,AZ,85001,4C,1,1,1500,1500',
-      'Mesa Pads,200 Mesa Rd,Mesa,AZ,85201,1A,3,2,2200,2200',
+      'property_name,street1,city,state,zip,unit_number,bedrooms,bathrooms,rent_amount,security_deposit,unit_type',
+      'Sunset Apartments,100 Main St,Phoenix,AZ,85001,4B,2,1.5,1850,1850,apartment',
+      'Sunset Apartments,100 Main St,Phoenix,AZ,85001,4C,1,1,1500,1500,apartment',
+      'Mesa Pads,200 Mesa Rd,Mesa,AZ,85201,1A,3,2,2200,2200,mobile_home',
     ].join('\n')
 
     // First validate to get the resolved-row payload
@@ -263,7 +266,11 @@ describe('POST /api/landlords/me/onboard-properties-csv/commit', () => {
     const commitRes = await request(buildApp())
       .post('/api/landlords/me/onboard-properties-csv/commit')
       .set('Authorization', `Bearer ${token}`)
-      .send({ rows: valRes.body.data.rows, source: 'generic', claimedPlatformName: 'TestPlatform' })
+      .send({ rows: valRes.body.data.rows, source: 'generic', claimedPlatformName: 'TestPlatform',
+        lateFeeDecisions: [
+          { propertyName: 'Sunset Apartments', street1: '100 Main St', unitType: 'apartment', noLateFee: false, graceDays: 5, initialAmount: 15, initialType: 'flat' },
+          { propertyName: 'Mesa Pads', street1: '200 Mesa Rd', unitType: 'mobile_home', noLateFee: true },
+        ] })
 
     expect(commitRes.status).toBe(200)
     expect(commitRes.body.data.propertiesCreated).toBe(2)  // Sunset + Mesa
@@ -302,10 +309,10 @@ describe('POST /api/landlords/me/onboard-properties-csv/commit', () => {
   it('shares one property across multiple unit rows (find-or-create within batch)', async () => {
     const { landlordId, token } = await seedLandlordWithToken()
     const csv = [
-      'property_name,street1,city,state,zip,unit_number,rent_amount',
-      'Sunset,100 Main St,Phoenix,AZ,85001,A,1000',
-      'Sunset,100 Main St,Phoenix,AZ,85001,B,1000',
-      'Sunset,100 Main St,Phoenix,AZ,85001,C,1000',
+      'property_name,street1,city,state,zip,unit_number,rent_amount,unit_type',
+      'Sunset,100 Main St,Phoenix,AZ,85001,A,1000,apartment',
+      'Sunset,100 Main St,Phoenix,AZ,85001,B,1000,apartment',
+      'Sunset,100 Main St,Phoenix,AZ,85001,C,1000,apartment',
     ].join('\n')
 
     const val = await request(buildApp())
@@ -316,7 +323,8 @@ describe('POST /api/landlords/me/onboard-properties-csv/commit', () => {
     const commit = await request(buildApp())
       .post('/api/landlords/me/onboard-properties-csv/commit')
       .set('Authorization', `Bearer ${token}`)
-      .send({ rows: val.body.data.rows, source: 'generic', claimedPlatformName: 'TestPlatform' })
+      .send({ rows: val.body.data.rows, source: 'generic', claimedPlatformName: 'TestPlatform',
+        lateFeeDecisions: [{ propertyName: 'Sunset', street1: '100 Main St', unitType: 'apartment', noLateFee: false, graceDays: 5, initialAmount: 15, initialType: 'flat' }], })
 
     expect(commit.body.data.propertiesCreated).toBe(1)
     expect(commit.body.data.unitsCreated).toBe(3)
@@ -344,9 +352,9 @@ describe('POST /api/landlords/me/onboard-properties-csv/commit', () => {
     )
 
     const csv = [
-      'property_name,street1,city,state,zip,unit_number,rent_amount',
-      'Sunset,100 Main St,Phoenix,AZ,85001,4B,1850',  // exists — skip on commit
-      'Sunset,100 Main St,Phoenix,AZ,85001,4C,1500',  // new — create
+      'property_name,street1,city,state,zip,unit_number,rent_amount,unit_type',
+      'Sunset,100 Main St,Phoenix,AZ,85001,4B,1850,apartment',  // exists — skip on commit
+      'Sunset,100 Main St,Phoenix,AZ,85001,4C,1500,apartment',  // new — create
     ].join('\n')
 
     const val = await request(buildApp())
@@ -357,7 +365,8 @@ describe('POST /api/landlords/me/onboard-properties-csv/commit', () => {
     const commit = await request(buildApp())
       .post('/api/landlords/me/onboard-properties-csv/commit')
       .set('Authorization', `Bearer ${token}`)
-      .send({ rows: val.body.data.rows, source: 'generic', claimedPlatformName: 'TestPlatform' })
+      .send({ rows: val.body.data.rows, source: 'generic', claimedPlatformName: 'TestPlatform',
+        lateFeeDecisions: [{ propertyName: 'Sunset', street1: '100 Main St', unitType: 'apartment', noLateFee: false, graceDays: 5, initialAmount: 15, initialType: 'flat' }], })
 
     expect(commit.body.data.propertiesCreated).toBe(0)
     expect(commit.body.data.unitsCreated).toBe(1)
@@ -418,8 +427,8 @@ describe('S491: state-law warnings on CSV property validate', () => {
     const { token } = await seedLandlordWithToken()
     await seedAzDepositCap()
     const csv = [
-      'property_name,street1,city,state,zip,unit_number,rent_amount,security_deposit',
-      'Sunset,100 Main St,Phoenix,AZ,85001,4B,1500,3000',
+      'property_name,street1,city,state,zip,unit_number,rent_amount,security_deposit,unit_type',
+      'Sunset,100 Main St,Phoenix,AZ,85001,4B,1500,3000,apartment',
     ].join('\n')
     const res = await request(buildApp())
       .post('/api/landlords/me/onboard-properties-csv/validate')

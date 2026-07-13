@@ -13,6 +13,7 @@
 
 import { useEffect, useRef, useState } from 'react'
 import { apiGet, apiDelete, api } from '../lib/api'
+import { appConfirm } from './dialogs'
 import { Paperclip, X, Upload, FileText, EyeOff } from 'lucide-react'
 
 export type AttachmentEntityType = 'work_order' | 'customer' | 'quote' | 'invoice' | 'inventory_item'
@@ -99,7 +100,7 @@ export function AttachmentList({
   }
 
   const onDelete = async (a: Attachment) => {
-    if (!window.confirm(`Delete "${a.fileName}"?`)) return
+    if (!(await appConfirm(`Delete "${a.fileName}"?`, { danger: true, confirmLabel: 'Delete' }))) return
     setErr(null)
     try {
       await apiDelete(`/business-attachments/${a.id}`)

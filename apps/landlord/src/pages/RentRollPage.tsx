@@ -1,5 +1,6 @@
 import { useQuery } from 'react-query'
 import { useNavigate } from 'react-router-dom'
+import { humanize } from '@gam/shared'
 import { apiGet } from '../lib/api'
 import { ScrollText } from 'lucide-react'
 
@@ -71,7 +72,7 @@ export function RentRollPage() {
                         </td>
                         <td style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>{fmtDate(r.startDate)}</td>
                         <td style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>{r.leaseId ? (r.endDate ? fmtDate(r.endDate) : 'Month-to-month') : '—'}</td>
-                        <td><span className={`badge ${STATUS_COLORS[r.status] || 'badge-muted'}`}>{r.status}</span></td>
+                        <td><span className={`badge ${STATUS_COLORS[r.status] || 'badge-muted'}`}>{humanize(r.status)}</span></td>
                         <td className="mono" style={{ textAlign: 'right', fontWeight: 600 }}>{fmt(r.rentAmount)}</td>
                       </tr>
                     ))}

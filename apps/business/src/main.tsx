@@ -31,6 +31,7 @@ import { ReportsPage } from './pages/ReportsPage'
 import { RecurringInvoicesPage } from './pages/RecurringInvoicesPage'
 import { BookableServicesPage } from './pages/BookableServicesPage'
 import { BookkeepingPage } from './pages/BookkeepingPage'
+import { DialogHost } from './components/dialogs'
 import './styles/globals.css'
 
 function Protected({ children }: { children: React.ReactNode }) {
@@ -83,6 +84,7 @@ function App() {
           <Route path="/" element={<Navigate to="/dashboard" replace />} />
           <Route path="*" element={<Navigate to="/dashboard" replace />} />
         </Routes>
+        <DialogHost />
       </AuthProvider>
     </BrowserRouter>
   )

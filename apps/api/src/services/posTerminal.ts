@@ -289,3 +289,150 @@ export async function retrieveTerminalPaymentIntent(opts: {
     { stripeAccount: opts.landlordConnectAccountId },
   )
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// S536 (Nic): BUSINESS-scope Terminal — the POS portal is the front
+// counter for businesses too, and "swiping the card or tap completes
+// the transaction." Readers pair to the BUSINESS's Connect account;
+// PaymentIntents are DIRECT charges there (business pays Stripe's
+// card-present cost) with GAM's markup as application_fee_amount —
+// structurally impossible for GAM to lose money on a sale. The
+// process/capture/cancel/retrieve helpers above are account-generic
+// and are reused as-is.
+// ═══════════════════════════════════════════════════════════════════
+
+interface BusinessReaderRow {
+  id:               string
+  business_id:      string
+  stripe_reader_id: string
+  nickname:         string
+  status:           'active' | 'archived'
+  registered_at:    string
+}
+
+// S536 rework: ALL money flows through GAM. Readers register on the
+// PLATFORM account (not the business's Connect), inside a per-business
+// Terminal Location built from the business address; charges are
+// platform destination charges. Friday payouts batch the balance out.
+async function getOrCreateBusinessLocation(businessId: string): Promise<string> {
+  const biz = await queryOne<any>(
+    `SELECT name, street1, street2, city, state, zip, stripe_terminal_location_id
+       FROM businesses WHERE id = $1`, [businessId])
+  if (!biz) throw new AppError(404, 'Business not found')
+  if (biz.stripe_terminal_location_id) return biz.stripe_terminal_location_id
+  if (!biz.street1 || !biz.city || !biz.state || !biz.zip) {
+    throw new AppError(409, 'Add the business address in Settings before pairing a reader — Stripe requires a location')
+  }
+  const stripe = getStripe()
+  const loc = await stripe.terminal.locations.create({
+    display_name: biz.name,
+    address: {
+      line1: biz.street1, line2: biz.street2 ?? undefined,
+      city: biz.city, state: biz.state, postal_code: biz.zip, country: 'US',
+    },
+  })
+  await query(`UPDATE businesses SET stripe_terminal_location_id = $1 WHERE id = $2`, [loc.id, businessId])
+  return loc.id
+}
+
+export async function registerBusinessReader(opts: {
+  businessId:               string
+  businessConnectAccountId: string
+  registrationCode:         string
+  nickname:                 string
+  label?:                   string
+}): Promise<BusinessReaderRow> {
+  const stripe = getStripe()
+  const locationId = await getOrCreateBusinessLocation(opts.businessId)
+  const reader = await stripe.terminal.readers.create(
+    {
+      registration_code: opts.registrationCode,
+      label:             opts.label ?? opts.nickname,
+      location:          locationId,
+      metadata:          { gam_business_id: opts.businessId },
+    },
+  )
+  const row = await queryOne<BusinessReaderRow>(
+    `INSERT INTO business_terminal_readers (business_id, stripe_reader_id, nickname)
+     VALUES ($1, $2, $3)
+     RETURNING id, business_id, stripe_reader_id, nickname, status, registered_at`,
+    [opts.businessId, reader.id, opts.nickname])
+  return row!
+}
+
+export async function listBusinessReaders(businessId: string): Promise<BusinessReaderRow[]> {
+  return query<BusinessReaderRow>(
+    `SELECT id, business_id, stripe_reader_id, nickname, status, registered_at
+       FROM business_terminal_readers
+      WHERE business_id = $1 AND status = 'active'
+      ORDER BY registered_at DESC`, [businessId])
+}
+
+export async function archiveBusinessReader(businessId: string, id: string): Promise<BusinessReaderRow> {
+  const row = await queryOne<BusinessReaderRow>(
+    `UPDATE business_terminal_readers
+        SET status = 'archived', updated_at = NOW()
+      WHERE id = $1 AND business_id = $2 AND status = 'active'
+      RETURNING id, business_id, stripe_reader_id, nickname, status, registered_at`,
+    [id, businessId])
+  if (!row) throw new AppError(404, 'Reader not found')
+  return row
+}
+
+export async function assertBusinessReader(businessId: string, stripeReaderId: string): Promise<void> {
+  const row = await queryOne(
+    `SELECT 1 FROM business_terminal_readers
+      WHERE business_id = $1 AND stripe_reader_id = $2 AND status = 'active'`,
+    [businessId, stripeReaderId])
+  if (!row) throw new AppError(404, 'Reader not paired to this business')
+}
+
+export async function createBusinessCardPresentPaymentIntent(opts: {
+  businessConnectAccountId: string
+  businessId:               string
+  amountCents:              number
+  applicationFeeCents:      number
+  currency?:                string
+  description?:             string
+}): Promise<Stripe.PaymentIntent> {
+  if (!Number.isInteger(opts.amountCents) || opts.amountCents <= 0) {
+    throw new AppError(400, 'amountCents must be a positive integer')
+  }
+  const stripe = getStripe()
+  // Platform destination charge: GAM is the merchant, the gross (minus
+  // GAM's application fee) transfers to the business's Connect balance,
+  // and the Friday payout batch moves it to their bank.
+  return stripe.paymentIntents.create(
+    {
+      amount:                 opts.amountCents,
+      currency:               opts.currency ?? 'usd',
+      payment_method_types:   ['card_present'],
+      capture_method:         'manual',
+      application_fee_amount: Math.max(0, Math.round(opts.applicationFeeCents)),
+      transfer_data:          { destination: opts.businessConnectAccountId },
+      on_behalf_of:           opts.businessConnectAccountId,
+      description:            opts.description ?? 'POS sale',
+      metadata: {
+        gam_purpose:     'business_pos_terminal',
+        gam_business_id: opts.businessId,
+      },
+    },
+  )
+}
+
+// Platform-account variants of the PI lifecycle (business terminal
+// flow) — same shapes as the landlord fns above minus the
+// stripeAccount override.
+export async function processBusinessPIOnReader(opts: { stripeReaderId: string; paymentIntentId: string }): Promise<Stripe.Terminal.Reader> {
+  const stripe = getStripe()
+  return stripe.terminal.readers.processPaymentIntent(opts.stripeReaderId, { payment_intent: opts.paymentIntentId })
+}
+export async function retrieveBusinessPI(paymentIntentId: string): Promise<Stripe.PaymentIntent> {
+  return getStripe().paymentIntents.retrieve(paymentIntentId)
+}
+export async function captureBusinessPI(paymentIntentId: string): Promise<Stripe.PaymentIntent> {
+  return getStripe().paymentIntents.capture(paymentIntentId)
+}
+export async function cancelBusinessPI(paymentIntentId: string): Promise<Stripe.PaymentIntent> {
+  return getStripe().paymentIntents.cancel(paymentIntentId)
+}

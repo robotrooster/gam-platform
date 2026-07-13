@@ -124,12 +124,14 @@ describe('POST /api/business-customers', () => {
     expect(res.body.data.company_name).toBeNull()
   })
 
-  it('missing address (no street1) → 400', async () => {
+  it('S536: missing address → 201 (POS quick-add customers have no address; no geocode attempted)', async () => {
     const o = await seedOwner()
     const res = await request(buildApp())
       .post('/api/business-customers').set('Authorization', `Bearer ${o.token}`)
-      .send(validCustomer({ street1: undefined }))
-    expect(res.status).toBe(400)
+      .send(validCustomer({ street1: undefined, city: undefined, state: undefined, zip: undefined }))
+    expect(res.status).toBe(201)
+    expect(res.body.data.street1).toBeNull()
+    expect(res.body.data.lat).toBeFalsy()
   })
 
   it('invalid email → 400', async () => {

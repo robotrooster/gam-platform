@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { Plus, Trash2 } from 'lucide-react'
 import { apiGet, apiPost, apiDelete } from '../lib/api'
+import { appConfirm } from '../components/dialogs'
 
 type FeeRow = {
   id: string
@@ -299,7 +300,7 @@ function FeeRowEditor({
             <button
               className="btn btn-ghost btn-sm"
               onClick={() => {
-                if (window.confirm(`Remove "${label}" from this property's fee schedule?`)) deleteMut.mutate()
+                appConfirm(`Remove "${label}" from this property's fee schedule?`, { danger: true, confirmLabel: 'Remove' }).then(ok => { if (ok) deleteMut.mutate() })
               }}
               style={{ color: 'var(--red)' }}
               title="Remove"

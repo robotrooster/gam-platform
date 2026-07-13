@@ -19,10 +19,10 @@
  *   - **POST /units/:id/photos** upload filename used
  *     path.extname(originalname) UNFILTERED. Same XSS extension-mismatch
  *     pattern as S380 avatar + S394 esign + S395 pending-tenants
- *     (4th instance). `/uploads/` is served by express.static which
- *     uses extension-based content-type, so a `.html` upload would
- *     be served as text/html → XSS. Fix forces safe extension from
- *     MIME type whitelist.
+ *     (4th instance). Fix forces safe extension from MIME type
+ *     whitelist. (S535: photos moved off static serving entirely —
+ *     GET /api/properties/unit-photo-files/:filename, authed, pins
+ *     Content-Type from the same whitelist.)
  */
 
 import { describe, it, expect, beforeEach, afterAll } from 'vitest'
@@ -364,14 +364,14 @@ describe('POST /units/:id/photos — S399 XSS fix', () => {
     cleanupTargets.push(path.join(process.cwd(), 'uploads', 'unit-photos', filename))
   })
 
-  it('happy: legitimate JPEG upload returns row with /uploads/unit-photos/ URL', async () => {
+  it('happy: legitimate JPEG upload returns row with authed unit-photo-files URL', async () => {
     const f = await seed()
     const res = await request(buildApp())
       .post(`/api/properties/units/${f.unitAId}/photos`)
       .set('Authorization', `Bearer ${f.tokenA}`)
       .attach('photos', JPEG_HEADER, { filename: 'photo.jpg', contentType: 'image/jpeg' })
     expect(res.status).toBe(201)
-    expect(res.body.data[0].url).toMatch(/^\/uploads\/unit-photos\/\d+-[a-z0-9]+\.jpg$/)
+    expect(res.body.data[0].url).toMatch(/^\/api\/properties\/unit-photo-files\/\d+-[a-z0-9]+\.jpg$/)
     expect(res.body.data[0].landlord_id).toBe(f.landlordAId)
     const filename = res.body.data[0].url.split('/').pop()!
     cleanupTargets.push(path.join(process.cwd(), 'uploads', 'unit-photos', filename))

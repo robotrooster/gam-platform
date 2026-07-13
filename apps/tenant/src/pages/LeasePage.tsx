@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { FileText, Download, PenTool, CheckCircle, AlertCircle, RotateCcw } from 'lucide-react'
 import { ADDENDUM_DIFF_FIELD_LABEL, formatAddendumDiffValue } from '@gam/shared'
+import { toast } from '../components/dialogs'
 
 const API_URL = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
 
@@ -555,7 +556,7 @@ async function openAddendumPdf(leaseId: string, filename: string, token: string)
     headers: { Authorization: 'Bearer ' + token },
   })
   if (!res.ok) {
-    alert('Could not load PDF (status ' + res.status + ')')
+    toast.error('Could not load PDF (status ' + res.status + ')')
     return
   }
   const blob = await res.blob()

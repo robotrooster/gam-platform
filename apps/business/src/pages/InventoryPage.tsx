@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { apiGet, apiPost, apiPatch, apiDelete } from '../lib/api'
+import { appConfirm } from '../components/dialogs'
 import { Modal } from '../components/Modal'
 import {
   Plus, ChevronRight, ArrowLeft, Search, AlertTriangle, Archive,
@@ -292,7 +293,7 @@ function ItemDetailView({
   useEffect(() => { reload() }, [id])
 
   const onArchive = async () => {
-    if (!window.confirm(`Archive "${item?.name}"? It won't appear in lists but stays on record.`)) return
+    if (!(await appConfirm(`Archive "${item?.name}"? It won't appear in lists but stays on record.`, { danger: true, confirmLabel: 'Archive' }))) return
     setArchiving(true)
     try {
       await apiPost(`/business-inventory/items/${id}/archive`)
@@ -793,7 +794,7 @@ function CategoryManagerModal({
   }
 
   const onDelete = async (c: Category) => {
-    if (!window.confirm(`Delete category "${c.name}"? Items in it stay but become uncategorized.`)) return
+    if (!(await appConfirm(`Delete category "${c.name}"? Items in it stay but become uncategorized.`, { danger: true, confirmLabel: 'Delete' }))) return
     setBusy(true); setErr(null)
     try {
       await apiDelete(`/business-inventory/categories/${c.id}`)

@@ -9,6 +9,7 @@ const AUTO_RENEW_MODE_DESC: Record<AutoRenewMode, string> = {
 
 import { X, Check, DollarSign, AlertTriangle, Image as ImageIcon } from 'lucide-react'
 import { LawWarningBanner, type LawFlag } from '../components/LawWarningBanner'
+import { toast } from '../components/dialogs'
 
 // S225: this modal is currently invoked in EDIT MODE ONLY. The
 // landlord-portal "Add Lease" entry point was replaced with a
@@ -1006,7 +1007,7 @@ async function openLandlordAddendumPdf(leaseId: string, filename: string) {
     headers: { Authorization: 'Bearer ' + token },
   })
   if (!res.ok) {
-    alert('Could not load PDF (status ' + res.status + ')')
+    toast.error('Could not load PDF (status ' + res.status + ')')
     return
   }
   const blob = await res.blob()

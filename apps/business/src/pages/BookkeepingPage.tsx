@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react'
+import { humanize } from '@gam/shared'
 import { apiGet, apiPost, apiPatch, apiDelete } from '../lib/api'
+import { appConfirm } from '../components/dialogs'
 import { useAuth } from '../context/AuthContext'
 import { BookOpen, Plus, Receipt, TrendingUp, Pencil, Trash2 } from 'lucide-react'
 
@@ -206,7 +208,7 @@ function ExpensesTab() {
   const cancelEdit = () => { setEditingId(null); setForm(blank) }
 
   const remove = async (r: Txn) => {
-    if (!window.confirm(`Delete "${r.description}"? This can't be undone.`)) return
+    if (!(await appConfirm(`Delete "${r.description}"? This can't be undone.`, { danger: true, confirmLabel: 'Delete' }))) return
     setErr(null)
     try { await apiDelete(`/books/transactions/${r.id}`); if (editingId === r.id) cancelEdit(); await load() }
     catch (e: any) { setErr(e?.response?.data?.error || 'Delete failed') }
@@ -368,7 +370,7 @@ function AccountsTab() {
                 <tr key={a.id} style={{ borderBottom: '1px solid var(--border-0)' }}>
                   <td style={{ ...tdStyle, fontFamily: 'var(--font-mono)' }}>{a.code}</td>
                   <td style={tdStyle}>{a.name}</td>
-                  <td style={{ ...tdStyle, color: 'var(--text-2)', textTransform: 'capitalize' }}>{a.type}</td>
+                  <td style={{ ...tdStyle, color: 'var(--text-2)', textTransform: 'capitalize' }}>{humanize(a.type)}</td>
                   <td style={{ ...tdStyle, textAlign: 'right', fontFamily: 'var(--font-mono)' }}>{fmtMoney(+a.balance)}</td>
                 </tr>
               ))}

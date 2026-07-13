@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { apiGet, apiPost, apiPatch, apiDelete } from '../lib/api'
+import { appConfirm } from '../components/dialogs'
 import { Modal } from '../components/Modal'
 import { Plus, Pencil, Trash2, Eye, EyeOff } from 'lucide-react'
 import {
@@ -60,7 +61,7 @@ export function BookableServicesPage() {
   }
 
   const remove = async (s: Service) => {
-    if (!window.confirm(`Delete "${s.name}"? This won't affect appointments already booked for it.`)) return
+    if (!(await appConfirm(`Delete "${s.name}"? This won't affect appointments already booked for it.`, { danger: true, confirmLabel: 'Delete' }))) return
     try {
       await apiDelete(`/business-bookable-services/${s.id}`)
       reload()

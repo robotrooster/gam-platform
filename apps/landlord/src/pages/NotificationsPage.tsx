@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { Bell, CheckCheck, ExternalLink } from 'lucide-react'
+import { humanize } from '@gam/shared'
 import { apiGet, apiPatch } from '../lib/api'
 
 type Notification = {
@@ -16,8 +17,6 @@ type Notification = {
   createdAt: string
   emailSent: boolean
   emailSentAt: string | null
-  smsSent: boolean
-  smsSentAt: string | null
 }
 
 const TYPE_LABEL: Record<string, string> = {
@@ -139,12 +138,11 @@ export function NotificationsPage() {
                     <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap', marginBottom: 4 }}>
                       <strong style={{ color: 'var(--text-0)' }}>{n.title}</strong>
                       <span style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>{new Date(n.createdAt).toLocaleString()}</span>
-                      <span style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>· {TYPE_LABEL[n.type] || n.type.replace(/_/g, ' ')}</span>
+                      <span style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>· {TYPE_LABEL[n.type] || humanize(n.type)}</span>
                     </div>
                     <div style={{ fontSize: '.85rem', color: 'var(--text-2)', lineHeight: 1.45 }}>{n.body}</div>
                     <div style={{ display: 'flex', gap: 6, marginTop: 6, flexWrap: 'wrap' }}>
                       {n.emailSent && <span className="badge badge-muted" style={{ fontSize: '.65rem' }}>email sent</span>}
-                      {n.smsSent && <span className="badge badge-muted" style={{ fontSize: '.65rem' }}>sms sent</span>}
                     </div>
                   </div>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 4, flexShrink: 0 }}>

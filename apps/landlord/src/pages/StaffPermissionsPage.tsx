@@ -10,6 +10,7 @@ import {
   MAINTENANCE_JOB_CATEGORY_LABEL,
   MaintenanceJobCategory,
 } from '@gam/shared'
+import { appConfirm } from '../components/dialogs'
 
 // Dedicated per-user permissions page — THE one surface for configuring a
 // staff member (S526: the old Team-row expandable grid is retired). The
@@ -126,12 +127,12 @@ export function StaffPermissionsPage() {
       {member.role === 'property_manager' && (
         <DirectDepositToggle
           member={member}
-          onChange={(enabled) => {
-            if (enabled && !confirm(
+          onChange={async (enabled) => {
+            if (enabled && !(await appConfirm(
               `Enable direct deposit for ${member.firstName} ${member.lastName}? ` +
               `They'll get an email + in-app notification to link their ` +
               `bank account before manager fees can be paid out.`
-            )) return
+            ))) return
             toggleDirectDeposit.mutate({ userId: member.userId, enabled })
           }}
           pending={toggleDirectDeposit.isLoading}

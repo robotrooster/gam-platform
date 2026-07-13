@@ -1,6 +1,7 @@
 import { useQuery } from 'react-query'
 import { useParams, useNavigate } from 'react-router-dom'
 import { Film, ArrowLeft, Video } from 'lucide-react'
+import { humanize } from '@gam/shared'
 import { apiGet } from '../lib/api'
 import { AuthedVideo } from '../components/AuthedMedia'
 
@@ -82,7 +83,7 @@ export function UnitLifecyclePage() {
               <div style={{ padding: 16, borderBottom: '1px solid var(--border-0)', display: 'flex', alignItems: 'center', gap: 10 }}>
                 <span style={{ width: 10, height: 10, borderRadius: '50%', background: STAGE_DOT[stage.inspectionType] || 'var(--text-3)' }} />
                 <strong>{STAGE_LABEL[stage.inspectionType] || stage.inspectionType}</strong>
-                <span className="badge badge-muted">{stage.status.replace('_', ' ')}</span>
+                <span className="badge badge-muted">{humanize(stage.status)}</span>
                 <span style={{ marginLeft: 'auto', fontSize: '.78rem', color: 'var(--text-3)' }}>
                   {fmtDate(stage.conductedAt || stage.scheduledFor || stage.createdAt)}
                 </span>

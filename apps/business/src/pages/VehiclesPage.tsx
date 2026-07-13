@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react'
+import { humanize } from '@gam/shared'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
+import { appConfirm } from '../components/dialogs'
 import { Pencil, Archive } from 'lucide-react'
 import { Modal } from '../components/Modal'
 import { iconBtnStyle, cancelBtnStyle, saveBtnStyle } from './CustomersPage'
@@ -112,7 +114,7 @@ export function VehiclesPage() {
   }
 
   const onArchive = async (r: VehicleRow) => {
-    if (!window.confirm(`Archive ${r.name}? It won't be eligible for route generation after this.`)) return
+    if (!(await appConfirm(`Archive ${r.name}? It won't be eligible for route generation after this.`, { danger: true, confirmLabel: 'Archive' }))) return
     setArchiving(r.id); setErr(null)
     try {
       await apiPost(`/vehicles/${r.id}/archive`)
@@ -171,7 +173,7 @@ export function VehiclesPage() {
                     <td style={tdStyle}>{r.plate_or_id ?? '—'}</td>
                     <td style={tdStyle}>{r.home_depot_name}</td>
                     <td style={tdStyle}>{r.stops_per_dump}</td>
-                    <td style={tdStyle}>{r.status}</td>
+                    <td style={tdStyle}>{humanize(r.status)}</td>
                     <td style={tdStyle}>
                       <div style={{ display: 'flex', gap: 6 }}>
                         <button onClick={() => startEdit(r)} style={iconBtnStyle('default', false)}>

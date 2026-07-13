@@ -2,7 +2,14 @@
  * S535 (Nic): late-fee policy resolution — per (property, UNIT TYPE)
  * rows ONLY. There is deliberately NO property-wide default: a default
  * silently applied to a unit class it wasn't vetted for is how an
- * illegal charge happens. No row = that class has no late fee.
+ * illegal charge happens.
+ *
+ * S537 (Nic): a row is now an explicit DECISION — either concrete fee
+ * terms or "this class has no late fee" (no_late_fee = TRUE). No row =
+ * UNDECIDED, and undecided classes are gated: units cannot be added and
+ * tenants cannot be onboarded for a (property, unit_type) until the
+ * landlord decides (assertLateFeeDecision below). This closes the import
+ * hole where per-tenant fee divergence could enter unvetted.
  *
  * Late fees are never set per lease (anti-discrimination — identical
  * terms for every tenant of a unit class). The unit's type resolves the
@@ -14,11 +21,15 @@
  *     signed terms and pick up the current policy at renewal.
  *   - the sign GET payload, so the signing UI locks the fields and the
  *     policy popup states the exact fee-start day.
+ *   - the late-fee billing cron, which caps every charge at the current
+ *     policy (tenant-favorable minimum — see jobs/lateFees.ts).
  *
  * Resolution: the (property, unit_type) row, gated by the property's
- * late_fee_enabled master toggle; null otherwise.
+ * late_fee_enabled master toggle; null when the class has no fee
+ * (explicit no-fee decision, master toggle off, or undecided).
  */
 import { queryOne } from '../db'
+import { AppError } from '../middleware/errorHandler'
 
 export interface ResolvedLateFeePolicy {
   source: 'unit_type_override'
@@ -60,9 +71,11 @@ export async function resolveLateFeePolicyForUnit(
 
   // S535 (Nic): NO property-wide default — a default silently applied to
   // a unit class it wasn't vetted for is how an illegal charge happens.
-  // The per-(property, unit_type) row is the ONLY source; no row = that
-  // class has no late fee.
-  if (!override) return null
+  // The per-(property, unit_type) row is the ONLY source.
+  // S537: an explicit no-fee decision resolves to null the same as
+  // undecided — the DECIDED/UNDECIDED distinction only matters to the
+  // onboarding gate (assertLateFeeDecision), never to billing/drafting.
+  if (!override || override.no_late_fee) return null
   return {
     source: 'unit_type_override',
     unit_type: unit.unit_type,
@@ -76,6 +89,53 @@ export async function resolveLateFeePolicyForUnit(
     late_fee_cap_amount: override.late_fee_cap_amount,
     late_fee_cap_type: override.late_fee_cap_type,
   }
+}
+
+/** S537: has the landlord made an explicit late-fee decision for this
+ *  (property, unit_type)? A row of either shape (fee terms or no-fee)
+ *  counts; absence = undecided. */
+export async function hasLateFeeDecision(
+  propertyId: string,
+  unitType: string,
+  client: Exec = null,
+): Promise<boolean> {
+  const one = async (sql: string, params: any[]) =>
+    client ? (await client.query(sql, params)).rows[0] ?? null : queryOne<any>(sql, params)
+  const row = await one(
+    `SELECT id FROM property_unit_type_late_fees WHERE property_id = $1 AND unit_type = $2`,
+    [propertyId, unitType])
+  return !!row
+}
+
+/** S537 gate: adding units / onboarding tenants for an undecided unit
+ *  class refuses with a pointer to the settings surface. Uniformity rule:
+ *  every tenant of a class gets identical, vetted late-fee terms — the
+ *  decision must exist BEFORE anyone can occupy the class. */
+export async function assertLateFeeDecision(
+  propertyId: string,
+  unitType: string,
+  client: Exec = null,
+): Promise<void> {
+  if (await hasLateFeeDecision(propertyId, unitType, client)) return
+  const label = unitType.replace(/_/g, ' ')
+  throw new AppError(422,
+    `No late-fee decision exists for ${label} units at this property. ` +
+    `Set the late-fee terms for ${label} — or explicitly choose "no late fee" — ` +
+    `in the property's Late Fees settings before adding ${label} units or onboarding tenants to them.`)
+}
+
+/** Same gate keyed by unit id (onboarding paths know the unit, not the
+ *  type). No-op for units with no type on record. */
+export async function assertLateFeeDecisionForUnit(
+  unitId: string,
+  client: Exec = null,
+): Promise<void> {
+  const one = async (sql: string, params: any[]) =>
+    client ? (await client.query(sql, params)).rows[0] ?? null : queryOne<any>(sql, params)
+  const unit = await one(
+    `SELECT property_id, unit_type FROM units WHERE id = $1`, [unitId])
+  if (!unit?.unit_type) return
+  await assertLateFeeDecision(unit.property_id, unit.unit_type, client)
 }
 
 /** Map a resolved policy onto the granular late-fee lease-column tags

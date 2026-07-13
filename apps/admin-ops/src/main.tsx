@@ -4,7 +4,7 @@ import ReactDOM from 'react-dom/client'
 import { BrowserRouter, Routes, Route, Navigate, NavLink, Outlet, useNavigate } from 'react-router-dom'
 import { QueryClient, QueryClientProvider, useQuery, useMutation, useQueryClient } from 'react-query'
 import axios from 'axios'
-import { applyCamelizeInterceptor } from '@gam/shared'
+import { applyCamelizeInterceptor, humanize } from '@gam/shared'
 
 const API = 'http://localhost:4000'
 const api = axios.create({ baseURL: `${API}/api` })
@@ -535,7 +535,7 @@ function Units() {
                     <td style={{fontSize:'.75rem'}}>{u.propertyName}</td>
                     <td style={{fontSize:'.75rem'}}>{u.tenantFirst?`${u.tenantFirst} ${u.tenantLast}`:<span style={{color:'var(--t3)'}}>Vacant</span>}</td>
                     <td className="mono">{fmt(u.rentAmount)}</td>
-                    <td><span className={`badge ${u.status==='active'?'bg2':u.status==='delinquent'?'ba':'bmu'}`}>{u.status}</span></td>
+                    <td><span className={`badge ${u.status==='active'?'bg2':u.status==='delinquent'?'ba':'bmu'}`}>{humanize(u.status)}</span></td>
                   </tr>
                 ))}
                 {filtered.length===0&&<tr><td colSpan={5}><div className="empty">No units found</div></td></tr>}
@@ -551,7 +551,7 @@ function Units() {
                 <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:2}}>{selected.propertyName}</div>
                 {selected.street1&&<div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:2}}>{selected.street1}, {selected.city}</div>}
               </div>
-              <div className="dr"><span className="dk">Status</span><span className={`badge ${selected.status==='active'?'bg2':selected.status==='delinquent'?'ba':'bmu'}`}>{selected.status}</span></div>
+              <div className="dr"><span className="dk">Status</span><span className={`badge ${selected.status==='active'?'bg2':selected.status==='delinquent'?'ba':'bmu'}`}>{humanize(selected.status)}</span></div>
               <div className="dr"><span className="dk">Rent</span><span className="dv mono">{fmt(selected.rentAmount)}/mo</span></div>
               <div className="dr"><span className="dk">Deposit</span><span className="dv mono">{fmt(selected.securityDeposit||0)}</span></div>
               <div className="dr"><span className="dk">Bedrooms</span><span className="dv">{selected.bedrooms||'—'}</span></div>
@@ -595,9 +595,9 @@ function Payments() {
                   <td className="mono" style={{fontSize:'.72rem'}}>{new Date(p.dueDate).toLocaleDateString()}</td>
                   <td style={{fontSize:'.75rem'}}><span style={{color:'var(--t3)'}}>{p.propertyName||'—'}</span>{p.propertyName&&' · '}<span className="mono">{p.unitNumber||'—'}</span></td>
                   <td style={{fontSize:'.75rem'}}>{p.tenantFirst?`${p.tenantFirst} ${p.tenantLast}`:<span style={{color:'var(--t3)'}}>—</span>}</td>
-                  <td><span className="badge bmu">{p.type}</span></td>
+                  <td><span className="badge bmu">{humanize(p.type)}</span></td>
                   <td className="mono" style={{fontWeight:600,color:'var(--t0)'}}>{fmt(p.amount)}</td>
-                  <td><span className={`badge ${ST[p.status]||'bmu'}`}>{p.status}</span></td>
+                  <td><span className={`badge ${ST[p.status]||'bmu'}`}>{humanize(p.status)}</span></td>
                 </tr>
               )):<tr><td colSpan={6}><div className="empty">{search?'No payments match your search.':'No payments yet.'}</div></td></tr>}
             </tbody>
@@ -614,10 +614,10 @@ function Payments() {
             <div className="dr"><span className="dk">Property</span><span className="dv">{selected.propertyName||'—'}</span></div>
             <div className="dr"><span className="dk">Unit</span><span className="dv mono">{selected.unitNumber||'—'}</span></div>
             <div className="dr"><span className="dk">Tenant</span><span className="dv">{selected.tenantFirst?`${selected.tenantFirst} ${selected.tenantLast}`:'—'}</span></div>
-            <div className="dr"><span className="dk">Type</span><span className="dv">{selected.type}</span></div>
+            <div className="dr"><span className="dk">Type</span><span className="dv">{humanize(selected.type)}</span></div>
             <div className="dr"><span className="dk">Amount</span><span className="dv mono" style={{color:'var(--gold)',fontWeight:700}}>{fmt(selected.amount)}</span></div>
             <div className="dr"><span className="dk">Due Date</span><span className="dv mono">{new Date(selected.dueDate).toLocaleDateString()}</span></div>
-            <div className="dr"><span className="dk">Status</span><span className={`badge ${ST[selected.status]||'bmu'}`}>{selected.status}</span></div>
+            <div className="dr"><span className="dk">Status</span><span className={`badge ${ST[selected.status]||'bmu'}`}>{humanize(selected.status)}</span></div>
             {selected.returnCode&&<div className="dr"><span className="dk">Return Code</span><span className="badge ba">{selected.returnCode}</span></div>}
           </div>
         </div>
@@ -1065,7 +1065,7 @@ function PropertyReviews(){
                     <td style={{fontSize:'.72rem',color:'var(--t3)'}}>{fmtDate(f.detectedAt)}</td>
                     <td><div style={{fontWeight:600}}>{f.newName}</div><div style={{fontSize:'.7rem',color:'var(--t3)'}}>{f.newStreet1}, {f.newCity}</div></td>
                     <td><div style={{fontWeight:600}}>{f.origName}</div><div style={{fontSize:'.7rem',color:'var(--t3)'}}>{f.origLandlordFirst} {f.origLandlordLast}</div></td>
-                    <td><span style={{fontSize:'.7rem',padding:'2px 8px',borderRadius:4,background:f.resolvedAt?'var(--b1)':'var(--gold)',color:f.resolvedAt?'var(--t3)':'#000'}}>{f.resolvedAt?f.resolution:'pending'}</span></td>
+                    <td><span style={{fontSize:'.7rem',padding:'2px 8px',borderRadius:4,background:f.resolvedAt?'var(--b1)':'var(--gold)',color:f.resolvedAt?'var(--t3)':'#000'}}>{f.resolvedAt?humanize(f.resolution):'Pending'}</span></td>
                   </tr>
                 ))}
               </tbody>
@@ -1113,7 +1113,7 @@ function PropertyReviews(){
             </>:<>
               <div style={{padding:14,background:'var(--b1)',borderRadius:8}}>
                 <div style={{fontSize:'.7rem',color:'var(--t3)',marginBottom:4}}>Resolved {fmtDate(selected.resolvedAt)}</div>
-                <div style={{fontSize:'.85rem',fontWeight:600,marginBottom:6}}>{selected.resolution}</div>
+                <div style={{fontSize:'.85rem',fontWeight:600,marginBottom:6}}>{humanize(selected.resolution)}</div>
                 {selected.notes&&<div style={{fontSize:'.78rem',color:'var(--t1)'}}>{selected.notes}</div>}
               </div>
             </>}

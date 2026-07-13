@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react'
 import { useQuery } from 'react-query'
 import { Search, UserSearch, Info } from 'lucide-react'
+import { humanize } from '@gam/shared'
 import { apiGet } from '../lib/api'
 
 type ScreeningPayload = {
@@ -110,7 +111,7 @@ function attestationLabel(src: string): string {
     case 'system_derived':        return 'system'
     case 'tenant_self_reported':  return 'self-reported'
     case 'partner_cra':           return 'CRA partner'
-    default:                      return src.replace(/_/g, ' ')
+    default:                      return humanize(src)
   }
 }
 

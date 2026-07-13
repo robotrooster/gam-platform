@@ -2,10 +2,11 @@
 import { useState, useRef, useCallback, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPatch, apiDelete, apiPut } from '../lib/api'
-import { LEASE_COLUMNS, LEASE_COLUMN_LABEL, LEASE_COLUMN_INPUT } from '@gam/shared'
+import { LEASE_COLUMNS, LEASE_COLUMN_LABEL, LEASE_COLUMN_INPUT, humanize } from '@gam/shared'
 import { useAuth } from '../context/AuthContext'
 import { usePerms } from '../lib/permissions'
 import { Plus, X, FileText, Send, Settings, Eye, Trash2, ChevronRight, Check, AlertCircle, Download, MoreVertical } from 'lucide-react'
+import { toast, appConfirm } from '../components/dialogs'
 
 const API_URL = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
 
@@ -147,7 +148,12 @@ function PDFCanvas({ url, page, width, height }: { url:string; page:number; widt
           })
         }
         const pdfjsLib = (window as any).pdfjsLib
-        const loadingTask = pdfjsLib.getDocument(url)
+        // S535: template PDFs are served by the authed /api/esign/files
+        // route — attach the Bearer token (pdf.js fetches the URL itself,
+        // so the axios interceptor never sees this request).
+        const loadingTask = pdfjsLib.getDocument({
+          url, httpHeaders: { Authorization: 'Bearer ' + (localStorage.getItem('gam_token') || '') }
+        })
         const pdf = await loadingTask.promise
         if (cancelled) return
         const pdfPage = await pdf.getPage(page)
@@ -268,7 +274,7 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
           <div style={{ display:'flex', flexDirection:'column', gap:4, marginBottom:16 }}>
             {SIGNER_ROLES.map(role => (
               <div key={role} onClick={() => setActiveRole(role)} style={{ padding:'6px 10px', borderRadius:6, cursor:'pointer', border:`1px solid ${activeRole===role?ROLE_COLORS[role]:'var(--border-0)'}`, background:activeRole===role?`${ROLE_COLORS[role]}22`:'transparent', fontSize:'.75rem', fontWeight:activeRole===role?700:400, color:activeRole===role?ROLE_COLORS[role]:'var(--text-3)', textTransform:'capitalize' }}>
-                {role.replace('_',' ')}
+                {humanize(role)}
               </div>
             ))}
           </div>
@@ -284,7 +290,7 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
 
           {activeTool && (
             <div style={{ padding:'8px 10px', background:'rgba(201,162,39,.08)', border:'1px solid rgba(201,162,39,.2)', borderRadius:8, fontSize:'.72rem', color:'var(--gold)', lineHeight:1.5 }}>
-              Click on the document to place a <b>{activeTool}</b> field for <b>{activeRole.replace('_',' ')}</b>.
+              Click on the document to place a <b>{FIELD_TYPES.find(f => f.type === activeTool)?.label || humanize(activeTool)}</b> field for <b>{humanize(activeRole)}</b>.
             </div>
           )}
 
@@ -331,7 +337,7 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
                     const newFields = Array.from({ length: template.pageCount }, (_, i) => i+1)
                       .filter(pg => pg !== base.page && !existing.includes(pg))
                       .map(pg => ({ ...base, id: `f_${Date.now()}_${pg}`, page: pg }))
-                    if (newFields.length === 0) return alert('Already stamped to all pages')
+                    if (newFields.length === 0) return toast('Already stamped to all pages')
                     setFields(prev => [...prev, ...newFields])
                   }}>
                   🔘 Stamp to all {template.pageCount} pages
@@ -830,7 +836,7 @@ export function ESignPage() {
                   <tr key={d.id}>
                     <td style={{ fontWeight:600, color:'var(--text-0)' }}>{d.title}</td>
                     <td style={{ fontSize:'.75rem' }}>{d.propertyName} · Unit {d.unitNumber}</td>
-                    <td><span className={`badge ${STATUS_COLORS[d.status]||'badge-muted'}`}>{d.status.replace('_',' ')}</span></td>
+                    <td><span className={`badge ${STATUS_COLORS[d.status]||'badge-muted'}`}>{humanize(d.status)}</span></td>
                     <td style={{ fontSize:'.75rem' }}>{d.signedCount}/{d.signerCount} signed</td>
                     <td style={{ fontSize:'.72rem', color:'var(--text-3)' }}>{d.sentAt ? new Date(d.sentAt).toLocaleDateString() : '—'}</td>
                     <td style={{ fontSize:'.72rem', color: d.completedAt ? 'var(--green)' : 'var(--text-3)' }}>{d.completedAt ? new Date(d.completedAt).toLocaleDateString() : '—'}</td>
@@ -838,7 +844,7 @@ export function ESignPage() {
                       <div style={{ display:'flex', gap:6 }}>
                         {can('esign.download') && d.completedPdfUrl && <a href={d.completedPdfUrl} className="btn btn-ghost btn-sm"><Download size={12} /></a>}
                         {can('esign.void') && d.status !== 'completed' && d.status !== 'voided' && (
-                          <button className="btn btn-ghost btn-sm" style={{ color:'var(--red)' }} onClick={() => { if(window.confirm('Void this document?')) voidMut.mutate(d.id) }}><X size={12} /></button>
+                          <button className="btn btn-ghost btn-sm" style={{ color:'var(--red)' }} onClick={() => { appConfirm('Void this document?', { danger: true, confirmLabel: 'Void' }).then(ok => { if (ok) voidMut.mutate(d.id) }) }}><X size={12} /></button>
                         )}
                       </div>
                     </td>
@@ -868,7 +874,7 @@ export function ESignPage() {
                   <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start', marginBottom:10 }}>
                     <div>
                       <div style={{ fontWeight:700, color:'var(--text-0)', marginBottom:2 }}>{t.name}</div>
-                      <div style={{ fontSize:'.72rem', color:'var(--text-3)' }}>{t.fieldCount} fields · {t.pageCount} pages · {t.unitType ? t.unitType.replace('_',' ') : 'any unit type'} · {t.propertyName || 'any property'}</div>
+                      <div style={{ fontSize:'.72rem', color:'var(--text-3)' }}>{t.fieldCount} fields · {t.pageCount} pages · {t.unitType ? humanize(t.unitType) : 'any unit type'} · {t.propertyName || 'any property'}</div>
                     </div>
                     <FileText size={18} style={{ color:'var(--text-3)' }} />
                   </div>
@@ -882,9 +888,7 @@ export function ESignPage() {
                         <Settings size={12} /> Edit Fields
                       </button>
                       <button className="btn btn-ghost btn-sm" style={{ color:'var(--red)' }} onClick={() => {
-                        if (window.confirm('Delete template "' + t.name + '"? This cannot be undone.')) {
-                          deleteTemplateMut.mutate(t.id)
-                        }
+                        appConfirm('Delete template "' + t.name + '"? This cannot be undone.', { danger: true, confirmLabel: 'Delete' }).then(ok => { if (ok) deleteTemplateMut.mutate(t.id) })
                       }}>
                         <Trash2 size={12} />
                       </button>
@@ -957,7 +961,7 @@ export function ESignPage() {
                           setDetectedPropertyName(data.data.detectedProperty.propertyName)
                         } else { setDetectedPropertyName(null) }
                       }
-                    } catch(err) { alert('Upload failed') }
+                    } catch(err) { toast.error('Upload failed') }
                     setTmplUploading(false)
                   }} />
                 </label>

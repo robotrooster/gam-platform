@@ -2,8 +2,8 @@ import { useState, useRef, useMemo } from 'react'
 import { useMutation, useQuery } from 'react-query'
 import { useNavigate } from 'react-router-dom'
 import { Upload, Download, FileText, AlertCircle, CheckCircle2, AlertTriangle, ArrowUp, X, Inbox } from 'lucide-react'
-import { api, apiPost, apiGet } from '../lib/api'
-import { AUTO_RENEW_MODES, AUTO_RENEW_MODE_LABEL } from '@gam/shared'
+import { api, apiPost, apiGet, apiPut } from '../lib/api'
+import { AUTO_RENEW_MODES, AUTO_RENEW_MODE_LABEL, UNIT_TYPE_LABEL, humanize } from '@gam/shared'
 
 // Backend response shape from POST /onboard-tenants-csv/validate.
 type CsvIssue = { severity: 'block' | 'warn'; field?: string; message: string }
@@ -33,6 +33,12 @@ type CsvRow = {
 type ValidateResponse = {
   rows: CsvRow[]
   summary: { total: number; blockers: number; warnings: number; ready: number }
+  // S537: (property, unit_type) pairs lacking a late-fee decision, each
+  // with a suggested prefill = the file's most frequent (fee, grace) pair.
+  missingLateFeeDecisions?: {
+    propertyId: string; propertyName: string; unitType: string
+    suggested: { initialAmount: number; graceDays: number; initialType: 'flat'; leaseCount: number; leaseTotal: number } | null
+  }[]
 }
 type CommitResponse = {
   committed: number
@@ -455,6 +461,11 @@ function BulkCsvMode({ onBack }: { onBack: () => void }) {
   const [reviewBanner, setReviewBanner] = useState<{ platform: string } | null>(null)
   // S297: free-text claim required on generic uploads.
   const [claimedPlatformName, setClaimedPlatformName] = useState<string>('')
+  // S537: decision interception — when validate reports undecided unit
+  // classes, the import pauses here until the landlord decides.
+  const [pendingDecisions, setPendingDecisions] = useState<NonNullable<ValidateResponse['missingLateFeeDecisions']>>([])
+  const [decisionInputs, setDecisionInputs] = useState<Record<string, { noLateFee: boolean; amount: string; grace: string; kind: 'flat' | 'percent_of_rent' }>>({})
+  const [savingDecisions, setSavingDecisions] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
   // Limbo state — rows missing only lease data routed to pending pool.
@@ -483,6 +494,23 @@ function BulkCsvMode({ onBack }: { onBack: () => void }) {
         setValidateSummary(data.summary)
         setLimboBanner('')
         setLimboErrors([])
+
+        // S537: undecided late-fee classes pause the import BEFORE any
+        // commit — the fast-path would 422 against the gate anyway. The
+        // landlord decides (mode-of-file prefill), we save, re-validate,
+        // and the flow resumes clean.
+        if (data.missingLateFeeDecisions && data.missingLateFeeDecisions.length > 0) {
+          setPendingDecisions(data.missingLateFeeDecisions)
+          setDecisionInputs(Object.fromEntries(data.missingLateFeeDecisions.map(m => [
+            `${m.propertyId}|${m.unitType}`,
+            m.suggested
+              ? { noLateFee: false, amount: String(m.suggested.initialAmount), grace: String(m.suggested.graceDays), kind: 'flat' as const }
+              : { noLateFee: false, amount: '', grace: '5', kind: 'flat' as const },
+          ])))
+          setPunchListRows(null)
+          return
+        }
+        setPendingDecisions([])
 
         const { fastPathRows, dirtyRows } = splitFastPath(data.rows)
         const { limboRows, punchListRows: identityBlockerRows } = splitDirtyRows(dirtyRows)
@@ -613,11 +641,41 @@ function BulkCsvMode({ onBack }: { onBack: () => void }) {
     })
   }
 
+  // S537: persist the decisions (properties already exist in the tenant
+  // flow), then re-validate — the gate is satisfied and the import resumes.
+  const handleSaveDecisions = async () => {
+    const incomplete = pendingDecisions.some(m => {
+      const d = decisionInputs[`${m.propertyId}|${m.unitType}`]
+      return !d || (!d.noLateFee && (d.amount === '' || d.grace === ''))
+    })
+    if (incomplete) { setErrorMsg('Every listed unit type needs a decision (terms or "no late fee").'); return }
+    setSavingDecisions(true)
+    setErrorMsg('')
+    try {
+      for (const m of pendingDecisions) {
+        const d = decisionInputs[`${m.propertyId}|${m.unitType}`]!
+        await apiPut(`/properties/${m.propertyId}/late-fee-overrides`, d.noLateFee
+          ? { unitType: m.unitType, noLateFee: true }
+          : { unitType: m.unitType, graceDays: Math.trunc(Number(d.grace) || 0), initialAmount: Number(d.amount), initialType: d.kind })
+      }
+      setPendingDecisions([])
+      validateMut.mutate({
+        csv: csvText, source,
+        ...(source === 'generic' ? { claimedPlatformName: claimedPlatformName.trim() } : {}),
+      })
+    } catch (e: any) {
+      setErrorMsg(e?.response?.data?.error || 'Could not save the late-fee decisions.')
+    } finally {
+      setSavingDecisions(false)
+    }
+  }
+
   const handleReset = () => {
     setFileName('')
     setCsvText('')
     setPunchListRows(null)
     setValidateSummary(null)
+    setPendingDecisions([])
     setErrorMsg('')
     setFastPathBanner('')
     setLimboBanner('')
@@ -786,6 +844,65 @@ function BulkCsvMode({ onBack }: { onBack: () => void }) {
               </ul>
             </div>
           )}
+        </div>
+      )}
+
+      {/* S537: late-fee decision interception — import is paused until
+          every unit class in the file has a decision. Prefill = the most
+          frequent (fee, grace) among the file's own leases. */}
+      {pendingDecisions.length > 0 && (
+        <div style={{ padding: 20, borderRadius: 10, background: 'var(--bg-1)', border: '1px solid var(--gold)', marginBottom: 16 }}>
+          <div style={{ fontSize: '1rem', fontWeight: 700, color: 'var(--text-0)', marginBottom: 4 }}>
+            Late-fee decisions needed before import
+          </div>
+          <div style={{ fontSize: '.8rem', color: 'var(--text-3)', marginBottom: 14, lineHeight: 1.5 }}>
+            These unit types have no late-fee decision yet. Where your file&apos;s leases share a
+            consistent late fee, it&apos;s prefilled below as the suggested policy — confirm or change
+            it. Imported leases keep the exact terms on their paper; this decision caps what can be
+            billed and applies to every future lease of the class.
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+            {pendingDecisions.map(m => {
+              const key = `${m.propertyId}|${m.unitType}`
+              const d = decisionInputs[key] || { noLateFee: false, amount: '', grace: '5', kind: 'flat' as const }
+              const setD = (patch: Partial<typeof d>) => setDecisionInputs(prev => ({ ...prev, [key]: { ...d, ...patch } }))
+              return (
+                <div key={key} style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', fontSize: '.84rem' }}>
+                  <span style={{ flex: '0 0 300px', color: 'var(--text-1)' }}>
+                    <strong>{m.propertyName}</strong> · {UNIT_TYPE_LABEL[m.unitType as keyof typeof UNIT_TYPE_LABEL] || humanize(m.unitType)}
+                    {m.suggested && (
+                      <span style={{ display: 'block', fontSize: '.72rem', color: 'var(--text-3)' }}>
+                        suggested from {m.suggested.leaseCount} of {m.suggested.leaseTotal} lease{m.suggested.leaseTotal === 1 ? '' : 's'} in your file
+                      </span>
+                    )}
+                  </span>
+                  <select className="input" value={d.noLateFee ? 'none' : 'fee'}
+                    onChange={e => setD({ noLateFee: e.target.value === 'none' })}
+                    style={{ width: 120, fontSize: '.8rem', padding: '4px 6px' }}>
+                    <option value="fee">Charge a fee</option>
+                    <option value="none">No late fee</option>
+                  </select>
+                  {!d.noLateFee && (
+                    <>
+                      <span style={{ color: 'var(--text-3)' }}>$</span>
+                      <input className="input" value={d.amount} inputMode="decimal"
+                        onChange={e => { const v = e.target.value; if (v === '' || /^\d*\.?\d*$/.test(v)) setD({ amount: v }) }}
+                        style={{ width: 70, fontSize: '.8rem', padding: '4px 6px' }} />
+                      <span style={{ color: 'var(--text-3)' }}>grace</span>
+                      <input className="input" value={d.grace} inputMode="numeric"
+                        onChange={e => { const v = e.target.value; if (v === '' || /^\d+$/.test(v)) setD({ grace: v }) }}
+                        style={{ width: 50, fontSize: '.8rem', padding: '4px 6px' }} />
+                      <span style={{ color: 'var(--text-3)' }}>days</span>
+                    </>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+          <button className="btn btn-primary" style={{ marginTop: 14 }} disabled={savingDecisions}
+            onClick={handleSaveDecisions}>
+            {savingDecisions ? 'Saving…' : 'Save decisions & continue import'}
+          </button>
         </div>
       )}
 

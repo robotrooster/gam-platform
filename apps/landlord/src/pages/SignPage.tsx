@@ -2,7 +2,8 @@ import { useState, useRef, useEffect, useCallback } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation } from 'react-query'
 import { Check, AlertCircle, ChevronLeft, ChevronRight, Upload, PenTool, ArrowRight } from 'lucide-react'
-import { LEASE_COLUMN_CATEGORY } from '@gam/shared'
+import { LEASE_COLUMN_CATEGORY, humanize } from '@gam/shared'
+import { toast } from '../components/dialogs'
 
 const API = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
 const tok = () => localStorage.getItem('gam_token')
@@ -251,7 +252,7 @@ export function SignPage() {
       .then(r=>r.json())
       .then((r:any)=>{ if(!r.success) throw new Error(r.error || 'Signing failed'); return r }),
     { onSuccess:(res:any)=>{ setAllDone(res.data?.completed ?? res.completed); setStage('done') },
-      onError:(e:any)=>{ setStage('signing'); alert(e?.message || 'Signing failed — try again.') } }
+      onError:(e:any)=>{ setStage('signing'); toast.error(e?.message || 'Signing failed — try again.') } }
   )
 
   const renderPageImperative = useCallback(async (pdf:any, pageNum:number) => {
@@ -515,10 +516,10 @@ export function SignPage() {
           return (
             <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,.6)', zIndex:1000, display:'flex', alignItems:'center', justifyContent:'center', padding:20 }}>
               <div style={{ background:'white', borderRadius:16, padding:24, maxWidth:400, width:'100%' }}>
-                <div style={{ fontWeight:700, color:'#1a1a1a', marginBottom:12 }}>No Late-Fee Policy — {plf.propertyName}{plf.unitType ? ` · ${String(plf.unitType).replace('_',' ')} units` : ''}</div>
+                <div style={{ fontWeight:700, color:'#1a1a1a', marginBottom:12 }}>No Late-Fee Policy — {plf.propertyName}{plf.unitType ? ` · ${humanize(plf.unitType)} units` : ''}</div>
                 <div style={{ background:'#fef3c7', border:'1px solid #d97706', borderRadius:8, padding:'10px 12px', marginBottom:14, fontSize:'.8rem', color:'#78350f', lineHeight:1.55 }}>
                   No late-fee policy is set for this unit type, so this lease has <strong>no late fees</strong> ("N/A").
-                  Late fees are never typed per lease — set a policy for {plf.unitType ? String(plf.unitType).replace('_',' ') : 'this'} units
+                  Late fees are never typed per lease — set a policy for {plf.unitType ? humanize(plf.unitType) : 'this'} units
                   on the property page and it applies to all future leases of that type.
                 </div>
                 <button onClick={()=>setActiveField(null)} style={{ width:'100%', padding:'10px', borderRadius:8, border:'none', background:'#c9a227', color:'white', fontWeight:700, cursor:'pointer' }}>Close</button>
@@ -537,7 +538,7 @@ export function SignPage() {
         return (
           <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,.6)', zIndex:1000, display:'flex', alignItems:'center', justifyContent:'center', padding:20 }}>
             <div style={{ background:'white', borderRadius:16, padding:24, maxWidth:400, width:'100%' }}>
-              <div style={{ fontWeight:700, color:'#1a1a1a', marginBottom:12 }}>Late Fee Policy — {plf.propertyName}{plf.unitType ? ` · ${String(plf.unitType).replace('_',' ')} units` : ''}</div>
+              <div style={{ fontWeight:700, color:'#1a1a1a', marginBottom:12 }}>Late Fee Policy — {plf.propertyName}{plf.unitType ? ` · ${humanize(plf.unitType)} units` : ''}</div>
               <div style={{ background:'#fef3c7', border:'1px solid #d97706', borderRadius:8, padding:'10px 12px', marginBottom:12, fontSize:'.78rem', color:'#78350f', lineHeight:1.55 }}>
                 Late fees are set per <strong>unit type</strong> at the property so every tenant of a
                 class has identical terms (fair-housing). This document reflects that policy — to change
@@ -656,7 +657,7 @@ export function SignPage() {
             <div style={{ display:'flex', flexDirection:'column' as const, gap:7, marginBottom:18 }}>
               {allFields.filter((f:any)=>fieldValues[f.id]).map((f:any)=>(
                 <div key={f.id} style={{ display:'flex', alignItems:'center', justifyContent:'space-between', padding:'7px 11px', background:'#f8f8f5', borderRadius:8 }}>
-                  <span style={{ fontSize:'.75rem', color:'#999', textTransform:'capitalize' as const }}>{f.fieldType.replace('_',' ')} · p{f.page}</span>
+                  <span style={{ fontSize:'.75rem', color:'#999', textTransform:'capitalize' as const }}>{humanize(f.fieldType)} · p{f.page}</span>
                   {(f.fieldType==='signature'||f.fieldType==='initials') && fieldValues[f.id].startsWith('data:')
                     ? <img src={fieldValues[f.id]} style={{ height:28, maxWidth:110, objectFit:'contain' }}/>
                     : <span style={{ fontFamily:fieldFonts[f.id]||'inherit', fontSize:'.95rem', color:'#1a1a1a', fontWeight:600 }}>{fieldValues[f.id]}</span>

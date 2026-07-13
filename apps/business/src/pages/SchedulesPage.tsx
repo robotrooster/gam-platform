@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { humanize, humanizeServiceType } from '@gam/shared'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
 import { Pause, Play, Pencil } from 'lucide-react'
 import { Modal } from '../components/Modal'
@@ -256,14 +257,14 @@ export function SchedulesPage() {
                         <div style={{ fontSize: 12, color: 'var(--text-2)' }}>{r.company_name}</div>
                       )}
                     </td>
-                    <td style={tdStyle}>{r.service_type}</td>
+                    <td style={tdStyle}>{humanizeServiceType(r.service_type)}</td>
                     <td style={tdStyle}>
                       <div>{describeRrule(r.rrule)}</div>
                       <div style={{ fontSize: 12, color: 'var(--text-2)' }}>
                         at {r.time_of_day}
                       </div>
                     </td>
-                    <td style={tdStyle}>{r.status}</td>
+                    <td style={tdStyle}>{humanize(r.status)}</td>
                     <td style={tdStyle}>
                       <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
                         {r.status !== 'ended' && (

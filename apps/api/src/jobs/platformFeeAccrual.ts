@@ -10,6 +10,11 @@
  *   - $10/property/month minimum (if rate × billable < min, bill min)
  *   - Vacant units never charged
  *   - "Billable units" = long_term_unit_count + CEIL(short_stay_nights/30)
+ *   - S538 STR carve-out (Nic-locked): the /30 aggregation is ONLY for
+ *     NIGHTS_AGGREGATION_UNIT_TYPES (rv_spot — space-only, landlord
+ *     coordinates nothing). Short-stay bookings on ANY other unit type
+ *     bill str_fee_pct (default 5%) of booking revenue pro-rated to
+ *     the month instead. total = MAX(rate × billable + str_fee, min).
  *
  * Long-term unit count: distinct units on the property with an active
  * lease (leases.status='active') whose [start_date, end_date OR ∞] range
@@ -41,6 +46,7 @@
  */
 
 import { getClient, query } from '../db'
+import { NIGHTS_AGGREGATION_UNIT_TYPES } from '@gam/shared'
 import type { PoolClient } from 'pg'
 
 interface AccrualResult {
@@ -144,24 +150,53 @@ async function accrueOneProperty(
         FROM unit_bookings b
         JOIN units u ON u.id = b.unit_id
        WHERE u.property_id = $1
+         AND u.unit_type = ANY($3::text[])
          AND b.lease_type IN ('nightly', 'weekly')
          AND b.status NOT IN ('cancelled', 'no_show')
          AND b.check_in  <  $2::date + INTERVAL '1 month'
          AND b.check_out >  $2::date
-    `, [propertyId, monthIso])
+    `, [propertyId, monthIso, [...NIGHTS_AGGREGATION_UNIT_TYPES]])
     const shortStayNights = ssRes.rows[0].nights ?? 0
     const shortStayEquivalent = Math.ceil(shortStayNights / 30)
 
     const totalBillable = longTermUnitCount + shortStayEquivalent
 
+    // ── STR revenue (S538) ───────────────────────────────────────────────
+    // Bookings on any NON-aggregation unit type (everything but rv_spot)
+    // bill a percentage of revenue instead of nights/30. Revenue
+    // attributes to the month pro-rata by nights:
+    // total_amount × in-month / full-stay.
+    const strRes = await client.query<{ revenue: string | null }>(`
+      SELECT COALESCE(SUM(
+          COALESCE(b.total_amount, 0)
+            * GREATEST(
+                LEAST(b.check_out, $2::date + INTERVAL '1 month')::date
+                  - GREATEST(b.check_in, $2::date)::date,
+                0
+              )::numeric
+            / GREATEST((b.check_out - b.check_in), 1)::numeric
+        ), 0) AS revenue
+        FROM unit_bookings b
+        JOIN units u ON u.id = b.unit_id
+       WHERE u.property_id = $1
+         AND u.unit_type <> ALL($3::text[])
+         AND b.lease_type IN ('nightly', 'weekly')
+         AND b.status NOT IN ('cancelled', 'no_show')
+         AND b.check_in  <  $2::date + INTERVAL '1 month'
+         AND b.check_out >  $2::date
+    `, [propertyId, monthIso, [...NIGHTS_AGGREGATION_UNIT_TYPES]])
+    const strRevenue = round2(parseFloat(strRes.rows[0].revenue ?? '0'))
+
     // ── Rate + minimum (cascade through landlord override → platform default) ──
     const rateRes = await client.query<{
       rate_per_unit: string
       min_per_property: string
+      str_fee_pct: string
     }>(`
       SELECT
         COALESCE(o.rate_per_unit,    pfc.rate_per_unit)    AS rate_per_unit,
-        COALESCE(o.min_per_property, pfc.min_per_property) AS min_per_property
+        COALESCE(o.min_per_property, pfc.min_per_property) AS min_per_property,
+        COALESCE(o.str_fee_pct,      pfc.str_fee_pct)      AS str_fee_pct
       FROM platform_fee_config pfc
       LEFT JOIN landlord_platform_fee_overrides o
              ON o.landlord_id = $1
@@ -175,14 +210,18 @@ async function accrueOneProperty(
     }
     const ratePerUnit    = parseFloat(rateRes.rows[0].rate_per_unit)
     const minPerProperty = parseFloat(rateRes.rows[0].min_per_property)
+    const strFeePct      = parseFloat(rateRes.rows[0].str_fee_pct)
+    const strFeeAmount   = round2(strFeePct * strRevenue)
 
-    // If totalBillable is 0 AND minimum is 0, nothing to bill.
-    if (totalBillable === 0 && minPerProperty === 0) {
+    // If nothing is billable AND the minimum is 0, nothing to bill.
+    if (totalBillable === 0 && strFeeAmount === 0 && minPerProperty === 0) {
       await client.query('ROLLBACK')
       return 'zero'
     }
 
-    const totalAmount = round2(Math.max(ratePerUnit * totalBillable, minPerProperty))
+    // STR fee folds UNDER the per-property minimum (it replaces those
+    // units' per-unit fee, it doesn't stack on top of the floor).
+    const totalAmount = round2(Math.max(ratePerUnit * totalBillable + strFeeAmount, minPerProperty))
 
     // ── Resolve platform_fee_payer at accrual time ──────────────────────
     const payerRes = await client.query<{ platform_fee_payer: 'landlord' | 'tenant' | null }>(`
@@ -196,13 +235,15 @@ async function accrueOneProperty(
         (landlord_id, property_id, accrual_month,
          long_term_unit_count, short_stay_nights, short_stay_equivalent, total_billable,
          rate_per_unit, min_per_property, total_amount,
+         str_revenue, str_fee_amount,
          payer)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
       RETURNING id
     `, [
       landlordId, propertyId, monthIso,
       longTermUnitCount, shortStayNights, shortStayEquivalent, totalBillable,
       ratePerUnit, minPerProperty, totalAmount,
+      strRevenue, strFeeAmount,
       payer,
     ])
     const accrualId = accrualRes.rows[0].id
@@ -233,7 +274,10 @@ async function accrueOneProperty(
         totalAmount, newBal, accrualId, propertyId,
         `Platform fee for ${monthIso} (${totalBillable} billable units` +
         (shortStayEquivalent > 0
-          ? `, ${longTermUnitCount} long-term + CEIL(${shortStayNights}/30)=${shortStayEquivalent} STR`
+          ? `, ${longTermUnitCount} long-term + CEIL(${shortStayNights}/30)=${shortStayEquivalent} short-stay`
+          : '') +
+        (strFeeAmount > 0
+          ? `, +${(strFeePct * 100).toFixed(1)}% of ${strRevenue.toFixed(2)} STR revenue = ${strFeeAmount.toFixed(2)}`
           : '') + `)`,
       ])
 

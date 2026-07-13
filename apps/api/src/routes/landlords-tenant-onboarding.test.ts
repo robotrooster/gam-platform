@@ -72,7 +72,7 @@ async function seedTOFixture(): Promise<TOFixture> {
     const propertyId = await seedProperty(client, {
       landlordId, ownerUserId: landlordUserId, managedByUserId: landlordUserId,
     })
-    const unitId = await seedUnit(client, { propertyId, landlordId })
+    const unitId = await seedUnit(client, { propertyId, landlordId, withLateFeeDecision: true })
     await client.query('COMMIT')
     const landlordToken = jwt.sign(
       { userId: landlordUserId, role: 'landlord', email: 'll@test.dev',

@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { apiGet, apiPost, apiPatch, apiDelete } from '../lib/api'
+import { appConfirm } from '../components/dialogs'
 import { Modal } from '../components/Modal'
 import { Tag, Plus, Trash2, Power } from 'lucide-react'
 
@@ -64,7 +65,7 @@ export function DiscountsPage() {
   }
 
   const remove = async (d: DiscountCode) => {
-    if (!confirm(`Delete code ${d.code}? This can't be undone.`)) return
+    if (!(await appConfirm(`Delete code ${d.code}? This can't be undone.`, { danger: true, confirmLabel: 'Delete' }))) return
     try {
       await apiDelete(`/business-discounts/${d.id}`)
       reload()

@@ -8,6 +8,8 @@ import { getStripe } from '../lib/stripe'
 import { computeApplicationFee, createRentDestinationCharge, createRentPlatformCharge } from '../services/stripeConnect'
 import { createAdminNotification } from '../services/adminNotifications'
 import { computeTenantGamOutstandingTotal } from '../services/supersedence'
+import { allocateOldestFirst } from '@gam/shared'
+import { getClient } from '../db'
 import { logger } from '../lib/logger'
 
 export const paymentsRouter = Router()
@@ -481,4 +483,274 @@ paymentsRouter.post('/:id/pay', async (req: any, res, next) => {
       },
     })
   } catch (e) { next(e) }
+})
+
+// ── S537 (Nic): ONE "Pay now" — FIFO oldest-first application ─────────
+// The tenant portal shows a READ-ONLY oldest-first ledger and a single
+// Pay Now. The tenant may pay ANY amount (partial, full, or ahead) —
+// unless the property has accept_partial_payments=FALSE (accepting a
+// partial resets the eviction clock; the landlord may refuse less than
+// the full outstanding balance).
+//
+// Mechanics: allocateOldestFirst plans the application. Rows covered in
+// FULL get this charge's PI stamped (status 'processing') — the standard
+// payment_intent.succeeded path then settles them all, running the
+// allocation engine + credit ledger per row unchanged. A PARTIALLY
+// covered row is SPLIT at initiation (the propaneRedistribution
+// pattern): the applied slice carries the PI, the remainder stays a
+// pending row so "short is short" late-fee mechanics remain truthful.
+// Any pay-ahead remainder is recorded on the remittance; the webhook
+// turns it into a lease_prepaid_credit on settlement.
+// S537: everything the tenant's Pay Now card needs in one fetch — the
+// outstanding oldest-first ledger, the total, and whether the property
+// accepts partials (eviction-clock protection).
+paymentsRouter.get('/balance-context', async (req: any, res, next) => {
+  try {
+    if (req.user!.role !== 'tenant') throw new AppError(403, 'Only tenants can call this endpoint')
+    const rows = await query<any>(
+      `SELECT p.id, p.amount::float AS amount, p.due_date::text AS due_date, p.type,
+              p.entry_description, pr.accept_partial_payments, u.payment_block
+         FROM payments p
+         JOIN units u ON u.id = p.unit_id
+         JOIN properties pr ON pr.id = u.property_id
+        WHERE p.tenant_id = $1
+          AND ((p.status = 'pending' AND p.stripe_payment_intent_id IS NULL)
+               OR p.status = 'failed')
+        ORDER BY p.due_date ASC, p.created_at ASC`,
+      [req.user!.profileId])
+    const total = Math.round(rows.reduce((sum: number, r: any) => sum + r.amount, 0) * 100) / 100
+    res.json({ success: true, data: {
+      totalOutstanding: total,
+      acceptPartialPayments: rows.length ? rows[0].accept_partial_payments !== false : true,
+      paymentBlocked: rows.length ? !!rows[0].payment_block : false,
+      rows,
+    } })
+  } catch (e) { next(e) }
+})
+
+paymentsRouter.post('/pay-balance', async (req: any, res, next) => {
+  const client = await getClient()
+  try {
+    const body = z.object({
+      amount:            z.number().positive(),
+      paymentMethodId:   z.string().min(1),
+      paymentMethodType: z.enum(['ach', 'card']),
+    }).parse(req.body)
+
+    if (req.user!.role !== 'tenant') {
+      throw new AppError(403, 'Only tenants can call this endpoint')
+    }
+    const tenantId = req.user!.profileId
+
+    // The tenant's outstanding landlord-bound ledger, oldest first. One
+    // active lease context per remittance (multi-lease tenants are not a
+    // launch case; rows resolve through the newest active lease).
+    const rows = await query<any>(
+      `SELECT p.id, p.amount::float AS amount, p.due_date::text AS due_date, p.type,
+              p.lease_id, p.unit_id, p.landlord_id,
+              u.property_id, u.payment_block,
+              pr.accept_partial_payments,
+              t.stripe_customer_id,
+              l.user_id AS landlord_user_id,
+              lu.stripe_connect_account_id, lu.connect_charges_enabled, lu.connect_details_submitted
+         FROM payments p
+         JOIN units u ON u.id = p.unit_id
+         JOIN properties pr ON pr.id = u.property_id
+         JOIN tenants t ON t.id = p.tenant_id
+         JOIN landlords l ON l.id = p.landlord_id
+         JOIN users lu ON lu.id = l.user_id
+        WHERE p.tenant_id = $1
+          AND ((p.status = 'pending' AND p.stripe_payment_intent_id IS NULL)
+               OR p.status = 'failed')
+        ORDER BY p.due_date ASC, p.created_at ASC`,
+      [tenantId]
+    )
+    if (rows.length === 0) throw new AppError(409, 'Nothing outstanding to pay')
+    const ctx = rows[0]
+    if (ctx.payment_block) {
+      throw new AppError(409, 'This unit is in eviction mode — payments to the landlord are paused. Accepting one could reset the eviction timeline. Contact the landlord.')
+    }
+    if (!ctx.stripe_customer_id) {
+      throw new AppError(409, 'Tenant has no Stripe customer — complete ACH setup first')
+    }
+
+    const totalOutstanding = rows.reduce((sum: number, r: any) => sum + r.amount, 0)
+    // S537: eviction-clock protection — partials refused when the
+    // property opts out. Paying MORE than the balance never resets a
+    // clock, so pay-ahead stays allowed.
+    if (!ctx.accept_partial_payments && body.amount < totalOutstanding - 0.005) {
+      throw new AppError(422,
+        `This property does not accept partial payments — the full outstanding balance is $${totalOutstanding.toFixed(2)}.`)
+    }
+
+    const plan = allocateOldestFirst(
+      rows.map((r: any) => ({ id: r.id, amount: r.amount, due_date: r.due_date })),
+      body.amount
+    )
+    const appliedTotal = Math.round((body.amount - plan.unapplied) * 100) / 100
+    const rowById = new Map(rows.map((r: any) => [r.id, r]))
+
+    const landlordConnectReady =
+      !!ctx.stripe_connect_account_id &&
+      ctx.connect_charges_enabled === true &&
+      ctx.connect_details_submitted === true
+
+    const stripe = getStripe()
+    let cardCountry: string | null = null
+    if (body.paymentMethodType === 'card') {
+      const pm = await stripe.paymentMethods.retrieve(body.paymentMethodId)
+      cardCountry = pm.card?.country ?? null
+    }
+
+    const baseApplicationFee = computeApplicationFee({
+      amount: body.amount,
+      paymentMethod: body.paymentMethodType,
+      cardCountry,
+    })
+
+    // Tenant-payer platform fee passthrough — same as /:id/pay.
+    const unpaidAccruals = await query<{ id: string; total_amount: string }>(
+      `SELECT id, total_amount FROM platform_fee_accruals
+        WHERE property_id = $1 AND payer = 'tenant'
+          AND tenant_charge_id IS NULL AND total_amount > 0`,
+      [ctx.property_id]
+    )
+    const passthroughAmount = unpaidAccruals.reduce((sum, r) => sum + parseFloat(r.total_amount), 0)
+
+    // Sublease markup — applies per covered RENT dollar, same rule as
+    // the per-row flow (rare; sublessee pays marked-up rent, the markup
+    // stays on platform and credits the sublessor at settle).
+    let subleaseMarkup = 0
+    {
+      const sub = await queryOne<{ sub: string; master: string }>(
+        `SELECT s.sub_monthly_amount::text AS sub, s.master_share_amount::text AS master
+           FROM subleases s JOIN leases l ON l.id = s.master_lease_id
+          WHERE l.unit_id = $1 AND s.sublessee_tenant_id = $2 AND s.status = 'active'
+          LIMIT 1`,
+        [ctx.unit_id, tenantId],
+      )
+      if (sub) {
+        const perMonth = Math.max(0, parseFloat(sub.sub) - parseFloat(sub.master))
+        const coveredRentMonths = plan.lines.filter(ln => rowById.get(ln.payment_id)?.type === 'rent'
+          && Math.abs(ln.amount_applied - rowById.get(ln.payment_id)!.amount) < 0.005).length
+        subleaseMarkup = perMonth * coveredRentMonths
+      }
+    }
+
+    const gamSupersedenceAmount = Math.min(body.amount, await computeTenantGamOutstandingTotal(tenantId))
+    const applicationFeeAmount = Math.round(
+      (baseApplicationFee + passthroughAmount + subleaseMarkup + gamSupersedenceAmount) * 100) / 100
+
+    // Create the remittance BEFORE the Stripe call so the PI metadata can
+    // carry its id; stamp the PI after.
+    await client.query('BEGIN')
+    const rem = await client.query<{ id: string }>(
+      `INSERT INTO tenant_remittances
+         (tenant_id, lease_id, landlord_id, amount, applied_amount, unapplied_amount, payment_method)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+      [tenantId, ctx.lease_id, ctx.landlord_id, body.amount.toFixed(2),
+       appliedTotal.toFixed(2), plan.unapplied.toFixed(2), body.paymentMethodType])
+    const remittanceId = rem.rows[0].id
+
+    // Apply the plan: split the partial row, record every line.
+    const fullyCoveredIds: string[] = []
+    for (const line of plan.lines) {
+      const row = rowById.get(line.payment_id)!
+      const isFull = Math.abs(line.amount_applied - row.amount) < 0.005
+      let coveredPaymentId = line.payment_id
+      if (!isFull) {
+        // Split (propaneRedistribution pattern): the applied slice takes
+        // the charge; a remainder row stays pending — late fees remain
+        // truthful about the unpaid portion ("short is short").
+        const remainder = Math.round((row.amount - line.amount_applied) * 100) / 100
+        await client.query(
+          `UPDATE payments SET amount = $2::numeric,
+                  notes = COALESCE(notes || ' — ', '') || 'partially covered by Pay Now (FIFO application); $' || $3 || ' remains on a separate row'
+            WHERE id = $1`,
+          [row.id, line.amount_applied.toFixed(2), remainder.toFixed(2)])
+        await client.query(
+          `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, invoice_id,
+                                 type, amount, status, due_date, entry_description, notes, is_remainder)
+           SELECT unit_id, lease_id, tenant_id, landlord_id, invoice_id,
+                  type, $2::numeric, 'pending', due_date, entry_description,
+                  'Remainder after FIFO application of a partial payment', TRUE
+             FROM payments WHERE id = $1`,
+          [row.id, remainder.toFixed(2)])
+      }
+      fullyCoveredIds.push(coveredPaymentId)
+      await client.query(
+        `INSERT INTO remittance_applications (remittance_id, payment_id, amount_applied)
+         VALUES ($1, $2, $3)`,
+        [remittanceId, coveredPaymentId, line.amount_applied.toFixed(2)])
+    }
+
+    const intent = landlordConnectReady
+      ? await createRentDestinationCharge({
+          amount: body.amount,
+          stripeCustomerId: ctx.stripe_customer_id,
+          paymentMethodId: body.paymentMethodId,
+          paymentMethodTypes: body.paymentMethodType === 'ach' ? ['us_bank_account'] : ['card'],
+          destinationConnectAccountId: ctx.stripe_connect_account_id,
+          applicationFeeAmount,
+          entryDescription: 'BALANCE',
+          metadata: { gam_remittance_id: remittanceId, tenant_id: tenantId, landlord_id: ctx.landlord_id },
+        })
+      : await createRentPlatformCharge({
+          amount: body.amount,
+          stripeCustomerId: ctx.stripe_customer_id,
+          paymentMethodId: body.paymentMethodId,
+          paymentMethodTypes: body.paymentMethodType === 'ach' ? ['us_bank_account'] : ['card'],
+          entryDescription: 'BALANCE',
+          metadata: { gam_remittance_id: remittanceId, tenant_id: tenantId, landlord_id: ctx.landlord_id },
+        })
+
+    // Stamp the PI on every covered row — the standard webhook settle
+    // path (allocation engine, credit ledger, propane, supersedence)
+    // picks them ALL up by PI id, unchanged.
+    await client.query(
+      `UPDATE payments SET status = 'processing', stripe_payment_intent_id = $1,
+              platform_held = $3
+        WHERE id = ANY($2::uuid[])`,
+      [intent.id, fullyCoveredIds, !landlordConnectReady])
+    await client.query(
+      `UPDATE tenant_remittances SET stripe_payment_intent_id = $1, updated_at = NOW() WHERE id = $2`,
+      [intent.id, remittanceId])
+    if (unpaidAccruals.length > 0) {
+      // Claim passthrough accruals against the oldest covered row (the
+      // reconciliation anchor) — same one-winner semantics as /:id/pay.
+      await client.query(
+        `UPDATE platform_fee_accruals SET tenant_charge_id = $1, updated_at = NOW()
+          WHERE id = ANY($2::uuid[]) AND tenant_charge_id IS NULL`,
+        [fullyCoveredIds[0], unpaidAccruals.map(r => r.id)])
+    }
+    await client.query('COMMIT')
+
+    if (!landlordConnectReady) {
+      await createAdminNotification({
+        severity: 'warn',
+        category: 'platform_held_rent_charge',
+        title: `Balance payment collected to platform — landlord ${ctx.landlord_user_id} not Connect-ready`,
+        body: `Remittance ${remittanceId} for $${body.amount.toFixed(2)} collected to GAM platform balance. Reconciles via Transfer after Connect onboarding.`,
+        context: { remittance_id: remittanceId, landlord_id: ctx.landlord_id, amount: body.amount },
+      })
+    }
+
+    res.json({
+      success: true,
+      data: {
+        remittanceId,
+        paymentIntentId: intent.id,
+        status: intent.status,
+        appliedTotal,
+        payAhead: plan.unapplied,
+        lines: plan.lines,
+        applicationFeeAmount,
+      },
+    })
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    next(e)
+  } finally {
+    client.release()
+  }
 })

@@ -57,6 +57,16 @@ async function send(
   from: SenderKind = 'noreply',
   attachments: EmailAttachment[] | undefined = undefined,
 ): Promise<string | null> {
+  // S536 (Nic): dev runs against demo data with fake tenant addresses,
+  // and every bounce dings the domain's Resend sending reputation.
+  // Outside production (tests mock Resend and are unaffected), suppress
+  // the real send and log instead. Set EMAIL_SEND_LIVE=1 in .env for a
+  // deliberate live send from dev (deliverability checks etc.).
+  const nodeEnv = process.env.NODE_ENV || 'development'
+  if (nodeEnv !== 'production' && nodeEnv !== 'test' && process.env.EMAIL_SEND_LIVE !== '1') {
+    logger.info(`[EMAIL SUPPRESSED — non-production] ${subject} -> ${to}`)
+    return null
+  }
   let status: 'sent' | 'failed' = 'sent'
   let errorMessage: string | null = null
   let messageId: string | null = null
@@ -1316,4 +1326,26 @@ export async function emailBookingGuestAccess(args: {
     },
     'support',
   )
+}
+
+// S536 (Nic): POS receipts are emailed, never printed in-product —
+// the customer prints at home from the PDF attachment if they want
+// paper. Used by both the business register (business-pos) and the
+// property register.
+export async function emailPosReceipt(
+  to: string,
+  operatorName: string,
+  receiptNumber: string,
+  total: number,
+  pdf: Buffer,
+  ctx: EmailSendContext = {},
+): Promise<string | null> {
+  const subject = `Receipt ${receiptNumber} — ${operatorName}`
+  const html = base(`
+    <h2 style="margin:0 0 12px;color:#e8e6e3;font-size:1.05rem">Receipt from ${operatorName}</h2>
+    <p style="color:#9b9894;font-size:.9rem;margin:0 0 8px">Total: <strong style="color:#c9a227">$${total.toFixed(2)}</strong></p>
+    <p style="color:#9b9894;font-size:.9rem;margin:0">Your itemized receipt is attached as a PDF.</p>
+  `)
+  return send(to, subject, html, { ...ctx, category: ctx.category ?? 'pos_receipt' }, 'noreply',
+    [{ filename: `receipt-${receiptNumber}.pdf`, content: pdf }])
 }

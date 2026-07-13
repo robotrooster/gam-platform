@@ -6,6 +6,7 @@ import {
   UNIT_TYPES, UnitType, UNIT_TYPE_LABEL, UNIT_TYPE_ICON, UNIT_TYPE_HAS_BEDROOMS,
   PropertyUnitSubtype, unitSubtypeFactsLabel,
 } from '@gam/shared'
+import { appConfirm } from '../components/dialogs'
 
 // S527 (Nic): OWNER-DEFINED subtypes — replaces the S526 pre-baked
 // bed-count / RV-combo pricing grid. A subtype is the owner's own named
@@ -98,7 +99,7 @@ export function UnitSubtypesSection({ propertyId }: { propertyId: string }) {
                   <button className="btn btn-primary btn-sm" onClick={() => setEditing(s)}>Edit</button>
                   <button
                     className="btn btn-ghost btn-sm" style={{ color: 'var(--red)' }} title="Remove"
-                    onClick={() => { if (window.confirm(`Remove the "${s.name}" subtype? Existing units keep their details.`)) deleteMut.mutate(s.id!) }}
+                    onClick={() => { appConfirm(`Remove the "${s.name}" subtype? Existing units keep their details.`, { danger: true, confirmLabel: 'Remove' }).then(ok => { if (ok) deleteMut.mutate(s.id!) }) }}
                   >
                     <Trash2 size={13} />
                   </button>

@@ -19,7 +19,7 @@ import {
   applyPaymentMapping, buildPaymentTemplateCsv, getPaymentPlatformConfig,
   type CsvImportPlatform,
 } from '../lib/csvImportMappings'
-import { AUTO_RENEW_MODES, PM_LINK_SCOPES, formatInvoiceNumber } from '@gam/shared'
+import { AUTO_RENEW_MODES, PM_LINK_SCOPES, formatInvoiceNumber, UNIT_TYPES } from '@gam/shared'
 import { emailPmPropertyInvitation } from '../services/email'
 import { platformFeesByProperty, periodMonths } from '../services/platformFee'
 import {
@@ -28,6 +28,7 @@ import {
 } from '../services/pm'
 import { logger } from '../lib/logger'
 import { checkAgainstStatute } from '../services/stateLaw'
+import { assertLateFeeDecisionForUnit, assertLateFeeDecision } from '../services/lateFeePolicy'
 import {
   recordValidateAttempt,
   recordCommitAttempt,
@@ -324,6 +325,14 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
       FROM background_checks
       WHERE landlord_id = $1 AND status = 'submitted'`, [id])
 
+    // S536 (Nic): needs-review leases belong on the main dashboard, not
+    // just the Leases page banner. Current leases only (active+pending) —
+    // the Leases page's default view — so the two counts always agree.
+    const [leaseReview] = await query<any>(`
+      SELECT COUNT(*)::int AS count
+      FROM leases
+      WHERE landlord_id = $1 AND needs_review = TRUE AND status IN ('active','pending')`, [id])
+
     const [otpStats] = await query<any>(`
       SELECT
         COUNT(*)::int AS otp_units,
@@ -384,7 +393,7 @@ landlordsRouter.get('/:id/dashboard', async (req, res, next) => {
     const totalUnits = stats?.total_units || 0
     const occupancyRate = totalUnits > 0 ? Math.round(100 * (stats?.active_units || 0) / totalUnits) : 0
 
-    res.json({ success: true, data: { ...stats, upcoming_disbursement: upcoming, trend, maintenance, bg_pending: bgPending?.count||0, otp_units: otpStats?.otp_units||0, projected_otp_disbursement: otpStats?.projected_otp_disbursement||0, platformFee, platformFeeByProperty, collected_mtd: collectedRow?.collected_mtd||0, outstanding: outstandingRow?.outstanding||0, leases_expiring_30d: expiring?.leases_expiring_30d||0, leases_expiring_60d: expiring?.leases_expiring_60d||0, occupancy_rate: occupancyRate } })
+    res.json({ success: true, data: { ...stats, upcoming_disbursement: upcoming, trend, maintenance, bg_pending: bgPending?.count||0, leases_need_review: leaseReview?.count||0, otp_units: otpStats?.otp_units||0, projected_otp_disbursement: otpStats?.projected_otp_disbursement||0, platformFee, platformFeeByProperty, collected_mtd: collectedRow?.collected_mtd||0, outstanding: outstandingRow?.outstanding||0, leases_expiring_30d: expiring?.leases_expiring_30d||0, leases_expiring_60d: expiring?.leases_expiring_60d||0, occupancy_rate: occupancyRate } })
   } catch (e) { next(e) }
 })
 
@@ -901,6 +910,9 @@ landlordsRouter.post('/me/onboard-tenant', requirePerm('tenants.onboard'), async
     if (!unit) throw new AppError(404, 'Unit not found')
     if (unit.landlord_id !== landlordId) throw new AppError(403, 'Unit not owned by this landlord')
 
+    // S537 gate: no onboarding onto an UNDECIDED late-fee class.
+    await assertLateFeeDecisionForUnit(unit.id)
+
     // --- Verify unit is not already occupied ---
     const occ = await queryOne<any>(
       `SELECT is_occupied FROM v_unit_occupancy WHERE unit_id = $1`,
@@ -997,8 +1009,10 @@ landlordsRouter.post('/me/onboard-tenant', requirePerm('tenants.onboard'), async
        ) RETURNING id`,
       [
         unitId, landlordId, leaseStart, leaseEnd || null, rentNum,
-        lateFeeAmount ?? 15.00,
-        lateFeeGraceDays ?? 5,
+        // S537: NEVER invent a late fee — absent input means the signed
+        // paper had none; class policy applies at renewal (lease-is-law).
+        lateFeeAmount ?? null,
+        lateFeeAmount != null ? (lateFeeGraceDays ?? 5) : null,
         leaseType, ar, arMode,
         noticeDaysRequired ?? 30,
       ]
@@ -1175,6 +1189,9 @@ landlordsRouter.post('/me/onboard-tenant-pending', requirePerm('tenants.create')
       const owned = await queryOne<any>(
         'SELECT id FROM units WHERE id=$1 AND landlord_id=$2', [unitId, landlordId])
       if (!owned) throw new AppError(400, 'unitId does not belong to this landlord')
+      // S537 gate: pending intents bound to a unit require a late-fee
+      // decision for that unit's class (unbound intents gate at resolve).
+      await assertLateFeeDecisionForUnit(unitId)
       const held = await queryOne<any>(
         'SELECT id FROM pending_tenant_intents WHERE unit_id=$1 AND resolved_at IS NULL', [unitId])
       if (held) throw new AppError(409, 'That unit is already held by another pending tenant')
@@ -2034,8 +2051,14 @@ landlordsRouter.post('/me/onboard-properties-csv/validate', requirePerm('propert
       }
 
       const UNIT_TYPES = ['apartment', 'single_family', 'rv_spot', 'mobile_home', 'storage', 'commercial']
-      if (row.unitType && !UNIT_TYPES.includes(row.unitType)) {
-        issues.push({ severity: 'block', field: 'unit_type', message: `Must be one of: ${UNIT_TYPES.join(', ')}` })
+      // S537 (Nic): NO silent apartment default. Source platforms don't
+      // know GAM's unit classes (an RV site exports as generic
+      // "residential") — the landlord maps every unit to a real class in
+      // the review step before commit.
+      if (!row.unitType) {
+        issues.push({ severity: 'block', field: 'unit_type', message: `Required — the export didn't say. Pick one of: ${UNIT_TYPES.join(', ')}` })
+      } else if (!UNIT_TYPES.includes(row.unitType)) {
+        issues.push({ severity: 'block', field: 'unit_type', message: `Unrecognized type "${row.unitType}" — pick one of: ${UNIT_TYPES.join(', ')}` })
       }
 
       // In-batch duplicate property — same name+street appearing in
@@ -2102,6 +2125,35 @@ landlordsRouter.post('/me/onboard-properties-csv/validate', requirePerm('propert
     const warnings = rows.reduce((n, r) => n + r.issues.filter(i => i.severity === 'warn').length, 0)
     const ready = rows.filter(r => !r.issues.some(i => i.severity === 'block')).length
     const newProperties = seenPropertyKeys.size
+
+    // S537 (Nic): CSV-first onboarding — the wizard collects the late-fee
+    // DECISION for every (property, unit_type) the file touches before
+    // commit. Report each pair + whether a decision already exists (only
+    // possible for existing properties).
+    const decisionPairs = new Map<string, { propertyName: string; street1: string; propertyId: string | null; unitType: string; decided: boolean }>()
+    for (const r of rows) {
+      if (!r.propertyName || !r.unitType) continue
+      const key = `${r.propertyName.toLowerCase()}|${r.street1.toLowerCase()}|${r.unitType}`
+      if (!decisionPairs.has(key)) {
+        decisionPairs.set(key, {
+          propertyName: r.propertyName, street1: r.street1,
+          propertyId: r.resolvedPropertyId || null, unitType: r.unitType, decided: false,
+        })
+      }
+    }
+    {
+      const existingIds = Array.from(new Set(Array.from(decisionPairs.values()).map(d => d.propertyId).filter(Boolean))) as string[]
+      if (existingIds.length > 0) {
+        const decidedRows = await query<any>(
+          `SELECT property_id, unit_type FROM property_unit_type_late_fees WHERE property_id = ANY($1::uuid[])`,
+          [existingIds])
+        const decidedSet = new Set(decidedRows.map(d => `${d.property_id}|${d.unit_type}`))
+        for (const d of decisionPairs.values()) {
+          if (d.propertyId && decidedSet.has(`${d.propertyId}|${d.unitType}`)) d.decided = true
+        }
+      }
+    }
+    const lateFeeDecisions = Array.from(decisionPairs.values())
     const newUnits = rows.filter(r =>
       !r.resolvedUnitId && !r.issues.some(i => i.severity === 'block')
     ).length
@@ -2130,6 +2182,7 @@ landlordsRouter.post('/me/onboard-properties-csv/validate', requirePerm('propert
       data: {
         rows,
         summary: { total: rows.length, blockers, warnings, ready, newProperties, newUnits },
+        lateFeeDecisions,
       },
     })
   } catch (e) { next(e) }
@@ -2145,10 +2198,26 @@ landlordsRouter.post('/me/onboard-properties-csv/validate', requirePerm('propert
 landlordsRouter.post('/me/onboard-properties-csv/commit', requirePerm('properties.bulk_import'), async (req, res, next) => {
   const client = await getClient()
   try {
-    const { rows, source, claimedPlatformName } = req.body
+    const { rows, source, claimedPlatformName, lateFeeDecisions } = req.body
     if (!Array.isArray(rows) || rows.length === 0) {
       throw new AppError(400, 'rows array required')
     }
+    // S537 (Nic): CSV-first onboarding — the wizard sends the late-fee
+    // DECISION for each (property, unit_type) in the file. Validate the
+    // shapes up front; they upsert right after each property resolves.
+    const decisionSchema = z.array(z.object({
+      propertyName:  z.string().min(1),
+      street1:       z.string(),
+      unitType:      z.enum(UNIT_TYPES as unknown as [string, ...string[]]),
+      noLateFee:     z.boolean().default(false),
+      graceDays:     z.number().int().min(0).max(60).optional(),
+      initialAmount: z.number().min(0).optional(),
+      initialType:   z.enum(['flat', 'percent_of_rent']).optional(),
+    }).refine(d => d.noLateFee || (d.graceDays !== undefined && d.initialAmount !== undefined && d.initialType !== undefined),
+      { message: 'Fee decisions need graceDays, initialAmount and initialType' }))
+    const decisions = decisionSchema.parse(lateFeeDecisions ?? [])
+    const decisionByKey = new Map(decisions.map(d =>
+      [`${d.propertyName.toLowerCase()}|${d.street1.toLowerCase()}|${d.unitType}`, d]))
     const propSourceNorm = source && isCsvImportPlatform(String(source).toLowerCase())
       ? String(source).toLowerCase()
       : 'generic'
@@ -2229,9 +2298,36 @@ landlordsRouter.post('/me/onboard-properties-csv/commit', requirePerm('propertie
         continue
       }
 
-      const unitType = ['apartment', 'single_family', 'rv_spot', 'mobile_home', 'storage', 'commercial'].includes(row.unitType)
-        ? row.unitType
-        : 'apartment'
+      // S537 (Nic): NO silent apartment default — validate blocks blank/
+      // unrecognized types, and commit refuses them outright.
+      if (!['apartment', 'single_family', 'rv_spot', 'mobile_home', 'storage', 'commercial'].includes(row.unitType)) {
+        throw new AppError(400, `Row ${row.rowIndex + 1}: unit type "${row.unitType || '(blank)'}" is not a GAM unit type — set it in the review step`)
+      }
+      const unitType = row.unitType
+
+      // Upsert this (property, unit_type)'s late-fee decision from the
+      // wizard payload before the unit exists, so the S537 gate holds.
+      const decisionKey = `${row.propertyName.toLowerCase()}|${row.street1.toLowerCase()}|${unitType}`
+      const decision = decisionByKey.get(decisionKey)
+      if (decision) {
+        await client.query(
+          `INSERT INTO property_unit_type_late_fees
+             (property_id, unit_type, no_late_fee, late_fee_grace_days, late_fee_initial_amount, late_fee_initial_type)
+           VALUES ($1, $2, $3, $4, $5, $6)
+           ON CONFLICT (property_id, unit_type) DO UPDATE SET
+             no_late_fee = EXCLUDED.no_late_fee,
+             late_fee_grace_days = EXCLUDED.late_fee_grace_days,
+             late_fee_initial_amount = EXCLUDED.late_fee_initial_amount,
+             late_fee_initial_type = EXCLUDED.late_fee_initial_type,
+             updated_at = NOW()`,
+          [propertyId, unitType, decision.noLateFee,
+           decision.noLateFee ? null : decision.graceDays,
+           decision.noLateFee ? null : decision.initialAmount!.toFixed(2),
+           decision.noLateFee ? null : decision.initialType])
+        decisionByKey.delete(decisionKey) // upsert once per pair
+      }
+      // Final gate — decision must exist (wizard-sent or pre-existing).
+      await assertLateFeeDecision(propertyId!, unitType, client)
       const unitRes = await client.query<any>(
         `INSERT INTO units
            (property_id, landlord_id, unit_number, bedrooms, bathrooms, sqft,
@@ -2553,6 +2649,60 @@ landlordsRouter.post('/me/onboard-tenants-csv/validate', requirePerm('tenants.cr
     const warnings = rows.reduce((n, r) => n + r.issues.filter(i => i.severity === 'warn').length, 0)
     const ready = rows.filter(r => !r.issues.some(i => i.severity === 'block')).length
 
+    // S537 (Nic): the tenant-CSV commit gates on a late-fee decision for
+    // every (property, unit_type) it touches. Report the UNDECIDED pairs
+    // here, each with a SUGGESTED prefill = the most frequent
+    // (late_fee_amount, grace_days) among this file's leases for that
+    // pair — a landlord who kept per-lease fees consistent on their old
+    // platform was expressing a de-facto property policy; surface it as
+    // the default they confirm (never auto-applied).
+    const missingLateFeeDecisions: any[] = []
+    {
+      const unitIdsAll = Array.from(new Set(rows.map(r => r.resolvedUnitId).filter(Boolean))) as string[]
+      if (unitIdsAll.length > 0) {
+        const pairRows = await query<any>(
+          `SELECT u.id AS unit_id, u.property_id, u.unit_type, p.name AS property_name
+             FROM units u JOIN properties p ON p.id = u.property_id
+            WHERE u.id = ANY($1::uuid[]) AND u.unit_type IS NOT NULL`, [unitIdsAll])
+        const unitPair = new Map(pairRows.map((r: any) => [r.unit_id, r]))
+        const decided = await query<any>(
+          `SELECT property_id, unit_type FROM property_unit_type_late_fees
+            WHERE property_id = ANY($1::uuid[])`,
+          [Array.from(new Set(pairRows.map((r: any) => r.property_id)))])
+        const decidedSet = new Set(decided.map((d: any) => `${d.property_id}|${d.unit_type}`))
+        // Tally (amount, grace) frequencies per undecided pair.
+        const tally = new Map<string, { info: any; counts: Map<string, { n: number; amount: number; graceDays: number }> }>()
+        for (const r of rows) {
+          const pr: any = r.resolvedUnitId ? unitPair.get(r.resolvedUnitId) : null
+          if (!pr) continue
+          const pairKey = `${pr.property_id}|${pr.unit_type}`
+          if (decidedSet.has(pairKey)) continue
+          if (!tally.has(pairKey)) tally.set(pairKey, { info: pr, counts: new Map() })
+          const amt = r.lateFeeAmount ? parseFloat(r.lateFeeAmount) : NaN
+          if (isNaN(amt) || amt <= 0) continue
+          const grace = r.lateFeeGraceDays ? parseInt(r.lateFeeGraceDays, 10) : 5
+          const vKey = `${amt}|${isNaN(grace) ? 5 : grace}`
+          const cur = tally.get(pairKey)!.counts.get(vKey) || { n: 0, amount: amt, graceDays: isNaN(grace) ? 5 : grace }
+          cur.n++
+          tally.get(pairKey)!.counts.set(vKey, cur)
+        }
+        for (const { info, counts } of tally.values()) {
+          let suggested: any = null
+          let best = 0
+          let total = 0
+          for (const c of counts.values()) {
+            total += c.n
+            if (c.n > best) { best = c.n; suggested = { initialAmount: c.amount, graceDays: c.graceDays, initialType: 'flat', leaseCount: c.n } }
+          }
+          if (suggested) suggested.leaseTotal = total
+          missingLateFeeDecisions.push({
+            propertyId: info.property_id, propertyName: info.property_name,
+            unitType: info.unit_type, suggested,
+          })
+        }
+      }
+    }
+
     // S295: persist the validate attempt to the review queue.
     await recordValidateAttempt({
       landlordId,
@@ -2575,6 +2725,7 @@ landlordsRouter.post('/me/onboard-tenants-csv/validate', requirePerm('tenants.cr
       data: {
         rows,
         summary: { total: rows.length, blockers, warnings, ready },
+        missingLateFeeDecisions,
       },
     })
   } catch (e) { next(e) }
@@ -2643,6 +2794,18 @@ landlordsRouter.post('/me/onboard-tenants-csv/commit', requirePerm('tenants.crea
     )
     const unitDetailMap = new Map(unitDetails.map(u => [u.id, u]))
 
+    // S537 gate: every distinct (property, unit_type) in the commit needs
+    // an explicit late-fee decision — bulk migration is exactly where
+    // unvetted classes would otherwise slip in.
+    {
+      const typePairs = await query<any>(
+        `SELECT DISTINCT property_id, unit_type FROM units
+         WHERE id = ANY($1::uuid[]) AND unit_type IS NOT NULL`,
+        [Array.from(groups.keys())]
+      )
+      for (const tp of typePairs) await assertLateFeeDecision(tp.property_id, tp.unit_type)
+    }
+
     const landlord = await queryOne<any>(
       `SELECT u.first_name, u.last_name FROM landlords l JOIN users u ON u.id = l.user_id WHERE l.id = $1`,
       [landlordId]
@@ -2685,8 +2848,9 @@ landlordsRouter.post('/me/onboard-tenants-csv/commit', requirePerm('tenants.crea
         [
           unitId, landlordId,
           primary.leaseStart, primary.leaseEnd || null, parseFloat(primary.monthlyRent),
-          primary.lateFeeAmount ? parseFloat(primary.lateFeeAmount) : 15.00,
-          primary.lateFeeGraceDays ? parseInt(primary.lateFeeGraceDays) : 5,
+          // S537: NEVER invent a late fee (see onboard-tenant note).
+          primary.lateFeeAmount ? parseFloat(primary.lateFeeAmount) : null,
+          primary.lateFeeAmount ? (primary.lateFeeGraceDays ? parseInt(primary.lateFeeGraceDays) : 5) : null,
           leaseType, arBool, arMode,
           primary.noticeDaysRequired ? parseInt(primary.noticeDaysRequired) : 30,
           primary.extra && Object.keys(primary.extra).length > 0

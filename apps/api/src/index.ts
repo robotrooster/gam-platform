@@ -136,6 +136,12 @@ const STATIC_ALLOWED_ORIGINS = [
   process.env.FITNESS_APP_URL        || 'http://localhost:3013',
   process.env.CUSTOMER_PORTAL_URL    || 'http://localhost:3014',
   'https://experience.arcgis.com',
+  // S536: dedicated PREVIEW ports — Claude's preview duplicates a portal
+  // on 31xx instead of taking over the real dev server on 30xx.
+  'http://localhost:3101', // landlord preview
+  'http://localhost:3102', // tenant preview
+  'http://localhost:3103', // admin preview
+  'http://localhost:3105', // pos preview
 ]
 // Any GAM production origin: apex marketing + www + every portal subdomain.
 const PROD_HOST = 'goldassetmanagement.com'
@@ -153,21 +159,18 @@ app.use(cors({
   credentials: true,
 }))
 
-// S534: static uploads must mount AFTER the CORS middleware — pre-fix it
-// sat before cors(), so cross-origin fetches from the portals (e.g.
-// pdf.js loading a template's base PDF at /uploads/public/...) failed
-// silently and the e-sign document rendered as a blank page.
-// S535: only genuinely-public subdirectories are served statically.
-// The old catch-all `app.use('/uploads', ...)` exposed tenant PII
-// (id-documents, executed lease PDFs, inspections, docs) to anyone
-// who knew a filename. Those all have authorized per-file routes
-// (/api/esign/files, /api/background/id-files, /api/documents/:id/file,
-// /api/inspections/photo-files|video-files, /api/tenants/avatar-files,
-// /api/leases/:id/addendum-pdf) — never re-add a catch-all mount here.
-//   unit-photos → property marketing images rendered in <img> tags
-//   public      → demo/template assets (blank demo lease + notice PDFs)
-app.use('/uploads/unit-photos', express.static(path.join(uploadsDir, 'unit-photos')))
-app.use('/uploads/public',      express.static(path.join(uploadsDir, 'public')))
+// S535 (Nic-locked): there is NO static /uploads mount — NOTHING is
+// served without login. The old catch-all `app.use('/uploads', ...)`
+// exposed tenant PII (id-documents, executed lease PDFs, inspections,
+// docs) to anyone who knew a filename. Every file now goes through an
+// authorized per-file route: /api/esign/files (docs + templates, owner
+// landlord/team/signer), /api/background/id-files,
+// /api/documents/:id/file, /api/inspections/photo-files|video-files,
+// /api/tenants/avatar-files, /api/properties/unit-photo-files,
+// /api/leases/:id/addendum-pdf. Listings require sign-in + approved
+// background check. Never re-add a static mount here — the demo lease
+// template is Nic's test data, not a platform asset (GAM offers NO
+// lease templates/samples: that would edge into legal advice).
 
 // Stripe webhooks need raw body — must be before express.json()
 app.use('/webhooks/stripe', express.raw({ type: 'application/json' }))

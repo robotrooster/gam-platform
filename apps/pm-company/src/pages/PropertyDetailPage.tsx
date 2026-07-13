@@ -6,6 +6,7 @@
 
 import { useQuery } from 'react-query'
 import { Link, useParams } from 'react-router-dom'
+import { humanize } from '@gam/shared'
 import { useAuth } from '../context/AuthContext'
 import { apiGet } from '../lib/api'
 
@@ -176,7 +177,7 @@ export function PropertyDetailPage() {
               {d.units.map(u => (
                 <tr key={u.id} style={{ borderTop: '1px solid var(--border-0)' }}>
                   <Td><strong>{u.unitNumber}</strong></Td>
-                  <Td><span className="badge" style={{ background: u.status === 'active' ? 'rgba(46,163,90,.18)' : 'var(--bg-2)' }}>{u.status}</span></Td>
+                  <Td><span className="badge" style={{ background: u.status === 'active' ? 'rgba(46,163,90,.18)' : 'var(--bg-2)' }}>{humanize(u.status)}</span></Td>
                   <Td style={{ fontFamily: 'JetBrains Mono' }}>{fmt(u.rentAmount)}</Td>
                   <Td>{[u.tenantFirst, u.tenantLast].filter(Boolean).join(' ') || '—'}</Td>
                 </tr>
@@ -216,7 +217,7 @@ export function PropertyDetailPage() {
                   <Td>{m.unitNumber}</Td>
                   <Td>{m.title}</Td>
                   <Td><span className="badge" style={{ background: m.priority === 'emergency' ? 'rgba(220,76,76,.18)' : m.priority === 'high' ? 'rgba(245,158,11,.18)' : 'var(--bg-2)' }}>{m.priority}</span></Td>
-                  <Td><span className="badge" style={{ background: m.status === 'completed' ? 'rgba(46,163,90,.18)' : 'var(--bg-2)' }}>{m.status}</span></Td>
+                  <Td><span className="badge" style={{ background: m.status === 'completed' ? 'rgba(46,163,90,.18)' : 'var(--bg-2)' }}>{humanize(m.status)}</span></Td>
                   <Td style={{ fontFamily: 'JetBrains Mono' }}>{fmt(m.actualCost ?? m.estimatedCost)}</Td>
                 </tr>
               ))}

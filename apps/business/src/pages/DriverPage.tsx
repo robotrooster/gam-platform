@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
+import { humanizeServiceType } from '@gam/shared'
 import { apiGet, apiPost } from '../lib/api'
 import {
   ArrowLeft, X, MapPin, Phone, Navigation,
@@ -480,7 +481,7 @@ export function DriverPage() {
         </div>
         {current.serviceType && (
           <div style={{ fontSize: 14, color: 'var(--gold)', marginBottom: 12, fontWeight: 600 }}>
-            {current.serviceType}
+            {humanizeServiceType(current.serviceType)}
           </div>
         )}
         {address && (

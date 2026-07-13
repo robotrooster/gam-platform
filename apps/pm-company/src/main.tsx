@@ -5,6 +5,7 @@ import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from 'react-query'
 import { AuthProvider, useAuth } from './context/AuthContext'
 import { Layout } from './components/Layout'
+import { DialogHost } from './components/dialogs'
 import { LoginPage } from './pages/LoginPage'
 import { RegisterPage } from './pages/RegisterPage'
 import { DashboardPage } from './pages/DashboardPage'
@@ -65,6 +66,7 @@ appRoot.render(
             </Route>
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
+          <DialogHost />
         </BrowserRouter>
       </AuthProvider>
     </QueryClientProvider>

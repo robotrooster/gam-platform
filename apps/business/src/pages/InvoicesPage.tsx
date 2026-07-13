@@ -3,7 +3,7 @@ import { apiGet, apiPost, openPdfInNewTab } from '../lib/api'
 import { useAuth } from '../context/AuthContext'
 import { Modal } from '../components/Modal'
 import { Plus, Trash, ChevronRight, ArrowLeft, Check, X, Printer } from 'lucide-react'
-import { BUSINESS_DEPOSIT_TYPES, BUSINESS_DEPOSIT_TYPE_LABEL } from '@gam/shared'
+import { BUSINESS_DEPOSIT_TYPES, BUSINESS_DEPOSIT_TYPE_LABEL, humanize } from '@gam/shared'
 
 interface CustomerLite {
   id: string
@@ -419,7 +419,7 @@ function InvoiceDetailView({
           }}>
             <Check size={14} style={{ color: 'var(--green, #22c55e)', marginRight: 6, verticalAlign: 'middle' }} />
             Paid {fmtDate(inv.paidAt)}
-            {inv.paymentMethod && ` via ${inv.paymentMethod}`} · {fmtMoney(inv.amountPaid)}
+            {inv.paymentMethod && ` via ${humanize(inv.paymentMethod).toLowerCase()}`} · {fmtMoney(inv.amountPaid)}
           </div>
         )}
         {inv.status === 'void' && (

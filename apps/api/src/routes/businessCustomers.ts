@@ -37,6 +37,15 @@ export const businessCustomersRouter = Router()
 
 /** Resolve the businessId for the calling owner. Errors if non-owner
  *  or no active business. */
+// S536: the REGISTER lists + quick-adds customers, and cashiers run the
+// register — GET / and POST / accept the owner OR staff holding pos.use.
+// Everything else (archive, import, geocode, edits) stays owner-only.
+async function requireOwnerOrPosBusinessId(req: any): Promise<string> {
+  if (req.user!.role === 'business_owner') return requireOwnerBusinessId(req)
+  const { requireBusinessAccess } = await import('../middleware/businessAccess')
+  return (await requireBusinessAccess(req, { permission: 'pos.use' })).businessId
+}
+
 async function requireOwnerBusinessId(req: any): Promise<string> {
   if (req.user!.role !== 'business_owner') {
     throw new AppError(403, 'Only business owners can manage customers')
@@ -61,18 +70,21 @@ const createSchema = z.object({
   lastName:     z.string().min(1),
   email:        z.string().email().optional(),
   phone:        z.string().optional(),
-  street1:      z.string().min(1),
+  // S536 (Nic): address optional — POS quick-add customers (walk-in
+  // repeat buyers) often have none. Route/visit features only use
+  // customers WITH geocoded addresses.
+  street1:      z.string().min(1).optional(),
   street2:      z.string().optional(),
-  city:         z.string().min(1),
-  state:        z.string().min(1),
-  zip:          z.string().min(1),
+  city:         z.string().min(1).optional(),
+  state:        z.string().min(1).optional(),
+  zip:          z.string().min(1).optional(),
   notes:        z.string().optional(),
   unitCount:    z.number().int().min(0).optional(),
 })
 
 businessCustomersRouter.post('/', requireAuth, async (req, res, next) => {
   try {
-    const businessId = await requireOwnerBusinessId(req)
+    const businessId = await requireOwnerOrPosBusinessId(req)
     const body = createSchema.parse(req.body)
 
     // App-layer guard mirroring the schema CHECK so the user gets a
@@ -104,10 +116,13 @@ businessCustomersRouter.post('/', requireAuth, async (req, res, next) => {
     // contract slip doesn't take down customer create.
     let coords: { lat: number; lon: number } | null = null
     try {
-      coords = await geocode({
-        street1: body.street1, street2: body.street2 ?? null,
-        city: body.city, state: body.state, zip: body.zip,
-      })
+      // S536: address is optional (POS quick-add) — no address, no geocode.
+      if (body.street1 && body.city && body.state && body.zip) {
+        coords = await geocode({
+          street1: body.street1, street2: body.street2 ?? null,
+          city: body.city, state: body.state, zip: body.zip,
+        })
+      }
     } catch (e) {
       logger.error({ err: e, customer_id: row.id }, '[geocoder] hypothetical throw — customer create continues without coords')
     }
@@ -250,7 +265,7 @@ const listSchema = z.object({
 
 businessCustomersRouter.get('/', requireAuth, async (req, res, next) => {
   try {
-    const businessId = await requireOwnerBusinessId(req)
+    const businessId = await requireOwnerOrPosBusinessId(req)
     const q = listSchema.parse(req.query)
     const params: any[] = [businessId]
     let whereSql = 'WHERE bc.business_id = $1'
@@ -430,7 +445,10 @@ businessCustomersRouter.post('/:id/revoke-portal-access', requireAuth, async (re
 
 businessCustomersRouter.patch('/:id', requireAuth, async (req, res, next) => {
   try {
-    const businessId = await requireOwnerBusinessId(req)
+    // S536 (Nic): the front counter deals with customers, not the owner —
+    // staff holding pos.use save edits too. Delete (/archive) stays
+    // owner-only.
+    const businessId = await requireOwnerOrPosBusinessId(req)
     const patch = patchSchema.parse(req.body)
     if (Object.keys(patch).length === 0) {
       throw new AppError(400, 'Nothing to update')

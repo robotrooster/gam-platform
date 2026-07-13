@@ -1,7 +1,7 @@
 /**
  * Tool: update_notification_preference (tenant + landlord).
  *
- * Lets the user turn notification channels (email / SMS / in-app) on or off
+ * Lets the user turn notification channels (email / in-app) on or off
  * for one of THEIR OWN existing notification types. Hard-scoped to
  * actor.userId (notification_preferences.user_id). It will NOT create new
  * preference types (those are free-form and managed in settings) — if the
@@ -15,14 +15,13 @@ import type { AgentTool, AgentActor } from './types'
 interface PrefRow {
   type: string
   email_enabled: boolean
-  sms_enabled: boolean
   in_app_enabled: boolean
 }
 
 export const updateNotificationPreference: AgentTool = {
   name: 'update_notification_preference',
   description:
-    'Turn notification channels (email, SMS, in-app) on or off for one of the user’s existing ' +
+    'Turn notification channels (email, in-app) on or off for one of the user’s existing ' +
     'notification types. Use for “stop emailing me about X” or “turn on text alerts for Y”. If you ' +
     'don’t know the exact type, call it with no type to list the user’s current settings first.',
   parameters: {
@@ -30,7 +29,6 @@ export const updateNotificationPreference: AgentTool = {
     properties: {
       type: { type: 'string', description: 'The notification type to change (omit to list current types).' },
       emailEnabled: { type: 'boolean' },
-      smsEnabled: { type: 'boolean' },
       inAppEnabled: { type: 'boolean' },
     },
   },
@@ -38,13 +36,13 @@ export const updateNotificationPreference: AgentTool = {
 
   async execute(args, actor: AgentActor) {
     const prefs = await query<PrefRow>(
-      `SELECT type, email_enabled, sms_enabled, in_app_enabled
+      `SELECT type, email_enabled, in_app_enabled
          FROM notification_preferences WHERE user_id = $1 ORDER BY type`,
       [actor.userId]
     )
 
     const listCurrent = () => ({
-      types: prefs.map((p) => ({ type: p.type, email: p.email_enabled, sms: p.sms_enabled, inApp: p.in_app_enabled })),
+      types: prefs.map((p) => ({ type: p.type, email: p.email_enabled, inApp: p.in_app_enabled })),
     })
 
     if (prefs.length === 0) {
@@ -64,16 +62,15 @@ export const updateNotificationPreference: AgentTool = {
 
     // Apply only the channels the caller specified; keep the rest.
     const email = typeof args.emailEnabled === 'boolean' ? args.emailEnabled : target.email_enabled
-    const sms = typeof args.smsEnabled === 'boolean' ? args.smsEnabled : target.sms_enabled
     const inApp = typeof args.inAppEnabled === 'boolean' ? args.inAppEnabled : target.in_app_enabled
 
     await query(
       `UPDATE notification_preferences
-          SET email_enabled = $3, sms_enabled = $4, in_app_enabled = $5, updated_at = now()
+          SET email_enabled = $3, in_app_enabled = $4, updated_at = now()
         WHERE user_id = $1 AND type = $2`,
-      [actor.userId, type, email, sms, inApp]
+      [actor.userId, type, email, inApp]
     )
 
-    return { ok: true, type, email, sms, inApp, message: `Updated your “${type}” notification settings.` }
+    return { ok: true, type, email, inApp, message: `Updated your “${type}” notification settings.` }
   },
 }

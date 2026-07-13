@@ -715,6 +715,21 @@ export function humanizeServiceType(s: string): string {
   return spaced.charAt(0).toUpperCase() + spaced.slice(1)
 }
 
+// S538 (Nic-locked): raw backend identifiers must NEVER render in a UI —
+// no user ever sees 'rv_spot' or 'month_to_month'. Use the dedicated
+// *_LABEL map when one exists (UNIT_TYPE_LABEL, BUSINESS_TYPE_LABEL, …);
+// humanize() is the fallback for any enum-ish value without one
+// ('rv_spot' → 'RV Spot', 'month_to_month' → 'Month To Month').
+const HUMANIZE_ACRONYMS = new Set(['rv', 'ach', 'pos', 'csv', 'pdf', 'ein', 'llc', 'pm', 'str', 'po', 'nnn', 'id', 'ssn', 'eod', 'gam', 'otp'])
+export function humanize(value: string | null | undefined): string {
+  if (!value) return ''
+  return String(value).split(/[_-]+/).map(w => {
+    const lw = w.toLowerCase()
+    if (HUMANIZE_ACRONYMS.has(lw)) return lw.toUpperCase()
+    return w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()
+  }).join(' ')
+}
+
 // rrule BYDAY codes indexed by JS getDay() (0=Sun .. 6=Sat).
 export const RRULE_WEEKDAY_CODES = ['SU', 'MO', 'TU', 'WE', 'TH', 'FR', 'SA'] as const
 export const WEEKDAY_LABEL = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
@@ -1441,13 +1456,17 @@ export const UNIT_STATUS_LABEL: Record<UnitStatus, string> = {
 
 // Unit type values.
 // Single source of truth for units.unit_type CHECK constraint.
-export const UNIT_TYPES = ['apartment', 'single_family', 'rv_spot', 'mobile_home', 'storage', 'commercial'] as const
+// S538: hotel_room added (Nic) — small hotel/motel operators are a target
+// market (Oak Park Motel is customer #1); their short-stays bill the 5%
+// STR fee like every non-RV type (maps to the Airbnb-competitor pricing).
+export const UNIT_TYPES = ['apartment', 'single_family', 'rv_spot', 'mobile_home', 'hotel_room', 'storage', 'commercial'] as const
 export type UnitType = typeof UNIT_TYPES[number]
 export const UNIT_TYPE_LABEL: Record<UnitType, string> = {
   apartment:     'Apartment',
   single_family: 'Single Family Home',
   rv_spot:       'RV Spot',
   mobile_home:   'Mobile Home',
+  hotel_room:    'Hotel / Motel Room',
   storage:       'Storage',
   commercial:    'Commercial',
 }
@@ -1456,6 +1475,7 @@ export const UNIT_TYPE_PREFIX: Record<UnitType, string> = {
   single_family: 'SFH',
   rv_spot:       'RV',
   mobile_home:   'MH',
+  hotel_room:    'RM',
   storage:       'STG',
   commercial:    'COM',
 }
@@ -1464,15 +1484,30 @@ export const UNIT_TYPE_ICON: Record<UnitType, string> = {
   single_family: '🏠',
   rv_spot:       '🚐',
   mobile_home:   '🏡',
+  hotel_room:    '🛏️',
   storage:       '📦',
   commercial:    '🏪',
 }
+// S538 STR pricing (Nic-locked). The $2 x CEIL(nights/30) aggregation is
+// ONLY for RV spots — the space is just there, the landlord coordinates
+// nothing. A short-stay booking on ANY other unit type (apartment, house,
+// mobile home, …) is a coordinated stay and bills str_fee_pct (default 5%,
+// platform_fee_config) of booking revenue instead. New unit types default
+// to the 5% side. Consumed by jobs/platformFeeAccrual.ts and
+// services/platformFee.ts.
+export const NIGHTS_AGGREGATION_UNIT_TYPES = ['rv_spot'] as const
+// S538 (Nic-locked): storage units can NEVER be short-term bookable — no
+// nightly/weekly bookings, no public booking page, no subtype override.
+// Enforced at unit create (allow-list), unit type config (isBookable),
+// manual reservation create, and the public bookStay flow.
+export const SHORT_STAY_LOCKED_UNIT_TYPES = ['storage'] as const
 // Whether this unit type conceptually has bedrooms (affects UI rendering).
 export const UNIT_TYPE_HAS_BEDROOMS: Record<UnitType, boolean> = {
   apartment:     true,
   single_family: true,
   rv_spot:       false,
   mobile_home:   true,
+  hotel_room:    false,
   storage:       false,
   commercial:    false,
 }
@@ -2868,6 +2903,22 @@ export const PLATFORM_FEES = {
   FLOAT_FEE_MO:    20.00,     // SSI/SSDI opt-in service fee
   REINSTATEMENT:   25.00,     // After FlexDeposit default
   BG_CHECK_NET:    15.00,     // Platform nets $15, applicant pays $40
+
+  // S536 (Nic): ALL money flows through GAM — business charges are
+  // platform DESTINATION charges (GAM = merchant of record; gross
+  // routes to the business's Connect balance; GAM keeps the
+  // application fee below and pays Stripe's processing cost out of
+  // it; businesses get Friday-batched payouts like landlords).
+  // Card-present: fee 2.9% + 10¢, Stripe costs ~2.7% + 5¢ → GAM nets
+  // ~0.2% + 5¢. Hosted invoice (card or ACH): fee 3.25% + 30¢, worst
+  // Stripe cost (card) 2.9% + 30¢ → GAM nets ≥0.35%.
+  BUSINESS_TERMINAL_APP_FEE_PCT:         0.029,  // card-present, % of sale
+  BUSINESS_TERMINAL_APP_FEE_FIXED_CENTS: 10,     // card-present, fixed
+  BUSINESS_INVOICE_APP_FEE_PCT:          0.0325, // hosted invoice, % of amount
+  BUSINESS_INVOICE_APP_FEE_FIXED_CENTS:  30,     // hosted invoice, fixed
+  // S536 (Nic): register is FREE; invoicing = $10/mo in any month the
+  // business sends ≥1 invoice (usage-based). jobs/businessMonthlyFees.
+  BUSINESS_INVOICING_MONTHLY:            10.00,
   MAINTENANCE_PCT: 0.03,      // 3% of job value — reserved for the future on-platform
                               // contractor marketplace (Angi competitor). NOT billed
                               // today; never charged to the landlord, who pays only

@@ -511,6 +511,68 @@ async function runGeneration(
           utilitiesInserted++
         }
 
+        // S537 (Nic): consume prepaid credit (pay-ahead remainder from a
+        // FIFO remittance) against this invoice's fresh charge rows,
+        // oldest credit first. Rows fully covered settle out-of-band (no
+        // Stripe money moves — it already moved when the tenant paid
+        // ahead); a partially covered row splits per the standard
+        // remainder pattern so late-fee mechanics stay truthful.
+        {
+          const credits = await client.query<{ id: string; amount_remaining: string }>(
+            `SELECT id, amount_remaining::text FROM lease_prepaid_credits
+              WHERE lease_id = $1 AND amount_remaining > 0
+              ORDER BY created_at ASC
+              FOR UPDATE`,
+            [lease.id])
+          let available = credits.rows.reduce((sum, c) => sum + Number(c.amount_remaining), 0)
+          if (available > 0) {
+            const fresh = await client.query<{ id: string; amount: string; type: string }>(
+              `SELECT id, amount::text, type FROM payments
+                WHERE invoice_id = $1 AND status = 'pending'
+                ORDER BY due_date ASC, created_at ASC`,
+              [invoiceId])
+            let consumed = 0
+            for (const row of fresh.rows) {
+              if (available <= 0.005) break
+              const rowAmt = Number(row.amount)
+              const apply = Math.min(rowAmt, available)
+              if (apply >= rowAmt - 0.005) {
+                await client.query(
+                  `UPDATE payments SET status='settled', settled_at=NOW(),
+                          notes = COALESCE(notes || ' — ', '') || 'covered by prepaid credit (paid ahead)'
+                    WHERE id = $1`, [row.id])
+              } else {
+                const remainder = Math.round((rowAmt - apply) * 100) / 100
+                await client.query(
+                  `UPDATE payments SET amount = $2::numeric, status='settled', settled_at=NOW(),
+                          notes = COALESCE(notes || ' — ', '') || 'partially covered by prepaid credit'
+                    WHERE id = $1`, [row.id, apply.toFixed(2)])
+                await client.query(
+                  `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id,
+                                         type, amount, status, due_date, entry_description, notes, is_remainder)
+                   SELECT invoice_id, unit_id, lease_id, tenant_id, landlord_id,
+                          type, $2::numeric, 'pending', due_date, entry_description,
+                          'Remainder after prepaid credit application', TRUE
+                     FROM payments WHERE id = $1`,
+                  [row.id, remainder.toFixed(2)])
+              }
+              available -= apply
+              consumed += apply
+            }
+            // Draw down the credits oldest-first by what was consumed.
+            let toDraw = consumed
+            for (const c of credits.rows) {
+              if (toDraw <= 0.005) break
+              const draw = Math.min(Number(c.amount_remaining), toDraw)
+              await client.query(
+                `UPDATE lease_prepaid_credits
+                    SET amount_remaining = amount_remaining - $2::numeric, updated_at = NOW()
+                  WHERE id = $1`, [c.id, draw.toFixed(2)])
+              toDraw -= draw
+            }
+          }
+        }
+
         await client.query('COMMIT')
         invoicesInserted++
       } catch (e) {

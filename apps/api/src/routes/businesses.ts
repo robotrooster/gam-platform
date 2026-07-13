@@ -174,7 +174,8 @@ businessesRouter.get('/me', requireAuth, async (req, res, next) => {
               public_booking_enabled, public_booking_slug,
               public_booking_intro, business_hours,
               appointment_reminders_enabled,
-              service_seconds_per_unit, service_unit_label,
+              service_seconds_per_unit, service_unit_label, tips_enabled,
+              card_fees_paid_by,
               onboarding_completed_at,
               created_at, updated_at
          FROM businesses
@@ -322,6 +323,11 @@ const patchMeSchema = z.object({
   // S510 — per-unit service time (route efficiency).
   serviceSecondsPerUnit: z.number().int().min(0).max(86400).optional(),
   serviceUnitLabel:      z.string().min(1).max(30).optional(),
+  // S536 (Nic) — tips are a per-business choice, not universal.
+  tipsEnabled:           z.boolean().optional(),
+  // S536 (Nic) — who pays card processing fees: the business (netted
+  // from gross; default) or the customer (auto surcharge per card txn).
+  cardFeesPaidBy:        z.enum(['business','customer']).optional(),
 }).strict()  // refuses unknown keys (status flip is the admin route)
 
 // PATCH /api/businesses/me — update mutable fields for the owner's business
@@ -362,7 +368,9 @@ businessesRouter.patch('/me', requireAuth, async (req, res, next) => {
               business_hours         = COALESCE($18, business_hours),
               appointment_reminders_enabled = COALESCE($19, appointment_reminders_enabled),
               service_seconds_per_unit = COALESCE($20, service_seconds_per_unit),
-              service_unit_label       = COALESCE($21, service_unit_label)
+              service_unit_label       = COALESCE($21, service_unit_label),
+              tips_enabled             = COALESCE($22, tips_enabled),
+              card_fees_paid_by        = COALESCE($23, card_fees_paid_by)
         WHERE owner_user_id = $12
           AND status IN ('active', 'suspended')`,
       [
@@ -387,6 +395,8 @@ businessesRouter.patch('/me', requireAuth, async (req, res, next) => {
         patch.appointmentRemindersEnabled ?? null,
         patch.serviceSecondsPerUnit ?? null,
         patch.serviceUnitLabel ?? null,
+        patch.tipsEnabled ?? null,
+        patch.cardFeesPaidBy ?? null,
       ])
     const biz = await queryOne<any>(
       `SELECT id, name, business_type, email, phone,
@@ -396,7 +406,8 @@ businessesRouter.patch('/me', requireAuth, async (req, res, next) => {
               public_booking_enabled, public_booking_slug,
               public_booking_intro, business_hours,
               appointment_reminders_enabled,
-              service_seconds_per_unit, service_unit_label
+              service_seconds_per_unit, service_unit_label, tips_enabled,
+              card_fees_paid_by
          FROM businesses
         WHERE owner_user_id = $1
           AND status IN ('active', 'suspended')

@@ -312,7 +312,11 @@ async function processInvitationExpiry() {
 }
 
 // ── ESIGN TIMEOUTS (S29 item 4) ─────────────────────────────
-// Every 15 min: 2h reminder (one-shot per signer) + 24h auto-void.
+// Every 15 min: 2h reminder (one-shot per signer) + 24h auto-void —
+// NON-renewal docs only. Renewals (renews_lease_id) get their own
+// cadence at the bottom of this function (S536): deadline = 1 day
+// before the predecessor lease ends, landlord reminded each morning,
+// tenant reminded twice daily after the landlord signs.
 // Reminder anchor is invite_sent_at (per-signer), so when the cascade
 // flips the next signer to 'sent', their 2h clock resets correctly.
 // Auto-void uses cascade-first ordering for idempotent re-runs:
@@ -322,7 +326,7 @@ async function processEsignTimeouts() {
   try {
     // Pass 1: reminders
     const remind = await query<any>(`
-      SELECT s.id, s.email, s.name,
+      SELECT s.id, s.email, s.name, s.role,
              d.id as doc_id, d.title, d.landlord_id,
              u.unit_number, p.name as property_name,
              lu.first_name || ' ' || lu.last_name as landlord_name
@@ -337,11 +341,17 @@ async function processEsignTimeouts() {
         AND s.invite_sent_at IS NOT NULL
         AND s.invite_sent_at < NOW() - INTERVAL '2 hours'
         AND d.status NOT IN ('completed','voided','execution_failed')
+        AND d.renews_lease_id IS NULL
     `)
     for (const r of remind as any[]) {
       try {
         const unitLabel = r.unit_number ? `Unit ${r.unit_number} — ${r.property_name}` : r.title
-        const signingUrl = `${process.env.TENANT_APP_URL || 'http://localhost:3002'}/sign/${r.doc_id}`
+        // S536: landlords sign in the landlord portal — a tenant-portal
+        // link would bounce off tenant auth for them.
+        const appUrl = r.role === 'landlord'
+          ? (process.env.LANDLORD_APP_URL || 'http://localhost:3001')
+          : (process.env.TENANT_APP_URL || 'http://localhost:3002')
+        const signingUrl = `${appUrl}/sign/${r.doc_id}`
         await emailSigningReminder(r.email, r.name, r.title, unitLabel, r.landlord_name, signingUrl, { landlordId: r.landlord_id, documentId: r.doc_id })
         await query(`UPDATE lease_document_signers SET reminder_sent_at=NOW() WHERE id=$1`, [r.id])
       } catch(e) {
@@ -362,6 +372,7 @@ async function processEsignTimeouts() {
       WHERE d.status='sent'
         AND d.sent_at IS NOT NULL
         AND d.sent_at < NOW() - INTERVAL '24 hours'
+        AND d.renews_lease_id IS NULL
     `)
     for (const d of expired as any[]) {
       try {
@@ -389,6 +400,112 @@ async function processEsignTimeouts() {
     }
     if ((expired as any[]).length > 0) {
       logger.info(`[ESIGN-TIMEOUTS] auto-voided ${(expired as any[]).length} document(s)`)
+    }
+
+    // ── S536 (Nic): RENEWALS ARE A DIFFERENT FLOW ─────────────────────
+    // The tenant already lives in the unit, so renewals do NOT ride the
+    // 24h window above (both passes exclude renews_lease_id). Their
+    // clock is the predecessor lease: everyone must have signed 1 DAY
+    // BEFORE the old lease ends so the unit never lapses — even when
+    // the renewal went out 2 weeks early. Cadence: landlord is reminded
+    // each morning until they sign; after that the tenant is reminded
+    // twice daily. reminder_sent_at is safe to reuse as the cadence
+    // anchor because pass 1 (the one-shot 2h reminder) skips renewals.
+    const hour = new Date().getHours()
+
+    // Pass 3: renewal deadline — void anything not fully signed by
+    // 1 day before the predecessor's end. The normal lease-end
+    // processor (extend / m2m / expire) then handles the unit.
+    // Month-to-month predecessors have no end_date: their termination
+    // point is the END OF THE MONTH AFTER the renewal was created
+    // (30-day-notice convention — created Jul 10 → effective end Aug 31
+    // → signing deadline Aug 30 under the same 1-day-prior rule).
+    // Anchored to created_at, NOT sent_at (Nic): renewals auto-send at
+    // creation — the landlord drafts, signs, and it flows — so there is
+    // no draft/send distinction, and a sent_at anchor would leave a doc
+    // whose send hiccuped with no deadline at all.
+    const renewalExpired = await query<any>(`
+      SELECT d.id, d.title, d.document_type, d.landlord_id,
+             u.unit_number, p.name as property_name
+      FROM lease_documents d
+      JOIN leases ol ON ol.id = d.renews_lease_id
+      LEFT JOIN units u ON u.id = d.unit_id
+      LEFT JOIN properties p ON p.id = u.property_id
+      WHERE d.status IN ('sent','in_progress')
+        AND NOW() >= COALESCE(
+              ol.end_date::timestamp,
+              date_trunc('month', d.created_at) + INTERVAL '2 months' - INTERVAL '1 day'
+            ) - INTERVAL '1 day'
+    `)
+    for (const d of renewalExpired as any[]) {
+      try {
+        await cascadeLeaseTenantsOnVoid(query, d)
+        await query(`UPDATE lease_documents SET status='voided', voided_at=NOW(), void_reason=$1, updated_at=NOW() WHERE id=$2`,
+          ['auto-voided: renewal not fully signed 1 day before the current lease ends', d.id])
+        const unitLabel = d.unit_number ? `Unit ${d.unit_number} — ${d.property_name}` : d.title
+        const recipients = await query<any>(`
+          SELECT email, name FROM lease_document_signers WHERE document_id=$1
+          UNION ALL
+          SELECT lu.email, (lu.first_name || ' ' || lu.last_name) as name
+          FROM landlords la JOIN users lu ON lu.id = la.user_id WHERE la.id=$2
+        `, [d.id, d.landlord_id])
+        for (const rcp of recipients as any[]) {
+          try {
+            await emailDocumentAutoVoided(rcp.email, rcp.name, d.title, unitLabel, { landlordId: d.landlord_id, documentId: d.id })
+          } catch(e) {
+            logger.error({ err: e, recipient_email: rcp.email }, '[ESIGN-TIMEOUTS] renewal deadline-void email failed')
+          }
+        }
+      } catch(e) {
+        logger.error({ err: e, document_id: d.id }, '[ESIGN-TIMEOUTS] renewal deadline-void failed for doc')
+      }
+    }
+    if ((renewalExpired as any[]).length > 0) {
+      logger.info(`[ESIGN-TIMEOUTS] deadline-voided ${(renewalExpired as any[]).length} renewal(s)`)
+    }
+
+    // Pass 4 (8am): remind the landlord every morning until they sign.
+    // Pass 5 (9am + 4pm): after the landlord signs, remind the tenant
+    // twice daily. The job runs every 15 min; the reminder_sent_at gap
+    // check makes each window fire exactly once.
+    if (hour === 8 || hour === 9 || hour === 16) {
+      const landlordPass = hour === 8
+      const renewalRemind = await query<any>(`
+        SELECT s.id, s.email, s.name, s.role,
+               d.id as doc_id, d.title, d.landlord_id,
+               u.unit_number, p.name as property_name,
+               lu.first_name || ' ' || lu.last_name as landlord_name
+        FROM lease_document_signers s
+        JOIN lease_documents d ON d.id = s.document_id
+        LEFT JOIN units u ON u.id = d.unit_id
+        LEFT JOIN properties p ON p.id = u.property_id
+        JOIN landlords la ON la.id = d.landlord_id
+        JOIN users lu ON lu.id = la.user_id
+        WHERE d.renews_lease_id IS NOT NULL
+          AND d.status IN ('sent','in_progress')
+          AND s.status IN ('sent','viewed')
+          AND (s.reminder_sent_at IS NULL OR s.reminder_sent_at < NOW() - INTERVAL '${landlordPass ? '20 hours' : '5 hours'}')
+          AND ${landlordPass
+            ? `s.role = 'landlord'`
+            : `s.role != 'landlord' AND NOT EXISTS (
+                 SELECT 1 FROM lease_document_signers ls
+                 WHERE ls.document_id = d.id AND ls.role='landlord' AND ls.status != 'signed')`}
+      `)
+      for (const r of renewalRemind as any[]) {
+        try {
+          const unitLabel = r.unit_number ? `Unit ${r.unit_number} — ${r.property_name}` : r.title
+          const appUrl = r.role === 'landlord'
+            ? (process.env.LANDLORD_APP_URL || 'http://localhost:3001')
+            : (process.env.TENANT_APP_URL || 'http://localhost:3002')
+          await emailSigningReminder(r.email, r.name, r.title, unitLabel, r.landlord_name, `${appUrl}/sign/${r.doc_id}`, { landlordId: r.landlord_id, documentId: r.doc_id })
+          await query(`UPDATE lease_document_signers SET reminder_sent_at=NOW() WHERE id=$1`, [r.id])
+        } catch(e) {
+          logger.error({ err: e, signer_id: r.id }, '[ESIGN-TIMEOUTS] renewal reminder failed')
+        }
+      }
+      if ((renewalRemind as any[]).length > 0) {
+        logger.info(`[ESIGN-TIMEOUTS] sent ${(renewalRemind as any[]).length} renewal ${landlordPass ? 'landlord' : 'tenant'} reminder(s)`)
+      }
     }
   } catch(e) { logger.error({ err: e }, '[SCHEDULER] esign timeouts') }
 }
@@ -843,6 +960,16 @@ export function schedulerInit() {
   // more than 7 days ago and never moved past status='generated'.
   // Routes that started or completed are never touched. FK cascade
   // pulls the route_stops along with them.
+  // S536: business invoicing subscription — accrue on the 1st for the
+  // prior month, retry pending collections daily. 4:15am Phoenix.
+  cron.schedule('15 4 * * *', async () => {
+    try {
+      const { processBusinessMonthlyFees } = await import('./businessMonthlyFees')
+      const r = await processBusinessMonthlyFees()
+      if (r.accrued || r.collected || r.failed) logger.info(r, '[business-fees]')
+    } catch (e) { logger.error({ err: e }, '[business-fees] fatal') }
+  })
+
   cron.schedule('45 1 * * *', async () => {
     try {
       const { processRouteCleanup } = await import('./routeCleanup')

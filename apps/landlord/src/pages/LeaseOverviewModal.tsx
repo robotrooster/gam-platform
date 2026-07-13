@@ -8,6 +8,7 @@
 import { useQuery } from 'react-query'
 import { useNavigate } from 'react-router-dom'
 import { FileText, X } from 'lucide-react'
+import { humanize } from '@gam/shared'
 import { apiGet } from '../lib/api'
 
 const fmtMoney = (n: any) =>
@@ -21,7 +22,7 @@ const LEASE_TYPE_LABEL: Record<string, string> = {
 const FEE_TIMING_LABEL: Record<string, string> = {
   move_in: 'due at move-in', monthly_ongoing: 'monthly', move_out: 'at move-out', other: 'as billed',
 }
-const feeLabel = (t: string) => t.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase())
+const feeLabel = (t: string) => humanize(t)
 const ordinal = (n: number) => {
   const v = n % 100
   if (v >= 11 && v <= 13) return `${n}th`
@@ -51,7 +52,7 @@ export function LeaseOverviewModal({ leaseId, onClose }: { leaseId: string; onCl
           <div style={{ padding: '4px 24px 24px' }}>
             <div style={{ display: 'grid', gridTemplateColumns: 'auto 1fr', gap: '10px 16px', fontSize: '.86rem' }}>
               <div style={{ color: 'var(--text-3)' }}>Status</div>
-              <div style={{ textTransform: 'capitalize' }}>{String(lease.status || '').replace(/_/g, ' ')}</div>
+              <div style={{ textTransform: 'capitalize' }}>{humanize(lease.status)}</div>
 
               <div style={{ color: 'var(--text-3)' }}>{tenants.length === 1 ? 'Tenant' : 'Tenants'}</div>
               <div>
@@ -67,7 +68,7 @@ export function LeaseOverviewModal({ leaseId, onClose }: { leaseId: string; onCl
               <div style={{ color: 'var(--text-3)' }}>Term</div>
               <div>
                 {fmtDay(lease.startDate)} → {lease.endDate ? fmtDay(lease.endDate) : 'ongoing'}
-                <span style={{ color: 'var(--text-3)' }}> · {LEASE_TYPE_LABEL[lease.leaseType] || lease.leaseType}</span>
+                <span style={{ color: 'var(--text-3)' }}> · {LEASE_TYPE_LABEL[lease.leaseType] || humanize(lease.leaseType)}</span>
                 {lease.autoRenew && <span style={{ color: 'var(--text-3)' }}> · auto-renews</span>}
               </div>
 

@@ -28,6 +28,33 @@ export const tenantsRouter = Router()
 //      via path.basename to block ../ traversal.
 
 // POST /api/tenants/accept-invite — tenant sets password and activates account
+// S537: landlord-scoped tenant list — the picker feed for the landlord
+// portal (lease form, screening, entry requests, FlexCharge, POS tab).
+// This root GET was missing since the beginning: five pages called it
+// and silently rendered empty pickers off the 404. Returns every tenant
+// with any lease under the calling landlord (newest lease's unit for
+// display), deduped.
+tenantsRouter.get('/', requireAuth, async (req: any, res, next) => {
+  try {
+    const landlordId = req.user!.role === 'landlord' ? req.user!.profileId : req.user!.landlordId
+    if (!landlordId) throw new AppError(403, 'Forbidden')
+    const rows = await query<any>(
+      `SELECT DISTINCT ON (t.id)
+              t.id, uu.first_name, uu.last_name, uu.email, uu.phone,
+              un.unit_number, p.name AS property_name, l.status AS lease_status
+         FROM tenants t
+         JOIN users uu ON uu.id = t.user_id
+         JOIN lease_tenants lt ON lt.tenant_id = t.id
+         JOIN leases l ON l.id = lt.lease_id
+         JOIN units un ON un.id = l.unit_id
+         JOIN properties p ON p.id = un.property_id
+        WHERE l.landlord_id = $1
+        ORDER BY t.id, l.created_at DESC`,
+      [landlordId])
+    res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
 tenantsRouter.post('/accept-invite', async (req, res, next) => {
   try {
     const { token, password, phone, ssiSsdi, acceptedTerms } = req.body

@@ -1,4 +1,5 @@
 import { useQuery } from 'react-query'
+import { humanize } from '@gam/shared'
 import { apiGet } from '../lib/api'
 
 // S527 W-6: this page queried GET /background-checks — a route that never
@@ -35,7 +36,7 @@ export function BackgroundChecksPage() {
                       ? <span className={`badge ${c.riskLevel === 'low' ? 'badge-green' : c.riskLevel === 'medium' ? 'badge-amber' : 'badge-red'}`}>{c.riskLevel}{c.riskScore != null ? ` · ${c.riskScore}` : ''}</span>
                       : <span style={{color:'var(--text-3)'}}>—</span>}
                   </td>
-                  <td><span className={`badge ${STATUS_MAP[c.status] || 'badge-muted'}`}>{(c.status || '—').replace('_', ' ')}</span></td>
+                  <td><span className={`badge ${STATUS_MAP[c.status] || 'badge-muted'}`}>{humanize(c.status) || '—'}</span></td>
                 </tr>
               )) : (
                 <tr><td colSpan={4} style={{textAlign:'center',color:'var(--text-3)',padding:32}}>No background checks yet.</td></tr>

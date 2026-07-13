@@ -414,8 +414,14 @@ businessInvoicesRouter.post('/:id/send', requireAuth, async (req, res, next) => 
       try {
         const { createInvoiceCheckoutSession } = await import('../services/stripeConnect')
         const appBase = process.env.MARKETING_URL || 'http://localhost:3004'
+        const { PLATFORM_FEES: BIZ_FEES } = await import('@gam/shared')
         const session = await createInvoiceCheckoutSession({
-          amountCents:              Math.round(due.amountDueNow * 100),
+          amountCents: Math.round(due.amountDueNow * 100),
+          // S536 (Nic): all money flows through GAM — the platform fee
+          // covers Stripe's processing cost with margin (see shared
+          // PLATFORM_FEES.BUSINESS_INVOICE_APP_FEE_*). Pre-fix this was 0
+          // and GAM ate the processing cost on every hosted payment.
+          applicationFeeCents: Math.round((Math.round(due.amountDueNow * 100)) * BIZ_FEES.BUSINESS_INVOICE_APP_FEE_PCT) + BIZ_FEES.BUSINESS_INVOICE_APP_FEE_FIXED_CENTS,
           businessConnectAccountId: biz.stripe_connect_account_id,
           invoiceNumber:            inv.invoice_number,
           customerEmail:            customer?.email ?? null,

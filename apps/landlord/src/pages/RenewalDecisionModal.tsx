@@ -3,6 +3,7 @@ import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useNavigate } from 'react-router-dom'
 import { apiGet, apiPost } from '../lib/api'
 import { RefreshCw, CalendarX2, FileSignature } from 'lucide-react'
+import { appConfirm } from '../components/dialogs'
 
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 const fmtDate = (d: any) => d ? new Date(d).toLocaleDateString() : '—'
@@ -148,7 +149,7 @@ export function RenewalDecisionModal({ leaseId, onClose }: { leaseId: string; on
                 <div className="modal-footer">
                   <button className="btn btn-ghost" onClick={onClose}>Close</button>
                   <button className="btn btn-ghost" disabled={voidMut.isLoading || working}
-                    onClick={()=>{ if (window.confirm('Void this renewal draft? Any values already entered are discarded.')) voidMut.mutate() }}>
+                    onClick={()=>{ appConfirm('Void this renewal draft? Any values already entered are discarded.', { danger: true, confirmLabel: 'Void draft' }).then(ok => { if (ok) voidMut.mutate() }) }}>
                     {voidMut.isLoading ? 'Voiding…' : 'Void draft'}
                   </button>
                   {openDraft.landlord_signer_status !== 'signed' && (
@@ -208,7 +209,7 @@ export function RenewalDecisionModal({ leaseId, onClose }: { leaseId: string; on
                     </button>
                   )}
                   {decision === 'non_renew' && (
-                    <button className="btn btn-primary" disabled={nonRenewMut.isLoading} onClick={()=>{ if (window.confirm('Record the non-renewal and notify the tenants now?')) nonRenewMut.mutate() }}>
+                    <button className="btn btn-primary" disabled={nonRenewMut.isLoading} onClick={()=>{ appConfirm('Record the non-renewal and notify the tenants now?', { confirmLabel: 'Record non-renewal' }).then(ok => { if (ok) nonRenewMut.mutate() }) }}>
                       {nonRenewMut.isLoading ? 'Recording…' : 'Confirm Non-Renewal'}
                     </button>
                   )}

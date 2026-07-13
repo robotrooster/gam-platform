@@ -23,6 +23,7 @@ interface BusinessSummary {
   name: string
   businessType: string
   enabledFeatures: string[]
+  tipsEnabled?: boolean
 }
 
 interface AuthCtx {
@@ -64,6 +65,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         name:            biz.name,
         businessType:    biz.businessType ?? biz.business_type,
         enabledFeatures: biz.enabledFeatures ?? biz.enabled_features ?? [],
+        tipsEnabled:     biz.tipsEnabled ?? biz.tips_enabled ?? true,
       })
     } catch {
       setBusiness(null)

@@ -3,7 +3,11 @@ import { X, AlertCircle, AlertTriangle, CheckCircle2, Loader } from 'lucide-reac
 import { api, apiGet } from '../lib/api'
 import {
   AUTO_RENEW_MODES,
+  AUTO_RENEW_MODE_LABEL,
   LEASE_TYPES,
+  LEASE_TYPE_LABEL,
+  UNIT_TYPE_LABEL,
+  humanize,
   PARSER_FLAG_CATEGORY_META,
   SUBLEASING_POLICIES,
   UNIT_TYPES,
@@ -801,10 +805,10 @@ export function ConfirmIntentModal({
               <FieldRow label="Property name"    parsed={fieldAt(parsed, 'unit.propertyName')}    override={overrides['unit.propertyName']}    onEdit={v => setOverride('unit.propertyName', v)} />
               <FieldRow label="Unit number"      parsed={fieldAt(parsed, 'unit.unitNumber')}      override={overrides['unit.unitNumber']}      onEdit={v => setOverride('unit.unitNumber', v)} />
               <FieldRow label="Property address" parsed={fieldAt(parsed, 'unit.propertyAddress')} override={overrides['unit.propertyAddress']} onEdit={v => setOverride('unit.propertyAddress', v)} />
-              <FieldRow label="Unit type" type="select" options={UNIT_TYPES.map(t => ({ value: t, label: t.replace(/_/g, ' ') }))} parsed={fieldAt(parsed, 'unit.unitType')} override={overrides['unit.unitType']} onEdit={v => setOverride('unit.unitType', v)} />
+              <FieldRow label="Unit type" type="select" options={UNIT_TYPES.map(t => ({ value: t, label: UNIT_TYPE_LABEL[t] }))} parsed={fieldAt(parsed, 'unit.unitType')} override={overrides['unit.unitType']} onEdit={v => setOverride('unit.unitType', v)} />
 
               <SectionHeader title="Lease terms" />
-              <FieldRow label="Lease type" type="select" options={LEASE_TYPES.map(t => ({ value: t, label: t.replace(/_/g, ' ') }))} parsed={fieldAt(parsed, 'lease.leaseType')} override={overrides['lease.leaseType']} onEdit={v => setOverride('lease.leaseType', v)} />
+              <FieldRow label="Lease type" type="select" options={LEASE_TYPES.map(t => ({ value: t, label: LEASE_TYPE_LABEL[t] }))} parsed={fieldAt(parsed, 'lease.leaseType')} override={overrides['lease.leaseType']} onEdit={v => setOverride('lease.leaseType', v)} />
               <FieldRow label="Start date" type="date" parsed={fieldAt(parsed, 'lease.leaseStart')} override={overrides['lease.leaseStart']} onEdit={v => setOverride('lease.leaseStart', v)} />
               <FieldRow label="End date"   type="date" parsed={fieldAt(parsed, 'lease.leaseEnd')}   override={overrides['lease.leaseEnd']}   onEdit={v => setOverride('lease.leaseEnd', v)} hint="Leave blank for month-to-month" />
               <FieldRow label="Monthly rent"        type="number" parsed={fieldAt(parsed, 'lease.monthlyRent')}        override={overrides['lease.monthlyRent']}        onEdit={v => setOverride('lease.monthlyRent', v)} />
@@ -814,12 +818,12 @@ export function ConfirmIntentModal({
               <FieldRow label="Auto-renew"          type="checkbox" parsed={fieldAt(parsed, 'lease.autoRenew')}      override={overrides['lease.autoRenew']}      onEdit={v => setOverride('lease.autoRenew', v)} />
               <FieldRow label="Auto-renew mode"     type="select"
                 options={[
-                  ...AUTO_RENEW_MODES.map(m => ({ value: m, label: m.replace(/_/g, ' ') })),
+                  ...AUTO_RENEW_MODES.map(m => ({ value: m, label: AUTO_RENEW_MODE_LABEL[m] })),
                 ]}
                 parsed={fieldAt(parsed, 'lease.autoRenewMode')} override={overrides['lease.autoRenewMode']} onEdit={v => setOverride('lease.autoRenewMode', v)} />
               <FieldRow label="Notice days required" type="number" parsed={fieldAt(parsed, 'lease.noticeDaysRequired')} override={overrides['lease.noticeDaysRequired']} onEdit={v => setOverride('lease.noticeDaysRequired', v)} />
               <FieldRow label="Subleasing policy" type="select"
-                options={SUBLEASING_POLICIES.map((s: string) => ({ value: s, label: s.replace(/_/g, ' ') }))}
+                options={SUBLEASING_POLICIES.map((s: string) => ({ value: s, label: humanize(s) }))}
                 parsed={fieldAt(parsed, 'lease.subleasingAllowed')} override={overrides['lease.subleasingAllowed']} onEdit={v => setOverride('lease.subleasingAllowed', v)} />
 
               <SectionHeader title="Co-residents" />

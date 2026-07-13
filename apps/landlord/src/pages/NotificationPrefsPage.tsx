@@ -45,21 +45,16 @@ export function NotificationPrefsSection() {
   for (const p of (prefs as any[])) prefMap.set(p.type, p)
 
   const update = useMutation(
-    (body: { type: string; emailEnabled: boolean; smsEnabled: boolean; inAppEnabled: boolean }) =>
+    (body: { type: string; emailEnabled: boolean; inAppEnabled: boolean }) =>
       api.patch('/notifications/preferences', body).then(r => r.data),
     { onSuccess: () => qc.invalidateQueries('notification-prefs') },
   )
 
   const { can } = usePerms()
 
-  const toggle = (type: string, channel: 'email' | 'sms', currentVal: boolean) => {
-    const current = prefMap.get(type) || { emailEnabled: true, smsEnabled: false, inAppEnabled: true }
-    update.mutate({
-      type,
-      emailEnabled: channel === 'email' ? !currentVal : current.emailEnabled,
-      smsEnabled:   channel === 'sms'   ? !currentVal : current.smsEnabled,
-      inAppEnabled: current.inAppEnabled,
-    })
+  const toggle = (type: string, currentVal: boolean) => {
+    const current = prefMap.get(type) || { emailEnabled: true, inAppEnabled: true }
+    update.mutate({ type, emailEnabled: !currentVal, inAppEnabled: current.inAppEnabled })
   }
 
   return (
@@ -72,8 +67,8 @@ export function NotificationPrefsSection() {
       </div>
 
       <div className="card" style={{ padding: 12, marginBottom: 16, fontSize: '.82rem', color: 'var(--text-2)' }}>
-        In-app notifications always show in your dashboard. Email and SMS
-        are optional channels per type. Defaults: email on, SMS off.
+        In-app notifications always show in your dashboard. Email is an
+        optional channel per type. Default: email on.
       </div>
 
       <div className="card" style={{ padding: 0 }}>
@@ -85,20 +80,16 @@ export function NotificationPrefsSection() {
               <tr>
                 <th>Notification</th>
                 <th style={{ textAlign: 'center' }}>Email</th>
-                <th style={{ textAlign: 'center' }}>SMS</th>
               </tr>
             </thead>
             <tbody>
               {LANDLORD_NOTIFICATION_TYPES.map(({ type, label }) => {
-                const p = prefMap.get(type) || { emailEnabled: true, smsEnabled: false }
+                const p = prefMap.get(type) || { emailEnabled: true }
                 return (
                   <tr key={type}>
                     <td><strong>{label}</strong></td>
                     <td style={{ textAlign: 'center' }}>
-                      <input type="checkbox" checked={p.emailEnabled} onChange={() => toggle(type, 'email', p.emailEnabled)} />
-                    </td>
-                    <td style={{ textAlign: 'center' }}>
-                      <input type="checkbox" checked={p.smsEnabled} onChange={() => toggle(type, 'sms', p.smsEnabled)} />
+                      <input type="checkbox" checked={p.emailEnabled} onChange={() => toggle(type, p.emailEnabled)} />
                     </td>
                   </tr>
                 )

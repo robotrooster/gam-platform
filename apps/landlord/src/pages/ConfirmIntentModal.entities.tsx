@@ -22,6 +22,7 @@ import {
   PET_SPECIES,
   RV_HOOKUP_CLASSES,
   ID_TYPES,
+  humanize,
 } from '@gam/shared'
 
 // ---------------------------------------------------------------------
@@ -77,7 +78,7 @@ export type EntityFieldConfig = {
 }
 
 const enumOptions = (vals: readonly string[]) =>
-  vals.map(v => ({ value: v, label: v.replace(/_/g, ' ') }))
+  vals.map(v => ({ value: v, label: humanize(v) }))
 
 const VEHICLE_FIELDS: EntityFieldConfig[] = [
   { key: 'vehicleType',  label: 'Type',          type: 'select', options: enumOptions(VEHICLE_TYPES), required: true },

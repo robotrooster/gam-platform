@@ -14,6 +14,7 @@ import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useAuth } from '../context/AuthContext'
 import { apiGet, apiPost, apiDelete } from '../lib/api'
+import { toast, appConfirm, appPrompt } from '../components/dialogs'
 import { Plus, X, Inbox, Send, Check, XCircle, RotateCcw } from 'lucide-react'
 
 type Direction = 'owner_to_pm' | 'pm_to_owner'
@@ -216,26 +217,29 @@ export function InvitationsPage() {
       const status = e?.response?.status
       const msg: string = e?.response?.data?.error ?? ''
       if (status === 409 && msg.toLowerCase().includes('currently managed')) {
-        if (window.confirm(
+        if (await appConfirm(
           'This property is currently managed by another PM company. ' +
           'Accepting will replace that linkage. Continue?',
+          { confirmLabel: 'Replace linkage' },
         )) {
           await acceptMut.mutateAsync({ id, replace: true })
         }
       } else if (status === 409 && msg.toLowerCase().includes('banking onboarding incomplete')) {
-        if (window.confirm(
+        if (await appConfirm(
           msg + '\n\nOpen the Banking page now?',
+          { confirmLabel: 'Open Banking' },
         )) {
           window.location.href = '/banking'
         }
       } else {
-        alert(msg || 'Accept failed.')
+        toast.error(msg || 'Accept failed.')
       }
     }
   }
 
   const handleReject = async (id: string) => {
-    const reason = window.prompt('Optional reason (or leave blank):')
+    const reason = await appPrompt('Optional reason (or leave blank):', { title: 'Reject invitation' })
+    if (reason === null) return
     await rejectMut.mutateAsync({ id, reason: reason || null })
   }
 
@@ -345,7 +349,7 @@ export function InvitationsPage() {
                   <button className="btn btn-ghost btn-sm"
                           disabled={revokeMut.isLoading}
                           onClick={() => {
-                            if (window.confirm('Revoke this invitation?')) revokeMut.mutate(inv.id)
+                            appConfirm('Revoke this invitation?', { danger: true, confirmLabel: 'Revoke' }).then(ok => { if (ok) revokeMut.mutate(inv.id) })
                           }}>
                     <RotateCcw size={12} style={{ marginRight: 4 }} /> Revoke
                   </button>

@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
+import { appConfirm } from '../components/dialogs'
 import { Pencil, Archive } from 'lucide-react'
 import { Modal } from '../components/Modal'
 import { iconBtnStyle, cancelBtnStyle, saveBtnStyle } from './CustomersPage'
@@ -97,7 +98,7 @@ export function DumpLocationsPage() {
   }
 
   const onArchive = async (r: DumpRow) => {
-    if (!window.confirm(`Archive ${r.name}? It won't be used by the route engine after this.`)) return
+    if (!(await appConfirm(`Archive ${r.name}? It won't be used by the route engine after this.`, { danger: true, confirmLabel: 'Archive' }))) return
     setArchiving(r.id); setErr(null)
     try {
       await apiPost(`/dump-locations/${r.id}/archive`)

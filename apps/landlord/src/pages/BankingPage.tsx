@@ -27,6 +27,7 @@ import type { StripeConnectInstance } from '@stripe/connect-js'
 import {
   ConnectAccountOnboarding, ConnectComponentsProvider,
 } from '@stripe/react-connect-js'
+import { appConfirm } from '../components/dialogs'
 
 interface BankAccountRow {
   id: string
@@ -175,9 +176,7 @@ export function BankingPage() {
                 <button
                   className="btn btn-ghost btn-sm"
                   onClick={() => {
-                    if (confirm(`Archive "${a.nickname}"? This cannot be undone.`)) {
-                      archiveMut.mutate(a.id)
-                    }
+                    appConfirm(`Archive "${a.nickname}"? This cannot be undone.`, { danger: true, confirmLabel: 'Archive' }).then(ok => { if (ok) archiveMut.mutate(a.id) })
                   }}
                   disabled={archiveMut.isLoading}
                   title="Archive"

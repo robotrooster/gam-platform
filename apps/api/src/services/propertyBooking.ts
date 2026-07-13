@@ -6,7 +6,7 @@ import { AppError } from '../middleware/errorHandler'
 import { createBookingDepositCheckoutSession } from './stripeConnect'
 import { sendNotificationEmail } from './email'
 import { logger } from '../lib/logger'
-import { WAITLIST_CLAIM_WINDOW_MINUTES, computeStayPrice } from '@gam/shared'
+import { WAITLIST_CLAIM_WINDOW_MINUTES, computeStayPrice, SHORT_STAY_LOCKED_UNIT_TYPES } from '@gam/shared'
 
 // ============================================================
 // S517 / Walkthrough #11 — public property booking + waitlist.
@@ -71,10 +71,15 @@ async function resolvePropertyBySlug(slug: string): Promise<PropertyRow> {
 }
 
 async function resolveUnit(propertyId: string, unitId: string): Promise<UnitRow> {
-  const unit = await queryOne<UnitRow>(
-    `SELECT id, unit_number, nightly_rate, weekly_rate, monthly_rate, min_stay_nights, max_stay_nights, is_bookable
+  const unit = await queryOne<UnitRow & { unit_type?: string }>(
+    `SELECT id, unit_number, unit_type, nightly_rate, weekly_rate, monthly_rate, min_stay_nights, max_stay_nights, is_bookable
        FROM units WHERE id=$1 AND property_id=$2`, [unitId, propertyId])
   if (!unit || !unit.is_bookable) throw new AppError(404, 'Unit not bookable')
+  // S538 (Nic): storage is hard-locked out of short-term rental — belt over
+  // the config gates, covers legacy rows flagged bookable before the lock.
+  if ((SHORT_STAY_LOCKED_UNIT_TYPES as readonly string[]).includes(unit.unit_type ?? '')) {
+    throw new AppError(404, 'Unit not bookable')
+  }
   return unit
 }
 

@@ -14,8 +14,6 @@
  *      notifications.email_sent=TRUE + email_sent_at=NOW() on THIS
  *      specific row (S106 fix — pre-S106 the UPDATE used MySQL ORDER
  *      BY LIMIT 1 which postgres rejected, leaving flags FALSE).
- *   4. If sms_enabled AND p.sendSMS AND p.smsTo: SMS stub fires +
- *      flip sms_sent flag.
  *   5. Best-effort: never throws. Outer try/catch logs and returns.
  *
  * The 30 notify* wrappers are thin shells over this; testing them all
@@ -59,26 +57,23 @@ async function setPrefs(
   prefs: { email?: boolean; sms?: boolean; inApp?: boolean },
 ): Promise<void> {
   await db.query(
-    `INSERT INTO notification_preferences (user_id, type, email_enabled, sms_enabled, in_app_enabled)
-     VALUES ($1, $2, $3, $4, $5)`,
-    [userId, type, prefs.email ?? true, prefs.sms ?? false, prefs.inApp ?? true])
+    `INSERT INTO notification_preferences (user_id, type, email_enabled, in_app_enabled)
+     VALUES ($1, $2, $3, $4)`,
+    [userId, type, prefs.email ?? true, prefs.inApp ?? true])
 }
 
 describe('createNotification — preference defaults (no row exists)', () => {
-  it('writes in-app row + sends email when sendEmail+emailTo set; SMS skipped (default sms=false)', async () => {
+  it('writes in-app row + sends email when sendEmail+emailTo set', async () => {
     const { userId, email } = await seedUser()
     await createNotification({
       userId, type: 'rent_collected', title: 'Rent paid', body: 'Got it',
       sendEmail: true, emailTo: email,
-      sendSMS: true, smsTo: '+15555550001',
     })
-    const rows = await db.query<{ id: string; email_sent: boolean; sms_sent: boolean }>(
-      `SELECT id, email_sent, sms_sent FROM notifications WHERE user_id = $1`, [userId])
+    const rows = await db.query<{ id: string; email_sent: boolean }>(
+      `SELECT id, email_sent FROM notifications WHERE user_id = $1`, [userId])
     expect(rows.rows.length).toBe(1)
     // email flipped TRUE (default email=true + flags set + messageId returned)
     expect(rows.rows[0].email_sent).toBe(true)
-    // sms NOT flipped — default sms_enabled is false even though p.sendSMS=true
-    expect(rows.rows[0].sms_sent).toBe(false)
     expect(sendNotificationEmailMock).toHaveBeenCalledTimes(1)
   })
 })
@@ -110,19 +105,6 @@ describe('createNotification — prefs gates', () => {
     expect(rows.rows.length).toBe(1)
   })
 
-  it('sms_enabled=true → SMS stub fires + sms_sent flag flips', async () => {
-    const { userId, email } = await seedUser()
-    await setPrefs(userId, 'maintenance_update', { sms: true, email: true, inApp: true })
-    await createNotification({
-      userId, type: 'maintenance_update', title: 'Status', body: 'In progress',
-      sendEmail: false, emailTo: email,
-      sendSMS: true, smsTo: '+15555550002', smsBody: 'GAM: maintenance update',
-    })
-    const row = await db.query<{ sms_sent: boolean; email_sent: boolean }>(
-      `SELECT sms_sent, email_sent FROM notifications WHERE user_id = $1`, [userId])
-    expect(row.rows[0].sms_sent).toBe(true)
-    expect(row.rows[0].email_sent).toBe(false)  // sendEmail=false
-  })
 })
 
 describe('createNotification — sendEmail / emailTo gating', () => {

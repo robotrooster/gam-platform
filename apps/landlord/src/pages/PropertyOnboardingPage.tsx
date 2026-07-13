@@ -3,6 +3,7 @@ import { useMutation } from 'react-query'
 import { useNavigate } from 'react-router-dom'
 import { Upload, FileText, AlertCircle, CheckCircle2, AlertTriangle, X } from 'lucide-react'
 import { apiPost } from '../lib/api'
+import { humanize } from '@gam/shared'
 
 type CsvIssue = { severity: 'block' | 'warn'; field?: string; message: string }
 type PropertyCsvRow = {
@@ -29,7 +30,16 @@ type PropertyCsvRow = {
 type ValidateResponse = {
   rows: PropertyCsvRow[]
   summary: { total: number; blockers: number; warnings: number; ready: number; newProperties: number; newUnits: number }
+  // S537: (property, unit_type) pairs in the file + whether a late-fee
+  // decision already exists (only possible for existing properties).
+  lateFeeDecisions?: { propertyName: string; street1: string; propertyId: string | null; unitType: string; decided: boolean }[]
 }
+const GAM_UNIT_TYPES = ['apartment', 'single_family', 'rv_spot', 'mobile_home', 'storage', 'commercial'] as const
+const UNIT_TYPE_LABEL: Record<string, string> = {
+  apartment: 'Apartment', single_family: 'Single family', rv_spot: 'RV spot',
+  mobile_home: 'Mobile home', storage: 'Storage', commercial: 'Commercial',
+}
+type FeeDecisionInput = { noLateFee: boolean; amount: string; grace: string; kind: 'flat' | 'percent_of_rent' }
 type CommitResponse = {
   propertiesCreated: number
   unitsCreated: number
@@ -80,6 +90,9 @@ export function PropertyOnboardingPage() {
   const [csvText, setCsvText] = useState<string>('')
   const [punchListRows, setPunchListRows] = useState<PropertyCsvRow[] | null>(null)
   const [summary, setSummary] = useState<ValidateResponse['summary'] | null>(null)
+  // S537: server-known decided pairs + the landlord's decision inputs.
+  const [decidedPairs, setDecidedPairs] = useState<Set<string>>(new Set())
+  const [feeDecisions, setFeeDecisions] = useState<Record<string, FeeDecisionInput>>({})
   const [errorMsg, setErrorMsg] = useState<string>('')
   const [successBanner, setSuccessBanner] = useState<string>('')
   const [reviewBanner, setReviewBanner] = useState<{ platform: string } | null>(null)
@@ -111,6 +124,9 @@ export function PropertyOnboardingPage() {
         setErrorMsg('')
         setSummary(data.summary)
         setPunchListRows(data.rows)
+        setDecidedPairs(new Set((data.lateFeeDecisions || []).filter(d => d.decided)
+          .map(d => `${d.propertyName.toLowerCase()}|${d.street1.toLowerCase()}|${d.unitType}`)))
+        setFeeDecisions({})
       },
       onError: (err: any) => {
         setErrorMsg(err?.response?.data?.message || 'Validation failed. Check the CSV format and try again.')
@@ -121,9 +137,9 @@ export function PropertyOnboardingPage() {
   )
 
   const commitMut = useMutation(
-    (rows: PropertyCsvRow[]) =>
+    ({ rows, decisions }: { rows: PropertyCsvRow[]; decisions: any[] }) =>
       apiPost<CommitResponse>('/landlords/me/onboard-properties-csv/commit', {
-        rows, source,
+        rows, source, lateFeeDecisions: decisions,
         ...(source === 'generic' ? { claimedPlatformName: claimedPlatformName.trim() } : {}),
       }),
     {
@@ -198,6 +214,26 @@ export function PropertyOnboardingPage() {
     ) || null)
   }
 
+  // S537: the distinct (property, unit_type) pairs in the CURRENT rows
+  // (recomputed live so unit-type edits update the decision list), minus
+  // pairs the server says are already decided.
+  const undecidedPairs = useMemo(() => {
+    if (!punchListRows) return []
+    const seen = new Map<string, { propertyName: string; street1: string; unitType: string }>()
+    for (const r of punchListRows) {
+      if (!r.propertyName || !(GAM_UNIT_TYPES as readonly string[]).includes(r.unitType)) continue
+      const key = `${r.propertyName.toLowerCase()}|${r.street1.toLowerCase()}|${r.unitType}`
+      if (!decidedPairs.has(key) && !seen.has(key)) {
+        seen.set(key, { propertyName: r.propertyName, street1: r.street1, unitType: r.unitType })
+      }
+    }
+    return Array.from(seen.entries()).map(([key, v]) => ({ key, ...v }))
+  }, [punchListRows, decidedPairs])
+
+  const decisionComplete = (d?: FeeDecisionInput) =>
+    !!d && (d.noLateFee || (d.amount !== '' && !isNaN(parseFloat(d.amount)) && d.grace !== ''))
+  const allDecided = undecidedPairs.every(p => decisionComplete(feeDecisions[p.key]))
+
   const handleCommit = () => {
     if (!punchListRows) return
     if (source === 'generic' && !claimedPlatformName.trim()) {
@@ -209,7 +245,18 @@ export function PropertyOnboardingPage() {
       setErrorMsg(`${stillBlocked.length} row(s) still have blockers. Fix them or remove the rows before committing.`)
       return
     }
-    commitMut.mutate(punchListRows)
+    if (!allDecided) {
+      setErrorMsg('Every unit type needs a late-fee decision (terms or "no late fee") before committing.')
+      return
+    }
+    const decisions = undecidedPairs.map(p => {
+      const d = feeDecisions[p.key]!
+      return d.noLateFee
+        ? { propertyName: p.propertyName, street1: p.street1, unitType: p.unitType, noLateFee: true }
+        : { propertyName: p.propertyName, street1: p.street1, unitType: p.unitType, noLateFee: false,
+            graceDays: Math.trunc(Number(d.grace) || 0), initialAmount: Number(d.amount), initialType: d.kind }
+    })
+    commitMut.mutate({ rows: punchListRows, decisions })
   }
 
   return (
@@ -391,6 +438,7 @@ export function PropertyOnboardingPage() {
                   <th style={th}>State</th>
                   <th style={th}>Zip</th>
                   <th style={th}>Unit #</th>
+                  <th style={th}>Type</th>
                   <th style={th}>Beds</th>
                   <th style={th}>Baths</th>
                   <th style={th}>Rent</th>
@@ -410,6 +458,14 @@ export function PropertyOnboardingPage() {
                       <td style={td}><EditCell value={r.state} onChange={v => updateRow(r.rowIndex, 'state', v)} width={60} /></td>
                       <td style={td}><EditCell value={r.zip} onChange={v => updateRow(r.rowIndex, 'zip', v)} width={80} /></td>
                       <td style={td}><EditCell value={r.unitNumber} onChange={v => updateRow(r.rowIndex, 'unitNumber', v)} width={80} /></td>
+                      <td style={td}>
+                        <select className="input" value={(GAM_UNIT_TYPES as readonly string[]).includes(r.unitType) ? r.unitType : ''}
+                          onChange={e => updateRow(r.rowIndex, 'unitType', e.target.value)}
+                          style={{ width: 120, fontSize: '.8rem', padding: '4px 6px', borderColor: (GAM_UNIT_TYPES as readonly string[]).includes(r.unitType) ? undefined : '#dc2626' }}>
+                          <option value="" disabled>{r.unitType ? `"${r.unitType}"?` : 'Pick…'}</option>
+                          {GAM_UNIT_TYPES.map(t => <option key={t} value={t}>{UNIT_TYPE_LABEL[t]}</option>)}
+                        </select>
+                      </td>
                       <td style={td}><EditCell value={r.bedrooms} onChange={v => updateRow(r.rowIndex, 'bedrooms', v)} width={50} /></td>
                       <td style={td}><EditCell value={r.bathrooms} onChange={v => updateRow(r.rowIndex, 'bathrooms', v)} width={50} /></td>
                       <td style={td}><EditCell value={r.rentAmount} onChange={v => updateRow(r.rowIndex, 'rentAmount', v)} width={80} /></td>
@@ -437,10 +493,64 @@ export function PropertyOnboardingPage() {
             </table>
           </div>
 
+          {/* S537: late-fee decision step — one decision per (property,
+              unit type) in the file; GAM never invents fee terms. */}
+          {undecidedPairs.length > 0 && (
+            <div style={{ marginTop: 16, padding: 14, borderRadius: 8, background: 'var(--bg-2)', border: '1px solid var(--border-0)' }}>
+              <div style={{ fontSize: '.92rem', fontWeight: 700, color: 'var(--text-0)', marginBottom: 4 }}>Late-fee decisions</div>
+              <div style={{ fontSize: '.78rem', color: 'var(--text-3)', marginBottom: 12, lineHeight: 1.5 }}>
+                Your file doesn&apos;t carry late-fee policy (no platform exports it). Decide it now for each
+                unit type — terms, or explicitly no late fee. Every lease GAM drafts for a class uses its
+                decision, and no tenant is ever billed more than it allows.
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                {undecidedPairs.map(pair => {
+                  const d = feeDecisions[pair.key] || { noLateFee: false, amount: '', grace: '5', kind: 'flat' as const }
+                  const setD = (patch: Partial<FeeDecisionInput>) =>
+                    setFeeDecisions(prev => ({ ...prev, [pair.key]: { ...d, ...patch } }))
+                  return (
+                    <div key={pair.key} style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', fontSize: '.82rem' }}>
+                      <span style={{ flex: '0 0 260px', color: 'var(--text-1)' }}>
+                        <strong>{pair.propertyName}</strong> · {UNIT_TYPE_LABEL[pair.unitType] || humanize(pair.unitType)}
+                      </span>
+                      <select className="input" value={d.noLateFee ? 'none' : 'fee'}
+                        onChange={e => setD({ noLateFee: e.target.value === 'none' })}
+                        style={{ width: 120, fontSize: '.8rem', padding: '4px 6px' }}>
+                        <option value="fee">Charge a fee</option>
+                        <option value="none">No late fee</option>
+                      </select>
+                      {!d.noLateFee && (
+                        <>
+                          <input className="input" placeholder="25" value={d.amount} inputMode="decimal"
+                            onChange={e => { const v = e.target.value; if (v === '' || /^\d*\.?\d*$/.test(v)) setD({ amount: v }) }}
+                            style={{ width: 70, fontSize: '.8rem', padding: '4px 6px' }} />
+                          <select className="input" value={d.kind}
+                            onChange={e => setD({ kind: e.target.value as FeeDecisionInput['kind'] })}
+                            style={{ width: 100, fontSize: '.8rem', padding: '4px 6px' }}>
+                            <option value="flat">Flat $</option>
+                            <option value="percent_of_rent">% of rent</option>
+                          </select>
+                          <span style={{ color: 'var(--text-3)' }}>grace</span>
+                          <input className="input" value={d.grace} inputMode="numeric"
+                            onChange={e => { const v = e.target.value; if (v === '' || /^\d+$/.test(v)) setD({ grace: v }) }}
+                            style={{ width: 50, fontSize: '.8rem', padding: '4px 6px' }} />
+                          <span style={{ color: 'var(--text-3)' }}>days</span>
+                        </>
+                      )}
+                      {decisionComplete(feeDecisions[pair.key])
+                        ? <CheckCircle2 size={14} style={{ color: '#16a34a' }} />
+                        : <span style={{ color: '#f59e0b', fontSize: '.76rem' }}>needs a decision</span>}
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+          )}
+
           <div style={{ marginTop: 16, display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
             <button
               onClick={handleCommit}
-              disabled={commitMut.isLoading || punchListRows.some(r => r.issues.some(i => i.severity === 'block'))}
+              disabled={commitMut.isLoading || !allDecided || punchListRows.some(r => r.issues.some(i => i.severity === 'block'))}
               className="btn btn-primary"
               style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}
             >

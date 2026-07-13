@@ -10,7 +10,9 @@ import {
 } from '../lib/terminal'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPatch, apiDel } from '../lib/api'
+import { humanize } from '@gam/shared'
 import { enqueue as enqueueSync, preloadMapping, mintClientId } from '../lib/syncQueue'
+import { toast, appConfirm, appPrompt } from '../components/dialogs'
 
 // S243: Active reader for the terminal flow. Two paths:
 //   - 'smart'     — server-driven (S700, WisePOS E, etc.) registered
@@ -43,25 +45,6 @@ const TAX_TYPES = ['state','city','county','special']
 
 interface CartItem { id:string; name:string; price:number; qty:number; tax:number; cat:string; icon:string; chargeEligible:boolean }
 
-// Preset icons for categories AND items — a clickable dropdown replaces the old
-// free-text box (you can't type an arbitrary character in as an "icon"). ~130.
-const POS_ICON_OPTIONS = [
-  '📦','🛒','🛍️','🏷️','🎁','🎟️','💳','🧾',
-  '⛽','🔥','🪵','🔋','💡','🔌','🕯️','🔦','♨️','🧯',
-  '🍔','🌭','🍕','🌮','🌯','🥪','🍟','🥨','🍿','🥓','🥚','🧀','🥖','🍞',
-  '🍩','🍪','🍫','🍬','🍭','🧁','🍰','🍦','🍨',
-  '🍎','🍌','🍇','🍓','🍊','🍉','🥑','🥕','🌽','🥔','🥜','🍅',
-  '☕','🥤','🧃','🧋','🍵','🍺','🍷','🥛','🧉','🍶','🧊',
-  '🧺','🧹','🧴','🧻','🧼','🪣','🧽','🪥','🚿','🛁','🚽',
-  '🔧','🛠️','🔨','🪛','🔩','⚙️','🪚','🧲','🪝',
-  '🏕️','⛺','🎣','🚲','🛶','🧭','🏊','🏖️','⛱️','🥾','🌅',
-  '🅿️','🚗','🚙','🚐','🛻','🏍️','🛞','🛴',
-  '🐾','🦴','🐕','🐈','🐟',
-  '🩹','💊','🪒','👕','🧢','🕶️','☂️','🧦','🧤',
-  '🔑','🗝️','⏰','✂️','🖊️','📎','🔒','🎈','🧸','🎀',
-  '🎱','🎰','🎮','🎲','🏓','⚽','🎯',
-  '🌱','🪴','🌸','🌵','🍄',
-]
 
 // POS money/quantity fields are never negative. Spread {...nonNeg} into every
 // numeric input to block a value < 0 three ways: typing '-'/'+'/'e', spinner-
@@ -79,6 +62,12 @@ export function POSPage() {
   const [tab, setTab] = useState<'register'|'history'|'items'|'categories'|'taxes'|'discounts'|'vendors'|'orders'|'inventory'|'readers'>('register')
 
   const [cart, setCart] = useState<CartItem[]>([])
+  // S536: browser-neutral — no native alert(); transient in-app notice.
+  const [stockNotice, setStockNotice] = useState<string | null>(null)
+  const showStockNotice = (msg: string) => {
+    setStockNotice(msg)
+    setTimeout(() => setStockNotice(null), 2500)
+  }
   // S263/S264: server-of-record cart sync. clientSessionId is the LOCAL
   // identifier of the active session — generated at session-open time
   // and used to enqueue subsequent mutations through services/syncQueue.
@@ -89,9 +78,9 @@ export function POSPage() {
   const [openTabBanner, setOpenTabBanner] = useState<{ id:string; total:number; openedAt:string; itemCount:number }|null>(null)
   const [method, setMethod] = useState<'cash'|'card'|'charge'>('cash')
   const [tenantId, setTenantId] = useState('')
-  // S254: FlexCharge customer can be a tenant OR a pos_customer
-  // (merchant-owned non-tenant). UI picks one type at a time.
-  const [chargeCustomerType, setChargeCustomerType] = useState<'tenant'|'pos_customer'>('tenant')
+  // S254/S538: FlexCharge account holder can come from either backing
+  // list (resident account or POS customer account). The register shows
+  // ONE neutral "customer" picker; the ids stay mutually exclusive.
   const [posCustomerId, setPosCustomerId] = useState('')
   const [cashGiven, setCashGiven] = useState('')
   const [filterCat, setFilterCat] = useState('all')
@@ -302,8 +291,8 @@ export function POSPage() {
       clientSessionId: csid,
       payload: {
         propertyId: registerProperty,
-        tenantId: method==='charge' && chargeCustomerType==='tenant' && tenantId ? tenantId : null,
-        posCustomerId: method==='charge' && chargeCustomerType==='pos_customer' && posCustomerId ? posCustomerId : null,
+        tenantId: method==='charge' && tenantId ? tenantId : null,
+        posCustomerId: method==='charge' && posCustomerId ? posCustomerId : null,
       },
     })
     return csid
@@ -355,6 +344,13 @@ export function POSPage() {
   }
 
   const addToCart = async (item: any) => {
+    // S536 (Nic): the cart can never hold more quantity than inventory
+    // shows — the tile says "N left", so N is the ceiling.
+    const inCartQty = cart.find(x => x.id === item.id)?.qty ?? 0
+    if (inCartQty + 1 > Number(item.stockQty)) {
+      showStockNotice(Number(item.stockQty) <= 0 ? 'Out of stock' : `Only ${item.stockQty} in stock`)
+      return
+    }
     const csid = ensureSession()
     if (!csid) return
     const clientItemId = mintClientId()
@@ -378,7 +374,10 @@ export function POSPage() {
       // Server resolves into two pos_session_items rows; resume after a
       // tab reopen will show them split. Acceptable for v1; merge logic
       // can come later if line clutter becomes a complaint.
-      if (ex) return c.map(x => x.id===item.id ? {...x,qty:x.qty+1, _sessionItemId: (x as any)._sessionItemId ?? clientItemId} as any : x)
+      // clamp INSIDE the updater too — rapid clicks batch renders, so the
+      // pre-check above can read a stale cart; the updater always sees
+      // the latest state and is the hard guarantee.
+      if (ex) return c.map(x => x.id===item.id ? {...x,qty:Math.min(x.qty+1, Math.max(1, Number(item.stockQty))), _sessionItemId: (x as any)._sessionItemId ?? clientItemId} as any : x)
       return [...c, { id:item.id, name:item.name, price:Number(item.sellPrice), qty:1, tax:Number(item.taxRate), cat:item.category, icon:item.icon, chargeEligible:item.chargeEligible, _sessionItemId: clientItemId } as any]
     })
   }
@@ -400,10 +399,21 @@ export function POSPage() {
     setCart(c => [...c, { id:'open-'+Date.now(), name:openItem.name, price:Number(openItem.price), qty:1, tax:0, cat:'misc', icon:'📝', chargeEligible:false, _sessionItemId: clientItemId } as any])
     setOpenItem({ name:'', price:'', show:false })
   }
-  const updateQty = async (id:string, delta:number) => {
+  // S536 (Nic): absolute-quantity setter — the register quantity is
+  // typeable (selling 40 gallons shouldn't take 40 clicks) and every
+  // path caps at the item's stock so the cart can never exceed
+  // inventory. Open items (no inventory row) are uncapped.
+  const stockCapFor = (id:string) => {
+    if (id.startsWith('open-')) return Infinity
+    const it = (items as any[]).find((x:any) => x.id === id)
+    return it ? Number(it.stockQty) : Infinity
+  }
+  const setQty = async (id:string, target:number) => {
     const line = cart.find(x => x.id === id)
     if (!line) return
-    const newQty = Math.max(0, line.qty + delta)
+    const cap = stockCapFor(id)
+    if (Number.isFinite(cap) && target > cap) showStockNotice(`Only ${cap} in stock`)
+    const newQty = Math.min(Math.max(0, Math.floor(target)), cap)
     const csid = clientSessionId
     const lineClientId = (line as any)._sessionItemId
     if (csid && lineClientId) {
@@ -424,6 +434,10 @@ export function POSPage() {
       }
     }
     setCart(c => c.map(x => x.id===id ? {...x,qty:newQty} : x).filter(x=>x.qty>0))
+  }
+  const updateQty = (id:string, delta:number) => {
+    const line = cart.find(x => x.id === id)
+    if (line) void setQty(id, line.qty + delta)
   }
 
   const subtotal = cart.reduce((s,i) => s+i.price*i.qty, 0)
@@ -450,8 +464,8 @@ export function POSPage() {
       items: cart.map(i => ({ id:i.id.startsWith('open-')?null:i.id, name:i.name, qty:i.qty, price:i.price, tax:i.tax, cat:i.cat })),
       paymentMethod:method,
       // S254: charge mode posts customer + property scoping for FlexCharge
-      tenantId: method==='charge' && chargeCustomerType==='tenant' ? (tenantId||null) : (method==='charge' ? null : (tenantId||null)),
-      posCustomerId: method==='charge' && chargeCustomerType==='pos_customer' ? (posCustomerId||null) : null,
+      tenantId: tenantId||null,
+      posCustomerId: method==='charge' ? (posCustomerId||null) : null,
       // Always send the register's property (not just for FlexCharge) so every
       // sale is tied to a property — required for cashier property-lock scoping.
       propertyId: registerProperty || null,
@@ -483,7 +497,7 @@ export function POSPage() {
 
   const toggleChargeMut = useMutation(({ id, val }:{ id:string; val:boolean }) => apiPatch(`/pos/items/${id}`, { chargeEligible:val }), { onSuccess: () => qc.invalidateQueries('pos-items') })
   const toggleActiveMut = useMutation(({ id, val }:{ id:string; val:boolean }) => apiPatch(`/pos/items/${id}`, { isActive:val }), { onSuccess: () => qc.invalidateQueries('pos-items') })
-  const createItemMut = useMutation(() => apiPost('/pos/items', { ...newItem, propertyId: registerProperty, categoryId: newItem.categoryId, costPrice:Number(newItem.costPrice), sellPrice:Number(newItem.sellPrice), marginPct: newItem.marginPct === '' ? null : Number(newItem.marginPct), taxCategoryId: newItem.taxCategoryId || null, chargeEligible:newItem.chargeEligible, stockQty:Number(newItem.stockQty), stockMin:Number(newItem.stockMin), stockMax:Number(newItem.stockMax) }), { onSuccess: () => { qc.invalidateQueries('pos-items'); setNewItem({ name:'', categoryId:'', icon:'📦', sellPrice:'', costPrice:'', marginPct: defaultMarginPct!=null?String(defaultMarginPct):'', taxCategoryId:'', chargeEligible:true, stockQty:'0', stockMin:'5', stockMax:'50', propertyId:'' }) }, onError: (e:any) => alert(e?.response?.data?.error?.message || e?.response?.data?.error || 'Could not add item — set name, sell price, category, and property') })
+  const createItemMut = useMutation(() => apiPost('/pos/items', { ...newItem, propertyId: registerProperty, categoryId: newItem.categoryId, costPrice:Number(newItem.costPrice), sellPrice:Number(newItem.sellPrice), marginPct: newItem.marginPct === '' ? null : Number(newItem.marginPct), taxCategoryId: newItem.taxCategoryId || null, chargeEligible:newItem.chargeEligible, stockQty:Number(newItem.stockQty), stockMin:Number(newItem.stockMin), stockMax:Number(newItem.stockMax) }), { onSuccess: () => { qc.invalidateQueries('pos-items'); setNewItem({ name:'', categoryId:'', icon:'📦', sellPrice:'', costPrice:'', marginPct: defaultMarginPct!=null?String(defaultMarginPct):'', taxCategoryId:'', chargeEligible:true, stockQty:'0', stockMin:'5', stockMax:'50', propertyId:'' }) }, onError: (e:any) => toast.error(e?.response?.data?.error?.message || e?.response?.data?.error || 'Could not add item — set name, sell price, category, and property') })
 
   // POS #1 auto-pricing helpers. Margin is gross % of sell price:
   // sell = cost / (1 - margin/100); margin = (sell - cost) / sell * 100.
@@ -514,11 +528,11 @@ export function POSPage() {
   }, [defaultMarginPct])
   // Override-confirm: if a default margin exists and this item's margin
   // deviates from it, confirm before saving.
-  const submitNewItem = () => {
+  const submitNewItem = async () => {
     if (defaultMarginPct != null && newItem.marginPct !== '') {
       const m = Number(newItem.marginPct)
       if (Math.abs(m - defaultMarginPct) > 0.5) {
-        if (!window.confirm(`This price is a ${m.toFixed(1)}% margin, not your ${defaultMarginPct}% default. Save anyway?`)) return
+        if (!(await appConfirm(`This price is a ${m.toFixed(1)}% margin, not your ${defaultMarginPct}% default. Save anyway?`, { confirmLabel: 'Save anyway' }))) return
       }
     }
     createItemMut.mutate()
@@ -553,7 +567,7 @@ export function POSPage() {
   const deleteTaxMut = useMutation((id:string) => apiDel(`/pos/tax-rates/${id}`), { onSuccess: () => qc.invalidateQueries('pos-tax-rates') })
   // Tax categories: add + edit-rate. Rates entered as % in the UI, stored as decimals.
   const [newTaxCat, setNewTaxCat] = useState({ name:'', ratePct:'' })
-  const createTaxCatMut = useMutation(() => apiPost('/pos/tax-categories', { name:newTaxCat.name, rate:Number(newTaxCat.ratePct||0)/100 }), { onSuccess: () => { qc.invalidateQueries('pos-tax-categories'); setNewTaxCat({ name:'', ratePct:'' }) }, onError:(e:any)=>alert(e?.response?.data?.error?.message||e?.response?.data?.error||'Could not add tax category') })
+  const createTaxCatMut = useMutation(() => apiPost('/pos/tax-categories', { name:newTaxCat.name, rate:Number(newTaxCat.ratePct||0)/100 }), { onSuccess: () => { qc.invalidateQueries('pos-tax-categories'); setNewTaxCat({ name:'', ratePct:'' }) }, onError:(e:any)=>toast.error(e?.response?.data?.error?.message||e?.response?.data?.error||'Could not add tax category') })
   const updateTaxCatMut = useMutation((v:any) => apiPatch(`/pos/tax-categories/${v.id}`, { rate:v.rate, isActive:v.isActive }), { onSuccess: () => { qc.invalidateQueries('pos-tax-categories'); qc.invalidateQueries('pos-items') } })
   const createDiscountMut = useMutation(() => apiPost('/pos/discounts', { ...newDiscount, value:Number(newDiscount.value), propertyId: registerProperty }), { onSuccess: () => { qc.invalidateQueries('pos-discounts'); setNewDiscount({ name:'', type:'percent', value:'', code:'' }) } })
   const deleteDiscountMut = useMutation((id:string) => apiDel(`/pos/discounts/${id}`), { onSuccess: () => qc.invalidateQueries('pos-discounts') })
@@ -670,6 +684,17 @@ export function POSPage() {
     { key:'readers',   label:'Readers',    perm:'pos.tab.readers' },
   ].filter(t => canSeeTab(t.perm))
 
+  // S536 (Nic): consolidate configuration under one Settings tab —
+  // Register / History / Inventory are daily-use and stay top-level;
+  // Items / Categories / Tax Rates / Discounts / Vendors / Orders /
+  // Readers are set-once config behind Settings. Permission gating is
+  // unchanged: Settings shows only the subtabs the user may see and
+  // disappears entirely when none are allowed.
+  const SETTINGS_KEYS = ['items','categories','taxes','discounts','vendors','orders','readers']
+  const settingsTabs = TABS.filter(t => SETTINGS_KEYS.includes(t.key))
+  const primaryTabs  = TABS.filter(t => !SETTINGS_KEYS.includes(t.key))
+  const inSettings   = SETTINGS_KEYS.includes(tab)
+
   // If the active tab isn't one this user can see (e.g. a cashier without the
   // default Register tab), snap to their first available tab so content and
   // the tab bar stay in sync.
@@ -688,7 +713,7 @@ export function POSPage() {
           <div style={{fontWeight:700,fontSize:'1.1rem',marginBottom:4}}>Sale Complete</div>
           <div style={{color:'var(--text-3)',fontSize:'.82rem',marginBottom:24}}>Transaction recorded</div>
           <table className="data-table" style={{marginBottom:16}}>
-            <tbody>{receipt.cartItems.map((i:any,idx:number) => (<tr key={idx}><td>{i.icon} {i.name}</td><td className="mono">x{i.qty}</td><td className="mono">{fmt(i.price*i.qty)}</td></tr>))}</tbody>
+            <tbody>{receipt.cartItems.map((i:any,idx:number) => (<tr key={idx}><td>{i.name}</td><td className="mono">x{i.qty}</td><td className="mono">{fmt(i.price*i.qty)}</td></tr>))}</tbody>
           </table>
           <div style={{display:'grid',gap:4,fontSize:'.88rem',marginBottom:16}}>
             <div style={{display:'flex',justifyContent:'space-between'}}><span style={{color:'var(--text-3)'}}>Subtotal</span><span>{fmt(receipt.subtotal)}</span></div>
@@ -722,9 +747,18 @@ export function POSPage() {
           )}
         </div>
         <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>
-          {TABS.map(t => <button key={t.key} className={"tab-btn "+(tab===t.key?'active':'')} onClick={()=>setTab(t.key as any)}>{t.label}</button>)}
+          {primaryTabs.map(t => <button key={t.key} className={"tab-btn "+(tab===t.key?'active':'')} onClick={()=>setTab(t.key as any)}>{t.label}</button>)}
+          {settingsTabs.length > 0 && (
+            <button className={"tab-btn "+(inSettings?'active':'')} onClick={()=>setTab(settingsTabs[0].key as any)}>Settings</button>
+          )}
         </div>
       </div>
+
+      {inSettings && (
+        <div style={{display:'flex',gap:6,flexWrap:'wrap',marginBottom:14}}>
+          {settingsTabs.map(t => <button key={t.key} className={"tab-btn "+(tab===t.key?'active':'')} onClick={()=>setTab(t.key as any)} style={{fontSize:'.78rem',padding:'4px 12px'}}>{t.label}</button>)}
+        </div>
+      )}
 
       {!registerProperty && (
         <div style={{padding:'48px 24px',textAlign:'center',color:'var(--text-3)',border:'1px dashed var(--border-1)',borderRadius:12}}>
@@ -758,7 +792,6 @@ export function POSPage() {
             <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(130px,1fr))',gap:10}}>
               {visibleItems.filter((i:any)=>i.isActive).map((item:any) => (
                 <button key={item.id} onClick={()=>addToCart(item)} style={{background:'var(--bg-2)',border:'1px solid var(--border-1)',borderRadius:'var(--r-lg)',padding:16,cursor:'pointer',textAlign:'left'}} onMouseEnter={e=>(e.currentTarget.style.borderColor='var(--gold)')} onMouseLeave={e=>(e.currentTarget.style.borderColor='var(--border-1)')}>
-                  <div style={{fontSize:'1.4rem',marginBottom:6}}>{item.icon}</div>
                   <div style={{fontSize:'.82rem',fontWeight:600,color:'var(--text-0)',marginBottom:2}}>{item.name}</div>
                   <div style={{fontSize:'.88rem',color:'var(--gold)',fontWeight:700}}>{fmt(item.sellPrice)}</div>
                   <div style={{display:'flex',gap:4,marginTop:4,flexWrap:'wrap'}}>
@@ -771,6 +804,11 @@ export function POSPage() {
             </>)}
           </div>
           <div className="card" style={{position:'sticky',top:80}}>
+            {stockNotice && (
+              <div style={{background:'rgba(245,158,11,.12)',border:'1px solid var(--amber)',borderRadius:8,padding:'6px 10px',marginBottom:8,fontSize:'.78rem',color:'var(--amber)',fontWeight:600}}>
+                {stockNotice}
+              </div>
+            )}
             <div className="card-header"><span className="card-title">Current Sale</span>
               {cart.length>0&&<button onClick={() => {
                 // S263/S264: clearing the cart enqueues a void on the
@@ -789,13 +827,12 @@ export function POSPage() {
             {cart.length===0?(<div style={{color:'var(--text-3)',fontSize:'.85rem',padding:'24px 0',textAlign:'center'}}>No items added</div>):(
               <div style={{marginBottom:12}}>
                 {cart.map(i=>(<div key={i.id} style={{display:'flex',alignItems:'center',gap:6,padding:'7px 0',borderBottom:'1px solid var(--border-1)'}}>
-                  <span>{i.icon}</span>
                   <div style={{flex:1,minWidth:0}}><div style={{fontSize:'.8rem',fontWeight:500,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{i.name}</div>
                     {!i.chargeEligible&&method==='charge'&&<div style={{fontSize:'.65rem',color:'var(--red)'}}>not charge eligible</div>}
                   </div>
                   <div style={{display:'flex',alignItems:'center',gap:4}}>
                     <button onClick={()=>updateQty(i.id,-1)} style={{background:'var(--bg-3)',border:'none',borderRadius:3,width:20,height:20,cursor:'pointer',fontWeight:700}}>-</button>
-                    <span style={{fontSize:'.82rem',fontWeight:600,minWidth:14,textAlign:'center'}}>{i.qty}</span>
+                    <input type="number" min={0} value={i.qty} onFocus={e=>e.currentTarget.select()} onChange={e=>{const v=parseInt(e.target.value,10); if(!isNaN(v)) void setQty(i.id, v)}} style={{width:46,textAlign:'center',fontSize:'.82rem',fontWeight:600,background:'var(--bg-3)',border:'1px solid var(--border-1)',borderRadius:4,color:'var(--text-0)',padding:'2px 0'}} />
                     <button onClick={()=>updateQty(i.id,1)} style={{background:'var(--bg-3)',border:'none',borderRadius:3,width:20,height:20,cursor:'pointer',fontWeight:700}}>+</button>
                   </div>
                   <div style={{fontSize:'.82rem',fontWeight:600,minWidth:44,textAlign:'right'}}>{fmt(i.price*i.qty)}</div>
@@ -837,24 +874,16 @@ export function POSPage() {
                   {(properties as any[]).map((p:any)=><option key={p.id} value={p.id}>{p.name||p.address1||p.id}</option>)}
                 </select>
               )}
-              {/* Customer type toggle */}
-              <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:5}}>
-                {(['tenant','pos_customer'] as const).map(t=>(
-                  <button key={t} type="button" onClick={()=>{ setChargeCustomerType(t); setTenantId(''); setPosCustomerId('') }} style={{padding:'5px 0',border:'1px solid '+(chargeCustomerType===t?'var(--gold)':'var(--border-1)'),background:chargeCustomerType===t?'var(--gold-bg)':'var(--bg-2)',borderRadius:'var(--r-md)',cursor:'pointer',fontSize:'.72rem',color:chargeCustomerType===t?'var(--gold)':'var(--text-2)',fontWeight:chargeCustomerType===t?600:400}}>{t==='tenant'?'Tenant':'POS Customer'}</button>
-                ))}
-              </div>
-              {/* Customer picker */}
-              {chargeCustomerType==='tenant'?(
-                <select className="form-select" value={tenantId} onChange={e=>setTenantId(e.target.value)} style={{width:'100%'}}>
-                  <option value="">Select tenant...</option>
-                  {(tenants as any[]).map((t:any)=><option key={t.id} value={t.id}>{t.firstName} {t.lastName}</option>)}
-                </select>
-              ):(
-                <select className="form-select" value={posCustomerId} onChange={e=>setPosCustomerId(e.target.value)} style={{width:'100%'}}>
-                  <option value="">Select customer...</option>
-                  {(posCustomers as any[]).map((c:any)=><option key={c.id} value={c.id}>{c.firstName} {c.lastName} — {c.email}</option>)}
-                </select>
-              )}
+              {/* S538: ONE neutral customer picker — both backing lists
+                  merged. Which id gets sent is carried by the option's
+                  prefix; the two ids stay mutually exclusive. */}
+              <select className="form-select" value={tenantId?`t:${tenantId}`:posCustomerId?`c:${posCustomerId}`:''} onChange={e=>{ const v=e.target.value; if(v.startsWith('t:')){ setTenantId(v.slice(2)); setPosCustomerId('') } else if(v.startsWith('c:')){ setPosCustomerId(v.slice(2)); setTenantId('') } else { setTenantId(''); setPosCustomerId('') } }} style={{width:'100%'}}>
+                <option value="">Select customer...</option>
+                {[
+                  ...(tenants as any[]).map((t:any)=>({ key:`t:${t.id}`, label:`${t.firstName} ${t.lastName}`.trim() })),
+                  ...(posCustomers as any[]).map((c:any)=>({ key:`c:${c.id}`, label:(`${c.firstName} ${c.lastName}`.trim())+(c.email?` — ${c.email}`:'') })),
+                ].sort((a,b)=>a.label.localeCompare(b.label)).map(o=><option key={o.key} value={o.key}>{o.label}</option>)}
+              </select>
               {chargeBlocked&&<div style={{fontSize:'.72rem',color:'var(--red)'}}>Cart has non-charge-eligible items</div>}
             </div>)}
             {/* S243: card-method property + reader controls. Auto-hidden
@@ -882,7 +911,7 @@ export function POSPage() {
               || checkoutMut.isLoading
               || terminalStatus==='collecting'
               || terminalStatus==='capturing'
-              || (method==='charge' && (chargeBlocked || !registerProperty || (chargeCustomerType==='tenant' ? !tenantId : !posCustomerId)))
+              || (method==='charge' && (chargeBlocked || !registerProperty || (!tenantId && !posCustomerId)))
               || (method==='card' && !registerProperty)
             } onClick={()=>method==='card'?chargeWithReader():checkoutMut.mutate(undefined)}>
               {checkoutMut.isLoading?'Processing...':terminalStatus==='collecting'?'Awaiting card…':terminalStatus==='capturing'?'Capturing…':'Charge '+fmt(total)}
@@ -902,7 +931,7 @@ export function POSPage() {
                   <td style={{color:'var(--text-3)',fontSize:'.82rem'}}>{t.itemCount} items</td>
                   <td className="mono">{fmt(t.subtotal)}</td>
                   <td className="mono" style={{fontWeight:600}}>{fmt(t.total)}</td>
-                  <td><span className={"badge "+(METHOD_MAP[t.paymentMethod]||'badge-muted')}>{t.paymentMethod}</span></td>
+                  <td><span className={"badge "+(METHOD_MAP[t.paymentMethod]||'badge-muted')}>{humanize(t.paymentMethod)}</span></td>
                   <td><span className={"badge "+(STATUS_MAP[t.status]||'badge-muted')}>{t.status||'completed'}</span></td>
                   <td>{t.status==='completed'&&(<div style={{display:'flex',gap:6}}>
                     <button className="btn btn-ghost btn-sm" onClick={()=>setRefundModal({show:true,tx:t})}>Refund</button>
@@ -932,9 +961,8 @@ export function POSPage() {
               </div>
             </div>
             <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:12,marginTop:12}}>
-              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Icon</div><select className="form-select" value={newItem.icon} onChange={e=>setNewItem(s=>({...s,icon:e.target.value}))} style={{width:'100%'}}>{POS_ICON_OPTIONS.map(ic=><option key={ic} value={ic}>{ic}</option>)}</select></div>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Name</div><input className="form-input" value={newItem.name} onChange={e=>setNewItem(s=>({...s,name:e.target.value}))} style={{width:'100%'}} /></div>
-              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Category</div><select className="form-select" value={newItem.categoryId} onChange={e=>setNewItem(s=>({...s,categoryId:e.target.value}))} style={{width:'100%'}}>{categoriesForProperty(registerProperty).map(c=><option key={c.id} value={c.id}>{c.icon} {c.name}</option>)}</select></div>
+              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Category</div><select className="form-select" value={newItem.categoryId} onChange={e=>setNewItem(s=>({...s,categoryId:e.target.value}))} style={{width:'100%'}}>{categoriesForProperty(registerProperty).map(c=><option key={c.id} value={c.id}>{c.name}</option>)}</select></div>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Cost Price</div><input className="form-input" type="number" {...nonNeg} value={newItem.costPrice} onChange={e=>setItemCost(e.target.value)} style={{width:'100%'}} /></div>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Margin %{defaultMarginPct!=null?` (default ${defaultMarginPct})`:''}</div><input className="form-input" type="number" {...nonNeg} value={newItem.marginPct} onChange={e=>setItemMargin(e.target.value)} placeholder={defaultMarginPct!=null?String(defaultMarginPct):'—'} style={{width:'100%'}} /></div>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Sell Price{newItem.costPrice&&newItem.marginPct?' (auto)':''}</div><input className="form-input" type="number" {...nonNeg} value={newItem.sellPrice} onChange={e=>setItemSell(e.target.value)} style={{width:'100%'}} /></div>
@@ -976,7 +1004,7 @@ export function POSPage() {
                   const iprop = item.propertyId ? (properties as any[]).find((p:any)=>p.id===item.propertyId) : null
                   const ipropAddr = iprop ? (iprop.street1 || iprop.name || '(unknown)') : null
                   return (<tr key={item.id}>
-                  <td style={{fontWeight:500}}>{item.icon} {item.name}</td>
+                  <td style={{fontWeight:500}}>{item.name}</td>
                   <td><span className="badge badge-muted">{item.category}</span></td>
                   <td>{ipropAddr
                     ? <span style={{color:'var(--gold)',fontWeight:500,fontSize:'.78rem'}}>{ipropAddr}</span>
@@ -1001,7 +1029,6 @@ export function POSPage() {
           <div className="card">
             <div className="card-header"><span className="card-title">Add Category</span></div>
             <div style={{display:'grid',gridTemplateColumns:'80px 1fr auto',gap:12,marginTop:12,alignItems:'end'}}>
-              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Icon</div><select className="form-select" value={newCategory.icon} onChange={e=>setNewCategory(s=>({...s,icon:e.target.value}))} style={{width:'100%'}}>{POS_ICON_OPTIONS.map(ic=><option key={ic} value={ic}>{ic}</option>)}</select></div>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Name *</div><input className="form-input" placeholder="Snacks" value={newCategory.name} onChange={e=>setNewCategory(s=>({...s,name:e.target.value}))} style={{width:'100%'}} /></div>
               <button className="btn btn-primary" onClick={()=>createCategoryMut.mutate()} disabled={!newCategory.name||createCategoryMut.isLoading}>{createCategoryMut.isLoading?'Adding...':'Add'}</button>
             </div>
@@ -1038,7 +1065,6 @@ export function POSPage() {
           <div className="card" style={{padding:0}}>
             <table className="data-table">
               <thead><tr>
-                <th style={{width:60}}>Icon</th>
                 <th style={{cursor:'pointer',userSelect:'none'}} onClick={()=>toggleCatSort('name')}>Name {catSort.key==='name' ? (catSort.dir==='asc'?'▲':'▼') : ''}</th>
                 <th style={{cursor:'pointer',userSelect:'none'}} onClick={()=>toggleCatSort('property')}>Property {catSort.key==='property' ? (catSort.dir==='asc'?'▲':'▼') : ''}</th>
                 <th style={{width:80}}>Items</th>
@@ -1075,7 +1101,6 @@ export function POSPage() {
                     // company-wide → business name; else the address (1) or count.
                     const scope = catScopeLabel(c)
                     return (<tr key={c.id}>
-                      <td style={{fontSize:'1.2rem'}}>{c.icon || '📦'}</td>
                       <td style={{fontWeight:500}}>{c.name}</td>
                       <td><span style={{color:scope.scoped?'var(--gold)':'var(--text-3)',fontWeight:scope.scoped?500:400,fontSize:'.78rem'}}>{scope.text}</span></td>
                       <td className="mono" style={{color:'var(--text-3)'}}>{itemCount}</td>
@@ -1118,8 +1143,8 @@ export function POSPage() {
             <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:12,marginTop:12}}>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Name</div><input className="form-input" placeholder="State Tax" value={newTax.name} onChange={e=>setNewTax(s=>({...s,name:e.target.value}))} style={{width:'100%'}} /></div>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Rate %</div><input className="form-input" type="number" {...nonNeg} value={newTax.rate} onChange={e=>setNewTax(s=>({...s,rate:e.target.value}))} style={{width:'100%'}} /></div>
-              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Type</div><select className="form-select" value={newTax.taxType} onChange={e=>setNewTax(s=>({...s,taxType:e.target.value}))} style={{width:'100%'}}>{TAX_TYPES.map(t=><option key={t} value={t}>{t}</option>)}</select></div>
-              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Applies To</div><select className="form-select" value={newTax.appliesTo} onChange={e=>setNewTax(s=>({...s,appliesTo:e.target.value}))} style={{width:'100%'}}><option value="all">All categories</option>{categoriesForProperty(newTax.propertyId).map(c=><option key={c.name} value={c.name}>{c.icon} {c.name}</option>)}</select></div>
+              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Type</div><select className="form-select" value={newTax.taxType} onChange={e=>setNewTax(s=>({...s,taxType:e.target.value}))} style={{width:'100%'}}>{TAX_TYPES.map(t=><option key={t} value={t}>{humanize(t)}</option>)}</select></div>
+              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Applies To</div><select className="form-select" value={newTax.appliesTo} onChange={e=>setNewTax(s=>({...s,appliesTo:e.target.value}))} style={{width:'100%'}}><option value="all">All categories</option>{categoriesForProperty(newTax.propertyId).map(c=><option key={c.name} value={c.name}>{c.name}</option>)}</select></div>
               {/* S217: property selector. Empty = company-wide library. */}
               <div style={{gridColumn:'span 2'}}>
                 <div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>
@@ -1160,7 +1185,7 @@ export function POSPage() {
                       ? (properties as any[]).find((p:any)=>p.id===r.propertyId)?.name ?? '(unknown)'
                       : null
                     return (<tr key={r.id}>
-                      <td style={{fontWeight:500}}>{r.name}</td><td><span className="badge badge-muted">{r.taxType}</span></td>
+                      <td style={{fontWeight:500}}>{r.name}</td><td><span className="badge badge-muted">{humanize(r.taxType)}</span></td>
                       <td>{propName
                         ? <span style={{color:'var(--gold)',fontWeight:500,fontSize:'.78rem'}}>{propName}</span>
                         : <span style={{color:'var(--text-3)',fontStyle:'italic',fontSize:'.78rem'}}>All locations</span>
@@ -1195,7 +1220,7 @@ export function POSPage() {
               <thead><tr><th>Name</th><th>Type</th><th>Value</th><th>Code</th><th></th></tr></thead>
               <tbody>
                 {(discounts as any[]).length?(discounts as any[]).map((d:any)=>(<tr key={d.id}>
-                  <td style={{fontWeight:500}}>{d.name}</td><td><span className="badge badge-muted">{d.type}</span></td>
+                  <td style={{fontWeight:500}}>{d.name}</td><td><span className="badge badge-muted">{humanize(d.type)}</span></td>
                   <td className="mono">{d.type==='percent'?d.value+"%":fmt(d.value)}</td>
                   <td className="mono" style={{color:'var(--gold)'}}>{d.code||'—'}</td>
                   <td><button className="btn btn-ghost btn-sm" style={{color:'var(--red)'}} onClick={()=>deleteDiscountMut.mutate(d.id)}>Remove</button></td>
@@ -1260,7 +1285,7 @@ export function POSPage() {
                 <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:3}}>Item</div>
                   <select className="form-select" style={{width:'100%'}} value={poItemRow.itemId} onChange={e=>{const it=(items as any[]).find((x:any)=>x.id===e.target.value);setPoItemRow(s=>({...s,itemId:e.target.value,unitCost:it?String(it.costPrice):s.unitCost}))}}>
                     <option value="">Select item...</option>
-                    {(items as any[]).map((i:any)=><option key={i.id} value={i.id}>{i.icon} {i.name}</option>)}
+                    {(items as any[]).map((i:any)=><option key={i.id} value={i.id}>{i.name}</option>)}
                   </select>
                 </div>
                 <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:3}}>Qty</div><input className="form-input" type="number" {...nonNeg} style={{width:'100%'}} value={poItemRow.qtyOrdered} onChange={e=>setPoItemRow(s=>({...s,qtyOrdered:e.target.value}))} /></div>
@@ -1298,7 +1323,7 @@ export function POSPage() {
                     <td style={{fontWeight:500}}>{po.vendorName}</td>
                     <td className="mono">{po.itemCount}</td>
                     <td className="mono">{fmt(po.subtotal)}</td>
-                    <td><span className={"badge "+(po.status==='received'?'badge-green':po.status==='draft'?'badge-muted':po.status==='sent'?'badge-blue':'badge-amber')}>{po.status}</span></td>
+                    <td><span className={"badge "+(po.status==='received'?'badge-green':po.status==='draft'?'badge-muted':po.status==='sent'?'badge-blue':'badge-amber')}>{humanize(po.status)}</span></td>
                     <td style={{fontSize:'.82rem',color:'var(--text-3)'}}>{po.expectedDate?new Date(po.expectedDate).toLocaleDateString():'—'}</td>
                     <td><div style={{display:'flex',gap:6}} onClick={e=>e.stopPropagation()}>
                       {po.status==='draft'&&<button className="btn btn-ghost btn-sm" onClick={()=>updatePOMut.mutate({id:po.id,status:'sent'})}>Mark Sent</button>}
@@ -1326,7 +1351,7 @@ export function POSPage() {
             <div className="card-header"><span className="card-title" style={{color:'var(--amber)'}}>Low Stock ({(lowStock as any[]).length} items)</span></div>
             <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(200px,1fr))',gap:10,marginTop:12}}>
               {(lowStock as any[]).map((item:any)=>(<div key={item.id} style={{background:'var(--bg-1)',borderRadius:8,padding:'10px 14px',border:'1px solid var(--border-1)'}}>
-                <div style={{fontWeight:600,fontSize:'.85rem'}}>{item.icon} {item.name}</div>
+                <div style={{fontWeight:600,fontSize:'.85rem'}}>{item.name}</div>
                 <div style={{fontSize:'.75rem',color:'var(--text-3)',marginTop:2}}>{item.vendorName||'No vendor linked'}</div>
                 <div style={{marginTop:6,display:'flex',justifyContent:'space-between'}}>
                   <span style={{color:'var(--amber)',fontWeight:700}}>{item.stockQty} left</span>
@@ -1341,14 +1366,14 @@ export function POSPage() {
               <thead><tr><th>Item</th><th>Category</th><th>In Stock</th><th>Min</th><th>Max</th><th>Status</th><th>Adjust</th></tr></thead>
               <tbody>
                 {(items as any[]).filter((i:any)=>i.stockQty<999).map((item:any)=>(<tr key={item.id}>
-                  <td style={{fontWeight:500}}>{item.icon} {item.name}</td>
+                  <td style={{fontWeight:500}}>{item.name}</td>
                   <td><span className="badge badge-muted">{item.category}</span></td>
                   <td className="mono" style={{fontWeight:700,color:item.stockQty===0?'var(--red)':item.stockQty<=item.stockMin?'var(--amber)':'var(--text-0)'}}>{item.stockQty}</td>
                   <td className="mono" style={{color:'var(--text-3)'}}>{item.stockMin}</td>
                   <td className="mono" style={{color:'var(--text-3)'}}>{item.stockMax}</td>
                   <td>{item.stockQty===0?<span className="badge badge-red">Out</span>:item.stockQty<=item.stockMin?<span className="badge badge-amber">Low</span>:<span className="badge badge-green">OK</span>}</td>
                   <td><button className="btn btn-ghost btn-sm" onClick={async()=>{
-                    const n=prompt('Adjust qty by (negative to reduce):')
+                    const n=await appPrompt('Adjust qty by (negative to reduce):', { title: 'Adjust stock' })
                     if(!n||isNaN(Number(n)))return
                     await apiPost("/pos/items/"+item.id+"/adjust-stock",{changeQty:Number(n),reason:'manual'})
                     qc.invalidateQueries('pos-items');qc.invalidateQueries('pos-low-stock');qc.invalidateQueries('pos-inventory-log')
@@ -1368,7 +1393,7 @@ export function POSPage() {
                   <td className="mono" style={{fontWeight:700,color:log.changeQty>0?'var(--green)':'var(--red)'}}>{log.changeQty>0?'+':''}{log.changeQty}</td>
                   <td className="mono">{log.stockBefore}</td>
                   <td className="mono">{log.stockAfter}</td>
-                  <td><span className="badge badge-muted">{log.reason}</span></td>
+                  <td><span className="badge badge-muted">{humanize(log.reason)}</span></td>
                 </tr>)):<tr><td colSpan={6} style={{textAlign:'center',color:'var(--text-3)',padding:32}}>No stock movements yet.</td></tr>}
               </tbody>
             </table>
@@ -1439,7 +1464,7 @@ export function POSPage() {
                         <button
                           className="btn btn-ghost btn-sm"
                           style={{color:'var(--red)'}}
-                          onClick={()=>{ if(confirm('Archive '+r.nickname+'? It will no longer appear in the charge modal.')) archiveReaderMut.mutate(r.id) }}
+                          onClick={()=>{ appConfirm('Archive '+r.nickname+'? It will no longer appear in the charge modal.', { danger: true, confirmLabel: 'Archive' }).then(ok => { if (ok) archiveReaderMut.mutate(r.id) }) }}
                         >Archive</button>
                       </td>
                     </tr>
@@ -1452,11 +1477,10 @@ export function POSPage() {
       )}
 
       {editItem&&(<div className="modal-overlay" onClick={()=>setEditItem(null)}><div className="modal" style={{maxWidth:520}} onClick={e=>e.stopPropagation()}>
-        <div className="modal-header"><span className="modal-title">{editItem.icon} Edit {editItem.name}</span><button className="btn btn-ghost btn-sm" onClick={()=>setEditItem(null)}>x</button></div>
+        <div className="modal-header"><span className="modal-title">Edit {editItem.name}</span><button className="btn btn-ghost btn-sm" onClick={()=>setEditItem(null)}>x</button></div>
         <div style={{padding:'0 24px 24px',display:'grid',gridTemplateColumns:'1fr 1fr',gap:12}}>
           <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Name</div><input className="form-input" style={{width:'100%'}} value={editItem.name} onChange={e=>setEditItem((s:any)=>({...s,name:e.target.value}))} /></div>
-          <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Icon</div><select className="form-select" style={{width:'100%'}} value={editItem.icon} onChange={e=>setEditItem((s:any)=>({...s,icon:e.target.value}))}>{(POS_ICON_OPTIONS.includes(editItem.icon)?POS_ICON_OPTIONS:[editItem.icon,...POS_ICON_OPTIONS]).map((ic:string)=><option key={ic} value={ic}>{ic}</option>)}</select></div>
-          <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Category</div><select className="form-select" style={{width:'100%'}} value={editItem.categoryId} onChange={e=>setEditItem((s:any)=>({...s,categoryId:e.target.value}))}>{categoriesForProperty(editItem.propertyId).map(c=><option key={c.id} value={c.id}>{c.icon} {c.name}</option>)}</select></div>
+          <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Category</div><select className="form-select" style={{width:'100%'}} value={editItem.categoryId} onChange={e=>setEditItem((s:any)=>({...s,categoryId:e.target.value}))}>{categoriesForProperty(editItem.propertyId).map(c=><option key={c.id} value={c.id}>{c.name}</option>)}</select></div>
           <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Sell Price</div><input className="form-input" style={{width:'100%'}} type="number" {...nonNeg} value={editItem._sell} onChange={e=>setEditItem((s:any)=>({...s,_sell:e.target.value}))} /></div>
           <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Cost Price</div><input className="form-input" style={{width:'100%'}} type="number" {...nonNeg} value={editItem._cost} onChange={e=>setEditItem((s:any)=>({...s,_cost:e.target.value}))} /></div>
           <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Tax Category</div><select className="form-select" style={{width:'100%'}} value={editItem._taxCategoryId} onChange={e=>setEditItem((s:any)=>({...s,_taxCategoryId:e.target.value}))}><option value="">— none (0%) —</option>{(posTaxCategories as any[]).map((t:any)=><option key={t.id} value={t.id}>{t.name} ({(Number(t.rate)*100).toFixed(2)}%)</option>)}</select></div>
@@ -1487,7 +1511,6 @@ export function POSPage() {
         <div className="modal-header"><span className="modal-title">Edit Category — {editCategory.name}</span><button className="btn btn-ghost btn-sm" onClick={()=>setEditCategory(null)}>x</button></div>
         <div style={{padding:'0 24px 24px',display:'grid',gap:12}}>
           <div style={{display:'grid',gridTemplateColumns:'80px 1fr',gap:12}}>
-            <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Icon</div><select className="form-select" style={{width:'100%'}} value={editCategory._icon} onChange={e=>setEditCategory((s:any)=>({...s,_icon:e.target.value}))}>{(POS_ICON_OPTIONS.includes(editCategory._icon)?POS_ICON_OPTIONS:[editCategory._icon,...POS_ICON_OPTIONS]).map((ic:string)=><option key={ic} value={ic}>{ic}</option>)}</select></div>
             <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Name</div><input className="form-input" style={{width:'100%'}} value={editCategory._name} onChange={e=>setEditCategory((s:any)=>({...s,_name:e.target.value}))} /></div>
           </div>
           {/* Property scope — toggle per property. "All properties" (empty) = company-wide. */}
@@ -1567,7 +1590,7 @@ export function POSPage() {
           {readers.length===0&&terminalStatus==='idle'&&<div style={{fontSize:'.78rem',color:'var(--text-3)'}}>Tap Discover to scan nearby readers.</div>}
           {readers.map((r:any)=>(
             <div key={r.id} onClick={()=>selectBluetoothReader(r)} style={{border:'1px solid var(--border-1)',borderRadius:8,padding:'10px 14px',marginBottom:6,cursor:'pointer',display:'flex',alignItems:'center',justifyContent:'space-between'}} onMouseEnter={e=>(e.currentTarget.style.borderColor='var(--gold)')} onMouseLeave={e=>(e.currentTarget.style.borderColor='var(--border-1)')}>
-              <div><div style={{fontWeight:600,fontSize:'.85rem'}}>{r.label||r.serialNumber}</div><div style={{fontSize:'.72rem',color:'var(--text-3)'}}>{r.deviceType} · {r.status}</div></div>
+              <div><div style={{fontWeight:600,fontSize:'.85rem'}}>{r.label||r.serialNumber}</div><div style={{fontSize:'.72rem',color:'var(--text-3)'}}>{humanize(r.deviceType)} · {humanize(r.status)}</div></div>
               <span style={{color:'var(--gold)',fontSize:'.78rem'}}>Connect</span>
             </div>
           ))}

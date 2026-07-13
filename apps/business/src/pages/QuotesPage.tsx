@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { apiGet, apiPost, apiPatch, apiDelete, openPdfInNewTab } from '../lib/api'
+import { appConfirm } from '../components/dialogs'
 import { useAuth } from '../context/AuthContext'
 import { Modal } from '../components/Modal'
 import {
@@ -387,7 +388,7 @@ function Detail({ id, onBack }: { id: string; onBack: () => void }) {
     }
   }
   const removeLine = async (lineId: string) => {
-    if (!window.confirm('Remove this line?')) return
+    if (!(await appConfirm('Remove this line?', { danger: true, confirmLabel: 'Remove' }))) return
     setErr(null)
     try {
       await apiDelete(`/business-quotes/${id}/lines/${lineId}`)

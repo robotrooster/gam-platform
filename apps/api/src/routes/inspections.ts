@@ -15,6 +15,7 @@ import {
   notifyInspectionFinalized,
 } from '../services/notifications'
 import { logger } from '../lib/logger'
+import { resolveUploadPath } from '../lib/uploadPaths'
 import { insertInspectionWithChecklist } from '../services/inspections'
 import { INSPECTION_TYPES, INSPECTION_ITEM_CONDITIONS } from '@gam/shared'
 
@@ -305,7 +306,12 @@ inspectionsRouter.post('/:id/photos', photoUpload.single('file'), async (req: an
 
 inspectionsRouter.get('/photo-files/:filename', async (req, res, next) => {
   try {
-    const fp = path.join(inspectionPhotoDir, req.params.filename)
+    // S535: resolveUploadPath, not a raw path.join — an encoded slash
+    // (%2F) decodes into the route param, so '..%2F..%2F...' would
+    // traverse out of the photos dir. Same class as the S380 avatar
+    // finding; the other file routes already use it.
+    const fp = resolveUploadPath(inspectionPhotoDir, req.params.filename)
+    if (!fp) throw new AppError(400, 'Invalid filename')
     if (!fs.existsSync(fp)) throw new AppError(404, 'Not found')
     res.sendFile(fp)
   } catch (e) {
@@ -424,7 +430,8 @@ inspectionsRouter.get('/video-files/:filename', async (req, res, next) => {
       canAccessLandlordResource(u, v.landlord_id)
     if (!allowed) throw new AppError(403, 'Forbidden')
 
-    const fp = path.join(inspectionVideoDir, req.params.filename)
+    const fp = resolveUploadPath(inspectionVideoDir, req.params.filename)
+    if (!fp) throw new AppError(400, 'Invalid filename')
     if (!fs.existsSync(fp)) throw new AppError(404, 'Not found')
     res.sendFile(fp)
   } catch (e) {

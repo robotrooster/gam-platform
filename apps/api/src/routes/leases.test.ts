@@ -143,6 +143,13 @@ async function seedFixture(opts: {
         [opts.endDate ?? '2026-12-31', leaseId],
       )
     }
+    // S537 dropped the $15/5d column defaults (no invented late fees) —
+    // this suite's S201 cases assume a lease whose signed paper HAS
+    // late-fee terms, so set them explicitly.
+    await client.query(
+      `UPDATE leases SET late_fee_initial_amount = 15, late_fee_grace_days = 5 WHERE id = $1`,
+      [leaseId],
+    )
     await seedLeaseTenant(client, { leaseId, tenantId })
     await client.query('COMMIT')
 

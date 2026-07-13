@@ -2,6 +2,7 @@ import { useState, useRef, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPatch, apiPost } from '../lib/api'
 import { Bell, CheckCheck, Send } from 'lucide-react'
+import { toast } from './dialogs'
 
 const TYPE_ROUTES: Record<string, string> = {
   rent_collected:           '/reports',
@@ -50,7 +51,7 @@ export function NotificationBell() {
   const qc = useQueryClient()
   const [open, setOpen] = useState(false)
   const [showBulk, setShowBulk] = useState(false)
-  const [bulkForm, setBulkForm] = useState({ title:'', body:'', propertyId:'', sendEmail:true, sendSMS:false })
+  const [bulkForm, setBulkForm] = useState({ title:'', body:'', propertyId:'', sendEmail:true })
   const ref = useRef<HTMLDivElement>(null)
 
   const { data } = useQuery(
@@ -87,9 +88,9 @@ export function NotificationBell() {
   const bulkMut = useMutation(
     () => apiPost('/notifications/bulk', bulkForm),
     { onSuccess: (res: any) => {
-      alert(`Message sent to ${res.data?.sent} tenants.`)
+      toast(`Message sent to ${res.data?.sent} tenants.`)
       setShowBulk(false)
-      setBulkForm({ title:'', body:'', propertyId:'', sendEmail:true, sendSMS:false })
+      setBulkForm({ title:'', body:'', propertyId:'', sendEmail:true })
     }}
   )
 
@@ -141,9 +142,6 @@ export function NotificationBell() {
               <div style={{ display:'flex', gap:12, alignItems:'center', marginBottom:8 }}>
                 <label style={{ display:'flex', alignItems:'center', gap:4, fontSize:'.72rem', cursor:'pointer' }}>
                   <input type="checkbox" checked={bulkForm.sendEmail} onChange={e => setBulkForm(f => ({...f,sendEmail:e.target.checked}))} /> Email
-                </label>
-                <label style={{ display:'flex', alignItems:'center', gap:4, fontSize:'.72rem', cursor:'pointer' }}>
-                  <input type="checkbox" checked={bulkForm.sendSMS} onChange={e => setBulkForm(f => ({...f,sendSMS:e.target.checked}))} /> SMS
                 </label>
               </div>
               <div style={{ display:'flex', gap:6 }}>

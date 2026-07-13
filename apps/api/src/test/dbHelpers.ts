@@ -111,6 +111,9 @@ export async function cleanupAllSchema(): Promise<void> {
   await db.query(`DELETE FROM flex_charge_transactions`)
   await db.query(`DELETE FROM flex_charge_statements`)
   await db.query(`DELETE FROM flex_charge_accounts`)
+  await db.query(`DELETE FROM remittance_applications`)
+  await db.query(`DELETE FROM lease_prepaid_credits`)
+  await db.query(`DELETE FROM tenant_remittances`)
   await db.query(`DELETE FROM payments`)
   await db.query(`DELETE FROM invoices`)
   await db.query(`DELETE FROM invoice_sequences`)
@@ -386,15 +389,53 @@ export async function seedUnit(
     propertyId: string
     landlordId: string
     rentAmount?: number
+    unitType?: string
+    withLateFeeDecision?: boolean
   }
 ): Promise<string> {
+  const unitType = params.unitType ?? 'apartment'
+  // S537: routes that onboard tenants onto a unit gate on an explicit
+  // (property, unit_type) late-fee decision. Direct-SQL unit seeding is
+  // NOT gated, so decision seeding is opt-in — suites that exercise
+  // gated routes pass withLateFeeDecision (or call seedLateFeeDecision
+  // themselves); suites asserting the undecided/no-policy state stay
+  // untouched.
+  if (params.withLateFeeDecision) {
+    await seedLateFeeDecision(client, { propertyId: params.propertyId, unitType })
+  }
   const res = await client.query<{ id: string }>(
-    `INSERT INTO units (property_id, landlord_id, unit_number, rent_amount)
-     VALUES ($1, $2, $3, $4) RETURNING id`,
+    `INSERT INTO units (property_id, landlord_id, unit_number, rent_amount, unit_type)
+     VALUES ($1, $2, $3, $4, $5) RETURNING id`,
     [params.propertyId, params.landlordId,
-     `U-${randomUUID().slice(0, 6)}`, params.rentAmount ?? 1000]
+     `U-${randomUUID().slice(0, 6)}`, params.rentAmount ?? 1000, unitType]
   )
   return res.rows[0].id
+}
+
+/** S537: explicit per-(property, unit_type) late-fee decision. Defaults to
+ *  a $15/5-day fee decision; pass noLateFee for the no-fee shape. */
+export async function seedLateFeeDecision(
+  client: PoolClient,
+  params: {
+    propertyId: string
+    unitType?: string
+    noLateFee?: boolean
+    initialAmount?: number
+    graceDays?: number
+    initialType?: 'flat' | 'percent_of_rent'
+  }
+): Promise<void> {
+  const noFee = !!params.noLateFee
+  await client.query(
+    `INSERT INTO property_unit_type_late_fees
+       (property_id, unit_type, no_late_fee, late_fee_grace_days, late_fee_initial_amount, late_fee_initial_type)
+     VALUES ($1, $2, $3, $4, $5, $6)
+     ON CONFLICT (property_id, unit_type) DO NOTHING`,
+    [params.propertyId, params.unitType ?? 'apartment', noFee,
+     noFee ? null : (params.graceDays ?? 5),
+     noFee ? null : (params.initialAmount ?? 15),
+     noFee ? null : (params.initialType ?? 'flat')]
+  )
 }
 
 export async function seedAllocationRule(

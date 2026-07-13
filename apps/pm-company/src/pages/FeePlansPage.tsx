@@ -7,8 +7,10 @@
 
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
+import { humanize } from '@gam/shared'
 import { useAuth } from '../context/AuthContext'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
+import { appConfirm } from '../components/dialogs'
 import { Plus, X } from 'lucide-react'
 
 interface FeePlan {
@@ -71,7 +73,7 @@ function PlanModal({ pmCompanyId, onClose }: { pmCompanyId: string; onClose: () 
         <div style={{ marginBottom: 12 }}>
           <label style={lbl}>Fee type *</label>
           <select className="input" value={feeType} onChange={e => setFeeType(e.target.value as any)} style={{ width: '100%' }}>
-            {FEE_TYPES.map(t => <option key={t} value={t}>{t.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase())}</option>)}
+            {FEE_TYPES.map(t => <option key={t} value={t}>{humanize(t)}</option>)}
           </select>
         </div>
 
@@ -193,7 +195,7 @@ export function FeePlansPage() {
               {(plansQ.data ?? []).map(p => (
                 <tr key={p.id} style={{ borderTop: '1px solid var(--border-0)' }}>
                   <Td><strong>{p.name}</strong></Td>
-                  <Td style={{ color: 'var(--text-3)' }}>{p.feeType}</Td>
+                  <Td style={{ color: 'var(--text-3)' }}>{humanize(p.feeType)}</Td>
                   <Td>{p.percent ?? '—'}</Td>
                   <Td>{p.flatAmount ?? '—'}</Td>
                   <Td>{p.floorAmount ?? '—'}</Td>
@@ -204,9 +206,7 @@ export function FeePlansPage() {
                       <button className="btn btn-ghost btn-sm"
                               disabled={deprecateMut.isLoading}
                               onClick={() => {
-                                if (window.confirm(`Deprecate "${p.name}"? It can no longer be selected on new invitations, but existing linkages remain.`)) {
-                                  deprecateMut.mutate(p.id)
-                                }
+                                appConfirm(`Deprecate "${p.name}"? It can no longer be selected on new invitations, but existing linkages remain.`, { confirmLabel: 'Deprecate' }).then(ok => { if (ok) deprecateMut.mutate(p.id) })
                               }}>
                         Deprecate
                       </button>

@@ -4,13 +4,14 @@ import { query, queryOne } from '../db'
 import { requireAuth, requireLandlord, requirePerm, getScopedPropertyIds, assertPropertyInScope } from '../middleware/auth'
 import { canAccessLandlordResource, canManageLandlordResource, canViewLandlordFinances } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
-import { UnitStatus, calcNetPerUnit, getReservePhase, LAUNCH_PLATFORM_FEE, UNIT_STATUSES, UNIT_TYPES, computeStayPrice, RV_SITE_LAYOUTS, RV_AMP_SERVICES, isSiteLayoutMismatch, isAmpServiceMismatch } from '@gam/shared'
+import { UnitStatus, calcNetPerUnit, getReservePhase, LAUNCH_PLATFORM_FEE, UNIT_STATUSES, UNIT_TYPES, computeStayPrice, RV_SITE_LAYOUTS, RV_AMP_SERVICES, isSiteLayoutMismatch, isAmpServiceMismatch, SHORT_STAY_LOCKED_UNIT_TYPES } from '@gam/shared'
 import { findStayConflict, findAvailableUnits, STAY_CONFLICT_MESSAGE } from '../services/unitAvailability'
 import { formatUnitNumber } from '../lib/format'
 import { logger } from '../lib/logger'
 import { promoteNextWaitlister } from '../services/propertyBooking'
 import { recordBookingEvent, recordBookingChange } from '../services/bookingEvents'
 import { maybeDraftLeaseFromBooking } from '../services/bookingLeaseDraft'
+import { assertLateFeeDecision } from '../services/lateFeePolicy'
 import {
   sendBookingGuestAccessEmail,
   issueBookingGuestToken,
@@ -175,7 +176,18 @@ unitsRouter.post('/', requirePerm('properties.add_unit'), async (req, res, next)
       if (!sub) throw new AppError(404, 'Subtype not found on this property')
     }
 
-    const unitType = body.unitType ?? sub?.unit_type ?? 'apartment'
+    // S537 (Nic): a subtype LOCKS the unit type — "Back-in 30 amp" can
+    // only ever mint an rv_spot. A conflicting explicit unitType in the
+    // body is a client bug, not a preference; refuse rather than pick.
+    if (sub && body.unitType && body.unitType !== sub.unit_type) {
+      throw new AppError(400,
+        `Subtype "${sub.name}" is a ${String(sub.unit_type).replace(/_/g, ' ')} subtype — it cannot create a ${String(body.unitType).replace(/_/g, ' ')} unit. Pick a matching subtype or clear the unit type.`)
+    }
+    const unitType = sub?.unit_type ?? body.unitType ?? 'apartment'
+    // S537 gate: no units of an UNDECIDED late-fee class. The landlord
+    // must hold an explicit (property, unit_type) decision — fee terms or
+    // "no late fee" — before this class can exist at the property.
+    await assertLateFeeDecision(body.propertyId, unitType)
     const num = (v: any) => v == null ? null : Number(v)
     const rentAmount = body.rentAmount ?? num(sub?.rent_amount)
     if (rentAmount == null || rentAmount <= 0) {
@@ -216,20 +228,25 @@ unitsRouter.post('/', requirePerm('properties.add_unit'), async (req, res, next)
       // W-16: the units_property_unit_number_uniq index rejects duplicate
       // numbers at a property — surface it as a friendly 409, not a 500.
       try {
+      // S538 (Nic): storage units are LOCKED out of short-term rental —
+      // their allow-list never contains nightly/weekly.
+      const leaseTypesAllowed = (SHORT_STAY_LOCKED_UNIT_TYPES as readonly string[]).includes(unitType)
+        ? ['month_to_month', 'long_term']
+        : isRv
+          ? ['nightly', 'weekly', 'month_to_month', 'long_term']
+          : ['nightly', 'weekly', 'month_to_month']
       const [unit] = await query<any>(`
         INSERT INTO units (property_id, landlord_id, unit_number, unit_type, bedrooms, bathrooms, sqft,
                            rent_amount, security_deposit, rv_site_layout, rv_amp_service,
                            nightly_rate, weekly_rate, monthly_rate, storage_size, subtype_id, status,
                            is_bookable, lease_types_allowed)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
-                $18,
-                CASE WHEN $18 THEN ARRAY['nightly','weekly','month_to_month','long_term']::text[]
-                     ELSE ARRAY['nightly','weekly','month_to_month']::text[] END)
+                $18, $19::text[])
         RETURNING *`,
         [body.propertyId, prop.landlord_id, unitNumber, unitType, bedrooms,
          bathrooms, body.sqft ?? null, rentAmount, securityDeposit, rvLayout, rvAmp,
          nightlyRate, weeklyRate, monthlyRate, storageSize, sub?.id ?? null, body.status,
-         isRv]
+         isRv, leaseTypesAllowed]
       )
       created.push(unit)
       } catch (err: any) {
@@ -383,6 +400,9 @@ const LEASE_TYPE_MATRIX: Record<string, string[]> = {
   storage:         ['month_to_month', 'long_term'],
   parking:         ['nightly', 'weekly', 'month_to_month', 'long_term'],
   short_term_cabin:['nightly', 'weekly', 'month_to_month'],
+  // S538: hotel/motel rooms — every stay length (weekly-rate motels and
+  // long-term room tenants like Oak Park's are both real).
+  hotel_room:      ['nightly', 'weekly', 'month_to_month', 'long_term'],
 }
 
 // PATCH /api/units/:id/type — set unit type and rates
@@ -402,6 +422,12 @@ unitsRouter.patch('/:id/type', requirePerm('schedule.configure_unit'), async (re
     if (!unit) throw new AppError(404, 'Unit not found')
     if (!canManageLandlordResource(req.user, unit.landlord_id)) {
       throw new AppError(403, 'Forbidden')
+    }
+
+    // S538 (Nic): storage can never be publicly bookable (the public flow
+    // auto-tiers nightly/weekly pricing — is_bookable IS the short-stay gate).
+    if ((SHORT_STAY_LOCKED_UNIT_TYPES as readonly string[]).includes(unitType || 'residential') && isBookable) {
+      throw new AppError(400, 'Storage units cannot be made bookable for short-term stays')
     }
 
     const leaseTypesAllowed = LEASE_TYPE_MATRIX[unitType] || LEASE_TYPE_MATRIX['residential']
@@ -487,6 +513,12 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
     // Property-locked workers may only create reservations at their properties.
     await assertPropertyInScope(req.user, unit.property_id)
 
+    // S538 (Nic): storage is HARD-locked out of short-term rental — the
+    // block holds even when the allow-list is empty/unrestricted.
+    if ((SHORT_STAY_LOCKED_UNIT_TYPES as readonly string[]).includes(unit.unit_type)
+        && (body.leaseType === 'nightly' || body.leaseType === 'weekly')) {
+      throw new AppError(400, `${unit.unit_type} units cannot be booked short-term`)
+    }
     // Check allowed lease types. An EMPTY list means unrestricted (a manual
     // staff reservation can book any unit) — only enforce when the unit has an
     // explicit allow-list configured.

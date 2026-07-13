@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
+import { toast, appConfirm } from '../components/dialogs'
 import { MapPin, Pencil, Archive, CreditCard, Link2, Upload, Link2Off } from 'lucide-react'
 import { Modal } from '../components/Modal'
 import { parseCustomerCsv, type CustomerImportResult } from '../lib/customerCsv'
@@ -186,7 +187,7 @@ export function CustomersPage() {
 
   const onArchive = async (r: CustomerRow) => {
     const label = r.companyName || `${r.firstName} ${r.lastName}`
-    if (!window.confirm(`Archive ${label}? They'll be hidden from the active list and won't appear on new routes.`)) return
+    if (!(await appConfirm(`Archive ${label}? They'll be hidden from the active list and won't appear on new routes.`, { danger: true, confirmLabel: 'Archive' }))) return
     setArchiving(r.id); setErr(null)
     try {
       await apiPost(`/business-customers/${r.id}/archive`)
@@ -202,12 +203,12 @@ export function CustomersPage() {
       return
     }
     const label = r.companyName || `${r.firstName} ${r.lastName}`
-    if (!window.confirm(`Email ${label} a secure link to update their card on file?`)) return
+    if (!(await appConfirm(`Email ${label} a secure link to update their card on file?`, { confirmLabel: 'Send' }))) return
     setErr(null)
     try {
       await apiPost(`/business-customers/${r.id}/send-card-update-link`, {})
       setErr(null)
-      window.alert(`Update-card link sent to ${r.email}. Expires in 7 days.`)
+      toast(`Update-card link sent to ${r.email}. Expires in 7 days.`)
     } catch (e: any) {
       setErr(e?.response?.data?.error || 'Send failed')
     }
@@ -220,13 +221,13 @@ export function CustomersPage() {
       const resp = await apiPost<{ url: string }>(`/business-customers/${r.id}/portal-link`, {})
       const url = resp.data.url
       try { await navigator.clipboard?.writeText(url) } catch { /* clipboard may be blocked */ }
-      const emailToo = r.email && window.confirm(
-        `Account link copied to clipboard:\n${url}\n\nAlso email it to ${r.email}?`)
+      const emailToo = r.email && (await appConfirm(
+        `Account link copied to clipboard:\n${url}\n\nAlso email it to ${r.email}?`, { confirmLabel: 'Email' }))
       if (emailToo) {
         await apiPost(`/business-customers/${r.id}/portal-link`, { sendEmail: true })
-        window.alert(`Account link emailed to ${r.email}.`)
+        toast(`Account link emailed to ${r.email}.`)
       } else {
-        window.alert(`Account link for ${label} copied to clipboard.`)
+        toast(`Account link for ${label} copied to clipboard.`)
       }
     } catch (e: any) {
       setErr(e?.response?.data?.error || 'Could not create the account link')
@@ -235,13 +236,13 @@ export function CustomersPage() {
 
   const onRevokePortal = async (r: CustomerRow) => {
     const label = r.companyName || `${r.firstName} ${r.lastName}`
-    if (!window.confirm(
+    if (!(await appConfirm(
       `Revoke ${label}'s portal access? Their current link stops working immediately. ` +
-      `You can issue a fresh link anytime with "Account link".`)) return
+      `You can issue a fresh link anytime with "Account link".`, { danger: true, confirmLabel: 'Revoke' }))) return
     setErr(null); setRevoking(r.id)
     try {
       const resp = await apiPost<{ revoked: number }>(`/business-customers/${r.id}/revoke-portal-access`, {})
-      window.alert(resp.data.revoked > 0
+      toast(resp.data.revoked > 0
         ? `Portal access revoked for ${label}.`
         : `${label} had no active portal link.`)
     } catch (e: any) {

@@ -4,6 +4,7 @@ import { useSearchParams } from 'react-router-dom'
 import { apiGet, apiPost } from '../lib/api'
 import { METER_READING_DEFAULT_DIGITS, PROPANE_SPLIT_FOUR_MIN_GALLONS, PROPANE_SPLIT_MIN_GALLONS, propaneSplitOptions } from '@gam/shared'
 import { ClipboardList, Receipt, ChevronRight, CheckCircle2, AlertTriangle } from 'lucide-react'
+import { toast, appConfirm } from '../components/dialogs'
 
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 // Meter reads are odometer values — display with leading zeros at the
@@ -68,7 +69,7 @@ export function UtilityMetersPage() {
   const openRunMut = useMutation(
     () => apiPost('/utility/reading-runs', { propertyId }),
     { onSuccess: (r: any) => { invalidate(); if (r?.data) setWalkRun(r.data) },
-      onError: (e: any) => alert(e?.response?.data?.error || 'Could not open a reading run') }
+      onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not open a reading run') }
   )
 
   // S534: force-complete escape hatch — an unread submeter now HOLDS the
@@ -77,7 +78,7 @@ export function UtilityMetersPage() {
   const forceCompleteMut = useMutation(
     (runId: string) => apiPost(`/utility/reading-runs/${runId}/complete`, {}),
     { onSuccess: invalidate,
-      onError: (e: any) => alert(e?.response?.data?.error || 'Could not complete the run') }
+      onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not complete the run') }
   )
 
   const propertyBills = (bills as any[]).filter(b => !propertyId || (units as any[]).some(u => u.id === b.unitId))
@@ -127,7 +128,7 @@ export function UtilityMetersPage() {
               </button>
               {(openRun.status === 'double_check' || openRun.metersRead > 0) && (
                 <button className="btn btn-primary btn-sm" disabled={forceCompleteMut.isLoading}
-                  onClick={()=>{ if (confirm('Complete this run now? Unread meters produce no bill this cycle and their held invoices release. Flagged reads still need your review before their unit\'s invoice goes out.')) forceCompleteMut.mutate(openRun.id) }}>
+                  onClick={()=>{ appConfirm('Complete this run now? Unread meters produce no bill this cycle and their held invoices release. Flagged reads still need your review before their unit\'s invoice goes out.', { confirmLabel: 'Complete run' }).then(ok => { if (ok) forceCompleteMut.mutate(openRun.id) }) }}>
                   Complete now
                 </button>
               )}
@@ -235,7 +236,7 @@ function ReviewReadingModal({ reading, onClose }: { reading: any; onClose: () =>
   const reasonNeeded = (value === '' && enteredIsLow) || correctionIsLow
   const resolve = useMutation(
     (p: { correctedValue?: number; rollover?: boolean }) => apiPost(`/utility/readings/${reading.id}/resolve-review`, p),
-    { onSuccess: onClose, onError: (e: any) => alert(e?.response?.data?.error || 'Could not resolve') }
+    { onSuccess: onClose, onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not resolve') }
   )
   return (
     <div className="modal-overlay" onClick={onClose}>
@@ -480,7 +481,7 @@ function PropaneSection({ propertyId, property, units, onChanged }: { propertyId
   const settingsMut = useMutation(
     (p: any) => apiPost('/propane/settings', { propertyId, ...p }),
     { onSuccess: () => { qc.invalidateQueries('properties'); onChanged() },
-      onError: (e: any) => alert(e?.response?.data?.error || 'Could not save setting') }
+      onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not save setting') }
   )
   const saveThreshold = (key: 'splitMinGallons' | 'splitFourMinGallons', draft: string, current: number) => {
     const v = Math.trunc(Number(draft))
@@ -587,7 +588,7 @@ function PropaneFillModal({ propertyId, units, allowSplits, splitMin, splitFourM
 
   const mut = useMutation(
     () => apiPost('/propane/fills', { unitId, gallons: g, pricePerGallon: Number(ppg), installments }),
-    { onSuccess: onClose, onError: (e: any) => alert(e?.response?.data?.error || 'Could not record fill') }
+    { onSuccess: onClose, onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not record fill') }
   )
 
   return (
@@ -657,7 +658,7 @@ function TaxRatesCard({ propertyId }: { propertyId: string }) {
   const mut = useMutation(
     (p: { utilityType: string; taxRatePct: number }) => apiPost('/utility/tax-rates', { propertyId, ...p }),
     { onSuccess: () => qc.invalidateQueries(['utility-tax-rates', propertyId]),
-      onError: (e: any) => alert(e?.response?.data?.error || 'Could not save tax rate') }
+      onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not save tax rate') }
   )
   return (
     <>

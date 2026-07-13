@@ -6,6 +6,7 @@ import {
   CheckCircle2, FileSignature, Calendar,
 } from 'lucide-react'
 import { api, apiGet, apiPatch, apiPost } from '../lib/api'
+import { humanize } from '@gam/shared'
 import { CameraCapture } from '../components/CameraCapture'
 import { AuthedImg, AuthedVideo } from '../components/AuthedMedia'
 
@@ -183,7 +184,7 @@ export function InspectionDetailPage() {
             <ClipboardCheck size={22} />
             {labelType(insp.inspectionType)} Inspection
             <span className={`badge ${STATUS_BADGE[insp.status] || 'badge-muted'}`} style={{ marginLeft: 6 }}>
-              {insp.status.replace('_', ' ')}
+              {humanize(insp.status)}
             </span>
           </h1>
           <div className="page-sub">

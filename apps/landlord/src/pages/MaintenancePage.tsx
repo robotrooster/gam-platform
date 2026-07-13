@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useSearchParams, useNavigate } from 'react-router-dom'
+import { humanize } from '@gam/shared'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
 import { usePerms } from '../lib/permissions'
 import { EntryRequestsPage } from './EntryRequestsPage'
@@ -68,8 +69,8 @@ function RequestDetailModal({ request: r, onClose }: { request: any; onClose: ()
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 16 }}>
           <div style={{ flex: 1 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
-              <span className={`badge ${PRI_COLORS[req.priority]}`}>{req.priority}</span>
-              <span className={`badge ${ST_COLORS[req.status]}`}>{req.status?.replace('_',' ')}</span>
+              <span className={`badge ${PRI_COLORS[req.priority]}`}>{humanize(req.priority)}</span>
+              <span className={`badge ${ST_COLORS[req.status]}`}>{humanize(req.status)}</span>
               {parseInt(req.commentCount) > 0 && (
                 <span style={{ fontSize: '.65rem', color: 'var(--text-3)', display: 'flex', alignItems: 'center', gap: 3 }}>
                   <MessageSquare size={10} /> {req.commentCount}
@@ -103,7 +104,7 @@ function RequestDetailModal({ request: r, onClose }: { request: any; onClose: ()
                  i === currentStep ? <div style={{ width: 8, height: 8, borderRadius: '50%', background: 'var(--bg-0)' }} /> :
                  <div style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--text-3)' }} />}
               </div>
-              <div style={{ fontSize: '.6rem', color: i <= currentStep ? 'var(--gold)' : 'var(--text-3)', marginLeft: 4, marginRight: 4, whiteSpace: 'nowrap', textTransform: 'capitalize' }}>{s.replace('_',' ')}</div>
+              <div style={{ fontSize: '.6rem', color: i <= currentStep ? 'var(--gold)' : 'var(--text-3)', marginLeft: 4, marginRight: 4, whiteSpace: 'nowrap', textTransform: 'capitalize' }}>{humanize(s)}</div>
               {i < STATUS_FLOW.length-1 && <div style={{ flex: 1, height: 2, background: i < currentStep ? 'var(--gold)' : 'var(--border-0)', margin: '0 4px' }} />}
             </div>
           ))}
@@ -252,7 +253,7 @@ function RequestDetailModal({ request: r, onClose }: { request: any; onClose: ()
                 <div style={{ flex: 1 }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 2 }}>
                     <span style={{ fontSize: '.72rem', fontWeight: 600, color: 'var(--text-0)' }}>{c.firstName} {c.lastName}</span>
-                    <span style={{ fontSize: '.62rem', color: 'var(--text-3)', textTransform: 'capitalize' }}>{c.role}</span>
+                    <span style={{ fontSize: '.62rem', color: 'var(--text-3)', textTransform: 'capitalize' }}>{humanize(c.role)}</span>
                     {c.isInternal && <span style={{ fontSize: '.58rem', color: 'var(--amber)', background: 'rgba(201,162,39,.1)', padding: '1px 5px', borderRadius: 4 }}>Internal</span>}
                     <span style={{ fontSize: '.62rem', color: 'var(--text-3)', marginLeft: 'auto' }}>{new Date(c.createdAt).toLocaleString()}</span>
                   </div>
@@ -465,7 +466,7 @@ export function MaintenancePage() {
       <div style={{ display: 'flex', gap: 8, marginBottom: 14 }}>
         {['all','open','assigned','in_progress','completed','cancelled'].map(s => (
           <button key={s} onClick={() => setFilterStatus(s)} className={`btn btn-sm ${filterStatus===s?'btn-primary':'btn-ghost'}`} style={{ textTransform: 'capitalize', fontSize: '.72rem' }}>
-            {s.replace('_',' ')}
+            {humanize(s)}
           </button>
         ))}
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
@@ -485,7 +486,7 @@ export function MaintenancePage() {
           <div className="empty-state" style={{ padding: 40 }}>
             <Wrench size={40} />
             <h3>No requests</h3>
-            <p>{filterStatus === 'all' ? 'No maintenance requests yet.' : `No ${filterStatus.replace('_',' ')} requests.`}</p>
+            <p>{filterStatus === 'all' ? 'No maintenance requests yet.' : `No ${humanize(filterStatus).toLowerCase()} requests.`}</p>
           </div>
         ) : (
           <table className="data-table" style={{ minWidth: 980 }}>
@@ -510,8 +511,8 @@ export function MaintenancePage() {
                       {parseInt(r.commentCount) > 0 && <span style={{ display: 'flex', alignItems: 'center', gap: 2 }}><MessageSquare size={9} />{r.commentCount}</span>}
                     </div>
                   </td>
-                  <td><span className={`badge ${PRI_COLORS[r.priority]}`}>{r.priority}</span></td>
-                  <td><span className={`badge ${ST_COLORS[r.status]}`}>{r.status?.replace('_',' ')}</span></td>
+                  <td><span className={`badge ${PRI_COLORS[r.priority]}`}>{humanize(r.priority)}</span></td>
+                  <td><span className={`badge ${ST_COLORS[r.status]}`}>{humanize(r.status)}</span></td>
                   <td style={{ fontSize: '.75rem' }}>{r.assignedFirst ? `${r.assignedFirst} ${r.assignedLast}` : <span style={{ color: 'var(--text-3)' }}>—</span>}</td>
                   <td className="mono" style={{ fontSize: '.72rem' }}>{r.scheduledAt ? new Date(r.scheduledAt).toLocaleDateString() : <span style={{ color: 'var(--text-3)' }}>—</span>}</td>
                   <td className="mono">{r.actualCost ? fmt(r.actualCost) : <span style={{ color: 'var(--text-3)' }}>—</span>}</td>

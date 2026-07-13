@@ -64,14 +64,17 @@ async function seedSite(opts: { connect?: boolean } = {}) {
   } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
 }
 
-const guest = (unitId: string, ci = plusDays(30), co = plusDays(33)) => ({
-  unitId, guestName: 'Pat Guest', guestEmail: 'pat@guest.dev', checkIn: ci, checkOut: co, stayType: 'nightly',
+// W-20 (S531): the public contract books a SITE TYPE, not a unit — units
+// without a subtype group under the 'general' type. This suite seeds ONE
+// bookable unit, so best-fit always lands on it.
+const guest = (ci = plusDays(30), co = plusDays(33)) => ({
+  siteTypeId: 'general', guestName: 'Pat Guest', guestEmail: 'pat@guest.dev', checkIn: ci, checkOut: co, stayType: 'nightly',
 })
 
 describe('POST /book', () => {
   it('happy: tentative hold + deposit checkout', async () => {
     const s = await seedSite()
-    const res = await request(buildApp()).post('/api/public/property/sunny/book').send(guest(s.unitId))
+    const res = await request(buildApp()).post('/api/public/property/sunny/book').send(guest())
     expect(res.status).toBe(200)
     expect(res.body.data.checkoutUrl).toContain('checkout.stripe.test')
     expect(res.body.data.depositAmount).toBe(75) // 25% of 300
@@ -85,7 +88,7 @@ describe('POST /book', () => {
 
   it('no landlord Connect → 409', async () => {
     const s = await seedSite({ connect: false })
-    const res = await request(buildApp()).post('/api/public/property/sunny/book').send(guest(s.unitId))
+    const res = await request(buildApp()).post('/api/public/property/sunny/book').send(guest())
     expect(res.status).toBe(409)
   })
 
@@ -95,7 +98,7 @@ describe('POST /book', () => {
       `INSERT INTO unit_bookings (unit_id, landlord_id, lease_type, check_in, check_out, status)
        VALUES ($1,$2,'nightly',$3,$4,'confirmed')`,
       [s.unitId, s.landlordId, plusDays(30), plusDays(33)])
-    const res = await request(buildApp()).post('/api/public/property/sunny/book').send(guest(s.unitId, plusDays(31), plusDays(34)))
+    const res = await request(buildApp()).post('/api/public/property/sunny/book').send(guest(plusDays(31), plusDays(34)))
     expect(res.status).toBe(409)
     expect(res.body.full).toBe(true)
   })
@@ -104,7 +107,7 @@ describe('POST /book', () => {
 describe('deposit confirmation', () => {
   it('confirmBookingDeposit flips tentative → confirmed', async () => {
     const s = await seedSite()
-    const res = await request(buildApp()).post('/api/public/property/sunny/book').send(guest(s.unitId))
+    const res = await request(buildApp()).post('/api/public/property/sunny/book').send(guest())
     const id = res.body.data.bookingId
     const sess = (await db.query<any>('SELECT stripe_checkout_session_id FROM unit_bookings WHERE id=$1', [id])).rows[0].stripe_checkout_session_id
     await confirmBookingDeposit(id, sess)
@@ -127,7 +130,7 @@ describe('waitlist', () => {
 
   it('join when full → waiting row at position 1', async () => {
     const s = await seedFull()
-    const res = await request(buildApp()).post('/api/public/property/sunny/waitlist').send(guest(s.unitId))
+    const res = await request(buildApp()).post('/api/public/property/sunny/waitlist').send(guest())
     expect(res.status).toBe(200)
     expect(res.body.data.position).toBe(1)
     const w = (await db.query<any>('SELECT * FROM unit_booking_waitlists WHERE id=$1', [res.body.data.waitlistId])).rows[0]
@@ -136,7 +139,7 @@ describe('waitlist', () => {
 
   it('cancel frees dates → promote mints a claim token', async () => {
     const s = await seedFull()
-    await request(buildApp()).post('/api/public/property/sunny/waitlist').send(guest(s.unitId))
+    await request(buildApp()).post('/api/public/property/sunny/waitlist').send(guest())
     // free the dates, then promote
     await db.query(`UPDATE unit_bookings SET status='cancelled' WHERE id=$1`, [s.blockerId])
     const promoted = await promoteNextWaitlister(s.unitId)
@@ -162,14 +165,14 @@ describe('waitlist', () => {
 
   it('promote is a no-op while dates still booked', async () => {
     const s = await seedFull()
-    await request(buildApp()).post('/api/public/property/sunny/waitlist').send(guest(s.unitId))
+    await request(buildApp()).post('/api/public/property/sunny/waitlist').send(guest())
     const promoted = await promoteNextWaitlister(s.unitId) // blocker still confirmed
     expect(promoted).toBe(false)
   })
 
   it('claim → tentative booking + deposit checkout', async () => {
     const s = await seedFull()
-    await request(buildApp()).post('/api/public/property/sunny/waitlist').send(guest(s.unitId))
+    await request(buildApp()).post('/api/public/property/sunny/waitlist').send(guest())
     await db.query(`UPDATE unit_bookings SET status='cancelled' WHERE id=$1`, [s.blockerId])
     await promoteNextWaitlister(s.unitId)
     const token = (await db.query<any>(`SELECT claim_token FROM unit_booking_waitlists WHERE unit_id=$1`, [s.unitId])).rows[0].claim_token
@@ -196,7 +199,7 @@ describe('sweep', () => {
        VALUES ($1,$2,'nightly',$3,$4,'tentative', now() - interval '1 minute')`,
       [s.unitId, s.landlordId, plusDays(30), plusDays(33)])
     // a guest waiting on those dates
-    await request(buildApp()).post('/api/public/property/sunny/waitlist').send(guest(s.unitId))
+    await request(buildApp()).post('/api/public/property/sunny/waitlist').send(guest())
 
     const r = await sweepBookingHoldsAndClaims()
     expect(r.holdsExpired).toBe(1)

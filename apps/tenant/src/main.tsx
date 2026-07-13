@@ -25,10 +25,11 @@ import { PosCustomerOnboardingPage } from './pages/PosCustomerOnboardingPage'
 import React, { useContext, useState, useEffect, useCallback } from 'react'
 import ReactDOM from 'react-dom/client'
 import { BrowserRouter, Routes, Route, Navigate, NavLink, Outlet, useNavigate, useParams, Link, useLocation } from 'react-router-dom'
+import { DialogHost, toast } from './components/dialogs'
 import { QueryClient, QueryClientProvider, useQuery, useMutation, useQueryClient } from 'react-query'
 import { useForm } from 'react-hook-form'
 import axios from 'axios'
-import { formatCurrency, applyCamelizeInterceptor, installDatePickerAutoClose } from '@gam/shared'
+import { formatCurrency, applyCamelizeInterceptor, installDatePickerAutoClose, humanize } from '@gam/shared'
 import { AgentChatWidget, SupportPage } from './components/AgentChatWidget'
 import { CameraCapture } from './components/CameraCapture'
 
@@ -391,6 +392,7 @@ function Layout() {
       <div className="main">
         <header className="topbar" />
         <div className="page">{moveInLocked ? <MoveInLockout gate={moveInGate} /> : <Outlet />}</div>
+        <DialogHost />
       </div>
       {showFullNav && <FlexsuiteReAcceptanceGate />}
       <AgentChatWidget />
@@ -1762,7 +1764,7 @@ function MaintenancePage() {
                   <td className="mono" style={{fontSize:'.75rem'}}>{new Date(r.createdAt).toLocaleDateString()}</td>
                   <td style={{color:'var(--t0)',fontWeight:500}}>{r.title}</td>
                   <td><span className={`badge ${PRI[r.priority]}`}>{r.priority}</span></td>
-                  <td><span className={`badge ${ST[r.status]}`}>{ST_LABEL[r.status]||r.status}</span></td>
+                  <td><span className={`badge ${ST[r.status]}`}>{ST_LABEL[r.status]||humanize(r.status)}</span></td>
                   <td style={{fontSize:'.82rem',color:r.contractorName?'var(--t1)':'var(--t3)'}}>{r.contractorName||'Unassigned'}</td>
                   <td style={{color:'var(--t3)',fontSize:'.75rem'}}>View →</td>
                 </tr>
@@ -1780,7 +1782,7 @@ function MaintenancePage() {
                 <div className="modal-t" style={{marginBottom:4}}>{selected.title}</div>
                 <div style={{display:'flex',gap:8}}>
                   <span className={`badge ${PRI[selected.priority]}`}>{selected.priority}</span>
-                  <span className={`badge ${ST[selected.status]}`}>{ST_LABEL[selected.status]||selected.status}</span>
+                  <span className={`badge ${ST[selected.status]}`}>{ST_LABEL[selected.status]||humanize(selected.status)}</span>
                 </div>
               </div>
               <button onClick={()=>setSelected(null)} style={{background:'none',border:'none',cursor:'pointer',color:'var(--t3)',fontSize:'1.2rem',lineHeight:1}}>×</button>
@@ -1885,7 +1887,7 @@ function TenantInspectionsPage() {
               {list.map(r => (
                 <tr key={r.id}>
                   <td style={{ color: 'var(--t0)' }}>{labelType(r.inspectionType)}</td>
-                  <td><span className={`badge ${statusBadge(r.status)}`}>{r.status.replace('_', ' ')}</span></td>
+                  <td><span className={`badge ${statusBadge(r.status)}`}>{humanize(r.status)}</span></td>
                   <td className="mono" style={{ fontSize: '.75rem', color: 'var(--t3)' }}>{new Date(r.createdAt).toLocaleDateString()}</td>
                   <td className="mono" style={{ fontSize: '.75rem', color: 'var(--t3)' }}>{r.finalizedAt ? new Date(r.finalizedAt).toLocaleDateString() : '—'}</td>
                   <td><button className="btn btn-g btn-sm" onClick={() => navigate(`/inspections/${r.id}`)}>Open →</button></td>
@@ -1959,7 +1961,7 @@ function TenantInspectionDetailPage() {
           <button className="btn btn-g btn-sm" onClick={() => navigate('/inspections')} style={{ marginBottom: 8 }}>← Inspections</button>
           <h1 className="pt">{labelType(insp.inspectionType)} Inspection</h1>
           <p className="ps">
-            <span className={`badge ${statusBadge(insp.status)}`}>{insp.status.replace('_', ' ')}</span>
+            <span className={`badge ${statusBadge(insp.status)}`}>{humanize(insp.status)}</span>
           </p>
         </div>
       </div>
@@ -2292,7 +2294,7 @@ function CreditPage() {
 function CreditEventRow({ ev, onDispute }: { ev: any; onDispute: () => void }) {
   const tone = eventTone(ev.eventType)
   const dotColor = tone === 'positive' ? 'var(--green)' : tone === 'negative' ? 'var(--red)' : 'var(--t3)'
-  const label = EVENT_LABEL[ev.eventType] || ev.eventType
+  const label = EVENT_LABEL[ev.eventType] || humanize(ev.eventType)
   const canDispute = tone === 'negative' && !ev.eventType.startsWith('dispute_')
 
   return (
@@ -2324,7 +2326,7 @@ function attestationLabel(src: string): string {
     case 'plaid_attested':        return 'Plaid'
     case 'system_derived':        return 'system'
     case 'tenant_self_reported':  return 'self-reported'
-    default:                      return src.replace(/_/g, ' ')
+    default:                      return humanize(src)
   }
 }
 
@@ -2353,7 +2355,7 @@ function CreditDisputeModal({ ev, onClose }: { ev: any; onClose: () => void }) {
       <div className="modal" onClick={e => e.stopPropagation()}>
         <div className="modal-t">Dispute event</div>
         <div style={{ background: 'var(--bg3)', padding: 12, borderRadius: 8, marginBottom: 16, fontSize: '.85rem' }}>
-          <strong style={{ color: 'var(--t0)' }}>{EVENT_LABEL[ev.eventType] || ev.eventType}</strong>
+          <strong style={{ color: 'var(--t0)' }}>{EVENT_LABEL[ev.eventType] || humanize(ev.eventType)}</strong>
           <div style={{ color: 'var(--t3)', fontSize: '.75rem', marginTop: 2 }}>
             {new Date(ev.occurredAt).toLocaleDateString()} · {attestationLabel(ev.attestationSource)}
           </div>
@@ -2496,22 +2498,16 @@ function NotificationPrefsPage() {
   for (const p of (prefs as any[])) prefMap.set(p.type, p)
 
   const update = useMutation(
-    (body: { type: string; emailEnabled: boolean; smsEnabled: boolean; inAppEnabled: boolean }) =>
+    (body: { type: string; emailEnabled: boolean; inAppEnabled: boolean }) =>
       api.patch('/notifications/preferences', body).then(r => r.data),
     {
       onSuccess: () => qc.invalidateQueries('notification-prefs'),
     },
   )
 
-  const toggle = (type: string, channel: 'email' | 'sms', currentVal: boolean) => {
-    const current = prefMap.get(type) || { email_enabled: true, sms_enabled: false, in_app_enabled: true }
-    const next = {
-      type,
-      emailEnabled: channel === 'email' ? !currentVal : current.emailEnabled,
-      smsEnabled:   channel === 'sms'   ? !currentVal : current.smsEnabled,
-      inAppEnabled: current.inAppEnabled,
-    }
-    update.mutate(next)
+  const toggle = (type: string, currentVal: boolean) => {
+    const current = prefMap.get(type) || { email_enabled: true, in_app_enabled: true }
+    update.mutate({ type, emailEnabled: !currentVal, inAppEnabled: current.inAppEnabled })
   }
 
   return (
@@ -2523,8 +2519,8 @@ function NotificationPrefsPage() {
         </div>
       </div>
       <div className="alert a-blue" style={{ marginBottom: 16 }}>
-        ℹ️ In-app notifications always show in your dashboard. Email and SMS
-        are optional channels per notification type.
+        ℹ️ In-app notifications always show in your dashboard. Email is an
+        optional channel per notification type.
       </div>
       <div className="card" style={{ padding: 0, overflowX: 'auto' }}>
         {isLoading ? (
@@ -2535,20 +2531,16 @@ function NotificationPrefsPage() {
               <tr>
                 <th>Notification</th>
                 <th style={{ textAlign: 'center' }}>Email</th>
-                <th style={{ textAlign: 'center' }}>SMS</th>
               </tr>
             </thead>
             <tbody>
               {TENANT_NOTIFICATION_TYPES.map(({ type, label }) => {
-                const p = prefMap.get(type) || { email_enabled: true, sms_enabled: false }
+                const p = prefMap.get(type) || { email_enabled: true }
                 return (
                   <tr key={type}>
                     <td style={{ color: 'var(--t0)' }}>{label}</td>
                     <td style={{ textAlign: 'center' }}>
-                      <input type="checkbox" checked={p.emailEnabled} onChange={() => toggle(type, 'email', p.emailEnabled)} />
-                    </td>
-                    <td style={{ textAlign: 'center' }}>
-                      <input type="checkbox" checked={p.smsEnabled} onChange={() => toggle(type, 'sms', p.smsEnabled)} />
+                      <input type="checkbox" checked={p.emailEnabled} onChange={() => toggle(type, p.emailEnabled)} />
                     </td>
                   </tr>
                 )
@@ -2591,12 +2583,12 @@ function MyDisputesPage() {
                 const open = d.status === 'open' || d.status === 'evidence_pending'
                 return (
                   <tr key={d.id}>
-                    <td><span className={`badge ${disputeStatusBadgeTenant(d.status)}`}>{d.status.replace('_',' ')}</span></td>
+                    <td><span className={`badge ${disputeStatusBadgeTenant(d.status)}`}>{humanize(d.status)}</span></td>
                     <td style={{ color: 'var(--t0)' }}>
-                      {EVENT_LABEL[d.disputedEventType] || d.disputedEventType}
+                      {EVENT_LABEL[d.disputedEventType] || humanize(d.disputedEventType)}
                       <div style={{ fontSize: '.7rem', color: 'var(--t3)' }}>{new Date(d.disputedEventOccurredAt).toLocaleDateString()}</div>
                     </td>
-                    <td style={{ fontSize: '.78rem' }}>{d.reason.replace('_',' ')}</td>
+                    <td style={{ fontSize: '.78rem' }}>{humanize(d.reason)}</td>
                     <td className="mono" style={{ fontSize: '.72rem', color: 'var(--t3)' }}>{new Date(d.createdAt).toLocaleDateString()}</td>
                     <td className="mono" style={{ fontSize: '.72rem', color: 'var(--t3)' }}>{d.resolvedAt ? new Date(d.resolvedAt).toLocaleDateString() : '—'}</td>
                     <td>
@@ -2644,7 +2636,7 @@ function SubmitEvidenceModal({ dispute, onClose }: { dispute: any; onClose: () =
       <div className="modal" onClick={e => e.stopPropagation()}>
         <div className="modal-t">Submit evidence</div>
         <div style={{ background: 'var(--bg3)', padding: 12, borderRadius: 8, marginBottom: 16, fontSize: '.85rem' }}>
-          <strong style={{ color: 'var(--t0)' }}>{EVENT_LABEL[dispute.disputedEventType] || dispute.disputedEventType}</strong>
+          <strong style={{ color: 'var(--t0)' }}>{EVENT_LABEL[dispute.disputedEventType] || humanize(dispute.disputedEventType)}</strong>
           <div style={{ color: 'var(--t3)', fontSize: '.75rem', marginTop: 2 }}>
             Filed {new Date(dispute.createdAt).toLocaleDateString()}
           </div>
@@ -2944,7 +2936,7 @@ function TenantEntryRequestDetailPage() {
           <div style={{ color: 'var(--t3)' }}>Reason</div>
           <div style={{ color: 'var(--t0)', fontWeight: 600 }}>{r.reason}</div>
           <div style={{ color: 'var(--t3)' }}>Category</div>
-          <div>{r.reasonCategory}</div>
+          <div>{humanize(r.reasonCategory)}</div>
           <div style={{ color: 'var(--t3)' }}>Window</div>
           <div className="mono" style={{ fontSize: '.78rem' }}>
             {fmtEntryDateTime(r.proposedEntryWindowStart)} → {fmtEntryDateTime(r.proposedEntryWindowEnd)}
@@ -3072,6 +3064,20 @@ function TenantEntryRequestDetailPage() {
   )
 }
 
+// S535: documents live behind the authed /api/documents/:id/file stream
+// (the static /uploads mount no longer serves them). Browser <a> can't
+// carry the Bearer token, so the click handler fetches with auth and
+// opens a blob URL in a new tab — same S213 pattern as addendum PDFs.
+async function openDocumentFile(docId: string) {
+  const token = localStorage.getItem('gam_tenant_token') || ''
+  const res = await fetch(`${API_URL}/api/documents/${docId}/file`, {
+    headers: { Authorization: 'Bearer ' + token },
+  })
+  if (!res.ok) { toast.error('Could not load document (status ' + res.status + ')'); return }
+  const blob = await res.blob()
+  window.open(URL.createObjectURL(blob), '_blank')
+}
+
 function DocumentsPage() {
   const { data: docs = [], isLoading } = useQuery<any[]>('docs', () => get<any[]>('/documents'))
   return (
@@ -3085,10 +3091,10 @@ function DocumentsPage() {
               {docs.length ? docs.map((d:any)=>(
                 <tr key={d.id}>
                   <td style={{color:'var(--t0)'}}>{d.name}</td>
-                  <td><span className="badge b-muted">{d.type.replace('_',' ')}</span></td>
+                  <td><span className="badge b-muted">{humanize(d.type)}</span></td>
                   <td><span className={`badge ${d.signedAt?'b-green':'b-amber'}`}>{d.signedAt?'Signed':'Pending signature'}</span></td>
                   <td className="mono" style={{fontSize:'.75rem',color:'var(--t3)'}}>{new Date(d.createdAt).toLocaleDateString()}</td>
-                  <td><a href={d.url} target="_blank" rel="noreferrer" className="btn btn-g btn-sm">Download</a></td>
+                  <td><button onClick={()=>openDocumentFile(d.id)} className="btn btn-g btn-sm">Download</button></td>
                 </tr>
               )) : <tr><td colSpan={5} style={{textAlign:'center',color:'var(--t3)',padding:32}}>No documents yet.</td></tr>}
             </tbody>

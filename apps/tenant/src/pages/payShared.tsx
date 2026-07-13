@@ -53,6 +53,9 @@ export interface PayTarget {
   endpoint:  string  // e.g. '/payments/<id>/pay' or '/utility/bills/<id>/pay'
   subheader: string  // displayed under the amount in the modal
   kind:      'rent' | 'utility'
+  // S537: pay-balance sends the tenant-chosen amount in the body (FIFO
+  // application server-side). Per-row endpoints ignore it.
+  sendAmountInBody?: boolean
 }
 
 interface PayResponse {
@@ -159,6 +162,7 @@ export function PayNowModal({
       const res = await apiPost<PayResponse>(target.endpoint, {
         paymentMethodId:   selectedMethod.id,
         paymentMethodType: selectedMethod.type,
+        ...(target.sendAmountInBody ? { amount: target.amount } : {}),
       })
       const status = (res as any)?.data?.status
       // S534 (Nic): no propane-priority disclosure here — warning the

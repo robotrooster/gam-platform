@@ -315,6 +315,7 @@ describe('POST /api/landlords/me/onboard-properties-csv/commit', () => {
           issues: [],
         }],
         source: 'generic', claimedPlatformName: 'TestPlatform',
+        lateFeeDecisions: [{ propertyName: 'Sunset Apts', street1: '1 Main St', unitType: 'apartment', noLateFee: false, graceDays: 5, initialAmount: 15, initialType: 'flat' }],
       })
     expect(res.status).toBe(200)
     expect(res.body.data.propertiesCreated).toBe(1)

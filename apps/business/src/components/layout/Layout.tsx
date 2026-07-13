@@ -1,4 +1,5 @@
 import { Outlet, NavLink, useNavigate } from 'react-router-dom'
+import { humanize, BUSINESS_STAFF_ROLE_LABEL, BusinessStaffRole } from '@gam/shared'
 import { useAuth } from '../../context/AuthContext'
 import { GlobalSearch } from '../GlobalSearch'
 import {
@@ -195,8 +196,8 @@ export function Layout() {
               {user?.firstName} {user?.lastName}
             </div>
             <div style={{ fontSize: 11, color: 'var(--text-3)', textTransform: 'capitalize' }}>
-              {user?.role?.replace('_', ' ')}
-              {user?.staffRole ? ` · ${user.staffRole}` : ''}
+              {humanize(user?.role)}
+              {user?.staffRole ? ` · ${BUSINESS_STAFF_ROLE_LABEL[user.staffRole as BusinessStaffRole] ?? humanize(user.staffRole)}` : ''}
             </div>
           </div>
           <button

@@ -10,6 +10,7 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
+import { humanize, humanizeServiceType } from '@gam/shared'
 import { apiGet } from '../lib/api'
 import {
   Search, Users, Receipt, FileText, Wrench, CalendarDays, X, Car,
@@ -225,7 +226,7 @@ export function GlobalSearch() {
                           {i.invoiceNumber}
                         </strong>
                         <span>{customerLabel(i)}</span>
-                        <span style={statusPill(i.status)}>{i.status}</span>
+                        <span style={statusPill(i.status)}>{humanize(i.status)}</span>
                       </div>
                       <span style={metaStyle}>
                         {fmtMoney(i.totalAmount)} · Due {fmtDateShort(i.dueDate)}
@@ -243,7 +244,7 @@ export function GlobalSearch() {
                           {qu.quoteNumber}
                         </strong>
                         <span>{customerLabel(qu)}</span>
-                        <span style={statusPill(qu.status)}>{qu.status}</span>
+                        <span style={statusPill(qu.status)}>{humanize(qu.status)}</span>
                       </div>
                       <span style={metaStyle}>{fmtMoney(qu.totalAmount)}</span>
                     </Result>
@@ -261,7 +262,7 @@ export function GlobalSearch() {
                             {w.woNumber}
                           </strong>
                           <span>{customerLabel(w)}</span>
-                          <span style={statusPill(w.status)}>{w.status}</span>
+                          <span style={statusPill(w.status)}>{humanize(w.status)}</span>
                         </div>
                         <span style={metaStyle}>
                           {ymm && <><Car size={9} style={{ verticalAlign: 'middle', marginRight: 4 }} />{ymm} · </>}
@@ -280,10 +281,10 @@ export function GlobalSearch() {
                     <Result key={a.id} onClick={() => go(`/appointments`)}>
                       <div style={{ display: 'flex', gap: 8, alignItems: 'baseline' }}>
                         <span>{customerLabel(a)}</span>
-                        <span style={statusPill(a.status)}>{a.status}</span>
+                        <span style={statusPill(a.status)}>{humanize(a.status)}</span>
                       </div>
                       <span style={metaStyle}>
-                        {a.serviceType} · {new Date(a.scheduledFor).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })} · {a.durationMinutes}m
+                        {humanizeServiceType(a.serviceType)} · {new Date(a.scheduledFor).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })} · {a.durationMinutes}m
                       </span>
                     </Result>
                   ))}

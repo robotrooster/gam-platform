@@ -21,7 +21,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict FtIjsszd26h8kC1uECBBitZXR6yAEOLc0fRgSJ1aoQApF1tJcuJGSPEAp7XrOJJ
+\restrict OlxxBUlmTdKiToJb5GJ8QGiBpmYW8uBnP3JVIiCMKLGhMflu64jVg21Ej12FDxK
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -1126,11 +1126,11 @@ CREATE TABLE public.business_customers (
     last_name text NOT NULL,
     email text,
     phone text,
-    street1 text NOT NULL,
+    street1 text,
     street2 text,
-    city text NOT NULL,
-    state text NOT NULL,
-    zip text NOT NULL,
+    city text,
+    state text,
+    zip text,
     lat numeric(10,7),
     lon numeric(10,7),
     notes text,
@@ -1479,6 +1479,23 @@ COMMENT ON COLUMN public.business_invoices.deposit_paid_at IS 'S511 stamped when
 
 
 --
+-- Name: business_platform_fee_accruals; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.business_platform_fee_accruals (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    business_id uuid NOT NULL,
+    month text NOT NULL,
+    amount numeric(10,2) NOT NULL,
+    status text DEFAULT 'pending'::text NOT NULL,
+    stripe_charge_id text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    collected_at timestamp with time zone,
+    CONSTRAINT business_platform_fee_accruals_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'collected'::text, 'waived'::text])))
+);
+
+
+--
 -- Name: business_pos_sequences; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -1548,6 +1565,8 @@ CREATE TABLE public.business_pos_transactions (
     discount_code_id uuid,
     discount_amount numeric(10,2) DEFAULT 0 NOT NULL,
     refunded_amount numeric(10,2) DEFAULT 0 NOT NULL,
+    stripe_payment_intent_id text,
+    card_surcharge numeric(10,2) DEFAULT 0 NOT NULL,
     CONSTRAINT business_pos_transactions_discount_nonneg CHECK ((discount_amount >= (0)::numeric)),
     CONSTRAINT business_pos_transactions_payment_method_check CHECK ((payment_method = ANY (ARRAY['cash'::text, 'card_recorded'::text, 'stripe_terminal'::text, 'stripe_checkout'::text]))),
     CONSTRAINT business_pos_transactions_refund_consistency CHECK ((((status = ANY (ARRAY['refunded'::text, 'partially_refunded'::text])) AND (refunded_at IS NOT NULL)) OR ((status <> ALL (ARRAY['refunded'::text, 'partially_refunded'::text])) AND (refunded_at IS NULL)))),
@@ -1773,6 +1792,23 @@ COMMENT ON TABLE public.business_recurring_invoice_schedules IS 'S505 recurring 
 
 
 --
+-- Name: business_terminal_readers; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.business_terminal_readers (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    business_id uuid NOT NULL,
+    stripe_reader_id text NOT NULL,
+    nickname text NOT NULL,
+    status text DEFAULT 'active'::text NOT NULL,
+    registered_at timestamp with time zone DEFAULT now() NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT business_terminal_readers_status_check CHECK ((status = ANY (ARRAY['active'::text, 'archived'::text])))
+);
+
+
+--
 -- Name: business_user_invitations; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -1982,7 +2018,11 @@ CREATE TABLE public.businesses (
     service_seconds_per_unit integer DEFAULT 60 NOT NULL,
     service_unit_label text DEFAULT 'unit'::text NOT NULL,
     calendar_feed_token uuid,
+    tips_enabled boolean DEFAULT true NOT NULL,
+    stripe_terminal_location_id text,
+    card_fees_paid_by text DEFAULT 'business'::text NOT NULL,
     CONSTRAINT businesses_business_type_check CHECK ((business_type = ANY (ARRAY['trash_hauling'::text, 'maintenance_crew'::text, 'mobile_rental'::text, 'equipment_rental'::text, 'mini_market'::text, 'mechanic_stationary'::text, 'mechanic_mobile'::text, 'other'::text]))),
+    CONSTRAINT businesses_card_fees_paid_by_check CHECK ((card_fees_paid_by = ANY (ARRAY['business'::text, 'customer'::text]))),
     CONSTRAINT businesses_default_tax_rate_range CHECK (((default_tax_rate >= (0)::numeric) AND (default_tax_rate < (1)::numeric))),
     CONSTRAINT businesses_enabled_features_check CHECK ((enabled_features <@ ARRAY['customers'::text, 'staff'::text, 'recurring_schedules'::text, 'appointments'::text, 'routing'::text, 'pos'::text, 'inventory'::text, 'work_orders'::text, 'customer_vehicles'::text, 'invoicing'::text, 'payments'::text, 'quotes'::text, 'discounts'::text, 'bookkeeping'::text])),
     CONSTRAINT businesses_public_booking_enabled_needs_slug CHECK (((public_booking_enabled = false) OR (public_booking_slug IS NOT NULL))),
@@ -3184,6 +3224,7 @@ CREATE TABLE public.landlord_platform_fee_overrides (
     set_by_user_id uuid,
     reason text,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
+    str_fee_pct numeric(5,4),
     CONSTRAINT landlord_pfo_at_least_one CHECK (((rate_per_unit IS NOT NULL) OR (min_per_property IS NOT NULL))),
     CONSTRAINT landlord_pfo_effective_range CHECK (((effective_until IS NULL) OR (effective_until > effective_from))),
     CONSTRAINT landlord_pfo_min_nonneg CHECK (((min_per_property IS NULL) OR (min_per_property >= (0)::numeric))),
@@ -3397,6 +3438,24 @@ CREATE TABLE public.lease_pets (
 
 
 --
+-- Name: lease_prepaid_credits; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.lease_prepaid_credits (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    lease_id uuid NOT NULL,
+    tenant_id uuid NOT NULL,
+    amount_original numeric(12,2) NOT NULL,
+    amount_remaining numeric(12,2) NOT NULL,
+    source_remittance_id uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT lease_prepaid_credits_amount_original_check CHECK ((amount_original > (0)::numeric)),
+    CONSTRAINT lease_prepaid_credits_amount_remaining_check CHECK ((amount_remaining >= (0)::numeric))
+);
+
+
+--
 -- Name: lease_renewal_requests; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -3464,7 +3523,7 @@ CREATE TABLE public.lease_templates (
     updated_at timestamp with time zone DEFAULT now(),
     unit_type text,
     property_id uuid,
-    CONSTRAINT lease_templates_unit_type_check CHECK (((unit_type IS NULL) OR (unit_type = ANY (ARRAY['apartment'::text, 'single_family'::text, 'rv_spot'::text, 'mobile_home'::text, 'storage'::text, 'commercial'::text]))))
+    CONSTRAINT lease_templates_unit_type_check CHECK (((unit_type IS NULL) OR (unit_type = ANY (ARRAY['apartment'::text, 'single_family'::text, 'rv_spot'::text, 'mobile_home'::text, 'hotel_room'::text, 'storage'::text, 'commercial'::text]))))
 );
 
 
@@ -3589,8 +3648,8 @@ CREATE TABLE public.leases (
     end_date date,
     rent_amount numeric(10,2) NOT NULL,
     rent_due_day integer DEFAULT 1 NOT NULL,
-    late_fee_grace_days integer DEFAULT 5,
-    late_fee_initial_amount numeric(10,2) DEFAULT 15.00,
+    late_fee_grace_days integer,
+    late_fee_initial_amount numeric(10,2),
     signed_by_landlord boolean DEFAULT false,
     signed_by_tenant boolean DEFAULT false,
     signed_at timestamp with time zone,
@@ -3769,7 +3828,6 @@ CREATE TABLE public.notification_preferences (
     user_id uuid NOT NULL,
     type text NOT NULL,
     email_enabled boolean DEFAULT true NOT NULL,
-    sms_enabled boolean DEFAULT false NOT NULL,
     in_app_enabled boolean DEFAULT true NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL
@@ -3793,9 +3851,7 @@ CREATE TABLE public.notifications (
     landlord_id uuid,
     read_at timestamp with time zone,
     email_sent boolean DEFAULT false NOT NULL,
-    email_sent_at timestamp with time zone,
-    sms_sent boolean DEFAULT false NOT NULL,
-    sms_sent_at timestamp with time zone
+    email_sent_at timestamp with time zone
 );
 
 
@@ -4093,6 +4149,8 @@ CREATE TABLE public.platform_fee_accruals (
     tenant_charge_id uuid,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    str_revenue numeric(12,2) DEFAULT 0 NOT NULL,
+    str_fee_amount numeric(10,2) DEFAULT 0 NOT NULL,
     CONSTRAINT platform_fee_accruals_payer_check CHECK ((payer = ANY (ARRAY['landlord'::text, 'tenant'::text])))
 );
 
@@ -4110,6 +4168,7 @@ CREATE TABLE public.platform_fee_config (
     set_by_user_id uuid,
     notes text,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
+    str_fee_pct numeric(5,4) DEFAULT 0.05 NOT NULL,
     CONSTRAINT platform_fee_config_effective_range CHECK (((effective_until IS NULL) OR (effective_until > effective_from))),
     CONSTRAINT platform_fee_config_min_nonneg CHECK ((min_per_property >= (0)::numeric)),
     CONSTRAINT platform_fee_config_rate_nonneg CHECK ((rate_per_unit >= (0)::numeric))
@@ -4928,6 +4987,7 @@ CREATE TABLE public.properties (
     propane_allow_installments boolean DEFAULT false NOT NULL,
     propane_split_min_gallons integer DEFAULT 40 NOT NULL,
     propane_split_four_min_gallons integer DEFAULT 100 NOT NULL,
+    accept_partial_payments boolean DEFAULT true NOT NULL,
     CONSTRAINT properties_booking_deposit_pct_range CHECK (((booking_deposit_pct >= (0)::numeric) AND (booking_deposit_pct <= (100)::numeric))),
     CONSTRAINT properties_booking_slug_format CHECK (((booking_slug IS NULL) OR ((booking_slug ~ '^[a-z0-9][a-z0-9-]{1,60}$'::text) AND (booking_slug !~ '--'::text)))),
     CONSTRAINT properties_deposit_handling_mode_check CHECK ((deposit_handling_mode = ANY (ARRAY['gam_escrow'::text, 'landlord_held'::text]))),
@@ -5097,7 +5157,7 @@ CREATE TABLE public.property_unit_subtypes (
     CONSTRAINT property_unit_subtypes_name_check CHECK (((length(TRIM(BOTH FROM name)) >= 1) AND (length(TRIM(BOTH FROM name)) <= 60))),
     CONSTRAINT property_unit_subtypes_rv_amp_service_check CHECK ((rv_amp_service = ANY (ARRAY['none'::text, '30'::text, '50'::text, 'both'::text]))),
     CONSTRAINT property_unit_subtypes_rv_site_layout_check CHECK ((rv_site_layout = ANY (ARRAY['none'::text, 'back_in'::text, 'pull_through'::text]))),
-    CONSTRAINT property_unit_subtypes_unit_type_check CHECK ((unit_type = ANY (ARRAY['apartment'::text, 'single_family'::text, 'rv_spot'::text, 'mobile_home'::text, 'storage'::text, 'commercial'::text])))
+    CONSTRAINT property_unit_subtypes_unit_type_check CHECK ((unit_type = ANY (ARRAY['apartment'::text, 'single_family'::text, 'rv_spot'::text, 'mobile_home'::text, 'hotel_room'::text, 'storage'::text, 'commercial'::text])))
 );
 
 
@@ -5109,9 +5169,9 @@ CREATE TABLE public.property_unit_type_late_fees (
     id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
     property_id uuid NOT NULL,
     unit_type text NOT NULL,
-    late_fee_grace_days integer DEFAULT 5 NOT NULL,
-    late_fee_initial_amount numeric(10,2) NOT NULL,
-    late_fee_initial_type text NOT NULL,
+    late_fee_grace_days integer,
+    late_fee_initial_amount numeric(10,2),
+    late_fee_initial_type text,
     late_fee_accrual_amount numeric(10,2),
     late_fee_accrual_type text,
     late_fee_accrual_period text,
@@ -5119,6 +5179,7 @@ CREATE TABLE public.property_unit_type_late_fees (
     late_fee_cap_type text,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    no_late_fee boolean DEFAULT false NOT NULL,
     CONSTRAINT property_unit_type_late_fees_late_fee_accrual_amount_check CHECK (((late_fee_accrual_amount IS NULL) OR (late_fee_accrual_amount >= (0)::numeric))),
     CONSTRAINT property_unit_type_late_fees_late_fee_accrual_period_check CHECK (((late_fee_accrual_period IS NULL) OR (late_fee_accrual_period = ANY (ARRAY['daily'::text, 'weekly'::text, 'monthly'::text])))),
     CONSTRAINT property_unit_type_late_fees_late_fee_accrual_type_check CHECK (((late_fee_accrual_type IS NULL) OR (late_fee_accrual_type = ANY (ARRAY['flat'::text, 'percent_of_rent'::text])))),
@@ -5127,7 +5188,8 @@ CREATE TABLE public.property_unit_type_late_fees (
     CONSTRAINT property_unit_type_late_fees_late_fee_grace_days_check CHECK ((late_fee_grace_days >= 0)),
     CONSTRAINT property_unit_type_late_fees_late_fee_initial_amount_check CHECK ((late_fee_initial_amount >= (0)::numeric)),
     CONSTRAINT property_unit_type_late_fees_late_fee_initial_type_check CHECK ((late_fee_initial_type = ANY (ARRAY['flat'::text, 'percent_of_rent'::text]))),
-    CONSTRAINT property_unit_type_late_fees_unit_type_check CHECK ((unit_type = ANY (ARRAY['apartment'::text, 'single_family'::text, 'rv_spot'::text, 'mobile_home'::text, 'storage'::text, 'commercial'::text])))
+    CONSTRAINT property_unit_type_late_fees_unit_type_check CHECK ((unit_type = ANY (ARRAY['apartment'::text, 'single_family'::text, 'rv_spot'::text, 'mobile_home'::text, 'hotel_room'::text, 'storage'::text, 'commercial'::text]))),
+    CONSTRAINT put_late_fees_decision_shape CHECK ((((no_late_fee = true) AND (late_fee_grace_days IS NULL) AND (late_fee_initial_amount IS NULL) AND (late_fee_initial_type IS NULL) AND (late_fee_accrual_amount IS NULL) AND (late_fee_cap_amount IS NULL)) OR ((no_late_fee = false) AND (late_fee_grace_days IS NOT NULL) AND (late_fee_initial_amount IS NOT NULL) AND (late_fee_initial_type IS NOT NULL))))
 );
 
 
@@ -5195,6 +5257,20 @@ CREATE TABLE public.recurring_schedules (
     CONSTRAINT recurring_schedules_paused_audit CHECK (((status <> 'paused'::text) OR (paused_at IS NOT NULL))),
     CONSTRAINT recurring_schedules_status_check CHECK ((status = ANY (ARRAY['active'::text, 'paused'::text, 'ended'::text]))),
     CONSTRAINT recurring_schedules_time_of_day_format CHECK ((time_of_day ~ '^[0-2][0-9]:[0-5][0-9]$'::text))
+);
+
+
+--
+-- Name: remittance_applications; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.remittance_applications (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    remittance_id uuid NOT NULL,
+    payment_id uuid NOT NULL,
+    amount_applied numeric(12,2) NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT remittance_applications_amount_applied_check CHECK ((amount_applied > (0)::numeric))
 );
 
 
@@ -5797,6 +5873,32 @@ CREATE TABLE public.tenant_notifications (
 
 
 --
+-- Name: tenant_remittances; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.tenant_remittances (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    tenant_id uuid NOT NULL,
+    lease_id uuid,
+    landlord_id uuid NOT NULL,
+    amount numeric(12,2) NOT NULL,
+    applied_amount numeric(12,2) NOT NULL,
+    unapplied_amount numeric(12,2) DEFAULT 0 NOT NULL,
+    status text DEFAULT 'processing'::text NOT NULL,
+    payment_method text,
+    stripe_payment_intent_id text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    settled_at timestamp with time zone,
+    CONSTRAINT tenant_remittances_amount_check CHECK ((amount > (0)::numeric)),
+    CONSTRAINT tenant_remittances_applied_amount_check CHECK ((applied_amount >= (0)::numeric)),
+    CONSTRAINT tenant_remittances_payment_method_check CHECK ((payment_method = ANY (ARRAY['ach'::text, 'card'::text]))),
+    CONSTRAINT tenant_remittances_status_check CHECK ((status = ANY (ARRAY['processing'::text, 'settled'::text, 'failed'::text]))),
+    CONSTRAINT tenant_remittances_unapplied_amount_check CHECK ((unapplied_amount >= (0)::numeric))
+);
+
+
+--
 -- Name: tenants; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -6162,7 +6264,7 @@ CREATE TABLE public.units (
     CONSTRAINT units_rv_amp_service_check CHECK ((rv_amp_service = ANY (ARRAY['none'::text, '30'::text, '50'::text, 'both'::text]))),
     CONSTRAINT units_rv_site_layout_check CHECK ((rv_site_layout = ANY (ARRAY['none'::text, 'back_in'::text, 'pull_through'::text]))),
     CONSTRAINT units_status_check CHECK ((status = ANY (ARRAY['vacant'::text, 'available'::text, 'active'::text, 'delinquent'::text, 'suspended'::text]))),
-    CONSTRAINT units_unit_type_check CHECK ((unit_type = ANY (ARRAY['apartment'::text, 'single_family'::text, 'rv_spot'::text, 'mobile_home'::text, 'storage'::text, 'commercial'::text])))
+    CONSTRAINT units_unit_type_check CHECK ((unit_type = ANY (ARRAY['apartment'::text, 'single_family'::text, 'rv_spot'::text, 'mobile_home'::text, 'hotel_room'::text, 'storage'::text, 'commercial'::text])))
 );
 
 
@@ -6997,6 +7099,22 @@ ALTER TABLE ONLY public.business_invoices
 
 
 --
+-- Name: business_platform_fee_accruals business_platform_fee_accruals_business_id_month_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_platform_fee_accruals
+    ADD CONSTRAINT business_platform_fee_accruals_business_id_month_key UNIQUE (business_id, month);
+
+
+--
+-- Name: business_platform_fee_accruals business_platform_fee_accruals_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_platform_fee_accruals
+    ADD CONSTRAINT business_platform_fee_accruals_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: business_pos_sequences business_pos_sequences_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -7074,6 +7192,14 @@ ALTER TABLE ONLY public.business_recurring_invoice_lines
 
 ALTER TABLE ONLY public.business_recurring_invoice_schedules
     ADD CONSTRAINT business_recurring_invoice_schedules_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: business_terminal_readers business_terminal_readers_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_terminal_readers
+    ADD CONSTRAINT business_terminal_readers_pkey PRIMARY KEY (id);
 
 
 --
@@ -7730,6 +7856,14 @@ ALTER TABLE ONLY public.lease_occupants
 
 ALTER TABLE ONLY public.lease_pets
     ADD CONSTRAINT lease_pets_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: lease_prepaid_credits lease_prepaid_credits_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_prepaid_credits
+    ADD CONSTRAINT lease_prepaid_credits_pkey PRIMARY KEY (id);
 
 
 --
@@ -8469,6 +8603,14 @@ ALTER TABLE ONLY public.recurring_schedules
 
 
 --
+-- Name: remittance_applications remittance_applications_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.remittance_applications
+    ADD CONSTRAINT remittance_applications_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: reserve_fund_ledger reserve_fund_ledger_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -8706,6 +8848,14 @@ ALTER TABLE ONLY public.tenant_identifications
 
 ALTER TABLE ONLY public.tenant_notifications
     ADD CONSTRAINT tenant_notifications_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: tenant_remittances tenant_remittances_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_remittances
+    ADD CONSTRAINT tenant_remittances_pkey PRIMARY KEY (id);
 
 
 --
@@ -9669,6 +9819,13 @@ CREATE INDEX idx_business_pos_transactions_customer ON public.business_pos_trans
 
 
 --
+-- Name: idx_business_pos_tx_pi; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX idx_business_pos_tx_pi ON public.business_pos_transactions USING btree (stripe_payment_intent_id) WHERE (stripe_payment_intent_id IS NOT NULL);
+
+
+--
 -- Name: idx_business_quote_lines_quote; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -9715,6 +9872,13 @@ CREATE INDEX idx_business_quotes_vehicle ON public.business_quotes USING btree (
 --
 
 CREATE INDEX idx_business_quotes_work_order ON public.business_quotes USING btree (work_order_id) WHERE (work_order_id IS NOT NULL);
+
+
+--
+-- Name: idx_business_terminal_readers_business; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_business_terminal_readers_business ON public.business_terminal_readers USING btree (business_id) WHERE (status = 'active'::text);
 
 
 --
@@ -10583,6 +10747,13 @@ CREATE INDEX idx_lease_occupants_lease ON public.lease_occupants USING btree (le
 --
 
 CREATE INDEX idx_lease_pets_lease ON public.lease_pets USING btree (lease_id);
+
+
+--
+-- Name: idx_lease_prepaid_credits_lease; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_lease_prepaid_credits_lease ON public.lease_prepaid_credits USING btree (lease_id);
 
 
 --
@@ -11510,6 +11681,20 @@ CREATE INDEX idx_recurring_schedules_customer ON public.recurring_schedules USIN
 
 
 --
+-- Name: idx_remittance_applications_payment; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_remittance_applications_payment ON public.remittance_applications USING btree (payment_id);
+
+
+--
+-- Name: idx_remittance_applications_remittance; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_remittance_applications_remittance ON public.remittance_applications USING btree (remittance_id);
+
+
+--
 -- Name: idx_route_stops_appointment; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -11696,6 +11881,20 @@ CREATE INDEX idx_sublessor_credit_balances_tenant ON public.sublessor_credit_bal
 --
 
 CREATE INDEX idx_tenant_identifications_tenant ON public.tenant_identifications USING btree (tenant_id);
+
+
+--
+-- Name: idx_tenant_remittances_pi; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_tenant_remittances_pi ON public.tenant_remittances USING btree (stripe_payment_intent_id);
+
+
+--
+-- Name: idx_tenant_remittances_tenant; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_tenant_remittances_tenant ON public.tenant_remittances USING btree (tenant_id);
 
 
 --
@@ -13458,6 +13657,14 @@ ALTER TABLE ONLY public.business_invoices
 
 
 --
+-- Name: business_platform_fee_accruals business_platform_fee_accruals_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_platform_fee_accruals
+    ADD CONSTRAINT business_platform_fee_accruals_business_id_fkey FOREIGN KEY (business_id) REFERENCES public.businesses(id);
+
+
+--
 -- Name: business_pos_sequences business_pos_sequences_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -13631,6 +13838,14 @@ ALTER TABLE ONLY public.business_recurring_invoice_schedules
 
 ALTER TABLE ONLY public.business_recurring_invoice_schedules
     ADD CONSTRAINT business_recurring_invoice_schedules_last_invoice_id_fkey FOREIGN KEY (last_invoice_id) REFERENCES public.business_invoices(id) ON DELETE SET NULL;
+
+
+--
+-- Name: business_terminal_readers business_terminal_readers_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.business_terminal_readers
+    ADD CONSTRAINT business_terminal_readers_business_id_fkey FOREIGN KEY (business_id) REFERENCES public.businesses(id);
 
 
 --
@@ -14847,6 +15062,30 @@ ALTER TABLE ONLY public.lease_occupants
 
 ALTER TABLE ONLY public.lease_pets
     ADD CONSTRAINT lease_pets_lease_id_fkey FOREIGN KEY (lease_id) REFERENCES public.leases(id) ON DELETE CASCADE;
+
+
+--
+-- Name: lease_prepaid_credits lease_prepaid_credits_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_prepaid_credits
+    ADD CONSTRAINT lease_prepaid_credits_lease_id_fkey FOREIGN KEY (lease_id) REFERENCES public.leases(id);
+
+
+--
+-- Name: lease_prepaid_credits lease_prepaid_credits_source_remittance_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_prepaid_credits
+    ADD CONSTRAINT lease_prepaid_credits_source_remittance_id_fkey FOREIGN KEY (source_remittance_id) REFERENCES public.tenant_remittances(id);
+
+
+--
+-- Name: lease_prepaid_credits lease_prepaid_credits_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_prepaid_credits
+    ADD CONSTRAINT lease_prepaid_credits_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id);
 
 
 --
@@ -16322,6 +16561,22 @@ ALTER TABLE ONLY public.recurring_schedules
 
 
 --
+-- Name: remittance_applications remittance_applications_payment_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.remittance_applications
+    ADD CONSTRAINT remittance_applications_payment_id_fkey FOREIGN KEY (payment_id) REFERENCES public.payments(id);
+
+
+--
+-- Name: remittance_applications remittance_applications_remittance_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.remittance_applications
+    ADD CONSTRAINT remittance_applications_remittance_id_fkey FOREIGN KEY (remittance_id) REFERENCES public.tenant_remittances(id) ON DELETE CASCADE;
+
+
+--
 -- Name: route_stops route_stops_appointment_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -16615,6 +16870,30 @@ ALTER TABLE ONLY public.tenant_identifications
 
 ALTER TABLE ONLY public.tenant_notifications
     ADD CONSTRAINT tenant_notifications_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: tenant_remittances tenant_remittances_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_remittances
+    ADD CONSTRAINT tenant_remittances_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id);
+
+
+--
+-- Name: tenant_remittances tenant_remittances_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_remittances
+    ADD CONSTRAINT tenant_remittances_lease_id_fkey FOREIGN KEY (lease_id) REFERENCES public.leases(id);
+
+
+--
+-- Name: tenant_remittances tenant_remittances_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_remittances
+    ADD CONSTRAINT tenant_remittances_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id);
 
 
 --
@@ -17213,5 +17492,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict FtIjsszd26h8kC1uECBBitZXR6yAEOLc0fRgSJ1aoQApF1tJcuJGSPEAp7XrOJJ
+\unrestrict OlxxBUlmTdKiToJb5GJ8QGiBpmYW8uBnP3JVIiCMKLGhMflu64jVg21Ej12FDxK
 

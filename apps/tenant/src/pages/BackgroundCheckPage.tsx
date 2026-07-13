@@ -3,6 +3,7 @@ import { useQuery, useMutation } from 'react-query'
 import { Shield, Upload, Check, AlertCircle, Lock, Clock, XCircle } from 'lucide-react'
 import { loadStripe, Stripe as StripeJs } from '@stripe/stripe-js'
 import { Elements, PaymentElement, useStripe, useElements } from '@stripe/react-stripe-js'
+import { humanize } from '@gam/shared'
 
 const API = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
 
@@ -546,7 +547,7 @@ export function BackgroundCheckPage() {
               {idNameMatch.dobMismatch && <div style={{color:'#ef4444',fontSize:'.78rem',fontWeight:600,marginTop:6}}>✗ Date of birth does not match ID</div>}
               {idNameMatch.expired && <div style={{color:'#ef4444',fontSize:'.78rem',fontWeight:600,marginTop:6}}>⚠️ ID appears to be expired — please use a valid ID</div>}
               {idNameMatch.expirationDate && !idNameMatch.expired && <div style={{color:'#22c55e',fontSize:'.78rem',marginTop:6}}>✓ ID valid until {new Date(idNameMatch.expirationDate).toLocaleDateString()}</div>}
-              {idNameMatch.idType && <div style={{color:'#4a5568',fontSize:'.72rem',marginTop:4}}>Document type: {idNameMatch.idType.replace(/_/g,' ')}</div>}
+              {idNameMatch.idType && <div style={{color:'#4a5568',fontSize:'.72rem',marginTop:4}}>Document type: {humanize(idNameMatch.idType)}</div>}
             </div>
           )}
         </div>}

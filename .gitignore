@@ -18,3 +18,6 @@ CLAUDE.md
 apps/*/vite.config.js
 apps/*/vite.config.d.ts
 .vercel
+
+# DB checkpoint dumps are local reset assets — never in git (real data)
+deploy/*.dump

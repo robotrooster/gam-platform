@@ -24,6 +24,7 @@ import type { PoolClient } from 'pg'
 import { getClient, queryOne } from '../../db'
 import { emailTenantOnboarded } from '../../services/email'
 import { AppError } from '../../middleware/errorHandler'
+import { assertLateFeeDecisionForUnit } from '../../services/lateFeePolicy'
 import { extractUploadFilename } from '../../lib/uploadPaths'
 import type {
   ParserOutput, ParserExtractedField,
@@ -129,6 +130,10 @@ export async function resolveIntent(
     throw new AppError(404, `Unit not found in your portfolio: ${merged.unit.propertyName.value} - ${merged.unit.unitNumber.value}`)
   }
 
+  // S537 gate: no import onto an UNDECIDED late-fee class — the landlord
+  // decides the class policy before any tenant can be onboarded to it.
+  await assertLateFeeDecisionForUnit(unit.id)
+
   // 4. Cross-landlord active lease check (block).
   const userTenant = await queryOne<{ user_id: string; tenant_id: string }>(
     `SELECT u.id AS user_id, t.id AS tenant_id
@@ -197,8 +202,12 @@ export async function resolveIntent(
       [
         unit.id, landlordId,
         lease.leaseStart.value, lease.leaseEnd?.value || null, lease.monthlyRent.value,
-        lease.lateFeeAmount?.value ?? 15.00,
-        lease.lateFeeGraceDays?.value ?? 5,
+        // S537 (Nic): NEVER invent a late fee. Lease-is-law — a document
+        // silent on late fees means NO late fee for this tenancy (it can
+        // pick up the class policy at renewal). Pre-fix this defaulted to
+        // $15.00/5 days, billing a charge the signed paper never printed.
+        lease.lateFeeAmount?.value ?? null,
+        lease.lateFeeAmount?.value != null ? (lease.lateFeeGraceDays?.value ?? 5) : null,
         lease.leaseType?.value || 'fixed_term',
         arBool, arMode,
         lease.noticeDaysRequired?.value ?? 30,

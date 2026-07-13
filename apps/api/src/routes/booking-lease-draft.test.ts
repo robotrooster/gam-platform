@@ -9,7 +9,7 @@ import express from 'express'
 import request from 'supertest'
 import jwt from 'jsonwebtoken'
 import { db } from '../db'
-import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit } from '../test/dbHelpers'
+import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedLateFeeDecision } from '../test/dbHelpers'
 import { unitsRouter } from './units'
 import { errorHandler } from '../middleware/errorHandler'
 
@@ -121,12 +121,25 @@ describe('POST /units — storage size + RV defaults (S526)', () => {
   it('storage unit stores its size; rv unit is bookable with all stay lengths', async () => {
     const f = await seed()
     const app = buildApp()
+    // S537 gate: POST /units refuses undecided late-fee classes — seed
+    // explicit no-fee decisions for the two classes this test creates.
+    {
+      const client = await db.connect()
+      try {
+        const propId = (await client.query(`SELECT property_id FROM units WHERE id=$1`, [f.unitId])).rows[0].property_id
+        await seedLateFeeDecision(client, { propertyId: propId, unitType: 'storage', noLateFee: true })
+        await seedLateFeeDecision(client, { propertyId: propId, unitType: 'rv_spot', noLateFee: true })
+      } finally { client.release() }
+    }
     const stor = await request(app).post('/api/units')
       .set('Authorization', `Bearer ${f.token}`)
       .send({ propertyId: (await db.query(`SELECT property_id FROM units WHERE id=$1`, [f.unitId])).rows[0].property_id,
               unitNumber: 'S-1', unitType: 'storage', rentAmount: 80, storageSize: '10x10' })
     expect(stor.status).toBe(201)
     expect(stor.body.data.storage_size).toBe('10x10')
+    // S538: storage is locked out of short-term rental at creation.
+    expect(stor.body.data.lease_types_allowed).toEqual(['month_to_month', 'long_term'])
+    expect(stor.body.data.is_bookable).toBe(false)
 
     const rv = await request(app).post('/api/units')
       .set('Authorization', `Bearer ${f.token}`)

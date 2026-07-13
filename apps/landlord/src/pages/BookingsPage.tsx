@@ -4,7 +4,7 @@ import { useNavigate } from 'react-router-dom'
 import { CalendarRange, Search, ArrowRight, FileSignature, CheckCircle2, AlertTriangle, MessageSquare, Check, X, QrCode, Copy, Mail, Ban } from 'lucide-react'
 import { apiGet, apiPatch, apiPost, apiDelete } from '../lib/api'
 import { usePerms } from '../lib/permissions'
-import { BOOKING_CHANGE_REQUEST_TYPE_LABEL, type BookingChangeRequestType } from '@gam/shared'
+import { BOOKING_CHANGE_REQUEST_TYPE_LABEL, humanize, type BookingChangeRequestType } from '@gam/shared'
 
 type Booking = {
   id: string
@@ -416,7 +416,7 @@ export function BookingsPage() {
             <tbody>
               {list.map(b => (
                 <tr key={b.id}>
-                  <td><span className={`badge ${STATUS_BADGE[b.status] || 'badge-muted'}`}>{b.status.replace('_', ' ')}</span></td>
+                  <td><span className={`badge ${STATUS_BADGE[b.status] || 'badge-muted'}`}>{humanize(b.status)}</span></td>
                   <td>
                     <div style={{ color: 'var(--text-0)', fontWeight: 600 }}>{b.guestName || '—'}</div>
                     <div style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>{b.guestEmail || ''}</div>
@@ -433,7 +433,7 @@ export function BookingsPage() {
                   <td className="mono" style={{ color: 'var(--text-0)' }}>{fmt(b.totalAmount)}</td>
                   <td>
                     <span style={{ fontSize: '.72rem', color: 'var(--text-2)', textTransform: 'capitalize' }}>
-                      {b.source.replace('_', '.')}
+                      {humanize(b.source)}
                     </span>
                   </td>
                   <td>

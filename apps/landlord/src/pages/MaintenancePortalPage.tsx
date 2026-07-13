@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
+import { humanize } from '@gam/shared'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
 import { Clock, CheckCircle, Package, ShoppingCart, Calendar, Wrench, Plus, User, AlertTriangle } from 'lucide-react'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
@@ -131,8 +132,8 @@ export function MaintenancePortalPage() {
                     <td><div style={{ fontWeight:600 }}>{o.propertyName}</div><div style={{ fontSize:'.72rem', color:'var(--text-3)' }}>Unit {o.unitNumber}</div></td>
                     <td style={{ maxWidth:200 }}><div style={{ fontWeight:600, fontSize:'.82rem' }}>{o.title}</div><div style={{ fontSize:'.72rem', color:'var(--text-3)', overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{o.description}</div></td>
                     <td style={{ fontSize:'.78rem' }}><div>{o.tenantName||'—'}</div>{o.tenantPhone&&<div style={{ color:'var(--text-3)' }}>{o.tenantPhone}</div>}</td>
-                    <td><span className={`badge ${PRIORITY_COLORS[o.priority]||'badge-muted'}`}>{o.priority}</span></td>
-                    <td><span className="badge badge-amber">{o.status}</span></td>
+                    <td><span className={`badge ${PRIORITY_COLORS[o.priority]||'badge-muted'}`}>{humanize(o.priority)}</span></td>
+                    <td><span className="badge badge-amber">{humanize(o.status)}</span></td>
                   </tr>
                 ))}
               </tbody>
@@ -261,7 +262,7 @@ export function MaintenancePortalPage() {
                         <td><div style={{ fontWeight:600 }}>{p.requestedByName}</div><div style={{ fontSize:'.7rem', color:'var(--text-3)' }}>{new Date(p.createdAt).toLocaleDateString()}</div></td>
                         <td style={{ fontSize:'.78rem' }}>{items.map((i:any)=>i.name).join(', ')}</td>
                         <td className="mono" style={{ fontSize:'.78rem' }}>{p.totalEstimate ? fmt(p.totalEstimate) : '—'}</td>
-                        <td><span className={`badge ${p.status==='approved'?'badge-green':p.status==='denied'?'badge-red':p.status==='purchased'?'badge-blue':'badge-amber'}`}>{p.status}</span></td>
+                        <td><span className={`badge ${p.status==='approved'?'badge-green':p.status==='denied'?'badge-red':p.status==='purchased'?'badge-blue':'badge-amber'}`}>{humanize(p.status)}</span></td>
                         <td>
                           {p.status==='pending' && (
                             <div style={{ display:'flex', gap:6 }}>

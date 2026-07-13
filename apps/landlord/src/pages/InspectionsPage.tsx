@@ -5,6 +5,7 @@ import { ClipboardCheck, Plus, CheckCircle2 } from 'lucide-react'
 import { apiGet } from '../lib/api'
 import { usePerms } from '../lib/permissions'
 import type { InspectionType } from '@gam/shared'
+import { humanize } from '@gam/shared'
 
 type InspectionRow = {
   id: string
@@ -130,7 +131,7 @@ export function InspectionsPage() {
               {filtered.map(r => (
                 <tr key={r.id}>
                   <td><strong>{TYPE_LABEL[r.inspectionType] || r.inspectionType}</strong></td>
-                  <td><span className={`badge ${STATUS_BADGE[r.status] || 'badge-muted'}`}>{r.status.replace('_', ' ')}</span></td>
+                  <td><span className={`badge ${STATUS_BADGE[r.status] || 'badge-muted'}`}>{humanize(r.status)}</span></td>
                   <td>
                     {r.unitNumber ?? '—'}
                     {r.propertyName && <span style={{ fontSize: '.72rem', color: 'var(--text-3)' }}> · {r.propertyName}</span>}

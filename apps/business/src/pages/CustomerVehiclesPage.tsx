@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react'
+import { humanize } from '@gam/shared'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
+import { appConfirm } from '../components/dialogs'
 import { Modal } from '../components/Modal'
 import { Plus, ChevronRight, ArrowLeft, Search, Pencil, Archive, Car } from 'lucide-react'
 
@@ -201,7 +203,7 @@ function VehicleDetailView({
   useEffect(() => { reload() }, [id])
 
   const onArchive = async () => {
-    if (!window.confirm('Archive this vehicle? It stays on record but won\'t show in lists.')) return
+    if (!(await appConfirm('Archive this vehicle? It stays on record but won\'t show in lists.', { danger: true, confirmLabel: 'Archive' }))) return
     try {
       await apiPost(`/business-vehicles/${id}/archive`)
       onBack()
@@ -280,7 +282,7 @@ function VehicleDetailView({
                 <tr key={w.id} style={{ borderBottom: '1px solid var(--border-0)' }}>
                   <td style={{ ...tdStyle, fontFamily: 'var(--font-mono)' as const }}>{w.woNumber}</td>
                   <td style={tdStyle}>{fmtDate(w.createdAt)}</td>
-                  <td style={{ ...tdStyle, fontSize: 12, textTransform: 'capitalize' as const }}>{w.status.replace('_', ' ')}</td>
+                  <td style={{ ...tdStyle, fontSize: 12, textTransform: 'capitalize' as const }}>{humanize(w.status)}</td>
                   <td style={{ ...tdStyle, fontSize: 12, color: 'var(--text-2)' }}>
                     {w.complaint ? (w.complaint.length > 50 ? w.complaint.slice(0, 50) + '…' : w.complaint) : <span style={{ color: 'var(--text-3)' }}>—</span>}
                   </td>

@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useParams, useNavigate } from 'react-router-dom'
 import { ArrowLeft, AlertTriangle, CheckCircle2, X } from 'lucide-react'
+import { humanize } from '@gam/shared'
 import { apiGet, apiPost } from '../lib/api'
 
 type TerminationQuote = {
@@ -110,7 +111,7 @@ export function LeaseTerminationPage() {
               r.status === 'requested' ? 'badge-amber' :
               r.status === 'failed' ? 'badge-red' :
               'badge-muted'
-            }`}>{r.status.replace('_', ' ')}</span>
+            }`}>{humanize(r.status)}</span>
             <span style={{ fontSize: '.78rem', color: 'var(--text-3)' }}>
               requested {new Date(r.requestedAt).toLocaleString()}
             </span>
@@ -118,7 +119,7 @@ export function LeaseTerminationPage() {
 
           <div style={{ display: 'grid', gridTemplateColumns: '160px 1fr', gap: 8, fontSize: '.85rem', marginBottom: 12 }}>
             <div style={{ color: 'var(--text-3)' }}>Fee</div>
-            <div className="mono">{fmt(r.feeAmount)} ({r.feeBasis.replace('_', ' ')})</div>
+            <div className="mono">{fmt(r.feeAmount)} ({humanize(r.feeBasis)})</div>
             {r.reason && <>
               <div style={{ color: 'var(--text-3)' }}>Tenant reason</div>
               <div style={{ fontStyle: 'italic' }}>"{r.reason}"</div>

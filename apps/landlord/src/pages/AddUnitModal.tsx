@@ -8,6 +8,7 @@ import {
   PropertyUnitSubtype, unitSubtypeFactsLabel,
   METER_READING_DIGIT_OPTIONS, METER_READING_DEFAULT_DIGITS,
 } from '@gam/shared'
+import { toast } from '../components/dialogs'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
 interface Props { onClose: () => void; preselectedPropertyId?: string }
@@ -87,7 +88,7 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
               })
               await apiPost(`/utility/meters/${meterRes.data.id}/units`, { unitId: u.id })
             } catch (e: any) {
-              alert(e?.response?.data?.error || `Could not create the ${utility} meter for ${u.unitNumber ?? u.unit_number}`)
+              toast.error(e?.response?.data?.error || `Could not create the ${utility} meter for ${u.unitNumber ?? u.unit_number}`)
             }
           }
         }

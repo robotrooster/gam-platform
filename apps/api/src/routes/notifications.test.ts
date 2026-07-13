@@ -44,7 +44,7 @@ function buildApp() {
 beforeEach(async () => {
   await cleanupAllSchema()
   sendBulkMock.mockReset()
-  sendBulkMock.mockResolvedValue({ sentTo: 3, emailSent: 0, smsSent: 0 })
+  sendBulkMock.mockResolvedValue({ sentTo: 3, emailSent: 0 })
   process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_jwt_secret_notifications'
 })
 
@@ -208,8 +208,8 @@ describe('GET /api/notifications/preferences', () => {
   it('returns the caller\'s preference rows', async () => {
     const f = await seed()
     await db.query(
-      `INSERT INTO notification_preferences (user_id, type, email_enabled, sms_enabled, in_app_enabled)
-       VALUES ($1, 'rent_due', TRUE, FALSE, TRUE)`,
+      `INSERT INTO notification_preferences (user_id, type, email_enabled, in_app_enabled)
+       VALUES ($1, 'rent_due', TRUE, FALSE)`,
       [f.landlordUserId])
     const res = await request(buildApp()).get('/api/notifications/preferences')
       .set('Authorization', `Bearer ${f.landlordToken}`)
@@ -217,7 +217,6 @@ describe('GET /api/notifications/preferences', () => {
     expect(res.body.data).toHaveLength(1)
     expect(res.body.data[0].type).toBe('rent_due')
     expect(res.body.data[0].email_enabled).toBe(true)
-    expect(res.body.data[0].sms_enabled).toBe(false)
   })
 
   it('returns [] when caller has no preferences set', async () => {
@@ -231,8 +230,8 @@ describe('GET /api/notifications/preferences', () => {
   it('does not leak another user\'s preferences', async () => {
     const f = await seed()
     await db.query(
-      `INSERT INTO notification_preferences (user_id, type, email_enabled, sms_enabled, in_app_enabled)
-       VALUES ($1, 'rent_due', TRUE, TRUE, TRUE)`,
+      `INSERT INTO notification_preferences (user_id, type, email_enabled, in_app_enabled)
+       VALUES ($1, 'rent_due', TRUE, TRUE)`,
       [f.otherUserId])
     const res = await request(buildApp()).get('/api/notifications/preferences')
       .set('Authorization', `Bearer ${f.landlordToken}`)
@@ -249,14 +248,14 @@ describe('PATCH /api/notifications/preferences', () => {
     const res = await request(buildApp())
       .patch('/api/notifications/preferences')
       .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ type: 'rent_due', emailEnabled: false, smsEnabled: true, inAppEnabled: true })
+      .send({ type: 'rent_due', emailEnabled: false, inAppEnabled: true })
     expect(res.status).toBe(200)
     const { rows } = await db.query<any>(
-      `SELECT email_enabled, sms_enabled, in_app_enabled FROM notification_preferences
+      `SELECT email_enabled, in_app_enabled FROM notification_preferences
         WHERE user_id=$1 AND type=$2`, [f.landlordUserId, 'rent_due'])
     expect(rows).toHaveLength(1)
     expect(rows[0]).toMatchObject({
-      email_enabled: false, sms_enabled: true, in_app_enabled: true,
+      email_enabled: false, in_app_enabled: true,
     })
   })
 
@@ -265,18 +264,18 @@ describe('PATCH /api/notifications/preferences', () => {
     await request(buildApp())
       .patch('/api/notifications/preferences')
       .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ type: 'rent_due', emailEnabled: true, smsEnabled: true, inAppEnabled: true })
+      .send({ type: 'rent_due', emailEnabled: true, inAppEnabled: true })
     const res = await request(buildApp())
       .patch('/api/notifications/preferences')
       .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ type: 'rent_due', emailEnabled: false, smsEnabled: false, inAppEnabled: false })
+      .send({ type: 'rent_due', emailEnabled: false, inAppEnabled: false })
     expect(res.status).toBe(200)
     const { rows } = await db.query<any>(
-      `SELECT email_enabled, sms_enabled, in_app_enabled FROM notification_preferences
+      `SELECT email_enabled, in_app_enabled FROM notification_preferences
         WHERE user_id=$1 AND type=$2`, [f.landlordUserId, 'rent_due'])
     expect(rows).toHaveLength(1)
     expect(rows[0]).toMatchObject({
-      email_enabled: false, sms_enabled: false, in_app_enabled: false,
+      email_enabled: false, in_app_enabled: false,
     })
   })
 })

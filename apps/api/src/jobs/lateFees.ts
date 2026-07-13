@@ -25,12 +25,14 @@ import {
 } from '@gam/shared'
 import { registerEngine } from './timezoneCronManager'
 import { logger } from '../lib/logger'
+import { resolveLateFeePolicyForUnit, type ResolvedLateFeePolicy } from '../services/lateFeePolicy'
 
 interface QualifyingInvoice {
   invoice_id: number
   lease_id: number
   landlord_id: string
   unit_id: string | null
+  resolved_unit_id: string
   tenant_id: string | null
   due_date: string
   today_local: string
@@ -79,6 +81,7 @@ export async function generateLateFeesForTimezone(
         i.lease_id,
         i.landlord_id,
         i.unit_id,
+        u.id AS resolved_unit_id,
         i.tenant_id,
         i.due_date::text AS due_date,
         (NOW() AT TIME ZONE p.timezone)::date::text AS today_local,
@@ -100,6 +103,26 @@ export async function generateLateFeesForTimezone(
         AND l.late_fee_initial_amount IS NOT NULL
         AND (NOW() AT TIME ZONE p.timezone)::date
             >= (i.due_date + (COALESCE(l.late_fee_grace_days, 5) || ' days')::interval)::date
+        -- S537 (Nic): late fees track UNPAID BASE CHARGES, never themselves.
+        -- (a) Stop accruing once every non-late-fee child is settled — a
+        --     partial invoice whose only open child is the late fee itself
+        --     must not snowball daily forever.
+        AND EXISTS (
+          SELECT 1 FROM payments pb
+           WHERE pb.invoice_id = i.id AND pb.type != 'late_fee'
+             AND pb.status NOT IN ('settled')
+        )
+        -- (b) Postmark rule: an in-flight payment (ACH 'processing' takes
+        --     2-4 business days) counts as paid on its initiation date. No
+        --     fee while it clears; if it FAILS the child flips to a
+        --     non-settled status and the next nightly run back-fills every
+        --     missed tick since the due date — fees land retroactively,
+        --     which is the correct outcome for a bounced payment.
+        AND NOT EXISTS (
+          SELECT 1 FROM payments pf
+           WHERE pf.invoice_id = i.id AND pf.type != 'late_fee'
+             AND pf.status = 'processing'
+        )
     `, [tz])
 
     result.invoicesScanned = invoices.length
@@ -123,6 +146,47 @@ export async function generateLateFeesForTimezone(
   return result
 }
 
+/**
+ * S537 (Nic): uniformity enforcement. The signed lease is the billing
+ * source (lease-is-law) but the CURRENT (property, unit_type) policy is a
+ * hard ceiling: total late fees billed on an invoice never exceed what the
+ * class policy itself would have produced by today. Cumulative comparison
+ * (not per-field) so mismatched types/periods/grace between an imported
+ * lease and the policy always resolve tenant-favorably:
+ *   billed_total <= min(lease_schedule(today), policy_schedule(today)).
+ * No policy (explicit no-fee decision, undecided class, or master toggle
+ * off) => budget 0 => nothing bills, regardless of what the lease says.
+ */
+function policyScheduleTotal(
+  policy: ResolvedLateFeePolicy,
+  rentAmount: number,
+  dueDate: string,
+  today: string,
+): number {
+  const graceDays = policy.late_fee_grace_days ?? 5
+  const initialDate = lateFeeStartDate(dueDate, graceDays)
+  if (today < initialDate) return 0
+  let total = computeLateFeeAmount(
+    policy.late_fee_initial_type, Number(policy.late_fee_initial_amount), rentAmount)
+  if (policy.late_fee_accrual_type !== null &&
+      policy.late_fee_accrual_amount !== null &&
+      policy.late_fee_accrual_period !== null) {
+    const MAX_OCCURRENCES = 5000
+    for (let occ = 1; occ <= MAX_OCCURRENCES; occ++) {
+      const tickDate = nextAccrualDate(dueDate, graceDays, policy.late_fee_accrual_period, occ)
+      if (tickDate > today) break
+      total += computeLateFeeAmount(
+        policy.late_fee_accrual_type, Number(policy.late_fee_accrual_amount), rentAmount)
+    }
+  }
+  if (policy.late_fee_cap_amount !== null) {
+    const capTotal = computeLateFeeAmount(
+      policy.late_fee_cap_type ?? 'flat', Number(policy.late_fee_cap_amount), rentAmount)
+    total = Math.min(total, capTotal)
+  }
+  return total
+}
+
 async function processInvoice(
   client: PoolClient,
   inv: QualifyingInvoice,
@@ -138,6 +202,11 @@ async function processInvoice(
   `, [inv.invoice_id])
   const rentAmount = rentRows.length > 0 ? Number(rentRows[0].amount) : 0
 
+  // S537 policy ceiling — resolve the class policy and compute its budget.
+  const policy = await resolveLateFeePolicyForUnit(inv.resolved_unit_id, client)
+  const policyBudget = policy ? policyScheduleTotal(policy, rentAmount, inv.due_date, today) : 0
+  if (policyBudget <= 0) return
+
   const { rows: existingFees } = await client.query<{ amount: string; due_date: string }>(`
     SELECT amount::text AS amount, due_date::text AS due_date
     FROM payments
@@ -152,10 +221,12 @@ async function processInvoice(
   const capKind = inv.late_fee_cap_type
   const capAmt = inv.late_fee_cap_amount !== null ? Number(inv.late_fee_cap_amount) : null
   let remaining = capRemaining(capKind, capAmt, rentAmount, existingSum)
+  let remainingPolicy = policyBudget - existingSum
 
   if (capKind !== null && remaining <= 0) {
     return
   }
+  if (remainingPolicy <= 0) return
 
   const graceDays = inv.late_fee_grace_days
   const initialDate = lateFeeStartDate(inv.due_date, graceDays)
@@ -172,16 +243,19 @@ async function processInvoice(
       initialAmt = remaining
       capHitOnInitial = true
     }
+    if (initialAmt > remainingPolicy) initialAmt = remainingPolicy // S537 ceiling
     if (initialAmt > 0) {
       await insertLateFeeRow(client, inv, initialDate, initialAmt)
       result.rowsWritten += 1
       existingSum += initialAmt
       existingDates.add(initialDate)
       remaining = capRemaining(capKind, capAmt, rentAmount, existingSum)
+      remainingPolicy = policyBudget - existingSum
       if (capHitOnInitial) {
         result.capsHit += 1
         return
       }
+      if (remainingPolicy <= 0) return
     }
   }
 
@@ -212,6 +286,7 @@ async function processInvoice(
       tickAmt = remaining
       capHit = true
     }
+    if (tickAmt > remainingPolicy) tickAmt = remainingPolicy // S537 ceiling
     if (tickAmt <= 0) break
 
     await insertLateFeeRow(client, inv, tickDate, tickAmt)
@@ -219,11 +294,13 @@ async function processInvoice(
     existingSum += tickAmt
     existingDates.add(tickDate)
     remaining = capRemaining(capKind, capAmt, rentAmount, existingSum)
+    remainingPolicy = policyBudget - existingSum
 
     if (capHit) {
       result.capsHit += 1
       break
     }
+    if (remainingPolicy <= 0) break
   }
 }
 

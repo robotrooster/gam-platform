@@ -13,6 +13,7 @@
 
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
+import { humanize } from '@gam/shared'
 import { apiGet, apiPost } from '../lib/api'
 import { usePerms } from '../lib/permissions'
 
@@ -166,7 +167,7 @@ export function ApplicantPoolPage() {
                   <div style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>{c.zip || ''}</div>
                 </td>
                 <td style={{ fontSize: '.82rem', textTransform: 'capitalize' }}>
-                  {c.employmentStatus?.replace(/_/g, ' ') || '—'}
+                  {humanize(c.employmentStatus) || '—'}
                 </td>
                 <td className="mono">{fmt(c.monthlyIncome)}</td>
                 <td>

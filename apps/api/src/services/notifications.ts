@@ -2,13 +2,9 @@ import { query, queryOne } from '../db'
 import { sendNotificationEmail } from './email'
 import { logger } from '../lib/logger'
 
-// SMS is still stubbed — no Twilio account wired. When Twilio (or another
-// SMS provider) is selected, replace this stub with a real send + add log
-// rows to email_send_log (or a sibling sms_send_log) so failures surface
-// in the same dashboard.
-async function sendSMS(to: string, body: string) {
-  logger.info(`[SMS-STUB] To: ${to} | ${body}`)
-}
+// S536 (Nic): SMS is REMOVED platform-wide — notifications and
+// receipts go by email or in-app only. Do not reintroduce an SMS
+// channel or provider.
 
 function emailTemplate(title: string, body: string, cta?: { label: string; url: string }) {
   return `<!DOCTYPE html><html><head><meta charset="utf-8"><style>
@@ -40,19 +36,17 @@ export async function createNotification(p: {
   // the bell falls back to a per-type route when absent.
   actionUrl?: string
   sendEmail?: boolean; emailTo?: string; emailSubject?: string; emailHtml?: string
-  sendSMS?: boolean; smsTo?: string; smsBody?: string
 }) {
   try {
     const prefs = await queryOne<any>('SELECT * FROM notification_preferences WHERE user_id=$1 AND type=$2', [p.userId, p.type])
     const emailOk = prefs ? prefs.email_enabled : true
-    const smsOk   = prefs ? prefs.sms_enabled : false
     const inAppOk = prefs ? prefs.in_app_enabled : true
 
     // Capture the inserted notification id so the post-send flag updates can
     // target this exact row instead of the previously-broken
     // `UPDATE ... ORDER BY created_at LIMIT 1` shape (MySQL syntax; not
     // valid on PostgreSQL UPDATE — would throw and leave the email_sent
-    // and sms_sent flags forever FALSE).
+    // flags forever FALSE).
     let notificationId: string | null = null
     if (inAppOk) {
       const ins = await queryOne<{ id: string }>(
@@ -82,17 +76,11 @@ export async function createNotification(p: {
         await query("UPDATE notifications SET email_sent=TRUE, email_sent_at=NOW() WHERE id=$1", [notificationId])
       }
     }
-    if (smsOk && p.sendSMS && p.smsTo) {
-      await sendSMS(p.smsTo, p.smsBody||p.body)
-      if (notificationId) {
-        await query("UPDATE notifications SET sms_sent=TRUE, sms_sent_at=NOW() WHERE id=$1", [notificationId])
-      }
-    }
   } catch (e) { logger.error({ err: e }, '[NOTIFY]') }
 }
 
 export async function notifyRentCollected(o: { landlordUserId:string; landlordId:string; landlordEmail:string; landlordPhone?:string; tenantName:string; unitNumber:string; propertyName:string; amount:number }) {
-  await createNotification({ userId:o.landlordUserId, landlordId:o.landlordId, type:'rent_collected', title:`Rent Collected — Unit ${o.unitNumber}`, body:`${o.tenantName} paid $${o.amount.toFixed(2)} for Unit ${o.unitNumber} at ${o.propertyName}.`, data:o, sendEmail:true, emailTo:o.landlordEmail, emailSubject:`✅ Rent Collected — Unit ${o.unitNumber}`, emailHtml:emailTemplate(`Rent Collected — Unit ${o.unitNumber}`, `<b>${o.tenantName}</b> paid <b>$${o.amount.toFixed(2)}</b> for Unit ${o.unitNumber} at ${o.propertyName}.`), sendSMS:true, smsTo:o.landlordPhone, smsBody:`GAM: Rent $${o.amount.toFixed(2)} collected from ${o.tenantName}, Unit ${o.unitNumber}.` })
+  await createNotification({ userId:o.landlordUserId, landlordId:o.landlordId, type:'rent_collected', title:`Rent Collected — Unit ${o.unitNumber}`, body:`${o.tenantName} paid $${o.amount.toFixed(2)} for Unit ${o.unitNumber} at ${o.propertyName}.`, data:o, sendEmail:true, emailTo:o.landlordEmail, emailSubject:`✅ Rent Collected — Unit ${o.unitNumber}`, emailHtml:emailTemplate(`Rent Collected — Unit ${o.unitNumber}`, `<b>${o.tenantName}</b> paid <b>$${o.amount.toFixed(2)}</b> for Unit ${o.unitNumber} at ${o.propertyName}.`)})
 }
 
 // S125: ACH retry-scheduled notification. Fires when a payment fails on a
@@ -122,9 +110,7 @@ export async function notifyAchRetryScheduled(o: {
       `<div style="margin:12px 0;padding:10px;background:#0a0f14;border-left:3px solid #f59e0b;border-radius:6px;color:#b8c4d8">${o.reason}</div>` +
       `<p>We'll automatically retry the charge on <b>${o.retryDate}</b>. Please make sure your bank account has sufficient funds before then.</p>` +
       `<p style="font-size:.85rem;color:#4a5568">This is retry attempt ${o.retryAttempt} of 2 permitted by NACHA. If this retry also fails you'll need to update your payment method.</p>`
-    ),
-    sendSMS: true, smsTo: o.tenantPhone,
-    smsBody: `GAM: Payment of $${o.amount.toFixed(2)} failed. Retry on ${o.retryDate}. Ensure funds available.`,
+    )
   })
 
   // Landlord: shorter info-only copy
@@ -174,9 +160,7 @@ export async function notifyAchRetriesExhausted(o: {
       `<li>Update your payment method or bank account in the tenant portal</li>` +
       `<li>Contact your landlord directly to arrange payment</li>` +
       `</ul>`
-    ),
-    sendSMS: true, smsTo: o.tenantPhone,
-    smsBody: `GAM URGENT: Payment $${o.amount.toFixed(2)} cannot be auto-retried. Update payment method or contact landlord.`,
+    )
   })
 
   // Landlord: action-required, urgent
@@ -194,9 +178,7 @@ export async function notifyAchRetriesExhausted(o: {
       `<p><b>${o.tenantName}</b> payment of <b>$${o.amount.toFixed(2)}</b> for Unit ${o.unitNumber} has failed all NACHA-permitted retry attempts.</p>` +
       `<div style="margin:12px 0;padding:10px;background:#0a0f14;border-radius:6px;color:#b8c4d8">${o.reason}</div>` +
       `<p>The tenant has been notified to update their payment method. You may also want to contact them directly.</p>`
-    ),
-    sendSMS: true, smsTo: o.landlordPhone,
-    smsBody: `GAM ALERT: ${o.tenantName} Unit ${o.unitNumber} - payment $${o.amount.toFixed(2)} failed permanently. Manual review.`,
+    )
   })
 }
 
@@ -232,10 +214,7 @@ export async function notifyConnectPayoutPaid(o: {
       `Your Stripe Connect payout of <b>$${o.amount.toFixed(2)}</b> has been initiated.${
         o.arrivalDate ? `<br>Expected arrival: <b>${o.arrivalDate}</b>.` : ''
       }<br><br>You can review the transfer in your Banking page.`,
-    ),
-    sendSMS:       false,
-    smsTo:         o.userPhone,
-    smsBody:       `GAM: Payout $${o.amount.toFixed(2)} sent.${dateLine}`,
+    )
   })
 }
 
@@ -277,10 +256,7 @@ export async function notifyPmCompanyPayoutPaid(o: {
         `<b>${o.pmCompanyName}</b>'s Stripe Connect payout of <b>$${o.amount.toFixed(2)}</b> has been initiated.${
           o.arrivalDate ? `<br>Expected arrival: <b>${o.arrivalDate}</b>.` : ''
         }<br><br>Review the transfer in the Banking page.`,
-      ),
-      sendSMS:       false,
-      smsTo:         r.phone ?? undefined,
-      smsBody:       `GAM: ${o.pmCompanyName} payout $${o.amount.toFixed(2)} sent.${dateLine}`,
+      )
     })
   }
 }
@@ -318,10 +294,7 @@ export async function notifyPmCompanyPayoutFailed(o: {
           `<b>Reason:</b> ${o.reason}${o.failureCode ? ` (code: ${o.failureCode})` : ''}<br><br>` +
           `Verify the company's bank account details on the Banking page and re-initiate the payout, ` +
           `or contact support if the bank info looks correct.`,
-      ),
-      sendSMS:       true,
-      smsTo:         r.phone ?? undefined,
-      smsBody:       `GAM ALERT: ${o.pmCompanyName} payout $${o.amount.toFixed(2)} failed — ${o.reason}.`,
+      )
     })
   }
 }
@@ -350,17 +323,14 @@ export async function notifyConnectPayoutFailed(o: {
         `<b>Reason:</b> ${o.reason}${o.failureCode ? ` (code: ${o.failureCode})` : ''}<br><br>` +
         `Verify your bank account details on the Banking page and re-initiate the payout, ` +
         `or contact support if the bank info looks correct.`,
-    ),
-    sendSMS:       true,
-    smsTo:         o.userPhone,
-    smsBody:       `GAM ALERT: Payout $${o.amount.toFixed(2)} failed — ${o.reason}. Check Banking.`,
+    )
   })
 }
 
 export async function notifyMaintenanceUpdated(o: { tenantUserId:string; tenantEmail:string; tenantPhone?:string; unitNumber:string; requestTitle:string; newStatus:string; scheduledAt?:string; notes?:string }) {
   const labels: Record<string,string> = { assigned:'assigned', in_progress:'in progress', completed:'completed ✅', cancelled:'cancelled' }
   const label = labels[o.newStatus]||o.newStatus
-  await createNotification({ userId:o.tenantUserId, type:'maintenance_updated', title:`Maintenance ${o.newStatus==='completed'?'Completed':'Updated'} — ${o.requestTitle}`, body:`Your request "${o.requestTitle}" is now ${label}.${o.scheduledAt?` Scheduled: ${new Date(o.scheduledAt).toLocaleDateString()}.`:''}`, data:o, sendEmail:true, emailTo:o.tenantEmail, emailSubject:`🔧 Maintenance ${o.newStatus==='completed'?'Complete':'Update'}`, emailHtml:emailTemplate(`Maintenance ${o.newStatus==='completed'?'Completed':'Update'}`, `Your request <b>"${o.requestTitle}"</b> is now <b>${label}</b>.${o.scheduledAt?`<br>Scheduled: ${new Date(o.scheduledAt).toLocaleString()}`:''}${o.notes?`<br>Notes: ${o.notes}`:''}`), sendSMS:o.newStatus==='completed'||!!o.scheduledAt, smsTo:o.tenantPhone, smsBody:`GAM: Your maintenance "${o.requestTitle}" is ${label}.` })
+  await createNotification({ userId:o.tenantUserId, type:'maintenance_updated', title:`Maintenance ${o.newStatus==='completed'?'Completed':'Updated'} — ${o.requestTitle}`, body:`Your request "${o.requestTitle}" is now ${label}.${o.scheduledAt?` Scheduled: ${new Date(o.scheduledAt).toLocaleDateString()}.`:''}`, data:o, sendEmail:true, emailTo:o.tenantEmail, emailSubject:`🔧 Maintenance ${o.newStatus==='completed'?'Complete':'Update'}`, emailHtml:emailTemplate(`Maintenance ${o.newStatus==='completed'?'Completed':'Update'}`, `Your request <b>"${o.requestTitle}"</b> is now <b>${label}</b>.${o.scheduledAt?`<br>Scheduled: ${new Date(o.scheduledAt).toLocaleString()}`:''}${o.notes?`<br>Notes: ${o.notes}`:''}`) })
 }
 
 // S68: collapsed pre-S18 split (lease_expiring_60 / lease_expiring_30) into
@@ -369,7 +339,7 @@ export async function notifyMaintenanceUpdated(o: { tenantUserId:string; tenantE
 // expiration_notice_days, not a fixed 60/30-day cron.
 export async function notifyLeaseExpiring(o: { landlordUserId:string; landlordId:string; landlordEmail:string; landlordPhone?:string; tenantName:string; unitNumber:string; propertyName:string; endDate:string; daysRemaining:number; leaseId:string }) {
   const urgent = o.daysRemaining <= 30
-  await createNotification({ userId:o.landlordUserId, landlordId:o.landlordId, type:'lease_expiring', title:`${urgent?'⚠️ ':''}Lease Expiring in ${o.daysRemaining} Days — Unit ${o.unitNumber}`, body:`${o.tenantName}'s lease expires ${new Date(o.endDate).toLocaleDateString()}. ${urgent?'Take action soon — check your local notice requirements.':'Take action to renew or send non-renewal.'}`, data:{ ...o, urgent }, actionUrl:`/leases?open=${o.leaseId}`, sendEmail:true, emailTo:o.landlordEmail, emailSubject:`${urgent?'⚠️ URGENT: ':''}Lease Expiring ${o.daysRemaining} Days — Unit ${o.unitNumber}`, emailHtml:emailTemplate(`Lease Expiring in ${o.daysRemaining} Days`, `<b>${o.tenantName}'s</b> lease for Unit ${o.unitNumber} expires <b>${new Date(o.endDate).toLocaleDateString()}</b>.${urgent?'<br><br><b style="color:red">Act soon — check your local notice requirements for non-renewal.</b>':''}`), sendSMS:urgent, smsTo:o.landlordPhone, smsBody:`GAM: Lease expires ${o.daysRemaining} days — ${o.tenantName} Unit ${o.unitNumber}. Login to manage.` })
+  await createNotification({ userId:o.landlordUserId, landlordId:o.landlordId, type:'lease_expiring', title:`${urgent?'⚠️ ':''}Lease Expiring in ${o.daysRemaining} Days — Unit ${o.unitNumber}`, body:`${o.tenantName}'s lease expires ${new Date(o.endDate).toLocaleDateString()}. ${urgent?'Take action soon — check your local notice requirements.':'Take action to renew or send non-renewal.'}`, data:{ ...o, urgent }, actionUrl:`/leases?open=${o.leaseId}`, sendEmail:true, emailTo:o.landlordEmail, emailSubject:`${urgent?'⚠️ URGENT: ':''}Lease Expiring ${o.daysRemaining} Days — Unit ${o.unitNumber}`, emailHtml:emailTemplate(`Lease Expiring in ${o.daysRemaining} Days`, `<b>${o.tenantName}'s</b> lease for Unit ${o.unitNumber} expires <b>${new Date(o.endDate).toLocaleDateString()}</b>.${urgent?'<br><br><b style="color:red">Act soon — check your local notice requirements for non-renewal.</b>':''}`) })
 }
 
 export async function notifyLowStock(o: { landlordUserId:string; landlordId:string; landlordEmail:string; items:Array<{name:string;stock_qty:number;stock_min:number;vendor_name?:string}> }) {
@@ -408,9 +378,6 @@ export async function notifyInspectionReadyForTenant(o: {
     emailTo: o.tenantEmail,
     emailSubject: `📋 ${typeLabel} Inspection Ready — Sign Now`,
     emailHtml: emailTemplate(`${typeLabel} Inspection Ready`, `Your landlord has completed the ${typeLabel.toLowerCase()} checklist${o.unitNumber ? ` for <b>Unit ${o.unitNumber}</b>` : ''}. Review and sign it in your tenant portal so it can be finalized.`),
-    sendSMS: !!o.tenantPhone,
-    smsTo: o.tenantPhone,
-    smsBody: `GAM: ${typeLabel} inspection ready to sign${o.unitNumber ? ` for Unit ${o.unitNumber}` : ''}. Open tenant portal.`,
   })
 }
 
@@ -496,9 +463,6 @@ export async function notifyInspectionScheduledReminder(o: {
       emailTo: o.tenantEmail,
       emailSubject: `🔔 Inspection Tomorrow`,
       emailHtml: emailTemplate(`Inspection Tomorrow`, `Your ${typeLabel.toLowerCase()} inspection is scheduled for <b>${timestr}</b>${o.unitNumber ? ` (Unit ${o.unitNumber})` : ''}.`),
-      sendSMS: !!o.tenantPhone,
-      smsTo: o.tenantPhone,
-      smsBody: `GAM: ${typeLabel} inspection tomorrow at ${timestr}.`,
     })
   }
   await createNotification({
@@ -534,9 +498,6 @@ export async function notifyEntryRequestNew(o: {
     emailTo: o.tenantEmail,
     emailSubject: `${subUrgent ? '⚠️' : '🚪'} Entry Request — Respond Promptly`,
     emailHtml: emailTemplate(`Entry Request`, `Your landlord requests entry for <b>${o.reasonCategory}</b>: "${o.reason}".<br>Proposed window starts <b>${start}</b> (${o.noticeWindowHours}h notice).<br>Granting access promptly credits your record; denying does not penalize you.`),
-    sendSMS: !!o.tenantPhone,
-    smsTo: o.tenantPhone,
-    smsBody: `GAM: Entry request for ${o.reasonCategory}, ${start} (${o.noticeWindowHours}h notice). Open tenant portal to respond.`,
   })
 }
 
@@ -688,10 +649,10 @@ export async function notifyTenantInviteAccepted(o: { landlordUserId:string; lan
 
 export async function notifyWorkTradeHours(o: { tenantUserId:string; tenantEmail:string; tenantPhone?:string; unitNumber:string; hoursCommitted:number; hoursWorked:number; daysLeft:number }) {
   const short = o.hoursCommitted - o.hoursWorked
-  await createNotification({ userId:o.tenantUserId, type:'work_trade_reminder', title:`Work Trade: ${short}hrs remaining`, body:`${o.hoursWorked}/${o.hoursCommitted} hours logged. ${short} hours left with ${o.daysLeft} days remaining.`, data:o, sendEmail:true, emailTo:o.tenantEmail, emailSubject:`⚡ Work Trade Reminder — ${short} hours remaining`, emailHtml:emailTemplate('Work Trade Reminder', `<b>${short} hours remaining</b> this month.<br>Logged: ${o.hoursWorked} / ${o.hoursCommitted}<br>Days left: ${o.daysLeft}`), sendSMS:short>0&&o.daysLeft<=7, smsTo:o.tenantPhone, smsBody:`GAM: Work trade ${short} hours remaining, ${o.daysLeft} days left. Log hours in tenant portal.` })
+  await createNotification({ userId:o.tenantUserId, type:'work_trade_reminder', title:`Work Trade: ${short}hrs remaining`, body:`${o.hoursWorked}/${o.hoursCommitted} hours logged. ${short} hours left with ${o.daysLeft} days remaining.`, data:o, sendEmail:true, emailTo:o.tenantEmail, emailSubject:`⚡ Work Trade Reminder — ${short} hours remaining`, emailHtml:emailTemplate('Work Trade Reminder', `<b>${short} hours remaining</b> this month.<br>Logged: ${o.hoursWorked} / ${o.hoursCommitted}<br>Days left: ${o.daysLeft}`) })
 }
 
-export async function sendBulkNotification(o: { landlordId:string; propertyId?:string; title:string; body:string; sendEmail?:boolean; sendSMS?:boolean }) {
+export async function sendBulkNotification(o: { landlordId:string; propertyId?:string; title:string; body:string; sendEmail?:boolean }) {
   // Pre-S107 this query was broken in two ways:
   //   1. JOIN units un ON un.tenant_id=t.id — units.tenant_id has not
   //      existed since the lease_tenants model. Query would throw on
@@ -726,7 +687,7 @@ export async function sendBulkNotification(o: { landlordId:string; propertyId?:s
   `, params)
   let sent = 0
   for (const t of tenants) {
-    await createNotification({ userId:t.user_id, landlordId: o.landlordId, type:'bulk_message', title:o.title, body:`Unit ${t.unit_number}: ${o.body}`, data:{unitNumber:t.unit_number}, sendEmail:o.sendEmail, emailTo:t.email, emailSubject:o.title, emailHtml:emailTemplate(o.title, o.body), sendSMS:o.sendSMS, smsTo:t.phone, smsBody:`${o.title}: ${o.body}` })
+    await createNotification({ userId:t.user_id, landlordId: o.landlordId, type:'bulk_message', title:o.title, body:`Unit ${t.unit_number}: ${o.body}`, data:{unitNumber:t.unit_number}, sendEmail:o.sendEmail, emailTo:t.email, emailSubject:o.title, emailHtml:emailTemplate(o.title, o.body) })
     sent++
   }
   return { sent }
@@ -845,8 +806,6 @@ export async function routeMaintenanceNotification(requestId: string) {
         sendEmail: true, emailTo: member.email,
         emailSubject: `${isEmergency ? '🚨 EMERGENCY: ' : ''}Maintenance Request — Unit ${req.unit_number}`,
         emailHtml: `New ${req.priority} request from ${tenantName}: "${req.title}"${overThreshold ? '<br><b>APPROVAL REQUIRED before proceeding.</b>' : ''}`,
-        sendSMS: isEmergency, smsTo: member.phone,
-        smsBody: `GAM EMERGENCY: ${tenantName} Unit ${req.unit_number} - "${req.title}". Respond immediately.`
       })
     }
 
@@ -868,8 +827,6 @@ export async function routeMaintenanceNotification(requestId: string) {
         sendEmail: true, emailTo: req.landlord_email,
         emailSubject: `${isEmergency ? '🚨 EMERGENCY ' : overThreshold ? '⚠️ APPROVAL REQUIRED: ' : ''}Maintenance Unit ${req.unit_number}`,
         emailHtml: `<b>${tenantName}</b> submitted: "${req.title}"<br>Priority: ${req.priority}${overThreshold ? `<br><b>Estimated cost: $${estimatedCost} — exceeds your $${threshold} threshold. Your approval is required before work begins.</b>` : ''}`,
-        sendSMS: isEmergency || overThreshold, smsTo: req.landlord_phone,
-        smsBody: `GAM ${isEmergency ? 'EMERGENCY' : 'APPROVAL NEEDED'}: ${tenantName} Unit ${req.unit_number} - "${req.title}"${overThreshold ? ` Est $${estimatedCost}` : ''}`
       })
 
       // Mark approval required in DB
@@ -890,8 +847,6 @@ export async function routeMaintenanceNotification(requestId: string) {
         sendEmail: isEmergency || overThreshold, emailTo: pm.email,
         emailSubject: `Maintenance Alert — ${req.property_name} Unit ${req.unit_number}`,
         emailHtml: `Maintenance request at ${req.property_name} Unit ${req.unit_number}: "${req.title}"`,
-        sendSMS: isEmergency, smsTo: pm.phone,
-        smsBody: `GAM PM ALERT: ${req.property_name} Unit ${req.unit_number} - "${req.title}" EMERGENCY`
       })
     }
 
@@ -908,8 +863,6 @@ export async function routeMaintenanceNotification(requestId: string) {
         sendEmail: isEmergency || overThreshold, emailTo: staff.email,
         emailSubject: `Maintenance Alert — ${req.property_name} Unit ${req.unit_number}`,
         emailHtml: `Maintenance request at ${req.property_name} Unit ${req.unit_number}: "${req.title}"`,
-        sendSMS: isEmergency, smsTo: staff.phone,
-        smsBody: `GAM PM ALERT: ${req.property_name} Unit ${req.unit_number} - "${req.title}" EMERGENCY`,
       })
     }
 
@@ -941,8 +894,6 @@ export async function routeMaintenanceNotification(requestId: string) {
           sendEmail: true, emailTo: tenant.email,
           emailSubject: `Building Maintenance Notice — ${req.property_name}`,
           emailHtml: `Maintenance work is being performed that may affect Unit ${tenant.unit_number}: "${req.title}". You will be notified of scheduling.`,
-          sendSMS: isEmergency, smsTo: tenant.phone,
-          smsBody: `GAM: Building maintenance affecting your unit - "${req.title}". Check tenant portal for updates.`
         })
       }
     }
@@ -1133,7 +1084,7 @@ function interruptionWindow(startsAt: string | Date, restoreAt: string | Date | 
   return `${start} — expected back by ${end}`
 }
 
-// A utility interruption was posted → alert affected residents. SMS fires
+// A utility interruption was posted → alert affected residents. Email fires
 // for emergencies (immediate/unplanned). Returns count notified.
 export async function notifyServiceInterruption(o: {
   propertyId: string; landlordId: string; unitIds: string[];
@@ -1155,8 +1106,6 @@ export async function notifyServiceInterruption(o: {
       sendEmail: true, emailTo: r.email,
       emailSubject: `${headline}`,
       emailHtml: emailTemplate(headline, `${detail ? detail + '<br><br>' : ''}<b>${when}</b>`),
-      sendSMS: o.isEmergency, smsTo: r.phone ?? undefined,
-      smsBody: `GAM ${tag}${o.utilityLabel}: ${when}.${detail ? ' ' + detail : ''}`,
     })
   }
   return recipients.length

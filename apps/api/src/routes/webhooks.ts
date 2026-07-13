@@ -239,6 +239,26 @@ webhooksRouter.post('/stripe', async (req, res) => {
           }
         }
 
+        // S537: FIFO remittance settle — the covered rows were settled by
+        // the standard by-PI path above; here we close the remittance and
+        // bank any pay-ahead remainder as a prepaid credit for the next
+        // invoice generation to consume.
+        if (pi.metadata?.gam_remittance_id) {
+          const remRes = await client.query<{ id: string; tenant_id: string; lease_id: string | null; unapplied_amount: string }>(
+            `UPDATE tenant_remittances
+                SET status='settled', settled_at=NOW(), updated_at=NOW()
+              WHERE id = $1 AND status != 'settled'
+              RETURNING id, tenant_id, lease_id, unapplied_amount`,
+            [pi.metadata.gam_remittance_id])
+          const remRow = remRes.rows[0]
+          if (remRow && Number(remRow.unapplied_amount) > 0 && remRow.lease_id) {
+            await client.query(
+              `INSERT INTO lease_prepaid_credits (lease_id, tenant_id, amount_original, amount_remaining, source_remittance_id)
+               VALUES ($1, $2, $3, $3, $4)`,
+              [remRow.lease_id, remRow.tenant_id, remRow.unapplied_amount, remRow.id])
+          }
+        }
+
         await client.query('COMMIT')
       } catch (e) {
         await client.query('ROLLBACK')
@@ -476,6 +496,16 @@ webhooksRouter.post('/stripe', async (req, res) => {
       // card, or abandon the sale. No ledger row, no NACHA retry logic,
       // no notification. Skip.
       if (pi.metadata?.gam_purpose === 'pos_terminal') break
+
+      // S537: a failed FIFO remittance is closed out; its covered rows
+      // revert / retry through the standard by-PI NACHA logic below, and
+      // no prepaid credit is ever created for a failed pull.
+      if (pi.metadata?.gam_remittance_id) {
+        await query(
+          `UPDATE tenant_remittances SET status='failed', updated_at=NOW()
+            WHERE id = $1 AND status = 'processing'`,
+          [pi.metadata.gam_remittance_id])
+      }
 
       const { extractReturnCode, decideRetry } = await import('../services/achRetry')
       const { ACH_RETURN_CONFIG } = await import('@gam/shared')

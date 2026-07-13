@@ -477,7 +477,7 @@ describe('POST /api/pos/transactions — FlexCharge gate (S254)', () => {
         tenantId: randomUUID(),
       })
     expect(res.status).toBe(400)
-    expect(res.body.error).toMatch(/propertyId is required/i)
+    expect(res.body.error).toMatch(/property must be selected/i)
   })
 
   it('XOR: tenantId AND posCustomerId both set → 400', async () => {

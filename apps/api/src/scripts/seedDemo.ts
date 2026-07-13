@@ -478,8 +478,8 @@ async function main() {
     // ── DOCUMENTS ────────────────────────────────────────────────────
     await c.query(
       `INSERT INTO documents (landlord_id, type, name, url) VALUES
-       ($1, 'lease', 'Standard RV Site Lease (blank)', '/uploads/public/demo-lease.pdf'),
-       ($1, 'notice', 'Pool Maintenance Notice — July', '/uploads/public/demo-notice.pdf')`, [LL])
+       ($1, 'lease', 'Standard RV Site Lease (blank)', '/uploads/leases/demo-lease.pdf'),
+       ($1, 'notice', 'Pool Maintenance Notice — July', '/uploads/docs/demo-notice.pdf')`, [LL])
 
     // ── E-SIGN LEASE TEMPLATE (W-7, S531) ────────────────────────────
     // One usable template so the renewal-decision flow (and any e-sign
@@ -492,7 +492,7 @@ async function main() {
       `SELECT id FROM lease_templates WHERE landlord_id = $1 AND name = 'Standard Residential Lease'`, [LL])
     const tmplRes = existingTmpl.rows.length ? existingTmpl : await c.query(
       `INSERT INTO lease_templates (landlord_id, name, description, base_pdf_url, page_count)
-       VALUES ($1, 'Standard Residential Lease', 'Demo lease template', '/uploads/public/demo-lease.pdf', 1)
+       VALUES ($1, 'Standard Residential Lease', 'Demo lease template', '/api/esign/files/demo-lease.pdf', 1)
        RETURNING id`, [LL])
     const TMPL = tmplRes.rows[0].id
     if (!existingTmpl.rows.length) await c.query(

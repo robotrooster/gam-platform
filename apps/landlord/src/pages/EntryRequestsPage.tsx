@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react'
 import { useQuery } from 'react-query'
 import { Link } from 'react-router-dom'
 import { DoorOpen, Plus } from 'lucide-react'
+import { humanize } from '@gam/shared'
 import { apiGet } from '../lib/api'
 import { usePerms } from '../lib/permissions'
 
@@ -102,9 +103,9 @@ export function EntryRequestsPage() {
             <tbody>
               {filtered.map(r => (
                 <tr key={r.id}>
-                  <td><span className={`badge ${STATUS_BADGE[r.status] || 'badge-muted'}`}>{r.status}</span></td>
+                  <td><span className={`badge ${STATUS_BADGE[r.status] || 'badge-muted'}`}>{humanize(r.status)}</span></td>
                   <td style={{ color: 'var(--text-0)', maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.reason}</td>
-                  <td>{r.reasonCategory}</td>
+                  <td>{humanize(r.reasonCategory)}</td>
                   <td style={{ fontSize: '.78rem' }}>
                     {fmtDateTime(r.proposedEntryWindowStart)} → {fmtDateTime(r.proposedEntryWindowEnd)}
                   </td>

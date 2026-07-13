@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { Link } from 'react-router-dom'
+import { humanize } from '@gam/shared'
 import { apiGet, apiPost } from '../lib/api'
 import { usePerms } from '../lib/permissions'
 import { ArrowDownToLine, X, Landmark, Check } from 'lucide-react'
@@ -112,7 +113,7 @@ export function DisbursementsPage() {
               </div>
             </div>
             <div className="data-row"><span className="data-key">Status</span>
-              <span className={'badge ' + (selected.status === 'settled' ? 'badge-green' : 'badge-amber')}>{selected.status}</span>
+              <span className={'badge ' + (selected.status === 'settled' ? 'badge-green' : 'badge-amber')}>{humanize(selected.status)}</span>
             </div>
             <div className="data-row"><span className="data-key">Trigger</span>
               <span className="data-val">{selected.triggerType === 'auto_friday' ? 'Auto-Friday payout' : selected.triggerType === 'manual_on_demand' ? 'Manual on-demand' : (selected.triggerType || '—')}</span>

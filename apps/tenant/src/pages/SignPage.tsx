@@ -2,6 +2,8 @@ import { useState, useRef, useEffect, useCallback } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation } from 'react-query'
 import { Check, AlertCircle, ChevronLeft, ChevronRight, Upload, PenTool, ArrowRight } from 'lucide-react'
+import { toast } from '../components/dialogs'
+import { humanize } from '@gam/shared'
 
 const API = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
 const tok = () => localStorage.getItem('gam_tenant_token')
@@ -301,7 +303,7 @@ export function SignPage() {
       .then(r=>r.json())
       .then((r:any)=>{ if(!r.success) throw new Error(r.error || 'Signing failed'); return r }),
     { onSuccess:(res:any)=>{ clearDraft(); setAllDone(res.data?.completed ?? res.completed); setStage('done') },
-      onError:(e:any)=>{ setStage('signing'); alert(e?.message || 'Signing failed — try again.') } }
+      onError:(e:any)=>{ setStage('signing'); toast.error(e?.message || 'Signing failed — try again.') } }
   )
   // S234: decline path. The tenant can refuse a sent doc with a reason.
   // Backend voids the document on success — no path back.
@@ -623,7 +625,7 @@ export function SignPage() {
             <div style={{ display:'flex', flexDirection:'column' as const, gap:7, marginBottom:18 }}>
               {allFields.filter((f:any)=>fieldValues[f.id]).map((f:any)=>(
                 <div key={f.id} style={{ display:'flex', alignItems:'center', justifyContent:'space-between', padding:'7px 11px', background:'#f8f8f5', borderRadius:8 }}>
-                  <span style={{ fontSize:'.75rem', color:'#999', textTransform:'capitalize' as const }}>{f.fieldType.replace('_',' ')} · p{f.page}</span>
+                  <span style={{ fontSize:'.75rem', color:'#999', textTransform:'capitalize' as const }}>{humanize(f.fieldType)} · p{f.page}</span>
                   {(f.fieldType==='signature'||f.fieldType==='initials') && fieldValues[f.id].startsWith('data:')
                     ? <img src={fieldValues[f.id]} style={{ height:28, maxWidth:110, objectFit:'contain' }}/>
                     : <span style={{ fontFamily:fieldFonts[f.id]||'inherit', fontSize:'.95rem', color:'#1a1a1a', fontWeight:600 }}>{fieldValues[f.id]}</span>

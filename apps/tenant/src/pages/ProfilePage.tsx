@@ -85,15 +85,15 @@ export function ProfilePage() {
       onError: () => setPwError('Incorrect current password') }
   )
 
-  const getPref = (type: string, channel: 'email'|'sms'|'in_app') => {
+  const getPref = (type: string, channel: 'email'|'in_app') => {
     const p = (notifPrefs as any[]).find((x: any) => x.type === type)
-    if (!p) return channel !== 'sms'
-    return channel === 'email' ? p.emailEnabled : channel === 'sms' ? p.smsEnabled : p.inAppEnabled
+    if (!p) return true
+    return channel === 'email' ? p.emailEnabled : p.inAppEnabled
   }
 
   const togglePref = (type: string, channel: string, val: boolean) => {
     const p = (notifPrefs as any[]).find((x: any) => x.type === type) || {}
-    prefMut.mutate({ type, email_enabled: p.emailEnabled ?? true, sms_enabled: p.smsEnabled ?? false, in_app_enabled: p.inAppEnabled ?? true, [channel]: val })
+    prefMut.mutate({ type, email_enabled: p.emailEnabled ?? true, in_app_enabled: p.inAppEnabled ?? true, [channel]: val })
   }
 
   const s = (_label: string, color = 'var(--text-3)') => ({
@@ -141,7 +141,7 @@ export function ProfilePage() {
             <input className="input" type="email" value={email} onChange={e => setEmail(e.target.value)} style={{ width:'100%' }} />
           </div>
           <div style={{ marginBottom:20 }}>
-            <label style={s('Phone')}>Phone <span style={{ fontWeight:400, textTransform:'none', fontSize:'.68rem' }}>(for SMS alerts)</span></label>
+            <label style={s('Phone')}>Phone</label>
             <input className="input" type="tel" value={phone} onChange={e => setPhone(e.target.value)} placeholder="(555) 000-0000" style={{ width:'100%' }} />
           </div>
           <div style={{ display:'flex', alignItems:'center', gap:10 }}>
@@ -159,7 +159,7 @@ export function ProfilePage() {
           <div style={{ background:'var(--bg-2)', border:'1px solid var(--border-0)', borderRadius:10, overflow:'hidden' }}>
             <div style={{ display:'grid', gridTemplateColumns:'1fr auto auto auto', gap:0 }}>
               <div style={{ padding:'10px 16px', fontSize:'.68rem', fontWeight:700, color:'var(--text-3)', textTransform:'uppercase', letterSpacing:'.06em', borderBottom:'1px solid var(--border-0)' }}>Notification</div>
-              {['In-App','Email','SMS'].map(h => (
+              {['In-App','Email'].map(h => (
                 <div key={h} style={{ padding:'10px 16px', fontSize:'.68rem', fontWeight:700, color:'var(--text-3)', textTransform:'uppercase', letterSpacing:'.06em', borderBottom:'1px solid var(--border-0)', textAlign:'center' }}>{h}</div>
               ))}
               {NOTIF_TYPES.map((n, i) => (
@@ -168,7 +168,7 @@ export function ProfilePage() {
                     <div style={{ fontSize:'.82rem', fontWeight:600, color:'var(--text-0)' }}>{n.label}</div>
                     <div style={{ fontSize:'.68rem', color:'var(--text-3)' }}>{n.desc}</div>
                   </div>
-                  {(['in_app','email','sms'] as const).map(ch => (
+                  {(['in_app','email'] as const).map(ch => (
                     <div key={n.type+ch} style={{ padding:'12px 16px', textAlign:'center', borderBottom: i<NOTIF_TYPES.length-1?'1px solid var(--border-0)':'none', display:'flex', alignItems:'center', justifyContent:'center' }}>
                       {ch === 'in_app'
                         ? <span title="In-app notifications are always on" style={{ color:'var(--green)', fontSize:'.85rem' }}>✓</span>

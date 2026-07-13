@@ -72,16 +72,15 @@ notificationsRouter.get('/preferences', async (req, res, next) => {
 const prefsPatchSchema = z.object({
   type:          z.string().regex(/^[a-z][a-z0-9_]{0,63}$/, 'type must be snake_case, ≤64 chars'),
   emailEnabled:  z.boolean(),
-  smsEnabled:    z.boolean(),
   inAppEnabled:  z.boolean(),
 })
 notificationsRouter.patch('/preferences', async (req, res, next) => {
   try {
-    const { type, emailEnabled, smsEnabled, inAppEnabled } = prefsPatchSchema.parse(req.body)
-    await query(`INSERT INTO notification_preferences (user_id,type,email_enabled,sms_enabled,in_app_enabled)
-      VALUES ($1,$2,$3,$4,$5)
-      ON CONFLICT (user_id,type) DO UPDATE SET email_enabled=$3,sms_enabled=$4,in_app_enabled=$5`,
-      [req.user!.userId, type, emailEnabled, smsEnabled, inAppEnabled])
+    const { type, emailEnabled, inAppEnabled } = prefsPatchSchema.parse(req.body)
+    await query(`INSERT INTO notification_preferences (user_id,type,email_enabled,in_app_enabled)
+      VALUES ($1,$2,$3,$4)
+      ON CONFLICT (user_id,type) DO UPDATE SET email_enabled=$3,in_app_enabled=$4`,
+      [req.user!.userId, type, emailEnabled, inAppEnabled])
     res.json({ success: true })
   } catch (e) { next(e) }
 })
@@ -90,7 +89,7 @@ notificationsRouter.patch('/preferences', async (req, res, next) => {
 // S129: opened to property_manager via notifications.send_bulk.
 notificationsRouter.post('/bulk', requirePerm('notifications.send_bulk'), async (req, res, next) => {
   try {
-    const { title, body, propertyId, sendEmail, sendSMS } = req.body
+    const { title, body, propertyId, sendEmail } = req.body
     if (!title || !body) return res.status(400).json({ success: false, error: 'title and body required' })
     if (propertyId !== undefined && propertyId !== null && propertyId !== '' &&
         !/^[0-9a-f-]{36}$/i.test(String(propertyId))) {
@@ -99,7 +98,7 @@ notificationsRouter.post('/bulk', requirePerm('notifications.send_bulk'), async 
     const landlordId = resolveLandlordIdForUser(req.user!)
     if (!landlordId) throw new AppError(400, 'No landlord scope on this user')
     const result = await sendBulkNotification({
-      landlordId, propertyId: propertyId || undefined, title, body, sendEmail, sendSMS
+      landlordId, propertyId: propertyId || undefined, title, body, sendEmail
     })
     res.json({ success: true, data: result })
   } catch (e) { next(e) }

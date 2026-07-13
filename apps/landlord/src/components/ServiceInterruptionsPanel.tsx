@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { Zap, Plus, X, CheckCircle, Ban } from 'lucide-react'
-import { SERVICE_INTERRUPTION_TYPES, SERVICE_INTERRUPTION_TYPE_LABELS } from '@gam/shared'
+import { SERVICE_INTERRUPTION_TYPES, SERVICE_INTERRUPTION_TYPE_LABELS, humanize } from '@gam/shared'
 import { apiGet, apiPost } from '../lib/api'
 
 // Responses camelCased by the landlord axios client.
@@ -45,7 +45,7 @@ export function ServiceInterruptionsPanel() {
           </h1>
           <div className="page-sub">
             Tell residents a utility is down — water, power, gas, elevator — with an expected-back
-            time. Posts immediately notify every affected resident (SMS too, for emergencies).
+            time. Posts immediately notify every affected resident by email and in-app.
           </div>
         </div>
         <button className="btn btn-primary" disabled={!pid} onClick={() => setShowPost(true)}>
@@ -72,7 +72,7 @@ export function ServiceInterruptionsPanel() {
             <div>
               <div style={{ fontWeight: 700 }}>
                 {n.isEmergency && '🚨 '}{lbl(n.utilityType)}{n.title ? ` — ${n.title}` : ''}{' '}
-                <span className={`badge ${STATUS_BADGE[n.status]}`}>{n.status}</span>
+                <span className={`badge ${STATUS_BADGE[n.status]}`}>{humanize(n.status)}</span>
                 {n.unitIds.length > 0 && <span className="badge badge-muted" style={{ marginLeft: 4 }}>{n.unitIds.length} unit{n.unitIds.length > 1 ? 's' : ''}</span>}
               </div>
               {n.message && <div className="page-sub" style={{ marginTop: 3 }}>{n.message}</div>}
@@ -136,7 +136,7 @@ function PostModal({ propertyId, onClose, onPosted }: { propertyId: string; onCl
           </select>
         </Row>
         <label style={{ fontSize: '.82rem', display: 'block', margin: '8px 0' }}>
-          <input type="checkbox" checked={f.isEmergency} onChange={e => setF({ ...f, isEmergency: e.target.checked })} /> Emergency / unplanned (urgent copy + SMS)
+          <input type="checkbox" checked={f.isEmergency} onChange={e => setF({ ...f, isEmergency: e.target.checked })} /> Emergency / unplanned (urgent copy)
         </label>
         <Row label="Headline"><input className="input" value={f.title} onChange={e => setF({ ...f, title: e.target.value })} placeholder="Water main repair" /></Row>
         <Row label="Message (optional)"><input className="input" value={f.message} onChange={e => setF({ ...f, message: e.target.value })} placeholder="Please store water for the morning." /></Row>

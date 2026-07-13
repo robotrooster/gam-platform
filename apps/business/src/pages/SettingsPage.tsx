@@ -1,10 +1,10 @@
 import { useEffect, useState } from 'react'
-import { apiGet, apiPatch, apiPost } from '../lib/api'
+import { apiDelete, apiGet, apiPatch, apiPost } from '../lib/api'
 import { useAuth } from '../context/AuthContext'
 import {
   BUSINESS_TYPES, BUSINESS_TYPE_LABEL, BusinessType,
   BUSINESS_FEATURES, BUSINESS_FEATURE_LABEL, BUSINESS_FEATURE_DESCRIPTION,
-  BUSINESS_FEATURE_ALWAYS_ON, BusinessFeature,
+  BUSINESS_FEATURE_ALWAYS_ON, BusinessFeature, humanize,
 } from '@gam/shared'
 import { loadConnectAndInitialize } from '@stripe/connect-js'
 import type { StripeConnectInstance } from '@stripe/connect-js'
@@ -143,7 +143,7 @@ export function SettingsPage() {
         }}>
           Business id: <code style={{ color: 'var(--text-1)' }}>{biz.id}</code>
           {' · '}
-          Status: <span style={{ color: 'var(--text-1)' }}>{biz.status}</span>
+          Status: <span style={{ color: 'var(--text-1)' }}>{humanize(biz.status)}</span>
         </div>
       )}
 
@@ -153,7 +153,187 @@ export function SettingsPage() {
       {biz && <PublicBookingSection biz={biz} setBiz={setBiz} />}
       {biz && ((biz.enabledFeatures ?? biz.enabled_features ?? []) as string[]).includes('appointments') &&
         <AppointmentRemindersSection biz={biz} setBiz={setBiz} />}
+      {biz && <TipsSection biz={biz} setBiz={setBiz} />}
+      {biz && <CardFeesSection biz={biz} setBiz={setBiz} />}
+      <CardReadersSection />
       {biz && <FeaturesSection biz={biz} setBiz={setBiz} />}
+    </div>
+  )
+}
+
+// S536 (Nic): who pays card processing fees — the business (netted
+// from their payout; default) or the customer (auto surcharge added
+// to every card transaction at the register).
+function CardFeesSection({ biz, setBiz }: { biz: any; setBiz: (b: any) => void }) {
+  const current = (biz.cardFeesPaidBy ?? biz.card_fees_paid_by ?? 'business') as string
+  const [who, setWho] = useState<string>(current)
+  const [saving, setSaving] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+
+  const pick = async (next: string) => {
+    if (next === who) return
+    setWho(next); setErr(null); setSaving(true)
+    try {
+      const updated = await apiPatch<any>('/businesses/me', { cardFeesPaidBy: next })
+      setBiz(updated)
+    } catch (e: any) {
+      setWho(who)
+      setErr(e?.response?.data?.error || 'Save failed')
+    } finally { setSaving(false) }
+  }
+
+  return (
+    <div style={{
+      marginTop: 24, padding: 24,
+      background: 'var(--bg-1)', border: '1px solid var(--border-0)',
+      borderRadius: 12, maxWidth: 640,
+    }}>
+      <h2 style={{ fontFamily: 'var(--font-display)', fontSize: 18, marginTop: 0 }}>Card processing fees</h2>
+      <div style={{ fontSize: 13, color: 'var(--text-2)', marginBottom: 14 }}>
+        Card payments carry a 2.9% + 10¢ processing fee. Choose who pays it — applied
+        automatically to every card transaction at the register.
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, maxWidth: 420 }}>
+        {([['business', 'My business pays', 'Fee nets out of your payout'], ['customer', 'Customer pays', 'Fee added on top at the register']] as const).map(([val, label, sub]) => (
+          <button key={val} disabled={saving} onClick={() => pick(val)}
+            style={{
+              padding: 12, textAlign: 'left' as const, cursor: 'pointer',
+              background: who === val ? 'rgba(212,175,55,.12)' : 'var(--bg-2)',
+              border: `1px solid ${who === val ? 'var(--gold)' : 'var(--border-1)'}`,
+              borderRadius: 8,
+            }}>
+            <div style={{ fontSize: 13, fontWeight: 700, color: who === val ? 'var(--gold)' : 'var(--text-0)' }}>{label}</div>
+            <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 2 }}>{sub}</div>
+          </button>
+        ))}
+      </div>
+      {err && <div style={{ color: 'var(--red)', fontSize: 12, marginTop: 8 }}>{err}</div>}
+    </div>
+  )
+}
+
+// S536 (Nic): card payments at the register run on a paired Stripe
+// Terminal reader — set up here ("on the backend"), used at checkout.
+// Pairing: put the reader in registration mode, type the code it
+// shows. Requires completed Stripe payout onboarding.
+function CardReadersSection() {
+  const [readers, setReaders] = useState<any[]>([])
+  const [code, setCode] = useState('')
+  const [nickname, setNickname] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+
+  const load = () => apiGet<any[]>('/business-pos/terminal/readers').then(r => setReaders(r || [])).catch(() => {})
+  useEffect(() => { load() }, [])
+
+  const pair = async () => {
+    setErr(null); setBusy(true)
+    try {
+      await apiPost('/business-pos/terminal/readers', { registrationCode: code.trim(), nickname: nickname.trim() })
+      setCode(''); setNickname(''); await load()
+    } catch (e: any) {
+      setErr(e?.response?.data?.error || 'Pairing failed — check the code on the reader screen')
+    } finally { setBusy(false) }
+  }
+
+  // S536: no native confirm() — two-step armed button instead.
+  const [armed, setArmed] = useState<string | null>(null)
+  const archive = async (id: string) => {
+    if (armed !== id) {
+      setArmed(id)
+      setTimeout(() => setArmed(a => (a === id ? null : a)), 4000)
+      return
+    }
+    setArmed(null)
+    try { await apiDelete(`/business-pos/terminal/readers/${id}`); await load() }
+    catch (e: any) { setErr(e?.response?.data?.error || 'Could not remove reader') }
+  }
+
+  return (
+    <div style={{
+      marginTop: 24, padding: 24,
+      background: 'var(--bg-1)', border: '1px solid var(--border-0)',
+      borderRadius: 12, maxWidth: 640,
+    }}>
+      <h2 style={{ fontFamily: 'var(--font-display)', fontSize: 18, marginTop: 0 }}>Card readers</h2>
+      <div style={{ fontSize: 13, color: 'var(--text-2)', marginBottom: 14 }}>
+        Pair a Stripe Terminal reader and the register's Card option sends each sale straight to it —
+        the customer taps or swipes and the transaction completes. Any Stripe Terminal hardware works.
+      </div>
+      {readers.map(r => (
+        <div key={r.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 0', borderBottom: '1px solid var(--border-1)', fontSize: 13 }}>
+          <span style={{ color: 'var(--text-0)', fontWeight: 600 }}>{r.nickname}</span>
+          <span style={{ color: 'var(--text-3)', fontFamily: 'var(--font-mono)', fontSize: 11 }}>{r.stripeReaderId?.slice(-8)}</span>
+          <button onClick={() => archive(r.id)} style={{ background: 'none', border: 'none', color: armed === r.id ? 'var(--red)' : 'var(--text-3)', cursor: 'pointer', fontSize: 12, fontWeight: armed === r.id ? 700 : 400 }}>{armed === r.id ? 'Confirm remove?' : 'Remove'}</button>
+        </div>
+      ))}
+      {readers.length === 0 && <div style={{ fontSize: 12, color: 'var(--text-3)', padding: '8px 0' }}>No readers paired yet.</div>}
+      <div style={{ display: 'flex', gap: 8, marginTop: 14 }}>
+        <input value={code} onChange={e => setCode(e.target.value)} placeholder="Registration code (on reader screen)"
+          style={{ flex: 2, padding: '8px 10px', background: 'var(--bg-2)', border: '1px solid var(--border-1)', borderRadius: 8, color: 'var(--text-0)', fontSize: 13 }} />
+        <input value={nickname} onChange={e => setNickname(e.target.value)} placeholder="Name (e.g. Front counter)"
+          style={{ flex: 1, padding: '8px 10px', background: 'var(--bg-2)', border: '1px solid var(--border-1)', borderRadius: 8, color: 'var(--text-0)', fontSize: 13 }} />
+        <button onClick={pair} disabled={busy || !code.trim() || !nickname.trim()}
+          style={{ padding: '8px 16px', background: 'var(--gold)', border: 'none', borderRadius: 8, color: '#141414', fontWeight: 700, fontSize: 13, cursor: 'pointer' }}>
+          {busy ? 'Pairing…' : 'Pair'}
+        </button>
+      </div>
+      {err && <div style={{ color: 'var(--red)', fontSize: 12, marginTop: 8 }}>{err}</div>}
+    </div>
+  )
+}
+
+// S536 (Nic): tips are a per-business choice — hidden at the register
+// for operators who don't want or need them. Default ON.
+function TipsSection({ biz, setBiz }: { biz: any; setBiz: (b: any) => void }) {
+  const current = biz.tipsEnabled ?? biz.tips_enabled ?? true
+  const [enabled, setEnabled] = useState<boolean>(!!current)
+  const [saving, setSaving] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+
+  const onToggle = async () => {
+    const next = !enabled
+    setEnabled(next); setErr(null); setSaving(true)
+    try {
+      const updated = await apiPatch<any>('/businesses/me', { tipsEnabled: next })
+      setBiz(updated)
+    } catch (e: any) {
+      setEnabled(!next)
+      setErr(e?.response?.data?.error || 'Save failed')
+    } finally { setSaving(false) }
+  }
+
+  return (
+    <div style={{
+      marginTop: 24, padding: 24,
+      background: 'var(--bg-1)', border: '1px solid var(--border-0)',
+      borderRadius: 12, maxWidth: 640,
+    }}>
+      <h2 style={{ fontFamily: 'var(--font-display)', fontSize: 18, marginTop: 0 }}>
+        Tips at the register
+      </h2>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 16 }}>
+        <div style={{ fontSize: 13, color: 'var(--text-2)', maxWidth: 460 }}>
+          Show tip options (15% / 18% / 20% / custom) at POS checkout.
+          Turn this off and the register skips tips entirely.
+        </div>
+        <button
+          type="button" role="switch" aria-checked={enabled} aria-label="Tips at the register"
+          disabled={saving} onClick={onToggle}
+          style={{
+            flexShrink: 0, width: 44, height: 24, borderRadius: 999, border: 'none',
+            cursor: saving ? 'wait' : 'pointer', position: 'relative',
+            background: enabled ? 'var(--gold)' : 'var(--bg-3)',
+            transition: 'background .15s',
+          }}>
+          <span style={{
+            position: 'absolute', top: 3, left: enabled ? 23 : 3,
+            width: 18, height: 18, borderRadius: '50%',
+            background: '#fff', transition: 'left .15s',
+          }} />
+        </button>
+      </div>
+      {err && <div style={{ color: 'var(--red)', fontSize: 12, marginTop: 8 }}>{err}</div>}
     </div>
   )
 }

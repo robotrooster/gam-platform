@@ -436,7 +436,7 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
     assertNonNeg([surcharge, 'Surcharge'])
     // W-12 (S531): propertyId is REQUIRED — every sale belongs to a
     // property (per-property books, EOD drawers, sales history).
-    if (!propertyId) throw new AppError(400, 'propertyId is required — sales are per-property')
+    if (!propertyId) throw new AppError(400, 'A property must be selected — sales are per-property')
     // Property lock: a scoped worker (cashier) can only ring on a property in
     // their scope. Owners + all_properties bypass. Requires the client to send
     // propertyId on every sale (not just FlexCharge) — see POSPage checkout.

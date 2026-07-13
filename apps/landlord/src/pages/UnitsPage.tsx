@@ -2,6 +2,7 @@ import { AddUnitModal } from './AddUnitModal'
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useNavigate, Link, useSearchParams } from 'react-router-dom'
+import { humanize } from '@gam/shared'
 import { apiGet, apiPatch } from '../lib/api'
 import { usePerms } from '../lib/permissions'
 import { Search, AlertTriangle, Shield, DoorOpen } from 'lucide-react'
@@ -21,6 +22,10 @@ export function UnitsPage() {
   const [params] = useSearchParams()
   const [filter, setFilter] = useState(() => {
     const s = params.get('status')
+    // S536 (Nic): the dashboard eviction-mode alert links ?status=eviction.
+    // Eviction mode is the paymentBlock flag, coupled 1:1 to the
+    // 'suspended' unit status — land on the suspended filter, not "All".
+    if (s === 'eviction') return 'suspended'
     return s && s in STATUS_COLORS ? s : 'all'
   })
   const { data: units = [], isLoading } = useQuery<any[]>('units', () => apiGet('/units'))
@@ -65,7 +70,7 @@ export function UnitsPage() {
         </div>
         {['all', 'active', 'vacant', 'delinquent', 'suspended'].map(s => (
           <button key={s} className={`btn btn-sm ${filter === s ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setFilter(s)}>
-            {s === 'all' ? 'All' : s.replace('_', ' ')}
+            {s === 'all' ? 'All' : humanize(s)}
           </button>
         ))}
       </div>
@@ -96,10 +101,10 @@ export function UnitsPage() {
                       {can('units.set_status') && (
                         <select value={u.status} onChange={e => setStatusMut.mutate({ id: u.id, status: e.target.value })}
                           style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '.75rem', color: 'inherit', padding: 0 }}>
-                          {['occupied','vacant','maintenance','eviction'].map(s => <option key={s} value={s}>{s.replace('_', ' ')}</option>)}
+                          {['occupied','vacant','maintenance','eviction'].map(s => <option key={s} value={s}>{humanize(s)}</option>)}
                         </select>
                       )}
-                      <span className={'badge ' + (STATUS_COLORS[u.status] || 'badge-muted')} style={{ marginLeft: 4 }}>{u.status.replace('_', ' ')}</span>
+                      <span className={'badge ' + (STATUS_COLORS[u.status] || 'badge-muted')} style={{ marginLeft: 4 }}>{humanize(u.status)}</span>
                     </td>
                     <td>
                       {u.paymentBlock

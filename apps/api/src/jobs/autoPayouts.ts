@@ -150,7 +150,12 @@ interface PmCandidate {
   entity_id: string
   stripe_connect_account_id: string
 }
-type Candidate = UserCandidate | PmCandidate
+interface BusinessCandidate {
+  kind: 'business'
+  entity_id: string
+  stripe_connect_account_id: string
+}
+type Candidate = UserCandidate | PmCandidate | BusinessCandidate
 
 export async function processAutoPayouts(now: Date = new Date()): Promise<PayoutResult> {
   const result: PayoutResult = {
@@ -186,9 +191,21 @@ export async function processAutoPayouts(now: Date = new Date()): Promise<Payout
         AND connect_payouts_enabled    = TRUE
         AND connect_details_submitted  = TRUE`
   )
+  // S536 (Nic): business owners batch Friday the same way landlords do —
+  // all money flows through GAM (POS + invoice destination charges land
+  // on the business's Connect balance; this sweep moves it to their bank).
+  const bizRows = await query<{ entity_id: string; stripe_connect_account_id: string }>(
+    `SELECT id AS entity_id, stripe_connect_account_id
+       FROM businesses
+      WHERE stripe_connect_account_id IS NOT NULL
+        AND connect_payouts_enabled    = TRUE
+        AND connect_details_submitted  = TRUE
+        AND status = 'active'`
+  )
   const candidates: Candidate[] = [
     ...userRows.map((r): UserCandidate => ({ kind: 'user', ...r })),
     ...pmRows.map((r): PmCandidate => ({ kind: 'pm_company', ...r })),
+    ...bizRows.map((r): BusinessCandidate => ({ kind: 'business', ...r })),
   ]
   result.candidatesScanned = candidates.length
 

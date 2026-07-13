@@ -20,6 +20,7 @@
 
 import { useState, useEffect, useMemo } from 'react'
 import { useQuery, useQueryClient } from 'react-query'
+import { humanize } from '@gam/shared'
 import { useAuth } from '../context/AuthContext'
 import { apiGet, apiPost } from '../lib/api'
 import { loadConnectAndInitialize } from '@stripe/connect-js'
@@ -231,7 +232,7 @@ export function BankingPage() {
                 <tr key={p.id} style={{ borderTop: '1px solid var(--border-0)' }}>
                   <Td>{new Date(p.createdAt).toLocaleDateString()}</Td>
                   <Td>${Number(p.amount).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} {p.currency.toUpperCase()}</Td>
-                  <Td>{p.status}</Td>
+                  <Td>{humanize(p.status)}</Td>
                   <Td>{p.destinationBankLast4 ? `•••• ${p.destinationBankLast4}` : '—'}</Td>
                   <Td>{p.arrivalDate ? new Date(p.arrivalDate).toLocaleDateString() : '—'}</Td>
                 </tr>

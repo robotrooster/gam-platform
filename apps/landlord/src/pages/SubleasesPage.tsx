@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { ScrollText, Check, X, AlertTriangle } from 'lucide-react'
+import { humanize } from '@gam/shared'
 import { apiGet, apiPatch } from '../lib/api'
 import { usePerms } from '../lib/permissions'
 
@@ -135,7 +136,7 @@ export function SubleasesPage() {
             <tbody>
               {list.map(s => (
                 <tr key={s.id}>
-                  <td><span className={`badge ${STATUS_BADGE[s.status] || 'badge-muted'}`}>{s.status}</span></td>
+                  <td><span className={`badge ${STATUS_BADGE[s.status] || 'badge-muted'}`}>{humanize(s.status)}</span></td>
                   <td>
                     <div style={{ color: 'var(--text-0)' }}>{s.unitNumber}</div>
                     <div style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>{s.propertyName}</div>

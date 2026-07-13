@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
+import { humanizeServiceType } from '@gam/shared'
 import { apiGet } from '../lib/api'
 import { useAuth } from '../context/AuthContext'
 import { OnboardingWizard } from '../components/OnboardingWizard'
@@ -254,7 +255,7 @@ function TodayAppointmentsTile({ rows }: { rows: AppointmentRow[] }) {
                   {customerLabel(a)}
                 </div>
                 <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 2 }}>
-                  {a.serviceType} · {a.durationMinutes}min
+                  {humanizeServiceType(a.serviceType)} · {a.durationMinutes}min
                 </div>
               </div>
               <ChevronRight size={12} color="var(--text-3)" />

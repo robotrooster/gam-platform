@@ -18,6 +18,19 @@ api.interceptors.request.use(c => {
 // packages/shared/src/camelize.ts.
 applyCamelizeInterceptor(api)
 
+// S537: auto-logout on 401 — an expired session must land the tenant on
+// the login screen, never leave a dead-feeling portal (same as landlord).
+api.interceptors.response.use(
+  r => r,
+  err => {
+    if (err.response?.status === 401 && !String(err.config?.url || '').includes('/auth/')) {
+      localStorage.removeItem('gam_tenant_token')
+      window.location.href = '/login'
+    }
+    return Promise.reject(err)
+  }
+)
+
 export const apiGet = <T = any>(url: string): Promise<T> =>
   api.get<{ success: boolean; data: T }>(url).then(r => r.data.data)
 

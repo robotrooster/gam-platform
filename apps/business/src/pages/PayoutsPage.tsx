@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
+import { humanize } from '@gam/shared'
 import { apiGet, apiPost } from '../lib/api'
 import { Modal } from '../components/Modal'
 import { Banknote, ArrowRight, AlertTriangle, RefreshCw } from 'lucide-react'
@@ -161,7 +162,7 @@ function PayoutStatus({ status, message }: { status: Payout['status']; message: 
       padding: '3px 8px', fontSize: 11, fontWeight: 700,
       textTransform: 'uppercase' as const, letterSpacing: 0.5,
       border: `1px solid ${color}`, color, borderRadius: 4,
-    }}>{status.replace('_', ' ')}</span>
+    }}>{humanize(status)}</span>
   )
 }
 

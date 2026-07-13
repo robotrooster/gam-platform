@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useQueryClient, useMutation } from 'react-query'
+import { humanize } from '@gam/shared'
 import { apiGet, apiPatch } from '../lib/api'
 import { ArrowLeft, Plus, DoorOpen, DollarSign, Building2, MapPin, UserCheck } from 'lucide-react'
 import { AddUnitModal } from './AddUnitModal'
@@ -11,7 +12,7 @@ import { usePerms } from '../lib/permissions'
 // creates them; nothing pre-baked.
 import { UnitSubtypesSection } from './UnitSubtypesSection'
 import { PropertyAgentPermissionsSection } from './PropertyAgentPermissionsSection'
-import { PropertyLateFeeSection } from './PropertyLateFeeSection'
+import { PropertyLateFeeSection, PaymentAcceptanceCard } from './PropertyLateFeeSection'
 import { LawWarningBanner } from '../components/LawWarningBanner'
 import { LAUNCH_HIDDEN } from '../components/layout/Layout'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
@@ -109,6 +110,7 @@ export function PropertyDetailPage() {
             fees are set; stamped (locked) into every drafted lease so
             terms are identical for all tenants. */}
       <PropertyLateFeeSection property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
+      <PaymentAcceptanceCard property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
 
       {/* Occupancy bar */}
       <div style={{ marginBottom:24 }}>
@@ -169,7 +171,7 @@ export function PropertyDetailPage() {
                     )}
                   </td>
                   <td className="mono">{fmt(u.rentAmount)}/mo</td>
-                  <td><span className={`badge ${STATUS_COLORS[u.status] || 'badge-muted'}`}>{u.status?.replace('_',' ')}</span></td>
+                  <td><span className={`badge ${STATUS_COLORS[u.status] || 'badge-muted'}`}>{humanize(u.status)}</span></td>
                   <td style={{ fontSize:'.78rem' }}>{u.bedrooms}bd / {u.bathrooms}ba</td>
                   <td className="mono" style={{ fontSize:'.75rem' }}>{u.sqft ? u.sqft.toLocaleString() : '—'}</td>
                   <td onClick={e => e.stopPropagation()}>

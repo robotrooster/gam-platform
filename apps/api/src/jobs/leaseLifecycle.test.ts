@@ -66,6 +66,15 @@ async function buildLeaseStack(opts: {
     const unitId = await seedUnit(client, {
       propertyId, landlordId, rentAmount: opts.rentAmount ?? 1000,
     })
+    // S537: billing is min(lease schedule, class policy). This suite
+    // tests LEASE-schedule mechanics, so give the class a permissive
+    // policy (huge budget) that never becomes the binding constraint.
+    await client.query(
+      `INSERT INTO property_unit_type_late_fees
+         (property_id, unit_type, no_late_fee, late_fee_grace_days, late_fee_initial_amount, late_fee_initial_type)
+       VALUES ($1, 'apartment', FALSE, 0, 100000, 'flat')
+       ON CONFLICT (property_id, unit_type) DO NOTHING`,
+      [propertyId])
     const leaseId = await seedLease(client, {
       unitId, landlordId,
       rentAmount: opts.rentAmount ?? 1000,

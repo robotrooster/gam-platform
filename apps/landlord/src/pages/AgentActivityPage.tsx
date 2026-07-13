@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { useQuery } from 'react-query'
 import { Bot, MessageCircle, AlertTriangle, Zap, Wrench as WrenchIcon } from 'lucide-react'
+import { humanize } from '@gam/shared'
 import { apiGet } from '../lib/api'
 
 interface OutcomeRow { outcome: string; count: number }
@@ -51,7 +52,7 @@ const OUTCOME_LABEL: Record<string, string> = {
 }
 
 function fmtOutcome(o: string): string {
-  return OUTCOME_LABEL[o] ?? o.replace(/_/g, ' ')
+  return OUTCOME_LABEL[o] ?? humanize(o)
 }
 
 function fmtTime(iso: string): string {

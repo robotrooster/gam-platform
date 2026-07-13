@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { TrendingUp, AlertTriangle, CheckCircle2, Clock } from 'lucide-react'
+import { humanize } from '@gam/shared'
 import { apiGet, apiPost } from '../lib/api'
 
 type Tenant = {
@@ -285,7 +286,7 @@ export function OtpPage() {
                     <td className="mono" style={{ color: 'var(--text-3)' }}>{fmt(a.feeAmount)}</td>
                     <td className="mono" style={{ color: 'var(--text-0)', fontWeight: 600 }}>{fmt(a.advanceAmount)}</td>
                     <td>
-                      <span className={`badge ${STATUS_BADGE[a.status] || 'badge-muted'}`}>{a.status}</span>
+                      <span className={`badge ${STATUS_BADGE[a.status] || 'badge-muted'}`}>{humanize(a.status)}</span>
                       {a.defaultReason && (
                         <div style={{ fontSize: '.65rem', color: 'var(--red)', marginTop: 2 }}>{a.defaultReason}</div>
                       )}

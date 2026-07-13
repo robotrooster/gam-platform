@@ -2,6 +2,7 @@ import { useState, CSSProperties } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPatch, apiDelete } from '../lib/api'
 import { Package, Wrench, Plus, Pencil, Trash2, Check } from 'lucide-react'
+import { appConfirm } from '../components/dialogs'
 
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 const lbl: CSSProperties = { fontSize:'.68rem', fontWeight:600, color:'var(--text-3)', textTransform:'uppercase', letterSpacing:'.06em', display:'block', marginBottom:4 }
@@ -87,7 +88,7 @@ export function InventoryPage() {
                     <td>
                       <div style={{ display:'flex', gap:4, justifyContent:'flex-end' }}>
                         <button className="btn btn-ghost btn-sm" title="Edit" onClick={()=>openEdit(p)}><Pencil size={12}/></button>
-                        <button className="btn btn-ghost btn-sm" title="Delete" style={{ color:'var(--red)' }} onClick={()=>{ if (window.confirm(`Delete "${p.name}" from inventory? This cannot be undone.`)) deleteItemMut.mutate(p.id) }}><Trash2 size={12}/></button>
+                        <button className="btn btn-ghost btn-sm" title="Delete" style={{ color:'var(--red)' }} onClick={()=>{ appConfirm(`Delete "${p.name}" from inventory? This cannot be undone.`, { danger: true, confirmLabel: 'Delete' }).then(ok => { if (ok) deleteItemMut.mutate(p.id) }) }}><Trash2 size={12}/></button>
                       </div>
                     </td>
                   </tr>
