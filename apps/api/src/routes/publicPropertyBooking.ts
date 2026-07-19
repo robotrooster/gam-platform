@@ -1,12 +1,14 @@
 import { Router } from 'express'
 import { z } from 'zod'
+import path from 'path'
 import { DateTime } from 'luxon'
-import { query, queryOne } from '../db'
+import { query, queryOne, getClient } from '../db'
+import { resolveUploadPath } from '../lib/uploadPaths'
 import { AppError } from '../middleware/errorHandler'
 import {
   computeStayTotal, bookStay, joinWaitlist, getWaitlistClaim, claimWaitlistSpot, UnitFullError,
 } from '../services/propertyBooking'
-import { computeStayPrice } from '@gam/shared'
+import { computeStayPrice, computeMonthlyStaySchedule, BOOKING_MONTHLY_DEPOSIT_DEFAULT } from '@gam/shared'
 import { rankUnitsBestFit } from '../services/scheduleCompression'
 
 // Re-exported for tests that import the legacy pure pricing helper from the
@@ -33,6 +35,13 @@ interface PropertyRow {
   state: string | null
   booking_intro: string | null
   booking_deposit_pct: string
+  booking_monthly_deposit: string | null
+  booking_utilities_billed: boolean
+  street1: string | null
+  zip: string | null
+  office_phone: string | null
+  office_email: string | null
+  office_hours: string | null
   nightly_rate: string | null
   weekly_rate: string | null
   monthly_rate: string | null
@@ -43,6 +52,8 @@ interface PropertyRow {
 async function resolveProperty(slug: string): Promise<PropertyRow> {
   const prop = await queryOne<PropertyRow>(
     `SELECT id, landlord_id, name, city, state, booking_intro, booking_deposit_pct,
+            booking_monthly_deposit, booking_utilities_billed,
+            street1, zip, office_phone, office_email, office_hours,
             nightly_rate, weekly_rate, monthly_rate, short_term_tax_rate
        FROM properties
       WHERE booking_slug = $1 AND public_booking_enabled = TRUE`,
@@ -120,6 +131,34 @@ publicPropertyBookingRouter.get('/property/:slug', async (req, res, next) => {
   try {
     const prop = await resolveProperty(req.params.slug)
     const units = await bookableUnits(prop.id)
+    // S544: amenities for the storefront — the property's active common
+    // areas (names/descriptions/hours only; reservations stay
+    // resident-only in the tenant portal).
+    // S547: reservable areas expose enough for the guest reserve flow
+    // (fees, event posture, window rules) — still no unit inventory.
+    const amenities = await query<any>(
+      `SELECT id, name, description, capacity, open_time, close_time,
+              reservable, requires_approval, reservation_fee, weekend_fee,
+              events_enabled, event_deposit_amount,
+              max_reservation_hours, advance_booking_days
+         FROM common_areas
+        WHERE property_id = $1 AND active = TRUE
+        ORDER BY name`,
+      [prop.id])
+    // S547: full property-website content — gallery photos + FAQs. Public by
+    // virtue of the site being published (resolveProperty gates on
+    // public_booking_enabled).
+    const photos = (await query<any>(
+      `SELECT id, caption FROM property_site_photos
+        WHERE property_id = $1 ORDER BY sort_order ASC, created_at ASC`,
+      [prop.id])).map((p: any) => ({
+        id: p.id, caption: p.caption,
+        url: `/api/public/property/${req.params.slug}/photo/${p.id}`,
+      }))
+    const faqs = await query<any>(
+      `SELECT id, question, answer FROM property_faqs
+        WHERE property_id = $1 ORDER BY sort_order ASC, created_at ASC`,
+      [prop.id])
     // W-20: expose site TYPES only — never the unit inventory. The guest
     // learns their actual site the morning of check-in.
     const siteTypes = groupSiteTypes(units).map(t => {
@@ -145,19 +184,368 @@ publicPropertyBookingRouter.get('/property/:slug', async (req, res, next) => {
           state: prop.state,
           intro: prop.booking_intro,
           depositPct: Number(prop.booking_deposit_pct),
+          // S547 contact page
+          street1: prop.street1,
+          zip: prop.zip,
+          officePhone: prop.office_phone,
+          officeEmail: prop.office_email,
+          officeHours: prop.office_hours,
         },
         siteTypes,
+        amenities,
+        photos,
+        faqs,
+      },
+    })
+  } catch (e) { next(e) }
+})
+
+// ── GET /property/:slug/photo/:photoId — S547 public gallery image ──
+// Streams a site photo from disk. Only rows belonging to a PUBLISHED site
+// resolve (resolveProperty 404s otherwise), and only from the site-photo
+// dir — internal unit/inspection photos are unreachable by construction.
+const SITE_PHOTO_DIR = path.join(process.cwd(), 'uploads', 'property-site-photos')
+publicPropertyBookingRouter.get('/property/:slug/photo/:photoId', async (req, res, next) => {
+  try {
+    const prop = await resolveProperty(req.params.slug)
+    if (!z.string().uuid().safeParse(req.params.photoId).success) throw new AppError(404, 'Photo not found')
+    const row = await queryOne<{ filename: string }>(
+      `SELECT filename FROM property_site_photos WHERE id=$1 AND property_id=$2`,
+      [req.params.photoId, prop.id])
+    if (!row) throw new AppError(404, 'Photo not found')
+    const fp = resolveUploadPath(SITE_PHOTO_DIR, row.filename)
+    if (!fp) throw new AppError(404, 'Photo not found')
+    res.setHeader('Cache-Control', 'public, max-age=3600')
+    // Helmet defaults CORP to same-origin, which blocks the storefront's
+    // cross-origin <img> embeds — this image is public by definition.
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin')
+    res.sendFile(fp, err => { if (err && !res.headersSent) next(new AppError(404, 'Photo not found')) })
+  } catch (e) { next(e) }
+})
+
+// ── POST /property/:slug/inquiry — S544 storefront contact form ──
+// Anonymous guests asking about sites/amenities/availability. Stored
+// durably + landlord notification (with email) carrying the message.
+publicPropertyBookingRouter.post('/property/:slug/inquiry', async (req, res, next) => {
+  try {
+    const b = z.object({
+      name:    z.string().min(1).max(120),
+      email:   z.string().email().max(200),
+      phone:   z.string().max(40).optional(),
+      message: z.string().min(1).max(2000),
+    }).parse(req.body)
+    const prop = await resolveProperty(req.params.slug)
+    await recordGuestInquiry(prop, b)
+    res.json({ success: true, data: { received: true } })
+  } catch (e) { next(e) }
+})
+
+/** Store a guest inquiry + notify (and email) the landlord. Shared by the
+ *  standalone contact form and the S547 with-reservation question. */
+async function recordGuestInquiry(
+  prop: PropertyRow,
+  b: { name: string; email: string; phone?: string | null; message: string },
+  titlePrefix = 'New inquiry',
+): Promise<void> {
+  const row = await queryOne<{ id: string }>(
+    `INSERT INTO property_inquiries (property_id, guest_name, guest_email, guest_phone, message)
+     VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+    [prop.id, b.name, b.email, b.phone ?? null, b.message])
+
+  const landlord = await queryOne<{ user_id: string; email: string }>(
+    `SELECT l.user_id, u.email FROM landlords l JOIN users u ON u.id = l.user_id
+      WHERE l.id = $1`, [prop.landlord_id])
+  if (landlord) {
+    const { createNotification } = await import('../services/notifications')
+    await createNotification({
+      userId: landlord.user_id,
+      landlordId: prop.landlord_id,
+      type: 'property_inquiry',
+      title: `${titlePrefix} — ${prop.name}`,
+      body: `${b.name} (${b.email}${b.phone ? `, ${b.phone}` : ''}): ${b.message}`,
+      data: { inquiry_id: row!.id, property_id: prop.id },
+      sendEmail: true,
+      emailTo: landlord.email,
+      emailSubject: `${titlePrefix} — ${prop.name}`,
+    })
+  }
+}
+
+// ── S547 guest stay surface (token-gated, per Nic: amenity booking must
+// never look publicly bookable). The guest's STAY LINK (emailed at booking,
+// QR at the desk, expires after check-out) is the key: /stay/:token on the
+// property's own subdomain shows their stay + amenity booking. ──
+
+// GET /property/:slug/stay/:token — stay summary for the tokened page.
+publicPropertyBookingRouter.get('/property/:slug/stay/:token', async (req, res, next) => {
+  try {
+    const prop = await resolveProperty(req.params.slug)
+    const { resolveBookingGuestToken } = await import('../services/bookingGuestTokens')
+    const guest = await resolveBookingGuestToken(req.params.token)
+    if (!guest) throw new AppError(404, 'This stay link is invalid or has expired')
+    const stay = await queryOne<any>(
+      `SELECT b.id, b.guest_name, b.check_in, b.check_out, b.nights, b.status
+         FROM unit_bookings b JOIN units u ON u.id = b.unit_id
+        WHERE b.id = $1 AND u.property_id = $2`, [guest.bookingId, prop.id])
+    if (!stay || stay.status === 'cancelled') throw new AppError(404, 'This stay link is invalid or has expired')
+    res.json({
+      success: true,
+      data: {
+        guestName: stay.guest_name,
+        checkIn: stay.check_in, checkOut: stay.check_out, nights: stay.nights,
+        status: stay.status, propertyName: prop.name,
+      },
+    })
+  } catch (e) { next(e) }
+})
+
+// POST /property/:slug/stay-link — "resend my stay link". Always answers
+// success (no email enumeration); live stays under the email get a fresh
+// tokened link by email.
+publicPropertyBookingRouter.post('/property/:slug/stay-link', async (req, res, next) => {
+  try {
+    const b = z.object({ email: z.string().email().max(200) }).parse(req.body)
+    const prop = await resolveProperty(req.params.slug)
+    const stays = await query<any>(
+      `SELECT b.id, b.guest_name FROM unit_bookings b
+         JOIN units u ON u.id = b.unit_id
+        WHERE u.property_id = $1
+          AND LOWER(b.guest_email) = LOWER($2)
+          AND b.status IN ('confirmed', 'checked_in')
+          AND b.check_out >= CURRENT_DATE
+        ORDER BY b.check_in LIMIT 3`, [prop.id, b.email])
+    for (const s of stays) {
+      const { issueBookingGuestToken } = await import('../services/bookingGuestTokens')
+      const issued = await issueBookingGuestToken({ bookingId: s.id, landlordId: prop.landlord_id, delivery: 'email' })
+      const { emailGuestStayLink } = await import('../services/email')
+      await emailGuestStayLink(b.email, s.guest_name, prop.name,
+        storefrontStayUrl(req.params.slug, issued.token), { landlordId: prop.landlord_id })
+        .catch(() => {})
+    }
+    res.json({ success: true, data: { sent: true } })
+  } catch (e) { next(e) }
+})
+
+/** The stay page on the property's own site (path-slug dev / subdomain prod). */
+function storefrontStayUrl(slug: string, token: string): string {
+  const template = process.env.STOREFRONT_URL_TEMPLATE || 'http://localhost:3015/{slug}'
+  return template.replace('{slug}', slug) + `/stay/${token}`
+}
+
+// POST /property/:slug/stay/:token/amenity/:areaId/reserve — the guest's
+// amenity booking, authenticated by their stay link. Reuses the tenant
+// flow's machinery (window rules, advisory-lock conflict check, approval
+// posture, resident alerts). Fees are recorded but collected at the office —
+// guests have no payment rail yet.
+publicPropertyBookingRouter.post('/property/:slug/stay/:token/amenity/:areaId/reserve', async (req, res, next) => {
+  try {
+    const b = z.object({
+      startsAt:   z.string().datetime(),
+      endsAt:     z.string().datetime(),
+      title:      z.string().trim().max(160).optional(),
+      guestCount: z.number().int().positive().nullable().optional(),
+      notes:      z.string().trim().max(2000).optional(),
+      isEvent:    z.boolean().optional(),
+    }).parse(req.body)
+    const prop = await resolveProperty(req.params.slug)
+
+    const { resolveBookingGuestToken } = await import('../services/bookingGuestTokens')
+    const guest = await resolveBookingGuestToken(req.params.token)
+    if (!guest) throw new AppError(401, 'This stay link is invalid or has expired')
+
+    const { loadArea, validateWindow, fireAmenityAlert } = await import('./commonAreas')
+    const area = await loadArea(req.params.areaId)
+    if (!area || area.property_id !== prop.id || !area.active) throw new AppError(404, 'Common area not found')
+    if (!area.reservable) throw new AppError(400, 'This area is not reservable')
+    if (b.isEvent && !area.events_enabled) throw new AppError(400, `${area.name} does not host private events`)
+
+    // The reservation day must fall inside THIS stay.
+    const stay = await queryOne<any>(
+      `SELECT b.id, b.guest_name FROM unit_bookings b
+         JOIN units u ON u.id = b.unit_id
+        WHERE b.id = $1 AND u.property_id = $2
+          AND b.status IN ('tentative', 'confirmed', 'checked_in')
+          AND $3::date BETWEEN b.check_in AND b.check_out`,
+      [guest.bookingId, prop.id, b.startsAt.slice(0, 10)])
+    if (!stay) {
+      throw new AppError(403, 'Amenity reservations must fall within your stay dates.')
+    }
+
+    // Advance cap skipped: the stay-date bound above is the guest's limit.
+    validateWindow(area, b.startsAt, b.endsAt, { skipAdvanceLimit: true })
+    const { lockArea, findApprovedConflict, computeReservationFee, assertMonthlyReservationLimit } = await import('../services/commonAreas')
+    // S547: per-person monthly cap (bad-actor guard) — a guest can't squat
+    // the pool with stacked daily holds.
+    await assertMonthlyReservationLimit(area, { guestBookingId: stay.id }, b.startsAt)
+    const fee = b.isEvent ? Number(area.event_deposit_amount || 0) : computeReservationFee(area, b.startsAt)
+    const kind = b.isEvent ? 'event' : 'guest_reservation'
+    const notifyFlag = b.isEvent ? area.event_announce !== false : true
+    const autoApprove = !area.requires_approval
+    let id: string
+
+    if (autoApprove) {
+      const client = await getClient()
+      try {
+        await client.query('BEGIN')
+        await lockArea(client, area.id)
+        const conflict = await findApprovedConflict(client, area.id, b.startsAt, b.endsAt)
+        if (conflict) throw new AppError(409, 'That window is already reserved — pick another time')
+        const ins = await client.query(
+          `INSERT INTO common_area_reservations
+             (common_area_id, property_id, landlord_id, guest_booking_id,
+              title, kind, starts_at, ends_at, status, guest_count, notes, fee_amount,
+              notify_residents, decided_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'approved',$9,$10,$11,$12,now()) RETURNING id`,
+          [area.id, prop.id, prop.landlord_id, stay.id,
+           b.title ?? null, kind, b.startsAt, b.endsAt, b.guestCount ?? null, b.notes ?? null, fee, notifyFlag])
+        id = ins.rows[0].id
+        await client.query('COMMIT')
+      } catch (e) { try { await client.query('ROLLBACK') } catch {} throw e } finally { client.release() }
+      await fireAmenityAlert(id)
+    } else {
+      const ins = await queryOne<any>(
+        `INSERT INTO common_area_reservations
+           (common_area_id, property_id, landlord_id, guest_booking_id,
+            title, kind, starts_at, ends_at, status, guest_count, notes, fee_amount,
+            notify_residents)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending',$9,$10,$11,$12) RETURNING id`,
+        [area.id, prop.id, prop.landlord_id, stay.id,
+         b.title ?? null, kind, b.startsAt, b.endsAt, b.guestCount ?? null, b.notes ?? null, fee, notifyFlag])
+      id = ins!.id
+      const meta = await queryOne<any>(
+        `SELECT lu.id AS landlord_user_id, lu.email AS landlord_email
+           FROM landlords l JOIN users lu ON lu.id = l.user_id WHERE l.id = $1`, [prop.landlord_id])
+      if (meta?.landlord_user_id) {
+        const { notifyReservationRequested } = await import('../services/notifications')
+        await notifyReservationRequested({
+          landlordUserId: meta.landlord_user_id, landlordId: prop.landlord_id,
+          landlordEmail: meta.landlord_email,
+          tenantName: `${stay.guest_name || 'A guest'} (short-term guest)`,
+          areaName: area.name, propertyName: prop.name,
+          startsAt: b.startsAt, endsAt: b.endsAt, reservationId: id, guestCount: b.guestCount ?? null,
+        })
+      }
+    }
+
+    res.status(201).json({
+      success: true,
+      data: {
+        reservationId: id,
+        status: autoApprove ? 'approved' : 'pending',
+        feeAmount: fee,
       },
     })
   } catch (e) { next(e) }
 })
 
 // ── GET /api/public/property/:slug/availability ──
-// ?unitId=&checkIn=&checkOut=&stayType=  → availability + indicative price.
+// ?checkIn=&checkOut=[&siteTypeId=] → availability + indicative price.
+// With siteTypeId: the original single-type shape (legacy customer portal).
+// Without (S547, Nic — dates-first storefront): every site type's
+// availability + stay quote in one call, so the guest picks dates first and
+// only ever chooses from what's actually open.
+
+/** W-20: availability = ANY unit of the site type free for the window
+ *  (guests never see per-unit inventory). Returns the quote fields shared by
+ *  both response shapes. */
+async function typeAvailability(prop: PropertyRow, siteType: SiteType, nights: number, checkIn: string, checkOut: string) {
+  let freeUnit: any = null
+  for (const u of siteType.units) {
+    const conflict = await queryOne<{ id: string }>(
+      `SELECT id FROM unit_bookings
+        WHERE unit_id = $1
+          AND status <> 'cancelled'
+          AND NOT (status = 'tentative' AND hold_expires_at IS NOT NULL AND hold_expires_at < now())
+          AND check_in < $2::date AND check_out > $3::date
+        LIMIT 1`,
+      [u.id, checkOut, checkIn])
+    if (!conflict) { freeUnit = u; break }
+  }
+
+  // Auto-tiered pricing (guest does not pick a billing type — Nic 2026-06-27):
+  // length decides nightly/weekly/monthly, prorated, with short-term lodging
+  // tax on stays under 30 nights. Rates: subtype, else unit, else property.
+  const rep = freeUnit ?? siteType.units[0]
+  const rates = {
+    nightly: rep.subtype_nightly ?? rep.nightly_rate ?? prop.nightly_rate,
+    weekly:  rep.subtype_weekly  ?? rep.weekly_rate  ?? prop.weekly_rate,
+    monthly: rep.subtype_monthly ?? rep.monthly_rate ?? prop.monthly_rate,
+  }
+  const price = computeStayPrice(rates, Number(prop.short_term_tax_rate || 0), nights)
+  // S547 (Nic): 30+ night stays bill like residents — prorated arrival month
+  // (monthly/30), flat monthly on the 1st, prorated departure. The quote
+  // total is the schedule sum so quote and invoices can never disagree.
+  const monthlyBilling = price.tier === 'monthly' && rates.monthly != null
+    ? computeMonthlyStaySchedule(checkIn, checkOut, Number(rates.monthly))
+    : null
+  const total = monthlyBilling ? monthlyBilling.total : (price.total > 0 ? price.total : null)
+  const depositPct = Number(prop.booking_deposit_pct)
+  // Deposit rule (S547, Nic): % of total for short stays only; monthly-tier
+  // stays owe a flat deposit (per-property, default utility-bill-sized),
+  // hard-capped at one month's rent.
+  const monthlyFlat = prop.booking_monthly_deposit != null ? Number(prop.booking_monthly_deposit) : BOOKING_MONTHLY_DEPOSIT_DEFAULT
+  const depositAmount = total == null ? null
+    : monthlyBilling ? Math.round(Math.min(monthlyFlat, Number(rates.monthly)) * 100) / 100
+    : Math.round(total * (depositPct / 100) * 100) / 100
+
+  const minStay = rep.min_stay_nights
+  const maxStay = rep.max_stay_nights
+  const stayTooShort = minStay != null && nights < minStay
+  const stayTooLong  = maxStay != null && nights > maxStay
+
+  // S547 adaptive booking (Nic): when the type is full for the FULL range,
+  // find the longest stay that DOES fit starting at the same check-in — "a
+  // pull-through is open for 9 of your 10 nights" — so the guest can shorten
+  // instead of walking away, and the schedule packs tighter.
+  let altStay: { checkOut: string; nights: number } | null = null
+  if (!freeUnit && siteType.units.length > 0) {
+    const conflicts = await query<{ unit_id: string; first_conflict: string }>(
+      `SELECT unit_id, MIN(check_in)::text AS first_conflict
+         FROM unit_bookings
+        WHERE unit_id = ANY($1::uuid[])
+          AND status <> 'cancelled'
+          AND NOT (status = 'tentative' AND hold_expires_at IS NOT NULL AND hold_expires_at < now())
+          AND check_in < $2::date AND check_out > $3::date
+        GROUP BY unit_id`,
+      [siteType.units.map((u: any) => u.id), checkOut, checkIn])
+    const byUnit = new Map(conflicts.map(c => [c.unit_id, c.first_conflict.slice(0, 10)]))
+    let bestEnd: string | null = null
+    for (const u of siteType.units) {
+      const end = byUnit.get(u.id)
+      if (!end) continue                    // shouldn't happen: no conflict = freeUnit above
+      if (end > checkIn && (!bestEnd || end > bestEnd)) bestEnd = end
+    }
+    if (bestEnd && bestEnd < checkOut) {
+      const altNights = Math.round(
+        (new Date(bestEnd + 'T12:00:00Z').getTime() - new Date(checkIn + 'T12:00:00Z').getTime()) / 86400000)
+      if (altNights >= Math.max(1, minStay ?? 1)) altStay = { checkOut: bestEnd, nights: altNights }
+    }
+  }
+
+  return {
+    altStay,
+    available: !!freeUnit && !stayTooShort && !stayTooLong && total != null,
+    unavailableReason: !freeUnit ? 'booked'
+      : stayTooShort ? `Minimum stay is ${minStay} nights`
+      : stayTooLong ? `Maximum stay is ${maxStay} nights`
+      : total == null ? 'rate_unavailable'
+      : null,
+    tier: price.tier,
+    base: monthlyBilling ? monthlyBilling.total : price.base,
+    tax: monthlyBilling ? 0 : price.tax,
+    taxable: monthlyBilling ? false : price.taxable,
+    total, depositPct, depositAmount,
+    // Present only on monthly-tier stays: the calendar-aligned invoice plan.
+    monthlyBilling: monthlyBilling
+      ? { monthlyRate: Number(rates.monthly), segments: monthlyBilling.segments }
+      : null,
+  }
+}
+
 publicPropertyBookingRouter.get('/property/:slug/availability', async (req, res, next) => {
   try {
     const q = z.object({
-      siteTypeId: z.string(),
+      siteTypeId: z.string().optional(),
       checkIn:  z.string(),
       checkOut: z.string(),
       stayType: z.enum(['nightly', 'weekly']).default('nightly'),
@@ -172,53 +560,35 @@ publicPropertyBookingRouter.get('/property/:slug/availability', async (req, res,
     if (nights <= 0) throw new AppError(400, 'Check-out must be after check-in')
     if (ci < DateTime.now().startOf('day')) throw new AppError(400, 'Check-in is in the past')
 
-    // W-20: availability = ANY unit of the requested site type free for the
-    // window (guests never see per-unit inventory).
-    const siteType = resolveSiteType(await bookableUnits(prop.id), q.siteTypeId)
-    let freeUnit: any = null
-    for (const u of siteType.units) {
-      const conflict = await queryOne<{ id: string }>(
-        `SELECT id FROM unit_bookings
-          WHERE unit_id = $1
-            AND status <> 'cancelled'
-            AND NOT (status = 'tentative' AND hold_expires_at IS NOT NULL AND hold_expires_at < now())
-            AND check_in < $2::date AND check_out > $3::date
-          LIMIT 1`,
-        [u.id, q.checkOut, q.checkIn])
-      if (!conflict) { freeUnit = u; break }
+    const units = await bookableUnits(prop.id)
+
+    if (q.siteTypeId) {
+      const siteType = resolveSiteType(units, q.siteTypeId)
+      const a = await typeAvailability(prop, siteType, nights, q.checkIn, q.checkOut)
+      return res.json({ success: true, data: { ...a, nights } })
     }
 
-    // Auto-tiered pricing (guest does not pick a billing type — Nic 2026-06-27):
-    // length decides nightly/weekly/monthly, prorated, with short-term lodging
-    // tax on stays under 30 nights. Rates: subtype, else unit, else property.
-    const rep = freeUnit ?? siteType.units[0]
-    const price = computeStayPrice(
-      { nightly: rep.subtype_nightly ?? rep.nightly_rate ?? prop.nightly_rate,
-        weekly:  rep.subtype_weekly  ?? rep.weekly_rate  ?? prop.weekly_rate,
-        monthly: rep.subtype_monthly ?? rep.monthly_rate ?? prop.monthly_rate },
-      Number(prop.short_term_tax_rate || 0), nights)
-    const total = price.total > 0 ? price.total : null
-    const depositPct = Number(prop.booking_deposit_pct)
-    const depositAmount = total != null ? Math.round(total * (depositPct / 100) * 100) / 100 : null
-
-    const minStay = rep.min_stay_nights
-    const maxStay = rep.max_stay_nights
-    const stayTooShort = minStay != null && nights < minStay
-    const stayTooLong  = maxStay != null && nights > maxStay
-
-    const available = !!freeUnit && !stayTooShort && !stayTooLong && total != null
-
+    const siteTypes = []
+    for (const t of groupSiteTypes(units)) {
+      const a = await typeAvailability(prop, t, nights, q.checkIn, q.checkOut)
+      siteTypes.push({
+        id: t.id,
+        name: t.name,
+        minStayNights: t.units[0].min_stay_nights,
+        checkInTime: t.units[0].check_in_time,
+        checkOutTime: t.units[0].check_out_time,
+        ...a,
+      })
+    }
     res.json({
       success: true,
       data: {
-        available,
-        unavailableReason: !freeUnit ? 'booked'
-          : stayTooShort ? `Minimum stay is ${minStay} nights`
-          : stayTooLong ? `Maximum stay is ${maxStay} nights`
-          : total == null ? 'rate_unavailable'
-          : null,
-        nights, tier: price.tier, base: price.base, tax: price.tax, taxable: price.taxable,
-        total, depositPct, depositAmount,
+        nights,
+        depositPct: Number(prop.booking_deposit_pct),
+        // S547: monthly-tier quotes show "plus utilities" when the property
+        // bills utilities back on long stays.
+        utilitiesBilled: prop.booking_utilities_billed,
+        siteTypes,
       },
     })
   } catch (e) { next(e) }
@@ -233,6 +603,9 @@ const guestBody = z.object({
   checkIn:   z.string(),
   checkOut:  z.string(),
   stayType:  z.enum(['nightly', 'weekly']).default('nightly'),
+  // S547: optional question submitted WITH the reservation (the standalone
+  // contact form lives on the home page, not the booking page).
+  note: z.string().max(2000).optional(),
 })
 
 // ── POST /property/:slug/book — tentative hold + Stripe deposit checkout ──
@@ -257,6 +630,15 @@ publicPropertyBookingRouter.post('/property/:slug/book', async (req, res, next) 
           requiredSiteLayout: siteType.requiredLayout ?? 'none',
           requiredAmpService: siteType.requiredAmp ?? 'none',
         })
+        // S547: a question riding along with the reservation lands in the
+        // landlord's inquiry stream too (the booking's notes alone would sit
+        // unseen). Best-effort — never fails the booking.
+        if (b.note?.trim()) {
+          recordGuestInquiry(prop,
+            { name: b.guestName, email: b.guestEmail, phone: b.guestPhone, message: b.note.trim() },
+            'Reservation question')
+            .catch(() => {})
+        }
         return res.json({ success: true, data: r })
       } catch (e) {
         if (e instanceof UnitFullError) { lastFull = e; continue }
@@ -267,6 +649,38 @@ publicPropertyBookingRouter.post('/property/:slug/book', async (req, res, next) 
   } catch (e) {
     next(e)
   }
+})
+
+// ── GET /property/:slug/booking/:id — S547 confirmation-page status ──
+// The Stripe success URL returns the guest to /booked?booking=<id>; the page
+// polls this until the deposit webhook flips the booking 'confirmed'. Keyed by
+// the unguessable booking uuid + slug match; returns only what the guest
+// already knows plus status — never unit inventory or site numbers.
+publicPropertyBookingRouter.get('/property/:slug/booking/:id', async (req, res, next) => {
+  try {
+    const prop = await resolveProperty(req.params.slug)
+    if (!z.string().uuid().safeParse(req.params.id).success) throw new AppError(404, 'Booking not found')
+    const b = await queryOne<any>(
+      `SELECT b.status, b.check_in, b.check_out, b.nights, b.guest_name,
+              b.deposit_amount, b.total_amount, b.hold_expires_at
+         FROM unit_bookings b
+         JOIN units u ON u.id = b.unit_id
+        WHERE b.id = $1 AND u.property_id = $2`,
+      [req.params.id, prop.id])
+    if (!b) throw new AppError(404, 'Booking not found')
+    res.json({
+      success: true,
+      data: {
+        status: b.status,
+        checkIn: b.check_in, checkOut: b.check_out, nights: b.nights,
+        guestName: b.guest_name,
+        depositAmount: b.deposit_amount != null ? Number(b.deposit_amount) : null,
+        total: b.total_amount != null ? Number(b.total_amount) : null,
+        holdExpiresAt: b.hold_expires_at,
+        propertyName: prop.name,
+      },
+    })
+  } catch (e) { next(e) }
 })
 
 // ── POST /property/:slug/waitlist — join when dates are full ──

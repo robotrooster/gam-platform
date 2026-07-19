@@ -1,3 +1,4 @@
+import { isAuthRejection, fetchAuthMeWithRetry } from '@gam/shared'
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react'
 import { apiPost, apiGet } from '../lib/api'
 
@@ -74,7 +75,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const refresh = useCallback(async () => {
     try {
-      const me = await apiGet<AuthUser>('/auth/me')
+      const me = await fetchAuthMeWithRetry(() => apiGet<AuthUser>('/auth/me'))
       // Reject any /me response that isn't a business role — the
       // portal is business-only. Token may belong to a landlord who
       // clicked the wrong portal URL; bounce them to login.
@@ -84,7 +85,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       }
       setUser(me)
       await fetchBusiness(me.role)
-    } catch { logout() }
+    } catch (e) {
+      // S540: only a real auth rejection ends the session. API
+      // restarts / network blips keep the token; next load recovers.
+      if (isAuthRejection(e)) logout()
+    }
     finally { setLoading(false) }
   }, [logout, fetchBusiness])
 

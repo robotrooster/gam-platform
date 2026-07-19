@@ -1,3 +1,14 @@
+import { isAuthRejection, fetchAuthMeWithRetry } from '@gam/shared'
+// S540: self-hosted fonts — no render-blocking external stylesheet
+import '@fontsource/syne/600.css'
+import '@fontsource/syne/700.css'
+import '@fontsource/syne/800.css'
+import '@fontsource/dm-sans/300.css'
+import '@fontsource/dm-sans/400.css'
+import '@fontsource/dm-sans/500.css'
+import '@fontsource/dm-sans/600.css'
+import '@fontsource/dm-mono/400.css'
+import '@fontsource/dm-mono/500.css'
 import { SentryErrorBoundary } from './lib/sentry'
 import React, { createContext, useContext, useState } from 'react'
 import ReactDOM from 'react-dom/client'
@@ -41,11 +52,11 @@ function AuthProvider({children}:{children:React.ReactNode}){
     const t=getToken()
     if(!t){setLoading(false);return}
     api.defaults.headers.common['Authorization']='Bearer '+t
-    api.get('/auth/me').then(res=>{
+    fetchAuthMeWithRetry(() => api.get('/auth/me')).then(res=>{
       const u=res.data.data
       if(!u||!ALLOWED_ROLES.includes(u.role)){logout();return}
       setUser({id:u.id,email:u.email,role:u.role,firstName:u.firstName||u.firstName||'',lastName:u.lastName||u.lastName||'',landlordId:u.landlordId||u.landlordId})
-    }).catch(logout).finally(()=>setLoading(false))
+    }).catch((e:any)=>{ if (isAuthRejection(e)) logout() }).finally(()=>setLoading(false))
   },[logout])
   const login=async(email:string,password:string)=>{
     const res=await axios.post(`${API}/api/auth/login`,{email,password})
@@ -69,7 +80,6 @@ const qc=new QueryClient({defaultOptions:{queries:{retry:1,staleTime:15000}}})
 
 // ── STYLES ────────────────────────────────────────────────────────────
 const css=`
-@import url('https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;500&display=swap');
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
   --bg0:#080a0c;--bg1:#0d1014;--bg2:#121519;--bg3:#181c22;--bg4:#1e2330;

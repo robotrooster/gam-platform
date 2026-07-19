@@ -8,6 +8,7 @@
 // through the existing Stripe rails — refundable if cancelled 48h+ ahead.
 import type { PoolClient } from 'pg'
 import { query, queryOne } from '../db'
+import { AppError } from '../middleware/errorHandler'
 
 export interface ConflictRow {
   id: string
@@ -116,4 +117,33 @@ export async function settleReservationFeeOnCancel(
   await query(`DELETE FROM payments WHERE id = $1 AND status IN ('pending','failed')`, [r.fee_payment_id])
   await query(`UPDATE common_area_reservations SET fee_voided = true, fee_payment_id = NULL WHERE id = $1`, [r.id])
   return 'voided'
+}
+
+// S547 (Nic — bad-actor guard): per-person monthly cap. One person can't
+// squat an amenity by stacking daily holds. Counts the person's live
+// (pending/approved) reservations on this area in the same calendar month
+// as the requested start; landlord-created holds are exempt (no person key).
+export async function assertMonthlyReservationLimit(
+  area: { id: string; name: string; monthly_reservation_limit: number | null },
+  person: { tenantId?: string | null; guestBookingId?: string | null },
+  startsAt: string,
+): Promise<void> {
+  const limit = area.monthly_reservation_limit
+  if (!limit) return
+  const key = person.tenantId
+    ? { col: 'reserved_by_tenant_id', val: person.tenantId }
+    : person.guestBookingId
+    ? { col: 'guest_booking_id', val: person.guestBookingId }
+    : null
+  if (!key) return
+  const row = await queryOne<{ n: string }>(
+    `SELECT COUNT(*) AS n FROM common_area_reservations
+      WHERE common_area_id = $1 AND ${key.col} = $2
+        AND status IN ('pending', 'approved')
+        AND date_trunc('month', starts_at) = date_trunc('month', $3::timestamptz)`,
+    [area.id, key.val, startsAt])
+  if (Number(row?.n ?? 0) >= limit) {
+    throw new AppError(400,
+      `${area.name} allows ${limit} reservation${limit === 1 ? '' : 's'} per person per month — you've reached this month's limit.`)
+  }
 }

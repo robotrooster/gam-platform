@@ -86,10 +86,26 @@ describe('POST /book', () => {
     expect(bk.rows[0].hold_expires_at).not.toBeNull()
   })
 
-  it('no landlord Connect → 409', async () => {
+  it('no landlord Connect → 409 in production', async () => {
+    const s = await seedSite({ connect: false })
+    const prevEnv = process.env.NODE_ENV
+    process.env.NODE_ENV = 'production'
+    try {
+      const res = await request(buildApp()).post('/api/public/property/sunny/book').send(guest())
+      expect(res.status).toBe(409)
+    } finally { process.env.NODE_ENV = prevEnv }
+  })
+
+  it('no landlord Connect outside production → S547 dev-mock checkout, auto-confirmed', async () => {
     const s = await seedSite({ connect: false })
     const res = await request(buildApp()).post('/api/public/property/sunny/book').send(guest())
-    expect(res.status).toBe(409)
+    expect(res.status).toBe(200)
+    // No Stripe hop: the "checkout" URL is the confirmation page itself.
+    expect(res.body.data.checkoutUrl).toContain(`/booked?booking=${res.body.data.bookingId}`)
+    const bk = await db.query<any>('SELECT * FROM unit_bookings WHERE id=$1', [res.body.data.bookingId])
+    expect(bk.rows[0].status).toBe('confirmed')
+    expect(bk.rows[0].deposit_paid_at).not.toBeNull()
+    expect(bk.rows[0].stripe_checkout_session_id).toMatch(/^mock_/)
   })
 
   it('dates already booked → 409 full', async () => {

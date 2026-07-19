@@ -7,5 +7,5 @@ export default defineConfig({
   resolve: {
     alias: sharedAlias
   },
-  server: { strictPort: true, port: 3011 }
+  server: { host: true, strictPort: true, port: 3011 }
 })

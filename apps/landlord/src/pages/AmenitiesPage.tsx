@@ -13,17 +13,20 @@ type Area = {
   reservable: boolean; requiresApproval: boolean; capacity: number | null
   reservationFee: string; weekendFee: string | null; openTime: string | null; closeTime: string | null
   maxReservationHours: number | null; advanceBookingDays: number | null; active: boolean
+  monthlyReservationLimit: number | null   // S547: per-person monthly cap
 }
 type Reservation = {
   id: string; commonAreaId: string; kind: string; title: string | null
   status: 'pending' | 'approved' | 'rejected' | 'cancelled'
   startsAt: string; endsAt: string; guestCount: number | null; notes: string | null
   notifyResidents: boolean; tenantFirstName: string | null; tenantLastName: string | null
+  guestName: string | null   // S547: set when a short-term guest booked it
 }
 
 const KIND_LABEL: Record<string, string> = {
   tenant_reservation: 'Resident', private_rental: 'Private rental',
   maintenance_closure: 'Closure', event: 'Community event',
+  guest_reservation: 'Guest',
 }
 const STATUS_BADGE: Record<string, string> = {
   pending: 'badge-amber', approved: 'badge-green', rejected: 'badge-muted', cancelled: 'badge-muted',
@@ -99,6 +102,7 @@ export function AmenitiesPage() {
                   {a.openTime && a.closeTime && <span>Hours {a.openTime.slice(0, 5)}–{a.closeTime.slice(0, 5)}</span>}
                   {a.maxReservationHours && <span>Max {a.maxReservationHours}h</span>}
                   {a.advanceBookingDays && <span>Book ≤{a.advanceBookingDays}d ahead</span>}
+                  {a.monthlyReservationLimit && <span>≤{a.monthlyReservationLimit}/person/mo</span>}
                 </div>
               </div>
               <div style={{ display: 'flex', gap: 8, flexShrink: 0 }}>
@@ -129,7 +133,7 @@ export function AmenitiesPage() {
 function AreaModal({ propertyId, onClose, onSaved }: { propertyId: string; onClose: () => void; onSaved: () => void }) {
   const [f, setF] = useState({
     name: '', description: '', reservable: true, requiresApproval: true,
-    capacity: '', reservationFee: '', weekendFee: '', openTime: '', closeTime: '', maxReservationHours: '', advanceBookingDays: '',
+    capacity: '', reservationFee: '', weekendFee: '', openTime: '', closeTime: '', maxReservationHours: '', advanceBookingDays: '', monthlyReservationLimit: '',
     // W-44: private-event posture (per area).
     eventsEnabled: false, eventDepositAmount: '', eventAnnounce: true, eventAutoRelease: true,
   })
@@ -143,6 +147,7 @@ function AreaModal({ propertyId, onClose, onSaved }: { propertyId: string; onClo
       openTime: f.openTime || null, closeTime: f.closeTime || null,
       maxReservationHours: f.maxReservationHours ? Number(f.maxReservationHours) : null,
       advanceBookingDays: f.advanceBookingDays ? Number(f.advanceBookingDays) : null,
+      monthlyReservationLimit: f.monthlyReservationLimit ? Number(f.monthlyReservationLimit) : null,
       eventsEnabled: f.eventsEnabled,
       eventDepositAmount: f.eventDepositAmount ? Number(f.eventDepositAmount) : 0,
       eventAnnounce: f.eventAnnounce, eventAutoRelease: f.eventAutoRelease,
@@ -164,6 +169,7 @@ function AreaModal({ propertyId, onClose, onSaved }: { propertyId: string; onClo
         <Field label="Closes"><input className="input" type="time" value={f.closeTime} onChange={e => setF({ ...f, closeTime: e.target.value })} /></Field>
         <Field label="Max hours / booking"><input className="input" type="number" value={f.maxReservationHours} onChange={e => setF({ ...f, maxReservationHours: e.target.value })} /></Field>
         <Field label="Book ahead (days)"><input className="input" type="number" value={f.advanceBookingDays} onChange={e => setF({ ...f, advanceBookingDays: e.target.value })} /></Field>
+        <Field label="Max / person / month"><input className="input" type="number" placeholder="unlimited" value={f.monthlyReservationLimit} onChange={e => setF({ ...f, monthlyReservationLimit: e.target.value })} /></Field>
       </div>
       {/* W-44: tenant private events */}
       <div style={{ borderTop: '1px solid var(--border-0)', marginTop: 12, paddingTop: 10 }}>
@@ -260,6 +266,7 @@ function ReservationsModal({ area, onClose }: { area: Area; onClose: () => void 
               <div style={{ fontSize: '.78rem', color: 'var(--text-3)', marginTop: 2 }}>
                 {fmt(r.startsAt)} → {fmt(r.endsAt)}
                 {(r.tenantFirstName || r.tenantLastName) && ` · ${r.tenantFirstName ?? ''} ${r.tenantLastName ?? ''}`}
+                {!r.tenantFirstName && !r.tenantLastName && r.guestName && ` · ${r.guestName} (guest)`}
                 {r.guestCount ? ` · ${r.guestCount} guests` : ''}
               </div>
             </div>

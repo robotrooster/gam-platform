@@ -154,6 +154,9 @@ export type InspectionItemCondition = typeof INSPECTION_ITEM_CONDITIONS[number]
 //   event              — landlord-run community event (still occupies it)
 export const COMMON_AREA_RESERVATION_KINDS = [
   'tenant_reservation', 'private_rental', 'maintenance_closure', 'event',
+  // S547: a short-term GUEST (unit_bookings stay, no tenant account) booked
+  // it from the property's public website — keyed by guest_booking_id.
+  'guest_reservation',
 ] as const
 export type CommonAreaReservationKind = typeof COMMON_AREA_RESERVATION_KINDS[number]
 
@@ -2296,6 +2299,58 @@ export function computeStayPrice(rates: StayRates, taxRatePct: number, nights: n
   return { base, tax, total: round2(base + tax), tier, taxable }
 }
 
+// ── S547: calendar-aligned monthly-stay billing (Nic) ──
+// A 30+ night stay bills like a resident, not a lump sum: the arrival month
+// is prorated (days × monthly/30) from check-in to the 1st, every full
+// calendar month is the flat monthly rate invoiced on the 1st with all
+// tenants, and a mid-month departure prorates the final month. The stay
+// TOTAL is the sum of those segments — the quote and the invoice schedule
+// can never disagree.
+export interface MonthlyStaySegment {
+  from: string          // YYYY-MM-DD inclusive
+  to: string            // YYYY-MM-DD exclusive (next segment start / check-out)
+  nights: number
+  amount: number
+  fullMonth: boolean    // true = flat monthly rate, false = prorated at monthly/30
+}
+export interface MonthlyStaySchedule { segments: MonthlyStaySegment[]; total: number }
+
+export function computeMonthlyStaySchedule(checkIn: string, checkOut: string, monthlyRate: number): MonthlyStaySchedule {
+  const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100
+  const day = (s: string) => new Date(s.slice(0, 10) + 'T12:00:00Z')
+  const iso = (d: Date) => d.toISOString().slice(0, 10)
+  const addDays = (d: Date, n: number) => new Date(d.getTime() + n * 86400000)
+  const nightsBetween = (a: Date, b: Date) => Math.round((b.getTime() - a.getTime()) / 86400000)
+  const firstOfNextMonth = (d: Date) => new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1, 12))
+
+  const start = day(checkIn), end = day(checkOut)
+  const segments: MonthlyStaySegment[] = []
+  let cur = start
+  while (cur < end) {
+    const boundary = firstOfNextMonth(cur)
+    const segEnd = boundary < end ? boundary : end
+    const nights = nightsBetween(cur, segEnd)
+    // Flat month = 1st → 1st. Anything else (arrival month, departure month,
+    // or a stay contained inside one month) prorates at monthly/30.
+    const fullMonth = cur.getUTCDate() === 1 && segEnd.getTime() === boundary.getTime()
+    segments.push({
+      from: iso(cur), to: iso(segEnd), nights,
+      amount: fullMonth ? round2(monthlyRate) : round2(monthlyRate * nights / 30),
+      fullMonth,
+    })
+    cur = segEnd
+  }
+  return { segments, total: round2(segments.reduce((s, x) => s + x.amount, 0)) }
+}
+
+// S547 (Nic): deposit rules split by stay length. The percentage deposit
+// (booking_deposit_pct) applies ONLY to short stays (<30 nights) — those
+// guests are likelier to skip without money down. Monthly-tier stays owe a
+// FLAT deposit: per-property booking_monthly_deposit, defaulting to this
+// utility-bill-sized amount, and always HARD-CAPPED at one month's rent
+// (keeps it compliant for long-term living situations).
+export const BOOKING_MONTHLY_DEPOSIT_DEFAULT = 150
+
 // How long a promoted waitlister has to claim before it rolls to the next
 // person (Nic: short on purpose — high-demand next-day stays).
 export const WAITLIST_CLAIM_WINDOW_MINUTES = 60
@@ -4183,4 +4238,93 @@ export function propaneSplitOptions(
   if (gallons < minGallons) return [1]
   if (gallons < Math.max(fourMinGallons, minGallons)) return [1, 2]
   return [1, 2, 4]
+}
+
+// ── S540: resilient auth bootstrap ──────────────────────────────────
+// Only a real 401/403 may end a session. Transient /auth/me failures
+// (API mid-restart, network blip) must never wipe a stored token —
+// the old `catch { logout() }` pattern was logging every portal out
+// whenever the API bounced.
+export function isAuthRejection(e: any): boolean {
+  const s = e?.response?.status
+  return s === 401 || s === 403
+}
+
+// Ride out short API restarts (~12s window at the defaults). Auth
+// rejections re-throw immediately; other errors retry, then re-throw
+// the last one so callers can decide (they should keep the token).
+export async function fetchAuthMeWithRetry<T>(
+  fetchMe: () => Promise<T>,
+  attempts = 5,
+  delayMs = 2500,
+): Promise<T> {
+  let lastErr: any
+  for (let i = 0; i < attempts; i++) {
+    try { return await fetchMe() }
+    catch (e) {
+      if (isAuthRejection(e)) throw e
+      lastErr = e
+      if (i < attempts - 1) await new Promise(r => setTimeout(r, delayMs))
+    }
+  }
+  throw lastErr
+}
+
+// ── S541: FlexPay demand-test gate ──────────────────────────────────
+// Enrollment is approval-gated for initial rollout (every enrollment
+// is GAM float — the engine fronts rent each cycle). Tenant inquires
+// in the tenant portal; GAM reviews lease + verifies SSI/SSDI income;
+// only status='approved' unlocks enrollFlexPay. One row per tenant.
+export const FLEXPAY_INQUIRY_STATUS_VALUES = ['pending', 'approved', 'declined'] as const
+export type FlexPayInquiryStatus = typeof FLEXPAY_INQUIRY_STATUS_VALUES[number]
+export const FLEXPAY_INQUIRY_STATUS_LABEL: Record<FlexPayInquiryStatus, string> = {
+  pending:  'Pending review',
+  approved: 'Approved',
+  declined: 'Declined',
+}
+// S545: widened to the questionnaire vocabulary — non-SSI/SSDI
+// interest files TIER-2 inquiries (same queue, behind SSI/SSDI,
+// approval gated by flexpay_other_income_open).
+export const FLEXPAY_INCOME_SOURCE_VALUES = ['ssi', 'ssdi', 'other_fixed', 'none'] as const
+export type FlexPayIncomeSource = typeof FLEXPAY_INCOME_SOURCE_VALUES[number]
+export const FLEXPAY_INCOME_SOURCE_LABEL: Record<FlexPayIncomeSource, string> = {
+  ssi: 'SSI', ssdi: 'SSDI', other_fixed: 'Other fixed day', none: 'No fixed day',
+}
+export const FLEXPAY_TIER1_SOURCES: readonly string[] = ['ssi', 'ssdi']
+
+// ── S542: platform-originated tenant questionnaires ─────────────────
+// Landlord-invisible product-fit asks (FlexPay demand discovery).
+// One-shot per (tenant, trigger); positive answers funnel into
+// flexpay_inquiries. Trigger list grows as new indicators are added.
+export const QUESTIONNAIRE_TRIGGER_VALUES = ['ssi_ssdi_signal', 'late_fee_fixed_income'] as const
+export type QuestionnaireTrigger = typeof QUESTIONNAIRE_TRIGGER_VALUES[number]
+export const QUESTIONNAIRE_STATUS_VALUES = ['pending', 'answered', 'dismissed'] as const
+export type QuestionnaireStatus = typeof QUESTIONNAIRE_STATUS_VALUES[number]
+export const QUESTIONNAIRE_INCOME_VALUES = ['ssi', 'ssdi', 'other_fixed', 'none'] as const
+export type QuestionnaireIncome = typeof QUESTIONNAIRE_INCOME_VALUES[number]
+
+// ── S545b: benefit-arrival schedules (how the programs actually pay) ─
+// SSI → 1st; SSDI → 3rd (pre-1997 claims) or 2nd/3rd/4th Wednesday by
+// birth date; other fixed incomes → plain day of month. Float math
+// uses the LATEST day the pattern can land (conservative).
+export const BENEFIT_SCHEDULE_VALUES = ['ssi_day_1', 'ssdi_day_3', 'ssdi_wed_2', 'ssdi_wed_3', 'ssdi_wed_4', 'fixed_day'] as const
+export type BenefitSchedule = typeof BENEFIT_SCHEDULE_VALUES[number]
+export const BENEFIT_SCHEDULE_LABEL: Record<BenefitSchedule, string> = {
+  ssi_day_1: '1st of the month',
+  ssdi_day_3: '3rd of the month',
+  ssdi_wed_2: '2nd Wednesday',
+  ssdi_wed_3: '3rd Wednesday',
+  ssdi_wed_4: '4th Wednesday',
+  fixed_day: 'Fixed day of month',
+}
+// Latest day-of-month the pattern can land on — drives desired_pull_day.
+export function benefitScheduleToDay(s: BenefitSchedule, fixedDay?: number | null): number | null {
+  switch (s) {
+    case 'ssi_day_1':  return 1
+    case 'ssdi_day_3': return 3
+    case 'ssdi_wed_2': return 14
+    case 'ssdi_wed_3': return 21
+    case 'ssdi_wed_4': return 28
+    case 'fixed_day':  return fixedDay ?? null
+  }
 }

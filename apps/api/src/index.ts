@@ -135,6 +135,7 @@ const STATIC_ALLOWED_ORIGINS = [
   process.env.BUSINESS_APP_URL       || 'http://localhost:3012',
   process.env.FITNESS_APP_URL        || 'http://localhost:3013',
   process.env.CUSTOMER_PORTAL_URL    || 'http://localhost:3014',
+  process.env.STOREFRONT_APP_URL     || 'http://localhost:3015', // S544 guest storefront
   'https://experience.arcgis.com',
   // S536: dedicated PREVIEW ports — Claude's preview duplicates a portal
   // on 31xx instead of taking over the real dev server on 30xx.
@@ -145,6 +146,9 @@ const STATIC_ALLOWED_ORIGINS = [
 ]
 // Any GAM production origin: apex marketing + www + every portal subdomain.
 const PROD_HOST = 'goldassetmanagement.com'
+// S544: guest storefronts live on {booking_slug}.gam.biz — every
+// subdomain is an allowed origin (public, unauthenticated API surface).
+const STOREFRONT_HOST = 'gam.biz'
 app.use(cors({
   origin: (origin, cb) => {
     // Non-browser / same-origin / curl requests have no Origin header.
@@ -153,6 +157,7 @@ app.use(cors({
     try {
       const host = new URL(origin).hostname
       if (host === PROD_HOST || host.endsWith('.' + PROD_HOST)) return cb(null, true)
+      if (host === STOREFRONT_HOST || host.endsWith('.' + STOREFRONT_HOST)) return cb(null, true)
     } catch { /* malformed origin → reject below */ }
     return cb(new Error('Not allowed by CORS'))
   },
@@ -208,8 +213,21 @@ app.use((_req, res, next) => {
 // one-line summary when the response finishes. Replaces morgan.
 app.use(httpLogger)
 
-// Rate limiting
-const limiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 200 })
+// S544: trust the first proxy hop (cloudflared tunnel) so req.ip is
+// the real visitor IP from X-Forwarded-For. WITHOUT this, every
+// public request behind the tunnel counts against ONE shared
+// 127.0.0.1 rate bucket — ~14 visitors/min would 429 the whole
+// platform at launch. Dev (direct connection, no XFF) is unaffected.
+app.set('trust proxy', 1)
+
+// Rate limiting. General limit sized for AUTHENTICATED PORTAL USE:
+// the portals poll in the background (notification bell + pending-
+// sign every 30s per tab, move-in gate 5min, react-query refocus
+// refetches), so one landlord with two tabs open runs ~250 req/15min
+// at idle — the old max:200 429'd real users doing nothing (and dev,
+// where every portal shares localhost, tripped constantly). Abuse
+// protection lives in the tighter auth/login limiters below.
+const limiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 3000 })
 app.use('/api/', limiter)
 
 const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 100 })

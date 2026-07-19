@@ -4,7 +4,7 @@ import { query, queryOne } from '../db'
 import { requireAuth, requireLandlord, requirePerm, getScopedPropertyIds, assertPropertyInScope } from '../middleware/auth'
 import { canAccessLandlordResource, canManageLandlordResource, canViewLandlordFinances } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
-import { UnitStatus, calcNetPerUnit, getReservePhase, LAUNCH_PLATFORM_FEE, UNIT_STATUSES, UNIT_TYPES, computeStayPrice, RV_SITE_LAYOUTS, RV_AMP_SERVICES, isSiteLayoutMismatch, isAmpServiceMismatch, SHORT_STAY_LOCKED_UNIT_TYPES } from '@gam/shared'
+import { UnitStatus, calcNetPerUnit, getReservePhase, LAUNCH_PLATFORM_FEE, UNIT_STATUSES, UNIT_TYPES, computeStayPrice, computeMonthlyStaySchedule, RV_SITE_LAYOUTS, RV_AMP_SERVICES, isSiteLayoutMismatch, isAmpServiceMismatch, SHORT_STAY_LOCKED_UNIT_TYPES } from '@gam/shared'
 import { findStayConflict, findAvailableUnits, STAY_CONFLICT_MESSAGE } from '../services/unitAvailability'
 import { formatUnitNumber } from '../lib/format'
 import { logger } from '../lib/logger'
@@ -541,12 +541,17 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
     const prop = await queryOne<any>(
       'SELECT nightly_rate, weekly_rate, monthly_rate, short_term_tax_rate FROM properties WHERE id=$1',
       [unit.property_id])
+    const staffMonthlyRate = unit.monthly_rate ?? prop?.monthly_rate
     const price = computeStayPrice(
       { nightly: unit.nightly_rate ?? prop?.nightly_rate,
         weekly:  unit.weekly_rate  ?? prop?.weekly_rate,
-        monthly: unit.monthly_rate ?? prop?.monthly_rate },
+        monthly: staffMonthlyRate },
       Number(prop?.short_term_tax_rate || 0), nights)
-    const total = price.total > 0 ? price.total : (body.totalAmount || 0)
+    // S547: monthly-tier stays price on the calendar-aligned schedule (prorated
+    // arrival/departure months, flat months between) — same rule everywhere.
+    const total = price.tier === 'monthly' && staffMonthlyRate != null
+      ? computeMonthlyStaySchedule(body.checkIn, body.checkOut, Number(staffMonthlyRate)).total
+      : price.total > 0 ? price.total : (body.totalAmount || 0)
     // S526 (Nic): reservations carry ZERO platform fee — GAM's income is the
     // $2/occupied-unit monthly fee (services/platformFee.ts), not a booking cut.
     const platformFee = 0
@@ -704,7 +709,7 @@ unitsRouter.get('/:id/bookings', requirePerm(
 // PATCH /api/units/:id/bookings/:bookingId — update booking (status, move dates, swap unit)
 unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reservation'), async (req, res, next) => {
   try {
-    const { status, notes, checkIn, checkOut, unitId, guestName, guestEmail, guestPhone, requiredSiteLayout, requiredAmpService } = req.body
+    const { status, notes, checkIn, checkOut, unitId, guestName, guestEmail, guestPhone, requiredSiteLayout, requiredAmpService, lockedToUnit } = req.body
     if (requiredSiteLayout != null && !RV_SITE_LAYOUTS.includes(requiredSiteLayout)) {
       throw new AppError(400, `Invalid requiredSiteLayout '${requiredSiteLayout}'`)
     }
@@ -758,6 +763,10 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
           conflict = await findStayConflict(newUnitId, {
             checkIn: newCheckIn, checkOut: newCheckOut, excludeBookingId: booking.id,
           })
+        } else if (booking.locked_to_unit) {
+          // S547: a locked (snowbird) reservation never moves — not even by
+          // its own extension. The extension simply fails on conflict.
+          throw new AppError(409, `Cannot extend: ${relo.reason}, and this reservation is locked to its site`)
         } else {
           // BACKUP (Nic — busy seasons are competitive): the incoming
           // reservation can't move, so try moving the EXTENDING guest
@@ -803,12 +812,17 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
       const prop = await queryOne<any>(
         'SELECT nightly_rate, weekly_rate, monthly_rate, short_term_tax_rate FROM properties WHERE id=$1',
         [targetUnit.property_id])
+      const monthlyRate = targetUnit.monthly_rate ?? prop?.monthly_rate
       const price = computeStayPrice(
         { nightly: targetUnit.nightly_rate ?? prop?.nightly_rate,
           weekly:  targetUnit.weekly_rate  ?? prop?.weekly_rate,
-          monthly: targetUnit.monthly_rate ?? prop?.monthly_rate },
+          monthly: monthlyRate },
         Number(prop?.short_term_tax_rate || 0), nights)
-      if (price.total > 0) newTotal = price.total
+      // S547: monthly-tier stays reprice on the calendar-aligned schedule —
+      // same rule as booking creation, so edits never drift from invoices.
+      if (price.tier === 'monthly' && monthlyRate != null) {
+        newTotal = computeMonthlyStaySchedule(newCheckIn, newCheckOut, Number(monthlyRate)).total
+      } else if (price.total > 0) newTotal = price.total
     }
 
     const updated = await queryOne<any>(`
@@ -822,12 +836,14 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
           platform_fee=COALESCE($12,platform_fee),
           required_site_layout=COALESCE($13,required_site_layout),
           required_amp_service=COALESCE($14,required_amp_service),
+          locked_to_unit=COALESCE($15,locked_to_unit),
           updated_at=NOW()
       WHERE id=$7 RETURNING *`,
       [status||null, notes||null, newUnitId, newCheckIn, newCheckOut, nights, booking.id,
        guestName ?? null, guestEmail ?? null, guestPhone ?? null,
        // Reprice zeroes the fee too (S526: reservations carry no platform fee).
-       newTotal, newTotal != null ? 0 : null, requiredSiteLayout ?? null, requiredAmpService ?? null])
+       newTotal, newTotal != null ? 0 : null, requiredSiteLayout ?? null, requiredAmpService ?? null,
+       typeof lockedToUnit === 'boolean' ? lockedToUnit : null])
 
     // S526: an extension can push the stay over the lease threshold (30d, or
     // 7d in weekly-lease mode) — re-check on every edit. Best-effort.

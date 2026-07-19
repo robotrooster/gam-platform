@@ -528,6 +528,63 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
   } catch (e) { next(e) }
 })
 
+// S539: tenant-facing "where every dollar went" — the tenant's Pay Now
+// remittances with their per-line FIFO applications (stored in
+// remittance_applications since S537, never surfaced until now), plus
+// any prepaid credit still waiting for invoice generation to consume.
+paymentsRouter.get('/remittances', async (req: any, res, next) => {
+  try {
+    if (req.user!.role !== 'tenant') throw new AppError(403, 'Only tenants can call this endpoint')
+    const tenantId = req.user!.profileId
+
+    const remits = await query<any>(
+      `SELECT id, amount::float AS amount,
+              applied_amount::float AS applied_amount,
+              unapplied_amount::float AS unapplied_amount,
+              status, payment_method,
+              created_at, settled_at
+         FROM tenant_remittances
+        WHERE tenant_id = $1
+        ORDER BY created_at DESC
+        LIMIT 50`,
+      [tenantId])
+
+    const linesByRemit = new Map<string, any[]>()
+    if (remits.length > 0) {
+      const lines = await query<any>(
+        `SELECT ra.remittance_id, ra.payment_id,
+                ra.amount_applied::float AS amount_applied,
+                p.type, p.due_date::text AS due_date,
+                p.entry_description, p.status AS payment_status
+           FROM remittance_applications ra
+           JOIN payments p ON p.id = ra.payment_id
+          WHERE ra.remittance_id = ANY($1::uuid[])
+          ORDER BY p.due_date ASC, p.created_at ASC`,
+        [remits.map((r: any) => r.id)])
+      for (const ln of lines) {
+        const bucket = linesByRemit.get(ln.remittance_id)
+        if (bucket) bucket.push(ln)
+        else linesByRemit.set(ln.remittance_id, [ln])
+      }
+    }
+
+    const credits = await query<any>(
+      `SELECT id, amount_original::float AS amount_original,
+              amount_remaining::float AS amount_remaining, created_at
+         FROM lease_prepaid_credits
+        WHERE tenant_id = $1 AND amount_remaining > 0
+        ORDER BY created_at ASC`,
+      [tenantId])
+    const prepaidRemaining = Math.round(
+      credits.reduce((sum: number, c: any) => sum + c.amount_remaining, 0) * 100) / 100
+
+    res.json({ success: true, data: {
+      remittances: remits.map((r: any) => ({ ...r, lines: linesByRemit.get(r.id) ?? [] })),
+      prepaidRemaining,
+    } })
+  } catch (e) { next(e) }
+})
+
 paymentsRouter.post('/pay-balance', async (req: any, res, next) => {
   const client = await getClient()
   try {

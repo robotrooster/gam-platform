@@ -1,3 +1,20 @@
+import { isAuthRejection, fetchAuthMeWithRetry } from '@gam/shared'
+// S540: self-hosted fonts — no render-blocking external stylesheet
+import '@fontsource/syne/600.css'
+import '@fontsource/syne/700.css'
+import '@fontsource/syne/800.css'
+import '@fontsource/dm-sans/300.css'
+import '@fontsource/dm-sans/400.css'
+import '@fontsource/dm-sans/500.css'
+import '@fontsource/dm-sans/600.css'
+import '@fontsource/dm-mono/400.css'
+import '@fontsource/dm-mono/500.css'
+import '@fontsource/inter/400.css'
+import '@fontsource/inter/500.css'
+import '@fontsource/inter/600.css'
+import '@fontsource/inter/700.css'
+import '@fontsource/jetbrains-mono/400.css'
+import '@fontsource/jetbrains-mono/500.css'
 import { SentryErrorBoundary } from './lib/sentry'
 import React, { useContext, useState } from 'react'
 import ReactDOM from 'react-dom/client'
@@ -51,7 +68,7 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
     if (!t) { setLoading(false); return }
     api.defaults.headers.common['Authorization'] = 'Bearer ' + t
     try {
-      const res = await api.get('/auth/me')
+      const res = await fetchAuthMeWithRetry(() => api.get('/auth/me'))
       const u = res.data.data
       if (!u || (u.role !== 'admin' && u.role !== 'super_admin')) { logout(); return }
       setUser({
@@ -61,7 +78,7 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
         totpEnabled: !!u.totpEnabled,
         mustEnrollTotp: !!u.mustEnrollTotp,
       })
-    } catch { logout() }
+    } catch (e) { if (isAuthRejection(e)) logout() }  // S540: transient failures keep the token
     finally { setLoading(false) }
   }, [logout])
 
@@ -122,7 +139,6 @@ const qc=new QueryClient({defaultOptions:{queries:{retry:1,staleTime:30000,refet
 
 // ── STYLES ────────────────────────────────────────────────────
 const css=`
-@import url('https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;500&display=swap');
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{--bg0:#080a0c;--bg1:#0d1014;--bg2:#121519;--bg3:#181c22;--bg4:#1e2330;
   --b0:#1a1f28;--b1:#222a38;--b2:#2a3547;
@@ -220,6 +236,7 @@ function Layout(){
           {!isSuperAdmin&&<NavLink to="/onboarding" className={({isActive})=>`ni${isActive?' active':''}`}>🚀 Onboarding</NavLink>}
           <NavLink to="/landlords" className={({isActive})=>`ni${isActive?' active':''}`}>🏢 Landlords</NavLink>
           <NavLink to="/tenants" className={({isActive})=>`ni${isActive?' active':''}`}>👤 Tenants</NavLink>
+          <NavLink to="/flexpay-requests" className={({isActive})=>`ni${isActive?' active':''}`}>⚡ FlexPay Requests</NavLink>
           <NavLink to="/property-reviews" className={({isActive})=>`ni${isActive?' active':''}`}>📋 Property Reviews</NavLink>
           <NavLink to="/units" className={({isActive})=>`ni${isActive?' active':''}`}>🚪 Units</NavLink>
           <div className="nl" style={{marginTop:8}}>Finance</div>
@@ -2511,6 +2528,7 @@ function App(){
           <Route path="onboarding"    element={<AdminOnboardingOverview/>}/>
           <Route path="landlords"     element={<Landlords/>}/>
           <Route path="tenants"       element={<Tenants/>}/>
+          <Route path="flexpay-requests" element={<FlexPayRequests/>}/>
           <Route path="property-reviews" element={<PropertyReviews/>}/>
           <Route path="units"         element={<Units/>}/>
           <Route path="payments"      element={<Payments/>}/>
@@ -3256,6 +3274,381 @@ interface PendingTransferRow {
   prevLandlordEmail: string | null
   prevLandlordConnectId: string | null
   notes: string | null
+}
+
+// ── S541: FlexPay demand-test review queue ──────────────────────────
+// FlexPay fronts rent each cycle, so every enrollment is GAM float.
+// Tenants raise a hand from the tenant portal; an admin reviews the
+// lease + verifies SSI/SSDI income here. Approve marks the income
+// verified (tenants.ssi_ssdi) and unlocks enrollment server-side.
+// Inquiry volume doubles as the demand signal for a capital raise.
+interface FlexPayInquiryRow {
+  id: string; status: 'pending'|'approved'|'declined'
+  claimedIncomeSource: 'ssi'|'ssdi'|'other_fixed'|'none'; tenantNote: string|null; adminNotes: string|null
+  createdAt: string; reviewedAt: string|null; reviewedByEmail: string|null
+  tenantId: string; ssiSsdi: boolean; achVerified: boolean; flexpayEnrolled: boolean
+  firstName: string; lastName: string; email: string; phone: string|null
+  leaseId: string|null; leaseRent: string|null; startDate: string|null; endDate: string|null
+  unitNumber: string|null; propertyName: string|null
+  // S542b: FCFS queue + state holds + platform-side income proof.
+  propertyState: string|null; stateHold: boolean; queuePosition: number|null
+  proofOriginalName: string|null; proofUploadedAt: string|null
+  // S542c: float-need ordering — benefit-arrival day + est float days
+  // (front at grace-end → their day). Shortest float first.
+  desiredPullDay: number|null; estFloatDays: number|null
+  // S545: the lease terms the float rides on.
+  rentDueDay: number|null; leaseStatus: string|null; leaseMonthsLeft: number|null
+  // S545: tier-2 (non-SSI/SSDI) income hold until expansion opens.
+  incomeHold: boolean
+  // S545b: the pay pattern behind the derived day.
+  benefitSchedule: string|null
+  // S545c: silent verification hold + lease-holder names for the
+  // document-name check.
+  heldAt: string|null; holdReason: string|null; leaseHolderNames: string|null
+  // S546: automated document verification + backend-only prequal.
+  autoVerification: { nameMatch?: string; matchedName?: string; benefitKeywords?: boolean; checkedAt?: string } | null
+  prequalStatus: string|null
+}
+
+const INCOME_LABEL: Record<string, string> = {
+  ssi: 'SSI', ssdi: 'SSDI', other_fixed: 'Other fixed day', none: 'No fixed day',
+}
+const SCHEDULE_LABEL: Record<string, string> = {
+  ssi_day_1: '1st of month', ssdi_day_3: '3rd of month',
+  ssdi_wed_2: '2nd Wednesday', ssdi_wed_3: '3rd Wednesday',
+  ssdi_wed_4: '4th Wednesday', fixed_day: 'Fixed day',
+}
+
+function FlexPayRequests() {
+  const qc = useQueryClient()
+  const [review, setReview] = React.useState<{ row: FlexPayInquiryRow; action: 'approve'|'decline'; incomeVerified: boolean; nameMatchConfirmed: boolean; notes: string } | null>(null)
+  const { data: rows = [], isLoading } = useQuery<FlexPayInquiryRow[]>(
+    'flexpay-inquiries', () => get<FlexPayInquiryRow[]>('/admin/flexpay/inquiries'))
+  const fmt = (n: any) => n == null ? '—' : '$' + Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+  const fmtDate = (s: string|null) => s ? new Date(s).toLocaleDateString() : '—'
+
+  const [reviewError, setReviewError] = React.useState<string | null>(null)
+  const reviewMut = useMutation(
+    (p: { id: string; action: 'approve'|'decline'; incomeVerified: boolean; nameMatchConfirmed?: boolean; notes: string }) =>
+      post(`/admin/flexpay/inquiries/${p.id}/review`, { action: p.action, incomeVerified: p.incomeVerified, nameMatchConfirmed: p.nameMatchConfirmed, notes: p.notes || undefined }),
+    { onSuccess: () => { qc.invalidateQueries('flexpay-inquiries'); setReview(null); setReviewError(null) },
+      onError: (e: any) => setReviewError(e?.response?.data?.error || 'Review failed — try again') },
+  )
+
+  // S542b: open the tenant-uploaded proof (authed blob — no static URL).
+  const viewProof = async (id: string) => {
+    const res = await api.get(`/admin/flexpay/inquiries/${id}/proof-file`, { responseType: 'blob' })
+    window.open(URL.createObjectURL(res.data as Blob), '_blank')
+  }
+
+  // S545c: verification hold + release (silent — no tenant signal).
+  const holdMut = useMutation(
+    (p: { id: string; reason: string }) => post(`/admin/flexpay/inquiries/${p.id}/hold`, { reason: p.reason }),
+    { onSuccess: () => { qc.invalidateQueries('flexpay-inquiries'); qc.invalidateQueries('flexpay-funnel'); setReview(null); setReviewError(null) },
+      onError: (e: any) => setReviewError(e?.response?.data?.error || 'Hold failed') },
+  )
+  const releaseMut = useMutation(
+    (id: string) => post(`/admin/flexpay/inquiries/${id}/release-hold`, {}),
+    { onSuccess: () => { qc.invalidateQueries('flexpay-inquiries'); qc.invalidateQueries('flexpay-funnel') } },
+  )
+
+  // S543: capture the benefit-arrival day during phone reach-out —
+  // fills the "?" float slots so the queue can order them.
+  const [editDay, setEditDay] = React.useState<{ id: string; value: number } | null>(null)
+  const dayMut = useMutation(
+    (p: { id: string; benefitDay: number }) =>
+      post(`/admin/flexpay/inquiries/${p.id}/benefit-day`, { benefitDay: p.benefitDay }),
+    { onSuccess: () => { qc.invalidateQueries('flexpay-inquiries'); setEditDay(null) } },
+  )
+
+  // S545c: held rows leave the working queue (silently — the tenant
+  // sees nothing) and live in their own section until released.
+  const pending = rows.filter(r => r.status === 'pending' && !r.heldAt)
+  const held    = rows.filter(r => r.status === 'pending' && r.heldAt)
+  const decided = rows.filter(r => r.status !== 'pending')
+  const BADGE: Record<string, string> = { pending: 'b-amber', approved: 'b-green', declined: 'b-muted' }
+
+  // S543: demand funnel — asked → interested → approved → enrolled,
+  // plus the monthly front commitment (the bankroll number).
+  const { data: funnel } = useQuery<any>('flexpay-funnel', () => get<any>('/admin/flexpay/funnel'))
+  const fq = funnel?.questionnaires ?? {}
+  const fi = funnel?.inquiries ?? {}
+  const qSent = (fq.pending ?? 0) + (fq.answered ?? 0) + (fq.dismissed ?? 0)
+
+  const Table = ({ list, title }: { list: FlexPayInquiryRow[]; title: string }) => (
+    <div className="card" style={{ padding: 0, overflowX: 'auto', marginBottom: 16 }}>
+      <div style={{ padding: '12px 16px', fontWeight: 700, color: 'var(--t0)', fontSize: '.85rem' }}>{title} ({list.length})</div>
+      <table className="tbl" style={{ minWidth: 1020 }}>
+        <thead><tr>
+          <th>#</th><th>Requested</th><th>Tenant</th><th>Property / Unit</th><th>Rent</th>
+          <th>Float</th><th>Claims</th><th>Proof</th><th>Income verified</th><th>ACH</th><th>Status</th><th></th>
+        </tr></thead>
+        <tbody>
+          {list.length ? list.map(r => (
+            <tr key={r.id}>
+              <td className="mono" style={{ fontSize: '.78rem', fontWeight: 700 }}>{r.queuePosition ?? '—'}</td>
+              <td className="mono" style={{ fontSize: '.75rem' }}>{fmtDate(r.createdAt)}</td>
+              <td>
+                <div style={{ fontWeight: 600, color: 'var(--t0)' }}>{r.firstName} {r.lastName}</div>
+                <div style={{ fontSize: '.72rem', color: 'var(--t3)' }}>{r.email}{r.phone ? ` · ${r.phone}` : ''}</div>
+                {r.tenantNote && <div style={{ fontSize: '.72rem', color: 'var(--t2)', marginTop: 2 }}>“{r.tenantNote}”</div>}
+                {r.prequalStatus === 'prequalified' && <span className="badge b-gold" title="Backend pre-qualification (never shown to the tenant)">PRE-QUALIFIED</span>}
+              </td>
+              <td style={{ fontSize: '.78rem' }}>
+                {r.propertyName ?? '— no active lease —'}{r.unitNumber ? ` · ${r.unitNumber}` : ''}
+                {r.propertyState && <span style={{ color: 'var(--t3)' }}> · {r.propertyState}</span>}
+                {r.stateHold && <div><span className="badge b-red">STATE HOLD</span></div>}
+              </td>
+              <td className="mono">
+                {fmt(r.leaseRent)}
+                {/* S545: the lease terms the float rides on. */}
+                {r.rentDueDay != null && <div style={{ fontSize: '.68rem', color: 'var(--t3)' }}>due day {r.rentDueDay}</div>}
+                <div style={{ fontSize: '.68rem', color: r.leaseMonthsLeft != null && r.leaseMonthsLeft <= 2 ? 'var(--amber)' : 'var(--t3)' }}>
+                  {r.endDate
+                    ? `ends ${fmtDate(r.endDate)}${r.leaseMonthsLeft != null ? ` (~${r.leaseMonthsLeft} mo)` : ''}`
+                    : r.leaseStatus ? 'month-to-month' : ''}
+                </div>
+              </td>
+              <td>
+                {editDay?.id === r.id ? (
+                  <span style={{ display: 'inline-flex', gap: 4, alignItems: 'center' }}>
+                    <input type="number" min={1} max={28} value={editDay.value} autoFocus
+                      onChange={e => setEditDay({ id: r.id, value: Number(e.target.value) })}
+                      onKeyDown={e => { if (e.key === 'Enter' && editDay.value >= 1 && editDay.value <= 28) dayMut.mutate({ id: r.id, benefitDay: editDay.value }); if (e.key === 'Escape') setEditDay(null) }}
+                      style={{ width: 52 }} className="inp" />
+                    <button className="btn btn-p btn-sm" disabled={dayMut.isLoading || editDay.value < 1 || editDay.value > 28}
+                      onClick={() => dayMut.mutate({ id: r.id, benefitDay: editDay.value })}>✓</button>
+                    <button className="btn btn-g btn-sm" onClick={() => setEditDay(null)}>✕</button>
+                  </span>
+                ) : (
+                  <>
+                    {r.estFloatDays != null
+                      ? <span className="mono" style={{ fontWeight: 700, color: r.estFloatDays <= 5 ? 'var(--green)' : r.estFloatDays <= 12 ? 'var(--amber)' : 'var(--red)' }}>~{r.estFloatDays}d</span>
+                      : <span className="badge b-muted" title="Benefit day unknown — sorts last until captured">?</span>}
+                    {r.desiredPullDay != null && (
+                      <div style={{ fontSize: '.68rem', color: 'var(--t3)' }}>
+                        {r.benefitSchedule ? (SCHEDULE_LABEL[r.benefitSchedule] ?? `day ${r.desiredPullDay}`) : `day ${r.desiredPullDay}`}
+                        {r.benefitSchedule && r.benefitSchedule !== 'fixed_day' ? ` (≤ day ${r.desiredPullDay})` : ''}
+                      </div>
+                    )}
+                    {r.status === 'pending' && (
+                      <div>
+                        <button className="btn btn-g btn-sm" style={{ marginTop: 2 }}
+                          onClick={() => setEditDay({ id: r.id, value: r.desiredPullDay ?? 3 })}>
+                          {r.desiredPullDay != null ? 'Edit day' : 'Set day'}
+                        </button>
+                      </div>
+                    )}
+                  </>
+                )}
+              </td>
+              <td>
+                <span className="badge b-muted">{INCOME_LABEL[r.claimedIncomeSource] ?? r.claimedIncomeSource}</span>
+                {r.incomeHold && <div><span className="badge b-amber" title="Non-SSI/SSDI — waits behind tier 1 until flexpay_other_income_open flips">TIER 2 · HELD</span></div>}
+              </td>
+              <td>
+                {r.proofUploadedAt
+                  ? <>
+                      <button className="btn btn-g btn-sm" onClick={() => viewProof(r.id)} title={r.proofOriginalName ?? ''}>View</button>
+                      {r.autoVerification?.nameMatch === 'matched' && <div><span className="badge b-green" title={`Matched: ${r.autoVerification.matchedName}`}>✓ auto</span></div>}
+                      {r.autoVerification?.nameMatch === 'manual_ok' && <div><span className="badge b-green">✓ manual</span></div>}
+                      {(r.autoVerification?.nameMatch === 'no_match' || r.autoVerification?.nameMatch === 'unreadable') && <div><span className="badge b-amber">check</span></div>}
+                    </>
+                  : <span className="badge b-muted">None</span>}
+              </td>
+              <td>
+                {/* S545b (Nic): "verified" ONLY when this review process
+                    proved it (approved = proof doc + attestation). The
+                    import/onboarding ssi_ssdi flag alone is a LEAD, not
+                    verification. */}
+                {r.status === 'approved'
+                  ? <span className="badge b-green">Verified</span>
+                  : r.ssiSsdi
+                  ? <span className="badge b-amber" title="Flagged SSI/SSDI at import/onboarding — no proof reviewed yet">Flagged · unproven</span>
+                  : <span className="badge b-muted">Unverified</span>}
+              </td>
+              <td><span className={`badge ${r.achVerified ? 'b-green' : 'b-muted'}`}>{r.achVerified ? 'Verified' : 'No'}</span></td>
+              <td>
+                <span className={`badge ${BADGE[r.status]}`}>{r.status}</span>
+                {r.flexpayEnrolled && <span className="badge b-green" style={{ marginLeft: 6 }}>Enrolled</span>}
+                {r.reviewedAt && <div style={{ fontSize: '.68rem', color: 'var(--t3)', marginTop: 2 }}>{fmtDate(r.reviewedAt)}{r.reviewedByEmail ? ` · ${r.reviewedByEmail}` : ''}</div>}
+              </td>
+              <td style={{ whiteSpace: 'nowrap' }}>
+                {r.status === 'pending' && <>
+                  <button className="btn btn-p btn-sm" onClick={() => setReview({ row: r, action: 'approve', incomeVerified: false, nameMatchConfirmed: false, notes: '' })}>Approve</button>{' '}
+                  <button className="btn btn-g btn-sm" onClick={() => setReview({ row: r, action: 'decline', incomeVerified: false, nameMatchConfirmed: false, notes: '' })}>Decline</button>
+                </>}
+                {r.status === 'declined' && (
+                  <button className="btn btn-g btn-sm" onClick={() => setReview({ row: r, action: 'approve', incomeVerified: false, nameMatchConfirmed: false, notes: '' })}>Re-review</button>
+                )}
+              </td>
+            </tr>
+          )) : (
+            <tr><td colSpan={12} style={{ textAlign: 'center', color: 'var(--t3)', padding: 24 }}>None</td></tr>
+          )}
+        </tbody>
+      </table>
+    </div>
+  )
+
+  return (
+    <div>
+      <div className="ph">
+        <div>
+          <h1 className="pt">FlexPay Requests</h1>
+          <p className="ps">{pending.length} awaiting review — every approval adds monthly rent-front float</p>
+        </div>
+      </div>
+      {funnel && (
+        <div className="grid3" style={{ marginBottom: 16 }}>
+          <div className="kpi">
+            <div className="kpi-l">Demand funnel</div>
+            <div className="kpi-v" style={{ fontSize: '1.05rem', marginTop: 4 }}>
+              {qSent} asked → {(fi.pending ?? 0) + (fi.approved ?? 0) + (fi.declined ?? 0)} interested
+            </div>
+            <div className="kpi-s">
+              {fq.answered ?? 0} answered · {fq.dismissed ?? 0} passed
+              {(funnel.otherIncomeInterest ?? 0) > 0 && <> · <span style={{ color: 'var(--amber)' }}>{funnel.otherIncomeInterest} tier-2 waiting on expansion</span></>}
+            </div>
+          </div>
+          <div className="kpi">
+            <div className="kpi-l">Queue</div>
+            <div className="kpi-v" style={{ fontSize: '1.05rem', marginTop: 4 }}>
+              {fi.pending ?? 0} waiting · {fi.approved ?? 0} approved · {funnel.enrolled} enrolled
+            </div>
+            <div className="kpi-s">{fi.declined ?? 0} declined</div>
+          </div>
+          <div className="kpi">
+            <div className="kpi-l">Monthly front commitment</div>
+            <div className="kpi-v" style={{ color: 'var(--gold)' }}>{fmt(funnel.monthlyFloat)}</div>
+            <div className="kpi-s">Sum of enrolled tenants' rent — bankroll out each cycle</div>
+          </div>
+        </div>
+      )}
+
+      <div className="card" style={{ padding: 14, marginBottom: 16, background: 'rgba(245,158,11,.06)', border: '1px solid rgba(245,158,11,.25)', fontSize: '.8rem', color: 'var(--t1)', lineHeight: 1.5 }}>
+        <strong style={{ color: 'var(--amber)' }}>Review checklist:</strong> open the tenant's lease
+        (rent amount = the float you're approving), verify SSI/SSDI income (award letter or bank
+        deposit history), then Approve. Approval marks income verified and lets the tenant enroll
+        from their portal; total approved float is the bankroll commitment.
+      </div>
+      {isLoading ? <div style={{ padding: 32, color: 'var(--t3)' }}>Loading…</div> : <>
+        <Table list={pending} title="Pending" />
+
+        {/* S545c: verification holds — out of the queue, tenant sees
+            NOTHING. Release restores their original spot (ordering is
+            float+created_at, which never changed). */}
+        {held.length > 0 && (
+          <div className="card" style={{ padding: 0, overflowX: 'auto', marginBottom: 16, border: '1px solid rgba(239,68,68,.35)' }}>
+            <div style={{ padding: '12px 16px', fontWeight: 700, color: 'var(--t0)', fontSize: '.85rem' }}>
+              🔒 Held — verification ({held.length})
+              <span style={{ fontWeight: 400, color: 'var(--t3)', marginLeft: 8, fontSize: '.75rem' }}>
+                Silent: the tenant portal shows normal pending copy. Resolve, then release — they resume their spot in line.
+              </span>
+            </div>
+            <table className="tbl" style={{ minWidth: 800 }}>
+              <thead><tr>
+                <th>Held</th><th>Tenant</th><th>Property / Unit</th><th>Claims</th><th>Reason</th><th></th>
+              </tr></thead>
+              <tbody>
+                {held.map(r => (
+                  <tr key={r.id}>
+                    <td className="mono" style={{ fontSize: '.75rem' }}>{fmtDate(r.heldAt)}</td>
+                    <td>
+                      <div style={{ fontWeight: 600, color: 'var(--t0)' }}>{r.firstName} {r.lastName}</div>
+                      <div style={{ fontSize: '.72rem', color: 'var(--t3)' }}>{r.email}</div>
+                    </td>
+                    <td style={{ fontSize: '.78rem' }}>{r.propertyName ?? '—'}{r.unitNumber ? ` · ${r.unitNumber}` : ''}</td>
+                    <td><span className="badge b-muted">{INCOME_LABEL[r.claimedIncomeSource] ?? r.claimedIncomeSource}</span></td>
+                    <td style={{ fontSize: '.76rem', color: 'var(--amber)', maxWidth: 340 }}>{r.holdReason}</td>
+                    <td>
+                      <button className="btn btn-p btn-sm" disabled={releaseMut.isLoading}
+                        onClick={() => releaseMut.mutate(r.id)}>Release hold</button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        <Table list={decided} title="Decided" />
+      </>}
+
+      {review && (
+        <div className="modal-ov" onClick={() => setReview(null)}>
+          <div className="modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 480 }}>
+            <div className="modal-t">{review.action === 'approve' ? 'Approve' : 'Decline'} FlexPay — {review.row.firstName} {review.row.lastName}</div>
+            <div style={{ fontSize: '.8rem', color: 'var(--t2)', marginBottom: 12 }}>
+              Claims {review.row.claimedIncomeSource.toUpperCase()} · rent {fmt(review.row.leaseRent)} at {review.row.propertyName ?? '—'}
+            </div>
+            {review.action === 'approve' && (() => {
+              // S546: automated checks — the machine read the document.
+              const av = review.row.autoVerification
+              const nameOk = av?.nameMatch === 'matched' || av?.nameMatch === 'manual_ok'
+              const Row = ({ ok, warn, label }: { ok?: boolean; warn?: boolean; label: string }) => (
+                <div style={{ fontSize: '.8rem', color: ok ? 'var(--green)' : warn ? 'var(--amber)' : 'var(--t3)', marginBottom: 4 }}>
+                  {ok ? '✓' : warn ? '⚠' : '·'} {label}
+                </div>
+              )
+              return (
+                <div style={{ background: 'var(--bg3, rgba(255,255,255,.03))', border: '1px solid var(--b1, #1e2530)', borderRadius: 8, padding: 12, marginBottom: 12 }}>
+                  <div style={{ fontSize: '.72rem', fontWeight: 700, color: 'var(--t3)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 8 }}>
+                    Automated checks
+                  </div>
+                  <Row ok={!!review.row.proofUploadedAt} warn={!review.row.proofUploadedAt}
+                    label={review.row.proofUploadedAt ? 'Proof document on file' : 'No proof document — approval will be refused'} />
+                  <Row ok={nameOk} warn={!!av && !nameOk}
+                    label={av?.nameMatch === 'matched' ? `Name matched lease holder: ${av.matchedName}`
+                      : av?.nameMatch === 'manual_ok' ? 'Name verified manually (hold released)'
+                      : av?.nameMatch === 'no_match' ? `No lease-holder name found in document (lease holders: ${review.row.leaseHolderNames ?? '—'})`
+                      : av?.nameMatch === 'unreadable' ? 'Document not machine-readable (photo) — resolve via hold/release'
+                      : 'Not checked yet — runs automatically on upload'} />
+                  <Row ok={av?.benefitKeywords === true} warn={av ? av.benefitKeywords === false : false}
+                    label={av?.benefitKeywords ? 'SSA/SSI/SSDI benefit language detected'
+                      : av ? 'No benefit language detected — eyeball the document' : 'Benefit-language scan pending'} />
+                  <Row ok={!review.row.heldAt} warn={!!review.row.heldAt}
+                    label={review.row.heldAt ? 'On verification hold' : 'No verification holds (birthdate consistent or N/A)'} />
+                  <div style={{ fontSize: '.72rem', color: 'var(--t3)', marginTop: 8 }}>
+                    Discrepancy?{' '}
+                    <button className="btn btn-g btn-sm" disabled={holdMut.isLoading || !review.notes.trim()}
+                      title="Uses your Notes text as the hold reason"
+                      onClick={() => holdMut.mutate({ id: review.row.id, reason: review.notes.trim() })}>
+                      Place verification hold
+                    </button>
+                    {' '}— silent, spot preserved. Needs a reason in Notes.
+                  </div>
+                </div>
+              )
+            })()}
+            <div className="fg">
+              <label className="fl">Notes {review.action === 'decline' ? '(reason)' : '(optional)'}</label>
+              <textarea className="inp" rows={3} maxLength={2000} value={review.notes}
+                onChange={e => setReview({ ...review, notes: e.target.value })} />
+            </div>
+            {review.action === 'approve' && !review.row.proofUploadedAt && (
+              <div style={{ fontSize: '.78rem', color: 'var(--amber)', margin: '10px 0', padding: 10, background: 'rgba(245,158,11,.08)', borderRadius: 6 }}>
+                ⚠ No proof of benefits on file — approval will be refused until the tenant uploads their award letter.
+              </div>
+            )}
+            {reviewError && (
+              <div style={{ fontSize: '.78rem', color: 'var(--red, #ef4444)', margin: '10px 0', padding: 10, background: 'rgba(239,68,68,.08)', borderRadius: 6 }}>
+                {reviewError}
+              </div>
+            )}
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, marginTop: 16 }}>
+              <button className="btn btn-g" onClick={() => { setReview(null); setReviewError(null) }}>Cancel</button>
+              <button className={`btn ${review.action === 'approve' ? 'btn-p' : 'btn-g'}`}
+                disabled={reviewMut.isLoading}
+                onClick={() => reviewMut.mutate({ id: review.row.id, action: review.action, incomeVerified: review.incomeVerified, nameMatchConfirmed: review.nameMatchConfirmed, notes: review.notes } as any)}>
+                {reviewMut.isLoading ? 'Saving…' : review.action === 'approve' ? 'Approve request' : 'Decline request'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
 }
 
 function DepositPortability() {

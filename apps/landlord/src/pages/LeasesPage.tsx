@@ -4,6 +4,7 @@ import { useSearchParams, useNavigate, Link } from 'react-router-dom'
 import { apiGet, apiPost } from '../lib/api'
 import { UserPlus, AlertTriangle, DollarSign, FileText, Eye, X } from 'lucide-react'
 import { LEASE_TYPE_LABEL, LeaseStatus, humanize } from '@gam/shared'
+import { toast, appConfirm } from '../components/dialogs'
 import { LeaseFormModal } from './LeaseFormModal'
 import { LeaseOverviewModal } from './LeaseOverviewModal'
 import { RenewalDecisionModal } from './RenewalDecisionModal'
@@ -59,6 +60,25 @@ export function LeasesPage() {
     if (searchParams.get('renew')) {
       searchParams.delete('renew')
       setSearchParams(searchParams, { replace: true })
+    }
+  }
+
+  // S547 (Nic): screening for a long-stay draft is the landlord's explicit
+  // choice — with a consistency reminder so the choice is applied evenly.
+  const requestScreening = async (leaseId: string) => {
+    const ok = await appConfirm(
+      'Email this guest a background-screening request?\n\n' +
+      'Consistency note: apply screening evenly. Requiring background checks from some guests ' +
+      'but not others in the same situation can be considered discriminatory. If you screen, ' +
+      'screen everyone in comparable situations; if you don’t, apply that policy to everyone too.',
+      { title: 'Request screening', confirmLabel: 'Send request' },
+    )
+    if (!ok) return
+    try {
+      const r = await apiPost(`/leases/${leaseId}/request-background-check`)
+      toast(`Screening request sent to ${(r as any)?.data?.sentTo || 'the guest'}`)
+    } catch (e: any) {
+      toast.error(e?.response?.data?.error || 'Could not send the screening request')
     }
   }
 
@@ -263,6 +283,16 @@ export function LeasesPage() {
                         >
                           From reservation
                         </span>
+                      )}
+                      {/* S547: the screening decision is the landlord's — never automatic. */}
+                      {l.leaseSource === 'booking_draft' && l.status === 'pending' && can('tenants.run_background_check') && (
+                        <button
+                          className="btn btn-ghost"
+                          style={{ marginLeft: 6, padding: '1px 8px', fontSize: '.65rem' }}
+                          onClick={e => { e.stopPropagation(); requestScreening(l.id) }}
+                        >
+                          Request screening
+                        </button>
                       )}
                     </td>
                     <td style={{ fontSize: '.78rem', color: 'var(--text-2)' }}>

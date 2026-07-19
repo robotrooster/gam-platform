@@ -1,3 +1,14 @@
+import { isAuthRejection, fetchAuthMeWithRetry } from '@gam/shared'
+// S540: self-hosted fonts — no render-blocking external stylesheet
+import '@fontsource/syne/600.css'
+import '@fontsource/syne/700.css'
+import '@fontsource/syne/800.css'
+import '@fontsource/dm-sans/300.css'
+import '@fontsource/dm-sans/400.css'
+import '@fontsource/dm-sans/500.css'
+import '@fontsource/dm-sans/600.css'
+import '@fontsource/dm-mono/400.css'
+import '@fontsource/dm-mono/500.css'
 import { SentryErrorBoundary } from './lib/sentry'
 import React, { useState, useCallback, useContext } from 'react'
 import ReactDOM from 'react-dom/client'
@@ -41,11 +52,11 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
     if (!t) { setLoading(false); return }
     api.defaults.headers.common['Authorization'] = 'Bearer ' + t
     try {
-      const res = await api.get('/auth/me')
+      const res = await fetchAuthMeWithRetry(() => api.get('/auth/me'))
       const u = res.data.data
       if (!u || (u.role !== 'admin' && u.role !== 'super_admin')) { logout(); return }
       setUser({ id:u.id, email:u.email, role:u.role, firstName:u.firstName||'', lastName:u.lastName||'', totpEnabled:!!u.totpEnabled, mustEnrollTotp:!!u.mustEnrollTotp })
-    } catch { logout() }
+    } catch (e) { if (isAuthRejection(e)) logout() }  // S540: transient failures keep the token
     finally { setLoading(false) }
   }, [logout])
 
@@ -90,7 +101,6 @@ const qc = new QueryClient({ defaultOptions: { queries: { retry:1, staleTime:300
 const fmt = (n: any) => n!=null ? new Intl.NumberFormat('en-US',{style:'currency',currency:'USD'}).format(+n) : '—'
 
 const css = `
-@import url('https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;500&display=swap');
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
   --bg0:#080a0c;--bg1:#0d1014;--bg2:#121519;--bg3:#181c22;--bg4:#1e2330;

@@ -160,6 +160,37 @@ export async function emailNewBackgroundCheck(landlordEmail: string, landlordNam
   )
 }
 
+// S547: the guest's stay link — their key to the tokened stay page on the
+// property's site (amenity booking, stay details). Sent at booking and via
+// the "resend my stay link" box.
+export async function emailGuestStayLink(guestEmail: string, guestName: string | null, propertyName: string, stayUrl: string, ctx?: { landlordId?: string }) {
+  await send(guestEmail, `Your stay at ${propertyName}`,
+    base(h('Your stay link') +
+      p(`Hi ${guestName || 'there'},`) +
+      p(`Manage your stay at <strong style="color:#eef1f8">${propertyName}</strong> — reserve amenities like the clubhouse or pool, and see your stay details.`) +
+      p('This private link is just for you and expires after check-out.') +
+      btn('Open my stay', stayUrl) +
+      `<p style="color:#888;font-size:12px">${stayUrl}</p>`
+    ),
+    { category: 'guest_stay_link', landlordId: ctx?.landlordId ?? null }
+  )
+}
+
+// S547 (Nic): landlord-INITIATED screening request for a long-stay guest.
+// Sent only when the landlord explicitly chooses to screen — the system
+// never auto-sends a background check to a prospect.
+export async function emailBackgroundCheckScreeningRequest(guestEmail: string, guestName: string | null, propertyName: string, portalUrl = 'http://localhost:3002/background', ctx?: { landlordId?: string }) {
+  await send(guestEmail, `${propertyName} — screening needed for your extended stay`,
+    base(h('One more step for your extended stay') +
+      p(`Hi ${guestName || 'there'},`) +
+      p(`<strong style="color:#eef1f8">${propertyName}</strong> asks guests staying 30 nights or longer to complete a routine background screening before the lease is finalized.`) +
+      p('Sign in to your GAM account (or create one with this email address) and complete the screening from your portal — it takes a few minutes.') +
+      btn('Complete screening', portalUrl)
+    ),
+    { category: 'background_screening_request', landlordId: ctx?.landlordId ?? null }
+  )
+}
+
 export async function emailBackgroundDecision(tenantEmail: string, tenantName: string, decision: 'approved' | 'denied', propertyName: string, unitNumber: string, notes?: string, portalUrl = 'http://localhost:3002', ctx?: { landlordId?: string; backgroundCheckId?: string }) {
   const approved = decision === 'approved'
   await send(tenantEmail,

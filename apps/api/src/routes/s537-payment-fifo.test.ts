@@ -18,7 +18,7 @@ import jwt from 'jsonwebtoken'
 import { db } from '../db'
 import {
   cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant,
-  seedLease, seedLeaseTenant,
+  seedLease, seedLeaseTenant, seedAllocationRule,
 } from '../test/dbHelpers'
 import { errorHandler } from '../middleware/errorHandler'
 
@@ -230,5 +230,90 @@ describe('S537 POST /payments/pay-balance — FIFO application', () => {
     expect(remainder.rows.map((r: any) => r.amount)).toEqual([340])
     const credit = await db.query<any>(`SELECT amount_remaining::float AS r FROM lease_prepaid_credits WHERE lease_id=$1`, [f.leaseId])
     expect(credit.rows[0].r).toBe(0)
+  })
+})
+
+// S539: the tenant-facing "where every dollar went" read — remittances
+// with their per-line applications + outstanding prepaid credit.
+describe('S539 GET /payments/remittances — per-line application display', () => {
+  it('returns lines oldest-first with charge context, pay-ahead, and prepaid credit', async () => {
+    const f = await fixture()
+    // Settling a RENT row runs the allocation engine — it needs an
+    // allocation rule + active processing rate (unlike the fee-only
+    // pay-ahead test above).
+    {
+      const client = await db.connect()
+      try {
+        await client.query('BEGIN')
+        await seedAllocationRule(client, { propertyId: f.propertyId })
+        // platform_processing_rates survives cleanupAllSchema — guard the
+        // insert (suite convention) so repeated runs don't stack rows.
+        await client.query(
+          `INSERT INTO platform_processing_rates
+             (payment_method, customer_facing_flat, customer_facing_percent,
+              stripe_cost_flat, stripe_cost_percent)
+           SELECT 'ach', 0, 1, 0, 0.5
+            WHERE NOT EXISTS (
+              SELECT 1 FROM platform_processing_rates
+               WHERE payment_method = 'ach' AND effective_until IS NULL)`)
+        await client.query('COMMIT')
+      } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+    }
+    await seedCharge(f, 'late_fee', 60, '2026-06-06')
+    await seedCharge(f, 'rent', 440, '2026-07-01')
+
+    const app = buildApp()
+    const pay = await request(app)
+      .post('/api/payments/pay-balance')
+      .set('Authorization', `Bearer ${tenantToken(f.tenantUserId, f.tenantId)}`)
+      .send({ amount: 550, paymentMethodId: 'pm_test', paymentMethodType: 'ach' })
+    expect(pay.status).toBe(200)
+    const remittanceId = pay.body.data.remittanceId
+
+    // Settle via webhook so the $50 pay-ahead becomes a prepaid credit.
+    const event = {
+      type: 'payment_intent.succeeded',
+      data: { object: {
+        id: 'pi_fifo_test',
+        metadata: { gam_remittance_id: remittanceId, tenant_id: f.tenantId, landlord_id: f.landlordId },
+        charges: { data: [{ id: 'ch_mock', payment_method_details: { type: 'us_bank_account' } }] },
+      } },
+    }
+    const hook = await request(app)
+      .post('/webhooks/stripe')
+      .set('stripe-signature', 'sig_mock')
+      .set('content-type', 'application/json')
+      .send(JSON.stringify(event))
+    expect(hook.status).toBe(200)
+
+    const res = await request(app)
+      .get('/api/payments/remittances')
+      .set('Authorization', `Bearer ${tenantToken(f.tenantUserId, f.tenantId)}`)
+    expect(res.status).toBe(200)
+
+    const { remittances, prepaidRemaining } = res.body.data
+    expect(remittances.length).toBe(1)
+    const r = remittances[0]
+    expect(r.id).toBe(remittanceId)
+    expect(r.status).toBe('settled')
+    expect(r.amount).toBe(550)
+    expect(r.applied_amount).toBe(500)
+    expect(r.unapplied_amount).toBe(50)
+    // Lines come back oldest-first with the covered charge's context.
+    expect(r.lines.map((ln: any) => [ln.type, ln.amount_applied])).toEqual(
+      [['late_fee', 60], ['rent', 440]])
+    expect(r.lines[0].due_date).toBe('2026-06-06')
+    expect(r.lines.every((ln: any) => ln.payment_status === 'settled')).toBe(true)
+    expect(prepaidRemaining).toBe(50)
+  })
+
+  it('rejects non-tenant callers', async () => {
+    const f = await fixture()
+    const landlordJwt = jwt.sign({ userId: f.userId, role: 'landlord', profileId: f.landlordId },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
+    const res = await request(buildApp())
+      .get('/api/payments/remittances')
+      .set('Authorization', `Bearer ${landlordJwt}`)
+    expect(res.status).toBe(403)
   })
 })

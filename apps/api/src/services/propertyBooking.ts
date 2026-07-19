@@ -4,9 +4,10 @@ import type { PoolClient } from 'pg'
 import { getClient, query, queryOne } from '../db'
 import { AppError } from '../middleware/errorHandler'
 import { createBookingDepositCheckoutSession } from './stripeConnect'
+import { maybeDraftLeaseFromBooking } from './bookingLeaseDraft'
 import { sendNotificationEmail } from './email'
 import { logger } from '../lib/logger'
-import { WAITLIST_CLAIM_WINDOW_MINUTES, computeStayPrice, SHORT_STAY_LOCKED_UNIT_TYPES } from '@gam/shared'
+import { WAITLIST_CLAIM_WINDOW_MINUTES, computeStayPrice, computeMonthlyStaySchedule, BOOKING_MONTHLY_DEPOSIT_DEFAULT, SHORT_STAY_LOCKED_UNIT_TYPES } from '@gam/shared'
 
 // ============================================================
 // S517 / Walkthrough #11 — public property booking + waitlist.
@@ -21,9 +22,16 @@ import { WAITLIST_CLAIM_WINDOW_MINUTES, computeStayPrice, SHORT_STAY_LOCKED_UNIT
 
 const HOLD_MINUTES = 30
 
-/** Public booking site base URL (the customer app; subdomain/path resolves the slug). */
-function publicBaseUrl(): string {
-  return process.env.CUSTOMER_PORTAL_URL || 'http://localhost:3014'
+/**
+ * Guest-facing storefront URL for a property (S544 — supersedes the legacy
+ * customer-portal base for booking returns and claim links). The template's
+ * {slug} token covers both hosting modes: path-slug in dev
+ * (http://localhost:3015/{slug}) and subdomain in prod
+ * (set STOREFRONT_URL_TEMPLATE=https://{slug}.gam.biz).
+ */
+function storefrontUrl(slug: string, path = ''): string {
+  const template = process.env.STOREFRONT_URL_TEMPLATE || 'http://localhost:3015/{slug}'
+  return template.replace('{slug}', slug) + path
 }
 
 /**
@@ -52,6 +60,7 @@ export function computeStayTotal(
 interface PropertyRow {
   id: string; landlord_id: string; name: string; booking_slug: string
   booking_deposit_pct: string
+  booking_monthly_deposit: string | null
   nightly_rate: string | null; weekly_rate: string | null; monthly_rate: string | null
   short_term_tax_rate: string | null
 }
@@ -63,7 +72,7 @@ interface UnitRow {
 
 async function resolvePropertyBySlug(slug: string): Promise<PropertyRow> {
   const prop = await queryOne<PropertyRow>(
-    `SELECT id, landlord_id, name, booking_slug, booking_deposit_pct,
+    `SELECT id, landlord_id, name, booking_slug, booking_deposit_pct, booking_monthly_deposit,
             nightly_rate, weekly_rate, monthly_rate, short_term_tax_rate
        FROM properties WHERE booking_slug=$1 AND public_booking_enabled=TRUE`, [slug])
   if (!prop) throw new AppError(404, 'Booking site not found')
@@ -101,12 +110,24 @@ function quoteStay(unit: UnitRow, prop: PropertyRow, checkIn: string, checkOut: 
   if (unit.min_stay_nights != null && nights < unit.min_stay_nights) throw new AppError(400, `Minimum stay is ${unit.min_stay_nights} nights`)
   if (unit.max_stay_nights != null && nights > unit.max_stay_nights) throw new AppError(400, `Maximum stay is ${unit.max_stay_nights} nights`)
   const num = (x: string | null) => x != null ? Number(x) : null
+  const monthlyRate = num(unit.monthly_rate) ?? num(prop.monthly_rate)
   const price = computeStayPrice(
     { nightly: num(unit.nightly_rate) ?? num(prop.nightly_rate),
       weekly:  num(unit.weekly_rate)  ?? num(prop.weekly_rate),
-      monthly: num(unit.monthly_rate) ?? num(prop.monthly_rate) },
+      monthly: monthlyRate },
     Number(prop.short_term_tax_rate || 0), nights)
   if (price.total <= 0) throw new AppError(400, 'No rate is configured for this unit')
+  // S547 (Nic): monthly-tier stays bill calendar-aligned (prorated arrival →
+  // flat months on the 1st → prorated departure); the booking total is the
+  // schedule sum so it always matches what will actually be invoiced.
+  if (price.tier === 'monthly' && monthlyRate != null) {
+    const sched = computeMonthlyStaySchedule(checkIn, checkOut, monthlyRate)
+    // Flat deposit for monthly stays — the % never applies here. Hard cap at
+    // one month's rent regardless of the property's flat setting.
+    const flat = prop.booking_monthly_deposit != null ? Number(prop.booking_monthly_deposit) : BOOKING_MONTHLY_DEPOSIT_DEFAULT
+    const deposit = Math.round(Math.min(flat, monthlyRate) * 100) / 100
+    return { nights, base: sched.total, tax: 0, total: sched.total, deposit, tier: 'monthly' }
+  }
   const deposit = Math.round(price.total * (Number(prop.booking_deposit_pct) / 100) * 100) / 100
   return { nights, base: price.base, tax: price.tax, total: price.total, deposit, tier: price.tier }
 }
@@ -137,6 +158,8 @@ interface GuestBooking {
   slug: string; unitId: string
   guestName: string; guestEmail: string; guestPhone?: string | null
   checkIn: string; checkOut: string
+  // S547: optional guest question submitted with the reservation.
+  note?: string | null
   // Legacy — the guest no longer picks a billing type; pricing auto-tiers by
   // length. Accepted for backward compat but ignored.
   stayType?: 'nightly' | 'weekly'
@@ -159,7 +182,12 @@ export async function bookStay(opts: GuestBooking): Promise<BookingDepositResult
   const unit = await resolveUnit(prop.id, opts.unitId)
   const quote = quoteStay(unit, prop, opts.checkIn, opts.checkOut)
   const connect = await landlordConnect(prop.landlord_id)
-  if (!connect) throw new AppError(409, 'This property is not accepting online deposits yet')
+  // S547 dev-mock: demo landlords have no Connect account, so outside
+  // production a Connect-less landlord gets a SIMULATED deposit checkout and
+  // the whole guest flow is walkable end-to-end. A dev landlord WITH Connect
+  // still exercises real Stripe; in production the gate below is absolute.
+  const mockCheckout = process.env.NODE_ENV !== 'production' && !connect
+  if (!connect && !mockCheckout) throw new AppError(409, 'This property is not accepting online deposits yet')
 
   const client = await getClient()
   try {
@@ -175,23 +203,59 @@ export async function bookStay(opts: GuestBooking): Promise<BookingDepositResult
          (unit_id, landlord_id, lease_type, check_in, check_out, nights,
           guest_name, guest_email, guest_phone, nightly_rate, weekly_rate,
           total_amount, deposit_amount, platform_fee, status, source, hold_expires_at,
-          required_site_layout, required_amp_service)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,0,'tentative','public',$14,$15,$16)
+          required_site_layout, required_amp_service, notes)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,0,'tentative','public',$14,$15,$16,$17)
        RETURNING id`,
-      [unit.id, prop.landlord_id, quote.tier, opts.checkIn, opts.checkOut, quote.nights,
+      // unit_bookings.lease_type has no 'monthly' — 30+ night stays store as
+      // month_to_month (pre-existing gap: monthly-tier public bookings always
+      // violated the CHECK; surfaced by the S547 long-stay flow).
+      [unit.id, prop.landlord_id, quote.tier === 'monthly' ? 'month_to_month' : quote.tier, opts.checkIn, opts.checkOut, quote.nights,
        opts.guestName, opts.guestEmail, opts.guestPhone ?? null,
        unit.nightly_rate, unit.weekly_rate, quote.total, quote.deposit, holdExpires,
-       opts.requiredSiteLayout ?? 'none', opts.requiredAmpService ?? 'none'])
+       opts.requiredSiteLayout ?? 'none', opts.requiredAmpService ?? 'none',
+       opts.note?.trim() || null])
     const bookingId = ins.rows[0].id
     await client.query('COMMIT')
 
+    // S547: public long stays get the same S526 treatment as staff-created
+    // ones — 30+ nights (7+ weekly-lease mode) drafts a lease for landlord
+    // review, so monthly invoicing takes over from the reservation.
+    // Best-effort: a draft failure never fails the booking.
+    maybeDraftLeaseFromBooking(bookingId)
+      .catch(err => logger.error({ err, bookingId }, '[propertyBooking] lease draft from public booking failed'))
+
+    // S547: every public booking emails the guest their STAY LINK — the
+    // tokened page on the property's site where amenities are booked (Nic:
+    // amenity booking must never look publicly bookable). Best-effort.
+    ;(async () => {
+      const { issueBookingGuestToken } = await import('./bookingGuestTokens')
+      const issued = await issueBookingGuestToken({ bookingId, landlordId: prop.landlord_id, delivery: 'email' })
+      const { emailGuestStayLink } = await import('./email')
+      await emailGuestStayLink(opts.guestEmail, opts.guestName, prop.name,
+        storefrontUrl(prop.booking_slug, `/stay/${issued.token}`), { landlordId: prop.landlord_id })
+    })().catch(err => logger.error({ err, bookingId }, '[propertyBooking] guest stay-link email failed'))
+
+    if (mockCheckout) {
+      // Mirror the real path: stamp a session id, then confirm through the
+      // same function the Stripe webhook calls.
+      const mockSession = `mock_${bookingId}`
+      await query(`UPDATE unit_bookings SET stripe_checkout_session_id=$1, updated_at=now() WHERE id=$2`,
+        [mockSession, bookingId])
+      await confirmBookingDeposit(bookingId, mockSession)
+      logger.warn({ bookingId }, '[propertyBooking] dev-mock checkout — landlord has no Connect account, deposit simulated, booking auto-confirmed')
+      return { bookingId, depositAmount: quote.deposit, total: quote.total,
+               checkoutUrl: storefrontUrl(prop.booking_slug, `/booked?booking=${bookingId}`) }
+    }
+
     const checkout = await createBookingDepositCheckoutSession({
       amountCents: Math.round(quote.deposit * 100),
-      landlordConnectAccountId: connect,
+      // Non-null: the mock path returned above; without it a null Connect
+      // account already threw the 409 gate.
+      landlordConnectAccountId: connect!,
       unitLabel: `${prop.name} · Unit ${unit.unit_number}`,
       guestEmail: opts.guestEmail,
-      successUrl: `${publicBaseUrl()}/property/${prop.booking_slug}/booked`,
-      cancelUrl:  `${publicBaseUrl()}/property/${prop.booking_slug}`,
+      successUrl: storefrontUrl(prop.booking_slug, `/booked?booking=${bookingId}`),
+      cancelUrl:  storefrontUrl(prop.booking_slug),
       applicationFeeCents: 0,
       metadata: { gam_booking_id: bookingId },
     })
@@ -289,7 +353,7 @@ async function emailClaimLink(w: any, token: string): Promise<void> {
   const slugRow = await queryOne<{ booking_slug: string; name: string }>(
     `SELECT booking_slug, name FROM properties WHERE id=$1`, [w.property_id])
   if (!slugRow) return
-  const url = `${publicBaseUrl()}/property/${slugRow.booking_slug}/claim/${token}`
+  const url = storefrontUrl(slugRow.booking_slug, `/claim/${token}`)
   const html = `
     <h2>A spot just opened up</h2>
     <p>Good news ${w.guest_name} — a stay at <b>${slugRow.name}</b> for ${w.check_in} → ${w.check_out} is now available.</p>

@@ -982,6 +982,48 @@ export function schedulerInit() {
     }
   }, { timezone: 'America/Phoenix' })
 
+  // S542: FlexPay demand discovery — tenants already flagged ssi_ssdi
+  // with an active lease who never engaged with FlexPay get the
+  // private ssi_ssdi_signal questionnaire. Idempotent (one-shot per
+  // tenant); no-ops while flexpay_rollout_visible is off. 5:30am PHX.
+  cron.schedule('30 5 * * *', async () => {
+    try {
+      const { sweepSsiSsdiQuestionnaires } = await import('../services/tenantQuestionnaires')
+      await sweepSsiSsdiQuestionnaires()
+    } catch (e) { logger.error({ err: e }, '[questionnaire-sweep] fatal') }
+    // S546: backend-only pre-qualification — warm every file before
+    // interest arrives. NEVER tenant-visible.
+    try {
+      const { sweepFlexpayPrequal } = await import('../services/flexpayAutoVerify')
+      await sweepFlexpayPrequal()
+    } catch (e) { logger.error({ err: e }, '[flexpay-prequal] fatal') }
+  }, { timezone: 'America/Phoenix' })
+
+  // S542b: FlexPay queue follow-up vigilance (Nic: "reaching out, and
+  // then following up"). Daily summary alert when pending inquiries
+  // are aging past 7 days without review — the queue is first come,
+  // first serve, so a stale head blocks everyone behind it.
+  cron.schedule('45 5 * * *', async () => {
+    try {
+      const { queryOne } = await import('../db')
+      const aging = await queryOne<{ n: string; oldest_days: string }>(
+        `SELECT COUNT(*)::text AS n,
+                COALESCE(MAX(EXTRACT(DAY FROM NOW() - created_at))::int, 0)::text AS oldest_days
+           FROM flexpay_inquiries
+          WHERE status = 'pending' AND created_at < NOW() - INTERVAL '7 days'`)
+      if (aging && Number(aging.n) > 0) {
+        const { createAdminNotification } = await import('../services/adminNotifications')
+        await createAdminNotification({
+          severity: 'warn',
+          category: 'flexpay_queue_aging',
+          title: `FlexPay queue: ${aging.n} request(s) pending > 7 days`,
+          body: `Oldest has waited ${aging.oldest_days} days. The queue orders by float need (shortest first) — review the head of the queue in Admin → FlexPay Requests.`,
+          context: { pending_over_7d: Number(aging.n), oldest_days: Number(aging.oldest_days) },
+        })
+      }
+    } catch (e) { logger.error({ err: e }, '[flexpay-queue-aging] fatal') }
+  }, { timezone: 'America/Phoenix' })
+
   // Route auto-advance (service-business). Every minute: walk every
   // in_progress route and auto-complete stops whose timer has elapsed
   // (planned drive leg + 1 min after the previous stop finalized).

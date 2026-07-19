@@ -21,7 +21,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict OlxxBUlmTdKiToJb5GJ8QGiBpmYW8uBnP3JVIiCMKLGhMflu64jVg21Ej12FDxK
+\restrict XHf5eSmHPRkgF4p4hc7nkvkd9Lbyxw2pRi0yI29hVlO78tBK958LCq75dXLhacg
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -2077,7 +2077,7 @@ CREATE TABLE public.common_area_reservations (
     property_id uuid NOT NULL,
     landlord_id uuid NOT NULL,
     reserved_by_tenant_id uuid,
-    created_by_user_id uuid NOT NULL,
+    created_by_user_id uuid,
     title text,
     kind text DEFAULT 'tenant_reservation'::text NOT NULL,
     starts_at timestamp with time zone NOT NULL,
@@ -2096,9 +2096,11 @@ CREATE TABLE public.common_area_reservations (
     fee_payment_id uuid,
     fee_refund_due boolean DEFAULT false NOT NULL,
     fee_voided boolean DEFAULT false NOT NULL,
-    CONSTRAINT car_kind_check CHECK ((kind = ANY (ARRAY['tenant_reservation'::text, 'private_rental'::text, 'maintenance_closure'::text, 'event'::text]))),
+    guest_booking_id uuid,
+    CONSTRAINT car_kind_check CHECK ((kind = ANY (ARRAY['tenant_reservation'::text, 'private_rental'::text, 'maintenance_closure'::text, 'event'::text, 'guest_reservation'::text]))),
     CONSTRAINT car_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'approved'::text, 'rejected'::text, 'cancelled'::text]))),
-    CONSTRAINT car_time_order_check CHECK ((ends_at > starts_at))
+    CONSTRAINT car_time_order_check CHECK ((ends_at > starts_at)),
+    CONSTRAINT common_area_reservations_actor_check CHECK (((created_by_user_id IS NOT NULL) OR (guest_booking_id IS NOT NULL)))
 );
 
 
@@ -2127,7 +2129,9 @@ CREATE TABLE public.common_areas (
     events_enabled boolean DEFAULT false NOT NULL,
     event_deposit_amount numeric(10,2) DEFAULT 0 NOT NULL,
     event_announce boolean DEFAULT true NOT NULL,
-    event_auto_release boolean DEFAULT true NOT NULL
+    event_auto_release boolean DEFAULT true NOT NULL,
+    monthly_reservation_limit integer,
+    CONSTRAINT common_areas_monthly_reservation_limit_check CHECK ((monthly_reservation_limit > 0))
 );
 
 
@@ -2965,6 +2969,48 @@ CREATE TABLE public.flexpay_advances (
     CONSTRAINT flexpay_advances_amount_positive CHECK (((rent_amount > (0)::numeric) AND (tenant_fee_amount > (0)::numeric))),
     CONSTRAINT flexpay_advances_pull_day_check CHECK (((pull_day >= 1) AND (pull_day <= 28))),
     CONSTRAINT flexpay_advances_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'fronted'::text, 'pulled'::text, 'reconciled'::text, 'nsf'::text, 'defaulted'::text])))
+);
+
+
+--
+-- Name: flexpay_blocked_states; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.flexpay_blocked_states (
+    state text NOT NULL,
+    reason text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT flexpay_blocked_states_state_check CHECK ((length(state) = 2))
+);
+
+
+--
+-- Name: flexpay_inquiries; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.flexpay_inquiries (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    tenant_id uuid NOT NULL,
+    status text DEFAULT 'pending'::text NOT NULL,
+    claimed_income_source text NOT NULL,
+    tenant_note text,
+    admin_notes text,
+    reviewed_by_user_id uuid,
+    reviewed_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    proof_file_path text,
+    proof_original_name text,
+    proof_uploaded_at timestamp with time zone,
+    desired_pull_day integer,
+    benefit_schedule text,
+    held_at timestamp with time zone,
+    hold_reason text,
+    auto_verification jsonb,
+    CONSTRAINT flexpay_inquiries_benefit_schedule_check CHECK (((benefit_schedule IS NULL) OR (benefit_schedule = ANY (ARRAY['ssi_day_1'::text, 'ssdi_day_3'::text, 'ssdi_wed_2'::text, 'ssdi_wed_3'::text, 'ssdi_wed_4'::text, 'fixed_day'::text])))),
+    CONSTRAINT flexpay_inquiries_claimed_income_source_check CHECK ((claimed_income_source = ANY (ARRAY['ssi'::text, 'ssdi'::text, 'other_fixed'::text, 'none'::text]))),
+    CONSTRAINT flexpay_inquiries_desired_pull_day_check CHECK (((desired_pull_day IS NULL) OR ((desired_pull_day >= 1) AND (desired_pull_day <= 28)))),
+    CONSTRAINT flexpay_inquiries_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'approved'::text, 'declined'::text])))
 );
 
 
@@ -4988,6 +5034,11 @@ CREATE TABLE public.properties (
     propane_split_min_gallons integer DEFAULT 40 NOT NULL,
     propane_split_four_min_gallons integer DEFAULT 100 NOT NULL,
     accept_partial_payments boolean DEFAULT true NOT NULL,
+    booking_monthly_deposit numeric(10,2),
+    booking_utilities_billed boolean DEFAULT true NOT NULL,
+    office_phone text,
+    office_email text,
+    office_hours text,
     CONSTRAINT properties_booking_deposit_pct_range CHECK (((booking_deposit_pct >= (0)::numeric) AND (booking_deposit_pct <= (100)::numeric))),
     CONSTRAINT properties_booking_slug_format CHECK (((booking_slug IS NULL) OR ((booking_slug ~ '^[a-z0-9][a-z0-9-]{1,60}$'::text) AND (booking_slug !~ '--'::text)))),
     CONSTRAINT properties_deposit_handling_mode_check CHECK ((deposit_handling_mode = ANY (ARRAY['gam_escrow'::text, 'landlord_held'::text]))),
@@ -5091,6 +5142,22 @@ CREATE TABLE public.property_duplicate_flags (
 
 
 --
+-- Name: property_faqs; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.property_faqs (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    property_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    question text NOT NULL,
+    answer text NOT NULL,
+    sort_order integer DEFAULT 0 NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
 -- Name: property_fee_schedules; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -5113,6 +5180,22 @@ CREATE TABLE public.property_fee_schedules (
 
 
 --
+-- Name: property_inquiries; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.property_inquiries (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    property_id uuid NOT NULL,
+    guest_name text NOT NULL,
+    guest_email text NOT NULL,
+    guest_phone text,
+    message text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    handled_at timestamp with time zone
+);
+
+
+--
 -- Name: property_manager_scopes; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -5128,6 +5211,21 @@ CREATE TABLE public.property_manager_scopes (
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     permissions jsonb DEFAULT '{}'::jsonb NOT NULL,
     direct_deposit_enabled boolean DEFAULT false NOT NULL
+);
+
+
+--
+-- Name: property_site_photos; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.property_site_photos (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    property_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    filename text NOT NULL,
+    caption text,
+    sort_order integer DEFAULT 0 NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
 
@@ -5873,6 +5971,23 @@ CREATE TABLE public.tenant_notifications (
 
 
 --
+-- Name: tenant_questionnaires; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.tenant_questionnaires (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    tenant_id uuid NOT NULL,
+    trigger_type text NOT NULL,
+    status text DEFAULT 'pending'::text NOT NULL,
+    answers jsonb,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    answered_at timestamp with time zone,
+    CONSTRAINT tenant_questionnaires_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'answered'::text, 'dismissed'::text]))),
+    CONSTRAINT tenant_questionnaires_trigger_type_check CHECK ((trigger_type = ANY (ARRAY['ssi_ssdi_signal'::text, 'late_fee_fixed_income'::text])))
+);
+
+
+--
 -- Name: tenant_remittances; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -5939,6 +6054,7 @@ CREATE TABLE public.tenants (
     flexpay_disqualified_reason text,
     flex_deposit_disqualified_until timestamp with time zone,
     flex_deposit_disqualified_reason text,
+    flexpay_prequal jsonb,
     CONSTRAINT tenants_background_check_status_check CHECK ((background_check_status = ANY (ARRAY['not_started'::text, 'submitted'::text, 'approved'::text, 'denied'::text, 'cancelled'::text, 'expired'::text]))),
     CONSTRAINT tenants_flexpay_pull_day_check CHECK (((flexpay_pull_day IS NULL) OR ((flexpay_pull_day >= 1) AND (flexpay_pull_day <= 28)))),
     CONSTRAINT tenants_income_arrival_day_check CHECK (((income_arrival_day >= 1) AND (income_arrival_day <= 28))),
@@ -6048,6 +6164,7 @@ CREATE TABLE public.unit_bookings (
     required_site_layout text DEFAULT 'none'::text NOT NULL,
     required_amp_service text DEFAULT 'none'::text NOT NULL,
     site_reveal_sent_at timestamp with time zone,
+    locked_to_unit boolean DEFAULT false NOT NULL,
     CONSTRAINT unit_bookings_lease_type_check CHECK ((lease_type = ANY (ARRAY['nightly'::text, 'weekly'::text, 'month_to_month'::text, 'long_term'::text, 'lease_hold'::text]))),
     CONSTRAINT unit_bookings_required_amp_service_check CHECK ((required_amp_service = ANY (ARRAY['none'::text, '30'::text, '50'::text, 'both'::text]))),
     CONSTRAINT unit_bookings_required_site_layout_check CHECK ((required_site_layout = ANY (ARRAY['none'::text, 'back_in'::text, 'pull_through'::text]))),
@@ -7699,6 +7816,30 @@ ALTER TABLE ONLY public.flexpay_advances
 
 
 --
+-- Name: flexpay_blocked_states flexpay_blocked_states_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.flexpay_blocked_states
+    ADD CONSTRAINT flexpay_blocked_states_pkey PRIMARY KEY (state);
+
+
+--
+-- Name: flexpay_inquiries flexpay_inquiries_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.flexpay_inquiries
+    ADD CONSTRAINT flexpay_inquiries_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: flexpay_inquiries flexpay_inquiries_tenant_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.flexpay_inquiries
+    ADD CONSTRAINT flexpay_inquiries_tenant_id_key UNIQUE (tenant_id);
+
+
+--
 -- Name: flexsuite_enrollment_acceptances flexsuite_enrollment_acceptances_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -8507,6 +8648,14 @@ ALTER TABLE ONLY public.property_duplicate_flags
 
 
 --
+-- Name: property_faqs property_faqs_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_faqs
+    ADD CONSTRAINT property_faqs_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: property_fee_schedules property_fee_schedules_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -8523,6 +8672,14 @@ ALTER TABLE ONLY public.property_fee_schedules
 
 
 --
+-- Name: property_inquiries property_inquiries_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_inquiries
+    ADD CONSTRAINT property_inquiries_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: property_manager_scopes property_manager_scopes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -8536,6 +8693,14 @@ ALTER TABLE ONLY public.property_manager_scopes
 
 ALTER TABLE ONLY public.property_manager_scopes
     ADD CONSTRAINT property_manager_scopes_user_id_landlord_id_key UNIQUE (user_id, landlord_id);
+
+
+--
+-- Name: property_site_photos property_site_photos_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_site_photos
+    ADD CONSTRAINT property_site_photos_pkey PRIMARY KEY (id);
 
 
 --
@@ -8848,6 +9013,22 @@ ALTER TABLE ONLY public.tenant_identifications
 
 ALTER TABLE ONLY public.tenant_notifications
     ADD CONSTRAINT tenant_notifications_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: tenant_questionnaires tenant_questionnaires_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_questionnaires
+    ADD CONSTRAINT tenant_questionnaires_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: tenant_questionnaires tenant_questionnaires_tenant_id_trigger_type_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_questionnaires
+    ADD CONSTRAINT tenant_questionnaires_tenant_id_trigger_type_key UNIQUE (tenant_id, trigger_type);
 
 
 --
@@ -12346,6 +12527,48 @@ CREATE UNIQUE INDEX invitations_unique_pending ON public.invitations USING btree
 
 
 --
+-- Name: ix_common_area_reservations_guest_booking; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_common_area_reservations_guest_booking ON public.common_area_reservations USING btree (guest_booking_id) WHERE (guest_booking_id IS NOT NULL);
+
+
+--
+-- Name: ix_flexpay_inquiries_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_flexpay_inquiries_status ON public.flexpay_inquiries USING btree (status);
+
+
+--
+-- Name: ix_property_faqs_property; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_property_faqs_property ON public.property_faqs USING btree (property_id, sort_order);
+
+
+--
+-- Name: ix_property_inquiries_property; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_property_inquiries_property ON public.property_inquiries USING btree (property_id) WHERE (handled_at IS NULL);
+
+
+--
+-- Name: ix_property_site_photos_property; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_property_site_photos_property ON public.property_site_photos USING btree (property_id, sort_order);
+
+
+--
+-- Name: ix_tenant_questionnaires_pending; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX ix_tenant_questionnaires_pending ON public.tenant_questionnaires USING btree (tenant_id) WHERE (status = 'pending'::text);
+
+
+--
 -- Name: landlord_pfo_one_active_per_landlord; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -14049,6 +14272,14 @@ ALTER TABLE ONLY public.common_area_reservations
 
 
 --
+-- Name: common_area_reservations common_area_reservations_guest_booking_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.common_area_reservations
+    ADD CONSTRAINT common_area_reservations_guest_booking_id_fkey FOREIGN KEY (guest_booking_id) REFERENCES public.unit_bookings(id) ON DELETE SET NULL;
+
+
+--
 -- Name: common_area_reservations common_area_reservations_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -14718,6 +14949,22 @@ ALTER TABLE ONLY public.flexpay_advances
 
 ALTER TABLE ONLY public.flexpay_advances
     ADD CONSTRAINT flexpay_advances_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id);
+
+
+--
+-- Name: flexpay_inquiries flexpay_inquiries_reviewed_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.flexpay_inquiries
+    ADD CONSTRAINT flexpay_inquiries_reviewed_by_user_id_fkey FOREIGN KEY (reviewed_by_user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: flexpay_inquiries flexpay_inquiries_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.flexpay_inquiries
+    ADD CONSTRAINT flexpay_inquiries_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id) ON DELETE CASCADE;
 
 
 --
@@ -16457,11 +16704,35 @@ ALTER TABLE ONLY public.property_duplicate_flags
 
 
 --
+-- Name: property_faqs property_faqs_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_faqs
+    ADD CONSTRAINT property_faqs_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: property_faqs property_faqs_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_faqs
+    ADD CONSTRAINT property_faqs_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE CASCADE;
+
+
+--
 -- Name: property_fee_schedules property_fee_schedules_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.property_fee_schedules
     ADD CONSTRAINT property_fee_schedules_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE CASCADE;
+
+
+--
+-- Name: property_inquiries property_inquiries_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_inquiries
+    ADD CONSTRAINT property_inquiries_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE CASCADE;
 
 
 --
@@ -16478,6 +16749,22 @@ ALTER TABLE ONLY public.property_manager_scopes
 
 ALTER TABLE ONLY public.property_manager_scopes
     ADD CONSTRAINT property_manager_scopes_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: property_site_photos property_site_photos_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_site_photos
+    ADD CONSTRAINT property_site_photos_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: property_site_photos property_site_photos_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_site_photos
+    ADD CONSTRAINT property_site_photos_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE CASCADE;
 
 
 --
@@ -16870,6 +17157,14 @@ ALTER TABLE ONLY public.tenant_identifications
 
 ALTER TABLE ONLY public.tenant_notifications
     ADD CONSTRAINT tenant_notifications_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: tenant_questionnaires tenant_questionnaires_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_questionnaires
+    ADD CONSTRAINT tenant_questionnaires_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id) ON DELETE CASCADE;
 
 
 --
@@ -17492,5 +17787,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict OlxxBUlmTdKiToJb5GJ8QGiBpmYW8uBnP3JVIiCMKLGhMflu64jVg21Ej12FDxK
+\unrestrict XHf5eSmHPRkgF4p4hc7nkvkd9Lbyxw2pRi0yI29hVlO78tBK958LCq75dXLhacg
 

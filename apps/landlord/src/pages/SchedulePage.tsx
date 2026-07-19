@@ -8,8 +8,32 @@ import { toast, appConfirm, appPrompt } from '../components/dialogs'
 
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
-// Public customer-portal base for the booking-site preview URL (ported from BookingSitesPage).
-const CUSTOMER_URL = (import.meta as any).env?.VITE_CUSTOMER_PORTAL_URL || 'http://localhost:3014'
+// S547: the public site is the per-property storefront — path-slug in dev,
+// {slug}.gam.biz subdomain in prod (mirrors the API's STOREFRONT_URL_TEMPLATE).
+const STOREFRONT_TEMPLATE = (import.meta as any).env?.VITE_STOREFRONT_URL_TEMPLATE || 'http://localhost:3015/{slug}'
+const API_URL = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
+
+// S535 pattern (see UnitDetailPage): authed photo files can't ride an <img>
+// tag — fetch with the Bearer token, render via a blob object-URL.
+function AuthThumb({ url, h = 90 }: { url: string; h?: number }) {
+  const [src, setSrc] = useState<string | null>(null)
+  useEffect(() => {
+    let objectUrl: string | null = null
+    let cancelled = false
+    const token = localStorage.getItem('gam_token') || ''
+    fetch(`${API_URL}/api${url}`, { headers: { Authorization: 'Bearer ' + token } })
+      .then(r => r.ok ? r.blob() : null)
+      .then(b => {
+        if (!b || cancelled) return
+        objectUrl = URL.createObjectURL(b)
+        setSrc(objectUrl)
+      })
+      .catch(() => {})
+    return () => { cancelled = true; if (objectUrl) URL.revokeObjectURL(objectUrl) }
+  }, [url])
+  if (!src) return <div style={{ width: '100%', height: h, background: 'var(--bg-2)', borderRadius: 8 }} />
+  return <img src={src} alt="" style={{ width: '100%', height: h, objectFit: 'cover', borderRadius: 8, display: 'block' }} />
+}
 
 const UNIT_TYPE_LABELS: Record<string,string> = {
   residential:'🏠 Residential', rv_spot:'🚐 RV Spot', storage:'📦 Storage',
@@ -446,6 +470,11 @@ export function SchedulePage() {
         enabled: bpCfg.enabled,
         intro: bpCfg.intro || null,
         depositPct: Number(bpCfg.depositPct),
+        monthlyDeposit: num(bpCfg.monthlyDeposit),
+        utilitiesBilled: bpCfg.utilitiesBilled !== false,
+        officePhone: bpCfg.officePhone?.trim() || null,
+        officeEmail: bpCfg.officeEmail?.trim() || null,
+        officeHours: bpCfg.officeHours?.trim() || null,
         nightlyRate: num(bpCfg.nightlyRate),
         weeklyRate: num(bpCfg.weeklyRate),
         monthlyRate: num(bpCfg.monthlyRate),
@@ -458,7 +487,65 @@ export function SchedulePage() {
     }
     setBpSaving(false)
   }
-  const bpPublicUrl = bpCfg?.slug ? `${CUSTOMER_URL}/property/${bpCfg.slug}` : null
+  const bpPublicUrl = bpCfg?.slug ? STOREFRONT_TEMPLATE.replace('{slug}', bpCfg.slug) : null
+
+  // ── S547: property-website content (photos + FAQs) ──
+  const { data: bpPhotos = [] } = useQuery<any[]>(
+    ['site-photos', bpPropId],
+    () => apiGet(`/properties/${bpPropId}/site-photos`),
+    { enabled: view === 'booking_page' && !!bpPropId },
+  )
+  const { data: bpFaqs = [] } = useQuery<any[]>(
+    ['property-faqs', bpPropId],
+    () => apiGet(`/properties/${bpPropId}/faqs`),
+    { enabled: view === 'booking_page' && !!bpPropId },
+  )
+  const [bpFaqDraft, setBpFaqDraft] = useState({ question: '', answer: '' })
+  const [bpUploading, setBpUploading] = useState(false)
+  const uploadSitePhotos = async (files: FileList | null) => {
+    if (!files?.length || !bpPropId) return
+    setBpUploading(true); setBpErr('')
+    try {
+      const fd = new FormData()
+      Array.from(files).forEach(f => fd.append('photos', f))
+      await apiPost(`/properties/${bpPropId}/site-photos`, fd)
+      qc.invalidateQueries(['site-photos', bpPropId])
+    } catch (e: any) {
+      setBpErr(e?.response?.data?.error || 'Upload failed')
+    }
+    setBpUploading(false)
+  }
+  const deleteSitePhoto = async (photoId: string) => {
+    if (!await appConfirm('Remove this photo from the website?')) return
+    await apiDelete(`/properties/${bpPropId}/site-photos/${photoId}`)
+    qc.invalidateQueries(['site-photos', bpPropId])
+  }
+  const captionSitePhoto = async (photoId: string, current: string | null) => {
+    const caption = await appPrompt('Photo caption (blank to clear):', { defaultValue: current || '' })
+    if (caption === null) return
+    await apiPatch(`/properties/${bpPropId}/site-photos/${photoId}`, { caption: caption || null })
+    qc.invalidateQueries(['site-photos', bpPropId])
+  }
+  const addFaq = async () => {
+    if (!bpFaqDraft.question.trim() || !bpFaqDraft.answer.trim()) return
+    await apiPost(`/properties/${bpPropId}/faqs`, { question: bpFaqDraft.question.trim(), answer: bpFaqDraft.answer.trim() })
+    setBpFaqDraft({ question: '', answer: '' })
+    qc.invalidateQueries(['property-faqs', bpPropId])
+  }
+  const editFaq = async (f: any) => {
+    const question = await appPrompt('Question:', { defaultValue: f.question })
+    if (question === null) return
+    const answer = await appPrompt('Answer:', { defaultValue: f.answer })
+    if (answer === null) return
+    if (!question.trim() || !answer.trim()) return
+    await apiPatch(`/properties/${bpPropId}/faqs/${f.id}`, { question: question.trim(), answer: answer.trim() })
+    qc.invalidateQueries(['property-faqs', bpPropId])
+  }
+  const deleteFaq = async (faqId: string) => {
+    if (!await appConfirm('Delete this FAQ?')) return
+    await apiDelete(`/properties/${bpPropId}/faqs/${faqId}`)
+    qc.invalidateQueries(['property-faqs', bpPropId])
+  }
 
   const resvTotalAmount = resvList.reduce((s, b) => s + (parseFloat(String(b.totalAmount || 0)) || 0), 0)
 
@@ -599,6 +686,20 @@ export function SchedulePage() {
     {
       onSuccess: () => { qc.invalidateQueries('schedule'); qc.invalidateQueries('schedule-history'); setDetailBooking(null) },
       onError: () => toast.error('Could not cancel the reservation.'),
+    }
+  )
+
+  // S547: snowbird lock toggle — pins the stay to its site, exempt from the
+  // compressor / relocation / extend-fallback movers.
+  const lockBookingMut = useMutation(
+    (b: any) => apiPatch(`/units/${b.unitId}/bookings/${b.id}`, { lockedToUnit: !b.lockedToUnit }),
+    {
+      onSuccess: (updated: any, b: any) => {
+        qc.invalidateQueries('schedule')
+        setDetailBooking((prev: any) => prev ? { ...prev, lockedToUnit: updated?.lockedToUnit ?? !b.lockedToUnit } : prev)
+        toast(updated?.lockedToUnit ?? !b.lockedToUnit ? 'Locked to its site — automatic scheduling will not move this stay.' : 'Unlocked — automatic scheduling may re-site this stay again.')
+      },
+      onError: () => toast.error('Could not update the site lock.'),
     }
   )
 
@@ -1624,9 +1725,43 @@ export function SchedulePage() {
                   onChange={e => setBpCfg((c: any) => ({ ...c, shortTermTaxRate: e.target.value }))} style={{ marginBottom: 16, maxWidth: 140 }} />
 
                 <div style={{ borderTop: '1px solid var(--border-1)', margin: '6px 0 14px' }} />
-                <label className="form-label">Deposit at booking (% of stay total)</label>
+                <label className="form-label">Deposit for short stays (% of stay total — stays under 30 nights)</label>
                 <input className="input" type="number" min={0} max={100} value={bpCfg.depositPct}
-                  onChange={e => setBpCfg((c: any) => ({ ...c, depositPct: e.target.value }))} style={{ marginBottom: 16, maxWidth: 140 }} />
+                  onChange={e => setBpCfg((c: any) => ({ ...c, depositPct: e.target.value }))} style={{ marginBottom: 14, maxWidth: 140 }} />
+
+                <label className="form-label">Deposit for monthly stays ($ flat — 30+ nights)</label>
+                <input className="input" type="number" min={0} value={bpCfg.monthlyDeposit ?? ''} placeholder="150"
+                  onChange={e => setBpCfg((c: any) => ({ ...c, monthlyDeposit: e.target.value }))} style={{ marginBottom: 4, maxWidth: 140 }} />
+                <div style={{ color: 'var(--text-3)', fontSize: '.8rem', marginBottom: 16 }}>
+                  Blank = $150 default. Always capped at one month's rent — long-term guests never owe more than a month up front.
+                </div>
+
+                <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16, cursor: 'pointer' }}>
+                  <input type="checkbox" checked={bpCfg.utilitiesBilled !== false} onChange={e => setBpCfg((c: any) => ({ ...c, utilitiesBilled: e.target.checked }))} />
+                  <span>Utilities billed back on monthly stays (quote shows "plus utilities")</span>
+                </label>
+
+                <div style={{ borderTop: '1px solid var(--border-1)', margin: '6px 0 14px' }} />
+                <div style={{ fontWeight: 600, marginBottom: 4 }}>Contact page</div>
+                <div style={{ color: 'var(--text-3)', fontSize: '.8rem', marginBottom: 10 }}>
+                  Shown on the website's Contact page with the property address and the message form.
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 12 }}>
+                  <div>
+                    <label className="form-label">Office phone</label>
+                    <input className="input" value={bpCfg.officePhone ?? ''} placeholder="(555) 555-0100"
+                      onChange={e => setBpCfg((c: any) => ({ ...c, officePhone: e.target.value }))} />
+                  </div>
+                  <div>
+                    <label className="form-label">Office email</label>
+                    <input className="input" type="email" value={bpCfg.officeEmail ?? ''} placeholder="office@yourpark.com"
+                      onChange={e => setBpCfg((c: any) => ({ ...c, officeEmail: e.target.value }))} />
+                  </div>
+                </div>
+                <label className="form-label">Office hours</label>
+                <textarea className="input" rows={3} value={bpCfg.officeHours ?? ''}
+                  placeholder={'Mon–Fri 9am–5pm\nSat 10am–2pm\nClosed Sunday'}
+                  onChange={e => setBpCfg((c: any) => ({ ...c, officeHours: e.target.value }))} style={{ marginBottom: 16, resize: 'vertical' }} />
 
                 <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16, cursor: 'pointer' }}>
                   <input type="checkbox" checked={!!bpCfg.enabled} onChange={e => setBpCfg((c: any) => ({ ...c, enabled: e.target.checked }))} />
@@ -1639,6 +1774,76 @@ export function SchedulePage() {
               </>
             )}
           </div>
+
+          {/* ── S547: website photos ── */}
+          {bpCfg && (
+            <div className="card" style={{ padding: 16, maxWidth: 560, marginTop: 14 }}>
+              <div style={{ fontWeight: 600, marginBottom: 4 }}>Website photos</div>
+              <div style={{ color: 'var(--text-3)', fontSize: '.8rem', marginBottom: 12 }}>
+                Shown in the Gallery and on the home page of this property’s website. JPEG/PNG/WebP, up to 10 MB each.
+              </div>
+              {can('booking_sites.edit') && (
+                <label className="btn" style={{ display: 'inline-block', marginBottom: 12, cursor: 'pointer' }}>
+                  {bpUploading ? 'Uploading…' : 'Add photos'}
+                  <input type="file" accept="image/jpeg,image/png,image/webp,image/gif" multiple hidden
+                    disabled={bpUploading}
+                    onChange={e => { uploadSitePhotos(e.target.files); e.target.value = '' }} />
+                </label>
+              )}
+              {bpPhotos.length === 0 ? (
+                <div style={{ color: 'var(--text-3)', fontSize: '.85rem' }}>No photos yet.</div>
+              ) : (
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 10 }}>
+                  {bpPhotos.map((ph: any) => (
+                    <div key={ph.id}>
+                      <AuthThumb url={`/properties/${bpPropId}/site-photos/${ph.id}/file`} />
+                      <div style={{ fontSize: '.72rem', color: 'var(--text-3)', margin: '4px 0', minHeight: 14, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{ph.caption || '—'}</div>
+                      {can('booking_sites.edit') && (
+                        <div style={{ display: 'flex', gap: 8 }}>
+                          <button className="btn btn-ghost" style={{ padding: '2px 8px', fontSize: '.72rem' }} onClick={() => captionSitePhoto(ph.id, ph.caption)}>Caption</button>
+                          <button className="btn btn-ghost" style={{ padding: '2px 8px', fontSize: '.72rem' }} onClick={() => deleteSitePhoto(ph.id)}>Remove</button>
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ── S547: website FAQs ── */}
+          {bpCfg && (
+            <div className="card" style={{ padding: 16, maxWidth: 560, marginTop: 14 }}>
+              <div style={{ fontWeight: 600, marginBottom: 4 }}>Website FAQ</div>
+              <div style={{ color: 'var(--text-3)', fontSize: '.8rem', marginBottom: 12 }}>
+                Questions guests ask before booking — office hours, pets, rig limits, cancellation policy.
+              </div>
+              {bpFaqs.map((f: any) => (
+                <div key={f.id} style={{ borderTop: '1px solid var(--border-1)', padding: '10px 0' }}>
+                  <div style={{ fontWeight: 600, fontSize: '.88rem' }}>{f.question}</div>
+                  <div style={{ color: 'var(--text-3)', fontSize: '.84rem', whiteSpace: 'pre-wrap', margin: '4px 0 6px' }}>{f.answer}</div>
+                  {can('booking_sites.edit') && (
+                    <div style={{ display: 'flex', gap: 8 }}>
+                      <button className="btn btn-ghost" style={{ padding: '2px 8px', fontSize: '.72rem' }} onClick={() => editFaq(f)}>Edit</button>
+                      <button className="btn btn-ghost" style={{ padding: '2px 8px', fontSize: '.72rem' }} onClick={() => deleteFaq(f.id)}>Delete</button>
+                    </div>
+                  )}
+                </div>
+              ))}
+              {bpFaqs.length === 0 && <div style={{ color: 'var(--text-3)', fontSize: '.85rem', marginBottom: 10 }}>No FAQs yet.</div>}
+              {can('booking_sites.edit') && (
+                <div style={{ borderTop: '1px solid var(--border-1)', paddingTop: 12, marginTop: 6 }}>
+                  <label className="form-label">Question</label>
+                  <input className="input" value={bpFaqDraft.question}
+                    onChange={e => setBpFaqDraft(d => ({ ...d, question: e.target.value }))} style={{ marginBottom: 8 }} />
+                  <label className="form-label">Answer</label>
+                  <textarea className="input" rows={3} value={bpFaqDraft.answer}
+                    onChange={e => setBpFaqDraft(d => ({ ...d, answer: e.target.value }))} style={{ marginBottom: 10, resize: 'vertical' }} />
+                  <button className="btn" disabled={!bpFaqDraft.question.trim() || !bpFaqDraft.answer.trim()} onClick={addFaq}>Add FAQ</button>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       )}
 
@@ -1752,6 +1957,18 @@ export function SchedulePage() {
                 <div style={{display:'flex',gap:8,marginTop:18}}>
                   {can('guest_access') && <button className="btn btn-ghost btn-sm" onClick={()=>copyStayLink(d)}>Copy stay link</button>}
                   {can('schedule.edit_reservation') && d.status!=='cancelled' && <button className="btn btn-ghost btn-sm" onClick={()=>startEdit(d)}>Edit</button>}
+                  {/* S547: snowbird lock — pin the stay to this exact site, exempt from auto re-siting */}
+                  {can('schedule.edit_reservation') && d.status!=='cancelled' && (
+                    <button className="btn btn-ghost btn-sm"
+                      style={d.lockedToUnit ? { color: 'var(--gold)', borderColor: 'var(--gold)' } : undefined}
+                      disabled={lockBookingMut.isLoading}
+                      title={d.lockedToUnit
+                        ? 'Locked to this site — automatic scheduling will never move it. Click to unlock.'
+                        : 'Lock this reservation to its site (e.g. a returning snowbird) — exempt from automatic re-siting.'}
+                      onClick={()=>lockBookingMut.mutate(d)}>
+                      {lockBookingMut.isLoading ? '…' : d.lockedToUnit ? '🔒 Locked to site' : 'Lock to site'}
+                    </button>
+                  )}
                   {can('schedule.edit_reservation') && (
                     <button className="btn btn-sm" style={{marginLeft:'auto',color:'var(--red,#ff6b81)',borderColor:'var(--red,#ff6b81)'}}
                       disabled={cancelBookingMut.isLoading || d.status==='cancelled'}

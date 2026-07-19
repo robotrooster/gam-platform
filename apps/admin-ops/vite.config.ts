@@ -6,4 +6,5 @@ export default defineConfig({
   resolve: {
     alias: sharedAlias
   },
+  server: { host: true },
 })

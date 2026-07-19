@@ -1,3 +1,13 @@
+// S540: self-hosted fonts — no render-blocking external stylesheet
+import '@fontsource/syne/600.css'
+import '@fontsource/syne/700.css'
+import '@fontsource/syne/800.css'
+import '@fontsource/dm-sans/300.css'
+import '@fontsource/dm-sans/400.css'
+import '@fontsource/dm-sans/500.css'
+import '@fontsource/dm-sans/600.css'
+import '@fontsource/dm-mono/400.css'
+import '@fontsource/dm-mono/500.css'
 import { SentryErrorBoundary } from './lib/sentry'
 import React, { useState, useEffect } from 'react'
 import ReactDOM from 'react-dom/client'
@@ -14,7 +24,6 @@ const TENANT_URL = (import.meta as any).env?.VITE_TENANT_APP_URL || 'http://loca
 applyCamelizeInterceptor(axios)
 
 const css = `
-@import url('https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;500&display=swap');
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
   --bg0:#f8f7f4;--bg1:#ffffff;--bg2:#f3f2ef;--bg3:#e8e6e1;

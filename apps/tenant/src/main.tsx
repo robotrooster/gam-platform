@@ -1,3 +1,20 @@
+import { isAuthRejection, fetchAuthMeWithRetry } from '@gam/shared'
+// S540: self-hosted fonts — no render-blocking external stylesheet
+import '@fontsource/syne/600.css'
+import '@fontsource/syne/700.css'
+import '@fontsource/syne/800.css'
+import '@fontsource/dm-sans/300.css'
+import '@fontsource/dm-sans/400.css'
+import '@fontsource/dm-sans/500.css'
+import '@fontsource/dm-sans/600.css'
+import '@fontsource/dm-mono/400.css'
+import '@fontsource/dm-mono/500.css'
+import '@fontsource/inter/400.css'
+import '@fontsource/inter/500.css'
+import '@fontsource/inter/600.css'
+import '@fontsource/inter/700.css'
+import '@fontsource/jetbrains-mono/400.css'
+import '@fontsource/jetbrains-mono/500.css'
 import { SentryErrorBoundary } from './lib/sentry'
 import { AcceptInvitePage } from './pages/AcceptInvitePage'
 import { BackgroundCheckPage } from './pages/BackgroundCheckPage'
@@ -77,12 +94,15 @@ function AuthedVideo({ path, style }: { path: string; style?: React.CSSPropertie
   return <video controls preload="metadata" src={src} style={style} />
 }
 
-// S512 LAUNCH: tenant features hidden for the initial launch — the Flex
-// Suite hub (/services) and the credit-ledger surfaces (/credit, /my-disputes,
-// which are the FlexCredit/internal-scoring tenant view). Nav links are
-// filtered and routes redirect to /home; the pages + backend stay intact.
-// Unhide post-launch by emptying this set.
-const LAUNCH_HIDDEN = new Set<string>(['/services', '/credit', '/my-disputes'])
+// S512 LAUNCH: tenant features hidden for the initial launch — the
+// credit-ledger surfaces (/credit, /my-disputes, the FlexCredit/internal-
+// scoring tenant view). Nav links are filtered and routes redirect to
+// /home; the pages + backend stay intact. Unhide post-launch by
+// emptying this set.
+// S541: /services LEFT this set — the Flex hub is now driven by the
+// per-product rollout flags (GET /tenants/flex-visibility), so flipping
+// e.g. flexpay_rollout_visible surfaces exactly that product.
+const LAUNCH_HIDDEN = new Set<string>(['/credit', '/my-disputes'])
 const LAUNCH_HIDE_FITNESS = true
 api.interceptors.request.use(c => { const t = localStorage.getItem('gam_tenant_token'); if(t) c.headers.Authorization=`Bearer ${t}`; return c })
 api.interceptors.response.use(r=>r, e => { if(e.response?.status===401){localStorage.removeItem('gam_tenant_token');window.location.href='/login'} return Promise.reject(e) })
@@ -90,6 +110,18 @@ api.interceptors.response.use(r=>r, e => { if(e.response?.status===401){localSto
 applyCamelizeInterceptor(api)
 const get = <T,>(url: string) => api.get<{success:boolean;data:T}>(url).then(r=>r.data.data)
 const post = <T,>(url: string, body?: any) => api.post<{success:boolean;data:T;message?:string}>(url,body).then(r=>r.data)
+
+// S541: per-product Flex rollout visibility. FlexPay's initial rollout
+// is demand-test gated — the card offers "I'm interested" (inquiry)
+// until GAM reviews the lease + verifies SSI/SSDI income and approves;
+// only approved tenants can enroll (server-enforced).
+function useFlexVisibility() {
+  const { data } = useQuery('flex-visibility',
+    () => get<{ flexpay: boolean; flexdeposit: boolean; flexcredit: boolean }>('/tenants/flex-visibility'),
+    { staleTime: 5 * 60 * 1000, retry: false })
+  const v = data ?? { flexpay: false, flexdeposit: false, flexcredit: false }
+  return { ...v, any: v.flexpay || v.flexdeposit || v.flexcredit }
+}
 
 // ── AUTH ──────────────────────────────────────────────────────
 // S289: optional 2FA. Tenant is NOT in MANDATORY_TOTP_ROLES, so
@@ -112,13 +144,13 @@ function AuthProvider({children}:{children:React.ReactNode}) {
   const refresh = useCallback(async()=>{
     const t = localStorage.getItem('gam_tenant_token')
     if(!t){setLoading(false);return}
-    try{ const u = await get<AuthUser>('/auth/me'); setUser(u) }
-    catch{ logout() }
+    try{ const u = await fetchAuthMeWithRetry(() => get<AuthUser>('/auth/me')); setUser(u) }
+    catch(e){ if (isAuthRejection(e)) logout() }  // S540: transient failures keep the token
     finally{ setLoading(false) }
   },[logout])
   useEffect(()=>{
     if(!token){setLoading(false);return}
-    get<AuthUser>('/auth/me').then(u=>setUser(u)).catch(logout).finally(()=>setLoading(false))
+    fetchAuthMeWithRetry(() => get<AuthUser>('/auth/me')).then(u=>setUser(u)).catch(e=>{ if (isAuthRejection(e)) logout() }).finally(()=>setLoading(false))
   },[token,logout])
   // S289: post-credentials login. Returns a discriminated result so
   // LoginPage can pivot into the TOTP second step when 2FA is enabled
@@ -148,7 +180,6 @@ function AuthProvider({children}:{children:React.ReactNode}) {
 
 // ── STYLES ────────────────────────────────────────────────────
 const css = `
-@import url('https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;500&display=swap');
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{--bg0:#0a0b0e;--bg1:#0f1116;--bg2:#141720;--bg3:#1a1f2e;--bg4:#212636;
   --b0:#1e2435;--b1:#252d42;--b2:#2f3a55;
@@ -210,6 +241,11 @@ input,select,textarea{font-family:var(--font-b)}
 .modal-f{display:flex;justify-content:flex-end;gap:10px;margin-top:20px;padding-top:16px;border-top:1px solid var(--b0)}
 .fg{margin-bottom:16px}
 .fl{display:block;font-size:.75rem;font-weight:600;color:var(--t2);margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em}
+/* S544: .inp was used in 5 places but never defined — fields rendered
+   browser-default white on the dark theme. */
+.inp{width:100%;background:var(--bg3);border:1px solid var(--b1);border-radius:8px;color:var(--t0);padding:10px 12px;font-size:.9rem;color-scheme:dark}
+.inp:focus{outline:none;border-color:var(--gold)}
+textarea.inp{resize:vertical}
 .fi,.fs,.fta{width:100%;background:var(--bg3);border:1px solid var(--b1);border-radius:8px;color:var(--t0);padding:9px 12px;font-size:.875rem;font-family:var(--font-b);outline:none;transition:border-color .15s}
 .fi:focus,.fs:focus,.fta:focus{border-color:var(--gold)}
 .fi::placeholder{color:var(--t3)}
@@ -342,6 +378,7 @@ function Layout() {
   )
   const onInspectionRoute = location.pathname.startsWith('/inspections')
   const moveInLocked = moveInGate?.gated === true && !onInspectionRoute
+  const flexVis = useFlexVisibility()
   return (
     <div className="shell">
       <style dangerouslySetInnerHTML={{__html: themeCss}} />
@@ -356,7 +393,7 @@ function Layout() {
           )}
           {showFullNav && <>
             <NavLink to="/home" className={({isActive})=>`ni${isActive?' active':''}`}>🏠 Home</NavLink>
-            {!LAUNCH_HIDDEN.has('/services') && <NavLink to="/services" className={({isActive})=>`ni${isActive?' active':''}`}>⭐ Flex Advantage</NavLink>}
+            {flexVis.any && <NavLink to="/services" className={({isActive})=>`ni${isActive?' active':''}`}>⭐ Flex Advantage</NavLink>}
             <NavLink to="/payments" className={({isActive})=>`ni${isActive?' active':''}`}>💳 Payments</NavLink>
             <NavLink to="/maintenance" className={({isActive})=>`ni${isActive?' active':''}`}>🔧 Maintenance</NavLink>
             <NavLink to="/support" className={({isActive})=>`ni${isActive?' active':''}`}>💬 Support</NavLink>
@@ -433,10 +470,131 @@ function ServiceOutageBanner() {
   )
 }
 
+// ── S542: platform-originated questionnaire (LANDLORD-INVISIBLE) ────
+// Private product-fit ask from GAM. Copy per trigger; a positive
+// answer (SSI/SSDI + interested) auto-files a FlexPay request into
+// the S541 admin review queue.
+const QUESTIONNAIRE_COPY: Record<string, { title: string; intro: string; q1: string; q2: string }> = {
+  late_fee_fixed_income: {
+    title: 'A private question about your recent late fee',
+    intro: 'This comes from GAM, not your landlord — your landlord can’t see this or your answers. You were recently charged a late fee. If your money arrives on a fixed day each month, we may be able to keep that from happening again.',
+    q1: 'Does your income arrive on a fixed day each month?',
+    q2: 'Would you like rent to come out AFTER your money arrives, so late fees stop?',
+  },
+  ssi_ssdi_signal: {
+    title: 'A private question about your rent timing',
+    intro: 'This comes from GAM, not your landlord — they can’t see this or your answers. If your income comes from SSI or SSDI, our FlexPay service can pull rent on the day your deposit lands instead of the 1st.',
+    q1: 'Which applies to you?',
+    q2: 'Want us to review your account for FlexPay?',
+  },
+}
+const Q_INCOME_OPTIONS: { v: 'ssi'|'ssdi'|'other_fixed'|'none'; label: string }[] = [
+  { v: 'ssi', label: 'SSI' }, { v: 'ssdi', label: 'SSDI' },
+  { v: 'other_fixed', label: 'Other fixed day' }, { v: 'none', label: 'No / Neither' },
+]
+
+function QuestionnairePrompt() {
+  const qc = useQueryClient()
+  const { data: pending = [] } = useQuery<any[]>('tenant-questionnaires',
+    () => get<any[]>('/tenants/questionnaires'))
+  const [open, setOpen] = useState(false)
+  const [income, setIncome] = useState<'ssi'|'ssdi'|'other_fixed'|'none'|null>(null)
+  const [interested, setInterested] = useState<boolean|null>(null)
+  const [schedule, setSchedule] = useState<string|null>(null)
+  const [benefitDay, setBenefitDay] = useState<number>(3)
+  const [done, setDone] = useState<null | { inquiryFiled: boolean }>(null)
+  const [error, setError] = useState<string|null>(null)
+  const q = pending[0]
+  const refetch = () => qc.invalidateQueries('tenant-questionnaires')
+
+  const answerMut = useMutation(
+    () => post(`/tenants/questionnaires/${q.id}/answer`,
+      // S545b: pattern-based schedule fields per income type.
+      { incomeSource: income, interested, ...scheduleSubmission(income ?? 'none', schedule, benefitDay) }),
+    { onSuccess: (r: any) => setDone({ inquiryFiled: !!r?.data?.inquiryFiled }),
+      onError: (e: any) => setError(e?.response?.data?.error || 'Something went wrong.') })
+  const dismissMut = useMutation(
+    () => post(`/tenants/questionnaires/${q.id}/dismiss`),
+    { onSuccess: refetch })
+
+  if (!q) return null
+  const copy = QUESTIONNAIRE_COPY[q.triggerType] ?? QUESTIONNAIRE_COPY.ssi_ssdi_signal
+  return (
+    <>
+      <div className="card" style={{marginBottom:24, border:'1px solid var(--gold)', background:'rgba(201,162,39,.05)'}}>
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:12,flexWrap:'wrap'}}>
+          <div>
+            <div style={{fontWeight:700,color:'var(--t0)'}}>🔒 {copy.title}</div>
+            <div style={{fontSize:'.78rem',color:'var(--t2)',marginTop:4}}>Two quick questions from GAM. Private — your landlord never sees this.</div>
+          </div>
+          <div style={{display:'flex',gap:8}}>
+            <button className="btn btn-g btn-sm" onClick={()=>dismissMut.mutate()}>No thanks</button>
+            <button className="btn btn-p btn-sm" onClick={()=>setOpen(true)}>Answer</button>
+          </div>
+        </div>
+      </div>
+      {open && (
+        <div className="modal-ov" onClick={()=>{ if(done) refetch(); setOpen(false) }}>
+          <div className="modal" onClick={e=>e.stopPropagation()} style={{maxWidth:500}}>
+            {done ? (
+              <>
+                <div className="modal-t">✓ Thanks — that helps</div>
+                <p style={{fontSize:'.82rem',color:'var(--t2)',marginBottom:16}}>
+                  {done.inquiryFiled
+                    // S544: no-promise phrasing — valid in survey mode and
+                    // after launch alike. No signup implied, no timeline.
+                    ? 'Thanks — we’ve recorded your interest in FlexPay. When it’s available for your account, we’ll let you know. We may ask for proof of income source (like an award letter) at that point, only where permitted.'
+                    : 'Your answers are saved. Nothing else is needed from you.'}
+                </p>
+                <div style={{display:'flex',justifyContent:'flex-end'}}>
+                  <button className="btn btn-p" onClick={()=>{ refetch(); setOpen(false) }}>Done</button>
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="modal-t">🔒 {copy.title}</div>
+                <p style={{fontSize:'.8rem',color:'var(--t2)',marginBottom:16}}>{copy.intro}</p>
+                <div className="fg">
+                  <label className="fl">{copy.q1}</label>
+                  <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
+                    {Q_INCOME_OPTIONS.map(o => (
+                      <button key={o.v} type="button" className={`btn btn-sm ${income===o.v?'btn-p':'btn-g'}`}
+                        onClick={()=>setIncome(o.v)}>{o.label}</button>
+                    ))}
+                  </div>
+                </div>
+                {income && (
+                  <BenefitScheduleFields income={income} schedule={schedule} setSchedule={setSchedule} day={benefitDay} setDay={setBenefitDay} />
+                )}
+                <div className="fg" style={{marginTop:14}}>
+                  <label className="fl">{copy.q2}</label>
+                  <div style={{display:'flex',gap:8}}>
+                    <button type="button" className={`btn btn-sm ${interested===true?'btn-p':'btn-g'}`} onClick={()=>setInterested(true)}>Yes, I’m interested</button>
+                    <button type="button" className={`btn btn-sm ${interested===false?'btn-p':'btn-g'}`} onClick={()=>setInterested(false)}>No thanks</button>
+                  </div>
+                </div>
+                {error && <div className="alert a-warn" style={{marginTop:12}}>{error}</div>}
+                <div style={{display:'flex',justifyContent:'flex-end',gap:10,marginTop:18}}>
+                  <button className="btn btn-g" onClick={()=>setOpen(false)}>Later</button>
+                  <button className="btn btn-p" disabled={income===null||interested===null||!scheduleReady(income ?? 'none', schedule)||answerMut.isLoading}
+                    onClick={()=>answerMut.mutate()}>
+                    {answerMut.isLoading ? <span className="spinner"/> : 'Submit'}
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+    </>
+  )
+}
+
 function HomePage() {
   const { user } = useAuth()
   const { data: me } = useQuery('tenant-me', () => get<any>('/tenants/me'))
   const { data: health } = useQuery<any>('tenant-payment-health', () => get<any>('/tenants/me/payment-health'))
+  const flexVis = useFlexVisibility()
   const [bulletinScope, setBulletinScope] = useState<'property'|'city'|'state'>('property')
   const [bulletinSort, setBulletinSort] = useState<'new'|'old'>('new')
   const [bulletinSearch, setBulletinSearch] = useState('')
@@ -487,6 +645,9 @@ function HomePage() {
           KPI tile below, the Lease Details ACH row, and the
           AchVerifyForm on /services. */}
 
+      {/* S542: private platform questionnaire — landlord never sees it. */}
+      <QuestionnairePrompt />
+
       <div className="grid3" style={{marginBottom:24}}>
         <a href="/payments" style={{textDecoration:'none'}} className="kpi"
           onMouseEnter={e=>(e.currentTarget as any).style.borderColor='var(--gold)'}
@@ -502,8 +663,8 @@ function HomePage() {
           </div>
           <div className="kpi-s">{me?.propertyName}</div>
         </div>
-        {LAUNCH_HIDDEN.has('/services') ? (
-          // S512 launch: Flex Suite hidden — deposit KPI is informational
+        {!flexVis.flexdeposit ? (
+          // S541: FlexDeposit not rolled out — deposit KPI is informational
           // only (no /services link, no FlexDeposit framing).
           <div className="kpi">
             <div className="kpi-l">Security Deposit</div>
@@ -564,9 +725,9 @@ function HomePage() {
           <div className="dr"><span className="dk">Rent</span><span className="dv mono">{me?.rentAmount ? formatCurrency(me.rentAmount) : '—'}/mo</span></div>
           <div className="dr"><span className="dk">ACH</span><span className={`badge ${me?.achVerified?'b-green':'b-amber'}`}>{me?.achVerified?'Verified':'Pending'}</span></div>
         </a>
-        {/* S512 launch: "Your Subscriptions" is the Flex Suite card — hidden
-            with the rest of the suite. */}
-        {!LAUNCH_HIDDEN.has('/services') && (
+        {/* S541: "Your Subscriptions" surfaces only rolled-out Flex
+            products (per-product flags), one row per visible product. */}
+        {flexVis.any && (
         <a href="/services" style={{textDecoration:'none'}} className="card"
           onMouseEnter={e=>(e.currentTarget as any).style.borderColor='var(--gold)'}
           onMouseLeave={e=>(e.currentTarget as any).style.borderColor=''}>
@@ -574,8 +735,9 @@ function HomePage() {
             <h3>Your Subscriptions</h3>
             <span style={{fontSize:'.72rem',color:'var(--t3)'}}>Manage →</span>
           </div>
-          <div className="dr"><span className="dk">Credit Reporting</span><span className={`badge ${me?.creditReportingEnrolled?'b-green':'b-muted'}`}>{me?.creditReportingEnrolled?'Active — $5/mo':'Not enrolled'}</span></div>
-          <div className="dr"><span className="dk">FlexDeposit</span><span className={`badge ${me?.flexDepositEnrolled?'b-green':'b-muted'}`}>{me?.flexDepositEnrolled?'Active — $3/mo':'Not enrolled'}</span></div>
+          {flexVis.flexcredit && <div className="dr"><span className="dk">Credit Reporting</span><span className={`badge ${me?.creditReportingEnrolled?'b-green':'b-muted'}`}>{me?.creditReportingEnrolled?'Active — $5/mo':'Not enrolled'}</span></div>}
+          {flexVis.flexpay && <div className="dr"><span className="dk">FlexPay</span><span className={`badge ${me?.flexpayEnrolled?'b-green':'b-muted'}`}>{me?.flexpayEnrolled?`Active — day ${me.flexpayPullDay}`:'Not enrolled'}</span></div>}
+          {flexVis.flexdeposit && <div className="dr"><span className="dk">FlexDeposit</span><span className={`badge ${me?.flexDepositEnrolled?'b-green':'b-muted'}`}>{me?.flexDepositEnrolled?'Active — $3/mo':'Not enrolled'}</span></div>}
           <div style={{marginTop:16}}>
             <span className="btn btn-g btn-sm">Manage services →</span>
           </div>
@@ -1018,6 +1180,174 @@ function TermsViewerModal({ title, body, onClose }: { title: string; body: strin
 }
 
 // ── FLEXPAY ENROLL MODAL (S245, terms capture S314) ───────────────────────
+// S545b: per-income benefit-schedule fields — the ask matches how
+// each program actually pays (SSI 1st; SSDI 3rd or Nth Wednesday by
+// birth date; other fixed incomes a plain day). Used by the FlexPay
+// survey modal AND the private questionnaire.
+const SSDI_SCHEDULES: [string, string][] = [
+  ['ssdi_wed_2', '2nd Wednesday'], ['ssdi_wed_3', '3rd Wednesday'],
+  ['ssdi_wed_4', '4th Wednesday'], ['ssdi_day_3', '3rd of the month'],
+]
+function BenefitScheduleFields({ income, schedule, setSchedule, day, setDay }: {
+  income: 'ssi'|'ssdi'|'other_fixed'|'none'
+  schedule: string | null; setSchedule: (s: string) => void
+  day: number; setDay: (n: number) => void
+}) {
+  if (income === 'none') return null
+  if (income === 'ssi') return (
+    <div className="fg" style={{marginTop:12}}>
+      <label className="fl">When it arrives</label>
+      <div style={{fontSize:'.82rem',color:'var(--t1)'}}>
+        SSI arrives on the <strong>1st of the month</strong> (or the business day before). We’ll plan around that.
+      </div>
+    </div>
+  )
+  if (income === 'ssdi') return (
+    <div className="fg" style={{marginTop:12}}>
+      <label className="fl">When does your SSDI arrive?</label>
+      <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
+        {SSDI_SCHEDULES.map(([v, l]) => (
+          <button key={v} type="button" className={`btn btn-sm ${schedule===v?'btn-p':'btn-g'}`}
+            onClick={()=>setSchedule(v)}>{l}</button>
+        ))}
+      </div>
+      <div style={{fontSize:'.7rem',color:'var(--t3)',marginTop:6,lineHeight:1.5}}>
+        SSDI pays by birthday — 1st–10th: 2nd Wednesday · 11th–20th: 3rd Wednesday · 21st–31st: 4th Wednesday. Started before May 1997? It pays on the 3rd.
+      </div>
+    </div>
+  )
+  return (
+    <div className="fg" style={{marginTop:12}}>
+      <label className="fl">What day of the month does your money arrive?</label>
+      <div style={{display:'flex',alignItems:'center',gap:12}}>
+        <input type="range" min={1} max={28} value={day}
+          onChange={e=>setDay(parseInt(e.target.value))}
+          style={{flex:1,accentColor:'var(--gold)'}} />
+        <span style={{fontFamily:'var(--font-m)',fontSize:'1.2rem',fontWeight:800,color:'var(--t0)',minWidth:32,textAlign:'center'}}>{day}</span>
+      </div>
+      <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:4}}>If it varies, pick the latest day it can land.</div>
+    </div>
+  )
+}
+// Submission payload bits for the chosen income/schedule/day.
+function scheduleSubmission(income: string, schedule: string | null, day: number) {
+  if (income === 'none') return {}
+  if (income === 'ssi') return { benefitSchedule: 'ssi_day_1' }
+  if (income === 'ssdi') return schedule ? { benefitSchedule: schedule } : {}
+  return { benefitSchedule: 'fixed_day', benefitDay: day }
+}
+const scheduleReady = (income: string, schedule: string | null) =>
+  income !== 'ssdi' || !!schedule
+
+// S542b: proof-of-income upload card (pending FlexPay request only).
+function FlexPayProofCard({ proofName, onUploaded }: { proofName: string | null; onUploaded: () => void }) {
+  const fileRef = React.useRef<HTMLInputElement>(null)
+  const [error, setError] = useState<string | null>(null)
+  const upMut = useMutation(
+    (file: File) => {
+      const fd = new FormData(); fd.append('file', file)
+      return api.post('/tenants/flexpay/inquiry/proof', fd, { headers: { 'Content-Type': 'multipart/form-data' } }).then(r => r.data)
+    },
+    { onSuccess: () => { setError(null); onUploaded() },
+      onError: (e: any) => setError(e?.response?.data?.error || 'Upload failed — PDF, JPEG, PNG or WEBP up to 10MB.') },
+  )
+  return (
+    <div className="card" style={{ marginTop: 24 }}>
+      <h3 style={{ marginBottom: 4 }}>🪪 Proof of income {proofName ? <span className="badge b-green" style={{ marginLeft: 8 }}>✓ On file</span> : <span className="badge b-amber" style={{ marginLeft: 8 }}>Needed</span>}</h3>
+      <p style={{ fontSize: '.82rem', color: 'var(--t3)', marginBottom: 12 }}>
+        FlexPay is for SSI/SSDI recipients, and your request can’t be approved
+        until we can verify that. Upload your SSA award letter or benefit
+        verification letter (PDF or photo). Only GAM sees this — never your
+        landlord.
+      </p>
+      {proofName && (
+        <div style={{ fontSize: '.78rem', color: 'var(--t1)', marginBottom: 10 }}>
+          Uploaded: <span className="mono">{proofName}</span>
+        </div>
+      )}
+      {error && <div className="alert a-warn" style={{ marginBottom: 10 }}>{error}</div>}
+      <input ref={fileRef} type="file" accept=".pdf,image/jpeg,image/png,image/webp" style={{ display: 'none' }}
+        onChange={e => { const f = e.target.files?.[0]; if (f) upMut.mutate(f); e.target.value = '' }} />
+      <button className="btn btn-p btn-sm" disabled={upMut.isLoading} onClick={() => fileRef.current?.click()}>
+        {upMut.isLoading ? <span className="spinner" /> : proofName ? 'Replace document' : 'Upload document'}
+      </button>
+    </div>
+  )
+}
+
+// S541: FlexPay demand-test inquiry ("I'm interested"). Low friction by
+// design — the tenant claims SSI or SSDI and optionally adds a note;
+// GAM reviews the lease + verifies income, then approves from the admin
+// portal. No ACH/eligibility gate here; that all guards ENROLLMENT.
+function FlexPayInquireModal({ survey, onClose, onSuccess }: { survey?: boolean; onClose: () => void; onSuccess: () => void }) {
+  // S545: all income types accepted — non-SSI/SSDI files a tier-2
+  // request (waits behind SSI/SSDI; nothing promised either way).
+  const [incomeSource, setIncomeSource] = useState<'ssi' | 'ssdi' | 'other_fixed' | 'none'>('ssi')
+  // S545b: pay pattern per program + raw day for fixed-day incomes.
+  const [schedule, setSchedule] = useState<string | null>(null)
+  const [benefitDay, setBenefitDay] = useState<number>(3)
+  const [note, setNote] = useState('')
+  const [error, setError] = useState<string | null>(null)
+  const mut = useMutation(
+    () => post('/tenants/flexpay/inquiry', {
+      incomeSource,
+      ...scheduleSubmission(incomeSource, schedule, benefitDay),
+      note: note.trim() || undefined,
+    }),
+    {
+      onSuccess,
+      onError: (e: any) => setError(e?.response?.data?.error || 'Something went wrong. Please try again.'),
+    },
+  )
+  return (
+    <div className="modal-ov" onClick={onClose}>
+      <div className="modal" onClick={e=>e.stopPropagation()} style={{maxWidth:480}}>
+        <div className="modal-t">⚡ {survey ? 'FlexPay is coming soon' : 'FlexPay — request access'}</div>
+        <p style={{fontSize:'.82rem',color:'var(--t2)',marginBottom:16}}>
+          {survey ? (
+            <>FlexPay will let you move your rent pull to the day your benefits
+            arrive, for SSI and SSDI recipients. It hasn’t launched yet — this
+            30-second survey just gauges interest. It isn’t a signup and doesn’t
+            guarantee availability, but it helps us bring it to the right people
+            first.</>
+          ) : (
+            <>FlexPay lets you move your rent pull to the day your benefits arrive.
+            It’s available to SSI and SSDI recipients. Tell us which applies to
+            you and we’ll review your request — usually within a few business
+            days — and reach out with next steps.</>
+          )}
+        </p>
+        <div className="fg">
+          <label className="fl">My monthly income is</label>
+          <div style={{display:'flex',gap:10,flexWrap:'wrap'}}>
+            {([['ssi','SSI'],['ssdi','SSDI'],['other_fixed','Other fixed day'],['none','No fixed day']] as const).map(([src,label]) => (
+              <button key={src} type="button"
+                className={`btn btn-sm ${incomeSource===src?'btn-p':'btn-g'}`}
+                onClick={()=>setIncomeSource(src)}>
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
+        <BenefitScheduleFields income={incomeSource} schedule={schedule} setSchedule={setSchedule} day={benefitDay} setDay={setBenefitDay} />
+        <div className="fg" style={{marginTop:12}}>
+          <label className="fl">Anything we should know? (optional)</label>
+          <textarea className="inp" rows={3} maxLength={1000} value={note}
+            onChange={e=>setNote(e.target.value)}
+            placeholder="e.g. my deposit day is the 3rd Wednesday" />
+        </div>
+        {error && <div className="alert a-warn" style={{marginTop:12}}>{error}</div>}
+        <div style={{display:'flex',justifyContent:'flex-end',gap:10,marginTop:18}}>
+          <button className="btn btn-g" onClick={onClose}>Cancel</button>
+          <button className="btn btn-p" onClick={()=>mut.mutate()} disabled={mut.isLoading || !scheduleReady(incomeSource, schedule)}>
+            {mut.isLoading ? <span className="spinner"/> : survey ? 'Submit survey' : 'Request access'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // FlexPay is a payment-scheduling subscription. Tenant picks a pull day
 // (1-28); fee is $5 + day-of-month ($6 to $33). Day 28 cap covers all
 // U.S. social security payout windows (SSDI 4th-Wed-of-month). S314:
@@ -1550,10 +1880,19 @@ function FlexChargeDisputeModal({ tx, onClose, onSuccess }: {
 function ServicesPage() {
   const qc2 = useQuery('tenant-me', () => get<any>('/tenants/me'))
   const me = qc2.data
+  const flexVis = useFlexVisibility()
   const [flexPayModal, setFlexPayModal] = useState(false)
+  const [flexPayInquireModal, setFlexPayInquireModal] = useState(false)
   const [flexPayChangeModal, setFlexPayChangeModal] = useState(false)
   const [flexDepositModal, setFlexDepositModal] = useState(false)
-  const fd = useQuery('tenant-flexdeposit', () => get<any>('/tenants/flexdeposit'))
+  const fd = useQuery('tenant-flexdeposit', () => get<any>('/tenants/flexdeposit'), { enabled: flexVis.flexdeposit })
+  // S541: FlexPay demand-test — the inquiry disposition drives the card.
+  const fp = useQuery('tenant-flexpay', () => get<any>('/tenants/flexpay'), { enabled: flexVis.flexpay })
+  const fpInquiry = fp.data?.inquiry ?? null
+  const fpApproved = fpInquiry?.status === 'approved'
+  // S544: survey mode — visible but not launched. "Coming soon" +
+  // interest survey; NO enrollment promises, no queue language.
+  const fpLaunched = fp.data?.enrollmentOpen === true
 
   // S310: OTP became landlord-only at S155; the tenant /enroll-on-time-pay
   // route returns 410 Gone. The tenant portal must not surface OTP
@@ -1582,13 +1921,41 @@ function ServicesPage() {
       desc: 'Pick the day of the month your rent gets pulled from your bank. Your landlord gets paid on the lease grace-period day no matter what; you pay later.',
       price: '$6–$33/month',
       enrolled: me?.flexpayEnrolled,
-      action: () => setFlexPayModal(true),
+      // S544 survey mode (pre-launch): "coming soon" + interest
+      // survey — no enrollment promises, no queue language, no
+      // reach-out commitments. Any recorded inquiry (whatever its
+      // admin status) reads as "interest recorded".
+      // S541 launched states: no inquiry → "I'm interested";
+      // pending/declined → badge; approved → Enroll (ACH-gated).
+      // Server enforces both gates.
+      action: () => (fpLaunched && fpApproved) ? setFlexPayModal(true) : setFlexPayInquireModal(true),
       loading: false,
       highlight: me?.flexpayEnrolled
         ? `Day ${me.flexpayPullDay} · $${me.flexpayMonthlyFee}/mo`
-        : !me?.achVerified ? '⚠ Bank account must be verified first'
-        : 'Pick your pull date 1–28',
-      locked: !me?.achVerified,
+        : !fpLaunched
+          ? (fpInquiry
+              ? '✓ Interest recorded — we’ll announce availability'
+              : 'Coming soon — take the 30-second interest survey')
+        // S542c: NO queue numbers tenant-side — no promises. Ordering
+        // (float-need first) is admin-only.
+        : fpInquiry?.status === 'pending'
+          ? (fp.data?.stateHold
+              ? 'In line — not yet available in your state; you keep your place'
+              : 'You’re in line — we’ll reach out when it’s your turn')
+        : fpInquiry?.status === 'declined' ? null
+        : fpApproved
+          ? (!me?.achVerified ? '⚠ Approved — verify your bank account to enroll' : '✓ Approved — pick your pull date 1–28')
+          : 'For SSI/SSDI recipients — tap to request access',
+      locked: fpLaunched && fpApproved && !me?.achVerified,
+      ctaLabel: !fpLaunched ? 'Take the survey' : fpApproved ? 'Enroll' : 'I’m interested',
+      // statusBadge REPLACES the CTA button — so in survey mode only
+      // the already-surveyed state gets one (nothing more to do);
+      // the not-yet-surveyed state keeps the "Take the survey" CTA.
+      statusBadge: !fpLaunched
+        ? (fpInquiry ? { text: 'Interest recorded', tone: 'b-green' } : null)
+        : fpInquiry?.status === 'pending' ? { text: 'Request received', tone: 'b-amber' }
+        : fpInquiry?.status === 'declined' ? { text: 'Not available right now', tone: 'b-muted' }
+        : null,
     },
     {
       id: 'flexdeposit',
@@ -1606,6 +1973,13 @@ function ServicesPage() {
     },
   ]
 
+  // S541: only rolled-out products render; none rolled out → no page.
+  const visibleServices = services.filter(s =>
+    s.id === 'credit' ? flexVis.flexcredit :
+    s.id === 'flexpay' ? flexVis.flexpay :
+    flexVis.flexdeposit)
+  if (!flexVis.any) return <Navigate to="/home" replace />
+
   return (
     <div>
       <div className="ph">
@@ -1615,7 +1989,7 @@ function ServicesPage() {
         ℹ️ None of these services are required as a condition of your tenancy. Subscribe only if they benefit you.
       </div>
       <div className="grid3">
-        {services.map(s => (
+        {visibleServices.map(s => (
           <div key={s.id} className={`service-card${s.enrolled?' enrolled':''}`}>
             <div>
               <div style={{fontFamily:'var(--font-d)',fontWeight:700,fontSize:'1rem',color:'var(--t0)',marginBottom:6}}>{s.name}</div>
@@ -1629,14 +2003,30 @@ function ServicesPage() {
                     <span className="badge b-green">✓ Active</span>
                     {s.id==='flexpay' && <button className="btn btn-g btn-sm" onClick={()=>setFlexPayChangeModal(true)}>Change day</button>}
                   </span>
+                : (s as any).statusBadge
+                ? <span className={`badge ${(s as any).statusBadge.tone}`}>{(s as any).statusBadge.text}</span>
                 : (s as any).locked
                 ? <span className="badge b-muted">🔒 Locked</span>
-                : <button className="btn btn-p btn-sm" onClick={s.action} disabled={s.loading}>{s.loading?<span className="spinner"/>:'Enroll'}</button>}
+                : <button className="btn btn-p btn-sm" onClick={s.action} disabled={s.loading}>{s.loading?<span className="spinner"/>:((s as any).ctaLabel || 'Enroll')}</button>}
             </div>
           </div>
         ))}
       </div>
 
+
+      {/* S542b: proof-of-income upload — the tenant shows proof TO THE
+          PLATFORM (never the landlord). FlexPay is hard-gated to proven
+          SSI/SSDI; imported tenants have no income on file, so this is
+          how anyone gets verified. */}
+      {/* S545 (Nic): proof of benefits is part of the INTEREST flow —
+          no approval happens without a document on file, so the ask
+          starts as soon as a request exists (survey mode included). */}
+      {flexVis.flexpay && fpInquiry?.status === 'pending' && (
+        <FlexPayProofCard
+          proofName={fpInquiry?.proofOriginalName ?? null}
+          onUploaded={() => fp.refetch()}
+        />
+      )}
 
       {/* ── ACH Verification ─────────────────────────────────────── */}
       {!me?.achVerified && (
@@ -1666,7 +2056,14 @@ function ServicesPage() {
     {flexPayModal && (
         <FlexPayModal
           onClose={() => setFlexPayModal(false)}
-          onSuccess={() => { qc2.refetch(); setFlexPayModal(false) }}
+          onSuccess={() => { qc2.refetch(); fp.refetch(); setFlexPayModal(false) }}
+        />
+      )}
+      {flexPayInquireModal && (
+        <FlexPayInquireModal
+          survey={!fpLaunched}
+          onClose={() => setFlexPayInquireModal(false)}
+          onSuccess={() => { fp.refetch(); setFlexPayInquireModal(false) }}
         />
       )}
       {flexPayChangeModal && (
@@ -3476,7 +3873,7 @@ function App() {
           <Route path="maintenance"      element={<MaintenancePage />} />
           <Route path="lease"            element={<LeasePage />} />
           <Route path="sign/:documentId" element={<SignPage />} />
-          <Route path="services"         element={LAUNCH_HIDDEN.has('/services') ? <Navigate to="/home" replace /> : <ServicesPage />} />
+          <Route path="services"         element={<ServicesPage />} />
           <Route path="documents"        element={<DocumentsPage />} />
           <Route path="support"          element={<SupportPage />} />
           <Route path="inspections"      element={<TenantInspectionsPage />} />

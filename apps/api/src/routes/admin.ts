@@ -1,5 +1,8 @@
 import os from 'os'
+import path from 'path'
+import fs from 'fs'
 import { Router } from 'express'
+import { z } from 'zod'
 import { query, queryOne } from '../db'
 import { requireAuth, requireAdmin, requireSuperAdmin } from '../middleware/auth'
 import { latencyP95, sampleSize } from '../lib/apiMetrics'
@@ -945,6 +948,391 @@ adminRouter.post('/deposit-portability/:depositId/mark-transferred', requireAdmi
     )
 
     res.json({ success: true, data: { id: req.params.depositId, status: 'carried_forward' } })
+  } catch (e) { next(e) }
+})
+
+// ── S541: FlexPay demand-test review queue ────────────────────────────────
+//
+// FlexPay fronts rent every cycle, so enrollment volume = GAM float.
+// Initial rollout is approval-gated (Nic): tenant inquires from the
+// tenant portal; an admin reviews the lease + verifies SSI/SSDI income
+// here; only an approved inquiry unlocks enrollFlexPay (enforced in
+// services/flexpay.ts). Inquiry volume doubles as the demand signal
+// for whether outside capital is worth raising.
+
+adminRouter.get('/flexpay/inquiries', requireAdmin, async (req: any, res, next) => {
+  try {
+    const status = ['pending', 'approved', 'declined'].includes(req.query.status)
+      ? req.query.status : null
+    // S545: tier-2 (non-SSI/SSDI) rows carry an income hold until the
+    // expansion flag opens; they always sort behind tier 1.
+    const { isFeatureEnabled } = await import('../services/systemFeatures')
+    const otherIncomeOpen = await isFeatureEnabled('flexpay_other_income_open')
+    // S542c (Nic): queue ordered by FLOAT NEED — shortest float first,
+    // FIFO created_at as tiebreak. Float = days between GAM's front
+    // (lease grace-period end, default 5) and the tenant's benefit-
+    // arrival day; a benefit day at/before grace-end is ~zero float.
+    // Shorter float recycles bankroll faster (3 tenants × 1 week beats
+    // 1 tenant × 3 weeks) and longer floats earn less per dollar-day.
+    // Unknown day (questionnaire-funneled) sorts LAST until captured.
+    // Position numbers are ADMIN-SIDE ONLY — tenants never see one.
+    // state_hold rows keep their place but cannot be approved (422).
+    const rows = await query<any>(
+      `SELECT fi.id, fi.status, fi.claimed_income_source, fi.tenant_note,
+              fi.admin_notes, fi.created_at, fi.reviewed_at,
+              fi.desired_pull_day, fi.benefit_schedule,
+              -- NB: CASE guard required — GREATEST(0, NULL) is 0 in
+              -- Postgres, which would sort unknown-day rows FIRST.
+              CASE WHEN fi.desired_pull_day IS NULL THEN NULL
+                   ELSE GREATEST(0, fi.desired_pull_day - COALESCE(l.late_fee_grace_days, 5))
+              END AS est_float_days,
+              -- S545: lease context the reviewer needs — the terms the
+              -- float rides on: due day, remaining term.
+              l.rent_due_day, l.status AS lease_status,
+              CASE WHEN l.end_date IS NULL THEN NULL
+                   ELSE GREATEST(0, ROUND(EXTRACT(EPOCH FROM (l.end_date::timestamp - NOW())) / 2592000))::int
+              END AS lease_months_left,
+              t.id AS tenant_id, t.ssi_ssdi, t.ach_verified,
+              t.flexpay_enrolled,
+              u.first_name, u.last_name, u.email, u.phone,
+              l.id AS lease_id, l.rent_amount AS lease_rent, l.start_date, l.end_date,
+              un.unit_number, pr.name AS property_name, pr.state AS property_state,
+              (bs.state IS NOT NULL) AS state_hold,
+              (fi.claimed_income_source NOT IN ('ssi', 'ssdi') AND NOT $2::boolean) AS income_hold,
+              fi.held_at, fi.hold_reason,
+              fi.proof_original_name, fi.proof_uploaded_at,
+              fi.auto_verification,
+              t.flexpay_prequal->>'status' AS prequal_status,
+              -- S545c: lease-holder names for the document-name check.
+              (SELECT string_agg(u2.first_name || ' ' || u2.last_name, ', ' ORDER BY u2.last_name)
+                 FROM lease_tenants lt2
+                 JOIN tenants t2 ON t2.id = lt2.tenant_id
+                 JOIN users u2 ON u2.id = t2.user_id
+                WHERE lt2.lease_id = l.id AND lt2.status = 'active') AS lease_holder_names,
+              -- S545c: held rows carry NO number — they're out of the
+              -- working queue until released (created_at preserved, so
+              -- release restores their spot automatically).
+              CASE WHEN fi.status = 'pending' AND fi.held_at IS NULL THEN
+                (ROW_NUMBER() OVER (PARTITION BY (fi.status = 'pending' AND fi.held_at IS NULL) ORDER BY
+                  (fi.claimed_income_source IN ('ssi', 'ssdi')) DESC,
+                  CASE WHEN fi.desired_pull_day IS NULL THEN NULL
+                       ELSE GREATEST(0, fi.desired_pull_day - COALESCE(l.late_fee_grace_days, 5))
+                  END ASC NULLS LAST,
+                  fi.created_at ASC))::int
+              END AS queue_position,
+              ru.email AS reviewed_by_email
+         FROM flexpay_inquiries fi
+         JOIN tenants t ON t.id = fi.tenant_id
+         JOIN users u ON u.id = t.user_id
+    LEFT JOIN LATERAL (
+           SELECT l2.* FROM lease_tenants lt
+             JOIN leases l2 ON l2.id = lt.lease_id
+            WHERE lt.tenant_id = t.id AND lt.status = 'active'
+              AND l2.status IN ('active', 'pending')
+            ORDER BY l2.created_at DESC LIMIT 1
+         ) l ON TRUE
+    LEFT JOIN units un ON un.id = l.unit_id
+    LEFT JOIN properties pr ON pr.id = un.property_id
+    LEFT JOIN flexpay_blocked_states bs ON bs.state = pr.state
+    LEFT JOIN users ru ON ru.id = fi.reviewed_by_user_id
+        WHERE ($1::text IS NULL OR fi.status = $1)
+        ORDER BY (fi.status = 'pending') DESC,
+                 (fi.claimed_income_source IN ('ssi', 'ssdi')) DESC,
+                 CASE WHEN fi.desired_pull_day IS NULL THEN NULL
+                      ELSE GREATEST(0, fi.desired_pull_day - COALESCE(l.late_fee_grace_days, 5))
+                 END ASC NULLS LAST,
+                 fi.created_at ASC`,
+      [status, otherIncomeOpen],
+    )
+    res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
+// Approve or decline. Approving with incomeVerified=true marks
+// tenants.ssi_ssdi (the eligibility gate enrollFlexPay checks) — the
+// admin is attesting they verified the SSI/SSDI award letter / bank
+// deposit history. Approving WITHOUT it is blocked: an approved tenant
+// who fails the ssi_ssdi eligibility check would be stuck in a
+// contradictory state.
+adminRouter.post('/flexpay/inquiries/:id/review', requireAdmin, async (req: any, res, next) => {
+  try {
+    const body = z.object({
+      action:         z.enum(['approve', 'decline']),
+      // S546: legacy attestation fields accepted but IGNORED — the
+      // checks are automated now (checkbox ritual removed per Nic).
+      incomeVerified: z.boolean().optional(),
+      nameMatchConfirmed: z.boolean().optional(),
+      notes:          z.string().max(2000).optional(),
+    }).parse(req.body)
+
+    const inq = await queryOne<{ id: string; tenant_id: string; status: string; proof_uploaded_at: string | null; claimed_income_source: string; held_at: string | null; auto_verification: any }>(
+      `SELECT id, tenant_id, status, proof_uploaded_at, claimed_income_source, held_at, auto_verification FROM flexpay_inquiries WHERE id = $1`,
+      [req.params.id],
+    )
+    if (!inq) throw new AppError(404, 'Inquiry not found')
+
+    // S545c: a held request can't be decided either way until the
+    // discrepancy is resolved and the hold released.
+    if (inq.held_at) {
+      throw new AppError(422, 'This request is on a verification hold — resolve the discrepancy and release the hold first')
+    }
+
+    // S545: tier-2 income hold — non-SSI/SSDI requests wait in the
+    // queue (place preserved) until the expansion flag opens.
+    const isTier1 = inq.claimed_income_source === 'ssi' || inq.claimed_income_source === 'ssdi'
+    if (body.action === 'approve' && !isTier1) {
+      const { isFeatureEnabled } = await import('../services/systemFeatures')
+      if (!(await isFeatureEnabled('flexpay_other_income_open'))) {
+        throw new AppError(422,
+          'Income-type hold: FlexPay currently serves SSI/SSDI only. This tier-2 request keeps its place; approve once the expansion flag (flexpay_other_income_open) is on.')
+      }
+    }
+
+    // S545/S546: proof document required, and its AUTOMATED check must
+    // have passed — the platform read the document and found a lease
+    // holder's name ('matched'), or a human resolved a hold
+    // ('manual_ok' — set by release-hold, the one exception path).
+    // No checkboxes: the machine did the verification.
+    if (body.action === 'approve' && !inq.proof_uploaded_at) {
+      throw new AppError(422,
+        'No proof of benefits on file — the tenant must upload their award letter (or benefit verification letter) before this request can be approved')
+    }
+    if (body.action === 'approve') {
+      const nameMatch = inq.auto_verification?.nameMatch
+      if (nameMatch !== 'matched' && nameMatch !== 'manual_ok') {
+        throw new AppError(422,
+          'Automated document check has not passed — the proof must contain a lease holder\'s name (or resolve via the hold/release path)')
+      }
+    }
+
+    // S542b: state hold — a tenant whose property is in a blocked
+    // state stays WAITLISTED (keeps their queue place); approval is
+    // refused until the state clears (flexpay_blocked_states row
+    // removed by superadmin).
+    if (body.action === 'approve') {
+      const hold = await queryOne<{ state: string; reason: string }>(
+        `SELECT bs.state, bs.reason
+           FROM lease_tenants lt
+           JOIN leases l ON l.id = lt.lease_id
+           JOIN units u ON u.id = l.unit_id
+           JOIN properties pr ON pr.id = u.property_id
+           JOIN flexpay_blocked_states bs ON bs.state = pr.state
+          WHERE lt.tenant_id = $1 AND lt.status = 'active'
+            AND l.status IN ('active', 'pending')
+          LIMIT 1`,
+        [inq.tenant_id])
+      if (hold) {
+        throw new AppError(422,
+          `State hold: FlexPay is blocked in ${hold.state} (${hold.reason}). ` +
+          `The tenant keeps their queue place; approve once the state clears.`)
+      }
+    }
+
+    const newStatus = body.action === 'approve' ? 'approved' : 'declined'
+    await query(
+      `UPDATE flexpay_inquiries
+          SET status = $1, admin_notes = $2,
+              reviewed_by_user_id = $3, reviewed_at = NOW(), updated_at = NOW()
+        WHERE id = $4`,
+      [newStatus, body.notes ?? null, req.user!.userId, inq.id],
+    )
+    // ssi_ssdi is the SSI/SSDI service-tier flag — only a tier-1
+    // approval may set it (a tier-2 approval verifying a pension is
+    // NOT an SSI/SSDI attestation).
+    if (body.action === 'approve' && isTier1) {
+      await query(`UPDATE tenants SET ssi_ssdi = TRUE WHERE id = $1`, [inq.tenant_id])
+    }
+
+    await logAdminAction({
+      adminUserId: req.user!.userId,
+      actionType: `flexpay_inquiry_${newStatus}`,
+      targetType: 'flexpay_inquiry',
+      targetId: inq.id,
+      notes: body.notes ?? null,
+      metadata: { tenant_id: inq.tenant_id, income_verified: body.incomeVerified === true },
+    })
+
+    res.json({ success: true, data: { id: inq.id, status: newStatus } })
+  } catch (e) { next(e) }
+})
+
+// S543: demand-funnel numbers for the FlexPay Requests page — the
+// data Nic's capital-raise decision reads from: how many were asked,
+// how many raised a hand, how many are approved/enrolled, and the
+// monthly front commitment (sum of enrolled tenants' active-lease
+// rent = bankroll out the door each cycle).
+adminRouter.get('/flexpay/funnel', requireAdmin, async (_req, res, next) => {
+  try {
+    const [q, i, other, enr] = await Promise.all([
+      query<any>(`SELECT status, COUNT(*)::int AS n FROM tenant_questionnaires GROUP BY status`),
+      query<any>(`SELECT status, COUNT(*)::int AS n FROM flexpay_inquiries GROUP BY status`),
+      // S545: tier-2 backlog — non-SSI/SSDI requests waiting on the
+      // expansion flag. The expand-to-other-income-types signal.
+      // (Held rows excluded — they're out of the working queue.)
+      queryOne<any>(
+        `SELECT COUNT(*)::int AS n FROM flexpay_inquiries
+          WHERE status = 'pending' AND held_at IS NULL
+            AND claimed_income_source NOT IN ('ssi', 'ssdi')`),
+      queryOne<any>(
+        `SELECT COUNT(*)::int AS enrolled,
+                COALESCE(SUM(l.rent_amount), 0)::float AS monthly_float
+           FROM tenants t
+      LEFT JOIN LATERAL (
+             SELECT l2.rent_amount FROM lease_tenants lt
+               JOIN leases l2 ON l2.id = lt.lease_id
+              WHERE lt.tenant_id = t.id AND lt.status = 'active'
+                AND l2.status IN ('active', 'pending')
+              ORDER BY l2.created_at DESC LIMIT 1
+           ) l ON TRUE
+          WHERE t.flexpay_enrolled = TRUE`),
+    ])
+    const by = (rows: any[]) => Object.fromEntries(rows.map(r => [r.status, r.n]))
+    res.json({ success: true, data: {
+      questionnaires: by(q),
+      inquiries: by(i),
+      otherIncomeInterest: other?.n ?? 0,
+      enrolled: enr?.enrolled ?? 0,
+      monthlyFloat: enr?.monthly_float ?? 0,
+    } })
+  } catch (e) { next(e) }
+})
+
+// (S545: the short-lived /flexpay/interest-only roster endpoint was
+// removed same-session — non-SSI/SSDI interest now files TIER-2
+// inquiries directly into the main queue with an income hold.)
+
+// S545c: manual verification hold + release. Hold = silently out of
+// the working queue (no tenant-facing signal — their portal keeps the
+// normal pending copy). Release restores their original spot in line
+// automatically (created_at is the tiebreak and never changes).
+adminRouter.post('/flexpay/inquiries/:id/hold', requireAdmin, async (req: any, res, next) => {
+  try {
+    const body = z.object({ reason: z.string().min(3).max(500) }).parse(req.body)
+    const rows = await query<any>(
+      `UPDATE flexpay_inquiries
+          SET held_at = NOW(), hold_reason = $2, updated_at = NOW()
+        WHERE id = $1 AND status = 'pending' AND held_at IS NULL
+        RETURNING id`,
+      [req.params.id, body.reason])
+    if (rows.length === 0) throw new AppError(404, 'Inquiry not found, already held, or already reviewed')
+    await logAdminAction({
+      adminUserId: req.user!.userId, actionType: 'flexpay_inquiry_held',
+      targetType: 'flexpay_inquiry', targetId: req.params.id, notes: body.reason,
+    })
+    res.json({ success: true, data: { id: req.params.id, held: true } })
+  } catch (e) { next(e) }
+})
+
+adminRouter.post('/flexpay/inquiries/:id/release-hold', requireAdmin, async (req: any, res, next) => {
+  try {
+    const body = z.object({ notes: z.string().max(500).optional() }).parse(req.body ?? {})
+    // S546: releasing a hold IS the manual verification — record
+    // manual_ok so the automated approve gate accepts the file
+    // (unless the machine already matched it).
+    const rows = await query<any>(
+      `UPDATE flexpay_inquiries
+          SET held_at = NULL, hold_reason = NULL,
+              auto_verification = CASE
+                WHEN auto_verification->>'nameMatch' = 'matched' THEN auto_verification
+                ELSE COALESCE(auto_verification, '{}'::jsonb) ||
+                     jsonb_build_object('nameMatch', 'manual_ok', 'checkedAt', NOW()::text)
+              END,
+              updated_at = NOW()
+        WHERE id = $1 AND held_at IS NOT NULL
+        RETURNING id`,
+      [req.params.id])
+    if (rows.length === 0) throw new AppError(404, 'Inquiry not found or not held')
+    await logAdminAction({
+      adminUserId: req.user!.userId, actionType: 'flexpay_inquiry_hold_released',
+      targetType: 'flexpay_inquiry', targetId: req.params.id, notes: body.notes ?? null,
+    })
+    res.json({ success: true, data: { id: req.params.id, held: false } })
+  } catch (e) { next(e) }
+})
+
+// S543: capture/correct the benefit-arrival day during reach-out.
+// Pending inquiries only — the day drives float-need queue ordering,
+// and once reviewed the real pull day is chosen at enrollment.
+adminRouter.post('/flexpay/inquiries/:id/benefit-day', requireAdmin, async (req: any, res, next) => {
+  try {
+    const body = z.object({ benefitDay: z.number().int().min(1).max(28) }).parse(req.body)
+    const rows = await query<any>(
+      `UPDATE flexpay_inquiries
+          SET desired_pull_day = $2, updated_at = NOW()
+        WHERE id = $1 AND status = 'pending'
+        RETURNING id, desired_pull_day`,
+      [req.params.id, body.benefitDay])
+    if (rows.length === 0) throw new AppError(404, 'Inquiry not found or already reviewed')
+    await logAdminAction({
+      adminUserId: req.user!.userId, actionType: 'flexpay_inquiry_benefit_day_set',
+      targetType: 'flexpay_inquiry', targetId: req.params.id,
+      metadata: { benefit_day: body.benefitDay },
+    })
+    res.json({ success: true, data: rows[0] })
+  } catch (e) { next(e) }
+})
+
+// S542b: admin view of a tenant's proof-of-income document. The
+// tenant uploaded it to the PLATFORM (never landlord-visible); the
+// reviewer opens it here before attesting income verification.
+adminRouter.get('/flexpay/inquiries/:id/proof-file', requireAdmin, async (req: any, res, next) => {
+  try {
+    const inq = await queryOne<{ proof_file_path: string | null }>(
+      `SELECT proof_file_path FROM flexpay_inquiries WHERE id = $1`,
+      [req.params.id])
+    if (!inq) throw new AppError(404, 'Inquiry not found')
+    if (!inq.proof_file_path) throw new AppError(404, 'No proof uploaded')
+    const { flexpayProofContentType } = await import('./tenants')
+    const fp = path.join(process.cwd(), 'uploads', 'flexpay-proofs', path.basename(inq.proof_file_path))
+    if (!fs.existsSync(fp)) throw new AppError(404, 'File missing')
+    res.setHeader('Content-Type', flexpayProofContentType(fp))
+    fs.createReadStream(fp).pipe(res)
+  } catch (e) { next(e) }
+})
+
+// S542b: state blocks — superadmin-managed list of states where a
+// legal requirement prevents offering FlexPay. Starts EMPTY (no state
+// identified); this is the mechanism per the S177 posture. Tenants in
+// a blocked state stay waitlisted with their queue place preserved.
+adminRouter.get('/flexpay/blocked-states', requireAdmin, async (_req, res, next) => {
+  try {
+    const rows = await query<any>(
+      `SELECT state, reason, created_at FROM flexpay_blocked_states ORDER BY state`)
+    res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
+adminRouter.put('/flexpay/blocked-states/:state', requireSuperAdmin, async (req: any, res, next) => {
+  try {
+    const state = String(req.params.state || '').toUpperCase()
+    if (!/^[A-Z]{2}$/.test(state)) throw new AppError(400, 'state must be a 2-letter code')
+    const body = z.object({ reason: z.string().min(3).max(500) }).parse(req.body)
+    await query(
+      `INSERT INTO flexpay_blocked_states (state, reason) VALUES ($1, $2)
+       ON CONFLICT (state) DO UPDATE SET reason = $2`,
+      [state, body.reason])
+    // targetId is a uuid column — state codes ride in metadata.
+    await logAdminAction({
+      adminUserId: req.user!.userId, actionType: 'flexpay_state_blocked',
+      targetType: 'flexpay_blocked_state', notes: body.reason,
+      metadata: { state },
+    })
+    res.json({ success: true, data: { state, reason: body.reason } })
+  } catch (e) { next(e) }
+})
+
+adminRouter.delete('/flexpay/blocked-states/:state', requireSuperAdmin, async (req: any, res, next) => {
+  try {
+    const state = String(req.params.state || '').toUpperCase()
+    const rows = await query<any>(
+      `DELETE FROM flexpay_blocked_states WHERE state = $1 RETURNING state`, [state])
+    if (rows.length === 0) throw new AppError(404, 'State not blocked')
+    await logAdminAction({
+      adminUserId: req.user!.userId, actionType: 'flexpay_state_unblocked',
+      targetType: 'flexpay_blocked_state',
+      metadata: { state },
+    })
+    res.json({ success: true, data: { state, unblocked: true } })
   } catch (e) { next(e) }
 })
 

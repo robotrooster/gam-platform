@@ -934,6 +934,32 @@ leasesRouter.get('/:id/deposit-return', async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
+// POST /api/leases/:id/request-background-check — S547 (Nic): the long-stay
+// screening DECISION. A 30+ night booking drafts a lease and pings the
+// landlord; the landlord — never the system — chooses to screen. This arm
+// emails the guest a screening request pointing at the tenant-portal
+// background flow. The other arm is simply reviewing + sending the lease.
+leasesRouter.post('/:id/request-background-check', requirePerm('tenants.run_background_check'), async (req, res, next) => {
+  try {
+    const lease = await queryOne<any>(`
+      SELECT l.id, l.landlord_id, l.lease_source, b.guest_email, b.guest_name, p.name AS property_name
+        FROM leases l
+        JOIN unit_bookings b ON b.id = l.source_booking_id
+        JOIN units u ON u.id = l.unit_id
+        JOIN properties p ON p.id = u.property_id
+       WHERE l.id = $1`, [req.params.id])
+    if (!lease) throw new AppError(404, 'No reservation-drafted lease found')
+    if (!canManageLandlordResource(req.user, lease.landlord_id)) throw new AppError(403, 'Forbidden')
+    if (!lease.guest_email) throw new AppError(400, 'The reservation has no guest email on file')
+    const { emailBackgroundCheckScreeningRequest } = await import('../services/email')
+    await emailBackgroundCheckScreeningRequest(
+      lease.guest_email, lease.guest_name, lease.property_name,
+      undefined, { landlordId: lease.landlord_id })
+    logger.info({ leaseId: lease.id }, '[leases] screening request emailed to long-stay guest')
+    res.json({ success: true, data: { sentTo: lease.guest_email } })
+  } catch (e) { next(e) }
+})
+
 // POST /api/leases/:id/non-renewal — W-7 (S531): the "don't renew" arm of
 // the renewal decision form. Arms the natural lease-end path: auto_renew
 // off, so processLeaseEnds expires + vacates at end_date, and every active

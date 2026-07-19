@@ -87,6 +87,14 @@ export async function isFlexPayVisible(): Promise<boolean> {
   return isFeatureEnabled('flexpay_rollout_visible')
 }
 
+// S544 (Nic): pre-launch SURVEY MODE. Visible but not launched —
+// the tenant portal shows "coming soon" + an interest survey, no
+// enrollment promises. Enrollment stays closed regardless of
+// approval status until this flips ON at launch.
+export async function isFlexPayEnrollmentOpen(): Promise<boolean> {
+  return isFeatureEnabled('flexpay_enrollment_open')
+}
+
 // ── Eligibility ─────────────────────────────────────────────────
 
 export interface FlexPayEligibility {
@@ -197,6 +205,34 @@ export async function enrollFlexPay(args: {
 
   if (!Number.isInteger(args.pullDay) || args.pullDay < 1 || args.pullDay > FLEXPAY_MAX_PULL_DAY) {
     return { ok: false, reason: `Pull day must be an integer 1 through ${FLEXPAY_MAX_PULL_DAY}` }
+  }
+
+  // S544 (Nic): survey mode — until launch, nobody enrolls, no
+  // matter their approval status. The survey/inquiry data still
+  // collects; this is the launch switch.
+  if (!(await isFlexPayEnrollmentOpen())) {
+    return { ok: false, reason: 'FlexPay hasn’t launched yet — your interest is recorded and we’ll announce availability' }
+  }
+
+  // S541 (Nic): demand-test gate — checked BEFORE eligibility so a
+  // pending tenant sees "under review", not an eligibility blocker
+  // (their ssi_ssdi flag is set by the approval itself). Every
+  // enrollment is GAM float (the engine fronts rent each cycle), so
+  // initial rollout is approval-gated: the tenant inquires, GAM
+  // reviews the lease + verifies SSI/SSDI income, and only an
+  // APPROVED inquiry unlocks enrollment. Enforced here — the tenant
+  // UI is not the gate.
+  const inquiry = await queryOne<{ status: string }>(
+    `SELECT status FROM flexpay_inquiries WHERE tenant_id = $1`,
+    [args.tenantId],
+  )
+  if (!inquiry || inquiry.status !== 'approved') {
+    return {
+      ok: false,
+      reason: inquiry?.status === 'pending'
+        ? 'Your FlexPay request is still under review — we’ll reach out soon'
+        : 'FlexPay enrollment requires an approved request — tap "I’m interested" first',
+    }
   }
 
   const elig = await getFlexPayEligibility(args.tenantId)

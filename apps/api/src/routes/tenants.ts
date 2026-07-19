@@ -699,12 +699,161 @@ tenantsRouter.post('/flexcharge/dispute/:txId', async (req, res, next) => {
 // flexpay_pull_pattern, otp_qualified_at) and gated on deposit-funded
 // (an OTP concern, not a FlexPay one). All replaced.
 
+// ── S542: platform-originated questionnaires (LANDLORD-INVISIBLE) ──
+// Tenant-only surfaces. No landlord route may ever expose this table.
+tenantsRouter.get('/questionnaires', async (req: any, res, next) => {
+  try {
+    if (req.user!.role !== 'tenant') throw new AppError(403, 'Tenant only')
+    const rows = await query<any>(
+      `SELECT id, trigger_type, created_at
+         FROM tenant_questionnaires
+        WHERE tenant_id = $1 AND status = 'pending'
+        ORDER BY created_at ASC`,
+      [req.user!.profileId])
+    res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
+tenantsRouter.post('/questionnaires/:id/answer', async (req: any, res, next) => {
+  try {
+    if (req.user!.role !== 'tenant') throw new AppError(403, 'Tenant only')
+    const body = z.object({
+      incomeSource: z.enum(['ssi', 'ssdi', 'other_fixed', 'none']),
+      interested:   z.boolean(),
+      benefitDay:   z.number().int().min(1).max(28).optional(),
+      benefitSchedule: z.enum(['ssi_day_1', 'ssdi_day_3', 'ssdi_wed_2', 'ssdi_wed_3', 'ssdi_wed_4', 'fixed_day']).optional(),
+    }).parse(req.body)
+    const { answerQuestionnaire } = await import('../services/tenantQuestionnaires')
+    const out = await answerQuestionnaire({
+      tenantId: req.user!.profileId,
+      questionnaireId: req.params.id,
+      answers: body,
+    })
+    if (!out.ok) throw new AppError(409, out.reason)
+    res.json({ success: true, data: { inquiryFiled: out.inquiryFiled } })
+  } catch (e) { next(e) }
+})
+
+tenantsRouter.post('/questionnaires/:id/dismiss', async (req: any, res, next) => {
+  try {
+    if (req.user!.role !== 'tenant') throw new AppError(403, 'Tenant only')
+    const { dismissQuestionnaire } = await import('../services/tenantQuestionnaires')
+    const ok = await dismissQuestionnaire(req.user!.profileId, req.params.id)
+    if (!ok) throw new AppError(404, 'Questionnaire not found or already completed')
+    res.json({ success: true, data: { dismissed: true } })
+  } catch (e) { next(e) }
+})
+
+// ── S542b: FlexPay proof-of-income upload ───────────────────────────
+// Imported tenants have no income data on file (they never ran the
+// new-tenant flow), and FlexPay is hard-gated to PROVEN SSI/SSDI —
+// so the tenant shows proof directly TO THE PLATFORM here (award
+// letter / benefit verification letter), attached to their inquiry.
+// Landlord never sees it: served only via the tenant's own GET below
+// and the admin queue's GET (routes/admin.ts). S409 posture: on-disk
+// extension normalized from validated MIME, Content-Type pinned at
+// serve time.
+const FLEXPAY_PROOF_MIME_TO_EXT: Record<string, string> = {
+  'application/pdf': '.pdf',
+  'image/jpeg': '.jpg',
+  'image/png':  '.png',
+  'image/webp': '.webp',
+}
+const flexpayProofDir = path.join(process.cwd(), 'uploads', 'flexpay-proofs')
+if (!fs.existsSync(flexpayProofDir)) fs.mkdirSync(flexpayProofDir, { recursive: true })
+const flexpayProofUpload = multer({
+  storage: multer.diskStorage({
+    destination: flexpayProofDir,
+    filename: (_req: any, file: any, cb: any) => {
+      const ext = FLEXPAY_PROOF_MIME_TO_EXT[file.mimetype] ?? '.pdf'
+      cb(null, Date.now() + '-' + crypto.randomBytes(8).toString('hex') + ext)
+    },
+  }),
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: (_req: any, file: any, cb: any) => {
+    if (FLEXPAY_PROOF_MIME_TO_EXT[file.mimetype]) cb(null, true)
+    else cb(new Error('PDF, JPEG, PNG or WEBP only'))
+  },
+})
+
+tenantsRouter.post('/flexpay/inquiry/proof', flexpayProofUpload.single('file'), async (req: any, res, next) => {
+  try {
+    if (req.user!.role !== 'tenant') throw new AppError(403, 'Tenant only')
+    if (!req.file) throw new AppError(400, 'No file')
+    const inq = await queryOne<{ id: string; status: string; proof_file_path: string | null }>(
+      `SELECT id, status, proof_file_path FROM flexpay_inquiries WHERE tenant_id = $1`,
+      [req.user!.profileId])
+    if (!inq) throw new AppError(409, 'No FlexPay request on file — tap "I’m interested" first')
+    if (inq.status !== 'pending') throw new AppError(409, 'Your request has already been reviewed')
+    // Replace semantics: one active document; unlink the old one.
+    if (inq.proof_file_path) {
+      fs.unlink(path.join(flexpayProofDir, path.basename(inq.proof_file_path)), () => {})
+    }
+    await query(
+      `UPDATE flexpay_inquiries
+          SET proof_file_path = $2, proof_original_name = $3,
+              proof_uploaded_at = NOW(), updated_at = NOW()
+        WHERE id = $1`,
+      [inq.id, req.file.filename, String(req.file.originalname || 'proof').slice(0, 200)])
+
+    // S546: automated verification — reads the PDF, matches lease-
+    // holder names, scans for benefit language. Mismatch/unreadable →
+    // SILENT hold; the response never reveals the outcome.
+    const { verifyProofDocument } = await import('../services/flexpayAutoVerify')
+    await verifyProofDocument(inq.id)
+
+    res.json({ success: true, data: { uploaded: true, originalName: req.file.originalname } })
+  } catch (e) { next(e) }
+})
+
+// Tenant's own proof view. Content-Type pinned from the stored
+// (MIME-normalized) extension — never from client input.
+export function flexpayProofContentType(filename: string): string {
+  if (filename.endsWith('.pdf')) return 'application/pdf'
+  if (filename.endsWith('.png')) return 'image/png'
+  if (filename.endsWith('.webp')) return 'image/webp'
+  return 'image/jpeg'
+}
+tenantsRouter.get('/flexpay/inquiry/proof-file', async (req: any, res, next) => {
+  try {
+    if (req.user!.role !== 'tenant') throw new AppError(403, 'Tenant only')
+    const inq = await queryOne<{ proof_file_path: string | null }>(
+      `SELECT proof_file_path FROM flexpay_inquiries WHERE tenant_id = $1`,
+      [req.user!.profileId])
+    if (!inq?.proof_file_path) throw new AppError(404, 'No proof on file')
+    const fp = path.join(flexpayProofDir, path.basename(inq.proof_file_path))
+    if (!fs.existsSync(fp)) throw new AppError(404, 'File missing')
+    res.setHeader('Content-Type', flexpayProofContentType(fp))
+    fs.createReadStream(fp).pipe(res)
+  } catch (e) { next(e) }
+})
+
+// GET /api/tenants/flex-visibility — S541: which Flex products the
+// tenant portal may surface. Per-product rollout flags drive the UI
+// (the old client-side LAUNCH_HIDDEN gate showed all-or-nothing);
+// flipping one product on shows exactly that product.
+tenantsRouter.get('/flex-visibility', async (req, res, next) => {
+  try {
+    if (req.user!.role !== 'tenant') throw new AppError(403, 'Tenant only')
+    const { isFeatureEnabled } = await import('../services/systemFeatures')
+    const [flexpay, flexdeposit, flexcredit] = await Promise.all([
+      isFeatureEnabled('flexpay_rollout_visible'),
+      isFeatureEnabled('flexdeposit_rollout_visible'),
+      isFeatureEnabled('flexcredit_rollout_visible'),
+    ])
+    res.json({ success: true, data: { flexpay, flexdeposit, flexcredit } })
+  } catch (e) { next(e) }
+})
+
 // GET /api/tenants/flexpay — current enrollment + eligibility
 tenantsRouter.get('/flexpay', async (req, res, next) => {
   try {
-    const { isFlexPayVisible, getFlexPayEligibility, calculateFlexPayFee } = await import('../services/flexpay')
+    const { isFlexPayVisible, isFlexPayEnrollmentOpen, getFlexPayEligibility, calculateFlexPayFee } = await import('../services/flexpay')
     const visible = await isFlexPayVisible()
     if (!visible) return res.json({ success: true, data: { visible: false } })
+    // S544: survey mode — visible but not launched. Drives the
+    // "coming soon" tenant framing; enrollment refuses server-side too.
+    const enrollmentOpen = await isFlexPayEnrollmentOpen()
 
     const row = await queryOne<any>(
       `SELECT flexpay_enrolled, flexpay_pull_day, flexpay_monthly_fee,
@@ -715,15 +864,108 @@ tenantsRouter.get('/flexpay', async (req, res, next) => {
     )
     const eligibility = await getFlexPayEligibility(req.user!.profileId)
 
+    // S541: demand-test gate — the tenant's inquiry disposition drives
+    // the card state (inquire → pending → approved-can-enroll / declined).
+    const inquiry = await queryOne<any>(
+      `SELECT id, status, claimed_income_source, created_at, reviewed_at,
+              proof_original_name, proof_uploaded_at
+         FROM flexpay_inquiries WHERE tenant_id = $1`,
+      [req.user!.profileId],
+    )
+
+    // S542c (Nic): tenants NEVER see a queue number — no promises.
+    // Ordering (float-need first, then FIFO) lives admin-side only;
+    // the tenant just knows they're in line, plus a state hold when
+    // their state is legally blocked (place preserved either way).
+    let stateHold = false
+    if (inquiry?.status === 'pending') {
+      const hold = await queryOne(
+        `SELECT 1
+           FROM lease_tenants lt
+           JOIN leases l ON l.id = lt.lease_id
+           JOIN units u ON u.id = l.unit_id
+           JOIN properties pr ON pr.id = u.property_id
+           JOIN flexpay_blocked_states bs ON bs.state = pr.state
+          WHERE lt.tenant_id = $1 AND lt.status = 'active'
+            AND l.status IN ('active', 'pending')
+          LIMIT 1`,
+        [req.user!.profileId])
+      stateHold = !!hold
+    }
+
     res.json({
       success: true,
       data: {
         visible: true,
+        enrollmentOpen,
         ...row,
         eligibility,
+        inquiry,
+        stateHold,
         previewFee: row?.flexpay_pull_day ? calculateFlexPayFee(row.flexpay_pull_day) : null,
       },
     })
+  } catch (e) { next(e) }
+})
+
+// POST /api/tenants/flexpay/inquiry — S541 demand-test entry point.
+// The tenant raises a hand ("I'm interested"); GAM reviews the lease,
+// verifies SSI/SSDI income, and approves from the admin portal. Low
+// friction by design: no ACH / eligibility precheck here — that all
+// gates ENROLLMENT, not interest. One inquiry row per tenant.
+tenantsRouter.post('/flexpay/inquiry', async (req, res, next) => {
+  try {
+    if (req.user!.role !== 'tenant') throw new AppError(403, 'Tenant only')
+    const { isFlexPayVisible } = await import('../services/flexpay')
+    if (!(await isFlexPayVisible())) throw new AppError(409, 'FlexPay is not available')
+
+    const body = z.object({
+      // S545: all income types accepted — non-SSI/SSDI files a TIER-2
+      // request (same queue, behind SSI/SSDI, income-hold on approval).
+      incomeSource: z.enum(['ssi', 'ssdi', 'other_fixed', 'none']),
+      // S545b: the PATTERN the program pays on (SSI 1st, SSDI 3rd or
+      // Nth Wednesday, fixed day). Preferred over a raw day.
+      benefitSchedule: z.enum(['ssi_day_1', 'ssdi_day_3', 'ssdi_wed_2', 'ssdi_wed_3', 'ssdi_wed_4', 'fixed_day']).optional(),
+      // S542c: raw day — used with fixed_day schedules / legacy calls.
+      benefitDay:   z.number().int().min(1).max(28).optional(),
+      note:         z.string().max(1000).optional(),
+    }).parse(req.body)
+
+    // Derive the conservative arrival day from the schedule (latest
+    // day the pattern can land) — float math runs on days.
+    const { benefitScheduleToDay } = await import('@gam/shared')
+    const derivedDay = body.benefitSchedule
+      ? benefitScheduleToDay(body.benefitSchedule, body.benefitDay ?? null)
+      : body.benefitDay ?? null
+
+    const existing = await queryOne<{ status: string }>(
+      `SELECT status FROM flexpay_inquiries WHERE tenant_id = $1`,
+      [req.user!.profileId],
+    )
+    if (existing) throw new AppError(409, 'You already have a FlexPay request on file')
+
+    const row = await queryOne<any>(
+      `INSERT INTO flexpay_inquiries (tenant_id, claimed_income_source, desired_pull_day, benefit_schedule, tenant_note)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, status, claimed_income_source, created_at`,
+      [req.user!.profileId, body.incomeSource, derivedDay, body.benefitSchedule ?? null, body.note ?? null],
+    )
+
+    // S545c: silent birthdate-consistency check — may place a
+    // verification hold. NO tenant-facing signal either way.
+    const { runBirthdateCheck } = await import('../services/flexpayVerification')
+    await runBirthdateCheck(row!.id)
+
+    const { createAdminNotification } = await import('../services/adminNotifications')
+    await createAdminNotification({
+      severity: 'info',
+      category: 'flexpay_inquiry',
+      title: 'New FlexPay interest request',
+      body: `Tenant ${req.user!.profileId} requested FlexPay (claims ${body.incomeSource.toUpperCase()}). Review in Admin → FlexPay Requests.`,
+      context: { tenant_id: req.user!.profileId, inquiry_id: row.id },
+    })
+
+    res.json({ success: true, data: row })
   } catch (e) { next(e) }
 })
 

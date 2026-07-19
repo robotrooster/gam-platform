@@ -310,7 +310,7 @@ async function insertLateFeeRow(
   dueDate: string,
   amount: number
 ): Promise<void> {
-  await client.query(`
+  const res = await client.query(`
     INSERT INTO payments (
       landlord_id, unit_id, lease_id, tenant_id,
       type, amount, status, entry_description,
@@ -324,6 +324,7 @@ async function insertLateFeeRow(
       WHERE type = 'late_fee'
         AND status IN ('pending', 'processing', 'settled')
     DO NOTHING
+    RETURNING id
   `, [
     inv.landlord_id,
     inv.unit_id,
@@ -333,6 +334,14 @@ async function insertLateFeeRow(
     dueDate,
     inv.invoice_id,
   ])
+
+  // S542: a fresh late fee is a fixed-income-timing indicator — ask
+  // the tenant privately whether FlexPay would prevent the next one.
+  // Own pool connection + never throws; fee generation must not care.
+  if ((res.rowCount ?? 0) > 0 && inv.tenant_id) {
+    const { maybeCreateQuestionnaire } = await import('../services/tenantQuestionnaires')
+    await maybeCreateQuestionnaire(inv.tenant_id, 'late_fee_fixed_income')
+  }
 }
 
 /**

@@ -27,7 +27,7 @@ import { query, queryOne, getClient } from '../db'
 import { requireAuth, requirePerm } from '../middleware/auth'
 import { canAccessLandlordResource, canManageLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
-import { lockArea, findApprovedConflict, computeReservationFee, billReservationFee, settleReservationFeeOnCancel } from '../services/commonAreas'
+import { lockArea, findApprovedConflict, computeReservationFee, billReservationFee, settleReservationFeeOnCancel, assertMonthlyReservationLimit } from '../services/commonAreas'
 import {
   notifyReservationRequested,
   notifyReservationDecision,
@@ -51,7 +51,10 @@ async function tenantPropertyIds(tenantId: string): Promise<string[]> {
   return rows.map(r => r.property_id)
 }
 
-async function loadArea(id: string) {
+// Exported for the S547 public guest-reservation path
+// (routes/publicPropertyBooking.ts) — same load/validation/alert machinery,
+// reached without auth.
+export async function loadArea(id: string) {
   return queryOne<any>(`SELECT * FROM common_areas WHERE id = $1`, [id])
 }
 
@@ -69,6 +72,8 @@ const areaCreateSchema = z.object({
   closeTime: z.string().regex(/^\d{2}:\d{2}$/).nullable().optional(),
   maxReservationHours: z.number().int().positive().nullable().optional(),
   advanceBookingDays: z.number().int().positive().nullable().optional(),
+  // S547: per-person monthly reservation cap (null = unlimited).
+  monthlyReservationLimit: z.number().int().positive().nullable().optional(),
   // W-44 (S531): private-event posture, landlord-chosen per area.
   eventsEnabled: z.boolean().optional(),
   eventDepositAmount: z.number().nonnegative().optional(),
@@ -96,7 +101,7 @@ const landlordReservationSchema = requestSchema.extend({
   notifyResidents: z.boolean().optional(),
 })
 
-function validateWindow(area: any, startsAt: string, endsAt: string) {
+export function validateWindow(area: any, startsAt: string, endsAt: string, opts?: { skipAdvanceLimit?: boolean }) {
   const s = new Date(startsAt), e = new Date(endsAt)
   if (!(e.getTime() > s.getTime())) throw new AppError(400, 'End must be after start')
   if (area.max_reservation_hours) {
@@ -104,7 +109,11 @@ function validateWindow(area: any, startsAt: string, endsAt: string) {
     if (hours > area.max_reservation_hours)
       throw new AppError(400, `Reservation exceeds the ${area.max_reservation_hours}-hour limit for ${area.name}`)
   }
-  if (area.advance_booking_days) {
+  // S547: guests booking THROUGH their stay link skip the advance cap — the
+  // cap stops residents squatting far-future slots, but a guest's reachable
+  // dates are already bounded to their own stay (a booking made 6 months out
+  // can reserve the pool for that week at booking time).
+  if (area.advance_booking_days && !opts?.skipAdvanceLimit) {
     const maxLead = Date.now() + area.advance_booking_days * 86_400_000
     if (s.getTime() > maxLead)
       throw new AppError(400, `${area.name} can only be booked up to ${area.advance_booking_days} days ahead`)
@@ -113,7 +122,7 @@ function validateWindow(area: any, startsAt: string, endsAt: string) {
 
 // Fire the resident amenity alert for a now-live reservation (best-effort;
 // stamps residents_notified_at). Called AFTER the write commits.
-async function fireAmenityAlert(reservationId: string) {
+export async function fireAmenityAlert(reservationId: string) {
   const r = await queryOne<any>(
     `SELECT car.*, ca.name AS area_name, p.name AS property_name
        FROM common_area_reservations car
@@ -171,12 +180,14 @@ commonAreasRouter.post('/', requirePerm('amenities.manage_areas'), async (req, r
       `INSERT INTO common_areas
          (property_id, landlord_id, name, description, reservable, requires_approval,
           capacity, reservation_fee, weekend_fee, open_time, close_time, max_reservation_hours, advance_booking_days,
+          monthly_reservation_limit,
           events_enabled, event_deposit_amount, event_announce, event_auto_release)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING *`,
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING *`,
       [b.propertyId, prop.landlord_id, b.name, b.description ?? null,
        b.reservable ?? true, b.requiresApproval ?? true, b.capacity ?? null,
        b.reservationFee ?? 0, b.weekendFee ?? null, b.openTime ?? null, b.closeTime ?? null,
        b.maxReservationHours ?? null, b.advanceBookingDays ?? null,
+       b.monthlyReservationLimit ?? null,
        b.eventsEnabled ?? false, b.eventDepositAmount ?? 0, b.eventAnnounce ?? true, b.eventAutoRelease ?? true]
     )
     res.status(201).json({ success: true, data: row })
@@ -196,6 +207,7 @@ commonAreasRouter.patch('/:id', requirePerm('amenities.manage_areas'), async (re
       requires_approval: b.requiresApproval, capacity: b.capacity,
       reservation_fee: b.reservationFee, weekend_fee: b.weekendFee, open_time: b.openTime, close_time: b.closeTime,
       max_reservation_hours: b.maxReservationHours, advance_booking_days: b.advanceBookingDays,
+      monthly_reservation_limit: b.monthlyReservationLimit,
       active: b.active,
       events_enabled: b.eventsEnabled, event_deposit_amount: b.eventDepositAmount,
       event_announce: b.eventAnnounce, event_auto_release: b.eventAutoRelease,
@@ -236,10 +248,12 @@ commonAreasRouter.get('/:id/reservations', async (req, res, next) => {
     let where = `car.common_area_id = $1`
     if (status) { params.push(status); where += ` AND car.status = $${params.length}` }
     const rows = await query(
-      `SELECT car.*, us.first_name AS tenant_first_name, us.last_name AS tenant_last_name
+      `SELECT car.*, us.first_name AS tenant_first_name, us.last_name AS tenant_last_name,
+              gb.guest_name AS guest_name
          FROM common_area_reservations car
          LEFT JOIN tenants t ON t.id = car.reserved_by_tenant_id
          LEFT JOIN users  us ON us.id = t.user_id
+         LEFT JOIN unit_bookings gb ON gb.id = car.guest_booking_id
         WHERE ${where}
         ORDER BY car.starts_at DESC`, params)
     res.json({ success: true, data: rows })
@@ -399,6 +413,8 @@ commonAreasRouter.post('/:id/request', async (req, res, next) => {
     const propIds = await tenantPropertyIds(u.profileId)
     if (!propIds.includes(area.property_id)) throw new AppError(403, 'Not a resident of this property')
     validateWindow(area, b.startsAt, b.endsAt)
+    // S547: per-person monthly cap (bad-actor guard) — residents included.
+    await assertMonthlyReservationLimit(area, { tenantId: u.profileId }, b.startsAt)
     // W-44: events bill the area's NON-REFUNDABLE event deposit instead of
     // the reservation fee; announcements follow the area's event_announce.
     const feeFor = (startsAt: string) => b.kind === 'event'

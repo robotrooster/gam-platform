@@ -111,6 +111,7 @@ export async function compressPropertySchedule(propertyId: string): Promise<Comp
   const bookingRows = await query<any>(`
     SELECT b.id, b.unit_id, b.guest_name, b.status, b.hold_expires_at,
            b.site_reveal_sent_at, b.required_site_layout, b.required_amp_service,
+           b.locked_to_unit,
            b.check_in::text AS check_in, b.check_out::text AS check_out,
            EXISTS (SELECT 1 FROM leases l WHERE l.source_booking_id = b.id) AS has_lease
       FROM unit_bookings b
@@ -127,7 +128,8 @@ export async function compressPropertySchedule(propertyId: string): Promise<Comp
     const pinned =
       b.status === 'checked_in' ||
       b.site_reveal_sent_at != null ||
-      b.has_lease
+      b.has_lease ||
+      b.locked_to_unit   // S547: snowbird lock — landlord pinned this stay to its site
     if (pinned || !['tentative', 'confirmed'].includes(b.status)) {
       siteById.get(b.unit_id)?.timeline.push({ checkIn: b.check_in, checkOut: b.check_out })
     } else {
@@ -261,7 +263,7 @@ export async function relocateBlockingBookings(
   const winN = { checkIn: dayStr(win.checkIn), checkOut: dayStr(win.checkOut) }
   const blockers = await query<any>(`
     SELECT b.id, b.guest_name, b.status, b.hold_expires_at, b.site_reveal_sent_at,
-           b.required_site_layout, b.required_amp_service,
+           b.required_site_layout, b.required_amp_service, b.locked_to_unit,
            b.check_in::text AS check_in, b.check_out::text AS check_out,
            u.property_id, u.unit_number,
            EXISTS (SELECT 1 FROM leases l WHERE l.source_booking_id = b.id) AS has_lease
@@ -283,6 +285,10 @@ export async function relocateBlockingBookings(
     }
     if (blk.has_lease) {
       return { ok: false, moves, reason: 'The next reservation has a drafted lease bound to this site' }
+    }
+    if (blk.locked_to_unit) {
+      // S547: snowbird lock — the landlord pinned this stay to this exact site.
+      return { ok: false, moves, reason: `The next reservation (${blk.guest_name ?? 'guest'}) is locked to this site by the landlord` }
     }
     // Candidate sites: same property, bookable, compatible with the
     // blocker's requirements, not this unit. Best-fit keeps the schedule

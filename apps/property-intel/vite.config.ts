@@ -6,5 +6,5 @@ export default defineConfig({
   resolve: {
     alias: sharedAlias
   },
-  server: { strictPort: true, port: 3007, host: '127.0.0.1' },
+  server: { host: true, strictPort: true, port: 3007, host: '127.0.0.1' },
 })

@@ -4,11 +4,51 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>GAM for Businesses</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 </head>
 <body>
   <div id="root"></div>
   <script type="module" src="/src/main.tsx"></script>
+  <script>
+    // S540: tab resilience — a portal tab must keep working no matter
+    // how long it sits open (Nic: "5 hours away, no refresh needed").
+    //  1. Boot watchdog: app mounts within 10s or the page reloads
+    //     (max once per 60s — sessionStorage-guarded).
+    //  2. Sleep-gap: a >45min gap between 30s ticks means the system
+    //     slept or Safari suspended the tab -> reload on wake.
+    //  3. Long-hidden: hidden >2h -> self-reload while hidden, so
+    //     hours of renderer state never accumulate.
+    (function () {
+      var KEY = 'gam_boot_retry'
+      function guardedReload () {
+        var last = +sessionStorage.getItem(KEY) || 0
+        if (Date.now() - last > 60000) {
+          sessionStorage.setItem(KEY, String(Date.now()))
+          location.reload()
+        }
+      }
+      setTimeout(function () {
+        var root = document.getElementById('root')
+        if (root && root.children.length === 0) guardedReload()
+      }, 10000)
+
+      var lastSeen = Date.now()
+      var hiddenSince = null
+      document.addEventListener('visibilitychange', function () {
+        hiddenSince = document.hidden ? Date.now() : null
+        tick()
+      })
+      window.addEventListener('focus', tick)
+      setInterval(tick, 30000)
+      function tick () {
+        var now = Date.now()
+        var gap = now - lastSeen
+        lastSeen = now
+        if (gap > 45 * 60 * 1000) { location.reload(); return }
+        if (document.hidden && hiddenSince && now - hiddenSince > 2 * 60 * 60 * 1000) {
+          location.reload()
+        }
+      }
+    })()
+  </script>
 </body>
 </html>

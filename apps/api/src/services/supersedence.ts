@@ -124,6 +124,16 @@ export async function computeTenantGamOutstanding(
     })
   }
 
+  // S542 (Nic, confirmed): GAM-First interception IS FlexPay's one and
+  // only recourse. A defaulted (written-off) advance is recovered by
+  // routing the tenant's NEXT landlord-bound payment to outstanding
+  // GAM balances first — authorized in the FlexPay service agreement
+  // the tenant accepts at enrollment (each Flex product's terms carry
+  // the same routing acknowledgment). The landlord receives any
+  // surplus; a shorted landlord proceeds on the normal eviction path.
+  // No other recourse exists: no collections, no suits, no credit
+  // reporting — the tenant is unenrolled (90-day lockout) and this
+  // routing is the entire recovery mechanism.
   const fpAdv = await exec<{
     id: string; rent_amount: string; tenant_fee_amount: string; defaulted_at: string;
   }>(
