@@ -154,6 +154,30 @@ interface SeedFixture {
   tenantToken:    string
 }
 
+/** S553: put `tenantId` on an overlapping ACTIVE lease under a brand-new
+ *  DIFFERENT landlord — the case the overlap guard still blocks after the
+ *  same-landlord exception (a landlord drafting a 2nd lease for their own
+ *  tenant is deliberate; a cross-landlord overlap is double-booking). */
+async function seedCrossLandlordOverlap(tenantId: string): Promise<void> {
+  const client = await db.connect()
+  try {
+    await client.query('BEGIN')
+    const { userId, landlordId } = await seedLandlord(client)
+    const propertyId = await seedProperty(client, { landlordId, ownerUserId: userId, managedByUserId: userId })
+    const unitId = await seedUnit(client, { propertyId, landlordId })
+    const r = await client.query<{ id: string }>(
+      `INSERT INTO leases (unit_id, landlord_id, rent_amount, lease_type, status, start_date, end_date)
+       VALUES ($1, $2, 1000, 'fixed_term', 'active', '2025-01-01', '2025-12-31') RETURNING id`,
+      [unitId, landlordId])
+    await client.query(
+      `INSERT INTO lease_tenants (lease_id, tenant_id, role, status, added_at, added_reason, financial_responsibility)
+       VALUES ($1, $2, 'primary', 'active', NOW(), 'original', 'joint_several')`,
+      [r.rows[0].id, tenantId])
+    await client.query('COMMIT')
+  } catch (e) { await client.query('ROLLBACK'); throw e }
+  finally { client.release() }
+}
+
 async function seedFixture(): Promise<SeedFixture> {
   const client = await db.connect()
   try {
@@ -1168,9 +1192,10 @@ describe('POST /sign/:documentId — completion handler failure paths', () => {
     expect(res.body.data.reason).toMatch(/Invalid rent_amount/i)
   })
 
-  it('tenant has an overlapping active lease → execution_failed (overlap detected)', async () => {
+  it('S553: same-landlord overlap on a DIFFERENT unit is ALLOWED (two leases, one tenant)', async () => {
     const f = await seedFixture()
-    // Seed a second unit on the same property and put the tenant on an overlapping lease there.
+    // Same landlord, second unit, overlapping active lease — the Oak Park
+    // case (space rent on two mobile homes). Signing must now complete.
     const otherUnit = await db.query<{ id: string }>(
       `INSERT INTO units (property_id, landlord_id, unit_number, rent_amount)
        VALUES ($1, $2, 'U-OTHER', 1000) RETURNING id`,
@@ -1183,6 +1208,21 @@ describe('POST /sign/:documentId — completion handler failure paths', () => {
       `INSERT INTO lease_tenants (lease_id, tenant_id, role, status, added_at, added_reason, financial_responsibility)
        VALUES ($1, $2, 'primary', 'active', NOW(), 'original', 'joint_several')`,
       [otherLease.rows[0].id, f.tenantId])
+    const { documentId } = await seedCompleteableDoc(f)
+    const res = await request(buildApp())
+      .post(`/api/esign/sign/${documentId}`)
+      .set('Authorization', `Bearer ${f.tenantToken}`)
+      .send({ fieldValues: [] })
+    expect(res.status).toBe(200)
+    expect(res.body.data.executionFailed).toBeFalsy()
+    // The second lease materialized on the new unit.
+    const leases = await db.query(`SELECT id FROM leases WHERE unit_id = $1 AND status = 'active'`, [f.unitId])
+    expect(leases.rows.length).toBe(1)
+  })
+
+  it('CROSS-landlord overlapping active lease → still blocked (409, overlap detected)', async () => {
+    const f = await seedFixture()
+    await seedCrossLandlordOverlap(f.tenantId)
     const { documentId } = await seedCompleteableDoc(f)
     const res = await request(buildApp())
       .post(`/api/esign/sign/${documentId}`)
@@ -1611,24 +1651,13 @@ describe('POST /sign/:documentId — addendum_add completion', () => {
     expect(res.body.data.reason).toMatch(/parent lease is expired/i)
   })
 
-  it('new tenant has overlapping active lease elsewhere → execution_failed (409)', async () => {
+  it('new tenant has overlapping active lease under ANOTHER landlord → execution_failed (409)', async () => {
     const f = await seedFixture()
     const parentLeaseId = await seedParentLease(f)
     const newTenant = await seedNewTenant()
-    // Seed a second unit on the same property and put newTenant on an
-    // overlapping active lease there.
-    const otherUnit = await db.query<{ id: string }>(
-      `INSERT INTO units (property_id, landlord_id, unit_number, rent_amount)
-       VALUES ($1, $2, 'U-OTHER', 1000) RETURNING id`,
-      [f.propertyId, f.landlordId])
-    const otherLeaseRes = await db.query<{ id: string }>(
-      `INSERT INTO leases (unit_id, landlord_id, rent_amount, lease_type, status, start_date, end_date)
-       VALUES ($1, $2, 1000, 'fixed_term', 'active', '2025-01-01', '2025-12-31') RETURNING id`,
-      [otherUnit.rows[0].id, f.landlordId])
-    await db.query(
-      `INSERT INTO lease_tenants (lease_id, tenant_id, role, status, added_at, added_reason, financial_responsibility)
-       VALUES ($1, $2, 'primary', 'active', NOW(), 'original', 'joint_several')`,
-      [otherLeaseRes.rows[0].id, newTenant.tenantId])
+    // S553: same-landlord overlap is now allowed, so the block case seeds
+    // the overlap under a DIFFERENT landlord.
+    await seedCrossLandlordOverlap(newTenant.tenantId)
 
     const { documentId } = await seedAddendumAddDoc(f, parentLeaseId, newTenant)
     const res = await request(buildApp())

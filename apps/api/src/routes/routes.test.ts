@@ -436,6 +436,11 @@ describe('stop lifecycle', () => {
     const f = await seedFixture()
     const { routeId, stops } = await genAndGetStops(f)
     const customerStop = stops.find((s: any) => s.stop_kind === 'customer')
+    // Skip is only valid while the route is IN PROGRESS (auto-advance era —
+    // see routes.ts skip handler); the driver starts the route first.
+    await request(buildApp())
+      .post(`/api/routes/${routeId}/start`)
+      .set('Authorization', `Bearer ${f.token}`).send({})
     const res = await request(buildApp())
       .post(`/api/routes/${routeId}/stops/${customerStop.id}/skip`)
       .set('Authorization', `Bearer ${f.token}`)
@@ -487,6 +492,9 @@ describe('stop lifecycle', () => {
     const f = await seedFixture()
     const { routeId, stops } = await genAndGetStops(f)
     const customerStop = stops.find((s: any) => s.stop_kind === 'customer')
+    await request(buildApp())
+      .post(`/api/routes/${routeId}/start`)
+      .set('Authorization', `Bearer ${f.token}`).send({})
     await request(buildApp())
       .post(`/api/routes/${routeId}/stops/${customerStop.id}/skip`)
       .set('Authorization', `Bearer ${f.token}`)

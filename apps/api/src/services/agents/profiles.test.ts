@@ -99,7 +99,7 @@ describe('agent profile registry', () => {
     const sales = requireProfile('sales_entry')
     expect(sales.agentType).toBe('sales')
     expect(sales.audience).toBe('prospect')
-    expect(sales.toolNames).toEqual(['capture_lead'])
+    expect(sales.toolNames).toEqual(['capture_lead', 'get_available_call_times', 'book_sales_call'])
     expect(sales.systemPrompt).toContain('Lucy')
     // sales does NOT carry the CS guardrails (its own prompt)
     expect(sales.systemPrompt).not.toContain('Hard stops')

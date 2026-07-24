@@ -21,7 +21,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict 8mdonzrelxRI3FRG3heGYzPdDuUjAIV39qBrPad04uMxacky8bKUvnp8Z20bBzc
+\restrict Jhx9uwfSPv5fwfvSPJpWxuRqgYASb0nlNkyLiylwkbc7DhT56zcuHIf8yAZfrZT
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -3341,6 +3341,22 @@ COMMENT ON TABLE public.landlord_deposit_interest_rate_overrides IS 'Per-landlor
 --
 
 COMMENT ON COLUMN public.landlord_deposit_interest_rate_overrides.source_notes IS 'Free-text — landlord captures their bank name + current passbook rate, the state-published rate, or the date they verified it. Audit trail for "why this rate".';
+
+
+--
+-- Name: landlord_members; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.landlord_members (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    landlord_id uuid NOT NULL,
+    user_id uuid NOT NULL,
+    role text DEFAULT 'owner'::text NOT NULL,
+    added_by_user_id uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT landlord_members_role_check CHECK ((role = 'owner'::text))
+);
 
 
 --
@@ -8213,6 +8229,22 @@ ALTER TABLE ONLY public.landlord_deposit_interest_rate_overrides
 
 
 --
+-- Name: landlord_members landlord_members_landlord_id_user_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.landlord_members
+    ADD CONSTRAINT landlord_members_landlord_id_user_id_key UNIQUE (landlord_id, user_id);
+
+
+--
+-- Name: landlord_members landlord_members_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.landlord_members
+    ADD CONSTRAINT landlord_members_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: landlord_platform_fee_overrides landlord_platform_fee_overrides_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -12994,6 +13026,13 @@ CREATE INDEX ix_tenant_questionnaires_pending ON public.tenant_questionnaires US
 
 
 --
+-- Name: landlord_members_user_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX landlord_members_user_idx ON public.landlord_members USING btree (user_id);
+
+
+--
 -- Name: landlord_pfo_one_active_per_landlord; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -13586,6 +13625,13 @@ CREATE TRIGGER audit_flexpay_inquiries AFTER DELETE OR UPDATE ON public.flexpay_
 --
 
 CREATE TRIGGER audit_invoices AFTER DELETE OR UPDATE ON public.invoices FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: landlord_members audit_landlord_members; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_landlord_members AFTER DELETE OR UPDATE ON public.landlord_members FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
 
 
 --
@@ -16388,6 +16434,30 @@ ALTER TABLE ONLY public.landlord_deposit_interest_rate_overrides
 
 
 --
+-- Name: landlord_members landlord_members_added_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.landlord_members
+    ADD CONSTRAINT landlord_members_added_by_user_id_fkey FOREIGN KEY (added_by_user_id) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: landlord_members landlord_members_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.landlord_members
+    ADD CONSTRAINT landlord_members_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: landlord_members landlord_members_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.landlord_members
+    ADD CONSTRAINT landlord_members_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
 -- Name: landlord_platform_fee_overrides landlord_platform_fee_overrides_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -19103,5 +19173,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 8mdonzrelxRI3FRG3heGYzPdDuUjAIV39qBrPad04uMxacky8bKUvnp8Z20bBzc
+\unrestrict Jhx9uwfSPv5fwfvSPJpWxuRqgYASb0nlNkyLiylwkbc7DhT56zcuHIf8yAZfrZT
 

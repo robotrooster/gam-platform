@@ -106,7 +106,7 @@ async function seedFlexDepositEnrolledTenant(): Promise<{
           installments_remaining, gam_advance_amount)
        VALUES ($1, $2, $3, 1000, 'partial', 'gam_escrow',
                TRUE, 'active',
-               3, 333.33, 0, 3, 666.67)
+               3, 333.33, 0, 3, 0)
        RETURNING id`,
       [unitId, leaseId, tenantId],
     )

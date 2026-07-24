@@ -10,6 +10,11 @@ export interface AuthPayload {
   email:       string
   profileId:   string
   landlordId?: string | null
+  // S553: multi-owner entities — ALL landlord entities this user is an
+  // owner-member of (landlord_members), resolved at login. profileId stays
+  // the founding/primary entity; scope checks accept any id in this list.
+  // Membership changes take effect at next login/refresh.
+  landlordIds?: string[] | null
   // S453: business-side scope. Set for business_owner (resolved at
   // login from businesses.owner_user_id) and for business_staff
   // (resolved from business_users at login via getScopeForUser).

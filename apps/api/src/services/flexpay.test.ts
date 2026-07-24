@@ -231,6 +231,12 @@ describe('enrollFlexPay', () => {
       `INSERT INTO system_features (key, enabled, description)
        VALUES ('flexpay_rollout_visible', TRUE, 'S431')
        ON CONFLICT (key) DO UPDATE SET enabled=TRUE`)
+    // S544 survey-mode launch switch + S541 approved-inquiry gate — both
+    // must be open for the enrollment machinery these tests exercise.
+    await db.query(
+      `INSERT INTO system_features (key, enabled, description)
+       VALUES ('flexpay_enrollment_open', TRUE, 'S544 launch switch')
+       ON CONFLICT (key) DO UPDATE SET enabled=TRUE`)
     const c = await db.connect()
     try {
       await c.query('BEGIN')
@@ -243,6 +249,10 @@ describe('enrollFlexPay', () => {
       const leaseId = await seedLease(c, { unitId, landlordId })
       await seedLeaseTenant(c, { leaseId, tenantId, role: 'primary' })
       await c.query(`UPDATE tenants SET ach_verified=TRUE, ssi_ssdi=TRUE WHERE id=$1`, [tenantId])
+      // S541 demand-test gate: enrollment requires an APPROVED inquiry.
+      await c.query(
+        `INSERT INTO flexpay_inquiries (tenant_id, status, claimed_income_source, reviewed_at)
+         VALUES ($1, 'approved', 'ssdi', now())`, [tenantId])
       const { rows: [{ user_id }] } = await c.query<{ user_id: string }>(
         `SELECT user_id FROM tenants WHERE id=$1`, [tenantId])
       await c.query('COMMIT')

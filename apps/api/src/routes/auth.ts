@@ -155,6 +155,11 @@ authRouter.post('/register', async (req, res, next) => {
           `INSERT INTO landlords (user_id) VALUES ($1) RETURNING id`, [user.id]
         ).then(r => r.rows)
         profileId = l.id
+        // S553: founding owner-membership (multi-owner entities).
+        await client.query(
+          `INSERT INTO landlord_members (landlord_id, user_id, role) VALUES ($1, $2, 'owner')
+           ON CONFLICT (landlord_id, user_id) DO NOTHING`,
+          [l.id, user.id])
       } else {
         const [t] = await client.query(
           `INSERT INTO tenants (user_id) VALUES ($1) RETURNING id`, [user.id]
@@ -170,7 +175,12 @@ authRouter.post('/register', async (req, res, next) => {
       // the account is already auto-verified (model C).
       if (!devAutoVerify) void mintAndSendVerifyEmail(user.id, user.email, user.first_name)
 
-      const token = signToken({ userId: user.id, role: user.role, email: user.email, profileId })
+      // S553: a fresh registration's only membership is the founding one
+      // the landlords-insert backfilled trigger-free — mirror it in the JWT.
+      const token = signToken({
+        userId: user.id, role: user.role, email: user.email, profileId,
+        ...(body.role === 'landlord' ? { landlordIds: [profileId] } : {}),
+      })
       res.status(201).json({
         success: true,
         data: { token, user: { id: user.id, email: user.email, role: user.role,
@@ -285,6 +295,13 @@ authRouter.post('/login', async (req, res, next) => {
       throw new AppError(403, msg)
     }
     const profileId = user.profile_id || scope?.landlordId || scope?.businessId || null
+    // S553: multi-owner entities — every landlord entity this user is an
+    // owner-member of rides in the JWT so scope checks stay synchronous.
+    const landlordIds = user.role === 'landlord'
+      ? await query<{ landlord_id: string }>(
+          `SELECT landlord_id FROM landlord_members WHERE user_id = $1`, [user.id]
+        ).then((rows) => rows.map((r) => r.landlord_id))
+      : null
     // S453: businessId carries either the owner's business (from JOIN) or
     // the staff member's scoped business (from getScopeForUser). null for
     // any non-business role.
@@ -306,6 +323,7 @@ authRouter.post('/login', async (req, res, next) => {
         email:       user.email,
         profileId,
         landlordId:  scope?.landlordId || null,
+        landlordIds,
         permissions: scope?.permissions || null,
       })
       return res.json({
@@ -318,6 +336,7 @@ authRouter.post('/login', async (req, res, next) => {
       userId: user.id, role: user.role, email: user.email,
       profileId,
       landlordId: scope?.landlordId || null,
+      landlordIds,
       businessId,
       staffRole,
       permissions: scope?.permissions || null,

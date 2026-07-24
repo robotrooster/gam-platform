@@ -264,19 +264,26 @@ describe('POST /api/units/:id/bookings — create', () => {
 })
 
 describe('PATCH /api/units/:id/bookings/:bookingId — update', () => {
-  it('happy path: date change recomputes nights', async () => {
+  it('happy path: date change recomputes nights (checkout-only PATCH — mixed date representations)', async () => {
     const f = await seedUnitsFixture()
     const c = await request(buildApp())
       .post(`/api/units/${f.unitId}/bookings`)
       .set('Authorization', `Bearer ${f.landlordToken}`)
       .send({ leaseType: 'nightly', checkIn: '2026-07-01', checkOut: '2026-07-05' })
+    // S553: assert the arrange step loudly — a create failure here used to
+    // surface as a baffling 404/undefined downstream.
+    expect(c.status, JSON.stringify(c.body)).toBe(201)
     const bookingId = c.body.data.id
+    expect(bookingId).toBeTruthy()
 
+    // Patching ONLY checkout makes the route mix a pg DATE (midnight
+    // LOCAL) with a 'YYYY-MM-DD' string (midnight UTC) — the S553 dayDiff
+    // regression shape. Raw ms math here was host-timezone-dependent.
     const res = await request(buildApp())
       .patch(`/api/units/${f.unitId}/bookings/${bookingId}`)
       .set('Authorization', `Bearer ${f.landlordToken}`)
       .send({ checkOut: '2026-07-08' })
-    expect(res.status).toBe(200)
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
     expect(res.body.data.nights).toBe(7)  // 07-01 to 07-08
   })
 

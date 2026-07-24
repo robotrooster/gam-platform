@@ -71,13 +71,15 @@ async function canTenantsSignNewLease(
   excludeLeaseId?: string
 ): Promise<{ ok: boolean; reason?: string; conflictingTenantId?: string; conflictingLeaseId?: string }> {
   if (!tenantIds.length) return { ok: false, reason: 'No tenants provided' }
-  const newUnit = await queryOne<any>('SELECT unit_type FROM units WHERE id=$1', [newUnitId])
+  const newUnit = await queryOne<any>(
+    `SELECT u.unit_type, p.landlord_id FROM units u JOIN properties p ON p.id = u.property_id WHERE u.id = $1`,
+    [newUnitId])
   if (!newUnit) return { ok: false, reason: 'Unit not found' }
   const newBucket = bucketFor(newUnit.unit_type)
 
   for (const tenantId of tenantIds) {
     const actives = await query<any>(`
-      SELECT l.id, l.start_date, l.end_date, u.unit_type, u.unit_number,
+      SELECT l.id, l.start_date, l.end_date, l.landlord_id, l.unit_id, u.unit_type, u.unit_number,
         tu.first_name || ' ' || tu.last_name as tenant_name
       FROM lease_tenants lt
       JOIN leases l ON l.id = lt.lease_id
@@ -92,6 +94,13 @@ async function canTenantsSignNewLease(
 
     for (const l of actives as any[]) {
       if (bucketFor(l.unit_type) !== newBucket) continue
+      // S553 (Nic, Oak Park): SAME-LANDLORD overlap on a DIFFERENT unit is
+      // deliberate — a landlord drafting a second lease for their own
+      // tenant (e.g. space rent on two mobile homes) is doing it on
+      // purpose, and the tenant still signs the printed document. The
+      // guard's real targets stay blocked: cross-landlord double-booking,
+      // and two active leases on the SAME unit.
+      if (l.landlord_id === newUnit.landlord_id && l.unit_id !== newUnitId) continue
       const aStart = new Date(l.start_date)
       const aEnd   = l.end_date ? new Date(l.end_date) : null
       const bStart = new Date(newStartDate)

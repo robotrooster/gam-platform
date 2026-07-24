@@ -241,7 +241,7 @@ describe('GET /api/admin/income/projection', () => {
     })
   })
 
-  it('seeded data: math pins direct-unit fees ($5/active unit without OTP)', async () => {
+  it('seeded data: math pins direct-unit fees ($2/occupied unit, LAUNCH_PLATFORM_FEE)', async () => {
     const f = await seedAFixture()
     const client = await db.connect()
     try {
@@ -262,8 +262,10 @@ describe('GET /api/admin/income/projection', () => {
     expect(res.status).toBe(200)
     expect(res.body.data.counts.active_units).toBe(2)
     expect(res.body.data.counts.direct_units).toBe(2)  // no OTP enrolled
-    expect(res.body.data.monthly.direct_unit_fees).toBe(10)  // 2 × $5
-    expect(res.body.data.annual).toBe(120)  // 10 × 12
+    // S512+ flat launch pricing: $2/occupied unit (this projection sums the
+    // per-unit rate without per-property floors — see routes/admin.ts).
+    expect(res.body.data.monthly.direct_unit_fees).toBe(4)  // 2 × $2
+    expect(res.body.data.annual).toBe(48)  // 4 × 12
   })
 })
 

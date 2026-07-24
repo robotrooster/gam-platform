@@ -202,6 +202,22 @@ export type ServiceInterruptionStatus = typeof SERVICE_INTERRUPTION_STATUSES[num
 // ── Sales leads (marketing-site sales agent → Portfolio Specialists) ──
 // S553: single source for the sales_leads.status CHECK (values predate this
 // export; the DB CHECK lists the same five).
+// ── Calendar-day math (S553) ──────────────────────────────────────────
+// Whole-day difference between two calendar dates, immune to the source
+// representation. Mixing `new Date('YYYY-MM-DD')` (midnight UTC) with a
+// pg DATE column (a Date at midnight LOCAL time) skews raw millisecond
+// math by the host's UTC offset — correct only by accident on a
+// west-of-UTC server (Math.ceil absorbs the shortfall) and off by one on
+// UTC-or-east hosts. Slice both ends to their calendar day first.
+export function dayDiff(from: string | Date, to: string | Date): number {
+  const day = (v: string | Date): number => {
+    if (v instanceof Date) return Date.UTC(v.getFullYear(), v.getMonth(), v.getDate())
+    const [y, m, d] = String(v).slice(0, 10).split('-').map(Number)
+    return Date.UTC(y, m - 1, d)
+  }
+  return Math.round((day(to) - day(from)) / 86_400_000)
+}
+
 export const SALES_LEAD_STATUSES = [
   'new', 'contacted', 'qualified', 'converted', 'closed',
 ] as const

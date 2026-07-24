@@ -28,8 +28,15 @@ propertiesRouter.use(requireAuth)
 propertiesRouter.get('/', async (req, res, next) => {
   try {
     const isAdmin = req.user!.role === 'admin' || req.user!.role === 'super_admin'
-    const filter = isAdmin ? '' : 'WHERE p.landlord_id = $1'
-    const qParams = isAdmin ? [] : [req.user!.profileId]
+    // S553: a landlord's portfolio aggregates EVERY entity they're an
+    // owner-member of (Oak Park LLC next to their own properties — one
+    // list, no switcher). Staff/team stay scoped to their one landlord.
+    const u = req.user!
+    const memberIds = u.role === 'landlord'
+      ? Array.from(new Set([u.profileId, ...(u.landlordIds ?? [])]))
+      : [u.profileId]
+    const filter = isAdmin ? '' : 'WHERE p.landlord_id = ANY($1)'
+    const qParams: any[] = isAdmin ? [] : [memberIds]
     // S355 fix: property_allocation_rules has no `id` column (primary key
     // is `property_id`, 1:1 with properties). Pre-S355 the GROUP BY r.id
     // crashed with "column r.id does not exist" on every list call where
@@ -39,12 +46,15 @@ propertiesRouter.get('/', async (req, res, next) => {
       SELECT p.*, COUNT(u.id)::int AS total_units,
         COUNT(u.id) FILTER (WHERE u.status='active')::int AS occupied_units,
         COUNT(u.id) FILTER (WHERE u.status='vacant')::int AS vacant_units,
-        to_jsonb(r.*) AS allocation_rule
+        to_jsonb(r.*) AS allocation_rule,
+        COALESCE(ll.business_name, lu.first_name || ' ' || lu.last_name) AS entity_name
       FROM properties p
       LEFT JOIN units u ON u.property_id = p.id
       LEFT JOIN property_allocation_rules r ON r.property_id = p.id
+      LEFT JOIN landlords ll ON ll.id = p.landlord_id
+      LEFT JOIN users lu ON lu.id = ll.user_id
       ${filter}
-      GROUP BY p.id, r.property_id
+      GROUP BY p.id, r.property_id, ll.business_name, lu.first_name, lu.last_name
       ORDER BY p.name`, qParams)
     res.json({ success: true, data: props })
   } catch (e) { next(e) }

@@ -29,7 +29,13 @@ describe('buildContextBlock', () => {
       chunk({ title: 'Rent', content: 'Due on the 1st.' }),
       chunk({ title: 'Pay', content: 'Use ACH.' }),
     ])
-    expect(block).toContain('ONLY the facts below')
+    // S552 reframe: the old "answer using ONLY the facts below" preamble
+    // overrode tool use + escalation (root cause of the 58% eval) — the
+    // block must now route account questions to TOOLS and must NEVER
+    // regress to the only-facts wording.
+    expect(block).not.toContain('ONLY the facts below')
+    expect(block).toContain('CALL the matching tool')
+    expect(block).toContain('hard-stop rules OVERRIDE')
     expect(block).toContain('[1] (Rent) Due on the 1st.')
     expect(block).toContain('[2] (Pay) Use ACH.')
   })

@@ -20,6 +20,61 @@ const fmt = (n: any) => n != null
   ? '$' + Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
   : '—'
 
+// S553: owner-members of this landlord entity (multi-owner LLCs — Oak
+// Park). Any owner can add a co-owner by email (they must already have a
+// GAM landlord account); the founding owner can't be removed. Memberships
+// take effect at the co-owner's next sign-in.
+function OwnersSection() {
+  const qc = useQueryClient()
+  const { data: members = [], isLoading } = useQuery<any[]>('landlord-members', () => apiGet('/landlords/members'))
+  const [email, setEmail] = useState('')
+  const [err, setErr] = useState<string | null>(null)
+  const addMut = useMutation(() => api.post('/landlords/members', { email: email.trim() }).then(r => r.data), {
+    onSuccess: () => { qc.invalidateQueries('landlord-members'); setEmail(''); setErr(null) },
+    onError: (e: any) => setErr(e?.response?.data?.error?.message || e?.response?.data?.error || 'Could not add owner.'),
+  })
+  const rmMut = useMutation((id: string) => api.delete(`/landlords/members/${id}`).then(r => r.data), {
+    onSuccess: () => qc.invalidateQueries('landlord-members'),
+  })
+  if (isLoading) return null
+  return (
+    <div className="card" style={{ marginBottom: 16 }}>
+      <div style={{ fontWeight: 700, color: 'var(--text-0)', marginBottom: 4 }}>Owners</div>
+      <div style={{ fontSize: '.75rem', color: 'var(--text-3)', marginBottom: 12 }}>
+        Co-owners see this entity's properties alongside their own portfolio. They need their own GAM landlord
+        account first; changes apply the next time they sign in.
+      </div>
+      {members.map((m: any) => (
+        <div key={m.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 0', borderBottom: '1px solid var(--border-1, rgba(255,255,255,.06))' }}>
+          <div>
+            <div style={{ fontSize: '.82rem', color: 'var(--text-0)', fontWeight: 600 }}>
+              {[m.firstName, m.lastName].filter(Boolean).join(' ') || m.email}
+              {m.isFounding && <span style={{ marginLeft: 8, fontSize: '.62rem', color: 'var(--gold)', fontWeight: 700 }}>FOUNDING</span>}
+            </div>
+            <div style={{ fontSize: '.7rem', color: 'var(--text-3)' }}>{m.email}</div>
+          </div>
+          {!m.isFounding && (
+            <button className="btn btn-ghost btn-sm" onClick={() => rmMut.mutate(m.id)} disabled={rmMut.isLoading}>
+              <X size={12} /> Remove
+            </button>
+          )}
+        </div>
+      ))}
+      <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
+        <input
+          type="email" value={email} onChange={e => setEmail(e.target.value)}
+          placeholder="co-owner@email.com"
+          style={{ flex: 1, background: 'var(--surface-1, rgba(255,255,255,.04))', border: '1px solid var(--border-1, rgba(255,255,255,.1))', borderRadius: 8, padding: '8px 10px', color: 'var(--text-0)', fontSize: '.8rem' }}
+        />
+        <button className="btn btn-primary btn-sm" disabled={!email.trim() || addMut.isLoading} onClick={() => addMut.mutate()}>
+          Add owner
+        </button>
+      </div>
+      {err && <div style={{ fontSize: '.72rem', color: '#ef4444', marginTop: 8 }}>{err}</div>}
+    </div>
+  )
+}
+
 export function SettingsPage() {
   const qc = useQueryClient()
   const { data: me, isLoading } = useQuery<any>('landlord-me', () => apiGet('/landlords/me'))
@@ -237,6 +292,9 @@ export function SettingsPage() {
               onChange={() => qc.invalidateQueries('landlord-me')}
             />
           )}
+
+          {/* S553: entity owner-members (multi-owner LLCs). */}
+          <OwnersSection />
 
           {/* W-53 (S531): Notification Prefs merged in as a real section —
               the standalone nav item is gone. The section renders its own

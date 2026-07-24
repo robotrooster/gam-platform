@@ -23,13 +23,25 @@ import { describe, it, expect, beforeEach, vi } from 'vitest'
 const {
   getConnectBalanceMock,
   firePayoutMock,
+  transfersCreateMock,
 } = vi.hoisted(() => ({
+  transfersCreateMock: vi.fn(async () => ({ id: 'tr_margin_mock' } as any)),
   getConnectBalanceMock: vi.fn(async () => ({
     available:         [{ currency: 'usd', amount: 0 }],
     pending:           [{ currency: 'usd', amount: 0 }],
     instant_available: [{ currency: 'usd', amount: 0 }],
   } as any)),
   firePayoutMock: vi.fn(async () => ({ id: 'po_default_mock' } as any)),
+}))
+
+// S553: the W-32 (S531) instant-margin path calls the real Stripe SDK
+// (transfers.create + accounts.retrieve) — unmocked, these tests hit LIVE
+// Stripe with .env keys and 403'd. Mock the SDK surface the route touches.
+vi.mock('../lib/stripe', () => ({
+  getStripe: () => ({
+    transfers: { create: transfersCreateMock, createReversal: vi.fn(async () => ({ id: 'trr_mock' })) },
+    accounts:  { retrieve: vi.fn(async () => ({ id: 'acct_platform_mock' })) },
+  }),
 }))
 
 vi.mock('../services/connectPayouts', () => ({
@@ -152,14 +164,17 @@ describe('GET /me/withdrawals/preview', () => {
       .set('Authorization', `Bearer ${u.token}`)
     expect(res.status).toBe(200)
     expect(res.body.data.standard).toEqual({ available: 100, eligible: true })
-    // instant fee = max(50 * 0.015, 0.50) = max(0.75, 0.50) = 0.75
+    // S531 (Nic-set): user-facing instant fee = max(50 * 0.02, $5.00) = $5.00
+    // (INSTANT_WITHDRAWAL_FEE in shared — this suite predated the change).
     expect(res.body.data.instant.available).toBe(50)
-    expect(res.body.data.instant.fee).toBe(0.75)
-    expect(res.body.data.instant.net).toBe(49.25)
+    expect(res.body.data.instant.fee).toBe(5)
+    // net under the W-32 margin model: payout = 50 − (5 − 0.75 Stripe-projected)
+    // = 45.75; Stripe's actual cut on that = 0.69 → net 45.06
+    expect(res.body.data.instant.net).toBe(45.06)
     expect(res.body.data.instant.eligible).toBe(true)
   })
 
-  it('instant fee MIN $0.50 floor: small balance ($10) → fee = $0.50', async () => {
+  it('instant fee MIN $5 floor: small balance ($10) → fee = $5.00', async () => {
     const u = await seedUser()
     getConnectBalanceMock.mockResolvedValueOnce({
       available:         [{ currency: 'usd', amount: 0 }],
@@ -169,8 +184,8 @@ describe('GET /me/withdrawals/preview', () => {
     const res = await request(buildApp())
       .get('/api/me/withdrawals/preview')
       .set('Authorization', `Bearer ${u.token}`)
-    expect(res.body.data.instant.fee).toBe(0.5)   // floor wins over 10*0.015=0.15
-    expect(res.body.data.instant.net).toBe(9.5)
+    expect(res.body.data.instant.fee).toBe(5)   // $5 floor wins over 10*0.02=0.20 (S531)
+    expect(res.body.data.instant.net).toBe(5)
   })
 
   it('zero balance → both channels ineligible, no fee on instant', async () => {
@@ -278,20 +293,25 @@ describe('POST /me/withdrawals', () => {
       .send({ method: 'instant' })
     expect(res.status).toBe(201)
     expect(res.body.data.amount).toBe(100)        // instant_available, not available
-    // fee = max(100 * 0.015, 0.50) = max(1.5, 0.5) = 1.5
-    expect(res.body.data.fee_charged).toBe(1.5)
-    expect(res.body.data.net_to_user).toBe(98.5)
+    // S531: all-in fee = max(100 * 0.02, $5.00) = $5.00. Margin model:
+    // payout = 100 − (5 − 1.50) = 96.50; Stripe cut 1.45 → net 95.05.
+    expect(res.body.data.fee_charged).toBe(5)
+    expect(res.body.data.net_to_user).toBe(95.05)
     expect(res.body.data.method).toBe('instant')
 
     const call = (firePayoutMock.mock.calls[0] as any[])[0] as any
     expect(call.method).toBe('instant')
-    expect(call.amount).toBe(100)
+    // W-32: GAM's margin ($3.50) is debited FIRST; the payout fires for the
+    // remainder — Stripe's own fee then comes out of that payout.
+    expect(call.amount).toBe(96.5)
+    expect(transfersCreateMock).toHaveBeenCalledTimes(1)
+    expect((transfersCreateMock.mock.calls[0] as any[])[0].amount).toBe(350) // $3.50 margin in cents
 
     const { rows } = await db.query<any>(
       `SELECT amount, fee_charged FROM disbursements WHERE id = $1`,
       [res.body.data.disbursement_id])
     expect(rows[0].amount).toBe('100.00')
-    expect(rows[0].fee_charged).toBe('1.50')
+    expect(rows[0].fee_charged).toBe('5.00')
   })
 
   it('default method (omitted) → standard', async () => {

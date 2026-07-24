@@ -11,7 +11,10 @@
     "seed": "node -r ts-node/register src/db/seed.ts",
     "schema:diff": "node -r ts-node/register scripts/diff-schema.ts",
     "db:dump-schema": "bash scripts/dump-schema.sh",
-    "verify:webhooks": "node -r ts-node/register scripts/verify-stripe-webhooks.ts"
+    "verify:webhooks": "node -r ts-node/register scripts/verify-stripe-webhooks.ts",
+    "agents:eval": "LLM_ENDPOINT=http://localhost:8080/v1 LLM_MODEL=/Users/nicholasrhoades/models/Hermes-4.3-36B-6bit-mlx EMBEDDINGS_ENDPOINT=http://localhost:8081/v1 EMBEDDINGS_MODEL=bge-large-en-v1.5 ts-node -T src/services/agents/agentEval.ts",
+    "agents:ingest": "EMBEDDINGS_ENDPOINT=http://localhost:8081/v1 EMBEDDINGS_MODEL=bge-large-en-v1.5 ts-node -T src/services/agents/ingestKnowledge.ts",
+    "notify:nic": "ts-node -T src/scripts/notifyNic.ts"
   },
   "dependencies": {
     "@gam/shared": "*",

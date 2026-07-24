@@ -78,6 +78,14 @@ async function seedLandlordWithProperty(): Promise<{
     [propertyId, landlordId],
   )
   const unitId = un.rows[0].id
+  // S537: tenant-CSV commit gates on a late-fee DECISION per
+  // (property, unit_type) — seed an explicit no-fee decision so these
+  // opening-balance tests exercise the invoice path, not the gate.
+  await db.query(
+    `INSERT INTO property_unit_type_late_fees (property_id, unit_type, no_late_fee)
+     VALUES ($1, 'apartment', TRUE) ON CONFLICT DO NOTHING`,
+    [propertyId],
+  )
   const token = jwt.sign(
     { userId, role: 'landlord', email, profileId: landlordId, permissions: {} },
     process.env.JWT_SECRET!,

@@ -24,10 +24,22 @@ webhooksRouter.post('/stripe', async (req, res) => {
   const sig = req.headers['stripe-signature'] as string
   let event: Stripe.Event
 
+  // S553 (C3): dual-secret verify. Stripe signs PLATFORM events and
+  // CONNECT (connected-account) events with different endpoint secrets,
+  // both delivered to this URL. Try platform first, then Connect. A
+  // payload that matches neither is rejected exactly as before.
   try {
     event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET!)
-  } catch (err: any) {
-    return res.status(400).json({ error: `Webhook signature failed: ${err.message}` })
+  } catch (platformErr: any) {
+    const connectSecret = process.env.STRIPE_CONNECT_WEBHOOK_SECRET
+    if (!connectSecret) {
+      return res.status(400).json({ error: `Webhook signature failed: ${platformErr.message}` })
+    }
+    try {
+      event = stripe.webhooks.constructEvent(req.body, sig, connectSecret)
+    } catch (err: any) {
+      return res.status(400).json({ error: `Webhook signature failed: ${err.message}` })
+    }
   }
 
   // C3 (S550 data-completeness): persist the raw verified payload append-

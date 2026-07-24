@@ -694,6 +694,11 @@ export function PropertiesPage() {
     return { ...p, totalUnits: propUnits.length, occupied, vacant, monthlyRevenue }
   })
 
+  // S553: multi-owner entities — badge each card with its owning entity,
+  // but ONLY when the portfolio actually spans more than one (single-
+  // entity landlords never see the distinction).
+  const multiEntity = new Set(propStats.map(p => p.landlordId)).size > 1
+
   const totalUnits    = propStats.reduce((s, p) => s + p.totalUnits, 0)
   const totalOccupied = propStats.reduce((s, p) => s + p.occupied, 0)
   const totalRevenue  = propStats.reduce((s, p) => s + p.monthlyRevenue, 0)
@@ -778,6 +783,11 @@ export function PropertiesPage() {
                         <div style={{ fontSize: '.7rem', color: 'var(--text-3)', display: 'flex', alignItems: 'center', gap: 3, marginTop: 1 }}>
                           <MapPin size={9} /> {p.street1}, {p.city}
                         </div>
+                        {multiEntity && p.entityName && (
+                          <div style={{ fontSize: '.62rem', color: 'var(--gold)', marginTop: 3, fontWeight: 600, letterSpacing: '.02em' }}>
+                            {p.entityName}
+                          </div>
+                        )}
                       </div>
                     </div>
                     <div style={{ display: 'flex', gap: 6 }}>

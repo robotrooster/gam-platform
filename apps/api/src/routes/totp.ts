@@ -61,6 +61,9 @@ export function signTotpSessionToken(payload: {
   email:       string
   profileId:   string | null
   landlordId?: string | null
+  /** S553: owner-memberships (multi-owner entities), carried through to
+   *  the full JWT minted at verify. */
+  landlordIds?: string[] | null
   permissions?: unknown
 }): string {
   return jwt.sign(
@@ -292,6 +295,7 @@ totpRouter.post('/verify', async (req, res, next) => {
       email:       session.email,
       profileId:   session.profileId,
       landlordId:  session.landlordId ?? null,
+      landlordIds: session.landlordIds ?? null,
       permissions: session.permissions ?? null,
     })
 

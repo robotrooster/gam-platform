@@ -34,13 +34,19 @@ function isTeamRole(role: string): boolean {
   return (TEAM_ROLES as readonly string[]).includes(role)
 }
 
+// S553: a landlord matches an entity when it's their own (profileId) OR
+// they're an owner-member of it (landlordIds, resolved at login).
+function landlordOwns(user: AuthPayload, landlordId: string): boolean {
+  return user.profileId === landlordId || (user.landlordIds ?? []).includes(landlordId)
+}
+
 export function canAccessLandlordResource(
   user: AuthPayload | undefined,
   landlordId: string | null | undefined
 ): boolean {
   if (!user || !landlordId) return false
   if (user.role === 'admin' || user.role === 'super_admin') return true
-  if (user.role === 'landlord' && user.profileId === landlordId) return true
+  if (user.role === 'landlord' && landlordOwns(user, landlordId)) return true
   if (isTeamRole(user.role) && user.landlordId === landlordId) return true
   return false
 }
@@ -51,7 +57,7 @@ export function canViewLandlordFinances(
 ): boolean {
   if (!user || !landlordId) return false
   if (user.role === 'admin' || user.role === 'super_admin') return true
-  if (user.role === 'landlord' && user.profileId === landlordId) return true
+  if (user.role === 'landlord' && landlordOwns(user, landlordId)) return true
   return false
 }
 
@@ -62,7 +68,7 @@ export function canManageLandlordResource(
 ): boolean {
   if (!user || !landlordId) return false
   if (user.role === 'admin' || user.role === 'super_admin') return true
-  if (user.role === 'landlord' && user.profileId === landlordId) return true
+  if (user.role === 'landlord' && landlordOwns(user, landlordId)) return true
   const allowed = allowedTeamRoles ?? TEAM_ROLES
   if (allowed.includes(user.role) && user.landlordId === landlordId) return true
   return false

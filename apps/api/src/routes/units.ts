@@ -4,7 +4,7 @@ import { query, queryOne } from '../db'
 import { requireAuth, requireLandlord, requirePerm, getScopedPropertyIds, assertPropertyInScope } from '../middleware/auth'
 import { canAccessLandlordResource, canManageLandlordResource, canViewLandlordFinances } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
-import { UnitStatus, calcNetPerUnit, getReservePhase, LAUNCH_PLATFORM_FEE, UNIT_STATUSES, UNIT_TYPES, computeStayPrice, computeMonthlyStaySchedule, RV_SITE_LAYOUTS, RV_AMP_SERVICES, isSiteLayoutMismatch, isAmpServiceMismatch, SHORT_STAY_LOCKED_UNIT_TYPES, DWELLING_OWNERSHIP_VALUES } from '@gam/shared'
+import { UnitStatus, calcNetPerUnit, getReservePhase, LAUNCH_PLATFORM_FEE, UNIT_STATUSES, UNIT_TYPES, computeStayPrice, computeMonthlyStaySchedule, RV_SITE_LAYOUTS, RV_AMP_SERVICES, isSiteLayoutMismatch, isAmpServiceMismatch, SHORT_STAY_LOCKED_UNIT_TYPES, DWELLING_OWNERSHIP_VALUES, dayDiff } from '@gam/shared'
 import { findStayConflict, findAvailableUnits, STAY_CONFLICT_MESSAGE } from '../services/unitAvailability'
 import { formatUnitNumber } from '../lib/format'
 import { logger } from '../lib/logger'
@@ -548,7 +548,7 @@ unitsRouter.post('/:id/bookings', requirePerm('schedule.create_reservation'), as
     const conflict = await findStayConflict(unit.id, { checkIn: body.checkIn, checkOut: body.checkOut })
     if (conflict) throw new AppError(409, STAY_CONFLICT_MESSAGE[conflict])
 
-    const nights = Math.ceil((checkOutD.getTime() - checkInD.getTime()) / (1000*60*60*24))
+    const nights = dayDiff(body.checkIn, body.checkOut)
     // Price authoritatively from the UNIT's stay rates, falling back to the
     // PROPERTY default per rate when the unit hasn't been configured separately
     // (Nic: rates are uniform by default — RV spots/storage share a price — but
@@ -819,7 +819,10 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
       if (conflict) throw new AppError(409, STAY_CONFLICT_MESSAGE[conflict])
     }
 
-    const nights = Math.ceil((new Date(newCheckOut).getTime() - new Date(newCheckIn).getTime()) / (1000*60*60*24))
+    // S553: newCheckIn/newCheckOut mix 'YYYY-MM-DD' strings (from the
+    // request) with pg DATE Dates (from the row) — dayDiff is immune to
+    // the representation; raw ms math was host-timezone-dependent.
+    const nights = dayDiff(newCheckIn, newCheckOut)
 
     // Reprice when dates or the unit change — the stored total must never drift
     // from the new stay. Same unit-rate-then-property-default rule as create.

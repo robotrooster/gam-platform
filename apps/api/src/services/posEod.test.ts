@@ -56,10 +56,10 @@ async function seedTxOnDay(
 ): Promise<string> {
   const r = await db.query<{ id: string }>(
     `INSERT INTO pos_transactions
-       (landlord_id, cashier_id, payment_method, subtotal, tax_amount, total, status, created_at)
-     VALUES ($1, $2, $3, $4, 0, $4, 'completed', ($5 || ' 12:00:00 America/Phoenix')::timestamptz)
+       (landlord_id, property_id, cashier_id, payment_method, subtotal, tax_amount, total, status, created_at)
+     VALUES ($1, $2, $3, $4, $5, 0, $5, 'completed', ($6 || ' 12:00:00 America/Phoenix')::timestamptz)
      RETURNING id`,
-    [f.landlordId, f.landlordUserId, opts.paymentMethod ?? 'cash',
+    [f.landlordId, f.propertyId, f.landlordUserId, opts.paymentMethod ?? 'cash',
      opts.total ?? 50, isoDate])
   return r.rows[0].id
 }

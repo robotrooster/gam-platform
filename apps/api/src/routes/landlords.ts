@@ -3,9 +3,10 @@ import { z } from 'zod'
 import { query, queryOne, getClient } from '../db'
 import { requireAuth, requireAdmin, requireLandlord, requirePerm } from '../middleware/auth'
 import { resolveLandlordIdForUser } from '../lib/scope'
-import { canAccessLandlordResource, canViewLandlordFinances } from '../middleware/scope'
+import { canAccessLandlordResource, canViewLandlordFinances, canManageLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
 import { emailTenantOnboarded } from '../services/email'
+import { createNotification } from '../services/notifications'
 import { scheduleParserJob } from '../jobs/leaseParser/runParserJob'
 import { resolveIntent } from '../jobs/leaseParser/resolveIntent'
 import { parse as parseCsv } from 'csv-parse/sync'
@@ -245,6 +246,122 @@ landlordsRouter.patch('/theme', requireLandlord, async (req, res, next) => {
       'UPDATE landlords SET theme_accent=$1, font_style=$2 WHERE id=$3',
       [themeAccent || null, fontStyle || null, req.user!.profileId]
     )
+    res.json({ success: true })
+  } catch (e) { next(e) }
+})
+
+// ── S553: entity owner-members (multi-owner landlord entities) ───────
+// A landlord entity (person or LLC) can have multiple owner-members, each
+// seeing it in their aggregated portfolio. Membership resolves into the
+// JWT at login — changes take effect on the member's next sign-in.
+landlordsRouter.get('/members', async (req, res, next) => {
+  try {
+    const u = req.user!
+    const landlordId = (req.query.landlordId as string) || u.profileId
+    if (!canManageLandlordResource(u, landlordId, [])) throw new AppError(403, 'Forbidden')
+    const rows = await query(
+      `SELECT lm.id, lm.user_id, lm.role, lm.created_at,
+              us.email, us.first_name, us.last_name,
+              (lm.user_id = l.user_id) AS is_founding
+         FROM landlord_members lm
+         JOIN users us ON us.id = lm.user_id
+         JOIN landlords l ON l.id = lm.landlord_id
+        WHERE lm.landlord_id = $1
+        ORDER BY lm.created_at ASC`, [landlordId])
+    res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
+// Add an owner-member by email. v1: the person must already have a GAM
+// landlord account (register first, then be added) — invite-token flow is
+// a later polish. Any current owner-member can add.
+landlordsRouter.post('/members', async (req, res, next) => {
+  try {
+    const u = req.user!
+    const b = z.object({
+      email: z.string().trim().email(),
+      landlordId: z.string().uuid().optional(),
+    }).parse(req.body)
+    const landlordId = b.landlordId || u.profileId
+    if (!canManageLandlordResource(u, landlordId, [])) throw new AppError(403, 'Forbidden')
+
+    const target = await queryOne<any>(
+      `SELECT id, role, first_name FROM users WHERE lower(email) = lower($1)`, [b.email])
+    if (!target) throw new AppError(404, 'No GAM account with that email. Have them register as a landlord first, then add them.')
+    if (target.role !== 'landlord') throw new AppError(400, 'That account is not a landlord account. Co-owners need their own landlord login.')
+
+    const row = await queryOne<any>(
+      `INSERT INTO landlord_members (landlord_id, user_id, role, added_by_user_id)
+       VALUES ($1, $2, 'owner', $3)
+       ON CONFLICT (landlord_id, user_id) DO NOTHING RETURNING id`,
+      [landlordId, target.id, u.userId])
+    if (!row) throw new AppError(409, 'They are already an owner of this entity.')
+
+    const entity = await queryOne<{ business_name: string | null }>(
+      `SELECT business_name FROM landlords WHERE id = $1`, [landlordId])
+    await createNotification({
+      userId: target.id, landlordId,
+      type: 'landlord_member_added',
+      title: `You've been added as an owner${entity?.business_name ? ` of ${entity.business_name}` : ''}`,
+      body: 'The entity now appears in your portfolio. Sign out and back in to see it.',
+    }).catch(() => {})
+    res.status(201).json({ success: true, data: { id: row.id } })
+  } catch (e) { next(e) }
+})
+
+// Remove an owner-member. Dissolution-proofing (S553, Nic):
+//  - the FOUNDING member (landlords.user_id) can never be removed — it
+//    anchors the entity; ownership transfer is a future flow.
+//  - ONLY the founding owner may remove OTHER owners — co-owners cannot
+//    retaliate against each other.
+//  - any non-founding owner may remove THEMSELVES (walk away).
+//  - every removal notifies the removed owner and all remaining owners,
+//    and lands in the audit journal (trigger).
+// Known limit (documented): the removed owner's JWT keeps its memberships
+// until expiry (≤7d); money-critical routes get live re-checks in the
+// Connect re-anchor.
+landlordsRouter.delete('/members/:id', async (req, res, next) => {
+  try {
+    const u = req.user!
+    const m = await queryOne<any>(
+      `SELECT lm.id, lm.landlord_id, lm.user_id, (lm.user_id = l.user_id) AS is_founding,
+              l.user_id AS founding_user_id, l.business_name
+         FROM landlord_members lm JOIN landlords l ON l.id = lm.landlord_id
+        WHERE lm.id = $1`, [req.params.id])
+    if (!m) throw new AppError(404, 'Member not found')
+    if (!canManageLandlordResource(u, m.landlord_id, [])) throw new AppError(403, 'Forbidden')
+    if (m.is_founding) throw new AppError(400, 'The founding owner cannot be removed from the entity.')
+    const isSelf = m.user_id === u.userId
+    const callerIsFounding = m.founding_user_id === u.userId || u.role === 'admin' || u.role === 'super_admin'
+    if (!isSelf && !callerIsFounding) {
+      throw new AppError(403, 'Only the founding owner can remove other owners. You can remove yourself.')
+    }
+    await query(`DELETE FROM landlord_members WHERE id = $1`, [m.id])
+
+    // Notify the removed owner + every remaining owner (best-effort).
+    try {
+      const entityName = m.business_name || 'the shared entity'
+      const remaining = await query<{ user_id: string }>(
+        `SELECT user_id FROM landlord_members WHERE landlord_id = $1`, [m.landlord_id])
+      const actor = await queryOne<{ first_name: string; last_name: string }>(
+        `SELECT first_name, last_name FROM users WHERE id = $1`, [u.userId])
+      const who = [actor?.first_name, actor?.last_name].filter(Boolean).join(' ') || 'An owner'
+      await createNotification({
+        userId: m.user_id, landlordId: m.landlord_id,
+        type: 'landlord_member_removed',
+        title: `Your ownership access to ${entityName} was removed`,
+        body: isSelf ? 'You left the entity.' : `${who} removed your access. If this is unexpected, contact GAM support.`,
+      }).catch(() => {})
+      for (const r of remaining) {
+        if (r.user_id === u.userId) continue
+        await createNotification({
+          userId: r.user_id, landlordId: m.landlord_id,
+          type: 'landlord_member_removed',
+          title: `Ownership change on ${entityName}`,
+          body: isSelf ? `${who} left the entity.` : `${who} removed an owner from the entity.`,
+        }).catch(() => {})
+      }
+    } catch { /* best-effort */ }
     res.json({ success: true })
   } catch (e) { next(e) }
 })
