@@ -332,13 +332,13 @@ The flake fix (dayDiff) is already done + deployed; NONE of these 22 are.
 Fix order = launch-path impact. Each is frontend↔API mismatch, no DB risk.
 
 ### TIER 1 — onboarding/money, fix before onboarding anyone
-1. **admin + admin-ops "Resend" buttons are STUBS (no email sent).**
-   POST /admin/onboarding/resend (admin.ts:377-390) only writes an audit
-   row + returns "queued" — never calls services/email.ts, nothing
-   consumes resend_* actions. All 5 admin (main.tsx 414/418/423/471/…) +
-   4 admin-ops (main.tsx 366/367/385/386) buttons show green success while
-   NOTHING sends. Nic will think onboarding/bank/ACH emails went out.
-   Fix: wire the handler to the real senders (map type→sender).
+1. **[FIXED S553, deployed] admin/admin-ops "Resend" buttons were STUBS.**
+   /admin/onboarding/resend now ACTUALLY resends tenant_invite (+ reminder)
+   with a fresh 7-day token (mirrors onboard route); other types return an
+   honest 501; both frontends show the real server message. Commit a5546c6.
+   NOT YET DONE: a test for the endpoint (email suppresses in test now, so
+   safe to add); wiring landlord_setup/bank_verification/ach_enrollment
+   resends (currently honest-501 — lower priority, Nic can act manually).
 2. **POS card checkout captures the card THEN 400s (money taken, no sale)
    — discount.** POSPage.tsx sends discountAmount/discountReason;
    pos.ts:426 /transactions destructure DROPS them, recomputes total w/o
@@ -417,11 +417,71 @@ suppressed sends still write email_send_log so tests pass. email.test.ts
 (mocks Resend, asserts the send path) opts back in via EMAIL_SEND_LIVE=1 in
 its beforeEach. Verified: email.test.ts 35/35 + 10 email-sending suites
 186/186 green. Production unchanged (willSend=true → real tenant mail sends).
-STILL A LAUNCH BLOCKER regardless: free-tier 100/day can't cover onboarding
-~100 tenants (invite+verify+e-sign+first-invoice each = 300-500 day-one
-emails). **Upgrade Resend to a paid plan before onboarding.** Also worth
-checking the domain's current bounce/reputation status after weeks of test
-sends (may need a reputation warm-up before blasting real tenants).
+DOMAIN AUTH — COMPLETE (S553): SPF ✓ (send. subdomain) + DKIM ✓ (both
+Resend-verified) + DMARC ✓ (Nic added `v=DMARC1; p=none;
+rua=mailto:nic@golddoor.io; fo=1` at _dmarc in CLOUDFLARE, verified live).
+DNS is CLOUDFLARE not GoDaddy (GoDaddy=registrar only; NS=sasha/norm.ns.
+cloudflare.com). All 3 Gmail/Yahoo bulk requirements met. Tighten p=none →
+p=quarantine after weeks of clean sends.
+VOLUME (Nic updated): Oak Park + Mountain View ALL sign NEW leases → ~3
+emails/tenant (invite + esign request + esign completion) + reminders.
+~100 tenants = ~300+ launch-week emails. **Free 100/day WON'T cover it —
+upgrading Resend to paid is REQUIRED before the invite blast (Fri-Sun pre
+Aug 1).** Bulk VERIFIED: CSV tenant-import commit (landlords.ts:2993-3152)
+creates each tenant + fires emailTenantOnboarded per row → onboard all via
+CSV, invites auto-send. Happy path = 1 invite, no retry loop; accept-invite
+AUTO-VERIFIES email (no separate verify email); ACH set up in-portal.
+Monitor DMARC rua reports + Resend bounce rate on first real sends.
+
+## S554+ BUILD SPEC — Portfolio-Manager (sales agent) compensation + lead routing (Nic, 2026-07-24)
+NOT built yet — design captured. The "Portfolio Specialist / Portfolio
+Manager" is the human Lucy hands leads to (see [[gam-agent-roster]], Leads
+page already exists at admin /leads).
+
+COMPENSATION (Nic-decided):
+- Recurring, NOT hourly, NOT per-close bounty. Agent earns a recurring cut
+  of the landlord platform fee for landlords THEY closed.
+- Rate: **$0.50 per OCCUPIED unit per month** (= 25% of the $2/occupied-unit
+  platform fee). KEY DESIGN: comp basis = OCCUPIED units (matches the
+  platform-fee basis in services/platformFee.ts) so the agent only earns on
+  filled units → auto-incentive to help the landlord fill vacancies (the
+  "Portfolio Manager reaches out about long-empty units" behavior Nic wants
+  falls out of this, no separate mechanism needed).
+- Future Flex income (FlexVault custody + FlexPay float): KEEP FLAT $0.50/
+  occupied unit — do NOT couple agent pay to float/custody income (agent
+  doesn't influence it; keeps math clean). Any Flex-adoption reward = a
+  separate one-time spiff, not a base rework.
+- Compute monthly off the EXISTING platform_revenue_ledger / platformFee.ts
+  (same source Reports + Dashboard use) — one calc, per S-rule.
+
+ATTRIBUTION (Nic to decide before build — the thorny recurring part):
+- Stamp each landlord with closing_agent_user_id + effective_at.
+- OPEN Qs: how long does the agent earn (while landlord active?)? What
+  happens to the book when an AGENT leaves (reassign / house account /
+  stop)? Clawback if landlord churns in month 1? Build schema to answer
+  these day-one even if launch has one agent (Nic).
+
+AGENT-FACING UI:
+- Agent login + a commission DASHBOARD WIDGET (this-month accrual, per-
+  landlord breakdown, occupied-unit counts). New portal or a role in an
+  existing one — TBD.
+
+LEAD ROUTING:
+- LAUNCH: all leads → Nic (already the case; routing is a no-op). DO NOT
+  build complex routing now — build only the SEAM (pluggable "assignment
+  strategy" so adding agents later flips strategy without rearchitecting).
+- FUTURE strategy (when >1 agent): weighted round-robin within an eligible
+  pool; "eligible" optionally filtered by territory/expertise; weighting
+  accounts for current load so volume stays even (pure state-based starves
+  low-volume-state closers — Nic flagged this; pure round-robin ignores
+  fit). Plus: availability check + unclaimed-lead fallback reassign.
+
+LAUNCH ONBOARDING REALITY (Nic correction): Oak Park + Mountain View BOTH
+sign NEW leases, NO existing-lease data → NO bulk CSV import for launch.
+Onboard each tenant individually (onboard flow creates account+lease+invite
+in one action). CSV bulk-import (verified working) is for a FUTURE landlord
+migrating existing leases, NOT these two. Mountain View currently runs on a
+Square terminal + invoicing, no leasing data to migrate.
 
 ## Next session candidates
 (1-3 of the original list SHIPPED in-session — Leads page, FlexVault name,
