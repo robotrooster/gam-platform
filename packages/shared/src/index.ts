@@ -199,6 +199,21 @@ export const SERVICE_INTERRUPTION_STATUSES = [
 ] as const
 export type ServiceInterruptionStatus = typeof SERVICE_INTERRUPTION_STATUSES[number]
 
+// ── Sales leads (marketing-site sales agent → Portfolio Specialists) ──
+// S553: single source for the sales_leads.status CHECK (values predate this
+// export; the DB CHECK lists the same five).
+export const SALES_LEAD_STATUSES = [
+  'new', 'contacted', 'qualified', 'converted', 'closed',
+] as const
+export type SalesLeadStatus = typeof SALES_LEAD_STATUSES[number]
+export const SALES_LEAD_STATUS_LABELS: Record<SalesLeadStatus, string> = {
+  new: 'New',
+  contacted: 'Contacted',
+  qualified: 'Qualified',
+  converted: 'Converted',
+  closed: 'Closed',
+}
+
 // ── Standard inspection walkthrough checklist (single source) ──────────
 // The areas the agent walks a tenant/landlord through on a move-in / move-out
 // / periodic inspection. Each area expects at least one fresh camera photo;
@@ -213,15 +228,18 @@ export interface InspectionChecklistArea {
 }
 
 export const MAX_INSPECTION_BEDROOMS = 4
+export const MAX_INSPECTION_BATHROOMS = 4
 
 const BEDROOM_ITEMS = ['Walls', 'Flooring', 'Closet', 'Window', 'Lighting'] as const
+const BATHROOM_ITEMS = ['Toilet', 'Sink & vanity', 'Tub/shower', 'Tile & grout', 'Exhaust fan', 'Floor'] as const
 
-// Residential base, MINUS bedrooms — bedrooms are spliced in after
-// 'Living / common' by the builder, sized to the unit.
+// Residential base, MINUS bedrooms AND bathrooms — both are spliced in by
+// the builder, sized to the unit's REAL counts (S550: an inspector going
+// inside covers everything the unit actually has — every bathroom, the
+// kitchen, living/dining — never a room that doesn't exist).
 const RESIDENTIAL_INSPECTION_AREAS_BASE: readonly InspectionChecklistArea[] = [
   { area: 'Kitchen', items: ['Countertops & cabinets', 'Sink & faucet', 'Stove/oven', 'Refrigerator', 'Dishwasher/microwave', 'Floor'] },
-  { area: 'Bathroom', items: ['Toilet', 'Sink & vanity', 'Tub/shower', 'Tile & grout', 'Exhaust fan', 'Floor'] },
-  { area: 'Living / common', items: ['Walls', 'Flooring', 'Ceiling', 'Windows & blinds', 'Doors', 'Lighting & outlets'] },
+  { area: 'Living / dining', items: ['Walls', 'Flooring', 'Ceiling', 'Windows & blinds', 'Doors', 'Dining area', 'Lighting & outlets'] },
   { area: 'Systems & safety', items: ['HVAC/thermostat', 'Water heater', 'Smoke & CO detectors', 'Breaker panel'] },
   { area: 'Laundry', items: ['Washer/dryer or hookups'] },
   { area: 'Exterior / entry', items: ['Entry door & locks', 'Patio/balcony', 'Exterior walls/screens'] },
@@ -236,16 +254,110 @@ const RV_SITE_INSPECTION_AREAS: readonly InspectionChecklistArea[] = [
   { area: 'Handover', items: ['Gate/access code', 'Meter reading (if metered)'] },
 ]
 
+// S550 (Nic): who owns the DWELLING on the unit. Backs units.dwelling_ownership
+// (migration 20260719160000). Only meaningful for rv_spot and mobile_home —
+// every other unit type is landlord-owned by definition and ignores the flag.
+export const DWELLING_OWNERSHIP_VALUES = ['landlord', 'tenant'] as const
+export type DwellingOwnership = typeof DWELLING_OWNERSHIP_VALUES[number]
+export const DWELLING_OWNERSHIP_LABEL: Record<DwellingOwnership, string> = {
+  landlord: 'Park/landlord-owned',
+  tenant:   'Tenant-owned',
+}
+
+// Park-owned RV rented as a unit: the site areas PLUS the rig itself.
+// An RV never gets bedroom areas, no matter who owns it.
+export const RV_UNIT_INSPECTION_AREAS: readonly InspectionChecklistArea[] = [
+  { area: 'RV interior', items: ['Sleeping area', 'Dinette/seating', 'Cabinets & storage', 'Flooring'] },
+  { area: 'RV kitchenette', items: ['Stove/range', 'Refrigerator', 'Sink & faucet', 'Microwave'] },
+  { area: 'RV bath', items: ['Toilet', 'Shower', 'Sink', 'Ventilation'] },
+  { area: 'RV systems', items: ['A/C & furnace', 'Water heater', 'Smoke/CO/LP detectors', 'Slide-outs', 'Awning'] },
+  { area: 'RV exterior', items: ['Body & roof', 'Windows & seals', 'Steps & handrails', 'Keys & locks'] },
+]
+
+// Tenant-owned mobile home on a rented lot: the park owns the SPACE, not the
+// home — inspections never enter the tenant's dwelling. Space rent only.
+export const MH_SPACE_INSPECTION_AREAS: readonly InspectionChecklistArea[] = [
+  { area: 'Lot & pad', items: ['Pad/foundation piers', 'Driveway/parking', 'Steps & landings (park-owned)'] },
+  { area: 'Hookups', items: ['Electric service', 'Water connection', 'Sewer connection'] },
+  { area: 'Yard', items: ['Landscaping/clearance', 'Trash removed', 'Fencing (park-owned)'] },
+  { area: 'Handover', items: ['Gate/access code', 'Utility meter readings'] },
+]
+
+// S548 (Nic): storage/parking walkthroughs are deliberately tiny — empty,
+// and the door/latch in similar condition to move-in (the comparison
+// inspection has the move-in photos). No point walking a 10x20 like an
+// apartment.
+const STORAGE_INSPECTION_AREAS: readonly InspectionChecklistArea[] = [
+  { area: 'Contents', items: ['Unit completely empty', 'No debris left behind'] },
+  { area: 'Door & lock', items: ['Door operates', 'Latch/locking mechanism condition vs move-in', 'Lock removed/returned'] },
+]
+
 // Dwelling unit types that get bedroom areas. rv_spot uses the site list;
-// storage/commercial get the residential base WITHOUT bedrooms.
+// storage/parking use the tiny checklist; commercial gets the residential
+// base WITHOUT bedrooms.
 const BEDROOM_UNIT_TYPES = ['apartment', 'single_family', 'mobile_home']
 
-export function buildInspectionChecklist(input: { unitType?: string | null; bedrooms?: number | null }): InspectionChecklistArea[] {
-  if (input.unitType === 'rv_spot') return RV_SITE_INSPECTION_AREAS.map((a) => ({ ...a }))
+// S548: which unit types require a FINALIZED in-person move-out inspection
+// before a deposit return can begin. rv_spot deliberately absent — its
+// "walkthrough" is the mandatory pull-out meter read + same-day settlement.
+export const MOVE_OUT_INSPECTION_REQUIRED_UNIT_TYPES = [
+  'apartment', 'single_family', 'mobile_home', 'storage', 'parking',
+] as const
+
+// The master derivation (S550): every consumer — self-directed tenant
+// walkthrough, agent-guided walkthrough, staff/landlord creation, scheduled
+// move-outs — calls THIS with the unit's real facts (type, bedroom count,
+// dwelling ownership) and gets exactly the relevant areas:
+//   rv_spot     tenant-owned   -> site only (tenant's rig is theirs)
+//   rv_spot     landlord-owned -> site + RV interior/rig (NEVER bedrooms)
+//   mobile_home tenant-owned   -> lot/space only (never inside their home)
+//   mobile_home landlord-owned -> full residential, bedrooms = actual count
+//   apartment / single_family  -> full residential, bedrooms = actual count
+//   storage / parking          -> tiny empty-and-latch checklist
+//   everything else            -> residential base without bedrooms
+export function buildInspectionChecklist(input: {
+  unitType?: string | null
+  bedrooms?: number | null
+  bathrooms?: number | null
+  dwellingOwnership?: string | null
+}): InspectionChecklistArea[] {
+  const ownership: DwellingOwnership =
+    input.dwellingOwnership === 'tenant' ? 'tenant' : 'landlord'
+  if (input.unitType === 'rv_spot') {
+    const site = RV_SITE_INSPECTION_AREAS.map((a) => ({ ...a }))
+    if (ownership === 'landlord') {
+      return [...site, ...RV_UNIT_INSPECTION_AREAS.map((a) => ({ ...a }))]
+    }
+    return site
+  }
+  if (input.unitType === 'mobile_home' && ownership === 'tenant') {
+    return MH_SPACE_INSPECTION_AREAS.map((a) => ({ ...a }))
+  }
+  if (input.unitType === 'storage' || input.unitType === 'parking') {
+    return STORAGE_INSPECTION_AREAS.map((a) => ({ ...a }))
+  }
+
+  // Bathrooms: one area per REAL bathroom (ceil — a 1.5-bath gets two areas,
+  // the fractional one labeled as the half bath). Applies to every
+  // interior-inspected type, not just bedroom types (a hotel room has a
+  // bathroom too). Defaults to 1 when unknown.
+  const bathRaw = Number(input.bathrooms ?? 1)
+  const bathCount = Math.min(
+    Math.max(Number.isFinite(bathRaw) ? Math.ceil(bathRaw) : 1, 1),
+    MAX_INSPECTION_BATHROOMS,
+  )
+  const hasHalf = Number.isFinite(bathRaw) && bathRaw > 0 && bathRaw % 1 !== 0
+  const bathrooms: InspectionChecklistArea[] = Array.from({ length: bathCount }, (_, i) => ({
+    area: bathCount === 1 ? 'Bathroom' : (hasHalf && i === bathCount - 1 ? `Bathroom ${i + 1} (half)` : `Bathroom ${i + 1}`),
+    items: [...BATHROOM_ITEMS],
+  }))
 
   const base = RESIDENTIAL_INSPECTION_AREAS_BASE
+  const kitchenIdx = base.findIndex((a) => a.area === 'Kitchen')
+  const withBaths = [...base.slice(0, kitchenIdx + 1), ...bathrooms, ...base.slice(kitchenIdx + 1)]
+
   if (!BEDROOM_UNIT_TYPES.includes(input.unitType ?? 'apartment')) {
-    return base.map((a) => ({ ...a }))
+    return withBaths.map((a) => ({ ...a }))
   }
 
   const n = Math.trunc(Number(input.bedrooms ?? 1))
@@ -254,8 +366,8 @@ export function buildInspectionChecklist(input: { unitType?: string | null; bedr
     area: `Bedroom ${i + 1}`,
     items: [...BEDROOM_ITEMS],
   }))
-  const idx = base.findIndex((a) => a.area === 'Living / common')
-  return [...base.slice(0, idx + 1), ...bedrooms, ...base.slice(idx + 1)].map((a) => ({ ...a }))
+  const idx = withBaths.findIndex((a) => a.area === 'Living / dining')
+  return [...withBaths.slice(0, idx + 1), ...bedrooms, ...withBaths.slice(idx + 1)].map((a) => ({ ...a }))
 }
 
 // Per-business staff positions. Single source of truth for the
@@ -1530,6 +1642,7 @@ export interface PropertyUnitSubtype {
   bathrooms?: number | string | null
   rvSiteLayout?: string | null
   rvAmpService?: string | null
+  dwellingOwnership?: string | null
   storageSize?: string | null
   rentAmount: number | string | null
   securityDeposit: number | string | null
@@ -2950,6 +3063,27 @@ export const STRIPE_CONFIG = {
   CONNECT_ACCT_MO: 2.00,
 } as const
 
+// S551 (Nic): the platform-wide CUSTOMER-FACING processing fee schedule —
+// THE single source for every card/ACH processing fee on any service
+// (rent, background checks, deposits, POS, everything). Consumers:
+// services/stripeConnect.ts computeApplicationFee (destination charges) and
+// the platform_processing_rates DB rows (allocation engine) — the
+// 20260721 migration seeds those rows from these same numbers; if these
+// change, cut a new migration to match.
+//   Card: 3.25% + $0.26 per transaction (+1.5% on non-US-issued cards).
+//         The 26¢ mirrors the fixed per-transaction cost of GAM's Stripe
+//         IC+ contract (interchange + 0.7% + $0.26) exactly — S552 (Nic),
+//         raised from the earlier $0.10 so no transaction size loses on
+//         the fixed component.
+//   ACH:  1.0% capped at $6.00
+export const PROCESSING_FEES = {
+  CARD_PCT:      0.0325,
+  CARD_FLAT:     0.26,
+  CARD_INTL_PCT: 0.015,
+  ACH_PCT:       0.01,
+  ACH_CAP:       6.00,
+} as const
+
 export const PLATFORM_FEES = {
   ACTIVE_UNIT:     15.00,
   DIRECT_PAY_UNIT: 5.00,
@@ -3332,6 +3466,7 @@ export const PARSER_FLAG_CATEGORIES = [
   'field_missing',
   'field_suspect',
   'field_low_confidence',
+  'unattributed_amount',
 ] as const
 export type ParserFlagCategory = typeof PARSER_FLAG_CATEGORIES[number]
 
@@ -3341,6 +3476,7 @@ export const PARSER_FLAG_CATEGORY_META: Record<ParserFlagCategory, { label: stri
   field_missing:        { label: 'Missing field',        description: 'Lease term could not be located in the document.' },
   field_suspect:        { label: 'Suspect value',        description: 'Lease term was extracted but the value looks wrong (zero rent, dates far in future, etc.).' },
   field_low_confidence: { label: 'Low confidence',       description: 'Parser is not confident in this extraction. Landlord should verify.' },
+  unattributed_amount:  { label: 'Unrecognized dollar amount', description: 'The document mentions a dollar amount the parser could not attribute to any known charge — review the clause so no financial obligation is missed.' },
 }
 
 export const PARSER_FLAG_SEVERITIES = ['block', 'confirm'] as const
@@ -3392,6 +3528,19 @@ export type ParserExtractedLease = {
   subleasingAllowed?:  ParserExtractedField<string>   // SUBLEASING_POLICIES value
 }
 
+// S550: a conditional fee the parser detected — "if you don't do X (or do
+// X), then $Y". Lease-is-law: only ever created from a clause that PRINTS in
+// the document; conditionText carries that clause verbatim. Resolve-time
+// logic writes these to lease_fees with condition_text set; they charge only
+// when the move-out inspection assesses the condition as failed.
+export type ParserExtractedConditionalFee = {
+  label: string          // short human label, e.g. 'Carpet cleaning'
+  amount: number
+  conditionText: string  // the clause from the lease (verbatim, trimmed)
+  confidence: number     // 0..1
+  rawText: string
+}
+
 // Full parser output — written to pending_tenant_intents.parser_output (JSONB).
 // Stored as-is; resolve-time logic reads from this shape.
 export type ParserOutput = {
@@ -3409,6 +3558,9 @@ export type ParserOutput = {
   additionalOccupants?: ParserExtractedOccupant[]
   liabilityInsurance?:  ParserExtractedLiabilityInsurance
   sublease?:            ParserExtractedSublease
+  // S550: conditional fees ("if not X, then $Y") — written to lease_fees
+  // with condition_text at resolve time; never auto-charged until assessed.
+  conditionalFees?:     ParserExtractedConditionalFee[]
   // Catchall for fields the parser pulls out but we have not yet
   // promoted to typed columns. Written to leases.extraction_extras
   // (JSONB) at resolve time.

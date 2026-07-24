@@ -3,7 +3,7 @@ import { z } from 'zod'
 import path from 'path'
 import fs from 'fs'
 import { query, queryOne } from '../db'
-import { LEASE_TYPES, AUTO_RENEW_MODES, LEASE_STATUSES } from '@gam/shared'
+import { LEASE_TYPES, AUTO_RENEW_MODES, LEASE_STATUSES, MOVE_OUT_INSPECTION_REQUIRED_UNIT_TYPES } from '@gam/shared'
 import { requireAuth, requirePerm } from '../middleware/auth'
 import { canAccessLandlordResource, canManageLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
@@ -909,6 +909,34 @@ leasesRouter.get('/:id/deposit-return', async (req, res, next) => {
     if (!canAccessLandlordResource(req.user, lease.landlord_id)) throw new AppError(403, 'Forbidden')
 
     const { calculateDepositReturn, fetchUnpaidBalanceLines } = await import('../services/depositReturn')
+    // S548: the page needs the approval context — the landlord's threshold
+    // and whether the viewer is owner-level — to render the staff finalize
+    // button correctly (send-for-approval vs. locked "landlord reviewing").
+    // S548: move-out walkthrough state rides along — the page gates "Begin
+    // Move-Out" on it (per unit type) and links the photo evidence for the
+    // landlord's approval review.
+    const unitTypeRow = await queryOne<{ unit_type: string | null }>(
+      `SELECT u.unit_type FROM units u JOIN leases l ON l.unit_id = u.id WHERE l.id = $1`,
+      [req.params.id])
+    const moveOutRequired = (MOVE_OUT_INSPECTION_REQUIRED_UNIT_TYPES as readonly string[])
+      .includes(unitTypeRow?.unit_type ?? '')
+    const moveOutInspection = moveOutRequired ? await queryOne<any>(
+      `SELECT i.id, i.status, i.scheduled_for, i.finalized_at,
+              (SELECT COUNT(*) FROM unit_inspection_items it
+                 JOIN unit_inspection_photos ph ON ph.item_id = it.id
+                WHERE it.inspection_id = i.id)::int AS photo_count
+         FROM unit_inspections i
+        WHERE i.lease_id = $1 AND i.inspection_type = 'move_out' AND i.status <> 'cancelled'
+        ORDER BY (i.status = 'finalized') DESC, i.created_at DESC LIMIT 1`,
+      [req.params.id]) : null
+    const approvalMeta = {
+      approval_threshold: Number((await queryOne<{ t: string }>(
+        `SELECT deposit_return_approval_threshold::text AS t FROM landlords WHERE id=$1`,
+        [lease.landlord_id]))?.t ?? 500),
+      viewer_is_owner: ['landlord', 'admin', 'super_admin'].includes(req.user!.role),
+      move_out_inspection_required: moveOutRequired,
+      move_out_inspection: moveOutInspection,
+    }
     const existing = await queryOne<any>('SELECT * FROM deposit_returns WHERE lease_id=$1', [req.params.id])
     if (existing) {
       // S182 / A1 frontend: attach a live re-pull of the auto-sweep
@@ -925,12 +953,12 @@ leasesRouter.get('/:id/deposit-return', async (req, res, next) => {
         [req.params.id],
       )
       const interest_accrued = Number(sd?.interest_accrued ?? 0)
-      return res.json({ success: true, data: { ...existing, unpaid_balance_lines, interest_accrued } })
+      return res.json({ success: true, data: { ...existing, unpaid_balance_lines, interest_accrued, ...approvalMeta } })
     }
     // No row yet — return calculation preview
     const calc = await calculateDepositReturn(req.params.id)
     if (!calc) throw new AppError(404, 'Lease not found')
-    res.json({ success: true, data: { preview: true, ...calc } })
+    res.json({ success: true, data: { preview: true, ...calc, ...approvalMeta } })
   } catch (e) { next(e) }
 })
 
@@ -1109,9 +1137,26 @@ leasesRouter.post('/:id/bill-fee', requirePerm('leases.bill_fee'), async (req, r
 
 leasesRouter.post('/:id/deposit-return', requirePerm('leases.deposit_return'), async (req, res, next) => {
   try {
-    const lease = await queryOne<any>('SELECT id, landlord_id FROM leases WHERE id=$1', [req.params.id])
+    const lease = await queryOne<any>(
+      `SELECT l.id, l.landlord_id, u.unit_type
+         FROM leases l JOIN units u ON u.id = l.unit_id WHERE l.id=$1`, [req.params.id])
     if (!lease) throw new AppError(404, 'Lease not found')
     if (!canManageLandlordResource(req.user, lease.landlord_id)) throw new AppError(403, 'Forbidden')
+
+    // S548 (Nic): dwellings and storage require a FINALIZED in-person
+    // move-out walkthrough before the deposit return can begin — the
+    // landlord approves refunds looking at the pictures, not on faith.
+    // rv_spot is exempt (its walkthrough IS the pull-out meter read).
+    if ((MOVE_OUT_INSPECTION_REQUIRED_UNIT_TYPES as readonly string[]).includes(lease.unit_type ?? '')) {
+      const insp = await queryOne<{ id: string }>(
+        `SELECT id FROM unit_inspections
+          WHERE lease_id = $1 AND inspection_type = 'move_out' AND status = 'finalized'
+          ORDER BY finalized_at DESC LIMIT 1`, [req.params.id])
+      if (!insp) {
+        throw new AppError(409,
+          'A finalized move-out walkthrough is required before starting this deposit return. Complete the in-person inspection (with photos) first.')
+      }
+    }
 
     const { createOrFetchDraft } = await import('../services/depositReturn')
     const row = await createOrFetchDraft(req.params.id)
@@ -1159,9 +1204,49 @@ leasesRouter.post('/:id/deposit-return/finalize', requirePerm('leases.deposit_re
     if (!lease) throw new AppError(404, 'Lease not found')
     if (!canManageLandlordResource(req.user, lease.landlord_id)) throw new AppError(403, 'Forbidden')
 
-    const draft = await queryOne<any>('SELECT id, status FROM deposit_returns WHERE lease_id=$1', [req.params.id])
+    const draft = await queryOne<any>(
+      'SELECT id, status, damage_lines, other_deductions FROM deposit_returns WHERE lease_id=$1', [req.params.id])
     if (!draft) throw new AppError(404, 'No draft. POST first to create.')
-    if (draft.status !== 'draft') throw new AppError(409, `Already finalized: ${draft.status}`)
+    if (!['draft', 'awaiting_approval'].includes(draft.status)) throw new AppError(409, `Already finalized: ${draft.status}`)
+
+    // S548 (Nic): staff can run deposit returns without wasting the
+    // landlord's time — up to the landlord's threshold. A refund above it
+    // parks awaiting_approval; the landlord (or admin) finalizes from
+    // there. Gap-only or zero returns move no money out, so staff always
+    // may finalize those.
+    const isOwnerLevel = ['landlord', 'admin', 'super_admin'].includes(req.user!.role)
+    if (!isOwnerLevel) {
+      const threshold = Number((await queryOne<{ t: string }>(
+        `SELECT deposit_return_approval_threshold::text AS t FROM landlords WHERE id=$1`,
+        [lease.landlord_id]))?.t ?? 500)
+      const { calculateDepositReturn } = await import('../services/depositReturn')
+      const calc = await calculateDepositReturn(
+        req.params.id, draft.damage_lines ?? [], draft.other_deductions ?? [])
+      const refund = calc?.refund_amount ?? 0
+      if (refund > threshold) {
+        if (draft.status === 'draft') {
+          await query(`UPDATE deposit_returns SET status='awaiting_approval', updated_at=NOW() WHERE id=$1`, [draft.id])
+          const owner = await queryOne<{ user_id: string }>(
+            `SELECT user_id FROM landlords WHERE id=$1`, [lease.landlord_id])
+          if (owner) {
+            const { createNotification } = await import('../services/notifications')
+            await createNotification({
+              userId: owner.user_id,
+              landlordId: lease.landlord_id,
+              type: 'deposit_return_approval',
+              title: 'Deposit return needs your approval',
+              body: `A team member prepared a deposit return with a $${refund.toFixed(2)} refund — above your $${threshold.toFixed(2)} approval threshold. Review and finalize it.`,
+              data: { leaseId: lease.id, depositReturnId: draft.id, refund, threshold },
+              actionUrl: `/leases/${lease.id}/deposit-return`,
+            }).catch(() => {})
+          }
+        }
+        return res.status(202).json({
+          success: true,
+          data: { status: 'awaiting_approval', refund_amount: refund, threshold },
+        })
+      }
+    }
 
     const { finalizeDepositReturn } = await import('../services/depositReturn')
     const finalized = await finalizeDepositReturn(draft.id, req.user!.userId)

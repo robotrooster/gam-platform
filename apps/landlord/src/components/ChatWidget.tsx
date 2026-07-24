@@ -14,7 +14,7 @@
 
 import { useState, useRef, useEffect } from 'react'
 import { MessageCircle, Send, X, ChevronDown } from 'lucide-react'
-import { apiPost } from '../lib/api'
+import { apiGet, apiPost } from '../lib/api'
 
 interface AgentProfile { title: string; c1: string; c2: string }
 
@@ -201,11 +201,20 @@ export function openAssistant(prefill?: string) {
 export function ChatWidget() {
   const [open, setOpen] = useState(false)
   const [prefill, setPrefill] = useState<string | undefined>()
+  // S553: server-decided visibility (silent abuse auto-hide, dark by
+  // default). Defaults visible; hides only on an explicit false.
+  const [visible, setVisible] = useState(true)
   useEffect(() => {
     const handler = (e: Event) => { setPrefill((e as CustomEvent).detail?.prefill); setOpen(true) }
     window.addEventListener('gam:open-assistant', handler)
     return () => window.removeEventListener('gam:open-assistant', handler)
   }, [])
+  useEffect(() => {
+    apiGet<{ visible: boolean }>('/agent/visibility')
+      .then((d) => { if (d?.visible === false) setVisible(false) })
+      .catch(() => {})
+  }, [])
+  if (!visible) return null
   return (
     <>
       <style>{DOT_CSS}</style>

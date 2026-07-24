@@ -6,7 +6,7 @@ Once a background check is complete, you make the call. GAM records your decisio
 
 ## When you can decide
 
-You can approve or decline a check once it has results back from the provider — that is, when its status is **complete** (or while it is still **processing** or **submitted**, if you choose to act early). You cannot record a decision on a check that is pending fraud-screening, failed, cancelled, or expired; those have to resolve first.
+You can approve or decline a check once it has results back from the provider — that is, when its status is **complete** (or while it is still **processing** or **submitted**, if you choose to act early). You cannot record a decision on a check that is still pending, awaiting the applicant's consent step, failed, cancelled, expired, or already decided; those have to resolve first.
 
 ## Recording the decision
 

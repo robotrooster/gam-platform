@@ -259,8 +259,12 @@ function Layout(){
           {isSuperAdmin&&<div className="nl" style={{marginTop:8}}>Tools</div>}
           {isSuperAdmin&&<button className="ni" onClick={()=>{const t=localStorage.getItem('gam_admin_token');window.open(BOOKS_URL+(t?'?token='+t:''),'_blank')}}>📒 GAM Books</button>}
 
+          <div className="nl" style={{marginTop:8}}>Sales</div>
+          <NavLink to="/leads" className={({isActive})=>`ni${isActive?' active':''}`}>🎯 Leads</NavLink>
+
           <div className="nl" style={{marginTop:8}}>Platform</div>
           <NavLink to="/scaling" className={({isActive})=>`ni${isActive?' active':''}`}>📈 Scaling Readiness</NavLink>
+          <NavLink to="/agent-analytics" className={({isActive})=>`ni${isActive?' active':''}`}>🤖 Agent Analytics</NavLink>
 
           <div className="nl" style={{marginTop:8}}>Account</div>
           <NavLink to="/security" className={({isActive})=>`ni${isActive?' active':''}`}>🔐 Security</NavLink>
@@ -536,6 +540,269 @@ function ScalingReadiness(){
           <li><strong>When a tracker turns red ("Move"):</strong> migrate <strong>Postgres first</strong> to a managed host (Render / Neon) — that's the uptime + backup risk. The API can follow.</li>
           <li><strong>Hard rule:</strong> the day an unplanned outage would cost a real payment, payout, or dispute window — move the database, regardless of the numbers.</li>
         </ol>
+      </div>
+    </div>
+  )
+}
+
+// S553: the Specialist's weekly availability windows (business time,
+// America/Phoenix). Replace-all save — the server regenerates offered slots
+// from these on every request.
+const WEEKDAYS=['Sun','Mon','Tue','Wed','Thu','Fri','Sat']
+function AvailabilityEditor(){
+  const qc=useQueryClient()
+  const{data:windows=[],isLoading}=useQuery('call-availability',()=>get<any[]>('/admin/call-availability'))
+  const[draft,setDraft]=useState<any[]|null>(null)
+  const rows=draft??windows.map((w:any)=>({weekday:w.weekday,startTime:String(w.startTime).slice(0,5),endTime:String(w.endTime).slice(0,5)}))
+  const saveMut=useMutation((ws:any[])=>api.put('/admin/call-availability',{windows:ws}).then(r=>r.data),{
+    onSuccess:()=>{qc.invalidateQueries('call-availability');setDraft(null);toast('Availability saved')},
+    onError:()=>toast('Could not save availability — check the windows.'),
+  })
+  const upd=(i:number,k:string,v:any)=>{const n=[...rows];n[i]={...n[i],[k]:v};setDraft(n)}
+  if(isLoading)return<div style={{color:'var(--t3)',fontSize:'.75rem',marginBottom:10}}>Loading availability…</div>
+  return(
+    <div style={{background:'var(--s1)',borderRadius:8,padding:12,marginBottom:12}}>
+      <div style={{fontSize:'.72rem',color:'var(--t3)',marginBottom:8}}>Weekly call windows (Phoenix time). Slots are offered in 30-minute increments inside these windows for the next 14 days.</div>
+      {rows.map((w,i)=>(
+        <div key={i} style={{display:'flex',gap:8,alignItems:'center',marginBottom:6}}>
+          <select value={w.weekday} onChange={e=>upd(i,'weekday',Number(e.target.value))} style={{background:'var(--s2,var(--s1))',color:'var(--t0)',border:'1px solid var(--b1)',borderRadius:6,padding:'3px 6px',fontSize:'.75rem'}}>
+            {WEEKDAYS.map((d,di)=><option key={di} value={di}>{d}</option>)}
+          </select>
+          <input type="time" value={w.startTime} onChange={e=>upd(i,'startTime',e.target.value)} style={{background:'var(--s2,var(--s1))',color:'var(--t0)',border:'1px solid var(--b1)',borderRadius:6,padding:'3px 6px',fontSize:'.75rem'}}/>
+          <span style={{color:'var(--t3)'}}>–</span>
+          <input type="time" value={w.endTime} onChange={e=>upd(i,'endTime',e.target.value)} style={{background:'var(--s2,var(--s1))',color:'var(--t0)',border:'1px solid var(--b1)',borderRadius:6,padding:'3px 6px',fontSize:'.75rem'}}/>
+          <button className="btn bd bsm" onClick={()=>setDraft(rows.filter((_,x)=>x!==i))}>Remove</button>
+        </div>
+      ))}
+      <div style={{display:'flex',gap:8,marginTop:8}}>
+        <button className="btn bd bsm" onClick={()=>setDraft([...rows,{weekday:1,startTime:'09:00',endTime:'16:00'}])}>Add window</button>
+        <button className="btn bgold bsm" disabled={saveMut.isLoading||!draft} onClick={()=>saveMut.mutate(rows)}>Save</button>
+      </div>
+    </div>
+  )
+}
+
+// S553: the lead queue Portfolio Specialists work from — Lucy's captured
+// leads with status flow + the chat transcript that produced each one.
+const LEAD_STATUSES=['new','contacted','qualified','converted','closed'] as const
+const LEAD_STATUS_LABEL:Record<string,string>={new:'New',contacted:'Contacted',qualified:'Qualified',converted:'Converted',closed:'Closed'}
+const LEAD_STATUS_HEX:Record<string,string>={new:'#c9a227',contacted:'#3b82f6',qualified:'#a855f7',converted:'#22c55e',closed:'#6b7280'}
+function SalesLeads(){
+  const qc=useQueryClient()
+  const[statusFilter,setStatusFilter]=useState<string>('')
+  const[openId,setOpenId]=useState<string|null>(null)
+  const{data:leads=[],isLoading}=useQuery(['sales-leads',statusFilter],()=>get<any[]>(`/admin/leads${statusFilter?`?status=${statusFilter}`:''}`),{refetchInterval:60000,keepPreviousData:true})
+  const{data:transcript=[],isFetching:tLoading}=useQuery(['lead-transcript',openId],()=>get<any[]>(`/admin/leads/${openId}/transcript`),{enabled:!!openId})
+  const statusMut=useMutation(({id,status}:{id:string;status:string})=>api.patch(`/admin/leads/${id}/status`,{status}).then(r=>r.data),{
+    onSuccess:()=>{qc.invalidateQueries('sales-leads');toast('Lead updated')},
+    onError:()=>toast('Could not update the lead — try again.'),
+  })
+  const{data:calls=[]}=useQuery('sales-calls',()=>get<any[]>('/admin/call-slots'),{refetchInterval:60000})
+  const callMut=useMutation(({id,status}:{id:string;status:string})=>api.patch(`/admin/call-slots/${id}/status`,{status}).then(r=>r.data),{
+    onSuccess:()=>{qc.invalidateQueries('sales-calls');toast('Call updated')},
+  })
+  const[showAvail,setShowAvail]=useState(false)
+  if(isLoading&&leads.length===0)return<div style={{padding:32,color:'var(--t3)'}}>Loading leads…</div>
+  const CALL_HEX:Record<string,string>={booked:'#c9a227',completed:'#22c55e',cancelled:'#6b7280',no_show:'#ef4444'}
+  return(
+    <div>
+      <div className="ph">
+        <div><h1 className="pt">Sales Leads</h1><p className="ps">Captured by Lucy on the marketing site · work the queue, read the chat, make the call</p></div>
+        <div style={{display:'flex',gap:6}}>
+          <button className={`btn bsm${statusFilter===''?' bgold':' bd'}`} onClick={()=>setStatusFilter('')}>All</button>
+          {LEAD_STATUSES.map(st=>(
+            <button key={st} className={`btn bsm${statusFilter===st?' bgold':' bd'}`} onClick={()=>setStatusFilter(st)}>{LEAD_STATUS_LABEL[st]}</button>
+          ))}
+        </div>
+      </div>
+
+      <div className="card" style={{marginBottom:16}}>
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:10}}>
+          <div style={{fontWeight:700,color:'var(--t0)'}}>Upcoming calls <span style={{fontWeight:400,color:'var(--t3)',fontSize:'.72rem'}}>(video calls: email the meeting link before the call)</span></div>
+          <button className="btn bd bsm" onClick={()=>setShowAvail(s=>!s)}>{showAvail?'Hide availability':'Edit availability'}</button>
+        </div>
+        {showAvail&&<AvailabilityEditor/>}
+        <table className="tbl"><thead><tr><th>When</th><th>Prospect</th><th>Contact</th><th>Mode</th><th>Portfolio</th><th>Status</th><th></th></tr></thead>
+          <tbody>{calls.map((c:any)=>(
+            <tr key={c.id}>
+              <td style={{fontWeight:600}}>{new Date(c.startsAt).toLocaleString([],{weekday:'short',month:'short',day:'numeric',hour:'numeric',minute:'2-digit'})}</td>
+              <td>{c.prospectName||'—'}</td>
+              <td style={{fontSize:'.75rem'}}>{[c.prospectEmail,c.prospectPhone].filter(Boolean).join(' · ')||'—'}</td>
+              <td>{c.mode==='video'?'📹 Video':'📞 Phone'}</td>
+              <td style={{fontSize:'.72rem',color:'var(--t2)'}}>{[c.states,c.portfolioSize,c.propertyType].filter(Boolean).join(' · ')||'—'}</td>
+              <td><span className="badge" style={{background:(CALL_HEX[c.status]||'#6b7280')+'22',color:CALL_HEX[c.status]||'#6b7280'}}>{humanize(c.status)}</span></td>
+              <td>{c.status==='booked'&&<span style={{display:'flex',gap:4}}>
+                <button className="btn bd bsm" onClick={()=>callMut.mutate({id:c.id,status:'completed'})}>Done</button>
+                <button className="btn bd bsm" onClick={()=>callMut.mutate({id:c.id,status:'no_show'})}>No-show</button>
+                <button className="btn bd bsm" onClick={()=>{appConfirm('Cancel this call? The prospect is NOT notified automatically — reply to their confirmation email.',{confirmLabel:'Cancel call'}).then(ok=>{if(ok)callMut.mutate({id:c.id,status:'cancelled'})})}}>Cancel</button>
+              </span>}</td>
+            </tr>
+          ))}{calls.length===0&&<tr><td colSpan={7} style={{color:'var(--t3)'}}>No upcoming calls.</td></tr>}</tbody>
+        </table>
+      </div>
+
+      <div className="card">
+        <table className="tbl"><thead><tr><th>Lead</th><th>Contact</th><th>States</th><th>Portfolio</th><th>Looking for</th><th>Status</th><th>Captured</th><th></th></tr></thead>
+          <tbody>{leads.map(l=>(
+            <React.Fragment key={l.id}>
+              <tr>
+                <td style={{fontWeight:600}}>{l.name||<span style={{color:'var(--t3)'}}>—</span>}</td>
+                <td style={{fontSize:'.75rem'}}>{[l.email,l.phone].filter(Boolean).join(' · ')||'—'}</td>
+                <td>{l.states||'—'}</td>
+                <td style={{fontSize:'.75rem'}}>{[l.portfolioSize,l.propertyType].filter(Boolean).join(' · ')||'—'}</td>
+                <td style={{fontSize:'.72rem',color:'var(--t2)',maxWidth:220,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}} title={l.notes||''}>{l.notes||'—'}</td>
+                <td>
+                  <select value={l.status} onChange={e=>statusMut.mutate({id:l.id,status:e.target.value})}
+                    style={{background:'var(--s1)',color:LEAD_STATUS_HEX[l.status]||'var(--t0)',border:'1px solid var(--b1)',borderRadius:6,padding:'3px 6px',fontSize:'.72rem',fontWeight:600}}>
+                    {LEAD_STATUSES.map(st=><option key={st} value={st}>{LEAD_STATUS_LABEL[st]}</option>)}
+                  </select>
+                </td>
+                <td style={{color:'var(--t3)',fontSize:'.72rem'}}>{l.createdAt?new Date(l.createdAt).toLocaleString():'—'}</td>
+                <td><button className="btn bd bsm" onClick={()=>setOpenId(openId===l.id?null:l.id)}>{openId===l.id?'Hide chat':'Read chat'}</button></td>
+              </tr>
+              {openId===l.id&&(
+                <tr><td colSpan={8} style={{background:'var(--s1)',padding:'12px 16px'}}>
+                  {tLoading?<div style={{color:'var(--t3)',fontSize:'.75rem'}}>Loading transcript…</div>
+                  :transcript.length===0?<div style={{color:'var(--t3)',fontSize:'.75rem'}}>No transcript recorded for this lead.</div>
+                  :<div style={{display:'flex',flexDirection:'column',gap:8,maxHeight:320,overflowY:'auto'}}>
+                    {transcript.map((t:any)=>(
+                      <div key={t.turnIndex}>
+                        <div style={{fontSize:'.75rem',color:'var(--t1)',marginBottom:2}}><strong style={{color:'var(--t0)'}}>Prospect:</strong> {t.userMessage}</div>
+                        <div style={{fontSize:'.75rem',color:'var(--t2)'}}><strong style={{color:'var(--gold)'}}>{t.agentName||'Lucy'}:</strong> {t.agentReply}</div>
+                      </div>
+                    ))}
+                  </div>}
+                </td></tr>
+              )}
+            </React.Fragment>
+          ))}{leads.length===0&&<tr><td colSpan={8} style={{color:'var(--t3)'}}>No leads{statusFilter?` with status ${LEAD_STATUS_LABEL[statusFilter]}`:''} yet.</td></tr>}</tbody>
+        </table>
+      </div>
+    </div>
+  )
+}
+
+// S553: usage / quality / capacity dashboard over agent_interaction_logs.
+// Shed turns (the concurrency gate rejecting under overload) are the
+// "buy bigger hardware" alarm — anything > 0 goes red.
+function AgentAnalytics(){
+  const[days,setDays]=useState(30)
+  const{data,isLoading}=useQuery(['agent-analytics',days],()=>get<any>(`/admin/agent-analytics?days=${days}`),{refetchInterval:60000,keepPreviousData:true})
+  if(isLoading&&!data)return<div style={{padding:32,color:'var(--t3)'}}>Loading agent analytics…</div>
+  const s=data?.summary||{}
+  const daily:any[]=data?.daily||[]
+  const hourly:any[]=data?.hourly||[]
+  const byAudience:any[]=data?.byAudience||[]
+  const byAgent:any[]=data?.byAgent||[]
+  const topTools:any[]=data?.topTools||[]
+  const heaviestUsers:any[]=data?.heaviestUsers||[]
+  const shed=Number(s.shed||0)
+  const escRate=s.turns>0?Math.round((s.humanEscalations/s.turns)*100):0
+  const tokens=Number(s.promptTokens||0)+Number(s.completionTokens||0)
+  const fmtK=(n:number)=>n>=1_000_000?(n/1_000_000).toFixed(1)+'M':n>=1000?(n/1000).toFixed(1)+'k':String(n)
+  const maxHour=Math.max(1,...hourly.map(h=>h.turns))
+  const hourMap=new Map(hourly.map(h=>[h.hour,h.turns]))
+  return(
+    <div>
+      <div className="ph">
+        <div><h1 className="pt">Agent Analytics</h1><p className="ps">In-house AI agent usage, quality, and capacity · auto-refreshes every 60s</p></div>
+        <div style={{display:'flex',gap:6}}>
+          {[7,30,90].map(d=>(
+            <button key={d} className={`btn bsm${days===d?' bgold':' bd'}`} onClick={()=>setDays(d)}>{d}d</button>
+          ))}
+        </div>
+      </div>
+
+      {shed>0&&(
+        <div className="card" style={{borderColor:'#ef4444',marginBottom:16,display:'flex',gap:14,alignItems:'center'}}>
+          <div style={{width:12,height:12,borderRadius:'50%',background:'#ef4444',boxShadow:'0 0 12px #ef4444',flexShrink:0}}/>
+          <div>
+            <div style={{fontWeight:700,color:'#ef4444',fontSize:'.95rem'}}>{shed} turn{shed===1?'':'s'} shed under overload in the last {days} days</div>
+            <div style={{fontSize:'.78rem',color:'var(--t2)',marginTop:2}}>The concurrency gate rejected real customer turns — the model fleet is too small for demand. Time to buy bigger hardware (or raise AGENT_MAX_CONCURRENCY if the fleet has headroom).</div>
+          </div>
+        </div>
+      )}
+
+      <div className="grid3" style={{marginBottom:16}}>
+        <div className="kpi"><div className="kl">Turns</div><div className="kv">{fmtK(Number(s.turns||0))}</div><div style={{fontSize:'.68rem',color:'var(--t3)'}}>{fmtK(Number(s.conversations||0))} conversations · {fmtK(Number(s.uniqueUsers||0))} users</div></div>
+        <div className="kpi"><div className="kl">Latency</div><div className="kv">{s.avgLatencyMs!=null?`${(s.avgLatencyMs/1000).toFixed(1)}s`:'—'}</div><div style={{fontSize:'.68rem',color:'var(--t3)'}}>p95 {s.p95LatencyMs!=null?`${(s.p95LatencyMs/1000).toFixed(1)}s`:'—'}</div></div>
+        <div className="kpi"><div className="kl">Tokens</div><div className="kv">{fmtK(tokens)}</div><div style={{fontSize:'.68rem',color:'var(--t3)'}}>{fmtK(Number(s.promptTokens||0))} prompt · {fmtK(Number(s.completionTokens||0))} completion</div></div>
+        <div className="kpi"><div className="kl">Human escalations</div><div className="kv">{Number(s.humanEscalations||0)}</div><div style={{fontSize:'.68rem',color:'var(--t3)'}}>{escRate}% of turns</div></div>
+        <div className="kpi"><div className="kl">Tool turns</div><div className="kv">{Number(s.toolTurns||0)}</div><div style={{fontSize:'.68rem',color:'var(--t3)'}}>turns where the agent used account data or took an action</div></div>
+        <div className="kpi"><div className="kl">Errors · Shed</div><div className="kv" style={{color:(Number(s.errors||0)+shed)>0?'#ef4444':undefined}}>{Number(s.errors||0)} · {shed}</div><div style={{fontSize:'.68rem',color:'var(--t3)'}}>errored turns · capacity-shed turns</div></div>
+      </div>
+
+      <div className="card" style={{marginBottom:16}}>
+        <div style={{fontWeight:700,color:'var(--t0)',marginBottom:10}}>Daily turns</div>
+        <div style={{height:180}}>
+          <ResponsiveContainer width="100%" height="100%">
+            <AreaChart data={daily} margin={{top:0,right:0,left:-20,bottom:0}}>
+              <XAxis dataKey="day" tick={{fontSize:10,fill:'var(--t3)'}} tickLine={false} axisLine={false}/>
+              <YAxis tick={{fontSize:10,fill:'var(--t3)'}} tickLine={false} axisLine={false} allowDecimals={false}/>
+              <Tooltip contentStyle={{background:'var(--s1)',border:'1px solid var(--b1)',borderRadius:8,fontSize:'.75rem'}}/>
+              <Area type="monotone" dataKey="turns" stroke="var(--gold)" fill="var(--gold)" fillOpacity={0.15} strokeWidth={2}/>
+              <Area type="monotone" dataKey="escalations" stroke="#ef4444" fill="#ef4444" fillOpacity={0.1} strokeWidth={1.5}/>
+            </AreaChart>
+          </ResponsiveContainer>
+        </div>
+        <div style={{fontSize:'.68rem',color:'var(--t3)',marginTop:4}}>Gold = turns · red = human escalations</div>
+      </div>
+
+      <div className="card" style={{marginBottom:16}}>
+        <div style={{fontWeight:700,color:'var(--t0)',marginBottom:10}}>Turns by hour of day <span style={{fontWeight:400,color:'var(--t3)',fontSize:'.72rem'}}>(peak-load shape — size the fleet for the tallest bars)</span></div>
+        <div style={{display:'flex',alignItems:'flex-end',gap:3,height:90}}>
+          {Array.from({length:24},(_,h)=>{
+            const n=Number(hourMap.get(h)||0)
+            return(
+              <div key={h} style={{flex:1,display:'flex',flexDirection:'column',alignItems:'center',gap:3}} title={`${h}:00 — ${n} turn${n===1?'':'s'}`}>
+                <div style={{width:'100%',borderRadius:2,background:n>0?'var(--gold)':'var(--b1)',opacity:n>0?0.35+0.65*(n/maxHour):1,height:`${Math.max(3,(n/maxHour)*70)}px`}}/>
+                {h%4===0&&<div style={{fontSize:'.58rem',color:'var(--t3)'}}>{h}</div>}
+              </div>
+            )
+          })}
+        </div>
+      </div>
+
+      <div className="grid2" style={{marginBottom:16}}>
+        <div className="card">
+          <div style={{fontWeight:700,color:'var(--t0)',marginBottom:10}}>By audience</div>
+          <table className="tbl"><thead><tr><th>Audience</th><th>Turns</th><th>Escalations</th><th>Avg latency</th></tr></thead>
+            <tbody>{byAudience.map(a=>(
+              <tr key={a.audience}><td style={{textTransform:'capitalize'}}>{a.audience}</td><td>{a.turns}</td><td>{a.escalations}</td><td>{a.avgLatencyMs!=null?`${(a.avgLatencyMs/1000).toFixed(1)}s`:'—'}</td></tr>
+            ))}{byAudience.length===0&&<tr><td colSpan={4} style={{color:'var(--t3)'}}>No agent traffic in this window.</td></tr>}</tbody>
+          </table>
+        </div>
+        <div className="card">
+          <div style={{fontWeight:700,color:'var(--t0)',marginBottom:10}}>Top tools</div>
+          <table className="tbl"><thead><tr><th>Tool</th><th>Calls</th></tr></thead>
+            <tbody>{topTools.map(t=>(
+              <tr key={t.name}><td style={{fontFamily:'var(--mono, monospace)',fontSize:'.72rem'}}>{t.name}</td><td>{t.calls}</td></tr>
+            ))}{topTools.length===0&&<tr><td colSpan={2} style={{color:'var(--t3)'}}>No tool calls in this window.</td></tr>}</tbody>
+          </table>
+        </div>
+      </div>
+
+      <div className="card" style={{marginBottom:16}}>
+        <div style={{fontWeight:700,color:'var(--t0)',marginBottom:10}}>By agent</div>
+        <table className="tbl"><thead><tr><th>Agent</th><th>Profile</th><th>Turns</th><th>Tool turns</th><th>Human escalations</th></tr></thead>
+          <tbody>{byAgent.map(a=>(
+            <tr key={a.profileId}><td>{a.agentName}</td><td style={{color:'var(--t3)',fontSize:'.72rem'}}>{a.profileId}</td><td>{a.turns}</td><td>{a.toolTurns}</td><td>{a.escalations}</td></tr>
+          ))}{byAgent.length===0&&<tr><td colSpan={5} style={{color:'var(--t3)'}}>No agent traffic in this window.</td></tr>}</tbody>
+        </table>
+      </div>
+
+      <div className="card">
+        <div style={{fontWeight:700,color:'var(--t0)',marginBottom:10}}>Heaviest users <span style={{fontWeight:400,color:'var(--t3)',fontSize:'.72rem'}}>(unproductive = off-topic turns that count toward the daily budget; capped = turns refused by it)</span></div>
+        <table className="tbl"><thead><tr><th>User</th><th>Role</th><th>Turns</th><th>Unproductive</th><th>Capped</th><th>Last seen</th></tr></thead>
+          <tbody>{heaviestUsers.map(h=>(
+            <tr key={h.actorUserId}>
+              <td>{h.email}</td><td style={{textTransform:'capitalize'}}>{h.role}</td><td>{h.turns}</td>
+              <td style={{color:Number(h.unproductive)>0?'#f59e0b':undefined}}>{h.unproductive}</td>
+              <td style={{color:Number(h.cappedTurns)>0?'#ef4444':undefined}}>{h.cappedTurns}</td>
+              <td style={{color:'var(--t3)',fontSize:'.72rem'}}>{h.lastSeen?new Date(h.lastSeen).toLocaleString():'—'}</td>
+            </tr>
+          ))}{heaviestUsers.length===0&&<tr><td colSpan={6} style={{color:'var(--t3)'}}>No agent traffic in this window.</td></tr>}</tbody>
+        </table>
       </div>
     </div>
   )
@@ -2545,6 +2812,8 @@ function App(){
           <Route path="audit-log"     element={<SuperAdminGuard><AuditLog/></SuperAdminGuard>}/>
           <Route path="csv-imports"   element={<CsvImports/>}/>
           <Route path="scaling"       element={<ScalingReadiness/>}/>
+          <Route path="agent-analytics" element={<AgentAnalytics/>}/>
+          <Route path="leads"         element={<SalesLeads/>}/>
           <Route path="security"      element={<SecurityPage/>}/>
         </Route>
       </Routes>

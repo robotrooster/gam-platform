@@ -35,7 +35,7 @@ import {
   seedProperty, seedUnit,
   seedLease, seedLeaseTenant, seedLeaseFee,
   seedSecurityDeposit, seedDepositReturnDraft,
-  seedRentPayment,
+  seedRentPayment, seedUtilityMeter, seedUtilityBill,
 } from '../test/dbHelpers'
 
 // Pool lifecycle: don't end the singleton in afterAll. Multiple test
@@ -160,6 +160,38 @@ describe('calculateDepositReturn', () => {
     expect(calc!.refund_amount).toBe(512.34)
   })
 
+  it('S548 final utilities: uninvoiced meter-read bills deduct from the deposit', async () => {
+    const stack = await buildLeaseStack({ depositTotal: 150 })
+    const client = await getClient()
+    try {
+      const meterId = await seedUtilityMeter(client, { propertyId: stack.propertyId, utilityType: 'electric' })
+      // Final read billed 87.50, never attached to an invoice (guest left).
+      await seedUtilityBill(client, {
+        meterId, unitId: stack.unitId, tenantId: stack.tenantId,
+        leaseId: stack.leaseId, landlordId: stack.landlordId,
+        chargeAmount: 87.50, status: 'billed', utilityType: 'electric',
+      })
+    } finally { client.release() }
+    const calc = await calculateDepositReturn(stack.leaseId)
+    expect(calc!.final_utility_total).toBe(87.50)
+    expect(calc!.total_deductions).toBe(87.50)
+    // $150 monthly-stay deposit − final electric = $62.50 back to the guest.
+    expect(calc!.refund_amount).toBe(62.50)
+  })
+
+  it('S548 prepaid credit: unconsumed lease_prepaid_credits join the pool', async () => {
+    const stack = await buildLeaseStack({ depositTotal: 500 })
+    // Long-stay guest overpaid by 348.33 (schedule sync banked it) and the
+    // final invoices only netted part — 100 remains at lease end.
+    await db.query(
+      `INSERT INTO lease_prepaid_credits (lease_id, tenant_id, amount_original, amount_remaining)
+       VALUES ($1, $2, 348.33, 100)`, [stack.leaseId, stack.tenantId])
+    const calc = await calculateDepositReturn(stack.leaseId)
+    expect(calc!.prepaid_credit_remaining).toBe(100)
+    // pool = 500 + 100 → refund 600 with no deductions
+    expect(calc!.refund_amount).toBe(600)
+  })
+
   it('S180 auto-sweep: unpaid rent payment rolls into total_deductions', async () => {
     const stack = await buildLeaseStack({ depositTotal: 500 })
     const client = await getClient()
@@ -201,6 +233,35 @@ describe('calculateDepositReturn', () => {
 })
 
 describe('finalizeDepositReturn — workflow', () => {
+  it('S548 end-of-stay: finalize settles final utility bills from the deposit', async () => {
+    const stack = await buildLeaseStack({ depositTotal: 150 })
+    let billId: string
+    const client = await getClient()
+    try {
+      const meterId = await seedUtilityMeter(client, { propertyId: stack.propertyId, utilityType: 'electric' })
+      billId = await seedUtilityBill(client, {
+        meterId, unitId: stack.unitId, tenantId: stack.tenantId,
+        leaseId: stack.leaseId, landlordId: stack.landlordId,
+        chargeAmount: 87.50, status: 'billed', utilityType: 'electric',
+      })
+    } finally { client.release() }
+    const draftId = await makeDraft(stack, { totalDeposit: 150 })
+
+    const final = await finalizeDepositReturn(draftId, stack.ownerUserId)
+    // Live math: 150 pool − 87.50 final electric = 62.50 refund.
+    expect(final.status).toBe('sent_refund')
+    expect(Number(final.refund_amount)).toBe(62.50)
+
+    const bill = await db.query<any>(
+      `SELECT status, payment_id FROM utility_bills WHERE id=$1`, [billId!])
+    expect(bill.rows[0].status).toBe('paid')
+    expect(bill.rows[0].payment_id).not.toBeNull()
+    const pay = await db.query<any>(
+      `SELECT type, status, amount::numeric AS a FROM payments WHERE id=$1`, [bill.rows[0].payment_id])
+    expect(pay.rows[0]).toMatchObject({ type: 'utility', status: 'paid_via_deposit' })
+    expect(Number(pay.rows[0].a)).toBe(87.50)
+  })
+
   it('partial refund branch: status → sent_refund, negative-amount DEPOSIT payment row, admin notification fired for landlord with no Connect', async () => {
     // Deposit collected 500, cleaning 100 → refund 400 to tenant.
     // Landlord disbursement = collected (500) - refund (400) = 100.
@@ -405,5 +466,39 @@ describe('finalizeDepositReturn — workflow', () => {
         WHERE category='deposit_disbursement_pending_no_connect'`
     )
     expect(notifs.rows).toHaveLength(0)
+  })
+})
+
+// ─── S550: conditional fees never auto-sweep until assessed FAILED ──
+
+describe('S550 — conditional lease fees in the sweep', () => {
+  async function addConditionalFee(leaseId: string, amount: number, result: string | null) {
+    const r = await db.query<{ id: string }>(
+      `INSERT INTO lease_fees
+         (lease_id, fee_type, amount, due_timing, is_refundable, description, condition_text, condition_result)
+       VALUES ($1, 'other_fee', $2, 'move_out', FALSE, 'Carpet cleaning',
+               'Carpets professionally cleaned within 3 days of move-out, else this charge applies.', $3)
+       RETURNING id`,
+      [leaseId, amount, result],
+    )
+    return r.rows[0].id
+  }
+
+  it('unassessed conditional fee does NOT sum into the deduction', async () => {
+    const stack = await buildLeaseStack({ depositTotal: 500 })
+    await addConditionalFee(stack.leaseId, 150, null)
+    const calc = await calculateDepositReturn(stack.leaseId)
+    expect(calc!.cleaning_fee_amount).toBe(0)
+  })
+
+  it('condition met = no charge; condition FAILED = the fee sweeps', async () => {
+    const stack = await buildLeaseStack({ depositTotal: 500, cleaningFeeAmount: 100 })
+    await addConditionalFee(stack.leaseId, 150, 'met')
+    let calc = await calculateDepositReturn(stack.leaseId)
+    expect(calc!.cleaning_fee_amount).toBe(100) // unconditional fee only
+
+    await addConditionalFee(stack.leaseId, 75, 'failed')
+    calc = await calculateDepositReturn(stack.leaseId)
+    expect(calc!.cleaning_fee_amount).toBe(175) // + only the FAILED one
   })
 })

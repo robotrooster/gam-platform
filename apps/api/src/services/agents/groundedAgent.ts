@@ -50,10 +50,26 @@ export function buildContextBlock(chunks: RetrievedChunk[]): string {
   const facts = chunks
     .map((c, i) => `[${i + 1}]${c.title ? ` (${c.title})` : ''} ${c.content}`)
     .join('\n')
+  // S552: the old wording ("answer using ONLY the facts below") overrode the
+  // tool-use and escalation rules whenever ANY article was retrieved — the
+  // model would answer "when does my lease end?" from the generic lease
+  // explainer instead of calling get_my_lease, and would explain deposits
+  // instead of escalating a refund demand. The framing below subordinates
+  // the articles to tools (for account data) and hard-stops (always).
   return (
-    'GAM KNOWLEDGE — answer using ONLY the facts below. Treat them as the ' +
-    'source of truth. If they do not cover what the user needs, do not ' +
-    'guess — say you will check, and escalate per your rules.\n\n' +
+    'GAM KNOWLEDGE — general product documentation retrieved for this ' +
+    'question. Use it for how things work on GAM, and do not invent product ' +
+    'facts beyond it. It is NOT this customer’s account data: for anything ' +
+    'about THEIR OWN account — their lease, balance, deposit, payments, ' +
+    'maintenance requests, payouts — CALL the matching tool for their real ' +
+    'answer instead of answering from these general articles (e.g. "when ' +
+    'does my lease end?" → get_my_lease, even though lease documentation ' +
+    'appears below). Your hard-stop ' +
+    'rules OVERRIDE this context: a refund or money-movement request, an ' +
+    'access/security change, or a legal dispute still requires calling your ' +
+    'escalation tool immediately, even if these articles discuss the topic. ' +
+    'If neither the articles nor a tool covers what the user needs, do not ' +
+    'guess — escalate per your rules.\n\n' +
     facts
   )
 }

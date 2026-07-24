@@ -21,6 +21,10 @@ export interface InsertInspectionParams {
   /** unit facts that size the checklist (from the same unit lookup the caller did for auth) */
   unitType: string | null
   bedrooms: number | null
+  /** units.bathrooms — one checklist area per real bathroom (S550) */
+  bathrooms?: number | null
+  /** units.dwelling_ownership — drives site-only vs interior checklists (S550) */
+  dwellingOwnership?: string | null
   leaseId?: string | null
   tenantId?: string | null
   inspectionType: string
@@ -56,7 +60,12 @@ export async function insertInspectionWithChecklist(
   // walkthrough and per-area photo progress have real rows to attach to.
   // Sized to the unit. ON CONFLICT keeps this idempotent against the
   // (inspection_id, area, item_label) unique key.
-  const checklist = buildInspectionChecklist({ unitType: p.unitType, bedrooms: p.bedrooms })
+  const checklist = buildInspectionChecklist({
+    unitType: p.unitType,
+    bedrooms: p.bedrooms,
+    bathrooms: p.bathrooms ?? null,
+    dwellingOwnership: p.dwellingOwnership ?? null,
+  })
   const seedRows: string[] = []
   const seedParams: any[] = [inserted.id]
   for (const areaDef of checklist) {
@@ -74,5 +83,31 @@ export async function insertInspectionWithChecklist(
       seedParams,
     )
   }
-  return { id: inserted.id, seededItems: seedRows.length }
+
+  // S550: a move-out inspection also ASSESSES the lease's conditional fees
+  // ("professional carpet cleaning within N days, else $150"). One checklist
+  // item per unassessed conditional fee, linked via lease_fee_id, under the
+  // 'Lease conditions' area. At finalize: good/fair -> condition met (no
+  // charge); damaged/missing -> failed (the fee joins the deposit sweep).
+  let conditionItems = 0
+  if (p.inspectionType === 'move_out' && p.leaseId) {
+    const fees = (await client.query(
+      `SELECT id, amount::text AS amount, description, condition_text
+         FROM lease_fees
+        WHERE lease_id = $1 AND condition_text IS NOT NULL AND condition_result IS NULL`,
+      [p.leaseId],
+    )).rows as Array<{ id: string; amount: string; description: string | null; condition_text: string }>
+    for (const fee of fees) {
+      const label = `${fee.description || 'Lease condition'} — $${Number(fee.amount).toFixed(2)} if not met`
+      await client.query(
+        `INSERT INTO unit_inspection_items
+           (inspection_id, area, item_label, condition, notes, lease_fee_id)
+         VALUES ($1, 'Lease conditions', $2, 'na', $3, $4)
+         ON CONFLICT (inspection_id, area, item_label) DO NOTHING`,
+        [inserted.id, label.slice(0, 200), fee.condition_text.slice(0, 500), fee.id],
+      )
+      conditionItems++
+    }
+  }
+  return { id: inserted.id, seededItems: seedRows.length + conditionItems }
 }

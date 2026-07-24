@@ -7,20 +7,15 @@
 // feed for an at-a-glance banner.
 import { Router } from 'express'
 import { z } from 'zod'
-import {
-  SERVICE_INTERRUPTION_TYPES, SERVICE_INTERRUPTION_TYPE_LABELS,
-  type ServiceInterruptionType,
-} from '@gam/shared'
+import { SERVICE_INTERRUPTION_TYPES } from '@gam/shared'
 import { query, queryOne } from '../db'
 import { requireAuth } from '../middleware/auth'
 import { canAccessLandlordResource, canManageLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
-import { notifyServiceInterruption, notifyServiceRestored } from '../services/notifications'
+import { createServiceInterruption, resolveServiceInterruption } from '../services/serviceInterruptions'
 
 export const serviceInterruptionsRouter = Router()
 serviceInterruptionsRouter.use(requireAuth)
-
-const label = (t: string) => SERVICE_INTERRUPTION_TYPE_LABELS[t as ServiceInterruptionType] ?? t
 
 const createSchema = z.object({
   propertyId: z.string().uuid(),
@@ -51,25 +46,13 @@ serviceInterruptionsRouter.post('/', async (req, res, next) => {
       if ((ok?.n ?? 0) !== unitIds.length) throw new AppError(400, 'Some units are not in this property')
     }
 
-    const startsAt = b.startsAt ?? new Date().toISOString()
-    if (b.expectedRestoreAt && new Date(b.expectedRestoreAt) < new Date(startsAt))
-      throw new AppError(400, 'Expected-restore time cannot be before the start')
-    const status = new Date(startsAt) <= new Date() ? 'active' : 'scheduled'
-
-    const row = await queryOne<any>(
-      `INSERT INTO service_interruptions
-         (property_id, landlord_id, unit_ids, utility_type, title, message,
-          is_emergency, starts_at, expected_restore_at, status, created_by_user_id, residents_notified_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11, now()) RETURNING *`,
-      [b.propertyId, prop.landlord_id, unitIds, b.utilityType, b.title ?? null, b.message ?? null,
-       b.isEmergency ?? false, startsAt, b.expectedRestoreAt ?? null, status, u.userId])
-
-    const notified = await notifyServiceInterruption({
+    const { row, residentsNotified } = await createServiceInterruption({
       propertyId: b.propertyId, landlordId: prop.landlord_id, unitIds,
-      utilityLabel: label(b.utilityType), title: b.title ?? null, message: b.message ?? null,
-      isEmergency: b.isEmergency ?? false, startsAt, expectedRestoreAt: b.expectedRestoreAt ?? null,
+      utilityType: b.utilityType, title: b.title ?? null, message: b.message ?? null,
+      isEmergency: b.isEmergency ?? false, startsAt: b.startsAt ?? null,
+      expectedRestoreAt: b.expectedRestoreAt ?? null, createdByUserId: u.userId,
     })
-    res.status(201).json({ success: true, data: { ...row, notified } })
+    res.status(201).json({ success: true, data: { ...row, notified: residentsNotified } })
   } catch (e) { next(e) }
 })
 
@@ -96,21 +79,7 @@ serviceInterruptionsRouter.post('/:id/resolve', async (req, res, next) => {
     const si = await queryOne<any>(`SELECT * FROM service_interruptions WHERE id = $1`, [req.params.id])
     if (!si) throw new AppError(404, 'Notice not found')
     if (!canManageLandlordResource(u, si.landlord_id)) throw new AppError(403, 'Forbidden')
-    if (si.status === 'resolved' || si.status === 'cancelled')
-      throw new AppError(400, `Notice is already ${si.status}`)
-
-    let restoreNotified: string | null = si.restore_notified_at
-    if (b.sendAllClear) {
-      await notifyServiceRestored({
-        propertyId: si.property_id, landlordId: si.landlord_id,
-        unitIds: si.unit_ids ?? [], utilityLabel: label(si.utility_type),
-      })
-      restoreNotified = new Date().toISOString()
-    }
-    const row = await queryOne(
-      `UPDATE service_interruptions
-          SET status='resolved', resolved_at=now(), restore_notified_at=$2, updated_at=now()
-        WHERE id=$1 RETURNING *`, [si.id, restoreNotified])
+    const row = await resolveServiceInterruption(si, b.sendAllClear ?? false)
     res.json({ success: true, data: row })
   } catch (e) { next(e) }
 })

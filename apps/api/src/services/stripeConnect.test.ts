@@ -272,29 +272,29 @@ describe('computeApplicationFee — ACH', () => {
   })
 })
 
-describe('computeApplicationFee — card', () => {
-  it('US card 3.25% ($100 → $3.25)', () => {
+describe('computeApplicationFee — card (S552: 3.25% + $0.26/txn)', () => {
+  it('US card 3.25% + 26¢ ($100 → $3.51)', () => {
     expect(computeApplicationFee({
       amount: 100, paymentMethod: 'card', cardCountry: 'US',
-    })).toBe(3.25)
+    })).toBe(3.51)
   })
 
-  it('card with null country defaults to base 3.25%', () => {
+  it('card with null country defaults to base 3.25% + 26¢', () => {
     expect(computeApplicationFee({
       amount: 100, paymentMethod: 'card', cardCountry: null,
-    })).toBe(3.25)
+    })).toBe(3.51)
   })
 
-  it('non-US card adds 1.5% surcharge (CA $100 → $4.75)', () => {
+  it('non-US card adds 1.5% surcharge (CA $100 → $5.01)', () => {
     expect(computeApplicationFee({
       amount: 100, paymentMethod: 'card', cardCountry: 'CA',
-    })).toBe(4.75)
+    })).toBe(5.01)
   })
 
-  it('card amount rounded to cents (3.25% of $33.33 → $1.08, not $1.083225)', () => {
+  it('card amount rounded to cents (3.25% of $33.33 + 26¢ → $1.34)', () => {
     expect(computeApplicationFee({
       amount: 33.33, paymentMethod: 'card', cardCountry: 'US',
-    })).toBe(1.08)
+    })).toBe(1.34)
   })
 })
 

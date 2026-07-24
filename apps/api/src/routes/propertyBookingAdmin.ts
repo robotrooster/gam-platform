@@ -24,6 +24,33 @@ export const propertyBookingAdminRouter = Router()
 // the public, unauthenticated /api/sales and /api/guest agent endpoints
 // mounted after it. Per-route auth lets non-matching paths pass through.
 
+// S550 (Nic): suggested public web address — property names repeat in the
+// wild ("Oak Park" travels), so the DEFAULT slug is name + CITY
+// ("oak-park-yarnell"). Two same-named parks in the same city is where the
+// street NUMBER steps in ("oak-park-22658" — no two properties on one
+// street share a number). Last-resort: name-city-number. Landlord can still
+// type anything unique; this only prefills the blank field.
+function slugify(v: string): string {
+  return String(v || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').replace(/--+/g, '-')
+}
+export async function suggestBookingSlug(prop: { id: string; name: string; city: string | null; street1: string | null }): Promise<string | null> {
+  const name = slugify(prop.name)
+  if (!name) return null
+  const streetNum = String(prop.street1 ?? '').match(/\d{1,6}/)?.[0] ?? null
+  const candidates = [
+    slugify(`${prop.name} ${prop.city ?? ''}`),
+    streetNum ? slugify(`${prop.name} ${streetNum}`) : null,
+    streetNum ? slugify(`${prop.name} ${prop.city ?? ''} ${streetNum}`) : null,
+    name,
+  ].filter((c): c is string => !!c)
+  for (const c of candidates) {
+    const taken = await queryOne<{ id: string }>(
+      `SELECT id FROM properties WHERE booking_slug = $1 AND id <> $2 LIMIT 1`, [c, prop.id])
+    if (!taken) return c
+  }
+  return null
+}
+
 async function getOwnedProperty(propertyId: string, user: any) {
   const prop = await queryOne<any>('SELECT * FROM properties WHERE id=$1', [propertyId])
   if (!prop) throw new AppError(404, 'Property not found')
@@ -42,6 +69,7 @@ propertyBookingAdminRouter.get('/properties/:id/booking-config', requireAuth, as
       data: {
         enabled: prop.public_booking_enabled,
         slug: prop.booking_slug,
+        suggestedSlug: prop.booking_slug ?? await suggestBookingSlug(prop),
         intro: prop.booking_intro,
         depositPct: Number(prop.booking_deposit_pct),
         monthlyDeposit: prop.booking_monthly_deposit != null ? Number(prop.booking_monthly_deposit) : null,

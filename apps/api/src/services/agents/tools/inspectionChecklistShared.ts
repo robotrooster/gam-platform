@@ -17,7 +17,9 @@ export interface InspectionUnitRow {
   status: string
   unit_number: string | null
   bedrooms: number | null
+  bathrooms?: number | null
   unit_type: string | null
+  dwelling_ownership?: string | null
   guided_walkthrough_declined?: boolean
 }
 
@@ -30,7 +32,12 @@ export interface ChecklistProgress {
 }
 
 export async function checklistProgress(insp: InspectionUnitRow): Promise<ChecklistProgress> {
-  const checklist = buildInspectionChecklist({ unitType: insp.unit_type, bedrooms: insp.bedrooms })
+  const checklist = buildInspectionChecklist({
+    unitType: insp.unit_type,
+    bedrooms: insp.bedrooms,
+    bathrooms: insp.bathrooms ?? null,
+    dwellingOwnership: insp.dwelling_ownership ?? null,
+  })
   // Areas that already have at least one photo. Case-insensitive so an ad-hoc
   // "kitchen" item still counts toward the standard "Kitchen" area.
   const photographedRows = await query<{ area: string }>(

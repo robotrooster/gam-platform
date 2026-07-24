@@ -3,7 +3,11 @@ import { apiGet, apiPost } from '../lib/api'
 import { Plus, X, Send, MessageSquare, Clock, Check, AlertTriangle } from 'lucide-react'
 
 const PRI_COLORS: Record<string,string> = { emergency:'#ff4757', high:'#ffb820', normal:'#4a9eff', low:'#7a8aaa' }
-const ST_LABELS: Record<string,string>  = { open:'Open', assigned:'Assigned', in_progress:'In Progress', completed:'Completed', cancelled:'Cancelled' }
+// S552: awaiting_approval added — the status IS returned to tenants (only its
+// notification is suppressed), and the `|| req.status` fallback below was
+// rendering the raw enum (S538 violation). Tenant-friendly framing: the
+// landlord is approving the budget before work proceeds.
+const ST_LABELS: Record<string,string>  = { open:'Open', assigned:'Assigned', awaiting_approval:'Pending Approval', in_progress:'In Progress', completed:'Completed', cancelled:'Cancelled' }
 
 export function MaintenancePage() {
   const [requests, setRequests] = useState<any[]>([])

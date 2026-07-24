@@ -9,8 +9,9 @@ import { latencyP95, sampleSize } from '../lib/apiMetrics'
 import { AppError } from '../middleware/errorHandler'
 import { logAdminAction } from '../lib/adminAudit'
 import { backfillInvoices } from '../jobs/invoiceGeneration'
-import { PropertyReviewStatus, PLATFORM_FEES, LAUNCH_PLATFORM_FEE } from '@gam/shared'
+import { PropertyReviewStatus, PLATFORM_FEES, LAUNCH_PLATFORM_FEE, SALES_LEAD_STATUSES } from '@gam/shared'
 import { fetchAccountStatus } from '../services/stripeConnect'
+import { unproductiveTurnSql } from '../services/agents/turnBudget'
 
 export const adminRouter = Router()
 adminRouter.use(requireAuth)
@@ -1992,3 +1993,196 @@ adminRouter.post('/platform-claims/:normalized/promote', requireSuperAdmin, asyn
   } catch (e) { next(e) }
 })
 
+
+// ── S553: Agent Analytics ─────────────────────────────────────────────
+// Usage / quality / capacity dashboard over agent_interaction_logs.
+// One call returns everything the admin page renders. `days` window is
+// clamped 1–90. Shed volume is the "buy bigger hardware" alarm: the turn
+// gate logs outcome='shed' when it rejects a turn under overload.
+adminRouter.get('/agent-analytics', async (req, res, next) => {
+  try {
+    const days = Math.min(90, Math.max(1, Number(req.query.days) || 30))
+    const since = `now() - interval '1 day' * $1`
+
+    const [summary] = await query<any>(`
+      SELECT COUNT(*)::int AS turns,
+             COUNT(DISTINCT conversation_id)::int AS conversations,
+             COUNT(DISTINCT actor_subject_id)::int AS unique_users,
+             ROUND(AVG(latency_ms))::int AS avg_latency_ms,
+             ROUND(percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms))::int AS p95_latency_ms,
+             COALESCE(SUM(prompt_tokens), 0)::bigint AS prompt_tokens,
+             COALESCE(SUM(completion_tokens), 0)::bigint AS completion_tokens,
+             COUNT(*) FILTER (WHERE escalated_to_human)::int AS human_escalations,
+             COUNT(*) FILTER (WHERE tool_invocation_count > 0)::int AS tool_turns,
+             COUNT(*) FILTER (WHERE outcome = 'error')::int AS errors,
+             COUNT(*) FILTER (WHERE outcome = 'shed')::int AS shed
+        FROM agent_interaction_logs
+       WHERE created_at >= ${since}`, [days])
+
+    const daily = await query<any>(`
+      SELECT to_char(created_at::date, 'YYYY-MM-DD') AS day,
+             COUNT(*)::int AS turns,
+             COUNT(*) FILTER (WHERE escalated_to_human)::int AS escalations,
+             COUNT(*) FILTER (WHERE outcome = 'shed')::int AS shed,
+             COUNT(*) FILTER (WHERE outcome = 'error')::int AS errors,
+             ROUND(AVG(latency_ms))::int AS avg_latency_ms,
+             COALESCE(SUM(prompt_tokens + completion_tokens), 0)::bigint AS tokens
+        FROM agent_interaction_logs
+       WHERE created_at >= ${since}
+       GROUP BY 1 ORDER BY 1`, [days])
+
+    const hourly = await query<any>(`
+      SELECT EXTRACT(HOUR FROM created_at)::int AS hour, COUNT(*)::int AS turns
+        FROM agent_interaction_logs
+       WHERE created_at >= ${since}
+       GROUP BY 1 ORDER BY 1`, [days])
+
+    const byAudience = await query<any>(`
+      SELECT audience, COUNT(*)::int AS turns,
+             COUNT(*) FILTER (WHERE escalated_to_human)::int AS escalations,
+             ROUND(AVG(latency_ms))::int AS avg_latency_ms
+        FROM agent_interaction_logs
+       WHERE created_at >= ${since}
+       GROUP BY 1 ORDER BY 2 DESC`, [days])
+
+    const byAgent = await query<any>(`
+      SELECT agent_name, profile_id, COUNT(*)::int AS turns,
+             COUNT(*) FILTER (WHERE escalated_to_human)::int AS escalations,
+             COUNT(*) FILTER (WHERE tool_invocation_count > 0)::int AS tool_turns
+        FROM agent_interaction_logs
+       WHERE created_at >= ${since}
+       GROUP BY 1, 2 ORDER BY 3 DESC`, [days])
+
+    const topTools = await query<any>(`
+      SELECT tool AS name, COUNT(*)::int AS calls
+        FROM agent_interaction_logs, unnest(tool_names) AS tool
+       WHERE created_at >= ${since}
+       GROUP BY 1 ORDER BY 2 DESC LIMIT 15`, [days])
+
+    // S553 abuse visibility: who leans on the assistant hardest, and how
+    // much of it was unproductive (same definition the turn budget uses).
+    const heaviestUsers = await query<any>(`
+      SELECT l.actor_user_id, u.email, l.actor_role AS role,
+             COUNT(*)::int AS turns,
+             COUNT(*) FILTER (WHERE ${unproductiveTurnSql('l')})::int AS unproductive,
+             COUNT(*) FILTER (WHERE l.outcome = 'rate_limited')::int AS capped_turns,
+             MAX(l.created_at) AS last_seen
+        FROM agent_interaction_logs l
+        JOIN users u ON u.id = l.actor_user_id
+       WHERE l.created_at >= ${since}
+       GROUP BY 1, 2, 3 ORDER BY 4 DESC LIMIT 15`, [days])
+
+    res.json({ success: true, data: { days, summary, daily, hourly, byAudience, byAgent, topTools, heaviestUsers } })
+  } catch (e) { next(e) }
+})
+
+// ── S553: Sales leads (Lucy → Portfolio Specialists) ─────────────────
+// The lead queue the Specialists work from: list, status transitions, and
+// the chat transcript that produced the lead (conversation_id →
+// agent_interaction_logs), so the Specialist reads the conversation before
+// the follow-up call.
+adminRouter.get('/leads', async (req, res, next) => {
+  try {
+    const status = typeof req.query.status === 'string' && (SALES_LEAD_STATUSES as readonly string[]).includes(req.query.status)
+      ? req.query.status : null
+    const params: any[] = []
+    let filter = ''
+    if (status) { params.push(status); filter = `WHERE status = $${params.length}` }
+    const rows = await query(
+      `SELECT id, conversation_id, name, email, phone, states, portfolio_size, property_type,
+              notes, status, source, created_at, updated_at
+         FROM sales_leads ${filter}
+        ORDER BY created_at DESC LIMIT 200`, params)
+    res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
+adminRouter.patch('/leads/:id/status', async (req, res, next) => {
+  try {
+    const b = z.object({ status: z.enum(SALES_LEAD_STATUSES as unknown as [string, ...string[]]) }).parse(req.body)
+    const row = await queryOne<any>(
+      `UPDATE sales_leads SET status = $2, updated_at = now() WHERE id = $1 RETURNING *`,
+      [req.params.id, b.status])
+    if (!row) throw new AppError(404, 'Lead not found')
+    await logAdminAction({
+      adminUserId: req.user!.userId,
+      actionType: 'sales_lead_status',
+      targetType: 'sales_lead',
+      targetId: row.id,
+      metadata: { status: b.status },
+    })
+    res.json({ success: true, data: row })
+  } catch (e) { next(e) }
+})
+
+adminRouter.get('/leads/:id/transcript', async (req, res, next) => {
+  try {
+    const lead = await queryOne<any>(`SELECT id, conversation_id FROM sales_leads WHERE id = $1`, [req.params.id])
+    if (!lead) throw new AppError(404, 'Lead not found')
+    if (!lead.conversation_id) return res.json({ success: true, data: [] })
+    const rows = await query(
+      `SELECT turn_index, user_message, agent_reply, agent_name, created_at
+         FROM agent_interaction_logs
+        WHERE conversation_id = $1
+        ORDER BY turn_index ASC LIMIT 100`, [lead.conversation_id])
+    res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
+// ── S553: Specialist call calendar + availability ────────────────────
+adminRouter.get('/call-slots', async (_req, res, next) => {
+  try {
+    const rows = await query(
+      `SELECT s.id, s.lead_id, s.starts_at, s.duration_minutes, s.mode, s.status,
+              s.prospect_name, s.prospect_email, s.prospect_phone, s.notes, s.reminded_at,
+              l.states, l.portfolio_size, l.property_type
+         FROM sales_call_slots s
+         LEFT JOIN sales_leads l ON l.id = s.lead_id
+        WHERE s.starts_at >= now() - interval '1 day'
+        ORDER BY s.starts_at ASC LIMIT 100`)
+    res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
+adminRouter.patch('/call-slots/:id/status', async (req, res, next) => {
+  try {
+    const b = z.object({ status: z.enum(['booked', 'completed', 'cancelled', 'no_show']) }).parse(req.body)
+    const row = await queryOne<any>(
+      `UPDATE sales_call_slots SET status = $2, updated_at = now() WHERE id = $1 RETURNING *`,
+      [req.params.id, b.status])
+    if (!row) throw new AppError(404, 'Call not found')
+    res.json({ success: true, data: row })
+  } catch (e) { next(e) }
+})
+
+adminRouter.get('/call-availability', async (_req, res, next) => {
+  try {
+    const rows = await query(
+      `SELECT id, weekday, start_time, end_time, active FROM sales_call_availability ORDER BY weekday, start_time`)
+    res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
+// Replace-all editor: the admin page sends the full desired window list.
+adminRouter.put('/call-availability', async (req, res, next) => {
+  try {
+    const b = z.object({
+      windows: z.array(z.object({
+        weekday: z.number().int().min(0).max(6),
+        startTime: z.string().regex(/^\d{2}:\d{2}$/),
+        endTime: z.string().regex(/^\d{2}:\d{2}$/),
+      })).max(50),
+    }).parse(req.body)
+    for (const w of b.windows) {
+      if (w.endTime <= w.startTime) throw new AppError(400, 'Each window must end after it starts')
+    }
+    await query(`DELETE FROM sales_call_availability`)
+    for (const w of b.windows) {
+      await query(
+        `INSERT INTO sales_call_availability (weekday, start_time, end_time) VALUES ($1, $2, $3)`,
+        [w.weekday, w.startTime, w.endTime])
+    }
+    const rows = await query(`SELECT id, weekday, start_time, end_time, active FROM sales_call_availability ORDER BY weekday, start_time`)
+    res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})

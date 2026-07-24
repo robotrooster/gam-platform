@@ -27,6 +27,7 @@ import {
   extractMonthlyRent, extractSecurityDeposit,
   detectAutoRenew, detectNoticeDays, detectLateFees, detectSubleasingPolicy,
   extractPropertyNameAndAddress, extractAdditionalOccupants,
+  detectConditionalFees, auditUnattributedAmounts,
 } from './extractors'
 
 const PARSER_VERSION = 'gam-parser-0.1.0'
@@ -123,6 +124,8 @@ export async function parseLease(pdfBuffer: Buffer): Promise<ParseResult> {
   const noticeDays = detectNoticeDays(extracted.pages)
   const { lateFeeAmount, lateFeeGraceDays } = detectLateFees(extracted.pages)
   const subleasingPolicy = detectSubleasingPolicy(extracted.pages)
+  // S550: conditional fees ("if not X, then $Y") from the body prose.
+  const conditionalFees = detectConditionalFees(bodyPages)
 
   // 9. Lease type heuristic: fixed term + end date -> fixed_term;
   //    no end + monthly -> month_to_month
@@ -186,6 +189,7 @@ export async function parseLease(pdfBuffer: Buffer): Promise<ParseResult> {
     lease,
     mobileHome:          mobileHome ?? undefined,
     additionalOccupants: additionalOccupants.length > 0 ? additionalOccupants : undefined,
+    conditionalFees:     conditionalFees.length > 0 ? conditionalFees : undefined,
     liabilityInsurance:  liability  ?? undefined,
     parserVersion:       PARSER_VERSION,
     parsedAt:            new Date().toISOString(),
@@ -252,6 +256,36 @@ export async function parseLease(pdfBuffer: Buffer): Promise<ParseResult> {
         found:    String(c.field.value),
       })
     }
+  }
+
+  // S550: every conditional fee is a confirm-severity flag — the landlord
+  // approves or prunes each one at review (they become lease_fees rows).
+  conditionalFees.forEach((fee, i) => {
+    flags.push({
+      category: 'field_low_confidence',
+      severity: 'confirm',
+      field:    `conditionalFees.${i}`,
+      message:  `Conditional fee detected — ${fee.label}: $${fee.amount.toFixed(2)} if the condition isn't met. Confirm the clause.`,
+      found:    fee.conditionText.slice(0, 160),
+    })
+  })
+
+  // S550: the every-dollar audit — any $ amount not attributable to a
+  // known extraction surfaces for review so no financial obligation in
+  // the lease slips through silently.
+  const attributed: number[] = [
+    ...(rent ? [rent.value] : []),
+    ...(deposit ? [deposit.value] : []),
+    ...(lateFeeAmount ? [lateFeeAmount.value] : []),
+    ...conditionalFees.map(f => f.amount),
+  ]
+  for (const ua of auditUnattributedAmounts(bodyPages, attributed)) {
+    flags.push({
+      category: 'unattributed_amount',
+      severity: 'confirm',
+      message:  `The lease mentions $${ua.amount.toFixed(2)} that isn't attributed to rent, deposit, late fees, or a detected fee — review the clause.`,
+      found:    ua.context,
+    })
   }
 
   // Status decision: any block-severity flag -> mismatch, else parsed.

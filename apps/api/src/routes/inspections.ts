@@ -5,7 +5,7 @@ import path from 'path'
 import fs from 'fs'
 import crypto from 'crypto'
 import { query, queryOne, getClient } from '../db'
-import { requireAuth, requirePerm } from '../middleware/auth'
+import { requireAuth, requirePerm, getScopedPropertyIds } from '../middleware/auth'
 import { canManageLandlordResource, canAccessLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
 import { emitInspectionFinalizedEvents } from '../services/creditLedgerEmitters'
@@ -13,7 +13,9 @@ import {
   notifyInspectionReadyForTenant,
   notifyInspectionTenantSigned,
   notifyInspectionFinalized,
+  createNotification,
 } from '../services/notifications'
+import { addBusinessDays } from '../services/moveOutInspections'
 import { logger } from '../lib/logger'
 import { resolveUploadPath } from '../lib/uploadPaths'
 import { insertInspectionWithChecklist } from '../services/inspections'
@@ -97,13 +99,19 @@ inspectionsRouter.post('/', requirePerm('inspections.create'), async (req, res, 
     const body = createSchema.parse(req.body)
     // unit_type + bedrooms drive the standard walkthrough checklist (single
     // source: buildInspectionChecklist) seeded below.
-    const unit = await queryOne<{ id: string; landlord_id: string; bedrooms: number | null; unit_type: string | null }>(
-      `SELECT id, landlord_id, bedrooms, unit_type FROM units WHERE id=$1`,
+    const unit = await queryOne<{ id: string; landlord_id: string; bedrooms: number | null; bathrooms: number | null; unit_type: string | null; dwelling_ownership: string | null; property_id: string }>(
+      `SELECT id, landlord_id, bedrooms, bathrooms, unit_type, dwelling_ownership, property_id FROM units WHERE id=$1`,
       [body.unitId],
     )
     if (!unit) throw new AppError(404, 'Unit not found')
     if (!canManageLandlordResource(req.user, unit.landlord_id)) {
       throw new AppError(403, 'Forbidden')
+    }
+    // S550 property lock: team members only touch inspections on their
+    // assigned properties (owner roles resolve to null = unrestricted).
+    const scopedCreate = await getScopedPropertyIds(req.user)
+    if (scopedCreate && !scopedCreate.includes(unit.property_id)) {
+      throw new AppError(403, 'Property not in your assigned scope')
     }
 
     await client.query('BEGIN')
@@ -112,6 +120,8 @@ inspectionsRouter.post('/', requirePerm('inspections.create'), async (req, res, 
       landlordId: unit.landlord_id,
       unitType: unit.unit_type,
       bedrooms: unit.bedrooms,
+      bathrooms: unit.bathrooms,
+      dwellingOwnership: unit.dwelling_ownership,
       leaseId: body.leaseId ?? null,
       tenantId: body.tenantId ?? null,
       inspectionType: body.inspectionType,
@@ -133,7 +143,17 @@ inspectionsRouter.post('/', requirePerm('inspections.create'), async (req, res, 
 inspectionsRouter.get('/:id', async (req, res, next) => {
   try {
     const { row, items, photos, signatures } = await loadInspection(req.params.id, req)
-    res.json({ success: true, data: { ...row, items, photos, signatures } })
+    // S549: the suspicious-flag reason and flagger are landlord-side only —
+    // the tenant sees neutral copy (a scheduled in-person inspection), never
+    // "your photos were flagged suspicious because …".
+    const out: any = { ...row, items, photos, signatures }
+    if (req.user!.role === 'tenant') {
+      delete out.flag_reason
+      delete out.flagged_by_user_id
+      delete out.flagged_suspicious_at
+      delete out.followup_inspection_id
+    }
+    res.json({ success: true, data: out })
   } catch (e) {
     next(e)
   }
@@ -163,7 +183,8 @@ inspectionsRouter.get('/', async (req, res, next) => {
               i.inspection_type, i.status, i.comparison_inspection_id,
               i.scheduled_for, i.conducted_at, i.finalized_at,
               i.created_at, i.updated_at,
-              u.unit_number, p.name AS property_name,
+              i.flagged_suspicious_at, i.followup_inspection_id,
+              u.unit_number, u.property_id, p.name AS property_name,
               tu.first_name AS tenant_first_name, tu.last_name AS tenant_last_name
          FROM unit_inspections i
          JOIN units u ON u.id = i.unit_id
@@ -175,12 +196,22 @@ inspectionsRouter.get('/', async (req, res, next) => {
         LIMIT 200`,
       params,
     )
-    const filtered = rows.filter((r) =>
+    let filtered = rows.filter((r) =>
       req.user!.role === 'tenant'
         ? r.tenant_id === req.user!.profileId
         : canAccessLandlordResource(req.user, r.landlord_id),
     )
-    res.json({ success: true, data: filtered })
+    // S550 property lock (Nic): the landlord sees everything; team members
+    // see only inspections on their assigned properties.
+    if (req.user!.role !== 'tenant') {
+      const scoped = await getScopedPropertyIds(req.user)
+      if (scoped) filtered = filtered.filter((r) => scoped.includes(r.property_id))
+    }
+    // S549: flag metadata is landlord-side only (see GET /:id).
+    const out = req.user!.role === 'tenant'
+      ? filtered.map(({ flagged_suspicious_at, followup_inspection_id, ...rest }) => rest)
+      : filtered
+    res.json({ success: true, data: out })
   } catch (e) {
     next(e)
   }
@@ -414,20 +445,28 @@ inspectionsRouter.get('/videos/mine', async (req, res, next) => {
 inspectionsRouter.get('/video-files/:filename', async (req, res, next) => {
   try {
     const videoUrl = '/api/inspections/video-files/' + req.params.filename
-    const v = await queryOne<{ uploaded_by: string; landlord_id: string }>(
-      `SELECT v.uploaded_by, i.landlord_id
+    const v = await queryOne<{ uploaded_by: string; landlord_id: string; property_id: string }>(
+      `SELECT v.uploaded_by, i.landlord_id, un.property_id
          FROM unit_inspection_videos v
          JOIN unit_inspections i ON i.id = v.inspection_id
+         JOIN units un ON un.id = i.unit_id
         WHERE v.video_url = $1`,
       [videoUrl],
     )
     if (!v) throw new AppError(404, 'Not found')
     const u = req.user!
-    const allowed =
+    let allowed =
       u.role === 'admin' ||
       u.role === 'super_admin' ||
       v.uploaded_by === u.userId ||
       canAccessLandlordResource(u, v.landlord_id)
+    // S550 property lock: landlord-side access to someone else's upload is
+    // additionally bounded by the caller's property scope.
+    if (allowed && v.uploaded_by !== u.userId &&
+        u.role !== 'admin' && u.role !== 'super_admin') {
+      const scoped = await getScopedPropertyIds(u)
+      if (scoped && !scoped.includes(v.property_id)) allowed = false
+    }
     if (!allowed) throw new AppError(403, 'Forbidden')
 
     const fp = resolveUploadPath(inspectionVideoDir, req.params.filename)
@@ -445,12 +484,16 @@ inspectionsRouter.get('/video-files/:filename', async (req, res, next) => {
 inspectionsRouter.get('/unit/:unitId/lifecycle', async (req, res, next) => {
   try {
     denyTenant(req)
-    const unit = await queryOne<{ id: string; landlord_id: string; unit_number: string | null }>(
-      `SELECT id, landlord_id, unit_number FROM units WHERE id = $1`,
+    const unit = await queryOne<{ id: string; landlord_id: string; unit_number: string | null; property_id: string }>(
+      `SELECT id, landlord_id, unit_number, property_id FROM units WHERE id = $1`,
       [req.params.unitId],
     )
     if (!unit) throw new AppError(404, 'Unit not found')
     if (!canAccessLandlordResource(req.user, unit.landlord_id)) throw new AppError(403, 'Forbidden')
+    const scopedLc = await getScopedPropertyIds(req.user)
+    if (scopedLc && !scopedLc.includes(unit.property_id)) {
+      throw new AppError(403, 'Property not in your assigned scope')
+    }
 
     const stages = await query<any>(
       `SELECT i.id, i.inspection_type, i.status, i.scheduled_for, i.conducted_at,
@@ -488,6 +531,13 @@ inspectionsRouter.post('/:id/sign', async (req, res, next) => {
     let signerRole: 'tenant' | 'landlord' | 'inspector'
     if (role === 'tenant') {
       if (insp.tenant_id !== req.user!.profileId) throw new AppError(403, 'Not your inspection')
+      // S550 (Nic): the tenant signs the MOVE-IN inspection only — their
+      // certification of the photos and documented conditions. Everywhere
+      // else, being logged into their own portal IS the attestation
+      // (periodic uses POST /:id/submit; move-out is staff-conducted).
+      if (insp.inspection_type !== 'move_in') {
+        throw new AppError(409, 'Tenant signature only applies to move-in inspections')
+      }
       signerRole = 'tenant'
     } else if (role === 'landlord' || role === 'property_manager' || role === 'onsite_manager') {
       if (!canManageLandlordResource(req.user, insp.landlord_id)) throw new AppError(403, 'Forbidden')
@@ -521,12 +571,14 @@ inspectionsRouter.post('/:id/sign', async (req, res, next) => {
     )
     const hasTenant = sigs.some((s) => s.signer_role === 'tenant')
     const hasLandlord = sigs.some((s) => s.signer_role === 'landlord' || s.signer_role === 'inspector')
-    // A tenant-less inspection (landlord-initiated periodic / turnover with no
-    // tenant_id) has no second party to sign, so the landlord's signature
-    // alone must be enough to reach landlord_signed — otherwise it could never
-    // be finalized. When a tenant IS on the inspection, both signatures are
-    // still required before finalize.
-    const tenantRequired = insp.tenant_id != null
+    // Tenant signature is a MOVE-IN-ONLY requirement (Nic, S550): at move-in
+    // the tenant certifies their photos and documented conditions. Periodic
+    // and move-out inspections are staff-conducted under the legally required
+    // entry notice — the tenant gets notice, not a veto, so the landlord/
+    // inspector signature alone reaches landlord_signed. A tenant on the
+    // inspection may still sign (extra attestation), it just isn't gating.
+    // Tenant-less inspections likewise finalize on the landlord signature.
+    const tenantRequired = insp.tenant_id != null && insp.inspection_type === 'move_in'
     let newStatus = insp.status
     if (hasLandlord && (hasTenant || !tenantRequired)) newStatus = 'landlord_signed'
     else if (hasTenant) newStatus = 'tenant_signed'
@@ -606,6 +658,84 @@ inspectionsRouter.post('/:id/sign', async (req, res, next) => {
   }
 })
 
+// ── POST /api/inspections/:id/submit ───────────────────────────
+// S550 (Nic): the tenant does NOT sign a periodic inspection — they took
+// the photos while authenticated in their own portal, and that IS their
+// attestation. This is the signature-less "I'm done, review it" action for
+// the self-directed periodic flow: it flips the record to tenant_signed
+// (the same status the front-desk verdict queue reads — displayed as
+// "Submitted for review") without writing any signature row, stamps
+// conducted_at, and pings the property's responsible party.
+inspectionsRouter.post('/:id/submit', async (req, res, next) => {
+  try {
+    const insp = await loadInspectionRow(req.params.id, req)
+    if (req.user!.role !== 'tenant') throw new AppError(403, 'Tenant submission only')
+    if (insp.tenant_id !== req.user!.profileId) throw new AppError(403, 'Not your inspection')
+    if (insp.inspection_type !== 'periodic') {
+      throw new AppError(409, 'Only periodic inspections are tenant-submitted')
+    }
+    if (insp.status !== 'draft') throw new AppError(409, `cannot submit in status ${insp.status}`)
+    const photoRow = await queryOne<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM unit_inspection_photos WHERE inspection_id = $1`,
+      [req.params.id],
+    )
+    if (parseInt(photoRow?.n ?? '0', 10) === 0) {
+      throw new AppError(409, 'Add at least one photo before submitting')
+    }
+
+    await query(
+      `UPDATE unit_inspections
+          SET status = 'tenant_signed', conducted_at = NOW(), updated_at = NOW()
+        WHERE id = $1`,
+      [req.params.id],
+    )
+
+    // Best-effort: tell the front desk there's a submission to review.
+    try {
+      const ctx = await queryOne<{ property_id: string; unit_number: string | null }>(
+        `SELECT property_id, unit_number FROM units WHERE id = $1`,
+        [insp.unit_id],
+      )
+      const tenant = await queryOne<{ first_name: string | null; last_name: string | null }>(
+        `SELECT u.first_name, u.last_name
+           FROM tenants t JOIN users u ON u.id = t.user_id
+          WHERE t.id = $1`,
+        [insp.tenant_id],
+      )
+      if (ctx) {
+        const { getPropertyResponsibleParty } = await import('../services/responsibleParty')
+        const targets = await getPropertyResponsibleParty(ctx.property_id)
+        if (targets) {
+          const tenantName =
+            `${tenant?.first_name ?? ''} ${tenant?.last_name ?? ''}`.trim() || 'The tenant'
+          const body =
+            `${tenantName} completed their periodic inspection walkthrough for unit ` +
+            `${ctx.unit_number ?? insp.unit_id.slice(0, 8)} — review the photos and pass or flag it.`
+          for (const recipient of targets.primaries) {
+            await createNotification({
+              userId: recipient.user_id, landlordId: insp.landlord_id,
+              type: 'inspection_submitted',
+              title: `Periodic inspection submitted — unit ${ctx.unit_number ?? ''}`.trim(),
+              body,
+              data: { inspectionId: insp.id, unitId: insp.unit_id },
+              actionUrl: `/inspections/${insp.id}`,
+              sendEmail: true, emailTo: recipient.email,
+              emailSubject: `Periodic inspection submitted — unit ${ctx.unit_number ?? ''}`.trim(),
+              emailHtml: body,
+            })
+          }
+        }
+      }
+    } catch (e) {
+      logger.error({ err: e }, '[NOTIFY] inspection submit:')
+    }
+
+    res.json({ success: true, data: { status: 'tenant_signed' } })
+  } catch (e) {
+    next(e)
+  }
+})
+
 // ── POST /api/inspections/:id/finalize ─────────────────────────
 // Landlord-only. Requires both tenant + landlord signatures present.
 // Emits credit-ledger events transactionally.
@@ -659,6 +789,27 @@ inspectionsRouter.post('/:id/finalize', requirePerm('inspections.manage'), async
             SET status='finalized', finalized_at=NOW(), updated_at=NOW()
           WHERE id=$1`,
         [req.params.id],
+      )
+      // S550: assess the lease's conditional fees from their linked
+      // 'Lease conditions' items — good/fair = condition met (no charge),
+      // damaged/missing = failed (the fee joins the S180 deposit sweep).
+      // 'na' stays unassessed (never charges). Same transaction as the
+      // status flip so the deposit sweep can trust condition_result.
+      await client.query(
+        `UPDATE lease_fees lf
+            SET condition_result = CASE
+                  WHEN i.condition IN ('good', 'fair') THEN 'met'
+                  WHEN i.condition IN ('damaged', 'missing') THEN 'failed'
+                END,
+                condition_assessed_at = NOW(),
+                condition_assessed_by = $2,
+                updated_at = NOW()
+           FROM unit_inspection_items i
+          WHERE i.inspection_id = $1
+            AND i.lease_fee_id = lf.id
+            AND i.condition IN ('good', 'fair', 'damaged', 'missing')
+            AND lf.condition_result IS NULL`,
+        [req.params.id, req.user!.userId],
       )
       await emitInspectionFinalizedEvents(client, {
         inspectionType: insp.inspection_type,
@@ -735,6 +886,156 @@ inspectionsRouter.post('/:id/finalize', requirePerm('inspections.manage'), async
   }
 })
 
+// ── POST /api/inspections/:id/flag-suspicious ──────────────────
+// S549 verdict loop: the front desk reviews a tenant-self-directed periodic
+// inspection (agent-guided photos) and either PASSES it — the normal sign +
+// finalize path above — or flags it here. Flagging closes the tenant-
+// submitted record (status -> cancelled; photos preserved read-only, no
+// credit events) and auto-schedules an IN-PERSON physical inspection three
+// business days out, linked back via comparison_inspection_id so the
+// inspector has the tenant's photos side-by-side.
+//
+// The follow-up carries NO tenant_id on purpose: it is staff-conducted, so
+// the landlord/inspector signature alone reaches landlord_signed — a tenant
+// who won't sign can't stall the loop. The tenant is notified with neutral
+// copy only; the flag reason never leaves the landlord side.
+const flagSchema = z.object({ reason: z.string().trim().min(3) })
+
+inspectionsRouter.post('/:id/flag-suspicious', requirePerm('inspections.manage'), async (req, res, next) => {
+  const client = await getClient()
+  try {
+    const body = flagSchema.parse(req.body)
+    const insp = await loadInspectionRow(req.params.id, req)
+    if (!canManageLandlordResource(req.user, insp.landlord_id)) {
+      throw new AppError(403, 'Forbidden')
+    }
+    if (insp.inspection_type !== 'periodic') {
+      throw new AppError(409, 'Only periodic inspections can be flagged')
+    }
+    if (!insp.tenant_id) {
+      throw new AppError(409, 'Only tenant-submitted inspections can be flagged')
+    }
+    if (insp.status === 'finalized' || insp.status === 'cancelled') {
+      throw new AppError(409, `cannot flag in status ${insp.status}`)
+    }
+    if (insp.flagged_suspicious_at) throw new AppError(409, 'Already flagged')
+
+    const unit = await queryOne<{
+      bedrooms: number | null; bathrooms: number | null; unit_type: string | null; dwelling_ownership: string | null
+      unit_number: string | null; property_id: string; property_name: string
+    }>(
+      `SELECT u.bedrooms, u.bathrooms, u.unit_type, u.dwelling_ownership, u.unit_number, u.property_id,
+              p.name AS property_name
+         FROM units u JOIN properties p ON p.id = u.property_id
+        WHERE u.id = $1`,
+      [insp.unit_id],
+    )
+    if (!unit) throw new AppError(404, 'Unit not found')
+
+    const scheduledFor = addBusinessDays(new Date().toISOString().slice(0, 10), 3)
+
+    await client.query('BEGIN')
+    const { id: followupId } = await insertInspectionWithChecklist(client, {
+      unitId: insp.unit_id,
+      landlordId: insp.landlord_id,
+      unitType: unit.unit_type,
+      bedrooms: unit.bedrooms,
+      bathrooms: unit.bathrooms,
+      dwellingOwnership: unit.dwelling_ownership,
+      leaseId: insp.lease_id,
+      tenantId: null,
+      inspectionType: 'periodic',
+      comparisonInspectionId: insp.id,
+      scheduledFor,
+      notes: 'In-person follow-up — tenant-submitted periodic inspection flagged for physical verification.',
+    })
+    await client.query(
+      `UPDATE unit_inspections
+          SET status = 'cancelled', flagged_suspicious_at = NOW(),
+              flagged_by_user_id = $1, flag_reason = $2,
+              followup_inspection_id = $3, updated_at = NOW()
+        WHERE id = $4`,
+      [req.user!.userId, body.reason, followupId, insp.id],
+    )
+    await client.query('COMMIT')
+
+    // Best-effort notifications after commit.
+    try {
+      // Landlord + property-assigned staff who can conduct the follow-up
+      // (same recipient shape as scheduleMoveOutInspections).
+      const landlord = await queryOne<{ user_id: string; email: string }>(
+        `SELECT lo.user_id, us.email FROM landlords lo JOIN users us ON us.id = lo.user_id
+          WHERE lo.id = $1`,
+        [insp.landlord_id],
+      )
+      const staff = await query<{ user_id: string; email: string }>(
+        `SELECT DISTINCT u2.id AS user_id, u2.email FROM (
+            SELECT user_id FROM property_manager_scopes
+             WHERE landlord_id = $1 AND (all_properties = TRUE OR $2::uuid = ANY(property_ids))
+            UNION
+            SELECT user_id FROM onsite_manager_scopes
+             WHERE landlord_id = $1 AND (all_properties = TRUE OR $2::uuid = ANY(property_ids))
+          ) s JOIN users u2 ON u2.id = s.user_id`,
+        [insp.landlord_id, unit.property_id],
+      )
+      const recipients = [
+        ...(landlord ? [landlord] : []),
+        ...staff.filter((s) => s.user_id !== landlord?.user_id),
+      ]
+      const staffBody =
+        `Unit ${unit.unit_number} at ${unit.property_name} — a tenant-submitted periodic ` +
+        `inspection was flagged as suspicious: "${body.reason}". An in-person inspection ` +
+        `is scheduled for ${scheduledFor}.`
+      for (const r of recipients) {
+        if (r.user_id === req.user!.userId) continue // the flagger already knows
+        await createNotification({
+          userId: r.user_id, landlordId: insp.landlord_id,
+          type: 'inspection_flagged_suspicious',
+          title: `In-person inspection needed — unit ${unit.unit_number}`,
+          body: staffBody,
+          data: { inspectionId: followupId, flaggedInspectionId: insp.id, unitId: insp.unit_id, scheduledFor },
+          actionUrl: `/inspections/${followupId}`,
+          sendEmail: true, emailTo: r.email,
+          emailSubject: `In-person inspection scheduled for ${scheduledFor} — unit ${unit.unit_number}`,
+          emailHtml: staffBody,
+        })
+      }
+      // Tenant — neutral copy only (never "suspicious", never the reason).
+      const t = await queryOne<{ user_id: string; email: string }>(
+        `SELECT u.id AS user_id, u.email
+           FROM tenants tn JOIN users u ON u.id = tn.user_id
+          WHERE tn.id = $1`,
+        [insp.tenant_id],
+      )
+      if (t) {
+        const tenantBody =
+          `A routine in-person inspection of your unit is scheduled for ${scheduledFor}. ` +
+          `A member of the property staff will conduct it.`
+        await createNotification({
+          userId: t.user_id, landlordId: insp.landlord_id,
+          type: 'inspection_scheduled',
+          title: 'In-person inspection scheduled',
+          body: tenantBody,
+          data: { scheduledFor },
+          actionUrl: '/inspections',
+          sendEmail: true, emailTo: t.email,
+          emailSubject: `In-person inspection scheduled for ${scheduledFor}`,
+          emailHtml: tenantBody,
+        })
+      }
+    } catch (e) {
+      logger.error({ err: e }, '[NOTIFY] inspection flag-suspicious:')
+    }
+
+    res.json({ success: true, data: { followupInspectionId: followupId, scheduledFor } })
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    next(e)
+  } finally {
+    client.release()
+  }
+})
+
 // ── helpers ────────────────────────────────────────────────────
 
 interface InspectionRow {
@@ -750,6 +1051,11 @@ interface InspectionRow {
   conducted_at: string | null
   finalized_at: string | null
   notes: string | null
+  flagged_suspicious_at: string | null
+  flagged_by_user_id: string | null
+  flag_reason: string | null
+  followup_inspection_id: string | null
+  property_id: string
 }
 
 async function loadInspectionRow(
@@ -757,11 +1063,14 @@ async function loadInspectionRow(
   req: import('express').Request,
 ): Promise<InspectionRow> {
   const r = await queryOne<InspectionRow>(
-    `SELECT id, unit_id, lease_id, tenant_id, landlord_id,
-            inspection_type, status, comparison_inspection_id,
-            scheduled_for, conducted_at, finalized_at, notes
-       FROM unit_inspections
-      WHERE id = $1`,
+    `SELECT i.id, i.unit_id, i.lease_id, i.tenant_id, i.landlord_id,
+            i.inspection_type, i.status, i.comparison_inspection_id,
+            i.scheduled_for, i.conducted_at, i.finalized_at, i.notes,
+            i.flagged_suspicious_at, i.flagged_by_user_id, i.flag_reason,
+            i.followup_inspection_id, un.property_id
+       FROM unit_inspections i
+       JOIN units un ON un.id = i.unit_id
+      WHERE i.id = $1`,
     [id],
   )
   if (!r) throw new AppError(404, 'Inspection not found')
@@ -776,6 +1085,12 @@ async function loadInspectionRow(
     u.role === 'maintenance'
   ) {
     if (!canAccessLandlordResource(u, r.landlord_id)) throw new AppError(403, 'Forbidden')
+    // S550 property lock: team members only reach inspections on their
+    // assigned properties (null = owner/all-properties, unrestricted).
+    const scoped = await getScopedPropertyIds(u)
+    if (scoped && !scoped.includes(r.property_id)) {
+      throw new AppError(403, 'Property not in your assigned scope')
+    }
   } else if (u.role !== 'admin' && u.role !== 'super_admin') {
     throw new AppError(403, 'Forbidden')
   }

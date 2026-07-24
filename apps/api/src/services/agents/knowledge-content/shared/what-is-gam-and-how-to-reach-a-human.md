@@ -2,7 +2,7 @@
 scope: shared
 title: What GAM is and how to reach a human
 ---
-GAM is a property-rental software platform used by tenants and landlords to manage the rental relationship online — viewing lease documents, making and tracking payments, submitting maintenance requests, and staying in touch.
+GAM is the software platform that connects renters and landlords in one place — the system that handles the day-to-day: paying rent electronically, filing and tracking maintenance requests, signing lease documents, and keeping a clear record of it all.
 
 ## What GAM is — and isn't
 
@@ -12,7 +12,11 @@ For example, your rent amount, due date, grace period, and late fees are set by 
 
 ## Getting help
 
-Many questions can be answered right away by the GAM assistant — things like how to make a payment, where to find your lease, or how to file a maintenance request.
+When you need help, you have three doors:
+
+- **In-app support assistant** — the fastest way to get answers. Open it from anywhere in your account and ask about payments, your lease, maintenance, fees, or how something works. It can look at your account to give you a real answer, not a generic one.
+- **Human support** — the GAM support team handles platform and account questions the assistant can't resolve, or anytime you'd rather talk to a person.
+- **Your landlord** — anything specific to your home, lease terms, deposits, or repairs is your landlord's decision, so those questions route to them.
 
 Some topics are always handed off to a human GAM specialist:
 
@@ -21,4 +25,4 @@ Some topics are always handed off to a human GAM specialist:
 - Legal questions (these depend on your lease and your local laws)
 - Complex issues the assistant can't fully resolve
 
-If your question falls into one of these areas, just ask to be connected and we'll bring in a human specialist. For questions about your property, rent terms, or rules, your landlord is the right point of contact.
+If your question falls into one of these areas, just ask to be connected and we'll bring in a human specialist. If you're ever unsure who to ask, start with the in-app assistant — it will either answer or point you to the right place.

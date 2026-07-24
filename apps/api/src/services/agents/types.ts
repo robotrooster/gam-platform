@@ -70,6 +70,12 @@ export const AGENT_OUTCOMES = [
   'escalated_to_human',
   'abandoned',
   'error',
+  // S553: turn rejected by the concurrency gate under overload. Logged so
+  // capacity dashboards can alarm on shed volume ("buy bigger hardware").
+  'shed',
+  // S553: turn refused by the per-user daily budget (abuse guard) — served
+  // the canned reply with zero model calls.
+  'rate_limited',
 ] as const
 export type AgentOutcome = (typeof AGENT_OUTCOMES)[number]
 

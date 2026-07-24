@@ -21,7 +21,7 @@ import fs from 'fs'
 import path from 'path'
 import crypto from 'crypto'
 import type { PoolClient } from 'pg'
-import { getClient, queryOne } from '../../db'
+import { getClient, query, queryOne } from '../../db'
 import { emailTenantOnboarded } from '../../services/email'
 import { AppError } from '../../middleware/errorHandler'
 import { assertLateFeeDecisionForUnit } from '../../services/lateFeePolicy'
@@ -55,6 +55,42 @@ interface ResolveResult {
   userId: string
   email: string
   activationUrl: string
+}
+
+/**
+ * S550 (Nic): street-number address safety. Property names repeat in the
+ * wild and every park has an "RV 01" — the street NUMBER is what can't
+ * coincide. True (= conflict) only when BOTH the lease's extracted address
+ * and the property's street1 contain a street number and they differ.
+ */
+export function leadingStreetNumber(v: string | null | undefined): string | null {
+  // A street number LEADS the address ("22658 Highway 89"). A digit run
+  // elsewhere ("Highway 89 frontage") is a route/unit number, not a street
+  // number — never compare those.
+  return String(v ?? '').match(/^\s*(\d{1,6})\b/)?.[1] ?? null
+}
+
+export function streetNumbersConflict(leaseAddress: string | null | undefined, propertyStreet1: string | null | undefined): boolean {
+  const a = leadingStreetNumber(leaseAddress)
+  const b = leadingStreetNumber(propertyStreet1)
+  return !!a && !!b && a !== b
+}
+
+/**
+ * S550 (Nic): a landlord may own TWO properties named "Oak Park" — the
+ * street number on the lease picks between them. Returns the single
+ * candidate whose street number matches the lease address; 'ambiguous'
+ * when the lease can't single one out.
+ */
+export function pickCandidateByAddress<T extends { street1: string | null }>(
+  candidates: T[],
+  leaseAddress: string | null | undefined,
+): T | 'ambiguous' {
+  if (candidates.length === 1) return candidates[0]
+  const leaseNum = leadingStreetNumber(leaseAddress)
+  if (!leaseNum) return 'ambiguous'
+  const matches = candidates.filter(c => leadingStreetNumber(c.street1) === leaseNum)
+  return matches.length === 1 ? matches[0] : 'ambiguous'
 }
 
 /**
@@ -116,18 +152,45 @@ export async function resolveIntent(
   const phone     = tenant0.phone?.value ? String(tenant0.phone.value).trim() : null
 
   // 3. Resolve unit_id from propertyName + unitNumber within this landlord's
-  //    portfolio. Without a hit we can't build the lease.
-  const unit = await queryOne<{ id: string; property_name: string; street1: string; city: string; state: string; zip: string; unit_number: string }>(
+  //    portfolio. Without a hit we can't build the lease. S550: NO LIMIT 1 —
+  //    the landlord may own two same-named properties ("Oak Park" ×2), each
+  //    with an "RV 01"; the street number on the lease picks between them.
+  const unitCandidates = await query<{ id: string; property_name: string; street1: string; city: string; state: string; zip: string; unit_number: string }>(
     `SELECT u.id, u.unit_number, p.name AS property_name, p.street1, p.city, p.state, p.zip
      FROM units u JOIN properties p ON p.id = u.property_id
      WHERE p.landlord_id = $1
        AND LOWER(p.name) = LOWER($2)
-       AND LOWER(u.unit_number) = LOWER($3)
-     LIMIT 1`,
+       AND LOWER(u.unit_number) = LOWER($3)`,
     [landlordId, merged.unit.propertyName.value, merged.unit.unitNumber.value]
   )
-  if (!unit) {
+  if (unitCandidates.length === 0) {
     throw new AppError(404, `Unit not found in your portfolio: ${merged.unit.propertyName.value} - ${merged.unit.unitNumber.value}`)
+  }
+  const picked = pickCandidateByAddress(unitCandidates, String(merged.unit?.propertyAddress?.value ?? ''))
+  if (picked === 'ambiguous') {
+    const addrs = unitCandidates.map(c => `${c.street1}, ${c.city}`).join(' vs ')
+    throw new AppError(409,
+      `You have ${unitCandidates.length} properties named "${merged.unit.propertyName.value}" (${addrs}), ` +
+      `each with unit ${merged.unit.unitNumber.value}, and the address on the lease didn't single one out. ` +
+      `Check the property address on the lease, or correct the extracted address before building.`)
+  }
+  const unit = picked
+
+  // S550 (Nic): extra physical-address safety on top of the name match.
+  // Property names repeat in the wild ("Oak Park") and unit numbers repeat
+  // everywhere ("RV 01") — the street NUMBER on the lease is the thing that
+  // can't coincide. When both the lease's extracted address and the resolved
+  // property's street1 carry a street number and they disagree, this is the
+  // wrong property: hard stop, don't build the lease. Only enforced when
+  // both numbers exist (extraction is best-effort).
+  {
+    const leaseAddr = String(merged.unit?.propertyAddress?.value ?? '')
+    if (streetNumbersConflict(leaseAddr, unit.street1)) {
+      throw new AppError(409,
+        `Address mismatch: the lease shows "${leaseAddr.trim()}" but the property ` +
+        `"${unit.property_name}" in your portfolio is at "${unit.street1}". ` +
+        `Same name, different location — pick the right property or correct the address before building the lease.`)
+    }
   }
 
   // S537 gate: no import onto an UNDECIDED late-fee class — the landlord
@@ -224,6 +287,24 @@ export async function resolveIntent(
     {
       const { syncSecurityDepositLeaseFee } = await import('../../services/leaseFeesSync')
       await syncSecurityDepositLeaseFee(leaseId, Number(lease.securityDeposit?.value ?? 0), client)
+    }
+
+    // S550: conditional fees ("if not X, then $Y") the landlord confirmed at
+    // review. Lease-is-law: each row carries the clause verbatim in
+    // condition_text; it never charges until the move-out inspection
+    // assesses condition_result='failed' (the S180 sweep skips it until
+    // then). The landlord prunes false positives by overriding
+    // conditionalFees to a smaller array (or []) at review.
+    for (const cf of merged.conditionalFees ?? []) {
+      const amount = Number(cf?.amount)
+      const conditionText = String(cf?.conditionText ?? '').trim()
+      if (!Number.isFinite(amount) || amount <= 0 || !conditionText) continue
+      await client.query(
+        `INSERT INTO lease_fees
+           (lease_id, fee_type, amount, is_refundable, due_timing, description, condition_text)
+         VALUES ($1, 'other_fee', $2, FALSE, 'move_out', $3, $4)`,
+        [leaseId, amount, String(cf?.label ?? 'Lease condition fee').slice(0, 120), conditionText.slice(0, 1000)],
+      )
     }
 
     // 5c. Close the superseded lease if present

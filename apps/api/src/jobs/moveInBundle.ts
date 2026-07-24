@@ -3,6 +3,7 @@ import type { PoolClient } from 'pg'
 import { daysInMonth, formatInvoiceNumber } from '@gam/shared'
 import { getClient, queryOne } from '../db'
 import { logger } from '../lib/logger'
+import { isBookingScheduleLease, bookingRentForDueDate } from '../services/bookingLeaseBilling'
 
 // ============================================================
 // S26a: Move-in invoice generator (replaces S25 moveInBundle)
@@ -87,7 +88,18 @@ export async function generateMoveInInvoice(
   inputs: MoveInInputs,
   externalClient?: PoolClient
 ): Promise<MoveInBundleResult> {
-  const rentForMoveIn = moveInRentAmount(inputs.rent_amount, inputs.start_date)
+  // S548: booking-sourced leases prorate the arrival month at monthly/30
+  // (the calendar schedule the guest was quoted); regular leases keep the
+  // long-standing days-remaining/days-in-month proration.
+  const leaseMeta = await queryOne<{ lease_source: string | null; end_date: string | null }>(
+    `SELECT lease_source, to_char(end_date, 'YYYY-MM-DD') AS end_date FROM leases WHERE id = $1`,
+    [inputs.lease_id])
+  const bookingArrival = leaseMeta && isBookingScheduleLease(leaseMeta)
+    ? bookingRentForDueDate(inputs.start_date, leaseMeta.end_date!, inputs.rent_amount, inputs.start_date)
+    : null
+  const rentForMoveIn = bookingArrival != null
+    ? roundHalfEvenCents(bookingArrival)
+    : moveInRentAmount(inputs.rent_amount, inputs.start_date)
 
   // S28: optional caller-owned transaction. When externalClient is provided,
   // skip BEGIN/COMMIT/ROLLBACK/release — caller owns the tx lifecycle.

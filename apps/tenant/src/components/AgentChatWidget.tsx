@@ -15,7 +15,7 @@
 
 import { useState, useRef, useEffect } from 'react'
 import { MessageCircle, Send, X, ChevronDown } from 'lucide-react'
-import { apiPost } from '../lib/api'
+import { apiGet, apiPost } from '../lib/api'
 
 interface AgentProfile {
   title: string
@@ -204,6 +204,15 @@ function Working({ agent }: { agent: string }) {
 /** Floating bubble + popup panel, mounted globally in the Layout. */
 export function AgentChatWidget() {
   const [open, setOpen] = useState(false)
+  // S553: server-decided visibility (silent abuse auto-hide, dark by
+  // default). Defaults visible; hides only on an explicit false.
+  const [visible, setVisible] = useState(true)
+  useEffect(() => {
+    apiGet<{ visible: boolean }>('/agent/visibility')
+      .then((d) => { if (d?.visible === false) setVisible(false) })
+      .catch(() => {})
+  }, [])
+  if (!visible) return null
   return (
     <>
       <style>{DOT_CSS}</style>

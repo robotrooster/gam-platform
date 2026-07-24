@@ -39,14 +39,14 @@ export const getInspectionChecklist: AgentTool = {
     // for the bedroom/type facts that size the checklist.
     const insp = inspectionId
       ? await queryOne<InspectionUnitRow>(
-          `SELECT i.id, i.inspection_type, i.status, i.guided_walkthrough_declined, u.unit_number, u.bedrooms, u.unit_type
+          `SELECT i.id, i.inspection_type, i.status, i.guided_walkthrough_declined, u.unit_number, u.bedrooms, u.bathrooms, u.unit_type, u.dwelling_ownership
              FROM unit_inspections i JOIN units u ON u.id = i.unit_id
             WHERE i.id = $1 AND i.tenant_id = $2`,
           [inspectionId, actor.profileId]
         )
       : await queryOne<InspectionUnitRow>(
           // Prefer an OPEN inspection (not finalized/cancelled), newest first.
-          `SELECT i.id, i.inspection_type, i.status, i.guided_walkthrough_declined, u.unit_number, u.bedrooms, u.unit_type
+          `SELECT i.id, i.inspection_type, i.status, i.guided_walkthrough_declined, u.unit_number, u.bedrooms, u.bathrooms, u.unit_type, u.dwelling_ownership
              FROM unit_inspections i JOIN units u ON u.id = i.unit_id
             WHERE i.tenant_id = $1
             ORDER BY (i.status NOT IN ('finalized','cancelled')) DESC, COALESCE(i.scheduled_for, i.created_at) DESC

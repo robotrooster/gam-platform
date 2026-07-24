@@ -387,7 +387,7 @@ export function OnboardingPage() {
                   </div>
                   <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 12, display: 'flex', alignItems: 'flex-start', gap: 6 }}>
                     <CreditCard size={12} style={{ flexShrink: 0, marginTop: 2 }} />
-                    Card payments (3.25%) are always paid by the tenant — landlords never cover card fees.
+                    Card payments (3.25% + 26¢) are always paid by the tenant — landlords never cover card fees.
                   </div>
                 </div>
               </div>

@@ -59,6 +59,19 @@ export function BackgroundCheckPage() {
   const set = (k: string, v: any) => setForm(f=>({...f,[k]:v}))
   const { data: status, refetch } = useQuery('bg-status', () => get('/background/status'))
   const { data: me } = useQuery('tenant-me', () => get('/tenants/me'))
+  // S551: fee breakdown + provider from the API. When the landlord screens
+  // via Checkr Tenant, Checkr collects SSN/identity on ITS hosted apply flow
+  // — GAM's form drops those fields entirely.
+  const priceLandlordId = (me as any)?.landlordId || new URLSearchParams(window.location.search).get('landlordId') || ''
+  const priceUnitId = (me as any)?.unitId || new URLSearchParams(window.location.search).get('unitId') || ''
+  const { data: price } = useQuery(['bg-price', priceLandlordId, priceUnitId], () => get(`/background/price?landlordId=${priceLandlordId}&unitId=${priceUnitId}`))
+  const providerCollectsPii = !!(price as any)?.providerCollectsPii
+  const feeCheckUsd = (price as any)?.applicantFee ?? 45
+  const feeProcessingUsd = (price as any)?.processingFee ?? 0
+  const feeTotalUsd = (price as any)?.totalFee ?? (feeCheckUsd + feeProcessingUsd)
+  const capApplied = !!(price as any)?.capApplied
+  const feeProhibited = !!(price as any)?.feeProhibited
+  const fmtUsd = (n: number) => '$' + n.toFixed(2)
   const handleIdUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0];
     if (!f) return;
@@ -90,7 +103,7 @@ export function BackgroundCheckPage() {
     return fetch(`${API}/api/background/submit`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-      body: JSON.stringify({ firstName:form.firstName, lastName:form.lastName, dateOfBirth:form.dob, ssn:form.ssn.replace(/\D/g,''), street1:form.street1, street2:form.street2||null, city:form.city, state:form.state, zip:form.zip, yearsAtAddress:parseInt(form.years)||null, employmentStatus:form.empStatus, employerName:form.employer||null, employerPhone:form.empPhone||null, monthlyIncome:parseFloat(form.income)||null, prevLandlordName:form.prevName||null, prevLandlordPhone:form.prevPhone||null, prevLandlordEmail:form.prevEmail||null, idDocumentUrl:idUrl||null, incomeDocUrls:incomeFiles.map(f=>f.url), consentCredit:form.consentCredit, consentCriminal:form.consentCriminal, consentPool:form.consentPool, landlordId:(me as any)?.landlordId||null, unitId:(me as any)?.unitId||(new URLSearchParams(window.location.search).get('unitId'))||null, timeToComplete:Math.round((Date.now()-startTime)/1000), idVerification:idNameMatch||null, applicantPaymentIntentId:paymentIntentId })
+      body: JSON.stringify({ firstName:form.firstName, lastName:form.lastName, dateOfBirth:form.dob, ssn:providerCollectsPii?undefined:form.ssn.replace(/\D/g,''), street1:form.street1, street2:form.street2||null, city:form.city, state:form.state, zip:form.zip, yearsAtAddress:parseInt(form.years)||null, employmentStatus:form.empStatus, employerName:form.employer||null, employerPhone:form.empPhone||null, monthlyIncome:parseFloat(form.income)||null, prevLandlordName:form.prevName||null, prevLandlordPhone:form.prevPhone||null, prevLandlordEmail:form.prevEmail||null, idDocumentUrl:idUrl||null, incomeDocUrls:incomeFiles.map(f=>f.url), consentCredit:form.consentCredit, consentCriminal:form.consentCriminal, consentPool:form.consentPool, landlordId:(me as any)?.landlordId||null, unitId:(me as any)?.unitId||(new URLSearchParams(window.location.search).get('unitId'))||null, timeToComplete:Math.round((Date.now()-startTime)/1000), idVerification:idNameMatch||null, applicantPaymentIntentId:paymentIntentId })
     }).then(r => r.json())
   }, { onSuccess: () => refetch() })
   const ssnFmt = (d: string) => d.length<=3?d:d.length<=5?d.slice(0,3)+'-'+d.slice(3):d.slice(0,3)+'-'+d.slice(3,5)+'-'+d.slice(5)
@@ -271,13 +284,25 @@ export function BackgroundCheckPage() {
           token = regRes.data.token
           localStorage.setItem('gam_tenant_token', token!)
         }
+        const params = new URLSearchParams(window.location.search)
         const piRes = await fetch(`${API}/api/background/payment-intent`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          // S551: same landlord/unit inputs as /submit so the state-cap fee
+          // resolves identically on both calls.
+          body: JSON.stringify({
+            landlordId: (me as any)?.landlordId || params.get('landlordId') || null,
+            unitId: (me as any)?.unitId || params.get('unitId') || null,
+          }),
         }).then(r => r.json())
         if (cancelled) return
         if (!piRes.success) {
           setPaymentInitError(piRes.error || 'Failed to initialize payment')
+          return
+        }
+        if (piRes.data.feeWaived) {
+          // Fee-prohibited state: no charge, no payment step.
+          setPaid(true)
           return
         }
         setPaymentClientSecret(piRes.data.clientSecret)
@@ -310,23 +335,33 @@ export function BackgroundCheckPage() {
   }, [(status as any)?.status, (status as any)?.check?.decidedAt])
 
   const canNext=[
-    !!(validName(form.firstName)&&validName(form.lastName)&&validDob&&validSsn&&form.email.includes('@')&&form.password.length>=8&&form.password===(form as any).confirmPassword),
+    !!(validName(form.firstName)&&validName(form.lastName)&&validDob&&(providerCollectsPii||validSsn)&&form.email.includes('@')&&form.password.length>=8&&form.password===(form as any).confirmPassword),
     !!(form.street1.length>=5&&form.city.length>=2&&validZip&&(addrVerified||addrWarn)),
     !!(validPrev&&validIncome&&incomeFiles.length>=2&&form.income&&((['employed','part_time','self_employed'].includes(form.empStatus)?(form.employer&&form.empPhone):true))),
-    !!(idUrl),
+    !!(providerCollectsPii||idUrl),
     !!(form.consentCredit&&form.consentCriminal&&form.acceptedTerms),
     paid,
   ]
-  if((status as any)?.status==='submitted')return(
+  if((status as any)?.status==='submitted'){
+    const chk = (status as any)?.check
+    const applyUrl = chk?.status==='awaiting_applicant' ? (chk?.applicantRedirectUrl || null) : null
+    return(
     <div style={{display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',minHeight:'60vh',gap:16,textAlign:'center',padding:32}}>
       <div style={{width:72,height:72,borderRadius:'50%',background:'rgba(245,158,11,.1)',border:'2px solid #f59e0b',display:'flex',alignItems:'center',justifyContent:'center'}}><Clock size={32} style={{color:'#f59e0b'}}/></div>
-      <h2 style={{color:'#eef1f8',margin:0}}>Application Under Review</h2>
-      <p style={{color:'#4a5568',maxWidth:380,lineHeight:1.6}}>Your application is being reviewed. You will receive an email once a decision has been made.</p>
+      <h2 style={{color:'#eef1f8',margin:0}}>{applyUrl?'One More Step':'Application Under Review'}</h2>
+      {applyUrl ? (
+        <>
+          <p style={{color:'#4a5568',maxWidth:400,lineHeight:1.6}}>Your application is in. To run your screening, complete the secure identity &amp; consent step with Checkr, our screening partner — it takes about two minutes. Checkr also emailed you this link.</p>
+          <a href={applyUrl} target="_blank" rel="noopener noreferrer" style={{padding:'12px 28px',borderRadius:10,background:'#c9a227',color:'#060809',fontWeight:700,textDecoration:'none',fontSize:'.9rem'}}>Complete Screening with Checkr →</a>
+        </>
+      ) : (
+        <p style={{color:'#4a5568',maxWidth:380,lineHeight:1.6}}>Your application is being reviewed. You will receive an email once a decision has been made.</p>
+      )}
       {process.env.NODE_ENV !== 'production' && (
         <button onClick={async()=>{await fetch(API+'/api/background/dev-reset',{method:'POST',headers:{Authorization:'Bearer '+tok(),'Content-Type':'application/json'}});window.location.reload()}} style={{marginTop:8,padding:'6px 14px',borderRadius:6,border:'1px solid #333',background:'#141a22',color:'#4a5568',fontSize:'.72rem',cursor:'pointer'}}>🔧 Dev: Reset Application</button>
       )}
     </div>
-  )
+  )}
   if((status as any)?.status==='approved')return(
     <div style={{display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',minHeight:'60vh',gap:16,textAlign:'center',padding:32}}>
       <div style={{width:72,height:72,borderRadius:'50%',background:'rgba(34,197,94,.1)',border:'2px solid #22c55e',display:'flex',alignItems:'center',justifyContent:'center'}}><Check size={32} style={{color:'#22c55e'}}/></div>
@@ -382,7 +417,9 @@ export function BackgroundCheckPage() {
       <div style={{fontSize:'.7rem',color:'#4a5568',textAlign:'center',marginBottom:20}}>Step {step+1} of {STEPS.length} — {STEPS[step]}</div>
       <div style={{background:'#0a0d10',border:'1px solid #1e2530',borderRadius:12,padding:24,marginBottom:16}}>
         {step===0&&<div>
-          <div style={{background:'rgba(239,68,68,.06)',border:'1px solid rgba(239,68,68,.2)',borderRadius:8,padding:'8px 12px',marginBottom:14,fontSize:'.72rem',color:'#ef4444',display:'flex',gap:6}}><Lock size={12} style={{flexShrink:0,marginTop:1}}/> SSN encrypted with AES-256 — never stored in plaintext</div>
+          {providerCollectsPii
+            ? <div style={{background:'rgba(201,162,39,.06)',border:'1px solid rgba(201,162,39,.2)',borderRadius:8,padding:'8px 12px',marginBottom:14,fontSize:'.72rem',color:'#c9a227',display:'flex',gap:6}}><Lock size={12} style={{flexShrink:0,marginTop:1}}/> Sensitive details (SSN) are collected securely by Checkr, our screening partner — never by this form</div>
+            : <div style={{background:'rgba(239,68,68,.06)',border:'1px solid rgba(239,68,68,.2)',borderRadius:8,padding:'8px 12px',marginBottom:14,fontSize:'.72rem',color:'#ef4444',display:'flex',gap:6}}><Lock size={12} style={{flexShrink:0,marginTop:1}}/> SSN encrypted with AES-256 — never stored in plaintext</div>}
           <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:10}}>
             <div><label style={lbl}>First Name *</label><input style={{...inp,borderColor:form.firstName&&!validName(form.firstName)?'#ef4444':undefined}} value={form.firstName} onChange={e=>set('firstName',e.target.value.replace(/[^a-zA-Z\-' ]/g,''))} placeholder="Jane"/></div>
             <div><label style={lbl}>Last Name *</label><input style={{...inp,borderColor:form.lastName&&!validName(form.lastName)?'#ef4444':undefined}} value={form.lastName} onChange={e=>set('lastName',e.target.value.replace(/[^a-zA-Z\-' ]/g,''))} placeholder="Smith"/></div>
@@ -393,7 +430,7 @@ export function BackgroundCheckPage() {
             <div><label style={lbl}>Password *</label><input style={inp} type="password" value={form.password} onChange={e=>set('password',e.target.value)} placeholder="Min 8 characters"/></div>
             <div><label style={lbl}>Confirm Password *</label><input style={{...inp,borderColor:form.password&&form.confirmPassword&&form.password!==form.confirmPassword?'#ef4444':undefined}} type="password" value={(form as any).confirmPassword||''} onChange={e=>set('confirmPassword',e.target.value)} placeholder="Repeat password"/></div>
           </div>
-          <div><label style={lbl}>Social Security Number *</label><div style={{position:'relative'}}><input style={{...inp,borderColor:form.ssn&&!validSsn?'#ef4444':undefined}} type="text" inputMode="numeric" value={ssnDisplay()} onChange={e=>{const d=e.target.value.replace(/\D/g,'');set('ssn',d.slice(0,9))}} onFocus={()=>setShowSsn(true)} onBlur={()=>setShowSsn(false)} placeholder="XXX-XX-XXXX"/><span style={{position:'absolute',right:10,top:'50%',transform:'translateY(-50%)',fontSize:'.75rem',color:'#4a5568',cursor:'pointer'}} onClick={()=>setShowSsn(s=>!s)}>{showSsn?'🙈':'👁'}</span></div>{form.ssn&&!validSsn&&<div style={{color:'#ef4444',fontSize:'.68rem',marginTop:3}}>{ssnDigits.length<9?(9-ssnDigits.length)+' more digits required':'Invalid SSN format'}</div>}{validSsn&&<div style={{color:'#22c55e',fontSize:'.68rem',marginTop:3}}>✓ Format verified — stored encrypted</div>}</div>
+          {!providerCollectsPii&&<div><label style={lbl}>Social Security Number *</label><div style={{position:'relative'}}><input style={{...inp,borderColor:form.ssn&&!validSsn?'#ef4444':undefined}} type="text" inputMode="numeric" value={ssnDisplay()} onChange={e=>{const d=e.target.value.replace(/\D/g,'');set('ssn',d.slice(0,9))}} onFocus={()=>setShowSsn(true)} onBlur={()=>setShowSsn(false)} placeholder="XXX-XX-XXXX"/><span style={{position:'absolute',right:10,top:'50%',transform:'translateY(-50%)',fontSize:'.75rem',color:'#4a5568',cursor:'pointer'}} onClick={()=>setShowSsn(s=>!s)}>{showSsn?'🙈':'👁'}</span></div>{form.ssn&&!validSsn&&<div style={{color:'#ef4444',fontSize:'.68rem',marginTop:3}}>{ssnDigits.length<9?(9-ssnDigits.length)+' more digits required':'Invalid SSN format'}</div>}{validSsn&&<div style={{color:'#22c55e',fontSize:'.68rem',marginTop:3}}>✓ Format verified — stored encrypted</div>}</div>}
         </div>}
         {step===1&&<div>
           {!userCoords && !locationDenied && (
@@ -495,7 +532,9 @@ export function BackgroundCheckPage() {
               </div><div><label style={lbl}>Email</label><input style={inp} type="email" value={form.prevEmail} onChange={e=>set('prevEmail',e.target.value)}/></div></div></div>
         </div>}
         {step===3&&<div>
-          <div style={{fontSize:'.82rem',color:'#b8c4d8',marginBottom:16,lineHeight:1.6}}>Upload a photo of your government-issued ID (driver's license, state ID, or passport). <strong style={{color:'#c9a227'}}>Required.</strong> Your name will be verified against this document.</div>
+          {providerCollectsPii
+            ? <div style={{fontSize:'.82rem',color:'#b8c4d8',marginBottom:16,lineHeight:1.6}}>Identity verification is handled by Checkr, our screening partner, during their secure application step. Uploading an ID here is <strong style={{color:'#c9a227'}}>optional</strong> — it can speed up your landlord's review.</div>
+            : <div style={{fontSize:'.82rem',color:'#b8c4d8',marginBottom:16,lineHeight:1.6}}>Upload a photo of your government-issued ID (driver's license, state ID, or passport). <strong style={{color:'#c9a227'}}>Required.</strong> Your name will be verified against this document.</div>}
           <input ref={fileRef} type="file" accept="image/jpeg,image/png,application/pdf" style={{display:'none'}} onChange={handleIdUpload}/>
           <input ref={idCameraRef} type="file" accept="image/*" capture="environment" style={{display:'none'}} onChange={handleIdUpload}/>
           {idFile ? (
@@ -584,9 +623,22 @@ export function BackgroundCheckPage() {
           <div style={{fontSize:'1.1rem',fontWeight:800,color:'#eef1f8',marginBottom:6}}>Background Check Fee</div>
           <div style={{fontSize:'.82rem',color:'#4a5568',marginBottom:20}}>Payment required before your application is submitted.</div>
           <div style={{background:'#141a22',border:'1px solid #1e2530',borderRadius:12,padding:20,marginBottom:20,textAlign:'left'}}>
-            <div style={{display:'flex',justifyContent:'space-between',marginBottom:8,fontSize:'.82rem'}}><span style={{color:'#4a5568'}}>Platform Background Check</span><span style={{color:'#eef1f8',fontFamily:'monospace'}}>$25.00</span></div>
-            <div style={{display:'flex',justifyContent:'space-between',marginBottom:12,fontSize:'.82rem'}}><span style={{color:'#4a5568'}}>Processing & Report Fee</span><span style={{color:'#eef1f8',fontFamily:'monospace'}}>$20.00</span></div>
-            <div style={{display:'flex',justifyContent:'space-between',borderTop:'1px solid #1e2530',paddingTop:12,fontWeight:700}}><span style={{color:'#eef1f8'}}>Total</span><span style={{color:'#c9a227',fontFamily:'monospace',fontSize:'1.1rem'}}>$45.00</span></div>
+            {feeProhibited ? (
+              <div style={{fontSize:'.82rem',color:'#22c55e',lineHeight:1.6}}>No application fee — your state does not permit applicant-paid screening fees. Your landlord covers the screening cost.</div>
+            ) : capApplied ? (
+              <>
+                <div style={{display:'flex',justifyContent:'space-between',marginBottom:12,fontSize:'.82rem'}}><span style={{color:'#4a5568'}}>Application fee (state-capped)</span><span style={{color:'#eef1f8',fontFamily:'monospace'}}>{fmtUsd(feeTotalUsd)}</span></div>
+                <div style={{display:'flex',justifyContent:'space-between',borderTop:'1px solid #1e2530',paddingTop:12,fontWeight:700}}><span style={{color:'#eef1f8'}}>Total</span><span style={{color:'#c9a227',fontFamily:'monospace',fontSize:'1.1rem'}}>{fmtUsd(feeTotalUsd)}</span></div>
+                <div style={{fontSize:'.68rem',color:'#4a5568',marginTop:10}}>Your state caps applicant screening fees — your landlord covers the remainder of the screening cost.</div>
+              </>
+            ) : (
+              <>
+                <div style={{display:'flex',justifyContent:'space-between',marginBottom:8,fontSize:'.82rem'}}><span style={{color:'#4a5568'}}>Background screening{providerCollectsPii?' (Checkr)':''}</span><span style={{color:'#eef1f8',fontFamily:'monospace'}}>{fmtUsd(feeCheckUsd)}</span></div>
+                <div style={{display:'flex',justifyContent:'space-between',marginBottom:12,fontSize:'.82rem'}}><span style={{color:'#4a5568'}}>Card processing</span><span style={{color:'#eef1f8',fontFamily:'monospace'}}>{fmtUsd(feeProcessingUsd)}</span></div>
+                <div style={{display:'flex',justifyContent:'space-between',borderTop:'1px solid #1e2530',paddingTop:12,fontWeight:700}}><span style={{color:'#eef1f8'}}>Total</span><span style={{color:'#c9a227',fontFamily:'monospace',fontSize:'1.1rem'}}>{fmtUsd(feeTotalUsd)}</span></div>
+                <div style={{fontSize:'.68rem',color:'#4a5568',marginTop:10}}>The screening fee is passed through at cost — no markup.</div>
+              </>
+            )}
           </div>
           {paymentInitError && (
             <div style={{padding:'10px 14px',background:'rgba(239,68,68,.06)',border:'1px solid rgba(239,68,68,.25)',borderRadius:8,color:'#ef4444',fontSize:'.78rem',marginBottom:12}}>{paymentInitError}</div>
@@ -598,11 +650,11 @@ export function BackgroundCheckPage() {
             !STRIPE_PK ? (
               <>
                 <div style={{background:'rgba(201,162,39,.06)',border:'1px solid rgba(201,162,39,.2)',borderRadius:8,padding:'10px 14px',marginBottom:12,fontSize:'.75rem',color:'#c9a227'}}>⚠️ Stripe not configured — using mock payment (dev only)</div>
-                <button onClick={()=>setPaid(true)} style={{width:'100%',padding:'14px',borderRadius:10,border:'none',background:'#c9a227',color:'#060809',fontWeight:700,fontSize:'.95rem',cursor:'pointer'}}>💳 Confirm Mock Payment — $45.00</button>
+                <button onClick={()=>setPaid(true)} style={{width:'100%',padding:'14px',borderRadius:10,border:'none',background:'#c9a227',color:'#060809',fontWeight:700,fontSize:'.95rem',cursor:'pointer'}}>💳 Confirm Mock Payment — {fmtUsd(feeTotalUsd)}</button>
               </>
             ) : (
               <Elements stripe={stripePromise} options={{ clientSecret: paymentClientSecret, appearance: { theme: 'night' } }}>
-                <StripePayForm amount={45} onPaid={(intentId)=>{ setPaymentIntentId(intentId); setPaid(true) }} />
+                <StripePayForm amount={feeTotalUsd} onPaid={(intentId)=>{ setPaymentIntentId(intentId); setPaid(true) }} />
               </Elements>
             )
           )}

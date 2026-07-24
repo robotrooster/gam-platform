@@ -7,6 +7,7 @@ import {
   loadWorkTradeCreditContext, workTradeFraction, distributeWorkTradeCredit, round2,
 } from '../services/workTradeCredit'
 import { ensureBillsForUnit } from '../services/utilityBilling'
+import { isBookingScheduleLease, bookingRentForDueDate } from '../services/bookingLeaseBilling'
 
 // ============================================================
 // S26a: Invoice generator (replaces S25 rentGeneration)
@@ -26,6 +27,7 @@ interface ActiveLease {
   end_date: string | null
   tenant_id: string | null
   property_tz: string
+  lease_source: string | null   // S548: 'booking_draft' bills the calendar schedule
 }
 
 interface MonthlyFee {
@@ -105,6 +107,118 @@ async function allocateInvoiceNumber(
 }
 
 /**
+ * S548 (Nic — immediate move-out settlement). When the FINAL meter read
+ * lands for a lease that has ended, its stub utility bill can't ride a
+ * next cycle — there isn't one. Neither party waits a month to square up:
+ * this cuts an invoice DATED TODAY, DUE TODAY carrying every uninvoiced
+ * utility bill on the lease. The tenant can pay it immediately from their
+ * portal; if it's still unpaid at deposit-return finalize, the S180 sweep
+ * settles it from the deposit — and the surplus refunds the same day.
+ * Both parties get notified. Idempotent per (lease, day); a collision with
+ * an existing invoice leaves the bills unattached for the deposit backstop.
+ */
+export async function generateFinalUtilityInvoice(
+  leaseId: string,
+): Promise<{ invoiceId: string; total: number } | null> {
+  const lease = await queryOne<any>(`
+    SELECT l.id, l.landlord_id, l.unit_id,
+           (SELECT lt.tenant_id FROM lease_tenants lt
+             WHERE lt.lease_id = l.id AND lt.role = 'primary' LIMIT 1) AS tenant_id,
+           u.unit_number, p.name AS property_name
+      FROM leases l
+      JOIN units u ON u.id = l.unit_id
+      JOIN properties p ON p.id = u.property_id
+     WHERE l.id = $1`, [leaseId])
+  if (!lease) return null
+
+  const bills = await query<any>(`
+    SELECT ub.id, (ub.charge_amount + ub.tax_amount)::text AS amount,
+           ub.utility_type, ub.usage_amount::text, ub.reading_start::text, ub.reading_end::text
+      FROM utility_bills ub
+     WHERE ub.lease_id = $1 AND ub.payment_id IS NULL AND ub.status IN ('unbilled', 'billed')
+     ORDER BY ub.billing_cycle_month ASC`, [leaseId])
+  if (bills.length === 0) return null
+  const total = round2(bills.reduce((s: number, b: any) => s + Number(b.amount), 0))
+  const today = new Date().toISOString().slice(0, 10)
+
+  const client = await getClient()
+  let invoiceId: string
+  try {
+    await client.query('BEGIN')
+    const invoiceNumber = await allocateInvoiceNumber(client, lease.landlord_id, new Date().getFullYear())
+    const inv = await client.query<{ id: string }>(
+      `INSERT INTO invoices (
+         landlord_id, tenant_id, lease_id, unit_id, invoice_number, due_date,
+         subtotal_rent, subtotal_fees, subtotal_utilities, total_amount,
+         work_trade_credit_amount, work_trade_credit_hours, work_trade_agreement_id
+       ) VALUES ($1, $2, $3, $4, $5, $6, 0, 0, $7, $7, 0, 0, NULL)
+       ON CONFLICT (lease_id, due_date) DO NOTHING
+       RETURNING id`,
+      [lease.landlord_id, lease.tenant_id, lease.id, lease.unit_id,
+       invoiceNumber, today, total.toFixed(2)])
+    if (inv.rows.length === 0) { await client.query('ROLLBACK'); return null }
+    invoiceId = inv.rows[0].id
+    for (const b of bills) {
+      const readNote = b.reading_start != null && b.reading_end != null
+        ? `Final ${b.utility_type} — meter ${Math.trunc(Number(b.reading_start))} → ${Math.trunc(Number(b.reading_end))}`
+        : `Final ${b.utility_type}`
+      const pay = await client.query<{ id: string }>(
+        `INSERT INTO payments (
+           invoice_id, unit_id, lease_id, tenant_id, landlord_id,
+           type, amount, status, due_date, entry_description, notes
+         ) VALUES ($1, $2, $3, $4, $5, 'utility', $6, 'pending', $7, 'UTILITY', $8)
+         RETURNING id`,
+        [invoiceId, lease.unit_id, lease.id, lease.tenant_id, lease.landlord_id,
+         Number(b.amount).toFixed(2), today, readNote])
+      await client.query(
+        `UPDATE utility_bills
+            SET payment_id = $1, status = 'billed', billed_at = COALESCE(billed_at, NOW()), updated_at = NOW()
+          WHERE id = $2`,
+        [pay.rows[0].id, b.id])
+    }
+    await client.query('COMMIT')
+  } catch (e) {
+    try { await client.query('ROLLBACK') } catch {}
+    throw e
+  } finally { client.release() }
+
+  // Both parties want to square up TODAY — tell them it's ready.
+  try {
+    const { createNotification } = await import('../services/notifications')
+    const owner = await queryOne<{ user_id: string }>(
+      `SELECT user_id FROM landlords WHERE id = $1`, [lease.landlord_id])
+    if (owner) {
+      await createNotification({
+        userId: owner.user_id,
+        landlordId: lease.landlord_id,
+        type: 'final_utility_invoice',
+        title: `Final utilities billed — unit ${lease.unit_number}`,
+        body: `$${total.toFixed(2)} of final utility usage was invoiced to the departing tenant at ${lease.property_name}. Finalize the deposit return to settle it and refund their surplus today.`,
+        data: { leaseId: lease.id, invoiceId, total },
+        actionUrl: `/leases?open=${lease.id}`,
+      })
+    }
+    const tenantUser = lease.tenant_id ? await queryOne<{ user_id: string }>(
+      `SELECT user_id FROM tenants WHERE id = $1`, [lease.tenant_id]) : null
+    if (tenantUser) {
+      await createNotification({
+        userId: tenantUser.user_id,
+        landlordId: lease.landlord_id,
+        type: 'final_utility_invoice',
+        title: 'Your final utility bill is ready',
+        body: `$${total.toFixed(2)} for your last days at ${lease.property_name}. Pay it from your portal, or it settles from your deposit — the rest of your deposit comes back to you.`,
+        data: { leaseId: lease.id, invoiceId, total },
+      })
+    }
+  } catch (err) {
+    logger.error({ err, leaseId, invoiceId }, '[final-utility-invoice] notification failed')
+  }
+
+  logger.info({ leaseId, invoiceId, total }, '[final-utility-invoice] move-out utilities invoiced same-day')
+  return { invoiceId, total }
+}
+
+/**
  * Generate (or catch up) invoices for all active leases.
  * Called daily by cron.
  */
@@ -113,6 +227,7 @@ export async function generateInvoices(
 ): Promise<InvoiceGenResult> {
   const leases = await query<ActiveLease>(`
     SELECT l.id, l.unit_id, l.landlord_id, l.rent_amount, l.rent_due_day,
+           l.lease_source,
            to_char(l.start_date, 'YYYY-MM-DD') AS start_date,
            to_char(l.end_date,   'YYYY-MM-DD') AS end_date,
            (SELECT vlat.tenant_id
@@ -264,7 +379,19 @@ async function runGeneration(
         [lease.id, dueDate],
       )
       const effectiveTenantId = sublease?.sublessee_tenant_id ?? lease.tenant_id
-      const effectiveRentAmount = sublease ? Number(sublease.sub_monthly_amount).toFixed(2) : lease.rent_amount
+      // S548: booking-sourced leases bill the calendar-aligned schedule —
+      // flat monthly for full months, prorated (monthly/30) for the final
+      // partial month; a due date starting no segment owes no rent that
+      // cycle. Matches the guest's quote exactly (shared schedule math).
+      // Sublease pricing, when active, still wins (explicit contract).
+      let bookingRent: string | null = null
+      if (!sublease && isBookingScheduleLease(lease)) {
+        const seg = bookingRentForDueDate(lease.start_date, lease.end_date!, Number(lease.rent_amount), dueDate)
+        if (seg == null) continue
+        bookingRent = seg.toFixed(2)
+      }
+      const effectiveRentAmount = sublease ? Number(sublease.sub_monthly_amount).toFixed(2)
+        : bookingRent ?? lease.rent_amount
 
       // S178: pull any utility_bills for this lease that haven't been
       // attached to an invoice yet (payment_id IS NULL) and whose cycle
@@ -613,6 +740,7 @@ export async function generateInvoicesForTimezone(
 ): Promise<InvoiceGenResult> {
   const leases = await query<ActiveLease>(`
     SELECT l.id, l.unit_id, l.landlord_id, l.rent_amount, l.rent_due_day,
+           l.lease_source,
            to_char(l.start_date, 'YYYY-MM-DD') AS start_date,
            to_char(l.end_date,   'YYYY-MM-DD') AS end_date,
            (SELECT vlat.tenant_id
@@ -671,6 +799,7 @@ export async function backfillInvoices(opts: BackfillOpts): Promise<InvoiceGenRe
 
   const leases = await query<ActiveLease>(`
     SELECT l.id, l.unit_id, l.landlord_id, l.rent_amount, l.rent_due_day,
+           l.lease_source,
            to_char(l.start_date, 'YYYY-MM-DD') AS start_date,
            to_char(l.end_date,   'YYYY-MM-DD') AS end_date,
            (SELECT vlat.tenant_id

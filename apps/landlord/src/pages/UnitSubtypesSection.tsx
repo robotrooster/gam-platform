@@ -131,6 +131,7 @@ function SubtypeEditor({ propertyId, initial, onDone, onCancel, onError }: {
     bathrooms:    initial?.bathrooms != null ? String(initial.bathrooms) : '',
     rvSiteLayout: initial?.rvSiteLayout ?? 'none',
     rvAmpService: initial?.rvAmpService ?? 'none',
+    dwellingOwnership: initial?.dwellingOwnership ?? 'tenant',
     storageSize:  initial?.storageSize ?? '',
     rentAmount:      initial?.rentAmount?.toString() ?? '',
     securityDeposit: initial?.securityDeposit?.toString() ?? '',
@@ -141,6 +142,9 @@ function SubtypeEditor({ propertyId, initial, onDone, onCancel, onError }: {
   const set = (k: string, v: any) => setF(x => ({ ...x, [k]: v }))
   const isRv = f.unitType === 'rv_spot'
   const hasBeds = UNIT_TYPE_HAS_BEDROOMS[f.unitType]
+  // S550: ownership is a subtype fact for RV/MH — "MH Lot" (tenant-owned)
+  // vs "Park Model Rental" (park-owned). Tenant-owned is the norm/default.
+  const ownershipRelevant = isRv || f.unitType === 'mobile_home'
   const num = (s: string) => s.trim() === '' ? null : parseFloat(s)
 
   const saveMut = useMutation(
@@ -152,6 +156,7 @@ function SubtypeEditor({ propertyId, initial, onDone, onCancel, onError }: {
       bathrooms: hasBeds ? num(f.bathrooms) : null,
       rvSiteLayout: isRv ? f.rvSiteLayout : null,
       rvAmpService: isRv ? f.rvAmpService : null,
+      dwellingOwnership: ownershipRelevant ? f.dwellingOwnership : null,
       storageSize: f.unitType === 'storage' ? (f.storageSize.trim() || null) : null,
       rentAmount: num(f.rentAmount), securityDeposit: num(f.securityDeposit),
       nightlyRate: isRv ? num(f.nightlyRate) : null,
@@ -208,6 +213,15 @@ function SubtypeEditor({ propertyId, initial, onDone, onCancel, onError }: {
               </select>
             </div>
           </>
+        )}
+        {ownershipRelevant && (
+          <div>
+            <div style={lbl}>{isRv ? 'Who owns the RV?' : 'Who owns the home?'}</div>
+            <select className="input" value={f.dwellingOwnership} onChange={e => set('dwellingOwnership', e.target.value)}>
+              <option value="tenant">Tenant-owned (space rent)</option>
+              <option value="landlord">Park-owned rental</option>
+            </select>
+          </div>
         )}
         {f.unitType === 'storage' && (
           <div>

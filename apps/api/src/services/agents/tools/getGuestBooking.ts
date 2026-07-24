@@ -14,6 +14,7 @@ import type { AgentTool, AgentActor } from './types'
 export interface GuestBookingContext {
   booking_id: string
   guest_name: string | null
+  unit_id: string | null
   check_in: string
   check_out: string
   nights: number | null
@@ -23,6 +24,7 @@ export interface GuestBookingContext {
   notes: string | null
   landlord_id: string
   landlord_user_id: string
+  property_id: string | null
   property_name: string | null
   property_city: string | null
   property_state: string | null
@@ -32,10 +34,10 @@ export interface GuestBookingContext {
 /** Load the full booking + host context for a guest-scoped booking id, or null. */
 export async function loadGuestBookingContext(bookingId: string): Promise<GuestBookingContext | null> {
   return queryOne<GuestBookingContext>(
-    `SELECT b.id AS booking_id, b.guest_name, b.check_in, b.check_out, b.nights,
+    `SELECT b.id AS booking_id, b.guest_name, b.unit_id, b.check_in, b.check_out, b.nights,
             b.status, b.lease_type, b.total_amount, b.notes,
             b.landlord_id, lo.user_id AS landlord_user_id,
-            p.name AS property_name, p.city AS property_city, p.state AS property_state,
+            p.id AS property_id, p.name AS property_name, p.city AS property_city, p.state AS property_state,
             u.unit_number
        FROM unit_bookings b
        JOIN landlords lo ON lo.id = b.landlord_id

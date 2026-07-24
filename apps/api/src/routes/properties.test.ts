@@ -620,3 +620,66 @@ describe('agent-permissions (per-property revenue opt-in)', () => {
     expect(res.status).toBe(403)
   })
 })
+
+// ─── S550: duplicate property identity = name + ADDRESS, never name ─
+
+describe('S550 — duplicate property identity', () => {
+  const create = (f: PropsFixture, name: string, street1: string, city = 'Phoenix') =>
+    request(buildApp())
+      .post('/api/properties')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ name, street1, city, state: 'AZ', zip: '85001', type: 'residential', allocationRule: { platformFeePayer: 'landlord' } })
+
+  it('same landlord + same name + same address → 409 (same property entered twice)', async () => {
+    const f = await seedPropsFixture()
+    expect((await create(f, 'Oak Park', '22658 Highway 89', 'Yarnell')).status).toBe(201)
+    const dup = await create(f, 'oak park', '22658 highway 89', 'yarnell')
+    expect(dup.status).toBe(409)
+    expect(dup.body.error || dup.body.message).toContain('entered twice')
+  })
+
+  it('same landlord may own TWO properties sharing a name at different addresses', async () => {
+    const f = await seedPropsFixture()
+    expect((await create(f, 'Oak Park', '22658 Highway 89', 'Yarnell')).status).toBe(201)
+    expect((await create(f, 'Oak Park', '101 Desert Rose Ln', 'Phoenix')).status).toBe(201)
+  })
+
+  it('a DIFFERENT landlord may use the same name at a different address', async () => {
+    const f1 = await seedPropsFixture()
+    const f2 = await seedPropsFixture()
+    expect((await create(f1, 'Oak Park', '22658 Highway 89', 'Yarnell')).status).toBe(201)
+    expect((await create(f2, 'Oak Park', '500 Elm St', 'Yarnell')).status).toBe(201)
+  })
+
+  it('a DIFFERENT landlord claiming the SAME full address is blocked (any name) + admins alerted', async () => {
+    const f1 = await seedPropsFixture()
+    const f2 = await seedPropsFixture()
+    expect((await create(f1, 'Oak Park', '22658 Highway 89', 'Yarnell')).status).toBe(201)
+    // Different NAME, same full address — still blocked (renamed claim).
+    const claim = await create(f2, 'Sunset Pines', '22658 Highway 89', 'Yarnell')
+    expect(claim.status).toBe(409)
+    // Reveals nothing about the other account, and points at the suite path.
+    const msg = String(claim.body.error || claim.body.message)
+    expect(msg).toContain('already registered on GAM')
+    expect(msg).toContain('suite')
+    expect(msg).not.toContain(f1.landlordId)
+    const alert = await db.query(
+      `SELECT id FROM admin_notifications WHERE category='duplicate_property_claim'`)
+    expect(alert.rows.length).toBe(1)
+  })
+
+  it('strip-mall case: same street, DIFFERENT suite line, different owners → allowed', async () => {
+    const f1 = await seedPropsFixture()
+    const f2 = await seedPropsFixture()
+    const withSuite = (f: PropsFixture, name: string, street2: string) =>
+      request(buildApp())
+        .post('/api/properties')
+        .set('Authorization', `Bearer ${f.landlordToken}`)
+        .send({ name, street1: '100 Main St', street2, city: 'Phoenix', state: 'AZ', zip: '85001',
+                type: 'residential', allocationRule: { platformFeePayer: 'landlord' } })
+    expect((await withSuite(f1, 'Main St Plaza — East', 'Suite A')).status).toBe(201)
+    expect((await withSuite(f2, 'Main St Plaza — West', 'Suite B')).status).toBe(201)
+    // Same suite as an existing owner → blocked.
+    expect((await withSuite(f2, 'Plaza Clone', 'Suite A')).status).toBe(409)
+  })
+})

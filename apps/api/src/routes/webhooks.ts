@@ -1,4 +1,5 @@
 import { Router } from 'express'
+import { createHash } from 'crypto'
 import Stripe from 'stripe'
 import { query, getClient } from '../db'
 import { executeRentAllocation, type PaymentMethod } from '../services/allocation'
@@ -27,6 +28,28 @@ webhooksRouter.post('/stripe', async (req, res) => {
     event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET!)
   } catch (err: any) {
     return res.status(400).json({ error: `Webhook signature failed: ${err.message}` })
+  }
+
+  // C3 (S550 data-completeness): persist the raw verified payload append-
+  // only BEFORE any processing, so history stays replayable if processing
+  // logic ever changes. Idempotent under Stripe re-delivery via the
+  // stripe_event_id UNIQUE. If the insert itself fails we 500 — Stripe
+  // retries, so a transient DB error never loses a payload. Real Stripe
+  // events always carry an id; the body-hash fallback keeps id-less
+  // payloads (test fixtures) storable AND idempotent.
+  const rawEventId = event.id
+    || 'evt_local_' + createHash('sha256').update(req.body).digest('hex').slice(0, 32)
+  try {
+    await query(
+      `INSERT INTO stripe_webhook_events
+         (stripe_event_id, event_type, api_version, livemode, payload)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (stripe_event_id) DO NOTHING`,
+      [rawEventId, event.type, (event as any).api_version ?? null, event.livemode === true, JSON.stringify(event)]
+    )
+  } catch (e) {
+    logger.error({ err: e, stripe_event_id: event.id }, '[webhook] raw event persist failed')
+    return res.status(500).json({ error: 'raw event persist failed' })
   }
 
   switch (event.type) {
@@ -275,6 +298,7 @@ webhooksRouter.post('/stripe', async (req, res) => {
           context:  { stripe_payment_intent_id: pi.id },
         })
         // Return 500 so Stripe retries with backoff.
+        await stampWebhookError(rawEventId, e)
         return res.status(500).json({ error: 'webhook handler failed' })
       } finally {
         client.release()
@@ -771,6 +795,7 @@ webhooksRouter.post('/stripe', async (req, res) => {
           body:     e instanceof Error ? e.message : String(e),
           context:  { event_type: event.type, account_id: accountId, payout_id: payout.id },
         })
+        await stampWebhookError(rawEventId, e)
         return res.status(500).json({ error: 'webhook handler failed' })
       }
       break
@@ -795,6 +820,7 @@ webhooksRouter.post('/stripe', async (req, res) => {
           body:     e instanceof Error ? e.message : String(e),
           context:  { event_type: event.type, stripe_dispute_id: dispute.id },
         })
+        await stampWebhookError(rawEventId, e)
         return res.status(500).json({ error: 'webhook handler failed' })
       }
       break
@@ -818,6 +844,7 @@ webhooksRouter.post('/stripe', async (req, res) => {
         await recordAccountUpdated(account)
       } catch (e) {
         logger.error({ err: e, stripe_account_id: account.id }, 'webhook account.updated handler failed')
+        await stampWebhookError(rawEventId, e)
         return res.status(500).json({ error: 'webhook handler failed' })
       }
       break
@@ -956,14 +983,38 @@ webhooksRouter.post('/stripe', async (req, res) => {
       } catch (e) {
         logger.error({ err: e, session_id: session.id },
           'webhook checkout.session.completed (business invoice) failed')
+        await stampWebhookError(rawEventId, e)
         return res.status(500).json({ error: 'webhook handler failed' })
       }
       break
     }
   }
 
+  // Latest delivery processed clean — clear any failure stamp left by an
+  // earlier delivery of this same event (fire-and-forget; best-effort).
+  query(
+    `UPDATE stripe_webhook_events SET processing_error = NULL
+      WHERE stripe_event_id = $1 AND processing_error IS NOT NULL`,
+    [rawEventId]
+  ).catch(() => {})
+
   res.json({ received: true })
 })
+
+/**
+ * Stamp a processing failure on the raw-event row (C3). Best-effort and
+ * never throws — the surrounding 500 return already makes Stripe retry;
+ * this just makes "which events failed processing" a one-query report.
+ */
+async function stampWebhookError(stripeEventId: string, err: unknown): Promise<void> {
+  const msg = err instanceof Error ? err.message : String(err)
+  try {
+    await query(
+      `UPDATE stripe_webhook_events SET processing_error = $2 WHERE stripe_event_id = $1`,
+      [stripeEventId, msg]
+    )
+  } catch { /* best-effort */ }
+}
 
 /**
  * Map Stripe charge payment_method_details.type to GAM's collapsed bucket.

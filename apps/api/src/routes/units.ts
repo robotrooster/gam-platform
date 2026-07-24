@@ -4,13 +4,14 @@ import { query, queryOne } from '../db'
 import { requireAuth, requireLandlord, requirePerm, getScopedPropertyIds, assertPropertyInScope } from '../middleware/auth'
 import { canAccessLandlordResource, canManageLandlordResource, canViewLandlordFinances } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
-import { UnitStatus, calcNetPerUnit, getReservePhase, LAUNCH_PLATFORM_FEE, UNIT_STATUSES, UNIT_TYPES, computeStayPrice, computeMonthlyStaySchedule, RV_SITE_LAYOUTS, RV_AMP_SERVICES, isSiteLayoutMismatch, isAmpServiceMismatch, SHORT_STAY_LOCKED_UNIT_TYPES } from '@gam/shared'
+import { UnitStatus, calcNetPerUnit, getReservePhase, LAUNCH_PLATFORM_FEE, UNIT_STATUSES, UNIT_TYPES, computeStayPrice, computeMonthlyStaySchedule, RV_SITE_LAYOUTS, RV_AMP_SERVICES, isSiteLayoutMismatch, isAmpServiceMismatch, SHORT_STAY_LOCKED_UNIT_TYPES, DWELLING_OWNERSHIP_VALUES } from '@gam/shared'
 import { findStayConflict, findAvailableUnits, STAY_CONFLICT_MESSAGE } from '../services/unitAvailability'
 import { formatUnitNumber } from '../lib/format'
 import { logger } from '../lib/logger'
 import { promoteNextWaitlister } from '../services/propertyBooking'
 import { recordBookingEvent, recordBookingChange } from '../services/bookingEvents'
 import { maybeDraftLeaseFromBooking } from '../services/bookingLeaseDraft'
+import { syncLeaseWithBookingDates } from '../services/bookingLeaseBilling'
 import { assertLateFeeDecision } from '../services/lateFeePolicy'
 import {
   sendBookingGuestAccessEmail,
@@ -145,6 +146,10 @@ unitsRouter.post('/', requirePerm('properties.add_unit'), async (req, res, next)
       securityDeposit: z.number().min(0).optional(),
       rvSiteLayout:    z.enum(RV_SITE_LAYOUTS as unknown as [string, ...string[]]).optional(),
       rvAmpService:    z.enum(RV_AMP_SERVICES as unknown as [string, ...string[]]).optional(),
+      // S550: who owns the dwelling — drives the inspection checklist
+      // (site-only for tenant-owned MH/RV vs full interior). Only meaningful
+      // for rv_spot / mobile_home; defaulted below.
+      dwellingOwnership: z.enum(DWELLING_OWNERSHIP_VALUES as unknown as [string, ...string[]]).optional(),
       storageSize:     z.string().max(40).optional(),
       nightlyRate:     z.number().min(0).nullable().optional(),
       weeklyRate:      z.number().min(0).nullable().optional(),
@@ -206,6 +211,12 @@ unitsRouter.post('/', requirePerm('properties.add_unit'), async (req, res, next)
     // S526 (Nic): every RV site is short- AND long-term capable by default —
     // bookable, all stay lengths allowed. Landlord can narrow later.
     const isRv = unitType === 'rv_spot'
+    // S550 default (Nic): parks mostly do NOT own the dwellings — rv_spot
+    // AND mobile_home default TENANT-owned (space rent only); the subtype's
+    // ownership wins when set; park-owned rentals are the explicit exception.
+    const dwellingOwnership = body.dwellingOwnership
+      ?? sub?.dwelling_ownership
+      ?? ((isRv || unitType === 'mobile_home') ? 'tenant' : 'landlord')
 
     // quantity > 1: unitNumber is the PREFIX; continue numbering after the
     // highest existing "<prefix> <n>" on the property (old bulk-route logic).
@@ -239,14 +250,14 @@ unitsRouter.post('/', requirePerm('properties.add_unit'), async (req, res, next)
         INSERT INTO units (property_id, landlord_id, unit_number, unit_type, bedrooms, bathrooms, sqft,
                            rent_amount, security_deposit, rv_site_layout, rv_amp_service,
                            nightly_rate, weekly_rate, monthly_rate, storage_size, subtype_id, status,
-                           is_bookable, lease_types_allowed)
+                           is_bookable, lease_types_allowed, dwelling_ownership)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
-                $18, $19::text[])
+                $18, $19::text[], $20)
         RETURNING *`,
         [body.propertyId, prop.landlord_id, unitNumber, unitType, bedrooms,
          bathrooms, body.sqft ?? null, rentAmount, securityDeposit, rvLayout, rvAmp,
          nightlyRate, weeklyRate, monthlyRate, storageSize, sub?.id ?? null, body.status,
-         isRv, leaseTypesAllowed]
+         isRv, leaseTypesAllowed, dwellingOwnership]
       )
       created.push(unit)
       } catch (err: any) {
@@ -409,10 +420,14 @@ const LEASE_TYPE_MATRIX: Record<string, string[]> = {
 unitsRouter.patch('/:id/type', requirePerm('schedule.configure_unit'), async (req, res, next) => {
   try {
     const { unitType, nightlyRate, weeklyRate, monthlyRate, minStayNights, maxStayNights,
-            checkInTime, checkOutTime, amenities, unitDescription, isBookable, rvSiteLayout, rvAmpService } = req.body
+            checkInTime, checkOutTime, amenities, unitDescription, isBookable, rvSiteLayout, rvAmpService,
+            dwellingOwnership } = req.body
 
     if (rvSiteLayout != null && !RV_SITE_LAYOUTS.includes(rvSiteLayout)) {
       throw new AppError(400, `Invalid rvSiteLayout '${rvSiteLayout}'`)
+    }
+    if (dwellingOwnership != null && !(DWELLING_OWNERSHIP_VALUES as readonly string[]).includes(dwellingOwnership)) {
+      throw new AppError(400, `Invalid dwellingOwnership '${dwellingOwnership}'`)
     }
     if (rvAmpService != null && !RV_AMP_SERVICES.includes(rvAmpService)) {
       throw new AppError(400, `Invalid rvAmpService '${rvAmpService}'`)
@@ -437,12 +452,14 @@ unitsRouter.patch('/:id/type', requirePerm('schedule.configure_unit'), async (re
       min_stay_nights=$6, max_stay_nights=$7, check_in_time=$8, check_out_time=$9,
       amenities=$10, unit_description=$11, is_bookable=$12,
       rv_site_layout=COALESCE($14,rv_site_layout),
-      rv_amp_service=COALESCE($15,rv_amp_service), updated_at=NOW()
+      rv_amp_service=COALESCE($15,rv_amp_service),
+      dwelling_ownership=COALESCE($16,dwelling_ownership), updated_at=NOW()
       WHERE id=$13 RETURNING *`,
       [unitType||'residential', leaseTypesAllowed, nightlyRate||null, weeklyRate||null,
        monthlyRate||null, minStayNights||1, maxStayNights||null,
        checkInTime||'15:00', checkOutTime||'11:00',
-       amenities||[], unitDescription||null, isBookable??false, unit.id, rvSiteLayout ?? null, rvAmpService ?? null])
+       amenities||[], unitDescription||null, isBookable??false, unit.id, rvSiteLayout ?? null, rvAmpService ?? null,
+       dwellingOwnership ?? null])
 
     res.json({ success: true, data: updated })
   } catch (e) { next(e) }
@@ -849,6 +866,16 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
     // 7d in weekly-lease mode) — re-check on every edit. Best-effort.
     maybeDraftLeaseFromBooking(booking.id)
       .catch((err) => logger.error({ err, bookingId: booking.id }, '[booking] lease draft failed'))
+
+    // S548 (Nic): the Master Schedule is the source of truth for what a
+    // long-stay guest owes. A date change flows into the lease: pending
+    // drafts follow the dates; an active lease's end moves, no-longer-owed
+    // pending rent is dropped, and rent paid past the new end is banked as
+    // a prepaid credit that nets against the final bill. Best-effort.
+    if (datesOrUnitChanged) {
+      syncLeaseWithBookingDates(booking.id)
+        .catch((err) => logger.error({ err, bookingId: booking.id }, '[booking] lease-billing sync failed'))
+    }
 
     // S517: append the change-history events (moved / dates_changed / cancelled
     // / status_changed) by diffing old → new. Best-effort.

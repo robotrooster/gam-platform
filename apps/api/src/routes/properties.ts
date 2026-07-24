@@ -101,6 +101,65 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
     }
     const ar = body.allocationRule
 
+    // S550 (Nic): a landlord CAN own two properties that share a name — he
+    // buys another "Oak Park", it keeps its name. NEVER block on name alone.
+    // The true duplicate is same landlord + same name + same ADDRESS: that's
+    // the same physical property entered twice → 409. Distinct address =
+    // distinct property; the ADDRESS is the disambiguator everywhere
+    // (lease imports resolve by the street number on the lease, and the
+    // cross-landlord same-address case is flagged for admin review below).
+    // S550 (Nic, final form): the FULL ADDRESS — street + suite/unit line
+    // (street2) — is the property. One full address = one record = one
+    // account. Strip malls and split outbuildings are real: different
+    // owners at "100 Main St" are distinguished by their suite line
+    // ("Suite A" vs "Suite B"), so a different account at the same street
+    // is allowed ONLY with a different street2 (and still lands in the
+    // fuzzy duplicate-address admin flag below for review). A co-owner of
+    // the SAME space gets added as a USER on the primary account — never a
+    // rival property record.
+    //   * Your own account, same name + full address -> "entered twice".
+    //   * Your own account, same address, different name -> allowed.
+    //   * OTHER account, same street + SAME suite line (or both blank) ->
+    //     blocked claim + admin alert (nothing revealed about the owner).
+    //   * OTHER account, same street, DIFFERENT suite -> allowed + flagged.
+    const atAddress = await queryOne<{ id: string; landlord_id: string; name: string }>(
+      `SELECT id, landlord_id, name FROM properties
+        WHERE LOWER(TRIM(street1)) = LOWER(TRIM($1))
+          AND LOWER(TRIM(city)) = LOWER(TRIM($2))
+          AND LOWER(TRIM(state)) = LOWER(TRIM($3))
+          AND COALESCE(LOWER(TRIM(street2)), '') = COALESCE(LOWER(TRIM($4)), '')
+          AND (landlord_id <> $5 OR LOWER(TRIM(name)) = LOWER(TRIM($6)))
+        ORDER BY (landlord_id = $5) DESC
+        LIMIT 1`,
+      [body.street1, body.city, body.state, body.street2 ?? '', req.user!.profileId, body.name],
+    )
+    if (atAddress) {
+      if (atAddress.landlord_id === req.user!.profileId) {
+        throw new AppError(409,
+          `"${body.name}" at ${body.street1}, ${body.city} is already in your account — ` +
+          `this looks like the same property entered twice. A different property that happens ` +
+          `to share the name is fine; enter it with its own address.`)
+      }
+      const { createAdminNotification } = await import('../services/adminNotifications')
+      await createAdminNotification({
+        severity: 'warn',
+        category: 'duplicate_property_claim',
+        title: `Blocked duplicate property claim: ${body.street1}, ${body.city}`,
+        body: `Landlord ${req.user!.profileId} tried to create "${body.name}" at ` +
+              `${body.street1}${body.street2 ? ' ' + body.street2 : ''}, ${body.city}, ${body.state} — ` +
+              `that full address is already registered as "${atAddress.name}" under landlord ` +
+              `${atAddress.landlord_id} (property ${atAddress.id}). Possible typo or false claim; ` +
+              `review if it repeats.`,
+        context: { attemptingLandlordId: req.user!.profileId, existingPropertyId: atAddress.id },
+      }).catch(() => {})
+      throw new AppError(409,
+        `The address ${body.street1}${body.street2 ? ' ' + body.street2 : ''}, ${body.city} is ` +
+        `already registered on GAM. If you own a different suite or building at this address, ` +
+        `include its suite/unit line (e.g. "Suite B") in the address. If you co-own this ` +
+        `property, ask the primary account holder to add you as a user — or contact support ` +
+        `if you believe this is an error.`)
+    }
+
     await client.query('BEGIN')
 
     // Property INSERT — owner_user_id + managed_by_user_id default to the
@@ -170,6 +229,18 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
        ar.maintenanceMarkupPercent ?? null, ar.ownerBankAccountId ?? null])
 
     await client.query('COMMIT')
+
+    // S550: real-world address verification (parcel corroboration + geocode)
+    // — fire-and-forget; never blocks or delays creation. Lands
+    // address_verification on the row moments later; 'unverified' raises an
+    // admin alert.
+    {
+      const { verifyPropertyAddress } = await import('../services/addressVerification')
+      void verifyPropertyAddress(prop.id, {
+        street1: body.street1, street2: body.street2 ?? null,
+        city: body.city, state: body.state, zip: body.zip,
+      }).catch(() => {})
+    }
 
     // Silent duplicate-address check → flags for admin review
     try {
@@ -310,6 +381,9 @@ const unitSubtypeSchema = z.object({
   nightlyRate: z.number().min(0).nullable().optional(),
   weeklyRate: z.number().min(0).nullable().optional(),
   monthlyRate: z.number().min(0).nullable().optional(),
+  // S550: subtype-level dwelling ownership (rv_spot / mobile_home only) —
+  // "MH Lot" mints tenant-owned units, "Park Model Rental" mints park-owned.
+  dwellingOwnership: z.enum(['landlord', 'tenant']).nullable().optional(),
 })
 
 // POST /api/properties/:id/unit-subtypes — create (or update via id) one
@@ -325,6 +399,7 @@ propertiesRouter.post('/:id/unit-subtypes', requirePerm('properties.edit'), asyn
     const hasBedrooms = ['apartment', 'single_family', 'mobile_home'].includes(body.unitType)
     const isRv = body.unitType === 'rv_spot'
     const isStorage = body.unitType === 'storage'
+    const ownershipRelevant = isRv || body.unitType === 'mobile_home'
     const vals = [
       req.params.id, body.unitType, body.name,
       hasBedrooms ? body.bedrooms ?? null : null,
@@ -334,6 +409,7 @@ propertiesRouter.post('/:id/unit-subtypes', requirePerm('properties.edit'), asyn
       isStorage ? (body.storageSize?.trim() || null) : null,
       body.rentAmount ?? null, body.securityDeposit ?? null,
       body.nightlyRate ?? null, body.weeklyRate ?? null, body.monthlyRate ?? null,
+      ownershipRelevant ? body.dwellingOwnership ?? null : null,
     ]
 
     let row
@@ -342,8 +418,9 @@ propertiesRouter.post('/:id/unit-subtypes', requirePerm('properties.edit'), asyn
         `UPDATE property_unit_subtypes SET
            unit_type=$2, name=$3, bedrooms=$4, bathrooms=$5, rv_site_layout=$6,
            rv_amp_service=$7, storage_size=$8, rent_amount=$9, security_deposit=$10,
-           nightly_rate=$11, weekly_rate=$12, monthly_rate=$13, updated_at=NOW()
-         WHERE id=$14 AND property_id=$1
+           nightly_rate=$11, weekly_rate=$12, monthly_rate=$13,
+           dwelling_ownership=$14, updated_at=NOW()
+         WHERE id=$15 AND property_id=$1
          RETURNING *`,
         [...vals, body.id],
       )
@@ -353,14 +430,15 @@ propertiesRouter.post('/:id/unit-subtypes', requirePerm('properties.edit'), asyn
         `INSERT INTO property_unit_subtypes
            (property_id, unit_type, name, bedrooms, bathrooms, rv_site_layout,
             rv_amp_service, storage_size, rent_amount, security_deposit,
-            nightly_rate, weekly_rate, monthly_rate)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+            nightly_rate, weekly_rate, monthly_rate, dwelling_ownership)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
          ON CONFLICT (property_id, unit_type, name) DO UPDATE
            SET bedrooms=EXCLUDED.bedrooms, bathrooms=EXCLUDED.bathrooms,
                rv_site_layout=EXCLUDED.rv_site_layout, rv_amp_service=EXCLUDED.rv_amp_service,
                storage_size=EXCLUDED.storage_size, rent_amount=EXCLUDED.rent_amount,
                security_deposit=EXCLUDED.security_deposit, nightly_rate=EXCLUDED.nightly_rate,
                weekly_rate=EXCLUDED.weekly_rate, monthly_rate=EXCLUDED.monthly_rate,
+               dwelling_ownership=EXCLUDED.dwelling_ownership,
                updated_at=NOW()
          RETURNING *`,
         vals,

@@ -30,6 +30,11 @@ import { db, getClient } from '../db'
  * rows in place is correct.
  */
 export async function cleanupAllSchema(): Promise<void> {
+  // S553: call slots FK sales_leads — clear child first. Availability has
+  // no FKs but tests seed their own windows.
+  await db.query(`DELETE FROM sales_call_slots`)
+  await db.query(`DELETE FROM sales_leads`)
+  await db.query(`DELETE FROM sales_call_availability`)
   // S332: dispute lifecycle tables FK to credit_events; clear before
   // the parents. credit_scores + credit_stats FK to subjects.
   await db.query(`DELETE FROM credit_disputes`)
@@ -88,7 +93,9 @@ export async function cleanupAllSchema(): Promise<void> {
   // parents. background_checks FKs tenants + landlords — also wipe.
   await db.query(`DELETE FROM flexsuite_enrollment_acceptances`)
   await db.query(`DELETE FROM flex_deposit_installments`)
+  await db.query(`DELETE FROM screening_fee_accruals`)
   await db.query(`DELETE FROM background_checks`)
+  await db.query(`DELETE FROM state_application_fee_caps`)
   await db.query(`DELETE FROM security_deposits`)
   // Accrual tables FK to user_balance_ledger / platform_revenue_ledger
   // via ledger_entry_id, so they must be cleared before the ledger
@@ -115,6 +122,9 @@ export async function cleanupAllSchema(): Promise<void> {
   await db.query(`DELETE FROM lease_prepaid_credits`)
   await db.query(`DELETE FROM tenant_remittances`)
   await db.query(`DELETE FROM payments`)
+  // S550: the audit journal records every DELETE this cleanup performs —
+  // clear it too or gam_test grows without bound across runs.
+  await db.query(`DELETE FROM audit_row_changes`)
   await db.query(`DELETE FROM invoices`)
   await db.query(`DELETE FROM invoice_sequences`)
   await db.query(`DELETE FROM lease_fees`)

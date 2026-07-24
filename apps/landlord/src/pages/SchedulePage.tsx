@@ -459,7 +459,11 @@ export function SchedulePage() {
   useEffect(() => {
     if (!bpPropId) return
     setBpMsg(''); setBpErr('')
-    apiGet(`/properties/${bpPropId}/booking-config`).then(setBpCfg).catch(() => setBpCfg(null))
+    apiGet(`/properties/${bpPropId}/booking-config`)
+      // S550: prefill a blank slug with the server's suggestion —
+      // name + city ("oak-park-yarnell"), street number on collision.
+      .then((cfg: any) => setBpCfg(cfg?.slug || !cfg?.suggestedSlug ? cfg : { ...cfg, slug: cfg.suggestedSlug }))
+      .catch(() => setBpCfg(null))
   }, [bpPropId])
   const saveBookingConfig = async () => {
     setBpSaving(true); setBpMsg(''); setBpErr('')
@@ -865,6 +869,7 @@ export function SchedulePage() {
       isBookable: unit.isBookable || false,
       rvSiteLayout: unit.rvSiteLayout || 'none',
       rvAmpService: unit.rvAmpService || 'none',
+      dwellingOwnership: unit.dwellingOwnership || (unit.unitType === 'rv_spot' ? 'tenant' : 'landlord'),
     })
     setCustomAmenity('')
     setTypeModal({show:true, unit})
@@ -1682,7 +1687,7 @@ export function SchedulePage() {
               <>
                 <label className="form-label">Booking address (slug)</label>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
-                  <input className="input" value={bpCfg.slug || ''} placeholder="sunny-rv-park"
+                  <input className="input" value={bpCfg.slug || ''} placeholder="oak-park-yarnell"
                     onChange={e => setBpCfg((c: any) => ({ ...c, slug: e.target.value.toLowerCase() }))} style={{ flex: 1 }} />
                 </div>
                 <div style={{ color: 'var(--text-3)', fontSize: '.8rem', marginBottom: 14 }}>
@@ -2128,6 +2133,16 @@ export function SchedulePage() {
                       {RV_AMP_SERVICES.map(a=><option key={a} value={a}>{RV_AMP_SERVICE_LABEL[a]}</option>)}
                     </select>
                   </div>
+                </div>
+              )}
+              {(typeForm.unitType==='rv_spot' || typeForm.unitType==='mobile_home') && (
+                <div>
+                  {/* S550: drives the inspection checklist — site-only vs dwelling too */}
+                  <div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>{typeForm.unitType==='rv_spot' ? 'Who owns the RV?' : 'Who owns the home?'}</div>
+                  <select className="form-select" style={{width:'100%'}} value={typeForm.dwellingOwnership||'landlord'} onChange={e=>setTypeForm((s:any)=>({...s,dwellingOwnership:e.target.value}))}>
+                    <option value="tenant">Tenant-owned (space rent only — inspect the site, not their dwelling)</option>
+                    <option value="landlord">Park-owned rental (inspect the site and the dwelling)</option>
+                  </select>
                 </div>
               )}
               {STAY_CAPABLE_TYPES.includes(typeForm.unitType) ? (

@@ -29,7 +29,9 @@ export interface BackgroundProviderInitiateRequest {
   lastName: string
   email: string
   dateOfBirth: string  // YYYY-MM-DD
-  ssnLast4: string
+  // S551: optional — Checkr Tenant collects SSN on its own hosted consent
+  // form, so checkr-provider intakes never send one. Mock still accepts it.
+  ssnLast4?: string | null
   street1: string
   street2?: string | null
   city: string
@@ -37,6 +39,16 @@ export interface BackgroundProviderInitiateRequest {
   zip: string
   consentCredit: boolean
   consentCriminal: boolean
+  // S551: the RENTAL property being screened for (required by Checkr Tenant
+  // orders; distinct from the applicant's current residence above). Resolved
+  // by the route from unit_id, falling back to the landlord's property.
+  property?: {
+    name?: string | null
+    street: string
+    city: string
+    state: string
+    zipcode: string
+  } | null
 }
 
 export interface BackgroundProviderInitiateResult {
@@ -52,6 +64,10 @@ export interface BackgroundProviderWebhookUpdate {
   reportSummary?: Record<string, unknown> | null
   failureReason?: string | null
   receivedAt: Date
+  // S551: some providers (Checkr Tenant) deliver only a report id in the
+  // webhook; the route calls provider.fetchReport(reportRef) to pull the
+  // actual results after applying the status update.
+  reportRef?: string | null
 }
 
 // S87: CRA contact info for FCRA §615(a)(2) adverse action notices. Each
@@ -71,6 +87,10 @@ export interface BackgroundProvider {
   verifyWebhook(headers: Record<string, string | string[] | undefined>, rawBody: string): boolean
   parseWebhook(rawBody: string): BackgroundProviderWebhookUpdate
   craDisclosure(): CraDisclosure
+  // S551: optional — pull the full report when the webhook only carries a
+  // report id (see BackgroundProviderWebhookUpdate.reportRef). Returns the
+  // normalized summary to store on the row, or null if unavailable.
+  fetchReport?(reportRef: string): Promise<Record<string, unknown> | null>
 }
 
 // ── MOCK PROVIDER ─────────────────────────────────────────────
@@ -168,41 +188,55 @@ function mapProviderStatus(raw: string): BackgroundCheckStatus {
   }
 }
 
-// ── CHECKR PROVIDER ───────────────────────────────────────────
+// ── CHECKR TENANT PROVIDER ────────────────────────────────────
 //
-// S420: live Checkr API adapter. Implements BackgroundProvider against
-// https://api.checkr.com/v1. Credentials in env:
-//   CHECKR_API_KEY        — HTTP Basic username (empty password)
-//   CHECKR_PACKAGE        — package slug, e.g. 'tasker_pro'
-//   CHECKR_WEBHOOK_SECRET — HMAC secret for X-Checkr-Signature
+// S551: rewritten from the S420 classic-API adapter (api.checkr.com Basic
+// auth, candidate+report) to the CHECKR TENANT API the account actually
+// runs on (docs: https://checkr-tenant-api-docs.redocly.app). Env:
+//   CHECKR_API_KEY             — bearer token (ckr_sk_test_… / ckr_sk_live_…)
+//   CHECKR_TENANT_BASE_URL     — default https://tenant.checkr.com/api
+//   CHECKR_PACKAGE             — package slug: 'starter' | 'essential'
+//   CHECKR_WEBHOOK_SECRET      — signing secret from the dashboard webhook
+//                                (shown once at creation)
 //
-// Status mapping (Checkr → GAM enum):
-//   pending    → processing
-//   clear      → complete   (no adverse data)
-//   consider   → complete   (adverse data; landlord-side decision)
-//   suspended  → cancelled
-//   dispute    → processing  (Checkr re-running)
-//   anything else → failed (defensive)
+// Flow: POST /orders {package, property, applicant} → order id is the
+// providerRef. Checkr emails the applicant an apply link (application_url)
+// where THEY provide DOB/SSN + FCRA consent — GAM never touches screening
+// PII on this path. Results arrive via signed webhooks; report.completed
+// carries only report_id, so the route calls fetchReport() to pull the
+// per-product clear/consider results.
 //
-// Note on scope: report status drives the gating. Candidate-only states
-// (created, awaiting_consent) map to awaiting_applicant. The route's
-// initiate() returns the candidate creation result; the eventual report
-// status arrives via webhook.
+// Order status mapping (Checkr Tenant → GAM enum):
+//   waiting_for_applicant → awaiting_applicant
+//   pending               → processing
+//   completed             → complete  (clear AND consider both land here;
+//                            approve/deny is the landlord's decision)
+//   canceled              → cancelled
+
+// The report's per-product items. Each non-null product carries a status of
+// 'clear' | 'consider'; products not in the ordered package come back null.
+const CHECKR_TENANT_PRODUCTS = [
+  'criminal_history', 'credit_report', 'eviction_history',
+  'identity_verification', 'income_verification',
+  'sex_offender_registry', 'global_watchlist',
+] as const
 
 class CheckrProvider implements BackgroundProvider {
   readonly name = 'checkr'
 
   private get baseUrl(): string {
-    return process.env.CHECKR_BASE_URL || 'https://api.checkr.com/v1'
+    return process.env.CHECKR_TENANT_BASE_URL || 'https://tenant.checkr.com/api'
   }
 
-  private authHeader(): string {
+  private headers(): Record<string, string> {
     const key = process.env.CHECKR_API_KEY
     if (!key) {
-      throw new Error('CHECKR_API_KEY is not set — cannot call Checkr API')
+      throw new Error('CHECKR_API_KEY is not set — cannot call Checkr Tenant API')
     }
-    // Checkr uses Basic auth with API key as username, empty password.
-    return 'Basic ' + Buffer.from(key + ':').toString('base64')
+    return {
+      Authorization:  `Bearer ${key}`,
+      'Content-Type': 'application/json',
+    }
   }
 
   async initiate(req: BackgroundProviderInitiateRequest): Promise<BackgroundProviderInitiateResult> {
@@ -213,107 +247,142 @@ class CheckrProvider implements BackgroundProvider {
         failureReason: 'Provider rejected: missing required consents',
       }
     }
-
-    // Step 1: create the candidate. Checkr's candidate endpoint accepts
-    // form-encoded body (per their docs).
-    const candidatePayload = new URLSearchParams({
-      first_name:      req.firstName,
-      last_name:       req.lastName,
-      email:           req.email,
-      dob:             req.dateOfBirth,
-      ssn:             req.ssnLast4,            // partial SSN accepted
-      zipcode:         req.zip,
-      no_middle_name:  'true',
-    })
-
-    const candRes = await fetch(`${this.baseUrl}/candidates`, {
-      method: 'POST',
-      headers: {
-        Authorization:  this.authHeader(),
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-      body: candidatePayload.toString(),
-    })
-
-    if (!candRes.ok) {
-      const text = await candRes.text()
+    const pkg = process.env.CHECKR_PACKAGE || 'starter'
+    if (!req.property) {
       return {
         providerRef: '',
         status: 'failed',
-        failureReason: `Checkr candidate create failed: ${candRes.status} ${text.slice(0, 200)}`,
+        failureReason: 'Checkr Tenant orders require a rental property address — none resolved for this check',
       }
     }
-    const candidate = await candRes.json() as { id: string }
 
-    // Step 2: create the report against the candidate using the
-    // configured package slug. Without a package the report can't be
-    // ordered — env-driven so each install can pick the SKU they pay for.
-    const pkg = process.env.CHECKR_PACKAGE
-    if (!pkg) {
-      return {
-        providerRef: candidate.id,
-        status: 'failed',
-        failureReason: 'CHECKR_PACKAGE env var not set — candidate created but no report ordered',
-      }
-    }
-    const reportPayload = new URLSearchParams({
-      package:      pkg,
-      candidate_id: candidate.id,
-    })
-    const repRes = await fetch(`${this.baseUrl}/reports`, {
-      method: 'POST',
-      headers: {
-        Authorization:  this.authHeader(),
-        'Content-Type': 'application/x-www-form-urlencoded',
+    // Applicant identity: name + email (+ DOB when the intake captured it).
+    // SSN is deliberately NEVER sent — the applicant supplies it on Checkr's
+    // hosted consent form, so screening PII stays off GAM servers.
+    const body = {
+      order: {
+        package: pkg,
+        property: {
+          name:    req.property.name || null,
+          street:  req.property.street,
+          city:    req.property.city,
+          state:   req.property.state,
+          zipcode: req.property.zipcode,
+        },
+        applicant: {
+          first_name: req.firstName,
+          last_name:  req.lastName,
+          email:      req.email,
+          ...(req.dateOfBirth ? { dob: req.dateOfBirth } : {}),
+        },
       },
-      body: reportPayload.toString(),
+    }
+
+    const res = await fetch(`${this.baseUrl}/orders`, {
+      method: 'POST',
+      headers: this.headers(),
+      body: JSON.stringify(body),
     })
-    if (!repRes.ok) {
-      const text = await repRes.text()
+    if (!res.ok) {
+      const text = await res.text()
       return {
-        providerRef: candidate.id,
+        providerRef: '',
         status: 'failed',
-        failureReason: `Checkr report create failed: ${repRes.status} ${text.slice(0, 200)}`,
+        failureReason: `Checkr order create failed: ${res.status} ${text.slice(0, 200)}`,
       }
     }
-    const report = await repRes.json() as { id: string; status: string }
+    const order = await res.json() as { id: string; status: string; application_url?: string | null }
     return {
-      providerRef: report.id,
-      status: mapCheckrStatus(report.status),
-      applicantRedirectUrl: null,  // Checkr emails the applicant directly
+      providerRef:          order.id,
+      status:               mapCheckrTenantStatus(order.status),
+      // While waiting_for_applicant this is the Checkr-hosted apply link.
+      // Checkr emails (and in live mode texts) it to the applicant; we also
+      // surface it in the portal so they can finish without digging through
+      // their inbox.
+      applicantRedirectUrl: order.application_url || null,
     }
   }
 
   verifyWebhook(headers: Record<string, string | string[] | undefined>, rawBody: string): boolean {
     const secret = process.env.CHECKR_WEBHOOK_SECRET
     if (!secret) return false
-    const sigHeader = headers['x-checkr-signature']
+    // Tenant-Signature: t=<unix_ts>,v1=<hex hmac of "<t>.<raw_body>">
+    const sigHeader = headers['tenant-signature']
     const sig = Array.isArray(sigHeader) ? sigHeader[0] : sigHeader
     if (!sig) return false
-    const expected = crypto.createHmac('sha256', secret).update(rawBody).digest('hex')
+    const parts = Object.fromEntries(
+      sig.split(',').map((kv) => kv.trim().split('=') as [string, string])
+    ) as { t?: string; v1?: string }
+    if (!parts.t || !parts.v1) return false
+    const expected = crypto.createHmac('sha256', secret)
+      .update(`${parts.t}.${rawBody}`)
+      .digest('hex')
     try {
-      return crypto.timingSafeEqual(Buffer.from(sig, 'hex'), Buffer.from(expected, 'hex'))
+      return crypto.timingSafeEqual(Buffer.from(parts.v1, 'hex'), Buffer.from(expected, 'hex'))
     } catch {
       return false
     }
   }
 
   parseWebhook(rawBody: string): BackgroundProviderWebhookUpdate {
-    // Checkr webhook envelope: { type, data: { object: { id, status, ...report } } }
-    const payload = JSON.parse(rawBody) as {
+    // Event envelope: { id, object:'event', type, created_at, data }
+    const evt = JSON.parse(rawBody) as {
+      id: string
       type: string
-      data: { object: { id: string; status: string; adjudication?: string } }
+      created_at: string
+      data: Record<string, any>
     }
-    const obj = payload.data?.object
-    if (!obj?.id) {
-      throw new Error('Checkr webhook missing data.object.id')
+    const d = evt.data || {}
+    switch (evt.type) {
+      // Apply-flow progress. 'visited' means the link was opened but consent
+      // not yet given — still awaiting the applicant.
+      case 'order.applicant.visited':
+        return { providerRef: requireOrderRef(d, evt.type), status: 'awaiting_applicant', receivedAt: new Date() }
+      case 'order.applicant.started':
+      case 'order.applicant.completed':
+        return { providerRef: requireOrderRef(d, evt.type), status: 'processing', receivedAt: new Date() }
+      // Individual product done — report not complete yet; stay processing.
+      case 'report.product.completed':
+        return { providerRef: requireOrderRef(d, evt.type), status: 'processing', receivedAt: new Date() }
+      // Full report ready: data carries { id: report_id, order_id }. The route
+      // fetches the actual results via fetchReport(reportRef).
+      case 'report.completed':
+        return {
+          providerRef: requireOrderRef(d, evt.type),
+          status:      'complete',
+          reportRef:   d.id || null,
+          receivedAt:  new Date(),
+        }
+      default:
+        throw new Error(`Unhandled Checkr Tenant event type: ${evt.type}`)
+    }
+  }
+
+  // Pull the report and normalize into the row's report_summary jsonb:
+  // { result: 'clear'|'consider', products: { <product>: 'clear'|'consider' } }
+  // Overall result is 'consider' if ANY included product is consider.
+  async fetchReport(reportRef: string): Promise<Record<string, unknown> | null> {
+    const res = await fetch(`${this.baseUrl}/reports/${encodeURIComponent(reportRef)}`, {
+      headers: this.headers(),
+    })
+    if (!res.ok) return null
+    const report = await res.json() as Record<string, any>
+    const products: Record<string, string> = {}
+    let overall: 'clear' | 'consider' = 'clear'
+    for (const p of CHECKR_TENANT_PRODUCTS) {
+      const item = report[p]
+      if (item && typeof item === 'object' && typeof item.status === 'string') {
+        products[p] = item.status
+        if (item.status === 'consider') overall = 'consider'
+      }
     }
     return {
-      providerRef:   obj.id,
-      status:        mapCheckrStatus(obj.status),
-      reportSummary: { adjudication: obj.adjudication ?? null, raw_status: obj.status },
-      failureReason: null,
-      receivedAt:    new Date(),
+      provider:   'checkr',
+      report_id:  report.id ?? reportRef,
+      order_id:   report.order_id ?? null,
+      result:     overall,
+      products,
+      fetched_at: new Date().toISOString(),
     }
   }
 
@@ -327,18 +396,22 @@ class CheckrProvider implements BackgroundProvider {
   }
 }
 
-function mapCheckrStatus(raw: string): BackgroundCheckStatus {
-  const lower = (raw || '').toLowerCase()
-  switch (lower) {
-    case 'pending':         return 'processing'
-    case 'clear':           return 'complete'
-    case 'consider':        return 'complete'
-    case 'suspended':       return 'cancelled'
-    case 'dispute':         return 'processing'
-    case 'created':         return 'awaiting_applicant'
-    case 'awaiting_consent':return 'awaiting_applicant'
-    case 'complete':        return 'complete'
-    default:                return 'failed'
+// Webhook data carries order_id on report.* events and id on order.* events
+// (where the object IS the order). Either way we key updates by the order id,
+// which is what initiate() stored as provider_ref.
+function requireOrderRef(data: Record<string, any>, eventType: string): string {
+  const ref = eventType.startsWith('report.') ? data.order_id : (data.order_id || data.id)
+  if (!ref) throw new Error(`Checkr Tenant webhook ${eventType} missing order id`)
+  return ref
+}
+
+function mapCheckrTenantStatus(raw: string): BackgroundCheckStatus {
+  switch ((raw || '').toLowerCase()) {
+    case 'waiting_for_applicant': return 'awaiting_applicant'
+    case 'pending':               return 'processing'
+    case 'completed':             return 'complete'
+    case 'canceled':              return 'cancelled'
+    default:                      return 'failed'
   }
 }
 

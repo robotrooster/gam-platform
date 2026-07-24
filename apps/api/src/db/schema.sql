@@ -21,7 +21,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict XHf5eSmHPRkgF4p4hc7nkvkd9Lbyxw2pRi0yI29hVlO78tBK958LCq75dXLhacg
+\restrict 8mdonzrelxRI3FRG3heGYzPdDuUjAIV39qBrPad04uMxacky8bKUvnp8Z20bBzc
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -77,6 +77,61 @@ CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public;
 --
 
 COMMENT ON EXTENSION vector IS 'vector data type and ivfflat and hnsw access methods';
+
+
+--
+-- Name: audit_row_change(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.audit_row_change() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  IF TG_OP = 'UPDATE' THEN
+    -- Skip no-op UPDATEs (same row written back) to keep the journal signal.
+    IF to_jsonb(OLD) = to_jsonb(NEW) THEN RETURN NEW; END IF;
+    INSERT INTO audit_row_changes (table_name, row_id, op, old_row, new_row)
+    VALUES (TG_TABLE_NAME, (to_jsonb(OLD)->>'id')::uuid, 'UPDATE', to_jsonb(OLD), to_jsonb(NEW));
+    RETURN NEW;
+  ELSIF TG_OP = 'DELETE' THEN
+    INSERT INTO audit_row_changes (table_name, row_id, op, old_row, new_row)
+    VALUES (TG_TABLE_NAME, (to_jsonb(OLD)->>'id')::uuid, 'DELETE', to_jsonb(OLD), NULL);
+    RETURN OLD;
+  END IF;
+  RETURN NULL;
+END;
+$$;
+
+
+--
+-- Name: audit_row_change_redacted(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.audit_row_change_redacted() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+  redact text[] := ARRAY[
+    'password_hash', 'totp_secret', 'reset_token', 'email_verify_token',
+    'tenant_invite_token', 'landlord_invite_token'
+  ];
+  old_j jsonb; new_j jsonb;
+BEGIN
+  old_j := to_jsonb(OLD) - redact;
+  IF TG_OP = 'UPDATE' THEN
+    new_j := to_jsonb(NEW) - redact;
+    IF old_j = new_j THEN RETURN NEW; END IF;  -- secret-only change: skip
+    INSERT INTO audit_row_changes (table_name, row_id, op, old_row, new_row)
+    VALUES (TG_TABLE_NAME, (to_jsonb(OLD)->>'id')::uuid, 'UPDATE', old_j, new_j);
+    RETURN NEW;
+  ELSIF TG_OP = 'DELETE' THEN
+    INSERT INTO audit_row_changes (table_name, row_id, op, old_row, new_row)
+    VALUES (TG_TABLE_NAME, (to_jsonb(OLD)->>'id')::uuid, 'DELETE', old_j, NULL);
+    RETURN OLD;
+  END IF;
+  RETURN NULL;
+END;
+$$;
 
 
 --
@@ -471,7 +526,7 @@ CREATE TABLE public.agent_interaction_logs (
     CONSTRAINT agent_interaction_logs_agent_type_check CHECK ((agent_type = ANY (ARRAY['customer_service'::text, 'sales'::text, 'booking'::text]))),
     CONSTRAINT agent_interaction_logs_audience_check CHECK ((audience = ANY (ARRAY['tenant'::text, 'landlord'::text, 'prospect'::text, 'guest'::text]))),
     CONSTRAINT agent_interaction_logs_handled_by_tier_check CHECK ((handled_by_tier = ANY (ARRAY['entry'::text, 'escalation'::text, 'human'::text]))),
-    CONSTRAINT agent_interaction_logs_outcome_check CHECK ((outcome = ANY (ARRAY['answered_entry'::text, 'answered_escalation'::text, 'action_taken'::text, 'escalated_to_senior'::text, 'escalated_to_human'::text, 'abandoned'::text, 'error'::text])))
+    CONSTRAINT agent_interaction_logs_outcome_check CHECK ((outcome = ANY (ARRAY['answered_entry'::text, 'answered_escalation'::text, 'action_taken'::text, 'escalated_to_senior'::text, 'escalated_to_human'::text, 'abandoned'::text, 'error'::text, 'shed'::text, 'rate_limited'::text])))
 );
 
 
@@ -589,6 +644,36 @@ CREATE TABLE public.audit_log_archive (
 
 
 --
+-- Name: audit_row_changes; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.audit_row_changes (
+    id bigint NOT NULL,
+    table_name text NOT NULL,
+    row_id uuid,
+    op text NOT NULL,
+    old_row jsonb NOT NULL,
+    new_row jsonb,
+    changed_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT audit_row_changes_op_check CHECK ((op = ANY (ARRAY['UPDATE'::text, 'DELETE'::text])))
+);
+
+
+--
+-- Name: audit_row_changes_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+ALTER TABLE public.audit_row_changes ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY (
+    SEQUENCE NAME public.audit_row_changes_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+--
 -- Name: background_checks; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -646,6 +731,8 @@ CREATE TABLE public.background_checks (
     pool_entry_id uuid,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     applicant_payment_intent_id text,
+    stripe_refund_id text,
+    refunded_at timestamp with time zone,
     CONSTRAINT background_checks_risk_level_check CHECK (((risk_level IS NULL) OR (risk_level = ANY (ARRAY['low'::text, 'medium'::text, 'high'::text, 'very_high'::text])))),
     CONSTRAINT background_checks_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'awaiting_applicant'::text, 'submitted'::text, 'processing'::text, 'complete'::text, 'failed'::text, 'cancelled'::text, 'approved'::text, 'denied'::text, 'expired'::text])))
 );
@@ -2440,7 +2527,7 @@ CREATE TABLE public.deposit_returns (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     unpaid_balance_amount numeric(10,2) DEFAULT 0 NOT NULL,
-    CONSTRAINT deposit_returns_status_check CHECK ((status = ANY (ARRAY['draft'::text, 'sent_refund'::text, 'sent_gap'::text, 'sent_zero'::text, 'sent_carried_forward'::text, 'disputed'::text])))
+    CONSTRAINT deposit_returns_status_check CHECK ((status = ANY (ARRAY['draft'::text, 'awaiting_approval'::text, 'sent_refund'::text, 'sent_gap'::text, 'sent_zero'::text, 'sent_carried_forward'::text, 'disputed'::text])))
 );
 
 
@@ -3309,6 +3396,8 @@ CREATE TABLE public.landlords (
     background_provider text DEFAULT 'mock'::text NOT NULL,
     default_ach_fee_payer text DEFAULT 'tenant'::text NOT NULL,
     pos_default_margin_pct numeric(5,2),
+    deposit_return_approval_threshold numeric(10,2) DEFAULT 500 NOT NULL,
+    is_demo boolean DEFAULT false NOT NULL,
     CONSTRAINT landlords_background_provider_check CHECK ((background_provider = ANY (ARRAY['mock'::text, 'checkr'::text]))),
     CONSTRAINT landlords_default_ach_fee_payer_check CHECK ((default_ach_fee_payer = ANY (ARRAY['landlord'::text, 'tenant'::text]))),
     CONSTRAINT landlords_network_tier_check CHECK ((network_tier = 'tier_2_full'::text)),
@@ -3430,7 +3519,12 @@ CREATE TABLE public.lease_fees (
     updated_at timestamp with time zone DEFAULT now(),
     is_override boolean DEFAULT false NOT NULL,
     override_reason text,
+    condition_text text,
+    condition_result text,
+    condition_assessed_at timestamp with time zone,
+    condition_assessed_by uuid,
     CONSTRAINT lease_fees_amount_check CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT lease_fees_condition_result_check CHECK (((condition_result IS NULL) OR (condition_result = ANY (ARRAY['met'::text, 'failed'::text])))),
     CONSTRAINT lease_fees_due_timing_check CHECK ((due_timing = ANY (ARRAY['move_in'::text, 'monthly_ongoing'::text, 'move_out'::text, 'other'::text]))),
     CONSTRAINT lease_fees_fee_type_check CHECK ((fee_type = ANY (ARRAY['security_deposit'::text, 'pet_deposit'::text, 'key_deposit'::text, 'cleaning_deposit'::text, 'move_in_fee'::text, 'cleaning_fee'::text, 'pet_fee'::text, 'application_fee'::text, 'amenity_fee'::text, 'hoa_transfer_fee'::text, 'lease_prep_fee'::text, 'pet_rent'::text, 'parking_rent'::text, 'storage_rent'::text, 'amenity_fee_monthly'::text, 'trash_fee'::text, 'pest_control_fee'::text, 'technology_fee'::text, 'last_month_rent'::text, 'early_termination_fee'::text, 'other_fee'::text])))
 );
@@ -4222,6 +4316,32 @@ CREATE TABLE public.platform_fee_config (
 
 
 --
+-- Name: platform_growth_snapshots; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.platform_growth_snapshots (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    snapshot_date date NOT NULL,
+    state text NOT NULL,
+    city text NOT NULL,
+    landlords integer DEFAULT 0 NOT NULL,
+    properties integer DEFAULT 0 NOT NULL,
+    units integer DEFAULT 0 NOT NULL,
+    occupied_units integer DEFAULT 0 NOT NULL,
+    vacant_units integer DEFAULT 0 NOT NULL,
+    active_leases integer DEFAULT 0 NOT NULL,
+    active_tenants integer DEFAULT 0 NOT NULL,
+    monthly_rent_roll numeric(14,2) DEFAULT 0 NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    active_users_1d integer,
+    active_users_7d integer,
+    active_users_30d integer,
+    active_tenant_users_30d integer,
+    active_landlord_side_users_30d integer
+);
+
+
+--
 -- Name: platform_processing_rates; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -4236,6 +4356,8 @@ CREATE TABLE public.platform_processing_rates (
     effective_until timestamp with time zone,
     notes text,
     created_at timestamp with time zone DEFAULT now(),
+    customer_facing_cap numeric(10,2),
+    stripe_cost_cap numeric(10,2),
     CONSTRAINT platform_processing_rates_effective_window_check CHECK (((effective_until IS NULL) OR (effective_until > effective_from))),
     CONSTRAINT platform_processing_rates_payment_method_check CHECK ((payment_method = ANY (ARRAY['ach'::text, 'card'::text])))
 );
@@ -4938,6 +5060,37 @@ CREATE TABLE public.pos_vendors (
 
 
 --
+-- Name: product_events; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.product_events (
+    id bigint NOT NULL,
+    occurred_at timestamp with time zone DEFAULT now() NOT NULL,
+    portal text NOT NULL,
+    event text NOT NULL,
+    path text,
+    user_id uuid,
+    role text,
+    landlord_id uuid,
+    meta jsonb
+);
+
+
+--
+-- Name: product_events_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+ALTER TABLE public.product_events ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY (
+    SEQUENCE NAME public.product_events_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+--
 -- Name: propane_fill_installments; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -5039,6 +5192,11 @@ CREATE TABLE public.properties (
     office_phone text,
     office_email text,
     office_hours text,
+    latitude numeric(9,6),
+    longitude numeric(9,6),
+    address_verification text DEFAULT 'unverified'::text NOT NULL,
+    address_verified_at timestamp with time zone,
+    CONSTRAINT properties_address_verification_check CHECK ((address_verification = ANY (ARRAY['unverified'::text, 'geocoded'::text, 'parcel'::text]))),
     CONSTRAINT properties_booking_deposit_pct_range CHECK (((booking_deposit_pct >= (0)::numeric) AND (booking_deposit_pct <= (100)::numeric))),
     CONSTRAINT properties_booking_slug_format CHECK (((booking_slug IS NULL) OR ((booking_slug ~ '^[a-z0-9][a-z0-9-]{1,60}$'::text) AND (booking_slug !~ '--'::text)))),
     CONSTRAINT properties_deposit_handling_mode_check CHECK ((deposit_handling_mode = ANY (ARRAY['gam_escrow'::text, 'landlord_held'::text]))),
@@ -5180,6 +5338,29 @@ CREATE TABLE public.property_fee_schedules (
 
 
 --
+-- Name: property_growth_snapshots; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.property_growth_snapshots (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    snapshot_date date NOT NULL,
+    property_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    units integer DEFAULT 0 NOT NULL,
+    occupied_units integer DEFAULT 0 NOT NULL,
+    vacant_units integer DEFAULT 0 NOT NULL,
+    delinquent_units integer DEFAULT 0 NOT NULL,
+    suspended_units integer DEFAULT 0 NOT NULL,
+    active_leases integer DEFAULT 0 NOT NULL,
+    active_tenants integer DEFAULT 0 NOT NULL,
+    monthly_rent_roll numeric(14,2) DEFAULT 0 NOT NULL,
+    outstanding_balance numeric(14,2) DEFAULT 0 NOT NULL,
+    open_maintenance integer DEFAULT 0 NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
 -- Name: property_inquiries; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -5250,8 +5431,10 @@ CREATE TABLE public.property_unit_subtypes (
     monthly_rate numeric(10,2),
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    dwelling_ownership text,
     CONSTRAINT property_unit_subtypes_bathrooms_check CHECK ((bathrooms >= (0)::numeric)),
     CONSTRAINT property_unit_subtypes_bedrooms_check CHECK ((bedrooms >= 0)),
+    CONSTRAINT property_unit_subtypes_dwelling_ownership_check CHECK (((dwelling_ownership IS NULL) OR (dwelling_ownership = ANY (ARRAY['landlord'::text, 'tenant'::text])))),
     CONSTRAINT property_unit_subtypes_name_check CHECK (((length(TRIM(BOTH FROM name)) >= 1) AND (length(TRIM(BOTH FROM name)) <= 60))),
     CONSTRAINT property_unit_subtypes_rv_amp_service_check CHECK ((rv_amp_service = ANY (ARRAY['none'::text, '30'::text, '50'::text, 'both'::text]))),
     CONSTRAINT property_unit_subtypes_rv_site_layout_check CHECK ((rv_site_layout = ANY (ARRAY['none'::text, 'back_in'::text, 'pull_through'::text]))),
@@ -5461,6 +5644,46 @@ CREATE TABLE public.rvs (
 
 
 --
+-- Name: sales_call_availability; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.sales_call_availability (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    weekday integer NOT NULL,
+    start_time time without time zone NOT NULL,
+    end_time time without time zone NOT NULL,
+    active boolean DEFAULT true NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT sales_call_availability_check CHECK ((end_time > start_time)),
+    CONSTRAINT sales_call_availability_weekday_check CHECK (((weekday >= 0) AND (weekday <= 6)))
+);
+
+
+--
+-- Name: sales_call_slots; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.sales_call_slots (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    lead_id uuid,
+    starts_at timestamp with time zone NOT NULL,
+    duration_minutes integer DEFAULT 30 NOT NULL,
+    mode text NOT NULL,
+    status text DEFAULT 'booked'::text NOT NULL,
+    prospect_name text,
+    prospect_email text,
+    prospect_phone text,
+    notes text,
+    reminded_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT sales_call_slots_mode_check CHECK ((mode = ANY (ARRAY['video'::text, 'phone'::text]))),
+    CONSTRAINT sales_call_slots_status_check CHECK ((status = ANY (ARRAY['booked'::text, 'completed'::text, 'cancelled'::text, 'no_show'::text])))
+);
+
+
+--
 -- Name: sales_leads; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -5478,6 +5701,7 @@ CREATE TABLE public.sales_leads (
     metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    states text,
     CONSTRAINT sales_leads_status_check CHECK ((status = ANY (ARRAY['new'::text, 'contacted'::text, 'qualified'::text, 'converted'::text, 'closed'::text])))
 );
 
@@ -5512,6 +5736,26 @@ CREATE TABLE public.schema_migrations (
     filename text NOT NULL,
     applied_at timestamp with time zone DEFAULT now() NOT NULL,
     checksum text NOT NULL
+);
+
+
+--
+-- Name: screening_fee_accruals; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.screening_fee_accruals (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    background_check_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    accrual_month date NOT NULL,
+    compliance_fee numeric(10,2) NOT NULL,
+    standard_total numeric(10,2) NOT NULL,
+    applicant_charged numeric(10,2) NOT NULL,
+    shortfall numeric(10,2) NOT NULL,
+    state character(2),
+    billed_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    platform_revenue_ledger_id uuid
 );
 
 
@@ -5683,6 +5927,24 @@ CREATE TABLE public.shifts (
 
 
 --
+-- Name: state_application_fee_caps; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.state_application_fee_caps (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    state character(2) NOT NULL,
+    effective_year integer NOT NULL,
+    cap_amount numeric(10,2),
+    fee_prohibited boolean DEFAULT false NOT NULL,
+    notes text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    actual_cost_only boolean DEFAULT false NOT NULL,
+    CONSTRAINT state_application_fee_caps_cap_amount_check CHECK (((cap_amount IS NULL) OR (cap_amount >= (0)::numeric))),
+    CONSTRAINT state_application_fee_caps_check CHECK (((fee_prohibited = false) OR (cap_amount IS NULL)))
+);
+
+
+--
 -- Name: state_deposit_interest_rates; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -5840,6 +6102,22 @@ COMMENT ON TABLE public.state_tax_forms IS 'S203 / S177 carve-out: hardcoded per
 --
 
 COMMENT ON COLUMN public.state_tax_forms.filing_method IS 'S207: paper_form (form_code is official agency code) vs online_portal (form_code is descriptive label, file via agency_url). Source of truth for values: packages/shared/src/index.ts FILING_METHOD_VALUES.';
+
+
+--
+-- Name: stripe_webhook_events; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.stripe_webhook_events (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    stripe_event_id text NOT NULL,
+    event_type text NOT NULL,
+    api_version text,
+    livemode boolean NOT NULL,
+    payload jsonb NOT NULL,
+    received_at timestamp with time zone DEFAULT now() NOT NULL,
+    processing_error text
+);
 
 
 --
@@ -6236,6 +6514,7 @@ CREATE TABLE public.unit_inspection_items (
     estimated_repair_cost numeric(10,2),
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    lease_fee_id uuid,
     CONSTRAINT unit_inspection_items_condition_check CHECK ((condition = ANY (ARRAY['good'::text, 'fair'::text, 'damaged'::text, 'missing'::text, 'na'::text])))
 );
 
@@ -6314,6 +6593,10 @@ CREATE TABLE public.unit_inspections (
     guided_walkthrough_declined boolean DEFAULT false NOT NULL,
     guided_walkthrough_declined_at timestamp with time zone,
     move_in_deadline_missed_at timestamp with time zone,
+    flagged_suspicious_at timestamp with time zone,
+    flagged_by_user_id uuid,
+    flag_reason text,
+    followup_inspection_id uuid,
     CONSTRAINT unit_inspections_inspection_type_check CHECK ((inspection_type = ANY (ARRAY['move_in'::text, 'move_out'::text, 'periodic'::text, 'turnover'::text]))),
     CONSTRAINT unit_inspections_status_check CHECK ((status = ANY (ARRAY['draft'::text, 'tenant_signed'::text, 'landlord_signed'::text, 'finalized'::text, 'disputed'::text, 'cancelled'::text])))
 );
@@ -6378,6 +6661,8 @@ CREATE TABLE public.units (
     status_before_block text,
     storage_size text,
     subtype_id uuid,
+    dwelling_ownership text DEFAULT 'landlord'::text NOT NULL,
+    CONSTRAINT units_dwelling_ownership_check CHECK ((dwelling_ownership = ANY (ARRAY['landlord'::text, 'tenant'::text]))),
     CONSTRAINT units_rv_amp_service_check CHECK ((rv_amp_service = ANY (ARRAY['none'::text, '30'::text, '50'::text, 'both'::text]))),
     CONSTRAINT units_rv_site_layout_check CHECK ((rv_site_layout = ANY (ARRAY['none'::text, 'back_in'::text, 'pull_through'::text]))),
     CONSTRAINT units_status_check CHECK ((status = ANY (ARRAY['vacant'::text, 'available'::text, 'active'::text, 'delinquent'::text, 'suspended'::text]))),
@@ -6909,6 +7194,14 @@ ALTER TABLE ONLY public.appointments
 
 ALTER TABLE ONLY public.audit_log
     ADD CONSTRAINT audit_log_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: audit_row_changes audit_row_changes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.audit_row_changes
+    ADD CONSTRAINT audit_row_changes_pkey PRIMARY KEY (id);
 
 
 --
@@ -8280,6 +8573,22 @@ ALTER TABLE ONLY public.platform_fee_config
 
 
 --
+-- Name: platform_growth_snapshots platform_growth_snapshots_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.platform_growth_snapshots
+    ADD CONSTRAINT platform_growth_snapshots_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: platform_growth_snapshots platform_growth_snapshots_snapshot_date_state_city_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.platform_growth_snapshots
+    ADD CONSTRAINT platform_growth_snapshots_snapshot_date_state_city_key UNIQUE (snapshot_date, state, city);
+
+
+--
 -- Name: platform_processing_rates platform_processing_rates_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -8584,6 +8893,14 @@ ALTER TABLE ONLY public.pos_vendors
 
 
 --
+-- Name: product_events product_events_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.product_events
+    ADD CONSTRAINT product_events_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: propane_fill_installments propane_fill_installments_fill_id_installment_number_key; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -8669,6 +8986,22 @@ ALTER TABLE ONLY public.property_fee_schedules
 
 ALTER TABLE ONLY public.property_fee_schedules
     ADD CONSTRAINT property_fee_schedules_property_id_fee_type_slot_index_key UNIQUE (property_id, fee_type, slot_index);
+
+
+--
+-- Name: property_growth_snapshots property_growth_snapshots_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_growth_snapshots
+    ADD CONSTRAINT property_growth_snapshots_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: property_growth_snapshots property_growth_snapshots_snapshot_date_property_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_growth_snapshots
+    ADD CONSTRAINT property_growth_snapshots_snapshot_date_property_id_key UNIQUE (snapshot_date, property_id);
 
 
 --
@@ -8816,6 +9149,22 @@ ALTER TABLE ONLY public.rvs
 
 
 --
+-- Name: sales_call_availability sales_call_availability_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sales_call_availability
+    ADD CONSTRAINT sales_call_availability_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: sales_call_slots sales_call_slots_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sales_call_slots
+    ADD CONSTRAINT sales_call_slots_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: sales_leads sales_leads_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -8837,6 +9186,22 @@ ALTER TABLE ONLY public.scheduled_maintenance
 
 ALTER TABLE ONLY public.schema_migrations
     ADD CONSTRAINT schema_migrations_pkey PRIMARY KEY (filename);
+
+
+--
+-- Name: screening_fee_accruals screening_fee_accruals_background_check_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.screening_fee_accruals
+    ADD CONSTRAINT screening_fee_accruals_background_check_id_key UNIQUE (background_check_id);
+
+
+--
+-- Name: screening_fee_accruals screening_fee_accruals_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.screening_fee_accruals
+    ADD CONSTRAINT screening_fee_accruals_pkey PRIMARY KEY (id);
 
 
 --
@@ -8920,6 +9285,22 @@ ALTER TABLE ONLY public.state_landlord_tenant_acts
 
 
 --
+-- Name: state_application_fee_caps state_application_fee_caps_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.state_application_fee_caps
+    ADD CONSTRAINT state_application_fee_caps_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: state_application_fee_caps state_application_fee_caps_state_effective_year_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.state_application_fee_caps
+    ADD CONSTRAINT state_application_fee_caps_state_effective_year_key UNIQUE (state, effective_year);
+
+
+--
 -- Name: state_deposit_interest_rates state_deposit_interest_rates_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -8949,6 +9330,22 @@ ALTER TABLE ONLY public.state_tax_forms
 
 ALTER TABLE ONLY public.state_tax_forms
     ADD CONSTRAINT state_tax_forms_unique UNIQUE (state_code, form_code, effective_year);
+
+
+--
+-- Name: stripe_webhook_events stripe_webhook_events_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.stripe_webhook_events
+    ADD CONSTRAINT stripe_webhook_events_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: stripe_webhook_events stripe_webhook_events_stripe_event_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.stripe_webhook_events
+    ADD CONSTRAINT stripe_webhook_events_stripe_event_id_key UNIQUE (stripe_event_id);
 
 
 --
@@ -9381,6 +9778,20 @@ CREATE INDEX agent_knowledge_chunks_embedding_idx ON public.agent_knowledge_chun
 --
 
 CREATE INDEX agent_knowledge_chunks_scope_idx ON public.agent_knowledge_chunks USING btree (scope);
+
+
+--
+-- Name: audit_row_changes_changed_at_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX audit_row_changes_changed_at_idx ON public.audit_row_changes USING btree (changed_at);
+
+
+--
+-- Name: audit_row_changes_table_row_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX audit_row_changes_table_row_idx ON public.audit_row_changes USING btree (table_name, row_id, changed_at);
 
 
 --
@@ -11911,6 +12322,13 @@ CREATE INDEX idx_scheduled_maintenance_landlord_due ON public.scheduled_maintena
 
 
 --
+-- Name: idx_screening_fee_accruals_landlord_month; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_screening_fee_accruals_landlord_month ON public.screening_fee_accruals USING btree (landlord_id, accrual_month);
+
+
+--
 -- Name: idx_sdi_accruals_deposit; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -11992,6 +12410,13 @@ CREATE INDEX idx_sptp_lookup ON public.state_property_tax_provisions USING btree
 --
 
 CREATE INDEX idx_state_tax_forms_state_year ON public.state_tax_forms USING btree (state_code, effective_year);
+
+
+--
+-- Name: idx_stripe_webhook_events_type_received; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_stripe_webhook_events_type_received ON public.stripe_webhook_events USING btree (event_type, received_at);
 
 
 --
@@ -12625,6 +13050,13 @@ CREATE UNIQUE INDEX platform_fee_config_one_active ON public.platform_fee_config
 
 
 --
+-- Name: platform_growth_snapshots_date_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX platform_growth_snapshots_date_idx ON public.platform_growth_snapshots USING btree (snapshot_date);
+
+
+--
 -- Name: pm_invitations_token_unique; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -12695,10 +13127,59 @@ CREATE UNIQUE INDEX pos_transactions_stripe_pi_uniq ON public.pos_transactions U
 
 
 --
+-- Name: product_events_occurred_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX product_events_occurred_idx ON public.product_events USING btree (occurred_at);
+
+
+--
+-- Name: product_events_portal_event_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX product_events_portal_event_idx ON public.product_events USING btree (portal, event, occurred_at);
+
+
+--
+-- Name: product_events_user_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX product_events_user_idx ON public.product_events USING btree (user_id, occurred_at);
+
+
+--
+-- Name: property_growth_snapshots_date_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX property_growth_snapshots_date_idx ON public.property_growth_snapshots USING btree (snapshot_date);
+
+
+--
+-- Name: property_growth_snapshots_landlord_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX property_growth_snapshots_landlord_idx ON public.property_growth_snapshots USING btree (landlord_id, snapshot_date);
+
+
+--
 -- Name: reserve_fund_state_singleton; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE UNIQUE INDEX reserve_fund_state_singleton ON public.reserve_fund_state USING btree ((true));
+
+
+--
+-- Name: sales_call_slots_booked_start_uniq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX sales_call_slots_booked_start_uniq ON public.sales_call_slots USING btree (starts_at) WHERE (status = 'booked'::text);
+
+
+--
+-- Name: sales_call_slots_upcoming_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX sales_call_slots_upcoming_idx ON public.sales_call_slots USING btree (starts_at) WHERE (status = 'booked'::text);
 
 
 --
@@ -12888,6 +13369,769 @@ CREATE UNIQUE INDEX ux_users_landlord_invite_token ON public.users USING btree (
 --
 
 CREATE UNIQUE INDEX ux_users_tenant_invite_token ON public.users USING btree (tenant_invite_token) WHERE (tenant_invite_token IS NOT NULL);
+
+
+--
+-- Name: application_pool audit_application_pool; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_application_pool AFTER DELETE OR UPDATE ON public.application_pool FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: appointments audit_appointments; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_appointments AFTER DELETE OR UPDATE ON public.appointments FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: booking_change_requests audit_booking_change_requests; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_booking_change_requests AFTER DELETE OR UPDATE ON public.booking_change_requests FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: bookkeeper_scopes audit_bookkeeper_scopes; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_bookkeeper_scopes AFTER DELETE OR UPDATE ON public.bookkeeper_scopes FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: books_accounts audit_books_accounts; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_books_accounts AFTER DELETE OR UPDATE ON public.books_accounts FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: books_bills audit_books_bills; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_books_bills AFTER DELETE OR UPDATE ON public.books_bills FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: books_contractors audit_books_contractors; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_books_contractors AFTER DELETE OR UPDATE ON public.books_contractors FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: books_employees audit_books_employees; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_books_employees AFTER DELETE OR UPDATE ON public.books_employees FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: books_transactions audit_books_transactions; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_books_transactions AFTER DELETE OR UPDATE ON public.books_transactions FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: books_vendors audit_books_vendors; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_books_vendors AFTER DELETE OR UPDATE ON public.books_vendors FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: business_bookable_services audit_business_bookable_services; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_business_bookable_services AFTER DELETE OR UPDATE ON public.business_bookable_services FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: business_customers audit_business_customers; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_business_customers AFTER DELETE OR UPDATE ON public.business_customers FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: business_inventory_items audit_business_inventory_items; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_business_inventory_items AFTER DELETE OR UPDATE ON public.business_inventory_items FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: business_invoices audit_business_invoices; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_business_invoices AFTER DELETE OR UPDATE ON public.business_invoices FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: business_quotes audit_business_quotes; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_business_quotes AFTER DELETE OR UPDATE ON public.business_quotes FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: business_recurring_invoice_schedules audit_business_recurring_invoice_schedules; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_business_recurring_invoice_schedules AFTER DELETE OR UPDATE ON public.business_recurring_invoice_schedules FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: business_users audit_business_users; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_business_users AFTER DELETE OR UPDATE ON public.business_users FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: business_work_orders audit_business_work_orders; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_business_work_orders AFTER DELETE OR UPDATE ON public.business_work_orders FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: businesses audit_businesses; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_businesses AFTER DELETE OR UPDATE ON public.businesses FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: common_area_reservations audit_common_area_reservations; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_common_area_reservations AFTER DELETE OR UPDATE ON public.common_area_reservations FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: common_areas audit_common_areas; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_common_areas AFTER DELETE OR UPDATE ON public.common_areas FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: contractors audit_contractors; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_contractors AFTER DELETE OR UPDATE ON public.contractors FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: daily_tasks audit_daily_tasks; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_daily_tasks AFTER DELETE OR UPDATE ON public.daily_tasks FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: deposit_returns audit_deposit_returns; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_deposit_returns AFTER DELETE OR UPDATE ON public.deposit_returns FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: disbursements audit_disbursements; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_disbursements AFTER DELETE OR UPDATE ON public.disbursements FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: emergency_contacts audit_emergency_contacts; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_emergency_contacts AFTER DELETE OR UPDATE ON public.emergency_contacts FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: flex_charge_accounts audit_flex_charge_accounts; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_flex_charge_accounts AFTER DELETE OR UPDATE ON public.flex_charge_accounts FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: flex_deposit_installments audit_flex_deposit_installments; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_flex_deposit_installments AFTER DELETE OR UPDATE ON public.flex_deposit_installments FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: flexpay_advances audit_flexpay_advances; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_flexpay_advances AFTER DELETE OR UPDATE ON public.flexpay_advances FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: flexpay_inquiries audit_flexpay_inquiries; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_flexpay_inquiries AFTER DELETE OR UPDATE ON public.flexpay_inquiries FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: invoices audit_invoices; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_invoices AFTER DELETE OR UPDATE ON public.invoices FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: landlord_platform_fee_overrides audit_landlord_platform_fee_overrides; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_landlord_platform_fee_overrides AFTER DELETE OR UPDATE ON public.landlord_platform_fee_overrides FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: landlords audit_landlords; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_landlords AFTER DELETE OR UPDATE ON public.landlords FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: lease_document_fields audit_lease_document_fields; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_lease_document_fields AFTER DELETE OR UPDATE ON public.lease_document_fields FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: lease_document_signers audit_lease_document_signers; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_lease_document_signers AFTER DELETE OR UPDATE ON public.lease_document_signers FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: lease_documents audit_lease_documents; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_lease_documents AFTER DELETE OR UPDATE ON public.lease_documents FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: lease_fees audit_lease_fees; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_lease_fees AFTER DELETE OR UPDATE ON public.lease_fees FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: lease_occupants audit_lease_occupants; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_lease_occupants AFTER DELETE OR UPDATE ON public.lease_occupants FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: lease_pets audit_lease_pets; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_lease_pets AFTER DELETE OR UPDATE ON public.lease_pets FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: lease_prepaid_credits audit_lease_prepaid_credits; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_lease_prepaid_credits AFTER DELETE OR UPDATE ON public.lease_prepaid_credits FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: lease_renewal_requests audit_lease_renewal_requests; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_lease_renewal_requests AFTER DELETE OR UPDATE ON public.lease_renewal_requests FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: lease_template_fields audit_lease_template_fields; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_lease_template_fields AFTER DELETE OR UPDATE ON public.lease_template_fields FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: lease_templates audit_lease_templates; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_lease_templates AFTER DELETE OR UPDATE ON public.lease_templates FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: lease_tenants audit_lease_tenants; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_lease_tenants AFTER DELETE OR UPDATE ON public.lease_tenants FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: lease_termination_requests audit_lease_termination_requests; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_lease_termination_requests AFTER DELETE OR UPDATE ON public.lease_termination_requests FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: lease_utility_assignments audit_lease_utility_assignments; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_lease_utility_assignments AFTER DELETE OR UPDATE ON public.lease_utility_assignments FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: lease_utility_responsibilities audit_lease_utility_responsibilities; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_lease_utility_responsibilities AFTER DELETE OR UPDATE ON public.lease_utility_responsibilities FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: lease_vehicles audit_lease_vehicles; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_lease_vehicles AFTER DELETE OR UPDATE ON public.lease_vehicles FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: leases audit_leases; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_leases AFTER DELETE OR UPDATE ON public.leases FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: liability_insurance_policies audit_liability_insurance_policies; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_liability_insurance_policies AFTER DELETE OR UPDATE ON public.liability_insurance_policies FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: maintenance_requests audit_maintenance_requests; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_maintenance_requests AFTER DELETE OR UPDATE ON public.maintenance_requests FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: maintenance_worker_scopes audit_maintenance_worker_scopes; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_maintenance_worker_scopes AFTER DELETE OR UPDATE ON public.maintenance_worker_scopes FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: mobile_homes audit_mobile_homes; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_mobile_homes AFTER DELETE OR UPDATE ON public.mobile_homes FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: monthly_fee_accruals audit_monthly_fee_accruals; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_monthly_fee_accruals AFTER DELETE OR UPDATE ON public.monthly_fee_accruals FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: notification_preferences audit_notification_preferences; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_notification_preferences AFTER DELETE OR UPDATE ON public.notification_preferences FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: onsite_manager_scopes audit_onsite_manager_scopes; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_onsite_manager_scopes AFTER DELETE OR UPDATE ON public.onsite_manager_scopes FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: otp_advances audit_otp_advances; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_otp_advances AFTER DELETE OR UPDATE ON public.otp_advances FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: parts_inventory audit_parts_inventory; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_parts_inventory AFTER DELETE OR UPDATE ON public.parts_inventory FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: payments audit_payments; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_payments AFTER DELETE OR UPDATE ON public.payments FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: payroll_runs audit_payroll_runs; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_payroll_runs AFTER DELETE OR UPDATE ON public.payroll_runs FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: pending_tenant_intents audit_pending_tenant_intents; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_pending_tenant_intents AFTER DELETE OR UPDATE ON public.pending_tenant_intents FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: platform_fee_accruals audit_platform_fee_accruals; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_platform_fee_accruals AFTER DELETE OR UPDATE ON public.platform_fee_accruals FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: platform_fee_config audit_platform_fee_config; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_platform_fee_config AFTER DELETE OR UPDATE ON public.platform_fee_config FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: platform_processing_rates audit_platform_processing_rates; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_platform_processing_rates AFTER DELETE OR UPDATE ON public.platform_processing_rates FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: pm_companies audit_pm_companies; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_pm_companies AFTER DELETE OR UPDATE ON public.pm_companies FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: pm_fee_plans audit_pm_fee_plans; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_pm_fee_plans AFTER DELETE OR UPDATE ON public.pm_fee_plans FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: pm_property_invitations audit_pm_property_invitations; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_pm_property_invitations AFTER DELETE OR UPDATE ON public.pm_property_invitations FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: pm_staff audit_pm_staff; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_pm_staff AFTER DELETE OR UPDATE ON public.pm_staff FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: pos_categories audit_pos_categories; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_pos_categories AFTER DELETE OR UPDATE ON public.pos_categories FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: pos_customers audit_pos_customers; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_pos_customers AFTER DELETE OR UPDATE ON public.pos_customers FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: pos_discounts audit_pos_discounts; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_pos_discounts AFTER DELETE OR UPDATE ON public.pos_discounts FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: pos_item_variants audit_pos_item_variants; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_pos_item_variants AFTER DELETE OR UPDATE ON public.pos_item_variants FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: pos_items audit_pos_items; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_pos_items AFTER DELETE OR UPDATE ON public.pos_items FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: pos_purchase_orders audit_pos_purchase_orders; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_pos_purchase_orders AFTER DELETE OR UPDATE ON public.pos_purchase_orders FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: pos_sessions audit_pos_sessions; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_pos_sessions AFTER DELETE OR UPDATE ON public.pos_sessions FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: pos_tax_rates audit_pos_tax_rates; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_pos_tax_rates AFTER DELETE OR UPDATE ON public.pos_tax_rates FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: pos_vendors audit_pos_vendors; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_pos_vendors AFTER DELETE OR UPDATE ON public.pos_vendors FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: propane_fill_installments audit_propane_fill_installments; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_propane_fill_installments AFTER DELETE OR UPDATE ON public.propane_fill_installments FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: properties audit_properties; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_properties AFTER DELETE OR UPDATE ON public.properties FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: property_allocation_rules audit_property_allocation_rules; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_property_allocation_rules AFTER DELETE OR UPDATE ON public.property_allocation_rules FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: property_faqs audit_property_faqs; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_property_faqs AFTER DELETE OR UPDATE ON public.property_faqs FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: property_fee_schedules audit_property_fee_schedules; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_property_fee_schedules AFTER DELETE OR UPDATE ON public.property_fee_schedules FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: property_inquiries audit_property_inquiries; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_property_inquiries AFTER DELETE OR UPDATE ON public.property_inquiries FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: property_manager_scopes audit_property_manager_scopes; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_property_manager_scopes AFTER DELETE OR UPDATE ON public.property_manager_scopes FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: property_unit_subtypes audit_property_unit_subtypes; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_property_unit_subtypes AFTER DELETE OR UPDATE ON public.property_unit_subtypes FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: property_unit_type_late_fees audit_property_unit_type_late_fees; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_property_unit_type_late_fees AFTER DELETE OR UPDATE ON public.property_unit_type_late_fees FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: purchase_requests audit_purchase_requests; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_purchase_requests AFTER DELETE OR UPDATE ON public.purchase_requests FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: recurring_schedules audit_recurring_schedules; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_recurring_schedules AFTER DELETE OR UPDATE ON public.recurring_schedules FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: rvs audit_rvs; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_rvs AFTER DELETE OR UPDATE ON public.rvs FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: sales_leads audit_sales_leads; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_sales_leads AFTER DELETE OR UPDATE ON public.sales_leads FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: scheduled_maintenance audit_scheduled_maintenance; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_scheduled_maintenance AFTER DELETE OR UPDATE ON public.scheduled_maintenance FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: security_deposits audit_security_deposits; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_security_deposits AFTER DELETE OR UPDATE ON public.security_deposits FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: service_interruptions audit_service_interruptions; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_service_interruptions AFTER DELETE OR UPDATE ON public.service_interruptions FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: shifts audit_shifts; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_shifts AFTER DELETE OR UPDATE ON public.shifts FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: subleases audit_subleases; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_subleases AFTER DELETE OR UPDATE ON public.subleases FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: tenant_identifications audit_tenant_identifications; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_tenant_identifications AFTER DELETE OR UPDATE ON public.tenant_identifications FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: tenant_questionnaires audit_tenant_questionnaires; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_tenant_questionnaires AFTER DELETE OR UPDATE ON public.tenant_questionnaires FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: tenants audit_tenants; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_tenants AFTER DELETE OR UPDATE ON public.tenants FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: unit_applications audit_unit_applications; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_unit_applications AFTER DELETE OR UPDATE ON public.unit_applications FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: unit_booking_waitlists audit_unit_booking_waitlists; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_unit_booking_waitlists AFTER DELETE OR UPDATE ON public.unit_booking_waitlists FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: unit_bookings audit_unit_bookings; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_unit_bookings AFTER DELETE OR UPDATE ON public.unit_bookings FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: unit_entry_requests audit_unit_entry_requests; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_unit_entry_requests AFTER DELETE OR UPDATE ON public.unit_entry_requests FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: unit_inspection_items audit_unit_inspection_items; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_unit_inspection_items AFTER DELETE OR UPDATE ON public.unit_inspection_items FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: unit_inspections audit_unit_inspections; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_unit_inspections AFTER DELETE OR UPDATE ON public.unit_inspections FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: units audit_units; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_units AFTER DELETE OR UPDATE ON public.units FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: users audit_users; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_users AFTER DELETE OR UPDATE ON public.users FOR EACH ROW EXECUTE FUNCTION public.audit_row_change_redacted();
+
+
+--
+-- Name: utility_bills audit_utility_bills; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_utility_bills AFTER DELETE OR UPDATE ON public.utility_bills FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: utility_meters audit_utility_meters; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_utility_meters AFTER DELETE OR UPDATE ON public.utility_meters FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
+
+
+--
+-- Name: work_trade_agreements audit_work_trade_agreements; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER audit_work_trade_agreements AFTER DELETE OR UPDATE ON public.work_trade_agreements FOR EACH ROW EXECUTE FUNCTION public.audit_row_change();
 
 
 --
@@ -15280,6 +16524,14 @@ ALTER TABLE ONLY public.lease_documents
 
 
 --
+-- Name: lease_fees lease_fees_condition_assessed_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_fees
+    ADD CONSTRAINT lease_fees_condition_assessed_by_fkey FOREIGN KEY (condition_assessed_by) REFERENCES public.users(id);
+
+
+--
 -- Name: lease_fees lease_fees_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -16728,6 +17980,14 @@ ALTER TABLE ONLY public.property_fee_schedules
 
 
 --
+-- Name: property_growth_snapshots property_growth_snapshots_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_growth_snapshots
+    ADD CONSTRAINT property_growth_snapshots_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE CASCADE;
+
+
+--
 -- Name: property_inquiries property_inquiries_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -16904,6 +18164,14 @@ ALTER TABLE ONLY public.rvs
 
 
 --
+-- Name: sales_call_slots sales_call_slots_lead_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sales_call_slots
+    ADD CONSTRAINT sales_call_slots_lead_id_fkey FOREIGN KEY (lead_id) REFERENCES public.sales_leads(id) ON DELETE SET NULL;
+
+
+--
 -- Name: scheduled_maintenance scheduled_maintenance_assigned_to_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -16933,6 +18201,30 @@ ALTER TABLE ONLY public.scheduled_maintenance
 
 ALTER TABLE ONLY public.scheduled_maintenance
     ADD CONSTRAINT scheduled_maintenance_unit_id_fkey FOREIGN KEY (unit_id) REFERENCES public.units(id) ON DELETE SET NULL;
+
+
+--
+-- Name: screening_fee_accruals screening_fee_accruals_background_check_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.screening_fee_accruals
+    ADD CONSTRAINT screening_fee_accruals_background_check_id_fkey FOREIGN KEY (background_check_id) REFERENCES public.background_checks(id);
+
+
+--
+-- Name: screening_fee_accruals screening_fee_accruals_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.screening_fee_accruals
+    ADD CONSTRAINT screening_fee_accruals_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id);
+
+
+--
+-- Name: screening_fee_accruals screening_fee_accruals_platform_revenue_ledger_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.screening_fee_accruals
+    ADD CONSTRAINT screening_fee_accruals_platform_revenue_ledger_id_fkey FOREIGN KEY (platform_revenue_ledger_id) REFERENCES public.platform_revenue_ledger(id);
 
 
 --
@@ -17376,6 +18668,14 @@ ALTER TABLE ONLY public.unit_inspection_items
 
 
 --
+-- Name: unit_inspection_items unit_inspection_items_lease_fee_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_inspection_items
+    ADD CONSTRAINT unit_inspection_items_lease_fee_id_fkey FOREIGN KEY (lease_fee_id) REFERENCES public.lease_fees(id) ON DELETE SET NULL;
+
+
+--
 -- Name: unit_inspection_photos unit_inspection_photos_inspection_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -17437,6 +18737,22 @@ ALTER TABLE ONLY public.unit_inspections
 
 ALTER TABLE ONLY public.unit_inspections
     ADD CONSTRAINT unit_inspections_conducted_by_user_id_fkey FOREIGN KEY (conducted_by_user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: unit_inspections unit_inspections_flagged_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_inspections
+    ADD CONSTRAINT unit_inspections_flagged_by_user_id_fkey FOREIGN KEY (flagged_by_user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: unit_inspections unit_inspections_followup_inspection_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.unit_inspections
+    ADD CONSTRAINT unit_inspections_followup_inspection_id_fkey FOREIGN KEY (followup_inspection_id) REFERENCES public.unit_inspections(id);
 
 
 --
@@ -17787,5 +19103,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict XHf5eSmHPRkgF4p4hc7nkvkd9Lbyxw2pRi0yI29hVlO78tBK958LCq75dXLhacg
+\unrestrict 8mdonzrelxRI3FRG3heGYzPdDuUjAIV39qBrPad04uMxacky8bKUvnp8Z20bBzc
 

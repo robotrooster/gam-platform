@@ -248,6 +248,14 @@ authRouter.post('/login', async (req, res, next) => {
       [user.id]
     )
 
+    // S550: login EVENT persisted (last_login_at overwrites — per-user
+    // login history is only reconstructable from these rows). Best-effort.
+    db.query(
+      `INSERT INTO product_events (portal, event, user_id, role)
+       VALUES ('auth', 'login', $1, $2)`,
+      [user.id, user.role],
+    ).catch(() => {})
+
     // S281: email verification gate. AFTER bcrypt + counter reset so
     // an unverified user with wrong password gets generic "Invalid
     // credentials"; only after proving the password do we tell them

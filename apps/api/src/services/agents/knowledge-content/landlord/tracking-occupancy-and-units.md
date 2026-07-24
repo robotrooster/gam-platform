@@ -9,7 +9,7 @@ GAM tracks your properties at the unit level, and occupancy matters both for man
 - An **occupied** unit has a current tenant.
 - A **vacant** unit has no tenant.
 
-Keeping unit occupancy accurate in GAM matters because the platform fee is based on it: you're charged **$2 per occupied unit per month**, **vacant units are never charged**, and each property has a **$10/month minimum**. If a unit is marked occupied when it's actually empty, it could affect your fee — so it's worth keeping occupancy current.
+Keeping unit occupancy accurate in GAM matters because the platform fee is based on it: you're charged **$2 per occupied unit per month**, **vacant units are never charged**, and each property has a **$10/month minimum**. Billing occupancy follows your leases: a unit counts as occupied for the fee only while it has an active lease covering the month. If a lease should have ended but is still active in GAM, end or terminate it so the unit stops counting.
 
 ## Why accurate units help
 

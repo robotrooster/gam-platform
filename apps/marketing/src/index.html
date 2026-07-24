@@ -466,12 +466,12 @@ footer{background:var(--bg2);border-top:1px solid var(--border);padding:48px 0 3
   </div>
 </footer>
 
-<!-- ── GAM Sales Chat (Jordan) ───────────────────────────────────────────
+<!-- ── GAM Sales Chat (Lucy) ───────────────────────────────────────────
      Self-contained vanilla widget — the marketing site is static HTML, not
      a React app, so this does NOT mirror the portal TSX widgets in code,
      only in behavior. Floating bubble (bottom-right) + the "Contact sales"
      CTAs open it. Talks to the public, unauthenticated POST /api/sales/chat
-     ("Jordan", the sales lead-gen agent). Jordan is presented as a real GAM
+     ("Lucy", the sales lead-gen agent). Lucy is presented as a real GAM
      salesperson, never a bot. Conversation + thread id persist in
      localStorage. History is sent client-side (the prospect is anonymous;
      the server keeps no per-user thread for them).
@@ -521,7 +521,7 @@ footer{background:var(--bg2);border-top:1px solid var(--border);padding:48px 0 3
 <div class="gsc-panel" id="gsc-panel" role="dialog" aria-label="Chat with GAM sales" aria-modal="false">
   <div class="gsc-head">
     <div class="gsc-av"><div class="ring">J</div><div class="dot" title="Online"></div></div>
-    <div class="meta"><div class="nm">Jordan</div><div class="ti">GAM Sales · <span class="on">Online</span></div></div>
+    <div class="meta"><div class="nm">Lucy</div><div class="ti">GAM Sales · <span class="on">Online</span></div></div>
     <button class="gsc-x" id="gsc-close" aria-label="Close chat"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
   </div>
   <div class="gsc-msgs" id="gsc-msgs"></div>
@@ -534,7 +534,7 @@ footer{background:var(--bg2);border-top:1px solid var(--border);padding:48px 0 3
 (function(){
   var API = (window.GAM_API_BASE) || ((location.hostname==='localhost'||location.hostname==='127.0.0.1') ? 'http://localhost:4000' : '');
   var KEY = 'gam_sales_chat';
-  var GREETING = "Hi, I'm Jordan with Gold Asset Management. Wondering whether GAM's a fit for your properties? Ask me anything — pricing, features, or what getting set up looks like.";
+  var GREETING = "Hi, I'm Lucy with Gold Asset Management. Wondering whether GAM's a fit for your properties? Ask me anything — pricing, features, or what getting set up looks like.";
   var state = { messages: [], conversationId: undefined };
   try { var raw = localStorage.getItem(KEY); if (raw){ var s = JSON.parse(raw); if (Array.isArray(s.messages)) state.messages = s.messages; if (typeof s.conversationId==='string') state.conversationId = s.conversationId; } } catch(e){}
 
@@ -567,7 +567,7 @@ footer{background:var(--bg2);border-top:1px solid var(--border);padding:48px 0 3
     var row=document.createElement('div'); row.className='gsc-row'; row.id='gsc-typing';
     row.appendChild(smallAvatar());
     var b=document.createElement('div'); b.className='gsc-b them';
-    b.appendChild(document.createTextNode('Jordan is typing'));
+    b.appendChild(document.createTextNode('Lucy is typing'));
     var dots=document.createElement('span'); dots.className='gsc-typing';
     dots.appendChild(document.createElement('i')); dots.appendChild(document.createElement('i')); dots.appendChild(document.createElement('i'));
     b.appendChild(dots); row.appendChild(b); msgsEl.appendChild(row); scroll();

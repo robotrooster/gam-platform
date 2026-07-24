@@ -20,6 +20,8 @@ import rateLimit from 'express-rate-limit'
 import { requireAuth } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { runAgentSession } from '../services/agents/agentSession'
+import { isAssistantHidden } from '../services/agents/turnBudget'
+import { listAvailableSlots, formatSlotForHumans, bookSalesCall } from '../services/salesCalls'
 import { loadConversationHistory, loadGuestConversationHistory } from '../services/agents/conversationHistory'
 import { resolveBookingGuestToken } from '../services/bookingGuestTokens'
 import type { AgentAudience, ChatMessage } from '../services/agents/types'
@@ -43,6 +45,18 @@ const agentRateLimiter = rateLimit({
   message: { success: false, error: "You're sending messages too quickly — please wait a moment." },
 })
 agentRouter.use(agentRateLimiter)
+
+// GET /api/agent/visibility — should the assistant bubble render for this
+// user? False only when the silent auto-hide (S553 abuse guard, dark by
+// default) has tripped. The widget renders nothing on false — no
+// explanation is ever shown (that's the point of "silent").
+agentRouter.get('/visibility', async (req, res, next) => {
+  try {
+    const { userId, role } = req.user!
+    const hidden = await isAssistantHidden(userId, role).catch(() => false)
+    res.json({ success: true, data: { visible: !hidden } })
+  } catch (e) { next(e) }
+})
 
 const chatSchema = z.object({
   message: z.string().trim().min(1).max(4000),
@@ -164,6 +178,36 @@ salesAgentRouter.post('/chat', async (req, res, next) => {
   } catch (e) {
     next(e)
   }
+})
+
+// ── S553: sales-call booking (public, rides the sales limiter) ────────
+// Prospects book a real-time call with a Portfolio Specialist — in-chat
+// via Lucy's tools or directly. Same shared service both ways.
+salesAgentRouter.get('/call-slots', async (_req, res, next) => {
+  try {
+    const slots = await listAvailableSlots()
+    res.json({ success: true, data: slots.map((iso) => ({ startsAt: iso, label: formatSlotForHumans(iso) })) })
+  } catch (e) { next(e) }
+})
+
+salesAgentRouter.post('/call-slots/book', async (req, res, next) => {
+  try {
+    const b = z.object({
+      startsAt: z.string().datetime(),
+      mode: z.enum(['video', 'phone']),
+      name: z.string().trim().min(1).max(120),
+      email: z.string().trim().email().max(254),
+      phone: z.string().trim().max(40).optional(),
+      conversationId: z.string().uuid().optional(),
+      notes: z.string().trim().max(2000).optional(),
+    }).parse(req.body)
+    const result = await bookSalesCall({
+      startsAt: b.startsAt, mode: b.mode, name: b.name, email: b.email,
+      phone: b.phone ?? null, conversationId: b.conversationId ?? null, notes: b.notes ?? null,
+    })
+    if (!result.ok) throw new AppError(409, result.error)
+    res.status(201).json({ success: true, data: result })
+  } catch (e) { next(e) }
 })
 
 // ── Booking-guest agent (NO login — bearer token) ─────────────────────

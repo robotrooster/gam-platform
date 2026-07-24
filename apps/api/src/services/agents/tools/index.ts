@@ -20,6 +20,14 @@ import { getMyMaintenanceRequests } from './getMyMaintenanceRequests'
 import { getMyDocuments } from './getMyDocuments'
 import { getMyInspections } from './getMyInspections'
 import { getMyEntryRequests } from './getMyEntryRequests'
+import { respondToEntryRequest } from './respondToEntryRequest'
+import { getMyTerminationQuote } from './getMyTerminationQuote'
+import { getMyBalanceBreakdown } from './getMyBalanceBreakdown'
+import { getMyAmenities, requestAmenityReservation } from './amenityTools'
+import { getPendingAmenityRequests, decideAmenityReservation } from './landlordAmenityTools'
+import { getServiceInterruptions, postServiceInterruption, resolveServiceInterruptionTool } from './serviceInterruptionTools'
+import { getGuestAmenities, requestGuestAmenityReservation } from './guestAmenityTools'
+import { getAvailableCallTimes, bookSalesCallTool } from './salesCallTools'
 import { getMyPaymentMethods } from './getMyPaymentMethods'
 import { getMyNotifications } from './getMyNotifications'
 import { getPendingMaintenance } from './getPendingMaintenance'
@@ -84,6 +92,16 @@ export const ALL_TOOLS: readonly AgentTool[] = [
   getMyDocuments,
   getMyInspections,
   getMyEntryRequests,
+  respondToEntryRequest,
+  getMyTerminationQuote,
+  getMyBalanceBreakdown,
+  getMyAmenities,
+  requestAmenityReservation,
+  getPendingAmenityRequests,
+  decideAmenityReservation,
+  getServiceInterruptions,
+  postServiceInterruption,
+  resolveServiceInterruptionTool,
   getMyPaymentMethods,
   getMyDeposit,
   getMyInvoices,
@@ -127,9 +145,13 @@ export const ALL_TOOLS: readonly AgentTool[] = [
   setInspectionItemCondition,
   // sales (prospect)
   captureLead,
+  getAvailableCallTimes,
+  bookSalesCallTool,
   // booking guest (token-scoped)
   getGuestBooking,
   requestBookingChange,
+  getGuestAmenities,
+  requestGuestAmenityReservation,
   // both
   getApplicableLaws,
   searchStateLaw,

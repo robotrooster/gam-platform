@@ -300,3 +300,84 @@ async function accrueOneProperty(
 function round2(n: number): number {
   return Math.round(n * 100) / 100
 }
+
+// ── S552: SCREENING FEE SWEEP ────────────────────────────────────────────
+//
+// Sweeps every unbilled screening_fee_accruals row (billed_at IS NULL) into
+// platform revenue: one ledger entry per landlord covering the batch sum of
+// compliance fees ($5/screening) + capped-state shortfalls. Runs with the
+// monthly platform-fee cron; also safe to run ad hoc.
+//
+// Ledger type reuses 'platform_fee_subscription' (the CHECK-constrained
+// enum predates the shared single-source rule; screening fees ARE platform
+// service revenue) with reference_type='screening_fee_sweep' to keep the
+// two streams distinguishable in reporting.
+//
+// Idempotency: rows are selected FOR UPDATE and stamped billed_at +
+// platform_revenue_ledger_id in the same transaction as the ledger post —
+// a re-run finds nothing unbilled and posts nothing.
+
+export interface ScreeningSweepResult {
+  landlordsSwept: number
+  accrualsSwept: number
+  totalSwept: number
+  errors: { landlord_id: string; error: string }[]
+}
+
+export async function processScreeningFeeSweep(): Promise<ScreeningSweepResult> {
+  const result: ScreeningSweepResult = { landlordsSwept: 0, accrualsSwept: 0, totalSwept: 0, errors: [] }
+
+  const landlords = await query<{ landlord_id: string }>(`
+    SELECT DISTINCT landlord_id FROM screening_fee_accruals WHERE billed_at IS NULL
+  `)
+
+  for (const { landlord_id } of landlords) {
+    const client = await getClient()
+    try {
+      await client.query('BEGIN')
+      const rows = await client.query<{ id: string; compliance_fee: string; shortfall: string }>(
+        `SELECT id, compliance_fee, shortfall FROM screening_fee_accruals
+          WHERE landlord_id = $1 AND billed_at IS NULL
+          FOR UPDATE`,
+        [landlord_id]
+      )
+      if (rows.rowCount === 0) { await client.query('ROLLBACK'); client.release(); continue }
+      const total = round2(rows.rows.reduce(
+        (s, r) => s + parseFloat(r.compliance_fee) + parseFloat(r.shortfall), 0))
+
+      await client.query(`SELECT pg_advisory_xact_lock(hashtextextended('platform_revenue', 0))`)
+      const prev = await client.query<{ balance_after: string }>(
+        `SELECT balance_after FROM platform_revenue_ledger
+          ORDER BY created_at DESC, id DESC LIMIT 1`
+      )
+      const prevBal = (prev.rowCount && prev.rowCount > 0) ? parseFloat(prev.rows[0].balance_after) : 0
+
+      const ledger = await client.query<{ id: string }>(`
+        INSERT INTO platform_revenue_ledger
+          (type, amount, balance_after, reference_id, reference_type, notes)
+        VALUES ('platform_fee_subscription', $1, $2, $3, 'screening_fee_sweep', $4)
+        RETURNING id
+      `, [
+        total, round2(prevBal + total), landlord_id,
+        `Screening fees: ${rows.rowCount} check(s) — compliance fees + capped-state shortfalls`,
+      ])
+
+      await client.query(
+        `UPDATE screening_fee_accruals
+            SET billed_at = NOW(), platform_revenue_ledger_id = $1
+          WHERE landlord_id = $2 AND billed_at IS NULL`,
+        [ledger.rows[0].id, landlord_id]
+      )
+      await client.query('COMMIT')
+      result.landlordsSwept++
+      result.accrualsSwept += rows.rowCount ?? 0
+      result.totalSwept = round2(result.totalSwept + total)
+    } catch (e) {
+      try { await client.query('ROLLBACK') } catch {}
+      result.errors.push({ landlord_id, error: e instanceof Error ? e.message : String(e) })
+    } finally {
+      client.release()
+    }
+  }
+  return result
+}

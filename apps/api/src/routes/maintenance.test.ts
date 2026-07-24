@@ -690,3 +690,81 @@ describe('GET /maintenance/stats/summary', () => {
     expect(res.status).toBe(403)
   })
 })
+
+// ── S552: per-manager approval ceiling (Nic: Option B — route to landlord
+// with an attempted-approval note, never silently allow) ─────────────────
+describe('POST /maintenance/:id/approve — per-manager ceiling', () => {
+  async function seedApprovalReq(args: { landlordId: string; unitId: string; tenantId: string; estimatedCost: number }): Promise<string> {
+    const { rows: [r] } = await db.query<{ id: string }>(
+      `INSERT INTO maintenance_requests
+         (unit_id, tenant_id, landlord_id, title, description, priority, status, estimated_cost)
+       VALUES ($1, $2, $3, 'Ceiling test', 'desc', 'normal', 'awaiting_approval', $4)
+       RETURNING id`,
+      [args.unitId, args.tenantId, args.landlordId, args.estimatedCost])
+    return r.id
+  }
+
+  async function seedPmWithCeiling(landlordId: string, ceilingCents: number | null) {
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      const { rows: [{ id: pmUserId }] } = await client.query<{ id: string }>(
+        `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+         VALUES ($1, 'x', 'property_manager', 'Pat', 'Manager', TRUE) RETURNING id`,
+        [`pm-${randomUUID()}@test.dev`])
+      await client.query(
+        `INSERT INTO property_manager_scopes (user_id, landlord_id, all_properties, maint_approval_ceiling_cents)
+         VALUES ($1, $2, TRUE, $3)`,
+        [pmUserId, landlordId, ceilingCents])
+      await client.query('COMMIT')
+      const token = jwt.sign(
+        { userId: pmUserId, role: 'property_manager', email: 'pm@test.dev', profileId: landlordId,
+          landlordId, permissions: { 'maintenance.approve': true } },
+        process.env.JWT_SECRET!, { expiresIn: '1h' })
+      return { pmUserId, token }
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+  }
+
+  it('over-ceiling approval → 403, stays awaiting_approval, landlord notified of the attempt', async () => {
+    const f = await seedFixture()
+    const reqId = await seedApprovalReq({ landlordId: f.landlordId, unitId: f.unitId, tenantId: f.tenantId, estimatedCost: 450 })
+    const pm = await seedPmWithCeiling(f.landlordId, 30000) // $300 ceiling
+    const res = await request(buildApp())
+      .post(`/api/maintenance/${reqId}/approve`)
+      .set('Authorization', `Bearer ${pm.token}`)
+    expect(res.status).toBe(403)
+    expect(res.body.error).toMatch(/approval limit/i)
+    const { rows: [row] } = await db.query<any>(
+      `SELECT status FROM maintenance_requests WHERE id=$1`, [reqId])
+    expect(row.status).toBe('awaiting_approval')
+    const { rows: notes } = await db.query<any>(
+      `SELECT title, body FROM notifications WHERE user_id=$1 AND title='Approval above team member limit'`,
+      [f.landlordUserId])
+    expect(notes.length).toBe(1)
+    expect(notes[0].body).toMatch(/tried to approve/i)
+    expect(notes[0].body).toMatch(/\$300/)
+  })
+
+  it('under-ceiling approval succeeds', async () => {
+    const f = await seedFixture()
+    const reqId = await seedApprovalReq({ landlordId: f.landlordId, unitId: f.unitId, tenantId: f.tenantId, estimatedCost: 200 })
+    const pm = await seedPmWithCeiling(f.landlordId, 30000)
+    const res = await request(buildApp())
+      .post(`/api/maintenance/${reqId}/approve`)
+      .set('Authorization', `Bearer ${pm.token}`)
+    expect(res.status).toBe(200)
+    const { rows: [row] } = await db.query<any>(
+      `SELECT status FROM maintenance_requests WHERE id=$1`, [reqId])
+    expect(row.status).toBe('open')
+  })
+
+  it('no ceiling set → staff with the permission approves any amount (unchanged behavior)', async () => {
+    const f = await seedFixture()
+    const reqId = await seedApprovalReq({ landlordId: f.landlordId, unitId: f.unitId, tenantId: f.tenantId, estimatedCost: 5000 })
+    const pm = await seedPmWithCeiling(f.landlordId, null)
+    const res = await request(buildApp())
+      .post(`/api/maintenance/${reqId}/approve`)
+      .set('Authorization', `Bearer ${pm.token}`)
+    expect(res.status).toBe(200)
+  })
+})

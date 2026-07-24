@@ -3,10 +3,10 @@ import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useParams, useNavigate } from 'react-router-dom'
 import {
   ClipboardCheck, ArrowLeft, Plus, Camera, Video, Film,
-  CheckCircle2, FileSignature, Calendar,
+  CheckCircle2, FileSignature, Calendar, AlertTriangle,
 } from 'lucide-react'
 import { api, apiGet, apiPatch, apiPost } from '../lib/api'
-import { humanize } from '@gam/shared'
+import { inspectionStatusLabel } from './InspectionsPage'
 import { CameraCapture } from '../components/CameraCapture'
 import { AuthedImg, AuthedVideo } from '../components/AuthedMedia'
 
@@ -49,6 +49,9 @@ type Detail = {
   scheduledFor: string | null
   finalizedAt: string | null
   notes: string | null
+  flaggedSuspiciousAt: string | null
+  flagReason: string | null
+  followupInspectionId: string | null
   items: Item[]
   photos: Photo[]
   signatures: Sig[]
@@ -81,6 +84,7 @@ export function InspectionDetailPage() {
   const [error, setError] = useState<string | null>(null)
   const [finalizeResult, setFinalizeResult] = useState<any>(null)
   const [showReschedule, setShowReschedule] = useState(false)
+  const [showFlag, setShowFlag] = useState(false)
   const [camera, setCamera] = useState<null | 'photo' | 'video'>(null)
 
   const { data, isLoading } = useQuery<Detail>(
@@ -165,6 +169,18 @@ export function InspectionDetailPage() {
     },
   )
 
+  const flagMut = useMutation(
+    (reason: string) => apiPost(`/inspections/${id}/flag-suspicious`, { reason }),
+    {
+      onSuccess: () => {
+        qc.invalidateQueries(['inspection', id])
+        qc.invalidateQueries('inspections')
+        setShowFlag(false)
+      },
+      onError: (e: any) => setError(e?.response?.data?.error || 'Flag failed'),
+    },
+  )
+
   if (isLoading || !data) return <div style={{ padding: 32, color: 'var(--text-3)' }}>Loading…</div>
 
   const insp = data as Detail
@@ -172,6 +188,9 @@ export function InspectionDetailPage() {
   const hasTenantSig = insp.signatures.some(s => s.signerRole === 'tenant')
   const hasLandlordSig = insp.signatures.some(s => s.signerRole === 'landlord' || s.signerRole === 'inspector')
   const canFinalize = insp.status === 'landlord_signed'
+  // Tenant signature only gates move-in (their certification of photos +
+  // conditions). Periodic/move-out are staff-conducted under entry notice.
+  const tenantSigRequired = insp.inspectionType === 'move_in' && !!insp.tenantId
 
   return (
     <div style={{ maxWidth: 960 }}>
@@ -183,9 +202,11 @@ export function InspectionDetailPage() {
           <h1 style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
             <ClipboardCheck size={22} />
             {labelType(insp.inspectionType)} Inspection
-            <span className={`badge ${STATUS_BADGE[insp.status] || 'badge-muted'}`} style={{ marginLeft: 6 }}>
-              {humanize(insp.status)}
-            </span>
+            {insp.flaggedSuspiciousAt
+              ? <span className="badge badge-red" style={{ marginLeft: 6 }}>Flagged suspicious</span>
+              : <span className={`badge ${STATUS_BADGE[insp.status] || 'badge-muted'}`} style={{ marginLeft: 6 }}>
+                  {inspectionStatusLabel(insp.inspectionType, insp.status)}
+                </span>}
           </h1>
           <div className="page-sub">
             Unit {insp.unitId.slice(0, 8)}…
@@ -236,6 +257,49 @@ export function InspectionDetailPage() {
         <div className="card" style={{ padding: 12, marginBottom: 16, background: 'rgba(239,68,68,.08)', borderColor: 'rgba(239,68,68,.3)', color: 'var(--red)' }}>
           {error}
         </div>
+      )}
+
+      {insp.flaggedSuspiciousAt && (
+        <div className="card" style={{ padding: 16, marginBottom: 16, background: 'rgba(239,68,68,.06)', borderColor: 'rgba(239,68,68,.3)' }}>
+          <div style={{ fontWeight: 700, color: 'var(--red)', marginBottom: 6 }}>
+            <AlertTriangle size={15} style={{ verticalAlign: 'middle', marginRight: 6 }} />
+            Flagged suspicious on {new Date(insp.flaggedSuspiciousAt).toLocaleDateString()}
+          </div>
+          <div style={{ fontSize: '.82rem', color: 'var(--text-2)', marginBottom: insp.followupInspectionId ? 10 : 0 }}>
+            {insp.flagReason ? <>Reason: {insp.flagReason}. </> : null}
+            This tenant-submitted inspection is closed; an in-person inspection was scheduled in its place.
+            The tenant was notified of the visit date only — the flag reason stays internal.
+          </div>
+          {insp.followupInspectionId && (
+            <button className="btn btn-primary btn-sm" onClick={() => navigate(`/inspections/${insp.followupInspectionId}`)}>
+              Open in-person inspection →
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Verdict card — tenant-self-directed periodic review (S549) */}
+      {insp.inspectionType === 'periodic' && insp.tenantId && !insp.flaggedSuspiciousAt
+        && insp.status !== 'finalized' && insp.status !== 'cancelled' && (
+        <div className="card" style={{ padding: 16, marginBottom: 16 }}>
+          <strong style={{ display: 'block', marginBottom: 6 }}>Review tenant submission</strong>
+          <div style={{ fontSize: '.82rem', color: 'var(--text-2)', marginBottom: 12 }}>
+            Check the photos below against the checklist. If everything looks right, sign and
+            finalize to pass it. If anything looks staged, reused, or wrong, flag it — an
+            in-person inspection is scheduled automatically and staff are notified.
+          </div>
+          <button className="btn btn-danger btn-sm" onClick={() => setShowFlag(true)}>
+            <AlertTriangle size={14} /> Flag as suspicious
+          </button>
+        </div>
+      )}
+
+      {showFlag && (
+        <FlagModal
+          onClose={() => setShowFlag(false)}
+          onSubmit={(reason) => flagMut.mutate(reason)}
+          saving={flagMut.isLoading}
+        />
       )}
 
       {finalizeResult && (
@@ -436,8 +500,13 @@ export function InspectionDetailPage() {
             <div style={{ marginTop: 4, fontWeight: 700, color: hasTenantSig ? 'var(--green)' : 'var(--text-3)' }}>
               {hasTenantSig
                 ? <><CheckCircle2 size={14} style={{ verticalAlign: 'middle' }} /> Signed</>
-                : 'Not yet signed'}
+                : tenantSigRequired ? 'Not yet signed' : 'Not required'}
             </div>
+            {!tenantSigRequired && !hasTenantSig && (
+              <div style={{ marginTop: 4, fontSize: '.72rem', color: 'var(--text-3)' }}>
+                Tenant signature only gates move-in inspections — this one finalizes on the landlord signature.
+              </div>
+            )}
           </div>
           <div style={{ padding: 12, border: '1px solid var(--border-0)', borderRadius: 8 }}>
             <div style={{ fontSize: '.72rem', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.05em' }}>Landlord</div>
@@ -465,7 +534,7 @@ export function InspectionDetailPage() {
         <div className="card" style={{ padding: 16, background: 'rgba(201,162,39,.05)', borderColor: 'rgba(201,162,39,.3)' }}>
           <strong style={{ display: 'block', marginBottom: 6 }}>Ready to finalize</strong>
           <div style={{ fontSize: '.82rem', color: 'var(--text-2)', marginBottom: 12 }}>
-            Both parties have signed. Finalize will:
+            {tenantSigRequired ? 'Both parties have signed.' : 'Signatures complete.'} Finalize will:
             <ul style={{ marginLeft: 18, marginTop: 6 }}>
               <li>Lock the inspection (no further edits)</li>
               {insp.inspectionType === 'move_in' && <>
@@ -497,6 +566,48 @@ function labelType(t: string) {
     : t === 'move_out' ? 'Move-out'
     : t === 'turnover' ? 'Turnover'
     : 'Periodic'
+}
+
+function FlagModal({
+  onClose,
+  onSubmit,
+  saving,
+}: {
+  onClose: () => void
+  onSubmit: (reason: string) => void
+  saving: boolean
+}) {
+  const [reason, setReason] = useState('')
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }} onClick={onClose}>
+      <div className="card" style={{ width: 460, maxWidth: '92vw' }} onClick={e => e.stopPropagation()}>
+        <h3 style={{ marginBottom: 8 }}>Flag as suspicious</h3>
+        <div style={{ fontSize: '.8rem', color: 'var(--text-2)', marginBottom: 12 }}>
+          This closes the tenant-submitted inspection and schedules an in-person inspection
+          three business days out. The landlord and property staff see your reason; the tenant
+          is only told the visit date.
+        </div>
+        <textarea
+          className="input"
+          rows={3}
+          placeholder="What looks wrong? (e.g. photos reused from move-in, damage cropped out)"
+          value={reason}
+          onChange={e => setReason(e.target.value)}
+          style={{ width: '100%', resize: 'vertical' }}
+        />
+        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 16 }}>
+          <button className="btn btn-ghost" onClick={onClose} disabled={saving}>Cancel</button>
+          <button
+            className="btn btn-danger"
+            onClick={() => onSubmit(reason.trim())}
+            disabled={saving || reason.trim().length < 3}
+          >
+            {saving ? 'Flagging…' : 'Flag & schedule in-person'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
 }
 
 function RescheduleModal({

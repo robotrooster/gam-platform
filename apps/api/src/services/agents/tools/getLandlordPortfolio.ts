@@ -27,9 +27,9 @@ interface PayoutRow {
 export const getLandlordPortfolio: AgentTool = {
   name: 'get_landlord_portfolio',
   description:
-    'Look up the landlord’s own portfolio: how many properties and units they have, how many ' +
-    'are occupied vs vacant, and their most recent payouts. Use this for questions about ' +
-    'occupancy, vacancy, or “when/what was my last payout?”. Read-only.',
+    'Look up the landlord’s own portfolio: how many properties and units they have, and how many ' +
+    'are occupied vs vacant. Use this for questions about occupancy, vacancy, or portfolio size. ' +
+    'NOT for payout questions — use get_my_payouts for anything about payouts. Read-only.',
   parameters: {
     type: 'object',
     properties: {

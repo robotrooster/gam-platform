@@ -21,6 +21,7 @@
 // the session token.
 
 import Stripe from 'stripe'
+import { PROCESSING_FEES } from '@gam/shared'
 import { getStripe } from '../lib/stripe'
 import { query, queryOne } from '../db'
 import { AppError } from '../middleware/errorHandler'
@@ -254,10 +255,12 @@ export async function createRentPlatformCharge(opts: CreateRentPlatformChargeOpt
  * GAM charges). When 'landlord', the landlord absorbs the fee (so the
  * application_fee_amount equals what GAM charges them, deducted from gross).
  *
- * Rates (S113 locked, platform-wide):
+ * Rates (S113 locked; S551 added the card per-transaction dime — single
+ * source: PROCESSING_FEES in @gam/shared, mirrored into the
+ * platform_processing_rates DB rows by the 20260721150000 migration):
  *   ACH:  1.0% capped at $6.00
- *   Card: 3.25% flat
- *   Canadian card USD: +1.5% surcharge passed through to tenant
+ *   Card: 3.25% + $0.10 per transaction
+ *   Non-US-issued card: +1.5% surcharge passed through to tenant
  *
  * @returns dollar amount (not cents) GAM keeps as application fee
  */
@@ -267,14 +270,13 @@ export function computeApplicationFee(opts: {
   cardCountry?: string | null  // Stripe payment_method.card.country
 }): number {
   if (opts.paymentMethod === 'ach') {
-    return Math.min(opts.amount * 0.01, 6.00)
+    return Math.min(opts.amount * PROCESSING_FEES.ACH_PCT, PROCESSING_FEES.ACH_CAP)
   }
-  // card: 3.25% + Canadian USD surcharge if applicable
-  let pct = 0.0325
+  let pct: number = PROCESSING_FEES.CARD_PCT
   if (opts.cardCountry && opts.cardCountry !== 'US') {
-    pct += 0.015
+    pct += PROCESSING_FEES.CARD_INTL_PCT
   }
-  return Math.round(opts.amount * pct * 100) / 100
+  return Math.round((opts.amount * pct + PROCESSING_FEES.CARD_FLAT) * 100) / 100
 }
 
 // ── PM COMPANY TRANSFERS (S119) ───────────────────────────────────────────

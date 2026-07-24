@@ -16,19 +16,21 @@ import type { AgentTool, AgentActor } from './types'
 export const captureLead: AgentTool = {
   name: 'capture_lead',
   description:
-    'Save the prospect as a lead so the GAM sales team can follow up, and (optionally) set up a ' +
-    'call. Call this once you have at least their email or phone, plus their name and whatever they ' +
-    'shared about their portfolio (size/type) and what they’re looking for. Confirm their contact ' +
-    'info with them before saving. After saving, let them know someone from the team will reach out.',
+    'Save the prospect as a lead so a GAM Portfolio Specialist can follow up. Call this once you have ' +
+    'at least their email or phone (confirm it with them first). Fill EVERY other field you can from ' +
+    'what they said anywhere in the conversation — states, unit count, property mix — even if you never ' +
+    'asked directly; partial is fine, never leave a field empty that the chat answered. After saving, ' +
+    'let them know a Portfolio Specialist will reach out.',
   parameters: {
     type: 'object',
     properties: {
       name: { type: 'string', description: 'The prospect’s name, if given.' },
       email: { type: 'string', description: 'Their email (need email OR phone).' },
       phone: { type: 'string', description: 'Their phone (need email OR phone).' },
-      portfolioSize: { type: 'string', description: 'How many units/properties they have, in their words (e.g. "about 40 units").' },
-      propertyType: { type: 'string', description: 'What kind of properties (e.g. "RV park", "apartments", "single-family").' },
-      notes: { type: 'string', description: 'What they’re interested in / their situation / anything useful for the call.' },
+      states: { type: 'string', description: 'State(s) they operate in, in their words (e.g. "Arizona and Utah").' },
+      portfolioSize: { type: 'string', description: 'How many units/properties/sites they have, in their words (e.g. "about 40 units", "30-site park").' },
+      propertyType: { type: 'string', description: 'Their property mix, in their words (e.g. "mostly RVs, one storage facility, some boat parking").' },
+      notes: { type: 'string', description: 'What they’re interested in / their situation / anything useful for the Specialist’s call.' },
     },
   },
   audiences: ['prospect'],
@@ -41,14 +43,16 @@ export const captureLead: AgentTool = {
     }
 
     const name = typeof args.name === 'string' ? args.name.trim() : null
+    const states = typeof args.states === 'string' ? args.states.trim() : null
     const lead = await queryOne<{ id: string }>(
-      `INSERT INTO sales_leads (conversation_id, name, email, phone, portfolio_size, property_type, notes)
-       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+      `INSERT INTO sales_leads (conversation_id, name, email, phone, states, portfolio_size, property_type, notes)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
       [
         actor.profileId || null,
         name,
         email || null,
         phone || null,
+        states,
         typeof args.portfolioSize === 'string' ? args.portfolioSize.trim() : null,
         typeof args.propertyType === 'string' ? args.propertyType.trim() : null,
         typeof args.notes === 'string' ? args.notes.trim() : null,
@@ -62,10 +66,10 @@ export const captureLead: AgentTool = {
          VALUES ('info', 'sales_lead', $1, $2, $3::jsonb)`,
         [
           `New sales lead${name ? `: ${name}` : ''}`,
-          [email && `email: ${email}`, phone && `phone: ${phone}`, args.portfolioSize && `portfolio: ${args.portfolioSize}`]
+          [email && `email: ${email}`, phone && `phone: ${phone}`, states && `states: ${states}`, args.portfolioSize && `portfolio: ${args.portfolioSize}`]
             .filter(Boolean)
             .join(' · ') || 'New lead from the sales assistant',
-          JSON.stringify({ leadId: lead?.id, name, email, phone, portfolioSize: args.portfolioSize, propertyType: args.propertyType, notes: args.notes }),
+          JSON.stringify({ leadId: lead?.id, name, email, phone, states, portfolioSize: args.portfolioSize, propertyType: args.propertyType, notes: args.notes }),
         ]
       )
     } catch (e) {

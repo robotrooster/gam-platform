@@ -469,3 +469,169 @@ export function extractAdditionalOccupants(
   }
   return occupants
 }
+
+// ---------------------------------------------------------------------
+// S550: conditional fees + the every-dollar audit.
+//
+// Conditional fee = "if you don't do X (or do X), then $Y" — carpet
+// cleaning at move-out is the canonical case. Detection is sentence-
+// scoped: split the joined body text into clause-sized chunks, then
+// match chunks that contain BOTH a dollar amount AND conditional/
+// obligation language. The matched chunk (trimmed) becomes
+// condition_text verbatim — lease-is-law, the clause IS the authority.
+//
+// The audit (auditUnattributedAmounts) is the safety net for "the
+// parser must handle every financial liability": every $ amount in the
+// document that is not attributable to a known extraction (rent,
+// deposit, late fee, a detected conditional fee, …) surfaces as a
+// confirm-severity flag with the surrounding clause, so nothing
+// financial slips through silently.
+// ---------------------------------------------------------------------
+
+import type { ParserExtractedConditionalFee } from '@gam/shared'
+
+/** Joined body text of all pages (audit-trail pages excluded by caller). */
+function joinedText(pages: Page[]): string {
+  return pages.flatMap(p => p.items).map(i => i.text).join(' ')
+}
+
+/** Split prose into clause-sized chunks. PDF text has no layout left, so
+ * split on sentence enders; cap chunk length so a run-on paragraph can't
+ * swallow the whole page. */
+function clauseChunks(text: string): string[] {
+  const rough = text.split(/(?<=[.;])\s+(?=[A-Z(])/)
+  const out: string[] = []
+  for (const r of rough) {
+    if (r.length <= 400) { out.push(r); continue }
+    // Over-long run-on: sub-split on commas near the cap.
+    let rest = r
+    while (rest.length > 400) {
+      const cut = rest.lastIndexOf(',', 400)
+      out.push(rest.slice(0, cut > 100 ? cut : 400))
+      rest = rest.slice(cut > 100 ? cut + 1 : 400)
+    }
+    if (rest.trim()) out.push(rest)
+  }
+  return out.map(c => c.trim()).filter(Boolean)
+}
+
+/** All dollar amounts in a chunk, pdfjs-split tolerated ("$ 1 50 .00"). */
+function dollarAmounts(chunk: string): Array<{ amount: number; raw: string }> {
+  const out: Array<{ amount: number; raw: string }> = []
+  const re = /\$\s*((?:\d\s*){1,7}(?:,\s*(?:\d\s*){3})*(?:\.\s*(?:\d\s*){1,2})?)/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(chunk)) !== null) {
+    const n = coerceCurrency(m[1].replace(/\s+/g, ''))
+    if (n !== null && n > 0) out.push({ amount: n, raw: m[0] })
+  }
+  return out
+}
+
+// Obligation/conditional language that turns "$Y in a clause" into a
+// conditional fee. Kept broad on purpose; the landlord confirms at review.
+const CONDITIONAL_LANGUAGE = [
+  /failure to/i,
+  /if\s+(?:the\s+)?tenants?\s+(?:do(?:es)?\s+not|fails?\s+to|neglects?\s+to)/i,
+  /unless\s+(?:the\s+)?tenants?/i,
+  /(?:will|shall|may)\s+(?:be\s+)?(?:charged|assessed|deducted|forfeit(?:ed)?|withheld)/i,
+  /(?:charge|fee|penalty)\s+(?:of\s+\$|\s*will|\s*shall|\s*applies)/i,
+  /required\s+(?:to|within|before|at)\b[^.]*(?:or|otherwise|else)\b/i,
+]
+
+// Chunks that are already handled by dedicated extractors — never
+// double-report them as conditional fees or unattributed amounts.
+const KNOWN_CHARGE_LANGUAGE = [
+  /late\s+(?:charge|fee)/i,
+  // Only the labeled DEFINITION ("Security Deposit: …") — conditional
+  // clauses legitimately mention "deducted from the security deposit".
+  /security\s+deposit\s*:/i,
+  /monthly\s+installments/i,
+  /per\s+month\s+rent|monthly\s+rent/i,
+]
+
+/** Short human label for a conditional clause. */
+function conditionLabel(chunk: string): string {
+  const c = chunk.toLowerCase()
+  if (/carpet/.test(c))                return 'Carpet cleaning'
+  if (/smok/.test(c))                  return 'Smoking violation'
+  if (/pet|animal/.test(c))            return 'Pet violation'
+  if (/key|lock|remote|fob/.test(c))   return 'Keys / locks'
+  if (/clean/.test(c))                 return 'Cleaning'
+  if (/trash|garbage|debris/.test(c))  return 'Trash removal'
+  if (/paint|wall|nail|hole/.test(c))  return 'Wall / paint repair'
+  if (/lawn|yard|landscap/.test(c))    return 'Yard upkeep'
+  if (/utilit/.test(c))                return 'Utility obligation'
+  if (/insur/.test(c))                 return 'Insurance requirement'
+  if (/park/.test(c))                  return 'Parking violation'
+  return 'Lease condition fee'
+}
+
+export function detectConditionalFees(pages: Page[]): ParserExtractedConditionalFee[] {
+  const chunks = clauseChunks(joinedText(pages))
+  const fees: ParserExtractedConditionalFee[] = []
+  for (let ci = 0; ci < chunks.length; ci++) {
+    const chunk = chunks[ci]
+    if (KNOWN_CHARGE_LANGUAGE.some(re => re.test(chunk))) continue
+    const amounts = dollarAmounts(chunk)
+    if (amounts.length === 0) continue
+    const conditional = CONDITIONAL_LANGUAGE.some(re => re.test(chunk))
+    if (!conditional) continue
+    // The obligation often spans two sentences ("Tenant shall have the
+    // carpets professionally cleaned… . Failure to do so will result in a
+    // charge of $150.") — pull the PRECEDING clause in for labeling and
+    // condition_text when the matched one leans on it ("do so", "such",
+    // "the foregoing", or no topical keyword of its own).
+    const prev = ci > 0 && !KNOWN_CHARGE_LANGUAGE.some(re => re.test(chunks[ci - 1]))
+      ? chunks[ci - 1] : ''
+    const needsContext =
+      /(?:do so|to do so|such|the foregoing|this requirement|compliance)/i.test(chunk) ||
+      conditionLabel(chunk) === 'Lease condition fee'
+    const clause = needsContext && prev ? `${prev.slice(-300)} ${chunk}` : chunk
+    // One fee per distinct amount in the clause (a clause listing two
+    // amounts is two obligations; the landlord prunes at review).
+    const seen = new Set<number>()
+    for (const a of amounts) {
+      if (seen.has(a.amount)) continue
+      seen.add(a.amount)
+      // Confidence: strong obligation verbs + short clause read best.
+      let confidence = 0.75
+      if (/failure to|fails? to|do(?:es)? not/i.test(chunk)) confidence += 0.10
+      if (chunk.length > 300) confidence -= 0.10
+      if (amounts.length > 1) confidence -= 0.10
+      fees.push({
+        label: conditionLabel(clause),
+        amount: a.amount,
+        conditionText: clause.slice(0, 500),
+        confidence: Math.max(0.40, Math.min(0.90, confidence)),
+        rawText: a.raw,
+      })
+    }
+  }
+  return fees
+}
+
+/**
+ * The every-dollar audit: every $ amount in the body that is NOT in the
+ * attributed set (rent, deposit, late fee, detected conditional fees, and
+ * anything else the caller extracted) comes back with its clause so the
+ * parser run can flag it for landlord review.
+ */
+export function auditUnattributedAmounts(
+  pages: Page[],
+  attributedAmounts: number[],
+): Array<{ amount: number; context: string }> {
+  const attributed = new Set(attributedAmounts.map(a => Math.round(a * 100)))
+  const chunks = clauseChunks(joinedText(pages))
+  const out: Array<{ amount: number; context: string }> = []
+  const reported = new Set<number>()
+  for (const chunk of chunks) {
+    if (KNOWN_CHARGE_LANGUAGE.some(re => re.test(chunk))) continue
+    for (const a of dollarAmounts(chunk)) {
+      const cents = Math.round(a.amount * 100)
+      if (attributed.has(cents) || reported.has(cents)) continue
+      reported.add(cents)
+      out.push({ amount: a.amount, context: chunk.slice(0, 220) })
+    }
+  }
+  return out
+}

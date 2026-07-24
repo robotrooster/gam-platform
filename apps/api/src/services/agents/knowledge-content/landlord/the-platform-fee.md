@@ -14,7 +14,7 @@ GAM compares your occupied-unit total against the $10 minimum for each property 
 
 ## Stripe Connect account fee
 
-Stripe charges a separate $1/month fee per Connect account. GAM absorbs this fee on your behalf, and it's waived entirely once you have 10 or more billable units. You don't see a separate line item for it.
+Stripe's per-account fee for the connected payout account is absorbed by GAM — you never see it billed. You don't see a separate line item for it.
 
 ## What the platform fee is not
 

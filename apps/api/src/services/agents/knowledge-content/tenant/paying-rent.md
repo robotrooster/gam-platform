@@ -14,8 +14,8 @@ You can pay two ways:
 A processing fee may apply depending on how you pay:
 
 - **ACH (bank account):** 1.0% of the payment, capped at $6.00.
-- **Card:** 3.25% of the payment.
-- **Canadian cards charged in USD:** an additional 1.5%.
+- **Card:** 3.25% of the payment plus $0.26 per transaction.
+- **Non-US-issued cards:** an additional 1.5%.
 
 Because ACH is capped at $6.00, paying from a bank account is usually the lowest-cost option for larger payments.
 

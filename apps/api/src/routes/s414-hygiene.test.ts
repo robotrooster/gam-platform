@@ -22,6 +22,7 @@ import { randomUUID } from 'crypto'
 import { db } from '../db'
 import {
   cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant,
+  seedLateFeeDecision,
 } from '../test/dbHelpers'
 import { unitsRouter } from './units'
 import { errorHandler } from '../middleware/errorHandler'
@@ -57,6 +58,11 @@ async function seedPropsFixture(): Promise<PropsFixture> {
     const propertyId = await seedProperty(c, {
       landlordId, ownerUserId: userId, managedByUserId: userId,
     })
+    // S537 gate: POST /units 422s without an explicit (property, unit_type)
+    // late-fee decision — seed one per type this suite creates.
+    for (const t of ['rv_spot', 'apartment']) {
+      await seedLateFeeDecision(c, { propertyId, unitType: t })
+    }
     await c.query('COMMIT')
     return {
       userId, landlordId, propertyId,

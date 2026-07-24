@@ -36,16 +36,19 @@ import {
 } from '../test/dbHelpers'
 import { createInspection as createInspectionTool } from '../services/agents/tools/createInspection'
 import { setInspectionItemCondition as setItemConditionTool } from '../services/agents/tools/setInspectionItemCondition'
+import { addBusinessDays } from '../services/moveOutInspections'
 
 const {
   emitInspectionFinalizedEventsMock,
   notifyReadyMock, notifyTenantSignedMock, notifyFinalizedMock,
+  createNotificationMock,
   getResponsiblePartyMock,
 } = vi.hoisted(() => ({
   emitInspectionFinalizedEventsMock: vi.fn(async () => {}),
   notifyReadyMock:                   vi.fn(async () => {}),
   notifyTenantSignedMock:            vi.fn(async () => {}),
   notifyFinalizedMock:               vi.fn(async () => {}),
+  createNotificationMock:            vi.fn(async () => {}),
   getResponsiblePartyMock:           vi.fn(async () => null as any),
 }))
 vi.mock('../services/creditLedgerEmitters', async (importOriginal) => {
@@ -62,6 +65,7 @@ vi.mock('../services/notifications', async (importOriginal) => {
     notifyInspectionReadyForTenant: notifyReadyMock,
     notifyInspectionTenantSigned:   notifyTenantSignedMock,
     notifyInspectionFinalized:      notifyFinalizedMock,
+    createNotification:             createNotificationMock,
   }
 })
 vi.mock('../services/responsibleParty', async (importOriginal) => {
@@ -89,6 +93,7 @@ beforeEach(async () => {
   notifyReadyMock.mockClear()
   notifyTenantSignedMock.mockClear()
   notifyFinalizedMock.mockClear()
+  createNotificationMock.mockClear()
   getResponsiblePartyMock.mockClear()
   getResponsiblePartyMock.mockResolvedValue(null)
   process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_jwt_secret_inspections'
@@ -542,6 +547,34 @@ describe('POST /inspections/:id/sign — sign-off state machine', () => {
     expect(res.body.data.signed).toBe('landlord')
     // Status doesn't flip because tenant hasn't signed yet.
     expect(res.body.data.status).toBe('draft')
+  })
+
+  it('S550: landlord signs a move-out with an UNSIGNED tenant → landlord_signed (tenant sig only gates move-in)', async () => {
+    const f = await seedFixture()
+    const id = await createInspection(f, { inspectionType: 'move_out' })
+    const res = await request(buildApp())
+      .post(`/api/inspections/${id}/sign`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(res.status).toBe(200)
+    // Staff-conducted under entry notice — the tenant gets notice, not a
+    // veto. Landlord signature alone reaches landlord_signed, so the
+    // deposit-return gate can never be stalled by a tenant who won't sign.
+    expect(res.body.data.status).toBe('landlord_signed')
+    const fin = await request(buildApp())
+      .post(`/api/inspections/${id}/finalize`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(fin.status).toBe(200)
+    expect(fin.body.data.status).toBe('finalized')
+  })
+
+  it('S550: landlord signs a tenant-assigned periodic without the tenant → landlord_signed', async () => {
+    const f = await seedFixture()
+    const id = await createInspection(f, { inspectionType: 'periodic' })
+    const res = await request(buildApp())
+      .post(`/api/inspections/${id}/sign`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.status).toBe('landlord_signed')
   })
 
   it('landlord signs a tenant-less periodic (no tenant_id) → flips straight to landlord_signed', async () => {
@@ -1018,5 +1051,473 @@ describe('agent inspection tools', () => {
       landlordActor(f),
     )
     expect(res.ok).toBe(false)
+  })
+})
+
+// ─── POST /inspections/:id/flag-suspicious — S549 verdict loop ────
+
+describe('POST /inspections/:id/flag-suspicious', () => {
+  it('closes the tenant-submitted periodic inspection and schedules an in-person follow-up', async () => {
+    const f = await seedFixture()
+    const inspId = await createInspection(f, { inspectionType: 'periodic', status: 'tenant_signed' })
+    const res = await request(buildApp())
+      .post(`/api/inspections/${inspId}/flag-suspicious`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ reason: 'Photos appear reused from the move-in inspection' })
+    expect(res.status).toBe(200)
+    const followupId = res.body.data.followupInspectionId
+    expect(followupId).toBeTruthy()
+    expect(res.body.data.scheduledFor).toBe(addBusinessDays(new Date().toISOString().slice(0, 10), 3))
+
+    // Flagged record: closed with flag metadata + link to the follow-up.
+    const flagged = (await db.query<any>(
+      `SELECT status, flagged_suspicious_at, flagged_by_user_id, flag_reason, followup_inspection_id
+         FROM unit_inspections WHERE id = $1`, [inspId],
+    )).rows[0]
+    expect(flagged.status).toBe('cancelled')
+    expect(flagged.flagged_suspicious_at).toBeTruthy()
+    expect(flagged.flagged_by_user_id).toBe(f.landlordUserId)
+    expect(flagged.flag_reason).toContain('reused')
+    expect(flagged.followup_inspection_id).toBe(followupId)
+
+    // Follow-up: in-person (no tenant_id), periodic, compares against the
+    // flagged submission, checklist seeded.
+    const followup = (await db.query<any>(
+      `SELECT inspection_type, status, tenant_id, lease_id, comparison_inspection_id,
+              to_char(scheduled_for, 'YYYY-MM-DD') AS scheduled_day
+         FROM unit_inspections WHERE id = $1`, [followupId],
+    )).rows[0]
+    expect(followup.inspection_type).toBe('periodic')
+    expect(followup.status).toBe('draft')
+    expect(followup.tenant_id).toBeNull()
+    expect(followup.lease_id).toBe(f.leaseId)
+    expect(followup.comparison_inspection_id).toBe(inspId)
+    expect(followup.scheduled_day).toBe(res.body.data.scheduledFor)
+    const items = await db.query(
+      `SELECT id FROM unit_inspection_items WHERE inspection_id = $1`, [followupId],
+    )
+    expect(items.rows.length).toBeGreaterThan(0)
+  })
+
+  it('notifies landlord-side with the reason and the tenant with neutral copy only', async () => {
+    const f = await seedFixture()
+    const inspId = await createInspection(f, { inspectionType: 'periodic', status: 'tenant_signed' })
+    // Flag as a property manager so the landlord is a distinct recipient.
+    const pmUserId = randomUUID()
+    await db.query(
+      `INSERT INTO users (id, email, password_hash, role, first_name, last_name)
+       VALUES ($1, $2, 'x', 'property_manager', 'Pat', 'Manager')`,
+      [pmUserId, `pm-${pmUserId.slice(0, 8)}@test.dev`],
+    )
+    // S550 property lock: a worker with no scope row reaches nothing.
+    await db.query(
+      `INSERT INTO property_manager_scopes (user_id, landlord_id, all_properties, permissions)
+       VALUES ($1, $2, TRUE, '{"inspections.manage": true}'::jsonb)`,
+      [pmUserId, f.landlordId],
+    )
+    const pmToken = jwt.sign(
+      { userId: pmUserId, role: 'property_manager', email: 'pm@test.dev', profileId: f.landlordId,
+        landlordId: f.landlordId, permissions: { 'inspections.manage': true } },
+      process.env.JWT_SECRET!, { expiresIn: '1h' },
+    )
+    const res = await request(buildApp())
+      .post(`/api/inspections/${inspId}/flag-suspicious`)
+      .set('Authorization', `Bearer ${pmToken}`)
+      .send({ reason: 'Bathroom damage cropped out of frame' })
+    expect(res.status).toBe(200)
+
+    const calls = createNotificationMock.mock.calls.map((c: any[]) => c[0])
+    const landlordCall = calls.find((c: any) => c.userId === f.landlordUserId)
+    expect(landlordCall).toBeTruthy()
+    expect(landlordCall.type).toBe('inspection_flagged_suspicious')
+    expect(landlordCall.body).toContain('cropped out')
+    const tenantCall = calls.find((c: any) => c.userId === f.tenantUserId)
+    expect(tenantCall).toBeTruthy()
+    expect(tenantCall.type).toBe('inspection_scheduled')
+    expect(tenantCall.body).not.toContain('suspicious')
+    expect(tenantCall.body).not.toContain('cropped out')
+  })
+
+  it('rejects non-periodic, tenant-less, terminal, and repeat flags', async () => {
+    const f = await seedFixture()
+    const app = buildApp()
+    const auth = (r: request.Test) => r.set('Authorization', `Bearer ${f.landlordToken}`)
+
+    const moveIn = await createInspection(f, { inspectionType: 'move_in', status: 'tenant_signed' })
+    expect((await auth(request(app).post(`/api/inspections/${moveIn}/flag-suspicious`)).send({ reason: 'nope' })).status).toBe(409)
+
+    const noTenant = await createInspection(f, { inspectionType: 'periodic', tenantId: null })
+    expect((await auth(request(app).post(`/api/inspections/${noTenant}/flag-suspicious`)).send({ reason: 'nope' })).status).toBe(409)
+
+    const finalized = await createInspection(f, { inspectionType: 'periodic', status: 'finalized' })
+    expect((await auth(request(app).post(`/api/inspections/${finalized}/flag-suspicious`)).send({ reason: 'nope' })).status).toBe(409)
+
+    const flagged = await createInspection(f, { inspectionType: 'periodic', status: 'tenant_signed' })
+    expect((await auth(request(app).post(`/api/inspections/${flagged}/flag-suspicious`)).send({ reason: 'first flag' })).status).toBe(200)
+    expect((await auth(request(app).post(`/api/inspections/${flagged}/flag-suspicious`)).send({ reason: 'second flag' })).status).toBe(409)
+  })
+
+  it('tenant cannot flag, and flag metadata is redacted from tenant reads', async () => {
+    const f = await seedFixture()
+    const app = buildApp()
+    const inspId = await createInspection(f, { inspectionType: 'periodic', status: 'tenant_signed' })
+
+    const deny = await request(app)
+      .post(`/api/inspections/${inspId}/flag-suspicious`)
+      .set('Authorization', `Bearer ${f.tenantToken}`)
+      .send({ reason: 'self flag' })
+    expect(deny.status).toBe(403)
+
+    await request(app)
+      .post(`/api/inspections/${inspId}/flag-suspicious`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ reason: 'Internal-only reason text' })
+
+    const tenantDetail = await request(app)
+      .get(`/api/inspections/${inspId}`)
+      .set('Authorization', `Bearer ${f.tenantToken}`)
+    expect(tenantDetail.status).toBe(200)
+    expect(tenantDetail.body.data.flag_reason).toBeUndefined()
+    expect(tenantDetail.body.data.flagged_suspicious_at).toBeUndefined()
+    expect(JSON.stringify(tenantDetail.body.data)).not.toContain('Internal-only')
+
+    const tenantList = await request(app)
+      .get(`/api/inspections`)
+      .set('Authorization', `Bearer ${f.tenantToken}`)
+    const listRow = tenantList.body.data.find((r: any) => r.id === inspId)
+    expect(listRow).toBeTruthy()
+    expect(listRow.flagged_suspicious_at).toBeUndefined()
+
+    const landlordDetail = await request(app)
+      .get(`/api/inspections/${inspId}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(landlordDetail.body.data.flag_reason).toBe('Internal-only reason text')
+  })
+})
+
+// ─── S550: tenant signature is move-in only; periodic is SUBMITTED ─
+
+describe('S550 — tenant sign restriction + POST /inspections/:id/submit', () => {
+  it('tenant cannot sign a periodic or move-out (signature is move-in only)', async () => {
+    const f = await seedFixture()
+    const app = buildApp()
+    for (const inspectionType of ['periodic', 'move_out'] as const) {
+      const id = await createInspection(f, { inspectionType })
+      const res = await request(app)
+        .post(`/api/inspections/${id}/sign`)
+        .set('Authorization', `Bearer ${f.tenantToken}`)
+      expect(res.status).toBe(409)
+    }
+  })
+
+  it('tenant submits a periodic with photos → tenant_signed with NO signature row, front desk notified', async () => {
+    const f = await seedFixture()
+    const id = await createInspection(f, { inspectionType: 'periodic' })
+    await db.query(
+      `INSERT INTO unit_inspection_photos (inspection_id, photo_url, captured_live, uploaded_by)
+       VALUES ($1, '/api/inspections/photo-files/test.jpg', TRUE, $2)`,
+      [id, f.tenantUserId],
+    )
+    getResponsiblePartyMock.mockResolvedValue({
+      primaries: [{ user_id: f.landlordUserId, email: 'll@test.dev' }],
+    })
+    const res = await request(buildApp())
+      .post(`/api/inspections/${id}/submit`)
+      .set('Authorization', `Bearer ${f.tenantToken}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.status).toBe('tenant_signed')
+
+    const row = (await db.query<any>(
+      `SELECT status, conducted_at FROM unit_inspections WHERE id = $1`, [id],
+    )).rows[0]
+    expect(row.status).toBe('tenant_signed')
+    expect(row.conducted_at).toBeTruthy()
+    // The whole point: submission writes NO signature.
+    const sigs = await db.query(
+      `SELECT 1 FROM unit_inspection_signatures WHERE inspection_id = $1`, [id],
+    )
+    expect(sigs.rows.length).toBe(0)
+    const notif = createNotificationMock.mock.calls
+      .map((c: any[]) => c[0])
+      .find((c: any) => c.type === 'inspection_submitted')
+    expect(notif).toBeTruthy()
+    expect(notif.userId).toBe(f.landlordUserId)
+  })
+
+  it('submit guards: photos required, periodic only, tenant only, draft only', async () => {
+    const f = await seedFixture()
+    const app = buildApp()
+
+    const noPhotos = await createInspection(f, { inspectionType: 'periodic' })
+    expect((await request(app).post(`/api/inspections/${noPhotos}/submit`)
+      .set('Authorization', `Bearer ${f.tenantToken}`)).status).toBe(409)
+
+    const moveIn = await createInspection(f, { inspectionType: 'move_in' })
+    expect((await request(app).post(`/api/inspections/${moveIn}/submit`)
+      .set('Authorization', `Bearer ${f.tenantToken}`)).status).toBe(409)
+
+    const asLandlord = await createInspection(f, { inspectionType: 'periodic' })
+    expect((await request(app).post(`/api/inspections/${asLandlord}/submit`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)).status).toBe(403)
+
+    const submitted = await createInspection(f, { inspectionType: 'periodic', status: 'tenant_signed' })
+    expect((await request(app).post(`/api/inspections/${submitted}/submit`)
+      .set('Authorization', `Bearer ${f.tenantToken}`)).status).toBe(409)
+  })
+})
+
+// ─── S550: property lock + dwelling-ownership checklist catalog ────
+
+describe('S550 — property lock on inspections', () => {
+  async function seedScopedStaff(f: SeedFixture, propertyIds: string[]) {
+    const staffUserId = randomUUID()
+    await db.query(
+      `INSERT INTO users (id, email, password_hash, role, first_name, last_name)
+       VALUES ($1, $2, 'x', 'onsite_manager', 'Scoped', 'Staff')`,
+      [staffUserId, `staff-${staffUserId.slice(0, 8)}@test.dev`],
+    )
+    await db.query(
+      `INSERT INTO onsite_manager_scopes (user_id, landlord_id, all_properties, property_ids, permissions)
+       VALUES ($1, $2, FALSE, $3::uuid[], '{"inspections.view": true, "inspections.manage": true, "inspections.create": true}'::jsonb)`,
+      [staffUserId, f.landlordId, propertyIds],
+    )
+    return jwt.sign(
+      { userId: staffUserId, role: 'onsite_manager', email: 's@test.dev', profileId: f.landlordId,
+        landlordId: f.landlordId,
+        permissions: { 'inspections.view': true, 'inspections.manage': true, 'inspections.create': true } },
+      process.env.JWT_SECRET!, { expiresIn: '1h' },
+    )
+  }
+
+  async function seedSecondProperty(f: SeedFixture): Promise<{ propertyId: string; unitId: string; inspectionId: string }> {
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      const propertyId = await seedProperty(client, { landlordId: f.landlordId, ownerUserId: f.landlordUserId, managedByUserId: f.landlordUserId })
+      const unitId = await seedUnit(client, { propertyId, landlordId: f.landlordId })
+      await client.query('COMMIT')
+      const ins = await db.query<{ id: string }>(
+        `INSERT INTO unit_inspections (unit_id, landlord_id, inspection_type, status)
+         VALUES ($1, $2, 'periodic', 'draft') RETURNING id`,
+        [unitId, f.landlordId],
+      )
+      return { propertyId, unitId, inspectionId: ins.rows[0].id }
+    } catch (e) { await client.query('ROLLBACK'); throw e }
+    finally { client.release() }
+  }
+
+  it('scoped staff list only their assigned properties; the landlord sees everything', async () => {
+    const f = await seedFixture()
+    const inScope = await createInspection(f, { inspectionType: 'periodic' })
+    const other = await seedSecondProperty(f)
+    const staffToken = await seedScopedStaff(f, [f.propertyId])
+    const app = buildApp()
+
+    const staffList = await request(app).get('/api/inspections')
+      .set('Authorization', `Bearer ${staffToken}`)
+    const staffIds = staffList.body.data.map((r: any) => r.id)
+    expect(staffIds).toContain(inScope)
+    expect(staffIds).not.toContain(other.inspectionId)
+
+    const llList = await request(app).get('/api/inspections')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    const llIds = llList.body.data.map((r: any) => r.id)
+    expect(llIds).toContain(inScope)
+    expect(llIds).toContain(other.inspectionId)
+  })
+
+  it('scoped staff get 403 on detail, create, and flag for an out-of-scope property', async () => {
+    const f = await seedFixture()
+    const other = await seedSecondProperty(f)
+    const staffToken = await seedScopedStaff(f, [f.propertyId])
+    const app = buildApp()
+
+    expect((await request(app).get(`/api/inspections/${other.inspectionId}`)
+      .set('Authorization', `Bearer ${staffToken}`)).status).toBe(403)
+
+    expect((await request(app).post('/api/inspections')
+      .set('Authorization', `Bearer ${staffToken}`)
+      .send({ unitId: other.unitId, inspectionType: 'periodic' })).status).toBe(403)
+
+    // In-scope still works end to end.
+    const ok = await request(app).post('/api/inspections')
+      .set('Authorization', `Bearer ${staffToken}`)
+      .send({ unitId: f.unitId, inspectionType: 'periodic' })
+    expect(ok.status).toBe(200)
+  })
+})
+
+describe('S550 — dwelling-ownership checklist catalog', () => {
+  async function seededAreas(f: SeedFixture, unitType: string, ownership: string, bedrooms: number, bathrooms = 1): Promise<string[]> {
+    await db.query(
+      `UPDATE units SET unit_type=$1, dwelling_ownership=$2, bedrooms=$3, bathrooms=$4 WHERE id=$5`,
+      [unitType, ownership, bedrooms, bathrooms, f.unitId],
+    )
+    const res = await request(buildApp()).post('/api/inspections')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ unitId: f.unitId, inspectionType: 'periodic' })
+    expect(res.status).toBe(200)
+    const rows = await db.query<{ area: string }>(
+      `SELECT DISTINCT area FROM unit_inspection_items WHERE inspection_id = $1`,
+      [res.body.data.id],
+    )
+    return rows.rows.map(r => r.area)
+  }
+
+  it('tenant-owned rv_spot: site only — no rig interior, never bedrooms', async () => {
+    const f = await seedFixture()
+    const areas = await seededAreas(f, 'rv_spot', 'tenant', 0)
+    expect(areas).toContain('Hookups')
+    expect(areas).not.toContain('RV interior')
+    expect(areas.some(a => a.startsWith('Bedroom'))).toBe(false)
+  })
+
+  it('park-owned rv_spot: site plus the rig — still never bedrooms', async () => {
+    const f = await seedFixture()
+    const areas = await seededAreas(f, 'rv_spot', 'landlord', 2)
+    expect(areas).toContain('Pad & site')
+    expect(areas).toContain('RV interior')
+    expect(areas).toContain('RV systems')
+    expect(areas.some(a => a.startsWith('Bedroom'))).toBe(false)
+  })
+
+  it('tenant-owned mobile_home: lot/space only — never inside their home', async () => {
+    const f = await seedFixture()
+    const areas = await seededAreas(f, 'mobile_home', 'tenant', 3)
+    expect(areas).toContain('Lot & pad')
+    expect(areas).not.toContain('Kitchen')
+    expect(areas.some(a => a.startsWith('Bedroom'))).toBe(false)
+  })
+
+  it('park-owned mobile_home: full interior sized to the REAL bedroom count', async () => {
+    const f = await seedFixture()
+    const areas = await seededAreas(f, 'mobile_home', 'landlord', 2)
+    expect(areas).toContain('Kitchen')
+    expect(areas).toContain('Bedroom 1')
+    expect(areas).toContain('Bedroom 2')
+    expect(areas).not.toContain('Bedroom 3')
+  })
+
+  it('single_family: four real bedrooms means four bedroom areas', async () => {
+    const f = await seedFixture()
+    const areas = await seededAreas(f, 'single_family', 'landlord', 4)
+    expect(areas).toContain('Bedroom 4')
+    expect(areas).not.toContain('Bedroom 5' as any)
+  })
+
+  it('bathrooms are sized to the REAL count — 2.5 baths = three areas, last marked half', async () => {
+    const f = await seedFixture()
+    const areas = await seededAreas(f, 'single_family', 'landlord', 3, 2.5)
+    expect(areas).toContain('Bathroom 1')
+    expect(areas).toContain('Bathroom 2')
+    expect(areas).toContain('Bathroom 3 (half)')
+    expect(areas).not.toContain('Bathroom 4')
+    // A one-bath unit keeps the plain single area.
+    const oneBath = await seededAreas(f, 'apartment', 'landlord', 1, 1)
+    expect(oneBath).toContain('Bathroom')
+    expect(oneBath).not.toContain('Bathroom 1')
+  })
+
+  it('every interior checklist covers kitchen and living/dining', async () => {
+    const f = await seedFixture()
+    const areas = await seededAreas(f, 'apartment', 'landlord', 1)
+    expect(areas).toContain('Kitchen')
+    expect(areas).toContain('Living / dining')
+  })
+})
+
+describe('S550 — tenant on-the-go issue reporting', () => {
+  it('tenant adds an ad-hoc finding to their own draft periodic', async () => {
+    const f = await seedFixture()
+    const inspId = await createInspection(f, { inspectionType: 'periodic' })
+    const res = await request(buildApp())
+      .post(`/api/inspections/${inspId}/items`)
+      .set('Authorization', `Bearer ${f.tenantToken}`)
+      .send({ area: 'Reported issues', itemLabel: 'Bedroom window is broken', condition: 'damaged', notes: 'Bedroom window is broken' })
+    expect(res.status).toBe(200)
+    const row = (await db.query<any>(
+      `SELECT area, item_label, condition FROM unit_inspection_items
+        WHERE inspection_id = $1 AND area = 'Reported issues'`, [inspId],
+    )).rows[0]
+    expect(row.item_label).toBe('Bedroom window is broken')
+    expect(row.condition).toBe('damaged')
+  })
+})
+
+// ─── S550: conditional-fee assessment on the move-out inspection ───
+
+describe('S550 — conditional lease fees assessed at move-out', () => {
+  async function addConditionalFee(leaseId: string, amount: number): Promise<string> {
+    const r = await db.query<{ id: string }>(
+      `INSERT INTO lease_fees
+         (lease_id, fee_type, amount, due_timing, is_refundable, description, condition_text)
+       VALUES ($1, 'other_fee', $2, 'move_out', FALSE, 'Carpet cleaning',
+               'Carpets professionally cleaned within 3 days of move-out, else this charge applies.')
+       RETURNING id`,
+      [leaseId, amount],
+    )
+    return r.rows[0].id
+  }
+
+  async function createMoveOutWithCondition(f: SeedFixture, feeId: string) {
+    const res = await request(buildApp())
+      .post('/api/inspections')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ unitId: f.unitId, leaseId: f.leaseId, tenantId: f.tenantId, inspectionType: 'move_out' })
+    expect(res.status).toBe(200)
+    const item = (await db.query<{ id: string; area: string; item_label: string }>(
+      `SELECT id, area, item_label FROM unit_inspection_items
+        WHERE inspection_id = $1 AND lease_fee_id = $2`,
+      [res.body.data.id, feeId],
+    )).rows[0]
+    expect(item).toBeTruthy()
+    expect(item.area).toBe('Lease conditions')
+    expect(item.item_label).toContain('Carpet cleaning')
+    return { inspectionId: res.body.data.id as string, itemLabel: item.item_label }
+  }
+
+  async function assessAndFinalize(f: SeedFixture, inspectionId: string, itemLabel: string, condition: string) {
+    const app = buildApp()
+    const upsert = await request(app)
+      .post(`/api/inspections/${inspectionId}/items`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ area: 'Lease conditions', itemLabel, condition })
+    expect(upsert.status).toBe(200)
+    expect((await request(app).post(`/api/inspections/${inspectionId}/sign`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)).status).toBe(200)
+    expect((await request(app).post(`/api/inspections/${inspectionId}/finalize`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)).status).toBe(200)
+  }
+
+  it('item marked damaged at finalize → condition FAILED (fee will sweep)', async () => {
+    const f = await seedFixture()
+    const feeId = await addConditionalFee(f.leaseId, 150)
+    const { inspectionId, itemLabel } = await createMoveOutWithCondition(f, feeId)
+    await assessAndFinalize(f, inspectionId, itemLabel, 'damaged')
+    const fee = (await db.query<any>(
+      `SELECT condition_result, condition_assessed_at, condition_assessed_by
+         FROM lease_fees WHERE id = $1`, [feeId],
+    )).rows[0]
+    expect(fee.condition_result).toBe('failed')
+    expect(fee.condition_assessed_at).toBeTruthy()
+    expect(fee.condition_assessed_by).toBe(f.landlordUserId)
+  })
+
+  it('item marked good → condition MET (no charge); na stays unassessed', async () => {
+    const f = await seedFixture()
+    const metFee = await addConditionalFee(f.leaseId, 150)
+    const naFee  = await addConditionalFee(f.leaseId, 75)
+    const { inspectionId } = await createMoveOutWithCondition(f, metFee)
+    const metLabel = (await db.query<{ item_label: string }>(
+      `SELECT item_label FROM unit_inspection_items WHERE inspection_id=$1 AND lease_fee_id=$2`,
+      [inspectionId, metFee],
+    )).rows[0].item_label
+    await assessAndFinalize(f, inspectionId, metLabel, 'good')
+    const rows = (await db.query<any>(
+      `SELECT id, condition_result FROM lease_fees WHERE id = ANY($1::uuid[])`,
+      [[metFee, naFee]],
+    )).rows
+    expect(rows.find((r: any) => r.id === metFee).condition_result).toBe('met')
+    expect(rows.find((r: any) => r.id === naFee).condition_result).toBeNull()
   })
 })

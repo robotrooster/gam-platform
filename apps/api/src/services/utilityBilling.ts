@@ -1,6 +1,7 @@
 import { meterReadingModulus } from '@gam/shared'
 import { query, queryOne, getClient } from '../db'
 import { AppError } from '../middleware/errorHandler'
+import { logger } from '../lib/logger'
 
 // S90: utility bill generation engine.
 //
@@ -166,6 +167,7 @@ export async function generateBillsForMeter(
       if (inserted) billsCreated++
       else unitsSkipped++
     }
+    if (billsCreated > 0) await invoiceEndedLeaseBills(meterId, cycleIso)
     return { meterId, cycleMonth: cycleIso, billsCreated, unitsSkipped }
   }
 
@@ -224,7 +226,36 @@ export async function generateBillsForMeter(
     else unitsSkipped++
   }
 
+  if (billsCreated > 0) await invoiceEndedLeaseBills(meterId, cycleIso)
   return { meterId, cycleMonth: cycleIso, billsCreated, unitsSkipped }
+}
+
+// S548 (Nic — immediate move-out settlement): a bill that just landed on an
+// ENDED lease has no next cycle to ride — invoice it NOW so the landlord's
+// receivable and the departing tenant's deposit surplus square up the day
+// of pull-out. Best-effort: a failure here never unwinds bill generation
+// (the deposit-return sweep remains the backstop). Dynamic import because
+// invoiceGeneration imports this module (ensureBillsForUnit).
+async function invoiceEndedLeaseBills(meterId: string, cycleIso: string): Promise<void> {
+  try {
+    const ended = await query<{ lease_id: string }>(`
+      SELECT DISTINCT ub.lease_id
+        FROM utility_bills ub
+        JOIN leases l ON l.id = ub.lease_id
+       WHERE ub.meter_id = $1 AND ub.billing_cycle_month = $2
+         AND ub.payment_id IS NULL AND ub.status IN ('unbilled', 'billed')
+         AND (l.status IN ('expired', 'terminated')
+              OR (l.end_date IS NOT NULL AND l.end_date <= CURRENT_DATE))
+    `, [meterId, cycleIso])
+    if (ended.length === 0) return
+    const { generateFinalUtilityInvoice } = await import('../jobs/invoiceGeneration')
+    for (const r of ended) {
+      await generateFinalUtilityInvoice(r.lease_id)
+    }
+  } catch (err) {
+    // Bills stay swept-able via the deposit-return backstop.
+    logger.error({ err, meterId, cycleIso }, '[utility-billing] immediate move-out invoicing failed')
+  }
 }
 
 interface InsertBillArgs {
@@ -253,16 +284,42 @@ interface InsertBillArgs {
 // Returns true if a bill was inserted, false if skipped (unit not occupied,
 // tenant not responsible for this utility type, or bill already exists).
 async function tryInsertBill(args: InsertBillArgs): Promise<boolean> {
-  // Find the active lease + primary tenant on this unit at the cycle month.
-  // Use v_lease_active_tenants for the primary.
-  const lt = await queryOne<{ lease_id: string; tenant_id: string }>(`
-    SELECT vlat.lease_id, vlat.tenant_id
-      FROM v_lease_active_tenants vlat
-      JOIN leases l ON l.id = vlat.lease_id
-     WHERE l.unit_id = $1 AND l.status = 'active' AND vlat.role = 'primary'
+  // S548 (Nic — fast turnover): the cycle's usage belongs to the lease that
+  // covered the START of the cycle month, NOT whoever is active when the
+  // read gets entered. RV spots turn over same-day — the departing guest's
+  // Jan 1–10 electric must never land on the arrival whose lease went
+  // active on the 10th. Works for ended leases too (the final read usually
+  // lands after the lease-end processor expired the lease). Read the meter
+  // AT turnover — a late final read folds the gap days into the departing
+  // tenant's bill.
+  let lt = await queryOne<{ lease_id: string; tenant_id: string }>(`
+    SELECT l.id AS lease_id, lt2.tenant_id
+      FROM leases l
+      JOIN lease_tenants lt2 ON lt2.lease_id = l.id AND lt2.role = 'primary'
+     WHERE l.unit_id = $1
+       AND l.status IN ('active', 'expired', 'terminated')
+       AND l.start_date <= $2::date
+       AND COALESCE(l.end_date, '9999-12-31'::date) > $2::date
+     ORDER BY l.start_date DESC
      LIMIT 1
-  `, [args.unitId])
-  if (!lt) return false  // no active primary tenant — landlord absorbs
+  `, [args.unitId, args.cycleMonth])
+  if (!lt) {
+    // Nobody covered the 1st (mid-month first arrival): the cycle falls to
+    // the newest lease overlapping the month — same outcome as the old
+    // active-lease rule for that case.
+    lt = await queryOne<{ lease_id: string; tenant_id: string }>(`
+      SELECT l.id AS lease_id, lt2.tenant_id
+        FROM leases l
+        JOIN lease_tenants lt2 ON lt2.lease_id = l.id AND lt2.role = 'primary'
+       WHERE l.unit_id = $1
+         AND l.status IN ('active', 'expired', 'terminated')
+         AND l.start_date < ($2::date + interval '1 month')::date
+         AND COALESCE(l.end_date, '9999-12-31'::date) >= $2::date
+       ORDER BY l.start_date DESC
+       LIMIT 1
+    `, [args.unitId, args.cycleMonth])
+  }
+  if (!lt) return false  // no attributable tenant — landlord absorbs
 
   // Tenant responsibility gate.
   const resp = await queryOne<{ tenant_responsible: boolean }>(`

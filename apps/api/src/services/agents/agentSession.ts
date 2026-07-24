@@ -19,6 +19,7 @@ import { getEntryProfile, getEscalationProfile } from './profiles'
 import { logInteraction } from './logInteraction'
 import { getTurnGate } from './turnGate'
 import { answerCache, answerCacheEnabled, normalizeQuestion } from './cache'
+import { checkTurnBudget, BUDGET_CAPPED_REPLY } from './turnBudget'
 import { matchCuratedFaq } from './curatedFaq'
 import { loadUserContext } from './conversationHistory'
 import type { AgentActor } from './tools/types'
@@ -66,6 +67,8 @@ export interface AgentSessionResult {
   shed?: boolean
   /** true when the reply was served from the FAQ answer cache (no model call) */
   cached?: boolean
+  /** true when the turn was refused by the per-user daily budget (S553) */
+  rateLimited?: boolean
   /** true when the reply was an approved curated FAQ answer (no model call) */
   curated?: boolean
 }
@@ -202,6 +205,19 @@ export async function runAgentSession(input: AgentSessionInput): Promise<AgentSe
     }
   }
 
+  // S553: per-user daily turn budget (abuse guard) — checked AFTER the
+  // cache fast-paths on purpose: cached answers cost nothing, so a capped
+  // user keeps getting FAQ answers all day. Over budget → canned reply,
+  // zero model calls, logged as outcome 'rate_limited'.
+  const budget = await checkTurnBudget(audience, actor.userId, actor.profileId).catch(() => ({ allowed: true as const }))
+  if (!budget.allowed) {
+    logger.warn({ audience, reason: (budget as any).reason }, 'agent session: turn refused by daily budget')
+    return finalize(
+      { reply: BUDGET_CAPPED_REPLY, handledBy: { name: profile.name, tier: 'entry' }, escalations: [], toolInvocations: [], rateLimited: true },
+      profile.id
+    )
+  }
+
   // Cross-session memory: on a fresh conversation (and only on the model
   // path — fast-path hits above skip this), recall what this user recently
   // contacted support about so the agent feels like a rep who remembers them.
@@ -213,7 +229,12 @@ export async function runAgentSession(input: AgentSessionInput): Promise<AgentSe
   // rather than piling onto the model fleet and collapsing it.
   const release = await getTurnGate().acquire()
   if (!release) {
-    return { reply: HIGH_VOLUME_REPLY, handledBy: { name: 'GAM Support', tier: 'entry' }, escalations: [], toolInvocations: [], shed: true }
+    // S553: shed turns log too (outcome 'shed' via deriveOutcome) — shed
+    // volume is the capacity alarm on the admin Agent Analytics page.
+    return finalize(
+      { reply: HIGH_VOLUME_REPLY, handledBy: { name: 'GAM Support', tier: 'entry' }, escalations: [], toolInvocations: [], shed: true },
+      profile.id
+    )
   }
 
   try {

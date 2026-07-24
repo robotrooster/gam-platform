@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.gam.api</string>
+  <!-- S550 prod flip: the GAM API as a supervised production service —
+       compiled build (apps/api/dist), NODE_ENV=production, KeepAlive so a
+       crash self-heals in seconds and a reboot brings it back without
+       anyone typing commands. Same shape as com.gam.marketing.
+       WorkingDirectory MUST be apps/api: .env loads from cwd and the
+       uploads/ paths resolve relative to it.
+       Dev note: dev.sh/kill-all.sh killing :4000 just makes launchd
+       respawn this service. To run the API in dev-watch mode instead:
+         launchctl bootout gui/$UID/com.gam.api   # stop supervision
+         ...dev session...
+         launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.gam.api.plist -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/opt/node@22/bin/node</string>
+    <string>/Users/nicholasrhoades/gam/apps/api/dist/index.js</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/nicholasrhoades/gam/apps/api</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/opt/node@22/bin:/usr/bin:/bin</string>
+    <key>NODE_ENV</key>
+    <string>production</string>
+  </dict>
+  <key>KeepAlive</key>
+  <true/>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>/tmp/gam-api.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/gam-api.log</string>
+</dict>
+</plist>

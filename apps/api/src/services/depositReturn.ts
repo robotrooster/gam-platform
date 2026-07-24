@@ -1,6 +1,7 @@
 import type { PoolClient } from 'pg'
 import { query, queryOne, getClient } from '../db'
 import { appendEvent } from './creditLedger'
+import { ensureBillsForUnit } from './utilityBilling'
 import { getStripe } from '../lib/stripe'
 import { logger } from '../lib/logger'
 
@@ -152,6 +153,9 @@ export async function calculateDepositReturn(
 ): Promise<{
   total_deposit: number
   interest_accrued: number  // S188: statutory interest tenant is owed on top of deposit
+  prepaid_credit_remaining: number  // S548: unconsumed lease_prepaid_credits — tenant's money, joins the pool
+  final_utility_lines: { bill_id: string; utility_type: string; amount: number; cycle: string }[]  // S548: uninvoiced final meter-read bills, settled from the deposit
+  final_utility_total: number
   cleaning_fee_amount: number
   damage_lines_total: number
   other_deductions_total: number
@@ -166,14 +170,21 @@ export async function calculateDepositReturn(
   const lease = await queryOne<{
     tenant_id: string
     landlord_id: string
+    unit_id: string
   }>(
-    `SELECT lt.tenant_id, l.landlord_id
+    `SELECT lt.tenant_id, l.landlord_id, l.unit_id
        FROM leases l
        LEFT JOIN lease_tenants lt ON lt.lease_id = l.id AND lt.role = 'primary'
       WHERE l.id = $1`,
     [leaseId],
   )
   if (!lease) return null
+
+  // S548 (Nic — end-of-stay): materialize any bills the readings support
+  // BEFORE sweeping, so the final meter read entered at move-out becomes a
+  // utility_bills row this calculation can see. Best-effort — a generation
+  // hiccup must not block the deposit preview.
+  try { await ensureBillsForUnit(lease.unit_id, new Date().toISOString().slice(0, 10)) } catch { /* preview stays usable */ }
 
   const sd = await queryOne<{
     id: string; total_amount: string; collected_amount: string; interest_accrued: string;
@@ -222,10 +233,16 @@ export async function calculateDepositReturn(
   // should deduct from the deposit at lease end. Move_out covers
   // cleaning_fee; other covers early_termination_fee + other_fee. Damage
   // lines stay separate (landlord-entered judgment calls).
+  //
+  // S550: CONDITIONAL fees ("carpet cleaning within N days, else $X" —
+  // condition_text set) NEVER auto-sum here unless a human assessed the
+  // condition as FAILED (move-out inspection 'Lease conditions' item →
+  // condition_result). Unassessed or met = no charge, ever.
   const cleaningFees = await query<{ total: string }>(
     `SELECT COALESCE(SUM(amount), 0)::text AS total
        FROM lease_fees
-      WHERE lease_id = $1 AND due_timing IN ('move_out', 'other')`,
+      WHERE lease_id = $1 AND due_timing IN ('move_out', 'other')
+        AND (condition_text IS NULL OR condition_result = 'failed')`,
     [leaseId],
   )
   const cleaningFeeAmount = Number(cleaningFees[0]?.total ?? 0)
@@ -264,21 +281,56 @@ export async function calculateDepositReturn(
   }))
   const unpaidBalanceTotal = round2(unpaidBalanceLines.reduce((s, l) => s + l.amount, 0))
 
+  // S548 (Nic): final utilities never billed onto an invoice (the last
+  // meter read lands at/after move-out) settle straight from the deposit —
+  // that's why the monthly-stay deposit exists.
+  const finalUtilityRows = await query<{
+    id: string; utility_type: string; amount: string; cycle: string
+  }>(
+    `SELECT id, utility_type, (charge_amount + tax_amount)::text AS amount,
+            to_char(billing_cycle_month, 'YYYY-MM-DD') AS cycle
+       FROM utility_bills
+      WHERE lease_id = $1 AND payment_id IS NULL AND status IN ('unbilled', 'billed')
+      ORDER BY billing_cycle_month ASC`,
+    [leaseId],
+  )
+  const finalUtilityLines = finalUtilityRows.map((r) => ({
+    bill_id: r.id, utility_type: r.utility_type, amount: Number(r.amount), cycle: r.cycle,
+  }))
+  const finalUtilityTotal = round2(finalUtilityLines.reduce((s, l) => s + l.amount, 0))
+
   const damageTotal = sumLines(damageLines)
   const otherTotal = sumLines(otherDeductions)
   const totalDeductions = round2(
-    cleaningFeeAmount + damageTotal + otherTotal + unpaidBalanceTotal
+    cleaningFeeAmount + damageTotal + otherTotal + unpaidBalanceTotal + finalUtilityTotal
   )
 
   // S188: tenant pool = principal + statutory interest. Refund draws
   // against this pool; gap fires only when deductions exceed it.
-  const tenantPool = round2(totalDeposit + interestAccrued)
+  // S548: unconsumed prepaid credit (e.g. a long-stay guest paid the month
+  // then left at week 3 — the schedule sync banked the overpayment, invoices
+  // netted what they could, and whatever's left is the TENANT'S money). It
+  // joins the pool so the refund returns it; finalize zeroes the rows.
+  const prepaidCredit = await queryOne<{ total: string }>(
+    `SELECT COALESCE(SUM(amount_remaining), 0)::text AS total
+       FROM lease_prepaid_credits WHERE lease_id = $1`,
+    [leaseId],
+  )
+  const prepaidCreditRemaining = round2(Number(prepaidCredit?.total ?? 0))
+
+  // S188: tenant pool = principal + statutory interest (+ S548 leftover
+  // prepaid credit). Refund draws against this pool; gap fires only when
+  // deductions exceed it.
+  const tenantPool = round2(totalDeposit + interestAccrued + prepaidCreditRemaining)
   const refund = round2(Math.max(0, tenantPool - totalDeductions))
   const gap = round2(Math.max(0, totalDeductions - tenantPool))
 
   return {
     total_deposit: totalDeposit,
     interest_accrued: interestAccrued,
+    prepaid_credit_remaining: prepaidCreditRemaining,
+    final_utility_lines: finalUtilityLines,
+    final_utility_total: finalUtilityTotal,
     cleaning_fee_amount: cleaningFeeAmount,
     damage_lines_total: damageTotal,
     other_deductions_total: otherTotal,
@@ -447,7 +499,9 @@ export async function finalizeDepositReturn(
     )
     if (cur.rows.length === 0) throw new Error('Draft not found')
     row = cur.rows[0]
-    if (row.status !== 'draft') throw new Error(`Already finalized: ${row.status}`)
+    // S548: awaiting_approval = staff-prepared return parked above the
+    // landlord's threshold — the landlord's finalize releases it.
+    if (!['draft', 'awaiting_approval'].includes(row.status)) throw new Error(`Already finalized: ${row.status}`)
 
     // S180 / A1: re-query live unpaid payments inside the finalize tx
     // and refresh totals. Between draft create / last applyDeductions
@@ -470,6 +524,28 @@ export async function finalizeDepositReturn(
       sweptRows.rows.reduce((s, r) => s + Number(r.amount), 0)
     )
 
+    // S548 (Nic — end-of-stay): materialize + lock any final utility bills
+    // that never rode an invoice (the last meter read lands at/after
+    // move-out). They settle from the deposit right here.
+    const leaseUnitId = (await client.query<{ unit_id: string }>(
+      `SELECT unit_id FROM leases WHERE id = $1`, [row.lease_id])).rows[0].unit_id
+    try { await ensureBillsForUnit(leaseUnitId, new Date().toISOString().slice(0, 10)) }
+    catch { /* a generation hiccup must not block finalize */ }
+    const finalBillRows = await client.query<{
+      id: string; utility_type: string; amount: string
+      usage_amount: string | null; reading_start: string | null; reading_end: string | null
+    }>(
+      `SELECT id, utility_type, (charge_amount + tax_amount)::text AS amount,
+              usage_amount::text, reading_start::text, reading_end::text
+         FROM utility_bills
+        WHERE lease_id = $1 AND payment_id IS NULL AND status IN ('unbilled', 'billed')
+        FOR UPDATE`,
+      [row.lease_id],
+    )
+    const liveFinalUtilities = round2(
+      finalBillRows.rows.reduce((s, r) => s + Number(r.amount), 0)
+    )
+
     // Refresh row totals using live unpaid balance + the stored
     // landlord-controlled lines (cleaning_fee / damage_lines / other).
     // S188: also re-pull live interest_accrued in case the monthly
@@ -478,7 +554,7 @@ export async function finalizeDepositReturn(
     const damageTotal       = sumLines(row.damage_lines)
     const otherTotal        = sumLines(row.other_deductions)
     const liveTotalDeductions = round2(
-      cleaningFeeAmount + damageTotal + otherTotal + liveUnpaidBalance
+      cleaningFeeAmount + damageTotal + otherTotal + liveUnpaidBalance + liveFinalUtilities
     )
     const totalDeposit = Number(row.total_deposit)
     const sdInterest = await client.query<{ interest_accrued: string }>(
@@ -486,7 +562,23 @@ export async function finalizeDepositReturn(
       [row.lease_id],
     )
     const liveInterestAccrued = round2(Number(sdInterest.rows[0]?.interest_accrued ?? 0))
-    const liveTenantPool = round2(totalDeposit + liveInterestAccrued)
+    // S548: consume any unconsumed prepaid credit into the tenant pool
+    // (long-stay overpayment the invoices never got to net). FOR UPDATE +
+    // zeroing inside this tx so the credit can't also cover a late invoice.
+    const creditRows = await client.query<{ id: string; amount_remaining: string }>(
+      `SELECT id, amount_remaining::text FROM lease_prepaid_credits
+        WHERE lease_id = $1 AND amount_remaining > 0 FOR UPDATE`,
+      [row.lease_id],
+    )
+    const livePrepaidCredit = round2(creditRows.rows.reduce((s, r) => s + Number(r.amount_remaining), 0))
+    if (creditRows.rows.length > 0) {
+      await client.query(
+        `UPDATE lease_prepaid_credits SET amount_remaining = 0, updated_at = NOW()
+          WHERE id = ANY($1::uuid[])`,
+        [creditRows.rows.map((r) => r.id)],
+      )
+    }
+    const liveTenantPool = round2(totalDeposit + liveInterestAccrued + livePrepaidCredit)
     const liveRefund = round2(Math.max(0, liveTenantPool - liveTotalDeductions))
     const liveGap    = round2(Math.max(0, liveTotalDeductions - liveTenantPool))
 
@@ -502,6 +594,33 @@ export async function finalizeDepositReturn(
                 )
           WHERE id = ANY($1::uuid[])`,
         [sweptPaymentIds, draftId],
+      )
+    }
+
+    // S548: settle the final utility bills from the deposit — one
+    // paid_via_deposit payments row per bill (books show what was consumed
+    // and why), and the bill flips 'paid' with the payment linkage.
+    for (const fb of finalBillRows.rows) {
+      const readNote = fb.reading_start != null && fb.reading_end != null
+        ? ` (meter ${Math.trunc(Number(fb.reading_start))} → ${Math.trunc(Number(fb.reading_end))})`
+        : ''
+      const pay = await client.query<{ id: string }>(
+        `INSERT INTO payments (
+           unit_id, lease_id, tenant_id, landlord_id,
+           type, amount, status, due_date, entry_description, notes, settled_at
+         ) VALUES ($1, $2, $3, $4, 'utility', $5, 'paid_via_deposit', CURRENT_DATE, 'UTILITY', $6, NOW())
+         RETURNING id`,
+        [
+          leaseUnitId, row.lease_id, row.tenant_id, row.landlord_id,
+          Number(fb.amount).toFixed(2),
+          `S548: final ${fb.utility_type} settled from security deposit on deposit_return ${draftId}${readNote}`,
+        ],
+      )
+      await client.query(
+        `UPDATE utility_bills
+            SET payment_id = $1, status = 'paid', paid_at = NOW(), updated_at = NOW()
+          WHERE id = $2`,
+        [pay.rows[0].id, fb.id],
       )
     }
 

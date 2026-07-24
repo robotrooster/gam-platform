@@ -364,8 +364,23 @@ describe('POST /:id/deposit-return', () => {
     expect(res.status).toBe(403)
   })
 
-  it('happy: calls createOrFetchDraft', async () => {
+  it('S548: apartment without a finalized move-out walkthrough → 409', async () => {
     const f = await seed()
+    const res = await request(buildApp())
+      .post(`/api/leases/${f.leaseAId}/deposit-return`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+    expect(res.status).toBe(409)
+    expect(res.body.error).toMatch(/move-out walkthrough/i)
+    expect(createOrFetchDraftMock).not.toHaveBeenCalled()
+  })
+
+  it('happy: finalized move-out walkthrough → calls createOrFetchDraft', async () => {
+    const f = await seed()
+    // Gate satisfied: an in-person move-out inspection is finalized.
+    await db.query(
+      `INSERT INTO unit_inspections (unit_id, lease_id, landlord_id, inspection_type, status, finalized_at)
+       SELECT l.unit_id, l.id, l.landlord_id, 'move_out', 'finalized', NOW() FROM leases l WHERE l.id=$1`,
+      [f.leaseAId])
     const res = await request(buildApp())
       .post(`/api/leases/${f.leaseAId}/deposit-return`)
       .set('Authorization', `Bearer ${f.tokenA}`)
@@ -476,5 +491,62 @@ describe('POST /:id/deposit-return/finalize', () => {
     expect(res.status).toBe(200)
     expect(res.body.data.status).toBe('finalized')
     expect(finalizeDepositReturnMock).toHaveBeenCalledWith(draft.rows[0].id, f.landlordAUserId)
+  })
+})
+
+// ─── S548: deposit-return approval threshold ──────────────────────────
+
+describe('POST /:id/deposit-return/finalize — S548 staff approval threshold', () => {
+  const staffToken = (landlordId: string) => jwt.sign(
+    { userId: randomUUID(), role: 'property_manager', profileId: randomUUID(),
+      landlordId, permissions: { 'leases.deposit_return': true } },
+    process.env.JWT_SECRET!, { expiresIn: '1h' },
+  )
+
+  it('staff refund above threshold → 202 awaiting_approval + landlord notified, no payout', async () => {
+    const f = await seed()
+    await db.query(
+      `INSERT INTO deposit_returns (lease_id, tenant_id, landlord_id, total_deposit, total_deductions, refund_amount, status)
+       VALUES ($1, $2, $3, 1000, 200, 800, 'draft')`,
+      [f.leaseAId, f.tenantAId, f.landlordAId])
+    // Default threshold $500; mocked live refund is $800 → parks.
+    const res = await request(buildApp())
+      .post(`/api/leases/${f.leaseAId}/deposit-return/finalize`)
+      .set('Authorization', `Bearer ${staffToken(f.landlordAId)}`)
+    expect(res.status).toBe(202)
+    expect(res.body.data.status).toBe('awaiting_approval')
+    expect(finalizeDepositReturnMock).not.toHaveBeenCalled()
+    const row = await db.query<any>(`SELECT status FROM deposit_returns WHERE lease_id=$1`, [f.leaseAId])
+    expect(row.rows[0].status).toBe('awaiting_approval')
+    const n = await db.query<any>(
+      `SELECT title FROM notifications WHERE type='deposit_return_approval' AND landlord_id=$1`, [f.landlordAId])
+    expect(n.rows).toHaveLength(1)
+  })
+
+  it('staff refund at/below threshold → finalizes without the landlord', async () => {
+    const f = await seed()
+    calculateDepositReturnMock.mockResolvedValue({ deposit_amount: 150, total_deductions: 50, refund_amount: 100 } as any)
+    await db.query(
+      `INSERT INTO deposit_returns (lease_id, tenant_id, landlord_id, total_deposit, total_deductions, refund_amount, status)
+       VALUES ($1, $2, $3, 150, 50, 100, 'draft')`,
+      [f.leaseAId, f.tenantAId, f.landlordAId])
+    const res = await request(buildApp())
+      .post(`/api/leases/${f.leaseAId}/deposit-return/finalize`)
+      .set('Authorization', `Bearer ${staffToken(f.landlordAId)}`)
+    expect(res.status).toBe(200)
+    expect(finalizeDepositReturnMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('landlord finalizes an awaiting_approval return', async () => {
+    const f = await seed()
+    await db.query(
+      `INSERT INTO deposit_returns (lease_id, tenant_id, landlord_id, total_deposit, total_deductions, refund_amount, status)
+       VALUES ($1, $2, $3, 1000, 200, 800, 'awaiting_approval')`,
+      [f.leaseAId, f.tenantAId, f.landlordAId])
+    const res = await request(buildApp())
+      .post(`/api/leases/${f.leaseAId}/deposit-return/finalize`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+    expect(res.status).toBe(200)
+    expect(finalizeDepositReturnMock).toHaveBeenCalledTimes(1)
   })
 })

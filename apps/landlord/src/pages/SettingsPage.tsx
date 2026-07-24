@@ -25,17 +25,20 @@ export function SettingsPage() {
   const { data: me, isLoading } = useQuery<any>('landlord-me', () => apiGet('/landlords/me'))
 
   const [threshold, setThreshold] = useState<string>('')
+  const [depThreshold, setDepThreshold] = useState<string>('')
   const [saved, setSaved] = useState(false)
 
   useEffect(() => {
     if (me) {
       setThreshold(me.maintApprovalThreshold != null ? String(me.maintApprovalThreshold) : '500')
+      setDepThreshold(me.depositReturnApprovalThreshold != null ? String(me.depositReturnApprovalThreshold) : '500')
     }
   }, [me])
 
   const saveMut = useMutation(
     () => apiPatch('/landlords/me', {
       maintApprovalThreshold: Number(threshold),
+      depositReturnApprovalThreshold: Number(depThreshold),
     }),
     {
       onSuccess: () => {
@@ -49,9 +52,12 @@ export function SettingsPage() {
   const { can } = usePerms()
 
   const thresholdNum = Number(threshold)
+  const depThresholdNum = Number(depThreshold)
   const thresholdValid = !isNaN(thresholdNum) && thresholdNum >= 0
+    && !isNaN(depThresholdNum) && depThresholdNum >= 0
   const thresholdChanged = me && (
     Number(me.maintApprovalThreshold || 500) !== thresholdNum
+    || Number(me.depositReturnApprovalThreshold ?? 500) !== depThresholdNum
   )
 
   return (
@@ -159,6 +165,44 @@ export function SettingsPage() {
                 </div>
                 <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginTop: 6 }}>
                   Requests over {fmt(thresholdNum || 0)} will require approval.
+                </div>
+              </div>
+
+              {/* S548: deposit-return approval threshold — staff finalize refunds
+                  at/below this; larger refunds park for the landlord's approval. */}
+              <div style={{ maxWidth: 280, marginTop: 18 }}>
+                <label style={{
+                  fontSize: '.72rem',
+                  fontWeight: 600,
+                  color: 'var(--text-3)',
+                  textTransform: 'uppercase',
+                  letterSpacing: '.06em',
+                  display: 'block',
+                  marginBottom: 5
+                }}>
+                  Deposit Return Approval Threshold
+                </label>
+                <div style={{ position: 'relative' }}>
+                  <DollarSign size={14} style={{
+                    position: 'absolute',
+                    left: 11,
+                    top: '50%',
+                    transform: 'translateY(-50%)',
+                    color: 'var(--text-3)'
+                  }} />
+                  <input
+                    className="input"
+                    type="number"
+                    min="0"
+                    step="10"
+                    value={depThreshold}
+                    onChange={e => setDepThreshold(e.target.value)}
+                    placeholder="500"
+                    style={{ width: '100%', paddingLeft: 30 }}
+                  />
+                </div>
+                <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginTop: 6 }}>
+                  Team members can finalize deposit refunds up to {fmt(depThresholdNum || 0)}; anything above waits for your approval. Set 0 to approve every refund yourself.
                 </div>
               </div>
 

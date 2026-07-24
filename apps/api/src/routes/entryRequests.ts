@@ -14,6 +14,7 @@ import {
   notifyEntryRecorded,
 } from '../services/notifications'
 import { logger } from '../lib/logger'
+import { applyEntryRequestResponse } from '../services/entryRequestRespond'
 import { checkAgainstStatute, type LawFlag } from '../services/stateLaw'
 
 /**
@@ -304,82 +305,10 @@ entryRequestsRouter.post('/:id/respond', async (req, res, next) => {
       throw new AppError(409, `cannot respond to request in status ${r.status}`)
     }
 
-    const respondedAt = new Date()
-    const client = await getClient()
-    try {
-      await client.query('BEGIN')
-      await client.query(
-        `INSERT INTO unit_entry_request_responses (
-           request_id, responder_user_id, decision, reason
-         ) VALUES ($1, $2, $3, $4)
-         ON CONFLICT (request_id) DO UPDATE
-           SET decision = EXCLUDED.decision,
-               responded_at = NOW(),
-               reason = EXCLUDED.reason`,
-        [r.id, req.user!.userId, body.decision, body.reason ?? null],
-      )
-      const newStatus = body.decision === 'granted' ? 'granted' : 'denied'
-      await client.query(
-        `UPDATE unit_entry_requests SET status=$1, updated_at=NOW() WHERE id=$2`,
-        [newStatus, r.id],
-      )
-      await emitEntryRequestResponseEvents(client, {
-        tenantId: r.tenant_id,
-        requestId: r.id,
-        decision: body.decision,
-        respondedAt,
-        proposedWindowStart: new Date(r.proposed_entry_window_start),
-      })
-      await client.query('COMMIT')
-    } catch (e) {
-      await client.query('ROLLBACK').catch(() => {})
-      throw e
-    } finally {
-      client.release()
-    }
-
-    // Notify the responsible party of the tenant's response.
-    // S186: routed through resolver — entry requests are day-to-day
-    // tenant interactions, not owner-financial.
-    try {
-      const ctx = await queryOne<{
-        property_id: string
-        first_name: string | null
-        last_name: string | null
-        unit_number: string | null
-      }>(
-        `SELECT un.property_id,
-                tu.first_name,
-                tu.last_name,
-                un.unit_number
-           FROM units    un
-           JOIN tenants  t  ON t.id = $1
-           JOIN users    tu ON tu.id = t.user_id
-          WHERE un.id = $2`,
-        [r.tenant_id, r.unit_id],
-      )
-      if (ctx) {
-        const { getPropertyResponsibleParty } = await import('../services/responsibleParty')
-        const targets = await getPropertyResponsibleParty(ctx.property_id)
-        if (targets) {
-          for (const recipient of targets.primaries) {
-            await notifyEntryRequestResponded({
-              landlordUserId: recipient.user_id,
-              landlordId:     r.landlord_id,
-              landlordEmail:  recipient.email,
-              requestId:      r.id,
-              decision:       body.decision,
-              tenantName:     ctx.first_name || ctx.last_name
-                ? `${ctx.first_name ?? ''} ${ctx.last_name ?? ''}`.trim()
-                : undefined,
-              unitNumber:     ctx.unit_number ?? undefined,
-            })
-          }
-        }
-      }
-    } catch (e) {
-      logger.error({ err: e }, '[NOTIFY] entry-request respond:')
-    }
+    // S552: transactional core + notification extracted to
+    // services/entryRequestRespond.ts, shared with the agent tool
+    // respond_to_entry_request — identical semantics, one implementation.
+    await applyEntryRequestResponse(r, req.user!.userId, body.decision, body.reason ?? null)
 
     res.json({ success: true, data: { decision: body.decision } })
   } catch (e) {

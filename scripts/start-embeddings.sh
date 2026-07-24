@@ -21,6 +21,11 @@
 
 set -euo pipefail
 
+# launchd runs with a minimal PATH that excludes Homebrew — without this the
+# `command -v llama-server` check below fails under com.gam.embeddings even
+# though llama.cpp is installed (S552 fix).
+export PATH="/opt/homebrew/bin:$PATH"
+
 MODEL="${EMBEDDINGS_MODEL_PATH:-$HOME/models/gam-embeddings/bge-large-en-v1.5-f16.gguf}"
 PORT="${EMBEDDINGS_PORT:-8081}"
 

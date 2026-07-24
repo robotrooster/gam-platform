@@ -38,10 +38,23 @@ import { SignPage } from './pages/SignPage'
 import { LeasePage } from './pages/LeasePage'
 import { ProfilePage } from './pages/ProfilePage'
 import { PayoutsPage } from './pages/PayoutsPage'
+import { WorkTradePage } from './pages/WorkTradePage'
 import { PosCustomerOnboardingPage } from './pages/PosCustomerOnboardingPage'
 import React, { useContext, useState, useEffect, useCallback } from 'react'
 import ReactDOM from 'react-dom/client'
 import { BrowserRouter, Routes, Route, Navigate, NavLink, Outlet, useNavigate, useParams, Link, useLocation } from 'react-router-dom'
+
+// S550: first-party product telemetry — one page_view per route change.
+// Fire-and-forget; failures are silently ignored (never affects UX).
+function TelemetryPing() {
+  const location = useLocation()
+  useEffect(() => {
+    post('/telemetry/events', {
+      events: [{ portal: 'tenant', event: 'page_view', path: location.pathname }],
+    }).catch(() => {})
+  }, [location.pathname])
+  return null
+}
 import { DialogHost, toast } from './components/dialogs'
 import { QueryClient, QueryClientProvider, useQuery, useMutation, useQueryClient } from 'react-query'
 import { useForm } from 'react-hook-form'
@@ -401,6 +414,7 @@ function Layout() {
             <NavLink to="/walkthroughs" className={({isActive})=>`ni${isActive?' active':''}`}>🎥 My walkthroughs</NavLink>
             <NavLink to="/entry-requests" className={({isActive})=>`ni${isActive?' active':''}`}>🚪 Entry Requests</NavLink>
             <NavLink to="/amenities" className={({isActive})=>`ni${isActive?' active':''}`}>🎉 Amenities</NavLink>
+            <NavLink to="/work-trade" className={({isActive})=>`ni${isActive?' active':''}`}>🛠 Work Trade</NavLink>
             {!LAUNCH_HIDDEN.has('/credit') && <NavLink to="/credit" className={({isActive})=>`ni${isActive?' active':''}`}>📊 My Record</NavLink>}
             {!LAUNCH_HIDDEN.has('/my-disputes') && <NavLink to="/my-disputes" className={({isActive})=>`ni${isActive?' active':''}`}>⚖️ My Disputes</NavLink>}
             <LeaseNavLink/>
@@ -2284,7 +2298,7 @@ function TenantInspectionsPage() {
               {list.map(r => (
                 <tr key={r.id}>
                   <td style={{ color: 'var(--t0)' }}>{labelType(r.inspectionType)}</td>
-                  <td><span className={`badge ${statusBadge(r.status)}`}>{humanize(r.status)}</span></td>
+                  <td><span className={`badge ${statusBadge(r.status)}`}>{statusLabel(r.inspectionType, r.status)}</span></td>
                   <td className="mono" style={{ fontSize: '.75rem', color: 'var(--t3)' }}>{new Date(r.createdAt).toLocaleDateString()}</td>
                   <td className="mono" style={{ fontSize: '.75rem', color: 'var(--t3)' }}>{r.finalizedAt ? new Date(r.finalizedAt).toLocaleDateString() : '—'}</td>
                   <td><button className="btn btn-g btn-sm" onClick={() => navigate(`/inspections/${r.id}`)}>Open →</button></td>
@@ -2300,6 +2314,12 @@ function TenantInspectionsPage() {
 
 function labelType(t: string) {
   return t === 'move_in' ? 'Move-in' : t === 'move_out' ? 'Move-out' : 'Periodic'
+}
+// S550: on a periodic, 'tenant_signed' means the tenant SUBMITTED their
+// walkthrough (no signature exists — signing is move-in only).
+function statusLabel(type: string, status: string) {
+  if (type === 'periodic' && status === 'tenant_signed') return 'Submitted'
+  return humanize(status)
 }
 function statusBadge(s: string) {
   if (s === 'finalized') return 'b-green'
@@ -2326,14 +2346,41 @@ function TenantInspectionDetailPage() {
       onError: (e: any) => setError(e?.response?.data?.error || 'Sign failed'),
     },
   )
+  const submitMut = useMutation(
+    () => post(`/inspections/${id}/submit`),
+    {
+      onSuccess: () => qc.invalidateQueries(['tenant-inspection', id]),
+      onError: (e: any) => setError(e?.response?.data?.error || 'Submit failed'),
+    },
+  )
   const [camera, setCamera] = useState<null | 'photo' | 'video'>(null)
   const [videoSaved, setVideoSaved] = useState(false)
   const photoMut = useMutation(
-    ({ file, live }: { file: File; live?: boolean }) => {
+    ({ file, live, itemId }: { file: File; live?: boolean; itemId?: string }) => {
       const fd = new FormData(); fd.append('file', file); if (live) fd.append('capturedLive', 'true')
+      if (itemId) fd.append('itemId', itemId)
       return api.post(`/inspections/${id}/photos`, fd, { headers: { 'Content-Type': 'multipart/form-data' } }).then(r => r.data)
     },
     { onSuccess: () => qc.invalidateQueries(['tenant-inspection', id]), onError: (e: any) => setError(e?.response?.data?.error || 'Upload failed') },
+  )
+  // S550 (Nic): on-the-go issue reporting — "bedroom window is broken" +
+  // an immediate photo, recorded as its own checklist finding.
+  const [issueText, setIssueText] = useState('')
+  const [issueItemId, setIssueItemId] = useState<string | null>(null)
+  const addIssueMut = useMutation(
+    (label: string) => post<{ id: string }>(`/inspections/${id}/items`, {
+      area: 'Reported issues', itemLabel: label, condition: 'damaged', notes: label,
+    }),
+    {
+      onSuccess: (r: any) => {
+        setIssueText('')
+        qc.invalidateQueries(['tenant-inspection', id])
+        const newId = r?.id ?? r?.data?.id ?? null
+        setIssueItemId(newId)
+        setCamera('photo')
+      },
+      onError: (e: any) => setError(e?.response?.data?.error || 'Could not add the issue'),
+    },
   )
   const videoMut = useMutation(
     ({ file, live }: { file: File; live?: boolean }) => {
@@ -2358,7 +2405,7 @@ function TenantInspectionDetailPage() {
           <button className="btn btn-g btn-sm" onClick={() => navigate('/inspections')} style={{ marginBottom: 8 }}>← Inspections</button>
           <h1 className="pt">{labelType(insp.inspectionType)} Inspection</h1>
           <p className="ps">
-            <span className={`badge ${statusBadge(insp.status)}`}>{humanize(insp.status)}</span>
+            <span className={`badge ${statusBadge(insp.status)}`}>{statusLabel(insp.inspectionType, insp.status)}</span>
           </p>
         </div>
       </div>
@@ -2427,7 +2474,36 @@ function TenantInspectionDetailPage() {
         </div>
       )}
 
-      {insp.status !== 'finalized' && insp.status !== 'cancelled' && !tenantSigned && (
+      {insp.status === 'draft' && (
+        <div className="card" style={{ padding: 16, marginBottom: 16 }}>
+          <strong style={{ color: 'var(--t0)', display: 'block', marginBottom: 6 }}>Spot something wrong?</strong>
+          <div style={{ fontSize: '.8rem', color: 'var(--t2)', marginBottom: 10 }}>
+            Add it here as you go — e.g. "bedroom window is broken" — then snap a photo of it.
+          </div>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <input
+              className="input"
+              placeholder="What's wrong, and where?"
+              value={issueText}
+              onChange={e => setIssueText(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter' && issueText.trim().length >= 3) addIssueMut.mutate(issueText.trim()) }}
+              style={{ flex: 1 }}
+            />
+            <button
+              className="btn btn-p"
+              onClick={() => addIssueMut.mutate(issueText.trim())}
+              disabled={addIssueMut.isLoading || issueText.trim().length < 3}
+            >
+              {addIssueMut.isLoading ? 'Adding…' : '📷 Add & photograph'}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* S550: signing is MOVE-IN ONLY. A periodic is SUBMITTED (the photos
+          taken while logged into this portal are the attestation); a move-out
+          is staff-conducted in person — no tenant action at all. */}
+      {insp.inspectionType === 'move_in' && insp.status !== 'finalized' && insp.status !== 'cancelled' && !tenantSigned && (
         <div className="card" style={{ padding: 16, background: 'rgba(201,162,39,.05)', border: '1px solid rgba(201,162,39,.25)' }}>
           <strong style={{ color: 'var(--gold)', display: 'block', marginBottom: 6 }}>Sign-off required</strong>
           <div style={{ fontSize: '.82rem', color: 'var(--t2)', marginBottom: 12 }}>
@@ -2440,7 +2516,38 @@ function TenantInspectionDetailPage() {
         </div>
       )}
 
-      {tenantSigned && (
+      {insp.inspectionType === 'periodic' && insp.status === 'draft' && (
+        <div className="card" style={{ padding: 16, background: 'rgba(201,162,39,.05)', border: '1px solid rgba(201,162,39,.25)' }}>
+          <strong style={{ color: 'var(--gold)', display: 'block', marginBottom: 6 }}>Done with your walkthrough?</strong>
+          <div style={{ fontSize: '.82rem', color: 'var(--t2)', marginBottom: 12 }}>
+            Submit your photos for review. No signature needed — you took these photos
+            signed into your own portal, and that's your attestation.
+          </div>
+          <button
+            className="btn btn-p"
+            onClick={() => submitMut.mutate()}
+            disabled={submitMut.isLoading || photos.length === 0}
+          >
+            {submitMut.isLoading ? 'Submitting…' : 'Submit walkthrough'}
+          </button>
+          {photos.length === 0 && (
+            <div style={{ fontSize: '.75rem', color: 'var(--t3)', marginTop: 6 }}>
+              Add at least one photo first.
+            </div>
+          )}
+        </div>
+      )}
+
+      {insp.inspectionType === 'periodic' && insp.status === 'tenant_signed' && (
+        <div className="card" style={{ padding: 16, background: 'rgba(34,197,94,.05)', border: '1px solid rgba(34,197,94,.25)' }}>
+          <strong style={{ color: 'var(--green)' }}>✓ Walkthrough submitted.</strong>
+          <div style={{ fontSize: '.82rem', color: 'var(--t2)', marginTop: 4 }}>
+            The front desk will review your photos.
+          </div>
+        </div>
+      )}
+
+      {insp.inspectionType === 'move_in' && tenantSigned && (
         <div className="card" style={{ padding: 16, background: 'rgba(34,197,94,.05)', border: '1px solid rgba(34,197,94,.25)' }}>
           <strong style={{ color: 'var(--green)' }}>✓ You've signed this inspection.</strong>
           <div style={{ fontSize: '.82rem', color: 'var(--t2)', marginTop: 4 }}>
@@ -2452,8 +2559,12 @@ function TenantInspectionDetailPage() {
       {camera && (
         <CameraCapture
           mode={camera}
-          onClose={() => setCamera(null)}
-          onCapture={(file) => (camera === 'photo' ? photoMut : videoMut).mutate({ file, live: true })}
+          onClose={() => { setCamera(null); setIssueItemId(null) }}
+          onCapture={(file) => {
+            if (camera === 'photo') photoMut.mutate({ file, live: true, itemId: issueItemId ?? undefined })
+            else videoMut.mutate({ file, live: true })
+            setIssueItemId(null)
+          }}
         />
       )}
 
@@ -3857,6 +3968,7 @@ function App() {
   if (loading) return <div className="loading">Loading…</div>
   return (
     <BrowserRouter>
+      <TelemetryPing />
       <Routes>
         <Route path="/login" element={<LoginPage />} />
         <Route path="/forgot-password" element={<ForgotPasswordPage />} />
@@ -3881,6 +3993,7 @@ function App() {
           <Route path="walkthroughs"     element={<TenantMyWalkthroughsPage />} />
           <Route path="entry-requests"      element={<TenantEntryRequestsPage />} />
           <Route path="amenities"           element={<TenantAmenitiesPage />} />
+          <Route path="work-trade"          element={<WorkTradePage />} />
           <Route path="entry-requests/:id"  element={<TenantEntryRequestDetailPage />} />
           <Route path="credit"              element={LAUNCH_HIDDEN.has('/credit') ? <Navigate to="/home" replace /> : <CreditPage />} />
           <Route path="my-disputes"         element={LAUNCH_HIDDEN.has('/my-disputes') ? <Navigate to="/home" replace /> : <MyDisputesPage />} />

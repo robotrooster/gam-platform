@@ -8,7 +8,7 @@ import { query, queryOne, getClient } from '../db'
 import { requireAuth, requirePerm } from '../middleware/auth'
 import { canAccessLandlordResource, canManageLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
-import { routeMaintenanceNotification, notifyMaintenanceUpdated } from '../services/notifications'
+import { routeMaintenanceNotification, notifyMaintenanceUpdated, createNotification } from '../services/notifications'
 import { createMaintenanceRequest } from '../services/maintenanceRequests'
 import { PLATFORM_FEES, MAINTENANCE_PRIORITIES } from '@gam/shared'
 import {
@@ -261,6 +261,59 @@ maintenanceRouter.post('/:id/approve', requirePerm('maintenance.approve'), async
     }
     if (request.status !== 'awaiting_approval') {
       throw new AppError(400, 'Request is not awaiting approval')
+    }
+
+    // S552 (Nic: Option B): enforce the per-manager approval ceiling. A staff
+    // approver with maint_approval_ceiling_cents set may not approve above it
+    // — the request STAYS awaiting the landlord, and the landlord is notified
+    // that the employee attempted an over-limit approval (audit trail).
+    // Unknown cost counts as over-limit: a ceiling can't be verified against
+    // a request with no estimate, so those route to the landlord too.
+    if (req.user!.role !== 'landlord') {
+      const scope = await queryOne<{ maint_approval_ceiling_cents: number | null }>(
+        `SELECT maint_approval_ceiling_cents FROM property_manager_scopes
+          WHERE user_id = $1 AND landlord_id = $2`,
+        [req.user!.userId, request.landlord_id]
+      )
+      const ceilingCents = scope?.maint_approval_ceiling_cents ?? null
+      if (ceilingCents != null) {
+        const costCents = request.estimated_cost != null
+          ? Math.round(parseFloat(request.estimated_cost) * 100)
+          : null
+        if (costCents == null || costCents > ceilingCents) {
+          const ceiling = (ceilingCents / 100).toFixed(2)
+          const cost = costCents != null ? (costCents / 100).toFixed(2) : null
+          const approver = await queryOne<{ first_name: string; last_name: string }>(
+            `SELECT first_name, last_name FROM users WHERE id = $1`, [req.user!.userId])
+          const approverName = approver ? `${approver.first_name} ${approver.last_name}` : 'A team member'
+          try {
+            const owner = await queryOne<{ user_id: string }>(
+              `SELECT user_id FROM landlords WHERE id = $1`, [request.landlord_id])
+            if (owner) {
+              await createNotification({
+                userId: owner.user_id,
+                landlordId: request.landlord_id,
+                type: 'maintenance',
+                title: 'Approval above team member limit',
+                body: `${approverName} tried to approve "${request.title}"` +
+                  (cost ? ` (estimated $${cost})` : ' (no cost estimate)') +
+                  ` — above their $${ceiling} approval limit. It still needs your approval.`,
+                actionUrl: `/maintenance?open=${request.id}`,
+              })
+            }
+          } catch (e) { logger.error({ err: e }, '[MAINT CEILING] landlord notify failed') }
+          await query(
+            `INSERT INTO maintenance_comments (request_id, user_id, role, message, is_internal)
+             VALUES ($1, $2, 'landlord', $3, TRUE)`,
+            [request.id, req.user!.userId,
+             `Approval attempted by ${approverName}` + (cost ? ` at $${cost}` : ' (no estimate)') +
+             ` — above their $${ceiling} limit; routed to landlord.`])
+          throw new AppError(403,
+            cost
+              ? `This repair ($${cost}) is above your $${ceiling} approval limit — it has been sent to the landlord for approval.`
+              : `This request has no cost estimate, so it exceeds your $${ceiling} approval limit — it has been sent to the landlord for approval.`)
+        }
+      }
     }
 
     // Flip to 'assigned' if a contractor is already set, otherwise back to 'open'

@@ -10,6 +10,7 @@ vi.mock('../../../db', () => ({ query: vi.fn(), queryOne: vi.fn() }))
 vi.mock('../../../db/propertiesDb', () => ({ queryProperties: vi.fn() }))
 vi.mock('../../maintenanceRequests', () => ({ createMaintenanceRequest: vi.fn() }))
 vi.mock('../../notifications', () => ({ createNotification: vi.fn(), notifyMaintenanceUpdated: vi.fn() }))
+vi.mock('../../unitAvailability', () => ({ findStayConflict: vi.fn() }))
 
 import { query } from '../../../db'
 import { createMaintenanceRequest } from '../../maintenanceRequests'
@@ -66,6 +67,7 @@ import { getPropertyRentRoll } from './getPropertyRentRoll'
 import { getSetupProgress } from './getSetupProgress'
 import { getGuestBooking } from './getGuestBooking'
 import { requestBookingChange } from './requestBookingChange'
+import { findStayConflict } from '../../unitAvailability'
 import { queryOne } from '../../../db'
 import { createNotification } from '../../notifications'
 import { requireProfile } from '../profiles'
@@ -74,6 +76,7 @@ import type { AgentActor } from './types'
 const mockQuery = query as unknown as ReturnType<typeof vi.fn>
 const mockQueryOne = queryOne as unknown as ReturnType<typeof vi.fn>
 const mockCreateNotification = createNotification as unknown as ReturnType<typeof vi.fn>
+const mockFindStayConflict = findStayConflict as unknown as ReturnType<typeof vi.fn>
 
 const TENANT_ACTOR: AgentActor = { userId: 'u1', role: 'tenant', profileId: 't1' }
 const LANDLORD_ACTOR: AgentActor = { userId: 'u2', role: 'landlord', profileId: 'L1' }
@@ -123,13 +126,16 @@ describe('tool allowlist', () => {
     expect(getTool('nope')).toBeUndefined()
   })
 
-  it('guest profile gets ONLY the two booking-guest tools', () => {
+  it('guest profile gets ONLY the four booking-guest tools', () => {
     const g = getToolsForProfile(requireProfile('guest_entry')).map((x) => x.name)
-    expect(g.sort()).toEqual(['get_guest_booking', 'request_booking_change'])
+    expect(g.sort()).toEqual([
+      'get_guest_amenities', 'get_guest_booking',
+      'request_booking_change', 'request_guest_amenity_reservation',
+    ])
     // and those guest tools never leak to tenant/landlord profiles
     const t = getToolsForProfile(requireProfile('tenant_entry')).map((x) => x.name)
     const l = getToolsForProfile(requireProfile('landlord_entry')).map((x) => x.name)
-    for (const name of ['get_guest_booking', 'request_booking_change']) {
+    for (const name of ['get_guest_booking', 'request_booking_change', 'get_guest_amenities', 'request_guest_amenity_reservation']) {
       expect(t).not.toContain(name)
       expect(l).not.toContain(name)
     }
@@ -140,6 +146,7 @@ describe('guest tools scope to the actor.bookingId', () => {
   beforeEach(() => {
     mockQuery.mockReset(); mockQueryOne.mockReset()
     mockCreateNotification.mockReset(); mockCreateNotification.mockResolvedValue(undefined)
+    mockFindStayConflict.mockReset(); mockFindStayConflict.mockResolvedValue('booking')
   })
 
   it('get_guest_booking reads exactly the booking the token grants', async () => {
@@ -195,6 +202,63 @@ describe('guest tools scope to the actor.bookingId', () => {
     const r: any = await requestBookingChange.execute({ request_type: 'free upgrade' }, GUEST_ACTOR)
     expect(r.ok).toBe(false)
     expect(mockQueryOne).not.toHaveBeenCalled()
+  })
+
+  // S552: schedule-permitting changes auto-approve; conflicts fall back to
+  // the host-decides flow; extra_night extends the booking itself.
+  it('late_checkout auto-approves when the schedule has room', async () => {
+    mockQueryOne.mockResolvedValueOnce({
+      booking_id: 'bk1', guest_name: 'Sam', status: 'confirmed', unit_id: 'U1',
+      check_in: '2026-07-01', check_out: '2026-07-05',
+      landlord_id: 'L1', landlord_user_id: 'u-host', property_name: 'P', unit_number: 'A3',
+    })
+    mockFindStayConflict.mockResolvedValueOnce(null)
+    mockQuery
+      .mockResolvedValueOnce([])              // dedupe check
+      .mockResolvedValueOnce([{ id: 'cr1' }]) // insert
+    const r: any = await requestBookingChange.execute({ request_type: 'late_checkout', details: '2pm' }, GUEST_ACTOR)
+    expect(r.ok).toBe(true)
+    expect(r.autoApproved).toBe(true)
+    expect(r.note).toMatch(/confirmed/i)
+    // insert carried status 'approved'
+    const insertCall = mockQuery.mock.calls.find((c: any[]) => String(c[0]).includes('INSERT INTO booking_change_requests'))
+    expect(insertCall![1][4]).toBe('approved')
+    expect(mockCreateNotification.mock.calls[0][0].title).toMatch(/confirmed/i)
+  })
+
+  it('extra_night auto-approves AND extends the booking by one night', async () => {
+    mockQueryOne.mockResolvedValueOnce({
+      booking_id: 'bk1', guest_name: 'Sam', status: 'confirmed', unit_id: 'U1',
+      check_in: '2026-07-01', check_out: '2026-07-05',
+      landlord_id: 'L1', landlord_user_id: 'u-host', property_name: 'P', unit_number: 'A3',
+    })
+    mockFindStayConflict.mockResolvedValueOnce(null)
+    mockQuery
+      .mockResolvedValueOnce([])              // dedupe
+      .mockResolvedValueOnce([])              // UPDATE unit_bookings
+      .mockResolvedValueOnce([{ id: 'cr2' }]) // insert
+    const r: any = await requestBookingChange.execute({ request_type: 'extra_night' }, GUEST_ACTOR)
+    expect(r.autoApproved).toBe(true)
+    expect(r.newCheckOut).toBe('2026-07-06')
+    const updateCall = mockQuery.mock.calls.find((c: any[]) => String(c[0]).includes('UPDATE unit_bookings'))
+    expect(updateCall).toBeTruthy()
+  })
+
+  it('falls back to host-decides when the schedule conflicts', async () => {
+    mockQueryOne.mockResolvedValueOnce({
+      booking_id: 'bk1', guest_name: 'Sam', status: 'confirmed', unit_id: 'U1',
+      check_in: '2026-07-01', check_out: '2026-07-05',
+      landlord_id: 'L1', landlord_user_id: 'u-host', property_name: 'P', unit_number: 'A3',
+    })
+    mockFindStayConflict.mockResolvedValueOnce('booking')
+    mockQuery
+      .mockResolvedValueOnce([])              // dedupe
+      .mockResolvedValueOnce([{ id: 'cr3' }]) // insert
+    const r: any = await requestBookingChange.execute({ request_type: 'extra_night' }, GUEST_ACTOR)
+    expect(r.autoApproved).toBeUndefined()
+    expect(r.note).toMatch(/sent to the host/i)
+    const insertCall = mockQuery.mock.calls.find((c: any[]) => String(c[0]).includes('INSERT INTO booking_change_requests'))
+    expect(insertCall![1][4]).toBe('requested')
   })
 })
 

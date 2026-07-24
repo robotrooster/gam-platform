@@ -19,6 +19,8 @@ type InspectionRow = {
   scheduledFor: string | null
   finalizedAt: string | null
   createdAt: string
+  flaggedSuspiciousAt: string | null
+  followupInspectionId: string | null
   unitNumber: string | null
   propertyName: string | null
   tenantFirstName: string | null
@@ -39,6 +41,13 @@ const TYPE_LABEL: Record<InspectionType, string> = {
   move_out: 'Move-out',
   periodic: 'Periodic',
   turnover: 'Turnover',
+}
+
+// S550: on a periodic, 'tenant_signed' means the tenant SUBMITTED their
+// self-directed walkthrough — no signature exists (signing is move-in only).
+export function inspectionStatusLabel(type: string, status: string): string {
+  if (type === 'periodic' && status === 'tenant_signed') return 'Submitted for review'
+  return humanize(status)
 }
 
 export function InspectionsPage() {
@@ -96,7 +105,7 @@ export function InspectionsPage() {
             <select value={statusFilter} onChange={e => setStatusFilter(e.target.value)} className="input" style={{ minWidth: 160 }}>
               <option value="">All statuses</option>
               <option value="draft">Draft</option>
-              <option value="tenant_signed">Tenant signed</option>
+              <option value="tenant_signed">Tenant signed / Submitted</option>
               <option value="landlord_signed">Both signed</option>
               <option value="finalized">Finalized</option>
               <option value="disputed">Disputed</option>
@@ -131,7 +140,11 @@ export function InspectionsPage() {
               {filtered.map(r => (
                 <tr key={r.id}>
                   <td><strong>{TYPE_LABEL[r.inspectionType] || r.inspectionType}</strong></td>
-                  <td><span className={`badge ${STATUS_BADGE[r.status] || 'badge-muted'}`}>{humanize(r.status)}</span></td>
+                  <td>
+                    {r.flaggedSuspiciousAt
+                      ? <span className="badge badge-red">Flagged suspicious</span>
+                      : <span className={`badge ${STATUS_BADGE[r.status] || 'badge-muted'}`}>{inspectionStatusLabel(r.inspectionType, r.status)}</span>}
+                  </td>
                   <td>
                     {r.unitNumber ?? '—'}
                     {r.propertyName && <span style={{ fontSize: '.72rem', color: 'var(--text-3)' }}> · {r.propertyName}</span>}
@@ -149,9 +162,10 @@ export function InspectionsPage() {
       </div>
 
       <div style={{ marginTop: 16, fontSize: '.78rem', color: 'var(--text-3)' }}>
-        Move-out inspections compare against the linked move-in. Both
-        parties must sign before finalize. Finalize fires the
-        condition-match (or damage-documented) credit-ledger event.
+        Move-out inspections compare against the linked move-in. The tenant
+        signs move-in inspections only — everything else finalizes on the
+        landlord signature. Finalize fires the condition-match (or
+        damage-documented) credit-ledger event.
       </div>
     </div>
   )

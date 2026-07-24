@@ -6,14 +6,14 @@ Every team member you add is scoped two ways: by what they can do (their role an
 
 What each role does:
 
-- Property Manager — the broadest helper. With the right toggles, they can manage properties, units, tenants, and leases. You can also set a maintenance approval ceiling so they can approve repair costs up to a dollar limit you choose, while anything above it still comes to you. You decide which abilities are on; permissions you don't grant stay off.
+- Property Manager — the broadest helper. With the right toggles, they can manage properties, units, tenants, and leases. You can also grant or withhold the maintenance-approval permission per manager. You decide which abilities are on; permissions you don't grant stay off.
 - On-Site Manager — handles tasks at the properties you assign, without portfolio-wide reach.
 - Maintenance — receives repair requests tenants file. You can limit a worker to specific job categories (like plumbing, electrical, HVAC, appliance, or landscaping) so they only see work that fits their trade.
 - Bookkeeper — works at the books level with either read-only or read-write access, so you can give an accountant visibility without handing over operational controls.
 
 Limiting access by property or unit:
 
-For managers, on-site managers, and maintenance workers, you choose the boundary when you invite them and can change it later:
+For managers and maintenance workers, you choose the boundary when you invite them and can change it later. An on-site manager's property is fixed when they're added — to move them, remove and re-invite them at the new property (their units and permissions can still be adjusted):
 
 - All properties — full reach across everything you own.
 - Specific properties — only the ones you select.

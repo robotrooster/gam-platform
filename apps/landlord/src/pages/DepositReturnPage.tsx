@@ -4,6 +4,7 @@ import { useParams, useNavigate } from 'react-router-dom'
 import { ArrowLeft, Plus, Trash2, AlertTriangle, CheckCircle2, DollarSign } from 'lucide-react'
 import { humanize } from '@gam/shared'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
+import { toast } from '../components/dialogs'
 
 // W-31 (Nic decision): free-form deductions are DOCUMENTED DAMAGES only —
 // description + at least one photo/receipt per line. Utilities/rent arrive
@@ -39,6 +40,11 @@ type DepositReturnState = {
   gapChargeFailed?: boolean
   gapChargeFailureReason?: string | null
   notes?: string | null
+  // S548: approval-threshold context from the GET route
+  approvalThreshold?: number
+  viewerIsOwner?: boolean
+  moveOutInspectionRequired?: boolean
+  moveOutInspection?: { id: string; status: string; scheduledFor?: string | null; finalizedAt?: string | null; photoCount: number } | null
 }
 
 const UNPAID_TYPE_LABEL: Record<string, string> = {
@@ -96,9 +102,14 @@ export function DepositReturnPage() {
   const finalizeMut = useMutation(
     () => apiPost<any>(`/leases/${leaseId}/deposit-return/finalize`),
     {
-      onSuccess: () => {
+      onSuccess: (r: any) => {
         setShowFinalizeConfirm(false)
         qc.invalidateQueries(['deposit-return', leaseId])
+        // S548: staff finalize above the landlord's threshold parks the
+        // return for approval instead of paying out.
+        if (r?.data?.status === 'awaiting_approval') {
+          toast(`Refund of ${fmt(Number(r.data.refund_amount))} is above the ${fmt(Number(r.data.threshold))} approval threshold — sent to the landlord for approval.`)
+        }
       },
       onError: (e: any) => setError(e?.response?.data?.error || 'Finalize failed'),
     },
@@ -119,6 +130,15 @@ export function DepositReturnPage() {
   const gap = round2(Math.max(0, totalDeductions - tenantPool))
 
   const isFinalized = !!data.finalizedAt
+  // S548: approval-threshold context (owner-level viewers bypass the gate).
+  const viewerIsOwner = data.viewerIsOwner !== false
+  const approvalThreshold = Number(data.approvalThreshold ?? 500)
+  const isAwaitingApproval = data.status === 'awaiting_approval'
+  // S548: dwellings + storage need the finalized in-person walkthrough
+  // before Begin Move-Out; the evidence links here for the approval review.
+  const walkthrough = data.moveOutInspection ?? null
+  const walkthroughDone = walkthrough?.status === 'finalized'
+  const walkthroughBlocksBegin = !!data.moveOutInspectionRequired && !walkthroughDone
   const isPreview = !!data.preview
 
   return (
@@ -140,6 +160,45 @@ export function DepositReturnPage() {
       {error && (
         <div className="card" style={{ padding: 12, marginBottom: 16, background: 'rgba(239,68,68,.08)', borderColor: 'rgba(239,68,68,.3)', color: 'var(--red)' }}>
           {error}
+        </div>
+      )}
+
+      {/* S548: move-out walkthrough state — the gate before Begin, the
+          evidence link during review/approval. */}
+      {data.moveOutInspectionRequired && (
+        <div className="card" style={{ padding: 16, marginBottom: 16,
+          background: walkthroughDone ? 'rgba(34,197,94,.05)' : 'rgba(245,158,11,.06)',
+          borderColor: walkthroughDone ? 'rgba(34,197,94,.2)' : 'rgba(245,158,11,.25)' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+            <div>
+              <strong style={{ color: walkthroughDone ? 'var(--green)' : 'var(--amber)' }}>
+                {walkthroughDone ? 'Move-out walkthrough complete' : 'Move-out walkthrough required'}
+              </strong>
+              <div style={{ fontSize: '.82rem', color: 'var(--text-2)', marginTop: 4 }}>
+                {walkthroughDone
+                  ? `Finalized in-person inspection on file (${walkthrough!.photoCount} photo${walkthrough!.photoCount === 1 ? '' : 's'}) — review it before approving this return.`
+                  : walkthrough
+                  ? `In-person walkthrough scheduled — due by ${walkthrough.scheduledFor ? new Date(walkthrough.scheduledFor).toLocaleDateString() : 'the deadline'}. The deposit return can't begin until it's finalized with photos.`
+                  : 'This unit type requires a finalized in-person walkthrough (with photos) before the deposit return can begin.'}
+              </div>
+            </div>
+            {walkthrough && (
+              <button className="btn btn-ghost btn-sm" onClick={() => navigate(`/inspections/${walkthrough.id}`)}>
+                {walkthroughDone ? `View walkthrough (${walkthrough.photoCount} photos)` : 'Open walkthrough'}
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* S548: staff-prepared return above the landlord's threshold */}
+      {data.status === 'awaiting_approval' && !isFinalized && (
+        <div className="card" style={{ padding: 16, marginBottom: 16, background: 'rgba(245,158,11,.06)', borderColor: 'rgba(245,158,11,.25)' }}>
+          <strong style={{ color: 'var(--amber)' }}>Awaiting landlord approval</strong>
+          <div style={{ fontSize: '.85rem', color: 'var(--text-2)', marginTop: 6 }}>
+            This refund is above the approval threshold, so a team member can't send it alone.
+            The landlord has been notified — their Finalize releases it.
+          </div>
         </div>
       )}
 
@@ -365,8 +424,10 @@ export function DepositReturnPage() {
       {/* Action row */}
       <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
         {isPreview && !isFinalized && (
-          <button className="btn btn-primary" onClick={() => beginMut.mutate()} disabled={beginMut.isLoading}>
-            {beginMut.isLoading ? 'Starting…' : 'Begin Move-Out'}
+          <button className="btn btn-primary" onClick={() => beginMut.mutate()}
+            disabled={beginMut.isLoading || walkthroughBlocksBegin}
+            title={walkthroughBlocksBegin ? 'Finalize the in-person move-out walkthrough first' : undefined}>
+            {walkthroughBlocksBegin ? 'Walkthrough required first' : beginMut.isLoading ? 'Starting…' : 'Begin Move-Out'}
           </button>
         )}
         {!isPreview && !isFinalized && (
@@ -378,19 +439,32 @@ export function DepositReturnPage() {
             >
               {patchMut.isLoading ? 'Saving…' : 'Save draft'}
             </button>
-            <button
-              className="btn btn-primary"
-              onClick={() => {
-                // Save first, then finalize
-                patchMut.mutate(
-                  { damageLines: draftLines, notes },
-                  { onSuccess: () => setShowFinalizeConfirm(true) },
-                )
-              }}
-              disabled={patchMut.isLoading || finalizeMut.isLoading}
-            >
-              Review & Finalize
-            </button>
+            {/* S548: staff can't release a parked return — the landlord's
+                finalize is the approval. Staff over the threshold see the
+                button as the send-for-approval action instead. */}
+            {isAwaitingApproval && !viewerIsOwner ? (
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                <button className="btn btn-primary" disabled title="A refund this size needs the landlord's approval">
+                  Landlord reviewing…
+                </button>
+              </span>
+            ) : (
+              <button
+                className="btn btn-primary"
+                onClick={() => {
+                  // Save first, then finalize
+                  patchMut.mutate(
+                    { damageLines: draftLines, notes },
+                    { onSuccess: () => setShowFinalizeConfirm(true) },
+                  )
+                }}
+                disabled={patchMut.isLoading || finalizeMut.isLoading}
+              >
+                {isAwaitingApproval && viewerIsOwner ? 'Approve & Finalize'
+                  : !viewerIsOwner && refund > approvalThreshold ? 'Send to Landlord for Approval'
+                  : 'Review & Finalize'}
+              </button>
+            )}
           </>
         )}
       </div>
@@ -408,6 +482,11 @@ export function DepositReturnPage() {
                   <span style={{ color: 'var(--amber)', display: 'inline-flex', alignItems: 'center', gap: 6 }}>
                     <AlertTriangle size={13} /> If the auto-charge fails (no payment method, declined card), an admin alert will fire and you can pursue manually.
                   </span>
+                </>
+              ) : refund > 0 && !viewerIsOwner && refund > approvalThreshold ? (
+                <>
+                  This refund of <strong>{fmt(refund)}</strong> is above the landlord's <strong>{fmt(approvalThreshold)}</strong> approval threshold.
+                  Nothing pays out yet — the landlord will be notified to review and approve it.
                 </>
               ) : refund > 0 ? (
                 <>

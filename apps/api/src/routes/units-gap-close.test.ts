@@ -32,7 +32,7 @@ import jwt from 'jsonwebtoken'
 import { randomUUID } from 'crypto'
 import { db } from '../db'
 import {
-  cleanupAllSchema, seedLandlord, seedProperty, seedUnit,
+  cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedLateFeeDecision,
 } from '../test/dbHelpers'
 import { unitsRouter } from './units'
 import { errorHandler } from '../middleware/errorHandler'
@@ -504,5 +504,45 @@ describe('POST /api/units/:id/cancel-scheduled-activation', () => {
       .post(`/api/units/${f.bUnitId}/cancel-scheduled-activation`)
       .set('Authorization', `Bearer ${f.tokenA}`)
     expect(res.status).toBe(403)
+  })
+})
+
+// ─── S550: dwelling_ownership defaults + subtype inheritance ─────
+
+describe('POST /api/units — dwelling_ownership (S550)', () => {
+  async function decide(propertyId: string, unitType: string) {
+    const c = await db.connect()
+    try { await seedLateFeeDecision(c, { propertyId, unitType }) } finally { c.release() }
+  }
+  async function createUnit(f: Fixture, body: any) {
+    const res = await request(buildApp()).post('/api/units')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ propertyId: f.aPropId, unitNumber: `S550-${Math.random().toString(36).slice(2, 7)}`, rentAmount: 500, ...body })
+    expect(res.status).toBe(201)
+    const row = await db.query<{ dwelling_ownership: string }>(
+      `SELECT dwelling_ownership FROM units WHERE id = $1`, [res.body.data.id])
+    return row.rows[0].dwelling_ownership
+  }
+
+  it('mobile_home and rv_spot default TENANT-owned; apartment defaults landlord', async () => {
+    const f = await seed()
+    await decide(f.aPropId, 'mobile_home')
+    await decide(f.aPropId, 'rv_spot')
+    await decide(f.aPropId, 'apartment')
+    expect(await createUnit(f, { unitType: 'mobile_home' })).toBe('tenant')
+    expect(await createUnit(f, { unitType: 'rv_spot' })).toBe('tenant')
+    expect(await createUnit(f, { unitType: 'apartment' })).toBe('landlord')
+    // Explicit park-owned wins over the default.
+    expect(await createUnit(f, { unitType: 'mobile_home', dwellingOwnership: 'landlord' })).toBe('landlord')
+  })
+
+  it('a subtype carries ownership — units minted from it inherit', async () => {
+    const f = await seed()
+    await decide(f.aPropId, 'mobile_home')
+    const sub = await db.query<{ id: string }>(
+      `INSERT INTO property_unit_subtypes (property_id, unit_type, name, rent_amount, dwelling_ownership)
+       VALUES ($1, 'mobile_home', 'Park Model Rental', 800, 'landlord') RETURNING id`,
+      [f.aPropId])
+    expect(await createUnit(f, { subtypeId: sub.rows[0].id })).toBe('landlord')
   })
 })

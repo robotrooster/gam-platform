@@ -92,6 +92,8 @@ export async function resolveInteractionProperty(
  */
 export function deriveOutcome(result: AgentSessionResult, outcomeError?: string): AgentOutcome {
   if (outcomeError) return 'error'
+  if (result.shed) return 'shed'
+  if (result.rateLimited) return 'rate_limited'
   if (result.humanHandoff != null || result.handledBy.tier === 'human') return 'escalated_to_human'
   if (result.handledBy.tier === 'escalation') return 'answered_escalation'
   if (result.toolInvocations.length > 0) return 'action_taken'
@@ -172,7 +174,9 @@ export async function logInteraction(
         result.reply,
         result.humanHandoff ? JSON.stringify(result.humanHandoff) : null,
         ctx.outcomeError ?? null,
-        JSON.stringify({}),
+        // cached marks FAQ-cache hits (no model call) so the turn-budget's
+        // unproductive-turn counter can exclude them.
+        JSON.stringify(result.cached ? { cached: true } : {}),
       ]
     )
     return rows[0]?.id ?? null

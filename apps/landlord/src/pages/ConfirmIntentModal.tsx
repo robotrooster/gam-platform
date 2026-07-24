@@ -473,6 +473,12 @@ export function ConfirmIntentModal({
     liabilityInsurance: null, mobileHome: null,
   })
   const [touched, setTouched] = useState<Set<EntitySectionId>>(new Set())
+  // S550: conditional fees ("if not X, then $Y") detected by the parser.
+  // The landlord PRUNES false positives here; kept rows become lease_fees
+  // with condition_text (charged only when the move-out inspection assesses
+  // the condition as failed). Wholesale-replace semantics like other arrays.
+  const [condFees, setCondFees] = useState<any[]>([])
+  const [condFeesTouched, setCondFeesTouched] = useState(false)
   const [collapsed, setCollapsed] = useState<Set<EntitySectionId>>(new Set())
   const [pendingRemoval, setPendingRemoval] = useState<{ sectionId: EntityArraySectionId; idx: number; row: any } | null>(null)
   const removalTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -510,6 +516,7 @@ export function ConfirmIntentModal({
       liabilityInsurance: po.liabilityInsurance ?? null,
       mobileHome:         po.mobileHome ?? null,
     })
+    setCondFees(po.conditionalFees ? [...po.conditionalFees] : [])
     const initial = new Set<EntitySectionId>()
     ;(Object.keys(next) as EntityArraySectionId[]).forEach(k => {
       if (next[k].length === 0) initial.add(k)
@@ -695,6 +702,7 @@ export function ConfirmIntentModal({
       if (touched.has('occupants'))           materialized.additionalOccupants = entityArrays.occupants
       if (touched.has('liabilityInsurance'))  materialized.liabilityInsurance  = entityObjects.liabilityInsurance
       if (touched.has('mobileHome'))          materialized.mobileHome          = entityObjects.mobileHome
+      if (condFeesTouched)                    materialized.conditionalFees     = condFees
       // Tenant-nested arrays ride mergeTenants (which does { ...b, ...o } per index).
       if (touched.has('identifications') || touched.has('emergencyContacts')) {
         materialized.tenants = materialized.tenants || []
@@ -825,6 +833,31 @@ export function ConfirmIntentModal({
               <FieldRow label="Subleasing policy" type="select"
                 options={SUBLEASING_POLICIES.map((s: string) => ({ value: s, label: humanize(s) }))}
                 parsed={fieldAt(parsed, 'lease.subleasingAllowed')} override={overrides['lease.subleasingAllowed']} onEdit={v => setOverride('lease.subleasingAllowed', v)} />
+
+              {condFees.length > 0 && (
+                <>
+                  <SectionHeader title="Conditional fees (from the lease)" />
+                  <div style={{ fontSize: '.75rem', color: 'var(--text-3)', margin: '4px 0 8px' }}>
+                    "If not done, then $X" clauses found in the document. Each becomes a lease fee
+                    that only charges if the move-out walkthrough finds the condition unmet.
+                    Remove anything that isn't a real obligation.
+                  </div>
+                  {condFees.map((cf, i) => (
+                    <div key={i} style={{ display: 'flex', gap: 10, alignItems: 'flex-start', padding: '8px 10px', border: '1px solid var(--border-0)', borderRadius: 8, marginBottom: 6 }}>
+                      <div style={{ flex: 1 }}>
+                        <div style={{ fontWeight: 700 }}>{cf.label} — ${Number(cf.amount).toFixed(2)}</div>
+                        <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 2 }}>{cf.conditionText}</div>
+                      </div>
+                      <button
+                        className="btn btn-ghost btn-sm"
+                        onClick={() => { setCondFees(prev => prev.filter((_, j) => j !== i)); setCondFeesTouched(true) }}
+                      >
+                        Remove
+                      </button>
+                    </div>
+                  ))}
+                </>
+              )}
 
               <SectionHeader title="Co-residents" />
               <EntityArraySection

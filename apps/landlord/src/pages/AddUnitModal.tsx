@@ -38,6 +38,7 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
     sqft:             '',
     rvSiteLayout:     'back_in',
     rvAmpService:     '30',
+    dwellingOwnership: '',
     storageSize:      '',
     rentAmount:       '',
     securityDeposit:  '',
@@ -107,6 +108,12 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
   const selectedProperty = (properties as any[]).find(p => p.id === form.propertyId)
   const isRv = form.unitType === 'rv_spot'
   const hasBeds = UNIT_TYPE_HAS_BEDROOMS[form.unitType]
+  // S550: dwelling ownership only matters for RV spots and mobile homes —
+  // it decides whether inspections cover the site only (tenant-owned) or the
+  // dwelling too (park-owned). BOTH default tenant-owned (Nic: most parks
+  // deliberately don't own the homes); park-owned rentals are the exception.
+  const ownershipRelevant = isRv || form.unitType === 'mobile_home'
+  const dwellingOwnership = form.dwellingOwnership || 'tenant'
   const subtypesForType = (subtypes as PropertyUnitSubtype[]).filter(s => s.unitType === form.unitType)
   const selectedSubtype = subtypesForType.find(s => s.id === form.subtypeId) || null
   const qty = Math.max(1, parseInt(form.quantity) || 1)
@@ -178,6 +185,7 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
         weeklyRate:   form.weeklyRate ? Number(form.weeklyRate) : null,
       } : {}),
       ...(form.unitType === 'storage' && !s && form.storageSize.trim() ? { storageSize: form.storageSize.trim() } : {}),
+      ...(ownershipRelevant && !s ? { dwellingOwnership } : {}),
       status:          form.status,
     })
   }
@@ -387,6 +395,30 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
                           </div>
                         ))}
                       </div>
+                    </div>
+                  </div>
+                )}
+
+                {ownershipRelevant && (
+                  <div style={{ marginBottom: 14 }}>
+                    <label style={labelStyle}>{isRv ? 'Who owns the RV?' : 'Who owns the home?'}</label>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+                      {[{ v: 'tenant', l: 'Tenant-owned' }, { v: 'landlord', l: 'Park-owned' }].map(o => (
+                        <div key={o.v} onClick={() => set('dwellingOwnership', o.v)}
+                          style={{ padding: '8px 6px', borderRadius: 8, cursor: 'pointer', textAlign: 'center', fontSize: '.75rem', fontWeight: 600,
+                            border: `1px solid ${dwellingOwnership === o.v ? 'var(--gold)' : 'var(--border-0)'}`,
+                            background: dwellingOwnership === o.v ? 'rgba(201,162,39,.08)' : 'var(--bg-2)',
+                            color: dwellingOwnership === o.v ? 'var(--gold)' : 'var(--text-1)' }}>
+                          {o.l}
+                        </div>
+                      ))}
+                    </div>
+                    <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 4 }}>
+                      {dwellingOwnership === 'tenant'
+                        ? 'Space rent only — inspections cover the site/lot, never their dwelling.'
+                        : isRv
+                          ? 'Park-owned rental — inspections cover the site plus the RV itself.'
+                          : 'Park-owned rental home — inspections cover the full home interior.'}
                     </div>
                   </div>
                 )}

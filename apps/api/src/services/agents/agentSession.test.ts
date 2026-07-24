@@ -21,6 +21,12 @@ vi.mock('./curatedFaq', () => ({ matchCuratedFaq: matchCuratedFaqMock }))
 // Cross-session memory off by default; overridden in one test.
 const { loadUserContextMock } = vi.hoisted(() => ({ loadUserContextMock: vi.fn().mockResolvedValue(null) }))
 vi.mock('./conversationHistory', () => ({ loadUserContext: loadUserContextMock }))
+// Daily budget allows by default; overridden to cap in one test.
+const { checkTurnBudgetMock } = vi.hoisted(() => ({ checkTurnBudgetMock: vi.fn().mockResolvedValue({ allowed: true }) }))
+vi.mock('./turnBudget', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./turnBudget')>()),
+  checkTurnBudget: checkTurnBudgetMock,
+}))
 
 import { runAgentWithTools } from './agentRunner'
 import { logInteraction } from './logInteraction'
@@ -127,7 +133,7 @@ describe('runAgentSession', () => {
     matchCuratedFaqMock.mockResolvedValue(null) // restore default
   })
 
-  it('sheds gracefully under load without running the turn or logging', async () => {
+  it('sheds gracefully under load without running the turn — and LOGS the shed', async () => {
     getTurnGateMock.mockReturnValueOnce({ acquire: vi.fn().mockResolvedValue(null) }) // gate sheds
     const res = await runAgentSession({ audience: 'tenant', actor: ACTOR, message: 'hi' })
 
@@ -135,7 +141,23 @@ describe('runAgentSession', () => {
     expect(res.reply).toMatch(/high volume/i)
     expect(res.reply).not.toMatch(/specialist/i) // not the human-handoff copy
     expect(mockRun).not.toHaveBeenCalled() // never touched the model
-    expect(mockLog).not.toHaveBeenCalled()
+    // S553: shed turns ARE logged (outcome 'shed' via deriveOutcome) — shed
+    // volume drives the capacity alarm on the admin Agent Analytics page.
+    expect(mockLog).toHaveBeenCalledTimes(1)
+    const [, loggedResult] = mockLog.mock.calls[0]
+    expect(loggedResult.shed).toBe(true)
+  })
+
+  it('refuses a budget-capped turn with the canned reply, no model call — and LOGS it', async () => {
+    checkTurnBudgetMock.mockResolvedValueOnce({ allowed: false, reason: 'daily_unproductive' })
+    const res = await runAgentSession({ audience: 'tenant', actor: ACTOR, message: 'what is ten plus ten?' })
+
+    expect(res.rateLimited).toBe(true)
+    expect(res.reply).toMatch(/limit for our conversations today/i)
+    expect(mockRun).not.toHaveBeenCalled() // zero model calls — the whole point
+    expect(mockLog).toHaveBeenCalledTimes(1)
+    const [, loggedResult] = mockLog.mock.calls[0]
+    expect(loggedResult.rateLimited).toBe(true)
   })
 
   it('logs the interaction once, with the final handler profile id', async () => {

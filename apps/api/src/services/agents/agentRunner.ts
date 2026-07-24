@@ -57,6 +57,38 @@ function promisesHandoff(content: string): boolean {
   return HANDOFF_VERB.test(content) && SUPPORT_TARGET.test(content)
 }
 
+// S552: user messages that name THEIR OWN account data — "my lease", "my
+// deposit", "what do I owe", "my next payout"… A tool-less final answer to
+// one of these gets one forced retry (see the safety net in the loop).
+// Deliberately narrow: generic product questions ("how do late fees work")
+// must NOT match, or every FAQ turn would pay a second model call.
+const ACCOUNT_DATA_INTENT =
+  /\b(my|our)\s+(?:\w+\s+)?(lease|deposit|balance|rent|payments?|payout|invoice|maintenance requests?|documents?|payment methods?|property manager|entry requests?|inspections?)\b|what do (i|we) owe|when('| i)?s my (next |last )?(payment|payout|rent)|\bon file\b|what documents|documents? do (i|we) have|requested entry|entry request/i
+
+// S553: two more hard-stop nets, same philosophy as MONEY_DISPUTE_INTENT
+// (the prompt rule holds most runs; quantized variance drops it some runs —
+// the deterministic net doesn't). Both must END in the escalation tool:
+// - legal ACTION/dispute signals (suing, lawyer, "take legal action") — NOT
+//   what-does-the-law-say questions, which landlord agents answer with the
+//   law tools by design.
+// - account-security incidents (hacked, someone logged in, compromised).
+const LEGAL_ACTION_INTENT =
+  /take legal action|legal action against|(talk|speak|spoke) to (a |my )?(lawyer|attorney)|(my|a|an|the) (lawyer|attorney)\b|\bsue\b|\bsuing\b|small claims|press charges/i
+const ACCOUNT_SECURITY_INTENT =
+  /\bhacked\b|hacker|someone (else )?(logged|signed|got) in(to)?|unauthori[sz]ed (access|login)|account (was |got |is )?(compromised|stolen|taken over)|login (alert|attempt).{0,25}(don'?t|did ?n'?t|do not) recognize/i
+
+// S552: a demand to move money — refund, double-charge, dispute — is a hard
+// stop that must END in the escalation tool. The model follows the prompt
+// rule most runs but not all (quantized-model variance); when a matching
+// turn finishes with no handoff, force one corrective retry.
+// S553: missing-money phrasings added ("my payout never arrived", "where is
+// my money") — a landlord whose payout is lost is a money dispute exactly
+// like a tenant refund demand. Patterns stay TIGHT on the dispute framing so
+// ordinary balance questions ("where did my payment get applied?") never trip
+// the escalation net.
+const MONEY_DISPUTE_INTENT =
+  /\brefund\b|double.?charged|charged (me )?twice|overcharged|charge.?back|didn.?t authori[sz]e|(payout|transfer|my money).{0,30}(never|didn'?t|hasn'?t|not) (arrived?|show(ed|n)? up|hit|come)|where('?s| is) my money\b|disput(e|ing|ed).{0,30}(charge|payment|transaction|bank)|(want|get|getting) my money back/i
+
 function synthesizeHandoff(profile: AgentProfile, content: string): HandoffSignal | undefined {
   if (!promisesHandoff(content)) return undefined
   const allow = profile.toolNames ?? []
@@ -131,6 +163,9 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
   ]
 
   const toolInvocations: ToolInvocation[] = []
+  let nudgedForAccountData = false
+  let nudgedForDispute = false
+  let nudgedForHardStop = false
   let model = ''
   const usage = { promptTokens: 0, completionTokens: 0 }
   const grounded = retrieved.length > 0
@@ -152,6 +187,64 @@ export async function runAgentWithTools(input: RunWithToolsInput): Promise<RunWi
       if (synth) {
         logger.warn({ profile: profile.id }, 'agent runner: model promised a handoff in prose without calling escalate — synthesizing the escalation (safety net)')
         return { reply: out.content, model, retrieved, grounded, toolInvocations, usage, handoff: synth }
+      }
+      // S552 safety net (same philosophy as synthesizeHandoff): the model
+      // sometimes answers an obviously ACCOUNT-SPECIFIC question from
+      // general knowledge without calling any tool — observed fabricating
+      // lease dates ("ends September 15th" for a Nov 4 lease) and emitting
+      // literal placeholders ("[date]"). When the user's message names
+      // their own account data and NO tool ran this turn, force one
+      // corrective retry before accepting a tool-less answer.
+      // Money-dispute turns must end in the escalation tool, tool-less or
+      // not — a refund demand where the model only investigated (or only
+      // explained) still strands the customer without a human.
+      if (!nudgedForDispute && MONEY_DISPUTE_INTENT.test(message)) {
+        nudgedForDispute = true
+        logger.warn({ profile: profile.id }, 'agent runner: money-dispute turn ended without escalation — forcing one retry (safety net)')
+        messages.push({ role: 'assistant', content: out.content })
+        messages.push({
+          role: 'system',
+          content:
+            'STOP — this customer is disputing a charge or demanding a refund. That is a hard stop: ' +
+            'you must CALL your escalation tool now so a human handles the money movement. ' +
+            'Do not investigate further and do not promise any outcome — escalate in this reply.',
+        })
+        continue
+      }
+      if (!nudgedForHardStop && (LEGAL_ACTION_INTENT.test(message) || ACCOUNT_SECURITY_INTENT.test(message))) {
+        nudgedForHardStop = true
+        const kind = LEGAL_ACTION_INTENT.test(message) ? 'a legal dispute' : 'an account-security incident'
+        logger.warn({ profile: profile.id, kind }, 'agent runner: hard-stop turn ended without escalation — forcing one retry (safety net)')
+        messages.push({ role: 'assistant', content: out.content })
+        messages.push({
+          role: 'system',
+          content:
+            `STOP — this customer is raising ${kind}. That is a hard stop: you must CALL your ` +
+            'escalation tool now so a human specialist takes over. Do not give advice, do not ' +
+            'investigate further, and do not promise any outcome — escalate in this reply.',
+        })
+        continue
+      }
+      if (
+        !nudgedForAccountData &&
+        toolInvocations.length === 0 &&
+        ACCOUNT_DATA_INTENT.test(message)
+      ) {
+        nudgedForAccountData = true
+        logger.warn({ profile: profile.id }, 'agent runner: tool-less answer to an account-data question — forcing one tool retry (safety net)')
+        messages.push({ role: 'assistant', content: out.content })
+        messages.push({
+          role: 'system',
+          content:
+            'STOP — your last answer stated account-specific facts without fetching them. ' +
+            'You have NOT looked up this customer\'s data; any date or amount you stated was invented. ' +
+            'Call the matching tool NOW (their lease → get_my_lease, deposit → get_my_deposit, ' +
+            'balance/payments → the payment tools, payouts → get_my_payouts, documents → get_my_documents, ' +
+            'payment methods on file → get_my_payment_methods, entry requests → get_my_entry_requests, ' +
+            'property manager / contacts → get_my_contacts) and answer from its result. ' +
+            'If no tool covers it, say plainly that you cannot see that information.',
+        })
+        continue
       }
       return { reply: out.content, model, retrieved, grounded, toolInvocations, usage }
     }

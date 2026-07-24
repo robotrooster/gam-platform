@@ -1380,3 +1380,41 @@ export async function emailPosReceipt(
   return send(to, subject, html, { ...ctx, category: ctx.category ?? 'pos_receipt' }, 'noreply',
     [{ filename: `receipt-${receiptNumber}.pdf`, content: pdf }])
 }
+
+// ── S553: sales-call scheduling (Portfolio Specialist funnel) ─────────
+export async function sendSalesCallConfirmation({ to, name, when, mode }: {
+  to: string; name: string; when: string; mode: 'video' | 'phone'
+}) {
+  const first = name.trim().split(/\s+/)[0] || 'there'
+  await send(to, `Your GAM call is booked — ${when}`,
+    base(
+      h(`You're on the calendar`) +
+      p(`Hi ${first} — your call with a GAM Portfolio Specialist is confirmed:`) +
+      `<div style="background:#0a0f14;border-radius:8px;padding:16px;margin:12px 0">
+        <div style="font-weight:700;color:#c9a227;margin-bottom:4px">${when}</div>
+        <div style="color:#b8c4d8;font-size:.82rem">${mode === 'video' ? 'Video call — your Specialist will email you the meeting link before the call.' : 'Phone call — your Specialist will call the number you provided.'}</div>
+      </div>` +
+      p(`We'll walk through your portfolio, show you the platform live, and lay out exact pricing for your setup. If you need to reschedule, just reply to this email.`)
+    ),
+    { category: 'sales_call_confirmation', landlordId: null },
+    'support',
+  )
+}
+
+export async function sendSalesCallReminder({ to, name, when, mode }: {
+  to: string; name: string; when: string; mode: 'video' | 'phone'
+}) {
+  const first = name.trim().split(/\s+/)[0] || 'there'
+  await send(to, `Reminder: your GAM call is coming up — ${when}`,
+    base(
+      h(`See you soon`) +
+      p(`Hi ${first} — a quick reminder that your call with a GAM Portfolio Specialist is coming up:`) +
+      `<div style="background:#0a0f14;border-radius:8px;padding:16px;margin:12px 0">
+        <div style="font-weight:700;color:#c9a227;margin-bottom:4px">${when}</div>
+        <div style="color:#b8c4d8;font-size:.82rem">${mode === 'video' ? 'Video call — watch for the meeting link from your Specialist.' : 'Phone call — your Specialist will call you.'}</div>
+      </div>`
+    ),
+    { category: 'sales_call_reminder', landlordId: null },
+    'support',
+  )
+}

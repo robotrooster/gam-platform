@@ -452,3 +452,105 @@ export async function isRunFullyRead(runId: string): Promise<boolean> {
     [runId])
   return !!row && row.unread === 0
 }
+
+// ── S548: pull-out meter reads (Nic) ─────────────────────────────────
+//
+// The final read MUST happen on the pull-out date: it closes the departing
+// guest's bill (same-day settlement) AND sets the baseline that protects
+// the NEXT arrival from inheriting usage — RV sites turn over same-day in
+// season. Every morning this finds today's departures on submetered sites
+// and prompts the landlord + reading-capable staff, one notification per
+// property, idempotent per day.
+export async function promptMoveOutMeterReads(): Promise<{ prompted: number }> {
+  const departures = await query<{
+    property_id: string; property_name: string; landlord_id: string
+    unit_number: string; who: string | null
+  }>(`
+    SELECT DISTINCT p.id AS property_id, p.name AS property_name, p.landlord_id,
+           u.unit_number, x.who
+      FROM (
+        SELECT l.unit_id,
+               (SELECT us.first_name || ' ' || us.last_name
+                  FROM lease_tenants lt JOIN tenants t ON t.id = lt.tenant_id
+                  JOIN users us ON us.id = t.user_id
+                 WHERE lt.lease_id = l.id AND lt.role = 'primary' LIMIT 1) AS who
+          FROM leases l
+         WHERE l.status = 'active' AND l.end_date = CURRENT_DATE
+        UNION
+        SELECT b.unit_id, b.guest_name AS who
+          FROM unit_bookings b
+         WHERE b.status IN ('confirmed', 'checked_in') AND b.check_out = CURRENT_DATE
+      ) x
+      JOIN units u ON u.id = x.unit_id
+      JOIN properties p ON p.id = u.property_id
+     WHERE EXISTS (
+        SELECT 1 FROM utility_meter_units mu
+          JOIN utility_meters m ON m.id = mu.meter_id AND m.billing_method = 'submeter'
+         WHERE mu.unit_id = u.id)
+     ORDER BY p.id, u.unit_number`)
+  if (departures.length === 0) return { prompted: 0 }
+
+  // Group by property.
+  const byProperty = new Map<string, typeof departures>()
+  for (const d of departures) {
+    const arr = byProperty.get(d.property_id) ?? []
+    arr.push(d)
+    byProperty.set(d.property_id, arr)
+  }
+
+  let prompted = 0
+  for (const [propertyId, rows] of byProperty) {
+    // One prompt per property per day.
+    const already = await queryOne<{ id: string }>(
+      `SELECT id FROM notifications
+        WHERE type = 'moveout_meter_reads_due'
+          AND data ->> 'propertyId' = $1
+          AND created_at::date = CURRENT_DATE
+        LIMIT 1`, [propertyId])
+    if (already) continue
+
+    const prop = rows[0]
+    const siteList = rows.map(r => `${r.unit_number}${r.who ? ` (${r.who})` : ''}`).join(', ')
+    const body =
+      `${rows.length} site${rows.length === 1 ? ' is' : 's are'} pulling out today: ${siteList}. ` +
+      `Read each meter AT checkout — the final bill lands on the departing guest and settles the same day, ` +
+      `and the read is the baseline that keeps their usage off the next arrival's bill.`
+
+    const landlord = await queryOne<{ user_id: string; email: string }>(
+      `SELECT l.user_id, u.email FROM landlords l JOIN users u ON u.id = l.user_id
+        WHERE l.id = $1`, [prop.landlord_id])
+    const staff = await query<{ user_id: string; email: string }>(
+      `SELECT DISTINCT u.id AS user_id, u.email FROM (
+          SELECT user_id FROM property_manager_scopes
+           WHERE landlord_id = $1
+             AND (all_properties = TRUE OR $2::uuid = ANY(property_ids))
+             AND (permissions ->> 'properties.edit')::boolean IS TRUE
+          UNION
+          SELECT user_id FROM onsite_manager_scopes
+           WHERE landlord_id = $1
+             AND (all_properties = TRUE OR $2::uuid = ANY(property_ids))
+             AND (permissions ->> 'properties.edit')::boolean IS TRUE
+        ) s JOIN users u ON u.id = s.user_id`,
+      [prop.landlord_id, propertyId])
+
+    const recipients = [
+      ...(landlord ? [landlord] : []),
+      ...staff.filter(s => s.user_id !== landlord?.user_id),
+    ]
+    for (const r of recipients) {
+      await createNotification({
+        userId: r.user_id, landlordId: prop.landlord_id,
+        type: 'moveout_meter_reads_due',
+        title: `Pull-out meter reads due today — ${prop.property_name}`,
+        body,
+        data: { propertyId, unitNumbers: rows.map(x => x.unit_number) },
+        actionUrl: `/utilities?propertyId=${propertyId}`,
+        sendEmail: true, emailTo: r.email,
+        emailSubject: `Pull-out meter reads due today — ${prop.property_name}`,
+        emailHtml: body,
+      })
+    }
+    prompted++
+  }
+  return { prompted }
+}

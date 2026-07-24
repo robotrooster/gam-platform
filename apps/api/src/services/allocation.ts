@@ -82,8 +82,10 @@ interface PmFeeRow {
 interface ProcessingRateRow {
   customer_facing_flat: string | null
   customer_facing_percent: string | null
+  customer_facing_cap: string | null
   stripe_cost_flat: string | null
   stripe_cost_percent: string | null
+  stripe_cost_cap: string | null
 }
 
 export async function executeRentAllocation(
@@ -111,9 +113,13 @@ export async function executeRentAllocation(
   const cfPercent = parseFloat(rate.customer_facing_percent!)
   const scFlat = parseFloat(rate.stripe_cost_flat!)
   const scPercent = parseFloat(rate.stripe_cost_percent!)
+  // S551: caps are nullable — NULL means uncapped. The ACH row carries the
+  // $6.00 customer cap ($3.00 cost cap) of the locked S113/S551 schedule.
+  const cfCap = rate.customer_facing_cap != null ? parseFloat(rate.customer_facing_cap) : Infinity
+  const scCap = rate.stripe_cost_cap != null ? parseFloat(rate.stripe_cost_cap) : Infinity
 
-  const customerFacingFee = round2(cfFlat + gross * (cfPercent / 100))
-  const stripeCost = round2(scFlat + gross * (scPercent / 100))
+  const customerFacingFee = round2(Math.min(cfFlat + gross * (cfPercent / 100), cfCap))
+  const stripeCost = round2(Math.min(scFlat + gross * (scPercent / 100), scCap))
   const bankingSpread = round2(customerFacingFee - stripeCost)
 
   // S116: pick the right fee toggle based on the payment method.
@@ -360,8 +366,8 @@ async function fetchActiveProcessingRate(
   paymentMethod: PaymentMethod
 ): Promise<ProcessingRateRow> {
   const res = await client.query<ProcessingRateRow>(
-    `SELECT customer_facing_flat, customer_facing_percent,
-            stripe_cost_flat, stripe_cost_percent
+    `SELECT customer_facing_flat, customer_facing_percent, customer_facing_cap,
+            stripe_cost_flat, stripe_cost_percent, stripe_cost_cap
        FROM platform_processing_rates
       WHERE payment_method=$1 AND effective_until IS NULL
       LIMIT 1`,

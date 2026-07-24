@@ -936,6 +936,27 @@ export function schedulerInit() {
     } catch (e) {
       logger.error({ err: e }, '[reading-runs] fatal')
     }
+    // S548 (Nic): every morning — not just month-end — prompt for meter
+    // reads on submetered sites whose guests pull out TODAY. The at-checkout
+    // read closes the departing guest's bill same-day and baselines the
+    // meter for the next arrival.
+    try {
+      const { promptMoveOutMeterReads } = await import('../services/utilityReadingRuns')
+      const r = await promptMoveOutMeterReads()
+      if (r.prompted > 0) logger.info(r, '[moveout-reads]')
+    } catch (e) {
+      logger.error({ err: e }, '[moveout-reads] fatal')
+    }
+    // S548 (Nic): dwellings + storage leases that just ended get their
+    // in-person move-out walkthrough scheduled (3-business-day deadline)
+    // and the assigned staff prompted — the deposit return is gated on it.
+    try {
+      const { scheduleMoveOutInspections } = await import('../services/moveOutInspections')
+      const r = await scheduleMoveOutInspections()
+      if (r.scheduled > 0) logger.info(r, '[moveout-inspections]')
+    } catch (e) {
+      logger.error({ err: e }, '[moveout-inspections] fatal')
+    }
   }, { timezone: 'America/Phoenix' })
 
   // 16a Step 3: auto-Friday payout queue. Fires Mon-Fri 9am Phoenix; engine
@@ -962,6 +983,32 @@ export function schedulerInit() {
   // pulls the route_stops along with them.
   // S536: business invoicing subscription — accrue on the 1st for the
   // prior month, retry pending collections daily. 4:15am Phoenix.
+  // S550 (Nic): nightly address-verification sweep — every property ends
+  // up with coordinates (heat-map infrastructure) + graded verification.
+  // Never-attempted rows first, weekly retry of 'unverified'.
+  cron.schedule('0 4 * * *', async () => {
+    try {
+      const { sweepUnverifiedAddresses } = await import('../services/addressVerification')
+      const r = await sweepUnverifiedAddresses()
+      if (r.attempted > 0) logger.info(r, '[address-verify-sweep]')
+    } catch (e) {
+      logger.error({ err: e }, '[address-verify-sweep] fatal')
+    }
+  })
+
+  // S550 (Nic): daily growth snapshot — per-(state,city) + platform totals
+  // (landlords/properties/units/occupancy/rent-roll). History starts the
+  // day it landed; powers growth-velocity charts + the heat map over time.
+  cron.schedule('10 4 * * *', async () => {
+    try {
+      const { captureGrowthSnapshot } = await import('../services/growthSnapshots')
+      const r = await captureGrowthSnapshot()
+      logger.info(r, '[growth-snapshot]')
+    } catch (e) {
+      logger.error({ err: e }, '[growth-snapshot] fatal')
+    }
+  })
+
   cron.schedule('15 4 * * *', async () => {
     try {
       const { processBusinessMonthlyFees } = await import('./businessMonthlyFees')
@@ -1071,6 +1118,18 @@ export function schedulerInit() {
     }
   })
 
+  // S553: sales-call reminders — every 15 min, emails prospects whose
+  // Portfolio Specialist call starts within ~1h. Idempotent (reminded_at).
+  cron.schedule('*/15 * * * *', async () => {
+    try {
+      const { sendDueCallReminders } = await import('../services/salesCalls')
+      const r = await sendDueCallReminders()
+      if (r.sent > 0) logger.info(r, '[sales-call-reminders]')
+    } catch (e) {
+      logger.error({ err: e }, '[sales-call-reminders] fatal')
+    }
+  })
+
   // S468: recurring-schedule materializer (service-business / Phase 1a.2).
   // Daily at 1:15am Phoenix — sits between manager-fee accrual (1am 1st)
   // and platform-fee accrual (1:30am 1st); on non-monthly days it has the
@@ -1125,9 +1184,13 @@ export function schedulerInit() {
   // accrual row, picked up by the rent-charge code later.
   cron.schedule('30 1 1 * *', async () => {
     try {
-      const { processPlatformFeeAccrual } = await import('./platformFeeAccrual')
+      const { processPlatformFeeAccrual, processScreeningFeeSweep } = await import('./platformFeeAccrual')
       const result = await processPlatformFeeAccrual()
       logger.info(result, '[platform-fee-accrual]')
+      // S552: sweep unbilled screening accruals ($5 compliance fees +
+      // capped-state shortfalls) into platform revenue in the same run.
+      const sweep = await processScreeningFeeSweep()
+      logger.info(sweep, '[screening-fee-sweep]')
     } catch (e) {
       logger.error({ err: e }, '[platform-fee-accrual] fatal')
     }
@@ -1148,6 +1211,22 @@ export function schedulerInit() {
       }
     } catch (e) {
       logger.error({ err: e }, '[sublease-end-of-term] fatal')
+    }
+  }, { timezone: 'America/Phoenix' })
+
+  // S552: stale screening sweep. Daily 2:40am Phoenix — checks stuck in
+  // awaiting_applicant past BGC_STALE_DAYS (default 30; the applicant
+  // never finished Checkr's apply flow) are cancelled and the applicant
+  // refunded in full (MN et al. require refunds when no screening runs).
+  cron.schedule('40 2 * * *', async () => {
+    try {
+      const { sweepStaleBackgroundChecks } = await import('../services/backgroundRefund')
+      const result = await sweepStaleBackgroundChecks()
+      if (result.swept > 0) {
+        logger.info(result, '[bgc-stale-sweep]')
+      }
+    } catch (e) {
+      logger.error({ err: e }, '[bgc-stale-sweep] fatal')
     }
   }, { timezone: 'America/Phoenix' })
 

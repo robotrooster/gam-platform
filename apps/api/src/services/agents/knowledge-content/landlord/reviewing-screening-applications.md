@@ -11,7 +11,7 @@ Your screening list shows every application tied to your account, newest first. 
 Opening an application shows the full submission the applicant provided:
 
 - Name and date of birth
-- The last four digits of their SSN (the full number is never shown to you — it is encrypted and handed only to the screening provider)
+- Identity verification handled securely — depending on the screening provider, the applicant’s SSN is either collected on the provider’s own secure consent page (GAM never touches it) or encrypted end-to-end and handed only to the provider. The full number is never shown to you.
 - Current address and how long they have lived there
 - Employment status, employer name and phone, and monthly income
 - Previous landlord name, phone, and email

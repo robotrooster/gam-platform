@@ -482,7 +482,7 @@ landlordsRouter.post('/complete-onboarding', requireAuth, requireLandlord, async
 // EIN, approval threshold). Not a team-worker surface.
 landlordsRouter.patch('/me', requireAuth, requirePerm('settings.maintenance_approval'), async (req, res, next) => {
   try {
-    const { businessName, ein, maintApprovalThreshold, defaultEarlyTerminationMonthsRent } = req.body
+    const { businessName, ein, maintApprovalThreshold, depositReturnApprovalThreshold, defaultEarlyTerminationMonthsRent } = req.body
     // Sentinel value 'CLEAR' on the months-rent field nulls it out
     // (no policy on file). Otherwise COALESCE preserves prior value
     // when the field is absent.
@@ -492,12 +492,13 @@ landlordsRouter.patch('/me', requireAuth, requirePerm('settings.maintenance_appr
         business_name = COALESCE($1, business_name),
         ein = COALESCE($2, ein),
         maint_approval_threshold = COALESCE($3, maint_approval_threshold),
-        default_early_termination_months_rent = ${clearMonths ? 'NULL' : 'COALESCE($5, default_early_termination_months_rent)'},
+        deposit_return_approval_threshold = COALESCE($5, deposit_return_approval_threshold),
+        default_early_termination_months_rent = ${clearMonths ? 'NULL' : 'COALESCE($6, default_early_termination_months_rent)'},
         updated_at = NOW()
       WHERE id = $4`,
       clearMonths
-        ? [businessName||null, ein||null, maintApprovalThreshold||null, req.user!.profileId]
-        : [businessName||null, ein||null, maintApprovalThreshold||null, req.user!.profileId, defaultEarlyTerminationMonthsRent||null]
+        ? [businessName||null, ein||null, maintApprovalThreshold||null, req.user!.profileId, depositReturnApprovalThreshold ?? null]
+        : [businessName||null, ein||null, maintApprovalThreshold||null, req.user!.profileId, depositReturnApprovalThreshold ?? null, defaultEarlyTerminationMonthsRent||null]
     )
     const updated = await queryOne<any>('SELECT * FROM landlords WHERE id=$1', [req.user!.profileId])
     res.json({ success: true, data: updated })
@@ -2245,7 +2246,7 @@ landlordsRouter.post('/me/onboard-properties-csv/commit', requirePerm('propertie
     // Track property creates within this commit so multiple rows for the
     // same new property share one INSERT.
     const propertyIdByKey = new Map<string, string>()
-    const createdProperties: { id: string; name: string }[] = []
+    const createdProperties: { id: string; name: string; street1?: string; street2?: string | null; city?: string; state?: string; zip?: string }[] = []
     const createdUnits: { id: string; unitNumber: string; propertyId: string }[] = []
     let skippedUnits = 0
 
@@ -2255,6 +2256,44 @@ landlordsRouter.post('/me/onboard-properties-csv/commit', requirePerm('propertie
       // Resolve / create property
       let propertyId: string | undefined = row.resolvedPropertyId
       if (!propertyId) propertyId = propertyIdByKey.get(propKey)
+
+      if (!propertyId) {
+        // S550 (Nic, final form): the ADDRESS is the property — one address,
+        // one record, one account. Same landlord + same name+address ->
+        // attach rows to the existing property. ANY other account at this
+        // address (any name) -> blocked claim (mirrors POST /api/properties;
+        // reveal nothing about that account). Co-owners get added as users
+        // on the primary account, never a rival property record.
+        const existing = (await client.query<{ id: string; landlord_id: string; name: string }>(
+          `SELECT id, landlord_id, name FROM properties
+            WHERE LOWER(TRIM(street1)) = LOWER(TRIM($1))
+              AND LOWER(TRIM(city)) = LOWER(TRIM($2))
+              AND COALESCE(LOWER(TRIM(street2)), '') = COALESCE(LOWER(TRIM($3)), '')
+              AND (landlord_id <> $4 OR LOWER(TRIM(name)) = LOWER(TRIM($5)))
+            ORDER BY (landlord_id = $4) DESC
+            LIMIT 1`,
+          [row.street1, row.city, row.street2 ?? '', landlordId, row.propertyName])).rows[0]
+        if (existing && existing.landlord_id === landlordId) {
+          propertyId = existing.id
+          propertyIdByKey.set(propKey, existing.id)
+        } else if (existing) {
+          const { createAdminNotification } = await import('../services/adminNotifications')
+          await createAdminNotification({
+            severity: 'warn',
+            category: 'duplicate_property_claim',
+            title: `Blocked duplicate property claim (CSV): ${row.propertyName}`,
+            body: `Landlord ${landlordId} CSV-imported "${row.propertyName}" at ` +
+                  `${row.street1}, ${row.city} — already registered under landlord ` +
+                  `${existing.landlord_id} (property ${existing.id}).`,
+            context: { attemptingLandlordId: landlordId, existingPropertyId: existing.id },
+          }).catch(() => {})
+          throw new AppError(409,
+            `Row ${row.rowIndex + 1}: the address ${row.street1}, ${row.city} is already ` +
+            `registered on GAM. If you own a different suite or building at this address, ` +
+            `include its suite/unit line in the address. If you co-own this property, ask ` +
+            `the primary account holder to add you as a user — or contact support.`)
+        }
+      }
 
       if (!propertyId) {
         const propType = ['residential', 'rv_longterm', 'rv_weekly', 'rv_nightly', 'mixed'].includes(row.propertyType)
@@ -2278,7 +2317,11 @@ landlordsRouter.post('/me/onboard-properties-csv/commit', requirePerm('propertie
         )
         propertyId = propRes.rows[0].id as string
         propertyIdByKey.set(propKey, propertyId)
-        createdProperties.push({ id: propertyId, name: propRes.rows[0].name })
+        createdProperties.push({
+          id: propertyId, name: propRes.rows[0].name,
+          street1: row.street1, street2: row.street2 || null,
+          city: row.city, state: row.state, zip: row.zip,
+        })
 
         // Imported properties get a sensible-default allocation rule —
         // tenant pays banking + processing fees (per GAM pricing model),
@@ -2355,6 +2398,22 @@ landlordsRouter.post('/me/onboard-properties-csv/commit', requirePerm('propertie
     }
 
     await client.query('COMMIT')
+
+    // S550: real-world address verification for each newly created property —
+    // sequential (public geocoder is rate-limited), detached, never blocks
+    // the import response.
+    if (createdProperties.length > 0) {
+      const { verifyPropertyAddress } = await import('../services/addressVerification')
+      void (async () => {
+        for (const cp of createdProperties as any[]) {
+          if (!cp.street1) continue
+          await verifyPropertyAddress(cp.id, {
+            street1: cp.street1, street2: cp.street2,
+            city: cp.city, state: cp.state, zip: cp.zip,
+          }).catch(() => {})
+        }
+      })()
+    }
 
     // S295: record the commit + compute first-5 position for the
     // banner. Best-effort — failure here doesn't roll back the

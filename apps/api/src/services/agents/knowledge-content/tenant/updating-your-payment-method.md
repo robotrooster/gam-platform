@@ -8,15 +8,15 @@ You can change how you pay rent in GAM at any time. GAM supports electronic paym
 
 1. Sign in to your tenant portal and open your payment settings.
 2. Add a new payment method — a bank account or a card.
-3. Set it as your preferred method if you'd like to use it going forward, and remove any old method you no longer need.
+3. When you make your next payment, simply pick the new method — you choose which saved method to pay with each time.
 
 ## Choosing between bank account and card
 
 A processing fee may apply based on how you pay, and your payment screen shows it before you confirm:
 
 - **ACH (bank account):** 1.0%, capped at $6.00.
-- **Card:** 3.25%.
-- **Canadian cards charged in USD:** an additional 1.5%.
+- **Card:** 3.25% plus $0.26 per transaction.
+- **Non-US-issued cards:** an additional 1.5%.
 
 Whether you or your landlord covers this fee is a per-property setting. For larger payments, paying from a bank account is often the lowest-cost choice because the ACH fee is capped.
 

@@ -14,9 +14,22 @@ import '@fontsource/jetbrains-mono/400.css'
 import '@fontsource/jetbrains-mono/500.css'
 import { SentryErrorBoundary } from './lib/sentry'
 import { installDatePickerAutoClose } from '@gam/shared'
-import React from 'react'
+import React, { useEffect } from 'react'
+import { apiPost } from './lib/api'
 import ReactDOM from 'react-dom/client'
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
+import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom'
+
+// S550: first-party product telemetry — one page_view per route change.
+// Fire-and-forget; failures are silently ignored (never affects UX).
+function TelemetryPing() {
+  const location = useLocation()
+  useEffect(() => {
+    apiPost('/telemetry/events', {
+      events: [{ portal: 'landlord', event: 'page_view', path: location.pathname }],
+    }).catch(() => {})
+  }, [location.pathname])
+  return null
+}
 import { QueryClient, QueryClientProvider } from 'react-query'
 import { AuthProvider, useAuth } from './context/AuthContext'
 import { Layout, LAUNCH_HIDDEN, visibleNavItemsFor } from './components/layout/Layout'
@@ -137,6 +150,7 @@ export default function App() {
     <QueryClientProvider client={qc}>
       <AuthProvider>
         <BrowserRouter>
+          <TelemetryPing />
           <Routes>
             <Route path="/login"    element={<LoginPage />} />
             <Route path="/register" element={<RegisterPage />} />

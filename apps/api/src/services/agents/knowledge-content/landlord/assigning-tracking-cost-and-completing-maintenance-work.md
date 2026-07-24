@@ -8,6 +8,6 @@ To move a job forward, assign it to whoever's handling the repair. Assigning sta
 
 For cost, you can record an estimated cost and an actual cost. The estimate is what feeds the approval threshold: if it's over your configured limit, the request waits in "awaiting approval" until you approve it. Approving sends it on to the assigned worker if one is already set, or back to open if not, and the tenant is notified that their request is moving forward. The actual cost is what you log once the work is done.
 
-When the repair is finished, mark the request "completed." GAM stamps the completion time and, if you've entered an actual cost, notes it on the thread. A platform fee applies to completed maintenance based on the actual cost recorded.
+When the repair is finished, mark the request "completed." GAM stamps the completion time and, if you've entered an actual cost, notes it on the thread. You pay only the actual repair cost you record — GAM charges no fee on maintenance work.
 
-Your dashboard rolls all of this up: counts of open, assigned, in-progress, and completed work, a flag for any open emergencies, and totals for cost and fees on completed jobs — so you always have a clear read on what's outstanding and what you've spent.
+Your dashboard rolls all of this up: counts of open, assigned, in-progress, and completed work, a flag for any open emergencies, and a total of actual cost on completed jobs — so you always have a clear read on what's outstanding and what you've spent.

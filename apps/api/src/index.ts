@@ -58,6 +58,7 @@ import { tenantsRouter }      from './routes/tenants'
 import { propertiesRouter, publicPropertiesRouter } from './routes/properties'
 import { unitsRouter }        from './routes/units'
 import { propertyBookingAdminRouter } from './routes/propertyBookingAdmin'
+import { telemetryRouter } from './routes/telemetry'
 import { leasesRouter }       from './routes/leases'
 import { subleasesRouter }    from './routes/subleases'
 import { subleaseInvitationsRouter } from './routes/subleaseInvitations'
@@ -287,6 +288,7 @@ app.use('/api/properties',    propertiesRouter)
 app.use('/api/public/properties', publicPropertiesRouter)
 app.use('/api/units',         unitsRouter)
 app.use('/api',               propertyBookingAdminRouter)
+app.use('/api',               telemetryRouter)
 app.use('/api/leases',        leasesRouter)
 app.use('/api/subleases',     subleasesRouter)
 app.use('/api/sublease-invitations', subleaseInvitationsRouter)

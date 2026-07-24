@@ -6,7 +6,7 @@ GAM is built for landlords who want one place to run everything — collecting r
 
 It tends to be a great fit if you:
 
-- **Own anywhere from a single unit to a large portfolio.** The platform scales with you, and you only pay for occupied units.
+- **Own anywhere from a single unit to a large portfolio.** The platform scales with you — vacant units carry no per-unit fee (there is just a modest $10/month per-property minimum for having a property on the platform).
 - **Manage RV parks, extended-stay, or nightly/weekly stays.** GAM has first-class support for these — bookings, check-in/check-out, and flexible stay types — which most traditional tools treat as an afterthought.
 - **Want to stop chasing checks.** Tenants pay electronically (ACH or card), and your payouts land in your connected bank through Stripe on a regular schedule as those payments clear — no mailed checks, no manual deposits.
 - **Operate across more than one location or state.** GAM is a nationwide platform.

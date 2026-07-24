@@ -33,7 +33,10 @@ fi
 pkill -f "ts-node-dev" 2>/dev/null || true
 pkill -f "tsc.*-b.*--watch" 2>/dev/null || true
 sleep 1
-for port in 3001 3002 3003 3005 3009 4000; do
+# S550: :4000 is NOT in this list — the API is a production launchd
+# service (com.gam.api, KeepAlive); killing it here would just fight
+# launchd. Ports below are the local dev portal servers only.
+for port in 3001 3002 3003 3005 3009; do
   pid=$(lsof -ti tcp:$port 2>/dev/null) || true
   [ -n "$pid" ] && kill -9 $pid 2>/dev/null && echo "  killed :$port (pid $pid)" || true
 done
@@ -47,8 +50,9 @@ fi
 echo "Starting launch set..."
 nohup npm run build:watch --workspace=packages/shared > /tmp/gam-shared.log 2>&1 &
 sleep 5   # let shared do its first compile so api boots against fresh dist
-nohup npm run dev --workspace=apps/api       > /tmp/gam-api.log       2>&1 &
-sleep 4
+# S550: API runs as com.gam.api (production, compiled). Ensure it's up.
+launchctl kickstart gui/$(id -u)/com.gam.api 2>/dev/null || true
+sleep 2
 nohup npm run dev --workspace=apps/landlord  > /tmp/gam-landlord.log  2>&1 &
 nohup npm run dev --workspace=apps/tenant    > /tmp/gam-tenant.log    2>&1 &
 nohup npm run dev --workspace=apps/admin     > /tmp/gam-admin.log     2>&1 &

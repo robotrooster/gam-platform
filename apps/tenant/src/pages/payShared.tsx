@@ -16,7 +16,7 @@
  *   - Types: SavedPaymentMethod / SavedAch / SavedCard / PayTarget
  *
  * Backend pricing math lives in services/stripeConnect.computeApplicationFee
- * (S113: 1.0% capped $6 ACH, 3.25% flat card, +1.5% non-US-issued cards).
+ * (S113/S552: 1.0% capped $6 ACH; 3.25% + $0.26/txn card, +1.5% non-US-issued).
  * Frontend never computes the fee — it's shown in the authorization line
  * as customer-facing copy only.
  */
@@ -335,7 +335,7 @@ function authorizationCopy(
 ): string {
   const subject = kind === 'utility' ? 'utility bill' : 'payment'
   if (selectedType === 'card') {
-    return `By clicking Pay you authorize a one-time charge to the selected card for the ${subject} above. Card payments include a 3.25% processing fee (plus 1.5% for non-US-issued cards) which may be passed through depending on your landlord's settings.`
+    return `By clicking Pay you authorize a one-time charge to the selected card for the ${subject} above. Card payments include a 3.25% + $0.26 processing fee (plus 1.5% for non-US-issued cards) which may be passed through depending on your landlord's settings.`
   }
   return `By clicking Pay you authorize a one-time ACH debit from the selected account for the ${subject} above. ACH typically settles in 3–5 business days.`
 }

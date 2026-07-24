@@ -12,14 +12,19 @@ You do not place the order by hand. When an applicant completes and pays for the
 
 Each check carries a status you can watch in your screening list:
 
-- **Pending** — the application is in, the provider has just received it.
+- **Pending** — the application has been submitted and is being handed to the screening provider.
+- **Awaiting applicant** — the screening provider has emailed (and texted) the applicant a secure link to give consent and finish their identity details directly with the provider. The check cannot proceed until they complete that step. If an applicant never finishes, the check auto-cancels after about 30 days and their payment is refunded automatically.
 - **Processing / submitted** — the provider is working the check.
 - **Complete** — the provider returned results. The report is ready to read, and the check is now decision-ready. A completed check stays valid for six months.
 - **Failed** — the provider could not complete the check (for example, a data problem on intake). The failure reason is shown.
-- **Cancelled** — the applicant withdrew the application before it completed.
+- **Cancelled** — the applicant withdrew before it completed, or never finished the provider’s consent step and it auto-cancelled. Either way any screening payment the applicant made is refunded automatically, and you are not billed for that check.
 - **Expired** — the six-month validity window lapsed.
 
 Results arrive automatically from the provider; you do not need to refresh or chase anything.
+
+## What screening costs you
+
+The applicant pays the screening cost up front where their state allows it — passed through at exactly the provider’s price, never marked up, plus the standard card processing fee where state law allows it. Your side is a flat $5 per screening that goes through (if a check is cancelled without a report, the fee is voided), covering GAM’s screening administration and the customer-vetting compliance work. In states that cap or prohibit applicant screening fees, the portion the applicant legally could not be charged is billed to you instead. Both amounts arrive as line items on your monthly platform-fee statement — nothing to pay per-check.
 
 ## Reading the report
 

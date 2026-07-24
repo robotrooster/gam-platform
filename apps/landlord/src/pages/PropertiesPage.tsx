@@ -588,7 +588,7 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
             {/* S513 lock (#2): card is always the tenant's — not selectable. */}
             <div style={{ marginBottom: 12 }}>
               <div style={{ fontSize: '.74rem', fontWeight: 600, color: 'var(--text-1)', marginBottom: 2 }}>Card processing</div>
-              <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginBottom: 6 }}>3.25% per card charge (+1.5% on non-US-issued cards)</div>
+              <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginBottom: 6 }}>3.25% + 26¢ per card charge (+1.5% on non-US-issued cards)</div>
               <div style={{ padding: '6px 10px', borderRadius: 8, fontSize: '.74rem', border: '1px solid var(--border-0)', background: 'var(--bg-2)', color: 'var(--text-2)' }}>
                 Tenant pays — always (landlords never cover card)
               </div>

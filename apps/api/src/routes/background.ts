@@ -10,6 +10,8 @@ import { buildAdverseActionNoticeText } from '../lib/adverseAction'
 import { calculateRiskScore } from '../services/riskScore'
 import { findStayConflict } from '../services/unitAvailability'
 import { getProvider } from '../services/backgroundProvider'
+import { refundBackgroundCheckPayment } from '../services/backgroundRefund'
+import { computeApplicationFee } from '../services/stripeConnect'
 import { query, queryOne } from '../db'
 import { requireAuth, requireAdmin, requirePerm } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
@@ -34,6 +36,65 @@ function isMockIntentId(id: string): boolean {
   return id.startsWith('pi_intake_mock_') || id.startsWith('pi_pool_mock_')
 }
 
+// S551: applicant-side intake fee, capped by the PROPERTY state's
+// application-fee statute when the state_application_fee_caps catalog has a
+// row (S177 hard-compliance carve-out; no row = uncapped). The landlord's
+// screening bill is unchanged — the cap only limits what the APPLICANT is
+// charged; the landlord absorbs the remainder by construction. The cap
+// covers the applicant's TOTAL charge, card processing included (substance
+// over form). fee_prohibited states charge the applicant nothing and the
+// payment step is skipped entirely.
+interface ResolvedIntakeFee {
+  applicantFee: number
+  processingFee: number
+  totalFee: number
+  capApplied: boolean
+  feeProhibited: boolean
+  state: string | null
+}
+async function resolveIntakeFee(
+  landlordId?: string | null,
+  unitId?: string | null
+): Promise<ResolvedIntakeFee> {
+  let state: string | null = null
+  if (unitId) {
+    const r = await queryOne<{ state: string }>(
+      `SELECT p.state FROM units u JOIN properties p ON p.id = u.property_id WHERE u.id = $1`,
+      [unitId]).catch(() => null)
+    state = r?.state ?? null
+  }
+  if (!state && landlordId) {
+    const r = await queryOne<{ state: string }>(
+      `SELECT state FROM properties WHERE landlord_id = $1 ORDER BY created_at LIMIT 1`,
+      [landlordId]).catch(() => null)
+    state = r?.state ?? null
+  }
+  const uncapped: ResolvedIntakeFee = {
+    applicantFee: APPLICANT_FEE_USD, processingFee: INTAKE_PROCESSING_USD,
+    totalFee: INTAKE_TOTAL_USD, capApplied: false, feeProhibited: false, state,
+  }
+  if (!state) return uncapped
+  const cap = await queryOne<{ cap_amount: string | null; fee_prohibited: boolean; actual_cost_only: boolean }>(
+    `SELECT cap_amount, fee_prohibited, actual_cost_only FROM state_application_fee_caps
+      WHERE state = $1 AND effective_year <= EXTRACT(YEAR FROM NOW())
+      ORDER BY effective_year DESC LIMIT 1`,
+    [state]).catch(() => null)
+  if (!cap) return uncapped
+  if (cap.fee_prohibited) {
+    return { applicantFee: 0, processingFee: 0, totalFee: 0, capApplied: true, feeProhibited: true, state }
+  }
+  // Effective cap = the tighter of the numeric statutory cap and — in
+  // actual-cost-only states — the screening package cost itself (no card
+  // processing add-on, no margin of any kind on the applicant side there).
+  const numericCap = cap.cap_amount != null ? parseFloat(cap.cap_amount) : Infinity
+  const actualCostCap = cap.actual_cost_only ? APPLICANT_FEE_USD : Infinity
+  const effCap = Math.min(numericCap, actualCostCap)
+  if (effCap < INTAKE_TOTAL_USD) {
+    return { applicantFee: effCap, processingFee: 0, totalFee: effCap, capApplied: true, feeProhibited: false, state }
+  }
+  return uncapped
+}
+
 export const backgroundRouter = Router()
 
 // ── ENCRYPTION KEY (fail-fast in production) ─────────────────
@@ -46,10 +107,19 @@ if (process.env.NODE_ENV === 'production' && (ENCRYPTION_KEY === DEFAULT_KEY || 
 }
 const IV_LENGTH = 16
 
-// Pricing — read once at module load. Adjust BACKGROUND_CHECK_APPLICANT_FEE_USD
-// once the screening provider is selected and we know the wholesale cost.
+// Pricing — read once at module load. S551: BACKGROUND_CHECK_APPLICANT_FEE_USD
+// is the Checkr package cost passed through at EXACTLY cost (no upcharge —
+// Checkr's terms and Nic's launch rule both forbid marking up the product).
+// The applicant additionally pays card processing at the platform-wide card
+// rate (S113: 3.25%), same as every other card payment on the platform —
+// GAM never absorbs banking fees.
 const APPLICANT_FEE_USD = parseFloat(process.env.BACKGROUND_CHECK_APPLICANT_FEE_USD || '45')
+const INTAKE_PROCESSING_USD = computeApplicationFee({ amount: APPLICANT_FEE_USD, paymentMethod: 'card' })
+const INTAKE_TOTAL_USD = Math.round((APPLICANT_FEE_USD + INTAKE_PROCESSING_USD) * 100) / 100
 const POOL_REPORT_UNLOCK_USD = parseFloat(process.env.POOL_REPORT_UNLOCK_USD || '1')
+// S552: flat landlord-side fee per screening for GAM's administration +
+// Credit-Bureau customer vetting. Billed with the monthly platform fee.
+const SCREENING_COMPLIANCE_FEE_USD = parseFloat(process.env.SCREENING_COMPLIANCE_FEE_USD || '5')
 
 function encrypt(text: string): string {
   const key = Buffer.from(ENCRYPTION_KEY.slice(0, 64), 'hex')
@@ -128,8 +198,34 @@ async function upsertPoolEntry(check: any) {
 }
 
 // ── PRICING + PAYMENT INTENT (mock Stripe) ───────────────────
-backgroundRouter.get('/price', async (_req, res) => {
-  res.json({ success: true, data: { applicantFee: APPLICANT_FEE_USD, poolUnlockFee: POOL_REPORT_UNLOCK_USD } })
+backgroundRouter.get('/price', async (req, res) => {
+  // S551: optional ?landlordId resolves that landlord's screening provider so
+  // the intake form knows whether SSN/ID collection happens on GAM's form
+  // (mock) or on Checkr's hosted consent flow (checkr → GAM never collects).
+  // ?unitId (optional) sharpens the state resolution for the fee cap.
+  let provider = 'mock'
+  const landlordId = (req.query.landlordId as string) || null
+  const unitId = (req.query.unitId as string) || null
+  if (landlordId) {
+    const row = await queryOne<{ background_provider: string }>(
+      'SELECT background_provider FROM landlords WHERE id=$1', [landlordId]
+    ).catch(() => null)
+    if (row) provider = row.background_provider
+  }
+  const fee = await resolveIntakeFee(landlordId, unitId)
+  res.json({
+    success: true,
+    data: {
+      applicantFee:  fee.applicantFee,
+      processingFee: fee.processingFee,
+      totalFee:      fee.totalFee,
+      capApplied:    fee.capApplied,
+      feeProhibited: fee.feeProhibited,
+      provider,
+      providerCollectsPii: provider === 'checkr',
+      poolUnlockFee: POOL_REPORT_UNLOCK_USD,
+    },
+  })
 })
 
 // POST /api/background/payment-intent
@@ -143,22 +239,33 @@ backgroundRouter.get('/price', async (_req, res) => {
 // the caller — re-using someone else's intent id is rejected.
 backgroundRouter.post('/payment-intent', requireAuth, async (req, res, next) => {
   try {
+    // S551: fee is state-cap aware — the frontend sends the same
+    // landlordId/unitId it will send to /submit so both sides resolve the
+    // identical amount. fee_prohibited states skip payment entirely.
+    const { landlordId, unitId } = (req.body ?? {}) as { landlordId?: string | null; unitId?: string | null }
+    const fee = await resolveIntakeFee(landlordId, unitId)
+    if (fee.totalFee <= 0) {
+      return res.json({
+        success: true,
+        data: { clientSecret: null, intentId: null, amount: 0, feeWaived: true, testMode: !STRIPE_LIVE },
+      })
+    }
     if (!STRIPE_LIVE) {
       const mockId = 'pi_intake_mock_' + crypto.randomBytes(12).toString('hex')
       return res.json({
         success: true,
-        data: { clientSecret: mockId + '_secret', intentId: mockId, amount: APPLICANT_FEE_USD, testMode: true },
+        data: { clientSecret: mockId + '_secret', intentId: mockId, amount: fee.totalFee, testMode: true },
       })
     }
     const intent = await stripeForBgc!.paymentIntents.create({
-      amount: Math.round(APPLICANT_FEE_USD * 100),
+      amount: Math.round(fee.totalFee * 100),
       currency: 'usd',
       payment_method_types: ['card'],
       description: 'GAM background check intake fee',
       metadata: {
         kind:   'background_check_intake',
         userId: req.user!.userId,
-        feeUsd: String(APPLICANT_FEE_USD),
+        feeUsd: String(fee.totalFee),
       },
     })
     res.json({
@@ -166,7 +273,7 @@ backgroundRouter.post('/payment-intent', requireAuth, async (req, res, next) => 
       data: {
         clientSecret: intent.client_secret,
         intentId:     intent.id,
-        amount:       APPLICANT_FEE_USD,
+        amount:       fee.totalFee,
         testMode:     false,
       },
     })
@@ -232,39 +339,15 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
     const { landlordId, unitId } = req.body
     const isSpeculative = !landlordId
 
-    if (!firstName || !lastName || !dateOfBirth || !ssn) throw new AppError(400, 'Required fields missing')
+    if (!firstName || !lastName || !dateOfBirth) throw new AppError(400, 'Required fields missing')
     if (!consentCredit || !consentCriminal) throw new AppError(400, 'Both screening consents required')
     if (isSpeculative && !consentPool) throw new AppError(400, 'Pool consent required for speculative applications')
-    if (!applicantPaymentIntentId) throw new AppError(400, 'Payment required')
 
-    // S83: verify the PaymentIntent really succeeded, belongs to this user,
-    // and is for the right fee. Idempotency comes from the UNIQUE index on
-    // background_checks.applicant_payment_intent_id below — Postgres rejects
-    // a second insert with the same intent id.
-    await verifyPaymentIntent(applicantPaymentIntentId, {
-      kind:      'background_check_intake',
-      amountUsd: APPLICANT_FEE_USD,
-      userId:    req.user!.userId,
-    })
-
-    const ssnClean = (ssn as string).replace(/\D/g, '')
-    if (ssnClean.length < 9) throw new AppError(400, 'Full SSN required')
-    const ssnLast4 = ssnClean.slice(-4)
-    const ssnEncrypted = encrypt(ssnClean)
-    const ipAddr = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').toString()
-    const ua = (req.headers['user-agent'] || '').toString()
-
-    const tenant = await queryOne<any>('SELECT * FROM tenants WHERE user_id=$1', [req.user!.userId])
-    if (tenant && tenant.platform_status === 'blocked') {
-      throw new AppError(403, 'Account is blocked from submitting applications')
-    }
-
-    // S423: resolve the provider per-landlord. Pre-S423 the route
-    // hardcoded 'mock' at both the INSERT and the getProvider call.
-    // Now: read landlords.background_provider for the targeted-
-    // submission case; default to 'mock' for speculative (no landlord)
-    // since the row will be claimed by a landlord later via the pool
-    // and re-run under their provider then.
+    // S423: resolve the provider per-landlord (moved above SSN handling in
+    // S551 — whether GAM collects an SSN at all depends on the provider).
+    // Default to 'mock' for speculative (no landlord) since the row will be
+    // claimed by a landlord later via the pool and re-run under their
+    // provider then.
     let providerName: string = 'mock'
     if (landlordId) {
       const landlordRow = await queryOne<{ background_provider: string }>(
@@ -273,6 +356,42 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
       )
       if (!landlordRow) throw new AppError(404, 'Landlord not found')
       providerName = landlordRow.background_provider
+    }
+    // S551: Checkr Tenant collects DOB/SSN + FCRA consent on ITS hosted
+    // apply flow — GAM neither requires nor stores an SSN for those intakes.
+    const providerCollectsPii = providerName === 'checkr'
+    if (!providerCollectsPii && !ssn) throw new AppError(400, 'Required fields missing')
+
+    // S83/S551: verify the PaymentIntent succeeded, belongs to this user, and
+    // matches the state-cap-resolved fee (same landlordId/unitId inputs the
+    // frontend used at /payment-intent). fee_prohibited states have no
+    // payment at all. Idempotency comes from the UNIQUE index on
+    // background_checks.applicant_payment_intent_id below.
+    const resolvedFee = await resolveIntakeFee(landlordId, unitId)
+    if (resolvedFee.totalFee > 0) {
+      if (!applicantPaymentIntentId) throw new AppError(400, 'Payment required')
+      await verifyPaymentIntent(applicantPaymentIntentId, {
+        kind:      'background_check_intake',
+        amountUsd: resolvedFee.totalFee,
+        userId:    req.user!.userId,
+      })
+    }
+
+    let ssnClean: string | null = null
+    let ssnLast4: string | null = null
+    let ssnEncrypted: string | null = null
+    if (ssn) {
+      ssnClean = (ssn as string).replace(/\D/g, '')
+      if (ssnClean.length < 9) throw new AppError(400, 'Full SSN required')
+      ssnLast4 = ssnClean.slice(-4)
+      ssnEncrypted = encrypt(ssnClean)
+    }
+    const ipAddr = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').toString()
+    const ua = (req.headers['user-agent'] || '').toString()
+
+    const tenant = await queryOne<any>('SELECT * FROM tenants WHERE user_id=$1', [req.user!.userId])
+    if (tenant && tenant.platform_status === 'blocked') {
+      throw new AppError(403, 'Account is blocked from submitting applications')
     }
 
     let check: any
@@ -308,7 +427,7 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
           idDocumentUrl || null, JSON.stringify(incomeDocUrls || []),
           !!consentCredit, !!consentCriminal, !!consentPool, ipAddr,
           ipAddr, ua, providerName,
-          applicantPaymentIntentId,
+          applicantPaymentIntentId || null,
         ])
     } catch (e: any) {
       // Postgres unique violation on background_checks_applicant_pi_uniq —
@@ -331,7 +450,7 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
         firstName, lastName,
         email: (req as any).user.email,
         phone: null,
-        ssn: ssnClean, dob: dateOfBirth, state, zip,
+        ssn: ssnClean || '', dob: dateOfBirth, state, zip,
         employmentStatus: employmentStatus || 'unknown',
         monthlyIncome: monthlyIncome || null,
         timeToComplete: timeToComplete || null,
@@ -344,6 +463,33 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
         [risk.score, risk.level, JSON.stringify(risk.flags), check!.id]
       )
     } catch (e) { logger.error({ err: e }, '[RISK]') }
+
+    // S551: Checkr orders screen FOR a rental property (required by their
+    // API; distinct from the applicant's residence). Resolve from the unit
+    // when given; else fall back to the landlord's first property — the
+    // single-property launch case always resolves; multi-property landlords
+    // should pass unitId.
+    let screeningProperty: { name: string | null; street: string; city: string; state: string; zipcode: string } | null = null
+    if (providerName === 'checkr') {
+      const prop = unitId
+        ? await queryOne<any>(
+            `SELECT p.name, p.street1, p.street2, p.city, p.state, p.zip
+               FROM units u JOIN properties p ON p.id = u.property_id
+              WHERE u.id = $1`, [unitId])
+        : await queryOne<any>(
+            `SELECT name, street1, street2, city, state, zip
+               FROM properties WHERE landlord_id = $1
+              ORDER BY created_at LIMIT 1`, [landlordId])
+      if (prop) {
+        screeningProperty = {
+          name:    prop.name || null,
+          street:  [prop.street1, prop.street2].filter(Boolean).join(', '),
+          city:    prop.city,
+          state:   prop.state,
+          zipcode: prop.zip,
+        }
+      }
+    }
 
     // Hand off to provider. After successful initiate, drop ssn_encrypted —
     // provider has it now; we keep ssn_last4 for duplicate detection.
@@ -358,6 +504,7 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
         dateOfBirth, ssnLast4,
         street1, street2: street2 || null, city, state, zip,
         consentCredit: !!consentCredit, consentCriminal: !!consentCriminal,
+        property: screeningProperty,
       })
       providerStatus = initRes.status
       await query(`
@@ -370,6 +517,26 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
       await query("UPDATE background_checks SET status='failed', failure_reason=$1 WHERE id=$2",
         [e instanceof Error ? e.message : 'provider error', check!.id])
       providerStatus = 'failed'
+    }
+
+    // S552: landlord-side screening billing — flat compliance fee + capped-
+    // state shortfall (all-in basis: standard total minus what the applicant
+    // could legally be charged). Only for real (checkr) orders that actually
+    // initiated; failed initiates incur no Checkr cost and accrue nothing.
+    // Swept into the monthly platform-fee invoice by accrual_month.
+    if (providerName === 'checkr' && providerStatus !== 'failed' && landlordId) {
+      try {
+        await query(
+          `INSERT INTO screening_fee_accruals
+             (background_check_id, landlord_id, accrual_month, compliance_fee,
+              standard_total, applicant_charged, shortfall, state)
+           VALUES ($1, $2, date_trunc('month', NOW())::date, $3, $4, $5, $6, $7)
+           ON CONFLICT (background_check_id) DO NOTHING`,
+          [check!.id, landlordId, SCREENING_COMPLIANCE_FEE_USD, INTAKE_TOTAL_USD,
+           resolvedFee.totalFee,
+           Math.round((INTAKE_TOTAL_USD - resolvedFee.totalFee) * 100) / 100,
+           resolvedFee.state])
+      } catch (e) { logger.error({ err: e }, '[SCREENING ACCRUAL]') }
     }
 
     if (tenant) {
@@ -401,9 +568,20 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
       } catch (e) { logger.error({ err: e }, '[EMAIL]') }
     }
 
+    // S551: surface the provider's apply link (Checkr Tenant hosted consent
+    // flow) so the portal can send the applicant straight there — Checkr
+    // also emails/texts it, but the in-portal link removes the inbox hunt.
+    const freshUrl = await queryOne<{ applicant_redirect_url: string | null }>(
+      'SELECT applicant_redirect_url FROM background_checks WHERE id=$1', [check!.id]
+    )
     res.status(201).json({
       success: true,
-      data: { id: check!.id, status: providerStatus, mode: isSpeculative ? 'speculative' : 'targeted' },
+      data: {
+        id: check!.id,
+        status: providerStatus,
+        mode: isSpeculative ? 'speculative' : 'targeted',
+        applicantRedirectUrl: freshUrl?.applicant_redirect_url || null,
+      },
     })
   } catch (e) { next(e) }
 })
@@ -414,12 +592,12 @@ backgroundRouter.get('/status', requireAuth, async (req, res, next) => {
     const tenant = await queryOne<any>('SELECT * FROM tenants WHERE user_id=$1', [req.user!.userId])
     const check = tenant?.background_check_id
       ? await queryOne<any>(
-          `SELECT id, status, created_at, decided_at, decision_notes, first_name, last_name, ssn_last4, expires_at
+          `SELECT id, status, created_at, decided_at, decision_notes, first_name, last_name, ssn_last4, expires_at, applicant_redirect_url
            FROM background_checks WHERE id=$1`,
           [tenant.background_check_id]
         )
       : await queryOne<any>(
-          `SELECT id, status, created_at, decided_at, decision_notes, first_name, last_name, ssn_last4, expires_at
+          `SELECT id, status, created_at, decided_at, decision_notes, first_name, last_name, ssn_last4, expires_at, applicant_redirect_url
            FROM background_checks WHERE user_id=$1 ORDER BY created_at DESC LIMIT 1`,
           [req.user!.userId]
         )
@@ -656,7 +834,17 @@ backgroundRouter.post('/:id/cancel', requireAuth, async (req, res, next) => {
     if (check.tenant_id) {
       await query("UPDATE tenants SET background_check_status='cancelled' WHERE id=$1", [check.tenant_id])
     }
-    res.json({ success: true })
+    // S552: no screening delivered → refund the applicant in full and void
+    // the landlord's unbilled accrual. Refund failure doesn't fail the
+    // cancel — the stale sweep retries anything unrefunded... it won't:
+    // status is now 'cancelled'. So log loudly; admin follows up.
+    let refund: { refunded: boolean; reason: string } = { refunded: false, reason: 'not attempted' }
+    try {
+      refund = await refundBackgroundCheckPayment(check.id)
+    } catch (e) {
+      logger.error({ err: e, background_check_id: check.id }, '[BGC CANCEL] refund failed — manual follow-up required')
+    }
+    res.json({ success: true, data: { refunded: refund.refunded } })
   } catch (e) { next(e) }
 })
 
@@ -755,6 +943,20 @@ backgroundRouter.post('/webhook/:providerName', async (req, res, next) => {
       throw new AppError(401, 'Invalid webhook signature')
     }
     const update = provider.parseWebhook(rawBody)
+
+    // S551: providers whose webhooks carry only a report pointer (Checkr
+    // Tenant report.completed → { id, order_id }) get the real per-product
+    // results pulled here, before the row update, so status + summary land
+    // together. A failed fetch still applies the status — the summary can
+    // be backfilled by the next redelivery (their webhooks retry).
+    if (update.reportRef && provider.fetchReport) {
+      try {
+        update.reportSummary = (await provider.fetchReport(update.reportRef)) ?? update.reportSummary ?? null
+      } catch (e) {
+        logger.error({ err: e, report_ref: update.reportRef }, '[BGC WEBHOOK] report fetch failed')
+      }
+    }
+
     const check = await queryOne<any>(
       'SELECT * FROM background_checks WHERE provider_ref=$1 AND provider_name=$2',
       [update.providerRef, provider.name]
@@ -764,9 +966,13 @@ backgroundRouter.post('/webhook/:providerName', async (req, res, next) => {
     const expiresClause = update.status === 'complete'
       ? ", expires_at = NOW() + INTERVAL '6 months'"
       : ''
+    // COALESCE keeps an existing summary when this event carries none —
+    // Checkr Tenant sends summary-less progress events (applicant.visited,
+    // product.completed) that must not null a previously stored report.
     await query(`
       UPDATE background_checks
-      SET status=$1, report_summary=$2, failure_reason=$3, webhook_received_at=NOW()${expiresClause}
+      SET status=$1, report_summary=COALESCE($2::jsonb, report_summary),
+          failure_reason=$3, webhook_received_at=NOW()${expiresClause}
       WHERE id=$4`,
       [update.status, update.reportSummary ? JSON.stringify(update.reportSummary) : null, update.failureReason || null, check.id])
 
