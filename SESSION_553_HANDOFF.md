@@ -454,12 +454,51 @@ COMPENSATION (Nic-decided):
 - Compute monthly off the EXISTING platform_revenue_ledger / platformFee.ts
   (same source Reports + Dashboard use) — one calc, per S-rule.
 
-ATTRIBUTION (Nic to decide before build — the thorny recurring part):
+ATTRIBUTION (Nic-DECIDED 2026-07-24):
 - Stamp each landlord with closing_agent_user_id + effective_at.
-- OPEN Qs: how long does the agent earn (while landlord active?)? What
-  happens to the book when an AGENT leaves (reassign / house account /
-  stop)? Clawback if landlord churns in month 1? Build schema to answer
-  these day-one even if launch has one agent (Nic).
+- Earns INDEFINITELY while BOTH landlord and agent are active.
+- Agent LEAVES → their commission stream forfeits into an INTERNAL POOL
+  (funds team parties / retention / bonuses / hardware) — NOT reassigned to
+  another agent, NOT a house account. Turns attrition into a team benefit,
+  avoids succession fights.
+- Landlord LEAVES → agent's commission on that landlord ends (incentive to
+  keep closing). No reassignment.
+- CLAWBACK — Claude recommendation (Nic asked, leaning agree): DON'T BUILD
+  one. Commission is paid MONTHLY IN ARREARS on actually-occupied,
+  actually-paid units, so you never pre-pay uncollected revenue → nothing
+  to claw back; a landlord leaving just ends the stream (Nic's own read).
+  Rare fee-reversal-after-payment edge = net out of next month's commission,
+  no policy. For churn-and-burn protection use a VESTING GATE instead:
+  commission on a landlord starts only after that landlord's FIRST
+  SUCCESSFUL PAYMENT (or 30d) — agent who signs a non-activating landlord
+  earns nothing, automatically, with no agent-owes-company debt (which
+  poisons sales-team morale). NET: pay-in-arrears + first-payment vesting,
+  skip clawback. (Nic to give final yes next session.)
+
+## S554+ BUILD SPEC — smooth manual lease onboarding (Nic, 2026-07-24)
+The launch flow for Oak Park + Mountain View (individual onboards, new
+leases). Nic's envisioned workflow, must be SMOOTH (no per-lease box typing):
+1. Create property → add units → set rents → set utility rates per unit.
+2. UTILITY / WATER ALLOCATION (Oak Park specific, real requirement):
+   mobile homes have DIRECT water meters (AZ law: MH can't be on RUBS) →
+   billed on actual reads. RV spots = RUBS: total park water − sum(MH
+   metered gallons) = RV pool, divided by OCCUPANCY SHARE (headcount-
+   weighted, e.g. 1-2 shares of ~25-30 people in the RV category, MH
+   excluded). VERIFY whether existing utility-reading-runs / meter-billing
+   / RUBS infra (see utilityReadingRuns.test.ts, propane) already supports
+   RUBS-with-metered-exclusions or needs building — easy to get subtly
+   wrong, deserves its own pass.
+3. Enter LAST METER READ at onboard time so the unit is billing-ready
+   immediately.
+4. On tenant ACCEPT-INVITE → AUTO-DRAFT a lease from PROPERTY/UNIT DEFAULTS
+   (rent from unit, dates from a default term, utilities from property
+   rates, meter baseline) → notify landlord → landlord batch-signs → tenants
+   sign. Landlord must NOT retype terms per lease.
+   COMPAT w/ [[gam-lease-is-law]]: pre-fill the E-SIGN DOCUMENT from known
+   data (NOT a new GAM form) — term inputs still live in the document, just
+   pre-populated. Requires: landlord builds a lease TEMPLATE once + property
+   defaults once, then each tenant's lease self-drafts. This is the
+   launch-critical UX; today term entry is manual in the e-sign doc.
 
 AGENT-FACING UI:
 - Agent login + a commission DASHBOARD WIDGET (this-month accrual, per-
