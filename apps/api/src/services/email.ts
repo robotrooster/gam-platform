@@ -57,38 +57,43 @@ async function send(
   from: SenderKind = 'noreply',
   attachments: EmailAttachment[] | undefined = undefined,
 ): Promise<string | null> {
-  // S536 (Nic): dev runs against demo data with fake tenant addresses,
-  // and every bounce dings the domain's Resend sending reputation.
-  // Outside production (tests mock Resend and are unaffected), suppress
-  // the real send and log instead. Set EMAIL_SEND_LIVE=1 in .env for a
-  // deliberate live send from dev (deliverability checks etc.).
+  // S536/S553 (Nic): only PRODUCTION (or an explicit EMAIL_SEND_LIVE=1
+  // override) actually hits Resend. This now covers NODE_ENV=test too —
+  // the prior `nodeEnv !== 'test'` carve-out let any test with an UNMOCKED
+  // email path fire a REAL send to fake @test.dev / @x.dev addresses. That
+  // burned the Resend daily quota (a full-suite run × several email tests =
+  // dozens of sends) AND, worse, every fake address BOUNCES, which damages
+  // the domain's Resend sending reputation → real tenant mail lands in spam.
+  // Suppressed sends still WRITE the email_send_log row below, so tests that
+  // assert on the log keep passing; only the network call is skipped.
   const nodeEnv = process.env.NODE_ENV || 'development'
-  if (nodeEnv !== 'production' && nodeEnv !== 'test' && process.env.EMAIL_SEND_LIVE !== '1') {
-    logger.info(`[EMAIL SUPPRESSED — non-production] ${subject} -> ${to}`)
-    return null
-  }
+  const willSend = nodeEnv === 'production' || process.env.EMAIL_SEND_LIVE === '1'
   let status: 'sent' | 'failed' = 'sent'
   let errorMessage: string | null = null
   let messageId: string | null = null
-  try {
-    // S322: optional attachments via Resend's documented attachments[]
-    // field. Unset for the existing callers — only the new
-    // emailFlexsuiteEnrollment path passes a PDF.
-    const sendArgs: any = { from: senderFor(from), to, subject, html }
-    if (attachments && attachments.length > 0) sendArgs.attachments = attachments
-    const result = await resend.emails.send(sendArgs)
-    if (result.error) {
+  if (willSend) {
+    try {
+      // S322: optional attachments via Resend's documented attachments[]
+      // field. Unset for the existing callers — only the new
+      // emailFlexsuiteEnrollment path passes a PDF.
+      const sendArgs: any = { from: senderFor(from), to, subject, html }
+      if (attachments && attachments.length > 0) sendArgs.attachments = attachments
+      const result = await resend.emails.send(sendArgs)
+      if (result.error) {
+        status = 'failed'
+        errorMessage = (result.error as { message?: string }).message ?? JSON.stringify(result.error)
+        logger.error('[EMAIL ERROR]', result.error)
+      } else {
+        messageId = result.data?.id ?? null
+        logger.info('[EMAIL SENT]', subject, '->', to)
+      }
+    } catch(e) {
       status = 'failed'
-      errorMessage = (result.error as { message?: string }).message ?? JSON.stringify(result.error)
-      logger.error('[EMAIL ERROR]', result.error)
-    } else {
-      messageId = result.data?.id ?? null
-      logger.info('[EMAIL SENT]', subject, '->', to)
+      errorMessage = e instanceof Error ? e.message : String(e)
+      logger.error({ err: e }, '[EMAIL FAILED]')
     }
-  } catch(e) {
-    status = 'failed'
-    errorMessage = e instanceof Error ? e.message : String(e)
-    logger.error({ err: e }, '[EMAIL FAILED]')
+  } else {
+    logger.info(`[EMAIL SUPPRESSED — ${nodeEnv}] ${subject} -> ${to}`)
   }
   // Best-effort log — never let logging failure break a user-facing flow.
   try {

@@ -403,6 +403,26 @@ Full evidence: SESSION handoff was distilled from the sweep result at
 /private/tmp/.../tasks/wec96ds6b.output (confirmed[] array) — journal at
 subagents/workflows/wf_f7bc1d33-dd6/journal.jsonl if more detail needed.
 
+## Resend 80% warning — ROOT-CAUSED + FIXED (S553), + real launch blocker
+Nic got a Resend "80% of daily 100 quota" email. Resend API confirmed 70
+sends in the last 24h; recipient domains were ~96 fake test addresses
+(@test.dev 30, @demo.dev 28, @guest.dev 20, @x.dev 10, @tenant.dev 6,
+@cust.dev 4) + 4 real (Nic's notification tests). NOT Resend scamming.
+ROOT CAUSE: services/email.ts send() suppressed real Resend calls only for
+dev, NOT NODE_ENV=test (`nodeEnv !== 'test'` carve-out) — so every
+full-suite run fired REAL emails from unmocked email paths to fake
+addresses (quota burn + BOUNCES that damage domain sending reputation).
+FIX (deployed): send() now suppresses unless production OR EMAIL_SEND_LIVE=1;
+suppressed sends still write email_send_log so tests pass. email.test.ts
+(mocks Resend, asserts the send path) opts back in via EMAIL_SEND_LIVE=1 in
+its beforeEach. Verified: email.test.ts 35/35 + 10 email-sending suites
+186/186 green. Production unchanged (willSend=true → real tenant mail sends).
+STILL A LAUNCH BLOCKER regardless: free-tier 100/day can't cover onboarding
+~100 tenants (invite+verify+e-sign+first-invoice each = 300-500 day-one
+emails). **Upgrade Resend to a paid plan before onboarding.** Also worth
+checking the domain's current bounce/reputation status after weeks of test
+sends (may need a reputation warm-up before blasting real tenants).
+
 ## Next session candidates
 (1-3 of the original list SHIPPED in-session — Leads page, FlexVault name,
 custody mention in Lucy's KB. Remaining:)

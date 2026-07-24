@@ -22,7 +22,7 @@
  *   flexsuite enrollment.
  */
 
-import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 
 const { resendSendMock } = vi.hoisted(() => ({
   resendSendMock: vi.fn(async () => ({ data: { id: 'msg_default' }, error: null }) as any),
@@ -42,7 +42,14 @@ beforeEach(async () => {
   await cleanupAllSchema()
   resendSendMock.mockReset()
   resendSendMock.mockResolvedValue({ data: { id: 'msg_default' }, error: null } as any)
+  // S553: send() suppresses the real network call in every non-production
+  // mode (test included) so no other suite fires a live email to fake
+  // addresses. THIS file mocks the Resend client and asserts on the send
+  // path, so it opts back in via EMAIL_SEND_LIVE — the send hits the mock,
+  // never the network.
+  process.env.EMAIL_SEND_LIVE = '1'
 })
+afterEach(() => { delete process.env.EMAIL_SEND_LIVE })
 
 async function logRowFor(toEmail: string): Promise<any> {
   const { rows } = await db.query<any>(
