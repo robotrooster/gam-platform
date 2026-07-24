@@ -304,10 +304,10 @@ function AdminOnboardingOverview(){
   const resend=async(type:string,targetId:string)=>{
     setResending(type+targetId)
     try{
-      await post('/admin/onboarding/resend',{type,targetId})
-      setResendMsg('Notification queued successfully')
-      setTimeout(()=>setResendMsg(''),3000)
-    }catch(e:any){setResendMsg('Failed: '+e.message)}
+      const r=await post<{message?:string}>('/admin/onboarding/resend',{type,targetId})
+      setResendMsg(r?.data?.message||'Sent')
+      setTimeout(()=>setResendMsg(''),4000)
+    }catch(e:any){setResendMsg('Failed: '+(e?.response?.data?.error||e.message))}
     finally{setResending(null)}
   }
 
@@ -974,8 +974,8 @@ function Landlords(){
 
   const resend=async(type:string,id:string)=>{
     setResending(type)
-    try{ await post('/admin/onboarding/resend',{type,targetId:id}); setMsg('Notification queued'); setTimeout(()=>setMsg(''),3000) }
-    catch(e:any){ setMsg('Failed: '+e.message) }
+    try{ const r=await post<{message?:string}>('/admin/onboarding/resend',{type,targetId:id}); setMsg(r?.data?.message||'Sent'); setTimeout(()=>setMsg(''),4000) }
+    catch(e:any){ setMsg('Failed: '+(e?.response?.data?.error||e.message)) }
     finally{ setResending(null) }
   }
 
@@ -1544,8 +1544,8 @@ function Tenants(){
 
   const resend=async(type:string,id:string)=>{
     setResending(type)
-    try{ await post('/admin/onboarding/resend',{type,targetId:id}); setMsg('Notification queued'); setTimeout(()=>setMsg(''),3000) }
-    catch(e:any){ setMsg('Failed: '+e.message) }
+    try{ const r=await post<{message?:string}>('/admin/onboarding/resend',{type,targetId:id}); setMsg(r?.data?.message||'Sent'); setTimeout(()=>setMsg(''),4000) }
+    catch(e:any){ setMsg('Failed: '+(e?.response?.data?.error||e.message)) }
     finally{ setResending(null) }
   }
 

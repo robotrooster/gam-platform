@@ -12,6 +12,7 @@ import { backfillInvoices } from '../jobs/invoiceGeneration'
 import { PropertyReviewStatus, PLATFORM_FEES, LAUNCH_PLATFORM_FEE, SALES_LEAD_STATUSES } from '@gam/shared'
 import { fetchAccountStatus } from '../services/stripeConnect'
 import { unproductiveTurnSql } from '../services/agents/turnBudget'
+import { emailTenantOnboarded } from '../services/email'
 
 export const adminRouter = Router()
 adminRouter.use(requireAuth)
@@ -377,15 +378,55 @@ adminRouter.get('/tenants/:tenantId/flexsuite-acceptances', async (req, res, nex
 adminRouter.post('/onboarding/resend', async (req, res, next) => {
   try {
     const { type, targetId } = req.body
-    await logAdminAction({
-      adminUserId: req.user!.userId,
-      actionType: `resend_${type}`,
-      targetId: targetId ?? null,
-      targetType: 'tenant',
-      notes: `Resend triggered by admin`,
-      ipAddress: req.ip ?? null,
-    })
-    res.json({ success: true, data: { message: `${type} notification queued` } })
+    if (!targetId) throw new AppError(400, 'targetId is required')
+
+    // S553: this endpoint was a STUB — it logged an audit row and returned
+    // "queued" while sending NOTHING, so an admin recovering a failed
+    // invite got false success. tenant_invite (+ its reminder) is the
+    // launch-critical path (resend a tenant's portal invite); it now
+    // ACTUALLY sends. The other types aren't wired yet and return an
+    // honest error rather than lying.
+    if (type === 'tenant_invite' || type === 'tenant_invite_reminder') {
+      const t = await queryOne<any>(
+        `SELECT u.id AS user_id, u.email, u.first_name, u.email_verified,
+                un.unit_number, p.name AS property_name, p.street1, p.city, p.state, p.zip,
+                p.landlord_id, (llu.first_name || ' ' || llu.last_name) AS landlord_name
+           FROM tenants t
+           JOIN users u ON u.id = t.user_id
+           LEFT JOIN lease_tenants lt ON lt.tenant_id = t.id AND lt.status IN ('active','pending_add')
+           LEFT JOIN leases l ON l.id = lt.lease_id
+           LEFT JOIN units un ON un.id = l.unit_id
+           LEFT JOIN properties p ON p.id = un.property_id
+           LEFT JOIN landlords ll ON ll.id = p.landlord_id
+           LEFT JOIN users llu ON llu.id = ll.user_id
+          WHERE t.id = $1
+          ORDER BY lt.added_at DESC NULLS LAST
+          LIMIT 1`, [targetId])
+      if (!t) throw new AppError(404, 'Tenant not found')
+      if (t.email_verified) throw new AppError(409, 'This tenant has already activated their account — no invite to resend.')
+
+      // Fresh token resets the 7-day expiry (mirrors the onboard route).
+      const inviteToken = require('crypto').randomBytes(32).toString('hex')
+      await query(
+        `UPDATE users SET tenant_invite_token=$1, tenant_invite_expires_at=now()+interval '7 days', updated_at=now() WHERE id=$2`,
+        [inviteToken, t.user_id])
+      const tenantAppUrl = process.env.TENANT_APP_URL || 'http://localhost:3002'
+      const activationUrl = `${tenantAppUrl}/accept-invite?token=${inviteToken}`
+      const propertyAddress = [t.street1, t.city, t.state, t.zip].filter(Boolean).join(', ')
+      const unitLabel = t.property_name ? `${t.property_name} — Unit ${t.unit_number}` : 'your unit'
+      await emailTenantOnboarded(
+        t.email, t.first_name, t.landlord_name || 'Your landlord', propertyAddress, unitLabel, activationUrl,
+        { landlordId: t.landlord_id, tenantId: targetId })
+
+      await logAdminAction({
+        adminUserId: req.user!.userId, actionType: 'resend_tenant_invite',
+        targetId, targetType: 'tenant', notes: 'Portal invite resent (fresh token)', ipAddress: req.ip ?? null,
+      })
+      return res.json({ success: true, data: { message: `Invite resent to ${t.email}` } })
+    }
+
+    // Honest failure for the not-yet-wired types (no more fake success).
+    throw new AppError(501, `Resend for "${type}" isn't available yet. For a tenant invite, use the tenant's Resend Invite. For landlord setup/bank/ACH, contact the landlord directly for now.`)
   } catch (e) { next(e) }
 })
 

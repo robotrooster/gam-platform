@@ -254,8 +254,8 @@ function Onboarding() {
 
   const resend = async (type: string, id: string) => {
     setResending(type)
-    try { await post('/admin/onboarding/resend', { type, targetId: id }); setMsg('Notification queued'); setTimeout(()=>setMsg(''),3000) }
-    catch (e: any) { setMsg('Failed: ' + e.message) }
+    try { const r = await post<{message?:string}>('/admin/onboarding/resend', { type, targetId: id }); setMsg(r?.data?.message||'Sent'); setTimeout(()=>setMsg(''),4000) }
+    catch (e: any) { setMsg('Failed: ' + (e?.response?.data?.error || e.message)) }
     finally { setResending(null) }
   }
 
