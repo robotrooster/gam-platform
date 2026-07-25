@@ -453,6 +453,15 @@ COMPENSATION (Nic-decided):
   separate one-time spiff, not a base rework.
 - Compute monthly off the EXISTING platform_revenue_ledger / platformFee.ts
   (same source Reports + Dashboard use) — one calc, per S-rule.
+- VERIFY (before building commission): the EXACT collection path of the
+  $2/occupied-unit platform fee — is it swept as a Stripe application_fee on
+  rent charges, or billed/accrued separately? This determines precisely how
+  a landlord fee REVERSAL flows back to the commission calc. Commission is
+  arrears-on-collected so it's protected either way, but the build needs the
+  real mechanism (don't guess). Refund/loss posture is S512 pass-through
+  (GAM bears no charge burden; recovers reversals from the recipient) — a
+  reversed fee = that month's $0.50 slice simply never earned; net any
+  post-payment reversal out of the next month's commission (no clawback).
 
 ATTRIBUTION (Nic-DECIDED 2026-07-24):
 - Stamp each landlord with closing_agent_user_id + effective_at.
