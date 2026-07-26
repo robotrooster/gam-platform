@@ -9,10 +9,8 @@ uploads/
 **/tsconfig.tsbuildinfo
 CLAUDE.md
 
-# Local Claude Code config (per-machine, not shared)
-.claude/settings.local.json
-.claude/settings.local.json.bak*
-.claude/launch.json
+# Local Claude Code config (per-machine tooling, not GAM software)
+.claude/
 
 # Compiled vite configs (artifacts of tsc; source of truth is vite.config.ts)
 apps/*/vite.config.js
