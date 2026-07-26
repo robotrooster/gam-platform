@@ -108,7 +108,7 @@ export function DepositReturnPage() {
         // S548: staff finalize above the landlord's threshold parks the
         // return for approval instead of paying out.
         if (r?.data?.status === 'awaiting_approval') {
-          toast(`Refund of ${fmt(Number(r.data.refund_amount))} is above the ${fmt(Number(r.data.threshold))} approval threshold — sent to the landlord for approval.`)
+          toast(`Refund of ${fmt(Number(r.data.refundAmount))} is above the ${fmt(Number(r.data.threshold))} approval threshold — sent to the landlord for approval.`)
         }
       },
       onError: (e: any) => setError(e?.response?.data?.error || 'Finalize failed'),

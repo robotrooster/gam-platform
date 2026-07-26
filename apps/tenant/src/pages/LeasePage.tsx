@@ -188,11 +188,15 @@ export function LeasePage() {
   const [renewalSubmitted, setRenewalSubmitted] = useState(false)
   const leaseDocRef = useRef<HTMLDivElement>(null)
 
-  const { data: lease, isLoading } = useQuery('tenant-lease', () => get<any>('/tenants/lease'))
+  // S554 (Oak Park): a tenant can hold >1 active lease (e.g. space rent on two
+  // mobile homes). Fetch all and let the tenant switch; default to the first.
+  const { data: leases = [], isLoading } = useQuery<any[]>('tenant-leases', () => get<any[]>('/tenants/leases'))
+  const [selectedLeaseId, setSelectedLeaseId] = useState<string | null>(null)
+  const lease = (leases.find((l: any) => l.id === selectedLeaseId)) || leases[0] || null
 
   const signMut = useMutation(
     (sig: string) => post('/tenants/lease/sign', { signature: sig, signatureType: signMode, ip: 'client' }),
-    { onSuccess: () => { qc.invalidateQueries('tenant-lease') } }
+    { onSuccess: () => { qc.invalidateQueries('tenant-leases') } }
   )
 
   const renewalMut = useMutation(
@@ -226,6 +230,22 @@ export function LeasePage() {
 
   return (
     <div>
+      {/* S554 (Oak Park): lease switcher — a tenant with more than one active
+          lease (e.g. two mobile homes) picks which lease to view/sign/manage. */}
+      {leases.length > 1 && (
+        <div style={{ display:'flex', gap:8, flexWrap:'wrap', marginBottom:16 }}>
+          {leases.map((l: any) => {
+            const active = l.id === lease.id
+            return (
+              <button key={l.id} onClick={() => setSelectedLeaseId(l.id)}
+                className={active ? 'btn btn-primary btn-sm' : 'btn btn-ghost btn-sm'}
+                style={{ fontSize:'.75rem' }}>
+                {l.propertyName} · Unit {l.unitNumber}
+              </button>
+            )
+          })}
+        </div>
+      )}
       <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start', marginBottom:24 }}>
         <div>
           <h1 style={{ fontFamily:'var(--font-display)', fontSize:'1.4rem', fontWeight:800, color:'var(--text-0)', marginBottom:4 }}>Lease Agreement</h1>
@@ -410,9 +430,9 @@ export function LeasePage() {
         <div style={{ padding:'14px 18px', borderBottom:'1px solid var(--border-0)', display:'flex', justifyContent:'space-between', alignItems:'center' }}>
           <div style={{ fontFamily:'var(--font-display)', fontSize:'.85rem', fontWeight:700, color:'var(--text-0)' }}>📄 {fullyExecuted ? 'Executed Lease Agreement' : 'Lease Document'}</div>
           {fullyExecuted && lease.documentUrl && (
-            <a href={lease.documentUrl?.startsWith('http') ? lease.documentUrl : API_URL + lease.documentUrl} download="lease-agreement.pdf" className="btn btn-ghost btn-sm" style={{ textDecoration:'none', fontSize:'.72rem', display:'flex', alignItems:'center', gap:4 }}>
+            <button onClick={() => downloadLeasePdf(lease.documentUrl!, localStorage.getItem('gam_tenant_token')||'')} className="btn btn-ghost btn-sm" style={{ fontSize:'.72rem', display:'flex', alignItems:'center', gap:4 }}>
               <Download size={12}/> Download PDF
-            </a>
+            </button>
           )}
         </div>
         {lease.documentUrl ? (
@@ -563,6 +583,28 @@ async function openAddendumPdf(leaseId: string, filename: string, token: string)
   window.open(URL.createObjectURL(blob), '_blank')
 }
 
+// S554 (button-sweep bug #5): the lease "Download PDF" control was a bare
+// <a href download>, which can't carry the Bearer token, so the authed
+// leases route 401'd and the browser saved the JSON error as the PDF.
+// Same blob-fetch-with-auth pattern as openAddendumPdf above.
+async function downloadLeasePdf(documentUrl: string, token: string) {
+  const url = documentUrl.startsWith('http') ? documentUrl : API_URL + documentUrl
+  const res = await fetch(url, { headers: { Authorization: 'Bearer ' + token } })
+  if (!res.ok) {
+    toast.error('Could not download PDF (status ' + res.status + ')')
+    return
+  }
+  const blob = await res.blob()
+  const objUrl = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = objUrl
+  a.download = 'lease-agreement.pdf'
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  URL.revokeObjectURL(objUrl)
+}
+
 function AddendumHistorySection({ leaseId }: { leaseId: string }) {
   const { data, isLoading } = useQuery('tenant-lease-addendums', () =>
     get<AddendumEvent[]>('/tenants/lease/addendums')
@@ -642,7 +684,7 @@ function EarlyTerminationSurface({ leaseId }: { leaseId: string }) {
       onSuccess: (res: any) => {
         setResult(res?.data ?? res)
         qc.invalidateQueries(['termination-quote', leaseId])
-        qc.invalidateQueries('tenant-lease')
+        qc.invalidateQueries('tenant-leases')
       },
       onError: (e: any) => setError(e?.response?.data?.error || 'Failed'),
     },

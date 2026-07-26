@@ -939,7 +939,8 @@ async function fireLandlordDisbursementTransfer(row: DepositReturnRow): Promise<
             sd.collected_amount::text,
             sd.interest_accrued::text,
             usr.id AS landlord_user_id,
-            usr.stripe_connect_account_id AS connect_account
+            -- S554 Connect re-anchor: entity account preferred, user fallback.
+            COALESCE(ll.stripe_connect_account_id, usr.stripe_connect_account_id) AS connect_account
        FROM security_deposits sd
        JOIN leases    l   ON l.id  = sd.lease_id
        JOIN landlords ll  ON ll.id = l.landlord_id

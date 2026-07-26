@@ -683,6 +683,53 @@ propertiesRouter.put('/:id/late-fee-overrides', requirePerm('properties.edit'), 
   } catch (e) { next(e) }
 })
 
+// S556: per-(property, unit_type) security-DEPOSIT MULTIPLIER. A lease's
+// deposit is derived (deposit = rent × multiplier), so the landlord sets the
+// ratio once per unit class instead of retyping a dollar amount each lease.
+// Absence of a row = 1.0 (one month's rent). Consumed by lease-document
+// creation (esign) and the send-form prefill suggestion.
+propertiesRouter.get('/:id/deposit-multipliers', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const prop = await queryOne<any>('SELECT id, landlord_id FROM properties WHERE id=$1', [req.params.id])
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canManageLandlordResource(req.user, prop.landlord_id, ['property_manager'])) throw new AppError(403, 'Forbidden')
+    const rows = await query<any>(
+      `SELECT * FROM property_unit_type_deposits WHERE property_id=$1 ORDER BY unit_type`, [req.params.id])
+    res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
+propertiesRouter.put('/:id/deposit-multipliers', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const body = z.object({
+      unitType:   z.enum(UNIT_TYPES as unknown as [string, ...string[]]),
+      multiplier: z.number().min(0).max(12),
+    }).parse(req.body)
+    const prop = await queryOne<any>('SELECT id, landlord_id FROM properties WHERE id=$1', [req.params.id])
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canManageLandlordResource(req.user, prop.landlord_id, ['property_manager'])) throw new AppError(403, 'Forbidden')
+    const row = await queryOne<any>(`
+      INSERT INTO property_unit_type_deposits (property_id, unit_type, deposit_multiplier)
+      VALUES ($1, $2, $3)
+      ON CONFLICT (property_id, unit_type) DO UPDATE SET
+        deposit_multiplier = EXCLUDED.deposit_multiplier, updated_at = NOW()
+      RETURNING *`,
+      [req.params.id, body.unitType, body.multiplier.toFixed(2)])
+    res.json({ success: true, data: row })
+  } catch (e) { next(e) }
+})
+
+propertiesRouter.delete('/:id/deposit-multipliers/:unitType', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const prop = await queryOne<any>('SELECT id, landlord_id FROM properties WHERE id=$1', [req.params.id])
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canManageLandlordResource(req.user, prop.landlord_id, ['property_manager'])) throw new AppError(403, 'Forbidden')
+    await query('DELETE FROM property_unit_type_deposits WHERE property_id=$1 AND unit_type=$2',
+      [req.params.id, req.params.unitType])
+    res.json({ success: true })
+  } catch (e) { next(e) }
+})
+
 propertiesRouter.delete('/:id/late-fee-overrides/:unitType', requirePerm('properties.edit'), async (req, res, next) => {
   try {
     const prop = await queryOne<any>('SELECT id, landlord_id FROM properties WHERE id=$1', [req.params.id])

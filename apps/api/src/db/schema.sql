@@ -21,7 +21,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict Jhx9uwfSPv5fwfvSPJpWxuRqgYASb0nlNkyLiylwkbc7DhT56zcuHIf8yAZfrZT
+\restrict OrGRr35Gq5e0XRPGrsQyCWNxdHrhndYZ7vYt7EOqlPSyU13sF6bsj2HQjhz34PK
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -3414,6 +3414,11 @@ CREATE TABLE public.landlords (
     pos_default_margin_pct numeric(5,2),
     deposit_return_approval_threshold numeric(10,2) DEFAULT 500 NOT NULL,
     is_demo boolean DEFAULT false NOT NULL,
+    stripe_connect_account_id text,
+    stripe_connect_status_synced_at timestamp with time zone,
+    connect_charges_enabled boolean DEFAULT false NOT NULL,
+    connect_payouts_enabled boolean DEFAULT false NOT NULL,
+    connect_details_submitted boolean DEFAULT false NOT NULL,
     CONSTRAINT landlords_background_provider_check CHECK ((background_provider = ANY (ARRAY['mock'::text, 'checkr'::text]))),
     CONSTRAINT landlords_default_ach_fee_payer_check CHECK ((default_ach_fee_payer = ANY (ARRAY['landlord'::text, 'tenant'::text]))),
     CONSTRAINT landlords_network_tier_check CHECK ((network_tier = 'tier_2_full'::text)),
@@ -3452,6 +3457,9 @@ CREATE TABLE public.lease_document_fields (
     font_css text,
     signed_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now(),
+    options text,
+    parent_field_id uuid,
+    parent_option text,
     CONSTRAINT lease_document_fields_lease_column_check CHECK (((lease_column IS NULL) OR (lease_column = ANY (ARRAY['tenant_name'::text, 'tenant_email'::text, 'landlord_name'::text, 'unit_number'::text, 'property_name'::text, 'property_address'::text, 'tenant_signature'::text, 'landlord_signature'::text, 'tenant_initial'::text, 'landlord_initial'::text, 'date_signed'::text, 'rent_amount'::text, 'start_date'::text, 'end_date'::text, 'security_deposit'::text, 'rent_due_day'::text, 'lease_type'::text, 'auto_renew'::text, 'auto_renew_mode'::text, 'notice_days_required'::text, 'expiration_notice_days'::text, 'late_fee_grace_days'::text, 'late_fee_initial_flat'::text, 'late_fee_initial_percent'::text, 'late_fee_accrual_flat_daily'::text, 'late_fee_accrual_flat_weekly'::text, 'late_fee_accrual_flat_monthly'::text, 'late_fee_accrual_percent_daily'::text, 'late_fee_accrual_percent_weekly'::text, 'late_fee_accrual_percent_monthly'::text, 'late_fee_cap_flat'::text, 'late_fee_cap_percent'::text, 'pet_deposit'::text, 'key_deposit'::text, 'cleaning_deposit'::text, 'move_in_fee'::text, 'cleaning_fee'::text, 'pet_fee'::text, 'application_fee'::text, 'amenity_fee'::text, 'hoa_transfer_fee'::text, 'lease_prep_fee'::text, 'pet_rent'::text, 'parking_rent'::text, 'storage_rent'::text, 'amenity_fee_monthly'::text, 'trash_fee'::text, 'pest_control_fee'::text, 'technology_fee'::text, 'last_month_rent'::text, 'early_termination_fee'::text, 'other_fee'::text, 'utility_water_responsibility'::text, 'utility_gas_responsibility'::text, 'utility_electric_responsibility'::text, 'utility_sewer_responsibility'::text, 'utility_trash_responsibility'::text, 'custom_text'::text]))))
 );
 
@@ -3659,6 +3667,9 @@ CREATE TABLE public.lease_template_fields (
     sort_order integer DEFAULT 0,
     font_css text,
     created_at timestamp with time zone DEFAULT now(),
+    options text,
+    parent_field_id uuid,
+    parent_option text,
     CONSTRAINT lease_template_fields_lease_column_check CHECK (((lease_column IS NULL) OR (lease_column = ANY (ARRAY['tenant_name'::text, 'tenant_email'::text, 'landlord_name'::text, 'unit_number'::text, 'property_name'::text, 'property_address'::text, 'tenant_signature'::text, 'landlord_signature'::text, 'tenant_initial'::text, 'landlord_initial'::text, 'date_signed'::text, 'rent_amount'::text, 'start_date'::text, 'end_date'::text, 'security_deposit'::text, 'rent_due_day'::text, 'lease_type'::text, 'auto_renew'::text, 'auto_renew_mode'::text, 'notice_days_required'::text, 'expiration_notice_days'::text, 'late_fee_grace_days'::text, 'late_fee_initial_flat'::text, 'late_fee_initial_percent'::text, 'late_fee_accrual_flat_daily'::text, 'late_fee_accrual_flat_weekly'::text, 'late_fee_accrual_flat_monthly'::text, 'late_fee_accrual_percent_daily'::text, 'late_fee_accrual_percent_weekly'::text, 'late_fee_accrual_percent_monthly'::text, 'late_fee_cap_flat'::text, 'late_fee_cap_percent'::text, 'pet_deposit'::text, 'key_deposit'::text, 'cleaning_deposit'::text, 'move_in_fee'::text, 'cleaning_fee'::text, 'pet_fee'::text, 'application_fee'::text, 'amenity_fee'::text, 'hoa_transfer_fee'::text, 'lease_prep_fee'::text, 'pet_rent'::text, 'parking_rent'::text, 'storage_rent'::text, 'amenity_fee_monthly'::text, 'trash_fee'::text, 'pest_control_fee'::text, 'technology_fee'::text, 'last_month_rent'::text, 'early_termination_fee'::text, 'other_fee'::text, 'utility_water_responsibility'::text, 'utility_gas_responsibility'::text, 'utility_electric_responsibility'::text, 'utility_sewer_responsibility'::text, 'utility_trash_responsibility'::text, 'custom_text'::text]))))
 );
 
@@ -3834,6 +3845,9 @@ CREATE TABLE public.leases (
     supersedes_lease_id uuid,
     import_extra_data jsonb,
     source_booking_id uuid,
+    tenant_renewal_intent text,
+    tenant_renewal_intent_at timestamp with time zone,
+    tenant_renewal_notes text,
     CONSTRAINT leases_auto_renew_mode_check CHECK (((auto_renew_mode IS NULL) OR (auto_renew_mode = ANY (ARRAY['extend_same_term'::text, 'convert_to_month_to_month'::text])))),
     CONSTRAINT leases_auto_renew_mode_required CHECK (((auto_renew = false) OR (auto_renew_mode IS NOT NULL))),
     CONSTRAINT leases_late_fee_accrual_period_check CHECK ((late_fee_accrual_period = ANY (ARRAY['daily'::text, 'weekly'::text, 'monthly'::text]))),
@@ -3843,7 +3857,8 @@ CREATE TABLE public.leases (
     CONSTRAINT leases_lease_source_check CHECK ((lease_source = ANY (ARRAY['esigned'::text, 'imported'::text, 'booking_draft'::text]))),
     CONSTRAINT leases_lease_type_check CHECK ((lease_type = ANY (ARRAY['month_to_month'::text, 'fixed_term'::text, 'nnn_commercial'::text]))),
     CONSTRAINT leases_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'active'::text, 'expired'::text, 'terminated'::text]))),
-    CONSTRAINT leases_subleasing_allowed_check CHECK ((subleasing_allowed = ANY (ARRAY['prohibited'::text, 'with_consent'::text, 'allowed'::text])))
+    CONSTRAINT leases_subleasing_allowed_check CHECK ((subleasing_allowed = ANY (ARRAY['prohibited'::text, 'with_consent'::text, 'allowed'::text]))),
+    CONSTRAINT leases_tenant_renewal_intent_check CHECK (((tenant_renewal_intent IS NULL) OR (tenant_renewal_intent = ANY (ARRAY['yes'::text, 'no'::text, 'unsure'::text]))))
 );
 
 
@@ -5050,6 +5065,8 @@ CREATE TABLE public.pos_transactions (
     stripe_payment_intent_id text,
     pos_customer_id uuid,
     property_id uuid,
+    discount_amount numeric(10,2) DEFAULT 0 NOT NULL,
+    discount_reason text,
     CONSTRAINT pos_transactions_payment_method_check CHECK ((payment_method = ANY (ARRAY['cash'::text, 'card'::text, 'charge'::text]))),
     CONSTRAINT pos_transactions_status_check CHECK ((status = ANY (ARRAY['completed'::text, 'refunded'::text, 'partial_refund'::text, 'voided'::text])))
 );
@@ -5455,6 +5472,22 @@ CREATE TABLE public.property_unit_subtypes (
     CONSTRAINT property_unit_subtypes_rv_amp_service_check CHECK ((rv_amp_service = ANY (ARRAY['none'::text, '30'::text, '50'::text, 'both'::text]))),
     CONSTRAINT property_unit_subtypes_rv_site_layout_check CHECK ((rv_site_layout = ANY (ARRAY['none'::text, 'back_in'::text, 'pull_through'::text]))),
     CONSTRAINT property_unit_subtypes_unit_type_check CHECK ((unit_type = ANY (ARRAY['apartment'::text, 'single_family'::text, 'rv_spot'::text, 'mobile_home'::text, 'hotel_room'::text, 'storage'::text, 'commercial'::text])))
+);
+
+
+--
+-- Name: property_unit_type_deposits; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.property_unit_type_deposits (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    property_id uuid NOT NULL,
+    unit_type text NOT NULL,
+    deposit_multiplier numeric(5,2) DEFAULT 1.0 NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT property_unit_type_deposits_multiplier_check CHECK (((deposit_multiplier >= (0)::numeric) AND (deposit_multiplier <= (12)::numeric))),
+    CONSTRAINT property_unit_type_deposits_unit_type_check CHECK ((unit_type = ANY (ARRAY['apartment'::text, 'single_family'::text, 'rv_spot'::text, 'mobile_home'::text, 'hotel_room'::text, 'storage'::text, 'commercial'::text])))
 );
 
 
@@ -9082,6 +9115,22 @@ ALTER TABLE ONLY public.property_unit_subtypes
 
 ALTER TABLE ONLY public.property_unit_subtypes
     ADD CONSTRAINT property_unit_subtypes_property_id_unit_type_name_key UNIQUE (property_id, unit_type, name);
+
+
+--
+-- Name: property_unit_type_deposits property_unit_type_deposits_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_unit_type_deposits
+    ADD CONSTRAINT property_unit_type_deposits_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: property_unit_type_deposits property_unit_type_deposits_uniq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_unit_type_deposits
+    ADD CONSTRAINT property_unit_type_deposits_uniq UNIQUE (property_id, unit_type);
 
 
 --
@@ -13040,6 +13089,13 @@ CREATE UNIQUE INDEX landlord_pfo_one_active_per_landlord ON public.landlord_plat
 
 
 --
+-- Name: landlords_stripe_connect_account_id_uniq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX landlords_stripe_connect_account_id_uniq ON public.landlords USING btree (stripe_connect_account_id) WHERE (stripe_connect_account_id IS NOT NULL);
+
+
+--
 -- Name: lease_tenants_active_unique; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -16690,6 +16746,14 @@ ALTER TABLE ONLY public.lease_renewal_requests
 
 
 --
+-- Name: lease_template_fields lease_template_fields_parent_fk; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lease_template_fields
+    ADD CONSTRAINT lease_template_fields_parent_fk FOREIGN KEY (parent_field_id) REFERENCES public.lease_template_fields(id) ON DELETE SET NULL;
+
+
+--
 -- Name: lease_template_fields lease_template_fields_template_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -17014,7 +17078,7 @@ ALTER TABLE ONLY public.notifications
 --
 
 ALTER TABLE ONLY public.notifications
-    ADD CONSTRAINT notifications_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id);
+    ADD CONSTRAINT notifications_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
 
 
 --
@@ -18106,6 +18170,14 @@ ALTER TABLE ONLY public.property_unit_subtypes
 
 
 --
+-- Name: property_unit_type_deposits property_unit_type_deposits_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_unit_type_deposits
+    ADD CONSTRAINT property_unit_type_deposits_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE CASCADE;
+
+
+--
 -- Name: property_unit_type_late_fees property_unit_type_late_fees_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -19173,5 +19245,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict Jhx9uwfSPv5fwfvSPJpWxuRqgYASb0nlNkyLiylwkbc7DhT56zcuHIf8yAZfrZT
+\unrestrict OrGRr35Gq5e0XRPGrsQyCWNxdHrhndYZ7vYt7EOqlPSyU13sF6bsj2HQjhz34PK
 

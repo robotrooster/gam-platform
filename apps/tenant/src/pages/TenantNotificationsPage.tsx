@@ -4,8 +4,7 @@ import { Bell, Check, Building2 } from 'lucide-react'
 const API = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
 const tok = () => localStorage.getItem('gam_tenant_token')
 const get = (p: string) => fetch(API+'/api'+p,{headers:{Authorization:'Bearer '+tok()}}).then(r=>r.json()).then(r=>r.data??r)
-const patch = (p: string) => fetch(API+'/api'+p,{method:'PATCH',headers:{Authorization:'Bearer '+tok()}}).then(r=>r.json())
-const post = (p: string, b: any) => fetch(API+'/api'+p,{method:'POST',headers:{'Content-Type':'application/json',Authorization:'Bearer '+tok()},body:JSON.stringify(b)}).then(r=>r.json())
+const patch = (p: string, b?: any) => fetch(API+'/api'+p,{method:'PATCH',headers:{...(b!==undefined?{'Content-Type':'application/json'}:{}),Authorization:'Bearer '+tok()},body:b!==undefined?JSON.stringify(b):undefined}).then(r=>r.json())
 
 export function TenantNotificationsPage() {
   const qc = useQueryClient()
@@ -18,7 +17,8 @@ export function TenantNotificationsPage() {
   )
 
   const respondMut = useMutation(
-    ({ matchId, interested }: any) => post('/background/pool/match/'+matchId+'/respond', { interested }),
+    // S554 (button-sweep bug #6): route is PATCH, not POST → this 404'd silently.
+    ({ matchId, interested }: any) => patch('/background/pool/match/'+matchId+'/respond', { interested }),
     { onSuccess: () => qc.invalidateQueries('tenant-notifs') }
   )
 

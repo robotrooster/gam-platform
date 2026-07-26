@@ -12,7 +12,7 @@ import { backfillInvoices } from '../jobs/invoiceGeneration'
 import { PropertyReviewStatus, PLATFORM_FEES, LAUNCH_PLATFORM_FEE, SALES_LEAD_STATUSES } from '@gam/shared'
 import { fetchAccountStatus } from '../services/stripeConnect'
 import { unproductiveTurnSql } from '../services/agents/turnBudget'
-import { emailTenantOnboarded } from '../services/email'
+import { emailTenantOnboarded, emailLandlordBankingSetup, emailTenantAchSetup } from '../services/email'
 
 export const adminRouter = Router()
 adminRouter.use(requireAuth)
@@ -425,8 +425,47 @@ adminRouter.post('/onboarding/resend', async (req, res, next) => {
       return res.json({ success: true, data: { message: `Invite resent to ${t.email}` } })
     }
 
-    // Honest failure for the not-yet-wired types (no more fake success).
-    throw new AppError(501, `Resend for "${type}" isn't available yet. For a tenant invite, use the tenant's Resend Invite. For landlord setup/bank/ACH, contact the landlord directly for now.`)
+    // S554: bank_verification → nudge the LANDLORD (targetId = landlords.id)
+    // to finish Stripe Connect so rent can route.
+    if (type === 'bank_verification') {
+      const ll = await queryOne<any>(
+        `SELECT l.id AS landlord_id, u.email, (u.first_name || ' ' || u.last_name) AS name
+           FROM landlords l JOIN users u ON u.id = l.user_id WHERE l.id = $1`, [targetId])
+      if (!ll?.email) throw new AppError(404, 'Landlord not found')
+      const bankingUrl = `${process.env.LANDLORD_APP_URL || 'http://localhost:3001'}/banking`
+      await emailLandlordBankingSetup({ to: ll.email, landlordName: ll.name || 'there', bankingUrl, ctx: { landlordId: ll.landlord_id } })
+      await logAdminAction({
+        adminUserId: req.user!.userId, actionType: 'resend_bank_verification',
+        targetId, targetType: 'landlord', notes: 'Banking-setup nudge resent', ipAddress: req.ip ?? null,
+      })
+      return res.json({ success: true, data: { message: `Banking-setup reminder sent to ${ll.email}` } })
+    }
+
+    // S554: ach_enrollment → nudge the TENANT (targetId = tenants.id) to add a
+    // bank account so they can pay rent online.
+    if (type === 'ach_enrollment') {
+      const t = await queryOne<any>(
+        `SELECT u.email, u.first_name AS name, p.landlord_id
+           FROM tenants t
+           JOIN users u ON u.id = t.user_id
+           LEFT JOIN lease_tenants lt ON lt.tenant_id = t.id AND lt.status IN ('active','pending_add')
+           LEFT JOIN leases l ON l.id = lt.lease_id
+           LEFT JOIN units un ON un.id = l.unit_id
+           LEFT JOIN properties p ON p.id = un.property_id
+          WHERE t.id = $1 ORDER BY lt.added_at DESC NULLS LAST LIMIT 1`, [targetId])
+      if (!t?.email) throw new AppError(404, 'Tenant not found')
+      const paymentsUrl = `${process.env.TENANT_APP_URL || 'http://localhost:3002'}/payments`
+      await emailTenantAchSetup({ to: t.email, tenantName: t.name || 'there', paymentsUrl, ctx: { landlordId: t.landlord_id ?? null, tenantId: targetId } })
+      await logAdminAction({
+        adminUserId: req.user!.userId, actionType: 'resend_ach_enrollment',
+        targetId, targetType: 'tenant', notes: 'ACH-setup nudge resent', ipAddress: req.ip ?? null,
+      })
+      return res.json({ success: true, data: { message: `ACH-setup reminder sent to ${t.email}` } })
+    }
+
+    // landlord_setup is intentionally NOT wired: landlords self-register (no
+    // admin "setup invite" concept). Honest failure rather than a fake success.
+    throw new AppError(501, `Resend for "${type}" isn't available. Tenant invites, bank verification, and ACH enrollment can be resent; landlords self-register (no setup invite to resend).`)
   } catch (e) { next(e) }
 })
 

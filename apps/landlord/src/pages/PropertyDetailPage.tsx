@@ -13,6 +13,7 @@ import { usePerms } from '../lib/permissions'
 import { UnitSubtypesSection } from './UnitSubtypesSection'
 import { PropertyAgentPermissionsSection } from './PropertyAgentPermissionsSection'
 import { PropertyLateFeeSection, PaymentAcceptanceCard } from './PropertyLateFeeSection'
+import { PropertyDepositSection } from './PropertyDepositSection'
 import { LawWarningBanner } from '../components/LawWarningBanner'
 import { LAUNCH_HIDDEN } from '../components/layout/Layout'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
@@ -110,6 +111,8 @@ export function PropertyDetailPage() {
             fees are set; stamped (locked) into every drafted lease so
             terms are identical for all tenants. */}
       <PropertyLateFeeSection property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
+      {/* S556: security-deposit multiplier per unit type — deposit = rent × ratio. */}
+      <PropertyDepositSection property={property} />
       <PaymentAcceptanceCard property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
 
       {/* Occupancy bar */}

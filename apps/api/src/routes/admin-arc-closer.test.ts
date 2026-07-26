@@ -255,21 +255,46 @@ describe('GET /api/admin/tenants/:tenantId/flexsuite-acceptances', () => {
 })
 
 describe('POST /api/admin/onboarding/resend', () => {
-  it('happy: writes admin_action_log row with action_type derived from body.type', async () => {
+  // S554: the old stub returned "notification queued" for ANY type while
+  // sending nothing. Now bank_verification + ach_enrollment actually send a
+  // nudge (email suppressed in test but the send path + audit run); an
+  // unknown type is an honest 501.
+  it('bank_verification: nudges the landlord + logs resend_bank_verification', async () => {
     const f = await seedAFixture()
-    const targetId = randomUUID()
     const res = await request(buildApp())
       .post('/api/admin/onboarding/resend')
       .set('Authorization', `Bearer ${f.adminToken}`)
-      .send({ type: 'activation_email', targetId })
+      .send({ type: 'bank_verification', targetId: f.landlordId })
     expect(res.status).toBe(200)
-    expect(res.body.data.message).toMatch(/activation_email notification queued/)
+    expect(res.body.data.message).toMatch(/Banking-setup reminder sent/)
+    const log = await db.query<{ action_type: string }>(
+      `SELECT action_type FROM admin_action_log WHERE admin_user_id=$1 AND target_type='landlord'`, [f.adminUserId])
+    expect(log.rows.map(r => r.action_type)).toContain('resend_bank_verification')
+  })
 
-    const log = await db.query<{ action_type: string; target_id: string }>(
-      `SELECT action_type, target_id FROM admin_action_log
-        WHERE admin_user_id=$1 AND target_type='tenant'`, [f.adminUserId])
-    expect(log.rows.length).toBe(1)
-    expect(log.rows[0].action_type).toBe('resend_activation_email')
-    expect(log.rows[0].target_id).toBe(targetId)
+  it('ach_enrollment: nudges the tenant + logs resend_ach_enrollment', async () => {
+    const f = await seedAFixture()
+    const client = await db.connect()
+    let tenantId = ''
+    try { await client.query('BEGIN'); tenantId = await seedTenant(client); await client.query('COMMIT') }
+    finally { client.release() }
+    const res = await request(buildApp())
+      .post('/api/admin/onboarding/resend')
+      .set('Authorization', `Bearer ${f.adminToken}`)
+      .send({ type: 'ach_enrollment', targetId: tenantId })
+    expect(res.status).toBe(200)
+    expect(res.body.data.message).toMatch(/ACH-setup reminder sent/)
+    const log = await db.query<{ action_type: string }>(
+      `SELECT action_type FROM admin_action_log WHERE admin_user_id=$1 AND target_type='tenant'`, [f.adminUserId])
+    expect(log.rows.map(r => r.action_type)).toContain('resend_ach_enrollment')
+  })
+
+  it('landlord_setup (self-register, no invite) → honest 501', async () => {
+    const f = await seedAFixture()
+    const res = await request(buildApp())
+      .post('/api/admin/onboarding/resend')
+      .set('Authorization', `Bearer ${f.adminToken}`)
+      .send({ type: 'landlord_setup', targetId: f.landlordId })
+    expect(res.status).toBe(501)
   })
 })

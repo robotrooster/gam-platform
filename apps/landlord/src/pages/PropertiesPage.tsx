@@ -261,8 +261,8 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
         if (isEdit) {
           // S481: hold modal open when the backend surfaced state-law
           // warnings; save was committed regardless. apiPatch unwraps
-          // to r.data.data, so warnings sit at res.state_law_warnings.
-          const warnings: LawFlag[] = res?.state_law_warnings ?? []
+          // to r.data.data; responses are camelized, so warnings sit at res.stateLawWarnings.
+          const warnings: LawFlag[] = res?.stateLawWarnings ?? []
           if (warnings.length > 0) {
             setStateLawWarnings(warnings)
           } else {

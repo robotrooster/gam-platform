@@ -16,10 +16,10 @@ const FIELD_TYPES = [
   { type:'date',      label:'Date',       icon:'📅', color:'#22c55e', w:140, h:40 },
   { type:'text',      label:'Text Field', icon:'📝', color:'#a78bfa', w:200, h:40 },
   { type:'checkbox',  label:'Checkbox',   icon:'☑️', color:'#f59e0b', w:30,  h:30 },
-  { type:'radio_group',label:'Multiple Choice', icon:'🔘', color:'#ec4899', w:180, h:30 },
+  { type:'radio_group',label:'Multiple Choice', icon:'🔘', color:'#ec4899', w:16, h:16 },
 ]
 
-const SIGNER_ROLES = ['landlord','primary','co_tenant_1','co_tenant_2','witness']
+const SIGNER_ROLES = ['landlord','primary','co_tenant_1','co_tenant_2','co_tenant_3','witness']
 
 // DATA_LABELS derived from the shared lease_column registry. Single source
 // of truth is @gam/shared — adding a value there automatically surfaces it
@@ -34,7 +34,7 @@ const DATA_LABELS: Record<string, Array<{value:string; label:string}>> = {
     .map(c => ({ value: c, label: LEASE_COLUMN_LABEL[c] })),
 }
 const ROLE_COLORS: Record<string,string> = {
-  landlord:'#c9a227', primary:'#22c55e', co_tenant_1:'#4a9eff', co_tenant_2:'#a78bfa', witness:'#f59e0b'
+  landlord:'#c9a227', primary:'#22c55e', co_tenant_1:'#4a9eff', co_tenant_2:'#a78bfa', co_tenant_3:'#f472b6', witness:'#f59e0b'
 }
 
 // ── FIELD ITEM ON CANVAS ──────────────────────────────────────
@@ -238,10 +238,54 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
     () => apiPut(`/esign/templates/${template.id}/fields`, { fields: fields.map(f => ({
       fieldType: f.fieldType, signerRole: f.signerRole, label: f.label,
       page: f.page, x: f.x, y: f.y, width: f.width, height: f.height, required: f.required,
-      leaseColumn: f.leaseColumn || null
+      leaseColumn: f.leaseColumn || null, options: f.options || null,
+      // S556: conditional nesting — clientId is this field's stable key, and
+      // parentClientId points at the parent field's clientId (the server maps
+      // both to new DB ids after the full-replace insert).
+      clientId: f.id, parentClientId: f.parentFieldId || null, parentOption: f.parentOption || null
     })) }),
     { onSuccess: () => { qc.invalidateQueries('esign-templates'); onClose() } }
   )
+
+  // S556: auto-place fields from the raw lease PDF (detection + in-house
+  // model tagging). Loads proposals into the editor for review/adjust; nothing
+  // is saved until "Save Fields". Re-running replaces the current set.
+  const autoMut = useMutation(
+    () => apiPost(`/esign/templates/${template.id}/auto-fields`, {}),
+    {
+      onSuccess: (res: any) => {
+        const raw = res?.data?.fields || []
+        // First pass: assign editor ids + remember each proposal's radio key.
+        const keyToId: Record<string,string> = {}
+        const proposed = raw.map((f: any, i: number) => {
+          const id = `a_${Date.now()}_${i}`
+          if (f.key) keyToId[f.key] = id
+          return {
+            id, _parentKey: f.parentKey || null,
+            fieldType: f.fieldType, signerRole: f.signerRole,
+            label: f.label || (FIELD_TYPES.find(t => t.type === f.fieldType)?.label ?? 'Field'),
+            page: f.page || 1, x: f.x, y: f.y, width: f.width, height: f.height,
+            required: true, leaseColumn: f.leaseColumn || null, options: f.options || null,
+            parentOption: f.parentOption || null, parentFieldId: null,
+          }
+        })
+        // Second pass: resolve conditional parent links (radio key → editor id).
+        for (const p of proposed) {
+          if (p._parentKey && keyToId[p._parentKey]) p.parentFieldId = keyToId[p._parentKey]
+          delete p._parentKey
+        }
+        setFields(proposed)
+        setSelectedField(null)
+        toast(`Placed ${proposed.length} field${proposed.length === 1 ? '' : 's'} — review and adjust, then Save`)
+      },
+      onError: (e: any) => toast.error(e?.message || 'Auto-placement failed'),
+    }
+  )
+
+  const handleAutoPlace = async () => {
+    if (fields.length > 0 && !(await appConfirm('Replace the current fields with auto-placed ones? Your current fields will be cleared.'))) return
+    autoMut.mutate()
+  }
 
   const pageFields = fields.filter(f => f.page === currentPage)
   const sel = getSelected()
@@ -262,6 +306,9 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
         <div style={{ fontSize:'.72rem', color:'var(--text-3)' }}>Page {currentPage} of {template.pageCount}</div>
         {currentPage > 1 && <button className="btn btn-ghost btn-sm" onClick={() => setCurrentPage(p => p-1)}>← Prev</button>}
         {currentPage < template.pageCount && <button className="btn btn-ghost btn-sm" onClick={() => setCurrentPage(p => p+1)}>Next →</button>}
+        <button className="btn btn-primary btn-sm" onClick={handleAutoPlace} disabled={autoMut.isLoading} title="Detect and place field boxes from the lease PDF">
+          {autoMut.isLoading ? <><span className="spinner" /> Analyzing…</> : <>✨ Auto-place fields</>}
+        </button>
         <button className="btn btn-primary btn-sm" onClick={() => saveMut.mutate()} disabled={saveMut.isLoading}>
           {saveMut.isLoading ? <span className="spinner" /> : <><Check size={13} /> Save Fields</>}
         </button>
@@ -273,7 +320,9 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
           <div style={{ fontSize:'.68rem', fontWeight:700, color:'var(--text-3)', textTransform:'uppercase', letterSpacing:'.08em', marginBottom:8 }}>Signer Role</div>
           <div style={{ display:'flex', flexDirection:'column', gap:4, marginBottom:16 }}>
             {SIGNER_ROLES.map(role => (
-              <div key={role} onClick={() => setActiveRole(role)} style={{ padding:'6px 10px', borderRadius:6, cursor:'pointer', border:`1px solid ${activeRole===role?ROLE_COLORS[role]:'var(--border-0)'}`, background:activeRole===role?`${ROLE_COLORS[role]}22`:'transparent', fontSize:'.75rem', fontWeight:activeRole===role?700:400, color:activeRole===role?ROLE_COLORS[role]:'var(--text-3)', textTransform:'capitalize' }}>
+              <div key={role} onClick={() => setActiveRole(role)} style={{ padding:'6px 10px', borderRadius:6, cursor:'pointer', border:`1px solid ${activeRole===role?ROLE_COLORS[role]:'var(--border-0)'}`, background:activeRole===role?`${ROLE_COLORS[role]}22`:'transparent', fontSize:'.75rem', fontWeight:activeRole===role?700:400, color:activeRole===role?ROLE_COLORS[role]:'var(--text-3)', textTransform:'capitalize', display:'flex', alignItems:'center', gap:8 }}>
+                {/* persistent color swatch — the legend for box colors on the page */}
+                <span style={{ width:11, height:11, borderRadius:3, background:ROLE_COLORS[role]||'#888', flexShrink:0, border:'1px solid rgba(0,0,0,.2)' }} />
                 {humanize(role)}
               </div>
             ))}
@@ -326,6 +375,33 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
                   <input className="input" value={sel.groupName||''} onChange={e => updateSelected('groupName', e.target.value)} placeholder="e.g. lease_type" style={{ width:'100%', fontSize:'.75rem' }} />
                 </div>
               )}
+              {/* S556: conditional visibility — ANY field can be shown/required
+                  only when a radio equals a chosen option (e.g. end_date only
+                  when lease_type = "Fixed term"; a notice-period field only when
+                  = "Month-to-month"). Inapplicable fields auto-hide + drop their
+                  required flag, so the landlord never marks N/A. */}
+              {(() => {
+                const candidates = fields.filter(x => x.fieldType === 'radio_group' && x.id !== sel.id)
+                if (candidates.length === 0) return null
+                const parent = candidates.find(x => x.id === sel.parentFieldId)
+                const parentOpts = (parent?.options || '').split(',').map((o:string) => o.trim()).filter(Boolean)
+                return (
+                  <div style={{ marginBottom:8 }}>
+                    <label style={{ fontSize:'.65rem', color:'var(--text-3)', display:'block', marginBottom:3 }}>Only show if…</label>
+                    <select className="input" value={sel.parentFieldId || ''} onChange={e => { updateSelected('parentFieldId', e.target.value || null); updateSelected('parentOption', null) }} style={{ width:'100%', fontSize:'.75rem' }}>
+                      <option value="">Always shown</option>
+                      {candidates.map(c => <option key={c.id} value={c.id}>{c.label || c.groupName || 'Radio group'}</option>)}
+                    </select>
+                    {sel.parentFieldId && (
+                      <select className="input" value={sel.parentOption || ''} onChange={e => updateSelected('parentOption', e.target.value || null)} style={{ width:'100%', fontSize:'.75rem', marginTop:4 }}>
+                        <option value="">Pick trigger option…</option>
+                        {parentOpts.map((o:string) => <option key={o} value={o}>{o}</option>)}
+                      </select>
+                    )}
+                    {sel.parentFieldId && <div style={{ fontSize:'.62rem', color:'var(--text-3)', marginTop:2 }}>Shown + required only when that field equals this option.</div>}
+                  </div>
+                )
+              })()}
               {sel.fieldType === 'initials' && template.pageCount > 1 && (
                 <button
                   className="btn btn-ghost btn-sm"
@@ -466,6 +542,25 @@ function SendDocumentModal({ onClose }) {
       ?? pool.find((t:any) => t.propertyId === u.propertyId)
       ?? pool.find((t:any) => !t.unitType && !t.propertyId)
     if (pick) setTemplateId(pick.id)
+  }, [selectedUnitId, mode])
+
+  // S556: pre-fill the Document Values form from the unit's data (rent,
+  // derived deposit, unit #, property) so the landlord reviews/adjusts instead
+  // of retyping. Only fills blanks — anything already typed stays.
+  useEffect(() => {
+    if (mode !== 'unit' || !selectedUnitId) return
+    let cancelled = false
+    apiGet(`/esign/units/${selectedUnitId}/prefill-suggestions`)
+      .then((s: Record<string,string>) => {
+        if (cancelled || !s) return
+        setPrefillValues(prev => {
+          const next = { ...prev }
+          for (const [k, v] of Object.entries(s)) if (v && !next[k]) next[k] = v
+          return next
+        })
+      })
+      .catch(() => {})
+    return () => { cancelled = true }
   }, [selectedUnitId, mode])
 
   // Resolved lease signers for the picked unit / property.
@@ -842,7 +937,7 @@ export function ESignPage() {
                     <td style={{ fontSize:'.72rem', color: d.completedAt ? 'var(--green)' : 'var(--text-3)' }}>{d.completedAt ? new Date(d.completedAt).toLocaleDateString() : '—'}</td>
                     <td>
                       <div style={{ display:'flex', gap:6 }}>
-                        {can('esign.download') && d.completedPdfUrl && <a href={d.completedPdfUrl} className="btn btn-ghost btn-sm"><Download size={12} /></a>}
+                        {can('esign.download') && d.executedPdfUrl && <a href={d.executedPdfUrl} className="btn btn-ghost btn-sm"><Download size={12} /></a>}
                         {can('esign.void') && d.status !== 'completed' && d.status !== 'voided' && (
                           <button className="btn btn-ghost btn-sm" style={{ color:'var(--red)' }} onClick={() => { appConfirm('Void this document?', { danger: true, confirmLabel: 'Void' }).then(ok => { if (ok) voidMut.mutate(d.id) }) }}><X size={12} /></button>
                         )}

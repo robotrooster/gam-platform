@@ -1777,6 +1777,60 @@ tenantsRouter.get('/lease', requireAuth, async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
+// S554 (Oak Park): a tenant can hold MORE THAN ONE active lease — e.g. space
+// rent on two mobile homes under the same landlord (the same-landlord overlap
+// exception in esign.ts allows this deliberately). GET /lease (above) returns
+// only the first (LIMIT 1); this plural route returns EVERY active/pending
+// lease so the portal can switch between them. Billing is already per-lease
+// (payments/invoices carry lease_id), so this closes the display gap.
+tenantsRouter.get('/leases', requireAuth, async (req, res, next) => {
+  try {
+    const tenant = await queryOne<any>('SELECT id FROM tenants WHERE user_id=$1', [req.user!.userId])
+    if (!tenant) throw new AppError(404, 'Tenant not found')
+    const leases = await query<any>(`
+      SELECT l.*, p.name as property_name, p.state as property_state,
+        u.unit_number,
+        (SELECT amount FROM lease_fees lf
+          WHERE lf.lease_id = l.id
+            AND lf.fee_type = 'security_deposit'
+            AND lf.due_timing = 'move_in'
+          LIMIT 1) AS security_deposit,
+        lu.first_name || ' ' || lu.last_name as landlord_name,
+        COALESCE(vuo.primary_first_name || ' ' || vuo.primary_last_name, '') as tenant_name
+      FROM lease_tenants lt
+      JOIN leases l ON l.id = lt.lease_id
+      JOIN units u ON u.id = l.unit_id
+      JOIN properties p ON p.id = u.property_id
+      JOIN landlords la ON la.id = l.landlord_id
+      JOIN users lu ON lu.id = la.user_id
+      LEFT JOIN v_unit_occupancy vuo ON vuo.unit_id = u.id
+      WHERE lt.tenant_id = $1
+        AND lt.status = 'active'
+        AND l.status IN ('pending', 'active')
+      ORDER BY l.created_at DESC`, [tenant.id])
+
+    const enriched = []
+    for (const lease of leases as any[]) {
+      let stateLawWarnings: LawFlag[] = []
+      try {
+        stateLawWarnings = await checkLeaseAgainstStateLaw({
+          stateCode:             lease.property_state,
+          rentAmount:            Number(lease.rent_amount),
+          securityDepositAmount: lease.security_deposit != null ? Number(lease.security_deposit) : null,
+          lateFeeInitialAmount:  lease.late_fee_initial_amount != null ? Number(lease.late_fee_initial_amount) : null,
+          lateFeeInitialType:    lease.late_fee_initial_type,
+          lateFeeGraceDays:      lease.late_fee_grace_days != null ? Number(lease.late_fee_grace_days) : null,
+        })
+      } catch (e) {
+        logger.error({ err: e, lease_id: lease.id }, '[stateLaw] tenant leases GET checks failed')
+      }
+      enriched.push({ ...lease, document_url: `/api/leases/${lease.id}/pdf`, state_law_warnings: stateLawWarnings })
+    }
+
+    res.json({ success: true, data: enriched })
+  } catch (e) { next(e) }
+})
+
 tenantsRouter.post('/lease/sign', requireAuth, async (req, res, next) => {
   // Removed S20. Tenant signing is handled exclusively by the e-sign flow.
   // Tenants sign documents at POST /api/esign/sign/:documentId after a

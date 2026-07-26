@@ -599,6 +599,49 @@ export async function emailLandlordBankingNudge(args: {
   )
 }
 
+// S554: admin-initiated onboarding-step resends (POST /admin/onboarding/resend).
+// bank_verification → nudge the LANDLORD to finish Stripe Connect banking so
+// rent can route. ach_enrollment → nudge the TENANT to add a bank account so
+// they can pay online. Plain nudges (no token — both land on an authed portal
+// the recipient already has an account for).
+export async function emailLandlordBankingSetup(args: {
+  to: string; landlordName: string; bankingUrl: string
+  ctx?: { landlordId?: string | null }
+}) {
+  await send(args.to,
+    'Finish your GAM banking setup to receive rent',
+    base(
+      h('Complete your banking setup') +
+      p(`Hi ${args.landlordName},`) +
+      p('Your Stripe Connect onboarding with GAM isn’t finished yet. Until it is, GAM can’t route your tenants’ rent payments to your bank.') +
+      p('It takes a few minutes through the secure embedded Stripe form.') +
+      btn('Complete Banking Setup', args.bankingUrl)
+    ),
+    { category: 'landlord_banking_setup', landlordId: args.ctx?.landlordId ?? null },
+  )
+}
+
+export async function emailTenantAchSetup(args: {
+  to: string; tenantName: string; paymentsUrl: string
+  ctx?: { landlordId?: string | null; tenantId?: string | null }
+}) {
+  await send(args.to,
+    'Set up your bank account to pay rent online',
+    base(
+      h('Add your bank account') +
+      p(`Hi ${args.tenantName},`) +
+      p('To pay rent online through GAM, add and verify your bank account. It only takes a minute and we never see your full account number.') +
+      btn('Set Up Bank Account', args.paymentsUrl)
+    ),
+    {
+      category: 'tenant_ach_setup',
+      landlordId: args.ctx?.landlordId ?? null,
+      relatedEntityType: 'tenant',
+      relatedEntityId: args.ctx?.tenantId ?? null,
+    },
+  )
+}
+
 // ── ADVERSE ACTION NOTICE (S87, FCRA §615(a)) ─────────────────
 // Sent to an applicant when a landlord denies them based on a CRA
 // report. The notice_text is built by lib/adverseAction.ts and stored

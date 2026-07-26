@@ -91,9 +91,17 @@ export function ProfilePage() {
     return channel === 'email' ? p.emailEnabled : p.inAppEnabled
   }
 
-  const togglePref = (type: string, channel: string, val: boolean) => {
+  // S554 (button-sweep bug #4): the API PATCH requires camelCase
+  // emailEnabled/inAppEnabled (requests are NOT camelized — only responses
+  // are). This previously sent snake_case keys → silent 400, no pref ever
+  // saved (rows are only created by this PATCH, so the toggle was dead).
+  const togglePref = (type: string, channel: 'email'|'in_app', val: boolean) => {
     const p = (notifPrefs as any[]).find((x: any) => x.type === type) || {}
-    prefMut.mutate({ type, email_enabled: p.emailEnabled ?? true, in_app_enabled: p.inAppEnabled ?? true, [channel]: val })
+    prefMut.mutate({
+      type,
+      emailEnabled: channel === 'email'  ? val : (p.emailEnabled ?? true),
+      inAppEnabled: channel === 'in_app' ? val : (p.inAppEnabled ?? true),
+    })
   }
 
   const s = (_label: string, color = 'var(--text-3)') => ({
@@ -172,7 +180,7 @@ export function ProfilePage() {
                     <div key={n.type+ch} style={{ padding:'12px 16px', textAlign:'center', borderBottom: i<NOTIF_TYPES.length-1?'1px solid var(--border-0)':'none', display:'flex', alignItems:'center', justifyContent:'center' }}>
                       {ch === 'in_app'
                         ? <span title="In-app notifications are always on" style={{ color:'var(--green)', fontSize:'.85rem' }}>✓</span>
-                        : <input type="checkbox" checked={getPref(n.type, ch)} onChange={e => togglePref(n.type, `${ch}_enabled`, e.target.checked)} style={{ width:16, height:16, cursor:'pointer' }} />
+                        : <input type="checkbox" checked={getPref(n.type, ch)} onChange={e => togglePref(n.type, ch, e.target.checked)} style={{ width:16, height:16, cursor:'pointer' }} />
                       }
                     </div>
                   ))}

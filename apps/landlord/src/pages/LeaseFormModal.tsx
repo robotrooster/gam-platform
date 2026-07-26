@@ -274,7 +274,7 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
         qc.invalidateQueries(['lease', leaseId])
         qc.invalidateQueries('units')
         setPendingConfirm(null)
-        const warnings: LawFlag[] = result?.state_law_warnings ?? []
+        const warnings: LawFlag[] = result?.stateLawWarnings ?? []
         if (warnings.length > 0) {
           // Keep the modal open so the landlord can read the hedged
           // notice. Save is already committed; banner just informs.

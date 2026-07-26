@@ -10,6 +10,7 @@ import {
   fetchAccountStatus,
   type ConnectEntity,
 } from '../services/stripeConnect'
+import { assertLiveLandlordMember } from '../services/landlordMembership'
 
 export const stripeRouter = Router()
 stripeRouter.use(requireAuth)
@@ -35,7 +36,7 @@ stripeRouter.use(requireAuth)
 stripeRouter.post('/connect/onboarding-session', async (req: any, res, next) => {
   try {
     const body = z.object({
-      entity:   z.enum(['user', 'pm_company']),
+      entity:   z.enum(['user', 'pm_company', 'landlord']),
       entityId: z.string().uuid().optional(),
     }).parse(req.body)
 
@@ -50,6 +51,22 @@ stripeRouter.post('/connect/onboarding-session', async (req: any, res, next) => 
       const u = await queryOne<{ email: string }>(`SELECT email FROM users WHERE id=$1`, [entityId])
       if (!u) throw new AppError(404, 'User not found')
       email = u.email
+    } else if (entity === 'landlord') {
+      // S554 Connect re-anchor: onboard the landlord ENTITY's own account.
+      // entityId is the landlords.id. LIVE membership re-check (not JWT) — a
+      // removed co-owner must not be able to onboard/re-point the entity's
+      // money account with a stale token.
+      const landlordId = body.entityId
+      if (!landlordId) throw new AppError(400, 'entityId required for landlord entity')
+      await assertLiveLandlordMember(req.user!.userId, landlordId)
+      entityId = landlordId
+      const la = await queryOne<{ business_name: string | null; user_id: string }>(
+        `SELECT business_name, user_id FROM landlords WHERE id=$1`, [landlordId])
+      if (!la) throw new AppError(404, 'Landlord entity not found')
+      businessName = la.business_name
+      const callerEmail = (await queryOne<{ email: string }>(`SELECT email FROM users WHERE id=$1`, [req.user!.userId]))?.email
+      if (!callerEmail) throw new AppError(400, 'No email available for KYC contact')
+      email = callerEmail
     } else {
       // pm_company: must own it
       const pmCompanyId = body.entityId
@@ -88,12 +105,28 @@ stripeRouter.post('/connect/onboarding-session', async (req: any, res, next) => 
 // Auth: same scoping as the onboarding-session route.
 stripeRouter.get('/connect/status', async (req: any, res, next) => {
   try {
-    const entity = (req.query.entity === 'pm_company' ? 'pm_company' : 'user') as ConnectEntity
+    const entity = (
+      req.query.entity === 'pm_company' ? 'pm_company'
+      : req.query.entity === 'landlord' ? 'landlord'
+      : 'user'
+    ) as ConnectEntity
     let connectAccountId: string | null = null
 
     if (entity === 'user') {
       const r = await queryOne<{ stripe_connect_account_id: string | null }>(
         `SELECT stripe_connect_account_id FROM users WHERE id=$1`, [req.user!.userId]
+      )
+      connectAccountId = r?.stripe_connect_account_id ?? null
+    } else if (entity === 'landlord') {
+      // S554 Connect re-anchor: the entity's own account (COALESCE fallback to
+      // the founding owner's user account during the transition). LIVE
+      // membership re-check on this money-status surface.
+      const landlordId = typeof req.query.entityId === 'string' ? req.query.entityId : null
+      if (!landlordId) throw new AppError(400, 'entityId required for landlord entity')
+      await assertLiveLandlordMember(req.user!.userId, landlordId)
+      const r = await queryOne<{ stripe_connect_account_id: string | null }>(
+        `SELECT COALESCE(l.stripe_connect_account_id, u.stripe_connect_account_id) AS stripe_connect_account_id
+           FROM landlords l JOIN users u ON u.id = l.user_id WHERE l.id=$1`, [landlordId]
       )
       connectAccountId = r?.stripe_connect_account_id ?? null
     } else {

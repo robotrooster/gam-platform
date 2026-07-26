@@ -28,7 +28,11 @@ import { AppError } from '../middleware/errorHandler'
 import { createAdminNotification } from './adminNotifications'
 import { logger } from '../lib/logger'
 
-export type ConnectEntity = 'user' | 'pm_company' | 'business'
+// S554 Connect re-anchor: 'landlord' keys the account off the ENTITY
+// (landlords row = an LLC with its own EIN/bank), not the owner's user.
+// STAGE 1: the branch is wired but no live landlord caller passes it yet —
+// Banking/onboarding/disbursement still use 'user' until the Stage-2 switch.
+export type ConnectEntity = 'user' | 'pm_company' | 'business' | 'landlord'
 
 interface CreateConnectAccountOpts {
   entity: ConnectEntity
@@ -753,18 +757,41 @@ export async function recordAccountUpdated(account: Stripe.Account): Promise<voi
       WHERE stripe_connect_account_id = $1`,
     [account.id, charges, payouts, details]
   )
+  // S554 Connect re-anchor: mirror the capability cache onto the landlord
+  // ENTITY. Additive — matches only accounts anchored to a landlords row
+  // (none until the Stage-2 caller switch), so it's a no-op for user-keyed
+  // accounts today and correct once entities own their accounts.
+  await query(
+    `UPDATE landlords
+        SET stripe_connect_status_synced_at = NOW(),
+            connect_charges_enabled    = $2,
+            connect_payouts_enabled    = $3,
+            connect_details_submitted  = $4
+      WHERE stripe_connect_account_id = $1`,
+    [account.id, charges, payouts, details]
+  )
 
   // S113-PhaseA: when a Connect account becomes ready (charges + details),
   // try to reconcile any platform_held rent payments that were collected
   // while the landlord's Connect was incomplete. Best-effort — errors get
   // logged + admin-notified inside the helper but don't propagate.
   if (charges && details) {
-    const landlordRow = await queryOne<{ id: string }>(
+    // S554 Connect re-anchor: the account may be anchored on the USER (legacy)
+    // OR the landlord ENTITY. Resolve the founding owner's user id either way —
+    // reconcilePlatformHeldPayments takes that user id and resolves the account
+    // via COALESCE(entity, user), so the held rent transfers to whichever
+    // account is now live.
+    const userRow = await queryOne<{ id: string }>(
       `SELECT id FROM users WHERE stripe_connect_account_id = $1`, [account.id]
     )
-    if (landlordRow) {
+    const landlordUserId = userRow?.id
+      ?? (await queryOne<{ user_id: string }>(
+            `SELECT user_id FROM landlords WHERE stripe_connect_account_id = $1`, [account.id]
+          ))?.user_id
+      ?? null
+    if (landlordUserId) {
       const { tryReconcileForLandlordUserId } = await import('./landlordPassthrough')
-      await tryReconcileForLandlordUserId(landlordRow.id)
+      await tryReconcileForLandlordUserId(landlordUserId)
     }
   }
 }
@@ -966,6 +993,14 @@ async function fetchExistingConnectId(entity: ConnectEntity, entityId: string): 
     if (!row) throw new AppError(404, 'Business not found')
     return row.stripe_connect_account_id
   }
+  if (entity === 'landlord') {
+    // S554 Connect re-anchor: the landlords row (entity) owns the account.
+    const row = await queryOne<{ stripe_connect_account_id: string | null }>(
+      `SELECT stripe_connect_account_id FROM landlords WHERE id = $1`, [entityId]
+    )
+    if (!row) throw new AppError(404, 'Landlord entity not found')
+    return row.stripe_connect_account_id
+  }
   // pm_company
   const row = await queryOne<{ stripe_connect_account_id: string | null }>(
     `SELECT stripe_connect_account_id FROM pm_companies WHERE id = $1`, [entityId]
@@ -986,6 +1021,14 @@ async function persistConnectId(entity: ConnectEntity, entityId: string, connect
     // S494
     await query(
       `UPDATE businesses SET stripe_connect_account_id = $1 WHERE id = $2 AND stripe_connect_account_id IS NULL`,
+      [connectId, entityId]
+    )
+    return
+  }
+  if (entity === 'landlord') {
+    // S554 Connect re-anchor
+    await query(
+      `UPDATE landlords SET stripe_connect_account_id = $1 WHERE id = $2 AND stripe_connect_account_id IS NULL`,
       [connectId, entityId]
     )
     return

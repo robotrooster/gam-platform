@@ -4,7 +4,6 @@ import { useQuery } from 'react-query'
 import { humanize } from '@gam/shared'
 import { apiGet } from '../lib/api'
 import { ArrowLeft } from 'lucide-react'
-import { TransferTenantModal } from './TransferTenantModal'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
 // S252: legacy per-tenant FlexChargePanel removed. The new schema
@@ -16,7 +15,6 @@ const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minim
 export function TenantDetailPage() {
   const { id } = useParams()
   const navigate = useNavigate()
-  const [showTransfer, setShowTransfer] = useState(false)
   const [showPaymentDetail, setShowPaymentDetail] = useState(false)
   // S252: per-tenant FlexCharge query removed alongside the legacy
   // panel. New flex_charge_accounts schema is (customer, property)
@@ -47,7 +45,6 @@ export function TenantDetailPage() {
             </div>
           </div>
         </div>
-        {currentUnit && <button className="btn btn-primary" onClick={() => setShowTransfer(true)}>Transfer Unit</button>}
       </div>
 
       {(
@@ -185,14 +182,6 @@ export function TenantDetailPage() {
 
       {showPaymentDetail && (
         <PaymentTimelinessModal payments={payments || []} tenantName={`${tenant.firstName} ${tenant.lastName}`} onClose={() => setShowPaymentDetail(false)} />
-      )}
-      {showTransfer && currentUnit && (
-        <TransferTenantModal
-          tenantId={id!}
-          tenantName={tenant.firstName + ' ' + tenant.lastName}
-          currentUnit={currentUnit}
-          onClose={() => setShowTransfer(false)}
-        />
       )}
     </div>
   )

@@ -3,7 +3,7 @@ import { defineConfig } from 'vitest/config'
 export default defineConfig({
   test: {
     include: ['src/**/*.test.ts'],
-    exclude: ['src/lib/caseConversion.test.ts', 'node_modules/**', 'dist/**'],
+    exclude: ['node_modules/**', 'dist/**'],
     globalSetup: ['./src/test/globalSetup.ts'],
     pool: 'forks',
     poolOptions: { forks: { singleFork: true } },

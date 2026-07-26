@@ -85,6 +85,7 @@ export type TextItem = {
   x: number          // left edge in PDF user-space points
   y: number          // baseline -- PDF coords have y increasing UPWARD
   x2: number         // right edge
+  height: number     // glyph height in points (pdfjs raw.height); ~font size
   fontName: string   // pdfjs-internal id (e.g. 'g_d0_f1'); not stable across documents
 }
 
@@ -145,6 +146,7 @@ export async function extractPositionedText(pdfBuffer: Buffer): Promise<Extracte
         x,
         y,
         x2: x + w,
+        height: raw.height || 0,
         fontName: raw.fontName || 'unknown',
       })
     }

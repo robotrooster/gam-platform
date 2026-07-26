@@ -386,6 +386,27 @@ export function SignPage() {
 
   const { signer, document:doc, fields, readOnly } = data
   const allFields = fields || []
+  // S556: conditional (nested) fields. A child radio is only shown/required
+  // when its parent's current selection == the child's trigger option. Match a
+  // child to its parent by (child.parentFieldId == parent.templateFieldId).
+  const isFieldActive = (f:any): boolean => {
+    if (!f.parentFieldId) return true
+    const parent = allFields.find((p:any)=> p.templateFieldId && p.templateFieldId === f.parentFieldId)
+    if (!parent) return true
+    return (fieldValues[parent.id] ?? parent.value ?? null) === f.parentOption
+  }
+  const setFieldValue = (fieldId:string, value:string) => {
+    setFieldValues(prev => {
+      const next:Record<string,string> = { ...prev, [fieldId]: value }
+      const self = allFields.find((x:any)=> x.id === fieldId)
+      if (self?.templateFieldId) {
+        for (const child of allFields) {
+          if (child.parentFieldId === self.templateFieldId && child.parentOption !== value) delete next[child.id]
+        }
+      }
+      return next
+    })
+  }
 
   // S235: read-only re-open. Backend serves the executed state for
   // terminal-status docs (completed / voided / execution_failed) and
@@ -396,10 +417,11 @@ export function SignPage() {
     return <ReadOnlyView doc={doc} signer={signer} fields={allFields} onBack={()=>navigate('/')} />
   }
 
-  const requiredFields = allFields.filter((f:any)=>f.required)
+  const activeFields = allFields.filter(isFieldActive)
+  const requiredFields = activeFields.filter((f:any)=>f.required)
   const unfilledRequired = requiredFields.filter((f:any)=>!fieldValues[f.id]?.trim())
   const nextField = unfilledRequired[0]
-  const pageFields = allFields.filter((f:any)=>f.page===currentPage)
+  const pageFields = activeFields.filter((f:any)=>f.page===currentPage)
   const currentPageRequired = pageFields.filter((f:any)=>f.required)
   const currentPageComplete = currentPageRequired.every((f:any)=>fieldValues[f.id]?.trim())
   const allFilled = unfilledRequired.length === 0
@@ -595,7 +617,7 @@ export function SignPage() {
               <div style={{ display:'flex', flexDirection:'column' as const, gap:7, marginBottom:14 }}>
                 {(activeField.options||'Yes,No').split(',').map((opt:string)=>opt.trim()).map((opt:string)=>(
                   <label key={opt} style={{ display:'flex', alignItems:'center', gap:10, cursor:'pointer', padding:'9px 13px', border:`2px solid ${fieldValues[activeField.id]===opt?'#c9a227':'#e5e7eb'}`, borderRadius:8 }}>
-                    <input type="radio" checked={fieldValues[activeField.id]===opt} onChange={()=>setFieldValues(p=>({...p,[activeField.id]:opt}))} style={{ width:16, height:16 }}/>
+                    <input type="radio" checked={fieldValues[activeField.id]===opt} onChange={()=>setFieldValue(activeField.id, opt)} style={{ width:16, height:16 }}/>
                     <span style={{ fontWeight:fieldValues[activeField.id]===opt?600:400 }}>{opt}</span>
                   </label>
                 ))}

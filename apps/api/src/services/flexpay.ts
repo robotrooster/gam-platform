@@ -410,7 +410,8 @@ export async function processGracePeriodAdvance(now: Date = new Date()): Promise
             l.rent_amount, l.rent_due_day,
             COALESCE(l.late_fee_grace_days, $1) AS late_fee_grace_days,
             t.flexpay_pull_day AS pull_day,
-            u.stripe_connect_account_id AS connect_account_id
+            -- S554 Connect re-anchor: entity account preferred, user fallback.
+            COALESCE(la.stripe_connect_account_id, u.stripe_connect_account_id) AS connect_account_id
        FROM tenants t
        JOIN lease_tenants lt ON lt.tenant_id = t.id AND lt.status = 'active'
        JOIN leases l         ON l.id = lt.lease_id AND l.status IN ('active', 'pending')

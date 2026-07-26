@@ -1031,6 +1031,43 @@ backgroundRouter.post('/dev-reset', requireAuth, requireAdmin, async (req, res, 
   } catch (e) { next(e) }
 })
 
+// ── TENANT REAPPLY (post-denial cooldown) ────────────────────
+// S554 (button-sweep bug #7): the applicant-facing "Reapply Now" button
+// (shown when a denied applicant's 90-day cooldown has elapsed) was wired
+// to the admin-only, non-prod /dev-reset → every applicant got a 403 and
+// could never reapply. This is the real reapply endpoint: any authenticated
+// applicant may call it, but the 90-day cooldown is ENFORCED here — never
+// trusted from the client, which only decides whether to SHOW the button.
+const REAPPLY_COOLDOWN_DAYS = 90
+backgroundRouter.post('/reapply', requireAuth, async (req, res, next) => {
+  try {
+    const tenant = await queryOne<any>('SELECT * FROM tenants WHERE user_id=$1', [req.user!.userId])
+    // Resolve the applicant's most recent decision. Prefer the linked
+    // check; fall back to the latest by user (mirrors GET /status).
+    const check = tenant?.background_check_id
+      ? await queryOne<any>('SELECT id, status, decided_at FROM background_checks WHERE id=$1', [tenant.background_check_id])
+      : await queryOne<any>(
+          'SELECT id, status, decided_at FROM background_checks WHERE user_id=$1 ORDER BY created_at DESC LIMIT 1',
+          [req.user!.userId])
+
+    const status = tenant?.background_check_status || check?.status
+    if (status !== 'denied') throw new AppError(409, 'Reapplication is only available after a denied application')
+    if (!check?.decided_at) throw new AppError(409, 'No decision on record to reapply from')
+
+    const elapsedMs = Date.now() - new Date(check.decided_at).getTime()
+    const remainingMs = REAPPLY_COOLDOWN_DAYS * 24 * 60 * 60 * 1000 - elapsedMs
+    if (remainingMs > 0) {
+      const daysLeft = Math.ceil(remainingMs / (24 * 60 * 60 * 1000))
+      throw new AppError(403, `Reapplication is not yet available — ${daysLeft} day(s) remaining in the cooldown period`)
+    }
+
+    if (tenant) {
+      await query("UPDATE tenants SET background_check_status='not_started', background_check_id=NULL WHERE id=$1", [tenant.id])
+    }
+    res.json({ success: true })
+  } catch (e) { next(e) }
+})
+
 // ── POOL: TENANT WITHDRAW ────────────────────────────────────
 // Tenant says "no longer interested" — flips their pool entry to inactive.
 // In-flight match requests are unchanged; tenant won't see new ones because

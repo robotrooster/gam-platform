@@ -140,7 +140,7 @@ export function RenewalDecisionModal({ leaseId, onClose }: { leaseId: string; on
                     <FileSignature size={15} style={{ color:'var(--gold)' }}/> Renewal already in progress
                   </div>
                   <div style={{ fontSize:'.78rem', color:'var(--text-2)', lineHeight:1.5 }}>
-                    {openDraft.landlord_signer_status === 'signed'
+                    {openDraft.landlordSignerStatus === 'signed'
                       ? 'You\'ve signed — the renewal lease is with the tenant now. You can still void it if plans changed.'
                       : 'The renewal lease is drafted and waiting on you. Open it, type in the new rent and dates, and sign — the tenant gets it automatically.'}
                   </div>
@@ -152,7 +152,7 @@ export function RenewalDecisionModal({ leaseId, onClose }: { leaseId: string; on
                     onClick={()=>{ appConfirm('Void this renewal draft? Any values already entered are discarded.', { danger: true, confirmLabel: 'Void draft' }).then(ok => { if (ok) voidMut.mutate() }) }}>
                     {voidMut.isLoading ? 'Voiding…' : 'Void draft'}
                   </button>
-                  {openDraft.landlord_signer_status !== 'signed' && (
+                  {openDraft.landlordSignerStatus !== 'signed' && (
                     <button className="btn btn-primary" disabled={working} onClick={openExistingDraft}>
                       {working ? 'Opening…' : 'Open & Sign the Lease'}
                     </button>

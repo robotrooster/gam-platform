@@ -44,8 +44,11 @@ export interface PassthroughResult {
 export async function reconcilePlatformHeldPayments(
   landlordUserId: string
 ): Promise<PassthroughResult> {
+  // S554 Connect re-anchor: prefer the landlord ENTITY's account, fall back to
+  // the founding owner's user account during the transition.
   const landlordRow = await queryOne<{ landlord_id: string; stripe_connect_account_id: string | null }>(
-    `SELECT l.id AS landlord_id, u.stripe_connect_account_id
+    `SELECT l.id AS landlord_id,
+            COALESCE(l.stripe_connect_account_id, u.stripe_connect_account_id) AS stripe_connect_account_id
        FROM users u
        JOIN landlords l ON l.user_id = u.id
       WHERE u.id = $1`,

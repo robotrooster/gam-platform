@@ -34,7 +34,7 @@ export function PosCustomerOnboardingPage() {
   const [loadErr, setLoadErr] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [success, setSuccess] = useState<{ bank_last4: string | null } | null>(null)
+  const [success, setSuccess] = useState<{ bankLast4: string | null } | null>(null)
 
   useEffect(() => {
     if (!token) return
@@ -57,7 +57,9 @@ export function PosCustomerOnboardingPage() {
       const startRes = await fetch(`${API_URL}/api/pos-customer-onboarding/${token}/start`, { method: 'POST' })
         .then(r => r.json())
       if (!startRes.success) throw new Error(startRes.error?.message || startRes.error || 'Failed to start verification')
-      const { client_secret } = startRes.data
+      // S554 (response-camelize sweep): the API camelizes responses, so the
+      // route's snake_case client_secret arrives as clientSecret on the wire.
+      const { clientSecret: client_secret } = startRes.data
       if (!client_secret) throw new Error('No client_secret returned')
 
       // Collect bank via Stripe Financial Connections (FC modal).
@@ -83,7 +85,7 @@ export function PosCustomerOnboardingPage() {
       const completeRes = await fetch(`${API_URL}/api/pos-customer-onboarding/${token}/complete`, { method: 'POST' })
         .then(r => r.json())
       if (!completeRes.success) throw new Error(completeRes.error?.message || completeRes.error || 'Completion failed')
-      setSuccess({ bank_last4: completeRes.data.bank_last4 })
+      setSuccess({ bankLast4: completeRes.data.bankLast4 })  // S554: camelized on the wire
     } catch (e: any) {
       setError(e?.message || 'Verification failed')
     } finally {
@@ -108,9 +110,9 @@ export function PosCustomerOnboardingPage() {
       <CenteredCard>
         <div style={{ fontSize: '2.5rem', textAlign: 'center', marginBottom: 12 }}>✅</div>
         <h2 style={{ margin: '0 0 8px', textAlign: 'center' }}>Bank verified</h2>
-        {success.bank_last4 && (
+        {success.bankLast4 && (
           <p style={{ color: 'var(--t2)', textAlign: 'center' }}>
-            Linked: <strong>•••• {success.bank_last4}</strong>
+            Linked: <strong>•••• {success.bankLast4}</strong>
           </p>
         )}
         <p style={{ color: 'var(--t2)', textAlign: 'center', marginTop: 14, fontSize: '.85rem', lineHeight: 1.5 }}>

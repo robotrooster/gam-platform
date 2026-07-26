@@ -48,10 +48,15 @@ unitsRouter.get('/', async (req, res, next) => {
         vuo.primary_first_name AS tenant_first,
         vuo.primary_last_name AS tenant_last,
         vuo.primary_email AS tenant_email,
-        vuo.tenant_count
+        vuo.tenant_count,
+        -- S554 (button-sweep bug #10): the admin-ops Units panel reads
+        -- achVerified for the primary tenant's ACH badge; without this the
+        -- field was always undefined and the badge stuck on "Pending".
+        pt.ach_verified
       FROM units u
       JOIN properties p ON p.id = u.property_id
       LEFT JOIN v_unit_occupancy vuo ON vuo.unit_id = u.id
+      LEFT JOIN tenants pt ON pt.id = vuo.primary_tenant_id
       WHERE 1=1 ${landlordFilter} ${propertyFilter}
       ORDER BY p.name, u.unit_number
     `, params)

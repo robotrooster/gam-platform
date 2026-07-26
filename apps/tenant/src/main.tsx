@@ -36,6 +36,7 @@ function DefaultPage() {
 }
 import { SignPage } from './pages/SignPage'
 import { LeasePage } from './pages/LeasePage'
+import { MaintenancePage } from './pages/MaintenancePage'
 import { ProfilePage } from './pages/ProfilePage'
 import { PayoutsPage } from './pages/PayoutsPage'
 import { WorkTradePage } from './pages/WorkTradePage'
@@ -873,7 +874,7 @@ function HomePage() {
                       if(!p.canVote||p.myVote) return
                       try {
                         const r = await post(`/bulletin/${p.id}/vote`,{voteType:'up'})
-                        if((r as any).success) setBulletinPosts((prev:any[])=>prev.map((x:any)=>x.id===p.id?{...x,...(r as any).data,my_vote:'up',can_vote:false,can_flag:false}:x))
+                        if((r as any).success) setBulletinPosts((prev:any[])=>prev.map((x:any)=>x.id===p.id?{...x,...(r as any).data,myVote:'up',canVote:false,canFlag:false}:x))
                       } catch(e){}
                     }}
                     title="Upvote — boost this post"
@@ -886,7 +887,7 @@ function HomePage() {
                       if(!p.canFlag||p.myVote) return
                       try {
                         const r = await post(`/bulletin/${p.id}/vote`,{voteType:'flag'})
-                        if((r as any).success) setBulletinPosts((prev:any[])=>prev.map((x:any)=>x.id===p.id?{...x,...(r as any).data,my_vote:'flag',can_vote:false,can_flag:false}:x))
+                        if((r as any).success) setBulletinPosts((prev:any[])=>prev.map((x:any)=>x.id===p.id?{...x,...(r as any).data,myVote:'flag',canVote:false,canFlag:false}:x))
                       } catch(e){}
                     }}
                     title="Flag — report inappropriate content"
@@ -999,15 +1000,17 @@ function PaymentsPage() {
 
 // ── ACH VERIFY FORM ───────────────────────────────────────────────────────
 function AchVerifyForm({ onSuccess }: { onSuccess: () => void }) {
-  const [bankName, setBankName] = useState('')
   const [last4, setLast4] = useState('')
   const [error, setError] = useState('')
 
+  // S554 (button-sweep bug #13): the "Bank Name" input was dropped — the
+  // verify-ach route never read bankName (no bank_name column; Stripe feeds
+  // the real display name). Only last4 is used.
   const mut = useMutation(
     () => fetch((import.meta as any).env?.VITE_API_URL + '/api/tenants/verify-ach', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + localStorage.getItem('gam_tenant_token') },
-      body: JSON.stringify({ bankName, last4 })
+      body: JSON.stringify({ last4 })
     }).then(r => r.json()),
     {
       onSuccess: (data) => {
@@ -1022,12 +1025,8 @@ function AchVerifyForm({ onSuccess }: { onSuccess: () => void }) {
     <div style={{display:'flex',flexDirection:'column',gap:12,maxWidth:400}}>
       {error && <div className="alert a-warn">{error}</div>}
       <div className="fg">
-        <label className="fl">Bank Name</label>
-        <input className="fi" value={bankName} onChange={e=>setBankName(e.target.value)} placeholder="e.g. Chase, Bank of America" />
-      </div>
-      <div className="fg">
         <label className="fl">Last 4 digits of account number</label>
-        <input className="fi" value={last4} onChange={e=>setLast4(e.target.value.replace(/D/g,'').slice(0,4))} placeholder="1234" maxLength={4} style={{maxWidth:120,fontFamily:'var(--font-m)'}} />
+        <input className="fi" value={last4} onChange={e=>setLast4(e.target.value.replace(/\D/g,'').slice(0,4))} placeholder="1234" maxLength={4} style={{maxWidth:120,fontFamily:'var(--font-m)'}} />
       </div>
       <button className="btn btn-p" disabled={mut.isLoading || last4.length !== 4} onClick={()=>mut.mutate()}>
         {mut.isLoading ? <span className="spinner"/> : '✓ Verify Bank Account'}
@@ -2142,129 +2141,9 @@ function ServicesPage() {
 }
 
 // ── MAINTENANCE PAGE ──────────────────────────────────────────
-function MaintenancePage() {
-  const { data: me } = useQuery('tenant-me', () => get<any>('/tenants/me'))
-  const { data: reqs = [], isLoading } = useQuery<any[]>('maint', () => get<any[]>('/maintenance'))
-  const [showAdd, setShowAdd] = useState(false)
-  const [selected, setSelected] = useState<any>(null)
-  const { register, handleSubmit, reset } = useForm<any>()
-  const qc2 = useQueryClient()
-  const addMut = useMutation(
-    (d:any) => post('/maintenance', { ...d, unitId: me?.unitId }),
-    { onSuccess: () => { qc2.invalidateQueries('maint'); setShowAdd(false); reset() } }
-  )
-  const PRI: Record<string,string> = { emergency:'b-red',high:'b-amber',normal:'b-gold',low:'b-muted' }
-  const ST: Record<string,string> = { open:'b-amber',assigned:'b-gold',in_progress:'b-gold',completed:'b-green',cancelled:'b-muted' }
-  const ST_LABEL: Record<string,string> = { open:'Open',assigned:'Assigned',in_progress:'In Progress',completed:'Completed',cancelled:'Cancelled' }
-
-  return (
-    <div>
-      <div className="ph">
-        <div><h1 className="pt">Maintenance</h1><p className="ps">Submit and track repair requests</p></div>
-        <button className="btn btn-p" onClick={()=>setShowAdd(true)}>+ New request</button>
-      </div>
-      <div className="card" style={{padding:0,overflowX:'auto'}}>
-        {isLoading ? <div style={{padding:32,color:'var(--t3)',textAlign:'center'}}>Loading…</div> : (
-          <table className="tbl" style={{minWidth:780}}>
-            <thead><tr><th>Date</th><th>Title</th><th>Priority</th><th>Status</th><th>Assigned To</th><th></th></tr></thead>
-            <tbody>
-              {reqs.length ? reqs.map((r:any)=>(
-                <tr key={r.id} onClick={()=>setSelected(r)} style={{cursor:'pointer'}}
-                  onMouseEnter={e=>(e.currentTarget as any).style.background='var(--bg3)'}
-                  onMouseLeave={e=>(e.currentTarget as any).style.background=''}>
-                  <td className="mono" style={{fontSize:'.75rem'}}>{new Date(r.createdAt).toLocaleDateString()}</td>
-                  <td style={{color:'var(--t0)',fontWeight:500}}>{r.title}</td>
-                  <td><span className={`badge ${PRI[r.priority]}`}>{r.priority}</span></td>
-                  <td><span className={`badge ${ST[r.status]}`}>{ST_LABEL[r.status]||humanize(r.status)}</span></td>
-                  <td style={{fontSize:'.82rem',color:r.contractorName?'var(--t1)':'var(--t3)'}}>{r.contractorName||'Unassigned'}</td>
-                  <td style={{color:'var(--t3)',fontSize:'.75rem'}}>View →</td>
-                </tr>
-              )) : <tr><td colSpan={6} style={{textAlign:'center',color:'var(--t3)',padding:32}}>No maintenance requests yet.</td></tr>}
-            </tbody>
-          </table>
-        )}
-      </div>
-
-      {selected && (
-        <div className="modal-ov" onClick={()=>setSelected(null)}>
-          <div className="modal" onClick={e=>e.stopPropagation()} style={{maxWidth:560}}>
-            <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:16}}>
-              <div>
-                <div className="modal-t" style={{marginBottom:4}}>{selected.title}</div>
-                <div style={{display:'flex',gap:8}}>
-                  <span className={`badge ${PRI[selected.priority]}`}>{selected.priority}</span>
-                  <span className={`badge ${ST[selected.status]}`}>{ST_LABEL[selected.status]||humanize(selected.status)}</span>
-                </div>
-              </div>
-              <button onClick={()=>setSelected(null)} style={{background:'none',border:'none',cursor:'pointer',color:'var(--t3)',fontSize:'1.2rem',lineHeight:1}}>×</button>
-            </div>
-            {selected.description && (
-              <div style={{marginBottom:16}}>
-                <div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.08em',fontWeight:600,marginBottom:6}}>Description</div>
-                <div style={{fontSize:'.82rem',color:'var(--t1)',lineHeight:1.6,background:'var(--bg3)',padding:'10px 12px',borderRadius:8}}>{selected.description}</div>
-              </div>
-            )}
-            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:12,marginBottom:16}}>
-              <div style={{background:'var(--bg3)',borderRadius:8,padding:'10px 12px'}}>
-                <div style={{fontSize:'.62rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.08em',marginBottom:4}}>Assigned To</div>
-                <div style={{fontSize:'.85rem',fontWeight:600,color:selected.contractorName?'var(--t0)':'var(--t3)'}}>{selected.contractorName||'Unassigned'}</div>
-                {selected.contractorPhone && <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:2}}>📞 {selected.contractorPhone}</div>}
-              </div>
-              <div style={{background:'var(--bg3)',borderRadius:8,padding:'10px 12px'}}>
-                <div style={{fontSize:'.62rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.08em',marginBottom:4}}>Submitted</div>
-                <div style={{fontSize:'.82rem',color:'var(--t0)'}}>{new Date(selected.createdAt).toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'})}</div>
-                {selected.completedAt && <div style={{fontSize:'.72rem',color:'var(--green)',marginTop:2}}>✓ Completed {new Date(selected.completedAt).toLocaleDateString()}</div>}
-              </div>
-            </div>
-            {selected.notes && (
-              <div style={{marginBottom:16}}>
-                <div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.08em',fontWeight:600,marginBottom:6}}>Contractor Notes</div>
-                <div style={{fontSize:'.82rem',color:'var(--t1)',lineHeight:1.6,background:'var(--bg3)',padding:'10px 12px',borderRadius:8,borderLeft:'3px solid var(--gold)'}}>{selected.notes}</div>
-              </div>
-            )}
-            {selected.proofUrls?.length > 0 && (
-              <div style={{marginBottom:16}}>
-                <div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.08em',fontWeight:600,marginBottom:8}}>Completion Photos</div>
-                <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(120px,1fr))',gap:8}}>
-                  {selected.proofUrls.map((url:string,i:number)=>(
-                    <a key={i} href={url} target="_blank" rel="noreferrer">
-                      <img src={url} alt={'proof-'+i} style={{width:'100%',height:90,objectFit:'cover',borderRadius:8,border:'1px solid var(--b1)'}} />
-                    </a>
-                  ))}
-                </div>
-              </div>
-            )}
-            <div className="modal-f">
-              <button className="btn btn-g" onClick={()=>setSelected(null)}>Close</button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {showAdd && (
-        <div className="modal-ov" onClick={()=>setShowAdd(false)}>
-          <div className="modal" onClick={e=>e.stopPropagation()}>
-            <div className="modal-t">Submit Maintenance Request</div>
-            <form onSubmit={handleSubmit(d=>addMut.mutate(d))}>
-              <div className="fg"><label className="fl">What's the issue?</label><input className="fi" {...register('title',{required:true})} placeholder="e.g. Faucet leaking in kitchen" /></div>
-              <div className="fg"><label className="fl">Description</label><textarea className="fta" {...register('description',{required:true})} placeholder="Describe the issue in detail…" /></div>
-              <div className="fg"><label className="fl">Priority</label>
-                <select className="fs" {...register('priority')}>
-                  <option value="normal">Normal</option><option value="high">High</option>
-                  <option value="emergency">Emergency</option><option value="low">Low</option>
-                </select>
-              </div>
-              <div className="modal-f">
-                <button type="button" className="btn btn-g" onClick={()=>setShowAdd(false)}>Cancel</button>
-                <button type="submit" className="btn btn-p" disabled={addMut.isLoading}>{addMut.isLoading?<span className="spinner"/>:'Submit'}</button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
-    </div>
-  )
-}
+// S554 (button-sweep bug #11): the inline MaintenancePage (no comment
+// surface) was removed. The real page with the tenant comment thread
+// lives in ./pages/MaintenancePage, imported at the top of this file.
 
 // ── DOCUMENTS + UTILITIES (stubs) ─────────────────────────────
 // ── INSPECTIONS ──────────────────────────────────────────────
@@ -3014,8 +2893,13 @@ function NotificationPrefsPage() {
   )
 
   const toggle = (type: string, currentVal: boolean) => {
-    const current = prefMap.get(type) || { email_enabled: true, in_app_enabled: true }
-    update.mutate({ type, emailEnabled: !currentVal, inAppEnabled: current.inAppEnabled })
+    // S554 (button-sweep bug #4): responses are camelized, so an existing
+    // pref lands as emailEnabled/inAppEnabled. The default MUST use the
+    // same camelCase keys — a snake-case default left inAppEnabled
+    // undefined on the (common) no-existing-row path, and the API's
+    // zod .boolean() then 400'd the PATCH, so no pref ever saved.
+    const current = prefMap.get(type) || { emailEnabled: true, inAppEnabled: true }
+    update.mutate({ type, emailEnabled: !currentVal, inAppEnabled: current.inAppEnabled ?? true })
   }
 
   return (
@@ -3043,7 +2927,7 @@ function NotificationPrefsPage() {
             </thead>
             <tbody>
               {TENANT_NOTIFICATION_TYPES.map(({ type, label }) => {
-                const p = prefMap.get(type) || { email_enabled: true }
+                const p = prefMap.get(type) || { emailEnabled: true, inAppEnabled: true }
                 return (
                   <tr key={type}>
                     <td style={{ color: 'var(--t0)' }}>{label}</td>

@@ -2,7 +2,7 @@ import { Router } from 'express'
 import { query, queryOne, getClient } from '../db'
 import { requireAuth, requirePerm, assertPropertyInScope } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
-import { calculateCartTax } from '../services/posTax'
+import { calculateCartTax, computeCartTotals, aggregateCartTotals } from '../services/posTax'
 import {
   createConnectionToken, registerReader, listReaders, archiveReader,
   createCardPresentPaymentIntent, processPaymentIntentOnReader,
@@ -236,9 +236,14 @@ posRouter.patch('/items/:id', requirePerm('pos.manage_inventory'), async (req, r
     if (!item) throw new AppError(404, 'Item not found')
 
     const { name, categoryId, icon, costPrice, sellPrice, marginPct, taxRate,
-            chargeEligible, stockMin, stockMax, vendorId, isActive, propertyId, taxCategoryId } = req.body
+            chargeEligible, stockQty, stockMin, stockMax, vendorId, isActive, propertyId, taxCategoryId } = req.body
     assertNonNeg([costPrice, 'Cost price'], [sellPrice, 'Sell price'], [marginPct, 'Margin'],
-      [taxRate, 'Tax rate'], [stockMin, 'Stock min'], [stockMax, 'Stock max'])
+      [taxRate, 'Tax rate'], [stockQty, 'Stock qty'], [stockMin, 'Stock min'], [stockMax, 'Stock max'])
+    // S554 (button-sweep bug #12): the item-edit modal sends stockQty but the
+    // route dropped it — stock edits silently no-op'd. undefined preserves;
+    // a value re-sets and is audited via pos_inventory_log below (mirrors
+    // the adjust-stock route) so a manual correction leaves a trail.
+    const newStockQty: number = stockQty !== undefined ? Math.max(0, Number(stockQty)) : item.stock_qty
     // undefined preserves; null/value re-assigns the tax category.
     const newTaxCategoryId = taxCategoryId !== undefined ? (taxCategoryId || null) : item.tax_category_id
 
@@ -310,12 +315,19 @@ posRouter.patch('/items/:id', requirePerm('pos.manage_inventory'), async (req, r
     const updated = await queryOne<any>(`UPDATE pos_items SET
       name=$1, category_id=$2, icon=$3, cost_price=$4, sell_price=$5, margin_pct=$6,
       tax_rate=$7, charge_eligible=$8, stock_min=$9, stock_max=$10, vendor_id=$11,
-      is_active=$12, property_id=$13, tax_category_id=$15, updated_at=NOW() WHERE id=$14 RETURNING *`,
+      is_active=$12, property_id=$13, tax_category_id=$15, stock_qty=$16, updated_at=NOW() WHERE id=$14 RETURNING *`,
       [name??item.name, newCategoryId, icon??item.icon,
        newCostPrice, newSellPrice, newMargin,
        taxRate??item.tax_rate, chargeEligible??item.charge_eligible,
        stockMin??item.stock_min, stockMax??item.stock_max,
-       newVendorId, isActive??item.is_active, newPropertyId, item.id, newTaxCategoryId])
+       newVendorId, isActive??item.is_active, newPropertyId, item.id, newTaxCategoryId, newStockQty])
+
+    // Audit a manual stock correction made through the edit form.
+    if (newStockQty !== item.stock_qty) {
+      await query(`INSERT INTO pos_inventory_log (item_id,landlord_id,change_qty,reason,notes,stock_before,stock_after)
+        VALUES ($1,$2,$3,'manual','Item edit form',$4,$5)`,
+        [item.id, req.user!.profileId, newStockQty - item.stock_qty, item.stock_qty, newStockQty])
+    }
 
     res.json({ success: true, data: updated })
   } catch (e) { next(e) }
@@ -421,9 +433,27 @@ posRouter.get('/items/:id/shelf-label', async (req, res, next) => {
 // on stripe_payment_intent_id WHERE NOT NULL — a frontend retry after
 // successful capture but before this POST returned would otherwise
 // double-write; the 23505 catch turns it into a clean 409).
+// POST /api/pos/cart-quote — S554: authoritative cart total the client mints
+// the terminal PaymentIntent against. Uses the SAME computeCartTotals as
+// /transactions, so the minted PI amount always equals the recomputed
+// transaction total (closes the card-sale amount-mismatch 400 class even when
+// a pos_tax_rates row differs from an item's own tax_rate). Read-only.
+posRouter.post('/cart-quote', requirePerm('pos.ring_sale'), async (req, res, next) => {
+  try {
+    const { items, surcharge, discountAmount } = req.body
+    if (!Array.isArray(items)) throw new AppError(400, 'items array required')
+    for (const it of items) {
+      assertNonNeg([it.qty, 'Quantity'], [it.price, 'Price'], [it.tax ?? it.tax_rate, 'Tax rate'])
+    }
+    assertNonNeg([surcharge, 'Surcharge'], [discountAmount, 'Discount'])
+    const totals = await computeCartTotals(req.user!.profileId, items, { surcharge, discountAmount })
+    res.json({ success: true, data: totals })
+  } catch (e) { next(e) }
+})
+
 posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, next) => {
   try {
-    const { items, paymentMethod, tenantId, posCustomerId, propertyId, surcharge, changeGiven, stripePaymentIntentId } = req.body
+    const { items, paymentMethod, tenantId, posCustomerId, propertyId, surcharge, changeGiven, stripePaymentIntentId, discountAmount, discountReason } = req.body
     if (!Array.isArray(items) || items.length === 0) {
       throw new AppError(400, 'items array required')
     }
@@ -493,34 +523,20 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
       flexChargeAccountId = account.id
     }
 
-    // S241: server-side tax calculation from pos_tax_rates. Trust no
-    // client-side tax math. Items that have a `pos_items.id` get their
-    // tax computed from the live rate table; walk-up "misc" items
-    // (no item.id, frontend-typed name + price) get the client-supplied
-    // tax through since we have no row to look up.
+    // S554: ONE shared cart-total calc — calculateCartTax (S241 server tax,
+    // falling back to item.tax_rate) + the pure aggregateCartTotals that the
+    // POST /pos/cart-quote endpoint ALSO runs, so the terminal PI the client
+    // minted (against the quote) always equals this recomputed total.
     const cartLines = items
       .filter((it: any) => !!it.id)
       .map((it: any) => ({ itemId: it.id, qty: Number(it.qty) || 0, unitPrice: Number(it.price) || 0 }))
     const tax = await calculateCartTax(req.user!.profileId, cartLines)
-    const cartLineIdSet = new Set(cartLines.map(l => l.itemId))
+    const { subtotal, taxAmount, surcharge: surchargeAmt, discount: discountAmt, total } =
+      aggregateCartTotals(tax, items, { surcharge, discountAmount })
 
-    // Subtotal: server-side from cartLines, plus any walk-up items
-    // (free-form, no pos_items row). Walk-up items keep their client-
-    // declared price and tax — we have no source of truth to override.
-    let walkUpSubtotal = 0
-    let walkUpTax = 0
-    for (const it of items) {
-      if (it.id && cartLineIdSet.has(it.id)) continue  // already counted
-      const line = (Number(it.qty) || 0) * (Number(it.price) || 0)
-      walkUpSubtotal += line
-      walkUpTax += line * (Number(it.tax) || Number(it.tax_rate) || 0)
-    }
-    const subtotal = Math.round((tax.subtotal + walkUpSubtotal) * 100) / 100
-    const taxAmount = Math.round((tax.taxAmount + walkUpTax) * 100) / 100
-    const surchargeAmt = Number(surcharge) || 0
-    const total = Math.round((subtotal + taxAmount + surchargeAmt) * 100) / 100
-
-    const platformFee = paymentMethod === 'charge' ? subtotal * 0.01 : 0
+    // FlexCharge platform fee is 1% of what the customer is actually charged
+    // (net of discount), matching the surcharge the client computed.
+    const platformFee = paymentMethod === 'charge' ? Math.round((subtotal - discountAmt) * 100) / 100 * 0.01 : 0
 
     // S242: terminal-captured card sales pass a stripePaymentIntentId
     // (capture path from /terminal/payment-intents/:id/capture). Verify
@@ -570,11 +586,11 @@ posRouter.post('/transactions', requirePerm('pos.ring_sale'), async (req, res, n
       let tx: any
       try {
         const txRes = await client.query(`INSERT INTO pos_transactions
-          (landlord_id,tenant_id,pos_customer_id,cashier_id,payment_method,subtotal,tax_amount,surcharge,total,change_given,platform_fee,stripe_payment_intent_id,property_id)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
+          (landlord_id,tenant_id,pos_customer_id,cashier_id,payment_method,subtotal,tax_amount,surcharge,total,change_given,platform_fee,stripe_payment_intent_id,property_id,discount_amount,discount_reason)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *`,
           [req.user!.profileId, tenantId||null, posCustomerId||null, req.user!.userId,
            paymentMethod, subtotal, taxAmount, surchargeAmt, total, changeGiven||0, platformFee,
-           stripePaymentIntentId || null, propertyId || null])
+           stripePaymentIntentId || null, propertyId || null, discountAmt, discountReason || null])
         tx = txRes.rows[0]
       } catch (e: any) {
         // UNIQUE on pos_transactions_stripe_pi_uniq — same PI already
@@ -1207,6 +1223,16 @@ posRouter.patch('/discounts/:id', requirePerm('pos.manage_inventory'), async (re
   } catch (e) { next(e) }
 })
 
+// S554 (button-sweep bug #12): the Discounts tab "Remove" button
+// (apiDel /pos/discounts/:id) hit a nonexistent route → 404, discount never
+// removed. Soft-delete, landlord-scoped, mirrors DELETE /tax-rates/:id.
+posRouter.delete('/discounts/:id', requirePerm('pos.manage_inventory'), async (req, res, next) => {
+  try {
+    await query('UPDATE pos_discounts SET is_active=FALSE WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
+    res.json({ success: true })
+  } catch (e) { next(e) }
+})
+
 // ── REFUNDS ───────────────────────────────────────────────────
 
 posRouter.post('/transactions/:id/refund', requirePerm('pos.refund'), async (req, res, next) => {
@@ -1535,8 +1561,11 @@ posRouter.post('/eod/regenerate', requirePerm('pos.end_of_day'), async (req, res
 // Helper: pull the landlord's Connect account id, throw 409 if not
 // onboarded yet — Terminal requires an active Connect account.
 async function getLandlordConnectId(profileId: string): Promise<string> {
+  // S554 Connect re-anchor: prefer the landlord ENTITY's account; fall back to
+  // the founding owner's user account during the transition (entity col is
+  // NULL until the entity completes its own KYC).
   const row = await queryOne<{ stripe_connect_account_id: string | null }>(
-    `SELECT u.stripe_connect_account_id
+    `SELECT COALESCE(l.stripe_connect_account_id, u.stripe_connect_account_id) AS stripe_connect_account_id
        FROM landlords l JOIN users u ON u.id = l.user_id
       WHERE l.id = $1`,
     [profileId])

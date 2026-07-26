@@ -71,7 +71,11 @@ const {
   captureTerminalPaymentIntentMock:   vi.fn(async () => ({ id: 'pi_card_mock', status: 'succeeded', amount: 1000 })),
   cancelTerminalPaymentIntentMock:    vi.fn(async () => ({ id: 'pi_card_mock', status: 'canceled' })),
 }))
-vi.mock('../services/posTax', () => ({
+// S554: only the DB-hitting calculateCartTax is mocked; computeCartTotals (the
+// real aggregation) is kept so /transactions + /cart-quote exercise the true
+// total math on top of the mocked tax.
+vi.mock('../services/posTax', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../services/posTax')>()),
   calculateCartTax: calculateCartTaxMock,
 }))
 vi.mock('../services/posTerminal', () => ({
@@ -313,6 +317,62 @@ describe('POST /api/pos/transactions — happy paths', () => {
       landlordConnectAccountId: 'acct_test_landlord',
       paymentIntentId:          'pi_terminal_xyz',
     })
+  })
+
+  it('S554 bug #2: card sale with a cart discount — PI minted at NET total matches, discount persisted', async () => {
+    // Regression: the route dropped discountAmount and recomputed an
+    // UNDISCOUNTED total, so the S242 amount-match guard 400'd after the
+    // card was already captured. Here subtotal 25, tax 0, discount 5 →
+    // NET total 20 → the terminal PI amount is 2000 cents. Pre-fix the
+    // server computed total 25 (2500) and 400'd on the mismatch.
+    const f = await seedPosFixture({ withConnectAccount: true })
+    const itemId = await seedPosItem(f, { sellPrice: 25, stockQty: 999 })
+    calculateCartTaxMock.mockResolvedValueOnce({
+      subtotal: 25, taxAmount: 0,
+      lines: [{ itemId, lineSubtotal: 25, lineTax: 0 }],
+    })
+    retrieveTerminalPaymentIntentMock.mockResolvedValueOnce({
+      id: 'pi_disc', status: 'succeeded', amount: 2000,
+      metadata: { gam_purpose: 'pos_terminal', gam_landlord_id: f.landlordId },
+    })
+
+    const res = await request(buildApp())
+      .post('/api/pos/transactions')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({
+        propertyId: f.propertyId,
+        items: [{ id: itemId, name: 'I', qty: 1, price: 25 }],
+        paymentMethod: 'card',
+        stripePaymentIntentId: 'pi_disc',
+        discountAmount: 5, discountReason: 'Loyalty',
+      })
+
+    expect(res.status).toBe(201)
+    expect(Number(res.body.data.subtotal)).toBe(25)          // gross for books
+    expect(Number(res.body.data.discount_amount)).toBe(5)
+    expect(res.body.data.discount_reason).toBe('Loyalty')
+    expect(Number(res.body.data.total)).toBe(20)             // net
+  })
+
+  it('S554 bug #2: discount is clamped to [0, subtotal] (cannot invert a sale)', async () => {
+    const f = await seedPosFixture()
+    const itemId = await seedPosItem(f, { sellPrice: 10, stockQty: 999 })
+    calculateCartTaxMock.mockResolvedValueOnce({
+      subtotal: 10, taxAmount: 0,
+      lines: [{ itemId, lineSubtotal: 10, lineTax: 0 }],
+    })
+    const res = await request(buildApp())
+      .post('/api/pos/transactions')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({
+        propertyId: f.propertyId,
+        items: [{ id: itemId, name: 'I', qty: 1, price: 10 }],
+        paymentMethod: 'cash',
+        discountAmount: 999,  // absurd — clamped to the subtotal
+      })
+    expect(res.status).toBe(201)
+    expect(Number(res.body.data.discount_amount)).toBe(10)
+    expect(Number(res.body.data.total)).toBe(0)
   })
 
   it('walk-up item (no catalog id): client-supplied price + tax pass through, no stock decrement', async () => {

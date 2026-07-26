@@ -1,4 +1,11 @@
+import { describe, it, expect } from 'vitest'
 import { camelCaseKeys } from './caseConversion'
+
+// camelCaseKeys is the load-bearing GLOBAL response transform: the API returns
+// snake_case in res.json() bodies and this camelizes EVERYTHING (no passthrough)
+// before the frontend sees it. A regression here silently breaks every portal,
+// so pin its contract. (Converted S555 from a standalone process.exit script
+// that vitest excluded → it now runs with the suite.)
 
 const cases: Array<{ name: string; input: any; expect: any }> = [
   { name: 'null',             input: null,                                             expect: null },
@@ -19,32 +26,29 @@ const cases: Array<{ name: string; input: any; expect: any }> = [
   { name: 'with digits',      input: { bank_last4: '1234' },                           expect: { bankLast4: '1234' } },
 ]
 
-let pass = 0
-let fail = 0
+describe('camelCaseKeys', () => {
+  for (const c of cases) {
+    it(`converts: ${c.name}`, () => {
+      expect(camelCaseKeys(c.input)).toEqual(c.expect)
+    })
+  }
 
-for (const c of cases) {
-  const got = camelCaseKeys(c.input)
-  const match = JSON.stringify(got) === JSON.stringify(c.expect)
-  if (match) { pass++ }
-  else { fail++; console.log('FAIL:', c.name, '| got:', JSON.stringify(got), '| expected:', JSON.stringify(c.expect)) }
-}
+  it('preserves Date instances by reference (does not recurse into them)', () => {
+    const d = new Date()
+    const out: any = camelCaseKeys({ created_at: d })
+    expect(out.createdAt).toBe(d)
+  })
 
-const d = new Date()
-const dOut: any = camelCaseKeys({ created_at: d })
-if (dOut.createdAt === d) pass++
-else { fail++; console.log('FAIL: Date not preserved') }
+  it('preserves Buffer instances by reference', () => {
+    const b = Buffer.from('hi')
+    const out: any = camelCaseKeys({ raw_data: b })
+    expect(out.rawData).toBe(b)
+  })
 
-const b = Buffer.from('hi')
-const bOut: any = camelCaseKeys({ raw_data: b })
-if (bOut.rawData === b) pass++
-else { fail++; console.log('FAIL: Buffer not preserved') }
-
-const orig = { first_name: 'Nic' }
-const origCopy = JSON.parse(JSON.stringify(orig))
-camelCaseKeys(orig)
-const notMutated = JSON.stringify(orig) === JSON.stringify(origCopy)
-if (notMutated) pass++
-else { fail++; console.log('FAIL: input was mutated') }
-
-console.log('RESULT: ' + pass + ' passed, ' + fail + ' failed')
-if (fail > 0) process.exit(1)
+  it('does not mutate its input', () => {
+    const orig = { first_name: 'Nic' }
+    const origCopy = JSON.parse(JSON.stringify(orig))
+    camelCaseKeys(orig)
+    expect(orig).toEqual(origCopy)
+  })
+})

@@ -1042,6 +1042,74 @@ leasesRouter.post('/:id/non-renewal', requirePerm('leases.edit'), async (req, re
   } catch (e) { next(e) }
 })
 
+// POST /api/leases/:id/renewal-intent — S556: the TENANT's answer to the
+// "do you plan to renew?" survey shown near lease expiry. Records the intent on
+// the lease (so the survey hides), opens a renewal request when they want to
+// renew, and notifies the landlord. Tenant-facing (mirrors terminate-early auth).
+leasesRouter.post('/:id/renewal-intent', requireAuth, async (req, res, next) => {
+  try {
+    const u = req.user!
+    if (u.role !== 'tenant') throw new AppError(403, 'Only the tenant can submit renewal intent')
+    const intent = String(req.body?.intent || '')
+    if (!['yes', 'no', 'unsure'].includes(intent)) throw new AppError(400, "intent must be 'yes', 'no', or 'unsure'")
+    const notes = typeof req.body?.notes === 'string' ? req.body.notes.slice(0, 2000) : null
+
+    // Verify the caller is an active tenant on this lease.
+    const lease = await queryOne<any>(`
+      SELECT l.id, l.landlord_id, l.status, u.unit_number, p.name AS property_name, lt.tenant_id
+      FROM leases l
+      JOIN units u ON u.id = l.unit_id
+      JOIN properties p ON p.id = u.property_id
+      JOIN lease_tenants lt ON lt.lease_id = l.id AND lt.status = 'active'
+      JOIN tenants t ON t.id = lt.tenant_id
+      WHERE l.id = $1 AND t.user_id = $2`, [req.params.id, u.userId])
+    if (!lease) throw new AppError(404, 'Lease not found')
+    if (lease.status !== 'active') throw new AppError(409, `Lease is ${lease.status}, not active`)
+
+    await query(
+      `UPDATE leases SET tenant_renewal_intent=$1, tenant_renewal_intent_at=NOW(),
+                         tenant_renewal_notes=$2, updated_at=NOW() WHERE id=$3`,
+      [intent, notes, lease.id])
+
+    // "Yes" opens a renewal request for the landlord's workflow (no duplicate
+    // open one). "No"/"unsure" are recorded on the lease above for visibility.
+    if (intent === 'yes') {
+      const open = await queryOne<any>(
+        `SELECT id FROM lease_renewal_requests WHERE lease_id=$1 AND status IN ('requested','approved')`,
+        [lease.id])
+      if (!open) {
+        await query(
+          `INSERT INTO lease_renewal_requests (lease_id, tenant_id, landlord_id, requested_by_user_id, notes, status)
+           VALUES ($1, $2, $3, $4, $5, 'requested')`,
+          [lease.id, lease.tenant_id, lease.landlord_id, u.userId, notes])
+      }
+    }
+
+    // Notify the landlord.
+    const landlord = await queryOne<any>(
+      `SELECT u.id AS user_id, u.email FROM landlords la JOIN users u ON u.id = la.user_id WHERE la.id=$1`,
+      [lease.landlord_id])
+    if (landlord) {
+      const label = intent === 'yes' ? 'plans to renew' : intent === 'no' ? 'does NOT plan to renew' : 'is unsure about renewing'
+      const { createNotification } = await import('../services/notifications')
+      await createNotification({
+        userId: landlord.user_id,
+        landlordId: lease.landlord_id,
+        type: 'tenant_renewal_intent',
+        title: `Renewal response — Unit ${lease.unit_number}`,
+        body: `Your tenant at ${lease.property_name} (Unit ${lease.unit_number}) ${label}.${notes ? ` Note: "${notes}"` : ''}`,
+        data: { leaseId: lease.id, intent },
+        actionUrl: '/leases',
+        sendEmail: true,
+        emailTo: landlord.email,
+        emailSubject: `Tenant renewal response — Unit ${lease.unit_number}`,
+      })
+    }
+
+    res.json({ success: true, data: { leaseId: lease.id, intent } })
+  } catch (e) { next(e) }
+})
+
 // POST /api/leases/:id/bill-fee — S180 / A2.
 //
 // Landlord-triggered one-off charge against the tenant on this lease.

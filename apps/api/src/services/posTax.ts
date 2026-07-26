@@ -88,8 +88,10 @@ export async function calculateCartTax(
     property_id: string
     category_id: string
     category_name: string | null
+    tax_rate: string
   }>(
-    `SELECT pi.id, pi.name, pi.property_id, pi.category_id, pc.name AS category_name
+    `SELECT pi.id, pi.name, pi.property_id, pi.category_id, pi.tax_rate::text AS tax_rate,
+            pc.name AS category_name
        FROM pos_items pi
        LEFT JOIN pos_categories pc ON pc.id = pi.category_id
       WHERE pi.id = ANY($1::uuid[]) AND pi.landlord_id = $2`,
@@ -152,21 +154,43 @@ export async function calculateCartTax(
     const propRates = ratesByProperty.get(item.property_id) ?? []
     const applicableRates = propRates.length > 0 ? propRates : landlordWideRates
 
-    const matchingRates = applicableRates.filter(r =>
-      rateAppliesToCategory(r.applies_to, item.category_name))
-
     const lineAppliedRates: PosTaxBreakdownLine['appliedRates'] = []
     let lineTax = 0
-    for (const r of matchingRates) {
-      const rateNum = Number(r.rate)
-      const amt = round2(subtotal * rateNum)
-      lineAppliedRates.push({
-        rateId: r.id,
-        name:   r.name,
-        rate:   rateNum,
-        amount: amt,
-      })
-      lineTax = round2(lineTax + amt)
+
+    if (applicableRates.length === 0) {
+      // S554 (button-sweep bug #3): no pos_tax_rates configured for this
+      // item's property (neither property-bound nor landlord-wide). Fall
+      // back to the item's own pos_items.tax_rate — the same server-side
+      // rate the POS client uses to compute the cart total and mint the
+      // terminal PaymentIntent. Without this the server returned 0 tax
+      // while the client charged item.tax_rate, so the amount-match guard
+      // 400'd every card sale AFTER capture. This is NOT client-trusted
+      // math: tax_rate is read from the landlord-owned pos_items row.
+      const rateNum = Number(item.tax_rate) || 0
+      if (rateNum > 0) {
+        const amt = round2(subtotal * rateNum)
+        lineAppliedRates.push({
+          rateId: `item:${item.id}`,
+          name:   'Item tax rate',
+          rate:   rateNum,
+          amount: amt,
+        })
+        lineTax = round2(amt)
+      }
+    } else {
+      const matchingRates = applicableRates.filter(r =>
+        rateAppliesToCategory(r.applies_to, item.category_name))
+      for (const r of matchingRates) {
+        const rateNum = Number(r.rate)
+        const amt = round2(subtotal * rateNum)
+        lineAppliedRates.push({
+          rateId: r.id,
+          name:   r.name,
+          rate:   rateNum,
+          amount: amt,
+        })
+        lineTax = round2(lineTax + amt)
+      }
     }
     taxSum = round2(taxSum + lineTax)
 
@@ -205,4 +229,60 @@ function rateAppliesToCategory(
 
 function round2(n: number): number {
   return Math.round(n * 100) / 100
+}
+
+// S554: ONE cart-total calculation shared by POST /pos/transactions AND the
+// POST /pos/cart-quote endpoint the client mints the terminal PaymentIntent
+// against. Because both go through this, the client's minted PI amount and the
+// server's recomputed transaction total are ALWAYS equal — closing the
+// card-sale amount-mismatch 400 class even when a landlord configures a
+// pos_tax_rates row that differs from the item's own tax_rate.
+export interface CartTotals {
+  subtotal: number   // GROSS (pre-discount)
+  taxAmount: number
+  surcharge: number
+  discount: number
+  total: number      // subtotal - discount + tax + surcharge
+}
+
+/**
+ * PURE aggregation: given an already-computed server tax result + the raw cart,
+ * produce the final totals. No DB call — so callers keep calculateCartTax
+ * mockable and this stays trivially testable. `tax.lines` identifies the
+ * catalog items the server priced; everything else is a walk-up "misc" item
+ * that keeps its client-declared price + tax.
+ */
+export function aggregateCartTotals(
+  tax: PosTaxResult,
+  items: any[],
+  opts: { surcharge?: number; discountAmount?: number } = {},
+): CartTotals {
+  const cartLineIdSet = new Set(tax.lines.map(l => l.itemId))
+  let walkUpSubtotal = 0
+  let walkUpTax = 0
+  for (const it of (items || [])) {
+    if (it.id && cartLineIdSet.has(it.id)) continue
+    const line = (Number(it.qty) || 0) * (Number(it.price) || 0)
+    walkUpSubtotal += line
+    walkUpTax += line * (Number(it.tax) || Number(it.tax_rate) || 0)
+  }
+  const subtotal = round2(tax.subtotal + walkUpSubtotal)
+  const taxAmount = round2(tax.taxAmount + walkUpTax)
+  const surcharge = Number(opts.surcharge) || 0
+  const discount = Math.min(Math.max(0, round2(Number(opts.discountAmount) || 0)), subtotal)
+  const total = round2(subtotal - discount + taxAmount + surcharge)
+  return { subtotal, taxAmount, surcharge, discount, total }
+}
+
+/** Convenience: server-side tax lookup + aggregation in one call (cart-quote). */
+export async function computeCartTotals(
+  landlordId: string,
+  items: any[],
+  opts: { surcharge?: number; discountAmount?: number } = {},
+): Promise<CartTotals> {
+  const cartLines = (items || [])
+    .filter((it: any) => !!it.id)
+    .map((it: any) => ({ itemId: it.id, qty: Number(it.qty) || 0, unitPrice: Number(it.price) || 0 }))
+  const tax = await calculateCartTax(landlordId, cartLines)
+  return aggregateCartTotals(tax, items, opts)
 }

@@ -22,7 +22,9 @@ import { canManageLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
 import { stampPdf } from '../services/pdfStamp'
 import { resolveLateFeePolicyForUnit, lateFeePolicyToPrefills } from '../services/lateFeePolicy'
+import { suggestUnitPrefill } from '../services/leasePrefill'
 import { detectPropertyFromPdf } from '../services/templatePropertyDetect'
+import { autoPlaceFields } from '../services/autoFieldPlacement'
 import { createAdminNotification } from '../services/adminNotifications'
 import { emailSigningRequest, emailSigningCompleted } from '../services/email'
 import { createNotification } from '../services/notifications'
@@ -265,6 +267,21 @@ async function createDocumentRecord(client: any, opts: {
     }
   }
 
+  // S556 (Nic): auto-populate lease boxes from the assigned unit's data so the
+  // landlord doesn't retype what the unit already knows — rent, derived
+  // security deposit (rent × per-(property,unit_type) multiplier), unit number,
+  // property name/address. Only for ORIGINAL leases: renewals prefill from the
+  // prior lease, and a rent increase surfaces a landlord-confirmed deposit
+  // top-up, never a silent change. Caller-supplied values always win (we only
+  // fill blanks), so the Document Values form can still override anything.
+  if (opts.unitId && opts.documentType === 'original_lease') {
+    const pv: Record<string, string> = (opts as any).prefillValues = (opts as any).prefillValues || {}
+    const suggested = await suggestUnitPrefill(opts.unitId, client)
+    for (const [col, val] of Object.entries(suggested)) {
+      if (val && (pv[col] == null || pv[col] === '')) pv[col] = val // caller-supplied wins
+    }
+  }
+
   // Copy template fields — match by signer_role, prune unused role slots
   if (opts.templateId) {
     const filledRoles = new Set(opts.signers.map(s => s.role))
@@ -288,10 +305,13 @@ async function createDocumentRecord(client: any, opts: {
       await client.query(`
         INSERT INTO lease_document_fields
           (document_id, template_field_id, signer_id, field_type, signer_role, label, lease_column,
-           page, x, y, width, height, required, font_css, value)
-        VALUES ($1,$2,$3,$4,$5,$6,$7, $8,$9,$10,$11,$12,$13,$14,$15)`,
+           page, x, y, width, height, required, font_css, value, options, parent_field_id, parent_option)
+        VALUES ($1,$2,$3,$4,$5,$6,$7, $8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
         [doc.id, f.id, signer?.id || null, f.field_type, f.signer_role, f.label, f.lease_column,
-         f.page, f.x, f.y, f.width, f.height, f.required, f.font_css, prefill])
+         f.page, f.x, f.y, f.width, f.height, f.required, f.font_css, prefill, f.options ?? null,
+         // parent_field_id references the parent TEMPLATE field id; the sign UI
+         // matches child.parent_field_id to the parent doc field's template_field_id.
+         f.parent_field_id ?? null, f.parent_option ?? null])
     }
   }
 
@@ -1272,15 +1292,65 @@ esignRouter.put('/templates/:id/fields', requireAuth, requirePerm('esign.templat
     }
 
     await query('DELETE FROM lease_template_fields WHERE template_id=$1', [template.id])
+    // Two-pass so conditional (nested) fields can link to their parent: a full
+    // replace regenerates DB ids, so children reference the parent by its
+    // stable CLIENT key (clientId), which we map to the new DB id after insert.
+    const clientToDbId = new Map<string, string>()
+    const inserted: Array<{ f: any; dbId: string }> = []
     for (const f of (fields || [])) {
-      await query(`INSERT INTO lease_template_fields
-        (template_id, field_type, signer_role, label, lease_column, page, x, y, width, height, required, sort_order, font_css)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+      const row = await queryOne<{ id: string }>(`INSERT INTO lease_template_fields
+        (template_id, field_type, signer_role, label, lease_column, page, x, y, width, height, required, sort_order, font_css, options)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id`,
         [template.id, f.fieldType, f.signerRole, f.label||null, f.leaseColumn||null,
-         f.page||1, f.x, f.y, f.width||200, f.height||50, f.required??true, f.sortOrder||0, f.fontCss||null])
+         f.page||1, f.x, f.y, f.width||200, f.height||50, f.required??true, f.sortOrder||0, f.fontCss||null,
+         f.options||null])
+      if (f.clientId != null) clientToDbId.set(String(f.clientId), row!.id)
+      inserted.push({ f, dbId: row!.id })
+    }
+    // Second pass: resolve parent links now that every field has a DB id.
+    for (const { f, dbId } of inserted) {
+      const parentKey = f.parentClientId != null ? String(f.parentClientId) : null
+      if (parentKey && clientToDbId.has(parentKey)) {
+        await query('UPDATE lease_template_fields SET parent_field_id=$1, parent_option=$2 WHERE id=$3',
+          [clientToDbId.get(parentKey), f.parentOption || null, dbId])
+      }
     }
     const updated = await query<any>('SELECT * FROM lease_template_fields WHERE template_id=$1 ORDER BY page, sort_order', [template.id])
     res.json({ success: true, data: updated })
+  } catch (e) { next(e) }
+})
+
+// S556: auto-place e-sign field boxes on the template's raw lease PDF. Reads
+// the PDF, runs the deterministic detection + in-house model-tagging pass, and
+// RETURNS proposed fields (does NOT save). The landlord loads them into the
+// editor, adjusts, then the existing PUT /fields persists. Spec:
+// ~/gam/AUTO_FIELD_PLACEMENT_SPEC.md.
+esignRouter.post('/templates/:id/auto-fields', requireAuth, requirePerm('esign.template_manage'), async (req, res, next) => {
+  try {
+    const template = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
+    if (!template) throw new AppError(404, 'Template not found')
+    if (!template.base_pdf_url) throw new AppError(400, 'Template has no base PDF — upload one first')
+
+    const filename = extractUploadFilename(template.base_pdf_url)
+    if (!filename) throw new AppError(400, 'Template PDF path is not a local upload')
+    const pdfPath = path.join(uploadDir, filename)
+    if (!fs.existsSync(pdfPath)) throw new AppError(404, 'Template PDF file not found on disk')
+
+    const result = await autoPlaceFields(fs.readFileSync(pdfPath))
+    res.json({ success: true, data: result })
+  } catch (e) { next(e) }
+})
+
+// S556: suggested lease field values derived from a unit, so the send form can
+// pre-fill rent / derived deposit / unit# / property before the landlord even
+// types. Same computation the server seeds with at document creation.
+esignRouter.get('/units/:unitId/prefill-suggestions', requireAuth, requirePerm('leases.create'), async (req, res, next) => {
+  try {
+    const unit = await queryOne<{ id: string }>(
+      'SELECT id FROM units WHERE id=$1 AND landlord_id=$2', [req.params.unitId, req.user!.profileId])
+    if (!unit) throw new AppError(404, 'Unit not found')
+    const suggestions = await suggestUnitPrefill(req.params.unitId)
+    res.json({ success: true, data: suggestions })
   } catch (e) { next(e) }
 })
 
@@ -2719,25 +2789,38 @@ esignRouter.post('/sign/:documentId', requireAuth, async (req, res, next) => {
     // but malicious clients can bypass the gate. Verify every required field
     // assigned to this signer's role will have a non-empty value after this
     // submission completes (either submitted now or already in the DB).
-    const requiredFieldsRes = await client.query(`
-      SELECT id, label, field_type, value
-      FROM lease_document_fields
-      WHERE document_id=$1 AND signer_role=$2 AND required=TRUE`,
-      [doc.id, signer.role])
-    const requiredFields = requiredFieldsRes.rows
+    // S556: a required CONDITIONAL child (nested radio) is only enforced when
+    // its parent's effective selection == the child's trigger option — a hidden
+    // child (e.g. auto_renew_mode when the lease is month-to-month) is skipped.
+    const allFieldsRes = await client.query(`
+      SELECT id, template_field_id, parent_field_id, parent_option, label, field_type, signer_role, required, value
+      FROM lease_document_fields WHERE document_id=$1`, [doc.id])
+    const allFields = allFieldsRes.rows as any[]
     const submittedById = new Map<string, string>()
     for (const fv of (fieldValues || [])) {
       if (fv.value != null && String(fv.value).trim() !== '') {
         submittedById.set(fv.fieldId, String(fv.value))
       }
     }
+    const effVal = (f: any): string | null => {
+      const s = submittedById.get(f.id)
+      if (s != null && String(s).trim() !== '') return String(s)
+      return (f.value != null && String(f.value).trim() !== '') ? String(f.value) : null
+    }
+    // child.parent_field_id references the parent's TEMPLATE field id
+    const byTemplateFieldId = new Map<string, any>()
+    for (const f of allFields) if (f.template_field_id) byTemplateFieldId.set(f.template_field_id, f)
+    const isActive = (f: any): boolean => {
+      if (!f.parent_field_id) return true
+      const parent = byTemplateFieldId.get(f.parent_field_id)
+      if (!parent) return true // parent pruned/missing → degrade to always-shown
+      return effVal(parent) === f.parent_option
+    }
     const missingRequired: string[] = []
-    for (const f of (requiredFields as any[])) {
-      const submitted = submittedById.get(f.id)
-      const existing = (f.value != null && String(f.value).trim() !== '') ? f.value : null
-      if (!submitted && !existing) {
-        missingRequired.push(f.label || `${f.field_type} field`)
-      }
+    for (const f of allFields) {
+      if (f.signer_role !== signer.role || !f.required) continue
+      if (!isActive(f)) continue // hidden conditional child is not required
+      if (effVal(f) == null) missingRequired.push(f.label || `${f.field_type} field`)
     }
     if (missingRequired.length > 0) {
       throw new AppError(400, `Missing required fields: ${missingRequired.join(', ')}`)
@@ -2765,6 +2848,16 @@ esignRouter.post('/sign/:documentId', requireAuth, async (req, res, next) => {
         [fv.value, signer.id, fv.fieldId, doc.id, signer.role])
     }
 
+    // S556: clear any conditional child whose parent is no longer at its
+    // trigger option, so a stale/contradictory sub-answer never lands in the
+    // signed lease (Nic: clear-on-parent-change). Uses the post-submission
+    // effective values computed above.
+    for (const f of allFields) {
+      if (f.parent_field_id && !isActive(f) && effVal(f) != null) {
+        await client.query('UPDATE lease_document_fields SET value=NULL WHERE id=$1 AND document_id=$2', [f.id, doc.id])
+      }
+    }
+
     // S535: the LANDLORD-first signing pass is where lease terms are
     // typed into the doc (send no longer requires landlord-role tagged
     // fields to be prefilled — cross-template renewals may bind fields
@@ -2773,9 +2866,21 @@ esignRouter.post('/sign/:documentId', requireAuth, async (req, res, next) => {
     // tagged value-bearing field must be filled or the sign rolls back.
     if (signer.role === 'landlord') {
       const taggedRows = await client.query(
-        `SELECT lease_column, value FROM lease_document_fields WHERE document_id=$1`,
+        `SELECT template_field_id, parent_field_id, parent_option, lease_column, value FROM lease_document_fields WHERE document_id=$1`,
         [doc.id])
-      const unfilled = validateLeaseDocumentForSend(taggedRows.rows as any)
+      // S556: exclude inactive conditional children — a hidden sub-radio (its
+      // parent isn't at the trigger option) is not a required lease term.
+      const rows = taggedRows.rows as any[]
+      const byTfid = new Map<string, any>()
+      for (const r of rows) if (r.template_field_id) byTfid.set(r.template_field_id, r)
+      const activeRows = rows.filter((r) => {
+        if (!r.parent_field_id) return true
+        const p = byTfid.get(r.parent_field_id)
+        if (!p) return true
+        const pv = p.value != null && String(p.value).trim() !== '' ? String(p.value) : null
+        return pv === r.parent_option
+      })
+      const unfilled = validateLeaseDocumentForSend(activeRows as any)
       if (unfilled.length > 0) {
         const labels = unfilled.map(v => LEASE_COLUMN_LABEL[v.lease_column])
         throw new AppError(400, `Fill these lease terms before signing: ${labels.join(', ')}`)

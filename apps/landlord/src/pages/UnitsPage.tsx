@@ -101,7 +101,11 @@ export function UnitsPage() {
                       {can('units.set_status') && (
                         <select value={u.status} onChange={e => setStatusMut.mutate({ id: u.id, status: e.target.value })}
                           style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '.75rem', color: 'inherit', padding: 0 }}>
-                          {['occupied','vacant','maintenance','eviction'].map(s => <option key={s} value={s}>{humanize(s)}</option>)}
+                          {/* S554 (landlord button-sweep #9): must send real UNIT_STATUSES enum
+                              values — the old occupied/maintenance/eviction options 400'd (zod rejects).
+                              occupied→active, eviction→suspended, maintenance dropped; delinquent is
+                              system-derived from payment state, not manually set here. */}
+                          {['vacant','available','active','suspended'].map(s => <option key={s} value={s}>{humanize(s)}</option>)}
                         </select>
                       )}
                       <span className={'badge ' + (STATUS_COLORS[u.status] || 'badge-muted')} style={{ marginLeft: 4 }}>{humanize(u.status)}</span>

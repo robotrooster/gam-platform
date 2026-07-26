@@ -20,9 +20,12 @@ type ActiveLease = {
   landlord_user_id: string
 }
 
-async function activeLeaseForTenant(tenantId: string): Promise<ActiveLease | null> {
-  const rows = await query<ActiveLease>(
-    `SELECT l.id AS lease_id, l.landlord_id, u.property_id, u.unit_number,
+// S554 (Oak Park): a tenant can hold >1 active lease. Return ALL of them so
+// the tool never silently renews an arbitrary one — an ACTION on the wrong
+// lease (renewal request + landlord notification) is a real error.
+async function activeLeasesForTenant(tenantId: string): Promise<(ActiveLease & { unit_id: string })[]> {
+  return query<ActiveLease & { unit_id: string }>(
+    `SELECT l.id AS lease_id, l.landlord_id, u.id AS unit_id, u.property_id, u.unit_number,
             p.name AS property_name, lo.user_id AS landlord_user_id
        FROM v_lease_active_tenants vlat
        JOIN leases l   ON l.id = vlat.lease_id AND l.status = 'active'
@@ -30,10 +33,9 @@ async function activeLeaseForTenant(tenantId: string): Promise<ActiveLease | nul
        JOIN properties p ON p.id = u.property_id
        JOIN landlords lo ON lo.id = l.landlord_id
       WHERE vlat.tenant_id = $1
-      LIMIT 1`,
+      ORDER BY l.created_at`,
     [tenantId]
   )
-  return rows[0] ?? null
 }
 
 export const requestLeaseRenewal: AgentTool = {
@@ -48,13 +50,35 @@ export const requestLeaseRenewal: AgentTool = {
     properties: {
       preferred_term: { type: 'string', description: 'Optional: the term the tenant prefers, e.g. "12 months" or "month-to-month".' },
       notes: { type: 'string', description: 'Optional: any extra detail from the tenant.' },
+      unitId: { type: 'string', description: 'Only needed if the tenant holds more than one active lease; the unit id from a prior list, to say WHICH lease to renew.' },
     },
   },
   audiences: ['tenant'],
   async execute(args, actor: AgentActor) {
-    const lease = await activeLeaseForTenant(actor.profileId)
-    if (!lease) {
+    const leases = await activeLeasesForTenant(actor.profileId)
+    if (leases.length === 0) {
       return { ok: false, error: 'No active lease found for this tenant, so a renewal request cannot be filed.' }
+    }
+    // S554 (Oak Park): with >1 active lease, do NOT guess which to renew —
+    // ask, or use the unitId the model passed from a prior selection list.
+    let lease: (typeof leases)[number]
+    const unitId = typeof args.unitId === 'string' ? args.unitId : undefined
+    if (unitId) {
+      const match = leases.find((l) => l.unit_id === unitId)
+      if (!match) return { ok: false, error: 'That unit is not one of the tenant’s active leases.' }
+      lease = match
+    } else if (leases.length > 1) {
+      return {
+        ok: false,
+        needsLeaseSelection: true,
+        message: 'The tenant has more than one active lease. Ask which one they want to renew, then pass its unitId.',
+        leases: leases.map((l) => ({
+          unitId: l.unit_id,
+          label: `${l.property_name}${l.unit_number ? ` — Unit ${l.unit_number}` : ''}`,
+        })),
+      }
+    } else {
+      lease = leases[0]
     }
     const allowed = await isAgentCapabilityEnabled(lease.property_id, 'lease_renewal')
     if (!allowed) {

@@ -12,7 +12,7 @@ type Notification = {
   read: boolean
   readAt: string | null
   // `data` is a JSONB passthrough — content keys stay snake_case
-  // (e.g., n.data.inspection_id, n.data.entry_request_id).
+  // (e.g., n.data.inspectionId, n.data.entryRequestId).
   data: Record<string, any> | null
   createdAt: string
   emailSent: boolean
@@ -38,13 +38,13 @@ const TYPE_LABEL: Record<string, string> = {
 
 function deepLinkFor(n: Notification): string | null {
   const d = n.data ?? {}
-  if (d.inspection_id) return `/inspections/${d.inspection_id}`
-  if (d.entry_request_id) return `/entry-requests/${d.entry_request_id}`
+  if (d.inspectionId) return `/inspections/${d.inspectionId}`
+  if (d.entryRequestId) return `/entry-requests/${d.entryRequestId}`
   if (d.maintenance_request_id || d.requestId) {
     return `/maintenance` // no per-request page; nav to inbox
   }
-  if (d.lease_id) return '/leases'
-  if (d.dispute_id) return '/screening' // landlord-side review surface
+  if (d.leaseId) return '/leases'
+  if (d.disputeId) return '/screening' // landlord-side review surface
   return null
 }
 

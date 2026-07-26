@@ -346,6 +346,19 @@ function StripeConnectSection() {
   const [connectInstance, setConnectInstance] = useState<StripeConnectInstance | null>(null)
   const [initErr, setInitErr] = useState<string | null>(null)
   const qc = useQueryClient()
+  const { user } = useAuth()
+
+  // S554 Connect re-anchor: an OWNER landlord onboards the landlord ENTITY's
+  // own account (entity='landlord', entityId = their landlords.id = profileId).
+  // Scoped WORKERS (managers with a direct-deposit opt-in) still onboard their
+  // OWN user account (entity='user') — switching them would 403 on the live
+  // membership check and break manager direct deposit.
+  const isOwner = user?.role === 'landlord'
+  const connectEntity = isOwner ? 'landlord' : 'user'
+  const connectEntityQS = isOwner ? `entity=landlord&entityId=${user!.profileId}` : 'entity=user'
+  const connectOnboardBody = isOwner
+    ? { entity: 'landlord', entityId: user!.profileId }
+    : { entity: 'user' }
 
   const statusQ = useQuery<{
     connectAccountId: string | null
@@ -355,8 +368,8 @@ function StripeConnectSection() {
     detailsSubmitted?: boolean
     requirementsCurrentlyDue?: string[]
   }>(
-    'stripe-connect-status-user',
-    () => apiGet('/stripe/connect/status?entity=user'),
+    ['stripe-connect-status', connectEntity, user?.profileId],
+    () => apiGet(`/stripe/connect/status?${connectEntityQS}`),
     {
       refetchInterval: (data) =>
         showOnboarding && !(data?.payoutsEnabled && data?.detailsSubmitted)
@@ -367,7 +380,7 @@ function StripeConnectSection() {
   const ready = !!statusQ.data?.payoutsEnabled && !!statusQ.data?.detailsSubmitted
 
   useEffect(() => {
-    if (!showOnboarding) qc.invalidateQueries('stripe-connect-status-user')
+    if (!showOnboarding) qc.invalidateQueries('stripe-connect-status')
   }, [showOnboarding, qc])
 
   const startOnboarding = async () => {
@@ -379,7 +392,7 @@ function StripeConnectSection() {
         fetchClientSecret: async () => {
           const r = await apiPost<{ connectAccountId: string; clientSecret: string }>(
             '/stripe/connect/onboarding-session',
-            { entity: 'user' },
+            connectOnboardBody,
           )
           return r.data!.clientSecret
         },

@@ -35,7 +35,17 @@ export const businessInventoryRouter = Router()
 // load-bearing for POS + WO reference).
 import { requireBusinessAccess } from '../middleware/businessAccess'
 
-const requireRead   = async (req: any) => (await requireBusinessAccess(req, { permission: 'inventory.read',   feature: 'inventory' })).businessId
+// S554: the POS register lists items/categories to ring sales, so pos.use
+// grants catalog READ too — the 'office' staff preset has pos.use but NOT
+// inventory.read, and without this its whole register 400/403'd ("Failed to
+// load"). Writes/adjusts still require the stricter inventory perms below.
+const requireRead   = async (req: any) => {
+  const access = await requireBusinessAccess(req, { feature: 'inventory' })
+  if (!access.permissions.includes('inventory.read') && !access.permissions.includes('pos.use')) {
+    throw new AppError(403, 'Missing permission: inventory.read (or pos.use). Ask your owner to grant access on the Staff page.')
+  }
+  return access.businessId
+}
 const requireWrite  = async (req: any) => (await requireBusinessAccess(req, { permission: 'inventory.write',  feature: 'inventory' })).businessId
 const requireAdjust = async (req: any) => (await requireBusinessAccess(req, { permission: 'inventory.adjust', feature: 'inventory' })).businessId
 

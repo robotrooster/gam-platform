@@ -54,6 +54,7 @@ export function joinPageItems(page: Page): JoinedItem[] {
         x: it.x,
         y: it.y,
         x2: it.x2,
+        height: it.height,
         fontName: it.fontName,
         sources: [it],
       })
@@ -89,6 +90,7 @@ export function joinPageItemsRelaxed(page: Page): JoinedItem[] {
         x: it.x,
         y: it.y,
         x2: it.x2,
+        height: it.height,
         fontName: it.fontName,
         sources: [it],
       })

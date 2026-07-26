@@ -362,6 +362,94 @@ describe('POST /documents — validation', () => {
   })
 })
 
+// ─── POST /documents — S556 auto-populate from unit ────────────
+//
+// A new lease drafted off a unit seeds rent_amount, derived security_deposit
+// (rent × per-(property,unit_type) multiplier), and unit_number into the
+// document fields without the landlord typing them. Caller-supplied values win.
+
+describe('POST /documents — auto-populate from unit (S556)', () => {
+  async function seedTemplateWithFields(landlordId: string, cols: string[]): Promise<string> {
+    const t = await db.query<{ id: string }>(
+      `INSERT INTO lease_templates (landlord_id, name, page_count) VALUES ($1, 'AutoPop', 1) RETURNING id`,
+      [landlordId])
+    const tid = t.rows[0].id
+    for (const col of cols) {
+      await db.query(
+        `INSERT INTO lease_template_fields (template_id, field_type, signer_role, lease_column, page, x, y, width, height)
+         VALUES ($1, 'text', 'landlord', $2, 1, 10, 10, 100, 20)`, [tid, col])
+    }
+    return tid
+  }
+
+  async function docFieldValues(documentId: string): Promise<Record<string, string | null>> {
+    const r = await db.query<{ lease_column: string; value: string | null }>(
+      `SELECT lease_column, value FROM lease_document_fields WHERE document_id = $1`, [documentId])
+    return Object.fromEntries(r.rows.map(x => [x.lease_column, x.value]))
+  }
+
+  it('seeds rent, derived deposit (rent × multiplier), and unit_number from the unit', async () => {
+    const f = await seedFixture()  // unit rent defaults to 1000, unit_type apartment
+    const tid = await seedTemplateWithFields(f.landlordId, ['rent_amount', 'security_deposit', 'unit_number'])
+    await db.query(
+      `INSERT INTO property_unit_type_deposits (property_id, unit_type, deposit_multiplier)
+       VALUES ($1, 'apartment', 1.5)`, [f.propertyId])
+
+    const res = await request(buildApp())
+      .post('/api/esign/documents')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({
+        title: 'Auto Lease', templateId: tid, unitId: f.unitId,
+        signers: [
+          { role: 'landlord', userId: f.landlordUserId, name: 'L L', email: 'l@x' },
+          { role: 'primary',  userId: f.tenantUserId,   name: 'T T', email: f.tenantEmail },
+        ],
+      })
+    expect(res.status).toBe(201)
+    const vals = await docFieldValues(res.body.data.id)
+    expect(vals.rent_amount).toBe('1000.00')
+    expect(vals.security_deposit).toBe('1500.00') // 1000 × 1.5
+    expect(vals.unit_number).toBeTruthy()
+  })
+
+  it('defaults deposit to 1× rent when no multiplier row exists', async () => {
+    const f = await seedFixture()
+    const tid = await seedTemplateWithFields(f.landlordId, ['rent_amount', 'security_deposit'])
+    const res = await request(buildApp())
+      .post('/api/esign/documents')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({
+        title: 'Auto Lease', templateId: tid, unitId: f.unitId,
+        signers: [
+          { role: 'landlord', userId: f.landlordUserId, name: 'L L', email: 'l@x' },
+          { role: 'primary',  userId: f.tenantUserId,   name: 'T T', email: f.tenantEmail },
+        ],
+      })
+    expect(res.status).toBe(201)
+    const vals = await docFieldValues(res.body.data.id)
+    expect(vals.security_deposit).toBe('1000.00') // 1000 × 1.0 default
+  })
+
+  it('caller-supplied prefill wins over unit auto-seed', async () => {
+    const f = await seedFixture()
+    const tid = await seedTemplateWithFields(f.landlordId, ['rent_amount'])
+    const res = await request(buildApp())
+      .post('/api/esign/documents')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({
+        title: 'Auto Lease', templateId: tid, unitId: f.unitId,
+        prefillValues: { rent_amount: '2500.00' },
+        signers: [
+          { role: 'landlord', userId: f.landlordUserId, name: 'L L', email: 'l@x' },
+          { role: 'primary',  userId: f.tenantUserId,   name: 'T T', email: f.tenantEmail },
+        ],
+      })
+    expect(res.status).toBe(201)
+    const vals = await docFieldValues(res.body.data.id)
+    expect(vals.rent_amount).toBe('2500.00')
+  })
+})
+
 // ─── POST /documents/:id/send ──────────────────────────────────
 
 describe('POST /documents/:id/send', () => {
@@ -940,6 +1028,114 @@ async function seedCompleteableDoc(
   await seedDocFields(documentId, opts.fields ?? defaultLeaseFields())
   return { documentId, landlordSignerId: ls.rows[0].id, tenantSignerId: ts.rows[0].id }
 }
+
+// ─── POST /sign — conditional (nested) radio required (S556) ────
+describe('POST /sign — conditional radio required', () => {
+  async function seedConditionalDoc(f: SeedFixture) {
+    const t = await db.query<{ id: string }>(
+      `INSERT INTO lease_templates (landlord_id, name, page_count) VALUES ($1,'Cond',1) RETURNING id`, [f.landlordId])
+    const tid = t.rows[0].id
+    const pf = await db.query<{ id: string }>(
+      `INSERT INTO lease_template_fields (template_id, field_type, signer_role, required, options)
+       VALUES ($1,'radio_group','landlord',TRUE,'Fixed term,Month-to-month') RETURNING id`, [tid])
+    const parentTid = pf.rows[0].id
+    const cf = await db.query<{ id: string }>(
+      `INSERT INTO lease_template_fields (template_id, field_type, signer_role, required, options, parent_field_id, parent_option)
+       VALUES ($1,'radio_group','landlord',TRUE,'Continue,Vacate',$2,'Fixed term') RETURNING id`, [tid, parentTid])
+    const childTid = cf.rows[0].id
+    const d = await db.query<{ id: string }>(
+      `INSERT INTO lease_documents (landlord_id, unit_id, title, document_type, status)
+       VALUES ($1,$2,'Cond','original_lease','in_progress') RETURNING id`, [f.landlordId, f.unitId])
+    const docId = d.rows[0].id
+    await db.query(
+      `INSERT INTO lease_document_signers (document_id, user_id, role, name, email, order_index, token, status, viewed_at)
+       VALUES ($1,$2,'landlord','L','l@x',1,$3,'viewed',NOW())`,
+      [docId, f.landlordUserId, crypto.randomBytes(16).toString('hex')])
+    await db.query(
+      `INSERT INTO lease_document_signers (document_id, user_id, role, name, email, order_index, token, status)
+       VALUES ($1,$2,'primary','T',$3,2,$4,'sent')`,
+      [docId, f.tenantUserId, f.tenantEmail, crypto.randomBytes(16).toString('hex')])
+    const pdf = await db.query<{ id: string }>(
+      `INSERT INTO lease_document_fields (document_id, template_field_id, field_type, signer_role, required, options, label)
+       VALUES ($1,$2,'radio_group','landlord',TRUE,'Fixed term,Month-to-month','Lease type') RETURNING id`, [docId, parentTid])
+    const parentDocId = pdf.rows[0].id
+    const cdf = await db.query<{ id: string }>(
+      `INSERT INTO lease_document_fields (document_id, template_field_id, field_type, signer_role, required, options, parent_field_id, parent_option, label)
+       VALUES ($1,$2,'radio_group','landlord',TRUE,'Continue,Vacate',$3,'Fixed term','End of term') RETURNING id`,
+      [docId, childTid, parentTid])
+    return { docId, parentDocId, childDocId: cdf.rows[0].id }
+  }
+
+  it('parent = Month-to-month → child hidden, not required; sign succeeds and child stays empty', async () => {
+    const f = await seedFixture()
+    const { docId, parentDocId, childDocId } = await seedConditionalDoc(f)
+    const res = await request(buildApp())
+      .post(`/api/esign/sign/${docId}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ fieldValues: [{ fieldId: parentDocId, value: 'Month-to-month' }] })
+    expect(res.status).toBe(200)
+    const c = await db.query<{ value: string | null }>(`SELECT value FROM lease_document_fields WHERE id=$1`, [childDocId])
+    expect(c.rows[0].value == null || c.rows[0].value === '').toBe(true)
+  })
+
+  it('parent = Fixed term with no child answer → 400 missing required', async () => {
+    const f = await seedFixture()
+    const { docId, parentDocId } = await seedConditionalDoc(f)
+    const res = await request(buildApp())
+      .post(`/api/esign/sign/${docId}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ fieldValues: [{ fieldId: parentDocId, value: 'Fixed term' }] })
+    expect(res.status).toBe(400)
+    expect(res.body.error).toMatch(/required/i)
+  })
+
+  it('parent = Fixed term + child answered → sign succeeds', async () => {
+    const f = await seedFixture()
+    const { docId, parentDocId, childDocId } = await seedConditionalDoc(f)
+    const res = await request(buildApp())
+      .post(`/api/esign/sign/${docId}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ fieldValues: [
+        { fieldId: parentDocId, value: 'Fixed term' },
+        { fieldId: childDocId, value: 'Vacate' },
+      ] })
+    expect(res.status).toBe(200)
+  })
+
+  // Generalization (Nic S556): a conditional child can be ANY field type, not
+  // just a nested radio — e.g. a fixed-term end_date that only applies when
+  // lease_type = "Fixed term".
+  it('non-radio (date) child is required only under its trigger option', async () => {
+    const f = await seedFixture()
+    // template: lease_type radio + an end_date DATE child (only if Fixed term)
+    const t = await db.query<{ id: string }>(`INSERT INTO lease_templates (landlord_id, name, page_count) VALUES ($1,'C2',1) RETURNING id`, [f.landlordId])
+    const tid = t.rows[0].id
+    const pf = await db.query<{ id: string }>(`INSERT INTO lease_template_fields (template_id, field_type, signer_role, required, options) VALUES ($1,'radio_group','landlord',TRUE,'Fixed term,Month-to-month') RETURNING id`, [tid])
+    const parentTid = pf.rows[0].id
+    const cf = await db.query<{ id: string }>(`INSERT INTO lease_template_fields (template_id, field_type, signer_role, required, lease_column, parent_field_id, parent_option) VALUES ($1,'date','landlord',TRUE,'end_date',$2,'Fixed term') RETURNING id`, [tid, parentTid])
+    const childTid = cf.rows[0].id
+    async function mkDoc() {
+      const d = await db.query<{ id: string }>(`INSERT INTO lease_documents (landlord_id, unit_id, title, document_type, status) VALUES ($1,$2,'C2','original_lease','in_progress') RETURNING id`, [f.landlordId, f.unitId])
+      const docId = d.rows[0].id
+      await db.query(`INSERT INTO lease_document_signers (document_id, user_id, role, name, email, order_index, token, status, viewed_at) VALUES ($1,$2,'landlord','L','l@x',1,$3,'viewed',NOW())`, [docId, f.landlordUserId, crypto.randomBytes(16).toString('hex')])
+      await db.query(`INSERT INTO lease_document_signers (document_id, user_id, role, name, email, order_index, token, status) VALUES ($1,$2,'primary','T',$3,2,$4,'sent')`, [docId, f.tenantUserId, f.tenantEmail, crypto.randomBytes(16).toString('hex')])
+      const p = await db.query<{ id: string }>(`INSERT INTO lease_document_fields (document_id, template_field_id, field_type, signer_role, required, options, label) VALUES ($1,$2,'radio_group','landlord',TRUE,'Fixed term,Month-to-month','Lease type') RETURNING id`, [docId, parentTid])
+      await db.query(`INSERT INTO lease_document_fields (document_id, template_field_id, field_type, signer_role, required, lease_column, parent_field_id, parent_option, label) VALUES ($1,$2,'date','landlord',TRUE,'end_date',$3,'Fixed term','End date')`, [docId, childTid, parentTid])
+      return { docId, parentDocId: p.rows[0].id }
+    }
+    // Month-to-month → end_date hidden, not required → signs
+    const d1 = await mkDoc()
+    const r1 = await request(buildApp()).post(`/api/esign/sign/${d1.docId}`).set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ fieldValues: [{ fieldId: d1.parentDocId, value: 'Month-to-month' }] })
+    expect(r1.status).toBe(200)
+    // Fixed term → end_date required → 400
+    const d2 = await mkDoc()
+    const r2 = await request(buildApp()).post(`/api/esign/sign/${d2.docId}`).set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ fieldValues: [{ fieldId: d2.parentDocId, value: 'Fixed term' }] })
+    expect(r2.status).toBe(400)
+    expect(r2.body.error).toMatch(/required/i)
+  })
+})
 
 describe('POST /sign/:documentId — completion handler (original_lease)', () => {
   it('happy path: all-signed → lease created with writable cols, lease_tenants, doc flips completed', async () => {

@@ -266,9 +266,14 @@ paymentsRouter.post('/:id/pay', async (req: any, res, next) => {
               u.property_id, u.payment_block,
               t.stripe_customer_id,
               l.user_id AS landlord_user_id,
-              lu.stripe_connect_account_id,
-              lu.connect_charges_enabled,
-              lu.connect_details_submitted
+              -- S554 Connect re-anchor: prefer the landlord ENTITY's account +
+              -- its capability flags; fall back to the founding owner's user
+              -- account during the transition. The flags MUST come from the
+              -- same entity that owns the account being charged (a plain
+              -- COALESCE on the booleans would always pick landlords' false).
+              COALESCE(l.stripe_connect_account_id, lu.stripe_connect_account_id) AS stripe_connect_account_id,
+              CASE WHEN l.stripe_connect_account_id IS NOT NULL THEN l.connect_charges_enabled   ELSE lu.connect_charges_enabled   END AS connect_charges_enabled,
+              CASE WHEN l.stripe_connect_account_id IS NOT NULL THEN l.connect_details_submitted ELSE lu.connect_details_submitted END AS connect_details_submitted
          FROM payments p
          JOIN units u ON u.id = p.unit_id
          JOIN tenants t ON t.id = p.tenant_id
@@ -609,7 +614,11 @@ paymentsRouter.post('/pay-balance', async (req: any, res, next) => {
               pr.accept_partial_payments,
               t.stripe_customer_id,
               l.user_id AS landlord_user_id,
-              lu.stripe_connect_account_id, lu.connect_charges_enabled, lu.connect_details_submitted
+              -- S554 Connect re-anchor: entity account + its flags preferred,
+              -- founding-owner user account as transition fallback.
+              COALESCE(l.stripe_connect_account_id, lu.stripe_connect_account_id) AS stripe_connect_account_id,
+              CASE WHEN l.stripe_connect_account_id IS NOT NULL THEN l.connect_charges_enabled   ELSE lu.connect_charges_enabled   END AS connect_charges_enabled,
+              CASE WHEN l.stripe_connect_account_id IS NOT NULL THEN l.connect_details_submitted ELSE lu.connect_details_submitted END AS connect_details_submitted
          FROM payments p
          JOIN units u ON u.id = p.unit_id
          JOIN properties pr ON pr.id = u.property_id

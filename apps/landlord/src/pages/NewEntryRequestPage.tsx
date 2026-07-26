@@ -7,11 +7,11 @@ import { LawWarningBanner, type LawFlag } from '../components/LawWarningBanner'
 
 interface CreateResponseData {
   id: string
-  notice_window_hours: number
-  notice_window_meets_default: boolean
-  outside_typical_hours: boolean
-  typical_hours_warning: string | null
-  state_law_warnings: LawFlag[]
+  noticeWindowHours: number
+  noticeWindowMeetsDefault: boolean
+  outsideTypicalHours: boolean
+  typicalHoursWarning: string | null
+  stateLawWarnings: LawFlag[]
 }
 
 export function NewEntryRequestPage() {
@@ -36,8 +36,8 @@ export function NewEntryRequestPage() {
     {
       onSuccess: (res: any) => {
         const data: CreateResponseData = res.data
-        const hasWarnings = data.outside_typical_hours
-          || (data.state_law_warnings && data.state_law_warnings.length > 0)
+        const hasWarnings = data.outsideTypicalHours
+          || (data.stateLawWarnings && data.stateLawWarnings.length > 0)
         if (hasWarnings) {
           setSubmittedResult(data)
         } else {
@@ -93,7 +93,7 @@ export function NewEntryRequestPage() {
             <Check size={18} /> Entry request sent.
           </div>
 
-          {submittedResult.outside_typical_hours && submittedResult.typical_hours_warning && (
+          {submittedResult.outsideTypicalHours && submittedResult.typicalHoursWarning && (
             <div style={{
               background: 'rgba(245, 158, 11, 0.08)',
               border: '1px solid rgba(245, 158, 11, 0.4)',
@@ -109,12 +109,12 @@ export function NewEntryRequestPage() {
                 }}>
                   Outside typical hours
                 </div>
-                {submittedResult.typical_hours_warning}
+                {submittedResult.typicalHoursWarning}
               </div>
             </div>
           )}
 
-          <LawWarningBanner warnings={submittedResult.state_law_warnings} />
+          <LawWarningBanner warnings={submittedResult.stateLawWarnings} />
 
           <div style={{ fontSize: 12, color: 'var(--text-2)', marginTop: 8 }}>
             Your notice was sent to the tenant. The note(s) above are

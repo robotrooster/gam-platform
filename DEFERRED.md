@@ -624,3 +624,226 @@ walkthrough.
 **Remaining launch blockers** are all vendor / dev-team / Nic-pending:
 host pick → deploy → Stripe live keys → Resend domain → Plaid keys →
 Checkr credentials → Stripe Terminal hardware. Test thread is closed.
+
+---
+
+## OPEN DESIGN (S557, Nic) — FlexPay with two payers on one lease
+
+**The case:** husband and wife both on disability, one lease. Their
+benefit payments land on different days (e.g. SSDI 2nd Wednesday and
+4th Wednesday), and neither payment alone covers the rent. Nic's
+question: do they both enroll at $25 each, and how does the float work
+across two pull dates?
+
+**The mismatch:** FlexPay enrollment today is **per-tenant**
+(`tenants.flexpay_enrolled` / `flexpay_pull_day` /
+`flexpay_monthly_fee`), but the thing being fronted is a **per-lease**
+rent obligation — see [[gam-rent-obligation-principle]]. With one payer
+that's invisible. With two it surfaces immediately.
+
+**MODEL (Nic, S557 — decided). Each payer is an independent
+participant with their own float, their own fee, and their own
+consequences.** Treat co-tenants as roommates splitting rent, even when
+they're a married couple jointly and severally liable at law. GAM does
+not care how it settles with the landlord — GAM prices **each person's
+portion of the float against what they're charged for that portion.**
+
+A "one $25 split between two people" model was proposed here and
+**rejected.** The reasoning against it:
+- **Twice the risk.** Two ACH pulls, two failure points, and FlexPay
+  has no recourse by design.
+- **Roughly twice the float-days.** Two halves floated 10–12 days each
+  is 20–24 person-float-days versus one payer's 10–12, plus retries.
+- **Twice Stripe's ACH cost.** Per-transaction until the ODFI
+  partnership lands — not "pennies."
+- **Unfair to solo participants.** A single tenant pays $25 for one
+  float; a pair splitting $25 would pay $12.50 each for two. That
+  inequity is visible to other tenants in the program.
+- **Accountability.** Separate fees and separate consequences give each
+  person a reason to hold up their end. A shared fee invites a
+  free-rider.
+
+Mechanics that follow:
+- **Enrollment stays per-tenant** — the existing schema
+  (`tenants.flexpay_enrolled` / `flexpay_pull_day` /
+  `flexpay_monthly_fee`) already fits. No migration of that shape.
+- **$25 each.** Two enrolled payers on one lease = $50 total.
+- **Each has their own pull day**, both capped at
+  `FLEXPAY_MAX_PULL_DAY = 28` (SSDI 4th-Wednesday window).
+- **Failure is individual.** The payer who fails owns their retry,
+  their ACH-return pass-through, and their own 90-day lockout. The
+  payer who cleared is untouched.
+- **Both need SSI/SSDI verification** — each is a separate participant.
+
+**Consumer-protective disclosure (Nic):** verify the numbers against
+the lease, and if $50 in combined fees doesn't beat the late fees
+they're already paying, **tell them we can't save them money.** GAM
+declines the enrollment rather than selling a product that leaves them
+worse off. Worth treating as a standing FlexPay principle, not a
+one-off.
+
+**One-enrolls-one-doesn't is the common case, and it's an argument FOR
+separate fees (Nic).** The unenrolled roommate may just be a day late
+and eat a $10 late fee — their float was never needed. Charging them
+nothing while the enrolled roommate pays their own $25 is the equitable
+outcome, and it falls out of the per-person model automatically.
+
+**Rent owed to the landlord stays PER LEASE (Nic — important).** The
+per-tenant share is **exclusive to FlexPay** — an internal notion of
+"what portion did GAM float for this person." It does not change
+[[gam-rent-obligation-principle]] or anything the landlord sees. A
+tenant not enrolled in FlexPay is unaffected in every respect.
+
+### ⚠️ Why two-payer is deferred: it drifts toward underwriting
+
+Nic's instinct, and it's correct. Determining *who is responsible for
+how much* via a conversation with the household is an **individualized
+ability-to-repay assessment** — that is underwriting, and it's the core
+of consumer-lending regulation. The whole S304 structure depends on GAM
+making **no credit decisions** (FlexDeposit eligibility is explicitly
+"service-tier qualification, not a credit decision"). A case-by-case
+household negotiation breaks that.
+
+**The distinction that keeps it safe: rules are not underwriting;
+judgments are.** A flat mechanical eligibility rule applied uniformly —
+Nic's own idea of gating on a **percentage of verified income** — is a
+bright-line service-tier qualification, the same shape as the existing
+SSI/SSDI-only gate. Categorical, not evaluative. No one at GAM decides
+anything about a specific person.
+
+Which suggests the design when this is picked back up:
+**the household DECLARES the split; GAM only validates it against a
+fixed rule.** Declaration plus mechanical validation, never assessment.
+GAM never chooses the number.
+
+**And the line Nic was feeling for, stated plainly: front against the
+OBLIGATION, never against the INCOME.** His example — a $1,200
+disbursement against a $2,000 rent where their share is $1,000 — is
+exactly right. Fronting a declared share of a known rent obligation is
+a payment-scheduling service. Sizing an advance to what someone's
+income can carry is a loan. Same money, opposite legal character.
+
+**Status: deferred (Nic).** Single-payer FlexPay works today with none
+of this complexity, so the demand test isn't blocked. Also still open:
+whether three+ payers is ever allowed, or the model caps at two.
+
+Post-launch. FlexPay is demand-test gated and this doesn't block that.
+
+## IDEA (S557, Nic) — tenant-led landlord acquisition
+
+**Not scoped, not scheduled.** Captured so the good half isn't lost.
+
+**The shape (Nic's clarification, S557):** an open, disclosed referral
+program. The tenant tells their own landlord about GAM — *"I found
+software that doesn't have the rent-payment problems yours does, and
+they pay me if you sign up."* The tenant is the introduction; **GAM
+never cold-contacts the landlord.** Bounty pays only on conversion.
+Any lease/property info is used solely so the sales conversation isn't
+blind (where the property is, roughly how many units) — never as
+leverage.
+
+**This version is sound.** Referral programs with disclosure are
+ordinary. The earlier concerns about TCPA exposure, harvesting
+non-customer data, and blindsiding the landlord all applied to a
+cold-outreach model that was never the intent.
+
+**Can a tenant share their own lease?** Yes — they're a party to the
+contract and hold their own copy. Confidentiality clauses are routine
+in commercial leases, uncommon in residential.
+
+### Three refinements before this gets built
+
+**1. COLLECT THE LEASE — settled (Nic, S557).** Two earlier suggestions
+here were wrong and are withdrawn: conversion-gating does NOT stop an
+inflated rent claim (it only stops fake leads), and sourcing the rent
+from the landlord's entered rent roll at payout is **too slow** — a
+landlord can commit but delay migrating leases for weeks (e.g. the 1st
+is coming and they won't interrupt payment flows), which would strand
+the tenant's payout long after they did their part.
+
+**The lease is also an intelligence asset, which is the stronger
+reason.** It names *who actually manages the property* — frequently a
+PM company rather than the individual owner. That's the decision-maker,
+and the tenant can't report it because it isn't in their head. Build a
+heat map from it: if a PM company has already declined GAM, every
+future lease naming that company is a dead lead we don't spend a call
+on. Nothing else in the pipeline surfaces that.
+
+**Implementation note — this plugs into existing schema.** The PM
+subsystem already exists (`pm_companies`, `pm_staff`,
+`properties.pm_company_id`, S157). Lead tracking extends it rather than
+inventing a parallel structure: a `pm_companies` row can exist in a
+prospect / contacted / declined state before it's ever a customer.
+
+**How to hold it well, since we're holding it:**
+- **Extract, then index.** Pull rent amount, property address, unit
+  count, and managing entity into structured fields. The heat map runs
+  on the index forever; the document itself only needs to survive the
+  bounty-dispute window. Define a retention period and purge on it.
+- **Admin-only access.** These are non-customer documents — never
+  visible in the landlord or tenant portals. Consistent with
+  [[gam-nothing-public-rule]].
+- **Explicit tenant consent** at upload acknowledging the document
+  contains their landlord's information. One checkbox, protects
+  everyone.
+- **App Store privacy label** must honestly disclose collecting
+  documents containing third-party personal data. Not a blocker, but
+  it's an answer we have to have ready. See `APP_STORE_PLAN.md`.
+- The heat map is a genuinely valuable competitive asset *and* the most
+  sensitive dataset in the company — who manages what, and who said no.
+  Segregate and encrypt accordingly.
+
+**1a. Moved-out tenant still gets paid (Nic, S557).** If the conversion
+happened, the person who helped us gets their money — no exception for
+timing. Reach them via the forwarding address or emergency contact,
+both usually on the lease. Another reason to hold the document.
+
+**1b. Bounty scaling — an earlier claim in this file was wrong.** It
+said a 40-unit park is worth the same to GAM regardless of the tenant's
+rent. It isn't. Account value *does* rise with rent:
+- **FlexDeposit custody float** — deposit = rent × multiplier, so 40
+  units at $2,500 holds ~$100k versus ~$24k at $600. At T-bill yields
+  that's a several-thousand-a-year difference, and it's GAM's to invest
+  while held.
+- **Card processing** — 3.25% scales directly with rent.
+- Platform fee ($2/unit) and ACH (1% capped at $6) are both flat.
+  **FlexPay runs the other way**: flat $25 fee while the fronted float
+  grows with rent, so high-rent FlexPay enrollments are *less*
+  capital-efficient. Worth knowing when choosing which properties to
+  chase.
+
+So one month's rent is defensible. **The wrinkle Nic already spotted:**
+the real value driver is **rent × unit count**, not rent alone — a
+duplex at $2,500 and a 40-unit park at $2,500 pay the same bounty for
+wildly different accounts. If a scale gets built later, that product is
+the variable to scale on. **Undecided — not designed.**
+
+**2. Build the disclosure into the artifact, not the tenant's memory.**
+FTC endorsement guides require disclosing material connections, and a
+paid recommendation is one. Put it in the referral link and materials
+themselves so it's disclosed by construction — every landlord sees it
+whether or not the tenant thinks to mention it. Protects the tenant,
+and protects GAM from the one tenant who stays quiet.
+
+**3. ⚠️ THE BOUNTY CAN HURT AN SSI TENANT — this is the real risk.**
+A month's rent (~$1,000) paid to an SSI recipient is a problem *because
+of who our tenants are*:
+- Cash to the tenant = **countable unearned income**, which reduces or
+  eliminates that month's SSI payment.
+- Paying their rent directly = **in-kind support and maintenance
+  (ISM)**, which SSA also counts.
+- Either route can trigger an **overpayment clawback**, and $600+/year
+  is 1099-reportable on top of it.
+
+So the reward could cost the tenant more than it gives them — the exact
+harm the product exists to prevent. Before building: keep the amount
+small enough to stay clear of the thresholds, and disclose the possible
+benefits impact so the tenant can decline. Worth a benefits-counsel
+read given the SSDI/SSI concentration. See
+[[flexsuite-product-rules]].
+
+### Also worth keeping
+**FlexCredit as a parallel acquisition wedge.** Rent reporting to the
+bureaus gives a tenant standalone value whether or not their landlord
+ever joins (that's Esusu's whole business). It's a reason to be in the
+app before any referral happens, and it doesn't depend on a bounty.

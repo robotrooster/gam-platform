@@ -3,7 +3,6 @@ import { useQuery, useMutation } from 'react-query'
 import { Shield, Upload, Check, AlertCircle, Lock, Clock, XCircle } from 'lucide-react'
 import { loadStripe, Stripe as StripeJs } from '@stripe/stripe-js'
 import { Elements, PaymentElement, useStripe, useElements } from '@stripe/react-stripe-js'
-import { humanize } from '@gam/shared'
 
 const API = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
 
@@ -15,7 +14,6 @@ const STRIPE_PK = (import.meta as any).env?.VITE_STRIPE_PUBLISHABLE_KEY || ''
 const stripePromise: Promise<StripeJs | null> | null = STRIPE_PK ? loadStripe(STRIPE_PK) : null
 const tok = () => localStorage.getItem('gam_tenant_token')
 const get = (p: string) => fetch(`${API}/api${p}`,{headers:{Authorization:`Bearer ${tok()}`}}).then(r=>r.json()).then(r=>r.data??r)
-const post = (p: string, b: any) => fetch(`${API}/api${p}`,{method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${tok()}`},body:JSON.stringify(b)}).then(r=>r.json())
 const uploadFile = async (p: string, file: File) => { const fd=new FormData(); fd.append('file',file); return fetch(`${API}/api${p}`,{method:'POST',headers:{Authorization:`Bearer ${tok()}`},body:fd}).then(r=>r.json()) }
 
 const inp = { width:'100%', padding:'9px 12px', border:'1px solid #1e2530', borderRadius:8, background:'#0a0d10', color:'#eef1f8', fontSize:'.85rem', outline:'none', boxSizing:'border-box' as const }
@@ -28,15 +26,12 @@ export function BackgroundCheckPage() {
   const [idFile, setIdFile] = useState<File|null>(null)
   const [idUrl, setIdUrl] = useState('')
   const [, setUploading] = useState(false)
-  const [idVerifying, setIdVerifying] = useState(false)
   const [incomeFiles, setIncomeFiles] = useState<{file:File,url:string}[]>([])
   const [incomeUploading, setIncomeUploading] = useState(false)
   const incomeRef = useRef<HTMLInputElement>(null)
   const cameraRef = useRef<HTMLInputElement>(null)
-  const [phoneChecking, setPhoneChecking] = useState(false)
   const [phoneError, setPhoneError] = useState('')
   const [phoneValid, setPhoneValid] = useState(false)
-  const [idNameMatch, setIdNameMatch] = useState<any>(null)
   const [showSsn, setShowSsn] = useState(false)
   const [paid, setPaid] = useState(false)
   const [paymentIntentId, setPaymentIntentId] = useState<string>('')
@@ -44,6 +39,7 @@ export function BackgroundCheckPage() {
   const [paymentInitError, setPaymentInitError] = useState<string>('')
   const [startTime] = useState(Date.now())
   const [countdown, setCountdown] = useState('')
+  const [reapplyErr, setReapplyErr] = useState('')
   const fileRef = useRef<HTMLInputElement>(null)
   const idCameraRef = useRef<HTMLInputElement>(null)
   const [suggestions, setSuggestions] = useState<any[]>([])
@@ -79,20 +75,13 @@ export function BackgroundCheckPage() {
     setUploading(true);
     const r = await uploadFile('/background/upload-id', f);
     if (r.success) {
+      // S554 (button-sweep bug #8): the /background/verify-id-name OCR call
+      // was removed — the route never existed (404) and the submit route
+      // ignored idVerification. The ID is uploaded here and verified
+      // manually by staff downstream (blind-staff-entry standard).
       setIdUrl(r.data.url);
-      setUploading(false);
-      setIdVerifying(true);
-      try {
-        const v = await post('/background/verify-id-name', { idDocumentUrl: r.data.url, firstName: form.firstName, lastName: form.lastName, dateOfBirth: form.dob, zip: form.zip });
-        if (v.success) setIdNameMatch(v.data);
-      } catch (err) {
-        console.error('[ID verify]', err);
-      } finally {
-        setIdVerifying(false);
-      }
-    } else {
-      setUploading(false);
     }
+    setUploading(false);
   }
   // Account creation is moved to the step-5 effect below so the
   // /background/payment-intent call (which requires auth) can run before
@@ -103,7 +92,7 @@ export function BackgroundCheckPage() {
     return fetch(`${API}/api/background/submit`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-      body: JSON.stringify({ firstName:form.firstName, lastName:form.lastName, dateOfBirth:form.dob, ssn:providerCollectsPii?undefined:form.ssn.replace(/\D/g,''), street1:form.street1, street2:form.street2||null, city:form.city, state:form.state, zip:form.zip, yearsAtAddress:parseInt(form.years)||null, employmentStatus:form.empStatus, employerName:form.employer||null, employerPhone:form.empPhone||null, monthlyIncome:parseFloat(form.income)||null, prevLandlordName:form.prevName||null, prevLandlordPhone:form.prevPhone||null, prevLandlordEmail:form.prevEmail||null, idDocumentUrl:idUrl||null, incomeDocUrls:incomeFiles.map(f=>f.url), consentCredit:form.consentCredit, consentCriminal:form.consentCriminal, consentPool:form.consentPool, landlordId:(me as any)?.landlordId||null, unitId:(me as any)?.unitId||(new URLSearchParams(window.location.search).get('unitId'))||null, timeToComplete:Math.round((Date.now()-startTime)/1000), idVerification:idNameMatch||null, applicantPaymentIntentId:paymentIntentId })
+      body: JSON.stringify({ firstName:form.firstName, lastName:form.lastName, dateOfBirth:form.dob, ssn:providerCollectsPii?undefined:form.ssn.replace(/\D/g,''), street1:form.street1, street2:form.street2||null, city:form.city, state:form.state, zip:form.zip, yearsAtAddress:parseInt(form.years)||null, employmentStatus:form.empStatus, employerName:form.employer||null, employerPhone:form.empPhone||null, monthlyIncome:parseFloat(form.income)||null, prevLandlordName:form.prevName||null, prevLandlordPhone:form.prevPhone||null, prevLandlordEmail:form.prevEmail||null, idDocumentUrl:idUrl||null, incomeDocUrls:incomeFiles.map(f=>f.url), consentCredit:form.consentCredit, consentCriminal:form.consentCriminal, consentPool:form.consentPool, landlordId:(me as any)?.landlordId||null, unitId:(me as any)?.unitId||(new URLSearchParams(window.location.search).get('unitId'))||null, timeToComplete:Math.round((Date.now()-startTime)/1000), applicantPaymentIntentId:paymentIntentId })
     }).then(r => r.json())
   }, { onSuccess: () => refetch() })
   const ssnFmt = (d: string) => d.length<=3?d:d.length<=5?d.slice(0,3)+'-'+d.slice(3):d.slice(0,3)+'-'+d.slice(3,5)+'-'+d.slice(5)
@@ -185,17 +174,12 @@ export function BackgroundCheckPage() {
     if (clean==='1234567890'||clean==='0987654321') { setPhoneError('Invalid phone number'); return }
     // Exchange code cannot start with 0 or 1
     if (clean[3]==='0'||clean[3]==='1') { setPhoneError('Invalid phone number'); return }
-    // Check against system
-    setPhoneChecking(true)
-    try {
-      const res = await fetch(API+'/api/background/check-phone?phone='+encodeURIComponent(clean), {
-        headers:{Authorization:'Bearer '+tok()}
-      })
-      const data = await res.json()
-      if (data.data?.taken) { setPhoneError(data.data.reason||'Phone number already in use'); return }
-      setPhoneValid(true)
-    } catch(e) { setPhoneValid(true) } // network error — don't block
-    setPhoneChecking(false)
+    // S554 (button-sweep bug #12): the /background/check-phone "already in
+    // use" lookup was removed — the route never existed (404) so it always
+    // fell through to valid, and building it public would be a phone-
+    // enumeration oracle. Format validation above is the real guard;
+    // duplicate detection happens at account creation.
+    setPhoneValid(true)
   }
 
   const searchAddr = async (val: string) => {
@@ -400,9 +384,19 @@ export function BackgroundCheckPage() {
           </div>
         )}
         {daysLeft === 0 && (
-          <button onClick={async()=>{await fetch(API+'/api/background/dev-reset',{method:'POST',headers:{Authorization:'Bearer '+tok(),'Content-Type':'application/json'}});window.location.reload()}} style={{padding:'10px 24px',borderRadius:8,border:'none',background:'#c9a227',color:'#060809',fontWeight:700,cursor:'pointer'}}>
-            Reapply Now
-          </button>
+          <>
+            <button onClick={async()=>{
+              // S554 (button-sweep bug #7): real applicant reapply route; the
+              // 90-day cooldown is enforced server-side (dev-reset was admin-only → 403).
+              setReapplyErr('')
+              const r = await fetch(API+'/api/background/reapply',{method:'POST',headers:{Authorization:'Bearer '+tok(),'Content-Type':'application/json'}})
+              if (r.ok) { window.location.reload() }
+              else { const j = await r.json().catch(()=>({})); setReapplyErr(j?.error || 'Could not reapply yet') }
+            }} style={{padding:'10px 24px',borderRadius:8,border:'none',background:'#c9a227',color:'#060809',fontWeight:700,cursor:'pointer'}}>
+              Reapply Now
+            </button>
+            {reapplyErr && <div style={{fontSize:'.72rem',color:'#ef4444',marginTop:8}}>{reapplyErr}</div>}
+          </>
         )}
         {process.env.NODE_ENV !== 'production' && (
           <button onClick={async()=>{await fetch(API+'/api/background/dev-reset',{method:'POST',headers:{Authorization:'Bearer '+tok(),'Content-Type':'application/json'}});window.location.reload()}} style={{padding:'6px 14px',borderRadius:6,border:'1px solid #333',background:'#141a22',color:'#4a5568',fontSize:'.72rem',cursor:'pointer'}}>🔧 Dev: Reset Application</button>
@@ -525,7 +519,6 @@ export function BackgroundCheckPage() {
                 <input style={{...inp, borderColor:form.prevName&&!phoneValid&&form.prevPhone?'#ef4444':form.prevName&&phoneValid?'#22c55e':undefined}} type="tel" value={form.prevPhone}
                   onChange={e=>{set('prevPhone',fmtPhone(e.target.value));setPhoneValid(false);setPhoneError('')}} onBlur={e=>form.prevName&&validatePhone(e.target.value)}
                   placeholder="(555) 000-0000"/>
-                {phoneChecking && <div style={{fontSize:'.68rem',color:'#4a5568',marginTop:3}}>Checking...</div>}
                 {phoneError && <div style={{fontSize:'.68rem',color:'#ef4444',marginTop:3}}>{phoneError}</div>}
                 {phoneValid && <div style={{fontSize:'.68rem',color:'#22c55e',marginTop:3}}>✓ Valid phone number</div>}
                 {form.prevName&&!form.prevPhone&&<div style={{color:'#ef4444',fontSize:'.68rem',marginTop:3}}>Required if previous landlord provided</div>}
@@ -564,31 +557,10 @@ export function BackgroundCheckPage() {
               <div style={{textAlign:'center',marginTop:10,fontSize:'.68rem',color:'#4a5568'}}>JPEG, PNG, or PDF · Max 10MB · Required</div>
             </div>
           )}
-          {idVerifying && <div style={{marginTop:12,fontSize:'.78rem',color:'#4a5568',display:'flex',alignItems:'center',gap:6}}><span style={{display:'inline-block',width:10,height:10,border:'2px solid #4a5568',borderTopColor:'#c9a227',borderRadius:'50%',animation:'spin 1s linear infinite'}}/> Verifying name against ID...</div>}
-          {idNameMatch && !idVerifying && (
-            <div style={{marginTop:12,padding:'12px 14px',background:idNameMatch.fullMatch?'rgba(34,197,94,.06)':idNameMatch.closeMatch?'rgba(245,158,11,.06)':'rgba(239,68,68,.06)',border:'1px solid '+(idNameMatch.fullMatch?'rgba(34,197,94,.25)':idNameMatch.closeMatch?'rgba(245,158,11,.25)':'rgba(239,68,68,.25)'),borderRadius:10}}>
-              {idNameMatch.fullMatch && <div style={{color:'#22c55e',fontSize:'.78rem',fontWeight:600}}>✓ Name matches ID document</div>}
-              {!idNameMatch.fullMatch && idNameMatch.closeMatch && idNameMatch.suggestedFirstName && (
-                <div>
-                  <div style={{color:'#f59e0b',fontSize:'.78rem',fontWeight:600,marginBottom:6}}>⚠️ Possible name mismatch — ID shows:</div>
-                  <div style={{fontSize:'.82rem',color:'#eef1f8',marginBottom:8}}>{idNameMatch.suggestedFirstName} {idNameMatch.suggestedLastName}</div>
-                  <button onClick={()=>{set('firstName',idNameMatch.suggestedFirstName||form.firstName);set('lastName',idNameMatch.suggestedLastName||form.lastName);setIdNameMatch({...idNameMatch,fullMatch:true})}} style={{padding:'6px 14px',borderRadius:7,border:'none',background:'#f59e0b',color:'#060809',fontWeight:700,fontSize:'.75rem',cursor:'pointer'}}>Use ID Name</button>
-                </div>
-              )}
-              {!idNameMatch.fullMatch && !idNameMatch.closeMatch && idNameMatch.suggestedFirstName && (
-                <div>
-                  <div style={{color:'#ef4444',fontSize:'.78rem',fontWeight:600,marginBottom:6}}>✗ Name does not match ID — ID shows:</div>
-                  <div style={{fontSize:'.82rem',color:'#eef1f8',marginBottom:8}}>{idNameMatch.suggestedFirstName} {idNameMatch.suggestedLastName}</div>
-                  <button onClick={()=>{set('firstName',idNameMatch.suggestedFirstName||form.firstName);set('lastName',idNameMatch.suggestedLastName||form.lastName);setIdNameMatch({...idNameMatch,fullMatch:true})}} style={{padding:'6px 14px',borderRadius:7,border:'none',background:'#ef4444',color:'white',fontWeight:700,fontSize:'.75rem',cursor:'pointer'}}>Correct My Name</button>
-                </div>
-              )}
-              {!idNameMatch.suggestedFirstName && <div style={{color:'#4a5568',fontSize:'.78rem'}}>Could not read name from ID — a staff member will verify manually.</div>}
-              {idNameMatch.dobMismatch && <div style={{color:'#ef4444',fontSize:'.78rem',fontWeight:600,marginTop:6}}>✗ Date of birth does not match ID</div>}
-              {idNameMatch.expired && <div style={{color:'#ef4444',fontSize:'.78rem',fontWeight:600,marginTop:6}}>⚠️ ID appears to be expired — please use a valid ID</div>}
-              {idNameMatch.expirationDate && !idNameMatch.expired && <div style={{color:'#22c55e',fontSize:'.78rem',marginTop:6}}>✓ ID valid until {new Date(idNameMatch.expirationDate).toLocaleDateString()}</div>}
-              {idNameMatch.idType && <div style={{color:'#4a5568',fontSize:'.72rem',marginTop:4}}>Document type: {humanize(idNameMatch.idType)}</div>}
-            </div>
-          )}
+          {/* S554 (button-sweep bug #8): the client-side ID/name-match card
+              was removed — its /background/verify-id-name route never existed
+              and the submit route ignored the result. ID is verified manually
+              by staff downstream. */}
         </div>}
         {step===4&&<div>
           {[{k:'consentCredit',l:'Credit Check',b:'I authorize my landlord and/or GAM to obtain a consumer credit report as part of my rental application.'},{k:'consentCriminal',l:'Criminal Background Check',b:'I authorize my landlord and/or GAM to conduct a criminal background check. All information I have provided is true and accurate.'}].map(consent=>(

@@ -132,7 +132,8 @@ export async function enableOtpForTenant(args: {
   // Check up-front so the landlord sees a clear "complete Connect
   // onboarding first" message instead of a silent enroll-then-fail loop.
   const acct = await queryOne<{ connect_id: string | null }>(
-    `SELECT u.stripe_connect_account_id AS connect_id
+    // S554 Connect re-anchor: entity account preferred, user fallback.
+    `SELECT COALESCE(l.stripe_connect_account_id, u.stripe_connect_account_id) AS connect_id
        FROM landlords l JOIN users u ON u.id = l.user_id
       WHERE l.id = $1`,
     [args.landlordId],
@@ -276,7 +277,7 @@ export async function processMonthlyAdvance(now: Date = new Date()): Promise<Adv
     connect_account_id: string | null
   }>(
     `SELECT lt.tenant_id, l.landlord_id, l.unit_id, l.id AS lease_id, l.rent_amount,
-            u.stripe_connect_account_id AS connect_account_id
+            COALESCE(la.stripe_connect_account_id, u.stripe_connect_account_id) AS connect_account_id
        FROM tenants t
        JOIN lease_tenants lt ON lt.tenant_id = t.id AND lt.status = 'active'
        JOIN leases l ON l.id = lt.lease_id AND l.status IN ('active', 'pending')

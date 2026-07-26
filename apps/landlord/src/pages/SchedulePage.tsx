@@ -725,18 +725,21 @@ export function SchedulePage() {
     {
       onSuccess: (resp:any) => {
         qc.invalidateQueries('schedule'); qc.invalidateQueries('schedule-history')
-        const b = resp?.data
+        // apiPatch returns the already-unwrapped booking (r.data.data), and the
+        // global middleware + axios interceptor camelize every key — so `resp`
+        // IS the booking and its fields are camelCase (matches lockBookingMut).
+        const b = resp
         setDetailBooking((prev:any)=> prev ? {
           ...prev,
-          guestName: b?.guest_name ?? prev.guestName,
-          guestEmail: b?.guest_email ?? prev.guestEmail,
-          guestPhone: b?.guest_phone ?? prev.guestPhone,
-          checkIn: b?.check_in ? String(b.check_in).split('T')[0] : prev.checkIn,
-          checkOut: b?.check_out ? String(b.check_out).split('T')[0] : prev.checkOut,
+          guestName: b?.guestName ?? prev.guestName,
+          guestEmail: b?.guestEmail ?? prev.guestEmail,
+          guestPhone: b?.guestPhone ?? prev.guestPhone,
+          checkIn: b?.checkIn ? String(b.checkIn).split('T')[0] : prev.checkIn,
+          checkOut: b?.checkOut ? String(b.checkOut).split('T')[0] : prev.checkOut,
           nights: b?.nights ?? prev.nights,
-          totalAmount: b?.total_amount ?? prev.totalAmount,
-          unitId: b?.unit_id ?? prev.unitId,
-          unitNumber: units.find((u:any)=>u.id===(b?.unit_id))?.unitNumber ?? prev.unitNumber,
+          totalAmount: b?.totalAmount ?? prev.totalAmount,
+          unitId: b?.unitId ?? prev.unitId,
+          unitNumber: units.find((u:any)=>u.id===(b?.unitId))?.unitNumber ?? prev.unitNumber,
           notes: b?.notes ?? prev.notes,
         } : prev)
         setEditForm(null); setEditError('')

@@ -1054,8 +1054,11 @@ function PropertyReviews(){
     {onSuccess:()=>{qcLocal.invalidateQueries('property-flags');setSelected(null);setNotes('')}}
   )
   const fmtDate=(d:string)=>new Date(d).toLocaleString()
-  const fmtAddr=(p:any,pre:string)=>`${p[pre+'street1']}${p[pre+'street2']?' '+p[pre+'street2']:''}, ${p[pre+'city']}, ${p[pre+'state']} ${p[pre+'zip']}`
-  const fmtLL=(p:any,pre:string)=>`${p[pre+'landlord_first']} ${p[pre+'landlord_last']}${p[pre+'landlord_business']?' — '+p[pre+'landlord_business']:''}`
+  // S554 (response-camelize sweep): admin responses are camelized, so SQL
+  // aliases new_street1 / orig_landlord_first arrive as newStreet1 /
+  // origLandlordFirst. Snake reads returned undefined ("undefined undefined").
+  const fmtAddr=(p:any,pre:string)=>`${p[pre+'Street1']}${p[pre+'Street2']?' '+p[pre+'Street2']:''}, ${p[pre+'City']}, ${p[pre+'State']} ${p[pre+'Zip']}`
+  const fmtLL=(p:any,pre:string)=>`${p[pre+'LandlordFirst']} ${p[pre+'LandlordLast']}${p[pre+'LandlordBusiness']?' — '+p[pre+'LandlordBusiness']:''}`
   return(
     <div>
       <div className="ph"><div><h1 className="pt">Property Reviews</h1><p className="ps">Flagged duplicate addresses awaiting review</p></div></div>
@@ -1088,18 +1091,18 @@ function PropertyReviews(){
               <div style={{border:'1px solid var(--gold)',borderRadius:8,padding:14}}>
                 <div style={{fontSize:'.7rem',color:'var(--gold)',fontWeight:700,marginBottom:8}}>NEW SUBMISSION</div>
                 <div style={{fontWeight:600,marginBottom:4}}>{selected.newName}</div>
-                <div style={{fontSize:'.75rem',marginBottom:8}}>{fmtAddr(selected,'new_')}</div>
+                <div style={{fontSize:'.75rem',marginBottom:8}}>{fmtAddr(selected,'new')}</div>
                 <div style={{fontSize:'.7rem',color:'var(--t3)',marginBottom:4}}>Landlord</div>
-                <div style={{fontSize:'.78rem',marginBottom:4}}>{fmtLL(selected,'new_')}</div>
+                <div style={{fontSize:'.78rem',marginBottom:4}}>{fmtLL(selected,'new')}</div>
                 <div style={{fontSize:'.7rem',color:'var(--t3)'}}>{selected.newLandlordEmail}</div>
                 <div style={{fontSize:'.7rem',color:'var(--t3)',marginTop:8}}>Created {fmtDate(selected.newCreatedAt)}</div>
               </div>
               <div style={{border:'1px solid var(--b1)',borderRadius:8,padding:14}}>
                 <div style={{fontSize:'.7rem',color:'var(--t3)',fontWeight:700,marginBottom:8}}>EXISTING PROPERTY</div>
                 <div style={{fontWeight:600,marginBottom:4}}>{selected.origName}</div>
-                <div style={{fontSize:'.75rem',marginBottom:8}}>{fmtAddr(selected,'orig_')}</div>
+                <div style={{fontSize:'.75rem',marginBottom:8}}>{fmtAddr(selected,'orig')}</div>
                 <div style={{fontSize:'.7rem',color:'var(--t3)',marginBottom:4}}>Landlord</div>
-                <div style={{fontSize:'.78rem',marginBottom:4}}>{fmtLL(selected,'orig_')}</div>
+                <div style={{fontSize:'.78rem',marginBottom:4}}>{fmtLL(selected,'orig')}</div>
                 <div style={{fontSize:'.7rem',color:'var(--t3)'}}>{selected.origLandlordEmail}</div>
                 <div style={{fontSize:'.7rem',color:'var(--t3)',marginTop:8}}>Created {fmtDate(selected.origCreatedAt)}</div>
               </div>

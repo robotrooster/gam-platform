@@ -430,3 +430,76 @@ describe('recordAccountUpdated', () => {
     expect(transfersCreateMock).not.toHaveBeenCalled()
   })
 })
+
+// ─── S554 Connect re-anchor: landlord ENTITY ─────────────────
+
+describe('ensureConnectAccount — landlord entity (S554 re-anchor)', () => {
+  it('creates + persists the account on the landlords row', async () => {
+    const c = await db.connect()
+    let landlordId = ''
+    try {
+      await c.query('BEGIN')
+      const { landlordId: lid } = await seedLandlord(c)
+      landlordId = lid
+      await c.query('COMMIT')
+    } finally { c.release() }
+    accountsCreateMock.mockResolvedValueOnce({ id: 'acct_new_landlord' } as any)
+    const acctId = await ensureConnectAccount({
+      entity: 'landlord', entityId: landlordId, email: 'entity@example.com',
+    })
+    expect(acctId).toBe('acct_new_landlord')
+    expect(accountsCreateMock).toHaveBeenCalledTimes(1)
+    const { rows: [la] } = await db.query<any>(
+      `SELECT stripe_connect_account_id FROM landlords WHERE id=$1`, [landlordId])
+    expect(la.stripe_connect_account_id).toBe('acct_new_landlord')
+  })
+
+  it('idempotent: pre-existing entity account returned without a Stripe call', async () => {
+    const c = await db.connect()
+    let landlordId = ''
+    try {
+      await c.query('BEGIN')
+      const { landlordId: lid } = await seedLandlord(c)
+      landlordId = lid
+      await c.query('COMMIT')
+    } finally { c.release() }
+    await db.query(
+      `UPDATE landlords SET stripe_connect_account_id='acct_existing_entity' WHERE id=$1`,
+      [landlordId])
+    const acctId = await ensureConnectAccount({
+      entity: 'landlord', entityId: landlordId, email: 'entity@example.com',
+    })
+    expect(acctId).toBe('acct_existing_entity')
+    expect(accountsCreateMock).not.toHaveBeenCalled()
+  })
+})
+
+describe('recordAccountUpdated — landlord entity (S554 re-anchor)', () => {
+  it('landlord row with the account_id → mirrors readiness + synced_at', async () => {
+    const c = await db.connect()
+    let landlordId = ''
+    try {
+      await c.query('BEGIN')
+      const { landlordId: lid } = await seedLandlord(c)
+      landlordId = lid
+      await c.query('COMMIT')
+    } finally { c.release() }
+    await db.query(
+      `UPDATE landlords SET stripe_connect_account_id='acct_entity_sync' WHERE id=$1`,
+      [landlordId])
+    await recordAccountUpdated({
+      id: 'acct_entity_sync',
+      charges_enabled: true,
+      payouts_enabled: true,
+      details_submitted: true,
+    } as any)
+    const { rows: [la] } = await db.query<any>(
+      `SELECT connect_charges_enabled, connect_payouts_enabled,
+              connect_details_submitted, stripe_connect_status_synced_at
+         FROM landlords WHERE id=$1`, [landlordId])
+    expect(la.connect_charges_enabled).toBe(true)
+    expect(la.connect_payouts_enabled).toBe(true)
+    expect(la.connect_details_submitted).toBe(true)
+    expect(la.stripe_connect_status_synced_at).not.toBeNull()
+  })
+})

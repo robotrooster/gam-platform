@@ -168,6 +168,56 @@ async function seedFixture(opts: {
 
 // ─── GET /leases — list scoping ─────────────────────────────────
 
+describe('POST /leases/:id/renewal-intent (S556 tenant survey)', () => {
+  it("intent 'yes' → records on lease + opens a renewal request", async () => {
+    const f = await seedFixture()
+    const res = await request(buildApp())
+      .post(`/api/leases/${f.leaseId}/renewal-intent`)
+      .set('Authorization', `Bearer ${f.tenantToken}`)
+      .send({ intent: 'yes', notes: 'Love it here' })
+    expect(res.status).toBe(200)
+    const lease = await db.query<{ tenant_renewal_intent: string; tenant_renewal_notes: string }>(
+      `SELECT tenant_renewal_intent, tenant_renewal_notes FROM leases WHERE id=$1`, [f.leaseId])
+    expect(lease.rows[0].tenant_renewal_intent).toBe('yes')
+    expect(lease.rows[0].tenant_renewal_notes).toBe('Love it here')
+    const rr = await db.query(`SELECT status FROM lease_renewal_requests WHERE lease_id=$1`, [f.leaseId])
+    expect(rr.rows.length).toBe(1)
+    expect((rr.rows[0] as any).status).toBe('requested')
+  })
+
+  it("intent 'no' → records on lease, no renewal request", async () => {
+    const f = await seedFixture()
+    const res = await request(buildApp())
+      .post(`/api/leases/${f.leaseId}/renewal-intent`)
+      .set('Authorization', `Bearer ${f.tenantToken}`)
+      .send({ intent: 'no' })
+    expect(res.status).toBe(200)
+    const lease = await db.query<{ tenant_renewal_intent: string }>(
+      `SELECT tenant_renewal_intent FROM leases WHERE id=$1`, [f.leaseId])
+    expect(lease.rows[0].tenant_renewal_intent).toBe('no')
+    const rr = await db.query(`SELECT id FROM lease_renewal_requests WHERE lease_id=$1`, [f.leaseId])
+    expect(rr.rows.length).toBe(0)
+  })
+
+  it('bad intent value → 400', async () => {
+    const f = await seedFixture()
+    const res = await request(buildApp())
+      .post(`/api/leases/${f.leaseId}/renewal-intent`)
+      .set('Authorization', `Bearer ${f.tenantToken}`)
+      .send({ intent: 'maybe' })
+    expect(res.status).toBe(400)
+  })
+
+  it('landlord token → 403 (tenant-only)', async () => {
+    const f = await seedFixture()
+    const res = await request(buildApp())
+      .post(`/api/leases/${f.leaseId}/renewal-intent`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ intent: 'yes' })
+    expect(res.status).toBe(403)
+  })
+})
+
 describe('GET /leases — list scoping', () => {
   it('landlord sees own leases with tenants attached', async () => {
     const f = await seedFixture()
