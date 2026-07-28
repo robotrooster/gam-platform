@@ -4,7 +4,7 @@ import path from 'path'
 import fs from 'fs'
 import crypto from 'crypto'
 import { z } from 'zod'
-import { query, queryOne } from '../db'
+import { query, queryOne, getClient } from '../db'
 import { requireAuth, requirePerm } from '../middleware/auth'
 import { canAccessLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
@@ -102,6 +102,35 @@ tenantsRouter.post('/accept-invite', async (req, res, next) => {
       process.env.JWT_SECRET!,
       { expiresIn: '7d' }
     )
+
+    // S558 (Flow B): stamp this person's unit-bound intent as accepted, then
+    // auto-draft the lease(s) if the unit's roster is now ready. Best-effort in
+    // its own transaction — a draft failure never blocks the tenant's login.
+    try {
+      const intent = await queryOne<{ id: string; unit_id: string | null }>(
+        `SELECT pti.id, pti.unit_id
+           FROM pending_tenant_intents pti JOIN tenants t ON t.id = pti.tenant_id
+          WHERE t.user_id = $1 AND pti.resolved_at IS NULL AND pti.unit_id IS NOT NULL
+          ORDER BY pti.created_at DESC LIMIT 1`, [user.id])
+      if (intent?.unit_id) {
+        const draftClient = await getClient()
+        try {
+          await draftClient.query('BEGIN')
+          await draftClient.query(`UPDATE pending_tenant_intents SET accepted_at=NOW(), updated_at=NOW() WHERE id=$1 AND accepted_at IS NULL`, [intent.id])
+          const { autoDraftLeasesForUnit } = await import('../services/leaseOnboarding')
+          const { createDocumentRecord } = await import('./esign')
+          await autoDraftLeasesForUnit(draftClient as any, intent.unit_id, createDocumentRecord)
+          await draftClient.query('COMMIT')
+        } catch (draftErr) {
+          await draftClient.query('ROLLBACK').catch(() => {})
+          logger.error({ err: draftErr, ctx: user.id }, '[ONBOARD-NEW-LEASE] auto-draft on accept failed')
+        } finally {
+          draftClient.release()
+        }
+      }
+    } catch (e) {
+      logger.error({ err: e, ctx: user.id }, '[ONBOARD-NEW-LEASE] accept-intent lookup failed')
+    }
 
     // S174: notify the landlord that their invited tenant accepted. Best-
     // effort — failure here doesn't roll back the activation. Resolves the

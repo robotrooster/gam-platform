@@ -1,11 +1,13 @@
 import { Router } from 'express'
 import { z } from 'zod'
 import { query, queryOne } from '../db'
-import { requireAuth, requireAdmin } from '../middleware/auth'
+import { requireAuth, requireAdmin, requirePerm } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
-import { AchReturnCode, ACH_RETURN_CONFIG, PLATFORM_FEES } from '@gam/shared'
+import { canManageLandlordResource } from '../middleware/scope'
+import { AchReturnCode, ACH_RETURN_CONFIG, PLATFORM_FEES,
+         MANUAL_PAYMENT_METHODS, MANUAL_PAYMENT_FEE } from '@gam/shared'
 import { getStripe } from '../lib/stripe'
-import { computeApplicationFee, createRentDestinationCharge, createRentPlatformCharge } from '../services/stripeConnect'
+import { computeApplicationFee, createRentPlatformCharge } from '../services/stripeConnect'
 import { createAdminNotification } from '../services/adminNotifications'
 import { computeTenantGamOutstandingTotal } from '../services/supersedence'
 import { allocateOldestFirst } from '@gam/shared'
@@ -273,12 +275,17 @@ paymentsRouter.post('/:id/pay', async (req: any, res, next) => {
               -- COALESCE on the booleans would always pick landlords' false).
               COALESCE(l.stripe_connect_account_id, lu.stripe_connect_account_id) AS stripe_connect_account_id,
               CASE WHEN l.stripe_connect_account_id IS NOT NULL THEN l.connect_charges_enabled   ELSE lu.connect_charges_enabled   END AS connect_charges_enabled,
-              CASE WHEN l.stripe_connect_account_id IS NOT NULL THEN l.connect_details_submitted ELSE lu.connect_details_submitted END AS connect_details_submitted
+              CASE WHEN l.stripe_connect_account_id IS NOT NULL THEN l.connect_details_submitted ELSE lu.connect_details_submitted END AS connect_details_submitted,
+              -- S562: who bears the processing fee (must MATCH allocation.ts's
+              -- settle-time branch exactly, or GAM under/over-collects). Lives
+              -- on property_allocation_rules, not properties.
+              par.ach_fee_payer, par.card_fee_payer
          FROM payments p
          JOIN units u ON u.id = p.unit_id
          JOIN tenants t ON t.id = p.tenant_id
          JOIN landlords l ON l.id = p.landlord_id
          JOIN users lu ON lu.id = l.user_id
+         LEFT JOIN property_allocation_rules par ON par.property_id = u.property_id
         WHERE p.id = $1`,
       [req.params.id]
     )
@@ -401,43 +408,51 @@ paymentsRouter.post('/:id/pay', async (req: any, res, next) => {
       (baseApplicationFee + passthroughAmount + subleaseMarkup + gamSupersedenceAmount) * 100
     ) / 100
 
-    const intent = landlordConnectReady
-      ? await createRentDestinationCharge({
-          amount,
-          stripeCustomerId:        pmt.stripe_customer_id,
-          paymentMethodId:         body.paymentMethodId,
-          paymentMethodTypes:      body.paymentMethodType === 'ach' ? ['us_bank_account'] : ['card'],
-          destinationConnectAccountId: pmt.stripe_connect_account_id,
-          applicationFeeAmount,
-          entryDescription:        pmt.entry_description,
-          metadata: {
-            gam_payment_id: pmt.id,
-            tenant_id:      pmt.tenant_id,
-            landlord_id:    pmt.landlord_id,
-          },
-        })
-      : await createRentPlatformCharge({
-          amount,
-          stripeCustomerId:        pmt.stripe_customer_id,
-          paymentMethodId:         body.paymentMethodId,
-          paymentMethodTypes:      body.paymentMethodType === 'ach' ? ['us_bank_account'] : ['card'],
-          entryDescription:        pmt.entry_description,
-          metadata: {
-            gam_payment_id: pmt.id,
-            tenant_id:      pmt.tenant_id,
-            landlord_id:    pmt.landlord_id,
-          },
-        })
+    // S562: the tenant bears the processing fee UNLESS the property routes it to
+    // the landlord. Mirror allocation.ts EXACTLY (`=== 'landlord'` is the only
+    // landlord branch; null / 'tenant' → tenant pays). When the tenant pays, the
+    // fee must be ADDED to the charge — under platform-holds GAM keeps its cut by
+    // NOT transferring it, so if the fee isn't collected up front the landlord
+    // still gets full rent (allocation splittable=gross) and GAM eats Stripe's
+    // cost every payment (violates the #1 no-fee-absorption rule).
+    const feePayer = body.paymentMethodType === 'ach' ? pmt.ach_fee_payer : pmt.card_fee_payer
+    const tenantPaysProcessingFee = feePayer !== 'landlord'
+    // S562: the tenant-borne amounts that ride ON TOP of rent = the processing
+    // fee (when they're the fee payer) + the tenant-payer platform-fee
+    // passthrough (`passthroughAmount` is already the sum of payer='tenant'
+    // unclaimed accruals, so it's naturally $0 when the landlord pays the
+    // platform fee — the launch default). Same leak, same fix: under platform-
+    // holds these must be collected in the charge, or GAM eats them.
+    const tenantBorneOnTop = (tenantPaysProcessingFee ? baseApplicationFee : 0) + passthroughAmount
+    const chargeAmount = Math.round((amount + tenantBorneOnTop) * 100) / 100
+
+    // S560 money-flow rebuild (Phase 1): ALWAYS charge to the platform balance —
+    // no destination charge. Rent is held by GAM and batched out to the landlord
+    // on the weekly (Friday-delivered) run. GAM keeps its cut by simply not
+    // transferring it, and the settle-time allocation ledger records who is owed
+    // what. The tenant-borne processing fee (S562) rides on top of the charge.
+    const intent = await createRentPlatformCharge({
+      amount: chargeAmount,
+      stripeCustomerId:        pmt.stripe_customer_id,
+      paymentMethodId:         body.paymentMethodId,
+      paymentMethodTypes:      body.paymentMethodType === 'ach' ? ['us_bank_account'] : ['card'],
+      entryDescription:        pmt.entry_description,
+      metadata: {
+        gam_payment_id: pmt.id,
+        tenant_id:      pmt.tenant_id,
+        landlord_id:    pmt.landlord_id,
+      },
+    })
 
     if (!landlordConnectReady) {
-      // S113-PhaseA: notify admin that a payment landed on platform balance.
-      // Reconciliation will fire automatically when the landlord finishes
-      // Connect onboarding — but admin should see the case to nudge them.
+      // The money is held fine, but this landlord has no payout-ready Connect
+      // account, so the weekly batch can't disburse to them yet. Nudge admin to
+      // get them onboarded; funds release on the batch once they're ready.
       await createAdminNotification({
         severity: 'warn',
         category: 'platform_held_rent_charge',
-        title:    `Rent collected to platform — landlord ${pmt.landlord_user_id} not Connect-ready`,
-        body:     `Payment ${pmt.id} for $${amount} collected to GAM platform balance. Will reconcile via Transfer once landlord completes Connect onboarding.`,
+        title:    `Held rent can't batch out — landlord ${pmt.landlord_user_id} not Connect-ready`,
+        body:     `Payment ${pmt.id} for $${amount} is held on the GAM platform balance. It will be batched to the landlord once they finish Connect onboarding.`,
         context: {
           payment_id:        pmt.id,
           landlord_id:       pmt.landlord_id,
@@ -448,17 +463,19 @@ paymentsRouter.post('/:id/pay', async (req: any, res, next) => {
       })
     }
 
+    // S560: card, like ACH, stays 'processing' until the webhook confirms —
+    // the webhook's settle path (gated on status != 'settled') is what runs
+    // allocation, supersedence, Flex crediting, and PM/manager transfers.
+    // Pre-fix, card was stamped 'settled' here, so the webhook skipped ALL of
+    // that for card payments. (Matches the /pay-balance FIFO route.)
     await query(
       `UPDATE payments
-          SET status = CASE
-                WHEN $1 = 'card' THEN 'settled'
-                ELSE 'processing'
-              END,
-              stripe_payment_intent_id = $2,
-              platform_held = $4,
-              gam_supersedence_amount = $5
-        WHERE id = $3`,
-      [body.paymentMethodType, intent.id, pmt.id, !landlordConnectReady, gamSupersedenceAmount.toFixed(2)]
+          SET status = 'processing',
+              stripe_payment_intent_id = $1,
+              platform_held = TRUE,
+              gam_supersedence_amount = $3
+        WHERE id = $2`,
+      [intent.id, pmt.id, gamSupersedenceAmount.toFixed(2)]
     )
 
     // S121: claim the unpaid tenant-payer accruals atomically. The filter
@@ -618,13 +635,16 @@ paymentsRouter.post('/pay-balance', async (req: any, res, next) => {
               -- founding-owner user account as transition fallback.
               COALESCE(l.stripe_connect_account_id, lu.stripe_connect_account_id) AS stripe_connect_account_id,
               CASE WHEN l.stripe_connect_account_id IS NOT NULL THEN l.connect_charges_enabled   ELSE lu.connect_charges_enabled   END AS connect_charges_enabled,
-              CASE WHEN l.stripe_connect_account_id IS NOT NULL THEN l.connect_details_submitted ELSE lu.connect_details_submitted END AS connect_details_submitted
+              CASE WHEN l.stripe_connect_account_id IS NOT NULL THEN l.connect_details_submitted ELSE lu.connect_details_submitted END AS connect_details_submitted,
+              -- S562: fee-payer toggle (see /:id/pay note) — from the allocation rule.
+              par.ach_fee_payer, par.card_fee_payer
          FROM payments p
          JOIN units u ON u.id = p.unit_id
          JOIN properties pr ON pr.id = u.property_id
          JOIN tenants t ON t.id = p.tenant_id
          JOIN landlords l ON l.id = p.landlord_id
          JOIN users lu ON lu.id = l.user_id
+         LEFT JOIN property_allocation_rules par ON par.property_id = u.property_id
         WHERE p.tenant_id = $1
           AND ((p.status = 'pending' AND p.stripe_payment_intent_id IS NULL)
                OR p.status = 'failed')
@@ -707,6 +727,19 @@ paymentsRouter.post('/pay-balance', async (req: any, res, next) => {
     const applicationFeeAmount = Math.round(
       (baseApplicationFee + passthroughAmount + subleaseMarkup + gamSupersedenceAmount) * 100) / 100
 
+    // S562: tenant-borne processing fee rides on top of the lump charge (see
+    // /:id/pay note). Fee-payer resolved from the first row's property (ctx) —
+    // same context the rest of this route uses; a single ACH/card transaction
+    // means one capped customer-facing fee on the whole lump, matching Stripe's
+    // single-transaction cost. Mirrors allocation.ts (`=== 'landlord'` only).
+    const feePayer = body.paymentMethodType === 'ach' ? ctx.ach_fee_payer : ctx.card_fee_payer
+    const tenantPaysProcessingFee = feePayer !== 'landlord'
+    // S562: processing fee (when tenant-borne) + tenant-payer platform-fee
+    // passthrough ride on top of the lump (see /:id/pay note). passthroughAmount
+    // is $0 when the platform fee is landlord-paid (launch default).
+    const tenantBorneOnTop = (tenantPaysProcessingFee ? baseApplicationFee : 0) + passthroughAmount
+    const chargeAmount = Math.round((body.amount + tenantBorneOnTop) * 100) / 100
+
     // Create the remittance BEFORE the Stripe call so the PI metadata can
     // carry its id; stamp the PI after.
     await client.query('BEGIN')
@@ -750,34 +783,25 @@ paymentsRouter.post('/pay-balance', async (req: any, res, next) => {
         [remittanceId, coveredPaymentId, line.amount_applied.toFixed(2)])
     }
 
-    const intent = landlordConnectReady
-      ? await createRentDestinationCharge({
-          amount: body.amount,
-          stripeCustomerId: ctx.stripe_customer_id,
-          paymentMethodId: body.paymentMethodId,
-          paymentMethodTypes: body.paymentMethodType === 'ach' ? ['us_bank_account'] : ['card'],
-          destinationConnectAccountId: ctx.stripe_connect_account_id,
-          applicationFeeAmount,
-          entryDescription: 'BALANCE',
-          metadata: { gam_remittance_id: remittanceId, tenant_id: tenantId, landlord_id: ctx.landlord_id },
-        })
-      : await createRentPlatformCharge({
-          amount: body.amount,
-          stripeCustomerId: ctx.stripe_customer_id,
-          paymentMethodId: body.paymentMethodId,
-          paymentMethodTypes: body.paymentMethodType === 'ach' ? ['us_bank_account'] : ['card'],
-          entryDescription: 'BALANCE',
-          metadata: { gam_remittance_id: remittanceId, tenant_id: tenantId, landlord_id: ctx.landlord_id },
-        })
+    // S560 money-flow rebuild (Phase 1): ALWAYS platform charge — money held by
+    // GAM, batched to the landlord on the weekly run. See the /:id/pay note.
+    const intent = await createRentPlatformCharge({
+      amount: chargeAmount,
+      stripeCustomerId: ctx.stripe_customer_id,
+      paymentMethodId: body.paymentMethodId,
+      paymentMethodTypes: body.paymentMethodType === 'ach' ? ['us_bank_account'] : ['card'],
+      entryDescription: 'BALANCE',
+      metadata: { gam_remittance_id: remittanceId, tenant_id: tenantId, landlord_id: ctx.landlord_id },
+    })
 
     // Stamp the PI on every covered row — the standard webhook settle
     // path (allocation engine, credit ledger, propane, supersedence)
     // picks them ALL up by PI id, unchanged.
     await client.query(
       `UPDATE payments SET status = 'processing', stripe_payment_intent_id = $1,
-              platform_held = $3
+              platform_held = TRUE
         WHERE id = ANY($2::uuid[])`,
-      [intent.id, fullyCoveredIds, !landlordConnectReady])
+      [intent.id, fullyCoveredIds])
     await client.query(
       `UPDATE tenant_remittances SET stripe_payment_intent_id = $1, updated_at = NOW() WHERE id = $2`,
       [intent.id, remittanceId])
@@ -792,11 +816,12 @@ paymentsRouter.post('/pay-balance', async (req: any, res, next) => {
     await client.query('COMMIT')
 
     if (!landlordConnectReady) {
+      // Held fine; can't batch out until this landlord finishes Connect onboarding.
       await createAdminNotification({
         severity: 'warn',
         category: 'platform_held_rent_charge',
-        title: `Balance payment collected to platform — landlord ${ctx.landlord_user_id} not Connect-ready`,
-        body: `Remittance ${remittanceId} for $${body.amount.toFixed(2)} collected to GAM platform balance. Reconciles via Transfer after Connect onboarding.`,
+        title: `Held balance payment can't batch out — landlord ${ctx.landlord_user_id} not Connect-ready`,
+        body: `Remittance ${remittanceId} for $${body.amount.toFixed(2)} is held on the GAM platform balance. It batches to the landlord once they finish Connect onboarding.`,
         context: { remittance_id: remittanceId, landlord_id: ctx.landlord_id, amount: body.amount },
       })
     }
@@ -811,6 +836,120 @@ paymentsRouter.post('/pay-balance', async (req: any, res, next) => {
         payAhead: plan.unapplied,
         lines: plan.lines,
         applicationFeeAmount,
+      },
+    })
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    next(e)
+  } finally {
+    client.release()
+  }
+})
+
+// POST /api/payments/:id/record-manual — S562.
+//
+// Landlord/staff records that a tenant paid a pending rent charge OFF-PLATFORM
+// (cash / check / money order). The rent obligation is satisfied WITHOUT GAM
+// moving any money: the row is marked settled with platform_held=FALSE,
+// stripe_payment_intent_id=NULL, and manual_method set. It reads as "paid"
+// everywhere that treats settled as paid (balance / FIFO / late-fee / rent-roll),
+// while the weekly batch (services/landlordPassthrough.ts) SKIPS it because that
+// path requires platform_held=TRUE — so the landlord, who already physically
+// holds the cash, is never double-paid. type='fee' rows aren't disbursed either,
+// so the $10 fee below stays GAM revenue (same as RETURNFEE).
+//
+// Each manual payment carries a flat $10 fee (a tenant-owed 'fee' row,
+// entry_description 'MANUALPAY') EXCEPT the tenant's FIRST rent payment on the
+// lease — waived to give them time to onboard ACH. The tenant portal discloses
+// the future $10 charge.
+//
+// Auth: requirePerm('take_payment') (owner roles auto-pass; staff need the
+// take_payment sub-permission). canManageLandlordResource confirms scope.
+const recordManualSchema = z.object({
+  method:    z.enum(MANUAL_PAYMENT_METHODS),   // 'cash' | 'check' | 'money_order'
+  reference: z.string().max(120).optional(),   // check # / money-order # for the audit trail
+})
+
+paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (req: any, res, next) => {
+  const client = await getClient()
+  try {
+    const body = recordManualSchema.parse(req.body)
+    await client.query('BEGIN')
+
+    // Lock the rent row so a concurrent /pay can't settle it underneath us.
+    const pmt = (await client.query<any>(
+      `SELECT p.id, p.type, p.status, p.landlord_id, p.tenant_id, p.unit_id,
+              p.lease_id, p.amount::float AS amount, p.due_date::text AS due_date,
+              u.payment_block
+         FROM payments p
+         JOIN units u ON u.id = p.unit_id
+        WHERE p.id = $1
+          FOR UPDATE OF p`,
+      [req.params.id])).rows[0]
+    if (!pmt) throw new AppError(404, 'Payment not found')
+    if (!canManageLandlordResource(req.user, pmt.landlord_id)) {
+      throw new AppError(403, 'Forbidden')
+    }
+    if (pmt.type !== 'rent') {
+      throw new AppError(409, 'Only rent charges can be recorded as a manual payment')
+    }
+    if (pmt.status !== 'pending' && pmt.status !== 'failed') {
+      throw new AppError(409, `This charge is not open (status: ${pmt.status})`)
+    }
+    // Eviction pause (matches the tenant pay routes): accepting/booking landlord-
+    // bound money can reset the eviction timeline, so recording is blocked too.
+    if (pmt.payment_block) {
+      throw new AppError(409, 'This unit is in eviction mode — recording a payment is paused. Contact the landlord.')
+    }
+
+    // Waiver: is this the tenant's FIRST rent payment on the lease? Count prior
+    // SATISFIED rent rows (Stripe-settled or already recorded manual/deposit).
+    // Rent rows carry a lease_id in production; fall back to tenant_id if absent.
+    const scopeCol = pmt.lease_id ? 'lease_id' : 'tenant_id'
+    const scopeVal = pmt.lease_id ?? pmt.tenant_id
+    const priorPaid = (await client.query<{ n: string }>(
+      `SELECT COUNT(*) AS n FROM payments
+        WHERE ${scopeCol} = $1 AND type = 'rent'
+          AND status IN ('settled', 'paid_via_deposit')
+          AND id <> $2`,
+      [scopeVal, pmt.id])).rows[0]
+    const feeWaived = parseInt(priorPaid.n, 10) === 0
+
+    // Satisfy the rent obligation off-platform. platform_held stays FALSE.
+    const refNote = body.reference ? ` (ref ${body.reference})` : ''
+    await client.query(
+      `UPDATE payments
+          SET status = 'settled', settled_at = NOW(), manual_method = $2,
+              platform_held = FALSE,
+              notes = COALESCE(notes || ' — ', '') || $3
+        WHERE id = $1`,
+      [pmt.id, body.method, `Recorded as manual ${body.method} payment${refNote}`])
+
+    // The flat manual-payment fee — GAM revenue, tenant pays via the normal flow.
+    let feePaymentId: string | null = null
+    if (!feeWaived) {
+      feePaymentId = (await client.query<{ id: string }>(
+        `INSERT INTO payments
+           (unit_id, lease_id, tenant_id, landlord_id, type, amount, status,
+            entry_description, due_date, notes)
+         VALUES ($1, $2, $3, $4, 'fee', $5, 'pending', 'MANUALPAY', CURRENT_DATE, $6)
+         RETURNING id`,
+        [pmt.unit_id, pmt.lease_id, pmt.tenant_id, pmt.landlord_id,
+         MANUAL_PAYMENT_FEE.toFixed(2),
+         `$${MANUAL_PAYMENT_FEE.toFixed(2)} manual-payment fee — ${body.method} rent payment due ${pmt.due_date}`])).rows[0].id
+    }
+
+    await client.query('COMMIT')
+    res.json({
+      success: true,
+      data: {
+        paymentId:    pmt.id,
+        status:       'settled',
+        method:       body.method,
+        feeWaived,
+        feeAmount:    feeWaived ? 0 : MANUAL_PAYMENT_FEE,
+        feePaymentId,
+        firstPayment: feeWaived,
       },
     })
   } catch (e) {

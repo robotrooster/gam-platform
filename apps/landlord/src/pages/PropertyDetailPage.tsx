@@ -13,7 +13,6 @@ import { usePerms } from '../lib/permissions'
 import { UnitSubtypesSection } from './UnitSubtypesSection'
 import { PropertyAgentPermissionsSection } from './PropertyAgentPermissionsSection'
 import { PropertyLateFeeSection, PaymentAcceptanceCard } from './PropertyLateFeeSection'
-import { PropertyDepositSection } from './PropertyDepositSection'
 import { LawWarningBanner } from '../components/LawWarningBanner'
 import { LAUNCH_HIDDEN } from '../components/layout/Layout'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
@@ -111,8 +110,10 @@ export function PropertyDetailPage() {
             fees are set; stamped (locked) into every drafted lease so
             terms are identical for all tenants. */}
       <PropertyLateFeeSection property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
-      {/* S556: security-deposit multiplier per unit type — deposit = rent × ratio. */}
-      <PropertyDepositSection property={property} />
+      {/* S558: the security-deposit multiplier is a LEASE term (set on the
+            lease template, deposit = rent × template.deposit_months), not a
+            property setting — the S556 property-level section was removed. */}
+      <OccupancyDefaultCard property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
       <PaymentAcceptanceCard property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
 
       {/* Occupancy bar */}
@@ -523,6 +524,30 @@ function PropertyManagerCard({ propertyId }: { propertyId: string }) {
           {error}
         </div>
       )}
+    </div>
+  )
+}
+
+// S558 (Nic): property DEFAULT occupancy mode — the value NEW units inherit.
+// Not a governing setting: each unit's own mode wins and is toggled on the unit.
+function OccupancyDefaultCard({ property, onSaved }: { property: any; onSaved: () => void }) {
+  const [mode, setMode] = useState<string>(property.defaultOccupancyMode || 'whole_unit')
+  const mut = useMutation(
+    (m: string) => apiPatch(`/properties/${property.id}`, { defaultOccupancyMode: m }),
+    { onSuccess: onSaved },
+  )
+  return (
+    <div className="card" style={{ padding: 16, marginBottom: 16 }}>
+      <div style={{ fontWeight: 700, color: 'var(--text-0)', marginBottom: 4 }}>Default occupancy for new units</div>
+      <div style={{ fontSize: '.78rem', color: 'var(--text-3)', marginBottom: 10 }}>
+        New units start in this mode. Each unit can be switched independently — a whole-unit
+        building can still have a by-the-room unit or two.
+      </div>
+      <select className="form-select" value={mode} style={{ maxWidth: 320 }}
+        onChange={e => { setMode(e.target.value); mut.mutate(e.target.value) }}>
+        <option value="whole_unit">Whole unit — one lease (co-tenants share it)</option>
+        <option value="by_room">By the room — separate lease per person</option>
+      </select>
     </div>
   )
 }

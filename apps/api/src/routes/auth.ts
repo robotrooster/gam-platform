@@ -9,7 +9,7 @@ import { requireAuth } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { sendPasswordResetEmail, sendEmailVerification } from '../services/email'
 import { isDisposableEmail } from '../lib/email'
-import { signTotpSessionToken } from './totp'
+import { signTotpSessionToken, signTotpEnrollToken } from './totp'
 import { MANDATORY_TOTP_ROLES } from '../lib/totp'
 
 // S80: scope-table dispatch for login / refresh JWT claims. Replaced the
@@ -324,6 +324,8 @@ authRouter.post('/login', async (req, res, next) => {
         profileId,
         landlordId:  scope?.landlordId || null,
         landlordIds,
+        businessId,
+        staffRole,
         permissions: scope?.permissions || null,
       })
       return res.json({
@@ -332,7 +334,12 @@ authRouter.post('/login', async (req, res, next) => {
       })
     }
 
-    const token = signToken({
+    // S560: a MANDATORY-2FA role (admin/super_admin) that hasn't enrolled yet
+    // gets an ENROLLMENT-ONLY pass, not a full session. requireAuth rejects it
+    // everywhere except the enrollment endpoints, so "mandatory" is enforced
+    // server-side — not just by the client honoring mustEnrollTotp.
+    const mustEnroll = MANDATORY_TOTP_ROLES.has(user.role) && !user.totp_enabled
+    const claims = {
       userId: user.id, role: user.role, email: user.email,
       profileId,
       landlordId: scope?.landlordId || null,
@@ -340,7 +347,8 @@ authRouter.post('/login', async (req, res, next) => {
       businessId,
       staffRole,
       permissions: scope?.permissions || null,
-    })
+    }
+    const token = mustEnroll ? signTotpEnrollToken(claims) : signToken(claims)
     res.json({
       success: true,
       data: { token, user: {

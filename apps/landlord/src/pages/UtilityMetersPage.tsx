@@ -1,10 +1,11 @@
 import { useState, useEffect, useMemo, CSSProperties } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useSearchParams } from 'react-router-dom'
-import { apiGet, apiPost } from '../lib/api'
-import { METER_READING_DEFAULT_DIGITS, PROPANE_SPLIT_FOUR_MIN_GALLONS, PROPANE_SPLIT_MIN_GALLONS, propaneSplitOptions } from '@gam/shared'
-import { ClipboardList, Receipt, ChevronRight, CheckCircle2, AlertTriangle } from 'lucide-react'
+import { apiGet, apiPost, apiDelete, apiPatch } from '../lib/api'
+import { METER_READING_DEFAULT_DIGITS, PROPANE_SPLIT_FOUR_MIN_GALLONS, PROPANE_SPLIT_MIN_GALLONS, propaneSplitOptions, METER_READ_MANUAL_REASONS, METER_READ_REASON_LABEL } from '@gam/shared'
+import { ClipboardList, Receipt, ChevronRight, CheckCircle2, AlertTriangle, Gauge, Plus, Trash2, X, ClipboardCheck, Wrench } from 'lucide-react'
 import { toast, appConfirm } from '../components/dialogs'
+import { usePerms } from '../lib/permissions'
 
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 // Meter reads are odometer values — display with leading zeros at the
@@ -26,6 +27,11 @@ const monthLabel = (cycle: any) => new Date(String(cycle).slice(0, 10) + 'T00:00
 // charges ride each tenant's next monthly invoice automatically.
 export function UtilityMetersPage() {
   const qc = useQueryClient()
+  const { can } = usePerms()
+  // Front desk (utility.read_meters) can take reads; only the landlord
+  // (properties.edit) sees prior/entered values, meter setup, and reviews.
+  const canReview = can('properties.edit')
+  const canRead = canReview || can('utility.read_meters')
   const [searchParams] = useSearchParams()
   const { data: properties = [] } = useQuery<any[]>('properties', () => apiGet('/properties'))
   const [propertyId, setPropertyId] = useState(() => searchParams.get('propertyId') || '')
@@ -49,21 +55,32 @@ export function UtilityMetersPage() {
     () => apiGet(`/utility/reading-runs?propertyId=${propertyId}`),
     { enabled: !!propertyId }
   )
+  // Flagged double-check queue shows entered + prior values side by side —
+  // LANDLORD ONLY (the endpoint 403s otherwise). Front desk never fetches it.
   const { data: flagged = [] } = useQuery<any[]>(
     ['flagged-readings', propertyId],
     () => apiGet(`/utility/readings/flagged?propertyId=${propertyId}`),
-    { enabled: !!propertyId }
+    { enabled: !!propertyId && canReview }
+  )
+  // Live, calendar-derived "reads due" to-do (turnovers + move-outs on
+  // submetered spots with no post-departure read yet).
+  const { data: readsDue = [] } = useQuery<any[]>(
+    ['reads-due', propertyId],
+    () => apiGet(`/utility/reads-due?propertyId=${propertyId}`),
+    { enabled: !!propertyId && canRead }
   )
   const openRun = (runs as any[]).find(r => r.status === 'open' || r.status === 'double_check')
 
   const [walkRun, setWalkRun] = useState<any | null>(null)
   const [reviewReading, setReviewReading] = useState<any | null>(null)
+  const [specialRead, setSpecialRead] = useState<{ meterId?: string; unitNumber?: string; reason?: string; label?: string } | null>(null)
 
   const invalidate = () => {
     qc.invalidateQueries(['utility-meters', propertyId])
     qc.invalidateQueries('utility-bills')
     qc.invalidateQueries(['reading-runs', propertyId])
     qc.invalidateQueries(['flagged-readings', propertyId])
+    qc.invalidateQueries(['reads-due', propertyId])
   }
 
   const openRunMut = useMutation(
@@ -145,8 +162,34 @@ export function UtilityMetersPage() {
             </div>
           ) : null}
 
-          {/* ── DOUBLE-CHECK QUEUE ─────────────────────────── */}
-          {(flagged as any[]).length > 0 && (
+          {/* ── READS DUE (live to-do: turnovers + move-outs) ── */}
+          {(readsDue as any[]).length > 0 && (
+            <div className="card" style={{ marginBottom:24, borderColor:'var(--gold)' }}>
+              <div style={{ display:'flex', alignItems:'center', gap:8, fontWeight:700, marginBottom:8 }}>
+                <ClipboardCheck size={16} style={{ color:'var(--gold)' }}/> Meter reads due
+              </div>
+              <div style={{ fontSize:'.75rem', color:'var(--text-3)', marginBottom:10 }}>
+                A stay ended on these submetered spots — read each meter to close it out. Extend or cancel a stay and it drops off automatically.
+              </div>
+              <div style={{ display:'grid', gap:6 }}>
+                {(readsDue as any[]).map((r:any) => (
+                  <div key={`${r.meterId}-${r.unitId}`} style={{ display:'flex', alignItems:'center', gap:12, padding:'8px 12px', borderRadius:8, background:'var(--bg-2)' }}>
+                    <span style={{ fontSize:'.85rem', fontWeight:600 }}>{UTILITY_ICONS[r.utilityType]} {r.unitNumber ? `Unit ${r.unitNumber}` : r.meterLabel}</span>
+                    <span style={{ fontSize:'.75rem', color:'var(--text-3)' }}>
+                      {r.who ? `${r.who} — ` : ''}left {String(r.departedOn).slice(0,10)}
+                    </span>
+                    <button className="btn btn-primary btn-sm" style={{ marginLeft:'auto' }}
+                      onClick={()=>setSpecialRead({ meterId: r.meterId, unitNumber: r.unitNumber, reason: r.reason, label: r.meterLabel })}>
+                      Read meter
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* ── DOUBLE-CHECK QUEUE (landlord only — shows values) ── */}
+          {canReview && (flagged as any[]).length > 0 && (
             <div className="card" style={{ marginBottom:24, borderColor:'var(--amber, #d97706)' }}>
               <div style={{ display:'flex', alignItems:'center', gap:8, fontWeight:700, marginBottom:8 }}>
                 <AlertTriangle size={16} style={{ color:'var(--amber, #d97706)' }}/> Readings to double-check
@@ -169,23 +212,36 @@ export function UtilityMetersPage() {
             </div>
           )}
 
+          {/* ── METER SETUP (S558: masters, submeters, RUBS groups, flat-rate) ── */}
+          {/* Meter setup is LANDLORD-only (broken toggle, rates, links). */}
+          {canReview && (
+            <MeterConfigSection propertyId={propertyId} meters={meters as any[]} units={units as any[]} onChanged={invalidate} />
+          )}
+
           {/* ── BILLS (read-only status; runs create these) ── */}
           <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:12 }}>
             <h2 style={{ fontSize:'.95rem', margin:0, display:'flex', alignItems:'center', gap:8 }}><Receipt size={16}/> Utility Bills</h2>
+            {canRead && (meters as any[]).some((m:any)=>m.billingMethod==='submeter') && (
+              <button className="btn btn-primary btn-sm" onClick={()=>setSpecialRead({})}>
+                <Gauge size={13}/> Take a reading
+              </button>
+            )}
           </div>
           <div className="card" style={{ padding:0, overflowX:'auto' }}>
             {propertyBills.length === 0 ? (
               <div className="empty-state" style={{ padding:40 }}><Receipt size={36}/><h3>No utility bills</h3><p>Complete a reading run — leased units bill automatically and the charge rides the tenant's next monthly invoice.</p></div>
             ) : (
               <table className="data-table" style={{ minWidth:800 }}>
-                <thead><tr><th>Cycle</th><th>Unit</th><th>Meter</th><th>Reads</th><th>Usage</th><th>Amount</th><th>Tax</th><th>Status</th></tr></thead>
+                {/* S560: raw start→end reads are LANDLORD-only history — front desk
+                    sees them on the actual invoice, not as a lookupable history here. */}
+                <thead><tr><th>Cycle</th><th>Unit</th><th>Meter</th>{canReview && <th>Reads</th>}<th>Usage</th><th>Amount</th><th>Tax</th><th>Status</th></tr></thead>
                 <tbody>
                   {propertyBills.map((b:any) => (
                     <tr key={b.id}>
                       <td className="mono" style={{ fontSize:'.75rem' }}>{String(b.billingCycleMonth).slice(0,7)}</td>
                       <td className="mono">{b.unitNumber}</td>
                       <td style={{ fontSize:'.78rem' }}>{UTILITY_ICONS[b.utilityType]} {b.meterLabel}</td>
-                      <td className="mono" style={{ fontSize:'.75rem', color:'var(--text-3)' }}>{b.readingStart != null && b.readingEnd != null ? `${fmtRead(b.readingStart, b.digits)} → ${fmtRead(b.readingEnd, b.digits)}` : '—'}</td>
+                      {canReview && <td className="mono" style={{ fontSize:'.75rem', color:'var(--text-3)' }}>{b.readingStart != null && b.readingEnd != null ? `${fmtRead(b.readingStart, b.digits)} → ${fmtRead(b.readingEnd, b.digits)}` : '—'}</td>}
                       <td className="mono" style={{ fontSize:'.78rem' }}>{b.usageAmount != null ? `${Number(b.usageAmount).toLocaleString()} ${UTILITY_UNITS[b.utilityType] || ''}` : '—'}</td>
                       <td className="mono" style={{ fontWeight:600 }}>{fmt(b.chargeAmount)}</td>
                       <td className="mono" style={{ fontSize:'.78rem', color:'var(--text-3)' }}>{Number(b.taxAmount) > 0 ? `+${fmt(b.taxAmount)}` : '—'}</td>
@@ -206,6 +262,10 @@ export function UtilityMetersPage() {
 
       {walkRun && (
         <ReadingWalkModal run={walkRun} mode={walkRun.status === 'double_check' ? 'verify' : 'read'} onClose={()=>{ setWalkRun(null); invalidate() }} />
+      )}
+      {specialRead && (
+        <SpecialReadModal preset={specialRead} meters={(meters as any[]).filter(m=>m.billingMethod==='submeter')}
+          onClose={()=>{ setSpecialRead(null); invalidate() }} />
       )}
       {reviewReading && (
         <ReviewReadingModal reading={reviewReading} onClose={()=>{ setReviewReading(null); invalidate() }} />
@@ -280,6 +340,78 @@ function ReviewReadingModal({ reading, onClose }: { reading: any; onClose: () =>
             onClick={()=>resolve.mutate({ rollover: enteredIsLow && reason === 'rollover' })}>Entered read is correct</button>
           <button className="btn btn-primary" disabled={!valueOk || (correctionIsLow && reason == null) || resolve.isLoading}
             onClick={()=>resolve.mutate({ correctedValue: Number(value), ...(correctionIsLow ? { rollover: reason === 'rollover' } : {}) })}>Save correction</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── SPECIAL / OFF-CYCLE READ (S559) ──────────────────────────────────
+// Blind entry: pick the spot, pick a reason (or it's pre-set from the
+// reads-due to-do), punch the number. NO prior value is ever shown.
+// move_out_final bills the departing tenant; every other reason is a
+// reference/baseline read that resets the baseline for the next stay.
+function SpecialReadModal({ preset, meters, onClose }: { preset: { meterId?: string; unitNumber?: string; reason?: string; label?: string }; meters: any[]; onClose: () => void }) {
+  const presetReason = !!preset.reason && preset.reason !== 'monthly_cycle'
+  const [meterId, setMeterId] = useState(preset.meterId || (meters.length === 1 ? meters[0].id : ''))
+  const [reason, setReason] = useState<string>(presetReason ? preset.reason! : (METER_READ_MANUAL_REASONS[0] as string))
+  const [note, setNote] = useState('')
+  const [value, setValue] = useState('')
+  const meter = meters.find(m => m.id === meterId)
+  const digits = Number(meter?.digits) || METER_READING_DEFAULT_DIGITS
+  const valueOk = new RegExp(`^\\d{1,${digits}}$`).test(value)
+  const save = useMutation(
+    () => apiPost(`/utility/meters/${meterId}/reads`, { readingValue: Number(value), reason, reasonNote: note || undefined }),
+    { onSuccess: (r:any) => { toast(r?.data?.billed ? 'Read recorded — final bill created' : 'Reading recorded'); onClose() },
+      onError: (e:any) => toast.error(e?.response?.data?.error || 'Could not record the reading') }
+  )
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" style={{ maxWidth:420 }} onClick={e=>e.stopPropagation()}>
+        <div className="modal-title" style={{ display:'flex', alignItems:'center', gap:8 }}>
+          <Wrench size={16} style={{ color:'var(--gold)' }}/> {preset.unitNumber ? `Read — Unit ${preset.unitNumber}` : 'Take a reading'}
+        </div>
+        {presetReason && (
+          <div style={{ fontSize:'.8rem', color:'var(--text-3)', marginBottom:12 }}>
+            {preset.reason === 'move_out_final'
+              ? 'Final move-out read — the departing tenant is billed for usage since the last read.'
+              : 'Stay turnover — reference read, no charge. Sets the baseline for the next guest.'}
+          </div>
+        )}
+        {!preset.meterId && (
+          <div style={{ marginBottom:12 }}>
+            <span style={lbl}>Spot / meter</span>
+            <select className="form-select" value={meterId} onChange={e=>setMeterId(e.target.value)} style={{ width:'100%' }}>
+              <option value="" disabled>Select a submeter…</option>
+              {meters.map(m => <option key={m.id} value={m.id}>{UTILITY_ICONS[m.utilityType]} {m.label}</option>)}
+            </select>
+          </div>
+        )}
+        {!presetReason && (
+          <div style={{ marginBottom:12 }}>
+            <span style={lbl}>Reason</span>
+            <select className="form-select" value={reason} onChange={e=>setReason(e.target.value)} style={{ width:'100%' }}>
+              {METER_READ_MANUAL_REASONS.map(r => <option key={r} value={r}>{METER_READ_REASON_LABEL[r]}</option>)}
+            </select>
+          </div>
+        )}
+        {reason === 'other' && (
+          <div style={{ marginBottom:12 }}>
+            <span style={lbl}>Note</span>
+            <input className="form-input" value={note} onChange={e=>setNote(e.target.value)} maxLength={500} placeholder="Why this read?" style={{ width:'100%' }}/>
+          </div>
+        )}
+        <div style={{ marginBottom:12 }}>
+          <span style={lbl}>Reading{meter ? ` (${UTILITY_UNITS[meter.utilityType] || 'units'})` : ''}</span>
+          <input className="form-input mono" type="text" inputMode="numeric" maxLength={digits} autoFocus autoComplete="off"
+            value={value} onChange={e=>setValue(e.target.value.replace(/\D/g,'').slice(0, digits))}
+            placeholder={`up to ${digits} digits`} style={{ width:'100%', fontSize:'1.05rem', letterSpacing:'.12em' }}/>
+        </div>
+        <div className="modal-footer" style={{ display:'flex', justifyContent:'flex-end', gap:8 }}>
+          <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+          <button className="btn btn-primary" disabled={!meterId || !valueOk || save.isLoading} onClick={()=>save.mutate()}>
+            {save.isLoading ? '…' : 'Record'}
+          </button>
         </div>
       </div>
     </div>
@@ -681,5 +813,236 @@ function TaxRatesCard({ propertyId }: { propertyId: string }) {
         </div>
       </div>
     </>
+  )
+}
+
+// ── S558 (Nic): METER SETUP ──────────────────────────────────
+// Add master meters, attach submeters to a master (metered exclusion), assign a
+// RUBS group of units to a master, and flat-rate meters. Supports the one-master
+// park layout: a RUBS master carrying BOTH submeters (their usage excluded) AND
+// a RUBS unit group (the remainder, split by occupancy).
+const RUBS_ALLOC_LABEL: Record<string,string> = { occupant_count:'by occupancy (headcount)', sqft:'by sq ft', bedrooms:'by bedrooms', equal_split:'equal split' }
+function rateLabel(m: any) { return m.ratePerUnit != null ? `${fmt(m.ratePerUnit)}/${UTILITY_UNITS[m.utilityType] || 'unit'}` : 'no rate set' }
+function methodLabel(m: any): string {
+  if (m.billingMethod === 'rubs') return `RUBS master · ${RUBS_ALLOC_LABEL[m.rubsAllocationMethod] || m.rubsAllocationMethod} · ${rateLabel(m)}`
+  if (m.billingMethod === 'submeter') return `Submeter · ${rateLabel(m)}`
+  if (m.billingMethod === 'flat_rate') return `Flat rate · ${fmt(m.baseFee)}/unit`
+  if (m.billingMethod === 'master_bill_to_landlord') return 'Master meter · landlord pays'
+  return m.billingMethod
+}
+
+function MeterConfigSection({ propertyId, meters, units, onChanged }: {
+  propertyId: string; meters: any[]; units: any[]; onChanged: () => void
+}) {
+  const [showAdd, setShowAdd] = useState(false)
+  const unitLabel = (id: string) => { const u = units.find(x => x.id === id); return u ? `Unit ${u.unitNumber}` : id.slice(0, 8) }
+  const masters = meters.filter(m => m.billingMethod === 'rubs')
+  const submeters = meters.filter(m => m.billingMethod === 'submeter')
+  const others = meters.filter(m => m.billingMethod === 'flat_rate' || m.billingMethod === 'master_bill_to_landlord')
+  // S558: a unit is auto-excluded from a RUBS master's split when it has its OWN
+  // same-utility submeter — derived from shared unit membership, no manual link.
+  const unitHasSubmeter = (unitId: string, utilityType: string) =>
+    meters.some(x => x.billingMethod === 'submeter' && x.utilityType === utilityType && (x.assignedUnitIds || []).includes(unitId))
+
+  const del = useMutation((id: string) => apiDelete(`/utility/meters/${id}`),
+    { onSuccess: onChanged, onError: (e: any) => toast.error(e?.response?.data?.error || e?.message || 'Delete failed') })
+  const assign = useMutation(({ id, unitId }: any) => apiPost(`/utility/meters/${id}/units`, { unitId }),
+    { onSuccess: onChanged, onError: (e: any) => toast.error(e?.response?.data?.error || e?.message || 'Could not assign unit') })
+  const unassign = useMutation(({ id, unitId }: any) => apiDelete(`/utility/meters/${id}/units/${unitId}`), { onSuccess: onChanged })
+  const setBroken = useMutation(({ id, broken }: any) => apiPatch(`/utility/meters/${id}`, { outOfService: broken }),
+    { onSuccess: onChanged, onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not update the meter') })
+
+  function UnitAssigner({ m }: { m: any }) {
+    const assigned: string[] = m.assignedUnitIds || []
+    const available = units.filter(u => !assigned.includes(u.id))
+    // A submeter measures exactly ONE unit — cap it at 1. Only RUBS masters
+    // (the group that splits the pool) and flat-rate serve multiple units.
+    const isSubmeter = m.billingMethod === 'submeter'
+    const isMaster = m.billingMethod === 'rubs'
+    const label = isMaster
+      ? 'Units this master serves — submetered ones bill directly & are excluded; the rest split the remainder'
+      : isSubmeter ? 'Metered unit' : 'Units billed'
+    const canAddMore = available.length > 0 && !(isSubmeter && assigned.length >= 1)
+    return (
+      <div style={{ marginTop: 8 }}>
+        <div style={{ fontSize: '.68rem', color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 4 }}>
+          {label}
+        </div>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' }}>
+          {assigned.map(uid => {
+            const excluded = isMaster && unitHasSubmeter(uid, m.utilityType)
+            return (
+              <span key={uid} title={excluded ? 'Has its own submeter — billed directly and subtracted from the pool' : undefined}
+                style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: '.74rem', background: 'var(--bg-2)', border: `1px solid ${excluded ? 'var(--gold)' : 'var(--border-0)'}`, borderRadius: 6, padding: '2px 6px' }}>
+                {unitLabel(uid)}
+                {isMaster && <span style={{ fontSize: '.6rem', color: excluded ? 'var(--gold)' : 'var(--text-3)' }}>{excluded ? '🔌 submetered' : 'splits'}</span>}
+                <X size={11} style={{ cursor: 'pointer', color: 'var(--text-3)' }} onClick={() => unassign.mutate({ id: m.id, unitId: uid })} />
+              </span>
+            )
+          })}
+          {assigned.length === 0 && <span style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>none yet</span>}
+          {canAddMore && (
+            <select className="form-select" style={{ width: 'auto', fontSize: '.74rem', padding: '2px 6px' }} value="" onChange={e => { if (e.target.value) assign.mutate({ id: m.id, unitId: e.target.value }) }}>
+              <option value="">{isSubmeter ? 'set unit…' : '+ add unit…'}</option>
+              {available.map(u => <option key={u.id} value={u.id}>Unit {u.unitNumber}</option>)}
+            </select>
+          )}
+        </div>
+      </div>
+    )
+  }
+
+  function MasterCard({ m }: { m: any }) {
+    const served: string[] = m.assignedUnitIds || []
+    const submeteredCount = served.filter(uid => unitHasSubmeter(uid, m.utilityType)).length
+    return (
+      <div className="card" style={{ padding: 14, marginBottom: 12, borderColor: 'var(--gold)' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span style={{ fontSize: '1.15rem' }}>{UTILITY_ICONS[m.utilityType]}</span>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontWeight: 700, color: 'var(--text-0)' }}>{m.label}</div>
+            <div style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>{methodLabel(m)}</div>
+          </div>
+          <button className="btn btn-ghost btn-sm" style={{ color: 'var(--red)' }} onClick={() => appConfirm(`Delete master "${m.label}"? Its submeters stay.`, { danger: true, confirmLabel: 'Delete' }).then(ok => { if (ok) del.mutate(m.id) })}><Trash2 size={13} /></button>
+        </div>
+        <UnitAssigner m={m} />
+        {served.length > 0 && (
+          <div style={{ marginTop: 8, fontSize: '.68rem', color: 'var(--text-3)' }}>
+            {submeteredCount > 0
+              ? `${submeteredCount} of ${served.length} units are submetered → billed directly and subtracted; the other ${served.length - submeteredCount} split the remaining pool by ${RUBS_ALLOC_LABEL[m.rubsAllocationMethod] || m.rubsAllocationMethod}.`
+              : `No submetered units here — the whole reading splits by ${RUBS_ALLOC_LABEL[m.rubsAllocationMethod] || m.rubsAllocationMethod}. To exclude a unit, give it its own submeter.`}
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  function PlainCard({ m }: { m: any }) {
+    return (
+      <div className="card" style={{ padding: 14, marginBottom: 10 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span style={{ fontSize: '1.1rem' }}>{UTILITY_ICONS[m.utilityType]}</span>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontWeight: 700, color: 'var(--text-0)', display:'flex', alignItems:'center', gap:6 }}>
+              {m.label}
+              {m.outOfService && <span className="badge badge-amber" style={{ fontSize:'.62rem' }}>out of service</span>}
+            </div>
+            <div style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>
+              {methodLabel(m)}
+              {m.outOfService && <> · billed from the lowest comparable spot until repaired</>}
+            </div>
+          </div>
+          {m.billingMethod === 'submeter' && (
+            <button className="btn btn-ghost btn-sm" title={m.outOfService ? 'Mark repaired' : 'Mark broken — bills from comparable spots'}
+              onClick={() => setBroken.mutate({ id: m.id, broken: !m.outOfService })}>
+              <Wrench size={13} style={{ color: m.outOfService ? 'var(--gold)' : 'var(--text-3)' }} />
+            </button>
+          )}
+          <button className="btn btn-ghost btn-sm" style={{ color: 'var(--red)' }} onClick={() => appConfirm(`Delete meter "${m.label}"?`, { danger: true, confirmLabel: 'Delete' }).then(ok => { if (ok) del.mutate(m.id) })}><Trash2 size={13} /></button>
+        </div>
+        {m.billingMethod !== 'master_bill_to_landlord' && <UnitAssigner m={m} />}
+      </div>
+    )
+  }
+
+  return (
+    <div style={{ marginBottom: 28 }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
+        <h2 style={{ fontSize: '.95rem', margin: 0, display: 'flex', alignItems: 'center', gap: 8 }}><Gauge size={16} /> Meter Setup</h2>
+        <button className="btn btn-primary btn-sm" onClick={() => setShowAdd(true)}><Plus size={14} /> Add meter</button>
+      </div>
+      {meters.length === 0 && (
+        <div className="card" style={{ padding: 20, fontSize: '.82rem', color: 'var(--text-3)' }}>
+          No meters yet. Add a RUBS master for a shared meter, submeters for individually-metered units, or a flat-rate meter (e.g. trash).
+        </div>
+      )}
+      {masters.map(m => <MasterCard key={m.id} m={m} />)}
+      {submeters.map(m => <PlainCard key={m.id} m={m} />)}
+      {others.map(m => <PlainCard key={m.id} m={m} />)}
+      {showAdd && <AddMeterModal propertyId={propertyId} onClose={() => setShowAdd(false)} onCreated={onChanged} />}
+    </div>
+  )
+}
+
+function AddMeterModal({ propertyId, onClose, onCreated }: { propertyId: string; onClose: () => void; onCreated: () => void }) {
+  const [utilityType, setUtilityType] = useState('water')
+  const [label, setLabel] = useState('')
+  const [method, setMethod] = useState('rubs')
+  const [rate, setRate] = useState('')
+  const [baseFee, setBaseFee] = useState('')
+  const [alloc, setAlloc] = useState('occupant_count')
+  const [error, setError] = useState('')
+
+  const create = useMutation(
+    () => apiPost('/utility/meters', {
+      propertyId, utilityType, label,
+      billingMethod: method,
+      ratePerUnit: method === 'flat_rate' || method === 'master_bill_to_landlord' ? null : (rate === '' ? null : Number(rate)),
+      baseFee: method === 'flat_rate' ? Number(baseFee || 0) : Number(baseFee || 0),
+      rubsAllocationMethod: method === 'rubs' ? alloc : null,
+    }),
+    { onSuccess: () => { onCreated(); onClose() }, onError: (e: any) => setError(e?.response?.data?.error || e?.message || 'Could not create meter') }
+  )
+  const canSave = !!label && (method !== 'flat_rate' || Number(baseFee) > 0)
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" style={{ maxWidth: 420 }} onClick={e => e.stopPropagation()}>
+        <div className="modal-title">Add meter</div>
+        <div style={{ marginBottom: 10 }}>
+          <label style={lbl}>Utility</label>
+          <select className="form-select" value={utilityType} onChange={e => setUtilityType(e.target.value)} style={{ width: '100%' }}>
+            {['water', 'gas', 'electric', 'sewer', 'trash'].map(u => <option key={u} value={u}>{UTILITY_ICONS[u]} {u[0].toUpperCase() + u.slice(1)}</option>)}
+          </select>
+        </div>
+        <div style={{ marginBottom: 10 }}>
+          <label style={lbl}>Label</label>
+          <input className="input" value={label} onChange={e => setLabel(e.target.value)} placeholder="e.g. Master C — city water" style={{ width: '100%' }} autoFocus />
+        </div>
+        <div style={{ marginBottom: 10 }}>
+          <label style={lbl}>Billing method</label>
+          <select className="form-select" value={method} onChange={e => setMethod(e.target.value)} style={{ width: '100%' }}>
+            <option value="rubs">RUBS master — split a shared meter across units</option>
+            <option value="submeter">Submeter — one metered unit</option>
+            <option value="flat_rate">Flat rate — fixed charge per unit (e.g. trash)</option>
+            <option value="master_bill_to_landlord">Master — landlord pays, no tenant bills</option>
+          </select>
+        </div>
+        {method === 'rubs' && (
+          <div style={{ marginBottom: 10 }}>
+            <label style={lbl}>Split method</label>
+            <select className="form-select" value={alloc} onChange={e => setAlloc(e.target.value)} style={{ width: '100%' }}>
+              <option value="occupant_count">By occupancy (headcount)</option>
+              <option value="equal_split">Equal split</option>
+              <option value="sqft">By square footage</option>
+              <option value="bedrooms">By bedrooms</option>
+            </select>
+          </div>
+        )}
+        {(method === 'rubs' || method === 'submeter') && (
+          <div style={{ marginBottom: 10 }}>
+            <label style={lbl}>Rate per {UTILITY_UNITS[utilityType] || 'unit'} ($)</label>
+            <input className="input" type="number" step="0.001" value={rate} onChange={e => setRate(e.target.value)} placeholder="e.g. 0.01" style={{ width: '100%' }} />
+          </div>
+        )}
+        {method === 'flat_rate' && (
+          <div style={{ marginBottom: 10 }}>
+            <label style={lbl}>Flat amount per unit ($/cycle) *</label>
+            <input className="input" type="number" step="0.01" value={baseFee} onChange={e => setBaseFee(e.target.value)} placeholder="e.g. 20.00" style={{ width: '100%' }} />
+          </div>
+        )}
+        {(method === 'rubs' || method === 'submeter') && (
+          <div style={{ marginBottom: 10 }}>
+            <label style={lbl}>Base fee per bill ($, optional)</label>
+            <input className="input" type="number" step="0.01" value={baseFee} onChange={e => setBaseFee(e.target.value)} placeholder="0.00" style={{ width: '100%' }} />
+          </div>
+        )}
+        {error && <div style={{ color: 'var(--red)', fontSize: '.8rem', marginBottom: 8 }}>{error}</div>}
+        <div className="modal-footer">
+          <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+          <button className="btn btn-primary" disabled={!canSave || create.isLoading} onClick={() => create.mutate()}>{create.isLoading ? 'Adding…' : 'Add meter'}</button>
+        </div>
+      </div>
+    </div>
   )
 }

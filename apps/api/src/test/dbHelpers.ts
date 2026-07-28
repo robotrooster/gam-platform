@@ -63,6 +63,11 @@ export async function cleanupAllSchema(): Promise<void> {
   // clear keeps each test's prefs scope-controlled inside a describe.
   await db.query(`DELETE FROM notification_preferences`)
   await db.query(`DELETE FROM notifications`)
+  // S561: payments.reversal_id ⇄ payment_reversals.payment_id form a cycle —
+  // NULL the back-reference first, then clear reversals before their other
+  // parents (payments + connect_disputes, NO ACTION).
+  await db.query(`UPDATE payments SET reversal_id = NULL WHERE reversal_id IS NOT NULL`)
+  await db.query(`DELETE FROM payment_reversals`)
   await db.query(`DELETE FROM connect_disputes`)
   // S358: connect_payouts FK users (SET NULL) + pm_companies (SET NULL).
   // Rows survive parent deletes — explicit cleanup keeps tests

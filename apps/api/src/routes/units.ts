@@ -4,13 +4,14 @@ import { query, queryOne } from '../db'
 import { requireAuth, requireLandlord, requirePerm, getScopedPropertyIds, assertPropertyInScope } from '../middleware/auth'
 import { canAccessLandlordResource, canManageLandlordResource, canViewLandlordFinances } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
-import { UnitStatus, calcNetPerUnit, getReservePhase, LAUNCH_PLATFORM_FEE, UNIT_STATUSES, UNIT_TYPES, computeStayPrice, computeMonthlyStaySchedule, RV_SITE_LAYOUTS, RV_AMP_SERVICES, isSiteLayoutMismatch, isAmpServiceMismatch, SHORT_STAY_LOCKED_UNIT_TYPES, DWELLING_OWNERSHIP_VALUES, dayDiff } from '@gam/shared'
+import { UnitStatus, calcNetPerUnit, getReservePhase, LAUNCH_PLATFORM_FEE, UNIT_STATUSES, UNIT_TYPES, computeStayPrice, computeMonthlyStaySchedule, RV_SITE_LAYOUTS, RV_AMP_SERVICES, isSiteLayoutMismatch, isAmpServiceMismatch, SHORT_STAY_LOCKED_UNIT_TYPES, DWELLING_OWNERSHIP_VALUES, OCCUPANCY_MODES, dayDiff } from '@gam/shared'
 import { findStayConflict, findAvailableUnits, STAY_CONFLICT_MESSAGE } from '../services/unitAvailability'
 import { formatUnitNumber } from '../lib/format'
 import { logger } from '../lib/logger'
 import { promoteNextWaitlister } from '../services/propertyBooking'
 import { recordBookingEvent, recordBookingChange } from '../services/bookingEvents'
 import { maybeDraftLeaseFromBooking } from '../services/bookingLeaseDraft'
+import { unitPendingReads } from '../services/utilityReadingRuns'
 import { syncLeaseWithBookingDates } from '../services/bookingLeaseBilling'
 import { assertLateFeeDecision } from '../services/lateFeePolicy'
 import {
@@ -255,9 +256,12 @@ unitsRouter.post('/', requirePerm('properties.add_unit'), async (req, res, next)
         INSERT INTO units (property_id, landlord_id, unit_number, unit_type, bedrooms, bathrooms, sqft,
                            rent_amount, security_deposit, rv_site_layout, rv_amp_service,
                            nightly_rate, weekly_rate, monthly_rate, storage_size, subtype_id, status,
-                           is_bookable, lease_types_allowed, dwelling_ownership)
+                           is_bookable, lease_types_allowed, dwelling_ownership, occupancy_mode)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
-                $18, $19::text[], $20)
+                $18, $19::text[], $20,
+                -- S558: new unit inherits the property's default occupancy mode
+                -- (a seed, not a governing setting — the unit owns it after).
+                (SELECT default_occupancy_mode FROM properties WHERE id=$1))
         RETURNING *`,
         [body.propertyId, prop.landlord_id, unitNumber, unitType, bedrooms,
          bathrooms, body.sqft ?? null, rentAmount, securityDeposit, rvLayout, rvAmp,
@@ -426,10 +430,14 @@ unitsRouter.patch('/:id/type', requirePerm('schedule.configure_unit'), async (re
   try {
     const { unitType, nightlyRate, weeklyRate, monthlyRate, minStayNights, maxStayNights,
             checkInTime, checkOutTime, amenities, unitDescription, isBookable, rvSiteLayout, rvAmpService,
-            dwellingOwnership } = req.body
+            dwellingOwnership, occupancyMode } = req.body
 
     if (rvSiteLayout != null && !RV_SITE_LAYOUTS.includes(rvSiteLayout)) {
       throw new AppError(400, `Invalid rvSiteLayout '${rvSiteLayout}'`)
+    }
+    // S558: occupancy mode — whole_unit (one lease) vs by_room (stacked leases).
+    if (occupancyMode != null && !(OCCUPANCY_MODES as readonly string[]).includes(occupancyMode)) {
+      throw new AppError(400, `Invalid occupancyMode '${occupancyMode}'`)
     }
     if (dwellingOwnership != null && !(DWELLING_OWNERSHIP_VALUES as readonly string[]).includes(dwellingOwnership)) {
       throw new AppError(400, `Invalid dwellingOwnership '${dwellingOwnership}'`)
@@ -458,14 +466,37 @@ unitsRouter.patch('/:id/type', requirePerm('schedule.configure_unit'), async (re
       amenities=$10, unit_description=$11, is_bookable=$12,
       rv_site_layout=COALESCE($14,rv_site_layout),
       rv_amp_service=COALESCE($15,rv_amp_service),
-      dwelling_ownership=COALESCE($16,dwelling_ownership), updated_at=NOW()
+      dwelling_ownership=COALESCE($16,dwelling_ownership),
+      occupancy_mode=COALESCE($17,occupancy_mode), updated_at=NOW()
       WHERE id=$13 RETURNING *`,
       [unitType||'residential', leaseTypesAllowed, nightlyRate||null, weeklyRate||null,
        monthlyRate||null, minStayNights||1, maxStayNights||null,
        checkInTime||'15:00', checkOutTime||'11:00',
        amenities||[], unitDescription||null, isBookable??false, unit.id, rvSiteLayout ?? null, rvAmpService ?? null,
-       dwellingOwnership ?? null])
+       dwellingOwnership ?? null, occupancyMode ?? null])
 
+    res.json({ success: true, data: updated })
+  } catch (e) { next(e) }
+})
+
+// PATCH /api/units/:id/occupancy-mode (S558) — flip a single unit between
+// whole_unit and by_room. Dedicated route (not /type) so it never clobbers the
+// unit's other config. Guard: can't switch to whole_unit while >1 active lease
+// exists (that mode allows only one).
+unitsRouter.patch('/:id/occupancy-mode', requirePerm('schedule.configure_unit'), async (req, res, next) => {
+  try {
+    const { occupancyMode } = req.body
+    if (!(OCCUPANCY_MODES as readonly string[]).includes(occupancyMode)) {
+      throw new AppError(400, `Invalid occupancyMode '${occupancyMode}'`)
+    }
+    const unit = await queryOne<any>('SELECT id, landlord_id FROM units WHERE id=$1', [req.params.id])
+    if (!unit) throw new AppError(404, 'Unit not found')
+    if (!canManageLandlordResource(req.user, unit.landlord_id)) throw new AppError(403, 'Forbidden')
+    if (occupancyMode === 'whole_unit') {
+      const n = await queryOne<any>(`SELECT COUNT(*)::int AS c FROM leases WHERE unit_id=$1 AND status IN ('active','pending')`, [req.params.id])
+      if ((n?.c ?? 0) > 1) throw new AppError(409, 'This unit has multiple active leases — end all but one before switching to whole-unit mode.')
+    }
+    const updated = await queryOne<any>(`UPDATE units SET occupancy_mode=$1, updated_at=NOW() WHERE id=$2 RETURNING *`, [occupancyMode, req.params.id])
     res.json({ success: true, data: updated })
   } catch (e) { next(e) }
 })
@@ -822,6 +853,27 @@ unitsRouter.patch('/:id/bookings/:bookingId', requirePerm('schedule.edit_reserva
         }
       }
       if (conflict) throw new AppError(409, STAY_CONFLICT_MESSAGE[conflict])
+    }
+
+    // S559: same-day turnover guard — do NOT check a new guest into a spot
+    // whose previous occupant's submeter hasn't been read yet, or the two
+    // stays' usage smears together. Surface the pending read so the desk can
+    // take it inline (blind) and retry; a landlord (properties.edit) may
+    // override for a broken/unreadable meter so a paying guest is never
+    // stranded. Broken meters are already excluded (they bill from comparables).
+    if (status === 'checked_in' && booking.status !== 'checked_in') {
+      const pending = await unitPendingReads(newUnitId)
+      const isOwner = ['landlord', 'admin', 'super_admin'].includes(req.user!.role)
+      const canOverride = isOwner || (req.user!.permissions as any)?.['properties.edit'] === true
+      if (pending.length > 0 && !(req.body.overrideMeterRead && canOverride)) {
+        return res.status(409).json({
+          success: false,
+          code: 'meter_read_due',
+          error: 'A closing meter read is due on this spot before check-in. Take the read, then check the guest in.',
+          meters: pending,
+          canOverride,
+        })
+      }
     }
 
     // S553: newCheckIn/newCheckOut mix 'YYYY-MM-DD' strings (from the

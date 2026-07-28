@@ -1,0 +1,12 @@
+-- S561: landlord-owned adverse-action notices.
+--
+-- GAM no longer authors/auto-sends the FCRA §615(a) adverse-action notice on
+-- denial (Checkr call 7/27 — the landlord is the "user" of the consumer report
+-- and owns the adverse-action obligation). Instead the landlord composes and
+-- sends the notice; GAM only delivers it and keeps the audit record.
+--
+-- This column stores an OPTIONAL per-landlord reusable notice template the
+-- landlord authored themselves (GAM provides no template content of its own).
+-- The compose modal prefills from it and can save edits back. NULL = none saved.
+-- Safe add: nullable, no backfill needed.
+ALTER TABLE landlords ADD COLUMN IF NOT EXISTS adverse_action_template text;

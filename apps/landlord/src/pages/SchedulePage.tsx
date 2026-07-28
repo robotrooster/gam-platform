@@ -693,6 +693,48 @@ export function SchedulePage() {
     }
   )
 
+  // S559: front-desk check-in. Blocked server-side when the previous guest's
+  // submeter hasn't been read (same-day turnover) — the 409 carries the
+  // pending meters so we fold the blind closing read into check-in, then
+  // retry. A landlord may override for a broken meter.
+  const [checkInPrompt, setCheckInPrompt] = useState<{ booking: any; meters: any[]; canOverride: boolean } | null>(null)
+  const [checkInBusy, setCheckInBusy] = useState(false)
+  const doCheckIn = (b: any, override = false) =>
+    apiPatch(`/units/${b.unitId}/bookings/${b.id}`, { status: 'checked_in', ...(override ? { overrideMeterRead: true } : {}) })
+  const checkInMut = useMutation((b: any) => doCheckIn(b), {
+    onSuccess: () => { qc.invalidateQueries('schedule'); toast('Guest checked in'); setDetailBooking(null) },
+    onError: (e: any) => {
+      const data = e?.response?.data
+      if (data?.code === 'meter_read_due') { setCheckInPrompt({ booking: detailBooking, meters: data.meters || [], canOverride: !!data.canOverride }); return }
+      toast.error(data?.error || 'Could not check the guest in.')
+    },
+  })
+  const submitCheckInReads = async (values: Record<string, string>) => {
+    if (!checkInPrompt) return
+    setCheckInBusy(true)
+    try {
+      for (const m of checkInPrompt.meters) {
+        await apiPost(`/utility/meters/${m.meterId}/reads`, { readingValue: Number(values[m.meterId]), reason: m.reason })
+      }
+      await doCheckIn(checkInPrompt.booking)
+      qc.invalidateQueries('schedule')
+      toast('Read recorded — guest checked in')
+      setCheckInPrompt(null); setDetailBooking(null)
+    } catch (e: any) { toast.error(e?.response?.data?.error || 'Could not complete check-in.') }
+    finally { setCheckInBusy(false) }
+  }
+  const overrideCheckIn = async () => {
+    if (!checkInPrompt) return
+    setCheckInBusy(true)
+    try {
+      await doCheckIn(checkInPrompt.booking, true)
+      qc.invalidateQueries('schedule')
+      toast('Checked in — meter read still due')
+      setCheckInPrompt(null); setDetailBooking(null)
+    } catch (e: any) { toast.error(e?.response?.data?.error || 'Could not check in.') }
+    finally { setCheckInBusy(false) }
+  }
+
   // S547: snowbird lock toggle — pins the stay to its site, exempt from the
   // compressor / relocation / extend-fallback movers.
   const lockBookingMut = useMutation(
@@ -1218,6 +1260,13 @@ export function SchedulePage() {
                                 }}
                                 onDragEnd={onDragEnd}
                                 onClick={e => { e.stopPropagation(); setDetailBooking(bk) }}
+                                onContextMenu={e => {
+                                  // S559 (Nic): right-click a reservation to jump straight into
+                                  // edit. Leases edit on the Leases page — just open their detail.
+                                  e.preventDefault(); e.stopPropagation()
+                                  setDetailBooking(bk)
+                                  if (!isLease && can('schedule.edit_reservation')) startEdit(bk)
+                                }}
                                 style={{
                                   // The dragged bar's cells that fall in the new target
                                   // range tint gold (preview of the overlap with the
@@ -1965,6 +2014,12 @@ export function SchedulePage() {
                 <div style={{display:'flex',gap:8,marginTop:18}}>
                   {can('guest_access') && <button className="btn btn-ghost btn-sm" onClick={()=>copyStayLink(d)}>Copy stay link</button>}
                   {can('schedule.edit_reservation') && d.status!=='cancelled' && <button className="btn btn-ghost btn-sm" onClick={()=>startEdit(d)}>Edit</button>}
+                  {/* S559: front-desk check-in (guard prompts a closing read if the prior guest's meter is unread). */}
+                  {can('guests.check_in') && ['tentative','confirmed'].includes(d.status) && (
+                    <button className="btn btn-primary btn-sm" disabled={checkInMut.isLoading} onClick={()=>checkInMut.mutate(d)}>
+                      {checkInMut.isLoading?'…':'Check in'}
+                    </button>
+                  )}
                   {/* S547: snowbird lock — pin the stay to this exact site, exempt from auto re-siting */}
                   {can('schedule.edit_reservation') && d.status!=='cancelled' && (
                     <button className="btn btn-ghost btn-sm"
@@ -1992,6 +2047,12 @@ export function SchedulePage() {
         </div>
         )
       })()}
+
+      {checkInPrompt && (
+        <CheckInReadModal prompt={checkInPrompt} busy={checkInBusy}
+          onRead={submitCheckInReads} onOverride={overrideCheckIn}
+          onClose={()=>{ if (!checkInBusy) setCheckInPrompt(null) }} />
+      )}
 
       {/* ── NEW RESERVATION MODAL — dates → contact → pick available unit ── */}
       {newResvOpen && (() => {
@@ -2285,6 +2346,51 @@ export function SchedulePage() {
           </div>
         </div>
       )}
+    </div>
+  )
+}
+
+// S559: closing-read prompt folded into front-desk check-in. When the guard
+// blocks check-in because the previous guest's submeter is unread, the desk
+// enters the blind closing read(s) here and check-in proceeds. A landlord may
+// override for a broken/unreadable meter (read stays on the to-do).
+function CheckInReadModal({ prompt, busy, onRead, onOverride, onClose }: {
+  prompt: { booking: any; meters: any[]; canOverride: boolean }
+  busy: boolean
+  onRead: (values: Record<string, string>) => void
+  onOverride: () => void
+  onClose: () => void
+}) {
+  const [values, setValues] = useState<Record<string, string>>({})
+  const allFilled = prompt.meters.every((m: any) => /^\d+$/.test(values[m.meterId] ?? ''))
+  const many = prompt.meters.length > 1
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" style={{ maxWidth: 420 }} onClick={e => e.stopPropagation()}>
+        <div className="modal-title">Closing read required</div>
+        <div style={{ fontSize: '.82rem', color: 'var(--text-2)', marginBottom: 12, lineHeight: 1.5 }}>
+          The previous guest's meter{many ? "s haven't" : " hasn't"} been read on this spot. Enter the closing read{many ? 's' : ''} to check the new guest in — it keeps the two stays' usage from smearing together.
+        </div>
+        <div style={{ display: 'grid', gap: 10 }}>
+          {prompt.meters.map((m: any) => (
+            <div key={m.meterId}>
+              <span style={{ fontSize: '.75rem', color: 'var(--text-3)', display: 'block', marginBottom: 4 }}>{m.meterLabel} ({m.utilityType})</span>
+              <input className="form-input mono" inputMode="numeric" autoComplete="off"
+                value={values[m.meterId] ?? ''}
+                onChange={e => setValues(v => ({ ...v, [m.meterId]: e.target.value.replace(/\D/g, '') }))}
+                placeholder="closing read" style={{ width: '100%', letterSpacing: '.1em' }} />
+            </div>
+          ))}
+        </div>
+        <div className="modal-footer" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 16, gap: 8 }}>
+          {prompt.canOverride
+            ? <button className="btn btn-ghost btn-sm" disabled={busy} onClick={onOverride}>Meter broken — check in anyway</button>
+            : <span />}
+          <button className="btn btn-primary" disabled={!allFilled || busy} onClick={() => onRead(values)}>
+            {busy ? '…' : 'Record & check in'}
+          </button>
+        </div>
+      </div>
     </div>
   )
 }

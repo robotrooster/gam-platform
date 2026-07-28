@@ -4,6 +4,7 @@ import { useQuery, useMutation } from 'react-query'
 import { Check, AlertCircle, ChevronLeft, ChevronRight, Upload, PenTool, ArrowRight } from 'lucide-react'
 import { LEASE_COLUMN_CATEGORY, humanize } from '@gam/shared'
 import { toast } from '../components/dialogs'
+import { loadPdfjs } from '../lib/pdfjs'
 
 const API = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
 const tok = () => localStorage.getItem('gam_token')
@@ -128,12 +129,7 @@ function SignatureSetup({ name, initials, onComplete }: { name:string; initials:
 
   useEffect(() => {
     // Preload PDF.js while user picks font
-    if (!(window as any).pdfjsLib) {
-      const s = document.createElement('script')
-      s.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js'
-      s.onload = () => { ;(window as any).pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js' }
-      document.head.appendChild(s)
-    }
+    loadPdfjs()
   }, [])
 
   const handleComplete = () => {
@@ -273,16 +269,9 @@ export function SignPage() {
   }, [])
 
   const loadPdf = useCallback(async (url:string) => {
-    if (!(window as any).pdfjsLib) {
-      await new Promise<void>((resolve,reject) => {
-        const s = document.createElement('script')
-        s.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js'
-        s.onload = () => { ;(window as any).pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'; resolve() }
-        s.onerror = reject; document.head.appendChild(s)
-      })
-    }
+    const pdfjsLib = await loadPdfjs()
     const fullUrl = url.startsWith('http') ? url : API+url
-    const pdf = await (window as any).pdfjsLib.getDocument({ url:fullUrl, httpHeaders:{ Authorization:'Bearer '+tok() } }).promise
+    const pdf = await pdfjsLib.getDocument({ url:fullUrl, httpHeaders:{ Authorization:'Bearer '+tok() } }).promise
     pdfRef.current = pdf
     setPdfPageCount(pdf.numPages)
     await renderPageImperative(pdf, 1)

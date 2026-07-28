@@ -574,3 +574,107 @@ describe('S534 per-unit billing on the lease invoice date', () => {
     expect(outcome.rows[0].outcome).toBe('verified')
   })
 })
+
+// S558 (Nic): a RUBS-group unit's invoice must NOT go out without the current
+// master read behind its water charge. The master (and any linked submeter) now
+// hold the invoice, same as a submeter.
+describe('S558 RUBS invoice gate', () => {
+  const AUG = new Date('2026-08-05T12:00:00Z')
+  const invoiceFor = (leaseId: string) => db.query(
+    `SELECT id, subtotal_utilities FROM invoices WHERE lease_id = $1`, [leaseId])
+
+  async function addRubsMaster(f: Fixture): Promise<string> {
+    const c = await db.connect()
+    let masterId = ''
+    try {
+      await c.query('BEGIN')
+      masterId = await seedUtilityMeter(c, { propertyId: f.propertyAId, utilityType: 'water', billingMethod: 'submeter' })
+      await c.query(`UPDATE utility_meters SET billing_method='rubs', rubs_allocation_method='equal_split', rate_per_unit=0.01, base_fee=0 WHERE id=$1`, [masterId])
+      await c.query(`INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1,$2)`, [masterId, f.unitAId])
+      await c.query(`INSERT INTO lease_utility_responsibilities (lease_id, utility_type, tenant_responsible) VALUES ($1,'water',TRUE)`, [f.leaseAId])
+      await c.query('COMMIT')
+    } finally { c.release() }
+    return masterId
+  }
+
+  it("holds the RUBS-group unit's whole invoice until the master is read, then releases with the water charge", async () => {
+    const app = buildApp()
+    const f = await seed()
+    const masterId = await addRubsMaster(f)
+    const run = await openRun(app, f)
+    // Read the electric submeter (clears the submeter hold) but NOT the master.
+    await enterReading(app, f, run.id, f.meterLeased, 1250)
+    await enterReading(app, f, run.id, f.meterVacant, 560)
+
+    await generateInvoices(AUG)
+    expect((await invoiceFor(f.leaseAId)).rows).toHaveLength(0) // held — RUBS master unread
+
+    // Read the master (period usage 500 gal → equal_split, 1 RUBS unit → $5).
+    await enterReading(app, f, run.id, masterId, 500)
+    await generateInvoices(AUG)
+    const inv = await invoiceFor(f.leaseAId)
+    expect(inv.rows).toHaveLength(1) // released
+    // electric 250 × 0.14 = 35 + water RUBS 500 × 0.01 = 5 → 40
+    expect(Number(inv.rows[0].subtotal_utilities)).toBeCloseTo(40.0, 2)
+  })
+
+  it('an unread submeter on one of the master units also holds the RUBS unit invoice', async () => {
+    const app = buildApp()
+    const f = await seed()
+    const masterId = await addRubsMaster(f)
+    // unit2 is ALSO served by the master and has its own water submeter — so
+    // the master's pool depends on it. Leave that submeter unread this cycle.
+    const c = await db.connect()
+    let subId = ''
+    try {
+      await c.query('BEGIN')
+      subId = await seedUtilityMeter(c, { propertyId: f.propertyAId, utilityType: 'water', billingMethod: 'submeter' })
+      await c.query(`UPDATE utility_meters SET rate_per_unit=0.01 WHERE id=$1`, [subId])
+      await c.query(`INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1,$2)`, [subId, f.unit2Id])       // submeter on unit2
+      await c.query(`INSERT INTO utility_meter_units (meter_id, unit_id) VALUES ($1,$2)`, [masterId, f.unit2Id])    // unit2 also on the master
+      await c.query('COMMIT')
+    } finally { c.release() }
+    const run = await openRun(app, f)
+    await enterReading(app, f, run.id, f.meterLeased, 1250)
+    await enterReading(app, f, run.id, f.meterVacant, 560)
+    await enterReading(app, f, run.id, masterId, 500)   // master read…
+    // …but unit2's submeter is left unread → pool unknowable → hold.
+    await generateInvoices(AUG)
+    expect((await invoiceFor(f.leaseAId)).rows).toHaveLength(0) // still held
+  })
+})
+
+// ── S560 regression: mid-month reference read must not break the monthly run ──
+// A stay_turnover/special read shares the run's billing_cycle_month but is not
+// a monthly_cycle read. Before the fix, the run-progress joins counted it, so
+// the walk skipped the meter and the run completed with no cycle read → the
+// tenant was silently never billed. getRunMeters / isRunFullyRead now filter
+// reason='monthly_cycle'.
+describe('S560: mid-month reference read does not break the monthly run', () => {
+  it('a stay_turnover read in the cycle month is not counted as the meter being read', async () => {
+    const app = buildApp()
+    const f = await seed()
+    await db.query(
+      `INSERT INTO utility_meter_readings
+         (meter_id, reading_date, reading_value, billing_cycle_month, created_by_user_id, reason)
+       VALUES ($1, '2026-07-10', 1500, $2, $3, 'stay_turnover')`,
+      [f.meterLeased, CYCLE, f.landlordAUserId])
+
+    const run = await openRun(app, f)
+
+    // The blind walk must still list the leased meter as unread.
+    const meters = await request(app)
+      .get(`/api/utility/reading-runs/${run.id}/meters`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+    expect(meters.status).toBe(200)
+    const leased = (meters.body.data as any[]).find((m: any) => m.meter_id === f.meterLeased)
+    expect(leased?.is_read).toBe(false)
+
+    // Reading only the OTHER meter must NOT auto-advance the run — the leased
+    // meter still needs its monthly_cycle read (isRunFullyRead must not count
+    // the turnover read).
+    const r = await enterReading(app, f, run.id, f.meterVacant, 800)
+    expect(r.status).toBe(201)
+    expect(r.body.data.run.status).toBe('open')
+  })
+})

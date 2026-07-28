@@ -16,6 +16,7 @@ import {
   PropertyReviewStatus,
   AGENT_REVENUE_CAPABILITIES,
   UNIT_TYPES,
+  OCCUPANCY_MODES,
 } from '@gam/shared'
 import { listAgentPermissions, setAgentCapability } from '../services/agentPermissions'
 import { logger } from '../lib/logger'
@@ -683,52 +684,11 @@ propertiesRouter.put('/:id/late-fee-overrides', requirePerm('properties.edit'), 
   } catch (e) { next(e) }
 })
 
-// S556: per-(property, unit_type) security-DEPOSIT MULTIPLIER. A lease's
-// deposit is derived (deposit = rent × multiplier), so the landlord sets the
-// ratio once per unit class instead of retyping a dollar amount each lease.
-// Absence of a row = 1.0 (one month's rent). Consumed by lease-document
-// creation (esign) and the send-form prefill suggestion.
-propertiesRouter.get('/:id/deposit-multipliers', requirePerm('properties.edit'), async (req, res, next) => {
-  try {
-    const prop = await queryOne<any>('SELECT id, landlord_id FROM properties WHERE id=$1', [req.params.id])
-    if (!prop) throw new AppError(404, 'Property not found')
-    if (!canManageLandlordResource(req.user, prop.landlord_id, ['property_manager'])) throw new AppError(403, 'Forbidden')
-    const rows = await query<any>(
-      `SELECT * FROM property_unit_type_deposits WHERE property_id=$1 ORDER BY unit_type`, [req.params.id])
-    res.json({ success: true, data: rows })
-  } catch (e) { next(e) }
-})
-
-propertiesRouter.put('/:id/deposit-multipliers', requirePerm('properties.edit'), async (req, res, next) => {
-  try {
-    const body = z.object({
-      unitType:   z.enum(UNIT_TYPES as unknown as [string, ...string[]]),
-      multiplier: z.number().min(0).max(12),
-    }).parse(req.body)
-    const prop = await queryOne<any>('SELECT id, landlord_id FROM properties WHERE id=$1', [req.params.id])
-    if (!prop) throw new AppError(404, 'Property not found')
-    if (!canManageLandlordResource(req.user, prop.landlord_id, ['property_manager'])) throw new AppError(403, 'Forbidden')
-    const row = await queryOne<any>(`
-      INSERT INTO property_unit_type_deposits (property_id, unit_type, deposit_multiplier)
-      VALUES ($1, $2, $3)
-      ON CONFLICT (property_id, unit_type) DO UPDATE SET
-        deposit_multiplier = EXCLUDED.deposit_multiplier, updated_at = NOW()
-      RETURNING *`,
-      [req.params.id, body.unitType, body.multiplier.toFixed(2)])
-    res.json({ success: true, data: row })
-  } catch (e) { next(e) }
-})
-
-propertiesRouter.delete('/:id/deposit-multipliers/:unitType', requirePerm('properties.edit'), async (req, res, next) => {
-  try {
-    const prop = await queryOne<any>('SELECT id, landlord_id FROM properties WHERE id=$1', [req.params.id])
-    if (!prop) throw new AppError(404, 'Property not found')
-    if (!canManageLandlordResource(req.user, prop.landlord_id, ['property_manager'])) throw new AppError(403, 'Forbidden')
-    await query('DELETE FROM property_unit_type_deposits WHERE property_id=$1 AND unit_type=$2',
-      [req.params.id, req.params.unitType])
-    res.json({ success: true })
-  } catch (e) { next(e) }
-})
+// S558: the per-(property, unit_type) deposit-multiplier CRUD was removed. The
+// deposit multiplier is now a LEASE term on the template (lease_templates.
+// deposit_months) so the charge always matches the signed lease — see
+// migration 20260726091031 + services/depositPolicy.ts. No property-level
+// deposit setting exists any more.
 
 propertiesRouter.delete('/:id/late-fee-overrides/:unitType', requirePerm('properties.edit'), async (req, res, next) => {
   try {
@@ -842,6 +802,10 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
     // balance. Tenant portal's Pay Now enforces it server-side.
     const acceptPartialPayments =
       typeof raw.acceptPartialPayments === 'boolean' ? raw.acceptPartialPayments : undefined
+    // S558: property DEFAULT occupancy mode — seeds new units only (each unit's
+    // own occupancy_mode is authoritative). Not a governing property setting.
+    const defaultOccupancyMode =
+      (OCCUPANCY_MODES as readonly string[]).includes(raw.defaultOccupancyMode) ? raw.defaultOccupancyMode : undefined
 
     let updated = await queryOne<any>(`
       UPDATE properties SET
@@ -861,6 +825,7 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
         flexcharge_enabled      = COALESCE($14, flexcharge_enabled),
         weekly_lease_mode       = COALESCE($15, weekly_lease_mode),
         accept_partial_payments = COALESCE($17, accept_partial_payments),
+        default_occupancy_mode  = COALESCE($18, default_occupancy_mode),
         updated_at  = NOW()
       WHERE id=$16 RETURNING *`,
       [name||null, street1||null, street2||null, city||null, state||null,
@@ -874,7 +839,8 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
        flexchargeEnabled === undefined ? null : flexchargeEnabled,
        weeklyLeaseMode === undefined ? null : weeklyLeaseMode,
        req.params.id,
-       acceptPartialPayments === undefined ? null : acceptPartialPayments]
+       acceptPartialPayments === undefined ? null : acceptPartialPayments,
+       defaultOccupancyMode ?? null]
     )
 
     // S226: separate dynamic UPDATE for accrual + cap. The COALESCE

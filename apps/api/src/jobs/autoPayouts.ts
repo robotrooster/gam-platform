@@ -2,22 +2,28 @@
  * S113-Phase4: Auto-Friday payout cron — Stripe Payouts edition.
  *
  * Cron: Mon-Fri 9am Phoenix. Engine self-gates via shouldRunToday — only
- * runs on the auto-payout day for each work week. That is normally Friday,
- * but shifts to Monday when Friday is a US federal holiday (and continues
- * to shift to the next non-holiday weekday in the rare case Monday is also
- * a holiday).
+ * runs on the auto-payout day for each work week. That is normally TUESDAY
+ * (lands the landlord's bank by Friday at standard T+1–T+2), shifting forward
+ * to the next non-holiday weekday when Tuesday is a US federal holiday.
  *
- * Architecture (S113 — destination charges):
- *   Tenant rent destination-charges to landlord's Connect balance directly.
- *   PM cuts and manager fees are post-commit Stripe Transfers from the
- *   landlord's Connect to the PM's / manager's Connect (S113-Phase1 +
- *   pre-existing S119). What's left on each Connect account on Friday is
- *   that recipient's owed share, ready to payout to their external bank.
+ * Architecture (S561 — platform-holds, supersedes S113 destination charges;
+ * see memory gam-money-flow-platform-holds + MONEY_FLOW_REBUILD_SPEC.md):
+ *   Tenant rent now lands on GAM's PLATFORM balance and stays there
+ *   (payments.platform_held=true), NOT on the landlord's Connect. So this
+ *   cron, for each landlord user, FIRST moves the owed owner-share
+ *   platform → landlord Connect (reconcilePlatformHeldPayments), THEN sweeps
+ *   the Connect balance to the bank — both in the same weekly run.
  *
- *   This cron iterates every Connect-enabled user + pm_company, reads the
- *   live `available USD` balance from Stripe, and fires
- *   `stripe.payouts.create` against that account if > 0. Stripe routes the
- *   funds to the attached external bank (T+1–T+2 for standard ACH).
+ *   PM cuts and manager fees are still post-commit Stripe Transfers at
+ *   allocation time (sourced from the platform charge). PM-company + business
+ *   money already lands on their own Connect balance. (Phase 4 will move
+ *   PM/manager cuts onto this weekly batch too.)
+ *
+ *   This cron iterates every Connect-enabled user + pm_company + business,
+ *   (reconciles landlord platform-held funds first,) reads the live
+ *   `available USD` balance from Stripe, and fires `stripe.payouts.create`
+ *   against that account if > 0. Stripe routes the funds to the attached
+ *   external bank (T+1–T+2 for standard ACH).
  *
  * Replaces the pre-Phase4 model:
  *   - GAM-book ledger sweep against `user_balance_ledger` per (user, bank)
@@ -38,6 +44,7 @@
 import { query } from '../db'
 import { firePayoutForConnectAccount, getAvailableUsdBalance } from '../services/connectPayouts'
 import { createAdminNotification } from '../services/adminNotifications'
+import { reconcilePlatformHeldPayments } from '../services/landlordPassthrough'
 
 // US federal holidays 2026-2027. Refresh annually before each calendar year.
 // "Observed" dates used when the actual holiday falls on a weekend.
@@ -93,14 +100,23 @@ function addDays(date: Date, n: number): Date {
   return d
 }
 
-function thisWeeksFriday(now: Date, tz: string): Date {
+// D1 (Nic, S561): the batch INITIATES on the weekday whose standard-payout
+// arrival lands the money in the landlord's bank BY FRIDAY. Standard payouts
+// settle T+1–T+2 business days, so we target TUESDAY: T+2 → Thursday, a full
+// business-day buffer before Friday. Wednesday would be razor-thin at T+2
+// (Wed+2 = Fri, no margin) and only safe if the account reliably settles T+1.
+// PINNED PENDING C4 (live-account payout speed): if the live account is
+// confirmed reliably T+1, move to Wednesday to reclaim a float day.
+const PAYOUT_TARGET_DOW = 2  // Tuesday (0=Sun … 6=Sat)
+
+// The target payout day for the work-week containing `now`, computed from any
+// day of that week. Sun is treated as day 7 (end of a Mon..Sun week) so the
+// offset is stable; weekend inputs map back to that week's target day, which
+// is harmless because shouldRunToday never fires on a weekend or holiday.
+function thisWeeksTargetDay(now: Date, tz: string, targetDow: number): Date {
   const dow = localDayOfWeek(now, tz)
-  let offset: number
-  if (dow === 5)      offset = 0
-  else if (dow === 6) offset = -1
-  else if (dow === 0) offset = -2
-  else                offset = -(dow + 2)
-  return addDays(now, offset)
+  const d = dow === 0 ? 7 : dow
+  return addDays(now, targetDow - d)
 }
 
 function nextWeekday(date: Date, tz: string): Date {
@@ -113,7 +129,10 @@ function nextWeekday(date: Date, tz: string): Date {
 }
 
 function thisWeeksAutoPayoutDate(now: Date, tz: string): Date {
-  let d = thisWeeksFriday(now, tz)
+  // If the target day is a federal holiday, shift FORWARD to the next weekday
+  // (D1: no backward compensation — holiday weeks simply land the following
+  // Mon and everyone expects that).
+  let d = thisWeeksTargetDay(now, tz, PAYOUT_TARGET_DOW)
   while (US_FEDERAL_HOLIDAYS.has(localDateString(d, tz))) {
     d = nextWeekday(d, tz)
   }
@@ -249,6 +268,17 @@ async function processOneCandidate(cand: Candidate, today: string): Promise<OneC
       [cand.entity_id]
     )
     if (recent.length > 0) return 'already_paid_this_week'
+  }
+
+  // 1b. Platform-holds reconcile (S561). Landlord rent sits on the PLATFORM
+  //     balance, not this user's Connect. Move the owed owner-share
+  //     platform → their Connect BEFORE reading the balance, so the payout
+  //     below sweeps it to the bank in the same run. Self-gating: no-ops for
+  //     non-landlord users (opt-in managers) and when nothing is owed. Only
+  //     user candidates can be landlords; PM-company + business money already
+  //     lands on their own Connect at allocation/charge time.
+  if (cand.kind === 'user') {
+    await reconcilePlatformHeldPayments(cand.entity_id)
   }
 
   // 2. Read live Stripe available USD balance.

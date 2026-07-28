@@ -1,8 +1,9 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { useQuery } from 'react-query'
-import { humanize } from '@gam/shared'
-import { apiGet } from '../lib/api'
+import { useQuery, useMutation, useQueryClient } from 'react-query'
+import { humanize, MANUAL_PAYMENT_METHODS, MANUAL_PAYMENT_METHOD_LABELS,
+         MANUAL_PAYMENT_FEE, type ManualPaymentMethod } from '@gam/shared'
+import { apiGet, apiPost } from '../lib/api'
 import { usePerms } from '../lib/permissions'
 import { X, AlertTriangle, CheckCircle, Clock, XCircle } from 'lucide-react'
 
@@ -44,9 +45,33 @@ const STATUS_COLORS: Record<string, string> = {
   returned: 'var(--red)',
 }
 
-function PaymentDetailModal({ payment: p, onClose }: { payment: any; onClose: () => void }) {
+function PaymentDetailModal({ payment: p, onClose, canRecord, onRecorded }: {
+  payment: any; onClose: () => void; canRecord: boolean; onRecorded: () => void
+}) {
   const StatusIcon = STATUS_ICONS[p.status] || Clock
   const statusColor = STATUS_COLORS[p.status] || 'var(--text-3)'
+
+  // S562: record a rent charge paid off-platform (cash/check/money order). GAM
+  // moves no money — the row just flips to settled. The tenant's first rent
+  // payment is fee-free; subsequent ones bill a $10 manual-payment fee (the
+  // server decides + returns feeWaived). Only open, unpaid RENT rows qualify.
+  const isManualRecordable = canRecord && p.type === 'rent' &&
+    (p.status === 'pending' || p.status === 'failed')
+  const [recordOpen, setRecordOpen] = useState(false)
+  const [method, setMethod] = useState<ManualPaymentMethod>('check')
+  const [reference, setReference] = useState('')
+  const [recordMsg, setRecordMsg] = useState<string | null>(null)
+  const recordMut = useMutation(
+    () => apiPost(`/payments/${p.id}/record-manual`, { method, reference: reference || undefined }),
+    {
+      onSuccess: (res: any) => {
+        const waived = res?.data?.feeWaived
+        setRecordMsg(waived
+          ? 'Recorded. First rent payment — no manual-payment fee charged.'
+          : `Recorded. A $${MANUAL_PAYMENT_FEE.toFixed(2)} manual-payment fee was billed to the tenant.`)
+        onRecorded()
+      },
+    })
 
   const row = (label: string, value: any, opts?: { mono?: boolean; color?: string }) => (
     <div style={{ display: 'flex', justifyContent: 'space-between', padding: '10px 0', borderBottom: '1px solid var(--border-0)', fontSize: '.82rem' }}>
@@ -186,6 +211,51 @@ function PaymentDetailModal({ payment: p, onClose }: { payment: any; onClose: ()
           {row('Created', p.createdAt ? new Date(p.createdAt).toLocaleString() : null, { mono: true })}
         </div>
 
+        {/* S562: record a manual (off-platform) rent payment */}
+        {isManualRecordable && (
+          <div style={{ marginTop: 16, padding: '14px 0', borderTop: '1px solid var(--border-0)' }}>
+            {recordMsg ? (
+              <div style={{ fontSize: '.82rem', color: 'var(--green)', display: 'flex', alignItems: 'center', gap: 8 }}>
+                <CheckCircle size={15} /> {recordMsg}
+              </div>
+            ) : !recordOpen ? (
+              <button className="btn btn-ghost btn-sm" onClick={() => setRecordOpen(true)}>
+                Record manual payment (cash / check / money order)
+              </button>
+            ) : (
+              <div>
+                <div style={{ fontSize: '.75rem', fontWeight: 700, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 8 }}>
+                  Record off-platform payment
+                </div>
+                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+                  <select className="form-input" style={{ width: 'auto' }} value={method}
+                    onChange={e => setMethod(e.target.value as ManualPaymentMethod)}>
+                    {MANUAL_PAYMENT_METHODS.map(m => (
+                      <option key={m} value={m}>{MANUAL_PAYMENT_METHOD_LABELS[m]}</option>
+                    ))}
+                  </select>
+                  <input className="form-input" style={{ width: 160 }} placeholder="Reference # (optional)"
+                    value={reference} onChange={e => setReference(e.target.value)} />
+                  <button className="btn btn-primary btn-sm" disabled={recordMut.isLoading}
+                    onClick={() => recordMut.mutate()}>
+                    {recordMut.isLoading ? 'Recording…' : 'Confirm'}
+                  </button>
+                  <button className="btn btn-ghost btn-sm" onClick={() => setRecordOpen(false)}>Cancel</button>
+                </div>
+                <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 8 }}>
+                  Marks this rent as paid. GAM disburses nothing — you already hold the funds. The tenant's
+                  first payment is fee-free; later manual payments bill a ${MANUAL_PAYMENT_FEE.toFixed(2)} fee to the tenant.
+                </div>
+                {recordMut.isError && (
+                  <div style={{ fontSize: '.75rem', color: 'var(--red)', marginTop: 8 }}>
+                    {(recordMut.error as any)?.message || 'Could not record the payment.'}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
         {/* Footer */}
         <div className="modal-footer" style={{ marginTop: 16, flexShrink: 0 }}>
           <button className="btn btn-ghost" onClick={onClose}>Close</button>
@@ -200,6 +270,7 @@ export function PaymentsPage() {
   const [selected, setSelected] = useState<any>(null)
   const navigate = useNavigate()
   const { can } = usePerms()
+  const queryClient = useQueryClient()
 
   return (
     <div>
@@ -285,7 +356,9 @@ export function PaymentsPage() {
         )}
       </div>
 
-      {selected && <PaymentDetailModal payment={selected} onClose={() => setSelected(null)} />}
+      {selected && <PaymentDetailModal payment={selected} onClose={() => setSelected(null)}
+        canRecord={can('take_payment')}
+        onRecorded={() => queryClient.invalidateQueries('payments')} />}
     </div>
   )
 }

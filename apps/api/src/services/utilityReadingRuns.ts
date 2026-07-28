@@ -218,6 +218,7 @@ export async function getRunMeters(runId: string) {
        LEFT JOIN units u ON u.id = mu.unit_id
        LEFT JOIN utility_meter_readings cur
               ON cur.meter_id = m.id AND cur.billing_cycle_month = r.billing_cycle_month
+             AND cur.reason = 'monthly_cycle'
        LEFT JOIN LATERAL (
               SELECT vlat.tenant_id
                 FROM v_lease_active_tenants vlat
@@ -254,14 +255,14 @@ export async function startDoubleCheckPhase(runId: string) {
        FROM utility_meter_readings rd
        JOIN utility_meters m ON m.id = rd.meter_id
       WHERE m.property_id = $1 AND m.billing_method = 'submeter'
-        AND rd.billing_cycle_month = $2 AND rd.needs_review`,
+        AND rd.billing_cycle_month = $2 AND rd.reason = 'monthly_cycle' AND rd.needs_review`,
     [run.property_id, run.billing_cycle_month])
   const pads = await query<{ meter_id: string; reading_value: string }>(
     `SELECT rd.meter_id, rd.reading_value
        FROM utility_meter_readings rd
        JOIN utility_meters m ON m.id = rd.meter_id
       WHERE m.property_id = $1 AND m.billing_method = 'submeter'
-        AND rd.billing_cycle_month = $2 AND NOT rd.needs_review
+        AND rd.billing_cycle_month = $2 AND rd.reason = 'monthly_cycle' AND NOT rd.needs_review
       ORDER BY random()
       LIMIT $3`,
     [run.property_id, run.billing_cycle_month,
@@ -340,10 +341,14 @@ export async function enterDoubleCheck(runId: string, meterId: string, secondVal
   const withinTol = billLocked || Math.abs(secondValue - first) <= METER_DOUBLE_CHECK_TOLERANCE
   const effective = withinTol ? first : secondValue
 
+  // Point-in-time prior (S559): the read immediately before THIS cycle's
+  // read by time (excluding the cycle read itself), which may be a mid-month
+  // turnover/reference read that reset the baseline.
   const prior = await queryOne<{ reading_value: string }>(
     `SELECT reading_value FROM utility_meter_readings
-      WHERE meter_id = $1 AND billing_cycle_month < $2
-      ORDER BY billing_cycle_month DESC, reading_date DESC LIMIT 1`,
+      WHERE meter_id = $1
+        AND NOT (billing_cycle_month = $2 AND reason = 'monthly_cycle')
+      ORDER BY reading_date DESC, created_at DESC LIMIT 1`,
     [meterId, run.billing_cycle_month])
 
   let isRollover = false
@@ -360,7 +365,7 @@ export async function enterDoubleCheck(runId: string, meterId: string, secondVal
     await query(
       `UPDATE utility_meter_readings
           SET reading_value = $3, needs_review = $4, is_rollover = $5, review_note = $6
-        WHERE meter_id = $1 AND billing_cycle_month = $2`,
+        WHERE meter_id = $1 AND billing_cycle_month = $2 AND reason = 'monthly_cycle'`,
       [meterId, run.billing_cycle_month, effective, needsReview, isRollover,
        needsReview ? 'Re-read confirmed a value below the previous reading — rollover or meter swap?' : null])
     // An un-invoiced bill built on the superseded value is stale — drop
@@ -448,6 +453,7 @@ export async function isRunFullyRead(runId: string): Promise<boolean> {
                             AND m.billing_method IN ('submeter','rubs')
        LEFT JOIN utility_meter_readings rd
               ON rd.meter_id = m.id AND rd.billing_cycle_month = r.billing_cycle_month
+             AND rd.reason = 'monthly_cycle'
       WHERE r.id = $1 AND rd.id IS NULL`,
     [runId])
   return !!row && row.unread === 0
@@ -519,17 +525,21 @@ export async function promptMoveOutMeterReads(): Promise<{ prompted: number }> {
     const landlord = await queryOne<{ user_id: string; email: string }>(
       `SELECT l.user_id, u.email FROM landlords l JOIN users u ON u.id = l.user_id
         WHERE l.id = $1`, [prop.landlord_id])
+    // S559: notify whoever can actually take the read — landlord-tier
+    // (properties.edit) AND front desk (utility.read_meters).
     const staff = await query<{ user_id: string; email: string }>(
       `SELECT DISTINCT u.id AS user_id, u.email FROM (
           SELECT user_id FROM property_manager_scopes
            WHERE landlord_id = $1
              AND (all_properties = TRUE OR $2::uuid = ANY(property_ids))
-             AND (permissions ->> 'properties.edit')::boolean IS TRUE
+             AND ((permissions ->> 'properties.edit')::boolean IS TRUE
+                  OR (permissions ->> 'utility.read_meters')::boolean IS TRUE)
           UNION
           SELECT user_id FROM onsite_manager_scopes
            WHERE landlord_id = $1
              AND (all_properties = TRUE OR $2::uuid = ANY(property_ids))
-             AND (permissions ->> 'properties.edit')::boolean IS TRUE
+             AND ((permissions ->> 'properties.edit')::boolean IS TRUE
+                  OR (permissions ->> 'utility.read_meters')::boolean IS TRUE)
         ) s JOIN users u ON u.id = s.user_id`,
       [prop.landlord_id, propertyId])
 
@@ -553,4 +563,87 @@ export async function promptMoveOutMeterReads(): Promise<{ prompted: number }> {
     prompted++
   }
   return { prompted }
+}
+
+// S559: LIVE front-desk "reads due" list — derived from the CURRENT calendar
+// every call, never a stored snapshot, so guest extensions / early checkouts
+// / cancellations self-correct with zero special handling. A spot is "due"
+// when it has a submeter and a departure (lease ended, or booking checked out
+// / past checkout) within the last ~60 days that has NO read on or after the
+// departure date yet. Reason is CLASSIFIED from the stay so the read is
+// stamped without the reader choosing it: a departing lease whose tenant is
+// responsible for that utility → move_out_final (bills); everything else
+// (short-term / utilities-included) → stay_turnover (reference). Taking the
+// read, extending the stay, or cancelling all drop the row on the next fetch.
+export async function getReadsDue(propertyId: string) {
+  return query<any>(`
+    WITH departures AS (
+      SELECT l.unit_id, l.end_date AS departed_on, l.id AS lease_id,
+             (SELECT us.first_name || ' ' || us.last_name
+                FROM lease_tenants lt JOIN tenants t ON t.id = lt.tenant_id
+                JOIN users us ON us.id = t.user_id
+               WHERE lt.lease_id = l.id AND lt.role = 'primary' LIMIT 1) AS who
+        FROM leases l JOIN units u ON u.id = l.unit_id
+       WHERE u.property_id = $1 AND l.end_date IS NOT NULL
+         AND l.end_date <= CURRENT_DATE AND l.end_date >= CURRENT_DATE - INTERVAL '60 days'
+         AND l.status IN ('active','ended','expired')
+      UNION ALL
+      SELECT b.unit_id, b.check_out AS departed_on, NULL::uuid AS lease_id, b.guest_name AS who
+        FROM unit_bookings b JOIN units u ON u.id = b.unit_id
+       WHERE u.property_id = $1
+         AND b.check_out >= CURRENT_DATE - INTERVAL '60 days'
+         AND (b.status = 'checked_out'
+              OR (b.status IN ('confirmed','checked_in') AND b.check_out <= CURRENT_DATE))
+    )
+    SELECT d.unit_id, u.unit_number, d.departed_on, d.lease_id, d.who,
+           m.id AS meter_id, m.label AS meter_label, m.utility_type,
+           CASE WHEN d.lease_id IS NOT NULL AND COALESCE(lur.tenant_responsible, false)
+                THEN 'move_out_final' ELSE 'stay_turnover' END AS reason
+      FROM departures d
+      JOIN units u ON u.id = d.unit_id
+      JOIN utility_meter_units mu ON mu.unit_id = d.unit_id
+      JOIN utility_meters m ON m.id = mu.meter_id AND m.billing_method = 'submeter'
+           AND m.out_of_service = false
+      LEFT JOIN lease_utility_responsibilities lur
+             ON lur.lease_id = d.lease_id AND lur.utility_type = m.utility_type
+     WHERE NOT EXISTS (
+        SELECT 1 FROM utility_meter_readings r
+         WHERE r.meter_id = m.id AND r.reading_date >= d.departed_on)
+     ORDER BY d.departed_on, u.unit_number, m.label`, [propertyId])
+}
+
+// S559: pending closing reads for ONE unit — the same "departure with no
+// post-departure read" logic scoped to a single spot, used to BLOCK checking
+// a new guest into a spot whose previous occupant's meter hasn't been read
+// yet (same-day turnover). Broken meters are excluded — they bill from
+// comparables and need no read. Empty array = clear to check in.
+export async function unitPendingReads(unitId: string) {
+  return query<any>(`
+    WITH departures AS (
+      SELECT l.end_date AS departed_on, l.id AS lease_id
+        FROM leases l
+       WHERE l.unit_id = $1 AND l.end_date IS NOT NULL
+         AND l.end_date <= CURRENT_DATE AND l.end_date >= CURRENT_DATE - INTERVAL '60 days'
+         AND l.status IN ('active','ended','expired')
+      UNION ALL
+      SELECT b.check_out AS departed_on, NULL::uuid AS lease_id
+        FROM unit_bookings b
+       WHERE b.unit_id = $1
+         AND b.check_out >= CURRENT_DATE - INTERVAL '60 days'
+         AND (b.status = 'checked_out'
+              OR (b.status IN ('confirmed','checked_in') AND b.check_out <= CURRENT_DATE))
+    )
+    SELECT DISTINCT m.id AS meter_id, m.label AS meter_label, m.utility_type,
+           CASE WHEN d.lease_id IS NOT NULL AND COALESCE(lur.tenant_responsible, false)
+                THEN 'move_out_final' ELSE 'stay_turnover' END AS reason
+      FROM departures d
+      JOIN utility_meter_units mu ON mu.unit_id = $1
+      JOIN utility_meters m ON m.id = mu.meter_id
+           AND m.billing_method = 'submeter' AND m.out_of_service = false
+      LEFT JOIN lease_utility_responsibilities lur
+             ON lur.lease_id = d.lease_id AND lur.utility_type = m.utility_type
+     WHERE NOT EXISTS (
+        SELECT 1 FROM utility_meter_readings r
+         WHERE r.meter_id = m.id AND r.reading_date >= d.departed_on)`,
+    [unitId])
 }

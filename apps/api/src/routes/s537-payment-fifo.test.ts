@@ -21,6 +21,7 @@ import {
   seedLease, seedLeaseTenant, seedAllocationRule,
 } from '../test/dbHelpers'
 import { errorHandler } from '../middleware/errorHandler'
+import * as stripeConnect from '../services/stripeConnect'
 
 vi.mock('../services/email', async (importOriginal) => {
   const actual = await importOriginal<Record<string, unknown>>()
@@ -98,6 +99,54 @@ async function seedCharge(f: any, type: string, amount: number, dueDate: string)
 beforeEach(async () => {
   await cleanupAllSchema()
   process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_jwt_secret_fifo'
+  ;(stripeConnect.createRentPlatformCharge as any).mockClear()
+})
+
+// S562: the lump pay-balance charge must include the tenant-borne processing
+// fee (else GAM eats Stripe's cost on every FIFO payment). Fee computed once on
+// the whole lump (single capped ACH transaction), resolved from the first row's
+// property allocation rule.
+describe('S562 POST /payments/pay-balance — processing-fee collection', () => {
+  async function ruleFixture(ach: 'tenant' | 'landlord') {
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      const ll = await seedLandlord(client)
+      const propertyId = await seedProperty(client, { landlordId: ll.landlordId, ownerUserId: ll.userId, managedByUserId: ll.userId })
+      await seedAllocationRule(client, { propertyId, achFeePayer: ach, cardFeePayer: 'tenant' })
+      const unitId = await seedUnit(client, { propertyId, landlordId: ll.landlordId, withLateFeeDecision: true })
+      const tenantId = await seedTenant(client)
+      const tu = await client.query<{ user_id: string }>(`SELECT user_id FROM tenants WHERE id=$1`, [tenantId])
+      await client.query(`UPDATE tenants SET stripe_customer_id='cus_test_fifo' WHERE id=$1`, [tenantId])
+      const leaseId = await seedLease(client, { unitId, landlordId: ll.landlordId, rentAmount: 440 })
+      await seedLeaseTenant(client, { leaseId, tenantId })
+      await client.query('COMMIT')
+      return { ...ll, propertyId, unitId, tenantId, tenantUserId: tu.rows[0].user_id, leaseId }
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+  }
+
+  it('tenant pays fee → lump charge = balance + 1% ACH fee', async () => {
+    const f = await ruleFixture('tenant')
+    await seedCharge(f, 'rent', 440, '2026-07-01')
+    const res = await request(buildApp())
+      .post('/api/payments/pay-balance')
+      .set('Authorization', `Bearer ${tenantToken(f.tenantUserId, f.tenantId)}`)
+      .send({ amount: 440, paymentMethodId: 'pm_test', paymentMethodType: 'ach' })
+    expect(res.status).toBe(200)
+    // 1% of 440 = $4.40 (under the $6 cap)
+    expect((stripeConnect.createRentPlatformCharge as any).mock.calls[0][0].amount).toBeCloseTo(444.40, 2)
+  })
+
+  it('landlord pays fee → lump charge = balance only', async () => {
+    const f = await ruleFixture('landlord')
+    await seedCharge(f, 'rent', 440, '2026-07-01')
+    const res = await request(buildApp())
+      .post('/api/payments/pay-balance')
+      .set('Authorization', `Bearer ${tenantToken(f.tenantUserId, f.tenantId)}`)
+      .send({ amount: 440, paymentMethodId: 'pm_test', paymentMethodType: 'ach' })
+    expect(res.status).toBe(200)
+    expect((stripeConnect.createRentPlatformCharge as any).mock.calls[0][0].amount).toBeCloseTo(440, 2)
+  })
 })
 
 describe('S537 POST /payments/pay-balance — FIFO application', () => {
@@ -182,7 +231,7 @@ describe('S537 POST /payments/pay-balance — FIFO application', () => {
       data: { object: {
         id: 'pi_fifo_test',
         metadata: { gam_remittance_id: remittanceId, tenant_id: f.tenantId, landlord_id: f.landlordId },
-        charges: { data: [{ id: 'ch_mock', payment_method_details: { type: 'us_bank_account' } }] },
+        latest_charge: { id: 'ch_mock', payment_method_details: { type: 'us_bank_account' } }, // S560: modern Stripe shape
       } },
     }
     const hook = await request(app)
@@ -276,7 +325,7 @@ describe('S539 GET /payments/remittances — per-line application display', () =
       data: { object: {
         id: 'pi_fifo_test',
         metadata: { gam_remittance_id: remittanceId, tenant_id: f.tenantId, landlord_id: f.landlordId },
-        charges: { data: [{ id: 'ch_mock', payment_method_details: { type: 'us_bank_account' } }] },
+        latest_charge: { id: 'ch_mock', payment_method_details: { type: 'us_bank_account' } }, // S560: modern Stripe shape
       } },
     }
     const hook = await request(app)

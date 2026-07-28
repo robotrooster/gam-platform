@@ -311,60 +311,10 @@ describe('POST /api/properties/:id/fee-schedule', () => {
   })
 })
 
-describe('deposit-multipliers (S556)', () => {
-  it('upsert + list + delete per unit type', async () => {
-    const f = await seedPropsFixture()
-    const propId = (await createProperty(f)).body.data.id
-
-    const put = await request(buildApp())
-      .put(`/api/properties/${propId}/deposit-multipliers`)
-      .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ unitType: 'mobile_home', multiplier: 1.5 })
-    expect(put.status).toBe(200)
-    expect(Number(put.body.data.deposit_multiplier)).toBe(1.5)
-
-    // re-PUT same unit type → upsert (one row)
-    await request(buildApp())
-      .put(`/api/properties/${propId}/deposit-multipliers`)
-      .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ unitType: 'mobile_home', multiplier: 2 })
-    const list = await request(buildApp())
-      .get(`/api/properties/${propId}/deposit-multipliers`)
-      .set('Authorization', `Bearer ${f.landlordToken}`)
-    expect(list.body.data.length).toBe(1)
-    expect(Number(list.body.data[0].deposit_multiplier)).toBe(2)
-
-    const del = await request(buildApp())
-      .delete(`/api/properties/${propId}/deposit-multipliers/mobile_home`)
-      .set('Authorization', `Bearer ${f.landlordToken}`)
-    expect(del.status).toBe(200)
-    const after = await request(buildApp())
-      .get(`/api/properties/${propId}/deposit-multipliers`)
-      .set('Authorization', `Bearer ${f.landlordToken}`)
-    expect(after.body.data.length).toBe(0)
-  })
-
-  it('rejects out-of-range multiplier', async () => {
-    const f = await seedPropsFixture()
-    const propId = (await createProperty(f)).body.data.id
-    const res = await request(buildApp())
-      .put(`/api/properties/${propId}/deposit-multipliers`)
-      .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ unitType: 'apartment', multiplier: 99 })
-    expect(res.status).toBe(400)
-  })
-
-  it('cross-landlord → 403', async () => {
-    const a = await seedPropsFixture()
-    const b = await seedPropsFixture()
-    const bProp = (await createProperty(b)).body.data.id
-    const res = await request(buildApp())
-      .put(`/api/properties/${bProp}/deposit-multipliers`)
-      .set('Authorization', `Bearer ${a.landlordToken}`)
-      .send({ unitType: 'apartment', multiplier: 1.5 })
-    expect(res.status).toBe(403)
-  })
-})
+// S558: the deposit-multiplier CRUD (S556 property_unit_type_deposits) was
+// removed — the deposit multiplier is now a lease term on the template
+// (lease_templates.deposit_months). Coverage moved to esign.test.ts
+// "auto-populate from unit (S556/S558)".
 
 describe('PATCH /api/properties/:id — late-fee accrual all-or-nothing', () => {
   it('partial accrual config (amount only, no type/period) → 400', async () => {

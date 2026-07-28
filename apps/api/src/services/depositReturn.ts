@@ -595,6 +595,27 @@ export async function finalizeDepositReturn(
           WHERE id = ANY($1::uuid[])`,
         [sweptPaymentIds, draftId],
       )
+
+      // S561: if any swept row was a reopened-after-reversal rent, close its
+      // reversal here too. Otherwise the receivable stays open and GAM could
+      // still net/ACH-pull it from the landlord while the tenant's deposit has
+      // already made the landlord whole = double-recovery. Same resolution as a
+      // tenant re-payment (GAM keeps / cancels a pending clawback). (The rare
+      // landlord-already-clawed-back-before-move-out case returns true =
+      // re-disburse; the deposit path doesn't re-transfer, so that edge is left
+      // to the over-recovery admin alert — full re-disburse-from-deposit is a
+      // post-launch refinement.)
+      const reversalRows = await client.query<{ reversal_id: string }>(
+        `SELECT DISTINCT reversal_id FROM payments
+          WHERE id = ANY($1::uuid[]) AND reversal_id IS NOT NULL`,
+        [sweptPaymentIds],
+      )
+      if (reversalRows.rows.length > 0) {
+        const { resolveReversalOnTenantPayment } = await import('./paymentReversal')
+        for (const rr of reversalRows.rows) {
+          await resolveReversalOnTenantPayment(client, rr.reversal_id)
+        }
+      }
     }
 
     // S548: settle the final utility bills from the deposit — one

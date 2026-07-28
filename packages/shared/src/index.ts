@@ -280,6 +280,35 @@ export const DWELLING_OWNERSHIP_LABEL: Record<DwellingOwnership, string> = {
   tenant:   'Tenant-owned',
 }
 
+// S558 (Nic): per-unit occupancy mode. whole_unit = one lease, co-tenants share
+// it (default safeguard). by_room = independent stacked leases, one per person,
+// capped at 2×bedrooms (dorms / by-the-room rentals). See migration
+// 20260726101000.
+export const OCCUPANCY_MODES = ['whole_unit', 'by_room'] as const
+export type OccupancyMode = typeof OCCUPANCY_MODES[number]
+export const OCCUPANCY_MODE_LABEL: Record<OccupancyMode, string> = {
+  whole_unit: 'Whole unit (one lease)',
+  by_room:    'By the room (separate leases)',
+}
+// People-per-bedroom cap for by_room stacking.
+export const BY_ROOM_LEASES_PER_BEDROOM = 2
+
+// S558 (Nic): late-fee lease-document field columns. These boxes are populated
+// from the per-(property, unit_type) late-fee POLICY (S535/S537) and stamped
+// onto the drafted lease — the landlord must NOT be able to change the value,
+// rebind, or delete them (that's how an off-policy / illegal charge would enter
+// a signed lease). The template editor locks any field bound to one of these.
+export const LATE_FEE_LEASE_COLUMNS = [
+  'late_fee_grace_days',
+  'late_fee_initial_flat', 'late_fee_initial_percent',
+  'late_fee_accrual_flat_daily', 'late_fee_accrual_flat_weekly', 'late_fee_accrual_flat_monthly',
+  'late_fee_accrual_percent_daily', 'late_fee_accrual_percent_weekly', 'late_fee_accrual_percent_monthly',
+  'late_fee_cap_flat', 'late_fee_cap_percent',
+] as const
+export function isLateFeeColumn(col: string | null | undefined): boolean {
+  return !!col && (LATE_FEE_LEASE_COLUMNS as readonly string[]).includes(col)
+}
+
 // Park-owned RV rented as a unit: the site areas PLUS the rig itself.
 // An RV never gets bedroom areas, no matter who owns it.
 export const RV_UNIT_INSPECTION_AREAS: readonly InspectionChecklistArea[] = [
@@ -960,6 +989,7 @@ export const ONSITE_MANAGER_SUB_PERMISSIONS = [
   'guests.check_in',
   'guests.check_out',
   'units.view_status',
+  'utility.read_meters',
   'bulletin.view',
 ] as const
 export type OnsiteManagerSubPermission = typeof ONSITE_MANAGER_SUB_PERMISSIONS[number]
@@ -1022,6 +1052,7 @@ export const SUB_PERMISSION_LABEL: Record<AnySubPermission, string> = {
   'guests.check_in':                   'Check guests in',
   'guests.check_out':                  'Check guests out',
   'units.view_status':                 'View unit status',
+  'utility.read_meters':               'Enter meter readings',
   // maintenance
   'work_orders.create':                'Create work orders',
   'work_orders.complete':              'Complete work orders',
@@ -3101,6 +3132,10 @@ export const PROCESSING_FEES = {
 } as const
 
 export const PLATFORM_FEES = {
+  // @deprecated S561 — RETIRED pre-launch tiers. The LIVE landlord fee is
+  // LAUNCH_PLATFORM_FEE.PER_OCCUPIED_UNIT ($2/occupied unit, $10/property min).
+  // No remaining callers (calcNetPerUnit now uses the live model); kept only so
+  // any stray reference still resolves. Do NOT use for new fee math.
   ACTIVE_UNIT:     15.00,
   DIRECT_PAY_UNIT: 5.00,
   VACANT_UNIT:     0.00,
@@ -3249,7 +3284,10 @@ export function calcStripePerUnit(rentAmount: number) {
 
 export function calcNetPerUnit(rentAmount: number, reserveRate: number) {
   const stripe = calcStripePerUnit(rentAmount)
-  const gross  = PLATFORM_FEES.ACTIVE_UNIT
+  // S561: retired the stale pre-launch $15 tier (PLATFORM_FEES.ACTIVE_UNIT).
+  // The live landlord fee is the flat $2/occupied-unit launch model, so reserve
+  // + admin-income math must use it (walkthrough #34).
+  const gross  = LAUNCH_PLATFORM_FEE.PER_OCCUPIED_UNIT
   const netBR  = gross - stripe.total
   const reserve = netBR * reserveRate
   return { gross, stripe: stripe.total, netBR, reserve, netKept: netBR - reserve }
@@ -3320,8 +3358,40 @@ export const PAYMENT_TYPES = ['rent', 'fee', 'deposit', 'utility', 'float_fee', 
 export type PaymentType = typeof PAYMENT_TYPES[number]
 
 // NACHA CCD/PPD entry description field — uppercase, max 10 chars per spec.
-export const PAYMENT_ENTRY_DESCRIPTIONS = ['RENT', 'SUBSCRIP', 'DEPOSIT', 'UTILITY', 'ONTIMEPAY', 'LATEFEE', 'PROPANE'] as const
+// S561: 'RETURNFEE' (9 chars) added for the pass-through Stripe reversal fee
+// ($4 ACH / $15 card) billed to the tenant on a post-settlement reversal.
+// S562: 'MANUALPAY' (9 chars) for the $10 manual-payment fee; 'FLEXPAY' added
+// to close a long-standing drift (the DB CHECK always carried it).
+export const PAYMENT_ENTRY_DESCRIPTIONS = ['RENT', 'SUBSCRIP', 'DEPOSIT', 'UTILITY', 'ONTIMEPAY', 'LATEFEE', 'FLEXPAY', 'PROPANE', 'RETURNFEE', 'MANUALPAY'] as const
 export type PaymentEntryDescription = typeof PAYMENT_ENTRY_DESCRIPTIONS[number]
+
+// S562: manual (off-platform) rent payment recording. A landlord/staff records
+// receipt of cash/check/money-order; the rent row is marked settled with
+// platform_held=false (GAM disburses nothing — the landlord already holds the
+// cash). Each manual payment carries a flat fee EXCEPT the tenant's first rent
+// payment on the lease (waived to give them time to onboard ACH). The fee is
+// GAM revenue (a tenant-owed type='fee' row, entry_description 'MANUALPAY').
+export const MANUAL_PAYMENT_METHODS = ['cash', 'check', 'money_order'] as const
+export type ManualPaymentMethod = typeof MANUAL_PAYMENT_METHODS[number]
+export const MANUAL_PAYMENT_METHOD_LABELS: Record<ManualPaymentMethod, string> = {
+  cash: 'Cash', check: 'Check', money_order: 'Money order',
+}
+export const MANUAL_PAYMENT_FEE = 10.00
+
+// Friendly labels for NACHA entry-description codes shown to tenants (no raw
+// enums in the UI). Codes that just restate the payment type (RENT/DEPOSIT/…)
+// are omitted — callers already hide those; only the fee-style codes need a
+// human name. `humanizeEntryDescription` falls back to the raw code.
+export const PAYMENT_ENTRY_DESCRIPTION_LABELS: Partial<Record<PaymentEntryDescription, string>> = {
+  LATEFEE:   'Late fee',
+  RETURNFEE: 'Returned-payment fee',
+  MANUALPAY: 'Manual-payment fee',
+  ONTIMEPAY: 'On-time pay',
+  FLEXPAY:   'FlexPay',
+}
+export function humanizeEntryDescription(code: string): string {
+  return PAYMENT_ENTRY_DESCRIPTION_LABELS[code as PaymentEntryDescription] ?? code
+}
 
 export const DISBURSEMENT_STATUSES = ['pending', 'processing', 'settled', 'failed'] as const
 export type DisbursementStatus = typeof DISBURSEMENT_STATUSES[number]
@@ -4381,6 +4451,54 @@ export const METER_USAGE_ALERT_THRESHOLDS: Record<string, number | null> = {
 export const METER_DOUBLE_CHECK_MIN = 6
 export const METER_DOUBLE_CHECK_TOLERANCE = 2
 
+// Meter-read reasons (Nic, S559). Every reading carries a reason so we
+// know whether it's billing-intent or a pure reference/baseline read, and
+// so the audit trail records WHY a spot was read off-cycle. Two of these
+// are auto-stamped by the system and never chosen by a person:
+//   monthly_cycle  — the last-business-day reading run (BILLS via the
+//                    tenant-responsibility gate).
+//   stay_turnover  — a short-term / utilities-included departure detected
+//                    off the calendar (REFERENCE only; resets the baseline
+//                    so the departing guest's usage stays off the next
+//                    arrival's bill).
+//   move_out_final — a departing lease where the tenant IS responsible for
+//                    the utility, detected off the calendar (BILLS).
+// Only the last two are ever picked from a dropdown by front desk:
+//   meter_replaced — swapped/new meter; sets a fresh baseline, NEVER bills.
+//   other          — catch-all reference read (free-text note), NEVER bills.
+export const METER_READ_REASONS = [
+  'monthly_cycle',
+  'stay_turnover',
+  'move_out_final',
+  'meter_replaced',
+  'other',
+] as const
+export type MeterReadReason = typeof METER_READ_REASONS[number]
+
+// Reasons the reading is billing-INTENT (still subject to the per-lease
+// tenant-responsibility gate before an actual bill is generated). Every
+// other reason is reference/baseline only and never bills.
+export const METER_READ_BILLING_REASONS: readonly MeterReadReason[] = [
+  'monthly_cycle',
+  'move_out_final',
+] as const
+
+// Reasons a person may pick when initiating an ad-hoc read. The auto
+// reasons (monthly_cycle / stay_turnover / move_out_final) are stamped by
+// the system from the calendar and never surface in the dropdown.
+export const METER_READ_MANUAL_REASONS: readonly MeterReadReason[] = [
+  'meter_replaced',
+  'other',
+] as const
+
+export const METER_READ_REASON_LABEL: Record<MeterReadReason, string> = {
+  monthly_cycle:  'Monthly cycle',
+  stay_turnover:  'Stay turnover',
+  move_out_final: 'Move-out (final read)',
+  meter_replaced: 'Meter replaced',
+  other:          'Other',
+}
+
 // ── Propane tank fills (Nic, S533) ───────────────────────────────────────────
 // RV gas is propane TANK FILLS, not metered usage (natural gas on
 // single-family is direct-billed by the utility; a metered-gas billback
@@ -4496,3 +4614,34 @@ export function benefitScheduleToDay(s: BenefitSchedule, fixedDay?: number | nul
     case 'fixed_day':  return fixedDay ?? null
   }
 }
+
+// ── S561: post-settlement payment reversals (money-flow platform-holds) ─
+// A payment that already SETTLED and batched to the landlord, then reverses
+// (late ACH unauthorized/return up to 60d, or a card chargeback). Drives the
+// reopen-the-tenant + reclaim-from-the-landlord receivable engine. See
+// MONEY_FLOW_REBUILD_SPEC.md + memory gam-money-flow-platform-holds (D4).
+export const PAYMENT_REVERSAL_TYPE_VALUES = ['ach_return', 'ach_unauthorized', 'card_dispute'] as const
+export type PaymentReversalType = typeof PAYMENT_REVERSAL_TYPE_VALUES[number]
+
+// How GAM reclaims the reversed rent FROM the already-paid landlord.
+// null until the 7-day guaranteed-lease influx check decides.
+export const PAYMENT_REVERSAL_RECOVERY_METHOD_VALUES = ['netting', 'ach_pull'] as const
+export type PaymentReversalRecoveryMethod = typeof PAYMENT_REVERSAL_RECOVERY_METHOD_VALUES[number]
+
+// pending → (scheduled_netting | recovered | not_needed). not_needed = the
+// tenant re-paid before we clawed anything back, so the landlord is undisturbed.
+export const PAYMENT_REVERSAL_RECOVERY_STATUS_VALUES = ['pending', 'scheduled_netting', 'recovered', 'not_needed'] as const
+export type PaymentReversalRecoveryStatus = typeof PAYMENT_REVERSAL_RECOVERY_STATUS_VALUES[number]
+
+// tenant_paid → GAM whole + keeps late fee/reversal fee; landlord_clawback →
+// landlord ate it, pursues tenant, late fee reverts to landlord.
+export const PAYMENT_REVERSAL_OUTCOME_VALUES = ['tenant_paid', 'landlord_clawback', 'written_off'] as const
+export type PaymentReversalOutcome = typeof PAYMENT_REVERSAL_OUTCOME_VALUES[number]
+
+// Who ultimately owns the reversal-lateness late fee (Participation Agreement
+// assignment): 'gam' when the tenant makes good, 'landlord' when they clawed back.
+export const PAYMENT_REVERSAL_LATE_FEE_OWNER_VALUES = ['gam', 'landlord'] as const
+export type PaymentReversalLateFeeOwner = typeof PAYMENT_REVERSAL_LATE_FEE_OWNER_VALUES[number]
+
+export const PAYMENT_REVERSAL_STATUS_VALUES = ['open', 'recovering', 'resolved'] as const
+export type PaymentReversalStatus = typeof PAYMENT_REVERSAL_STATUS_VALUES[number]

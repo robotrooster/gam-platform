@@ -305,8 +305,9 @@ function round2(n: number): number {
 //
 // Sweeps every unbilled screening_fee_accruals row (billed_at IS NULL) into
 // platform revenue: one ledger entry per landlord covering the batch sum of
-// compliance fees ($5/screening) + capped-state shortfalls. Runs with the
-// monthly platform-fee cron; also safe to run ad hoc.
+// the landlord screening charge (S561: Checkr cost passed through + $5 margin).
+// Runs with the monthly platform-fee cron; also safe to run ad hoc. (Moves to
+// disbursement-netting under the money-flow rebuild — gam-money-flow-platform-holds.)
 //
 // Ledger type reuses 'platform_fee_subscription' (the CHECK-constrained
 // enum predates the shared single-source rule; screening fees ARE platform
@@ -335,15 +336,17 @@ export async function processScreeningFeeSweep(): Promise<ScreeningSweepResult> 
     const client = await getClient()
     try {
       await client.query('BEGIN')
-      const rows = await client.query<{ id: string; compliance_fee: string; shortfall: string }>(
-        `SELECT id, compliance_fee, shortfall FROM screening_fee_accruals
+      const rows = await client.query<{ id: string; standard_total: string; compliance_fee: string }>(
+        `SELECT id, standard_total, compliance_fee FROM screening_fee_accruals
           WHERE landlord_id = $1 AND billed_at IS NULL
           FOR UPDATE`,
         [landlord_id]
       )
       if (rows.rowCount === 0) { await client.query('ROLLBACK'); client.release(); continue }
+      // S561: landlord owes standard_total (Checkr cost passed through) +
+      // compliance_fee (GAM's $5 margin). (shortfall retired — always 0.)
       const total = round2(rows.rows.reduce(
-        (s, r) => s + parseFloat(r.compliance_fee) + parseFloat(r.shortfall), 0))
+        (s, r) => s + parseFloat(r.standard_total) + parseFloat(r.compliance_fee), 0))
 
       await client.query(`SELECT pg_advisory_xact_lock(hashtextextended('platform_revenue', 0))`)
       const prev = await client.query<{ balance_after: string }>(
@@ -359,7 +362,7 @@ export async function processScreeningFeeSweep(): Promise<ScreeningSweepResult> 
         RETURNING id
       `, [
         total, round2(prevBal + total), landlord_id,
-        `Screening fees: ${rows.rowCount} check(s) — compliance fees + capped-state shortfalls`,
+        `Screening fees: ${rows.rowCount} check(s) — Checkr cost + $5 margin`,
       ])
 
       await client.query(

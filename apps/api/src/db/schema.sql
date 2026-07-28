@@ -21,7 +21,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict OrGRr35Gq5e0XRPGrsQyCWNxdHrhndYZ7vYt7EOqlPSyU13sF6bsj2HQjhz34PK
+\restrict ITvGT4QAQVRrLYdv8THtwUbXw9aiu1xQbEjM2beEr2yhMyiGE8wj0omXBOY6wNu
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -3419,6 +3419,7 @@ CREATE TABLE public.landlords (
     connect_charges_enabled boolean DEFAULT false NOT NULL,
     connect_payouts_enabled boolean DEFAULT false NOT NULL,
     connect_details_submitted boolean DEFAULT false NOT NULL,
+    adverse_action_template text,
     CONSTRAINT landlords_background_provider_check CHECK ((background_provider = ANY (ARRAY['mock'::text, 'checkr'::text]))),
     CONSTRAINT landlords_default_ach_fee_payer_check CHECK ((default_ach_fee_payer = ANY (ARRAY['landlord'::text, 'tenant'::text]))),
     CONSTRAINT landlords_network_tier_check CHECK ((network_tier = 'tier_2_full'::text)),
@@ -3690,6 +3691,11 @@ CREATE TABLE public.lease_templates (
     updated_at timestamp with time zone DEFAULT now(),
     unit_type text,
     property_id uuid,
+    deposit_months numeric(5,2),
+    default_term_months integer,
+    is_unit_type_default boolean DEFAULT false NOT NULL,
+    CONSTRAINT lease_templates_default_term_months_check CHECK (((default_term_months IS NULL) OR ((default_term_months >= 1) AND (default_term_months <= 120)))),
+    CONSTRAINT lease_templates_deposit_months_check CHECK (((deposit_months IS NULL) OR ((deposit_months >= (0)::numeric) AND (deposit_months <= (12)::numeric)))),
     CONSTRAINT lease_templates_unit_type_check CHECK (((unit_type IS NULL) OR (unit_type = ANY (ARRAY['apartment'::text, 'single_family'::text, 'rv_spot'::text, 'mobile_home'::text, 'hotel_room'::text, 'storage'::text, 'commercial'::text]))))
 );
 
@@ -4095,6 +4101,42 @@ CREATE TABLE public.parts_inventory (
 
 
 --
+-- Name: payment_reversals; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.payment_reversals (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    payment_id uuid NOT NULL,
+    landlord_id uuid,
+    tenant_id uuid,
+    lease_id uuid,
+    reversal_type text NOT NULL,
+    reversed_amount numeric(10,2) NOT NULL,
+    reversal_fee numeric(10,2) DEFAULT 0 NOT NULL,
+    stripe_event_id text NOT NULL,
+    stripe_object_id text,
+    connect_dispute_id uuid,
+    raw_event jsonb NOT NULL,
+    recovery_method text,
+    recovery_status text DEFAULT 'pending'::text NOT NULL,
+    recovered_amount numeric(10,2) DEFAULT 0 NOT NULL,
+    recovered_at timestamp with time zone,
+    outcome text,
+    late_fee_owner text,
+    resolved_at timestamp with time zone,
+    status text DEFAULT 'open'::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT payment_reversals_late_fee_owner_check CHECK (((late_fee_owner IS NULL) OR (late_fee_owner = ANY (ARRAY['gam'::text, 'landlord'::text])))),
+    CONSTRAINT payment_reversals_outcome_check CHECK (((outcome IS NULL) OR (outcome = ANY (ARRAY['tenant_paid'::text, 'landlord_clawback'::text, 'written_off'::text])))),
+    CONSTRAINT payment_reversals_recovery_method_check CHECK (((recovery_method IS NULL) OR (recovery_method = ANY (ARRAY['netting'::text, 'ach_pull'::text])))),
+    CONSTRAINT payment_reversals_recovery_status_check CHECK ((recovery_status = ANY (ARRAY['pending'::text, 'scheduled_netting'::text, 'recovered'::text, 'not_needed'::text]))),
+    CONSTRAINT payment_reversals_status_check CHECK ((status = ANY (ARRAY['open'::text, 'recovering'::text, 'resolved'::text]))),
+    CONSTRAINT payment_reversals_type_check CHECK ((reversal_type = ANY (ARRAY['ach_return'::text, 'ach_unauthorized'::text, 'card_dispute'::text])))
+);
+
+
+--
 -- Name: payments; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -4133,8 +4175,11 @@ CREATE TABLE public.payments (
     imported_at timestamp with time zone,
     import_extra_data jsonb,
     is_remainder boolean DEFAULT false NOT NULL,
-    CONSTRAINT payments_entry_description_check CHECK ((entry_description = ANY (ARRAY['RENT'::text, 'SUBSCRIP'::text, 'DEPOSIT'::text, 'UTILITY'::text, 'ONTIMEPAY'::text, 'LATEFEE'::text, 'FLEXPAY'::text, 'PROPANE'::text]))),
+    reversal_id uuid,
+    manual_method text,
+    CONSTRAINT payments_entry_description_check CHECK ((entry_description = ANY (ARRAY['RENT'::text, 'SUBSCRIP'::text, 'DEPOSIT'::text, 'UTILITY'::text, 'ONTIMEPAY'::text, 'LATEFEE'::text, 'FLEXPAY'::text, 'PROPANE'::text, 'RETURNFEE'::text, 'MANUALPAY'::text]))),
     CONSTRAINT payments_gam_supersedence_amount_nonneg CHECK ((gam_supersedence_amount >= (0)::numeric)),
+    CONSTRAINT payments_manual_method_check CHECK (((manual_method IS NULL) OR (manual_method = ANY (ARRAY['cash'::text, 'check'::text, 'money_order'::text])))),
     CONSTRAINT payments_retry_count_check CHECK (((retry_count >= 0) AND (retry_count <= 2))),
     CONSTRAINT payments_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'processing'::text, 'settled'::text, 'failed'::text, 'returned'::text, 'paid_via_deposit'::text]))),
     CONSTRAINT payments_type_check CHECK ((type = ANY (ARRAY['rent'::text, 'fee'::text, 'deposit'::text, 'utility'::text, 'float_fee'::text, 'late_fee'::text, 'platform_fee'::text])))
@@ -4248,6 +4293,8 @@ CREATE TABLE public.pending_tenant_intents (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     unit_id uuid,
+    accepted_at timestamp with time zone,
+    draft_document_id uuid,
     CONSTRAINT pending_tenant_intents_parser_status_check CHECK ((parser_status = ANY (ARRAY['not_uploaded'::text, 'parsing'::text, 'parsed'::text, 'mismatch'::text, 'error'::text, 'resolved'::text])))
 );
 
@@ -5229,9 +5276,11 @@ CREATE TABLE public.properties (
     longitude numeric(9,6),
     address_verification text DEFAULT 'unverified'::text NOT NULL,
     address_verified_at timestamp with time zone,
+    default_occupancy_mode text DEFAULT 'whole_unit'::text NOT NULL,
     CONSTRAINT properties_address_verification_check CHECK ((address_verification = ANY (ARRAY['unverified'::text, 'geocoded'::text, 'parcel'::text]))),
     CONSTRAINT properties_booking_deposit_pct_range CHECK (((booking_deposit_pct >= (0)::numeric) AND (booking_deposit_pct <= (100)::numeric))),
     CONSTRAINT properties_booking_slug_format CHECK (((booking_slug IS NULL) OR ((booking_slug ~ '^[a-z0-9][a-z0-9-]{1,60}$'::text) AND (booking_slug !~ '--'::text)))),
+    CONSTRAINT properties_default_occupancy_mode_check CHECK ((default_occupancy_mode = ANY (ARRAY['whole_unit'::text, 'by_room'::text]))),
     CONSTRAINT properties_deposit_handling_mode_check CHECK ((deposit_handling_mode = ANY (ARRAY['gam_escrow'::text, 'landlord_held'::text]))),
     CONSTRAINT properties_deposit_interest_accrual_method_check CHECK ((deposit_interest_accrual_method = ANY (ARRAY['simple'::text, 'compound'::text]))),
     CONSTRAINT properties_deposit_interest_payment_cadence_check CHECK ((deposit_interest_payment_cadence = ANY (ARRAY['annual'::text, 'at_return'::text, 'on_anniversary'::text]))),
@@ -5472,22 +5521,6 @@ CREATE TABLE public.property_unit_subtypes (
     CONSTRAINT property_unit_subtypes_rv_amp_service_check CHECK ((rv_amp_service = ANY (ARRAY['none'::text, '30'::text, '50'::text, 'both'::text]))),
     CONSTRAINT property_unit_subtypes_rv_site_layout_check CHECK ((rv_site_layout = ANY (ARRAY['none'::text, 'back_in'::text, 'pull_through'::text]))),
     CONSTRAINT property_unit_subtypes_unit_type_check CHECK ((unit_type = ANY (ARRAY['apartment'::text, 'single_family'::text, 'rv_spot'::text, 'mobile_home'::text, 'hotel_room'::text, 'storage'::text, 'commercial'::text])))
-);
-
-
---
--- Name: property_unit_type_deposits; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.property_unit_type_deposits (
-    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
-    property_id uuid NOT NULL,
-    unit_type text NOT NULL,
-    deposit_multiplier numeric(5,2) DEFAULT 1.0 NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL,
-    updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT property_unit_type_deposits_multiplier_check CHECK (((deposit_multiplier >= (0)::numeric) AND (deposit_multiplier <= (12)::numeric))),
-    CONSTRAINT property_unit_type_deposits_unit_type_check CHECK ((unit_type = ANY (ARRAY['apartment'::text, 'single_family'::text, 'rv_spot'::text, 'mobile_home'::text, 'hotel_room'::text, 'storage'::text, 'commercial'::text])))
 );
 
 
@@ -6711,7 +6744,9 @@ CREATE TABLE public.units (
     storage_size text,
     subtype_id uuid,
     dwelling_ownership text DEFAULT 'landlord'::text NOT NULL,
+    occupancy_mode text DEFAULT 'whole_unit'::text NOT NULL,
     CONSTRAINT units_dwelling_ownership_check CHECK ((dwelling_ownership = ANY (ARRAY['landlord'::text, 'tenant'::text]))),
+    CONSTRAINT units_occupancy_mode_check CHECK ((occupancy_mode = ANY (ARRAY['whole_unit'::text, 'by_room'::text]))),
     CONSTRAINT units_rv_amp_service_check CHECK ((rv_amp_service = ANY (ARRAY['none'::text, '30'::text, '50'::text, 'both'::text]))),
     CONSTRAINT units_rv_site_layout_check CHECK ((rv_site_layout = ANY (ARRAY['none'::text, 'back_in'::text, 'pull_through'::text]))),
     CONSTRAINT units_status_check CHECK ((status = ANY (ARRAY['vacant'::text, 'available'::text, 'active'::text, 'delinquent'::text, 'suspended'::text]))),
@@ -6919,7 +6954,10 @@ CREATE TABLE public.utility_meter_readings (
     created_at timestamp with time zone DEFAULT now(),
     needs_review boolean DEFAULT false NOT NULL,
     review_note text,
-    is_rollover boolean DEFAULT false NOT NULL
+    is_rollover boolean DEFAULT false NOT NULL,
+    reason text DEFAULT 'monthly_cycle'::text NOT NULL,
+    reason_note text,
+    CONSTRAINT utility_meter_readings_reason_check CHECK ((reason = ANY (ARRAY['monthly_cycle'::text, 'stay_turnover'::text, 'move_out_final'::text, 'meter_replaced'::text, 'other'::text])))
 );
 
 
@@ -6951,7 +6989,9 @@ CREATE TABLE public.utility_meters (
     updated_at timestamp with time zone DEFAULT now(),
     digits integer DEFAULT 6 NOT NULL,
     sewer_rate_per_unit numeric,
-    CONSTRAINT utility_meters_billing_method_check CHECK ((billing_method = ANY (ARRAY['submeter'::text, 'rubs'::text, 'master_bill_to_landlord'::text]))),
+    out_of_service boolean DEFAULT false NOT NULL,
+    out_of_service_since date,
+    CONSTRAINT utility_meters_billing_method_check CHECK ((billing_method = ANY (ARRAY['submeter'::text, 'rubs'::text, 'master_bill_to_landlord'::text, 'flat_rate'::text]))),
     CONSTRAINT utility_meters_check CHECK ((((billing_method = 'rubs'::text) AND (rubs_allocation_method IS NOT NULL)) OR ((billing_method <> 'rubs'::text) AND (rubs_allocation_method IS NULL)))),
     CONSTRAINT utility_meters_digits_check CHECK ((digits = ANY (ARRAY[4, 5, 6, 7, 8]))),
     CONSTRAINT utility_meters_rubs_allocation_method_check CHECK ((rubs_allocation_method = ANY (ARRAY['occupant_count'::text, 'sqft'::text, 'bedrooms'::text, 'equal_split'::text]))),
@@ -8550,6 +8590,22 @@ ALTER TABLE ONLY public.parts_inventory
 
 
 --
+-- Name: payment_reversals payment_reversals_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_reversals
+    ADD CONSTRAINT payment_reversals_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: payment_reversals payment_reversals_stripe_event_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_reversals
+    ADD CONSTRAINT payment_reversals_stripe_event_id_key UNIQUE (stripe_event_id);
+
+
+--
 -- Name: payments payments_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -9115,22 +9171,6 @@ ALTER TABLE ONLY public.property_unit_subtypes
 
 ALTER TABLE ONLY public.property_unit_subtypes
     ADD CONSTRAINT property_unit_subtypes_property_id_unit_type_name_key UNIQUE (property_id, unit_type, name);
-
-
---
--- Name: property_unit_type_deposits property_unit_type_deposits_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.property_unit_type_deposits
-    ADD CONSTRAINT property_unit_type_deposits_pkey PRIMARY KEY (id);
-
-
---
--- Name: property_unit_type_deposits property_unit_type_deposits_uniq; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.property_unit_type_deposits
-    ADD CONSTRAINT property_unit_type_deposits_uniq UNIQUE (property_id, unit_type);
 
 
 --
@@ -9715,14 +9755,6 @@ ALTER TABLE ONLY public.utility_bills
 
 ALTER TABLE ONLY public.utility_bills
     ADD CONSTRAINT utility_bills_pkey PRIMARY KEY (id);
-
-
---
--- Name: utility_meter_readings utility_meter_readings_meter_id_billing_cycle_month_key; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.utility_meter_readings
-    ADD CONSTRAINT utility_meter_readings_meter_id_billing_cycle_month_key UNIQUE (meter_id, billing_cycle_month);
 
 
 --
@@ -11661,6 +11693,34 @@ CREATE INDEX idx_parts_inventory_landlord_name ON public.parts_inventory USING b
 
 
 --
+-- Name: idx_payment_reversals_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_payment_reversals_landlord ON public.payment_reversals USING btree (landlord_id) WHERE (status <> 'resolved'::text);
+
+
+--
+-- Name: idx_payment_reversals_payment; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_payment_reversals_payment ON public.payment_reversals USING btree (payment_id);
+
+
+--
+-- Name: idx_payment_reversals_recovery; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_payment_reversals_recovery ON public.payment_reversals USING btree (recovery_status) WHERE (status <> 'resolved'::text);
+
+
+--
+-- Name: idx_payment_reversals_tenant; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_payment_reversals_tenant ON public.payment_reversals USING btree (tenant_id);
+
+
+--
 -- Name: idx_payments_ach_retry_due; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -11707,6 +11767,13 @@ CREATE INDEX idx_payments_lease_fee_id ON public.payments USING btree (lease_fee
 --
 
 CREATE INDEX idx_payments_platform_held_landlord ON public.payments USING btree (landlord_id) WHERE (platform_held = true);
+
+
+--
+-- Name: idx_payments_reversal_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_payments_reversal_id ON public.payments USING btree (reversal_id) WHERE (reversal_id IS NOT NULL);
 
 
 --
@@ -13096,6 +13163,13 @@ CREATE UNIQUE INDEX landlords_stripe_connect_account_id_uniq ON public.landlords
 
 
 --
+-- Name: lease_templates_unit_type_default_lookup; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX lease_templates_unit_type_default_lookup ON public.lease_templates USING btree (landlord_id, unit_type) WHERE is_unit_type_default;
+
+
+--
 -- Name: lease_tenants_active_unique; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -13352,6 +13426,20 @@ CREATE UNIQUE INDEX units_property_unit_number_uniq ON public.units USING btree 
 --
 
 CREATE UNIQUE INDEX uq_business_wo_time_entries_one_running ON public.business_work_order_time_entries USING btree (work_order_id, user_id) WHERE (ended_at IS NULL);
+
+
+--
+-- Name: utility_meter_readings_meter_time_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX utility_meter_readings_meter_time_idx ON public.utility_meter_readings USING btree (meter_id, reading_date DESC, created_at DESC);
+
+
+--
+-- Name: utility_meter_readings_one_cycle_read_per_month; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX utility_meter_readings_one_cycle_read_per_month ON public.utility_meter_readings USING btree (meter_id, billing_cycle_month) WHERE (reason = 'monthly_cycle'::text);
 
 
 --
@@ -17154,6 +17242,22 @@ ALTER TABLE ONLY public.parts_inventory
 
 
 --
+-- Name: payment_reversals payment_reversals_connect_dispute_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_reversals
+    ADD CONSTRAINT payment_reversals_connect_dispute_id_fkey FOREIGN KEY (connect_dispute_id) REFERENCES public.connect_disputes(id);
+
+
+--
+-- Name: payment_reversals payment_reversals_payment_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payment_reversals
+    ADD CONSTRAINT payment_reversals_payment_id_fkey FOREIGN KEY (payment_id) REFERENCES public.payments(id);
+
+
+--
 -- Name: payments payments_invoice_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -17183,6 +17287,14 @@ ALTER TABLE ONLY public.payments
 
 ALTER TABLE ONLY public.payments
     ADD CONSTRAINT payments_lease_id_fkey FOREIGN KEY (lease_id) REFERENCES public.leases(id);
+
+
+--
+-- Name: payments payments_reversal_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.payments
+    ADD CONSTRAINT payments_reversal_id_fkey FOREIGN KEY (reversal_id) REFERENCES public.payment_reversals(id);
 
 
 --
@@ -17239,6 +17351,14 @@ ALTER TABLE ONLY public.payroll_runs
 
 ALTER TABLE ONLY public.payroll_runs
     ADD CONSTRAINT payroll_runs_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: pending_tenant_intents pending_tenant_intents_draft_document_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pending_tenant_intents
+    ADD CONSTRAINT pending_tenant_intents_draft_document_id_fkey FOREIGN KEY (draft_document_id) REFERENCES public.lease_documents(id) ON DELETE SET NULL;
 
 
 --
@@ -18167,14 +18287,6 @@ ALTER TABLE ONLY public.property_site_photos
 
 ALTER TABLE ONLY public.property_unit_subtypes
     ADD CONSTRAINT property_unit_subtypes_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE CASCADE;
-
-
---
--- Name: property_unit_type_deposits property_unit_type_deposits_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.property_unit_type_deposits
-    ADD CONSTRAINT property_unit_type_deposits_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE CASCADE;
 
 
 --
@@ -19245,5 +19357,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict OrGRr35Gq5e0XRPGrsQyCWNxdHrhndYZ7vYt7EOqlPSyU13sF6bsj2HQjhz34PK
+\unrestrict ITvGT4QAQVRrLYdv8THtwUbXw9aiu1xQbEjM2beEr2yhMyiGE8wj0omXBOY6wNu
 

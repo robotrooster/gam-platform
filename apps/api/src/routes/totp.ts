@@ -24,7 +24,7 @@
  * session from silently dropping the second factor.
  */
 
-import { Router } from 'express'
+import { Router, type Request, type Response, type NextFunction } from 'express'
 import { z } from 'zod'
 import bcrypt from 'bcryptjs'
 import jwt from 'jsonwebtoken'
@@ -64,6 +64,11 @@ export function signTotpSessionToken(payload: {
   /** S553: owner-memberships (multi-owner entities), carried through to
    *  the full JWT minted at verify. */
   landlordIds?: string[] | null
+  /** S560: business scope must survive TOTP too, or a business_owner/staff
+   *  who enables 2FA loses GAM Books access (requireBooksRead/Write gate on
+   *  businessId). Carried through to the full JWT minted at /verify. */
+  businessId?: string | null
+  staffRole?: string | null
   permissions?: unknown
 }): string {
   return jwt.sign(
@@ -73,8 +78,49 @@ export function signTotpSessionToken(payload: {
   )
 }
 
+const ENROLL_SESSION_TTL_SECONDS = 10 * 60   // 10 minutes to complete enrollment
+
+/**
+ * S560: enrollment-scoped session for a MANDATORY-TOTP user (admin/super_admin)
+ * who hasn't enrolled yet. Same claim shape as the full token (so /enroll-confirm
+ * can mint the full token once 2FA is set up) but `purpose: 'totp_enroll'` — so
+ * requireAuth REJECTS it everywhere except the enrollment endpoints below. This
+ * makes mandatory 2FA enforced server-side, not just by the client honoring the
+ * mustEnrollTotp flag: a raw API caller holding this token can ONLY enroll.
+ */
+export function signTotpEnrollToken(payload: object): string {
+  return jwt.sign(
+    { ...payload, purpose: 'totp_enroll' },
+    process.env.JWT_SECRET!,
+    { expiresIn: ENROLL_SESSION_TTL_SECONDS }
+  )
+}
+
+/**
+ * Accept a FULL session (voluntary enrollment from settings) OR an
+ * enrollment-scoped token (forced first-time enrollment). Used ONLY by the two
+ * enrollment endpoints. requireAuth continues to reject the enroll token — and
+ * the pending token — everywhere else.
+ */
+function requireEnrollable(req: Request, res: Response, next: NextFunction) {
+  const header = req.headers.authorization
+  if (!header?.startsWith('Bearer ')) {
+    return res.status(401).json({ success: false, error: 'No token provided' })
+  }
+  try {
+    const payload = jwt.verify(header.slice(7), process.env.JWT_SECRET!) as any
+    if (payload.purpose && payload.purpose !== 'totp_enroll') {
+      return res.status(401).json({ success: false, error: 'Invalid or expired token' })
+    }
+    ;(req as any).user = payload
+    next()
+  } catch {
+    return res.status(401).json({ success: false, error: 'Invalid or expired token' })
+  }
+}
+
 // ── POST /api/auth/totp/enroll-start ────────────────────────────
-totpRouter.post('/enroll-start', requireAuth, async (req, res, next) => {
+totpRouter.post('/enroll-start', requireEnrollable, async (req, res, next) => {
   try {
     const userId = (req as any).user.userId as string
     const user = await queryOne<{
@@ -140,9 +186,10 @@ const enrollConfirmSchema = z.object({
 })
 
 // ── POST /api/auth/totp/enroll-confirm ──────────────────────────
-totpRouter.post('/enroll-confirm', requireAuth, async (req, res, next) => {
+totpRouter.post('/enroll-confirm', requireEnrollable, async (req, res, next) => {
   try {
-    const userId = (req as any).user.userId as string
+    const sess = (req as any).user
+    const userId = sess.userId as string
     const { token } = enrollConfirmSchema.parse(req.body)
     const user = await queryOne<{
       totp_secret: string | null; totp_enabled: boolean
@@ -164,7 +211,21 @@ totpRouter.post('/enroll-confirm', requireAuth, async (req, res, next) => {
         WHERE id = $1`,
       [userId]
     )
-    res.json({ success: true, data: { message: 'Two-factor authentication enabled.' } })
+    // S560: 2FA is now set up, so upgrade the (possibly enrollment-scoped)
+    // session to a full token. The enroll token carries the same claims, so a
+    // just-enrolled admin gets a working session without re-login.
+    const fullToken = signFullToken({
+      userId,
+      role:        sess.role,
+      email:       sess.email,
+      profileId:   sess.profileId ?? null,
+      landlordId:  sess.landlordId ?? null,
+      landlordIds: sess.landlordIds ?? null,
+      businessId:  sess.businessId ?? null,
+      staffRole:   sess.staffRole ?? null,
+      permissions: sess.permissions ?? null,
+    })
+    res.json({ success: true, data: { message: 'Two-factor authentication enabled.', token: fullToken } })
   } catch (e) { next(e) }
 })
 
@@ -296,6 +357,8 @@ totpRouter.post('/verify', async (req, res, next) => {
       profileId:   session.profileId,
       landlordId:  session.landlordId ?? null,
       landlordIds: session.landlordIds ?? null,
+      businessId:  (session as any).businessId ?? null,
+      staffRole:   (session as any).staffRole ?? null,
       permissions: session.permissions ?? null,
     })
 

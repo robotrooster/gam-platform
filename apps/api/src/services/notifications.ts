@@ -83,6 +83,18 @@ export async function notifyRentCollected(o: { landlordUserId:string; landlordId
   await createNotification({ userId:o.landlordUserId, landlordId:o.landlordId, type:'rent_collected', title:`Rent Collected — Unit ${o.unitNumber}`, body:`${o.tenantName} paid $${o.amount.toFixed(2)} for Unit ${o.unitNumber} at ${o.propertyName}.`, data:o, sendEmail:true, emailTo:o.landlordEmail, emailSubject:`✅ Rent Collected — Unit ${o.unitNumber}`, emailHtml:emailTemplate(`Rent Collected — Unit ${o.unitNumber}`, `<b>${o.tenantName}</b> paid <b>$${o.amount.toFixed(2)}</b> for Unit ${o.unitNumber} at ${o.propertyName}.`)})
 }
 
+// S561: bold landlord alert when a tenant's already-paid rent REVERSES (late
+// ACH return/unauthorized or card chargeback). The landlord was paid on the
+// batch, so without this they'd read the reopened balance as a system glitch
+// and never act. Copy is generic — it points at "your lease and local law",
+// never legal direction (no-state-specific-legal-logic rule).
+export async function notifyRentReversed(o: { landlordUserId:string; landlordId:string; landlordEmail:string; landlordPhone?:string; tenantName:string; unitNumber:string; propertyName:string; amountOwed:number; actionUrl?:string }) {
+  const title = `⚠️ Rent Payment Reversed — Unit ${o.unitNumber}`
+  const plain = `${o.tenantName}'s rent payment for Unit ${o.unitNumber} at ${o.propertyName} was reversed by their bank. The invoice has been reopened automatically — they now owe $${o.amountOwed.toFixed(2)}. You may want to take action under your lease and local law.`
+  const html = `<b>${o.tenantName}</b>'s rent payment for Unit ${o.unitNumber} at ${o.propertyName} was <b>reversed</b> by their bank. The invoice has been reopened automatically — they now owe <b>$${o.amountOwed.toFixed(2)}</b>. You may want to take action under your lease and local law.`
+  await createNotification({ userId:o.landlordUserId, landlordId:o.landlordId, type:'rent_reversed', title, body:plain, data:o, actionUrl:o.actionUrl, sendEmail:true, emailTo:o.landlordEmail, emailSubject:title, emailHtml:emailTemplate(title, html) })
+}
+
 // S125: ACH retry-scheduled notification. Fires when a payment fails on a
 // retry-eligible NACHA code (R01 insufficient funds, R09 uncollected) and
 // retry_count < 2. Tenant gets the heads-up + retry date; landlord gets a

@@ -61,6 +61,13 @@ export function UnitDetailPage() {
     { onSuccess: () => { qc.invalidateQueries(['unit', id]); setActivateModal(false); setSchedLocal(''); setSchedChoice('now') } }
   )
   const cancelSchedMut = useMutation(() => apiPost('/units/' + id + '/cancel-scheduled-activation', {}), { onSuccess: () => qc.invalidateQueries(['unit', id]) })
+  // S558: flip this unit between whole-unit and by-room (authoritative per unit).
+  const [occError, setOccError] = useState('')
+  const occupancyModeMut = useMutation(
+    (m: string) => apiPatch('/units/' + id + '/occupancy-mode', { occupancyMode: m }),
+    { onSuccess: () => { setOccError(''); qc.invalidateQueries(['unit', id]) },
+      onError: (e: any) => setOccError(e?.response?.data?.message || e?.message || 'Could not change occupancy mode') },
+  )
 
   const { data: photos = [], refetch: refetchPhotos } = useQuery(['unit-photos', id], () => apiGet<any[]>('/properties/units/' + id + '/photos'))
 
@@ -190,6 +197,20 @@ export function UnitDetailPage() {
           <div className="card-title" style={{ marginBottom: 16 }}>Unit Details</div>
           <div className="data-row"><span className="data-key">Status</span><span className={'badge badge-' + (unit.status === 'active' ? 'green' : unit.status === 'vacant' ? 'muted' : 'amber')}>{humanize(unit.status)}</span></div>
           <div className="data-row"><span className="data-key">Type</span><span className="data-val">{UNIT_TYPE_LABEL[unit.unitType as UnitType] ?? unit.unitType}</span></div>
+          <div className="data-row">
+            <span className="data-key">Leasing</span>
+            {can('schedule.configure_unit') ? (
+              <select className="form-select" style={{ maxWidth: 220, fontSize: '.8rem', padding: '3px 8px' }}
+                value={unit.occupancyMode || 'whole_unit'}
+                onChange={e => occupancyModeMut.mutate(e.target.value)}>
+                <option value="whole_unit">Whole unit (one lease)</option>
+                <option value="by_room">By the room (separate leases)</option>
+              </select>
+            ) : (
+              <span className="data-val">{unit.occupancyMode === 'by_room' ? 'By the room' : 'Whole unit'}</span>
+            )}
+          </div>
+          {occError && <div style={{ color: 'var(--red)', fontSize: '.74rem', marginBottom: 6 }}>{occError}</div>}
           <div className="data-row"><span className="data-key">Rent</span><span className="data-val mono">{fmt(unit.rentAmount)}/mo</span></div>
           <div className="data-row"><span className="data-key">Deposit</span><span className="data-val mono">{fmt(unit.securityDeposit)}</span></div>
           {/* S527: type-appropriate facts — bedrooms only for bedroom types,

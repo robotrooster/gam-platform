@@ -30,6 +30,7 @@ import {
 import { logger } from '../lib/logger'
 import { checkAgainstStatute } from '../services/stateLaw'
 import { assertLateFeeDecisionForUnit, assertLateFeeDecision } from '../services/lateFeePolicy'
+import { assertUnitCanAcceptNewLease } from '../services/leaseOnboarding'
 import {
   recordValidateAttempt,
   recordCommitAttempt,
@@ -1186,6 +1187,137 @@ landlordsRouter.post('/me/onboard-tenant', requirePerm('tenants.onboard'), async
         activationUrl,
       },
     })
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    next(e)
+  } finally {
+    client.release()
+  }
+})
+
+
+// POST /api/landlords/me/onboard-new-lease-tenant (S558, Flow B — new lease)
+// Invite a person to a UNIT for a lease they will SIGN (vs onboard-tenant, which
+// migrates an already-signed paper lease). Unit-linked invite: the unit rides on
+// pending_tenant_intents.unit_id, so on accept the lease auto-drafts pre-filled
+// from the unit + its default template. NO lease row is created here — the
+// SIGNED e-sign document becomes the lease (lease-is-law). Co-tenants: call
+// again for the same unit before anyone signs (whole_unit) or per person up to
+// the 2×bedrooms cap (by_room). Adding a co-tenant voids any unsigned draft so
+// the roster re-drafts complete.
+landlordsRouter.post('/me/onboard-new-lease-tenant', requirePerm('tenants.onboard'), async (req, res, next) => {
+  const client = await getClient()
+  try {
+    const { firstName, lastName, email, phone, unitId } = req.body
+    if (!firstName || !lastName || !email || !phone) throw new AppError(400, 'firstName, lastName, email, phone required')
+    if (!unitId) throw new AppError(400, 'unitId required')
+    const emailNorm = String(email).trim().toLowerCase()
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailNorm)) throw new AppError(400, 'Invalid email format')
+
+    const landlordId = req.user!.profileId
+    const unit = await queryOne<any>(
+      `SELECT u.id, u.unit_number, u.property_id, u.landlord_id, u.rent_amount, u.occupancy_mode,
+              p.name AS property_name, p.street1, p.city, p.state, p.zip
+         FROM units u JOIN properties p ON p.id = u.property_id WHERE u.id = $1`, [unitId])
+    if (!unit) throw new AppError(404, 'Unit not found')
+    if (unit.landlord_id !== landlordId) throw new AppError(403, 'Unit not owned by this landlord')
+    // Gate: unit metrics (rent) must be set before inviting anyone to the unit.
+    if (unit.rent_amount == null || Number(unit.rent_amount) <= 0) {
+      throw new AppError(400, 'Set the unit’s rent before inviting a tenant to it.')
+    }
+    // S537: late-fee decision required for the unit's class before onboarding.
+    await assertLateFeeDecisionForUnit(unit.id)
+
+    // Cross-landlord conflict — refuse if this email is an active tenant elsewhere.
+    const existingUser = await queryOne<any>(
+      `SELECT u.id, t.id AS tenant_id FROM users u LEFT JOIN tenants t ON t.user_id = u.id WHERE u.email = $1`,
+      [emailNorm])
+    if (existingUser?.tenant_id) {
+      const otherLease = await queryOne<any>(
+        `SELECT l.landlord_id FROM lease_tenants lt JOIN leases l ON l.id = lt.lease_id
+          WHERE lt.tenant_id = $1 AND lt.status='active' AND l.status='active' AND l.landlord_id != $2 LIMIT 1`,
+        [existingUser.tenant_id, landlordId])
+      if (otherLease) throw new AppError(409, 'This email is already a tenant of another landlord. Cross-landlord onboarding requires a separate flow.')
+    }
+
+    await client.query('BEGIN')
+
+    // Occupancy-mode cap (whole_unit → 1 lease; by_room → 2×bedrooms leases).
+    await assertUnitCanAcceptNewLease(client, unitId)
+
+    // whole_unit repair: a new co-tenant invalidates any UNSIGNED draft for the
+    // unit (it's missing this person). Void it so the roster re-drafts complete
+    // on accept; block if a TENANT already signed (legally must supersede).
+    if (unit.occupancy_mode !== 'by_room') {
+      const draft = await client.query(
+        `SELECT draft_document_id FROM pending_tenant_intents
+          WHERE unit_id=$1 AND resolved_at IS NULL AND draft_document_id IS NOT NULL LIMIT 1`,
+        [unitId]).then((r: any) => r.rows[0])
+      if (draft?.draft_document_id) {
+        const tenantSigned = await client.query(
+          `SELECT 1 FROM lease_document_signers WHERE document_id=$1 AND signed_at IS NOT NULL AND role NOT IN ('landlord','witness') LIMIT 1`,
+          [draft.draft_document_id]).then((r: any) => r.rows[0])
+        if (tenantSigned) throw new AppError(409, 'A tenant has already signed the lease for this unit — void or supersede it before adding another person.')
+        await client.query(`UPDATE lease_documents SET status='voided', updated_at=NOW() WHERE id=$1 AND status NOT IN ('completed','voided')`, [draft.draft_document_id])
+        await client.query(`UPDATE pending_tenant_intents SET draft_document_id=NULL, updated_at=NOW() WHERE unit_id=$1 AND draft_document_id=$2`, [unitId, draft.draft_document_id])
+      }
+    }
+
+    // User (create or reuse).
+    let userId: string
+    if (existingUser) {
+      userId = existingUser.id
+    } else {
+      const u = await client.query(
+        `INSERT INTO users (email, password_hash, role, first_name, last_name, phone)
+         VALUES ($1, '$2b$10$placeholder_invite_pending', 'tenant', $2, $3, $4) RETURNING id`,
+        [emailNorm, firstName, lastName, phone])
+      userId = u.rows[0].id
+    }
+    // Invite token (7-day), reset acceptance state so a re-invite works.
+    const inviteToken = require('crypto').randomBytes(32).toString('hex')
+    await client.query(
+      `UPDATE users SET tenant_invite_token=$1, tenant_invite_expires_at=NOW()+INTERVAL '7 days', updated_at=NOW() WHERE id=$2`,
+      [inviteToken, userId])
+
+    // Tenant (create or reuse).
+    let tenantId: string
+    const existingTenant = await client.query('SELECT id FROM tenants WHERE user_id=$1', [userId])
+    if (existingTenant.rows.length) {
+      tenantId = existingTenant.rows[0].id
+      await client.query(`UPDATE tenants SET onboarding_source='onboarded' WHERE id=$1 AND onboarding_source != 'onboarded'`, [tenantId])
+    } else {
+      const t = await client.query(`INSERT INTO tenants (user_id, onboarding_source) VALUES ($1, 'onboarded') RETURNING id`, [userId])
+      tenantId = t.rows[0].id
+    }
+
+    // Unit-bound intent (the roster slot). One per tenant (UNIQUE) — re-invite
+    // updates it back to open on this unit.
+    await client.query(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, unit_id)
+       VALUES ($1, $2, 'not_uploaded', $3)
+       ON CONFLICT (tenant_id) DO UPDATE SET unit_id=EXCLUDED.unit_id, resolved_at=NULL,
+             accepted_at=NULL, draft_document_id=NULL, updated_at=NOW()`,
+      [landlordId, tenantId, unitId])
+
+    await client.query('COMMIT')
+
+    // Invite email (post-commit; failure doesn't roll back).
+    const tenantAppUrl = process.env.TENANT_APP_URL || 'http://localhost:3002'
+    const activationUrl = `${tenantAppUrl}/accept-invite?token=${inviteToken}`
+    const landlord = await queryOne<any>(
+      `SELECT u.first_name, u.last_name FROM landlords l JOIN users u ON u.id = l.user_id WHERE l.id = $1`, [landlordId])
+    const landlordName = landlord ? `${landlord.first_name} ${landlord.last_name}`.trim() : 'Your landlord'
+    const propertyAddress = [unit.street1, unit.city, unit.state, unit.zip].filter(Boolean).join(', ')
+    const unitLabel = `${unit.property_name} — Unit ${unit.unit_number}`
+    try {
+      await emailTenantOnboarded(emailNorm, firstName, landlordName, propertyAddress, unitLabel, activationUrl, { landlordId, tenantId })
+    } catch (emailErr) {
+      logger.error({ err: emailErr, ctx: emailNorm }, '[ONBOARD-NEW-LEASE] Email send failed for')
+      logger.info(`[ONBOARD-NEW-LEASE] Manual activation URL: ${activationUrl}`)
+    }
+
+    res.json({ success: true, data: { userId, tenantId, email: emailNorm, unitId, activationUrl } })
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {})
     next(e)

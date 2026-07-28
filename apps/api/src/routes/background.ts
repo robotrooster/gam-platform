@@ -6,12 +6,10 @@ import {
   emailPoolTenantInterested,
   emailAdverseActionNotice,
 } from '../services/email'
-import { buildAdverseActionNoticeText } from '../lib/adverseAction'
 import { calculateRiskScore } from '../services/riskScore'
 import { findStayConflict } from '../services/unitAvailability'
 import { getProvider } from '../services/backgroundProvider'
 import { refundBackgroundCheckPayment } from '../services/backgroundRefund'
-import { computeApplicationFee } from '../services/stripeConnect'
 import { query, queryOne } from '../db'
 import { requireAuth, requireAdmin, requirePerm } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
@@ -36,64 +34,14 @@ function isMockIntentId(id: string): boolean {
   return id.startsWith('pi_intake_mock_') || id.startsWith('pi_pool_mock_')
 }
 
-// S551: applicant-side intake fee, capped by the PROPERTY state's
-// application-fee statute when the state_application_fee_caps catalog has a
-// row (S177 hard-compliance carve-out; no row = uncapped). The landlord's
-// screening bill is unchanged — the cap only limits what the APPLICANT is
-// charged; the landlord absorbs the remainder by construction. The cap
-// covers the applicant's TOTAL charge, card processing included (substance
-// over form). fee_prohibited states charge the applicant nothing and the
-// payment step is skipped entirely.
-interface ResolvedIntakeFee {
-  applicantFee: number
-  processingFee: number
-  totalFee: number
-  capApplied: boolean
-  feeProhibited: boolean
-  state: string | null
-}
-async function resolveIntakeFee(
-  landlordId?: string | null,
-  unitId?: string | null
-): Promise<ResolvedIntakeFee> {
-  let state: string | null = null
-  if (unitId) {
-    const r = await queryOne<{ state: string }>(
-      `SELECT p.state FROM units u JOIN properties p ON p.id = u.property_id WHERE u.id = $1`,
-      [unitId]).catch(() => null)
-    state = r?.state ?? null
-  }
-  if (!state && landlordId) {
-    const r = await queryOne<{ state: string }>(
-      `SELECT state FROM properties WHERE landlord_id = $1 ORDER BY created_at LIMIT 1`,
-      [landlordId]).catch(() => null)
-    state = r?.state ?? null
-  }
-  const uncapped: ResolvedIntakeFee = {
-    applicantFee: APPLICANT_FEE_USD, processingFee: INTAKE_PROCESSING_USD,
-    totalFee: INTAKE_TOTAL_USD, capApplied: false, feeProhibited: false, state,
-  }
-  if (!state) return uncapped
-  const cap = await queryOne<{ cap_amount: string | null; fee_prohibited: boolean; actual_cost_only: boolean }>(
-    `SELECT cap_amount, fee_prohibited, actual_cost_only FROM state_application_fee_caps
-      WHERE state = $1 AND effective_year <= EXTRACT(YEAR FROM NOW())
-      ORDER BY effective_year DESC LIMIT 1`,
-    [state]).catch(() => null)
-  if (!cap) return uncapped
-  if (cap.fee_prohibited) {
-    return { applicantFee: 0, processingFee: 0, totalFee: 0, capApplied: true, feeProhibited: true, state }
-  }
-  // Effective cap = the tighter of the numeric statutory cap and — in
-  // actual-cost-only states — the screening package cost itself (no card
-  // processing add-on, no margin of any kind on the applicant side there).
-  const numericCap = cap.cap_amount != null ? parseFloat(cap.cap_amount) : Infinity
-  const actualCostCap = cap.actual_cost_only ? APPLICANT_FEE_USD : Infinity
-  const effCap = Math.min(numericCap, actualCostCap)
-  if (effCap < INTAKE_TOTAL_USD) {
-    return { applicantFee: effCap, processingFee: 0, totalFee: effCap, capApplied: true, feeProhibited: false, state }
-  }
-  return uncapped
-}
+// S561 (Nic, Checkr call 7/27): the APPLICANT no longer pays for screening.
+// GAM bills the LANDLORD directly (landlord = Checkr's customer; landlord may
+// pass the cost to the tenant via a POS line item or the first invoice, and
+// owns adverse-action / state fee-cap legality). This RETIRED the whole
+// applicant-side intake-fee + 50-state cap machinery (state_application_fee_caps,
+// actual_cost_only, fee_prohibited, shortfall recovery) — moot once the payer
+// is the landlord and the charge is one flat national amount. See the landlord
+// screening-charge model below.
 
 export const backgroundRouter = Router()
 
@@ -107,19 +55,22 @@ if (process.env.NODE_ENV === 'production' && (ENCRYPTION_KEY === DEFAULT_KEY || 
 }
 const IV_LENGTH = 16
 
-// Pricing — read once at module load. S551: BACKGROUND_CHECK_APPLICANT_FEE_USD
-// is the Checkr package cost passed through at EXACTLY cost (no upcharge —
-// Checkr's terms and Nic's launch rule both forbid marking up the product).
-// The applicant additionally pays card processing at the platform-wide card
-// rate (S113: 3.25%), same as every other card payment on the platform —
-// GAM never absorbs banking fees.
-const APPLICANT_FEE_USD = parseFloat(process.env.BACKGROUND_CHECK_APPLICANT_FEE_USD || '45')
-const INTAKE_PROCESSING_USD = computeApplicationFee({ amount: APPLICANT_FEE_USD, paymentMethod: 'card' })
-const INTAKE_TOTAL_USD = Math.round((APPLICANT_FEE_USD + INTAKE_PROCESSING_USD) * 100) / 100
+// Pricing — read once at module load.
+// S561 landlord-billed model (Checkr call 7/27):
+//   SCREENING_CHECKR_COST_USD = GAM's actual cost per report from Checkr.
+//     Checkr Tenant "Essential" ($34.99: financials + rental history +
+//     background + credit score) + Identity-Protection add-on ($2.95: live
+//     ID scan / biometric liveness, always-on) = $37.94. Checkr Tenant prices
+//     this FLAT (unlike the employment product's variable county pass-throughs),
+//     so a module constant is correct; if Checkr ever bills a variable/taxed
+//     amount, swap this for the invoiced actual (see accrual note in /submit).
+//   SCREENING_GAM_MARGIN_USD = GAM's flat margin per report ($5).
+//   Landlord is charged cost + margin ($42.94), netted from disbursement — NOT
+//   charged to the applicant, and NOT run through card processing (the landlord
+//   never makes a payment; it's a receivable, per gam-checkr-billing-model).
+const SCREENING_CHECKR_COST_USD = parseFloat(process.env.SCREENING_CHECKR_COST_USD || '37.94')
+const SCREENING_GAM_MARGIN_USD = parseFloat(process.env.SCREENING_GAM_MARGIN_USD || '5')
 const POOL_REPORT_UNLOCK_USD = parseFloat(process.env.POOL_REPORT_UNLOCK_USD || '1')
-// S552: flat landlord-side fee per screening for GAM's administration +
-// Credit-Bureau customer vetting. Billed with the monthly platform fee.
-const SCREENING_COMPLIANCE_FEE_USD = parseFloat(process.env.SCREENING_COMPLIANCE_FEE_USD || '5')
 
 function encrypt(text: string): string {
   const key = Buffer.from(ENCRYPTION_KEY.slice(0, 64), 'hex')
@@ -202,25 +153,26 @@ backgroundRouter.get('/price', async (req, res) => {
   // S551: optional ?landlordId resolves that landlord's screening provider so
   // the intake form knows whether SSN/ID collection happens on GAM's form
   // (mock) or on Checkr's hosted consent flow (checkr → GAM never collects).
-  // ?unitId (optional) sharpens the state resolution for the fee cap.
+  // S561: the applicant is never charged for screening (GAM bills the
+  // landlord), so the applicant-facing fee is always 0 / waived. The route
+  // stays for the provider + PII flags the intake form still needs.
   let provider = 'mock'
   const landlordId = (req.query.landlordId as string) || null
-  const unitId = (req.query.unitId as string) || null
   if (landlordId) {
     const row = await queryOne<{ background_provider: string }>(
       'SELECT background_provider FROM landlords WHERE id=$1', [landlordId]
     ).catch(() => null)
     if (row) provider = row.background_provider
   }
-  const fee = await resolveIntakeFee(landlordId, unitId)
   res.json({
     success: true,
     data: {
-      applicantFee:  fee.applicantFee,
-      processingFee: fee.processingFee,
-      totalFee:      fee.totalFee,
-      capApplied:    fee.capApplied,
-      feeProhibited: fee.feeProhibited,
+      applicantFee:  0,
+      processingFee: 0,
+      totalFee:      0,
+      capApplied:    false,
+      feeProhibited: false,
+      feeWaived:     true,
       provider,
       providerCollectsPii: provider === 'checkr',
       poolUnlockFee: POOL_REPORT_UNLOCK_USD,
@@ -229,53 +181,18 @@ backgroundRouter.get('/price', async (req, res) => {
 })
 
 // POST /api/background/payment-intent
-// Creates the Stripe PaymentIntent for the applicant intake fee.
-// Frontend confirms it via Stripe Elements with the returned clientSecret,
-// then passes the intentId to /submit which verifies status=succeeded
-// + metadata.userId match before letting the bg check insert through.
-//
-// Metadata.kind = 'background_check_intake' so the verifier can reject
-// PIs created for unrelated charges. Metadata.userId locks the PI to
-// the caller — re-using someone else's intent id is rejected.
-backgroundRouter.post('/payment-intent', requireAuth, async (req, res, next) => {
+// S561: retained for client compatibility only — the applicant is not charged
+// for screening (GAM bills the landlord), so this always reports fee waived.
+backgroundRouter.post('/payment-intent', requireAuth, async (_req, res, next) => {
   try {
-    // S551: fee is state-cap aware — the frontend sends the same
-    // landlordId/unitId it will send to /submit so both sides resolve the
-    // identical amount. fee_prohibited states skip payment entirely.
-    const { landlordId, unitId } = (req.body ?? {}) as { landlordId?: string | null; unitId?: string | null }
-    const fee = await resolveIntakeFee(landlordId, unitId)
-    if (fee.totalFee <= 0) {
-      return res.json({
-        success: true,
-        data: { clientSecret: null, intentId: null, amount: 0, feeWaived: true, testMode: !STRIPE_LIVE },
-      })
-    }
-    if (!STRIPE_LIVE) {
-      const mockId = 'pi_intake_mock_' + crypto.randomBytes(12).toString('hex')
-      return res.json({
-        success: true,
-        data: { clientSecret: mockId + '_secret', intentId: mockId, amount: fee.totalFee, testMode: true },
-      })
-    }
-    const intent = await stripeForBgc!.paymentIntents.create({
-      amount: Math.round(fee.totalFee * 100),
-      currency: 'usd',
-      payment_method_types: ['card'],
-      description: 'GAM background check intake fee',
-      metadata: {
-        kind:   'background_check_intake',
-        userId: req.user!.userId,
-        feeUsd: String(fee.totalFee),
-      },
-    })
+    // S561: the applicant no longer pays for screening — GAM bills the
+    // landlord (see the landlord screening-charge model above). This route is
+    // retained so existing clients don't 404; it always reports the fee waived
+    // so the intake UI skips the card step. (Pool-report unlock has its own
+    // route and still charges.)
     res.json({
       success: true,
-      data: {
-        clientSecret: intent.client_secret,
-        intentId:     intent.id,
-        amount:       fee.totalFee,
-        testMode:     false,
-      },
+      data: { clientSecret: null, intentId: null, amount: 0, feeWaived: true, testMode: !STRIPE_LIVE },
     })
   } catch (e) { next(e) }
 })
@@ -362,20 +279,8 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
     const providerCollectsPii = providerName === 'checkr'
     if (!providerCollectsPii && !ssn) throw new AppError(400, 'Required fields missing')
 
-    // S83/S551: verify the PaymentIntent succeeded, belongs to this user, and
-    // matches the state-cap-resolved fee (same landlordId/unitId inputs the
-    // frontend used at /payment-intent). fee_prohibited states have no
-    // payment at all. Idempotency comes from the UNIQUE index on
-    // background_checks.applicant_payment_intent_id below.
-    const resolvedFee = await resolveIntakeFee(landlordId, unitId)
-    if (resolvedFee.totalFee > 0) {
-      if (!applicantPaymentIntentId) throw new AppError(400, 'Payment required')
-      await verifyPaymentIntent(applicantPaymentIntentId, {
-        kind:      'background_check_intake',
-        amountUsd: resolvedFee.totalFee,
-        userId:    req.user!.userId,
-      })
-    }
+    // S561: no applicant payment step — GAM bills the landlord (below). The
+    // applicantPaymentIntentId field is accepted-but-ignored for old clients.
 
     let ssnClean: string | null = null
     let ssnLast4: string | null = null
@@ -427,7 +332,7 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
           idDocumentUrl || null, JSON.stringify(incomeDocUrls || []),
           !!consentCredit, !!consentCriminal, !!consentPool, ipAddr,
           ipAddr, ua, providerName,
-          applicantPaymentIntentId || null,
+          null, // S561: applicant no longer pays; no intake PaymentIntent
         ])
     } catch (e: any) {
       // Postgres unique violation on background_checks_applicant_pi_uniq —
@@ -519,23 +424,37 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
       providerStatus = 'failed'
     }
 
-    // S552: landlord-side screening billing — flat compliance fee + capped-
-    // state shortfall (all-in basis: standard total minus what the applicant
-    // could legally be charged). Only for real (checkr) orders that actually
-    // initiated; failed initiates incur no Checkr cost and accrue nothing.
-    // Swept into the monthly platform-fee invoice by accrual_month.
+    // ⚠️ INTERIM / SUPERSEDED — replaced in the Stripe/Connect block.
+    // Final model (gam-checkr-billing-model): the APPLICANT pays ~$44.60 at
+    // application ($37.94 Checkr + $5 GAM + card processing on top) via a
+    // destination charge to the LANDLORD's Connect account with application_fee
+    // = the full amount (landlord nets $0, GAM captured real-time, no float).
+    // That wiring waits for the Connect per-entity re-anchor. Until then this
+    // landlord-accrual path stays as a DORMANT stub (no real screenings run
+    // without live Checkr+Stripe keys anyway). Do NOT treat it as the live model.
+    //
+    // S561: landlord-side screening billing — GAM's actual Checkr cost passed
+    // through + a flat $5 margin, billed to the LANDLORD (never the applicant).
+    // Only for real (checkr) orders that actually initiated; failed initiates
+    // incur no Checkr cost and accrue nothing. Column mapping onto the existing
+    // accrual table: standard_total = Checkr cost passed through,
+    // compliance_fee = GAM's $5 margin, applicant_charged = 0 (applicant pays
+    // nothing now), shortfall = 0 (caps retired), state = null. The landlord
+    // owes standard_total + compliance_fee ($42.94). Collected by netting
+    // against the landlord's disbursement (via the money-flow rebuild batch —
+    // gam-money-flow-platform-holds); until that lands it rides the existing
+    // monthly screening-fee sweep. If Checkr ever bills a variable/taxed amount,
+    // set standard_total from the invoiced actual at completion instead of this
+    // module constant.
     if (providerName === 'checkr' && providerStatus !== 'failed' && landlordId) {
       try {
         await query(
           `INSERT INTO screening_fee_accruals
              (background_check_id, landlord_id, accrual_month, compliance_fee,
               standard_total, applicant_charged, shortfall, state)
-           VALUES ($1, $2, date_trunc('month', NOW())::date, $3, $4, $5, $6, $7)
+           VALUES ($1, $2, date_trunc('month', NOW())::date, $3, $4, 0, 0, NULL)
            ON CONFLICT (background_check_id) DO NOTHING`,
-          [check!.id, landlordId, SCREENING_COMPLIANCE_FEE_USD, INTAKE_TOTAL_USD,
-           resolvedFee.totalFee,
-           Math.round((INTAKE_TOTAL_USD - resolvedFee.totalFee) * 100) / 100,
-           resolvedFee.state])
+          [check!.id, landlordId, SCREENING_GAM_MARGIN_USD, SCREENING_CHECKR_COST_USD])
       } catch (e) { logger.error({ err: e }, '[SCREENING ACCRUAL]') }
     }
 
@@ -646,7 +565,7 @@ backgroundRouter.get('/', requireAuth, requirePerm('tenants.run_background_check
         bc.decision_notes, bc.decided_at, bc.created_at, bc.expires_at,
         bc.risk_score, bc.risk_level, bc.risk_flags,
         bc.provider_name, bc.provider_ref, bc.report_summary,
-        u.email,
+        u.email, u.phone,
         un.unit_number, p.name as property_name
       FROM background_checks bc
       JOIN users u ON u.id = bc.user_id
@@ -654,7 +573,15 @@ backgroundRouter.get('/', requireAuth, requirePerm('tenants.run_background_check
       LEFT JOIN properties p ON p.id = un.property_id
       WHERE bc.landlord_id = $1
       ORDER BY bc.created_at DESC`, [req.user!.profileId])
-    res.json({ success: true, data: checks })
+    // S561: surface the landlord's per-check screening charge (Checkr cost +
+    // $5 margin) so the review UI can show what they're billed. Only real
+    // checkr orders incur it; mock/speculative rows show 0.
+    const landlordCharge = Math.round((SCREENING_CHECKR_COST_USD + SCREENING_GAM_MARGIN_USD) * 100) / 100
+    const withCharge = checks.map((c) => ({
+      ...c,
+      landlord_charge: c.provider_name === 'checkr' ? landlordCharge : 0,
+    }))
+    res.json({ success: true, data: withCharge })
   } catch (e) { next(e) }
 })
 
@@ -714,74 +641,98 @@ backgroundRouter.patch('/:id/decision', requireAuth, requirePerm('tenants.run_ba
           tu.email, tu.first_name || 'there',
           decision as 'approved' | 'denied',
           u?.name || 'the property', u?.unit_number || '—',
-          notes || undefined,
+          // S561: on denial this courtesy email stays neutral — any report-based
+          // reasoning belongs only in the landlord's own adverse-action notice
+          // (POST /:id/adverse-action), never in a GAM-authored message.
+          decision === 'denied' ? undefined : (notes || undefined),
           undefined,
           { landlordId: check.landlord_id, backgroundCheckId: check.id }
         )
       } catch (e) { logger.error({ err: e }, '[EMAIL]') }
     }
 
-    // S87: FCRA §615(a) adverse action notice. Required when an applicant
-    // is denied based in whole or in part on a consumer report. We send
-    // it whenever the decision is 'denied' and the check ran through a
-    // CRA (provider_name set). The applicant's credit/criminal consents
-    // are a precondition of the check itself, so by the time we're here
-    // they exist.
-    if (decision === 'denied' && check.provider_name && tu?.email) {
+    // S561: GAM no longer authors or auto-sends the FCRA §615(a) adverse-action
+    // notice — the landlord is the "user" of the consumer report and owns that
+    // obligation (Checkr call 7/27). On a denial we hand the client only the
+    // FACTS it needs to help the landlord compose+send their OWN notice: the
+    // CRA contact block (which GAM already has from the provider) and the
+    // landlord's saved template, if any. The notice is sent by the landlord via
+    // POST /:id/adverse-action below — GAM authors no legal content.
+    let adverseAction: {
+      craInfo: { name: string; address: string; phone: string; website: string | null }
+      savedTemplate: string | null
+    } | undefined
+    if (decision === 'denied' && check.provider_name) {
       try {
-        const provider = getProvider(check.provider_name)
-        const cra = provider.craDisclosure()
-        const landlord = await queryOne<any>(
-          `SELECT COALESCE(l.business_name, u.first_name || ' ' || u.last_name) AS name
-             FROM landlords l JOIN users u ON u.id = l.user_id WHERE l.id = $1`,
-          [check.landlord_id]
-        )
-        const noticeText = buildAdverseActionNoticeText({
-          applicantFirstName: tu.first_name || check.first_name || '',
-          applicantLastName:  tu.last_name  || check.last_name  || '',
-          landlordName:       landlord?.name || 'your landlord',
-          cra,
-          decisionBasis:      notes || undefined,
-          disputeWindowDays:  60,
-          decisionDate:       new Date(),
-        })
-        const messageId = await emailAdverseActionNotice({
-          to: tu.email,
-          applicantFirstName: tu.first_name || check.first_name || 'Applicant',
-          noticeText,
-          ctx: { landlordId: check.landlord_id, backgroundCheckId: check.id },
-        })
-        try {
-          await query(
-            `INSERT INTO adverse_action_notices
-               (background_check_id, tenant_user_id, landlord_id,
-                cra_name, cra_address, cra_phone, cra_website,
-                decision_basis, risk_factors, notice_text,
-                dispute_window_days, email_message_id)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
-            [
-              check.id, check.user_id, check.landlord_id,
-              cra.name, cra.address, cra.phone, cra.website || null,
-              notes || null,
-              JSON.stringify(check.risk_flags || []),
-              noticeText, 60, messageId,
-            ]
-          )
-        } catch (insErr: any) {
-          // 23505 = UNIQUE on background_check_id — notice already exists
-          // (re-decision after a previous denial). Don't double-insert; the
-          // original notice is the legal record.
-          if (insErr?.code !== '23505') throw insErr
-          logger.warn(`[ADVERSE ACTION] notice already exists for check ${check.id} — skipping duplicate`)
+        const cra = getProvider(check.provider_name).craDisclosure()
+        const lt = await queryOne<{ adverse_action_template: string | null }>(
+          'SELECT adverse_action_template FROM landlords WHERE id=$1', [check.landlord_id])
+        adverseAction = {
+          craInfo: { name: cra.name, address: cra.address, phone: cra.phone, website: cra.website || null },
+          savedTemplate: lt?.adverse_action_template ?? null,
         }
-      } catch (e) {
-        logger.error({ err: e }, '[ADVERSE ACTION]')
-        // Email/insert failure must not block the denial. Log + continue;
-        // the audit trail can be reconciled by an admin later.
-      }
+      } catch (e) { logger.error({ err: e }, '[ADVERSE ACTION PREP]') }
     }
 
-    res.json({ success: true, data: { decision } })
+    res.json({ success: true, data: { decision, adverseAction } })
+  } catch (e) { next(e) }
+})
+
+// S561: the landlord sends THEIR OWN adverse-action notice to a denied
+// applicant. GAM only delivers the landlord-authored text and records it for
+// the audit trail — GAM authors no legal content. Optionally saves the text as
+// the landlord's reusable template. Prompted-but-skippable: the landlord may
+// decline to send here and handle it outside GAM (they own the obligation).
+backgroundRouter.post('/:id/adverse-action', requireAuth, requirePerm('tenants.run_background_check'), async (req, res, next) => {
+  try {
+    const { text, saveAsTemplate } = (req.body ?? {}) as { text?: string; saveAsTemplate?: boolean }
+    if (!text || !text.trim()) throw new AppError(400, 'Notice text is required')
+    const check = await queryOne<any>(
+      'SELECT * FROM background_checks WHERE id=$1 AND landlord_id=$2',
+      [req.params.id, req.user!.profileId]
+    )
+    if (!check) throw new AppError(404, 'Not found')
+    if (check.status !== 'denied') throw new AppError(400, 'Adverse-action notices apply only to denied applicants')
+
+    const tu = await queryOne<any>('SELECT email, first_name, last_name FROM users WHERE id=$1', [check.user_id])
+    if (!tu?.email) throw new AppError(400, 'Applicant has no email on file')
+
+    const cra = check.provider_name ? getProvider(check.provider_name).craDisclosure() : null
+    const body = text.trim()
+
+    const messageId = await emailAdverseActionNotice({
+      to: tu.email,
+      applicantFirstName: tu.first_name || check.first_name || 'Applicant',
+      noticeText: body,
+      ctx: { landlordId: check.landlord_id, backgroundCheckId: check.id },
+    })
+
+    try {
+      await query(
+        `INSERT INTO adverse_action_notices
+           (background_check_id, tenant_user_id, landlord_id,
+            cra_name, cra_address, cra_phone, cra_website,
+            decision_basis, risk_factors, notice_text,
+            dispute_window_days, email_message_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+         ON CONFLICT (background_check_id) DO UPDATE
+           SET notice_text = EXCLUDED.notice_text,
+               notice_sent_at = NOW(),
+               email_message_id = EXCLUDED.email_message_id`,
+        [
+          check.id, check.user_id, check.landlord_id,
+          cra?.name || '—', cra?.address || '—', cra?.phone || '—', cra?.website || null,
+          null, JSON.stringify(check.risk_flags || []),
+          body, 60, messageId,
+        ]
+      )
+    } catch (e) { logger.error({ err: e }, '[ADVERSE ACTION RECORD]') }
+
+    if (saveAsTemplate) {
+      await query('UPDATE landlords SET adverse_action_template=$1 WHERE id=$2', [body, check.landlord_id])
+    }
+
+    res.json({ success: true, data: { sent: true } })
   } catch (e) { next(e) }
 })
 

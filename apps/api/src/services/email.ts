@@ -642,12 +642,12 @@ export async function emailTenantAchSetup(args: {
   )
 }
 
-// ── ADVERSE ACTION NOTICE (S87, FCRA §615(a)) ─────────────────
-// Sent to an applicant when a landlord denies them based on a CRA
-// report. The notice_text is built by lib/adverseAction.ts and stored
-// verbatim in adverse_action_notices for the legal record. This email
-// renders the same text into the body — text and stored copy must
-// agree exactly.
+// ── ADVERSE ACTION NOTICE (S87; landlord-authored since S561) ─────────────
+// Sent to an applicant when a landlord denies them based on a CRA report.
+// S561: the notice_text is now composed by the LANDLORD (GAM authors no legal
+// content) and passed in via POST /:id/adverse-action; it is stored verbatim
+// in adverse_action_notices for the audit record. This email renders that same
+// text into the body — text and stored copy must agree exactly.
 //
 // Returns the Resend message id so the caller can stamp it onto the
 // adverse_action_notices row for delivery audit.

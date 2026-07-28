@@ -12,7 +12,7 @@
  */
 import { useState } from 'react'
 import { useQuery, useQueryClient } from 'react-query'
-import { formatCurrency, humanize } from '@gam/shared'
+import { formatCurrency, humanize, humanizeEntryDescription, MANUAL_PAYMENT_FEE } from '@gam/shared'
 import { apiGet } from '../lib/api'
 import {
   AddPaymentMethodModal,
@@ -133,6 +133,14 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
 
       <SavedMethodsCard methods={methods} loading={methodsLoading} />
 
+      {/* S562: disclose the manual-payment fee. Your first rent payment is
+          fee-free; after that, paying by cash/check/money order (recorded by
+          your landlord) adds a $10 fee — paying through GAM avoids it. */}
+      <div style={{ fontSize: '.74rem', color: 'var(--t3)', marginTop: 12, padding: '10px 12px', background: 'var(--bg2)', border: '1px solid var(--b1)', borderRadius: 8 }}>
+        Paying rent by cash, check, or money order? Your first payment is free; after that a
+        ${MANUAL_PAYMENT_FEE.toFixed(2)} manual-payment fee applies. Pay through GAM to skip it.
+      </div>
+
       {/* S537: THE payment surface — one button, FIFO application. */}
       {balanceCtx && total > 0 && !balanceCtx.paymentBlocked && (
         <div className="card" style={{ padding: 16, marginTop: 16 }}>
@@ -213,7 +221,7 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
                         </span>
                       </td>
                       <td style={{ fontSize: '.75rem', color: 'var(--t3)' }}>
-                        {p.entryDescription}
+                        {humanizeEntryDescription(p.entryDescription)}
                       </td>
 
                     </tr>
@@ -347,7 +355,7 @@ function RemittancesCard({ remittances, prepaidRemaining }: {
                         <td>
                           <span className="badge b-muted" style={{ marginRight: 6 }}>{humanize(ln.type)}</span>
                           {ln.entryDescription && norm(ln.entryDescription) !== norm(ln.type) && (
-                            <span style={{ fontSize: '.72rem', color: 'var(--t3)' }}>{ln.entryDescription}</span>
+                            <span style={{ fontSize: '.72rem', color: 'var(--t3)' }}>{humanizeEntryDescription(ln.entryDescription)}</span>
                           )}
                         </td>
                         <td className="mono" style={{ fontSize: '.72rem' }}>

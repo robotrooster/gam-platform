@@ -46,6 +46,16 @@ export function requireAuth(req: Request, res: Response, next: NextFunction) {
   const token = header.slice(7)
   try {
     const payload = jwt.verify(token, process.env.JWT_SECRET!) as AuthPayload
+    // S560 (CRITICAL): reject any purpose-scoped token (e.g. the
+    // `totp_pending` session minted by /login before the 2nd factor). Such
+    // tokens carry the real role/permissions but must NEVER be accepted as a
+    // full session — only the specific endpoint that expects them (e.g.
+    // /totp/verify) checks the positive `purpose`. Without this guard the
+    // pending token is a full session everywhere and /refresh would upgrade
+    // it to a 7-day token — a complete 2FA bypass.
+    if ((payload as any).purpose) {
+      return res.status(401).json({ success: false, error: 'Invalid or expired token' })
+    }
     req.user = payload
     next()
   } catch {

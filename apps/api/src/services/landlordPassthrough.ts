@@ -21,6 +21,7 @@
  * UPDATE flips them false. Subsequent webhooks find nothing to do.
  */
 
+import type { PoolClient } from 'pg'
 import { query, queryOne, getClient } from '../db'
 import { createPmCompanyTransfer } from './stripeConnect'
 import { createAdminNotification } from './adminNotifications'
@@ -31,6 +32,63 @@ export interface PassthroughResult {
   payments_settled: number
   transfer_id:      string | null
   amount:           number
+}
+
+/**
+ * S561: net this landlord's scheduled reversal receivables against the money
+ * about to be paid out to them. GAM keeps `netted` of the owed rent to cover
+ * prior reversals the landlord owes back (they were paid rent that later
+ * reversed); only the remainder transfers out. Oldest receivable first; caps at
+ * `availableOwed`. A receivable that gets fully covered resolves as a
+ * landlord_clawback (its late fee reverts to the landlord). Runs inside the
+ * caller's transaction. Returns the total amount netted.
+ */
+async function applyReversalNetting(
+  client: PoolClient,
+  landlordId: string,
+  availableOwed: number,
+): Promise<number> {
+  const recs = await client.query<{ id: string; outstanding: string }>(
+    `SELECT id, (reversed_amount - recovered_amount)::text AS outstanding
+       FROM payment_reversals
+      WHERE landlord_id = $1
+        AND status <> 'resolved'
+        AND recovery_status = 'scheduled_netting'
+        AND (reversed_amount - recovered_amount) > 0
+      ORDER BY created_at ASC
+      FOR UPDATE`,
+    [landlordId]
+  )
+
+  let remaining = availableOwed
+  let totalNetted = 0
+  for (const r of recs.rows) {
+    const outstanding = Math.round(parseFloat(r.outstanding) * 100) / 100
+    if (outstanding <= 0) continue
+    // NO PARTIAL NETTING (Nic, S561): net a receivable ONLY if THIS batch fully
+    // covers it. It's full-net or nothing — never a partial that leaves the
+    // landlord short (a not-fully-covered receivable stays scheduled_netting for
+    // a later fully-covering batch, or ages out to a full ACH clawback). FIFO
+    // order is preserved; a smaller later receivable may still fit `remaining`.
+    if (remaining < outstanding) continue
+    // Fully covered → resolve as a landlord clawback (late fee reverts to landlord).
+    await client.query(
+      `UPDATE payment_reversals
+          SET recovered_amount = reversed_amount,
+              recovery_status  = 'recovered',
+              recovered_at     = NOW(),
+              outcome          = 'landlord_clawback',
+              late_fee_owner   = 'landlord',
+              status           = 'resolved',
+              resolved_at      = NOW(),
+              updated_at       = NOW()
+        WHERE id = $1`,
+      [r.id]
+    )
+    remaining   -= outstanding
+    totalNetted += outstanding
+  }
+  return Math.round(totalNetted * 100) / 100
 }
 
 /**
@@ -89,21 +147,36 @@ export async function reconcilePlatformHeldPayments(
       return { attempted: false, payments_settled: 0, transfer_id: null, amount: 0 }
     }
 
-    // Fire the platform → landlord Connect Transfer. No source_transaction
-    // because the funds are aggregated across many charges; platform balance
-    // already has them (gross of every platform_held payment).
-    // createPmCompanyTransfer is the generic Transfer wrapper despite the
-    // name (kept to avoid a refactor outside this phase).
-    const transfer = await createPmCompanyTransfer({
-      amount: owed,
-      destinationConnectAccountId: landlordRow.stripe_connect_account_id,
-      metadata: {
-        gam_kind:             'platform_held_passthrough',
-        gam_landlord_id:      landlordRow.landlord_id,
-        gam_landlord_user_id: landlordUserId,
-      },
-      description: 'Platform-held rent passthrough',
-    })
+    // S561: net scheduled reversal receivables against this payout FIRST. GAM
+    // keeps `netted` of the owed rent to cover reversals the landlord owes back;
+    // only the remainder is transferred out.
+    const netted = await applyReversalNetting(client, landlordRow.landlord_id, owed)
+    const transferAmount = Math.round((owed - netted) * 100) / 100
+
+    // Fire the platform → landlord Connect Transfer for the net remainder. No
+    // source_transaction because the funds are aggregated across many charges;
+    // platform balance already has them (gross of every platform_held payment).
+    // createPmCompanyTransfer is the generic Transfer wrapper despite the name.
+    // If the payout was FULLY netted (transferAmount == 0) we skip the Stripe
+    // Transfer but still stamp the ledger + flip platform_held so the
+    // owner_share isn't reprocessed; a sentinel id marks the netted batch.
+    let transferId: string
+    if (transferAmount > 0) {
+      const transfer = await createPmCompanyTransfer({
+        amount: transferAmount,
+        destinationConnectAccountId: landlordRow.stripe_connect_account_id,
+        metadata: {
+          gam_kind:             'platform_held_passthrough',
+          gam_landlord_id:      landlordRow.landlord_id,
+          gam_landlord_user_id: landlordUserId,
+          ...(netted > 0 ? { gam_reversal_netted: String(netted) } : {}),
+        },
+        description: 'Platform-held rent passthrough',
+      })
+      transferId = transfer.id
+    } else {
+      transferId = `netted:${landlordRow.landlord_id}`
+    }
 
     await client.query(
       `UPDATE user_balance_ledger
@@ -115,7 +188,7 @@ export async function reconcilePlatformHeldPayments(
             SELECT id FROM payments
              WHERE landlord_id = $2 AND platform_held = true AND status = 'settled'
           )`,
-      [transfer.id, landlordRow.landlord_id]
+      [transferId, landlordRow.landlord_id]
     )
 
     const flipped = await client.query(
@@ -130,8 +203,8 @@ export async function reconcilePlatformHeldPayments(
     return {
       attempted:        true,
       payments_settled: flipped.rowCount ?? 0,
-      transfer_id:      transfer.id,
-      amount:           owed,
+      transfer_id:      transferId,
+      amount:           transferAmount,
     }
   } catch (e) {
     try { await client.query('ROLLBACK') } catch {}

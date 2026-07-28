@@ -87,6 +87,7 @@ beforeEach(async () => {
 interface Fixture {
   applicantUserId: string
   applicantToken:  string
+  landlordToken:   string
   landlordUserId:  string
   landlordId:      string
   propertyId:      string
@@ -116,8 +117,12 @@ async function seedFixture(opts: { provider?: 'mock' | 'checkr' } = {}): Promise
       { userId: applicantUserId, role: 'tenant', email,
         profileId: randomUUID() },
       process.env.JWT_SECRET!, { expiresIn: '1h' })
+    const landlordToken = jwt.sign(
+      { userId: landlordUserId, role: 'landlord', email: 'll@test.dev',
+        profileId: landlordId },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
     return {
-      applicantUserId, applicantToken,
+      applicantUserId, applicantToken, landlordToken,
       landlordUserId, landlordId, propertyId, unitId,
     }
   } catch (e) { await c.query('ROLLBACK'); throw e }
@@ -233,24 +238,20 @@ describe('POST /api/background/submit — S551 checkr no-SSN + property resoluti
   })
 })
 
-// S551: state application-fee caps — applicant pays min(fee, cap); the
-// landlord absorbs the remainder (their screening bill is unchanged).
-// fee_prohibited states charge nothing and skip payment entirely.
-describe('S551 state application-fee caps', () => {
-  it('capped state: /price returns capApplied with total = cap', async () => {
-    const f = await seedFixture({})
-    await db.query(
-      `INSERT INTO state_application_fee_caps (state, effective_year, cap_amount) VALUES ('AZ', 2020, 20.00)`)
+// S561: the applicant no longer pays for screening — GAM bills the LANDLORD
+// (Checkr cost passed through + a flat $5 margin). The 50-state applicant
+// fee-cap machinery was retired; there is no applicant payment step.
+describe('S561 landlord-billed screening', () => {
+  it('/price reports the applicant fee waived (applicant is never charged)', async () => {
+    const f = await seedFixture({ provider: 'checkr' })
     const res = await request(buildApp())
       .get(`/api/background/price?landlordId=${f.landlordId}&unitId=${f.unitId}`)
     expect(res.status).toBe(200)
-    expect(res.body.data).toMatchObject({ capApplied: true, feeProhibited: false, totalFee: 20 })
+    expect(res.body.data).toMatchObject({ totalFee: 0, feeWaived: true, providerCollectsPii: true })
   })
 
-  it('fee-prohibited state: submit succeeds with NO payment intent at all', async () => {
+  it('submit succeeds with NO applicant payment intent', async () => {
     const f = await seedFixture({ provider: 'mock' })
-    await db.query(
-      `INSERT INTO state_application_fee_caps (state, effective_year, fee_prohibited) VALUES ('AZ', 2020, TRUE)`)
     const res = await request(buildApp())
       .post('/api/background/submit')
       .set('Authorization', `Bearer ${f.applicantToken}`)
@@ -261,24 +262,8 @@ describe('S551 state application-fee caps', () => {
     expect(row.applicant_payment_intent_id).toBeNull()
   })
 
-  it('actual-cost-only state: applicant total = package cost, no processing add-on', async () => {
-    const f = await seedFixture({})
-    await db.query(
-      `INSERT INTO state_application_fee_caps (state, effective_year, actual_cost_only) VALUES ('AZ', 2020, TRUE)`)
-    const res = await request(buildApp())
-      .get(`/api/background/price?landlordId=${f.landlordId}&unitId=${f.unitId}`)
-    expect(res.status).toBe(200)
-    // Applicant pays exactly the package cost (whatever
-    // BACKGROUND_CHECK_APPLICANT_FEE_USD resolves to in this environment);
-    // the card-processing add-on is not chargeable.
-    const pkg = parseFloat(process.env.BACKGROUND_CHECK_APPLICANT_FEE_USD || '45')
-    expect(res.body.data).toMatchObject({ capApplied: true, totalFee: pkg, processingFee: 0 })
-  })
-
-  it('S552: checkr submit in a capped state writes the landlord accrual (all-in shortfall + $5 fee)', async () => {
+  it('checkr submit writes the landlord accrual = Checkr cost + $5 margin', async () => {
     const f = await seedFixture({ provider: 'checkr' })
-    await db.query(
-      `INSERT INTO state_application_fee_caps (state, effective_year, cap_amount) VALUES ('AZ', 2020, 20.00)`)
     const res = await request(buildApp())
       .post('/api/background/submit')
       .set('Authorization', `Bearer ${f.applicantToken}`)
@@ -288,19 +273,18 @@ describe('S551 state application-fee caps', () => {
       `SELECT compliance_fee, standard_total, applicant_charged, shortfall, state
          FROM screening_fee_accruals WHERE background_check_id=$1`, [res.body.data.id])
     expect(acc).toBeTruthy()
-    // Standard = package fee + card processing (3.25% + 26¢, S552),
-    // computed from env so the test is independent of the deployed fee;
-    // cap $20 → shortfall = standard − 20 on the all-in basis; $5 fee.
-    const pkgFee = parseFloat(process.env.BACKGROUND_CHECK_APPLICANT_FEE_USD || '45')
-    const standard = Math.round((pkgFee + Math.round((pkgFee * 0.0325 + 0.26) * 100) / 100) * 100) / 100
-    expect(parseFloat(acc.compliance_fee)).toBe(5)
-    expect(parseFloat(acc.standard_total)).toBeCloseTo(standard, 2)
-    expect(parseFloat(acc.applicant_charged)).toBe(20)
-    expect(parseFloat(acc.shortfall)).toBeCloseTo(Math.round((standard - 20) * 100) / 100, 2)
-    expect(acc.state).toBe('AZ')
+    // standard_total = Checkr cost passed through; compliance_fee = GAM's $5
+    // margin; landlord owes the sum ($42.94). applicant_charged/shortfall = 0.
+    const cost = parseFloat(process.env.SCREENING_CHECKR_COST_USD || '37.94')
+    const margin = parseFloat(process.env.SCREENING_GAM_MARGIN_USD || '5')
+    expect(parseFloat(acc.standard_total)).toBeCloseTo(cost, 2)
+    expect(parseFloat(acc.compliance_fee)).toBeCloseTo(margin, 2)
+    expect(parseFloat(acc.applicant_charged)).toBe(0)
+    expect(parseFloat(acc.shortfall)).toBe(0)
+    expect(acc.state).toBeNull()
   })
 
-  it('S552: mock-provider submit writes NO accrual', async () => {
+  it('mock-provider submit writes NO accrual', async () => {
     const f = await seedFixture({ provider: 'mock' })
     const res = await request(buildApp())
       .post('/api/background/submit')
@@ -310,16 +294,6 @@ describe('S551 state application-fee caps', () => {
     const { rows } = await db.query<any>(
       `SELECT id FROM screening_fee_accruals WHERE background_check_id=$1`, [res.body.data.id])
     expect(rows.length).toBe(0)
-  })
-
-  it('uncapped state (no catalog row): submit still requires payment', async () => {
-    const f = await seedFixture({ provider: 'mock' })
-    const res = await request(buildApp())
-      .post('/api/background/submit')
-      .set('Authorization', `Bearer ${f.applicantToken}`)
-      .send({ ...happyPayload({ landlordId: f.landlordId, unitId: f.unitId }), applicantPaymentIntentId: undefined })
-    expect(res.status).toBe(400)
-    expect(res.body.error).toMatch(/payment required/i)
   })
 })
 
@@ -383,8 +357,10 @@ describe('S552 screening refunds', () => {
 describe('S552 screening fee sweep', () => {
   it('sweeps unbilled accruals into platform_revenue_ledger and is idempotent', async () => {
     const f = await seedFixture({ provider: 'checkr' })
-    // Two checks: one uncapped ($5 + 0) and one with a $10 shortfall.
-    for (const [fee, short] of [[5, 0], [5, 10]] as const) {
+    // S561: each accrual = standard_total (Checkr cost passed through) +
+    // compliance_fee (GAM's $5 margin); applicant_charged/shortfall = 0. Seed
+    // two → 2 × $42.94.
+    for (let i = 0; i < 2; i++) {
       const { rows: [{ id: uid }] } = await db.query<{ id: string }>(
         `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
          VALUES ($1,'x','tenant','S','W', TRUE) RETURNING id`, [`sw-${randomUUID()}@t.dev`])
@@ -397,20 +373,20 @@ describe('S552 screening fee sweep', () => {
         `INSERT INTO screening_fee_accruals
            (background_check_id, landlord_id, accrual_month, compliance_fee,
             standard_total, applicant_charged, shortfall, state)
-         VALUES ($1,$2, date_trunc('month', NOW())::date, $3, 36.39, $4, $5, 'AZ')`,
-        [bcId, f.landlordId, fee, 36.39 - short, short])
+         VALUES ($1,$2, date_trunc('month', NOW())::date, 5, 37.94, 0, 0, NULL)`,
+        [bcId, f.landlordId])
     }
 
     const { processScreeningFeeSweep } = await import('../jobs/platformFeeAccrual')
     const sweep = await processScreeningFeeSweep()
     expect(sweep.landlordsSwept).toBe(1)
     expect(sweep.accrualsSwept).toBe(2)
-    expect(sweep.totalSwept).toBe(20)  // 5 + (5+10)
+    expect(sweep.totalSwept).toBe(85.88)  // 2 × (37.94 + 5)
 
     const { rows: [ledger] } = await db.query<any>(
       `SELECT amount, reference_type FROM platform_revenue_ledger
         WHERE reference_type='screening_fee_sweep' AND reference_id=$1`, [f.landlordId])
-    expect(parseFloat(ledger.amount)).toBe(20)
+    expect(parseFloat(ledger.amount)).toBe(85.88)
 
     const { rows } = await db.query<any>(
       `SELECT billed_at, platform_revenue_ledger_id FROM screening_fee_accruals WHERE landlord_id=$1`,
@@ -425,5 +401,71 @@ describe('S552 screening fee sweep', () => {
     const again = await processScreeningFeeSweep()
     expect(again.landlordsSwept).toBe(0)
     expect(again.accrualsSwept).toBe(0)
+  })
+})
+
+// S561: GAM no longer auto-authors/sends the FCRA adverse-action notice on
+// denial. The landlord composes+sends it; GAM returns CRA facts + the saved
+// template to help, delivers the landlord's text, and records it for audit.
+describe('S561 landlord-owned adverse action', () => {
+  async function denyFixture() {
+    const f = await seedFixture({ provider: 'checkr' })
+    const sub = await request(buildApp())
+      .post('/api/background/submit')
+      .set('Authorization', `Bearer ${f.applicantToken}`)
+      .send({ ...happyPayload({ landlordId: f.landlordId, unitId: f.unitId }), ssn: undefined })
+    expect(sub.status).toBe(201)
+    const checkId = sub.body.data.id
+    // Make the check decidable.
+    await db.query(`UPDATE background_checks SET status='processing' WHERE id=$1`, [checkId])
+    return { f, checkId }
+  }
+
+  it('denial returns CRA facts + saved template and does NOT auto-create a notice', async () => {
+    const { f, checkId } = await denyFixture()
+    const res = await request(buildApp())
+      .patch(`/api/background/${checkId}/decision`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ decision: 'denied' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.adverseAction).toBeTruthy()
+    expect(res.body.data.adverseAction.craInfo.name).toBeTruthy()
+    expect(res.body.data.adverseAction.savedTemplate).toBeNull()
+    // No auto-authored notice — the landlord sends it explicitly.
+    const { rows } = await db.query<any>(
+      `SELECT id FROM adverse_action_notices WHERE background_check_id=$1`, [checkId])
+    expect(rows.length).toBe(0)
+  })
+
+  it('landlord sends the notice → emailed, recorded verbatim, template saved', async () => {
+    const { f, checkId } = await denyFixture()
+    await request(buildApp())
+      .patch(`/api/background/${checkId}/decision`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ decision: 'denied' })
+
+    const body = 'Your application was declined. The report came from the agency below; they did not make the decision. You may dispute it.'
+    const send = await request(buildApp())
+      .post(`/api/background/${checkId}/adverse-action`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ text: body, saveAsTemplate: true })
+    expect(send.status).toBe(200)
+    expect(send.body.data.sent).toBe(true)
+
+    const { rows: [notice] } = await db.query<any>(
+      `SELECT notice_text FROM adverse_action_notices WHERE background_check_id=$1`, [checkId])
+    expect(notice.notice_text).toBe(body)
+    const { rows: [ll] } = await db.query<any>(
+      `SELECT adverse_action_template FROM landlords WHERE id=$1`, [f.landlordId])
+    expect(ll.adverse_action_template).toBe(body)
+  })
+
+  it('adverse-action send is rejected for a non-denied applicant', async () => {
+    const { f, checkId } = await denyFixture()  // status = 'processing', not denied
+    const res = await request(buildApp())
+      .post(`/api/background/${checkId}/adverse-action`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ text: 'nope' })
+    expect(res.status).toBe(400)
   })
 })

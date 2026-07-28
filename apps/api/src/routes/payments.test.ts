@@ -452,6 +452,74 @@ describe('POST /api/payments/:id/pay', () => {
     }
   }
 
+  async function setFeePayer(propId: string, ach: 'tenant' | 'landlord', card: 'tenant' | 'landlord') {
+    await db.query(
+      `INSERT INTO property_allocation_rules (property_id, ach_fee_payer, card_fee_payer)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (property_id) DO UPDATE SET ach_fee_payer=$2, card_fee_payer=$3`,
+      [propId, ach, card])
+  }
+
+  // S562: the processing fee (mock computeApplicationFee → $5) must be ADDED to
+  // the charge when the tenant is the fee payer, so GAM doesn't eat Stripe's
+  // cost. When the landlord pays it, the charge stays pure rent and the
+  // landlord absorbs the fee via the settle-time allocation split.
+  it('S562: tenant pays ACH fee → charge = rent + processing fee', async () => {
+    const f = await seed()
+    await setupTenantForPay(f, { connectReady: true })
+    await setFeePayer(f.aPropId, 'tenant', 'tenant')
+    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000 })
+    const res = await request(buildApp()).post(`/api/payments/${pid}/pay`)
+      .set('Authorization', `Bearer ${f.tokenTenant1}`)
+      .send({ paymentMethodId: 'pm_x', paymentMethodType: 'ach' })
+    expect(res.status).toBe(200)
+    expect(stripeConnect.createRentPlatformCharge).toHaveBeenCalledTimes(1)
+    expect((stripeConnect.createRentPlatformCharge as any).mock.calls[0][0].amount).toBe(1005)
+  })
+
+  it('S562: landlord pays ACH fee → charge = rent only (landlord absorbs at settle)', async () => {
+    const f = await seed()
+    await setupTenantForPay(f, { connectReady: true })
+    await setFeePayer(f.aPropId, 'landlord', 'tenant')
+    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000 })
+    const res = await request(buildApp()).post(`/api/payments/${pid}/pay`)
+      .set('Authorization', `Bearer ${f.tokenTenant1}`)
+      .send({ paymentMethodId: 'pm_x', paymentMethodType: 'ach' })
+    expect(res.status).toBe(200)
+    expect((stripeConnect.createRentPlatformCharge as any).mock.calls[0][0].amount).toBe(1000)
+  })
+
+  it('S562: card is always tenant-borne → charge = rent + fee even when ACH is landlord', async () => {
+    const f = await seed()
+    await setupTenantForPay(f, { connectReady: true })
+    await setFeePayer(f.aPropId, 'landlord', 'tenant')
+    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000 })
+    const res = await request(buildApp()).post(`/api/payments/${pid}/pay`)
+      .set('Authorization', `Bearer ${f.tokenTenant1}`)
+      .send({ paymentMethodId: 'pm_x', paymentMethodType: 'card' })
+    expect(res.status).toBe(200)
+    expect((stripeConnect.createRentPlatformCharge as any).mock.calls[0][0].amount).toBe(1005)
+  })
+
+  it('S562: tenant-payer platform-fee passthrough is added to the charge', async () => {
+    const f = await seed()
+    await setupTenantForPay(f, { connectReady: true })
+    // Landlord pays the ACH processing fee → isolates the passthrough on top.
+    await setFeePayer(f.aPropId, 'landlord', 'tenant')
+    await db.query(
+      `INSERT INTO platform_fee_accruals
+         (landlord_id, property_id, accrual_month, rate_per_unit, min_per_property, total_amount, payer)
+       VALUES ($1, $2, CURRENT_DATE, 2, 10, 20, 'tenant')`,
+      [f.aLid, f.aPropId])
+    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000 })
+    const res = await request(buildApp()).post(`/api/payments/${pid}/pay`)
+      .set('Authorization', `Bearer ${f.tokenTenant1}`)
+      .send({ paymentMethodId: 'pm_x', paymentMethodType: 'ach' })
+    expect(res.status).toBe(200)
+    // 1000 rent + 0 processing (landlord pays) + 20 passthrough = 1020
+    expect((stripeConnect.createRentPlatformCharge as any).mock.calls[0][0].amount).toBe(1020)
+  })
+
   it('non-tenant → 403', async () => {
     const f = await seed()
     const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid })
@@ -535,7 +603,9 @@ describe('POST /api/payments/:id/pay', () => {
     expect(res.status).toBe(409)
   })
 
-  it('happy: Connect-ready landlord → destination charge, status→processing', async () => {
+  it('S560: even a Connect-ready landlord → PLATFORM charge + held (no destination charge)', async () => {
+    // Money-flow rebuild Phase 1: rent always lands on the platform balance and
+    // is batched out on the weekly run — no destination charge, ever.
     const f = await seed()
     await setupTenantForPay(f, { connectReady: true })
     const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid })
@@ -543,14 +613,14 @@ describe('POST /api/payments/:id/pay', () => {
       .set('Authorization', `Bearer ${f.tokenTenant1}`)
       .send({ paymentMethodId: 'pm_x', paymentMethodType: 'ach' })
     expect(res.status).toBe(200)
-    expect(stripeConnect.createRentDestinationCharge).toHaveBeenCalledTimes(1)
-    expect(stripeConnect.createRentPlatformCharge).not.toHaveBeenCalled()
-    expect(res.body.data.paymentIntentId).toBe('pi_dest_mock')
+    expect(stripeConnect.createRentPlatformCharge).toHaveBeenCalledTimes(1)
+    expect(stripeConnect.createRentDestinationCharge).not.toHaveBeenCalled()
+    expect(res.body.data.paymentIntentId).toBe('pi_plat_mock')
     const { rows: [p] } = await db.query<any>(
       `SELECT status, stripe_payment_intent_id, platform_held FROM payments WHERE id=$1`, [pid])
     expect(p.status).toBe('processing')
-    expect(p.stripe_payment_intent_id).toBe('pi_dest_mock')
-    expect(p.platform_held).toBe(false)
+    expect(p.stripe_payment_intent_id).toBe('pi_plat_mock')
+    expect(p.platform_held).toBe(true)
   })
 
   it('S113-PhaseA: landlord NOT Connect-ready → platform charge + platform_held=TRUE', async () => {
@@ -569,7 +639,10 @@ describe('POST /api/payments/:id/pay', () => {
     expect(p.platform_held).toBe(true)
   })
 
-  it('card payment: status→settled immediately (no webhook needed)', async () => {
+  it('card payment: status→processing (webhook settles + allocates, like ACH) — S560', async () => {
+    // Pre-S560 this stamped 'settled' at charge time, which made the webhook's
+    // settle path (gated on status != 'settled') skip allocation, supersedence,
+    // Flex crediting, and PM/manager transfers for every card payment.
     const f = await seed()
     await setupTenantForPay(f, { connectReady: true })
     const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid })
@@ -579,7 +652,7 @@ describe('POST /api/payments/:id/pay', () => {
     expect(res.status).toBe(200)
     const { rows: [p] } = await db.query<any>(
       `SELECT status FROM payments WHERE id=$1`, [pid])
-    expect(p.status).toBe('settled')
+    expect(p.status).toBe('processing')
   })
 
   it('invalid paymentMethodType enum → 400', async () => {
@@ -589,6 +662,93 @@ describe('POST /api/payments/:id/pay', () => {
     const res = await request(buildApp()).post(`/api/payments/${pid}/pay`)
       .set('Authorization', `Bearer ${f.tokenTenant1}`)
       .send({ paymentMethodId: 'pm_x', paymentMethodType: 'crypto' })
+    expect(res.status).toBe(400)
+  })
+})
+
+// ─── POST /api/payments/:id/record-manual (S562) ──────────────
+describe('POST /api/payments/:id/record-manual', () => {
+  it('first rent payment → recorded settled (no disbursement), fee WAIVED', async () => {
+    const f = await seed()
+    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000 })
+    const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+      .send({ method: 'check', reference: 'CHK-1234' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.feeWaived).toBe(true)
+    expect(res.body.data.feeAmount).toBe(0)
+    expect(res.body.data.feePaymentId).toBeNull()
+    const { rows: [p] } = await db.query<any>(
+      `SELECT status, manual_method, platform_held, stripe_payment_intent_id FROM payments WHERE id=$1`, [pid])
+    expect(p.status).toBe('settled')            // paid everywhere that treats settled as paid
+    expect(p.manual_method).toBe('check')
+    expect(p.platform_held).toBe(false)         // ← batch skips it; landlord not double-paid
+    expect(p.stripe_payment_intent_id).toBeNull()
+    const { rows: fees } = await db.query<any>(
+      `SELECT id FROM payments WHERE entry_description='MANUALPAY' AND tenant_id=$1`, [f.tenant1Id])
+    expect(fees.length).toBe(0)
+  })
+
+  it('second rent payment → $10 MANUALPAY fee row created (GAM revenue)', async () => {
+    const f = await seed()
+    // prior satisfied rent = the tenant already made their first payment
+    await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000, status: 'settled', dueOffsetMonths: 0 })
+    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000, dueOffsetMonths: 1 })
+    const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+      .send({ method: 'cash' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.feeWaived).toBe(false)
+    expect(res.body.data.feeAmount).toBe(10)
+    expect(res.body.data.feePaymentId).toBeTruthy()
+    const { rows: [fee] } = await db.query<any>(
+      `SELECT type, amount::float AS amount, status, entry_description FROM payments WHERE id=$1`,
+      [res.body.data.feePaymentId])
+    expect(fee.type).toBe('fee')
+    expect(fee.amount).toBe(10)
+    expect(fee.status).toBe('pending')
+    expect(fee.entry_description).toBe('MANUALPAY')
+  })
+
+  it('non-rent charge → 409', async () => {
+    const f = await seed()
+    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, type: 'utility', amount: 50 })
+    const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`).send({ method: 'cash' })
+    expect(res.status).toBe(409)
+  })
+
+  it('already-settled charge → 409', async () => {
+    const f = await seed()
+    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, status: 'settled' })
+    const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`).send({ method: 'cash' })
+    expect(res.status).toBe(409)
+  })
+
+  it('different landlord cannot record on another landlord’s charge → 403', async () => {
+    const f = await seed()
+    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid })
+    const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordB}`).send({ method: 'cash' })
+    expect(res.status).toBe(403)
+  })
+
+  it('eviction mode (payment_block) → 409', async () => {
+    const f = await seed()
+    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid })
+    await db.query(`UPDATE units SET payment_block=TRUE WHERE id=$1`, [f.aUnitId])
+    const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`).send({ method: 'cash' })
+    expect(res.status).toBe(409)
+    expect(res.body.message || res.body.error).toMatch(/eviction/i)
+  })
+
+  it('invalid method → 400', async () => {
+    const f = await seed()
+    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid })
+    const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`).send({ method: 'venmo' })
     expect(res.status).toBe(400)
   })
 })

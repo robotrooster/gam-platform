@@ -1,17 +1,14 @@
 import { useState, useRef, useEffect } from 'react'
 import { useQuery, useMutation } from 'react-query'
 import { Shield, Upload, Check, AlertCircle, Lock, Clock, XCircle } from 'lucide-react'
-import { loadStripe, Stripe as StripeJs } from '@stripe/stripe-js'
-import { Elements, PaymentElement, useStripe, useElements } from '@stripe/react-stripe-js'
 
 const API = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
 
-// S84: Stripe Elements wiring for the applicant intake fee. When the
-// publishable key is unset (dev without Stripe creds, or test envs) the
-// component falls back to a mock-pay button that uses the pi_intake_mock_*
-// prefix accepted by the backend in non-production.
-const STRIPE_PK = (import.meta as any).env?.VITE_STRIPE_PUBLISHABLE_KEY || ''
-const stripePromise: Promise<StripeJs | null> | null = STRIPE_PK ? loadStripe(STRIPE_PK) : null
+// S561: the applicant no longer pays for screening (GAM bills the landlord),
+// so the Stripe Elements intake-fee flow was removed. The step-5 effect still
+// creates the prospect account and then calls /background/payment-intent,
+// which now always reports the fee waived → the flow advances straight to
+// submit with no card step.
 const tok = () => localStorage.getItem('gam_tenant_token')
 const get = (p: string) => fetch(`${API}/api${p}`,{headers:{Authorization:`Bearer ${tok()}`}}).then(r=>r.json()).then(r=>r.data??r)
 const uploadFile = async (p: string, file: File) => { const fd=new FormData(); fd.append('file',file); return fetch(`${API}/api${p}`,{method:'POST',headers:{Authorization:`Bearer ${tok()}`},body:fd}).then(r=>r.json()) }
@@ -62,12 +59,6 @@ export function BackgroundCheckPage() {
   const priceUnitId = (me as any)?.unitId || new URLSearchParams(window.location.search).get('unitId') || ''
   const { data: price } = useQuery(['bg-price', priceLandlordId, priceUnitId], () => get(`/background/price?landlordId=${priceLandlordId}&unitId=${priceUnitId}`))
   const providerCollectsPii = !!(price as any)?.providerCollectsPii
-  const feeCheckUsd = (price as any)?.applicantFee ?? 45
-  const feeProcessingUsd = (price as any)?.processingFee ?? 0
-  const feeTotalUsd = (price as any)?.totalFee ?? (feeCheckUsd + feeProcessingUsd)
-  const capApplied = !!(price as any)?.capApplied
-  const feeProhibited = !!(price as any)?.feeProhibited
-  const fmtUsd = (n: number) => '$' + n.toFixed(2)
   const handleIdUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0];
     if (!f) return;
@@ -591,47 +582,23 @@ export function BackgroundCheckPage() {
             <div style={{padding:'10px 14px',background:'#141a22',border:'1px solid #1e2530',borderRadius:8,fontSize:'.72rem',color:'#4a5568',lineHeight:1.5}}>By continuing I certify all information provided is accurate. Providing false information is grounds for immediate denial.</div>
         </div>}
         {step===5&&<div style={{textAlign:'center'}}>
-          <div style={{fontSize:'2rem',marginBottom:8}}>💳</div>
-          <div style={{fontSize:'1.1rem',fontWeight:800,color:'#eef1f8',marginBottom:6}}>Background Check Fee</div>
-          <div style={{fontSize:'.82rem',color:'#4a5568',marginBottom:20}}>Payment required before your application is submitted.</div>
+          <div style={{fontSize:'2rem',marginBottom:8}}>🛡️</div>
+          <div style={{fontSize:'1.1rem',fontWeight:800,color:'#eef1f8',marginBottom:6}}>Review & Submit</div>
+          <div style={{fontSize:'.82rem',color:'#4a5568',marginBottom:20}}>There's no charge to you — your landlord covers the cost of screening.</div>
           <div style={{background:'#141a22',border:'1px solid #1e2530',borderRadius:12,padding:20,marginBottom:20,textAlign:'left'}}>
-            {feeProhibited ? (
-              <div style={{fontSize:'.82rem',color:'#22c55e',lineHeight:1.6}}>No application fee — your state does not permit applicant-paid screening fees. Your landlord covers the screening cost.</div>
-            ) : capApplied ? (
-              <>
-                <div style={{display:'flex',justifyContent:'space-between',marginBottom:12,fontSize:'.82rem'}}><span style={{color:'#4a5568'}}>Application fee (state-capped)</span><span style={{color:'#eef1f8',fontFamily:'monospace'}}>{fmtUsd(feeTotalUsd)}</span></div>
-                <div style={{display:'flex',justifyContent:'space-between',borderTop:'1px solid #1e2530',paddingTop:12,fontWeight:700}}><span style={{color:'#eef1f8'}}>Total</span><span style={{color:'#c9a227',fontFamily:'monospace',fontSize:'1.1rem'}}>{fmtUsd(feeTotalUsd)}</span></div>
-                <div style={{fontSize:'.68rem',color:'#4a5568',marginTop:10}}>Your state caps applicant screening fees — your landlord covers the remainder of the screening cost.</div>
-              </>
-            ) : (
-              <>
-                <div style={{display:'flex',justifyContent:'space-between',marginBottom:8,fontSize:'.82rem'}}><span style={{color:'#4a5568'}}>Background screening{providerCollectsPii?' (Checkr)':''}</span><span style={{color:'#eef1f8',fontFamily:'monospace'}}>{fmtUsd(feeCheckUsd)}</span></div>
-                <div style={{display:'flex',justifyContent:'space-between',marginBottom:12,fontSize:'.82rem'}}><span style={{color:'#4a5568'}}>Card processing</span><span style={{color:'#eef1f8',fontFamily:'monospace'}}>{fmtUsd(feeProcessingUsd)}</span></div>
-                <div style={{display:'flex',justifyContent:'space-between',borderTop:'1px solid #1e2530',paddingTop:12,fontWeight:700}}><span style={{color:'#eef1f8'}}>Total</span><span style={{color:'#c9a227',fontFamily:'monospace',fontSize:'1.1rem'}}>{fmtUsd(feeTotalUsd)}</span></div>
-                <div style={{fontSize:'.68rem',color:'#4a5568',marginTop:10}}>The screening fee is passed through at cost — no markup.</div>
-              </>
-            )}
+            <div style={{fontSize:'.82rem',color:'#b8c4d8',lineHeight:1.6}}>
+              Your landlord pays for this background check — you owe nothing.
+              {providerCollectsPii ? ' After you submit, Checkr emails you a secure link to finish identity verification — a quick photo of your ID and a selfie, right from your phone.' : ''}
+            </div>
           </div>
           {paymentInitError && (
             <div style={{padding:'10px 14px',background:'rgba(239,68,68,.06)',border:'1px solid rgba(239,68,68,.25)',borderRadius:8,color:'#ef4444',fontSize:'.78rem',marginBottom:12}}>{paymentInitError}</div>
           )}
-          {!paid && !paymentClientSecret && !paymentInitError && (
-            <div style={{fontSize:'.78rem',color:'#4a5568',marginBottom:12}}>Initializing payment…</div>
-          )}
-          {!paid && paymentClientSecret && (
-            !STRIPE_PK ? (
-              <>
-                <div style={{background:'rgba(201,162,39,.06)',border:'1px solid rgba(201,162,39,.2)',borderRadius:8,padding:'10px 14px',marginBottom:12,fontSize:'.75rem',color:'#c9a227'}}>⚠️ Stripe not configured — using mock payment (dev only)</div>
-                <button onClick={()=>setPaid(true)} style={{width:'100%',padding:'14px',borderRadius:10,border:'none',background:'#c9a227',color:'#060809',fontWeight:700,fontSize:'.95rem',cursor:'pointer'}}>💳 Confirm Mock Payment — {fmtUsd(feeTotalUsd)}</button>
-              </>
-            ) : (
-              <Elements stripe={stripePromise} options={{ clientSecret: paymentClientSecret, appearance: { theme: 'night' } }}>
-                <StripePayForm amount={feeTotalUsd} onPaid={(intentId)=>{ setPaymentIntentId(intentId); setPaid(true) }} />
-              </Elements>
-            )
+          {!paid && !paymentInitError && (
+            <div style={{fontSize:'.78rem',color:'#4a5568',marginBottom:12}}>Setting up your application…</div>
           )}
           {paid && (
-            <div style={{display:'flex',alignItems:'center',justifyContent:'center',gap:8,padding:'12px 20px',background:'rgba(34,197,94,.08)',border:'1px solid rgba(34,197,94,.25)',borderRadius:10,color:'#22c55e',fontWeight:700}}><Check size={18}/> Payment confirmed — click Submit below</div>
+            <div style={{display:'flex',alignItems:'center',justifyContent:'center',gap:8,padding:'12px 20px',background:'rgba(34,197,94,.08)',border:'1px solid rgba(34,197,94,.25)',borderRadius:10,color:'#22c55e',fontWeight:700}}><Check size={18}/> Ready — click Submit below</div>
           )}
           {submitMut.isError&&<div style={{color:'#ef4444',fontSize:'.75rem',marginTop:10,display:'flex',gap:6,justifyContent:'center'}}><AlertCircle size={12}/> Submission failed — please try again</div>}
         </div>}
@@ -640,52 +607,6 @@ export function BackgroundCheckPage() {
         <button onClick={()=>step>0&&setStep(s=>s-1)} disabled={step===0} style={{padding:'10px 20px',borderRadius:8,border:'1px solid #1e2530',background:'transparent',color:step===0?'#4a5568':'#b8c4d8',cursor:step===0?'not-allowed':'pointer',fontSize:'.85rem'}}>← Back</button>
         {step<STEPS.length-1?<button onClick={()=>setStep(s=>s+1)} disabled={!canNext[step]} style={{flex:1,padding:'12px',borderRadius:8,border:'none',background:canNext[step]?'#c9a227':'#141a22',color:canNext[step]?'#060809':'#4a5568',fontWeight:700,cursor:canNext[step]?'pointer':'not-allowed',fontSize:'.88rem'}}>Continue →</button>:<button onClick={()=>submitMut.mutate()} disabled={!paid||submitMut.isLoading} style={{flex:1,padding:'12px',borderRadius:8,border:'none',background:paid?'#c9a227':'#141a22',color:paid?'#060809':'#4a5568',fontWeight:700,cursor:paid?'pointer':'not-allowed',fontSize:'.88rem'}}>{submitMut.isLoading?'Submitting...':'🔒 Submit Application'}</button>}
       </div>
-    </div>
-  )
-}
-
-// S84: card form rendered inside <Elements>. Uses Stripe hooks to confirm
-// the PaymentIntent client-side. On success, hands the verified intentId
-// back to the parent so /submit can attach it.
-function StripePayForm({ amount, onPaid }: { amount: number; onPaid: (intentId: string) => void }) {
-  const stripe = useStripe()
-  const elements = useElements()
-  const [submitting, setSubmitting] = useState(false)
-  const [error, setError] = useState('')
-
-  const handlePay = async () => {
-    if (!stripe || !elements) return
-    setSubmitting(true)
-    setError('')
-    const result = await stripe.confirmPayment({
-      elements,
-      confirmParams: { return_url: window.location.href },
-      redirect: 'if_required',
-    })
-    setSubmitting(false)
-    if (result.error) {
-      setError(result.error.message || 'Payment failed')
-      return
-    }
-    if (result.paymentIntent?.status === 'succeeded') {
-      onPaid(result.paymentIntent.id)
-    } else {
-      setError(`Payment status: ${result.paymentIntent?.status || 'unknown'}`)
-    }
-  }
-
-  return (
-    <div>
-      <div style={{background:'#0a0d10',border:'1px solid #1e2530',borderRadius:10,padding:14,marginBottom:12,textAlign:'left'}}>
-        <PaymentElement />
-      </div>
-      {error && (
-        <div style={{padding:'10px 14px',background:'rgba(239,68,68,.06)',border:'1px solid rgba(239,68,68,.25)',borderRadius:8,color:'#ef4444',fontSize:'.78rem',marginBottom:10}}>{error}</div>
-      )}
-      <button onClick={handlePay} disabled={!stripe || !elements || submitting}
-        style={{width:'100%',padding:'14px',borderRadius:10,border:'none',background:submitting?'#141a22':'#c9a227',color:submitting?'#4a5568':'#060809',fontWeight:700,fontSize:'.95rem',cursor:submitting?'not-allowed':'pointer'}}>
-        {submitting ? 'Processing payment…' : `💳 Pay $${amount.toFixed(2)}`}
-      </button>
     </div>
   )
 }

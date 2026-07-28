@@ -141,6 +141,54 @@ describe('reconcilePlatformHeldPayments', () => {
     expect(p.platform_held).toBe(false)
   })
 
+  it('S561: nets a scheduled reversal receivable against the payout + resolves it', async () => {
+    const ctx = await seedCtx()
+    await seedOwnerShareLedger(ctx, 950)
+    // Landlord owes back a reversed $200 (scheduled to net).
+    await db.query(
+      `INSERT INTO payment_reversals
+         (payment_id, landlord_id, reversal_type, reversed_amount, reversal_fee,
+          stripe_event_id, raw_event, recovery_method, recovery_status, status)
+       VALUES ($1,$2,'ach_unauthorized',200,4,'evt_net_200','{}','netting','scheduled_netting','recovering')`,
+      [ctx.paymentId, ctx.landlordId])
+    transferMock.mockResolvedValueOnce({ id: 'tr_net_750' } as any)
+
+    const res = await reconcilePlatformHeldPayments(ctx.landlordUserId)
+    // Transfer is owed minus netted: 950 - 200 = 750.
+    expect(res.amount).toBe(750)
+    expect(transferMock).toHaveBeenCalledWith(expect.objectContaining({ amount: 750 }))
+    // The receivable is fully recovered + resolved as a landlord clawback.
+    const { rows: [rev] } = await db.query<any>(
+      `SELECT recovered_amount, recovery_status, status, outcome, late_fee_owner
+         FROM payment_reversals WHERE stripe_event_id='evt_net_200'`)
+    expect(Number(rev.recovered_amount)).toBe(200)
+    expect(rev).toMatchObject({ recovery_status: 'recovered', status: 'resolved', outcome: 'landlord_clawback', late_fee_owner: 'landlord' })
+  })
+
+  it('S561: a receivable LARGER than the batch is NOT partially netted — full transfer fires, receivable carries', async () => {
+    const ctx = await seedCtx()
+    await seedOwnerShareLedger(ctx, 950)
+    // Landlord owes back $1200 — MORE than this batch's $950. No-partial rule
+    // (Nic S561): net fully or not at all → nothing nets, the full $950 goes out,
+    // the receivable carries for a fully-covering batch or a full clawback.
+    await db.query(
+      `INSERT INTO payment_reversals
+         (payment_id, landlord_id, reversal_type, reversed_amount, reversal_fee,
+          stripe_event_id, raw_event, recovery_method, recovery_status, status)
+       VALUES ($1,$2,'ach_unauthorized',1200,4,'evt_net_1200','{}','netting','scheduled_netting','recovering')`,
+      [ctx.paymentId, ctx.landlordId])
+    transferMock.mockResolvedValueOnce({ id: 'tr_full_950' } as any)
+
+    const res = await reconcilePlatformHeldPayments(ctx.landlordUserId)
+    expect(res.amount).toBe(950)                       // full transfer, nothing netted
+    expect(transferMock).toHaveBeenCalledWith(expect.objectContaining({ amount: 950 }))
+    // Receivable untouched — recovered 0, still scheduled (no landlord shortfall).
+    const { rows: [rev] } = await db.query<any>(
+      `SELECT recovered_amount, recovery_status, status FROM payment_reversals WHERE stripe_event_id='evt_net_1200'`)
+    expect(Number(rev.recovered_amount)).toBe(0)
+    expect(rev).toMatchObject({ recovery_status: 'scheduled_netting', status: 'recovering' })
+  })
+
   it('already-fired ledger row (stripe_transfer_id NOT NULL) is excluded from sum', async () => {
     const ctx = await seedCtx()
     // Seed a second platform_held payment so the two ledger rows have

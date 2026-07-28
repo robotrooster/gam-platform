@@ -162,6 +162,12 @@ interface CreateRentDestinationChargeOpts {
 }
 
 /**
+ * @deprecated S561 (platform-holds rebuild): DEAD — no callers. Rent now always
+ * uses `createRentPlatformCharge` (money held on GAM's platform balance, batched
+ * to landlords Tuesday), per memory gam-money-flow-platform-holds. Kept only for
+ * reference; safe to delete once the S113 destination-charge model is fully
+ * retired from docs. Do NOT reintroduce as a rent path.
+ *
  * Create a destination-charge PaymentIntent for a rent payment.
  * Returns the created intent. The webhook handler picks up settlement
  * via `payment_intent.succeeded` and runs allocation for ledger audit.
@@ -263,7 +269,7 @@ export async function createRentPlatformCharge(opts: CreateRentPlatformChargeOpt
  * source: PROCESSING_FEES in @gam/shared, mirrored into the
  * platform_processing_rates DB rows by the 20260721150000 migration):
  *   ACH:  1.0% capped at $6.00
- *   Card: 3.25% + $0.10 per transaction
+ *   Card: 3.25% + $0.26 per transaction (S552 — mirrors the IC+ fixed cost)
  *   Non-US-issued card: +1.5% surcharge passed through to tenant
  *
  * @returns dollar amount (not cents) GAM keeps as application fee

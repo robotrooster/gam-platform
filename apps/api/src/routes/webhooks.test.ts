@@ -108,13 +108,14 @@ function buildPaymentIntentSucceeded(opts: PiEventOpts): string {
       object: {
         id: opts.paymentIntentId,
         metadata: opts.metadata ?? {},
-        charges: {
-          data: [{
-            id: opts.chargeId ?? 'ch_' + opts.paymentIntentId,
-            payment_method_details: {
-              type: opts.paymentMethod ?? 'us_bank_account',
-            },
-          }],
+        // S560: modern Stripe payload shape — `latest_charge` (expanded
+        // object), NOT the removed `charges.data` list. Exercises the real
+        // resolveCharge path so the regression can't be masked again.
+        latest_charge: {
+          id: opts.chargeId ?? 'ch_' + opts.paymentIntentId,
+          payment_method_details: {
+            type: opts.paymentMethod ?? 'us_bank_account',
+          },
         },
       },
     },

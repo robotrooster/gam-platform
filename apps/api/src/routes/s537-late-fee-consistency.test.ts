@@ -154,16 +154,21 @@ describe('S537 gate: explicit decision before units / onboarding', () => {
   })
 })
 
-// ─── The billing policy ceiling ──────────────────────────────────────
-
-describe('S537 billing: total ≤ min(lease schedule, class policy)', () => {
-  it('lease $75 / policy $25 → bills $25 (policy is the ceiling)', async () => {
+// ─── Billing = PURE lease-stamp (S558, Nic) ──────────────────────────
+// The signed lease is the ENTIRE billing authority. The current (property,
+// unit_type) policy no longer bounds an already-signed lease's charges — a
+// policy change only reaches leases signed/renewed after it. Removing the S537
+// tenant-favorable ceiling keeps the charge == the document (FlexPay math +
+// everything downstream stays consistent; a mid-lease change needs a
+// superseding lease).
+describe('S558 billing: total = the signed lease stamp, policy ignored', () => {
+  it('lease $75 / policy $25 → bills $75 (the LEASE governs, not the policy)', async () => {
     const f = await fixture()
     const client = await db.connect()
     let unitId: string
     try {
       unitId = await seedUnit(client, { propertyId: f.propertyId, landlordId: f.landlordId, withLateFeeDecision: true })
-      // seeded $15/5d decision — overwrite with the case under test.
+      // Lower the CURRENT policy — must have no effect on the already-signed lease.
       await db.query(
         `UPDATE property_unit_type_late_fees SET late_fee_initial_amount=25, late_fee_grace_days=0 WHERE property_id=$1`,
         [f.propertyId])
@@ -171,10 +176,10 @@ describe('S537 billing: total ≤ min(lease schedule, class policy)', () => {
     const { invoiceId } = await leaseWithOverdueInvoice(f, { unitId, leaseFee: { amount: 75, grace: 0 } })
 
     await generateLateFeesForTimezone(TZ)
-    expect(await lateFeeTotal(invoiceId)).toBe(25)
+    expect(await lateFeeTotal(invoiceId)).toBe(75)
   })
 
-  it('lease $10 / policy $25 → bills $10 (lease-is-law is the other ceiling)', async () => {
+  it('lease $10 / policy $25 → bills $10 (the lease stamp, whether above or below policy)', async () => {
     const f = await fixture()
     const client = await db.connect()
     let unitId: string
@@ -190,7 +195,7 @@ describe('S537 billing: total ≤ min(lease schedule, class policy)', () => {
     expect(await lateFeeTotal(invoiceId)).toBe(10)
   })
 
-  it('explicit NO-FEE decision → bills nothing even if the lease says $50', async () => {
+  it('policy switched to NO-FEE after signing → the lease still bills its stamped $50', async () => {
     const f = await fixture()
     const client = await db.connect()
     let unitId: string
@@ -204,10 +209,10 @@ describe('S537 billing: total ≤ min(lease schedule, class policy)', () => {
     const { invoiceId } = await leaseWithOverdueInvoice(f, { unitId, leaseFee: { amount: 50, grace: 0 } })
 
     await generateLateFeesForTimezone(TZ)
-    expect(await lateFeeTotal(invoiceId)).toBe(0)
+    expect(await lateFeeTotal(invoiceId)).toBe(50)
   })
 
-  it('UNDECIDED class (row removed) → bills nothing', async () => {
+  it('policy row removed after signing → the lease still bills its stamped $50', async () => {
     const f = await fixture()
     const client = await db.connect()
     let unitId: string
@@ -217,10 +222,10 @@ describe('S537 billing: total ≤ min(lease schedule, class policy)', () => {
     const { invoiceId } = await leaseWithOverdueInvoice(f, { unitId, leaseFee: { amount: 50, grace: 0 } })
 
     await generateLateFeesForTimezone(TZ)
-    expect(await lateFeeTotal(invoiceId)).toBe(0)
+    expect(await lateFeeTotal(invoiceId)).toBe(50)
   })
 
-  it('longer POLICY grace wins: due 2 days ago, lease grace 0, policy grace 5 → nothing yet', async () => {
+  it('the LEASE grace governs: due 2 days ago, lease grace 0, policy grace 5 → bills the $25 stamp', async () => {
     const f = await fixture()
     const client = await db.connect()
     let unitId: string
@@ -233,7 +238,7 @@ describe('S537 billing: total ≤ min(lease schedule, class policy)', () => {
     const { invoiceId } = await leaseWithOverdueInvoice(f, { unitId, leaseFee: { amount: 25, grace: 0 }, daysOverdue: 2 })
 
     await generateLateFeesForTimezone(TZ)
-    expect(await lateFeeTotal(invoiceId)).toBe(0)
+    expect(await lateFeeTotal(invoiceId)).toBe(25)
   })
 })
 

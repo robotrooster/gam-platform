@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { ArrowLeft } from 'lucide-react'
+import { loadPdfjs } from '../lib/pdfjs'
 
 const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:4000'
 
@@ -29,20 +30,8 @@ export function PdfViewerPage() {
     const load = async () => {
       if (!src.startsWith('/')) { setError('Invalid document path'); return }
       try {
-        if (!(window as any).pdfjsLib) {
-          await new Promise<void>((resolve, reject) => {
-            const s = document.createElement('script')
-            s.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js'
-            s.onload = () => {
-              ;(window as any).pdfjsLib.GlobalWorkerOptions.workerSrc =
-                'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'
-              resolve()
-            }
-            s.onerror = () => reject(new Error('Failed to load the PDF renderer'))
-            document.head.appendChild(s)
-          })
-        }
-        const pdf = await (window as any).pdfjsLib.getDocument({
+        const pdfjsLib = await loadPdfjs()
+        const pdf = await pdfjsLib.getDocument({
           url: `${API_BASE}/api${src}`,
           httpHeaders: { Authorization: 'Bearer ' + (localStorage.getItem('gam_token') || '') },
         }).promise

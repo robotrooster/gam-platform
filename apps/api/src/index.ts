@@ -144,6 +144,16 @@ const STATIC_ALLOWED_ORIGINS = [
   'http://localhost:3102', // tenant preview
   'http://localhost:3103', // admin preview
   'http://localhost:3105', // pos preview
+  // S558: the real local dev servers (30xx). In prod-mode the *_APP_URL vars
+  // above resolve to the prod domains, so the localhost fallbacks drop out and
+  // a local dev portal hitting this API gets a CORS block ("login failed").
+  // Allowlist them unconditionally — a localhost origin can't be forged by a
+  // remote site, so this is dev-only convenience with no prod exposure.
+  'http://localhost:3001', 'http://localhost:3002', 'http://localhost:3003',
+  'http://localhost:3004', 'http://localhost:3005', 'http://localhost:3006',
+  'http://localhost:3007', 'http://localhost:3008', 'http://localhost:3009',
+  'http://localhost:3011', 'http://localhost:3012', 'http://localhost:3013',
+  'http://localhost:3014', 'http://localhost:3015',
 ]
 // Any GAM production origin: apex marketing + www + every portal subdomain.
 const PROD_HOST = 'goldassetmanagement.com'
@@ -160,7 +170,10 @@ app.use(cors({
       if (host === PROD_HOST || host.endsWith('.' + PROD_HOST)) return cb(null, true)
       if (host === STOREFRONT_HOST || host.endsWith('.' + STOREFRONT_HOST)) return cb(null, true)
     } catch { /* malformed origin → reject below */ }
-    return cb(new Error('Not allowed by CORS'))
+    // S558: reject CLEANLY (no CORS headers) rather than throwing — a thrown
+    // error here surfaces as a 500 on the preflight OPTIONS, which masks the
+    // real "origin not allowed" cause and looks like a server fault.
+    return cb(null, false)
   },
   credentials: true,
 }))

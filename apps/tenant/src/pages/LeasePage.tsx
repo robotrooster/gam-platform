@@ -4,6 +4,7 @@ import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { FileText, Download, PenTool, CheckCircle, AlertCircle, RotateCcw } from 'lucide-react'
 import { ADDENDUM_DIFF_FIELD_LABEL, formatAddendumDiffValue } from '@gam/shared'
 import { toast } from '../components/dialogs'
+import { loadPdfjs } from '../lib/pdfjs'
 
 const API_URL = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
 
@@ -121,15 +122,8 @@ function PdfViewer({ url, token }: { url:string; token:string }) {
     const load = async () => {
       if (loadedRef.current) return
       loadedRef.current = true
-      if (!(window as any).pdfjsLib) {
-        await new Promise<void>((resolve, reject) => {
-          const s = document.createElement('script')
-          s.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js'
-          s.onload = () => { ;(window as any).pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'; resolve() }
-          s.onerror = reject; document.head.appendChild(s)
-        })
-      }
-      const pdf = await (window as any).pdfjsLib.getDocument({ url, httpHeaders:{ Authorization:'Bearer '+token } }).promise
+      const pdfjsLib = await loadPdfjs()
+      const pdf = await pdfjsLib.getDocument({ url, httpHeaders:{ Authorization:'Bearer '+token } }).promise
       pdfRef.current = pdf; setTotal(pdf.numPages)
       setTimeout(() => renderPage(pdf, 1), 150)
     }

@@ -1,14 +1,11 @@
-// S552: applicant refunds for screenings that never happened.
+// Cancellation cleanup for screenings that never produced a report.
 //
-// The applicant pays GAM before the Checkr order is placed (see
-// routes/background.ts). When a check is cancelled without a report —
-// applicant-initiated cancel, or the stale-order sweep below — the payment
-// is refunded IN FULL and any unbilled landlord accrual for the check is
-// voided (no report ⇒ Checkr never bills GAM ⇒ the landlord owes nothing).
-//
-// Full-refund-everywhere is deliberate: some actual-cost states (MN
-// explicitly) REQUIRE refunding when no screening is performed; one
-// behavior for all 50 states is the simplest compliant posture.
+// S561: the applicant no longer pays for screening — GAM bills the landlord
+// (routes/background.ts). So the primary action here is voiding the unbilled
+// landlord accrual (no report ⇒ Checkr never bills GAM ⇒ the landlord owes
+// nothing). The applicant-refund branch below is retained only for any legacy
+// rows that still carry an applicant_payment_intent_id (pre-S561); new checks
+// have none, so that branch is a no-op for them.
 //
 // Already-billed accruals (billed_at NOT NULL — the monthly sweep ran
 // between submit and cancel) are left alone and logged: rare, small, and an
@@ -69,9 +66,9 @@ export async function refundBackgroundCheckPayment(backgroundCheckId: string): P
   return { refunded: true, reason: 'refunded', refundId: refund.id }
 }
 
-// No report ⇒ no Checkr cost ⇒ the landlord owes neither the $5 compliance
-// fee nor any shortfall. Delete only UNBILLED rows; billed ones are logged
-// for manual adjustment (the sweep already posted them to revenue).
+// No report ⇒ no Checkr cost ⇒ the landlord owes nothing (neither the passed-
+// through Checkr cost nor GAM's $5 margin). Delete only UNBILLED rows; billed
+// ones are logged for manual adjustment (the sweep already posted them).
 async function voidUnbilledAccrual(backgroundCheckId: string): Promise<void> {
   const del = await query<{ id: string }>(
     `DELETE FROM screening_fee_accruals

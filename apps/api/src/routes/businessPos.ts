@@ -211,7 +211,13 @@ businessPosRouter.post('/transactions', requireAuth, async (req, res, next) => {
         if (pi.metadata?.gam_business_id !== businessId) throw new AppError(404, 'Payment not found')
         if (pi.status !== 'succeeded') throw new AppError(409, `Payment is ${pi.status} — complete the card payment on the reader first`)
         const { PLATFORM_FEES: VF } = await import('@gam/shared')
-        const baseCents = Math.round(totalAmount * 100)
+        // S561 (Nic): validate against the GRAND total (sale + tip) — the reader
+        // is charged grandTotal (frontend BusinessRegisterPage charges
+        // Math.round(grandTotal*100)). The prior `totalAmount` base excluded the
+        // tip, so ANY tip made pi.amount mismatch → 409 AFTER the card was
+        // captured (customer charged, sale never recorded). Tip presets are on
+        // by default, so this fired constantly.
+        const baseCents = Math.round(grandTotal * 100)
         const feeCents = Math.round(baseCents * VF.BUSINESS_TERMINAL_APP_FEE_PCT) + VF.BUSINESS_TERMINAL_APP_FEE_FIXED_CENTS
         if (pi.amount === baseCents + feeCents) {
           cardSurcharge = feeCents / 100  // customer-paid card fee, shown on the receipt

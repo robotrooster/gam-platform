@@ -1,7 +1,7 @@
 import { Router } from 'express'
 import { createHash } from 'crypto'
 import Stripe from 'stripe'
-import { query, getClient } from '../db'
+import { query, queryOne, getClient } from '../db'
 import { executeRentAllocation, type PaymentMethod } from '../services/allocation'
 import {
   recordAccountUpdated, recordPayoutEvent, recordDisputeEvent,
@@ -82,11 +82,12 @@ webhooksRouter.post('/stripe', async (req, res) => {
         break
       }
 
-      const paymentMethod = extractPaymentMethod(pi)
+      const charge = await resolveCharge(stripe, pi)
+      const paymentMethod = extractPaymentMethod(charge)
       // S113-Phase2.5: snapshot the underlying charge id so post-commit
       // Transfer firing can use it as `source_transaction` to pull funds
       // from the original charge instead of the platform balance.
-      const stripeChargeId = (pi as any).charges?.data?.[0]?.id ?? null
+      const stripeChargeId = charge?.id ?? null
 
       const client = await getClient()
       let settledRows: { id: string; type: string }[] = []
@@ -107,6 +108,7 @@ webhooksRouter.post('/stripe', async (req, res) => {
           lease_id: string | null
           amount: string
           settled_at: string
+          reversal_id: string | null
         }>(
           `UPDATE payments
               SET status='settled', settled_at=NOW(),
@@ -114,10 +116,13 @@ webhooksRouter.post('/stripe', async (req, res) => {
                   stripe_charge_id = COALESCE($2, stripe_charge_id)
             WHERE stripe_payment_intent_id=$1
               AND status != 'settled'
-            RETURNING id, type, tenant_id, due_date, lease_id, amount, settled_at`,
+            RETURNING id, type, tenant_id, due_date, lease_id, amount, settled_at, reversal_id`,
           [pi.id, stripeChargeId]
         )
-        settledRows = settled.rows.map((r) => ({ id: r.id, type: r.type }))
+        // S561: reopened-after-reversal rows are handled in the loop below and
+        // must NOT drive the post-commit PM-transfer / rent-collected paths (a
+        // re-payment, not a fresh collection) — exclude them from settledRows.
+        settledRows = settled.rows.filter((r) => !r.reversal_id).map((r) => ({ id: r.id, type: r.type }))
 
         // Run allocation for every settled rent OR utility payment in this
         // batch. Utility payments use the same allocation engine as rent
@@ -131,6 +136,21 @@ webhooksRouter.post('/stripe', async (req, res) => {
                 `determined from charges payload (${row.type} payment ${row.id})`
               )
             }
+
+            // S561: a reopened-after-reversal rent settling = the tenant made
+            // GAM whole. Resolve the reversal + route the money — landlord
+            // already clawed back → re-disburse to them (normal allocation);
+            // otherwise GAM keeps the re-payment (reimburses its reversal loss)
+            // and no owner allocation runs. Skip the credit event (a
+            // re-payment, not a fresh signal). PM/manager-cut reversal = Phase 4
+            // (Oak Park is self-managed).
+            if (row.reversal_id) {
+              const { resolveReversalOnTenantPayment } = await import('../services/paymentReversal')
+              const reDisburse = await resolveReversalOnTenantPayment(client, row.reversal_id)
+              if (reDisburse) await executeRentAllocation(client, row.id, paymentMethod)
+              continue
+            }
+
             await executeRentAllocation(client, row.id, paymentMethod)
 
             // Credit ledger: emit payment_received_* event tagged to the
@@ -820,6 +840,43 @@ webhooksRouter.post('/stripe', async (req, res) => {
       const dispute = event.data.object as Stripe.Dispute
       try {
         await recordDisputeEvent(dispute)
+
+        // S561 (platform-holds Phase 3): on a NEWLY created dispute, if the
+        // disputed payment already SETTLED (it was batched to the landlord),
+        // run the post-settlement reversal flow — reopen the tenant + record
+        // the landlord receivable. Card chargebacks arrive here; the exact
+        // late-ACH-return event is confirmed + wired at C3 (live keys). The
+        // handler is idempotent (unique stripe_event_id + not-settled guard).
+        if (event.type === 'charge.dispute.created') {
+          const piId = typeof dispute.payment_intent === 'string'
+            ? dispute.payment_intent
+            : dispute.payment_intent?.id ?? null
+          const settledPay = piId ? await queryOne<{ id: string }>(
+            `SELECT id FROM payments
+              WHERE stripe_payment_intent_id = $1 AND status = 'settled'
+                AND type IN ('rent', 'utility') LIMIT 1`, [piId]
+          ) : null
+          if (settledPay) {
+            const disputeRow = await queryOne<{ id: string }>(
+              `SELECT id FROM connect_disputes WHERE stripe_dispute_id = $1`, [dispute.id]
+            )
+            // Pass-through fee = the actual Stripe dispute fee (balance-txn
+            // fee), fallback to the standard $15 card-dispute fee.
+            const feeCents = (dispute.balance_transactions ?? [])
+              .reduce((s, bt) => s + Math.abs(bt.fee ?? 0), 0)
+            const { handlePaymentReversal } = await import('../services/paymentReversal')
+            await handlePaymentReversal({
+              paymentId:        settledPay.id,
+              reversalType:     'card_dispute',
+              reversedAmount:   (dispute.amount ?? 0) / 100,
+              reversalFee:      feeCents > 0 ? feeCents / 100 : 15,
+              stripeEventId:    event.id,
+              stripeObjectId:   dispute.id,
+              connectDisputeId: disputeRow?.id ?? null,
+              rawEvent:         event,
+            })
+          }
+        }
       } catch (e) {
         logger.error({ err: e, event_type: event.type, stripe_dispute_id: dispute.id }, 'dispute webhook handler failed')
         // S132: critical — disputes hit GAM's platform balance and have
@@ -1034,11 +1091,32 @@ async function stampWebhookError(stripeEventId: string, err: unknown): Promise<v
  * - 'card' (credit + debit, collapsed S64) → 'card'
  * - Anything else (link, cashapp, etc.) → null; allocation will throw.
  */
-function extractPaymentMethod(pi: Stripe.PaymentIntent): PaymentMethod | null {
-  // Stripe SDK 2023-10-16 dropped `charges` from the default PaymentIntent type
-  // (use `expand: ['charges']` to retrieve it). The webhook event payload still
-  // ships it at runtime, so cast through. Schema-wise we read the same field.
-  const charge = (pi as any).charges?.data?.[0]
+/**
+ * Resolve the Charge for a succeeded PaymentIntent. S560: Stripe removed the
+ * `charges` list from the PaymentIntent resource in API version 2022-11-15,
+ * replacing it with `latest_charge` (a string id, or the expanded object).
+ * Modern accounts (GAM's is 2026) render webhook payloads at the new version,
+ * so `charges.data[0]` is empty — reading it returned null, which made
+ * allocation throw and the webhook retry forever. Read `latest_charge`
+ * (retrieving the charge when it's just an id), with a legacy `charges.data[0]`
+ * fallback so both payload shapes work.
+ */
+async function resolveCharge(stripe: Stripe, pi: Stripe.PaymentIntent): Promise<Stripe.Charge | null> {
+  const latest = (pi as any).latest_charge
+  if (latest && typeof latest === 'object') return latest as Stripe.Charge
+  if (typeof latest === 'string' && latest) {
+    try { return await stripe.charges.retrieve(latest) } catch { return null }
+  }
+  return (pi as any).charges?.data?.[0] ?? null
+}
+
+/**
+ * Map a Stripe charge's payment_method_details.type to GAM's collapsed bucket.
+ * - 'us_bank_account' (ACH debit) → 'ach'
+ * - 'card' (credit + debit, collapsed S64) → 'card'
+ * - Anything else (link, cashapp, etc.) → null; allocation will throw.
+ */
+function extractPaymentMethod(charge: Stripe.Charge | null | undefined): PaymentMethod | null {
   const type = charge?.payment_method_details?.type
   if (type === 'us_bank_account') return 'ach'
   if (type === 'card') return 'card'

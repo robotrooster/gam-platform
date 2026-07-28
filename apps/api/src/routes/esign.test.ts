@@ -368,11 +368,11 @@ describe('POST /documents — validation', () => {
 // (rent × per-(property,unit_type) multiplier), and unit_number into the
 // document fields without the landlord typing them. Caller-supplied values win.
 
-describe('POST /documents — auto-populate from unit (S556)', () => {
-  async function seedTemplateWithFields(landlordId: string, cols: string[]): Promise<string> {
+describe('POST /documents — auto-populate from unit (S556/S558)', () => {
+  async function seedTemplateWithFields(landlordId: string, cols: string[], depositMonths: number | null = null): Promise<string> {
     const t = await db.query<{ id: string }>(
-      `INSERT INTO lease_templates (landlord_id, name, page_count) VALUES ($1, 'AutoPop', 1) RETURNING id`,
-      [landlordId])
+      `INSERT INTO lease_templates (landlord_id, name, page_count, deposit_months) VALUES ($1, 'AutoPop', 1, $2) RETURNING id`,
+      [landlordId, depositMonths])
     const tid = t.rows[0].id
     for (const col of cols) {
       await db.query(
@@ -388,12 +388,10 @@ describe('POST /documents — auto-populate from unit (S556)', () => {
     return Object.fromEntries(r.rows.map(x => [x.lease_column, x.value]))
   }
 
-  it('seeds rent, derived deposit (rent × multiplier), and unit_number from the unit', async () => {
+  it('seeds rent, derived deposit (rent × template deposit_months), and unit_number from the unit', async () => {
     const f = await seedFixture()  // unit rent defaults to 1000, unit_type apartment
-    const tid = await seedTemplateWithFields(f.landlordId, ['rent_amount', 'security_deposit', 'unit_number'])
-    await db.query(
-      `INSERT INTO property_unit_type_deposits (property_id, unit_type, deposit_multiplier)
-       VALUES ($1, 'apartment', 1.5)`, [f.propertyId])
+    // S558: the multiplier lives on the TEMPLATE, not a property setting.
+    const tid = await seedTemplateWithFields(f.landlordId, ['rent_amount', 'security_deposit', 'unit_number'], 1.5)
 
     const res = await request(buildApp())
       .post('/api/esign/documents')
@@ -412,9 +410,9 @@ describe('POST /documents — auto-populate from unit (S556)', () => {
     expect(vals.unit_number).toBeTruthy()
   })
 
-  it('defaults deposit to 1× rent when no multiplier row exists', async () => {
+  it('leaves the deposit BLANK when the template states no deposit_months (never invents one)', async () => {
     const f = await seedFixture()
-    const tid = await seedTemplateWithFields(f.landlordId, ['rent_amount', 'security_deposit'])
+    const tid = await seedTemplateWithFields(f.landlordId, ['rent_amount', 'security_deposit']) // no deposit_months
     const res = await request(buildApp())
       .post('/api/esign/documents')
       .set('Authorization', `Bearer ${f.landlordToken}`)
@@ -427,7 +425,8 @@ describe('POST /documents — auto-populate from unit (S556)', () => {
       })
     expect(res.status).toBe(201)
     const vals = await docFieldValues(res.body.data.id)
-    expect(vals.security_deposit).toBe('1000.00') // 1000 × 1.0 default
+    expect(vals.rent_amount).toBe('1000.00')          // rent still seeds
+    expect(vals.security_deposit ?? null).toBeNull()  // deposit left for the landlord
   })
 
   it('caller-supplied prefill wins over unit auto-seed', async () => {
@@ -447,6 +446,68 @@ describe('POST /documents — auto-populate from unit (S556)', () => {
     expect(res.status).toBe(201)
     const vals = await docFieldValues(res.body.data.id)
     expect(vals.rent_amount).toBe('2500.00')
+  })
+})
+
+// ─── S558: unit-type default template + resolver ───────────────
+
+describe('template unit-type default (S558)', () => {
+  async function mkTemplate(landlordId: string, unitType: string | null, opts: { propertyId?: string | null; depositMonths?: number | null; termMonths?: number | null } = {}) {
+    const t = await db.query<{ id: string }>(
+      `INSERT INTO lease_templates (landlord_id, name, page_count, unit_type, property_id, deposit_months, default_term_months)
+       VALUES ($1, 'Tmpl', 1, $2, $3, $4, $5) RETURNING id`,
+      [landlordId, unitType, opts.propertyId ?? null, opts.depositMonths ?? null, opts.termMonths ?? null])
+    return t.rows[0].id
+  }
+
+  it('set-default is radio: marking a second apartment template clears the first', async () => {
+    const f = await seedFixture()
+    const a = await mkTemplate(f.landlordId, 'apartment')
+    const b = await mkTemplate(f.landlordId, 'apartment')
+    await request(buildApp()).post(`/api/esign/templates/${a}/set-default`).set('Authorization', `Bearer ${f.landlordToken}`).send({}).expect(200)
+    await request(buildApp()).post(`/api/esign/templates/${b}/set-default`).set('Authorization', `Bearer ${f.landlordToken}`).send({}).expect(200)
+    const rows = await db.query<{ id: string; is_unit_type_default: boolean }>(
+      `SELECT id, is_unit_type_default FROM lease_templates WHERE id = ANY($1)`, [[a, b]])
+    const byId = Object.fromEntries(rows.rows.map(r => [r.id, r.is_unit_type_default]))
+    expect(byId[a]).toBe(false)
+    expect(byId[b]).toBe(true)
+  })
+
+  it('refuses to make a universal (null unit_type) template a default', async () => {
+    const f = await seedFixture()
+    const u = await mkTemplate(f.landlordId, null)
+    await request(buildApp()).post(`/api/esign/templates/${u}/set-default`).set('Authorization', `Bearer ${f.landlordToken}`).send({}).expect(400)
+  })
+
+  it('resolver picks the unit type default and carries deposit + term', async () => {
+    const { resolveDefaultTemplateForUnit } = await import('../services/templateResolve')
+    const f = await seedFixture() // unit_type apartment
+    await mkTemplate(f.landlordId, 'rv_spot', { termMonths: null }) // decoy other type
+    const apt = await mkTemplate(f.landlordId, 'apartment', { depositMonths: 1.5, termMonths: 12 })
+    await request(buildApp()).post(`/api/esign/templates/${apt}/set-default`).set('Authorization', `Bearer ${f.landlordToken}`).send({}).expect(200)
+    const resolved = await resolveDefaultTemplateForUnit(f.unitId)
+    expect(resolved?.id).toBe(apt)
+    expect(Number(resolved?.deposit_months)).toBe(1.5)
+    expect(resolved?.default_term_months).toBe(12)
+  })
+
+  it('property-locked default wins over the unlocked one', async () => {
+    const { resolveDefaultTemplateForUnit } = await import('../services/templateResolve')
+    const f = await seedFixture()
+    const unlocked = await mkTemplate(f.landlordId, 'apartment')
+    const locked = await mkTemplate(f.landlordId, 'apartment', { propertyId: f.propertyId })
+    await request(buildApp()).post(`/api/esign/templates/${unlocked}/set-default`).set('Authorization', `Bearer ${f.landlordToken}`).send({}).expect(200)
+    await request(buildApp()).post(`/api/esign/templates/${locked}/set-default`).set('Authorization', `Bearer ${f.landlordToken}`).send({}).expect(200)
+    const resolved = await resolveDefaultTemplateForUnit(f.unitId)
+    expect(resolved?.id).toBe(locked)
+  })
+
+  it('resolver returns null when no default set for the unit type', async () => {
+    const { resolveDefaultTemplateForUnit } = await import('../services/templateResolve')
+    const f = await seedFixture()
+    await mkTemplate(f.landlordId, 'apartment') // exists but not marked default
+    const resolved = await resolveDefaultTemplateForUnit(f.unitId)
+    expect(resolved).toBeNull()
   })
 })
 
@@ -547,12 +608,29 @@ describe('POST /documents/:id/void', () => {
     expect(res.status).toBe(400)
   })
 
-  it('rejects voiding once any signer has signed (409)', async () => {
+  it('S558: still voidable when only the LANDLORD has signed (landlord signs first, binds no one)', async () => {
     const f = await seedFixture()
     const { documentId } = await seedDoc(f, { status: 'in_progress', landlordSignerStatus: 'signed' })
-    // Stamp signed_at on the landlord signer
+    // Stamp signed_at on the landlord signer only.
     await db.query(
       `UPDATE lease_document_signers SET signed_at = NOW() WHERE document_id = $1 AND role = 'landlord'`,
+      [documentId],
+    )
+    const res = await request(buildApp())
+      .post(`/api/esign/documents/${documentId}/void`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({})
+    expect(res.status).toBe(200)
+    const doc = await db.query<{ status: string }>(`SELECT status FROM lease_documents WHERE id=$1`, [documentId])
+    expect(doc.rows[0].status).toBe('voided')
+  })
+
+  it('S558: rejects voiding once a TENANT has signed (409 → supersede)', async () => {
+    const f = await seedFixture()
+    const { documentId } = await seedDoc(f, { status: 'in_progress', landlordSignerStatus: 'signed' })
+    // Both landlord and the primary tenant have signed.
+    await db.query(
+      `UPDATE lease_document_signers SET signed_at = NOW() WHERE document_id = $1 AND role IN ('landlord','primary')`,
       [documentId],
     )
     const res = await request(buildApp())

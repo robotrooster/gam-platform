@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useMemo } from 'react'
 import { X, AlertCircle, AlertTriangle, CheckCircle2, Loader } from 'lucide-react'
 import { api, apiGet } from '../lib/api'
+import { loadPdfjs } from '../lib/pdfjs'
 import {
   AUTO_RENEW_MODES,
   AUTO_RENEW_MODE_LABEL,
@@ -143,20 +144,8 @@ function PdfPanel({ intentId }: { intentId: string }) {
       if (loadedRef.current) return
       loadedRef.current = true
       try {
-        if (!(window as any).pdfjsLib) {
-          await new Promise<void>((resolve, reject) => {
-            const s = document.createElement('script')
-            s.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js'
-            s.onload = () => {
-              ;(window as any).pdfjsLib.GlobalWorkerOptions.workerSrc =
-                'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'
-              resolve()
-            }
-            s.onerror = () => reject(new Error('Failed to load pdf.js from CDN'))
-            document.head.appendChild(s)
-          })
-        }
-        const pdf = await (window as any).pdfjsLib.getDocument({
+        const pdfjsLib = await loadPdfjs()
+        const pdf = await pdfjsLib.getDocument({
           url,
           httpHeaders: { Authorization: 'Bearer ' + token },
         }).promise

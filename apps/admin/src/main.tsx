@@ -177,21 +177,21 @@ a{color:var(--gold);text-decoration:none}
 .ps{font-size:.78rem;color:var(--t3);margin-top:2px}
 .kpi{background:var(--bg2);border:1px solid var(--b1);border-radius:10px;padding:16px;position:relative;overflow:hidden}
 .kpi::after{content:'';position:absolute;bottom:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--gold),transparent);opacity:0.4}
-.kl{font-size:.65rem;color:var(--t3);text-transform:uppercase;letter-spacing:.09em;font-weight:600;margin-bottom:6px}
-.kv{font-family:var(--font-d);font-size:1.6rem;font-weight:800;color:var(--t0);line-height:1;margin-bottom:4px}
-.ks{font-size:.7rem;color:var(--t3)}
+.kl,.kpi-l{font-size:.65rem;color:var(--t3);text-transform:uppercase;letter-spacing:.09em;font-weight:600;margin-bottom:6px}
+.kv,.kpi-v{font-family:var(--font-d);font-size:1.6rem;font-weight:800;color:var(--t0);line-height:1;margin-bottom:4px}
+.ks,.kpi-s{font-size:.7rem;color:var(--t3)}
 .kv.g{color:var(--green)}.kv.r{color:var(--red)}.kv.a{color:var(--amber)}.kv.gold{color:var(--gold)}.kv.b{color:var(--blue)}
 .btn{display:inline-flex;align-items:center;gap:6px;padding:7px 14px;border-radius:7px;font-size:.78rem;font-weight:600;border:none;cursor:pointer;transition:all .12s;font-family:var(--font-b);text-decoration:none}
-.bp{background:var(--gold);color:#080a0c}.bp:hover{background:#d9af3a}
-.bg{background:var(--bg4);color:var(--t1);border:1px solid var(--b2)}.bg:hover{background:var(--bg3)}
+.bp,.btn-p,.btn-primary{background:var(--gold);color:#080a0c}.bp:hover,.btn-p:hover,.btn-primary:hover{background:#d9af3a}
+.bg,.btn-g,.btn-ghost{background:var(--bg4);color:var(--t1);border:1px solid var(--b2)}.bg:hover,.btn-g:hover,.btn-ghost:hover{background:var(--bg3)}
 .bd{background:rgba(239,68,68,.08);color:var(--red);border:1px solid rgba(239,68,68,.2)}.bd:hover{background:rgba(239,68,68,.14)}
 .bsm{padding:4px 9px;font-size:.72rem}
 .badge{display:inline-flex;align-items:center;gap:4px;padding:3px 9px;border-radius:20px;font-size:.65rem;font-weight:600;text-transform:uppercase;letter-spacing:.04em}
-.bg2{background:rgba(34,197,94,.08);color:var(--green);border:1px solid rgba(34,197,94,.18)}
-.ba{background:rgba(245,158,11,.08);color:var(--amber);border:1px solid rgba(245,158,11,.18)}
-.br{background:rgba(239,68,68,.08);color:var(--red);border:1px solid rgba(239,68,68,.18)}
-.bgold{background:rgba(201,162,39,.08);color:var(--gold);border:1px solid rgba(201,162,39,.18)}
-.bmu{background:var(--bg4);color:var(--t3);border:1px solid var(--b1)}
+.bg2,.b-green{background:rgba(34,197,94,.08);color:var(--green);border:1px solid rgba(34,197,94,.18)}
+.ba,.b-amber{background:rgba(245,158,11,.08);color:var(--amber);border:1px solid rgba(245,158,11,.18)}
+.br,.b-red{background:rgba(239,68,68,.08);color:var(--red);border:1px solid rgba(239,68,68,.18)}
+.bgold,.b-gold{background:rgba(201,162,39,.08);color:var(--gold);border:1px solid rgba(201,162,39,.18)}
+.bmu,.b-muted{background:var(--bg4);color:var(--t3);border:1px solid var(--b1)}
 .bb{background:rgba(59,130,246,.08);color:var(--blue);border:1px solid rgba(59,130,246,.18)}
 .tbl{width:100%;border-collapse:collapse;font-size:.78rem}
 .tbl th{background:var(--bg3);color:var(--t3);font-size:.64rem;font-weight:600;text-transform:uppercase;letter-spacing:.08em;padding:9px 12px;text-align:left;border-bottom:1px solid var(--b1)}
@@ -216,6 +216,20 @@ a{color:var(--gold);text-decoration:none}
 .tab.on{color:var(--gold);border-bottom-color:var(--gold)}
 .nacha-flag{background:rgba(239,68,68,.05);border:1px solid rgba(239,68,68,.2);border-radius:8px;padding:14px;margin-bottom:14px}
 @keyframes spin{to{transform:rotate(360deg)}}
+/* S562: classes referenced by newer admin surfaces (FlexPay review modal,
+   shared dialogs, form fields) that were never defined in this block — they
+   rendered unstyled (the FlexPay modal had no overlay). Small-button + modal +
+   input + form-group defs, matching the tenant vocabulary. */
+.btn-sm{padding:5px 10px;font-size:.72rem}
+.modal-ov,.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.75);display:flex;align-items:center;justify-content:center;z-index:100;padding:20px;backdrop-filter:blur(4px)}
+.modal{background:var(--bg2);border:1px solid var(--b2);border-radius:14px;padding:24px;width:100%;max-width:520px;max-height:90vh;overflow-y:auto;box-shadow:0 8px 32px rgba(0,0,0,.5)}
+.modal-t,.modal-title{font-family:var(--font-d);font-size:1.1rem;font-weight:800;color:var(--t0);margin-bottom:18px}
+.modal-f{display:flex;justify-content:flex-end;gap:10px;margin-top:20px;padding-top:16px;border-top:1px solid var(--b0)}
+.fg{margin-bottom:16px}
+.fl{display:block;font-size:.72rem;font-weight:600;color:var(--t2);margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em}
+.inp,.form-input{width:100%;background:var(--bg3);border:1px solid var(--b1);border-radius:8px;color:var(--t0);padding:10px 12px;font-size:.88rem;color-scheme:dark}
+.inp:focus,.form-input:focus{outline:none;border-color:var(--gold)}
+textarea.inp{resize:vertical}
 `
 
 // ── LAYOUT ────────────────────────────────────────────────────
@@ -2539,7 +2553,12 @@ function TotpEnrollPage(){
   const onConfirm=async(e:React.FormEvent)=>{
     e.preventDefault();setSubmitting(true);setErr('')
     try{
-      await api.post('/auth/totp/enroll-confirm',{token:code.trim()})
+      // S560: login now issues an enrollment-only pass to un-enrolled admins;
+      // enroll-confirm returns the real full session once 2FA is set up. Store
+      // it (the api interceptor reads gam_admin_token) before refreshing.
+      const cr=await api.post('/auth/totp/enroll-confirm',{token:code.trim()})
+      const fullTok=cr.data?.data?.token
+      if(fullTok)localStorage.setItem('gam_admin_token',fullTok)
       await refresh()
       setState('done')
       // Small delay so the user sees the success state before nav.

@@ -309,17 +309,18 @@ async function runGeneration(
       //      probable typo / rollover-vs-swap). Releases when the
       //      verification re-read or the landlord's review resolves it;
       //      force-completing the run does NOT clear a flag.
-      // The daily cron retries, so the invoice generates dated its
-      // original due date the moment the hold clears. Other units are
-      // untouched, and a clean unit's unfinished VERIFICATION never
-      // blocks — ensureBillsForUnit below bills from original reads.
-      // RUBS masters never block (separate system — their bills ride
-      // the next invoice whenever the master gets read).
+      // S558 (Nic): RUBS-group units ALSO hold — an invoice must never go
+      // out without the current master read behind its RUBS charge. A RUBS
+      // unit holds while, for a due run cycle, its master is unread OR any
+      // submeter feeding that master is unread (the pool can't be computed),
+      // and on any needs_review flag on the master or a linked submeter.
+      // (Supersedes the old "RUBS masters never block" posture.) Same
+      // force-complete escape hatch releases it.
       const readHold = await queryOne<{ meter_id: string }>(
         `SELECT m.id AS meter_id
            FROM utility_reading_runs r
            JOIN utility_meters m ON m.property_id = r.property_id
-                                AND m.billing_method = 'submeter'
+                                AND m.billing_method IN ('submeter','rubs')
            JOIN utility_meter_units mu ON mu.meter_id = m.id AND mu.unit_id = $2
            JOIN lease_utility_responsibilities lur
              ON lur.lease_id = $1
@@ -327,10 +328,29 @@ async function runGeneration(
             AND lur.tenant_responsible
           WHERE r.status <> 'completed'
             AND r.billing_cycle_month <= date_trunc('month', $3::date)::date
-            AND NOT EXISTS (
-              SELECT 1 FROM utility_meter_readings rd
-               WHERE rd.meter_id = m.id
-                 AND rd.billing_cycle_month = r.billing_cycle_month)
+            AND (
+              -- this meter (submeter or RUBS master) unread for the cycle
+              NOT EXISTS (
+                SELECT 1 FROM utility_meter_readings rd
+                 WHERE rd.meter_id = m.id
+                   AND rd.billing_cycle_month = r.billing_cycle_month
+                   AND rd.reason = 'monthly_cycle')
+              -- OR (RUBS master only, S558) any submeter on one of the master's
+              -- served units is unread — the pool subtracts them, so it can't
+              -- be computed until they're all in.
+              OR (m.billing_method = 'rubs' AND EXISTS (
+                SELECT 1 FROM utility_meter_units master_mu
+                  JOIN utility_meter_units sub_mu ON sub_mu.unit_id = master_mu.unit_id
+                  JOIN utility_meters sm ON sm.id = sub_mu.meter_id
+                                        AND sm.billing_method = 'submeter'
+                                        AND sm.utility_type = m.utility_type
+                 WHERE master_mu.meter_id = m.id
+                   AND NOT EXISTS (
+                     SELECT 1 FROM utility_meter_readings rd2
+                      WHERE rd2.meter_id = sm.id
+                        AND rd2.billing_cycle_month = r.billing_cycle_month
+                        AND rd2.reason = 'monthly_cycle')))
+            )
           LIMIT 1`,
         [lease.id, lease.unit_id, dueDate]
       )
@@ -342,10 +362,23 @@ async function runGeneration(
              ON lur.lease_id = $1
             AND lur.utility_type = m.utility_type
             AND lur.tenant_responsible
-           JOIN utility_meter_readings rd ON rd.meter_id = m.id
-          WHERE m.billing_method = 'submeter'
-            AND rd.needs_review
-            AND rd.billing_cycle_month <= date_trunc('month', $3::date)::date
+          WHERE m.billing_method IN ('submeter','rubs')
+            AND (
+              EXISTS (
+                SELECT 1 FROM utility_meter_readings rd
+                 WHERE rd.meter_id = m.id AND rd.needs_review
+                   AND rd.billing_cycle_month <= date_trunc('month', $3::date)::date)
+              -- a flagged reading on a submeter on one of the master's units
+              OR (m.billing_method = 'rubs' AND EXISTS (
+                SELECT 1 FROM utility_meter_units master_mu
+                  JOIN utility_meter_units sub_mu ON sub_mu.unit_id = master_mu.unit_id
+                  JOIN utility_meters sm ON sm.id = sub_mu.meter_id
+                                        AND sm.billing_method = 'submeter'
+                                        AND sm.utility_type = m.utility_type
+                  JOIN utility_meter_readings rd ON rd.meter_id = sm.id
+                 WHERE master_mu.meter_id = m.id AND rd.needs_review
+                   AND rd.billing_cycle_month <= date_trunc('month', $3::date)::date))
+            )
           LIMIT 1`,
         [lease.id, lease.unit_id, dueDate]
       )

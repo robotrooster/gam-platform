@@ -2,7 +2,8 @@
 import { useState, useRef, useCallback, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPatch, apiDelete, apiPut } from '../lib/api'
-import { LEASE_COLUMNS, LEASE_COLUMN_LABEL, LEASE_COLUMN_INPUT, humanize } from '@gam/shared'
+import { loadPdfjs } from '../lib/pdfjs'
+import { LEASE_COLUMNS, LEASE_COLUMN_LABEL, LEASE_COLUMN_INPUT, humanize, isLateFeeColumn } from '@gam/shared'
 import { useAuth } from '../context/AuthContext'
 import { usePerms } from '../lib/permissions'
 import { Plus, X, FileText, Send, Settings, Eye, Trash2, ChevronRight, Check, AlertCircle, Download, MoreVertical } from 'lucide-react'
@@ -42,6 +43,10 @@ function FieldItem({ field, selected, onSelect, onMove, onDelete, onResize, scal
   const ft = FIELD_TYPES.find(f => f.type === field.fieldType) || FIELD_TYPES[0]
   const color = ROLE_COLORS[field.signerRole] || '#888'
   const dragRef = useRef<{startX:number;startY:number;fieldX:number;fieldY:number}|null>(null)
+  // S558 (Nic): late-fee boxes are policy-controlled — locked from move / resize
+  // / delete / edit so the landlord can't tamper with the stamped fee (anti-
+  // discrimination; the signed lease is the legal charge).
+  const locked = isLateFeeColumn(field.leaseColumn)
 
   const onResizeMouseDown = (e: React.MouseEvent, handle: string) => {
     e.stopPropagation(); e.preventDefault()
@@ -66,6 +71,7 @@ function FieldItem({ field, selected, onSelect, onMove, onDelete, onResize, scal
     e.stopPropagation()
     e.preventDefault()
     onSelect(field.id)
+    if (locked) return // locked late-fee box: select only, no drag
     const startX = e.clientX
     const startY = e.clientY
     let moved = false
@@ -89,8 +95,8 @@ function FieldItem({ field, selected, onSelect, onMove, onDelete, onResize, scal
 
   return (
     <div style={{ position:'absolute', left: field.x * scale - 1, top: field.y * scale - 1 }} onMouseDown={e => e.stopPropagation()} onClick={e => e.stopPropagation()}>
-      {/* Delete button — outside the draggable area */}
-      {selected && (
+      {/* Delete button — outside the draggable area. Hidden for locked late-fee boxes. */}
+      {selected && !locked && (
         <div
           onMouseDown={e => { e.stopPropagation(); e.preventDefault() }}
           onClick={e => { e.stopPropagation(); onDelete(field.id) }}
@@ -98,23 +104,24 @@ function FieldItem({ field, selected, onSelect, onMove, onDelete, onResize, scal
           ×
         </div>
       )}
-      {/* Draggable field */}
-      <div onMouseDown={onMouseDown} style={{
+      {/* Field box. Late-fee boxes render locked (no drag cursor, lock badge). */}
+      <div onMouseDown={onMouseDown} title={locked ? 'Late-fee field — set by the property Late Fees policy, locked' : undefined} style={{
         position:'relative', width: field.width * scale, height: field.height * scale,
         border: `2px solid ${selected ? color : color + '99'}`,
         borderRadius: field.fieldType === 'checkbox' ? 4 : 6,
         background: `${color}18`,
-        cursor:'move', userSelect:'none', boxSizing:'border-box' as const,
+        cursor: locked ? 'not-allowed' : 'move', userSelect:'none', boxSizing:'border-box' as const,
         display:'flex', alignItems:'center', justifyContent:'center', gap:4,
         overflow:'visible',
       }}>
+        {locked && <span style={{ position:'absolute', top:-8, left:-8, fontSize: Math.max(9, 11*scale), zIndex:998, pointerEvents:'none' }}>🔒</span>}
         <span style={{ fontSize: Math.max(8, 11 * scale), flexShrink:0, pointerEvents:'none' }}>{ft.icon}</span>
         {field.width * scale > 50 && (
           <span style={{ color, fontWeight:700, whiteSpace:'nowrap' as const, overflow:'hidden', textOverflow:'ellipsis', fontSize: Math.max(7, 9 * scale), pointerEvents:'none' }}>
             {field.label || ft.label}
           </span>
         )}
-        {selected && [
+        {selected && !locked && [
           { id:'e',  style:{ position:'absolute' as const, right:-5, top:'50%', transform:'translateY(-50%)', cursor:'ew-resize',   width:8, height:20, background:color, borderRadius:2, zIndex:20 } },
           { id:'s',  style:{ position:'absolute' as const, bottom:-5, left:'50%', transform:'translateX(-50%)', cursor:'ns-resize',  width:20, height:8, background:color, borderRadius:2, zIndex:20 } },
           { id:'se', style:{ position:'absolute' as const, right:-5, bottom:-5, cursor:'nwse-resize', width:10, height:10, background:color, borderRadius:2, zIndex:20 } },
@@ -133,21 +140,7 @@ function PDFCanvas({ url, page, width, height }: { url:string; page:number; widt
     let cancelled = false
     const render = async () => {
       try {
-        // Load PDF.js from CDN
-        if (!(window as any).pdfjsLib) {
-          await new Promise<void>((resolve, reject) => {
-            const script = document.createElement('script')
-            script.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js'
-            script.onload = () => {
-              ;(window as any).pdfjsLib.GlobalWorkerOptions.workerSrc =
-                'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'
-              resolve()
-            }
-            script.onerror = reject
-            document.head.appendChild(script)
-          })
-        }
-        const pdfjsLib = (window as any).pdfjsLib
+        const pdfjsLib = await loadPdfjs()
         // S535: template PDFs are served by the authed /api/esign/files
         // route — attach the Bearer token (pdf.js fetches the URL itself,
         // so the axios interceptor never sees this request).
@@ -344,7 +337,19 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
           )}
 
           {/* Selected field properties */}
-          {sel && (
+          {sel && isLateFeeColumn(sel.leaseColumn) && (
+            <div style={{ marginTop:16, borderTop:'1px solid var(--border-0)', paddingTop:12 }}>
+              <div style={{ fontSize:'.68rem', fontWeight:700, color:'var(--text-3)', textTransform:'uppercase', letterSpacing:'.08em', marginBottom:8 }}>Field Properties</div>
+              <div style={{ padding:'10px 12px', background:'rgba(201,162,39,.08)', border:'1px solid rgba(201,162,39,.25)', borderRadius:8, fontSize:'.72rem', color:'var(--text-2)', lineHeight:1.5 }}>
+                🔒 <b>{LEASE_COLUMN_LABEL[sel.leaseColumn as keyof typeof LEASE_COLUMN_LABEL] || sel.leaseColumn}</b> — locked.
+                Late fees come from the property&apos;s <b>Late Fees</b> policy for this unit type. The amount is
+                stamped into the lease at signing and can&apos;t be edited, moved, or deleted here — that keeps the
+                charge identical for every tenant of the class and matching the signed document. To change late
+                fees, update the property settings; changes apply to new leases at signing/renewal.
+              </div>
+            </div>
+          )}
+          {sel && !isLateFeeColumn(sel.leaseColumn) && (
             <div style={{ marginTop:16, borderTop:'1px solid var(--border-0)', paddingTop:12 }}>
               <div style={{ fontSize:'.68rem', fontWeight:700, color:'var(--text-3)', textTransform:'uppercase', letterSpacing:'.08em', marginBottom:8 }}>Field Properties</div>
               <div style={{ marginBottom:8 }}>
@@ -467,7 +472,7 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
                 <FieldItem key={f.id} field={f} selected={selectedField===f.id}
                   onSelect={setSelectedField} onMove={moveField}
                   onResize={resizeField}
-                  onDelete={(id: string) => { setFields(prev => prev.filter(x => x.id !== id)); setSelectedField(null) }}
+                  onDelete={(id: string) => { setFields(prev => prev.filter(x => x.id !== id || isLateFeeColumn(x.leaseColumn))); setSelectedField(null) }}
                   scale={scale} />
               ))}
             </div>
@@ -544,13 +549,16 @@ function SendDocumentModal({ onClose }) {
     if (pick) setTemplateId(pick.id)
   }, [selectedUnitId, mode])
 
-  // S556: pre-fill the Document Values form from the unit's data (rent,
-  // derived deposit, unit #, property) so the landlord reviews/adjusts instead
-  // of retyping. Only fills blanks — anything already typed stays.
+  // S556/S558: pre-fill the Document Values form from the unit's data (rent,
+  // unit #, property) so the landlord reviews/adjusts instead of retyping. The
+  // derived security deposit needs the chosen template (deposit = rent ×
+  // template.deposit_months, S558), so pass templateId and re-run when it
+  // changes. Only fills blanks — anything already typed stays.
   useEffect(() => {
     if (mode !== 'unit' || !selectedUnitId) return
     let cancelled = false
-    apiGet(`/esign/units/${selectedUnitId}/prefill-suggestions`)
+    const qs = templateId ? `?templateId=${templateId}` : ''
+    apiGet(`/esign/units/${selectedUnitId}/prefill-suggestions${qs}`)
       .then((s: Record<string,string>) => {
         if (cancelled || !s) return
         setPrefillValues(prev => {
@@ -561,7 +569,7 @@ function SendDocumentModal({ onClose }) {
       })
       .catch(() => {})
     return () => { cancelled = true }
-  }, [selectedUnitId, mode])
+  }, [selectedUnitId, mode, templateId])
 
   // Resolved lease signers for the picked unit / property.
   const recipientsQ = mode === 'unit' && selectedUnitId
@@ -842,6 +850,11 @@ export function ESignPage() {
   // S535: optional PROPERTY lock — auto-set when the uploaded PDF's text
   // names exactly one of the landlord's properties.
   const [newTmplPropertyId, setNewTmplPropertyId] = useState('')
+  // S558: deposit multiplier the lease STATES ('' = none → landlord fills the
+  // deposit manually). deposit = unit rent × this, auto-filled at draft.
+  const [newTmplDepositMonths, setNewTmplDepositMonths] = useState('')
+  // S558: default lease term ('' = month-to-month; N = fixed N-month term).
+  const [newTmplTermMonths, setNewTmplTermMonths] = useState('')
   const [detectedPropertyName, setDetectedPropertyName] = useState<string | null>(null)
   const { data: tmplProperties = [] } = useQuery<any[]>('properties', () => apiGet('/properties'))
   const [newTmplPdf, setNewTmplPdf] = useState('')
@@ -857,8 +870,17 @@ export function ESignPage() {
     { onSuccess: () => qc.invalidateQueries('esign-templates') }
   )
 
+  // S558: designate a template as its unit type's default (the "primary
+  // <unit type> lease"). Server clears any prior default for the same
+  // (unit type, property) — radio behaviour.
+  const setDefaultTemplateMut = useMutation(
+    (id: string) => apiPost(`/esign/templates/${id}/set-default`, { isDefault: true }),
+    { onSuccess: () => qc.invalidateQueries('esign-templates'),
+      onError: (e: any) => toast.error(e?.message || 'Could not set default') }
+  )
+
   const createTemplateMut = useMutation(
-    () => apiPost('/esign/templates', { name: newTmplName, pageCount: tmplPageCount, basePdfUrl: newTmplPdf||null, unitType: newTmplUnitType === 'all' ? null : newTmplUnitType || null, propertyId: newTmplPropertyId || null }),
+    () => apiPost('/esign/templates', { name: newTmplName, pageCount: tmplPageCount, basePdfUrl: newTmplPdf||null, unitType: newTmplUnitType === 'all' ? null : newTmplUnitType || null, propertyId: newTmplPropertyId || null, depositMonths: newTmplDepositMonths === '' ? null : Number(newTmplDepositMonths), defaultTermMonths: newTmplTermMonths === '' ? null : Number(newTmplTermMonths) }),
     { onSuccess: async (res: any) => {
       qc.invalidateQueries('esign-templates')
       setShowNewTemplate(false)
@@ -968,20 +990,34 @@ export function ESignPage() {
                 <div key={t.id} className="card" style={{ padding:'16px' }}>
                   <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start', marginBottom:10 }}>
                     <div>
-                      <div style={{ fontWeight:700, color:'var(--text-0)', marginBottom:2 }}>{t.name}</div>
+                      <div style={{ display:'flex', alignItems:'center', gap:6, marginBottom:2 }}>
+                        <span style={{ fontWeight:700, color:'var(--text-0)' }}>{t.name}</span>
+                        {t.isUnitTypeDefault && (
+                          <span title={`Default lease for ${t.unitType ? humanize(t.unitType) : 'this unit type'}`} style={{ fontSize:'.6rem', fontWeight:700, textTransform:'uppercase' as const, letterSpacing:'.05em', color:'var(--gold)', border:'1px solid var(--gold)', borderRadius:4, padding:'1px 5px' }}>Default</span>
+                        )}
+                      </div>
                       <div style={{ fontSize:'.72rem', color:'var(--text-3)' }}>{t.fieldCount} fields · {t.pageCount} pages · {t.unitType ? humanize(t.unitType) : 'any unit type'} · {t.propertyName || 'any property'}</div>
+                      <div style={{ fontSize:'.72rem', color:'var(--text-3)', marginTop:2 }}>
+                        {t.defaultTermMonths ? `${t.defaultTermMonths}-mo term` : 'Month-to-month'}
+                        {t.depositMonths != null ? ` · deposit ${Number(t.depositMonths)}× rent` : ' · deposit set on lease'}
+                      </div>
                     </div>
                     <FileText size={18} style={{ color:'var(--text-3)' }} />
                   </div>
                   {t.description && <div style={{ fontSize:'.75rem', color:'var(--text-3)', marginBottom:12 }}>{t.description}</div>}
                   {can('esign.template_manage') && (
-                    <div style={{ display:'flex', gap:6 }}>
+                    <div style={{ display:'flex', gap:6, flexWrap:'wrap' as const }}>
                       <button className="btn btn-ghost btn-sm" onClick={async () => {
                         const full = await apiGet<any>(`/esign/templates/${t.id}`)
                         setEditTemplate(full)
                       }}>
                         <Settings size={12} /> Edit Fields
                       </button>
+                      {t.unitType && !t.isUnitTypeDefault && (
+                        <button className="btn btn-ghost btn-sm" disabled={setDefaultTemplateMut.isLoading} onClick={() => setDefaultTemplateMut.mutate(t.id)}>
+                          Make default
+                        </button>
+                      )}
                       <button className="btn btn-ghost btn-sm" style={{ color:'var(--red)' }} onClick={() => {
                         appConfirm('Delete template "' + t.name + '"? This cannot be undone.', { danger: true, confirmLabel: 'Delete' }).then(ok => { if (ok) deleteTemplateMut.mutate(t.id) })
                       }}>
@@ -1030,6 +1066,26 @@ export function ESignPage() {
               ) : (
                 <div style={{ fontSize:'.65rem', color:'var(--text-3)', marginTop:3 }}>Lease forms name their property — locking prevents sending the wrong property&apos;s form.</div>
               )}
+            </div>
+            <div style={{ marginBottom:12 }}>
+              <label style={{ fontSize:'.72rem', fontWeight:600, color:'var(--text-3)', textTransform:'uppercase' as const, letterSpacing:'.06em', display:'block', marginBottom:5 }}>Security Deposit</label>
+              <select className="form-select" value={newTmplDepositMonths} onChange={e => setNewTmplDepositMonths(e.target.value)} style={{ width:'100%' }}>
+                <option value="">No auto-deposit (fill on each lease)</option>
+                <option value="1">1 month&apos;s rent</option>
+                <option value="1.5">1½ months&apos; rent</option>
+                <option value="2">2 months&apos; rent</option>
+              </select>
+              <div style={{ fontSize:'.65rem', color:'var(--text-3)', marginTop:3 }}>Match what this lease states. The deposit auto-fills as unit rent × this — so the charge always matches the signed lease.</div>
+            </div>
+            <div style={{ marginBottom:12 }}>
+              <label style={{ fontSize:'.72rem', fontWeight:600, color:'var(--text-3)', textTransform:'uppercase' as const, letterSpacing:'.06em', display:'block', marginBottom:5 }}>Default Lease Term</label>
+              <select className="form-select" value={newTmplTermMonths} onChange={e => setNewTmplTermMonths(e.target.value)} style={{ width:'100%' }}>
+                <option value="">Month-to-month</option>
+                <option value="6">6 months</option>
+                <option value="12">12 months (1 year)</option>
+                <option value="24">24 months (2 years)</option>
+              </select>
+              <div style={{ fontSize:'.65rem', color:'var(--text-3)', marginTop:3 }}>Auto-fills the lease dates when drafting off a unit (start today, end + this term). Storage/RV are usually month-to-month; apartments a year.</div>
             </div>
 <div style={{ marginBottom:16 }}>
               <label style={{ fontSize:'.72rem', fontWeight:600, color:'var(--text-3)', textTransform:'uppercase' as const, letterSpacing:'.06em', display:'block', marginBottom:5 }}>Base PDF URL (optional)</label>

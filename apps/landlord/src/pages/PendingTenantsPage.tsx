@@ -6,6 +6,7 @@ import {
   Loader, Inbox, X,
 } from 'lucide-react'
 import { api, apiGet, apiDelete } from '../lib/api'
+import { loadPdfjs } from '../lib/pdfjs'
 import { ConfirmIntentModal } from './ConfirmIntentModal'
 import {
   PARSER_STATUS_META,
@@ -80,20 +81,8 @@ function PdfViewerModal({ intentId, name, onClose }: {
       if (loadedRef.current) return
       loadedRef.current = true
       try {
-        if (!(window as any).pdfjsLib) {
-          await new Promise<void>((resolve, reject) => {
-            const s = document.createElement('script')
-            s.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js'
-            s.onload = () => {
-              ;(window as any).pdfjsLib.GlobalWorkerOptions.workerSrc =
-                'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'
-              resolve()
-            }
-            s.onerror = () => reject(new Error('Failed to load pdf.js from CDN'))
-            document.head.appendChild(s)
-          })
-        }
-        const pdf = await (window as any).pdfjsLib.getDocument({
+        const pdfjsLib = await loadPdfjs()
+        const pdf = await pdfjsLib.getDocument({
           url,
           httpHeaders: { Authorization: 'Bearer ' + token },
         }).promise
@@ -402,20 +391,8 @@ function ReviewIntentModal({ intent, onClose, onConfirm }: {
     let cancelled = false
     const load = async () => {
       try {
-        if (!(window as any).pdfjsLib) {
-          await new Promise<void>((resolve, reject) => {
-            const s = document.createElement('script')
-            s.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js'
-            s.onload = () => {
-              ;(window as any).pdfjsLib.GlobalWorkerOptions.workerSrc =
-                'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'
-              resolve()
-            }
-            s.onerror = () => reject(new Error('Failed to load pdf.js from CDN'))
-            document.head.appendChild(s)
-          })
-        }
-        const pdf = await (window as any).pdfjsLib.getDocument({
+        const pdfjsLib = await loadPdfjs()
+        const pdf = await pdfjsLib.getDocument({
           url: `${API_URL}/api/landlords/me/pending-tenants/${intent.intentId}/document`,
           httpHeaders: { Authorization: 'Bearer ' + (localStorage.getItem('gam_token') || '') },
         }).promise

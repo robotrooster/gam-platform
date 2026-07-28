@@ -199,6 +199,14 @@ const css = `
   --b0:#1e2435;--b1:#252d42;--b2:#2f3a55;
   --t0:#f0f2f7;--t1:#c4ccde;--t2:#8a96b0;--t3:#555f7a;
   --gold:#c9a227;--green:#22c55e;--red:#ef4444;--amber:#f59e0b;--blue:#3b82f6;
+  /* S562: long-form token aliases — newer feature pages (LeasePage, SignPage,
+     dialogs) reference the text / border / bg tokens by their long names, which
+     were never defined, so those surfaces rendered with browser-default
+     (invisible) colors. Map them to the canonical short tokens. Same fix class
+     as .inp (S544). */
+  --text-0:var(--t0);--text-1:var(--t1);--text-2:var(--t2);--text-3:var(--t3);
+  --border-0:var(--b0);--border-1:var(--b1);
+  --bg-0:var(--bg0);--bg-1:var(--bg1);--bg-2:var(--bg2);--bg-3:var(--bg3);
   --font-d:'Syne',sans-serif;--font-b:'DM Sans',sans-serif;--font-m:'DM Mono',monospace}
 html{-webkit-font-smoothing:antialiased}
 body{font-family:var(--font-b);background:var(--bg0);color:var(--t1);line-height:1.6;min-height:100vh}
@@ -233,8 +241,9 @@ input,select,textarea{font-family:var(--font-b)}
 .kpi-v{font-family:var(--font-d);font-size:1.6rem;font-weight:800;color:var(--t0);line-height:1;margin-bottom:4px}
 .kpi-s{font-size:.72rem;color:var(--t3)}
 .btn{display:inline-flex;align-items:center;gap:7px;padding:8px 16px;border-radius:8px;font-size:.82rem;font-weight:600;border:none;cursor:pointer;transition:all .15s;font-family:var(--font-b);text-decoration:none}
-.btn-p{background:var(--gold);color:#0a0b0e}.btn-p:hover{background:#d9af3a}
-.btn-g{background:var(--bg4);color:var(--t1);border:1px solid var(--b2)}.btn-g:hover{background:var(--bg3);color:var(--t0)}
+.btn-p,.btn-primary{background:var(--gold);color:#0a0b0e}.btn-p:hover,.btn-primary:hover{background:#d9af3a}
+.btn-g,.btn-ghost{background:var(--bg4);color:var(--t1);border:1px solid var(--b2)}.btn-g:hover,.btn-ghost:hover{background:var(--bg3);color:var(--t0)}
+.btn-link{background:none;border:none;color:var(--gold);padding:0;font-weight:600;text-decoration:underline;font-size:.82rem}
 .btn-d{background:rgba(239,68,68,.08);color:var(--red);border:1px solid rgba(239,68,68,.25)}
 .btn-sm{padding:5px 10px;font-size:.75rem}
 .btn:disabled{opacity:.4;cursor:not-allowed}
@@ -249,16 +258,17 @@ input,select,textarea{font-family:var(--font-b)}
 .a-green{background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.2);color:#86efac}
 .a-warn{background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.2);color:#fcd34d}
 .a-blue{background:rgba(59,130,246,.08);border:1px solid rgba(59,130,246,.2);color:#93c5fd}
-.modal-ov{position:fixed;inset:0;background:rgba(0,0,0,.75);display:flex;align-items:center;justify-content:center;z-index:100;padding:20px;backdrop-filter:blur(4px)}
+.modal-ov,.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.75);display:flex;align-items:center;justify-content:center;z-index:100;padding:20px;backdrop-filter:blur(4px)}
 .modal{background:var(--bg2);border:1px solid var(--b2);border-radius:16px;padding:24px;width:100%;max-width:500px;max-height:90vh;overflow-y:auto;box-shadow:0 8px 32px rgba(0,0,0,.5)}
-.modal-t{font-family:var(--font-d);font-size:1.1rem;font-weight:800;color:var(--t0);margin-bottom:20px}
+.modal-t,.modal-title{font-family:var(--font-d);font-size:1.1rem;font-weight:800;color:var(--t0);margin-bottom:20px}
+.modal-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px}
 .modal-f{display:flex;justify-content:flex-end;gap:10px;margin-top:20px;padding-top:16px;border-top:1px solid var(--b0)}
 .fg{margin-bottom:16px}
 .fl{display:block;font-size:.75rem;font-weight:600;color:var(--t2);margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em}
 /* S544: .inp was used in 5 places but never defined — fields rendered
    browser-default white on the dark theme. */
-.inp{width:100%;background:var(--bg3);border:1px solid var(--b1);border-radius:8px;color:var(--t0);padding:10px 12px;font-size:.9rem;color-scheme:dark}
-.inp:focus{outline:none;border-color:var(--gold)}
+.inp,.form-input{width:100%;background:var(--bg3);border:1px solid var(--b1);border-radius:8px;color:var(--t0);padding:10px 12px;font-size:.9rem;color-scheme:dark}
+.inp:focus,.form-input:focus{outline:none;border-color:var(--gold)}
 textarea.inp{resize:vertical}
 .fi,.fs,.fta{width:100%;background:var(--bg3);border:1px solid var(--b1);border-radius:8px;color:var(--t0);padding:9px 12px;font-size:.875rem;font-family:var(--font-b);outline:none;transition:border-color .15s}
 .fi:focus,.fs:focus,.fta:focus{border-color:var(--gold)}

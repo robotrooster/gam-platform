@@ -171,7 +171,7 @@ async function getDocumentTenantSigners(documentId: string): Promise<{
  *
  * Returns the created lease_documents row.
  */
-async function createDocumentRecord(client: any, opts: {
+export async function createDocumentRecord(client: any, opts: {
   landlordId: string,
   templateId: string | null,
   unitId: string | null,
@@ -267,16 +267,17 @@ async function createDocumentRecord(client: any, opts: {
     }
   }
 
-  // S556 (Nic): auto-populate lease boxes from the assigned unit's data so the
-  // landlord doesn't retype what the unit already knows — rent, derived
-  // security deposit (rent × per-(property,unit_type) multiplier), unit number,
-  // property name/address. Only for ORIGINAL leases: renewals prefill from the
-  // prior lease, and a rent increase surfaces a landlord-confirmed deposit
-  // top-up, never a silent change. Caller-supplied values always win (we only
-  // fill blanks), so the Document Values form can still override anything.
+  // S556/S558 (Nic): auto-populate lease boxes from the assigned unit's data so
+  // the landlord doesn't retype what the unit already knows — rent, derived
+  // security deposit (unit rent × the template's stated deposit_months, S558),
+  // unit number, property name/address. Only for ORIGINAL leases: renewals
+  // prefill from the prior lease, and a rent increase surfaces a landlord-
+  // confirmed deposit top-up, never a silent change. Caller-supplied values
+  // always win (we only fill blanks), so the Document Values form can still
+  // override anything.
   if (opts.unitId && opts.documentType === 'original_lease') {
     const pv: Record<string, string> = (opts as any).prefillValues = (opts as any).prefillValues || {}
-    const suggested = await suggestUnitPrefill(opts.unitId, client)
+    const suggested = await suggestUnitPrefill(opts.unitId, client, opts.templateId)
     for (const [col, val] of Object.entries(suggested)) {
       if (val && (pv[col] == null || pv[col] === '')) pv[col] = val // caller-supplied wins
     }
@@ -1220,8 +1221,23 @@ esignRouter.get('/templates', requireAuth, requirePerm('leases.create'), async (
 
 esignRouter.post('/templates', requireAuth, requirePerm('esign.template_manage'), async (req, res, next) => {
   try {
-    const { name, description, basePdfUrl, pageCount, unitType, propertyId } = req.body
+    const { name, description, basePdfUrl, pageCount, unitType, propertyId, depositMonths, defaultTermMonths } = req.body
     if (!name) throw new AppError(400, 'Template name required')
+    // S558: the deposit multiplier ("N months' rent") is a lease term on the
+    // template. Optional (NULL = landlord fills the deposit manually); 0..12.
+    const depMonths = depositMonths === undefined || depositMonths === null || depositMonths === ''
+      ? null : Number(depositMonths)
+    if (depMonths != null && (!Number.isFinite(depMonths) || depMonths < 0 || depMonths > 12)) {
+      throw new AppError(400, 'depositMonths must be a number between 0 and 12, or null')
+    }
+    // S558: default lease term carried on the template. NULL = month-to-month;
+    // 1..120 = fixed N-month term. (Designate a template as its unit type's
+    // default separately via POST /templates/:id/set-default.)
+    const termMonths = defaultTermMonths === undefined || defaultTermMonths === null || defaultTermMonths === ''
+      ? null : Number(defaultTermMonths)
+    if (termMonths != null && (!Number.isInteger(termMonths) || termMonths < 1 || termMonths > 120)) {
+      throw new AppError(400, 'defaultTermMonths must be an integer 1..120, or null for month-to-month')
+    }
     // S535: templates are per unit TYPE (null = universal) — an RV spot
     // lease isn't an apartment lease. Drafting validates the pairing.
     if (unitType != null && !(UNIT_TYPES as readonly string[]).includes(unitType)) {
@@ -1235,9 +1251,9 @@ esignRouter.post('/templates', requireAuth, requirePerm('esign.template_manage')
       if (!prop) throw new AppError(404, 'Property not found')
     }
     const t = await queryOne<any>(`
-      INSERT INTO lease_templates (landlord_id, name, description, base_pdf_url, page_count, unit_type, property_id)
-      VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
-      [req.user!.profileId, name, description||null, basePdfUrl||null, pageCount||1, unitType||null, propertyId||null])
+      INSERT INTO lease_templates (landlord_id, name, description, base_pdf_url, page_count, unit_type, property_id, deposit_months, default_term_months)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+      [req.user!.profileId, name, description||null, basePdfUrl||null, pageCount||1, unitType||null, propertyId||null, depMonths, termMonths])
     res.status(201).json({ success: true, data: t })
   } catch (e) { next(e) }
 })
@@ -1253,20 +1269,75 @@ esignRouter.get('/templates/:id', requireAuth, requirePerm('leases.create'), asy
 
 esignRouter.patch('/templates/:id', requireAuth, requirePerm('esign.template_manage'), async (req, res, next) => {
   try {
-    const { name, description, basePdfUrl, pageCount, isActive, unitType } = req.body
+    const { name, description, basePdfUrl, pageCount, isActive, unitType, depositMonths, defaultTermMonths } = req.body
     const t = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
     if (!t) throw new AppError(404, 'Template not found')
     if (unitType !== undefined && unitType !== null && !(UNIT_TYPES as readonly string[]).includes(unitType)) {
       throw new AppError(400, `unitType must be one of ${UNIT_TYPES.join(', ')} or null`)
     }
+    // S558: deposit_months editable here. undefined = leave as-is; null/'' clears
+    // it (landlord fills deposit manually); a number 0..12 sets the multiplier.
+    let depMonths = t.deposit_months
+    if (depositMonths !== undefined) {
+      depMonths = depositMonths === null || depositMonths === '' ? null : Number(depositMonths)
+      if (depMonths != null && (!Number.isFinite(depMonths) || depMonths < 0 || depMonths > 12)) {
+        throw new AppError(400, 'depositMonths must be a number between 0 and 12, or null')
+      }
+    }
+    // S558: default_term_months editable here. undefined = leave as-is; null/''
+    // = month-to-month; 1..120 = fixed term.
+    let termMonths = t.default_term_months
+    if (defaultTermMonths !== undefined) {
+      termMonths = defaultTermMonths === null || defaultTermMonths === '' ? null : Number(defaultTermMonths)
+      if (termMonths != null && (!Number.isInteger(termMonths) || termMonths < 1 || termMonths > 120)) {
+        throw new AppError(400, 'defaultTermMonths must be an integer 1..120, or null for month-to-month')
+      }
+    }
     const updated = await queryOne<any>(`
       UPDATE lease_templates SET name=$1, description=$2, base_pdf_url=$3, page_count=$4, is_active=$5,
-             unit_type=$6, updated_at=NOW()
-      WHERE id=$7 RETURNING *`,
+             unit_type=$6, deposit_months=$7, default_term_months=$8, updated_at=NOW()
+      WHERE id=$9 RETURNING *`,
       [name??t.name, description??t.description, basePdfUrl??t.base_pdf_url, pageCount??t.page_count, isActive??t.is_active,
-       unitType===undefined ? t.unit_type : unitType, t.id])
+       unitType===undefined ? t.unit_type : unitType, depMonths, termMonths, t.id])
     res.json({ success: true, data: updated })
   } catch (e) { next(e) }
+})
+
+// S558: designate this template as the DEFAULT for its unit type (the "primary
+// <unit type> lease"). Radio behaviour: clears any other default for the same
+// (landlord, unit_type, property_id) first, then sets this one — atomic. Pass
+// { isDefault: false } to un-designate. A default requires a specific unit_type
+// (a universal/null-unit_type template can't be a unit-type default).
+esignRouter.post('/templates/:id/set-default', requireAuth, requirePerm('esign.template_manage'), async (req, res, next) => {
+  const client = await getClient()
+  try {
+    const makeDefault = req.body?.isDefault !== false // default true
+    const t = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
+    if (!t) throw new AppError(404, 'Template not found')
+    if (makeDefault && !t.unit_type) {
+      throw new AppError(400, 'Set the template’s unit type before making it a default — a default is per unit type.')
+    }
+    await client.query('BEGIN')
+    if (makeDefault) {
+      // Clear the current default for this (landlord, unit_type, property_id).
+      // property_id compared with IS NOT DISTINCT FROM so NULL matches NULL.
+      await client.query(
+        `UPDATE lease_templates SET is_unit_type_default=false, updated_at=NOW()
+          WHERE landlord_id=$1 AND unit_type=$2 AND property_id IS NOT DISTINCT FROM $3
+            AND is_unit_type_default=true AND id<>$4`,
+        [req.user!.profileId, t.unit_type, t.property_id, t.id])
+    }
+    const updated = await client.query(
+      `UPDATE lease_templates SET is_unit_type_default=$1, updated_at=NOW() WHERE id=$2 RETURNING *`,
+      [makeDefault, t.id])
+    await client.query('COMMIT')
+    res.json({ success: true, data: updated.rows[0] })
+  } catch (e) {
+    await client.query('ROLLBACK')
+    next(e)
+  } finally {
+    client.release()
+  }
 })
 
 esignRouter.delete('/templates/:id', requireAuth, requirePerm('esign.template_manage'), async (req, res, next) => {
@@ -1349,7 +1420,11 @@ esignRouter.get('/units/:unitId/prefill-suggestions', requireAuth, requirePerm('
     const unit = await queryOne<{ id: string }>(
       'SELECT id FROM units WHERE id=$1 AND landlord_id=$2', [req.params.unitId, req.user!.profileId])
     if (!unit) throw new AppError(404, 'Unit not found')
-    const suggestions = await suggestUnitPrefill(req.params.unitId)
+    // S558: deposit derives from the selected template's deposit_months, so the
+    // send form passes ?templateId when a template is chosen (deposit box fills
+    // once both unit + template are picked; without a template it stays blank).
+    const templateId = typeof req.query.templateId === 'string' ? req.query.templateId : null
+    const suggestions = await suggestUnitPrefill(req.params.unitId, null, templateId)
     res.json({ success: true, data: suggestions })
   } catch (e) { next(e) }
 })
@@ -2514,15 +2589,20 @@ esignRouter.post('/documents/:id/void', requireAuth, requirePerm('esign.void'), 
     if (doc.status === 'completed') throw new AppError(400, 'Cannot void a completed document')
     if (doc.status === 'voided') throw new AppError(400, 'Document is already voided')
 
-    // S29 item 6: Allow voiding sent-but-unsigned docs (typo recall, mistakes
-    // before any party has signed). Lock voiding once ANY signer has signed —
-    // at that point the legally clean path is to create a superseding document.
+    // S29 item 6 / S558: allow voiding through a landlord-only signature. The
+    // landlord always signs first (S28), and a lease is not an executed contract
+    // until the counterparty signs — a landlord's signature on a draft no tenant
+    // has signed binds no one, so it stays voidable (typo recall, roster changes
+    // before tenants commit). Lock voiding only once a TENANT signs; from there
+    // the legally clean path is a superseding document. (Blocking on the
+    // landlord's own signature would make void useless for every mid-roster fix,
+    // since the landlord-first flow means every fresh draft already carries it.)
     // This also unblocks voiding execution_failed docs so landlords can clear
     // them from their dashboard while admin investigates.
-    const anySigned = await queryOne<any>(
-      "SELECT 1 FROM lease_document_signers WHERE document_id=$1 AND signed_at IS NOT NULL LIMIT 1",
+    const tenantSigned = await queryOne<any>(
+      "SELECT 1 FROM lease_document_signers WHERE document_id=$1 AND signed_at IS NOT NULL AND role NOT IN ('landlord','witness') LIMIT 1",
       [doc.id])
-    if (anySigned) throw new AppError(409, 'Cannot void after signing has begun — create a superseding document instead')
+    if (tenantSigned) throw new AppError(409, 'Cannot void after a tenant has signed — create a superseding document instead')
 
     // Cascade lease_tenants state by document_type
     await cascadeLeaseTenantsOnVoid(client.query.bind(client), doc)

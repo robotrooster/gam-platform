@@ -474,3 +474,65 @@ describe('GET /api/auth/me — TOTP fields', () => {
     expect(res.body.data.mustEnrollTotp).toBe(false)
   })
 })
+
+// ── S560 regression: totp_pending token must NOT be a full session ──────────
+// The critical auth-bypass fix: requireAuth rejects any purpose-scoped token,
+// so the short-lived totpSession minted by /login cannot be used as a full
+// session anywhere, and /refresh cannot upgrade it to a 7-day token.
+describe('S560: totp_pending token is not a full session', () => {
+  it('a totpSession is rejected by a requireAuth route (/me) and by /refresh', async () => {
+    const secret = authenticator.generateSecret()
+    await seedUser({
+      email: 'admin2fa@test.dev', password: 'password1234',
+      role: 'admin', totpEnabled: true, totpSecret: secret,
+    })
+    const login = await request(buildApp())
+      .post('/api/auth/login')
+      .send({ email: 'admin2fa@test.dev', password: 'password1234' })
+    const totpSession = login.body.data.totpSession as string
+    expect(typeof totpSession).toBe('string')
+
+    // Not accepted as a full session on a requireAuth-gated route.
+    const me = await request(buildApp())
+      .get('/api/auth/me')
+      .set('Authorization', `Bearer ${totpSession}`)
+    expect(me.status).toBe(401)
+
+    // Not upgradable to a full 7-day token via /refresh.
+    const refresh = await request(buildApp())
+      .post('/api/auth/refresh')
+      .set('Authorization', `Bearer ${totpSession}`)
+    expect(refresh.status).toBe(401)
+  })
+})
+
+// ── S560 regression: mandatory-2FA admin, not yet enrolled, gets an ──────────
+// ENROLLMENT-ONLY pass — rejected on normal routes, accepted only to enroll.
+describe('S560: un-enrolled mandatory-2FA admin gets an enroll-only session', () => {
+  it('login pass is rejected by /me but works for enroll-start', async () => {
+    await seedUser({
+      email: 'newadmin@test.dev', password: 'password1234',
+      role: 'admin', totpEnabled: false,
+    })
+    const login = await request(buildApp())
+      .post('/api/auth/login')
+      .send({ email: 'newadmin@test.dev', password: 'password1234' })
+    expect(login.status).toBe(200)
+    expect(login.body.data.user.mustEnrollTotp).toBe(true)
+    const tok = login.body.data.token as string
+    expect(typeof tok).toBe('string')
+
+    // The enroll-only pass must NOT work on a normal requireAuth route.
+    const me = await request(buildApp())
+      .get('/api/auth/me')
+      .set('Authorization', `Bearer ${tok}`)
+    expect(me.status).toBe(401)
+
+    // But it MUST let them enroll.
+    const start = await request(buildApp())
+      .post('/api/auth/totp/enroll-start')
+      .set('Authorization', `Bearer ${tok}`)
+    expect(start.status).toBe(200)
+    expect(typeof start.body.data.otpauthUrl).toBe('string')
+  })
+})

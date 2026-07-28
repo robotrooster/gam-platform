@@ -959,9 +959,10 @@ export function schedulerInit() {
     }
   }, { timezone: 'America/Phoenix' })
 
-  // 16a Step 3: auto-Friday payout queue. Fires Mon-Fri 9am Phoenix; engine
-  // self-gates to only run on the auto-payout day (Friday, shifted forward
-  // over US federal holidays).
+  // 16a Step 3: weekly auto-payout batch. Fires Mon-Fri 9am Phoenix; engine
+  // self-gates to only run on the auto-payout day — TUESDAY (S561, D1: lands
+  // the landlord's bank by Friday at standard T+1–T+2), shifted forward over
+  // US federal holidays.
   cron.schedule('0 9 * * 1-5', async () => {
     try {
       const { processAutoPayouts } = await import('./autoPayouts')
@@ -971,6 +972,23 @@ export function schedulerInit() {
       }
     } catch (e) {
       logger.error({ err: e }, '[auto-payouts] fatal')
+    }
+  }, { timezone: 'America/Phoenix' })
+
+  // S561: reversal recovery. The handler decides net-vs-pull immediately when a
+  // reversal opens; this daily pass is the backstop — it decides any that
+  // slipped through and flips scheduled nettings past the 2-week cap to ACH
+  // pulls (their anticipated influx never arrived). Daily 8am Phoenix.
+  cron.schedule('0 8 * * *', async () => {
+    try {
+      const { processPendingReversalRecoveries, escalateStaleNetting } = await import('../services/reversalRecovery')
+      const decided = await processPendingReversalRecoveries()
+      const escalated = await escalateStaleNetting()
+      if (decided.decided > 0 || escalated.escalated > 0) {
+        logger.info({ ...decided, ...escalated }, '[reversal-recovery]')
+      }
+    } catch (e) {
+      logger.error({ err: e }, '[reversal-recovery] fatal')
     }
   }, { timezone: 'America/Phoenix' })
 
