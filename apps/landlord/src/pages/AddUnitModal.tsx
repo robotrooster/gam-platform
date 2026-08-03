@@ -5,6 +5,7 @@ import { apiGet, apiPost } from '../lib/api'
 import { X, Building2, DoorOpen, DollarSign, ChevronRight, ChevronLeft, Check } from 'lucide-react'
 import {
   UNIT_TYPES, UnitType, UNIT_TYPE_LABEL, UNIT_TYPE_ICON, UNIT_TYPE_HAS_BEDROOMS,
+  FLOOR_LEVELS, FLOOR_LEVEL_LABEL, type FloorLevel,
   PropertyUnitSubtype, unitSubtypeFactsLabel,
   METER_READING_DIGIT_OPTIONS, METER_READING_DEFAULT_DIGITS,
 } from '@gam/shared'
@@ -39,7 +40,11 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
     rvSiteLayout:     'back_in',
     rvAmpService:     '30',
     dwellingOwnership: '',
+    isMultiLevel:     false,
+    isAdaAccessible:  false,
+    floorLevel:       '',
     storageSize:      '',
+    lotRentAmount:    '',
     rentAmount:       '',
     securityDeposit:  '',
     nightlyRate:      '',
@@ -186,6 +191,9 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
       } : {}),
       ...(form.unitType === 'storage' && !s && form.storageSize.trim() ? { storageSize: form.storageSize.trim() } : {}),
       ...(ownershipRelevant && !s ? { dwellingOwnership } : {}),
+      ...(hasBeds ? { isMultiLevel: form.isMultiLevel, isAdaAccessible: form.isAdaAccessible, ...(form.floorLevel ? { floorLevel: form.floorLevel } : {}) } : {}),
+      // S568: lot rent the operator pays the external park (homes-only properties).
+      ...(form.lotRentAmount !== '' ? { lotRentAmount: Number(form.lotRentAmount) } : {}),
       status:          form.status,
     })
   }
@@ -439,6 +447,54 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
                     </div>
                   </div>
                 )}
+                {hasBeds && (
+                  <div style={{ marginBottom: 14, display: 'grid', gap: 12 }}>
+                    <div>
+                      <label
+                        onClick={() => set('isMultiLevel', !form.isMultiLevel)}
+                        style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: '.8rem', color: 'var(--text-1)' }}>
+                        <span style={{
+                          width: 18, height: 18, borderRadius: 4, flexShrink: 0,
+                          border: `1px solid ${form.isMultiLevel ? 'var(--gold)' : 'var(--border-0)'}`,
+                          background: form.isMultiLevel ? 'var(--gold)' : 'var(--bg-2)',
+                          display: 'flex', alignItems: 'center', justifyContent: 'center',
+                          color: '#000', fontSize: '.7rem', fontWeight: 700,
+                        }}>{form.isMultiLevel ? '✓' : ''}</span>
+                        Multi-level (has interior stairs)
+                      </label>
+                      <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 4, marginLeft: 26 }}>
+                        Adds a stairs &amp; handrails area to this unit's inspections.
+                      </div>
+                    </div>
+                    <div>
+                      <label
+                        onClick={() => set('isAdaAccessible', !form.isAdaAccessible)}
+                        style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: '.8rem', color: 'var(--text-1)' }}>
+                        <span style={{
+                          width: 18, height: 18, borderRadius: 4, flexShrink: 0,
+                          border: `1px solid ${form.isAdaAccessible ? 'var(--gold)' : 'var(--border-0)'}`,
+                          background: form.isAdaAccessible ? 'var(--gold)' : 'var(--bg-2)',
+                          display: 'flex', alignItems: 'center', justifyContent: 'center',
+                          color: '#000', fontSize: '.7rem', fontWeight: 700,
+                        }}>{form.isAdaAccessible ? '✓' : ''}</span>
+                        Accessible (ADA) unit
+                      </label>
+                      <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 4, marginLeft: 26 }}>
+                        Adds an accessibility area (grab bars, ramps, clearances) to inspections.
+                      </div>
+                    </div>
+                    <div>
+                      <label style={labelStyle}>Floor placement</label>
+                      <select className="input" value={form.floorLevel} onChange={e => set('floorLevel', e.target.value)} style={{ width: '100%' }}>
+                        <option value="">Unspecified</option>
+                        {(FLOOR_LEVELS as readonly string[]).map(fl => <option key={fl} value={fl}>{FLOOR_LEVEL_LABEL[fl as FloorLevel]}</option>)}
+                      </select>
+                      <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 4 }}>
+                        Lets renters filter by ground floor / upstairs / basement.
+                      </div>
+                    </div>
+                  </div>
+                )}
                 {!hasBeds && !isRv && (
                   <div style={{ display: 'flex', gap: 12, marginBottom: 14 }}>
                     {form.unitType === 'storage' && (
@@ -546,6 +602,24 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
               </div>
               {errors.rentAmount && <div style={{ color: 'var(--red)', fontSize: '.72rem', marginTop: 4 }}>{errors.rentAmount}</div>}
             </div>
+
+            {/* S568: homes-only external park — capture the lot rent the operator
+                pays the park, so their net (tenant rent − lot rent) is clean. */}
+            {selectedProperty && selectedProperty.operatorOwnsLand === false && (
+            <div style={{ marginBottom: 14 }}>
+              <label style={labelStyle}>Lot rent you pay the park</label>
+              <div style={{ position: 'relative' }}>
+                <DollarSign size={14} style={{ position: 'absolute', left: 11, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-3)' }} />
+                <input className="input" type="number" placeholder="0.00" value={form.lotRentAmount}
+                  onChange={e => set('lotRentAmount', e.target.value)} style={{ width: '100%', paddingLeft: 30 }} />
+              </div>
+              {form.rentAmount && form.lotRentAmount && (
+                <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 4 }}>
+                  Your net: {fmt(Number(form.rentAmount) - Number(form.lotRentAmount))}/mo (tenant rent − lot rent)
+                </div>
+              )}
+            </div>
+            )}
 
             <div style={{ marginBottom: isRv ? 14 : 20 }}>
               <label style={labelStyle}>Security Deposit</label>

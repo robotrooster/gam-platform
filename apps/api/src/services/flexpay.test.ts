@@ -42,7 +42,7 @@ import {
   seedLease, seedLeaseTenant,
 } from '../test/dbHelpers'
 import {
-  FLEXPAY_FEE_BASE, FLEXPAY_MAX_PULL_DAY,
+  FLEXPAY_MONTHLY_FEE, FLEXPAY_MAX_PULL_DAY,
   calculateFlexPayFee, cycleMonthForDate,
   isFlexPayVisible, getFlexPayEligibility,
   enrollFlexPay, cancelFlexPay, changeFlexPayPullDay,
@@ -59,10 +59,10 @@ beforeEach(async () => {
 // ─── calculateFlexPayFee (pure) ──────────────────────────────
 
 describe('calculateFlexPayFee', () => {
-  it('formula: $5 base + pullDay; pullDay=1 → $6; pullDay=28 → $33', () => {
-    expect(calculateFlexPayFee(1)).toBe(FLEXPAY_FEE_BASE + 1)
-    expect(calculateFlexPayFee(15)).toBe(20)
-    expect(calculateFlexPayFee(FLEXPAY_MAX_PULL_DAY)).toBe(33)
+  it('S562: FLAT $25 regardless of pull day (pull day is scheduling only)', () => {
+    expect(calculateFlexPayFee(1)).toBe(FLEXPAY_MONTHLY_FEE)
+    expect(calculateFlexPayFee(15)).toBe(25)
+    expect(calculateFlexPayFee(FLEXPAY_MAX_PULL_DAY)).toBe(25)
   })
 
   it('pullDay below 1 → throws', () => {
@@ -311,7 +311,7 @@ describe('enrollFlexPay', () => {
     })
     expect(r.ok).toBe(true)
     if (r.ok) {
-      expect(r.fee).toBe(10)  // $5 base + 5
+      expect(r.fee).toBe(25)  // S562: flat $25 regardless of pull day
       expect(r.acceptanceId).toBe('acc_mock_id')
     }
     const { rows: [t] } = await db.query<any>(
@@ -319,7 +319,7 @@ describe('enrollFlexPay', () => {
               flexpay_enrolled_at FROM tenants WHERE id=$1`, [tenantId])
     expect(t.flexpay_enrolled).toBe(true)
     expect(t.flexpay_pull_day).toBe(5)
-    expect(Number(t.flexpay_monthly_fee)).toBe(10)
+    expect(Number(t.flexpay_monthly_fee)).toBe(25)
     expect(t.flexpay_enrolled_at).not.toBeNull()
     expect(recordAcceptanceMock).toHaveBeenCalledWith(expect.objectContaining({
       tenantId, userId, productType: 'flexpay',

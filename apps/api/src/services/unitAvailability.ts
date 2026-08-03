@@ -45,7 +45,7 @@ export async function findStayConflict(unitId: string, w: StayWindow): Promise<S
   // regardless of window. Lifts when the intent resolves or is removed.
   const pending = await queryOne<any>(`
     SELECT id FROM pending_tenant_intents
-    WHERE unit_id = $1 AND resolved_at IS NULL`, [unitId])
+    WHERE unit_id = $1 AND resolved_at IS NULL AND cancelled_at IS NULL`, [unitId])
   return pending ? 'pending_tenant' : null
 }
 
@@ -98,6 +98,6 @@ export async function findAvailableUnits(opts: {
           AND (l.end_date IS NULL OR l.end_date > $4))
       AND NOT EXISTS (
         SELECT 1 FROM pending_tenant_intents pti
-        WHERE pti.unit_id = u.id AND pti.resolved_at IS NULL)
+        WHERE pti.unit_id = u.id AND pti.resolved_at IS NULL AND pti.cancelled_at IS NULL)
     ORDER BY p.name, u.unit_number`, params)
 }

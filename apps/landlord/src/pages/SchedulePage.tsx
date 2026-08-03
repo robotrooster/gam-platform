@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useMemo } from 'react'
+import { useState, useRef, useEffect, useMemo, useLayoutEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { Search, FileSignature, CheckCircle2, AlertTriangle, MessageSquare, Check, X, QrCode, Copy, Mail, Ban } from 'lucide-react'
 import { apiGet, apiPost, apiPatch, apiDelete } from '../lib/api'
@@ -10,7 +10,12 @@ const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minim
 
 // S547: the public site is the per-property storefront — path-slug in dev,
 // {slug}.gam.biz subdomain in prod (mirrors the API's STOREFRONT_URL_TEMPLATE).
-const STOREFRONT_TEMPLATE = (import.meta as any).env?.VITE_STOREFRONT_URL_TEMPLATE || 'http://localhost:3015/{slug}'
+// S574: explicit env override wins; else localhost → dev path, any real host →
+// prod subdomain, so the link is right in prod without a build-time env var.
+const STOREFRONT_TEMPLATE = (import.meta as any).env?.VITE_STOREFRONT_URL_TEMPLATE
+  || (typeof location !== 'undefined' && /^(localhost|127\.|192\.168\.|10\.)/.test(location.hostname)
+        ? 'http://localhost:3015/{slug}'
+        : 'https://{slug}.gam.biz')
 const API_URL = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
 
 // S535 pattern (see UnitDetailPage): authed photo files can't ride an <img>
@@ -263,12 +268,19 @@ export function SchedulePage() {
   const { can } = usePerms()
   const today = new Date().toISOString().split('T')[0]
   const [view, setView] = useState<'timeline'|'list'|'units'|'history'|'reservations'|'requests'|'booking_page'>('timeline')
-  // Wide fixed window — ~1 month back, ~5 months forward — so the timeline
-  // scrolls both directions naturally (no date-range "search" controls). Day
-  // columns size to fit roughly a month in the viewport (colW); the load
-  // scrolls to today so the coming month is what you see first.
-  const [fromDate] = useState(addDays(today, -31))
-  const [toDate] = useState(addDays(today, 151))
+  // Perpetual calendar (S576): the window starts ~1 month back, ~5 months
+  // forward, but the forward horizon EXTENDS on demand — infinite forward
+  // scroll appends days as you near the right edge, and the Jump-to-date
+  // control extends the window to reach any future date (e.g. next winter's
+  // reservations during busy season). No more hard ~5-month wall. Day columns
+  // size to fit roughly a month in the viewport (colW); the load scrolls to
+  // today so the coming month is what you see first.
+  const [fromDate, setFromDate] = useState(addDays(today, -31))
+  const [toDate, setToDate] = useState(addDays(today, 151))
+  // Guards + pending scroll target for the perpetual-calendar extends.
+  const extendingRef = useRef(false)
+  const [pendingScrollDate, setPendingScrollDate] = useState<string | null>(null)
+  const [jumpDate, setJumpDate] = useState('')
   // Fixed, compact day-column width: a normal window shows ~a month across,
   // a wide display shows more. (A measured fit-to-viewport mis-read the full
   // display width on large monitors and over-widened columns.)
@@ -379,7 +391,11 @@ export function SchedulePage() {
   const { data: schedule, isLoading } = useQuery(
     ['schedule', fromDate, toDate, filterType],
     () => apiGet(`/units/schedule/master?from=${fromDate}&to=${toDate}${filterType!=='all'?'&unitType='+filterType:''}`),
-    { staleTime: 30000 }
+    // keepPreviousData: when the perpetual-calendar window extends (from/to
+    // change → new query key), keep showing the current grid instead of
+    // flashing the "Loading schedule…" state and losing scroll position. The
+    // appended day columns pop in when the wider fetch resolves.
+    { staleTime: 30000, keepPreviousData: true }
   )
 
   const { data: history = [] } = useQuery(
@@ -854,6 +870,130 @@ export function SchedulePage() {
 
   const filteredUnits = filterType === 'all' ? units : units.filter(u => u.unitType === filterType)
 
+  // ── S575 (Nic): floating reservation names ──────────────────────────────────
+  // One name per reservation, pinned to the timeline's left edge and lining up in
+  // a column, instead of the old repeat-every-21-days in-bar label. A per-cell
+  // <td> label can't stay put across a multi-day span (it un-sticks the moment
+  // its one-day cell scrolls off), so the names live in a separate overlay layer:
+  // each reservation gets an absolutely-placed box the width of its bar, and the
+  // name inside uses `position:sticky; left:STICKY_LEFT`. CSS itself pins the name
+  // at the left edge while the reservation is under the scroll line, then — as the
+  // reservation's right edge closes in — pushes it left so it slides off contained
+  // within its own bar (Nic's end-of-reservation case). The layer is
+  // pointer-events:none, so every drag/resize/click on the bars underneath is
+  // untouched. UNIT_COL_W matches the sticky Unit column; STICKY_LEFT is the pin.
+  const UNIT_COL_W = 180
+  const STICKY_LEFT = 184
+  // Per-row geometry (offsetTop + height). Rows AREN'T a uniform height — unit
+  // cells with more content run taller (e.g. 85px vs 72px) — so assuming a fixed
+  // row height drifts lower-row names a full row high. Measure each row's actual
+  // offsetTop instead. tr.offsetTop is relative to the table, which sits at the
+  // scroll container's content origin, so it maps straight to the overlay layer.
+  // Re-measured only when the row set changes; horizontal scroll doesn't affect it.
+  const [rowGeom, setRowGeom] = useState<{ top: number; h: number }[]>([])
+  useLayoutEffect(() => {
+    const tbody = scrollContainerRef.current?.querySelector('tbody')
+    if (!tbody) return
+    const measure = () => {
+      const rows = tbody.querySelectorAll('tr')
+      if (!rows.length) return
+      const g = Array.from(rows).map(r => ({ top: (r as HTMLElement).offsetTop, h: (r as HTMLElement).offsetHeight }))
+      setRowGeom(prev => (prev.length === g.length && prev.every((p, i) => p.top === g[i].top && p.h === g[i].h)) ? prev : g)
+    }
+    measure()
+    // Re-measure on ANY change to row layout — a property-name edit that re-wraps,
+    // a window resize that reflows the wrap, a late web-font swap — not just the
+    // row-count/filter changes the deps below catch. Keeps the floating names
+    // pinned to their rows no matter what changed the height. (Read-only + an
+    // equality guard, so it can't feed back into a resize loop.)
+    const ro = new ResizeObserver(measure)
+    ro.observe(tbody)
+    return () => ro.disconnect()
+  }, [filteredUnits.length, days.length, isLoading, view])
+
+  const nameOverlays = useMemo(() => {
+    if (view !== 'timeline' || !days.length || !rowGeom.length) return [] as { key: string; left: number; top: number; height: number; width: number; label: string; isLease: boolean }[]
+    const dFirst = days[0], dLast = days[days.length - 1]
+    const out: { key: string; left: number; top: number; height: number; width: number; label: string; isLease: boolean }[] = []
+    filteredUnits.forEach((unit: any, rowIdx: number) => {
+      const rg = rowGeom[rowIdx]
+      if (!rg) return
+      const add = (id: string, startRaw: string, endRaw: string | null, isLease: boolean, label: string) => {
+        const start = dayOnly(startRaw)
+        // Booking check-out is EXCLUSIVE (last night = checkout − 1); lease end is
+        // INCLUSIVE — mirror the bar-painting convention so labels align exactly.
+        const lastDay = isLease
+          ? (endRaw ? dayOnly(endRaw) : dLast)
+          : (endRaw ? addDays(dayOnly(endRaw), -1) : dLast)
+        if (lastDay < dFirst || start > dLast) return          // fully outside the window
+        const sIdx = start <= dFirst ? 0 : days.indexOf(start)
+        const eIdx = lastDay >= dLast ? days.length - 1 : days.indexOf(lastDay)
+        if (sIdx < 0 || eIdx < 0 || eIdx < sIdx) return
+        out.push({
+          key: id,
+          left: UNIT_COL_W + sIdx * colW,
+          top: rg.top,
+          height: rg.h,
+          width: (eIdx - sIdx + 1) * colW,
+          label, isLease,
+        })
+      }
+      bookings.forEach((b: any) => { if (b.unitId === unit.id) add(b.id, b.checkIn, b.checkOut, false, b.guestName || 'Guest') })
+      leases.forEach((l: any) => {
+        if (l.unitId !== unit.id) return
+        const nm = (l.guestName || [l.firstName, l.lastName].filter(Boolean).join(' ')).trim() || 'Tenant'
+        add(l.id, l.startDate, l.endDate, true, nm)
+      })
+    })
+    return out
+  }, [filteredUnits, bookings, leases, days, colW, rowGeom, view])
+
+  // ── S575 (Nic): custom horizontal scrollbar ─────────────────────────────────
+  // macOS overlay scrollbars are invisible until you scroll — a Magic Mouse / plain
+  // mouse user has no sideways-drag handle. This is an ALWAYS-VISIBLE track + thumb
+  // strip that sits just above the legend and stays in sync with the grid's
+  // horizontal scroll (both ways: trackpad scroll moves the thumb; dragging the
+  // thumb scrolls the grid). thumb width/left are % of the full scrollWidth, so the
+  // track maps 1:1 to the scrollable range.
+  const hbarTrackRef = useRef<HTMLDivElement>(null)
+  const [hbar, setHbar] = useState({ thumbPct: 100, leftPct: 0, show: false })
+  const updateHbar = () => {
+    const c = scrollContainerRef.current
+    if (!c) return
+    const { scrollWidth, clientWidth, scrollLeft } = c
+    const show = scrollWidth > clientWidth + 1
+    setHbar({
+      show,
+      thumbPct: show ? Math.max(5, (clientWidth / scrollWidth) * 100) : 100,
+      leftPct:  show ? (scrollLeft / scrollWidth) * 100 : 0,
+    })
+  }
+  useEffect(() => {
+    updateHbar()
+    const onResize = () => updateHbar()
+    window.addEventListener('resize', onResize)
+    return () => window.removeEventListener('resize', onResize)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [days.length, filteredUnits.length, view, isLoading, rowGeom.length])
+  // Drag the thumb: map thumb travel across the track to the full scrollWidth.
+  const dragHbar = (e: React.MouseEvent) => {
+    e.preventDefault(); e.stopPropagation()
+    const c = scrollContainerRef.current, track = hbarTrackRef.current
+    if (!c || !track) return
+    const startX = e.clientX, startScroll = c.scrollLeft, trackW = track.clientWidth || 1
+    const move = (ev: MouseEvent) => { c.scrollLeft = startScroll + ((ev.clientX - startX) / trackW) * c.scrollWidth; updateHbar() }
+    const up = () => { window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up) }
+    window.addEventListener('mousemove', move); window.addEventListener('mouseup', up)
+  }
+  // Click anywhere on the track: jump so the view centers on that point.
+  const jumpHbar = (e: React.MouseEvent) => {
+    const c = scrollContainerRef.current, track = hbarTrackRef.current
+    if (!c || !track) return
+    const rect = track.getBoundingClientRect()
+    c.scrollLeft = ((e.clientX - rect.left) / (rect.width || 1)) * c.scrollWidth - c.clientWidth / 2
+    updateHbar()
+  }
+
   // Units a staff reservation can take for the entered dates: only units set up
   // for short-term stays (is_bookable) that are free of an overlapping booking
   // or lease. Units not configured for bookings (e.g. long-term apartments)
@@ -1031,6 +1171,47 @@ export function SchedulePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isLoading, view, colW])
 
+  // ── Perpetual calendar (S576) ──
+  // Clear the extend guard once the wider window's data has landed (days grew),
+  // so the next near-edge scroll can extend again.
+  useEffect(() => { extendingRef.current = false }, [toDate, schedule])
+
+  // Infinite forward scroll: as the timeline nears its right edge, push the
+  // forward horizon out. New key → refetch (keepPreviousData keeps the grid up),
+  // days array grows, columns append to the right (scrollLeft unaffected).
+  const maybeExtendForward = () => {
+    const c = scrollContainerRef.current
+    if (!c || extendingRef.current) return
+    if (c.scrollLeft + c.clientWidth >= c.scrollWidth - colW * 6) {
+      extendingRef.current = true
+      setToDate(t => addDays(t, 120))
+    }
+  }
+
+  // Jump-to-date: extend the window to cover the target (past or future) and
+  // scroll to it. If it's already in range, scrolls immediately; otherwise the
+  // pending-scroll effect fires once the extended fetch resolves.
+  const jumpToDate = (d: string) => {
+    if (!d) return
+    if (d > toDate) setToDate(addDays(d, 21))
+    else if (d < fromDate) setFromDate(addDays(d, -7))
+    setPendingScrollDate(d)
+  }
+
+  // Scroll to a pending jump target once the day column exists. Re-runs as
+  // `days` grows from an extend, so a far-future jump lands after its refetch.
+  useEffect(() => {
+    if (!pendingScrollDate || view !== 'timeline') return
+    const c = scrollContainerRef.current
+    if (!c) return
+    const idx = days.indexOf(pendingScrollDate)
+    if (idx < 0) return // wait for the extended window to include it
+    c.scrollLeft = Math.max(0, idx * colW - colW * 2)
+    updateHbar()
+    setPendingScrollDate(null)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingScrollDate, fromDate, toDate, view, colW])
+
   // Per-user tab gating: staff see only the sub-tabs they hold; owners see all.
   const SCHEDULE_TABS = ([
     { key: 'timeline',     perm: 'schedule.tab.timeline', label: 'Timeline' },
@@ -1049,9 +1230,15 @@ export function SchedulePage() {
   }, [visibleTabKeys])
 
   return (
-    <div style={{minWidth:0,overflow:'hidden'}}>
+    // S575: on the timeline sub-view the page fills the content region and only the
+    // unit grid scrolls (toolbar + legend stay put). height:100% resolves against
+    // .page-content (now a definite-height flex child of the fixed shell). Other
+    // sub-views keep auto height and scroll normally inside .page-content.
+    <div style={view==='timeline'
+      ? {minWidth:0,overflow:'hidden',height:'100%',display:'flex',flexDirection:'column'}
+      : {minWidth:0,overflow:'hidden'}}>
       {/* ── COMPACT TOOLBAR ── */}
-      <div style={{display:'flex',gap:8,alignItems:'center',marginBottom:12,flexWrap:'wrap'}}>
+      <div style={{display:'flex',gap:8,alignItems:'center',marginBottom:12,flexWrap:'wrap',flexShrink:0}}>
         {/* View toggle */}
         {SCHEDULE_TABS.map(({ key: v, label }) => (
           <button key={v} className={`tab-btn ${view===v?'active':''}`} onClick={()=>setView(v as any)} style={{fontSize:'.78rem'}}>{label ?? v}</button>
@@ -1086,8 +1273,23 @@ export function SchedulePage() {
 
         {view==='timeline' && <>
           <div style={{width:1,height:20,background:'var(--border-1)',margin:'0 4px'}} />
-          {/* Scroll-based nav — drag/scroll the timeline both ways; Today re-centers. */}
-          <button className="btn btn-ghost btn-sm" onClick={scrollToToday} style={{fontWeight:600,color:'var(--gold)'}}>Today</button>
+          {/* Jump-to-date (S576): extend the window to any future date and scroll
+              there — the perpetual-calendar reach for booking next season. Today
+              re-centers, and sits right next to Go for one clean nav cluster. */}
+          <div style={{display:'flex',alignItems:'center',gap:5,flexWrap:'nowrap'}}>
+            <input
+              type="date"
+              value={jumpDate}
+              min={fromDate}
+              onChange={e => setJumpDate(e.target.value)}
+              title="Jump to a date"
+              style={{fontSize:'.72rem',padding:'4px 7px',background:'var(--bg-3)',border:'1px solid var(--border-1)',borderRadius:6,color:'var(--text-1)'}}
+            />
+            <button className="btn btn-ghost btn-sm" disabled={!jumpDate}
+              onClick={() => jumpToDate(jumpDate)}
+              style={{fontWeight:600,color: jumpDate ? 'var(--gold)' : 'var(--text-3)'}}>Go</button>
+            <button className="btn btn-ghost btn-sm" onClick={scrollToToday} style={{fontWeight:600,color:'var(--gold)'}}>Today</button>
+          </div>
           <span style={{fontSize:'.72rem',color:'var(--text-3)'}}>← scroll for past · future →</span>
         </>}
 
@@ -1106,23 +1308,24 @@ export function SchedulePage() {
 
       {/* ── TIMELINE VIEW ── */}
       {!isLoading && view==='timeline' && (
-        <div style={{display:'flex',flexDirection:'column',minWidth:0}}>
+        <div style={{display:'flex',flexDirection:'column',minWidth:0,flex:1,minHeight:0}}>
+        {/* S575: the old JS row-snap (round scrollTop to a fixed 72px) was removed —
+            it rounded DOWN below max-scroll at the bottom (cutting off the last row)
+            and re-fired on every momentum tick, fighting the fling with a repeated
+            3-second bounce. Native scrolling reaches the bottom and stops cleanly;
+            overscrollBehavior:contain keeps a fling from chaining to the page. */}
+        {/* S575: hide the NATIVE scrollbars — scrolling still works (swipe/wheel),
+            but the macOS overlay bar that flashed on swipe was doubling up with the
+            custom bar below. Our own draggable bar is the only visible one now. */}
+        <style>{`
+          .schedule-scroll::-webkit-scrollbar{display:none;}
+          .schedule-scroll{scrollbar-width:none;-ms-overflow-style:none;}
+        `}</style>
         <div
           ref={scrollContainerRef}
-          className="card"
-          style={{padding:0,overflowX:'auto',overflowY:'scroll',height:'calc(100vh - 200px)',marginBottom:0,borderRadius:'12px 12px 0 0'}}
-          onScroll={e => {
-            const container = e.currentTarget
-            clearTimeout((container as any)._snapTimer)
-            ;(container as any)._snapTimer = setTimeout(() => {
-              const firstRow = container.querySelector('tbody tr') as HTMLElement
-              const ROW_H = firstRow ? firstRow.offsetHeight : 72
-              const snapped = Math.round(container.scrollTop / ROW_H) * ROW_H
-              if (Math.abs(container.scrollTop - snapped) > 1) {
-                container.scrollTop = snapped
-              }
-            }, 80)
-          }}
+          className="card schedule-scroll"
+          onScroll={() => { updateHbar(); maybeExtendForward() }}
+          style={{padding:0,position:'relative',overflowX:'auto',overflowY:'auto',overscrollBehavior:'contain',flex:1,minHeight:0,marginBottom:0,borderRadius:'12px 12px 0 0'}}
         >
           <table
             style={{borderCollapse:'collapse',tableLayout:'fixed',width:180+days.length*colW}}
@@ -1155,17 +1358,24 @@ export function SchedulePage() {
               </tr>
             </thead>
             <tbody>
+              {/* S575: every row is a UNIFORM 88px. The only thing that made rows vary
+                  was the sticky Unit cell's content — bookable units carry a "+ Book"
+                  button, and a long property name used to wrap unbounded (a 4-line name
+                  made a 118px row). We clamp the property name to 2 lines (full name on
+                  hover) and hard-cap the cell content to a fixed height with
+                  overflow:hidden, so nothing can push the row taller and nothing is
+                  truly hidden. */}
               {filteredUnits.map(unit => (
-                <tr key={unit.id} style={{height:72,maxHeight:72}}>
+                <tr key={unit.id} style={{height:88}}>
                   {/* zIndex 3: must beat the day-cell bars (zIndex 1–2). When the grid
                       is scrolled, past day-cells slide UNDER this sticky column — at
                       zIndex 1 the bars painted over the unit info (S526 glitch). */}
-                  <td style={{padding:'6px 12px',borderBottom:'1px solid var(--border-1)',position:'sticky',left:0,background:'var(--bg-2)',zIndex:3,height:72,boxSizing:'border-box',overflow:'hidden'}}>
-                    <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:8}}>
-                      <div>
+                  <td style={{padding:'6px 12px',borderBottom:'1px solid var(--border-1)',position:'sticky',left:0,background:'var(--bg-2)',zIndex:3,height:88,boxSizing:'border-box',overflow:'hidden'}}>
+                    <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:8,height:76,overflow:'hidden'}}>
+                      <div style={{minWidth:0}}>
                         <div style={{fontWeight:600,fontSize:'.82rem'}}>{unit.unitNumber}</div>
                         <div style={{fontSize:'.68rem',color:TYPE_COLORS[unit.unitType]||'var(--text-3)'}}>{UNIT_TYPE_LABELS[unit.unitType]||humanize(unit.unitType)}</div>
-                        <div style={{fontSize:'.65rem',color:'var(--text-3)'}}>{unit.propertyName}</div>
+                        <div title={unit.propertyName} style={{fontSize:'.65rem',color:'var(--text-3)',display:'-webkit-box',WebkitLineClamp:2,WebkitBoxOrient:'vertical',overflow:'hidden',lineHeight:1.25}}>{unit.propertyName}</div>
                       </div>
                       <div style={{display:'flex',gap:4}}>
                         {unit.isBookable && can('schedule.create_reservation') && <button className="btn btn-ghost btn-sm" style={{fontSize:'.65rem',padding:'2px 6px'}} onClick={()=>openBookingModal(unit)}>+ Book</button>}
@@ -1196,6 +1406,26 @@ export function SchedulePage() {
                     // the native drag isn't cancelled) and get tinted gold instead — that
                     // shows the overlap with the original position without unmounting it.
                     const showPreviewBlock = isDragTarget && !isGhostCell
+
+                    // S574 (Nic): repeat the guest name every 7 days across the bar
+                    // (a 6-month stay was blank after its start cell) and mark which
+                    // cells carry a label. Label cells get zIndex 2 (below the sticky
+                    // Unit column at 3, above plain bar cells at 1) so the name paints
+                    // OVER following day-cells instead of behind them — long stays whose
+                    // true start is off-screen previously labeled a zIndex-1 cell that
+                    // later cells painted over ("see-through" name).
+                    const barStart = booking ? dayOnly(booking.checkIn || booking.startDate) : ''
+                    const dayIndex = booking && barStart
+                      ? Math.round((new Date(d + 'T00:00:00').getTime() - new Date(barStart + 'T00:00:00').getTime()) / 86400000)
+                      : 0
+                    // S574: repeat interval widened 7→21 (7 was too frequent for
+                    // longer names). NOTE (Nic): the better end-state is a single
+                    // name that FLOATS pinned to the visible left edge per reservation
+                    // (so a full park's names line up in a column) — that's a
+                    // sticky-overlay rendering change, tracked separately.
+                    const showsLabel = !!booking
+                      && (isStart || d === days[0] || (dayIndex > 0 && dayIndex % 21 === 0))
+                      && (!isGhostCell || isDragTarget)
 
                     return (
                       <td
@@ -1284,7 +1514,7 @@ export function SchedulePage() {
                                   whiteSpace:'nowrap', paddingLeft: isStart?7:0,
                                   opacity: (isGhostCell && !isDragTarget) ? 0.2 : 0.92,
                                   cursor: isLease ? 'default' : 'grab',
-                                  position:'relative', zIndex: isStart?2:1,
+                                  position:'relative', zIndex: showsLabel?2:1,
                                   border: needsAck ? '1px solid var(--amber)' : 'none',
                                   userSelect: 'none',
                                 }}
@@ -1293,10 +1523,9 @@ export function SchedulePage() {
                                   + (needsAck ? ' — Property-rules acknowledgment pending' : '')
                                 }
                               >
-                                {/* S527 W-17: label on the bar's first VISIBLE cell — bars that
-                                    began before the grid (long leases) were nameless because the
-                                    label only painted on the true start cell, off-screen left. */}
-                                {(isStart || d === days[0]) && (!isGhostCell || isDragTarget) ? `${isLease?'🔒 ':''}${(booking.guestName || [booking.firstName, booking.lastName].filter(Boolean).join(' ') || '●').slice(0,16)}` : ''}
+                                {/* S575: the resting name now lives in the floating-name
+                                    overlay (one pinned name per reservation), so the bar itself
+                                    carries no text — just the colored block + ack dot + grips. */}
                                 {needsAck && isStart && (
                                   <span
                                     style={{
@@ -1344,8 +1573,37 @@ export function SchedulePage() {
               )}
             </tbody>
           </table>
+          {/* S575: floating-name overlay (see the nameOverlays comment). Sits above
+              the bars (zIndex 2) but below the sticky Unit column + header (zIndex 3),
+              so a name sliding left disappears cleanly under the Unit column. */}
+          <div aria-hidden style={{position:'absolute',top:0,left:0,zIndex:2,pointerEvents:'none'}}>
+            {nameOverlays.filter(o => o.key !== dragging).map(o => (
+              <div key={o.key} style={{position:'absolute',left:o.left,top:o.top,width:o.width,height:o.height,display:'flex',alignItems:'center',pointerEvents:'none'}}>
+                <div style={{position:'sticky',left:STICKY_LEFT,maxWidth:o.width,boxSizing:'border-box',padding:'0 6px',fontSize:'.72rem',fontWeight:700,lineHeight:1,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis',color:o.isLease?'#e6ecff':'#fff',textShadow:'0 1px 2px rgba(0,0,0,.6)'}}>
+                  {o.isLease ? '🔒 ' : ''}{o.label}
+                </div>
+              </div>
+            ))}
+          </div>
         </div>
-        <div ref={legendRef} style={{padding:'8px 12px',fontSize:'.72rem',color:'var(--text-3)',display:'flex',gap:16,borderTop:'1px solid var(--border-1)',background:'var(--bg-2)',borderRadius:'0 0 12px 12px',flexShrink:0}}>
+        {/* S575: always-visible horizontal scrollbar hovering just above the legend
+            — for mouse users who can't swipe sideways (see updateHbar/dragHbar). */}
+        <style>{`.hbar-thumb:hover{background:var(--gold)!important;} .hbar-thumb:active{background:var(--gold)!important;cursor:grabbing!important;}`}</style>
+        {hbar.show && (
+          <div
+            ref={hbarTrackRef}
+            onMouseDown={jumpHbar}
+            title="Drag to scroll the timeline sideways"
+            style={{position:'relative',height:16,background:'var(--bg-3)',borderTop:'1px solid var(--border-1)',cursor:'pointer',flexShrink:0}}
+          >
+            <div
+              onMouseDown={dragHbar}
+              className="hbar-thumb"
+              style={{position:'absolute',top:3,bottom:3,left:`${hbar.leftPct}%`,width:`${hbar.thumbPct}%`,minWidth:32,background:'var(--text-3)',borderRadius:5,cursor:'grab'}}
+            />
+          </div>
+        )}
+        <div ref={legendRef} style={{padding:'10px 14px 14px',fontSize:'.72rem',color:'var(--text-3)',display:'flex',flexWrap:'wrap',gap:16,borderTop:'1px solid var(--border-1)',background:'var(--bg-2)',borderRadius:'0 0 12px 12px',flexShrink:0}}>
           <span><span style={{display:'inline-block',width:12,height:12,background:'var(--green)',borderRadius:2,marginRight:4}}/>Reservation (draggable)</span>
           <span><span style={{display:'inline-block',width:12,height:12,background:'var(--blue)',borderRadius:2,marginRight:4}}/>🔒 Lease (managed on Leases page)</span>
           <span><span style={{display:'inline-block',width:12,height:12,background:'var(--gold)',borderRadius:2,opacity:.3,marginRight:4}}/>Today</span>

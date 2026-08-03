@@ -75,27 +75,73 @@ export function instantFeeBreakdown(available: number): {
   return { totalFee, gamMargin, payoutAmount, stripeFee, net }
 }
 
+// S554 re-anchor Stage 2: resolve which Connect account a caller withdraws.
+// If the caller is a CURRENT member (owner) of a landlord entity that has an
+// entity Connect account, withdraw the ENTITY's balance (rent) — and querying
+// landlord_members at request time IS the live dissolution recheck: a removed
+// owner no longer matches and falls through to their own user account (null for
+// a pure owner → 409). Managers / opt-in direct-deposit / legacy landlords keep
+// withdrawing their OWN user-level balance.
+async function resolveWithdrawalTarget(userId: string): Promise<{
+  account: string | null
+  payoutsEnabled: boolean
+  detailsSubmitted: boolean
+  entity: 'user' | 'landlord'
+  entityId: string
+}> {
+  const ent = await queryOne<{
+    landlord_id: string
+    stripe_connect_account_id: string
+    connect_payouts_enabled: boolean
+    connect_details_submitted: boolean
+  }>(
+    `SELECT l.id AS landlord_id, l.stripe_connect_account_id,
+            l.connect_payouts_enabled, l.connect_details_submitted
+       FROM landlord_members m
+       JOIN landlords l ON l.id = m.landlord_id
+      WHERE m.user_id = $1 AND l.stripe_connect_account_id IS NOT NULL
+      LIMIT 1`,
+    [userId]
+  )
+  if (ent) {
+    return {
+      account: ent.stripe_connect_account_id,
+      payoutsEnabled: ent.connect_payouts_enabled,
+      detailsSubmitted: ent.connect_details_submitted,
+      entity: 'landlord',
+      entityId: ent.landlord_id,
+    }
+  }
+  const usr = await queryOne<{
+    stripe_connect_account_id: string | null
+    connect_payouts_enabled: boolean
+    connect_details_submitted: boolean
+  }>(
+    `SELECT stripe_connect_account_id, connect_payouts_enabled, connect_details_submitted
+       FROM users WHERE id = $1`,
+    [userId]
+  )
+  return {
+    account: usr?.stripe_connect_account_id ?? null,
+    payoutsEnabled: !!usr?.connect_payouts_enabled,
+    detailsSubmitted: !!usr?.connect_details_submitted,
+    entity: 'user',
+    entityId: userId,
+  }
+}
+
 withdrawalsRouter.get('/me/withdrawals/preview', async (req, res, next) => {
   try {
     const userId = req.user!.userId
-    const userRow = await queryOne<{
-      stripe_connect_account_id: string | null
-      connect_payouts_enabled: boolean
-      connect_details_submitted: boolean
-    }>(
-      `SELECT stripe_connect_account_id, connect_payouts_enabled, connect_details_submitted
-         FROM users WHERE id = $1`,
-      [userId]
-    )
-    if (!userRow) throw new AppError(404, 'User not found')
-    if (!userRow.stripe_connect_account_id) {
+    const target = await resolveWithdrawalTarget(userId)
+    if (!target.account) {
       throw new AppError(409, 'Stripe Connect onboarding incomplete — finish KYC at /banking before withdrawing.')
     }
-    if (!userRow.connect_payouts_enabled || !userRow.connect_details_submitted) {
+    if (!target.payoutsEnabled || !target.detailsSubmitted) {
       throw new AppError(409, 'Stripe Connect onboarding incomplete — finish KYC at /banking before withdrawing.')
     }
 
-    const bal = await getConnectBalance(userRow.stripe_connect_account_id)
+    const bal = await getConnectBalance(target.account)
     const availableUsd        = bal.available.find((b) => b.currency === 'usd')?.amount ?? 0
     const instantAvailableUsd = bal.instant_available.find((b) => b.currency === 'usd')?.amount ?? 0
     const breakdown = instantFeeBreakdown(instantAvailableUsd)
@@ -124,34 +170,26 @@ const withdrawalSchema = z.object({
   method: z.enum(['standard', 'instant']).optional(),
 })
 
-// Self-service: withdraws the CALLER's own Connect balance (req.user.userId),
-// never the landlord's — so it is NOT gated on the landlord-staff catalog key
-// (that would break property_manager direct-deposit self-withdrawal for zero
-// security gain; a staff member can only ever move their own balance here).
+// Self-service withdrawal. Target resolved by resolveWithdrawalTarget: a live
+// landlord-entity owner withdraws the ENTITY's Connect balance (rent, S554
+// Stage 2); everyone else (managers on direct-deposit, legacy) withdraws their
+// OWN user balance. Not gated on a landlord-staff catalog key — a caller can
+// only ever move funds of an entity they're a current member of, or their own.
 withdrawalsRouter.post('/me/withdrawals', async (req, res, next) => {
   try {
     const userId = req.user!.userId
     const body   = withdrawalSchema.parse(req.body ?? {})
     const method = body.method ?? 'standard'
 
-    const userRow = await queryOne<{
-      stripe_connect_account_id: string | null
-      connect_payouts_enabled: boolean
-      connect_details_submitted: boolean
-    }>(
-      `SELECT stripe_connect_account_id, connect_payouts_enabled, connect_details_submitted
-         FROM users WHERE id = $1`,
-      [userId]
-    )
-    if (!userRow) throw new AppError(404, 'User not found')
-    if (!userRow.stripe_connect_account_id) {
+    const target = await resolveWithdrawalTarget(userId)
+    if (!target.account) {
       throw new AppError(409, 'Stripe Connect onboarding incomplete — finish KYC at /banking before withdrawing.')
     }
-    if (!userRow.connect_payouts_enabled || !userRow.connect_details_submitted) {
+    if (!target.payoutsEnabled || !target.detailsSubmitted) {
       throw new AppError(409, 'Stripe Connect onboarding incomplete — finish KYC at /banking before withdrawing.')
     }
 
-    const bal = await getConnectBalance(userRow.stripe_connect_account_id)
+    const bal = await getConnectBalance(target.account)
     const availableUsd =
       method === 'instant'
         ? bal.instant_available.find((b) => b.currency === 'usd')?.amount ?? 0
@@ -162,7 +200,7 @@ withdrawalsRouter.post('/me/withdrawals', async (req, res, next) => {
 
     // Idempotency key: deterministic per (account, method, ms-truncated-second)
     // so a double-click within the same second deduplicates at Stripe.
-    const idempotencyKey = `manual_${method}_${userRow.stripe_connect_account_id}_${Math.floor(Date.now() / 1000)}`
+    const idempotencyKey = `manual_${method}_${target.account}_${Math.floor(Date.now() / 1000)}`
 
     // W-32 instant pricing: pull GAM's margin off the Connect balance FIRST
     // (account-debit transfer to platform), then fire the instant payout for
@@ -189,12 +227,12 @@ withdrawalsRouter.post('/me/withdrawals', async (req, res, next) => {
           description: 'GAM instant withdrawal fee (margin over Stripe cost)',
           metadata: {
             gam_purpose:   'instant_withdrawal_fee_margin',
-            gam_entity:    'user',
-            gam_entity_id: userId,
+            gam_entity:    target.entity,
+            gam_entity_id: target.entityId,
             gam_total_fee: breakdown.totalFee.toFixed(2),
           },
         },
-        { stripeAccount: userRow.stripe_connect_account_id, idempotencyKey: `${idempotencyKey}_margin` },
+        { stripeAccount: target.account, idempotencyKey: `${idempotencyKey}_margin` },
       )
       marginTransferId = marginTransfer.id
     }
@@ -202,14 +240,14 @@ withdrawalsRouter.post('/me/withdrawals', async (req, res, next) => {
     let payout
     try {
       payout = await firePayoutForConnectAccount({
-        connectAccountId: userRow.stripe_connect_account_id,
+        connectAccountId: target.account,
         amount:           payoutAmount,
         method,
         idempotencyKey,
         metadata: {
           gam_trigger:   'manual_on_demand',
-          gam_entity:    'user',
-          gam_entity_id: userId,
+          gam_entity:    target.entity,
+          gam_entity_id: target.entityId,
           gam_method:    method,
         },
         description: method === 'instant' ? 'GAM instant payout' : 'GAM manual payout',
@@ -224,7 +262,7 @@ withdrawalsRouter.post('/me/withdrawals', async (req, res, next) => {
           await stripe.transfers.createReversal(
             marginTransferId,
             {},
-            { stripeAccount: userRow.stripe_connect_account_id, idempotencyKey: `${idempotencyKey}_margin_reversal` },
+            { stripeAccount: target.account, idempotencyKey: `${idempotencyKey}_margin_reversal` },
           )
         } catch (reversalErr) {
           logger.error({ err: reversalErr, marginTransferId, userId }, '[WITHDRAWALS] margin reversal failed after payout error — manual recovery needed')

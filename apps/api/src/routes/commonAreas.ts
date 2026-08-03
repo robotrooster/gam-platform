@@ -184,7 +184,7 @@ commonAreasRouter.post('/', requirePerm('amenities.manage_areas'), async (req, r
           events_enabled, event_deposit_amount, event_announce, event_auto_release)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING *`,
       [b.propertyId, prop.landlord_id, b.name, b.description ?? null,
-       b.reservable ?? true, b.requiresApproval ?? true, b.capacity ?? null,
+       b.reservable ?? false, b.requiresApproval ?? true, b.capacity ?? null,
        b.reservationFee ?? 0, b.weekendFee ?? null, b.openTime ?? null, b.closeTime ?? null,
        b.maxReservationHours ?? null, b.advanceBookingDays ?? null,
        b.monthlyReservationLimit ?? null,

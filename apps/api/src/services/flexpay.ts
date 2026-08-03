@@ -56,7 +56,13 @@ import { logger } from '../lib/logger'
 // awareness.
 // ============================================================
 
-export const FLEXPAY_FEE_BASE = 5            // dollars
+// S562 (Nic): FlexPay is a FLAT $25/month subscription — NOT the old date-based
+// "$5 + pull day" formula (that was a bug: the flat $25 was decided long ago but
+// never actually implemented). The pull day is still tenant-selected, but ONLY
+// for SCHEDULING (matched to when their benefits land) — it does not affect the
+// price. A failed-pull retry stays $25 (no re-pricing); only the actual Stripe
+// ACH-return fee is passed through on top, at cost.
+export const FLEXPAY_MONTHLY_FEE = 25        // dollars, flat
 export const FLEXPAY_MAX_PULL_DAY = 28       // SSDI 4th-Wednesday cap
 export const FLEXPAY_NSF_COOLDOWN_DAYS = 90  // matches Consumer ToS § (re-enroll lockout after a FlexPay failure)
 // Stripe ACH-return fee passed through to the tenant at cost on a retry pull
@@ -66,15 +72,15 @@ export const FLEXPAY_ACH_RETURN_FEE = 4
 export const FLEXPAY_DEFAULT_GRACE_DAYS = 5  // when lease.late_fee_grace_days is NULL
 
 /**
- * Fee for a given pull day. $5 base + day-of-month. day 1 = $6, day
- * 28 = $33. The formula is linear and the cap is 28 so the result is
- * always 6 ≤ fee ≤ 33.
+ * FlexPay monthly subscription fee — FLAT $25 regardless of pull day (S562).
+ * `pullDay` is still validated (it's a real scheduling choice, 1..28), but the
+ * price no longer depends on it.
  */
 export function calculateFlexPayFee(pullDay: number): number {
   if (!Number.isInteger(pullDay) || pullDay < 1 || pullDay > FLEXPAY_MAX_PULL_DAY) {
     throw new Error(`pullDay must be an integer 1..${FLEXPAY_MAX_PULL_DAY}`)
   }
-  return FLEXPAY_FEE_BASE + pullDay
+  return FLEXPAY_MONTHLY_FEE
 }
 
 /**

@@ -20,9 +20,15 @@ import React, { useContext, useState } from 'react'
 import ReactDOM from 'react-dom/client'
 import { BrowserRouter, Routes, Route, Navigate, NavLink, Outlet, useNavigate } from 'react-router-dom'
 import { QueryClient, QueryClientProvider, useQuery, useMutation, useQueryClient } from 'react-query'
+import {
+  LayoutDashboard, Rocket, Building2, Users, Zap, ClipboardList, DoorOpen,
+  CreditCard, ArrowDownToLine, Plug, Activity, Map as MapIcon, FileText,
+  Scale, SlidersHorizontal, BookOpen, Lightbulb,
+  Target, TrendingUp, Bot, Lock, LogOut, DollarSign,
+} from 'lucide-react'
 import axios from 'axios'
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
-import { formatCurrency, getReservePhase, RESERVE_CONFIG, applyCamelizeInterceptor, installDatePickerAutoClose, humanize } from '@gam/shared'
+import { formatCurrency, applyCamelizeInterceptor, installDatePickerAutoClose, humanize } from '@gam/shared'
 import { toast, appConfirm, DialogHost } from './components/dialogs'
 
 const API = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
@@ -38,13 +44,15 @@ const post=<T,>(url:string,body?:any)=>api.post<{success:boolean;data:T;message?
 interface AuthUser{id:string;email:string;role:string;firstName:string;lastName:string;profileId:string;totpEnabled?:boolean;mustEnrollTotp?:boolean}
 // S289: login() returns a discriminated result so LoginPage can branch
 // into the TOTP second step when the backend gates on 2FA.
-type LoginResult={kind:'success'}|{kind:'totp_required';totpSession:string}
+type LoginResult={kind:'success'}|{kind:'totp_required';totpSession:string}|{kind:'email_otp_required';emailOtpSession:string}
 interface AuthCtx{
   user:AuthUser|null
   token:string|null
   loading:boolean
   login:(e:string,p:string)=>Promise<LoginResult>
   loginWithTotp:(totpSession:string,code:string)=>Promise<void>
+  loginWithEmailOtp:(emailOtpSession:string,code:string)=>Promise<void>
+  resendEmailOtp:(emailOtpSession:string)=>Promise<void>
   refresh:()=>Promise<void>
   logout:()=>void
 }
@@ -94,6 +102,9 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
     if (data.requiresTotp) {
       return { kind: 'totp_required', totpSession: data.totpSession as string }
     }
+    if (data.requiresEmailOtp) {
+      return { kind: 'email_otp_required', emailOtpSession: data.emailOtpSession as string }
+    }
     const { token: tk, user: u } = data
     if (!u || (u.role !== 'admin' && u.role !== 'super_admin')) throw new Error('Admin access required')
     localStorage.setItem('gam_admin_token', tk)
@@ -132,7 +143,27 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
     await refresh()
   }
 
-  return <Ctx.Provider value={{ user, token, loading, login, loginWithTotp, refresh, logout }}>{children}</Ctx.Provider>
+  // S565: email-code 2FA second step. Trades the pending emailOtpSession +
+  // the 6-digit code emailed to the user for the full session JWT.
+  const loginWithEmailOtp = async (emailOtpSession: string, code: string): Promise<void> => {
+    const res = await axios.post(API + '/api/auth/email-otp/verify', { emailOtpSession, code })
+    const { token: tk, user: u } = res.data.data
+    if (!u || (u.role !== 'admin' && u.role !== 'super_admin')) throw new Error('Admin access required')
+    localStorage.setItem('gam_admin_token', tk)
+    api.defaults.headers.common['Authorization'] = 'Bearer ' + tk
+    setUser({
+      id: u.id, email: u.email, role: u.role,
+      firstName: '', lastName: '', profileId: u.profileId || '',
+    })
+    setToken(tk)
+    await refresh()
+  }
+
+  const resendEmailOtp = async (emailOtpSession: string): Promise<void> => {
+    await axios.post(API + '/api/auth/email-otp/resend', { emailOtpSession })
+  }
+
+  return <Ctx.Provider value={{ user, token, loading, login, loginWithTotp, loginWithEmailOtp, resendEmailOtp, refresh, logout }}>{children}</Ctx.Provider>
 }
 
 const qc=new QueryClient({defaultOptions:{queries:{retry:1,staleTime:30000,refetchOnWindowFocus:false}}})
@@ -145,17 +176,17 @@ const css=`
   --t0:#eef0f6;--t1:#b8c4d8;--t2:#7a8aaa;--t3:#475060;
   --gold:#c9a227;--green:#22c55e;--red:#ef4444;--amber:#f59e0b;--blue:#3b82f6;--purple:#a855f7;
   --font-d:'Syne',sans-serif;--font-b:'DM Sans',sans-serif;--font-m:'DM Mono',monospace}
-html{-webkit-font-smoothing:antialiased}
-body{font-family:var(--font-b);background:var(--bg0);color:var(--t1);line-height:1.6;min-height:100vh}
+html{-webkit-font-smoothing:antialiased;height:100%}
+body{font-family:var(--font-b);background:var(--bg0);color:var(--t1);line-height:1.6;height:100%;margin:0;overflow:hidden;overscroll-behavior:none}
 h1,h2,h3,h4{font-family:var(--font-d);color:var(--t0);line-height:1.2}
 h1{font-size:1.8rem;font-weight:800}h2{font-size:1.3rem;font-weight:700}h3{font-size:1rem;font-weight:700}
 button{cursor:pointer;font-family:var(--font-b)}input,select{font-family:var(--font-b)}
 a{color:var(--gold);text-decoration:none}
-.shell{display:flex;min-height:100vh}
+.shell{display:flex;height:100vh;overflow:hidden}
 .sidebar{width:220px;flex-shrink:0;background:var(--bg1);border-right:1px solid var(--b0);position:fixed;top:0;left:0;bottom:0;z-index:50;display:flex;flex-direction:column;overflow-y:auto}
-.main{flex:1;margin-left:220px;min-height:100vh;display:flex;flex-direction:column}
-.topbar{height:52px;background:var(--bg1);border-bottom:1px solid var(--b0);display:flex;align-items:center;padding:0 24px;position:sticky;top:0;z-index:40;gap:12px}
-.page{flex:1;padding:28px;max-width:1600px;width:100%}
+.main{flex:1;margin-left:220px;height:100vh;display:flex;flex-direction:column;min-width:0;overflow:hidden}
+.topbar{height:52px;background:var(--bg1);border-bottom:1px solid var(--b0);display:flex;align-items:center;padding:0 24px;position:sticky;top:0;z-index:40;gap:12px;flex-shrink:0}
+.page{flex:1;min-height:0;padding:28px;max-width:1600px;width:100%;overflow-y:auto;overflow-x:hidden;overscroll-behavior:none}
 .logo{padding:18px;border-bottom:1px solid var(--b0)}
 .logo-n{font-family:var(--font-d);font-size:1rem;font-weight:800;color:var(--red)}
 .logo-s{font-size:.65rem;color:var(--t3);margin-top:2px;text-transform:uppercase;letter-spacing:.1em}
@@ -246,49 +277,47 @@ function Layout(){
         </div>
         <nav className="nav">
           <div className="nl">Platform</div>
-          {isSuperAdmin&&<NavLink to="/overview" className={({isActive})=>`ni${isActive?' active':''}`}>📊 Overview</NavLink>}
-          {!isSuperAdmin&&<NavLink to="/onboarding" className={({isActive})=>`ni${isActive?' active':''}`}>🚀 Onboarding</NavLink>}
-          <NavLink to="/landlords" className={({isActive})=>`ni${isActive?' active':''}`}>🏢 Landlords</NavLink>
-          <NavLink to="/tenants" className={({isActive})=>`ni${isActive?' active':''}`}>👤 Tenants</NavLink>
-          <NavLink to="/flexpay-requests" className={({isActive})=>`ni${isActive?' active':''}`}>⚡ FlexPay Requests</NavLink>
-          <NavLink to="/property-reviews" className={({isActive})=>`ni${isActive?' active':''}`}>📋 Property Reviews</NavLink>
-          <NavLink to="/units" className={({isActive})=>`ni${isActive?' active':''}`}>🚪 Units</NavLink>
+          {isSuperAdmin&&<NavLink to="/overview" className={({isActive})=>`ni${isActive?' active':''}`}><LayoutDashboard size={15}/> Overview</NavLink>}
+          {!isSuperAdmin&&<NavLink to="/onboarding" className={({isActive})=>`ni${isActive?' active':''}`}><Rocket size={15}/> Onboarding</NavLink>}
+          <NavLink to="/landlords" className={({isActive})=>`ni${isActive?' active':''}`}><Building2 size={15}/> Landlords</NavLink>
+          <NavLink to="/tenants" className={({isActive})=>`ni${isActive?' active':''}`}><Users size={15}/> Tenants</NavLink>
+          <NavLink to="/commissions" className={({isActive})=>`ni${isActive?' active':''}`}><DollarSign size={15}/> Commissions</NavLink>
+          {isSuperAdmin&&<NavLink to="/flexpay-requests" className={({isActive})=>`ni${isActive?' active':''}`}><Zap size={15}/> FlexPay Requests</NavLink>}
+          {isSuperAdmin&&<NavLink to="/property-reviews" className={({isActive})=>`ni${isActive?' active':''}`}><ClipboardList size={15}/> Property Reviews</NavLink>}
+          {isSuperAdmin&&<NavLink to="/feature-requests" className={({isActive})=>`ni${isActive?' active':''}`}><Lightbulb size={15}/> Feature Requests</NavLink>}
+          <NavLink to="/units" className={({isActive})=>`ni${isActive?' active':''}`}><DoorOpen size={15}/> Units</NavLink>
           <div className="nl" style={{marginTop:8}}>Finance</div>
-          <NavLink to="/payments" className={({isActive})=>`ni${isActive?' active':''}`}>💳 Payments</NavLink>
-          <NavLink to="/disbursements" className={({isActive})=>`ni${isActive?' active':''}`}>💸 Disbursements</NavLink>
-          <NavLink to="/connect-accounts" className={({isActive})=>`ni${isActive?' active':''}`}>🔌 Connect Accounts</NavLink>
-          <div className="nl" style={{marginTop:8}}>Compliance</div>
-          {isSuperAdmin&&<NavLink to="/nacha" className={({isActive})=>`ni${isActive?' active':''}`}>⚡ NACHA Monitor</NavLink>}
-          {isSuperAdmin&&<NavLink to="/audit-log" className={({isActive})=>`ni${isActive?' active':''}`}>🧾 Admin Audit</NavLink>}
-          <NavLink to="/csv-imports" className={({isActive})=>`ni${isActive?' active':''}`}>📥 CSV Imports</NavLink>
-          <NavLink to="/disputes" className={({isActive})=>`ni${isActive?' active':''}`}>⚖️ Reporting Disputes</NavLink>
-          <NavLink to="/subleases" className={({isActive})=>`ni${isActive?' active':''}`}>🔁 Subleases</NavLink>
-          <NavLink to="/deposit-portability" className={({isActive})=>`ni${isActive?' active':''}`}>💰 Deposit Portability</NavLink>
-          {isSuperAdmin&&<NavLink to="/system-features" className={({isActive})=>`ni${isActive?' active':''}`}>🚦 System Features</NavLink>}
+          <NavLink to="/payments" className={({isActive})=>`ni${isActive?' active':''}`}><CreditCard size={15}/> Payments</NavLink>
+          <NavLink to="/disbursements" className={({isActive})=>`ni${isActive?' active':''}`}><ArrowDownToLine size={15}/> Disbursements</NavLink>
+          <NavLink to="/connect-accounts" className={({isActive})=>`ni${isActive?' active':''}`}><Plug size={15}/> Connect Accounts</NavLink>
+          {isSuperAdmin&&<div className="nl" style={{marginTop:8}}>Compliance</div>}
+          {isSuperAdmin&&<NavLink to="/nacha" className={({isActive})=>`ni${isActive?' active':''}`}><Activity size={15}/> NACHA Monitor</NavLink>}
+          {isSuperAdmin&&<NavLink to="/nexus" className={({isActive})=>`ni${isActive?' active':''}`}><MapIcon size={15}/> Sales-Tax Nexus</NavLink>}
+          {isSuperAdmin&&<NavLink to="/audit-log" className={({isActive})=>`ni${isActive?' active':''}`}><FileText size={15}/> Admin Audit</NavLink>}
+          {isSuperAdmin&&<NavLink to="/disputes" className={({isActive})=>`ni${isActive?' active':''}`}><Scale size={15}/> Reporting Disputes</NavLink>}
+          {user?.email===OWNER_EMAIL&&<NavLink to="/system-features" className={({isActive})=>`ni${isActive?' active':''}`}><SlidersHorizontal size={15}/> System Features</NavLink>}
           {/* S508 (#6): these sections only hold super-admin items — don't
               render the section label for regular admins (was an empty "dead"
               header). */}
-          {isSuperAdmin&&<div className="nl" style={{marginTop:8}}>Community</div>}
-          {isSuperAdmin&&<NavLink to="/bulletin" className={({isActive})=>`ni${isActive?' active':''}`}>📋 Bulletin Board</NavLink>}
           {isSuperAdmin&&<div className="nl" style={{marginTop:8}}>Tools</div>}
-          {isSuperAdmin&&<button className="ni" onClick={()=>{const t=localStorage.getItem('gam_admin_token');window.open(BOOKS_URL+(t?'?token='+t:''),'_blank')}}>📒 GAM Books</button>}
+          {isSuperAdmin&&<button className="ni" onClick={()=>{const t=localStorage.getItem('gam_admin_token');window.open(BOOKS_URL+(t?'?token='+t:''),'_blank')}}><BookOpen size={15}/> GAM Books</button>}
 
-          <div className="nl" style={{marginTop:8}}>Sales</div>
-          <NavLink to="/leads" className={({isActive})=>`ni${isActive?' active':''}`}>🎯 Leads</NavLink>
+          {isSuperAdmin&&<div className="nl" style={{marginTop:8}}>Sales</div>}
+          {isSuperAdmin&&<NavLink to="/leads" className={({isActive})=>`ni${isActive?' active':''}`}><Target size={15}/> Leads</NavLink>}
 
-          <div className="nl" style={{marginTop:8}}>Platform</div>
-          <NavLink to="/scaling" className={({isActive})=>`ni${isActive?' active':''}`}>📈 Scaling Readiness</NavLink>
-          <NavLink to="/agent-analytics" className={({isActive})=>`ni${isActive?' active':''}`}>🤖 Agent Analytics</NavLink>
+          {isSuperAdmin&&<div className="nl" style={{marginTop:8}}>Platform</div>}
+          {isSuperAdmin&&<NavLink to="/scaling" className={({isActive})=>`ni${isActive?' active':''}`}><TrendingUp size={15}/> Scaling Readiness</NavLink>}
+          {isSuperAdmin&&<NavLink to="/agent-analytics" className={({isActive})=>`ni${isActive?' active':''}`}><Bot size={15}/> Agent Analytics</NavLink>}
 
           <div className="nl" style={{marginTop:8}}>Account</div>
-          <NavLink to="/security" className={({isActive})=>`ni${isActive?' active':''}`}>🔐 Security</NavLink>
+          <NavLink to="/security" className={({isActive})=>`ni${isActive?' active':''}`}><Lock size={15}/> Security</NavLink>
         </nav>
         <div className="sfooter">
           <div style={{padding:'6px 10px',marginBottom:4}}>
             <div style={{fontWeight:600,color:'var(--t0)',fontSize:'.78rem'}}>{user?.firstName} {user?.lastName}</div>
             <div style={{fontSize:'.65rem',color:'var(--t3)'}}>Admin</div>
           </div>
-          <button className="ni" onClick={()=>{logout();navigate('/login')}} style={{color:'var(--red)'}}>🚪 Sign out</button>
+          <button className="ni" onClick={()=>{logout();navigate('/login')}} style={{color:'var(--red)'}}><LogOut size={15}/> Sign out</button>
         </div>
       </aside>
       <div className="main">
@@ -306,7 +335,10 @@ function AdminOnboardingOverview(){
   const{user}=useAuth()
   const{data:stats}=useQuery('onboarding-overview',()=>get<any>('/admin/onboarding/overview'),{enabled:!!user,staleTime:30000,refetchOnWindowFocus:false})
   const{data:tenants=[],isLoading:tLoading}=useQuery<any[]>('admin-tenants',()=>get('/admin/tenants'),{enabled:!!user,staleTime:30000,refetchOnWindowFocus:false})
-  const{data:landlords=[],isLoading:lLoading}=useQuery<any[]>('onboarding-landlords',()=>get('/landlords'),{enabled:!!user,staleTime:30000,refetchOnWindowFocus:false})
+  const{data:allLandlords=[],isLoading:lLoading}=useQuery<any[]>('onboarding-landlords',()=>get('/landlords'),{enabled:!!user,staleTime:30000,refetchOnWindowFocus:false})
+  // Onboarding = the PM's OWN deals to onboard (closer or CS = them), NOT the
+  // self-closed claim pool that /landlords also returns; super sees everyone.
+  const landlords=React.useMemo(()=>user?.role==='super_admin'?(allLandlords as any[]):(allLandlords as any[]).filter((l:any)=>l.portfolioManagerId===user?.id||l.serviceManagerId===user?.id),[allLandlords,user])
   const[selectedLandlord,setSelectedLandlord]=React.useState<any>(null)
   const[selectedTenant,setSelectedTenant]=React.useState<any>(null)
   const{data:landlordDetail}=useQuery(['landlord-detail',selectedLandlord?.id],()=>get<any>('/admin/onboarding/landlord/'+selectedLandlord.id),{enabled:!!selectedLandlord?.id,staleTime:15000})
@@ -328,7 +360,7 @@ function AdminOnboardingOverview(){
   return(
     <div>
       <div className="ph">
-        <div><h1 className="pt">Onboarding Console</h1><p className="ps">Help landlords and tenants complete setup</p></div>
+        <div><h1 className="pt">Onboarding Console</h1><p className="ps">Help your landlords and tenants complete setup</p></div>
       </div>
 
       {resendMsg&&<div className={`alert ${resendMsg.startsWith('Failed')?'ae':'ag'}`} style={{marginBottom:12}}>{resendMsg}</div>}
@@ -822,15 +854,27 @@ function AgentAnalytics(){
   )
 }
 
+const INCOME_COLORS:Record<string,string>={platform_unit:'#c9a227',processing:'#3b82f6',flexpay:'#22c55e',flex_deposit:'#ec4899',flex_credit:'#eab308',business_pos:'#06b6d4',placement:'#f97316',instant_withdrawal:'#14b8a6',background_checks:'#e10600'}
+const incomeColorOf=(k:string)=>INCOME_COLORS[k]||'#94a3b8'
+
 function Overview(){
   const{user}=useAuth()
   const navigate=useNavigate()
   const isSuperAdmin=user?.role==='super_admin'
   const{data:income}=useQuery('income-projection',()=>get<any>('/admin/income/projection'),{enabled:!!user,staleTime:60000,refetchOnWindowFocus:false})
+  const{data:compositionAll}=useQuery('income-composition-all',()=>get<any>('/admin/income/composition/all'),{enabled:!!user,staleTime:60000,refetchOnWindowFocus:false})
+  const[breakdownWindow,setBreakdownWindow]=React.useState<string|null>(null)
+  const{data:breakdown,isLoading:breakdownLoading}=useQuery(['income-breakdown',breakdownWindow],()=>get<any>(`/admin/income/breakdown?window=${breakdownWindow}`),{enabled:!!user&&!!breakdownWindow,staleTime:30000})
   const{data:stats,isLoading}=useQuery(['admin-overview',user?.id],()=>get<any>('/admin/overview'),{refetchInterval:30000,enabled:!!user,staleTime:30000,keepPreviousData:true})
   const{data:openDisputes=[]}=useQuery<any[]>('overview-open-disputes',()=>get<any[]>('/credit/disputes?status=open'),{enabled:!!user,staleTime:60000,refetchInterval:60000})
-  const{phase,rate}=getReservePhase(stats?.activeUnits||0)
-  const reserveTarget=RESERVE_CONFIG.DEFAULT_RATE*RESERVE_CONFIG.TARGET_MONTHS*(stats?.activeUnits||0)*(600)
+  // FlexPay float bankroll = rent of INCOME-VERIFIED FlexPay tenants (approved
+  // inquiries) — the money GAM would actually front. No phases; scales with
+  // enrollment.
+  const floatBankroll=stats?.flexpayBankroll||0
+  // Default reserve target = flat 3% default rate applied to the FlexPay FLOAT
+  // (the money at risk), NOT total platform rent. Covers FlexPay defaults.
+  const DEFAULT_RESERVE_RATE=0.03
+  const reserveTarget=floatBankroll*DEFAULT_RESERVE_RATE
   const reservePct=stats?.reserveBalance?Math.min((stats.reserveBalance/Math.max(reserveTarget,1))*100,100):0
 
   const trendData=[{m:'Oct',r:1800},{m:'Nov',r:2100},{m:'Dec',r:2400},{m:'Jan',r:2700},{m:'Feb',r:3000},{m:'Mar',r:stats?.monthlyRentVolume||0}]
@@ -885,8 +929,8 @@ function Overview(){
 
       {/* ── Row 3: Super admin financial ── */}
       {isSuperAdmin&&<div className="grid4" style={{marginBottom:12}}>
-        <div className="kpi"><div className="kl">Reserve Balance</div><div className={`kv ${reservePct>=100?'g':reservePct>=50?'a':'r'}`}>{formatCurrency(stats?.reserveBalance||0)}</div><div className="ks">{reservePct.toFixed(0)}% of target</div></div>
-        <div className="kpi"><div className="kl">Float Balance</div><div className="kv b">{formatCurrency(stats?.floatBalance||0)}</div><div className="ks">4.5% APY</div></div>
+        <div className="kpi"><div className="kl">Default Reserve</div><div className={`kv ${reservePct>=100?'g':reservePct>=50?'a':'r'}`}>{formatCurrency(stats?.reserveBalance||0)}</div><div className="ks">{reservePct.toFixed(0)}% of {formatCurrency(reserveTarget)} target (3% of FlexPay float)</div></div>
+        <div className="kpi"><div className="kl">FlexPay Float Bankroll</div><div className="kv b">{formatCurrency(floatBankroll)}</div><div className="ks">rent of income-verified tenants who requested FlexPay</div></div>
         <div className="kpi"><div className="kl">Pending Payments</div><div className={`kv ${(stats?.pendingPayments||0)>20?'r':'a'}`}>{stats?.pendingPayments||0}</div><div className="ks">awaiting ACH settlement</div></div>
         <div className="kpi"><div className="kl">Pending Disbursements</div><div className={`kv ${(stats?.pendingDisbursements||0)>0?'a':'g'}`}>{stats?.pendingDisbursements||0}</div><div className="ks">landlord payouts queued</div></div>
       </div>}
@@ -907,57 +951,80 @@ function Overview(){
           </ResponsiveContainer>
         </div>
         <div className="card">
-          <div className="ct">Reserve Fund Health</div>
-          <div className="dr"><span className="dk">Balance</span><span className="dv mono">{formatCurrency(stats?.reserveBalance||0)}</span></div>
-          <div className="dr"><span className="dk">Target (3-mo defaults)</span><span className="dv mono">{formatCurrency(reserveTarget)}</span></div>
+          <div className="ct">FlexPay Reserve &amp; Float</div>
+          <div className="dr"><span className="dk">Default reserve balance</span><span className="dv mono">{formatCurrency(stats?.reserveBalance||0)}</span></div>
+          <div className="dr"><span className="dk">Target (3% of FlexPay float)</span><span className="dv mono">{formatCurrency(reserveTarget)}</span></div>
           <div className="dr"><span className="dk">Coverage</span><span className={`badge ${reservePct>=100?'bg2':reservePct>=50?'ba':'br'}`}>{reservePct.toFixed(0)}%</span></div>
-          <div className="dr"><span className="dk">Phase</span><span className={`badge ${phase===1?'ba':phase===2?'bb':'bg2'}`}>Phase {phase} — {(rate*100).toFixed(0)}% rate</span></div>
-          <div className="dr"><span className="dk">Float balance</span><span className="dv mono">{formatCurrency(stats?.floatBalance||0)}</span></div>
-          <div className="dr"><span className="dk">Float APY income</span><span className="dv mono" style={{color:'var(--green)'}}>+{formatCurrency((stats?.floatBalance||0)*.045/12)}/mo</span></div>
+          <div className="dr"><span className="dk">Float bankroll needed</span><span className="dv mono">{formatCurrency(floatBankroll)}</span></div>
+          <div style={{fontSize:'.68rem',color:'var(--t3)',marginTop:8,lineHeight:1.5}}>Reserve absorbs FlexPay defaults — 3% of the FlexPay float (money at risk), not total rent. Bankroll = rent of income-verified tenants who requested FlexPay (survey inquiry approved) — the capital to front if they enroll. Verified SSI/SSDI income without a FlexPay request does NOT count. Float yield income begins at ODFI partnership.</div>
         </div>
       </div>}
       {isSuperAdmin&&<>
-      {/* ── Projected Platform Income ── */}
+      {/* ── Platform Revenue: recurring ARR + full income composition ── */}
       {(()=>{
-        const streams=[
-          // S507: $2/occupied-unit flat fee (no OTP/direct tiers). NOTE: the
-          // backend income calc still sums otpUnitFees/directUnitFees at the
-          // legacy $15/$5 — needs a $2/unit migration for accurate totals.
-          {label:'Platform Unit Fees',value:(income?.monthly?.otpUnitFees||0)+(income?.monthly?.directUnitFees||0), detail:`${(income?.counts?.otpUnits||0)+(income?.counts?.directUnits||0)} occupied units × $2`, color:'#c9a227'},
-          {label:'FlexPay Fees',      value:income?.monthly?.flexPayFees||0,    detail:`${income?.counts?.flexPay||0} tenants × $20`,    color:'#22c55e'},
-          {label:'Background Checks', value:income?.monthly?.bgCheckFees||0,    detail:`${income?.counts?.bgChecks||0} checks × $15`,    color:'#a855f7'},
+        const colorOf=incomeColorOf
+        const SRC=[
+          {key:'platform_unit',label:'Platform Fees',recurring:true},
+          {key:'processing',label:'Processing / ACH',recurring:true},
+          {key:'flexpay',label:'FlexPay',recurring:true},
+          {key:'flex_deposit',label:'FlexDeposit Custody',recurring:true},
+          {key:'flex_credit',label:'FlexCredit',recurring:true},
+          {key:'business_pos',label:'Business Fees',recurring:true},
+          {key:'placement',label:'Placement Fees',recurring:false},
+          {key:'instant_withdrawal',label:'Instant Withdrawals',recurring:false},
+          {key:'background_checks',label:'Background Checks',recurring:false},
         ]
-        const total=income?.monthly?.total||0
+        const recurringMonthly=income?.monthly?.total||0
+        const periods:any[]=compositionAll?.periods||[]
+        // Small-donut geometry (stroke-dasharray technique).
+        const R=40,SW=12,C=2*Math.PI*R
         return(
           <div className="card" style={{marginTop:4,background:'linear-gradient(135deg,rgba(201,162,39,.06) 0%,rgba(8,10,12,0) 60%)',border:'1px solid rgba(201,162,39,.2)'}}>
-            <div style={{display:'flex',alignItems:'flex-start',justifyContent:'space-between',marginBottom:24}}>
+            {/* Recurring ARR — one-time revenue is NEVER in these two numbers */}
+            <div style={{display:'flex',alignItems:'flex-start',justifyContent:'space-between',marginBottom:20,paddingBottom:20,borderBottom:'1px solid var(--b0)'}}>
               <div>
-                <div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.12em',marginBottom:6}}>Projected Platform Revenue</div>
-                <div style={{fontFamily:'var(--font-d)',fontSize:'2.8rem',fontWeight:800,color:'var(--gold)',lineHeight:1}}>{formatCurrency(total)}</div>
-                <div style={{fontSize:'.78rem',color:'var(--t3)',marginTop:6}}>per month · based on current enrollment</div>
+                <div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.12em',marginBottom:6}}>Recurring Revenue</div>
+                <div style={{fontFamily:'var(--font-d)',fontSize:'2.8rem',fontWeight:800,color:'var(--gold)',lineHeight:1}}>{formatCurrency(recurringMonthly)}</div>
+                <div style={{fontSize:'.78rem',color:'var(--t3)',marginTop:6}}>per month · recurring only</div>
               </div>
               <div style={{textAlign:'right'}}>
                 <div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.12em',marginBottom:6}}>Annual Run Rate</div>
                 <div style={{fontFamily:'var(--font-d)',fontSize:'1.8rem',fontWeight:800,color:'var(--green)',lineHeight:1}}>{formatCurrency(income?.annual||0)}</div>
-                <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:6}}>projected ARR</div>
+                <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:6}}>ARR · recurring × 12</div>
               </div>
             </div>
-            <div style={{display:'flex',flexDirection:'column',gap:12}}>
-              {streams.map((s:any)=>{
-                const pct=total>0?Math.max((s.value/total)*100,0):0
+            {/* Income composition — a wall of pies, one per time window */}
+            <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:12,flexWrap:'wrap',marginBottom:16}}>
+              <div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.12em'}}>Income composition by period <span style={{color:'var(--t3)',opacity:.7,textTransform:'none',letterSpacing:0}}>(incl. one-time)</span></div>
+              <div style={{display:'flex',gap:14,flexWrap:'wrap'}}>
+                {SRC.map(s=>(
+                  <div key={s.key} style={{display:'flex',alignItems:'center',gap:6}}>
+                    <div style={{width:9,height:9,borderRadius:'50%',background:colorOf(s.key),flexShrink:0}}/>
+                    <span style={{fontSize:'.7rem',color:'var(--t2)'}}>{s.label}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div style={{display:'flex',gap:16,flexWrap:'wrap',justifyContent:'space-between'}}>
+              {periods.length===0&&<div style={{color:'var(--t3)',fontSize:'.8rem',padding:'24px 0',width:'100%',textAlign:'center'}}>Loading…</div>}
+              {periods.map((p:any)=>{
+                const g=p.gross||0
+                let acc=0
+                const segs=(p.sources||[]).filter((s:any)=>s.amount>0).map((s:any)=>{const len=g>0?(s.amount/g)*C:0;const o=acc;acc+=len;return{key:s.key,len,off:o}})
                 return(
-                  <div key={s.label}>
-                    <div style={{display:'flex',justifyContent:'space-between',alignItems:'baseline',marginBottom:5}}>
-                      <div style={{display:'flex',alignItems:'center',gap:8}}>
-                        <div style={{width:8,height:8,borderRadius:'50%',background:s.color,flexShrink:0}}/>
-                        <span style={{fontSize:'.78rem',color:'var(--t1)',fontWeight:500}}>{s.label}</span>
-                        <span style={{fontSize:'.68rem',color:'var(--t3)'}}>{s.detail}</span>
-                      </div>
-                      <span style={{fontFamily:'var(--font-m)',fontSize:'.82rem',color:'var(--t0)',fontWeight:600}}>{formatCurrency(s.value)}</span>
-                    </div>
-                    <div style={{height:6,background:'var(--bg3)',borderRadius:3,overflow:'hidden'}}>
-                      <div style={{height:'100%',width:`${pct}%`,background:s.color,borderRadius:3,transition:'width .4s ease',opacity:.85}}/>
-                    </div>
+                  <div key={p.window} onClick={()=>setBreakdownWindow(p.window)} title={`View ${p.label} breakdown`}
+                    style={{flex:'1 1 130px',minWidth:120,maxWidth:180,textAlign:'center',cursor:'pointer',borderRadius:10,padding:'6px 4px',transition:'background .15s'}}
+                    onMouseEnter={e=>{(e.currentTarget as HTMLDivElement).style.background='rgba(201,162,39,.07)'}}
+                    onMouseLeave={e=>{(e.currentTarget as HTMLDivElement).style.background='transparent'}}>
+                    <div style={{fontSize:'.72rem',color:'var(--t1)',fontWeight:600,marginBottom:8}}>{p.label}</div>
+                    <svg width={112} height={112} viewBox="0 0 104 104" style={{maxWidth:'100%'}}>
+                      <circle cx={52} cy={52} r={R} fill="none" stroke="var(--bg3)" strokeWidth={SW}/>
+                      {segs.map((s:any)=>(
+                        <circle key={s.key} cx={52} cy={52} r={R} fill="none" stroke={colorOf(s.key)} strokeWidth={SW}
+                          strokeDasharray={`${s.len} ${C-s.len}`} strokeDashoffset={-s.off} transform="rotate(-90 52 52)"/>
+                      ))}
+                      <text x={52} y={56} textAnchor="middle" style={{fill:'var(--t0)',fontSize:13,fontWeight:800,fontFamily:'var(--font-d)'}}>{formatCurrency(g)}</text>
+                    </svg>
                   </div>
                 )
               })}
@@ -965,6 +1032,41 @@ function Overview(){
           </div>
         )
       })()}
+      {breakdownWindow&&(
+        <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,.72)',zIndex:200,display:'flex',alignItems:'center',justifyContent:'center',padding:20}} onClick={e=>{if(e.target===e.currentTarget)setBreakdownWindow(null)}}>
+          <div style={{background:'var(--bg2)',border:'1px solid var(--b1)',borderRadius:14,width:'100%',maxWidth:640,maxHeight:'85vh',overflowY:'auto',padding:24}}>
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:18,paddingBottom:16,borderBottom:'1px solid var(--b0)'}}>
+              <div>
+                <div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.12em',marginBottom:4}}>Income breakdown</div>
+                <div style={{fontFamily:'var(--font-d)',fontSize:'1.3rem',fontWeight:800,color:'var(--t0)'}}>{breakdown?.label||''}</div>
+                <div style={{fontSize:'.8rem',color:'var(--gold)',fontWeight:700,marginTop:2,fontFamily:'var(--font-m)'}}>{formatCurrency(breakdown?.gross||0)} total</div>
+              </div>
+              <button onClick={()=>setBreakdownWindow(null)} style={{background:'none',border:'none',color:'var(--t3)',fontSize:'1.4rem',cursor:'pointer',lineHeight:1}}>×</button>
+            </div>
+            {breakdownLoading?<div style={{padding:32,textAlign:'center',color:'var(--t3)'}}>Loading…</div>:(
+              <div style={{display:'flex',flexDirection:'column',gap:16}}>
+                {(breakdown?.sources||[]).map((s:any)=>{
+                  const pct=breakdown?.gross>0?(s.amount/breakdown.gross)*100:0
+                  const zero=s.amount===0&&s.count===0
+                  return(
+                    <div key={s.key} style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:10,opacity:zero?.5:1}}>
+                      <div style={{display:'flex',alignItems:'center',gap:8}}>
+                        <div style={{width:11,height:11,borderRadius:'50%',background:incomeColorOf(s.key),flexShrink:0}}/>
+                        <span style={{fontSize:'.85rem',color:'var(--t0)',fontWeight:600}}>{s.label}</span>
+                        {s.count>0&&<span style={{fontSize:'.68rem',color:'var(--t3)'}}>{s.count} item{s.count===1?'':'s'}</span>}
+                      </div>
+                      <div style={{display:'flex',alignItems:'baseline',gap:8}}>
+                        <span style={{fontFamily:'var(--font-m)',fontSize:'.85rem',color:'var(--t0)',fontWeight:700}}>{formatCurrency(s.amount)}</span>
+                        <span style={{fontFamily:'var(--font-m)',fontSize:'.7rem',color:'var(--t3)',width:40,textAlign:'right'}}>{pct.toFixed(0)}%</span>
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
       </> }
     </div>
   )
@@ -973,7 +1075,11 @@ function Overview(){
 // ── LANDLORDS ─────────────────────────────────────────────────
 function Landlords(){
   const{user}=useAuth()
+  const qc=useQueryClient()
+  const isSuper=user?.role==='super_admin'
   const{data:landlords=[],isLoading}=useQuery<any[]>('landlords',()=>get('/landlords'),{enabled:!!user,refetchOnWindowFocus:false})
+  const{data:referral}=useQuery<any>('my-referral',()=>get('/admin/my-referral'),{enabled:!!user,staleTime:300000})
+  const{data:pmRoster=[]}=useQuery<any[]>('portfolio-managers',()=>get('/admin/portfolio-managers'),{enabled:!!user&&isSuper,staleTime:300000})
   const[lSearch,setLSearch]=React.useState('')
   const sortedLandlords=React.useMemo(()=>[...(landlords as any[])].sort((a,b)=>{
     const aInc=(!a.bankAccountReady||!a.onboardingComplete)?0:1
@@ -985,34 +1091,61 @@ function Landlords(){
   const{data:detail}=useQuery(['landlord-detail',selected?.id],()=>get<any>('/admin/onboarding/landlord/'+selected.id),{enabled:!!selected?.id,staleTime:15000})
   const[resending,setResending]=React.useState<string|null>(null)
   const[msg,setMsg]=React.useState('')
+  const[copied,setCopied]=React.useState(false)
 
   const resend=async(type:string,id:string)=>{
     setResending(type)
-    try{ const r=await post<{message?:string}>('/admin/onboarding/resend',{type,targetId:id}); setMsg(r?.data?.message||'Sent'); setTimeout(()=>setMsg(''),4000) }
+    try{ const r=await post<{message?:string}>('/admin/onboarding/resend',{type,targetId:id}); setMsg(r?.message||'Sent'); setTimeout(()=>setMsg(''),4000) }
     catch(e:any){ setMsg('Failed: '+(e?.response?.data?.error||e.message)) }
     finally{ setResending(null) }
+  }
+  const refreshLL=()=>{ qc.invalidateQueries('landlords'); qc.invalidateQueries(['landlord-detail',selected?.id]) }
+  const assign=async(id:string,role:'closing'|'service',managerId:string|null)=>{
+    try{ await post('/admin/landlords/'+id+'/assign',{role,managerId}); refreshLL(); setMsg('Updated'); setTimeout(()=>setMsg(''),3000) }
+    catch(e:any){ setMsg('Failed: '+(e?.response?.data?.error||e.message)) }
+  }
+  const copyRef=()=>{ if(referral?.referralLink){ navigator.clipboard?.writeText(referral.referralLink); setCopied(true); setTimeout(()=>setCopied(false),2000) } }
+  const pmName=(l:any,role:'closing'|'service')=>{
+    if(role==='closing') return l.portfolioManagerId?`${l.pmFirstName||''} ${l.pmLastName||''}`.trim():null
+    return l.serviceManagerId?`${l.smFirstName||''} ${l.smLastName||''}`.trim():null
   }
 
   return(
     <div>
-      <div className="ph"><div><h1 className="pt">Landlords</h1><p className="ps">{(landlords as any[]).length} registered</p></div></div>
+      <div className="ph"><div><h1 className="pt">Landlords</h1><p className="ps">{(landlords as any[]).length} in your portfolio{isSuper?' (all)':''}</p></div></div>
+      {referral&&<div className="card" style={{marginBottom:12,padding:'10px 14px',display:'flex',alignItems:'center',gap:12,flexWrap:'wrap'}}>
+        <div><div style={{fontSize:'.65rem',color:'var(--t3)',textTransform:'uppercase',letterSpacing:.4}}>Your referral link</div>
+          <div className="mono" style={{fontSize:'.78rem',color:'var(--t0)'}}>{referral.referralLink||'—'}</div></div>
+        <div style={{marginLeft:'auto',display:'flex',alignItems:'center',gap:8}}>
+          <span className="badge bg2">Code {referral.referralCode||'—'}</span>
+          <button className="btn bg-btn" style={{padding:'5px 12px'}} onClick={copyRef}>{copied?'Copied ✓':'Copy link'}</button>
+        </div>
+        <div style={{flexBasis:'100%',fontSize:'.66rem',color:'var(--t3)'}}>A landlord who signs up through your link is credited to you as the closing manager.</div>
+      </div>}
       {msg&&<div className={`alert ${msg.startsWith('F')?'ae':'ag'}`} style={{marginBottom:12}}>{msg}</div>}
       <div className="grid2" style={{gap:16,alignItems:'start'}}>
         <div className="card" style={{padding:0}}>
           <div style={{padding:'10px 12px',borderBottom:'1px solid var(--b0)'}}><input type="text" placeholder="Search landlords…" value={lSearch} onChange={e=>setLSearch(e.target.value)} style={{width:'100%',background:'var(--bg3)',border:'1px solid var(--b1)',borderRadius:7,color:'var(--t0)',padding:'7px 10px',fontSize:'.78rem',outline:'none'}}/></div>
           {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}>Loading…</div>:(
             <table className="tbl">
-              <thead><tr><th>Landlord</th><th>Business</th><th>Units</th><th>Bank</th><th>Onboarded</th></tr></thead>
+              <thead><tr><th>Landlord</th><th>Units</th><th>Portfolio</th><th>Bank</th><th>Onboarded</th></tr></thead>
               <tbody>
-                {filteredLandlords.length?filteredLandlords.map((l:any)=>(
+                {filteredLandlords.length?filteredLandlords.map((l:any)=>{
+                  const closer=pmName(l,'closing'), cs=pmName(l,'service')
+                  const referrer=l.referredByUserId?`${l.referrerFirstName||''} ${l.referrerLastName||''}`.trim():null
+                  const selfClosed=!l.portfolioManagerId&&!referrer
+                  return(
                   <tr key={l.id} style={{cursor:'pointer',background:selected?.id===l.id?'rgba(201,162,39,.05)':''}} onClick={()=>setSelected(l)}>
-                    <td><div style={{fontWeight:600,color:'var(--t0)'}}>{l.firstName} {l.lastName}</div><div style={{fontSize:'.68rem',color:'var(--t3)'}}>{l.email}</div></td>
-                    <td style={{fontSize:'.78rem'}}>{l.businessName||'—'}</td>
+                    <td><div style={{fontWeight:600,color:'var(--t0)'}}>{l.firstName} {l.lastName}</div><div style={{fontSize:'.68rem',color:'var(--t3)'}}>{l.businessName||l.email}</div></td>
                     <td className="mono">{l.unitCount} <span style={{color:'var(--t3)'}}>({l.occupiedCount} occ)</span></td>
+                    <td style={{fontSize:'.68rem'}}>
+                      {referrer?<div style={{color:'var(--t2)'}}>Referral: {referrer}</div>:selfClosed?<span className="badge ba">Self-closed</span>:<div style={{color:'var(--t2)'}}>Close: {closer||'—'}</div>}
+                      <div style={{color:cs?'var(--t2)':'var(--red)'}}>CS: {closer&&!referrer&&!l.serviceManagerId?closer:(cs||'unstaffed')}</div>
+                    </td>
                     <td><span className={`badge ${l.bankAccountReady?'bg2':'br'}`}>{l.bankAccountReady?'✓':'Missing'}</span></td>
                     <td><span className={`badge ${l.onboardingComplete?'bg2':'ba'}`}>{l.onboardingComplete?'Done':'Pending'}</span></td>
                   </tr>
-                )):<tr><td colSpan={5} style={{textAlign:'center',color:'var(--t3)',padding:32}}>No landlords yet.</td></tr>}
+                )}):<tr><td colSpan={5} style={{textAlign:'center',color:'var(--t3)',padding:32}}>No landlords yet.</td></tr>}
               </tbody>
             </table>
           )}
@@ -1041,6 +1174,38 @@ function Landlords(){
                   <div style={{fontSize:'.65rem',color:'var(--t3)'}}>With Tenants</div>
                 </div>
               </div>
+              <div className="ct">Portfolio Management</div>
+              {(()=>{ const l=selected; const closer=pmName(l,'closing'); const cs=pmName(l,'service'); const meId=user?.id
+                const referrer=l.referredByUserId?`${l.referrerFirstName||''} ${l.referrerLastName||''}`.trim():null
+                const pmCloserDoesCs=!!l.portfolioManagerId&&!referrer
+                return(<div style={{marginBottom:16,fontSize:'.78rem'}}>
+                  <div style={{display:'flex',justifyContent:'space-between',padding:'6px 0',borderBottom:'1px solid var(--b0)'}}>
+                    <span style={{color:'var(--t3)'}}>Closing (25¢/occ · residual)</span>
+                    <span style={{color:'var(--t0)'}}>{referrer?<span>{referrer} <span className="badge bg2">landlord referral</span></span>:(closer||<span className="badge ba">Self-closed → pot</span>)}</span>
+                  </div>
+                  <div style={{display:'flex',justifyContent:'space-between',padding:'6px 0'}}>
+                    <span style={{color:'var(--t3)'}}>Customer service (25¢/occ)</span>
+                    <span style={{color:'var(--t0)'}}>{pmCloserDoesCs?(closer+' (closer)'):(cs||<span className="badge br">Unstaffed</span>)}</span>
+                  </div>
+                  {isSuper?(
+                    <div style={{marginTop:10,display:'grid',gap:8}}>
+                      {referrer
+                        ? <div style={{fontSize:'.66rem',color:'var(--t3)'}}>Closing earned by the referring landlord — not reassignable.</div>
+                        : <label style={{fontSize:'.66rem',color:'var(--t3)'}}>Closing manager
+                        <select value={l.portfolioManagerId||''} onChange={e=>assign(l.id,'closing',e.target.value||null)} style={{width:'100%',marginTop:3,background:'var(--bg3)',border:'1px solid var(--b1)',borderRadius:6,color:'var(--t0)',padding:'6px 8px',fontSize:'.76rem'}}>
+                          <option value="">— Self-closed (pot) —</option>
+                          {(pmRoster as any[]).map(p=><option key={p.id} value={p.id}>{p.firstName} {p.lastName}</option>)}
+                        </select></label>}
+                      <label style={{fontSize:'.66rem',color:'var(--t3)'}}>Customer-service manager {pmCloserDoesCs&&<span style={{color:'var(--amber)'}}>(closer handles CS unless overridden)</span>}
+                        <select value={l.serviceManagerId||''} onChange={e=>assign(l.id,'service',e.target.value||null)} style={{width:'100%',marginTop:3,background:'var(--bg3)',border:'1px solid var(--b1)',borderRadius:6,color:'var(--t0)',padding:'6px 8px',fontSize:'.76rem'}}>
+                          <option value="">— {pmCloserDoesCs?'Closer handles CS':'Unstaffed'} —</option>
+                          {(pmRoster as any[]).map(p=><option key={p.id} value={p.id}>{p.firstName} {p.lastName}</option>)}
+                        </select></label>
+                    </div>
+                  ):(
+                    l.serviceManagerId===meId&&<div style={{marginTop:10}}><span className="badge bg2">You handle customer service</span></div>
+                  )}
+                </div>)})()}
               <div className="ct">Onboarding Checklist</div>
               {detail.checklist.map((item:any)=>(
                 <div key={item.key} style={{display:'flex',alignItems:'center',gap:10,padding:'7px 0',borderBottom:'1px solid var(--b0)'}}>
@@ -1195,6 +1360,126 @@ function NachaMonitor(){
           </table>
         )}
       </div>
+    </div>
+  )
+}
+
+// ── SALES-TAX NEXUS MONITOR (S565) ───────────────────────────────────────
+// GAM own-revenue by customer state vs each state's economic-nexus registration
+// threshold. MONITORING ONLY — the dashboard never collects tax; the register
+// action flips collection (gated separately in the screening-fee path).
+const NEXUS_STATUS_BADGE:Record<string,string>={crossed:'br',approaching:'ba',registered:'bg2',under:'bmu',no_threshold:'bmu'}
+const NEXUS_STATUS_LABEL:Record<string,string>={crossed:'Threshold crossed',approaching:'Approaching',registered:'Registered',under:'Under',no_threshold:'No sales tax'}
+function NexusMonitor(){
+  const{user}=useAuth()
+  const qc=useQueryClient()
+  const{data,isLoading}=useQuery('nexus',()=>get<any>('/admin/nexus/dashboard'),{enabled:!!user})
+  const[confirm,setConfirm]=React.useState<any>(null) // {state, register, date, notes}
+  const states:any[]=data?.states||[]
+  const summary=data?.summary||{crossed:0,approaching:0,registered:0,under:0}
+  const warnPct=Math.round((data?.warnFraction??0.8)*100)
+
+  const recomputeMut=useMutation(()=>post('/admin/nexus/recompute'),{
+    onSuccess:()=>{qc.invalidateQueries('nexus');toast('Nexus tally recomputed')},
+  })
+  const registerMut=useMutation((b:any)=>post('/admin/nexus/register',b),{
+    onSuccess:()=>{qc.invalidateQueries('nexus');setConfirm(null);toast('Registration updated')},
+  })
+
+  // Show states that matter first: crossed, approaching, registered, then the
+  // rest — but only ones with a threshold + some signal by default.
+  const ORDER:Record<string,number>={crossed:0,approaching:1,registered:2,under:3,no_threshold:4}
+  const sorted=[...states].sort((a,b)=>(ORDER[a.status]-ORDER[b.status])||(b.pctOfThreshold||0)-(a.pctOfThreshold||0)||a.stateCode.localeCompare(b.stateCode))
+  const crossed=sorted.filter(s=>s.status==='crossed')
+
+  return(
+    <div>
+      <div className="ph">
+        <div><h1 className="pt">Sales-Tax Nexus Monitor</h1><p className="ps">GAM own-revenue by customer state vs economic-nexus thresholds</p></div>
+        <button className="btn bgold bsm" onClick={()=>recomputeMut.mutate()} disabled={recomputeMut.isLoading}>{recomputeMut.isLoading?'Recomputing…':'↻ Recompute tally'}</button>
+      </div>
+
+      <div className="nacha-flag" style={{borderColor:'var(--b1)'}}>
+        <div style={{fontSize:'.8rem',color:'var(--t2)',lineHeight:1.6}}>
+          <strong style={{color:'var(--gold)',fontFamily:'var(--font-d)'}}>Monitoring only — this page collects no tax.</strong> Revenue counted conservatively (platform fee + screening + Flex fees, by customer state) to register <em>early</em>. A crossing means it's time to register; collection turns on only when you register a state <em>and</em> a screening service is taxable there. Thresholds + tax rates are research-grade — confirm with a tax pro before registering.
+          {data?.computedAt&&<div style={{marginTop:6,color:'var(--t3)',fontSize:'.72rem'}}>Tally last computed {new Date(data.computedAt).toLocaleString()}</div>}
+        </div>
+      </div>
+
+      <div className="grid4" style={{marginBottom:16}}>
+        <div className="kpi"><div className="kl">Crossed</div><div className={`kv ${summary.crossed>0?'r':'g'}`}>{summary.crossed}</div><div className="ks">Register now</div></div>
+        <div className="kpi"><div className="kl">Approaching</div><div className={`kv ${summary.approaching>0?'a':'g'}`}>{summary.approaching}</div><div className="ks">≥{warnPct}% of threshold</div></div>
+        <div className="kpi"><div className="kl">Registered</div><div className="kv b">{summary.registered}</div><div className="ks">Collection live</div></div>
+        <div className="kpi"><div className="kl">Under</div><div className="kv g">{summary.under}</div><div className="ks">Below warn line</div></div>
+      </div>
+
+      {crossed.length>0&&<div className="alert ae">🚨 {crossed.length} state{crossed.length>1?'s have':' has'} crossed the economic-nexus threshold: {crossed.map(s=>s.stateCode).join(', ')}. Register to begin collecting where taxable.</div>}
+
+      <div className="card" style={{padding:0}}>
+        <div style={{padding:'12px 14px',borderBottom:'1px solid var(--b1)'}}><div className="ct" style={{marginBottom:0}}>All states</div></div>
+        {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}>Loading…</div>:(
+          <table className="tbl">
+            <thead><tr><th>State</th><th>Measured revenue</th><th>Threshold</th><th style={{width:'26%'}}>Progress</th><th>Taxable</th><th>Status</th><th></th></tr></thead>
+            <tbody>
+              {sorted.map((s:any)=>{
+                const pct=s.pctOfThreshold!=null?Math.min(s.pctOfThreshold,1.5):null
+                const barColor=s.status==='crossed'?'var(--red)':s.status==='approaching'?'var(--amber,#d99e2b)':s.status==='registered'?'var(--gold)':'var(--green,#3fb950)'
+                return(
+                  <tr key={s.stateCode} style={{background:s.status==='crossed'?'rgba(239,68,68,.04)':''}}>
+                    <td className="mono" style={{fontWeight:600,color:'var(--t0)'}}>{s.stateCode}</td>
+                    <td className="mono">{formatCurrency(s.measureUsd)}</td>
+                    <td className="mono" style={{color:'var(--t3)'}}>{s.thresholdUsd!=null?formatCurrency(s.thresholdUsd):'—'}</td>
+                    <td>
+                      {pct!=null?(
+                        <div style={{display:'flex',alignItems:'center',gap:8}}>
+                          <div style={{flex:1,height:7,background:'var(--bg3)',borderRadius:4,overflow:'hidden'}}><div style={{width:`${Math.min(pct*100,100)}%`,height:'100%',background:barColor,transition:'width .3s'}}/></div>
+                          <span className="mono" style={{fontSize:'.68rem',color:'var(--t3)',minWidth:34,textAlign:'right'}}>{Math.round(s.pctOfThreshold*100)}%</span>
+                        </div>
+                      ):<span style={{color:'var(--t3)',fontSize:'.72rem'}}>no threshold</span>}
+                    </td>
+                    <td>{s.thresholdUsd==null?<span style={{color:'var(--t3)'}}>—</span>:<span className={`badge ${s.taxable?'ba':'bmu'}`}>{s.taxable?'Taxable':'$0'}</span>}</td>
+                    <td><span className={`badge ${NEXUS_STATUS_BADGE[s.status]||'bmu'}`}>{NEXUS_STATUS_LABEL[s.status]||s.status}</span></td>
+                    <td style={{textAlign:'right'}}>
+                      {s.status!=='no_threshold'&&(
+                        s.registered
+                          ?<button className="btn bd bsm" style={{fontSize:'.7rem',padding:'3px 8px'}} onClick={()=>setConfirm({stateCode:s.stateCode,register:false})}>Unregister</button>
+                          :<button className="btn bgold bsm" style={{fontSize:'.7rem',padding:'3px 8px'}} onClick={()=>setConfirm({stateCode:s.stateCode,register:true,date:new Date().toISOString().slice(0,10),notes:''})}>Register</button>
+                      )}
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      {confirm&&(
+        <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,.7)',zIndex:200,display:'flex',alignItems:'center',justifyContent:'center',padding:20}} onClick={e=>{if(e.target===e.currentTarget)setConfirm(null)}}>
+          <div style={{background:'var(--bg2)',border:'1px solid var(--b1)',borderRadius:12,padding:24,width:'100%',maxWidth:440}}>
+            <div className="ct" style={{marginBottom:12}}>{confirm.register?'Register':'Unregister'} {confirm.stateCode}</div>
+            <p style={{fontSize:'.8rem',color:'var(--t2)',lineHeight:1.6,marginBottom:16}}>
+              {confirm.register
+                ?<>Registering <strong>{confirm.stateCode}</strong> turns ON sales-tax collection there for any taxable screening service. Only do this once you've actually registered with the state.</>
+                :<>Unregistering <strong>{confirm.stateCode}</strong> stops all sales-tax collection there.</>}
+            </p>
+            {confirm.register&&(
+              <div style={{display:'flex',flexDirection:'column',gap:10,marginBottom:16}}>
+                <label style={{fontSize:'.72rem',color:'var(--t3)'}}>Registration date
+                  <input type="date" value={confirm.date} onChange={e=>setConfirm({...confirm,date:e.target.value})} style={{width:'100%',marginTop:4,background:'var(--bg3)',border:'1px solid var(--b1)',borderRadius:7,color:'var(--t0)',padding:'7px 10px',fontSize:'.78rem'}}/>
+                </label>
+                <label style={{fontSize:'.72rem',color:'var(--t3)'}}>Notes (optional)
+                  <input type="text" value={confirm.notes} placeholder="permit #, filing cadence…" onChange={e=>setConfirm({...confirm,notes:e.target.value})} style={{width:'100%',marginTop:4,background:'var(--bg3)',border:'1px solid var(--b1)',borderRadius:7,color:'var(--t0)',padding:'7px 10px',fontSize:'.78rem'}}/>
+                </label>
+              </div>
+            )}
+            <div style={{display:'flex',gap:8,justifyContent:'flex-end'}}>
+              <button className="btn bd" onClick={()=>setConfirm(null)}>Cancel</button>
+              <button className="btn bgold" disabled={registerMut.isLoading} onClick={()=>registerMut.mutate({stateCode:confirm.stateCode,registered:confirm.register,registeredDate:confirm.date||null,notes:confirm.notes||null})}>{registerMut.isLoading?'Saving…':confirm.register?'Confirm register':'Confirm unregister'}</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -1502,34 +1787,91 @@ function Bool({ v }: { v: boolean }) {
   )
 }
 
+function Commissions(){
+  const{user}=useAuth()
+  const qc=useQueryClient()
+  const isSuper=user?.role==='super_admin'
+  const{data,isLoading}=useQuery<any>('commissions-summary',()=>get('/admin/commissions/summary'),{enabled:!!user})
+  const[running,setRunning]=React.useState(false)
+  const[msg,setMsg]=React.useState('')
+  const runAccrual=async()=>{ setRunning(true)
+    try{ const r=await post<any>('/admin/commissions/accrue'); setMsg(`Accrued ${r?.data?.landlordsAccrued??0} landlords for ${r?.data?.monthScanned}`); qc.invalidateQueries('commissions-summary') }
+    catch(e:any){ setMsg('Failed: '+(e?.response?.data?.error||e.message)) }
+    finally{ setRunning(false); setTimeout(()=>setMsg(''),5000) }
+  }
+  return(
+    <div>
+      <div className="ph"><div><h1 className="pt">Commissions</h1><p className="ps">{isSuper?'Portfolio-manager earnings + platform pot':'Your portfolio-manager earnings'}</p></div></div>
+      {msg&&<div className={`alert ${msg.startsWith('F')?'ae':'ag'}`} style={{marginBottom:12}}>{msg}</div>}
+      {isLoading?<div className="card" style={{padding:32,textAlign:'center',color:'var(--t3)'}}>Loading…</div>:(
+      <>
+        <div className="grid4" style={{marginBottom:14}}>
+          <div className="kpi"><div className="kl">Your earnings — this month</div><div className="kv gold">{formatCurrency(data?.myEarnings?.thisMonth||0)}</div><div className="ks">closing + customer service</div></div>
+          <div className="kpi"><div className="kl">Your earnings — all time</div><div className="kv">{formatCurrency(data?.myEarnings?.allTime||0)}</div><div className="ks">residual while landlords stay</div></div>
+          {isSuper&&<div className="kpi"><div className="kl">Pot — this month</div><div className="kv b">{formatCurrency(data?.pot?.thisMonth||0)}</div><div className="ks">10¢/occ always + orphaned closing</div></div>}
+          {isSuper&&<div className="kpi"><div className="kl">Pot — all time</div><div className="kv b">{formatCurrency(data?.pot?.allTime||0)}</div><div className="ks">held for later use</div></div>}
+        </div>
+        <div className="card" style={{padding:0,marginBottom:14}}>
+          <div className="ct" style={{padding:'10px 14px',margin:0,borderBottom:'1px solid var(--b0)'}}>Your commissions by landlord</div>
+          <table className="tbl">
+            <thead><tr><th>Landlord</th><th>Occupied units</th><th>This month</th><th>All time</th></tr></thead>
+            <tbody>
+              {(data?.myByLandlord||[]).length?(data.myByLandlord as any[]).map((m:any)=>(
+                <tr key={m.landlordId}><td style={{color:'var(--t0)'}}>{m.businessName||`${m.firstName} ${m.lastName}`}</td><td className="mono">{m.occupiedUnits||0}</td><td className="mono">{formatCurrency(+m.thisMonth||0)}</td><td className="mono">{formatCurrency(+m.allTime||0)}</td></tr>
+              )):<tr><td colSpan={4} style={{textAlign:'center',color:'var(--t3)',padding:24}}>No commissions yet — you earn once you close or service a landlord with occupied units.</td></tr>}
+            </tbody>
+          </table>
+        </div>
+        {isSuper&&(
+        <div className="card" style={{padding:0,marginBottom:14}}>
+          <div style={{display:'flex',alignItems:'center',padding:'10px 14px',borderBottom:'1px solid var(--b0)'}}>
+            <div className="ct" style={{margin:0}}>Earnings by portfolio manager</div>
+            <button className="btn bg-btn" style={{marginLeft:'auto',padding:'5px 12px'}} disabled={running} onClick={runAccrual}>{running?'Running…':'Run accrual now'}</button>
+          </div>
+          <table className="tbl">
+            <thead><tr><th>Portfolio manager</th><th>This month</th><th>All time</th></tr></thead>
+            <tbody>
+              {(data?.byManager||[]).length?(data.byManager as any[]).map((m:any)=>(
+                <tr key={m.managerId}><td style={{color:'var(--t0)'}}>{m.firstName} {m.lastName}</td><td className="mono">{formatCurrency(+m.thisMonth||0)}</td><td className="mono">{formatCurrency(+m.allTime||0)}</td></tr>
+              )):<tr><td colSpan={3} style={{textAlign:'center',color:'var(--t3)',padding:24}}>No commissions accrued yet.</td></tr>}
+            </tbody>
+          </table>
+        </div>)}
+      </>
+      )}
+    </div>
+  )
+}
+
 function Reserve(){
   const{user}=useAuth()
   const{data:stats}=useQuery('admin-overview',()=>get<any>('/admin/overview'),{enabled:!!user})
-  const{phase,rate}=getReservePhase(stats?.activeUnits||0)
-  const target=(stats?.activeUnits||0)*600*RESERVE_CONFIG.DEFAULT_RATE*RESERVE_CONFIG.TARGET_MONTHS
-  const pct=target>0?Math.min(((stats?.reserveBalance||0)/target)*100,100):0
+  // Matches the Overview reserve/float model (S566): reserve target = 3% of the
+  // FlexPay FLOAT (money at risk), NOT total platform rent; bankroll = rent of
+  // income-verified FlexPay tenants; no phases; float yield waits for ODFI.
+  const floatBankroll=stats?.flexpayBankroll||0
+  const DEFAULT_RESERVE_RATE=0.03
+  const target=floatBankroll*DEFAULT_RESERVE_RATE
+  const pct=stats?.reserveBalance?Math.min((stats.reserveBalance/Math.max(target,1))*100,100):0
   return(
     <div>
-      <div className="ph"><div><h1 className="pt">Reserve &amp; Float</h1><p className="ps">Not active at launch</p></div></div>
+      <div className="ph"><div><h1 className="pt">Reserve &amp; Float</h1><p className="ps">Scales with FlexPay enrollment — $0 until the first income-verified enrollment</p></div></div>
       <div className="grid2" style={{marginBottom:16}}>
         <div className="card">
           <div className="ct">Default Reserve Fund</div>
           <div className="dr"><span className="dk">Balance</span><span className="dv mono" style={{color:pct>=100?'var(--green)':pct>=50?'var(--amber)':'var(--red)'}}>{formatCurrency(stats?.reserveBalance||0)}</span></div>
-          <div className="dr"><span className="dk">Target (3-mo defaults)</span><span className="dv mono">{formatCurrency(target)}</span></div>
+          <div className="dr"><span className="dk">Target (3% of FlexPay float)</span><span className="dv mono">{formatCurrency(target)}</span></div>
           <div className="dr"><span className="dk">Coverage</span><span className={`badge ${pct>=100?'bg2':pct>=50?'ba':'br'}`}>{pct.toFixed(0)}%</span></div>
-          <div className="dr"><span className="dk">Phase</span><span className={`badge ${phase===1?'ba':phase===2?'bb':'bg2'}`}>Phase {phase} — {(rate*100).toFixed(0)}% contribution rate</span></div>
           <div style={{marginTop:14,fontSize:'.78rem',color:'var(--t3)',lineHeight:1.5}}>
-            At launch GAM does not advance rent or absorb payment-processing losses, so this reserve model is inactive. Page retained for a future reserve design.<br/><strong style={{color:'var(--amber)'}}>Attorney review required before any launch.</strong>
+            Reserve absorbs FlexPay defaults — sized at 3% of the FlexPay float (money at risk), not total rent. It only grows as income-verified tenants enroll, so it stays $0 during the demand-test phase.
           </div>
         </div>
         <div className="card">
-          <div className="ct">Float Account</div>
-          <div className="dr"><span className="dk">Balance</span><span className="dv mono" style={{color:'var(--blue)'}}>{formatCurrency(stats?.floatBalance||0)}</span></div>
-          <div className="dr"><span className="dk">Seed capital</span><span className="dv mono">$25,000</span></div>
-          <div className="dr"><span className="dk">APY</span><span className="dv mono">4.5%</span></div>
-          <div className="dr"><span className="dk">Monthly interest</span><span className="dv mono" style={{color:'var(--green)'}}>+{formatCurrency((stats?.floatBalance||0)*.045/12)}</span></div>
-          <div className="dr"><span className="dk">Float covers</span><span className="dv mono">{stats?.floatBalance&&stats?.monthlyRentVolume?((stats.floatBalance/stats.monthlyRentVolume)*100).toFixed(0)+'%':'—'} of monthly disbursements</span></div>
-          <div style={{marginTop:14,fontSize:'.78rem',color:'var(--t3)'}}>Platform fronts full month rent from float before tenant ACH settles. Standard tenants: 3-day float. SSI/SSDI: 19-day float.</div>
+          <div className="ct">FlexPay Float Bankroll</div>
+          <div className="dr"><span className="dk">Bankroll</span><span className="dv mono" style={{color:'var(--blue)'}}>{formatCurrency(floatBankroll)}</span></div>
+          <div className="dr"><span className="dk">Basis</span><span className="dv mono">rent of income-verified tenants who requested FlexPay</span></div>
+          <div className="dr"><span className="dk">Reserve needed (3%)</span><span className="dv mono">{formatCurrency(target)}</span></div>
+          <div style={{marginTop:14,fontSize:'.78rem',color:'var(--t3)',lineHeight:1.5}}>Bankroll = the rent GAM would front each cycle if these tenants enroll. Float yield income begins at ODFI partnership; no interest is booked before then.</div>
         </div>
       </div>
     </div>
@@ -1540,8 +1882,8 @@ function Tenants(){
   const{user}=useAuth()
   const{data:tenants=[],isLoading}=useQuery<any[]>('admin-tenants-page',()=>get('/admin/tenants'),{enabled:!!user,refetchOnWindowFocus:false})
   const sortedTenants=React.useMemo(()=>[...(tenants as any[])].sort((a,b)=>{
-    const aInc=(!a.achVerified||(!a.onTimePayEnrolled&&!a.creditReportingEnrolled&&!a.flexDepositEnrolled&&!a.floatFeeActive))?0:1
-    const bInc=(!b.achVerified||(!b.onTimePayEnrolled&&!b.creditReportingEnrolled&&!b.flexDepositEnrolled&&!b.floatFeeActive))?0:1
+    const aInc=(!a.achVerified||(!!a.creditReportingEnrolled&&!a.flexDepositEnrolled&&!a.floatFeeActive))?0:1
+    const bInc=(!b.achVerified||(!!b.creditReportingEnrolled&&!b.flexDepositEnrolled&&!b.floatFeeActive))?0:1
     return aInc-bInc
   }),[tenants])
   const[tSearch,setTSearch]=React.useState('')
@@ -1579,7 +1921,7 @@ function Tenants(){
                     <td><div style={{fontWeight:600,color:'var(--t0)',fontSize:'.78rem'}}>{t.firstName} {t.lastName}</div><div style={{fontSize:'.65rem',color:'var(--t3)'}}>{t.email}</div></td>
                     <td style={{fontSize:'.72rem'}}>{t.unitNumber?<span><span style={{color:'var(--t3)'}}>{t.propertyName}</span> · {t.unitNumber}</span>:<span style={{color:'var(--t3)'}}>—</span>}</td>
                     <td><span className={`badge ${t.achVerified?'bg2':'br'}`}>{t.achVerified?'✓':'No'}</span></td>
-                    <td><span className={`badge ${(t.onTimePayEnrolled||t.creditReportingEnrolled||t.flexDepositEnrolled||t.floatFeeActive)?'bg2':'bmu'}`}>{(t.onTimePayEnrolled||t.creditReportingEnrolled||t.flexDepositEnrolled||t.floatFeeActive)?'Active':'None'}</span></td>
+                    <td><span className={`badge ${(t.creditReportingEnrolled||t.flexDepositEnrolled||t.floatFeeActive)?'bg2':'bmu'}`}>{(t.creditReportingEnrolled||t.flexDepositEnrolled||t.floatFeeActive)?'Active':'None'}</span></td>
                     <td className="mono" style={{color:(t.latePaymentCount||0)>1?'var(--amber)':'var(--t3)'}}>{t.latePaymentCount||0}</td>
                   </tr>
                 ))}
@@ -1713,128 +2055,6 @@ function Maintenance(){
 }
 
 
-// ── BULLETIN BOARD (super_admin) ──────────────────────────────
-function BulletinBoard(){
-  const{user}=useAuth()
-  const isSuperAdmin=user?.role==='super_admin'
-  const[revealedIds,setRevealedIds]=React.useState<Record<string,any>>({})
-  const[revealLoading,setRevealLoading]=React.useState<string|null>(null)
-  const[filterTab,setFilterTab]=React.useState<'all'|'flagged'|'pinned'>('all')
-  const[bSearch,setBSearch]=React.useState('')
-  const[bDate,setBDate]=React.useState(new Date().toISOString().split('T')[0])
-
-  const{data:posts=[],isLoading,refetch}=useQuery<any[]>(['bulletin-admin',bDate],()=>get('/admin/bulletin?date='+bDate),{enabled:!!user,staleTime:15000})
-
-  const searched = bSearch?(posts as any[]).filter((p:any)=>`${p.content} ${p.alias}`.toLowerCase().includes(bSearch.toLowerCase())):(posts as any[])
-  const filtered = filterTab==='flagged'
-    ? searched.filter((p:any)=>p.flagCount>0)
-    : filterTab==='pinned'
-      ? searched.filter((p:any)=>p.pinned)
-      : searched
-
-  const revealIdentity=async(postId:string)=>{
-    if(!isSuperAdmin)return
-    setRevealLoading(postId)
-    try{
-      const res=await get<any>('/admin/bulletin/'+postId+'/reveal')
-      setRevealedIds(r=>({...r,[postId]:res}))
-    }catch(e:any){toast.error('Could not reveal: '+e.message)}
-    finally{setRevealLoading(null)}
-  }
-
-  const pinPost=async(postId:string,pin:boolean)=>{
-    await post('/admin/bulletin/'+postId+'/pin',{pin})
-    refetch()
-  }
-
-  const removePost=async(postId:string)=>{
-    if(!(await appConfirm('Remove this post from the bulletin board?', { danger: true, confirmLabel: 'Remove' })))return
-    await post('/admin/bulletin/'+postId+'/remove',{})
-    refetch()
-  }
-
-  return(
-    <div>
-      <div className="ph">
-        <div><h1 className="pt">Community Bulletin Board</h1><p className="ps">Anonymous posts across all properties{isSuperAdmin?' · Identity reveal enabled':''}</p></div>
-        {!isSuperAdmin&&<span className="badge ba">Read-only — super_admin required for reveals</span>}
-        {isSuperAdmin&&<span className="badge bgold">super_admin · Identity reveal active</span>}
-      </div>
-
-      {isSuperAdmin&&<div className="alert agold" style={{marginBottom:16}}>⚠ Identity reveals are logged and auditable. Only reveal for legitimate moderation purposes.</div>}
-      <div style={{display:'flex',gap:10,marginBottom:16,alignItems:'center'}}>
-        <input type="date" value={bDate} onChange={e=>setBDate(e.target.value)} style={{background:'var(--bg2)',border:'1px solid var(--b1)',borderRadius:7,color:'var(--t0)',padding:'7px 10px',fontSize:'.78rem',outline:'none'}}/>
-        <input type="text" placeholder="Search posts…" value={bSearch} onChange={e=>setBSearch(e.target.value)} style={{flex:1,background:'var(--bg2)',border:'1px solid var(--b1)',borderRadius:7,color:'var(--t0)',padding:'7px 10px',fontSize:'.78rem',outline:'none'}}/>
-        <button className="btn bg bsm" onClick={()=>setBDate(new Date().toISOString().split('T')[0])}>Today</button>
-      </div>
-
-      <div className="tabs" style={{marginBottom:20}}>
-        <button className={"tab "+(filterTab==='all'?'on':'')} onClick={()=>setFilterTab('all')}>All Posts ({searched.length})</button>
-        <button className={"tab "+(filterTab==='flagged'?'on':'')} onClick={()=>setFilterTab('flagged')} style={{color:(posts as any[]).filter((p:any)=>p.flagCount>0).length>0?'var(--red)':undefined}}>
-          Flagged ({(posts as any[]).filter((p:any)=>p.flagCount>0).length})
-        </button>
-        <button className={"tab "+(filterTab==='pinned'?'on':'')} onClick={()=>setFilterTab('pinned')}>Pinned ({(posts as any[]).filter((p:any)=>p.pinned).length})</button>
-      </div>
-
-      {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}>Loading...</div>:(
-        <div style={{display:'grid',gap:12}}>
-          {filtered.length?(filtered as any[]).map((post:any)=>(
-            <div key={post.id} className="card" style={{borderColor:post.flagCount>=3?'rgba(239,68,68,.4)':post.pinned?'rgba(201,162,39,.3)':'var(--b1)'}}>
-              <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',gap:16}}>
-                <div style={{flex:1}}>
-                  <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:8,flexWrap:'wrap'}}>
-                    <span style={{fontFamily:'var(--font-m)',fontSize:'.72rem',color:'var(--gold)',fontWeight:600}}>{post.alias}</span>
-                    {post.pinned&&<span className="badge bgold">📌 Pinned</span>}
-                    {post.flagCount>=3&&<span className="badge br">🚩 {post.flagCount} flags</span>}
-                    {post.flagCount>0&&post.flagCount<3&&<span className="badge ba">🚩 {post.flagCount} flag{post.flagCount>1?'s':''}</span>}
-                    <span className="badge bmu">{post.scope}</span>
-                    <span style={{fontSize:'.68rem',color:'var(--t3)',marginLeft:'auto'}}>{new Date(post.createdAt).toLocaleDateString()}</span>
-                  </div>
-                  <div style={{fontSize:'.85rem',color:'var(--t1)',lineHeight:1.6,marginBottom:10}}>{post.content}</div>
-                  <div style={{display:'flex',gap:12,fontSize:'.72rem',color:'var(--t3)'}}>
-                    <span>👍 {post.voteCount||0} votes</span>
-                    <span>💬 {post.replyCount||0} replies</span>
-                    <span>🏠 {post.propertyName||'Platform-wide'}</span>
-                  </div>
-
-                  {revealedIds[post.id]&&(
-                    <div style={{marginTop:12,background:'rgba(239,68,68,.06)',border:'1px solid rgba(239,68,68,.2)',borderRadius:8,padding:'10px 14px'}}>
-                      <div style={{fontSize:'.68rem',color:'var(--red)',fontWeight:700,textTransform:'uppercase',letterSpacing:'.06em',marginBottom:6}}>Identity Revealed — Confidential</div>
-                      <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:6,fontSize:'.78rem'}}>
-                        <div><span style={{color:'var(--t3)'}}>Name: </span><strong style={{color:'var(--t0)'}}>{revealedIds[post.id].firstName} {revealedIds[post.id].lastName}</strong></div>
-                        <div><span style={{color:'var(--t3)'}}>Email: </span><span style={{color:'var(--t0)'}}>{revealedIds[post.id].email}</span></div>
-                        <div><span style={{color:'var(--t3)'}}>Unit: </span><span style={{color:'var(--t0)'}}>{revealedIds[post.id].unitNumber||'—'}</span></div>
-                        <div><span style={{color:'var(--t3)'}}>Alias was: </span><span style={{fontFamily:'var(--font-m)',color:'var(--gold)'}}>{post.alias}</span></div>
-                      </div>
-                    </div>
-                  )}
-                </div>
-
-                <div style={{display:'flex',flexDirection:'column',gap:6,flexShrink:0}}>
-                  {isSuperAdmin&&!revealedIds[post.id]&&(
-                    <button className="btn bd bsm" onClick={()=>revealIdentity(post.id)} disabled={revealLoading===post.id} style={{whiteSpace:'nowrap'}}>
-                      {revealLoading===post.id?'Revealing...':'🔍 Reveal'}
-                    </button>
-                  )}
-                  {isSuperAdmin&&(
-                    <button className="btn bg bsm" onClick={()=>pinPost(post.id,!post.pinned)}>
-                      {post.pinned?'Unpin':'📌 Pin'}
-                    </button>
-                  )}
-                  {isSuperAdmin&&(
-                    <button className="btn bd bsm" style={{color:'var(--red)'}} onClick={()=>removePost(post.id)}>Remove</button>
-                  )}
-                </div>
-              </div>
-            </div>
-          )):<div className="empty">No posts{filterTab!=='all'?' matching this filter':''}.</div>}
-        </div>
-      )}
-    </div>
-  )
-}
-
-// ── AUDIT LOG (super_admin) ───────────────────────────────────
 function AuditLog(){
   const[actionType,setActionType]=React.useState('')
   const[adminUserId,setAdminUserId]=React.useState('')
@@ -2382,13 +2602,15 @@ function CsvImportDetail({id,onClose,onNavigate,onMarkReviewed}:{id:string;onClo
 // drops the user back to step 1, which is the desired safety
 // posture.
 function LoginPage(){
-  const{login,loginWithTotp}=useAuth()
+  const{login,loginWithTotp,loginWithEmailOtp,resendEmailOtp}=useAuth()
   React.useEffect(()=>{
     localStorage.removeItem('gam_admin_token')
     delete api.defaults.headers.common['Authorization']
   },[])
   const[email,setEmail]=useState('');const[pw,setPw]=useState('');const[err,setErr]=useState('');const[loading,setLoading]=useState(false)
   const[totpSession,setTotpSession]=useState<string|null>(null)
+  const[emailOtpSession,setEmailOtpSession]=useState<string|null>(null)
+  const[resentMsg,setResentMsg]=useState('')
   const[code,setCode]=useState('')
 
   const onCredentialsSubmit=async(e:React.FormEvent)=>{
@@ -2396,6 +2618,7 @@ function LoginPage(){
     try{
       const r=await login(email,pw)
       if(r.kind==='totp_required'){setTotpSession(r.totpSession);setCode('')}
+      else if(r.kind==='email_otp_required'){setEmailOtpSession(r.emailOtpSession);setCode('');setResentMsg('')}
     }
     catch(ex:any){
       // Surface the backend's error message when available — covers
@@ -2424,8 +2647,63 @@ function LoginPage(){
     finally{setLoading(false)}
   }
 
+  const onEmailOtpSubmit=async(e:React.FormEvent)=>{
+    e.preventDefault();setLoading(true);setErr('')
+    try{await loginWithEmailOtp(emailOtpSession!,code.trim())}
+    catch(ex:any){
+      const msg=ex.response?.data?.error||'Invalid code.'
+      setErr(msg)
+      if(/session/i.test(msg)){setEmailOtpSession(null);setCode('');setPw('')}
+    }
+    finally{setLoading(false)}
+  }
+
+  const onResendEmailOtp=async()=>{
+    setErr('');setResentMsg('')
+    try{await resendEmailOtp(emailOtpSession!);setResentMsg('A new code is on its way.')}
+    catch(ex:any){setErr(ex.response?.data?.error||'Could not resend. Start over.')}
+  }
+
   const onBackToCredentials=()=>{
-    setTotpSession(null);setCode('');setErr('');setPw('')
+    setTotpSession(null);setEmailOtpSession(null);setCode('');setErr('');setPw('');setResentMsg('')
+  }
+
+  // ── Step 2b: email code ───────────────────────────────────────
+  if(emailOtpSession){
+    return(
+      <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',background:'var(--bg0)',padding:20}}>
+        <div style={{width:'100%',maxWidth:380}}>
+          <div style={{textAlign:'center',marginBottom:40}}>
+            <div style={{fontFamily:'var(--font-d)',fontSize:'1.8rem',fontWeight:800,color:'var(--red)',marginBottom:8}}>⚠ ADMIN CONSOLE</div>
+            <div style={{color:'var(--t3)',fontSize:'.82rem'}}>Two-factor authentication</div>
+          </div>
+          <div className="card" style={{padding:24}}>
+            <div style={{fontSize:'.85rem',color:'var(--t1)',marginBottom:14,lineHeight:1.6}}>
+              We emailed a 6-digit code to <strong style={{color:'var(--t0)'}}>{email}</strong>. Enter it below to finish signing in.
+            </div>
+            {err&&<div className="alert ae" style={{marginBottom:14}}>{err}</div>}
+            {resentMsg&&<div className="alert" style={{marginBottom:14,background:'rgba(201,162,39,.08)',border:'1px solid var(--b1)',color:'var(--t1)'}}>{resentMsg}</div>}
+            <form onSubmit={onEmailOtpSubmit}>
+              <div style={{marginBottom:16}}>
+                <label style={{display:'block',fontSize:'.72rem',fontWeight:600,color:'var(--t3)',marginBottom:5,textTransform:'uppercase',letterSpacing:'.06em'}}>Code</label>
+                <input
+                  style={{width:'100%',background:'var(--bg3)',border:'1px solid var(--b1)',borderRadius:7,color:'var(--t0)',padding:'8px 11px',fontSize:'1rem',fontFamily:'var(--font-m)',letterSpacing:'.3em',textAlign:'center',outline:'none'}}
+                  type="text" value={code} onChange={e=>setCode(e.target.value)}
+                  autoFocus required autoComplete="one-time-code" inputMode="numeric" placeholder="123456"
+                />
+              </div>
+              <button className="bp btn" type="submit" disabled={loading||!code.trim()} style={{width:'100%',justifyContent:'center'}}>
+                {loading?<span className="spinner"/>:'Verify'}
+              </button>
+            </form>
+            <div style={{marginTop:14,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+              <button onClick={onBackToCredentials} style={{background:'none',border:'none',color:'var(--t2)',fontSize:'.82rem',cursor:'pointer',textDecoration:'underline'}}>← Back to sign in</button>
+              <button onClick={onResendEmailOtp} style={{background:'none',border:'none',color:'var(--gold)',fontSize:'.82rem',cursor:'pointer',textDecoration:'underline'}}>Resend code</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    )
   }
 
   // ── Step 2: TOTP code ─────────────────────────────────────────
@@ -2504,6 +2782,21 @@ function SuperAdminGuard({children}:{children:React.ReactNode}){
       <div style={{fontSize:'2rem',marginBottom:12}}>🔒</div>
       <h2 style={{color:'var(--t0)',marginBottom:8}}>Super Admin Only</h2>
       <p style={{color:'var(--t3)',fontSize:'.85rem'}}>This section requires super_admin access.</p>
+    </div>
+  )
+  return<>{children}</>
+}
+
+// S567: System Features is locked to the platform OWNER's account only, so no
+// other admin can flip a feature flag by accident.
+const OWNER_EMAIL='nic@golddoor.io'
+function OwnerGuard({children}:{children:React.ReactNode}){
+  const{user}=useAuth()
+  if(user?.email!==OWNER_EMAIL)return(
+    <div style={{padding:48,textAlign:'center'}}>
+      <div style={{fontSize:'2rem',marginBottom:12}}>🔒</div>
+      <h2 style={{color:'var(--t0)',marginBottom:8}}>Owner Only</h2>
+      <p style={{color:'var(--t3)',fontSize:'.85rem'}}>System Features can only be changed from the owner account.</p>
     </div>
   )
   return<>{children}</>
@@ -2789,6 +3082,45 @@ function SecurityPage(){
   )
 }
 
+// ── FEATURE REQUESTS (S571) ───────────────────────────────────
+// Tenants and landlords submit ideas via their portals (POST /feature-requests);
+// the GAM team reviews + triages them here.
+const FEATURE_STATUSES = ['new','reviewing','planned','declined','shipped'] as const
+const FR_BADGE:Record<string,string>={new:'b-blue',reviewing:'b-amber',planned:'b-green',declined:'b-muted',shipped:'b-green'}
+function FeatureRequests(){
+  const qc=useQueryClient()
+  const{data=[],isLoading}=useQuery<any[]>('feature-requests',()=>get<any[]>('/feature-requests'))
+  const patchMut=useMutation(({id,status}:{id:string;status:string})=>api.patch(`/feature-requests/${id}`,{status}).then(r=>r.data),{
+    onSuccess:()=>qc.invalidateQueries('feature-requests'),
+  })
+  return(
+    <div>
+      <div className="ph"><div><h1 className="pt">Feature Requests</h1><div className="ps">Ideas submitted by tenants and landlords.</div></div></div>
+      {isLoading?<div style={{padding:32,color:'var(--t3)'}}>Loading…</div>:
+       !data.length?<div className="card" style={{padding:24,textAlign:'center',color:'var(--t3)'}}>No feature requests yet.</div>:
+       <div style={{display:'flex',flexDirection:'column',gap:10}}>
+        {data.map((r:any)=>(
+          <div key={r.id} className="card" style={{padding:16}}>
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',gap:12,marginBottom:6}}>
+              <div style={{fontWeight:700,color:'var(--t0)'}}>{r.title}</div>
+              <span className={`badge ${FR_BADGE[r.status]||'b-muted'}`}>{r.status}</span>
+            </div>
+            <div style={{fontSize:'.85rem',color:'var(--t1)',lineHeight:1.5,marginBottom:8,whiteSpace:'pre-wrap'}}>{r.description}</div>
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:12,flexWrap:'wrap'}}>
+              <div style={{fontSize:'.72rem',color:'var(--t3)'}}>
+                {r.firstName} {r.lastName} · <span style={{textTransform:'capitalize'}}>{r.submitterRole}</span> · {r.email} · {new Date(r.createdAt).toLocaleDateString()}
+              </div>
+              <select className="inp" style={{width:'auto',fontSize:'.8rem'}} value={r.status} onChange={e=>patchMut.mutate({id:r.id,status:e.target.value})}>
+                {FEATURE_STATUSES.map(s=><option key={s} value={s}>{s}</option>)}
+              </select>
+            </div>
+          </div>
+        ))}
+       </div>}
+    </div>
+  )
+}
+
 // ── APP ───────────────────────────────────────────────────────
 function App(){
   const{user,loading}=useAuth()
@@ -2814,25 +3146,27 @@ function App(){
           <Route path="onboarding"    element={<AdminOnboardingOverview/>}/>
           <Route path="landlords"     element={<Landlords/>}/>
           <Route path="tenants"       element={<Tenants/>}/>
-          <Route path="flexpay-requests" element={<FlexPayRequests/>}/>
-          <Route path="property-reviews" element={<PropertyReviews/>}/>
+          <Route path="commissions"   element={<Commissions/>}/>
+          <Route path="flexpay-requests" element={<SuperAdminGuard><FlexPayRequests/></SuperAdminGuard>}/>
+          <Route path="property-reviews" element={<SuperAdminGuard><PropertyReviews/></SuperAdminGuard>}/>
+          <Route path="feature-requests" element={<SuperAdminGuard><FeatureRequests/></SuperAdminGuard>}/>
           <Route path="units"         element={<Units/>}/>
           <Route path="payments"      element={<Payments/>}/>
           <Route path="disbursements" element={<Disbursements/>}/>
           <Route path="connect-accounts" element={<ConnectAccounts/>}/>
           <Route path="reserve"       element={<SuperAdminGuard><Reserve/></SuperAdminGuard>}/>
           <Route path="nacha"         element={<SuperAdminGuard><NachaMonitor/></SuperAdminGuard>}/>
+          <Route path="nexus"         element={<SuperAdminGuard><NexusMonitor/></SuperAdminGuard>}/>
           <Route path="maintenance"   element={<Maintenance/>}/>
-          <Route path="disputes"      element={<Disputes/>}/>
-          <Route path="subleases"     element={<Subleases/>}/>
-          <Route path="deposit-portability" element={<DepositPortability/>}/>
-          <Route path="system-features" element={<SuperAdminGuard><SystemFeatures/></SuperAdminGuard>}/>
-          <Route path="bulletin"      element={<SuperAdminGuard><BulletinBoard/></SuperAdminGuard>}/>
+          <Route path="disputes"      element={<SuperAdminGuard><Disputes/></SuperAdminGuard>}/>
+          <Route path="subleases"     element={<SuperAdminGuard><Subleases/></SuperAdminGuard>}/>
+          <Route path="deposit-portability" element={<SuperAdminGuard><DepositPortability/></SuperAdminGuard>}/>
+          <Route path="system-features" element={<OwnerGuard><SystemFeatures/></OwnerGuard>}/>
           <Route path="audit-log"     element={<SuperAdminGuard><AuditLog/></SuperAdminGuard>}/>
-          <Route path="csv-imports"   element={<CsvImports/>}/>
-          <Route path="scaling"       element={<ScalingReadiness/>}/>
-          <Route path="agent-analytics" element={<AgentAnalytics/>}/>
-          <Route path="leads"         element={<SalesLeads/>}/>
+          <Route path="csv-imports"   element={<SuperAdminGuard><CsvImports/></SuperAdminGuard>}/>
+          <Route path="scaling"       element={<SuperAdminGuard><ScalingReadiness/></SuperAdminGuard>}/>
+          <Route path="agent-analytics" element={<SuperAdminGuard><AgentAnalytics/></SuperAdminGuard>}/>
+          <Route path="leads"         element={<SuperAdminGuard><SalesLeads/></SuperAdminGuard>}/>
           <Route path="security"      element={<SecurityPage/>}/>
         </Route>
       </Routes>

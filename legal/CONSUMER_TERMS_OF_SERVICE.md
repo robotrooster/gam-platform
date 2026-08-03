@@ -81,7 +81,7 @@ When fees are passed through, the rates are:
 - **ACH (bank account) payment processing**: 1.0% of the transaction amount, capped at $6.00 per transaction.
 - **Card payment processing**: 3.25% of the transaction amount, flat (no cap). A 1.5% surcharge is added to charges paid with a non-United States–issued card, passed through to the cardholder.
 
-If you enroll in FlexPay, the FlexPay enrollment terms disclose the monthly subscription fee (calculated per the date-based formula in Section 9.2 below); the fee is charged to you separately from your rent on the cadence disclosed at enrollment.
+If you enroll in FlexPay, the FlexPay enrollment terms disclose the monthly subscription fee (a flat $25.00 per month — see Section 9.2 below); the fee is charged to you separately from your rent on the cadence disclosed at enrollment.
 
 If you enroll in FlexDeposit, the FlexDeposit terms (Section 9.1) govern the installment schedule for funding your security deposit into GAM custody, plus the $3.00 monthly custody fee.
 
@@ -99,7 +99,7 @@ If you initiate a chargeback or your ACH payment is returned, the Platform will 
 
 **Each retry pull attempts to collect:**
 
-- **(a) The underlying amount then due under the applicable agreement.** For products priced on a date-based formula (e.g., FlexPay, governed by Section 9.2 and the FlexPay Subscription Terms), this amount is **recalculated based on the calendar day on which the retry pull is initiated** — see FlexPay Subscription Terms § 4.1 for the recalculation mechanics. For products with a fixed installment schedule (e.g., FlexDeposit SLA installments, governed by Section 9.1 and the FlexDeposit SLA), the underlying installment amount does not change — the retry attempts to collect the same installment amount as originally scheduled.
+- **(a) The underlying amount then due under the applicable agreement.** This amount does **not** change on a retry: FlexPay's monthly fee is a flat $25.00 that is not recalculated by retry date (Section 9.2 and FlexPay Subscription Terms § 4.1), and FlexDeposit SLA installments (Section 9.1) likewise retry for the same installment amount as originally scheduled.
 - **(b) Plus pass-through fees** (described below) applicable to **all** failed pulls under **all** products, regardless of whether the underlying amount is recalculated under (a) or remains fixed.
 
 If all retry attempts under GAM's failed-pull retry policy fail, the unpaid balance (computed under the foregoing rules, inclusive of accumulated pass-through fees) is added to your GAM-platform-side balance and is subject to the GAM-First payment-routing rules in Section 5.5.
@@ -226,15 +226,14 @@ If you commence any bankruptcy, insolvency, receivership, or similar proceeding,
 
 **FlexPay is available only to recipients of SSDI or SSI at this time. If you are funding your security deposit through FlexDeposit, you must complete that installment plan before you can enroll in FlexPay. A deposit you have otherwise already paid — including one carried over from before your Landlord joined the Platform — does not affect your FlexPay eligibility.**
 
-FlexPay is a subscription priced on a **date-based formula**:
+FlexPay is a subscription priced at a **flat monthly fee**:
 
-- **Monthly Fee = $5.00 + ($1.00 × Scheduled Pull Date)**, where the Scheduled Pull Date is the calendar day of each month on which you have scheduled your rent ACH pull.
-- The Scheduled Pull Date is capped at the 28th. So the monthly fee ranges from **$6.00** (pull date on the 1st) to **$33.00** (pull date on the 28th).
-- Example: a Scheduled Pull Date of the 11th of each month produces a Monthly Fee of $5 + $11 = **$16.00**.
-- **Failed pulls re-price.** If your rent ACH pull fails on the Scheduled Pull Date and the Platform retries on a later calendar day under the failed-pull retry policy described in Section 5.4, your FlexPay Monthly Fee for that cycle is **recalculated** using the formula at the actual (retry) pull date. A retry on the 15th, for example, recalculates the cycle's Monthly Fee to $5 + $15 = **$20.00**, replacing the originally-scheduled $16.00. **Plus, any Stripe ACH-return fees that GAM is charged are passed through to you** at GAM's actual cost. The full recalculation mechanics and Stripe pass-through provisions are set out in the FlexPay Subscription Terms § 4.1 and § 4.2.
+- **Monthly Fee = a flat $25.00 per month**, regardless of which Scheduled Pull Date you select.
+- Your **Scheduled Pull Date** is the calendar day (1st–28th) on which your rent ACH pull is scheduled. It is a **scheduling** choice only — you set it to match the day your income lands — and it does **not** affect the $25.00 fee.
+- **Failed pulls do not re-price.** If your rent ACH pull fails on the Scheduled Pull Date and the Platform retries on a later calendar day under the failed-pull retry policy described in Section 5.4, your FlexPay Monthly Fee stays a flat **$25.00** — it is not recalculated. **Plus, any Stripe ACH-return fees that GAM is charged (approximately $4 on an ACH return) are passed through to you** at GAM's actual cost, with no markup. The retry pull is therefore your rent + the $25.00 fee + the actual Stripe pass-through fee. Details in the FlexPay Subscription Terms § 4.1 and § 4.2.
 - The fee is for the scheduling-service access, not for any credit, advance, or money movement on your behalf.
 - **Failure and re-enrollment.** Your scheduled pull is retried up to two more times: the second attempt on the next business day, and the final attempt on the third business day after your original due date. A **FlexPay failure** occurs only if all three attempts fail. **Following a FlexPay failure, you may not re-enroll in FlexPay for 90 days.**
-- You may change your Scheduled Pull Date at any time through the in-platform FlexPay settings. The change (and the corresponding new Monthly Fee) **takes effect from the next full billing cycle** — it does not alter any pull already scheduled for the current cycle, so an outstanding balance does not block the change.
+- You may change your Scheduled Pull Date at any time through the in-platform FlexPay settings. The change **takes effect from the next full billing cycle** — it does not alter any pull already scheduled for the current cycle. The Monthly Fee remains a flat $25.00 and does not change with the Scheduled Pull Date.
 - You may cancel FlexPay at any time through the in-platform cancellation surface; the cancellation takes effect at the end of the then-current billing cycle.
 
 Because GAM is not advancing funds, **no Truth in Lending Act, FCRA, or state lending-law framework applies to FlexPay.** Auto-renewal of the FlexPay subscription is disclosed at enrollment per the state automatic-renewal laws listed in Section 9.5.

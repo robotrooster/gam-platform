@@ -40,5 +40,6 @@ boot 3001 apps/landlord  landlord
 boot 3002 apps/tenant    tenant
 boot 3003 apps/admin     admin
 boot 3005 apps/pos       pos
+boot 3006 apps/books     books
 boot 3009 apps/admin-ops admin-ops
 exit 0

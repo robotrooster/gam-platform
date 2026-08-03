@@ -30,7 +30,7 @@ export const setInspectionItemCondition: AgentTool = {
       inspectionId: { type: 'string', description: 'The inspection to write to (from create_inspection or get_inspection_progress).' },
       area: { type: 'string', description: 'The area, e.g. "Kitchen" (from the checklist).' },
       itemLabel: { type: 'string', description: 'The item within the area, e.g. "Refrigerator".' },
-      condition: { type: 'string', enum: [...INSPECTION_ITEM_CONDITIONS], description: 'good, fair, damaged, missing, or na.' },
+      condition: { type: 'string', enum: [...INSPECTION_ITEM_CONDITIONS], description: 'excellent, good, fair, or damaged_missing (damaged or missing).' },
       notes: { type: 'string', description: 'Optional note about the item’s condition.' },
       estimatedRepairCost: { type: 'number', description: 'Optional estimated repair cost in dollars, for damaged/missing items.' },
     },

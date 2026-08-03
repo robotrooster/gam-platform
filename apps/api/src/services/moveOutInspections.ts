@@ -61,7 +61,7 @@ export async function scheduleMoveOutInspections(): Promise<{ scheduled: number 
   const candidates = await query<any>(`
     SELECT l.id AS lease_id, l.unit_id, l.landlord_id,
            to_char(l.end_date, 'YYYY-MM-DD') AS end_date,
-           u.unit_number, u.unit_type, u.bedrooms, u.bathrooms, u.dwelling_ownership, u.property_id,
+           u.unit_number, u.unit_type, u.bedrooms, u.bathrooms, u.dwelling_ownership, u.is_multi_level, u.is_ada_accessible, u.living_areas, u.features, u.property_id,
            p.name AS property_name,
            (SELECT lt.tenant_id FROM lease_tenants lt
              WHERE lt.lease_id = l.id AND lt.role = 'primary' LIMIT 1) AS tenant_id
@@ -105,6 +105,10 @@ export async function scheduleMoveOutInspections(): Promise<{ scheduled: number 
         bedrooms: l.bedrooms,
         bathrooms: l.bathrooms,
         dwellingOwnership: l.dwelling_ownership,
+        isMultiLevel: l.is_multi_level,
+        isAdaAccessible: l.is_ada_accessible,
+        livingAreas: l.living_areas,
+        features: l.features,
         leaseId: l.lease_id,
         tenantId: l.tenant_id,
         inspectionType: 'move_out',

@@ -344,6 +344,31 @@ describe('generateInvoices (monthly cron)', () => {
     expect(inv.rows[0]).toMatchObject({ due_date: '2026-05-01', subtotal_rent: '1000.00' })
   })
 
+  it('S576 snowbird: a HIBERNATING lease generates NO invoices (off-season)', async () => {
+    const stack = await buildLeaseStack({
+      rentAmount: 1000, rentDueDay: 1, startDate: '2026-04-01',
+    })
+    await db.query(`UPDATE leases SET is_hibernating=TRUE WHERE id=$1`, [stack.leaseId])
+    const nowUtc = new Date('2026-05-05T12:00:00Z')
+    const res = await generateInvoices(nowUtc)
+    expect(res.invoicesInserted).toBe(0)
+    const inv = await db.query<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM invoices WHERE lease_id=$1`, [stack.leaseId])
+    expect(inv.rows[0].n).toBe('0')
+  })
+
+  it('S576 snowbird: RESUMING (clear the flag) restores billing', async () => {
+    const stack = await buildLeaseStack({
+      rentAmount: 1000, rentDueDay: 1, startDate: '2026-04-01',
+    })
+    await db.query(`UPDATE leases SET is_hibernating=TRUE WHERE id=$1`, [stack.leaseId])
+    const nowUtc = new Date('2026-05-05T12:00:00Z')
+    expect((await generateInvoices(nowUtc)).invoicesInserted).toBe(0)
+    // Resume → the next cron run bills the cycle.
+    await db.query(`UPDATE leases SET is_hibernating=FALSE WHERE id=$1`, [stack.leaseId])
+    expect((await generateInvoices(nowUtc)).invoicesInserted).toBe(1)
+  })
+
   it('catch-up: missed cycles in the prior 30 days backfill', async () => {
     const stack = await buildLeaseStack({
       rentAmount: 1000, rentDueDay: 1, startDate: '2026-01-01',

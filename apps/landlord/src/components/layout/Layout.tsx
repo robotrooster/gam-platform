@@ -12,7 +12,7 @@ import {
   ArrowDownToLine, Wrench, FileText, LogOut, Settings,
   ShoppingCart, Shield, Package, BarChart2, ScrollText,
   UserSearch, ClipboardList, HeartHandshake, PenTool, UserPlus,
-  Landmark, ClipboardCheck, CalendarClock
+  Landmark, ClipboardCheck, CalendarClock, RefreshCw
 } from 'lucide-react'
 
 // S82: each nav item has a `roles` admission list (which roles MAY see
@@ -27,15 +27,20 @@ import {
 // iff they hold ANY permission key in that item's `category` (owners see all).
 // Items with no `category` are owner-only (Team = permission management itself;
 // Work Trade). `guest_access` lives under the schedule category in the catalog.
+// S575: `hub` folds a cluster of items into ONE sidebar entry whose page
+// (HubTabLayout) renders the cluster's members as sub-tabs. Order within a hub
+// IS the tab order, and the first ACCESSIBLE member is that hub's landing page.
 const NAV_ITEMS: Array<{
   to: string
   icon: any
   label: string
   section: string | null
   category?: string
+  hub?: 'financials' | 'screening'
 }> = [
   // Overview
   { to: '/dashboard',     icon: LayoutDashboard, label: 'Dashboard',        section: 'Overview',    category: 'dashboard' },
+  { to: '/refer',         icon: HeartHandshake,   label: 'Refer & Earn',     section: null },
   { to: '/pos',           icon: ShoppingCart,     label: 'Point of Sale',    section: null,          category: 'pos' },
   // Portfolio
   { to: '/properties',    icon: Building2,        label: 'Properties',       section: 'Portfolio',   category: 'properties' },
@@ -46,17 +51,27 @@ const NAV_ITEMS: Array<{
   { to: '/leases',        icon: ScrollText,       label: 'Leases',           section: null,          category: 'leases' },
   { to: '/subleases',     icon: ScrollText,       label: 'Subleases',        section: null,          category: 'subleases' },
   { to: '/esign',         icon: PenTool,          label: 'E-Sign',           section: null,          category: 'esign' },
-  // Financials
-  { to: '/disbursements', icon: ArrowDownToLine,  label: 'Disbursements',    section: 'Financials',  category: 'disbursements' },
+  // Financials — S575: one "Financials" sidebar item, these render as sub-tabs.
+  // Items without a `category` stay owner-only (staff can't see them). Tab order
+  // is display order; the first the user can access is the landing tab.
+  { to: '/payments',      icon: CreditCard,       label: 'Payments',         section: null, hub: 'financials', category: 'payments' },
+  { to: '/balances',      icon: CreditCard,       label: 'Outstanding Balances', section: null, hub: 'financials', category: 'balances' },
+  // W-2 (S531): owner-only — matches the API canViewLandlordFinances gate.
+  { to: '/rent-roll',     icon: ScrollText,       label: 'Rent Roll',        section: null, hub: 'financials' },
+  { to: '/disbursements', icon: ArrowDownToLine,  label: 'Disbursements',    section: null, hub: 'financials', category: 'disbursements' },
+  { to: '/reports',       icon: BarChart2,        label: 'Reports',          section: null, hub: 'financials', category: 'reports' },
+  // S568: landlord expense entry (feeds the P&L). Owner-level.
+  { to: '/expenses',      icon: ArrowDownToLine,  label: 'Expenses',         section: null, hub: 'financials' },
+  // S570: bank feed — link operating bank, categorize spending into the P&L. Owner-level.
+  { to: '/bank-feed',     icon: RefreshCw,        label: 'Bank Feed',        section: null, hub: 'financials' },
+  // S568: bank reconciliation (categorize bank charges). Owner-level.
+  { to: '/bank-reconciliation', icon: Landmark,   label: 'Bank Reconciliation', section: null, hub: 'financials' },
   // S168: managers see /banking only when their landlord has flipped their
   // per-scope direct_deposit_enabled toggle on — special-cased in the filter.
-  { to: '/banking',       icon: Landmark,         label: 'Banking',          section: null,          category: 'banking' },
-  { to: '/payments',      icon: CreditCard,       label: 'Payments',         section: null,          category: 'payments' },
-  { to: '/balances',      icon: CreditCard,       label: 'Outstanding Balances', section: null,      category: 'balances' },
-  // W-2 (S531): no category → owner-only, matching the API's
-  // canViewLandlordFinances gate on /landlords/:id/rent-roll.
-  { to: '/rent-roll',     icon: ScrollText,       label: 'Rent Roll',        section: null },
-  { to: '/reports',       icon: BarChart2,        label: 'Reports',          section: null,          category: 'reports' },
+  { to: '/banking',       icon: Landmark,         label: 'Banking',          section: null, hub: 'financials', category: 'banking' },
+  // S568/S575: investor-operator net + lot rent (homes-only parks). Owner-level;
+  // the sub-tab is further gated on the landlord actually having a mobile-home unit.
+  { to: '/lot-rent',      icon: Landmark,         label: 'Lot Rent & Net',   section: null, hub: 'financials' },
   // Operations
   { to: '/maintenance',   icon: Wrench,           label: 'Maintenance',      section: 'Operations',  category: 'maintenance' },
   { to: '/inspections',   icon: ClipboardCheck,   label: 'Inspections',      section: null,          category: 'inspections' },
@@ -68,15 +83,28 @@ const NAV_ITEMS: Array<{
   // category for staff visibility.
   { to: '/utilities',     icon: Package,          label: 'Utilities',        section: null,          category: 'units' },
   { to: '/work-trade',    icon: HeartHandshake,   label: 'Work Trade',       section: null },
-  // Screening
-  { to: '/pool',          icon: UserSearch,       label: 'Applicant Pool',   section: 'Screening',   category: 'applicant_pool' },
-  { to: '/background',    icon: ClipboardList,    label: 'Background Checks',section: null,          category: 'background_checks' },
-  { to: '/screening',     icon: ScrollText,       label: 'Rental History',   section: null,          category: 'screening' },
+  // Screening — S575: one "Screening" sidebar item, these render as sub-tabs.
+  // S576 (Nic, B-9b): Background Checks leads — it's the day-to-day screening
+  // action, so clicking the Screening nav icon lands there. Applicant Pool
+  // (vacancy-fill backup) and Rental History follow.
+  { to: '/background',    icon: ClipboardList,    label: 'Background Checks',section: null, hub: 'screening', category: 'background_checks' },
+  { to: '/pool',          icon: UserSearch,       label: 'Applicant Pool',   section: null, hub: 'screening', category: 'applicant_pool' },
+  { to: '/screening',     icon: ScrollText,       label: 'Rental History',   section: null, hub: 'screening', category: 'screening' },
   // Admin
   { to: '/team',          icon: Shield,           label: 'Team',             section: 'Admin' },
   { to: '/pm-invitations', icon: HeartHandshake,  label: 'PM Invitations',   section: null,          category: 'pm_invitations' },
   { to: '/settings',      icon: Settings,         label: 'Settings',         section: null,          category: 'settings' },
 ]
+
+// S575: hub display metadata + the set of child paths (for sidebar active-state).
+const HUB_META: Record<'financials' | 'screening', { label: string; icon: any }> = {
+  financials: { label: 'Financials', icon: Landmark },
+  screening:  { label: 'Screening',  icon: UserSearch },
+}
+const HUB_CHILD_PATHS: Record<string, Set<string>> = {
+  financials: new Set(NAV_ITEMS.filter(i => i.hub === 'financials').map(i => i.to)),
+  screening:  new Set(NAV_ITEMS.filter(i => i.hub === 'screening').map(i => i.to)),
+}
 
 // category → its catalog permission keys (built once from the shared catalog).
 const CATALOG_KEYS_BY_CATEGORY: Record<string, string[]> = Object.fromEntries(
@@ -89,13 +117,22 @@ const OWNER_ROLES = new Set(['admin','super_admin','landlord'])
 // (main.tsx) so staff always LAND on a page they can actually see. Owners see
 // everything; staff see an item iff they hold ANY catalog key in its category
 // (plus the S168 banking special case). Items with no category are owner-only.
-export function visibleNavItemsFor(user: { role?: string; permissions?: Record<string, any> | null; directDepositEnabled?: boolean } | null | undefined) {
+export function visibleNavItemsFor(user: { role?: string; permissions?: Record<string, any> | null; directDepositEnabled?: boolean; hasMobileHomeUnits?: boolean } | null | undefined) {
   const role = user?.role || 'landlord'
   const perms = (user?.permissions || {}) as Record<string, boolean | string>
   const isOwner = OWNER_ROLES.has(role)
   const directDepositEnabled = (user as any)?.directDepositEnabled === true
+  const hasMobileHomeUnits = (user as any)?.hasMobileHomeUnits === true
   return NAV_ITEMS.filter(item => {
     if (LAUNCH_HIDDEN.has(item.to)) return false  // S512 launch hide
+    // S575: Lot Rent & Net is a mobile-home concept (lot rent + investor-operator
+    // net for homes-only parks). Landlords see it only once they have a
+    // mobile-home unit; admin/super_admin (platform oversight) always see it;
+    // staff never (owner-only item, no category).
+    if (item.to === '/lot-rent') {
+      if (role === 'landlord') return hasMobileHomeUnits
+      return isOwner
+    }
     if (isOwner) return true                       // owners see everything
     // --- staff: driven purely by catalog permissions ---
     // S168: /banking for property_manager — only when direct-deposit is on.
@@ -104,6 +141,52 @@ export function visibleNavItemsFor(user: { role?: string; permissions?: Record<s
     const keys = CATALOG_KEYS_BY_CATEGORY[item.category]
     return !!keys && keys.some(k => perms[k] === true)
   })
+}
+
+// S575: the sidebar list — same visibility as visibleNavItemsFor, but each hub's
+// members collapse into ONE entry (icon/label from HUB_META, landing = the first
+// accessible member). RoleRedirect keeps using the flat visibleNavItemsFor so
+// staff still land on a concrete page.
+export function sidebarNavItemsFor(user: Parameters<typeof visibleNavItemsFor>[0]) {
+  const out: Array<{ to: string; icon: any; label: string; section: string | null; hub?: 'financials' | 'screening' }> = []
+  const seen = new Set<string>()
+  for (const item of visibleNavItemsFor(user)) {
+    const hub = item.hub
+    if (hub) {
+      if (seen.has(hub)) continue
+      seen.add(hub)
+      out.push({ to: item.to, icon: HUB_META[hub].icon, label: HUB_META[hub].label, section: item.section, hub })
+    } else {
+      out.push(item)
+    }
+  }
+  return out
+}
+
+// S575: the page rendered for a hub route (/payments, /pool, …). Renders the
+// cluster's accessible members as a sub-tab bar over the active child page.
+export function HubTabLayout({ hub }: { hub: 'financials' | 'screening' }) {
+  const { user } = useAuth()
+  const tabs = visibleNavItemsFor(user).filter(i => i.hub === hub)
+  return (
+    <div>
+      {tabs.length > 1 && (
+        <div style={{ display: 'flex', gap: 4, borderBottom: '1px solid var(--border-0)', marginBottom: 20, flexWrap: 'wrap' }}>
+          {tabs.map(t => (
+            <NavLink key={t.to} to={t.to} end
+              style={({ isActive }) => ({
+                padding: '8px 16px', fontSize: '.82rem', fontWeight: 600, textDecoration: 'none',
+                color: isActive ? 'var(--gold)' : 'var(--text-3)',
+                borderBottom: isActive ? '2px solid var(--gold)' : '2px solid transparent', marginBottom: -1,
+              })}>
+              {t.label}
+            </NavLink>
+          ))}
+        </div>
+      )}
+      <Outlet />
+    </div>
+  )
 }
 
 // S512 LAUNCH: features hidden from the UI for the initial launch. Nav
@@ -205,44 +288,6 @@ function AnnouncementBar() {
   )
 }
 
-// Soft, dismissible nudge to enable 2FA. The landlord role is not in
-// MANDATORY_TOTP_ROLES, so this never blocks — it just reminds. Dismissal
-// persists per-account in localStorage; enabling 2FA clears it implicitly
-// (the banner stops rendering once totpEnabled is true).
-function TotpNudge() {
-  const { user } = useAuth()
-  const navigate = useNavigate()
-  const location = useLocation()
-  const dismissKey = user ? `gam_ll_totp_nudge_dismissed_${user.id}` : ''
-  const [dismissed, setDismissed] = useState(() => {
-    try { return !!dismissKey && localStorage.getItem(dismissKey) === '1' } catch { return false }
-  })
-
-  if (!user) return null
-  if ((user as any).totpEnabled) return null
-  if (dismissed) return null
-  // Don't nag while they're already on the enroll/settings flow.
-  if (location.pathname === '/totp/enroll' || location.pathname === '/settings') return null
-
-  const dismiss = () => {
-    try { localStorage.setItem(dismissKey, '1') } catch {}
-    setDismissed(true)
-  }
-
-  return (
-    <div style={{ background:'var(--gold-bg)', border:'1px solid rgba(201,162,39,.3)', borderRadius:10, padding:'12px 16px', marginBottom:16, display:'flex', alignItems:'center', justifyContent:'space-between', gap:12 }}>
-      <div>
-        <div style={{ fontWeight:700, color:'var(--gold)', fontSize:'.88rem' }}>🔐 Secure your account with two-factor authentication</div>
-        <div style={{ fontSize:'.75rem', color:'var(--text-2)', marginTop:2 }}>Add an authenticator-app code at sign-in so a stolen password isn't enough.</div>
-      </div>
-      <div style={{ display:'flex', alignItems:'center', gap:8, flexShrink:0 }}>
-        <button className="btn btn-primary btn-sm" onClick={() => navigate('/totp/enroll')}>Enable</button>
-        <button className="btn btn-ghost btn-sm" onClick={dismiss}>Dismiss</button>
-      </div>
-    </div>
-  )
-}
-
 export function Layout() {
   const { user, logout } = useAuth()
   const navigate = useNavigate()
@@ -275,8 +320,9 @@ export function Layout() {
 
   const handleLogout = () => { logout(); navigate('/login') }
 
-  // Visibility rule lives in visibleNavItemsFor (shared with RoleRedirect).
-  const visibleItems = visibleNavItemsFor(user)
+  // Visibility rule lives in visibleNavItemsFor (shared with RoleRedirect); the
+  // sidebar collapses the Financials/Screening clusters into one item each (S575).
+  const visibleItems = sidebarNavItemsFor(user)
 
   // Track section headers without side effects
   const renderedSections = new Set<string>()
@@ -295,6 +341,9 @@ export function Layout() {
             const Icon = item.icon
             const showSection = !!item.section && !renderedSections.has(item.section)
             if (showSection) renderedSections.add(item.section!)
+            // Hub items (Financials/Screening) are active for any of their child
+            // routes, not just the landing path a plain NavLink would match.
+            const hubActive = !!item.hub && HUB_CHILD_PATHS[item.hub].has(layoutLocation.pathname)
             return (
               <div key={item.to}>
                 {showSection && (
@@ -302,7 +351,8 @@ export function Layout() {
                     {item.section}
                   </div>
                 )}
-                <NavLink to={item.to} className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
+                <NavLink to={item.to}
+                  className={({ isActive }) => `nav-item ${(item.hub ? hubActive : isActive) ? 'active' : ''}`}>
                   <Icon size={16} /> {item.label}
                 </NavLink>
               </div>
@@ -360,7 +410,6 @@ export function Layout() {
           </button>
         </header>
         <div className={"page-content" + (fullBleed ? " page-content-wide" : "")}>
-          <TotpNudge />
           <Outlet />
           <DialogHost />
         </div>

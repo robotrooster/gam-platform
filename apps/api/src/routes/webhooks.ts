@@ -15,6 +15,7 @@ import {
   emitPaymentFailedEvent,
 } from '../services/creditLedgerEmitters'
 import { logger } from '../lib/logger'
+import { getStripe } from '../lib/stripe'
 
 export const webhooksRouter = Router()
 
@@ -184,6 +185,8 @@ webhooksRouter.post('/stripe', async (req, res) => {
               // Outside the transaction since reconcileSettledRentPayment
               // does its own DB connection. Best-effort; if it fails,
               // the cron-driven reconciliation could pick it up later.
+              // (OTP is hidden/gated behind otp_rollout_visible — this
+              // no-ops while the feature is off; kept intact for re-enable.)
               if (row.type === 'rent') {
                 try {
                   const { reconcileSettledRentPayment } = await import('../services/otp')
@@ -654,7 +657,8 @@ webhooksRouter.post('/stripe', async (req, res) => {
             // OTP NSF default (S155): if this terminal failure is on a
             // rent payment with an outstanding advance, mark it
             // defaulted + disqualify the tenant for 6 months. GAM eats
-            // the loss per the regulatory boundary.
+            // the loss per the regulatory boundary. (Gated/no-op while
+            // OTP is hidden; kept intact for re-enable.)
             if (p.type === 'rent') {
               try {
                 const { handleRentPaymentNsf } = await import('../services/otp')
@@ -894,6 +898,107 @@ webhooksRouter.post('/stripe', async (req, res) => {
       }
       break
     }
+    // S570: microdeposit ACH verification completes here. Tenant setup uses
+      // verification_method:'microdeposits' (NOT Financial Connections instant —
+      // that bills $1.50/verification). The SetupIntent stays in
+      // requires_action/processing until the tenant confirms the two deposits
+      // 1–3 days later; Stripe then fires setup_intent.succeeded and we flip
+      // ach_verified + stamp bank metadata + log the first-sender NACHA event.
+      // Idempotent: the UPDATE only fires the transition when ach_verified was
+      // still FALSE, so a re-delivered event won't double-log.
+    case 'setup_intent.succeeded': {
+      const setupIntent = event.data.object as Stripe.SetupIntent
+      const tenantId = (setupIntent.metadata?.tenantId as string | undefined) || null
+      const customerId = typeof setupIntent.customer === 'string'
+        ? setupIntent.customer
+        : setupIntent.customer?.id ?? null
+
+      // POS-customer FlexCharge onboarding: microdeposits clear here (the
+      // /complete route can no longer stamp synchronously — the SetupIntent
+      // isn't 'succeeded' at collect time). Stamp ach_verified + bank_last4,
+      // set the default PM for statement billing, mark the invitation accepted.
+      if (setupIntent.metadata?.gam_purpose === 'pos_customer_ach_onboarding') {
+        const invId = (setupIntent.metadata?.gam_invitation_id as string | undefined) || null
+        const posCustId = (setupIntent.metadata?.gam_pos_customer_id as string | undefined) || null
+        if (!posCustId) break
+        try {
+          const pmId = typeof setupIntent.payment_method === 'string'
+            ? setupIntent.payment_method : setupIntent.payment_method?.id ?? null
+          let bankLast4: string | null = null
+          if (pmId) {
+            const pm = await getStripe().paymentMethods.retrieve(pmId)
+            bankLast4 = pm.us_bank_account?.last4 ?? null
+          }
+          const flipped = await queryOne<{ id: string }>(
+            `UPDATE pos_customers SET ach_verified = TRUE, bank_last4 = $2, updated_at = NOW()
+              WHERE id = $1 AND ach_verified = FALSE RETURNING id`,
+            [posCustId, bankLast4])
+          if (flipped?.id && pmId && customerId) {
+            try {
+              await getStripe().customers.update(customerId, {
+                invoice_settings: { default_payment_method: pmId },
+              })
+            } catch (e) { logger.error({ err: e }, '[webhook] POS default PM set failed') }
+          }
+          if (invId) {
+            await query(`UPDATE pos_customer_invitations SET status='accepted', updated_at=NOW()
+                          WHERE id=$1 AND status <> 'accepted'`, [invId])
+          }
+          if (flipped?.id) logger.info({ pos_customer_id: posCustId, setup_intent: setupIntent.id }, '[webhook] POS ACH microdeposits verified')
+        } catch (e) {
+          logger.error({ err: e, setup_intent: setupIntent.id }, 'webhook setup_intent.succeeded POS handler failed')
+          await stampWebhookError(rawEventId, e)
+          return res.status(500).json({ error: 'webhook handler failed' })
+        }
+        break
+      }
+
+      if (!tenantId && !customerId) break
+      try {
+        const pmId = typeof setupIntent.payment_method === 'string'
+          ? setupIntent.payment_method
+          : setupIntent.payment_method?.id ?? null
+        let pm: Stripe.PaymentMethod | null = null
+        if (pmId) pm = await getStripe().paymentMethods.retrieve(pmId)
+        const isCard = setupIntent.metadata?.gam_purpose === 'tenant_card_setup' || pm?.type === 'card'
+
+        if (isCard) {
+          // S571 guard: a CARD setup must NOT flip ach_verified / stamp bank
+          // fields (pre-S571 this branch assumed us_bank_account and would mark
+          // ach_verified=TRUE with a null last4 for a saved card). Nothing else
+          // to do for a card here — email 2FA is already on for every tenant.
+          logger.info({ tenant_id: tenantId, customer: customerId, setup_intent: setupIntent.id }, '[webhook] tenant card saved (no ACH flip)')
+          break
+        }
+
+        const bank = pm?.us_bank_account
+        const bankLast4 = bank?.last4 ?? null
+        const routing = bank?.routing_number ?? null
+        const routingLast4 = bank?.routing_number?.slice(-4) ?? null
+        // Flip only on the FALSE→TRUE transition (idempotent on re-delivery).
+        const flipped = await queryOne<{ id: string }>(
+          `UPDATE tenants SET ach_verified = TRUE, bank_last4 = $2, bank_routing_last4 = $3
+            WHERE ${tenantId ? 'id = $1' : 'stripe_customer_id = $1'}
+              AND ach_verified = FALSE
+            RETURNING id`,
+          [tenantId ?? customerId, bankLast4, routingLast4],
+        )
+        if (flipped?.id) {
+          await query(`
+            INSERT INTO ach_monitoring_log (event_type, tenant_id, bank_fingerprint, notes)
+            VALUES ('first_sender', $1, $2, 'Microdeposits confirmed — bank verified, first-time sender tracking initiated')`,
+            [flipped.id, `${routing}_${bankLast4}`],
+          )
+          logger.info({ tenant_id: flipped.id, setup_intent: setupIntent.id }, '[webhook] ACH microdeposits verified')
+        }
+      } catch (e) {
+        logger.error({ err: e, setup_intent: setupIntent.id }, 'webhook setup_intent.succeeded handler failed')
+        await stampWebhookError(rawEventId, e)
+        return res.status(500).json({ error: 'webhook handler failed' })
+      }
+      break
+    }
+
     case 'account.updated': {
       // S115: Connect Express account state changed (KYC clears, capability
       // activates, requirements added, etc.). S159+ also caches the

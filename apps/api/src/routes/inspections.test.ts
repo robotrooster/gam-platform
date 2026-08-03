@@ -168,7 +168,7 @@ async function createInspection(f: SeedFixture, opts: Partial<{
   return res.rows[0].id
 }
 
-async function insertItem(inspectionId: string, area: string, item: string, cond: string) {
+async function insertItem(inspectionId: string, area: string, item: string, cond: string | null) {
   await db.query(
     `INSERT INTO unit_inspection_items (inspection_id, area, item_label, condition)
      VALUES ($1, $2, $3, $4)`,
@@ -183,6 +183,72 @@ async function insertSignature(inspectionId: string, userId: string, role: 'tena
     [inspectionId, userId, role],
   )
 }
+
+// S573: satisfy the completeness gate — set any un-inspected item to 'good',
+// add a note to fair/damaged items, and add one photo per area. Leaves already-
+// set conditions untouched (so comparison scenarios keep their intent).
+async function makeComplete(inspectionId: string) {
+  await db.query(`UPDATE unit_inspection_items SET condition='good' WHERE inspection_id=$1 AND condition IS NULL`, [inspectionId])
+  await db.query(`UPDATE unit_inspection_items SET notes='documented' WHERE inspection_id=$1 AND condition IN ('fair','damaged_missing') AND (notes IS NULL OR notes='')`, [inspectionId])
+  const uploader = await db.query<{ uid: string }>(
+    `SELECT us.id AS uid FROM unit_inspections i JOIN landlords l ON l.id=i.landlord_id JOIN users us ON us.id=l.user_id WHERE i.id=$1`, [inspectionId])
+  const uid = uploader.rows[0]?.uid
+  const areas = await db.query<{ area: string; id: string }>(
+    `SELECT DISTINCT ON (i.area) i.area, i.id FROM unit_inspection_items i
+      WHERE i.inspection_id=$1
+        AND NOT EXISTS (SELECT 1 FROM unit_inspection_photos p JOIN unit_inspection_items i2 ON i2.id=p.item_id
+                         WHERE i2.inspection_id=$1 AND i2.area=i.area)
+      ORDER BY i.area, i.id`, [inspectionId])
+  for (const a of areas.rows) {
+    await db.query(`INSERT INTO unit_inspection_photos (inspection_id, item_id, photo_url, uploaded_by) VALUES ($1,$2,'/x.jpg',$3)`,
+      [inspectionId, a.id, uid])
+  }
+}
+
+// ─── GET /inspections/preview (S573) ──────────────────────────────
+describe('GET /inspections/preview — pre-inspection review', () => {
+  it('resolves the master template for the unit without creating anything', async () => {
+    const f = await seedFixture()
+    const before = await db.query<{ c: string }>(`SELECT COUNT(*)::text AS c FROM unit_inspections WHERE unit_id=$1`, [f.unitId])
+    const res = await request(buildApp())
+      .get(`/api/inspections/preview?unitId=${f.unitId}&inspectionType=move_in`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.checklist.length).toBeGreaterThan(0)
+    expect(res.body.data.itemCount).toBeGreaterThan(0)
+    // no side effect — no inspection row created
+    const after = await db.query<{ c: string }>(`SELECT COUNT(*)::text AS c FROM unit_inspections WHERE unit_id=$1`, [f.unitId])
+    expect(after.rows[0].c).toBe(before.rows[0].c)
+  })
+
+  it('reflects the unit multi-level + ADA flags in the resolved areas', async () => {
+    const f = await seedFixture()
+    await db.query(`UPDATE units SET unit_type='single_family', is_multi_level=true, is_ada_accessible=true WHERE id=$1`, [f.unitId])
+    const res = await request(buildApp())
+      .get(`/api/inspections/preview?unitId=${f.unitId}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(res.status).toBe(200)
+    const areas = (res.body.data.checklist as any[]).map(a => a.area)
+    const stairItems = (res.body.data.checklist as any[]).find(a => a.area === 'Hallways & stairs')?.items ?? []
+    expect(stairItems).toContain('Staircase & treads')
+    expect(areas).toContain('Accessibility')
+    expect(areas).toContain('Yard & grounds')
+    expect(res.body.data.unit.isMultiLevel).toBe(true)
+    expect(res.body.data.unit.isAdaAccessible).toBe(true)
+  })
+
+  it('403s a landlord previewing another landlord\'s unit', async () => {
+    const f = await seedFixture()
+    const otherToken = jwt.sign(
+      { userId: randomUUID(), role: 'landlord', email: 'other@test.dev', profileId: randomUUID(), permissions: {} },
+      process.env.JWT_SECRET!, { expiresIn: '1h' },
+    )
+    const res = await request(buildApp())
+      .get(`/api/inspections/preview?unitId=${f.unitId}`)
+      .set('Authorization', `Bearer ${otherToken}`)
+    expect(res.status).toBe(403)
+  })
+})
 
 // ─── POST /inspections — create ───────────────────────────────────
 
@@ -201,7 +267,7 @@ describe('POST /inspections', () => {
     expect(row.rows[0].status).toBe('draft')
   })
 
-  it('seeds the standard walkthrough checklist as na items on create', async () => {
+  it('seeds the standard walkthrough checklist as un-inspected (null) items on create', async () => {
     const f = await seedFixture()
     const res = await request(buildApp())
       .post('/api/inspections')
@@ -209,11 +275,12 @@ describe('POST /inspections', () => {
       .send({ unitId: f.unitId, leaseId: f.leaseId, tenantId: f.tenantId, inspectionType: 'move_in' })
     expect(res.status).toBe(200)
     expect(res.body.data.seededItems).toBeGreaterThan(0)
-    const items = await db.query<{ area: string; condition: string }>(
+    const items = await db.query<{ area: string; condition: string | null }>(
       `SELECT area, condition FROM unit_inspection_items WHERE inspection_id = $1`, [res.body.data.id],
     )
     expect(items.rows.length).toBe(res.body.data.seededItems)
-    expect(items.rows.every((r) => r.condition === 'na')).toBe(true)
+    // S573: seeded items start un-inspected (null), never 'na'.
+    expect(items.rows.every((r) => r.condition === null)).toBe(true)
     expect(items.rows.map((r) => r.area)).toContain('Kitchen')
   })
 
@@ -481,12 +548,12 @@ describe('POST /inspections/:id/items', () => {
     await request(buildApp())
       .post(`/api/inspections/${id}/items`)
       .set('Authorization', `Bearer ${f.landlordToken}`)
-      .send({ area: 'kitchen', itemLabel: 'sink', condition: 'damaged', notes: 'cracked' })
+      .send({ area: 'kitchen', itemLabel: 'sink', condition: 'damaged_missing', notes: 'cracked' })
     const items = await db.query<{ condition: string; notes: string | null }>(
       `SELECT condition, notes FROM unit_inspection_items WHERE inspection_id = $1`, [id],
     )
     expect(items.rows).toHaveLength(1)
-    expect(items.rows[0].condition).toBe('damaged')
+    expect(items.rows[0].condition).toBe('damaged_missing')
     expect(items.rows[0].notes).toBe('cracked')
   })
 
@@ -686,6 +753,31 @@ describe('POST /inspections/:id/finalize', () => {
     expect(row.rows[0].finalized_at).not.toBeNull()
   })
 
+  it('S573: finalize files a summary report to the inspection + the tenant Documents', async () => {
+    const f = await seedFixture()
+    const id = await createInspection(f, { status: 'landlord_signed' })
+    const res = await request(buildApp())
+      .post(`/api/inspections/${id}/finalize`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(res.status).toBe(200)
+    // report_url set on the inspection (landlord reporting)
+    const row = await db.query<{ report_url: string }>(`SELECT report_url FROM unit_inspections WHERE id=$1`, [id])
+    expect(row.rows[0].report_url).toMatch(/^\/api\/inspections\/report-files\/inspection-report-/)
+    // a documents row filed to the tenant (surfaces in their Documents tab)
+    const docs = await db.query<{ type: string; tenant_id: string }>(
+      `SELECT type, tenant_id FROM documents WHERE url=$1`, [row.rows[0].report_url])
+    expect(docs.rows.length).toBe(1)
+    expect(docs.rows[0].type).toBe('move_in_checklist')
+    expect(docs.rows[0].tenant_id).toBe(f.tenantId)
+    // the tenant can fetch their own report PDF
+    const filename = row.rows[0].report_url.split('/').pop()!
+    const dl = await request(buildApp())
+      .get(`/api/inspections/report-files/${filename}`)
+      .set('Authorization', `Bearer ${f.tenantToken}`)
+    expect(dl.status).toBe(200)
+    expect(dl.headers['content-type']).toContain('application/pdf')
+  })
+
   it('landlord-initiated periodic with no tenant: sign → finalize works end-to-end', async () => {
     const f = await seedFixture()
     const id = await createInspection(f, { inspectionType: 'periodic', tenantId: null })
@@ -755,6 +847,7 @@ describe('POST /inspections/:id/finalize', () => {
     })
     await insertItem(moveOutId, 'kitchen', 'sink',  'good')
     await insertItem(moveOutId, 'kitchen', 'stove', 'fair')
+    await makeComplete(moveOutId)
 
     const res = await request(buildApp())
       .post(`/api/inspections/${moveOutId}/finalize`)
@@ -774,8 +867,9 @@ describe('POST /inspections/:id/finalize', () => {
       inspectionType: 'move_out', status: 'landlord_signed',
       comparisonInspectionId: moveInId,
     })
-    await insertItem(moveOutId, 'kitchen', 'sink',  'damaged')   // worse
+    await insertItem(moveOutId, 'kitchen', 'sink',  'damaged_missing')   // worse
     await insertItem(moveOutId, 'kitchen', 'stove', 'good')
+    await makeComplete(moveOutId)
 
     const res = await request(buildApp())
       .post(`/api/inspections/${moveOutId}/finalize`)
@@ -785,23 +879,19 @@ describe('POST /inspections/:id/finalize', () => {
     expect(res.body.data.damage_documented).toBe(true)
   })
 
-  it("'na' in move-out is excluded from comparison (doesn't count as damage)", async () => {
+  it('S573: completeness gate blocks finalize when an item is un-inspected (null)', async () => {
     const f = await seedFixture()
-    const moveInId = await createInspection(f, { inspectionType: 'move_in', status: 'finalized' })
-    await insertItem(moveInId, 'kitchen', 'dishwasher', 'good')
-
-    const moveOutId = await createInspection(f, {
-      inspectionType: 'move_out', status: 'landlord_signed',
-      comparisonInspectionId: moveInId,
-    })
-    // dishwasher condition can't be assessed at move-out — caller picked 'na'.
-    await insertItem(moveOutId, 'kitchen', 'dishwasher', 'na')
-
+    const moveOutId = await createInspection(f, { inspectionType: 'move_out', status: 'landlord_signed' })
+    await insertItem(moveOutId, 'kitchen', 'sink', 'good')
+    await insertItem(moveOutId, 'kitchen', 'dishwasher', null)   // un-inspected
+    // add a photo for the area so ONLY the null condition blocks finalize
+    await makeComplete(moveOutId)
+    await db.query(`UPDATE unit_inspection_items SET condition=NULL WHERE inspection_id=$1 AND item_label='dishwasher'`, [moveOutId])
     const res = await request(buildApp())
       .post(`/api/inspections/${moveOutId}/finalize`)
       .set('Authorization', `Bearer ${f.landlordToken}`)
-    expect(res.status).toBe(200)
-    expect(res.body.data.matches_move_in).toBe(true)
+    expect(res.status).toBe(409)
+    expect(res.body.error).toMatch(/not complete/i)
   })
 
   it('items only in move-out (not in move-in) are excluded from comparison', async () => {
@@ -815,7 +905,8 @@ describe('POST /inspections/:id/finalize', () => {
     })
     await insertItem(moveOutId, 'kitchen', 'sink', 'good')
     // New item at move-out — never in move-in. Should not flag damage.
-    await insertItem(moveOutId, 'kitchen', 'new_lamp', 'missing')
+    await insertItem(moveOutId, 'kitchen', 'new_lamp', 'damaged_missing')
+    await makeComplete(moveOutId)
 
     const res = await request(buildApp())
       .post(`/api/inspections/${moveOutId}/finalize`)
@@ -1011,7 +1102,7 @@ describe('agent inspection tools', () => {
     const unit = await unitNumberOf(f.unitId)
     const created: any = await createInspectionTool.execute({ unit, inspectionType: 'periodic' }, landlordActor(f))
     const res: any = await setItemConditionTool.execute(
-      { inspectionId: created.inspectionId, area: 'Kitchen', itemLabel: 'Sink', condition: 'damaged', notes: 'leak', estimatedRepairCost: 120 },
+      { inspectionId: created.inspectionId, area: 'Kitchen', itemLabel: 'Sink', condition: 'damaged_missing', notes: 'leak', estimatedRepairCost: 120 },
       landlordActor(f),
     )
     expect(res.ok).toBe(true)
@@ -1249,6 +1340,7 @@ describe('S550 — tenant sign restriction + POST /inspections/:id/submit', () =
     const app = buildApp()
 
     const noPhotos = await createInspection(f, { inspectionType: 'periodic' })
+    await insertItem(noPhotos, 'Kitchen', 'Sink', 'good')  // an item with no area photo → incomplete
     expect((await request(app).post(`/api/inspections/${noPhotos}/submit`)
       .set('Authorization', `Bearer ${f.tenantToken}`)).status).toBe(409)
 
@@ -1367,7 +1459,7 @@ describe('S550 — dwelling-ownership checklist catalog', () => {
   it('tenant-owned rv_spot: site only — no rig interior, never bedrooms', async () => {
     const f = await seedFixture()
     const areas = await seededAreas(f, 'rv_spot', 'tenant', 0)
-    expect(areas).toContain('Hookups')
+    expect(areas).toContain('RV site')
     expect(areas).not.toContain('RV interior')
     expect(areas.some(a => a.startsWith('Bedroom'))).toBe(false)
   })
@@ -1375,7 +1467,7 @@ describe('S550 — dwelling-ownership checklist catalog', () => {
   it('park-owned rv_spot: site plus the rig — still never bedrooms', async () => {
     const f = await seedFixture()
     const areas = await seededAreas(f, 'rv_spot', 'landlord', 2)
-    expect(areas).toContain('Pad & site')
+    expect(areas).toContain('RV site')
     expect(areas).toContain('RV interior')
     expect(areas).toContain('RV systems')
     expect(areas.some(a => a.startsWith('Bedroom'))).toBe(false)
@@ -1384,7 +1476,7 @@ describe('S550 — dwelling-ownership checklist catalog', () => {
   it('tenant-owned mobile_home: lot/space only — never inside their home', async () => {
     const f = await seedFixture()
     const areas = await seededAreas(f, 'mobile_home', 'tenant', 3)
-    expect(areas).toContain('Lot & pad')
+    expect(areas).toContain('Yard & grounds')
     expect(areas).not.toContain('Kitchen')
     expect(areas.some(a => a.startsWith('Bedroom'))).toBe(false)
   })
@@ -1433,14 +1525,14 @@ describe('S550 — tenant on-the-go issue reporting', () => {
     const res = await request(buildApp())
       .post(`/api/inspections/${inspId}/items`)
       .set('Authorization', `Bearer ${f.tenantToken}`)
-      .send({ area: 'Reported issues', itemLabel: 'Bedroom window is broken', condition: 'damaged', notes: 'Bedroom window is broken' })
+      .send({ area: 'Reported issues', itemLabel: 'Bedroom window is broken', condition: 'damaged_missing', notes: 'Bedroom window is broken' })
     expect(res.status).toBe(200)
     const row = (await db.query<any>(
       `SELECT area, item_label, condition FROM unit_inspection_items
         WHERE inspection_id = $1 AND area = 'Reported issues'`, [inspId],
     )).rows[0]
     expect(row.item_label).toBe('Bedroom window is broken')
-    expect(row.condition).toBe('damaged')
+    expect(row.condition).toBe('damaged_missing')
   })
 })
 
@@ -1483,6 +1575,7 @@ describe('S550 — conditional lease fees assessed at move-out', () => {
       .set('Authorization', `Bearer ${f.landlordToken}`)
       .send({ area: 'Lease conditions', itemLabel, condition })
     expect(upsert.status).toBe(200)
+    await makeComplete(inspectionId)
     expect((await request(app).post(`/api/inspections/${inspectionId}/sign`)
       .set('Authorization', `Bearer ${f.landlordToken}`)).status).toBe(200)
     expect((await request(app).post(`/api/inspections/${inspectionId}/finalize`)
@@ -1493,7 +1586,7 @@ describe('S550 — conditional lease fees assessed at move-out', () => {
     const f = await seedFixture()
     const feeId = await addConditionalFee(f.leaseId, 150)
     const { inspectionId, itemLabel } = await createMoveOutWithCondition(f, feeId)
-    await assessAndFinalize(f, inspectionId, itemLabel, 'damaged')
+    await assessAndFinalize(f, inspectionId, itemLabel, 'damaged_missing')
     const fee = (await db.query<any>(
       `SELECT condition_result, condition_assessed_at, condition_assessed_by
          FROM lease_fees WHERE id = $1`, [feeId],
@@ -1503,21 +1596,24 @@ describe('S550 — conditional lease fees assessed at move-out', () => {
     expect(fee.condition_assessed_by).toBe(f.landlordUserId)
   })
 
-  it('item marked good → condition MET (no charge); na stays unassessed', async () => {
+  it('item marked good → condition MET; S573: every seeded condition gets assessed (no un-inspected path)', async () => {
     const f = await seedFixture()
     const metFee = await addConditionalFee(f.leaseId, 150)
-    const naFee  = await addConditionalFee(f.leaseId, 75)
+    const otherFee = await addConditionalFee(f.leaseId, 75)
     const { inspectionId } = await createMoveOutWithCondition(f, metFee)
     const metLabel = (await db.query<{ item_label: string }>(
       `SELECT item_label FROM unit_inspection_items WHERE inspection_id=$1 AND lease_fee_id=$2`,
       [inspectionId, metFee],
     )).rows[0].item_label
+    // assessAndFinalize marks metFee 'good' and makeComplete fills every other
+    // seeded condition to 'good' — completeness requires all items inspected.
     await assessAndFinalize(f, inspectionId, metLabel, 'good')
     const rows = (await db.query<any>(
       `SELECT id, condition_result FROM lease_fees WHERE id = ANY($1::uuid[])`,
-      [[metFee, naFee]],
+      [[metFee, otherFee]],
     )).rows
     expect(rows.find((r: any) => r.id === metFee).condition_result).toBe('met')
-    expect(rows.find((r: any) => r.id === naFee).condition_result).toBeNull()
+    // The other conditional fee was seeded as an item too → now also assessed 'met'.
+    expect(rows.find((r: any) => r.id === otherFee).condition_result).toBe('met')
   })
 })

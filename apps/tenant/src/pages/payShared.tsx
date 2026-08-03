@@ -21,11 +21,11 @@
  * as customer-facing copy only.
  */
 import { useState } from 'react'
-import { useQuery } from 'react-query'
+import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { loadStripe, Stripe as StripeJs } from '@stripe/stripe-js'
 import { Elements, PaymentElement, useStripe, useElements } from '@stripe/react-stripe-js'
 import { formatCurrency } from '@gam/shared'
-import { apiGet, apiPost } from '../lib/api'
+import { apiGet, apiPost, apiPatch } from '../lib/api'
 
 const STRIPE_PK = (import.meta as any).env?.VITE_STRIPE_PUBLISHABLE_KEY || ''
 const stripePromise: Promise<StripeJs | null> | null = STRIPE_PK ? loadStripe(STRIPE_PK) : null
@@ -36,6 +36,8 @@ export interface SavedAch {
   type:     'ach'
   bankName: string | null
   last4:    string | null
+  verified?: boolean   // S570: false = microdeposits still pending, not chargeable
+  isDefault?: boolean  // S571: the tenant's chosen default (ACH by default)
 }
 export interface SavedCard {
   id:       string
@@ -45,6 +47,8 @@ export interface SavedCard {
   expMonth: number | null
   expYear:  number | null
   country:  string | null
+  verified?: boolean
+  isDefault?: boolean
 }
 export type SavedPaymentMethod = SavedAch | SavedCard
 
@@ -81,45 +85,74 @@ export function SavedMethodsCard({
   loading:    boolean
   emptyCopy?: React.ReactNode
 }) {
+  const qc = useQueryClient()
+  const setDefault = useMutation(
+    (paymentMethodId: string) => apiPatch('/stripe/tenant/default-payment-method', { paymentMethodId }),
+    { onSuccess: () => qc.invalidateQueries('tenant-payment-methods') },
+  )
   if (loading) return null
   if (!methods.length) {
+    // S570 (Nic): no redundant "add a method" banner — the header already has
+    // + Add bank / + Add card, and signup prompts for a method. Show nothing
+    // unless a caller passes explicit emptyCopy.
+    if (!emptyCopy) return null
     return (
       <div className="card" style={{ padding: 14, fontSize: '.82rem', color: 'var(--t2)' }}>
-        {emptyCopy ?? (
-          <>
-            No payment method on file. Click <strong>+ Add bank</strong> or{' '}
-            <strong>+ Add card</strong> to connect one and start paying through GAM. ACH is the
-            cheapest path; cards are available for urgent or out-of-cycle payments.
-          </>
-        )}
+        {emptyCopy}
       </div>
     )
   }
   return (
     <div className="card" style={{ padding: 14 }}>
-      <div style={{ fontSize: '.78rem', color: 'var(--t3)', marginBottom: 8 }}>Saved methods</div>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-        {methods.map((m) => (
-          <div
-            key={m.id}
-            style={{
-              display:        'flex',
-              justifyContent: 'space-between',
-              alignItems:     'center',
-              fontSize:       '.85rem',
-              color:          'var(--t1)',
-            }}
-          >
-            <span>
-              {m.type === 'ach'
-                ? `🏦 ${m.bankName ?? 'Bank'} ····${m.last4 ?? ''}`
-                : `💳 ${(m.brand ?? 'Card').toUpperCase()} ····${m.last4 ?? ''}`}
-            </span>
-            <span className="badge b-muted" style={{ fontSize: '.7rem' }}>
-              {m.type === 'ach' ? 'ACH' : 'Card'}
-            </span>
-          </div>
-        ))}
+      <div style={{ fontSize: '.78rem', color: 'var(--t3)', marginBottom: 8 }}>Saved methods — one bank &amp; one card</div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+        {methods.map((m) => {
+          const pending = m.type === 'ach' && m.verified === false
+          return (
+            <div
+              key={m.id}
+              style={{
+                display:        'flex',
+                justifyContent: 'space-between',
+                alignItems:     'center',
+                gap:            10,
+                fontSize:       '.85rem',
+                color:          'var(--t1)',
+              }}
+            >
+              <span>
+                {m.type === 'ach'
+                  ? `🏦 ${m.bankName ?? 'Bank'} ····${m.last4 ?? ''}`
+                  : `💳 ${(m.brand ?? 'Card').toUpperCase()} ····${m.last4 ?? ''}`}
+              </span>
+              <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                {pending && (
+                  <span className="badge b-warn" style={{ fontSize: '.7rem' }} title="Confirm the two small deposits (Stripe emailed you) to finish verifying.">
+                    Pending verification
+                  </span>
+                )}
+                {m.isDefault ? (
+                  <span className="badge b-green" style={{ fontSize: '.7rem' }}>✓ Default</span>
+                ) : !pending ? (
+                  <button
+                    onClick={() => setDefault.mutate(m.id)}
+                    disabled={setDefault.isLoading}
+                    style={{ fontSize: '.7rem', color: 'var(--gold)', background: 'none', border: '1px solid rgba(201,162,39,.3)', borderRadius: 6, padding: '2px 8px', cursor: 'pointer' }}
+                    title="Use this method by default"
+                  >
+                    Make default
+                  </button>
+                ) : null}
+                <span className="badge b-muted" style={{ fontSize: '.7rem' }}>
+                  {m.type === 'ach' ? 'ACH' : 'Card'}
+                </span>
+              </span>
+            </div>
+          )
+        })}
+      </div>
+      <div style={{ fontSize: '.68rem', color: 'var(--t3)', marginTop: 8 }}>
+        Adding a bank or card replaces the old one of that type. ACH is used by default — switch to card only if you want to (card fees apply).
       </div>
     </div>
   )
@@ -141,7 +174,12 @@ export function PayNowModal({
 }) {
   const achMethods  = methods.filter((m): m is SavedAch  => m.type === 'ach')
   const cardMethods = methods.filter((m): m is SavedCard => m.type === 'card')
-  const initialId   = achMethods[0]?.id ?? cardMethods[0]?.id ?? ''
+  // S570: a bank with microdeposits still pending can't be charged — don't
+  // pre-select it, badge it, and block Pay if it's the chosen method.
+  const isPending = (m: SavedPaymentMethod) => m.type === 'ach' && m.verified === false
+  const payable    = methods.filter((m) => !isPending(m))
+  // S571: pre-select the tenant's default method (ACH by default).
+  const initialId  = payable.find((m) => m.isDefault)?.id ?? payable[0]?.id ?? ''
   const [selectedId, setSelectedId] = useState<string>(initialId)
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState<string | null>(null)
@@ -149,10 +187,16 @@ export function PayNowModal({
 
   const selectedMethod = methods.find((m) => m.id === selectedId)
   const selectedType   = selectedMethod?.type ?? null
+  const selectedPending = selectedMethod ? isPending(selectedMethod) : false
+  const hasPendingBank = achMethods.some(isPending)
 
   const submit = async () => {
     if (!selectedMethod) {
       setError('Pick a payment method first')
+      return
+    }
+    if (isPending(selectedMethod)) {
+      setError('This bank is still verifying. Confirm the two small deposits Stripe emailed you, or pay with a card.')
       return
     }
     setSubmitting(true)
@@ -236,9 +280,16 @@ export function PayNowModal({
                 <PickerRow
                   key={m.id}
                   selected={selectedId === m.id}
-                  onSelect={() => setSelectedId(m.id)}
+                  onSelect={() => { if (!isPending(m)) setSelectedId(m.id) }}
                 >
-                  🏦 {m.bankName ?? 'Bank'} ····{m.last4 ?? ''}
+                  <span style={{ opacity: isPending(m) ? 0.55 : 1 }}>
+                    🏦 {m.bankName ?? 'Bank'} ····{m.last4 ?? ''}
+                  </span>
+                  {isPending(m) && (
+                    <span className="badge b-warn" style={{ marginLeft: 8, fontSize: '.68rem' }}>
+                      Pending verification
+                    </span>
+                  )}
                 </PickerRow>
               ))}
             </MethodPickerSection>
@@ -308,10 +359,17 @@ export function PayNowModal({
             </div>
           )}
 
+          {hasPendingBank && (
+            <div style={{ fontSize: '.72rem', color: 'var(--t3)', marginBottom: 10, lineHeight: 1.5 }}>
+              A bank still shows <strong>Pending verification</strong> — confirm the two small deposits Stripe
+              emailed you (1–3 business days) to use it. You can pay by card in the meantime.
+            </div>
+          )}
+
           <button
             className="btn btn-p"
             style={{ width: '100%' }}
-            disabled={!selectedId || submitting || !!success}
+            disabled={!selectedId || submitting || !!success || selectedPending}
             onClick={submit}
           >
             {submitting
@@ -438,16 +496,17 @@ export function AddPaymentMethodModal({
   onClose: () => void
   onAdded: () => void
 }) {
-  const [phase, setPhase] = useState<'idle' | 'loading' | 'collect' | 'done' | 'error'>('idle')
+  const [phase, setPhase] = useState<'idle' | 'loading' | 'collect' | 'done' | 'pending' | 'error'>('idle')
   const [clientSecret, setClientSecret] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [pendingMsg, setPendingMsg] = useState<string | null>(null)
 
   const titleVerb  = method === 'ach' ? 'bank account' : 'card'
   const idleCopy   =
     method === 'ach'
-      ? 'We\'ll open Stripe\'s secure bank-link flow. Sign in with your bank and instantly verify — no micro-deposits, no waiting.'
+      ? 'Enter your bank\'s routing and account numbers. Stripe sends two small deposits to your account — confirm them in 1–3 business days (Stripe emails you a link) to finish. No fees. Prefer to pay right away? Use a card instead.'
       : 'We\'ll collect your card securely through Stripe. Card details never touch GAM\'s servers; we only see the last 4 digits, brand, and expiration once Stripe attaches the card to your account.'
-  const loadingCopy = method === 'ach' ? 'Preparing secure bank link…' : 'Preparing secure card form…'
+  const loadingCopy = method === 'ach' ? 'Preparing secure bank form…' : 'Preparing secure card form…'
   const doneCopy    = method === 'ach' ? '✓ Bank account verified' : '✓ Card saved'
 
   const start = async () => {
@@ -503,9 +562,14 @@ export function AddPaymentMethodModal({
         <Elements stripe={stripePromise} options={{ clientSecret }}>
           <PaymentMethodSetupForm
             method={method}
-            onDone={() => {
-              setPhase('done')
-              setTimeout(onAdded, 800)
+            onDone={(result) => {
+              if (result?.pending) {
+                setPendingMsg(result.message ?? null)
+                setPhase('pending')
+              } else {
+                setPhase('done')
+                setTimeout(onAdded, 800)
+              }
             }}
             onError={(msg) => {
               setError(msg)
@@ -524,6 +588,15 @@ export function AddPaymentMethodModal({
           }}
         >
           {doneCopy}
+        </div>
+      )}
+      {phase === 'pending' && (
+        <div>
+          <div style={{ padding: '4px 0 14px', color: 'var(--t2)', fontSize: '.85rem', lineHeight: 1.55 }}>
+            <div style={{ fontWeight: 600, color: 'var(--t1)', marginBottom: 6 }}>Two small deposits are on the way</div>
+            {pendingMsg ?? 'We sent two small deposits to your bank. They arrive in 1–3 business days — check the email from Stripe and confirm the amounts to finish setting up your bank. You can pay by card in the meantime.'}
+          </div>
+          <button className="btn btn-p" style={{ width: '100%' }} onClick={onAdded}>Got it</button>
         </div>
       )}
       {phase === 'error' && (
@@ -546,7 +619,7 @@ function PaymentMethodSetupForm({
   onError,
 }: {
   method:  'ach' | 'card'
-  onDone:  () => void
+  onDone:  (result?: { pending?: boolean; message?: string }) => void
   onError: (msg: string) => void
 }) {
   const stripe = useStripe()
@@ -578,20 +651,32 @@ function PaymentMethodSetupForm({
       return
     }
     if (method === 'card') {
-      // Card auto-attaches on confirmSetup. No server-side capture step.
+      // Card auto-attaches on confirmSetup. S571: tell the server so it enforces
+      // one card on file (a new card replaces the old) + sets default if none.
+      try {
+        await apiPost('/stripe/tenant/confirm-card', {
+          paymentMethodId:
+            typeof setupIntent.payment_method === 'string'
+              ? setupIntent.payment_method
+              : setupIntent.payment_method.id,
+        })
+      } catch { /* non-fatal — the card is attached; swap/default is best-effort */ }
       onDone()
       return
     }
-    // ACH: server captures bank metadata, flips ach_verified, logs first-sender.
+    // ACH: server stamps the bank. With microdeposit verification the account
+    // is NOT yet verified — the server returns verified:false + a pending
+    // message until the tenant confirms the two deposits (setup_intent.succeeded
+    // webhook flips ach_verified then).
     try {
-      await apiPost('/stripe/tenant/confirm-setup', {
+      const resp: any = await apiPost('/stripe/tenant/confirm-setup', {
         setupIntentId:   setupIntent.id,
         paymentMethodId:
           typeof setupIntent.payment_method === 'string'
             ? setupIntent.payment_method
             : setupIntent.payment_method.id,
       })
-      onDone()
+      onDone(resp?.verified === false ? { pending: true, message: resp?.message } : undefined)
     } catch (e: any) {
       setSubmitting(false)
       onError(
@@ -628,10 +713,10 @@ function PaymentMethodSetupForm({
       >
         {submitting
           ? method === 'ach'
-            ? 'Verifying…'
+            ? 'Linking…'
             : 'Saving…'
           : method === 'ach'
-            ? 'Verify bank →'
+            ? 'Link bank →'
             : 'Save card →'}
       </button>
     </div>

@@ -115,18 +115,18 @@ describe('GET /api/admin/audit-log', () => {
     // Seed 2 distinct action_types
     await db.query(
       `INSERT INTO admin_action_log (admin_user_id, action_type) VALUES
-         ($1, 'bulletin_pin'),
-         ($1, 'bulletin_pin'),
-         ($1, 'bulletin_remove')`,
+         ($1, 'nexus_register'),
+         ($1, 'nexus_register'),
+         ($1, 'invoice_backfill')`,
       [f.superAdminUserId])
 
     const res = await request(buildApp())
-      .get('/api/admin/audit-log?action_type=bulletin_pin')
+      .get('/api/admin/audit-log?action_type=nexus_register')
       .set('Authorization', `Bearer ${f.superAdminToken}`)
     expect(res.status).toBe(200)
     expect(res.body.data.rows.length).toBe(2)
     expect(res.body.data.total).toBe(2)
-    expect(res.body.data.actionTypes.sort()).toEqual(['bulletin_pin', 'bulletin_remove'])
+    expect(res.body.data.actionTypes.sort()).toEqual(['invoice_backfill', 'nexus_register'])
     expect(res.body.data.admins.length).toBe(1)
     expect(res.body.data.admins[0].id).toBe(f.superAdminUserId)
   })

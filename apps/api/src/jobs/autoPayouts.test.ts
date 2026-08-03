@@ -83,6 +83,31 @@ async function seedConnectReadyLandlord(account = 'acct_test_ll'): Promise<strin
   }
 }
 
+// S554 Stage 2: account anchored on the LANDLORD ENTITY (users.stripe_connect
+// stays NULL). The pre-Stage-2 candidate scan looked only at `users` and would
+// strand this landlord's rent. Returns the founding user id.
+async function seedEntityAnchoredLandlord(account = 'acct_entity_ll'): Promise<string> {
+  const c = await db.connect()
+  try {
+    await c.query('BEGIN')
+    const { userId, landlordId } = await seedLandlord(c)
+    await c.query(
+      `UPDATE landlords
+          SET stripe_connect_account_id = $2,
+              connect_payouts_enabled   = true,
+              connect_details_submitted = true
+        WHERE id = $1`,
+      [landlordId, account]
+    )
+    await c.query('COMMIT')
+    return userId
+  } catch (e) {
+    await c.query('ROLLBACK'); throw e
+  } finally {
+    c.release()
+  }
+}
+
 describe('shouldRunToday — Tuesday gate (D1)', () => {
   it('is TRUE on Tuesday', () => {
     expect(shouldRunToday(TUESDAY)).toBe(true)
@@ -130,6 +155,37 @@ describe('processAutoPayouts — Phase 2 platform-holds merge', () => {
     )
     expect(disp.rows).toHaveLength(1)
     expect(disp.rows[0]).toMatchObject({ status: 'processing', trigger_type: 'auto_friday' })
+  })
+
+  it('sweeps an ENTITY-anchored landlord (Stage 2: account on landlords, users NULL)', async () => {
+    const userId = await seedEntityAnchoredLandlord('acct_entity_1')
+    const res = await processAutoPayouts(TUESDAY)
+
+    // The pre-Stage-2 scan (users-only) would have missed this entirely.
+    expect(res.candidatesScanned).toBe(1)
+    expect(res.payoutsFired).toBe(1)
+    // Reconcile keyed by the founding user (it re-resolves the entity account
+    // internally via COALESCE(entity, user)).
+    expect(reconcileMock).toHaveBeenCalledWith(userId)
+    // Payout fired against the ENTITY account, not a user account.
+    expect(firePayoutMock).toHaveBeenCalledTimes(1)
+    expect((firePayoutMock.mock.calls as any[])[0][0]).toMatchObject({ connectAccountId: 'acct_entity_1' })
+  })
+
+  it('does NOT scan an entity landlord whose entity payouts are not yet enabled', async () => {
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const { landlordId } = await seedLandlord(c)
+      // Entity account present but readiness flags still false (KYC incomplete).
+      await c.query(
+        `UPDATE landlords SET stripe_connect_account_id='acct_entity_pending' WHERE id=$1`,
+        [landlordId])
+      await c.query('COMMIT')
+    } finally { c.release() }
+    const res = await processAutoPayouts(TUESDAY)
+    expect(res.candidatesScanned).toBe(0)
+    expect(firePayoutMock).not.toHaveBeenCalled()
   })
 
   it('still fires the payout when the landlord is owed nothing to reconcile', async () => {

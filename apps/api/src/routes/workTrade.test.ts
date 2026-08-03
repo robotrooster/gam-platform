@@ -145,14 +145,15 @@ describe('POST /  — S397 tenant scope fix', () => {
     expect(res.status).toBe(404)
   })
 
-  it('S397 fix: stranger tenantId (no lease in caller portfolio) → 404; no row created', async () => {
+  it('S397 → S576 (B-8): stranger tenantId (no active lease on this unit) → 400; no row created', async () => {
     const f = await seed()
     const res = await request(buildApp())
       .post('/api/work-trade/')
       .set('Authorization', `Bearer ${f.tokenA}`)
       .send({ unitId: f.unitAId, tenantId: f.tenantBId, startDate: '2026-06-01' }) // B's tenant, A's unit
-    expect(res.status).toBe(404)
-    expect(res.body.error).toMatch(/no lease under this landlord/i)
+    // B-8: work trade now requires an ACTIVE lease for this tenant on this unit.
+    expect(res.status).toBe(400)
+    expect(res.body.error).toMatch(/no active lease on this unit/i)
     const rows = await db.query(`SELECT id FROM work_trade_agreements`)
     expect(rows.rows).toHaveLength(0)
   })

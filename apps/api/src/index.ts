@@ -24,6 +24,7 @@ import { camelCaseKeys } from './lib/caseConversion'
 import { recordLatency } from './lib/apiMetrics'
 import { authRouter }         from './routes/auth'
 import { totpRouter }         from './routes/totp'
+import { emailOtpRouter }     from './routes/emailOtp'
 import { landlordsRouter }    from './routes/landlords'
 import { landlordAgentActivityRouter } from './routes/landlordAgentActivity'
 import { pmAgentActivityRouter } from './routes/pmAgentActivity'
@@ -33,6 +34,7 @@ import { businessCustomersRouter } from './routes/businessCustomers'
 import { businessInvoicesRouter } from './routes/businessInvoices'
 import { businessInventoryRouter } from './routes/businessInventory'
 import { businessPosRouter } from './routes/businessPos'
+import { posLockRouter } from './routes/posLock'
 import { businessDiscountsRouter } from './routes/businessDiscounts'
 import { businessVehiclesRouter } from './routes/businessVehicles'
 import { businessWorkOrdersRouter } from './routes/businessWorkOrders'
@@ -60,6 +62,14 @@ import { unitsRouter }        from './routes/units'
 import { propertyBookingAdminRouter } from './routes/propertyBookingAdmin'
 import { telemetryRouter } from './routes/telemetry'
 import { leasesRouter }       from './routes/leases'
+import { homeSaleRouter }     from './routes/homeSale'
+import { homeOwnershipRouter } from './routes/homeOwnership'
+import { lotRentRouter }      from './routes/lotRent'
+import { expensesRouter }     from './routes/expenses'
+import { bankReconciliationRouter } from './routes/bankReconciliation'
+import { bankFeedRouter }     from './routes/bankFeed'
+import { featureRequestsRouter } from './routes/featureRequests'
+import { tenantWalkthroughsRouter } from './routes/tenantWalkthroughs'
 import { subleasesRouter }    from './routes/subleases'
 import { subleaseInvitationsRouter } from './routes/subleaseInvitations'
 import { posCustomerOnboardingRouter } from './routes/posCustomerOnboarding'
@@ -92,7 +102,6 @@ import { commonAreasRouter }  from './routes/commonAreas'
 import { serviceInterruptionsRouter } from './routes/serviceInterruptions'
 import { agentRouter, salesAgentRouter, guestAgentRouter } from './routes/agent'
 import { entryRequestsRouter } from './routes/entryRequests'
-import { bulletinRouter }      from './routes/bulletin'
 import { notificationsRouter } from './routes/notifications'
 import { bankAccountsRouter } from './routes/bankAccounts'
 import { adminBankAccountsRouter } from './routes/admin/bankAccounts'
@@ -267,6 +276,7 @@ app.get('/health', (_req, res) => res.json({ status: 'ok', ts: new Date() }))
 
 app.use('/api/auth',          authRouter)
 app.use('/api/auth/totp',     totpRouter)
+app.use('/api/auth/email-otp', emailOtpRouter)
 app.use('/api/landlords',     landlordsRouter)
 app.use('/api/landlord/agent-activity', landlordAgentActivityRouter)
 app.use('/api/businesses',    businessesRouter)
@@ -275,6 +285,7 @@ app.use('/api/business-customers', businessCustomersRouter)
 app.use('/api/business-invoices',  businessInvoicesRouter)
 app.use('/api/business-inventory', businessInventoryRouter)
 app.use('/api/business-pos', businessPosRouter)
+app.use('/api/pos-lock', posLockRouter)
 app.use('/api/business-discounts', businessDiscountsRouter)
 app.use('/api/business-vehicles', businessVehiclesRouter)
 app.use('/api/business-work-orders', businessWorkOrdersRouter)
@@ -303,6 +314,14 @@ app.use('/api/units',         unitsRouter)
 app.use('/api',               propertyBookingAdminRouter)
 app.use('/api',               telemetryRouter)
 app.use('/api/leases',        leasesRouter)
+app.use('/api/home-sales',    homeSaleRouter)
+app.use('/api/home-ownerships', homeOwnershipRouter)
+app.use('/api/lot-rent',      lotRentRouter)
+app.use('/api/expenses',      expensesRouter)
+app.use('/api/bank-reconciliations', bankReconciliationRouter)
+app.use('/api/bank-feed',         bankFeedRouter)
+app.use('/api/feature-requests',  featureRequestsRouter)
+app.use('/api/tenant-walkthroughs', tenantWalkthroughsRouter)
 app.use('/api/subleases',     subleasesRouter)
 app.use('/api/sublease-invitations', subleaseInvitationsRouter)
 app.use('/api/pos-customer-onboarding', posCustomerOnboardingRouter)
@@ -335,7 +354,6 @@ app.use('/api/esign',         esignRouter)
 app.use('/api/announcements',  announcementsRouter)
 app.use('/api/property-tax',   propertyTaxRouter)
 app.use('/api/real-estate-law', realEstateLawRouter)
-app.use('/api/bulletin',       bulletinRouter)
   app.use('/api/background',    backgroundRouter)
 app.use('/api/fitness',        fitnessRouter)
 app.use('/api/notifications',  notificationsRouter)

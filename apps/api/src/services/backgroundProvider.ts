@@ -247,7 +247,12 @@ class CheckrProvider implements BackgroundProvider {
         failureReason: 'Provider rejected: missing required consents',
       }
     }
-    const pkg = process.env.CHECKR_PACKAGE || 'starter'
+    // S564 (Nic): ONE package platform-wide, hardcoded — never env- or
+    // landlord-configurable. A single Essential screen for every applicant on
+    // every route/state removes any lever for a landlord to order a lighter or
+    // heavier check per applicant (discrimination guard). To change the platform
+    // package, change it here deliberately.
+    const pkg = 'essential'
     if (!req.property) {
       return {
         providerRef: '',

@@ -19,8 +19,7 @@
 // The existing ~91 snake_case zod fields are pre-S317 legacy
 // and migrate in subsequent sessions when their surrounding code
 // is touched (fix-it-right when nearby; not a separate refactor
-// pass). The 5 high-confidence pairs aligned in S317:
-//   - POST  /bulletin/:id/vote                (voteType)
+// pass). The high-confidence pairs aligned in S317:
 //   - PATCH /properties/:id/manager           (userId)
 //   - PATCH /landlords/me/default-pm-company  (pmCompanyId)
 //   - PATCH /inspections/:id                  (scheduledFor)

@@ -180,6 +180,9 @@ export function LeasePage() {
   const [renewalIntent, setRenewalIntent] = useState<'yes'|'no'|'unsure'|null>(null)
   const [renewalNotes, setRenewalNotes] = useState('')
   const [renewalSubmitted, setRenewalSubmitted] = useState(false)
+  // "No, moving out" is BINDING written notice of non-renewal (Nic) — gate it
+  // behind an explicit confirmation before it goes to the landlord.
+  const [confirmNoRenew, setConfirmNoRenew] = useState(false)
   const leaseDocRef = useRef<HTMLDivElement>(null)
 
   // S554 (Oak Park): a tenant can hold >1 active lease (e.g. space rent on two
@@ -220,7 +223,10 @@ export function LeasePage() {
     ? Math.ceil((new Date(lease.endDate).getTime() - Date.now()) / 86400000) : null
   const needsTenantSig = lease.signedByLandlord && !lease.signedByTenant
   const fullyExecuted = lease.signedByLandlord && lease.signedByTenant
-  const showRenewalSurvey = daysToExpiry !== null && daysToExpiry <= 60 && daysToExpiry > 0 && !renewalSubmitted && !lease.tenantRenewalIntent && fullyExecuted
+  // S562 (Nic): landlord-first — the survey ONLY releases to the tenant AFTER the
+  // landlord has offered renewal (landlord_renewal_offered_at). No reason to ask
+  // the tenant if the landlord doesn't plan to renew.
+  const showRenewalSurvey = daysToExpiry !== null && daysToExpiry <= 60 && daysToExpiry > 0 && !renewalSubmitted && !lease.tenantRenewalIntent && fullyExecuted && !!lease.landlordRenewalOfferedAt
 
   return (
     <div>
@@ -392,8 +398,8 @@ export function LeasePage() {
       {/* Renewal survey */}
       {showRenewalSurvey && (
         <div style={{ background:'var(--bg-2)', border:'1px solid var(--border-0)', borderRadius:12, padding:20, marginBottom:20 }}>
-          <div style={{ fontFamily:'var(--font-display)', fontSize:'.95rem', fontWeight:800, color:'var(--text-0)', marginBottom:6 }}>Do you plan to renew your lease?</div>
-          <div style={{ fontSize:'.78rem', color:'var(--text-3)', marginBottom:16 }}>Your landlord needs to know your plans. This helps them prepare for renewal or find a new tenant.</div>
+          <div style={{ fontFamily:'var(--font-display)', fontSize:'.95rem', fontWeight:800, color:'var(--text-0)', marginBottom:6 }}>Your landlord is offering to renew — do you want to?</div>
+          <div style={{ fontSize:'.78rem', color:'var(--text-3)', marginBottom:16 }}>Your landlord is willing to renew your lease. Let them know your plans so they can prepare the renewal or, if you're leaving, find a new tenant.</div>
           <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:8, marginBottom:14 }}>
             {[
               { val:'yes', icon:'✅', label:'Yes, I plan to renew' },
@@ -407,9 +413,36 @@ export function LeasePage() {
             ))}
           </div>
           <textarea placeholder="Any notes for your landlord? (optional)" value={renewalNotes} onChange={e => setRenewalNotes(e.target.value)} rows={2} style={{ width:'100%', marginBottom:10, resize:'none', fontFamily:'inherit', fontSize:'.78rem', padding:'8px 10px', background:'var(--bg-3)', border:'1px solid var(--border-0)', borderRadius:8, color:'var(--text-0)' }} />
-          <button className="btn btn-primary" disabled={!renewalIntent || renewalMut.isLoading} onClick={() => renewalMut.mutate()}>
+          <button className="btn btn-primary" disabled={!renewalIntent || renewalMut.isLoading}
+            onClick={() => renewalIntent === 'no' ? setConfirmNoRenew(true) : renewalMut.mutate()}>
             {renewalMut.isLoading ? <span className="spinner" /> : 'Submit Response'}
           </button>
+        </div>
+      )}
+
+      {/* Binding non-renewal confirmation (Nic) — the tenant's "no" is written
+          notice; make the commitment + continued liability explicit before it
+          goes to the landlord. Not an early move-out (that's a separate flow). */}
+      {confirmNoRenew && (
+        <div className="modal-overlay" onClick={() => setConfirmNoRenew(false)}>
+          <div className="modal" style={{ maxWidth: 460 }} onClick={e => e.stopPropagation()}>
+            <div className="modal-title" style={{ marginBottom: 12 }}>Confirm your notice not to renew</div>
+            <div style={{ fontSize: '.82rem', color: 'var(--text-1)', lineHeight: 1.6, marginBottom: 16 }}>
+              This is your <strong>binding written notice</strong> that you will not renew your lease.
+              Your landlord will be notified.
+              <ul style={{ margin: '10px 0 0 18px', padding: 0 }}>
+                <li>Your lease ends on <strong>{lease.endDate ? new Date(lease.endDate).toLocaleDateString() : 'its end date'}</strong>, and you are responsible for rent through that date.</li>
+                <li>This is <strong>not</strong> an early move-out. If you need to leave before your end date, that is a separate request with different terms.</li>
+              </ul>
+            </div>
+            <div className="modal-footer" style={{ display: 'flex', justifyContent: 'flex-end', gap: 10 }}>
+              <button className="btn btn-ghost" onClick={() => setConfirmNoRenew(false)}>Cancel</button>
+              <button className="btn btn-primary" disabled={renewalMut.isLoading}
+                onClick={() => { setConfirmNoRenew(false); renewalMut.mutate() }}>
+                {renewalMut.isLoading ? <span className="spinner" /> : 'Confirm — I will not renew'}
+              </button>
+            </div>
+          </div>
         </div>
       )}
 

@@ -11,6 +11,17 @@ import { sendPasswordResetEmail, sendEmailVerification } from '../services/email
 import { isDisposableEmail } from '../lib/email'
 import { signTotpSessionToken, signTotpEnrollToken } from './totp'
 import { MANDATORY_TOTP_ROLES } from '../lib/totp'
+import { signEmailOtpSessionToken, issueEmailOtp } from './emailOtp'
+
+// S574 (Nic): roles for which email-code 2FA is MANDATORY at every login,
+// canonicalized on first sign-in and backfilled by migration. These accounts
+// each control private data + money flow (a tenant's lease, a landlord's whole
+// portfolio, a business owner's reports + payouts), so a second factor is
+// non-negotiable. Email-code ONLY — none of these portals expose authenticator
+// enrollment. business_staff cashiers are deliberately excluded (register
+// passcode, transaction-scoped). Legacy TOTP accounts still verify via the
+// authenticator branch above; no new account in these roles can enroll one.
+const UNIVERSAL_EMAIL_2FA_ROLES = new Set<string>(['tenant', 'landlord', 'business_owner'])
 
 // S80: scope-table dispatch for login / refresh JWT claims. Replaced the
 // pre-S80 team_members LEFT JOIN. Role-keyed lookup against the right
@@ -100,6 +111,10 @@ const registerSchema = z.object({
   lastName:  z.string().min(1),
   phone:     z.string().optional(),
   role:      z.enum(['landlord', 'tenant']),
+  // S567: portfolio-manager referral code. A landlord self-registering with a
+  // rep's code is attributed to that rep as CLOSING manager (protects the rep
+  // when the landlord signs up on their own instead of an assisted flow).
+  referralCode: z.string().trim().min(1).optional(),
   // Legal acceptance — frontend gate sets this true when the user
   // checks the Terms + Privacy acknowledgement at registration.
   // We refuse the request if it's false or missing so the timestamps
@@ -151,8 +166,28 @@ authRouter.post('/register', async (req, res, next) => {
 
       let profileId: string
       if (body.role === 'landlord') {
+        // S567: resolve a referral code. A rep's code (admin/super_admin) sets
+        // the closing portfolio manager; a LANDLORD's code sets referred_by
+        // (that landlord earns the closing residual, CS routes to a PM).
+        // Unknown codes are ignored (self-closed), never an error.
+        let closerId: string | null = null
+        let referredByUserId: string | null = null
+        if (body.referralCode) {
+          const [ref] = await client.query(
+            `SELECT id, role FROM users WHERE referral_code = $1
+              AND role IN ('admin','super_admin','landlord')`,
+            [body.referralCode.toUpperCase()]
+          ).then((r: any) => r.rows)
+          if (ref?.role === 'landlord') referredByUserId = ref.id
+          else if (ref) closerId = ref.id
+        }
+        // S568: open the onboarding reconciliation window (21 days). While it's
+        // open the landlord can mark a tenant's FIRST GAM invoice paid off-platform
+        // (old-system autopay overlap during a migration) — see landlords.reconciliation_until.
         const [l] = await client.query(
-          `INSERT INTO landlords (user_id) VALUES ($1) RETURNING id`, [user.id]
+          `INSERT INTO landlords (user_id, portfolio_manager_id, referred_by_user_id, reconciliation_until)
+           VALUES ($1, $2, $3, NOW() + INTERVAL '21 days') RETURNING id`,
+          [user.id, closerId, referredByUserId]
         ).then(r => r.rows)
         profileId = l.id
         // S553: founding owner-membership (multi-owner entities).
@@ -334,11 +369,53 @@ authRouter.post('/login', async (req, res, next) => {
       })
     }
 
+    // S565: EMAIL-CODE 2FA (alternative to the authenticator app). If the user
+    // opted into email 2FA and has no TOTP, email a 6-digit code and return a
+    // pending session instead of the full token. Satisfies the mandatory-2FA
+    // requirement without an authenticator app.
+    // S571 (Nic): email 2FA is MANDATORY for EVERY tenant, always — from signup,
+    // no matter what — to protect their private lease data. The role check makes
+    // it universal without needing every tenant-creation path to set the flag;
+    // we also canonicalize the flag here so status/UI reads it truthfully.
+    // S574 (Nic): landlords are held to the same bar — a landlord's account
+    // controls every tenant's private data + the money flow, so email 2FA is
+    // mandatory from signup for landlords too. Email-code ONLY (no authenticator):
+    // the landlord portal exposes no TOTP enrollment, and totp_enabled fires the
+    // branch above only for legacy accounts, never a new landlord.
+    // S574 (Nic): business_owner too — the POS/business owner sees reports +
+    // sensitive business data + the money flow, so their account gets mandatory
+    // email 2FA (mirrors landlord). business_staff (cashiers) are intentionally
+    // NOT here — they authenticate with a transaction-scoped register passcode
+    // instead of a second factor (less access, no sensitive-data exposure).
+    if (UNIVERSAL_EMAIL_2FA_ROLES.has(user.role) && !user.email_2fa_enabled) {
+      await query(`UPDATE users SET email_2fa_enabled = TRUE WHERE id = $1`, [user.id])
+      user.email_2fa_enabled = true
+    }
+    if (user.email_2fa_enabled) {
+      const emailOtpSession = signEmailOtpSessionToken({
+        userId:      user.id,
+        role:        user.role,
+        email:       user.email,
+        profileId,
+        landlordId:  scope?.landlordId || null,
+        landlordIds,
+        businessId,
+        staffRole,
+        permissions: scope?.permissions || null,
+      })
+      await issueEmailOtp(user.id, user.email)
+      return res.json({
+        success: true,
+        data: { requiresEmailOtp: true, emailOtpSession },
+      })
+    }
+
     // S560: a MANDATORY-2FA role (admin/super_admin) that hasn't enrolled yet
     // gets an ENROLLMENT-ONLY pass, not a full session. requireAuth rejects it
     // everywhere except the enrollment endpoints, so "mandatory" is enforced
-    // server-side — not just by the client honoring mustEnrollTotp.
-    const mustEnroll = MANDATORY_TOTP_ROLES.has(user.role) && !user.totp_enabled
+    // server-side — not just by the client honoring mustEnrollTotp. S565: email
+    // 2FA also satisfies the mandatory requirement, so it exempts from enroll.
+    const mustEnroll = MANDATORY_TOTP_ROLES.has(user.role) && !user.totp_enabled && !user.email_2fa_enabled
     const claims = {
       userId: user.id, role: user.role, email: user.email,
       profileId,
@@ -366,7 +443,7 @@ authRouter.post('/login', async (req, res, next) => {
         // S288: forces enrollment-flow on first login post-rollout for
         // roles where TOTP is mandatory at launch. Frontend uses this
         // to gate access until totp_enabled flips TRUE.
-        mustEnrollTotp: MANDATORY_TOTP_ROLES.has(user.role) && !user.totp_enabled,
+        mustEnrollTotp: MANDATORY_TOTP_ROLES.has(user.role) && !user.totp_enabled && !user.email_2fa_enabled,
       }}
     })
   } catch (e) { next(e) }
@@ -384,7 +461,7 @@ authRouter.get('/me', requireAuth, async (req, res, next) => {
   try {
     const user = await queryOne<any>(
       `SELECT u.id, u.email, u.role, u.first_name, u.last_name, u.phone,
-         u.totp_enabled,
+         u.totp_enabled, u.email_2fa_enabled,
          COALESCE(l.id, t.id, b.id) AS profile_id,
          l.business_name, l.onboarding_complete,
          b.id   AS business_id,
@@ -394,6 +471,14 @@ authRouter.get('/me', requireAuth, async (req, res, next) => {
            SELECT 1 FROM user_bank_accounts ba
             WHERE ba.user_id = u.id AND ba.status = 'active'
          ) AS bank_account_ready,
+         -- S575: gates the "Lot Rent & Net" nav item — only surface it once the
+         -- landlord actually has a mobile-home unit (mirrors the tenant-portal
+         -- "only show what applies" principle). Owner landlords only; l.id is
+         -- NULL for non-landlord roles so the flag is false for them.
+         EXISTS (
+           SELECT 1 FROM units un
+            WHERE un.landlord_id = l.id AND un.unit_type = 'mobile_home'
+         ) AS has_mobile_home_units,
          t.ach_verified, t.on_time_pay_enrolled, t.credit_reporting_enrolled
        FROM users u
        LEFT JOIN landlords  l ON l.user_id = u.id
@@ -433,6 +518,8 @@ authRouter.get('/me', requireAuth, async (req, res, next) => {
       // landlord-portal nav can gate the /banking entry for managers
       // without an extra round-trip on each render.
       directDepositEnabled: scope?.directDepositEnabled ?? false,
+      // S575: MH-only nav gate for Lot Rent & Net (see the query comment).
+      hasMobileHomeUnits: !!user.has_mobile_home_units,
       // S289: server-computed flag — true when the user's role is in
       // MANDATORY_TOTP_ROLES AND they haven't enrolled. Frontend uses
       // it to force the /totp/enroll flow before any other route.
@@ -444,7 +531,7 @@ authRouter.get('/me', requireAuth, async (req, res, next) => {
       // wire-side, but a few consumers (and some test harnesses)
       // bypass that middleware. Both keys land at all times.
       totpEnabled:    !!user.totp_enabled,
-      mustEnrollTotp: MANDATORY_TOTP_ROLES.has(user.role) && !user.totp_enabled,
+      mustEnrollTotp: MANDATORY_TOTP_ROLES.has(user.role) && !user.totp_enabled && !user.email_2fa_enabled,
     }})
   } catch (e) { next(e) }
 })
@@ -645,7 +732,7 @@ authRouter.post('/reset-password', async (req, res, next) => {
 const verifyEmailSchema     = z.object({ token: z.string().min(1) })
 const resendVerifySchema    = z.object({ email: z.string().email() })
 
-async function mintAndSendVerifyEmail(userId: string, email: string, firstName: string | null): Promise<void> {
+export async function mintAndSendVerifyEmail(userId: string, email: string, firstName: string | null): Promise<void> {
   const token = crypto.randomBytes(32).toString('hex')
   await query(
     `UPDATE users SET email_verify_token = $1 WHERE id = $2`,

@@ -289,4 +289,46 @@ describe('GET /api/landlords/me/todos', () => {
     const failureTodos = res.body.data.ach.filter((a: any) => a.type === 'recent_failure')
     expect(failureTodos.length).toBe(0)
   })
+
+  // S576 (B-8): a work-trade agreement paused (by the lease-end processor)
+  // whose tenant now has NO active lease on the unit → surfaces a "renew to
+  // resume" todo. A paused agreement WHERE the tenant still has an active lease
+  // (a deliberate seasonal/manual pause) does NOT surface — tested below.
+  it('paused work-trade + no active lease → work_trade_paused todo', async () => {
+    const f = await seedTFixture()
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      await client.query(
+        `INSERT INTO work_trade_agreements (unit_id, tenant_id, landlord_id, start_date, status)
+         VALUES ($1, $2, $3, CURRENT_DATE - INTERVAL '90 days', 'paused')`,
+        [f.unitId, f.tenantId, f.landlordId])
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+
+    const res = await getTodos(f.landlordToken)
+    expect(res.status).toBe(200)
+    expect(res.body.data.workTrade.length).toBe(1)
+    expect(res.body.data.workTrade[0].type).toBe('work_trade_paused')
+    expect(res.body.data.counts.workTrade).toBe(1)
+  })
+
+  it('paused work-trade but tenant HAS an active lease (seasonal pause) → no todo', async () => {
+    const f = await seedTFixture()
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      const leaseId = await seedLease(client, { unitId: f.unitId, landlordId: f.landlordId })
+      await seedLeaseTenant(client, { leaseId, tenantId: f.tenantId, role: 'primary' })
+      await client.query(
+        `INSERT INTO work_trade_agreements (unit_id, tenant_id, landlord_id, start_date, status)
+         VALUES ($1, $2, $3, CURRENT_DATE - INTERVAL '90 days', 'paused')`,
+        [f.unitId, f.tenantId, f.landlordId])
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+
+    const res = await getTodos(f.landlordToken)
+    expect(res.status).toBe(200)
+    expect(res.body.data.workTrade.length).toBe(0)
+  })
 })

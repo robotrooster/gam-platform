@@ -122,10 +122,10 @@ async function seed() {
     const tHash = await bcrypt.hash('tenant1234', 12)
     const tenantData = [
       { email:'alice@tenant.dev', first:'Alice', last:'Morgan',   phone:'602-555-3001', ssi:false, late:0,  otp:false },
-      { email:'bob@tenant.dev',   first:'Bob',   last:'Chen',     phone:'602-555-3002', ssi:true,  late:2,  otp:true  },
+      { email:'bob@tenant.dev',   first:'Bob',   last:'Chen',     phone:'602-555-3002', ssi:true,  late:2,  otp:false },
       { email:'carol@tenant.dev', first:'Carol', last:'Vasquez',  phone:'602-555-3003', ssi:false, late:0,  otp:false },
       { email:'dan@tenant.dev',   first:'Dan',   last:'Okafor',   phone:'480-555-3004', ssi:false, late:1,  otp:false },
-      { email:'eva@tenant.dev',   first:'Eva',   last:'Schmidt',  phone:'480-555-3005', ssi:true,  late:3,  otp:true  },
+      { email:'eva@tenant.dev',   first:'Eva',   last:'Schmidt',  phone:'480-555-3005', ssi:true,  late:3,  otp:false },
       { email:'frank@tenant.dev', first:'Frank', last:'Williams', phone:'520-555-3006', ssi:false, late:0,  otp:false },
     ]
 
@@ -153,9 +153,9 @@ async function seed() {
     // ── UNITS ─────────────────────────────────────────────
     if (prop1?.id) {
       const units1 = [
-        { num:'101', beds:2, baths:1, rent:750,  tenant: tenants[0], status:'active',     otp:true  },
-        { num:'102', beds:1, baths:1, rent:650,  tenant: tenants[1], status:'active',     otp:true  },
-        { num:'103', beds:2, baths:2, rent:875,  tenant: tenants[2], status:'active',     otp:true  },
+        { num:'101', beds:2, baths:1, rent:750,  tenant: tenants[0], status:'active',     otp:false },
+        { num:'102', beds:1, baths:1, rent:650,  tenant: tenants[1], status:'active',     otp:false },
+        { num:'103', beds:2, baths:2, rent:875,  tenant: tenants[2], status:'active',     otp:false },
         { num:'104', beds:1, baths:1, rent:625,  tenant: null,       status:'vacant',     otp:false },
         { num:'105', beds:2, baths:1, rent:800,  tenant: tenants[3], status:'delinquent', otp:false },
         { num:'106', beds:3, baths:2, rent:1050, tenant: null,       status:'vacant',     otp:false },
@@ -173,9 +173,9 @@ async function seed() {
 
     if (prop2?.id) {
       const units2 = [
-        { num:'201', beds:2, baths:1, rent:825,  tenant: tenants[4], status:'active',  otp:true  },
+        { num:'201', beds:2, baths:1, rent:825,  tenant: tenants[4], status:'active',  otp:false },
         { num:'202', beds:2, baths:2, rent:950,  tenant: null,       status:'vacant',  otp:false },
-        { num:'203', beds:1, baths:1, rent:575,  tenant: tenants[5], status:'active',  otp:true  },
+        { num:'203', beds:1, baths:1, rent:575,  tenant: tenants[5], status:'active',  otp:false },
       ]
       for (const u of units2) {
         await client.query(`
@@ -375,7 +375,7 @@ async function seed() {
         ('contribution', 398, 398,   'Month 1 reserve contribution'),
         ('contribution', 796, 1194,  'Month 2 reserve contribution'),
         ('contribution', 796, 1990,  'Month 3 reserve contribution'),
-        ('disbursement_cover', -875, 1115, 'On-Time Pay SLA — Jan 2026 shortfall'),
+        ('disbursement_cover', -875, 1115, 'Reserve disbursement cover — Jan 2026'),
         ('contribution', 1990, 3105, 'Month 4 reserve contribution'),
         ('contribution', 1095, 4200, 'Month 5 reserve contribution')
       ON CONFLICT DO NOTHING`)
@@ -393,7 +393,7 @@ async function seed() {
     console.log('   Landlord: maria@demo.dev                / landlord1234')
     console.log('   Landlord: realestaterhoades@gmail.com   / landlord1234  (Nic, no portfolio)')
     console.log('   Tenant:   alice@tenant.dev              / tenant1234')
-    console.log('   Tenant:   bob@tenant.dev                / tenant1234  (SSI, On-Time Pay enrolled)')
+    console.log('   Tenant:   bob@tenant.dev                / tenant1234  (SSI recipient)')
     console.log('   Tenant:   eva@tenant.dev                / tenant1234  (SSI, delinquent history)\n')
 
   } catch (err: any) {

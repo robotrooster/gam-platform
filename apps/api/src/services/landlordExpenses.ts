@@ -1,0 +1,126 @@
+// Landlord-entered expenses (S568, Nic). Unit-linked or common (property-level);
+// common expenses can be allocated per unit for per-unit P&L. Feeds the landlord
+// reports P&L. Soft-void, never hard-delete (keep-everything).
+import { query, queryOne } from '../db'
+import { AppError } from '../middleware/errorHandler'
+import { EXPENSE_CATEGORIES } from '@gam/shared'
+
+export interface CreateExpenseInput {
+  landlordId: string
+  createdBy?: string | null
+  propertyId?: string | null
+  unitId?: string | null
+  category: string
+  amount: number
+  description?: string | null
+  vendor?: string | null
+  expenseDate: string          // YYYY-MM-DD
+  isCommon?: boolean
+  allocatePerUnit?: boolean
+}
+
+export async function createLandlordExpense(input: CreateExpenseInput) {
+  if (!(EXPENSE_CATEGORIES as readonly string[]).includes(input.category)) {
+    throw new AppError(400, `Invalid expense category '${input.category}'`)
+  }
+  // Unit-linked ⇒ not common. Common ⇒ property-level (no unit). Validate + verify
+  // the unit/property belong to this landlord.
+  const unitId = input.unitId ?? null
+  const isCommon = !!input.isCommon && !unitId
+  let propertyId = input.propertyId ?? null
+
+  if (unitId) {
+    const u = await queryOne<any>('SELECT id, property_id, landlord_id FROM units WHERE id=$1', [unitId])
+    if (!u || u.landlord_id !== input.landlordId) throw new AppError(400, 'Unit does not belong to you')
+    propertyId = u.property_id
+  } else if (propertyId) {
+    const p = await queryOne<any>('SELECT id, landlord_id FROM properties WHERE id=$1', [propertyId])
+    if (!p || p.landlord_id !== input.landlordId) throw new AppError(400, 'Property does not belong to you')
+  }
+  const allocate = isCommon && !!input.allocatePerUnit
+
+  const row = await queryOne<any>(
+    `INSERT INTO landlord_expenses
+       (landlord_id, created_by, property_id, unit_id, category, amount, description, vendor,
+        expense_date, is_common, allocate_per_unit)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
+    [input.landlordId, input.createdBy ?? null, propertyId, unitId, input.category,
+     input.amount.toFixed(2), input.description ?? null, input.vendor ?? null,
+     input.expenseDate, isCommon, allocate])
+  return row
+}
+
+export async function listLandlordExpenses(landlordId: string, opts: { from?: string; to?: string; propertyId?: string; unitId?: string } = {}) {
+  const conds = ['e.landlord_id = $1', `e.status = 'active'`]
+  const params: any[] = [landlordId]
+  if (opts.from) { params.push(opts.from); conds.push(`e.expense_date >= $${params.length}`) }
+  if (opts.to)   { params.push(opts.to);   conds.push(`e.expense_date <= $${params.length}`) }
+  if (opts.propertyId) { params.push(opts.propertyId); conds.push(`e.property_id = $${params.length}`) }
+  if (opts.unitId) { params.push(opts.unitId); conds.push(`e.unit_id = $${params.length}`) }
+  return query<any>(
+    `SELECT e.id, e.category, e.amount::float AS amount, e.description, e.vendor, e.expense_date,
+            e.is_common, e.allocate_per_unit, e.unit_id, e.property_id,
+            e.receipt_url, e.receipt_name, e.receipt_mime, e.receipt_size,
+            u.unit_number, p.name AS property_name
+       FROM landlord_expenses e
+       LEFT JOIN units u ON u.id = e.unit_id
+       LEFT JOIN properties p ON p.id = e.property_id
+      WHERE ${conds.join(' AND ')}
+      ORDER BY e.expense_date DESC, e.created_at DESC`, params)
+}
+
+/**
+ * Attach an uploaded receipt to an existing active expense. Scoped by landlord
+ * so a landlord can only stamp a receipt onto their own row. (S575)
+ */
+export async function attachExpenseReceipt(
+  id: string, landlordId: string,
+  receipt: { url: string; name: string; mime: string; size: number },
+) {
+  const row = await queryOne<any>(
+    `UPDATE landlord_expenses
+        SET receipt_url=$3, receipt_name=$4, receipt_mime=$5, receipt_size=$6, updated_at=NOW()
+      WHERE id=$1 AND landlord_id=$2 AND status='active'
+      RETURNING id, receipt_url, receipt_name, receipt_mime, receipt_size`,
+    [id, landlordId, receipt.url, receipt.name, receipt.mime, receipt.size])
+  if (!row) throw new AppError(404, 'Expense not found')
+  return row
+}
+
+export async function voidLandlordExpense(id: string, landlordId: string) {
+  const row = await queryOne<{ id: string }>(
+    `UPDATE landlord_expenses SET status='voided', voided_at=NOW(), updated_at=NOW()
+      WHERE id=$1 AND landlord_id=$2 AND status='active' RETURNING id`, [id, landlordId])
+  if (!row) throw new AppError(404, 'Expense not found or already voided')
+}
+
+/** Total active landlord-entered expenses for a landlord in a date range (P&L). */
+export async function landlordExpensesTotal(landlordId: string, from: string, to: string): Promise<number> {
+  const r = await queryOne<{ total: string }>(
+    `SELECT COALESCE(SUM(amount),0)::text AS total FROM landlord_expenses
+      WHERE landlord_id=$1 AND status='active' AND expense_date >= $2 AND expense_date <= $3`,
+    [landlordId, from, to])
+  return Math.round(parseFloat(r?.total ?? '0') * 100) / 100
+}
+
+/**
+ * Expense attributable to a single UNIT in a range, for per-unit P&L:
+ * unit-linked expenses in full + each allocate_per_unit common expense on the
+ * unit's property divided by that property's unit count.
+ */
+export async function unitAllocatedExpenses(unitId: string, from: string, to: string): Promise<number> {
+  const direct = await queryOne<{ total: string }>(
+    `SELECT COALESCE(SUM(amount),0)::text AS total FROM landlord_expenses
+      WHERE unit_id=$1 AND status='active' AND expense_date >= $2 AND expense_date <= $3`,
+    [unitId, from, to])
+  const allocated = await queryOne<{ total: string }>(
+    `SELECT COALESCE(SUM(e.amount / NULLIF(uc.n, 0)), 0)::text AS total
+       FROM landlord_expenses e
+       JOIN units target ON target.id = $1
+       JOIN LATERAL (SELECT COUNT(*)::int AS n FROM units u2 WHERE u2.property_id = target.property_id) uc ON TRUE
+      WHERE e.property_id = target.property_id AND e.unit_id IS NULL
+        AND e.is_common = TRUE AND e.allocate_per_unit = TRUE AND e.status='active'
+        AND e.expense_date >= $2 AND e.expense_date <= $3`,
+    [unitId, from, to])
+  return Math.round((parseFloat(direct?.total ?? '0') + parseFloat(allocated?.total ?? '0')) * 100) / 100
+}

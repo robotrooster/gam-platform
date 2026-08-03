@@ -9,6 +9,8 @@ import {
 import { calculateRiskScore } from '../services/riskScore'
 import { findStayConflict } from '../services/unitAvailability'
 import { getProvider } from '../services/backgroundProvider'
+import { getPoolIntakeShell, isPoolIntakeLandlord } from '../services/poolIntake'
+import { PROCESSING_FEES } from '@gam/shared'
 import { refundBackgroundCheckPayment } from '../services/backgroundRefund'
 import { query, queryOne } from '../db'
 import { requireAuth, requireAdmin, requirePerm } from '../middleware/auth'
@@ -70,6 +72,61 @@ const IV_LENGTH = 16
 //   never makes a payment; it's a receivable, per gam-checkr-billing-model).
 const SCREENING_CHECKR_COST_USD = parseFloat(process.env.SCREENING_CHECKR_COST_USD || '37.94')
 const SCREENING_GAM_MARGIN_USD = parseFloat(process.env.SCREENING_GAM_MARGIN_USD || '5')
+
+// S564/S565: renter-pool applicants pay for their OWN portable screen — one
+// flat national price, the same base every applicant pays (the landlord route
+// bills the landlord instead, who passes it through per state law). Itemized so
+// the books hold each line separately:
+//   screening  = Checkr Essential cost passed through
+//   gamFee     = GAM's flat margin
+//   tax        = per-state screening-service sales tax. TWO-LAYER + gated
+//                (state_screening_tax_rates × state_tax_registrations): a state
+//                must be BOTH taxable AND one GAM has registered in before a
+//                cent is collected. Registered nowhere yet → $0 everywhere.
+//                Base = the SCREENING line only (per each row's `basis`); the
+//                GAM margin (SaaS) + card processing (financial service) are
+//                separate untaxed lines. See migration 20260729100000 +
+//                gam-checkr-billing-model.
+//   processing = card fee the applicant covers (GAM eats no fees), on the full
+//                charged amount (incl. any tax — the processor bills on gross).
+//
+// S565: the applicant's state drives the tax lookup, so this is now async +
+// state-parameterized. Callers that don't know the state (or the landlord
+// route, which is waived) pass null → tax 0.
+async function screeningIntakeTax(applicantState: string | null | undefined, parts: { screening: number; gamFee: number }): Promise<number> {
+  if (!applicantState || applicantState.length !== 2) return 0
+  const st = applicantState.toUpperCase()
+  const year = new Date().getFullYear()
+  // Latest catalog row for the state at-or-before the current year (survives the
+  // annual-refresh gap before next year's rows land), gated on an active
+  // registration. Non-registered / non-taxable / no-row → no collection.
+  const row = await queryOne<{ rate_pct: string; basis: string }>(
+    `SELECT r.rate_pct, r.basis
+       FROM state_screening_tax_rates r
+       JOIN state_tax_registrations g
+         ON g.state_code = r.state_code AND g.registered = true
+      WHERE r.state_code = $1 AND r.effective_year <= $2 AND r.taxable = true
+      ORDER BY r.effective_year DESC
+      LIMIT 1`,
+    [st, year]
+  ).catch(() => null)
+  if (!row) return 0
+  const base =
+    row.basis === 'screening_plus_gamfee' || row.basis === 'total'
+      ? parts.screening + parts.gamFee
+      : parts.screening
+  return Math.round(base * (parseFloat(row.rate_pct) / 100) * 100) / 100
+}
+
+export async function screeningIntakeFee(applicantState?: string | null) {
+  const screening = SCREENING_CHECKR_COST_USD
+  const gamFee = SCREENING_GAM_MARGIN_USD
+  const tax = await screeningIntakeTax(applicantState, { screening, gamFee })
+  const preProcessing = screening + gamFee + tax
+  const processing = Math.round((preProcessing * PROCESSING_FEES.CARD_PCT + PROCESSING_FEES.CARD_FLAT) * 100) / 100
+  const total = Math.round((preProcessing + processing) * 100) / 100
+  return { screening, gamFee, tax, processing, total }
+}
 const POOL_REPORT_UNLOCK_USD = parseFloat(process.env.POOL_REPORT_UNLOCK_USD || '1')
 
 function encrypt(text: string): string {
@@ -183,16 +240,37 @@ backgroundRouter.get('/price', async (req, res) => {
 // POST /api/background/payment-intent
 // S561: retained for client compatibility only — the applicant is not charged
 // for screening (GAM bills the landlord), so this always reports fee waived.
-backgroundRouter.post('/payment-intent', requireAuth, async (_req, res, next) => {
+backgroundRouter.post('/payment-intent', requireAuth, async (req, res, next) => {
   try {
-    // S561: the applicant no longer pays for screening — GAM bills the
-    // landlord (see the landlord screening-charge model above). This route is
-    // retained so existing clients don't 404; it always reports the fee waived
-    // so the intake UI skips the card step. (Pool-report unlock has its own
-    // route and still charges.)
+    // S564: two routes. LANDLORD route — the applicant is NOT charged here (GAM
+    // bills the landlord, who passes through per state law), so the fee is waived
+    // and the intake UI skips the card step. POOL (speculative, no landlordId)
+    // route — the applicant pays GAM directly for their own portable screen.
+    const landlordId = req.body?.landlordId || null
+    if (landlordId) {
+      return res.json({
+        success: true,
+        data: { clientSecret: null, intentId: null, amount: 0, feeWaived: true, testMode: !STRIPE_LIVE },
+      })
+    }
+    const fee = await screeningIntakeFee(req.body?.state || null)
+    if (!STRIPE_LIVE) {
+      const mockId = 'pi_bgc_mock_' + crypto.randomBytes(8).toString('hex')
+      return res.json({
+        success: true,
+        data: { clientSecret: mockId + '_secret', intentId: mockId, amount: fee.total, breakdown: fee, feeWaived: false, testMode: true },
+      })
+    }
+    const intent = await stripeForBgc!.paymentIntents.create({
+      amount: Math.round(fee.total * 100),
+      currency: 'usd',
+      payment_method_types: ['card'],
+      description: 'GAM renter-pool background screening',
+      metadata: { kind: 'background_check_intake', userId: req.user!.userId, feeUsd: String(fee.total) },
+    })
     res.json({
       success: true,
-      data: { clientSecret: null, intentId: null, amount: 0, feeWaived: true, testMode: !STRIPE_LIVE },
+      data: { clientSecret: intent.client_secret, intentId: intent.id, amount: fee.total, breakdown: fee, feeWaived: false, testMode: false },
     })
   } catch (e) { next(e) }
 })
@@ -265,8 +343,18 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
     // Default to 'mock' for speculative (no landlord) since the row will be
     // claimed by a landlord later via the pool and re-run under their
     // provider then.
+    // S564: speculative (renter-pool) intakes anchor at the GAM shell landlord +
+    // property so Checkr Tenant has a property to run against; on completion the
+    // check auto-migrates into application_pool. Non-speculative intakes resolve
+    // the provider from the targeted landlord as before.
+    let effectiveLandlordId: string | null = landlordId || null
     let providerName: string = 'mock'
-    if (landlordId) {
+    if (isSpeculative) {
+      const shell = await getPoolIntakeShell()
+      if (!shell) throw new AppError(503, 'Renter pool intake is not set up')
+      effectiveLandlordId = shell.landlordId
+      providerName = shell.backgroundProvider
+    } else {
       const landlordRow = await queryOne<{ background_provider: string }>(
         'SELECT background_provider FROM landlords WHERE id=$1',
         [landlordId]
@@ -278,6 +366,18 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
     // apply flow — GAM neither requires nor stores an SSN for those intakes.
     const providerCollectsPii = providerName === 'checkr'
     if (!providerCollectsPii && !ssn) throw new AppError(400, 'Required fields missing')
+
+    // S564: pool (speculative) applicants pay for their own portable screen —
+    // verify the intake payment BEFORE creating the check. Landlord-route checks
+    // carry no applicant payment (the landlord is billed).
+    if (isSpeculative) {
+      if (!applicantPaymentIntentId) throw new AppError(402, 'Payment required for renter-pool screening')
+      await verifyPaymentIntent(applicantPaymentIntentId, {
+        kind: 'background_check_intake',
+        amountUsd: (await screeningIntakeFee(state)).total,
+        userId: req.user!.userId,
+      })
+    }
 
     // S561: no applicant payment step — GAM bills the landlord (below). The
     // applicantPaymentIntentId field is accepted-but-ignored for old clients.
@@ -324,7 +424,7 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
           $32
         ) RETURNING id`,
         [
-          tenant?.id || null, req.user!.userId, landlordId || null, unitId || null,
+          tenant?.id || null, req.user!.userId, effectiveLandlordId, unitId || null,
           firstName, lastName, dateOfBirth, ssnEncrypted, ssnLast4,
           street1, street2 || null, city, state, zip, yearsAtAddress || null,
           employmentStatus || null, employerName || null, employerPhone || null, monthlyIncome || null,
@@ -332,7 +432,7 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
           idDocumentUrl || null, JSON.stringify(incomeDocUrls || []),
           !!consentCredit, !!consentCriminal, !!consentPool, ipAddr,
           ipAddr, ua, providerName,
-          null, // S561: applicant no longer pays; no intake PaymentIntent
+          isSpeculative ? applicantPaymentIntentId : null, // S564: pool applicants pay; landlord route billed to landlord
         ])
     } catch (e: any) {
       // Postgres unique violation on background_checks_applicant_pi_uniq —
@@ -384,7 +484,7 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
         : await queryOne<any>(
             `SELECT name, street1, street2, city, state, zip
                FROM properties WHERE landlord_id = $1
-              ORDER BY created_at LIMIT 1`, [landlordId])
+              ORDER BY created_at LIMIT 1`, [effectiveLandlordId])
       if (prop) {
         screeningProperty = {
           name:    prop.name || null,
@@ -870,9 +970,11 @@ backgroundRouter.get('/suggest-address', async (req, res) => {
 
 // ── PROVIDER WEBHOOK ─────────────────────────────────────────
 // HMAC-verified per provider. Mock provider passes through if no secret set.
-// NOTE: real provider HMAC verification needs raw-body wiring in index.ts —
-// the global JSON parser strips the raw form. Mock works without it because
-// the secret is optional. Raw-body wiring is a deferred follow-up.
+// Raw-body wiring IS in place (index.ts mounts express.raw on
+// /api/background/webhook before the global JSON parser), so real-provider
+// (Checkr) HMAC verification receives the untouched raw bytes — req.body is a
+// Buffer below. (Prior note here said this was a deferred follow-up; that was
+// stale — it's wired.)
 backgroundRouter.post('/webhook/:providerName', async (req, res, next) => {
   try {
     const provider = getProvider(req.params.providerName)
@@ -928,7 +1030,7 @@ backgroundRouter.post('/webhook/:providerName', async (req, res, next) => {
       [update.status, update.reportSummary ? JSON.stringify(update.reportSummary) : null, update.failureReason || null, check.id])
 
     // Speculative path: complete → pool (if eligible). No landlord decision step.
-    if (update.status === 'complete' && !check.landlord_id) {
+    if (update.status === 'complete' && (!check.landlord_id || await isPoolIntakeLandlord(check.landlord_id))) {
       const fresh = await queryOne<any>('SELECT * FROM background_checks WHERE id=$1', [check.id])
       if (fresh && isPoolEligible(fresh)) {
         try { await upsertPoolEntry(fresh) } catch (e) { logger.error({ err: e }, '[POOL CREATE]') }
@@ -960,7 +1062,7 @@ backgroundRouter.post('/dev-mock-webhook', requireAuth, requireAdmin, async (req
       SET status=$1, report_summary=$2, failure_reason=$3, webhook_received_at=NOW()${expiresClause}
       WHERE id=$4`,
       [update.status, update.reportSummary ? JSON.stringify(update.reportSummary) : null, update.failureReason || null, check.id])
-    if (update.status === 'complete' && !check.landlord_id) {
+    if (update.status === 'complete' && (!check.landlord_id || await isPoolIntakeLandlord(check.landlord_id))) {
       const fresh = await queryOne<any>('SELECT * FROM background_checks WHERE id=$1', [check.id])
       if (fresh && isPoolEligible(fresh)) {
         try { await upsertPoolEntry(fresh) } catch (e) { logger.error({ err: e }, '[POOL CREATE]') }

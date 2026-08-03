@@ -109,16 +109,16 @@ const css = `
   --gold:#c9a227;--green:#22c55e;--red:#ef4444;--amber:#f59e0b;--blue:#3b82f6;
   --font-d:'Syne',sans-serif;--font-b:'DM Sans',sans-serif;--font-m:'DM Mono',monospace
 }
-html{-webkit-font-smoothing:antialiased}
-body{font-family:var(--font-b);background:var(--bg0);color:var(--t1);line-height:1.6;min-height:100vh}
+html{-webkit-font-smoothing:antialiased;height:100%}
+body{font-family:var(--font-b);background:var(--bg0);color:var(--t1);line-height:1.6;height:100%;margin:0;overflow:hidden;overscroll-behavior:none}
 h1,h2,h3{font-family:var(--font-d);color:var(--t0)}
 button{cursor:pointer;font-family:var(--font-b)}
 input,select,textarea{font-family:var(--font-b)}
-.shell{display:flex;min-height:100vh}
+.shell{display:flex;height:100vh;overflow:hidden}
 .sidebar{width:220px;flex-shrink:0;background:var(--bg1);border-right:1px solid var(--b0);position:fixed;top:0;left:0;bottom:0;z-index:50;display:flex;flex-direction:column;overflow-y:auto}
-.main{flex:1;margin-left:220px;min-height:100vh;display:flex;flex-direction:column}
-.topbar{height:52px;background:var(--bg1);border-bottom:1px solid var(--b0);display:flex;align-items:center;padding:0 24px;position:sticky;top:0;z-index:40}
-.page{flex:1;padding:28px;max-width:1600px;width:100%}
+.main{flex:1;margin-left:220px;height:100vh;display:flex;flex-direction:column;min-width:0;overflow:hidden}
+.topbar{height:52px;background:var(--bg1);border-bottom:1px solid var(--b0);display:flex;align-items:center;padding:0 24px;position:sticky;top:0;z-index:40;flex-shrink:0}
+.page{flex:1;min-height:0;padding:28px;max-width:1600px;width:100%;overflow-y:auto;overflow-x:hidden;overscroll-behavior:none}
 .logo{padding:18px;border-bottom:1px solid var(--b0)}
 .logo-n{font-family:var(--font-d);font-size:1rem;font-weight:800;color:var(--gold)}
 .logo-s{font-size:.65rem;color:var(--t3);margin-top:2px;text-transform:uppercase;letter-spacing:.1em}
@@ -186,8 +186,8 @@ function Layout() {
     <div className="shell">
       <aside className="sidebar">
         <div className="logo">
-          <div className="logo-n">GAM Operations</div>
-          <div className="logo-s">Admin Console</div>
+          <div className="logo-n">GAM Support</div>
+          <div className="logo-s">Support Console</div>
         </div>
         <nav className="nav">
           <div className="nl">Onboarding</div>
@@ -204,14 +204,14 @@ function Layout() {
         <div className="sfooter">
           <div style={{padding:'6px 10px',marginBottom:4}}>
             <div style={{fontWeight:600,color:'var(--t0)',fontSize:'.78rem'}}>{user?.firstName} {user?.lastName}</div>
-            <div style={{fontSize:'.65rem',color:'var(--t3)'}}>Operations Admin</div>
+            <div style={{fontSize:'.65rem',color:'var(--t3)'}}>Support Staff</div>
           </div>
           <button className="ni" onClick={()=>{logout();navigate('/login')}} style={{color:'var(--red)'}}>🚪 Sign out</button>
         </div>
       </aside>
       <div className="main">
         <header className="topbar">
-          <span style={{fontSize:'.72rem',color:'var(--t3)',fontFamily:'var(--font-m)'}}>GAM Platform — Operations Console</span>
+          <span style={{fontSize:'.72rem',color:'var(--t3)',fontFamily:'var(--font-m)'}}>GAM Platform — Support Console</span>
         </header>
         <div className="page"><Outlet /></div>
       </div>
@@ -239,7 +239,7 @@ function Onboarding() {
   const { data: tenants = [] } = useQuery('ops-tenants', () => get<any[]>('/admin/tenants'), { enabled: !!user })
   const [tab, setTab] = useState<'landlords'|'tenants'>('landlords')
   // Operations #1: the No-Flex KPI drills into the tenants with zero flex products.
-  const hasNoFlex = (t:any) => !(t.onTimePayEnrolled||t.creditReportingEnrolled||t.flexDepositEnrolled||t.floatFeeActive)
+  const hasNoFlex = (t:any) => !(t.creditReportingEnrolled||t.flexDepositEnrolled||t.floatFeeActive)
   const [tFilter, setTFilter] = useState<'all'|'no_flex'>('all')
   const [search, setSearch] = useState('')
   const [selected, setSelected] = useState<any>(null)
@@ -337,7 +337,7 @@ function Onboarding() {
                     <td><div style={{fontWeight:600,color:'var(--t0)'}}>{t.firstName} {t.lastName}</div><div style={{fontSize:'.68rem',color:'var(--t3)'}}>{t.email}</div></td>
                     <td style={{fontSize:'.72rem'}}>{t.unitNumber||<span style={{color:'var(--t3)'}}>—</span>}</td>
                     <td><span className={`badge ${t.achVerified?'bg2':'br'}`}>{t.achVerified?'✓':'No'}</span></td>
-                    <td><span className={`badge ${(t.onTimePayEnrolled||t.creditReportingEnrolled||t.flexDepositEnrolled||t.floatFeeActive)?'bg2':'bmu'}`}>{(t.onTimePayEnrolled||t.creditReportingEnrolled||t.flexDepositEnrolled||t.floatFeeActive)?'Active':'None'}</span></td>
+                    <td><span className={`badge ${(t.creditReportingEnrolled||t.flexDepositEnrolled||t.floatFeeActive)?'bg2':'bmu'}`}>{(t.creditReportingEnrolled||t.flexDepositEnrolled||t.floatFeeActive)?'Active':'None'}</span></td>
                   </tr>
                 ))}
                 {filteredT.length===0&&<tr><td colSpan={4}><div className="empty">No tenants found</div></td></tr>}
@@ -483,7 +483,7 @@ function Tenants() {
                     <td><div style={{fontWeight:600,color:'var(--t0)'}}>{t.firstName} {t.lastName}</div><div style={{fontSize:'.68rem',color:'var(--t3)'}}>{t.email}</div></td>
                     <td style={{fontSize:'.72rem'}}>{t.unitNumber?`${t.propertyName} · ${t.unitNumber}`:<span style={{color:'var(--t3)'}}>—</span>}</td>
                     <td><span className={`badge ${t.achVerified?'bg2':'br'}`}>{t.achVerified?'✓':'No'}</span></td>
-                    <td><span className={`badge ${(t.onTimePayEnrolled||t.creditReportingEnrolled||t.flexDepositEnrolled||t.floatFeeActive)?'bg2':'bmu'}`}>{(t.onTimePayEnrolled||t.creditReportingEnrolled||t.flexDepositEnrolled||t.floatFeeActive)?'Active':'None'}</span></td>
+                    <td><span className={`badge ${(t.creditReportingEnrolled||t.flexDepositEnrolled||t.floatFeeActive)?'bg2':'bmu'}`}>{(t.creditReportingEnrolled||t.flexDepositEnrolled||t.floatFeeActive)?'Active':'None'}</span></td>
                     <td className="mono" style={{color:(t.latePaymentCount||0)>1?'var(--amber)':'var(--t3)'}}>{t.latePaymentCount||0}</td>
                   </tr>
                 ))}
@@ -684,7 +684,7 @@ function LoginPage() {
       <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',background:'var(--bg0)',padding:20}}>
         <div style={{width:'100%',maxWidth:380}}>
           <div style={{textAlign:'center',marginBottom:40}}>
-            <div style={{fontFamily:'var(--font-d)',fontSize:'1.8rem',fontWeight:800,color:'var(--gold)',marginBottom:8}}>GAM Operations</div>
+            <div style={{fontFamily:'var(--font-d)',fontSize:'1.8rem',fontWeight:800,color:'var(--gold)',marginBottom:8}}>GAM Support</div>
             <div style={{color:'var(--t3)',fontSize:'.82rem'}}>Two-factor authentication</div>
           </div>
           <div className="card" style={{padding:24}}>
@@ -727,8 +727,8 @@ function LoginPage() {
     <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',background:'var(--bg0)',padding:20}}>
       <div style={{width:'100%',maxWidth:380}}>
         <div style={{textAlign:'center',marginBottom:40}}>
-          <div style={{fontFamily:'var(--font-d)',fontSize:'1.8rem',fontWeight:800,color:'var(--gold)',marginBottom:8}}>GAM Operations</div>
-          <div style={{color:'var(--t3)',fontSize:'.82rem'}}>Admin Operations Console</div>
+          <div style={{fontFamily:'var(--font-d)',fontSize:'1.8rem',fontWeight:800,color:'var(--gold)',marginBottom:8}}>GAM Support</div>
+          <div style={{color:'var(--t3)',fontSize:'.82rem'}}>Customer Support & Portfolio</div>
         </div>
         <div className="card" style={{padding:24}}>
           {err&&<div className="alert ae" style={{marginBottom:14}}>{err}</div>}
@@ -834,12 +834,12 @@ function TotpEnrollPage() {
     <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',background:'var(--bg0)',padding:20}}>
       <div style={{width:'100%',maxWidth:560}}>
         <div style={{textAlign:'center',marginBottom:24}}>
-          <div style={{fontFamily:'var(--font-d)',fontSize:'1.6rem',fontWeight:800,color:'var(--gold)',marginBottom:6}}>GAM Operations</div>
+          <div style={{fontFamily:'var(--font-d)',fontSize:'1.6rem',fontWeight:800,color:'var(--gold)',marginBottom:6}}>GAM Support</div>
           <div style={{color:'var(--t3)',fontSize:'.82rem'}}>Set up two-factor authentication</div>
         </div>
         <div className="card" style={{padding:24}}>
           <div style={{fontSize:'.82rem',color:'var(--t1)',marginBottom:14,lineHeight:1.6}}>
-            Operations accounts on GAM require a second factor. This is a one-time setup that adds an authenticator-app code to every sign-in. Without it your account is signed out.
+            Support Console accounts on GAM require a second factor. This is a one-time setup that adds an authenticator-app code to every sign-in. Without it your account is signed out.
           </div>
 
           <div style={{display:'grid',gridTemplateColumns:'auto 1fr',gap:16,alignItems:'start',marginBottom:18}}>
@@ -955,7 +955,7 @@ function SecurityPage() {
             <div style={{fontSize:'.78rem',color:'var(--t2)'}}>
               {user?.totpEnabled
                 ?'You will be prompted for a 6-digit code on every sign-in.'
-                :'Operations accounts are required to enroll. Sign out and sign back in to start.'}
+                :'Support Console accounts are required to enroll. Sign out and sign back in to start.'}
             </div>
           </div>
         </div>

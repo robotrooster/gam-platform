@@ -19,9 +19,11 @@ was DoorLoop test junk — **purged 7/20**; Nic rebuilds manually under the real
 business account. Checklist: `~/gam/OAK_PARK_LAUNCH.md` history in git.
 
 **Nic (nothing moves without these):**
-- **N1 — Stripe live account** (LONGEST POLE): finish the sales-rep/account
-  migration; deliver live secret+publishable keys + dashboard access.
-  Everything payment-side is behind this.
+- **N1 — Stripe live account** ✅ DONE 2026-07-21. Sales-rep/account migration
+  resolved; `sk_live`/`pk_live` + both webhook secrets are wired into
+  `apps/api/.env` (backup: `.env.bak-pre-live-20260721`). Payment path is
+  UNBLOCKED. (This doc previously called it the longest pole — stale; corrected
+  2026-07-28.)
 - **N2 — Real Oak Park landlord account**: register under the real business
   email; tell Claude which email (so prod QA hits the right landlord, never the
   demo/test accounts). See [[oak-park-gam-entity-separation]].
@@ -38,10 +40,10 @@ business account. Checklist: `~/gam/OAK_PARK_LAUNCH.md` history in git.
   ENCRYPTION_KEY set; crash-respawn verified).
 - **C2 prod env audit** ✅ 7/20 (all *_APP_URL → prod domains; Vercel portals
   live on prod API; tunnel + marketing verified; nightly backups current).
-- **C3 Stripe live wiring** (as soon as N1 lands): live keys → apps/api/.env,
-  create prod webhook endpoint + secret, verify signatures, Financial
-  Connections live (replaces dev mock SetupIntent), Radar on. Store RAW webhook
-  payloads append-only for replay.
+- **C3 Stripe live wiring** ✅ DONE (with N1, 7/21; code verified S562). Live keys
+  in `.env`, prod webhook endpoint + both secrets set, signature verify on
+  platform + connect webhooks, Financial Connections live in the ACH charge/setup,
+  RAW webhook payloads stored append-only. Radar = dashboard-side.
 - **C4 live-fire money test** (needs N1+N4): one small real ACH + one card
   against a test tenant → lands in Nic's Connect balance, app fee to GAM, then
   refund. Proof before any tenant pays.

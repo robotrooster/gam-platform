@@ -44,6 +44,14 @@ import { PosCustomerOnboardingPage } from './pages/PosCustomerOnboardingPage'
 import React, { useContext, useState, useEffect, useCallback } from 'react'
 import ReactDOM from 'react-dom/client'
 import { BrowserRouter, Routes, Route, Navigate, NavLink, Outlet, useNavigate, useParams, Link, useLocation } from 'react-router-dom'
+// S562: tenant nav icons — monochrome lucide (inherit currentColor via .ni:
+// grayscale --t2 idle, accent/gold when active), matching the landlord portal's
+// professional look. Replaces the off-brand multicolor emoji.
+import {
+  ShieldCheck, Home, Star, CreditCard, Wrench, ClipboardCheck,
+  Video, DoorOpen, CalendarClock, HeartHandshake, BarChart3, Scale, ScrollText,
+  Bell, Landmark, User, Dumbbell, MessagesSquare, FileText,
+} from 'lucide-react'
 
 // S550: first-party product telemetry — one page_view per route change.
 // Fire-and-forget; failures are silently ignored (never affects UX).
@@ -60,8 +68,8 @@ import { DialogHost, toast } from './components/dialogs'
 import { QueryClient, QueryClientProvider, useQuery, useMutation, useQueryClient } from 'react-query'
 import { useForm } from 'react-hook-form'
 import axios from 'axios'
-import { formatCurrency, applyCamelizeInterceptor, installDatePickerAutoClose, humanize } from '@gam/shared'
-import { AgentChatWidget, SupportPage } from './components/AgentChatWidget'
+import { formatCurrency, applyCamelizeInterceptor, installDatePickerAutoClose, humanize, INSPECTION_ITEM_CONDITION_LABEL } from '@gam/shared'
+import { AgentChatWidget } from './components/AgentChatWidget'
 import { CameraCapture } from './components/CameraCapture'
 
 // ── API ──────────────────────────────────────────────────────
@@ -145,8 +153,8 @@ function useFlexVisibility() {
 interface AuthUser { id:string;email:string;role:string;firstName:string;lastName:string;profileId:string;totpEnabled?:boolean;mustEnrollTotp?:boolean }
 // S289: login() returns a discriminated result so LoginPage can branch
 // into the TOTP second step when the backend gates on 2FA.
-type LoginResult = { kind:'success' } | { kind:'totp_required'; totpSession:string }
-interface AuthCtx { user:AuthUser|null;token:string|null;loading:boolean;login:(e:string,p:string)=>Promise<LoginResult>;loginWithTotp:(totpSession:string,code:string)=>Promise<void>;refresh:()=>Promise<void>;logout:()=>void }
+type LoginResult = { kind:'success' } | { kind:'totp_required'; totpSession:string } | { kind:'email_otp_required'; emailOtpSession:string }
+interface AuthCtx { user:AuthUser|null;token:string|null;loading:boolean;login:(e:string,p:string)=>Promise<LoginResult>;loginWithTotp:(totpSession:string,code:string)=>Promise<void>;loginWithEmailOtp:(emailOtpSession:string,code:string)=>Promise<void>;resendEmailOtp:(emailOtpSession:string)=>Promise<void>;refresh:()=>Promise<void>;logout:()=>void }
 const Ctx = React.createContext<AuthCtx>(null!)
 const useAuth = () => useContext(Ctx)
 
@@ -174,6 +182,8 @@ function AuthProvider({children}:{children:React.ReactNode}) {
     const res=await post<any>('/auth/login',{email,password})
     const data=res.data!
     if(data.requiresTotp){ return { kind:'totp_required', totpSession:data.totpSession as string } }
+    // S571: tenants with ACH set up get email-code 2FA (like admin).
+    if(data.requiresEmailOtp){ return { kind:'email_otp_required', emailOtpSession:data.emailOtpSession as string } }
     const { token:tk, user:u } = data as { token:string; user:AuthUser }
     localStorage.setItem('gam_tenant_token',tk);setToken(tk);setUser(u)
     return { kind:'success' }
@@ -189,7 +199,20 @@ function AuthProvider({children}:{children:React.ReactNode}) {
     const u=await get<AuthUser>('/auth/me')
     setUser(u);setToken(tk)
   }
-  return <Ctx.Provider value={{user,token,loading,login,loginWithTotp,refresh,logout}}>{children}</Ctx.Provider>
+  // S571: email-code 2FA exchange — trade the pending session + emailed code
+  // for the full session JWT. Mirrors loginWithTotp.
+  const loginWithEmailOtp = async(emailOtpSession:string,code:string):Promise<void>=>{
+    const res=await post<{token:string}>('/auth/email-otp/verify',{emailOtpSession,code})
+    const tk=res.data!.token
+    localStorage.setItem('gam_tenant_token',tk)
+    api.defaults.headers.common['Authorization']='Bearer '+tk
+    const u=await get<AuthUser>('/auth/me')
+    setUser(u);setToken(tk)
+  }
+  const resendEmailOtp = async(emailOtpSession:string):Promise<void>=>{
+    await post('/auth/email-otp/resend',{emailOtpSession})
+  }
+  return <Ctx.Provider value={{user,token,loading,login,loginWithTotp,loginWithEmailOtp,resendEmailOtp,refresh,logout}}>{children}</Ctx.Provider>
 }
 
 // ── STYLES ────────────────────────────────────────────────────
@@ -208,18 +231,18 @@ const css = `
   --border-0:var(--b0);--border-1:var(--b1);
   --bg-0:var(--bg0);--bg-1:var(--bg1);--bg-2:var(--bg2);--bg-3:var(--bg3);
   --font-d:'Syne',sans-serif;--font-b:'DM Sans',sans-serif;--font-m:'DM Mono',monospace}
-html{-webkit-font-smoothing:antialiased}
-body{font-family:var(--font-b);background:var(--bg0);color:var(--t1);line-height:1.6;min-height:100vh}
+html{-webkit-font-smoothing:antialiased;height:100%}
+body{font-family:var(--font-b);background:var(--bg0);color:var(--t1);line-height:1.6;height:100%;margin:0;overflow:hidden;overscroll-behavior:none}
 h1,h2,h3{font-family:var(--font-d);color:var(--t0);line-height:1.2}
 h1{font-size:1.8rem;font-weight:800}h2{font-size:1.3rem;font-weight:700}h3{font-size:1.1rem;font-weight:700}
 a{color:var(--gold);text-decoration:none}
 button{cursor:pointer;font-family:var(--font-b)}
 input,select,textarea{font-family:var(--font-b)}
-.shell{display:flex;min-height:100vh}
+.shell{display:flex;height:100vh;overflow:hidden}
 .sidebar{width:220px;flex-shrink:0;background:var(--bg1);border-right:1px solid var(--b0);display:flex;flex-direction:column;position:fixed;top:0;left:0;bottom:0;z-index:50}
-.main{flex:1;margin-left:220px;min-height:100vh;display:flex;flex-direction:column}
-.topbar{height:52px;background:var(--bg1);border-bottom:1px solid var(--b0);display:flex;align-items:center;padding:0 24px;position:sticky;top:0;z-index:40}
-.page{flex:1;padding:28px;max-width:1200px;width:100%}
+.main{flex:1;margin-left:220px;height:100vh;display:flex;flex-direction:column;min-width:0;overflow:hidden}
+.topbar{height:52px;background:var(--bg1);border-bottom:1px solid var(--b0);display:flex;align-items:center;padding:0 24px;position:sticky;top:0;z-index:40;flex-shrink:0}
+.page{flex:1;min-height:0;padding:28px;max-width:1200px;width:100%;overflow-y:auto;overflow-x:hidden;overscroll-behavior:none}
 .logo{padding:20px;border-bottom:1px solid var(--b0)}
 .logo-name{font-family:var(--font-d);font-size:1.1rem;font-weight:800;color:var(--gold)}
 .logo-sub{font-size:.7rem;color:var(--t3);margin-top:2px;text-transform:uppercase;letter-spacing:.08em}
@@ -305,8 +328,8 @@ function LeaseNavLink() {
   )
   const pendingDocId = (pendingDocs as any[])[0]?.documentId
   return pendingDocId
-    ? <NavLink to={'/sign/'+pendingDocId} className={({isActive})=>`ni${isActive?' active':''}`}>📋 Lease</NavLink>
-    : <NavLink to="/lease" className={({isActive})=>`ni${isActive?' active':''}`}>📋 Lease</NavLink>
+    ? <NavLink to={'/sign/'+pendingDocId} className={({isActive})=>`ni${isActive?' active':''}`}><ScrollText size={16}/>Lease</NavLink>
+    : <NavLink to="/lease" className={({isActive})=>`ni${isActive?' active':''}`}><ScrollText size={16}/>Lease</NavLink>
 }
 
 const FONTS: Record<string, string> = {
@@ -350,6 +373,53 @@ function MoveInLockout({ gate }: { gate: any }) {
           Complete my move-in inspection →
         </button>
       </div>
+    </div>
+  )
+}
+
+// S571 (Nic): Maintenance, Inspections, Entry Requests, and My Walkthroughs all
+// deal with communicating with the landlord, so they live inside ONE
+// "Communication" dashboard as sub-tabs — the same pattern as the Profile page,
+// NOT a sidebar dropdown. The standalone routes still exist for deep links.
+const COMMUNICATION_TABS = [
+  { id: 'maintenance',  label: 'Maintenance',    icon: Wrench },
+  { id: 'inspections',  label: 'Inspections',    icon: ClipboardCheck },
+  { id: 'entry',        label: 'Entry Requests', icon: DoorOpen },
+  { id: 'documents',    label: 'Documents',      icon: FileText },
+  { id: 'walkthroughs', label: 'My Walkthroughs', icon: Video },
+] as const
+type CommTab = typeof COMMUNICATION_TABS[number]['id']
+
+function CommunicationPage() {
+  const location = useLocation()
+  const initial = new URLSearchParams(location.search).get('tab') as CommTab | null
+  const [tab, setTab] = useState<CommTab>(
+    initial && COMMUNICATION_TABS.some(t => t.id === initial) ? initial : 'maintenance'
+  )
+  return (
+    <div>
+      <div style={{ marginBottom: 20 }}>
+        <h1 style={{ fontFamily: 'var(--font-d)', fontSize: '1.4rem', fontWeight: 800, color: 'var(--t0)', marginBottom: 4 }}>Communication</h1>
+        <p style={{ fontSize: '.82rem', color: 'var(--t3)' }}>Everything between you and your landlord — requests, inspections, and entry notices.</p>
+      </div>
+      <div style={{ display: 'flex', gap: 6, marginBottom: 20, borderBottom: '1px solid var(--b0)', paddingBottom: 12, flexWrap: 'wrap' }}>
+        {COMMUNICATION_TABS.map(t => {
+          const Icon = t.icon
+          const on = tab === t.id
+          return (
+            <button key={t.id} onClick={() => setTab(t.id)}
+              style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '8px 14px', borderRadius: 8, cursor: 'pointer', fontSize: '.82rem', fontWeight: 600,
+                background: on ? 'var(--gold)' : 'var(--bg2)', color: on ? 'var(--bg0)' : 'var(--t2)', border: 'none' }}>
+              <Icon size={15} />{t.label}
+            </button>
+          )
+        })}
+      </div>
+      {tab === 'maintenance'  && <MaintenancePage />}
+      {tab === 'inspections'  && <TenantInspectionsPage />}
+      {tab === 'entry'        && <TenantEntryRequestsPage />}
+      {tab === 'documents'    && <DocumentsPage />}
+      {tab === 'walkthroughs' && <TenantMyWalkthroughsPage />}
     </div>
   )
 }
@@ -403,6 +473,22 @@ function Layout() {
   const onInspectionRoute = location.pathname.startsWith('/inspections')
   const moveInLocked = moveInGate?.gated === true && !onInspectionRoute
   const flexVis = useFlexVisibility()
+  // Conditional nav (Nic): Work Trade only appears once the tenant is actually
+  // in a work-trade agreement; Amenities only when their property has something
+  // reservable. Otherwise these are dead/empty tabs.
+  const { data: workTradeNav } = useQuery('work-trade-nav', () =>
+    fetch((import.meta as any).env?.VITE_API_URL + '/api/tenants/work-trade', {
+      headers: { Authorization: 'Bearer ' + localStorage.getItem('gam_tenant_token') }
+    }).then(r=>r.json()).then(r=>r.data), { staleTime: 60000 })
+  const hasWorkTrade = Array.isArray(workTradeNav) ? workTradeNav.length > 0 : !!workTradeNav
+  const { data: amenityNav } = useQuery('amenity-nav', () =>
+    fetch((import.meta as any).env?.VITE_API_URL + '/api/common-areas/mine', {
+      headers: { Authorization: 'Bearer ' + localStorage.getItem('gam_tenant_token') }
+    }).then(r=>r.json()).then(r=>r.data), { staleTime: 60000 })
+  const hasAmenities = Array.isArray(amenityNav) && amenityNav.length > 0
+  // S571: My Walkthroughs is now a permanent tab inside the Communication
+  // dashboard (its own empty state covers the no-videos case), so the old
+  // conditional top-level nav link + its probe query were removed.
   return (
     <div className="shell">
       <style dangerouslySetInnerHTML={{__html: themeCss}} />
@@ -413,34 +499,34 @@ function Layout() {
         </div>
         <nav className="nav">
           {!showFullNav && (
-            <NavLink to="/background-check" className={({isActive})=>`ni${isActive?' active':''}`}>🛡 Application</NavLink>
+            <NavLink to="/background-check" className={({isActive})=>`ni${isActive?' active':''}`}><ShieldCheck size={16}/>Application</NavLink>
           )}
           {showFullNav && <>
-            <NavLink to="/home" className={({isActive})=>`ni${isActive?' active':''}`}>🏠 Home</NavLink>
-            {flexVis.any && <NavLink to="/services" className={({isActive})=>`ni${isActive?' active':''}`}>⭐ Flex Advantage</NavLink>}
-            <NavLink to="/payments" className={({isActive})=>`ni${isActive?' active':''}`}>💳 Payments</NavLink>
-            <NavLink to="/maintenance" className={({isActive})=>`ni${isActive?' active':''}`}>🔧 Maintenance</NavLink>
-            <NavLink to="/support" className={({isActive})=>`ni${isActive?' active':''}`}>💬 Support</NavLink>
-            <NavLink to="/inspections" className={({isActive})=>`ni${isActive?' active':''}`}>📋 Inspections</NavLink>
-            <NavLink to="/walkthroughs" className={({isActive})=>`ni${isActive?' active':''}`}>🎥 My walkthroughs</NavLink>
-            <NavLink to="/entry-requests" className={({isActive})=>`ni${isActive?' active':''}`}>🚪 Entry Requests</NavLink>
-            <NavLink to="/amenities" className={({isActive})=>`ni${isActive?' active':''}`}>🎉 Amenities</NavLink>
-            <NavLink to="/work-trade" className={({isActive})=>`ni${isActive?' active':''}`}>🛠 Work Trade</NavLink>
-            {!LAUNCH_HIDDEN.has('/credit') && <NavLink to="/credit" className={({isActive})=>`ni${isActive?' active':''}`}>📊 My Record</NavLink>}
-            {!LAUNCH_HIDDEN.has('/my-disputes') && <NavLink to="/my-disputes" className={({isActive})=>`ni${isActive?' active':''}`}>⚖️ My Disputes</NavLink>}
+            <NavLink to="/home" className={({isActive})=>`ni${isActive?' active':''}`}><Home size={16}/>Home</NavLink>
+            {flexVis.any && <NavLink to="/services" className={({isActive})=>`ni${isActive?' active':''}`}><Star size={16}/>Flex Advantage</NavLink>}
+            <NavLink to="/payments" className={({isActive})=>`ni${isActive?' active':''}`}><CreditCard size={16}/>Payments</NavLink>
+            {/* Support tab removed (Nic) — the chatbot floats on every screen via
+                AgentChatWidget, so a dedicated Support page/tab is redundant. */}
+            {/* S571 (Nic): Maintenance + Inspections + Entry Requests + My
+                Walkthroughs live inside the Communication dashboard (tabbed page,
+                same pattern as Profile) — all landlord-communication surfaces. */}
+            <NavLink to="/communication" className={({isActive})=>`ni${isActive?' active':''}`}><MessagesSquare size={16}/>Communication</NavLink>
+            {hasAmenities && <NavLink to="/amenities" className={({isActive})=>`ni${isActive?' active':''}`}><CalendarClock size={16}/>Amenities</NavLink>}
+            {hasWorkTrade && <NavLink to="/work-trade" className={({isActive})=>`ni${isActive?' active':''}`}><HeartHandshake size={16}/>Work Trade</NavLink>}
+            {!LAUNCH_HIDDEN.has('/credit') && <NavLink to="/credit" className={({isActive})=>`ni${isActive?' active':''}`}><BarChart3 size={16}/>My Record</NavLink>}
+            {!LAUNCH_HIDDEN.has('/my-disputes') && <NavLink to="/my-disputes" className={({isActive})=>`ni${isActive?' active':''}`}><Scale size={16}/>My Disputes</NavLink>}
             <LeaseNavLink/>
           </>}
-          <NavLink to="/notifications" className={({isActive})=>`ni${isActive?' active':''}`}>🔔 Notifications</NavLink>
-          <NavLink to="/notification-prefs" className={({isActive})=>`ni${isActive?' active':''}`} style={{paddingLeft:24,fontSize:'.78rem'}}>· Preferences</NavLink>
+          {/* S570 (Nic): Preferences + Security folded into Profile (which already
+              has Notification-prefs + Security tabs). Notifications feed → Home. */}
           {showFullNav && tenantMe?.stripeConnectAccountId && (
-            <NavLink to="/payouts" className={({isActive})=>`ni${isActive?' active':''}`}>🏦 Payouts</NavLink>
+            <NavLink to="/payouts" className={({isActive})=>`ni${isActive?' active':''}`}><Landmark size={16}/>Payouts</NavLink>
           )}
-          {showFullNav && <NavLink to="/profile" className={({isActive})=>`ni${isActive?' active':''}`}>👤 Profile</NavLink>}
-          <NavLink to="/security" className={({isActive})=>`ni${isActive?' active':''}`}>🔐 Security</NavLink>
+          {showFullNav && <NavLink to="/profile" className={({isActive})=>`ni${isActive?' active':''}`}><User size={16}/>Profile</NavLink>}
           {/* GAM Fitness — standalone app (:3013). Hand off the portal's JWT
               via ?sso= so the tenant lands signed-in without re-auth. */}
           {!LAUNCH_HIDE_FITNESS && (
-          <a className="ni" href="#" onClick={e=>{e.preventDefault();const t=localStorage.getItem('gam_tenant_token')||'';const base=(import.meta as any).env?.VITE_FITNESS_URL||'http://localhost:3013';window.open(`${base}/?sso=${encodeURIComponent(t)}`,'_blank')}}>🏋️ Fitness</a>
+          <a className="ni" href="#" onClick={e=>{e.preventDefault();const t=localStorage.getItem('gam_tenant_token')||'';const base=(import.meta as any).env?.VITE_FITNESS_URL||'http://localhost:3013';window.open(`${base}/?sso=${encodeURIComponent(t)}`,'_blank')}}><Dumbbell size={16}/>Fitness</a>
           )}
         </nav>
         <div className="footer">
@@ -615,37 +701,56 @@ function QuestionnairePrompt() {
   )
 }
 
+// S570 (Nic): the Notifications tab was removed — surface unread notifications
+// (vacancy/pool matches, with their respond actions) at the TOP of Home instead.
+// Renders nothing when there's nothing to act on.
+function HomeAlerts() {
+  const qc = useQueryClient()
+  const { data: notifs = [] } = useQuery<any[]>('tenant-notifs-home', () =>
+    get<any[]>('/background/notifications').then((r: any) => Array.isArray(r) ? r : []))
+  const readMut = useMutation((id: string) => api.patch('/background/notifications/' + id + '/read'),
+    { onSuccess: () => qc.invalidateQueries('tenant-notifs-home') })
+  const respondMut = useMutation(
+    ({ matchId, interested }: { matchId: string; interested: boolean }) =>
+      api.patch('/background/pool/match/' + matchId + '/respond', { interested }),
+    { onSuccess: () => qc.invalidateQueries('tenant-notifs-home') })
+  const unread = (notifs as any[]).filter(n => !n.read)
+  if (!unread.length) return null
+  return (
+    <div className="card" style={{ marginBottom: 16, borderColor: 'rgba(201,162,39,.3)' }}>
+      <div style={{ fontWeight: 700, color: 'var(--gold)', fontSize: '.8rem', marginBottom: 10, display: 'flex', alignItems: 'center', gap: 8 }}>
+        <Bell size={15} /> Needs your attention
+      </div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+        {unread.map((n: any) => {
+          let data: any = {}
+          try { data = typeof n.data === 'string' ? JSON.parse(n.data || '{}') : n.data || {} } catch { data = {} }
+          const isMatch = n.type === 'match_interest'
+          return (
+            <div key={n.id} onClick={() => readMut.mutate(n.id)}
+              style={{ padding: '10px 12px', borderRadius: 8, background: 'rgba(201,162,39,.05)', border: '1px solid rgba(201,162,39,.18)', cursor: 'pointer' }}>
+              <div style={{ fontWeight: 700, fontSize: '.82rem', color: 'var(--t0)', marginBottom: 3 }}>{n.title}</div>
+              <div style={{ fontSize: '.76rem', color: 'var(--t2)', lineHeight: 1.5 }}>{n.body}</div>
+              {isMatch && !data.responded && data.matchRequestId && (
+                <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+                  <button className="btn btn-p btn-sm" onClick={e => { e.stopPropagation(); respondMut.mutate({ matchId: data.matchRequestId, interested: true }) }}>Interested</button>
+                  <button className="btn btn-g btn-sm" onClick={e => { e.stopPropagation(); respondMut.mutate({ matchId: data.matchRequestId, interested: false }) }}>Not interested</button>
+                </div>
+              )}
+              {data.responded && <div style={{ fontSize: '.72rem', color: 'var(--green)', marginTop: 4 }}>✓ Response sent</div>}
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
 function HomePage() {
   const { user } = useAuth()
   const { data: me } = useQuery('tenant-me', () => get<any>('/tenants/me'))
   const { data: health } = useQuery<any>('tenant-payment-health', () => get<any>('/tenants/me/payment-health'))
   const flexVis = useFlexVisibility()
-  const [bulletinScope, setBulletinScope] = useState<'property'|'city'|'state'>('property')
-  const [bulletinSort, setBulletinSort] = useState<'new'|'old'>('new')
-  const [bulletinSearch, setBulletinSearch] = useState('')
-  const [bulletinDraft, setBulletinDraft] = useState('')
-  const [bulletinPosting, setBulletinPosting] = useState(false)
-  const [bulletinPosts, setBulletinPosts] = useState<any[]>([])
-  const [bulletinLoading, setBulletinLoading] = useState(false)
-  const [bulletinRefreshing, setBulletinRefreshing] = useState(false)
-
-  const bulletinFirstLoad = React.useRef(true)
-  useEffect(() => {
-    const isFirst = bulletinFirstLoad.current
-    bulletinFirstLoad.current = false
-    const delay = bulletinSearch ? 400 : 0
-    const timer = setTimeout(() => {
-      if (isFirst) setBulletinLoading(true)
-      else setBulletinRefreshing(true)
-      const params = new URLSearchParams({ scope: bulletinScope, sort: bulletinSort })
-      if (bulletinSearch) params.set('search', bulletinSearch)
-      get<any[]>('/bulletin?'+params.toString())
-        .then(d => setBulletinPosts(d || []))
-        .catch(()=>{})
-        .finally(()=>{ setBulletinLoading(false); setBulletinRefreshing(false) })
-    }, delay)
-    return () => clearTimeout(timer)
-  }, [bulletinScope, bulletinSort, bulletinSearch])
 
   return (
     <div>
@@ -657,18 +762,7 @@ function HomePage() {
       </div>
 
       <ServiceOutageBanner />
-      <LandlordBankingBanner />
-
-      {/* S311: removed the dashboard "On-Time Pay Qualification"
-          progression strip + "On-Time Pay is active" alert + header
-          OTP-Active badge. OTP is a landlord-only product as of S155;
-          the tenant portal must not surface OTP framing per the
-          project_flexsuite_otp_hidden.md memory ("OTP inverse:
-          landlord-only, never tenant"). The deposit-funded and
-          ACH-verified signals these surfaces visualized are still
-          available through the dedicated cards: the security-deposit
-          KPI tile below, the Lease Details ACH row, and the
-          AchVerifyForm on /services. */}
+      <HomeAlerts />
 
       {/* S542: private platform questionnaire — landlord never sees it. */}
       <QuestionnairePrompt />
@@ -770,241 +864,20 @@ function HomePage() {
         )}
       </div>
 
-      {/* ── Community Bulletin Board — hidden from tenant portal (toggle to re-enable) ── */}
-      {false && (
-      <div style={{marginTop:24,background:'var(--bg2)',border:'1px solid var(--b1)',borderRadius:12,overflow:'hidden'}}>
-
-        {/* Header */}
-        <div style={{padding:'16px 20px',borderBottom:'1px solid var(--b0)',display:'flex',alignItems:'center',justifyContent:'space-between',flexWrap:'wrap',gap:12}}>
-          <div>
-            <div style={{fontFamily:'var(--font-d)',fontSize:'1rem',fontWeight:800,color:'var(--t0)'}}>📢 Community Bulletin</div>
-            <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:2}}>Anonymous · your identity is never revealed</div>
-          </div>
-          <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>
-            {(['property','city','state'] as const).map(s => (
-              <button key={s} onClick={()=>setBulletinScope(s)}
-                style={{padding:'5px 12px',borderRadius:20,border:`1px solid ${bulletinScope===s?'var(--gold)':'var(--b1)'}`,background:bulletinScope===s?'rgba(201,162,39,.1)':'var(--bg3)',color:bulletinScope===s?'var(--gold)':'var(--t3)',cursor:'pointer',fontSize:'.72rem',fontWeight:600}}>
-                {s==='property'?'🏘 Property':s==='city'?'🏙 City':'🗺 State'}
-              </button>
-            ))}
-          </div>
-        </div>
-
-        {/* Controls: search + sort */}
-        <div style={{padding:'10px 20px',borderBottom:'1px solid var(--b0)',background:'var(--bg3)',display:'flex',gap:10,alignItems:'center',flexWrap:'wrap'}}>
-          <input
-            value={bulletinSearch}
-            onChange={e=>setBulletinSearch(e.target.value)}
-            placeholder="Search posts…"
-            style={{flex:1,minWidth:160,background:'var(--bg4)',border:'1px solid var(--b1)',borderRadius:8,color:'var(--t0)',padding:'6px 10px',fontSize:'.78rem',fontFamily:'inherit'}}
-          />
-          <div style={{display:'flex',gap:6,alignItems:'center'}}>
-            {bulletinRefreshing && <span className="spinner" style={{width:12,height:12,borderWidth:1.5,flexShrink:0}}/>}
-            {(['new','old'] as const).map(s => (
-              <button key={s} onClick={()=>setBulletinSort(s)}
-                style={{padding:'5px 10px',borderRadius:6,border:`1px solid ${bulletinSort===s?'var(--gold)':'var(--b1)'}`,background:bulletinSort===s?'rgba(201,162,39,.1)':'var(--bg4)',color:bulletinSort===s?'var(--gold)':'var(--t3)',cursor:'pointer',fontSize:'.72rem',fontWeight:600}}>
-                {s==='new'?'Newest':'Oldest'}
-              </button>
-            ))}
-          </div>
-        </div>
-
-        {/* Composer */}
-        <div style={{padding:'12px 20px',borderBottom:'1px solid var(--b0)'}}>
-          <div style={{display:'flex',gap:10,alignItems:'flex-end'}}>
-            <div style={{flex:1}}>
-              <textarea
-                value={bulletinDraft}
-                onChange={e=>setBulletinDraft(e.target.value.slice(0,500))}
-                placeholder="Share anonymously with your community…"
-                rows={2}
-                style={{width:'100%',background:'var(--bg3)',border:'1px solid var(--b1)',borderRadius:8,color:'var(--t0)',padding:'8px 12px',fontSize:'.82rem',resize:'none',fontFamily:'inherit',boxSizing:'border-box'}}
-              />
-              <div style={{fontSize:'.65rem',color:'var(--t3)',textAlign:'right',marginTop:2}}>{bulletinDraft.length}/500</div>
-            </div>
-            <button className="btn btn-p btn-sm"
-              disabled={bulletinDraft.trim().length < 3 || bulletinPosting}
-              onClick={async()=>{
-                setBulletinPosting(true)
-                try {
-                  const r = await post('/bulletin',{scope:bulletinScope,content:bulletinDraft.trim()})
-                  if((r as any).success){
-                    setBulletinDraft('')
-                    setBulletinPosts((prev:any[])=>[{...(r as any).data,isNew:true},...prev])
-                  }
-                } catch(e){} finally{setBulletinPosting(false)}
-              }}
-              style={{marginBottom:20,whiteSpace:'nowrap'}}
-            >
-              {bulletinPosting?<span className="spinner"/>:'Post'}
-            </button>
-          </div>
-          <div style={{fontSize:'.65rem',color:'var(--t3)'}}>⓪ Each post gets a random name. You look different every time you post.</div>
-        </div>
-
-        {/* Feed */}
-        <div style={{maxHeight:520,overflowY:'auto'}}>
-          {bulletinLoading ? (
-            <div style={{padding:32,textAlign:'center',color:'var(--t3)',fontSize:'.82rem'}}>Loading…</div>
-          ) : bulletinPosts.length===0 ? (
-            <div style={{padding:32,textAlign:'center',color:'var(--t3)',fontSize:'.82rem'}}>No posts yet. Be the first to share something.</div>
-          ) : (() => {
-            const grouped: Record<string,any[]> = {}
-            const pinned = bulletinPosts.filter((p:any)=>p.pinned)
-            const regular = bulletinPosts.filter((p:any)=>!p.pinned)
-
-            // Group by day — API already sorted correctly
-            regular.forEach((p:any)=>{
-              const day = new Date(p.createdAt).toLocaleDateString('en-US',{weekday:'long',month:'long',day:'numeric',year:'numeric'})
-              if(!grouped[day]) grouped[day]=[]
-              grouped[day].push(p)
-            })
-
-            const renderPost = (p:any) => (
-              <div key={p.id} style={{padding:'12px 20px',borderBottom:'1px solid var(--b0)',display:'flex',gap:12,alignItems:'flex-start',background:p.isNew?'rgba(201,162,39,.04)':p.pinned?'rgba(201,162,39,.02)':''}}>
-                {/* Avatar */}
-                <div style={{width:34,height:34,borderRadius:'50%',background:'var(--bg4)',border:'1px solid var(--b1)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'.65rem',fontWeight:800,color:'var(--t3)',flexShrink:0}}>
-                  {p.alias?.slice(0,2).toUpperCase()}
-                </div>
-                {/* Content */}
-                <div style={{flex:1,minWidth:0}}>
-                  <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:4,flexWrap:'wrap'}}>
-                    <span style={{fontSize:'.75rem',fontWeight:700,color:'var(--t2)'}}>{p.alias}</span>
-                    {p.pinned&&<span style={{fontSize:'.6rem',background:'rgba(201,162,39,.12)',color:'var(--gold)',border:'1px solid rgba(201,162,39,.3)',borderRadius:4,padding:'1px 6px',fontWeight:700}}>📌 PINNED</span>}
-                    <span style={{fontSize:'.65rem',color:'var(--t3)'}}>{new Date(p.createdAt).toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'})}</span>
-                    {p.isPast&&<span style={{fontSize:'.6rem',color:'var(--t3)',background:'var(--bg4)',borderRadius:4,padding:'1px 6px'}}>archived</span>}
-                  </div>
-                  <div style={{fontSize:'.82rem',color:'var(--t1)',lineHeight:1.6,wordBreak:'break-word'}}>{p.content}</div>
-                </div>
-                {/* Vote buttons */}
-                <div style={{display:'flex',flexDirection:'column',alignItems:'center',gap:6,flexShrink:0}}>
-                  <button
-                    disabled={!p.canVote||p.myVote==='up'}
-                    onClick={async()=>{
-                      if(!p.canVote||p.myVote) return
-                      try {
-                        const r = await post(`/bulletin/${p.id}/vote`,{voteType:'up'})
-                        if((r as any).success) setBulletinPosts((prev:any[])=>prev.map((x:any)=>x.id===p.id?{...x,...(r as any).data,myVote:'up',canVote:false,canFlag:false}:x))
-                      } catch(e){}
-                    }}
-                    title="Upvote — boost this post"
-                    style={{background:'none',border:'none',cursor:p.canVote&&p.myVote!=='up'?'pointer':'default',color:p.myVote==='up'?'var(--green)':'var(--t3)',fontSize:'.85rem',padding:'2px 4px',lineHeight:1,opacity:p.isPast?0.4:1}}
-                  >▲</button>
-                  <span style={{fontSize:'.65rem',color:'var(--t3)',fontFamily:'var(--font-m)',minWidth:16,textAlign:'center'}}>{p.upvoteCount||0}</span>
-                  <button
-                    disabled={!p.canFlag||p.myVote==='flag'}
-                    onClick={async()=>{
-                      if(!p.canFlag||p.myVote) return
-                      try {
-                        const r = await post(`/bulletin/${p.id}/vote`,{voteType:'flag'})
-                        if((r as any).success) setBulletinPosts((prev:any[])=>prev.map((x:any)=>x.id===p.id?{...x,...(r as any).data,myVote:'flag',canVote:false,canFlag:false}:x))
-                      } catch(e){}
-                    }}
-                    title="Flag — report inappropriate content"
-                    style={{background:'none',border:'none',cursor:p.canFlag&&p.myVote!=='flag'?'pointer':'default',color:p.myVote==='flag'?'var(--amber)':'var(--t3)',fontSize:'.78rem',padding:'2px 4px',lineHeight:1,opacity:p.isPast?0.4:1}}
-                  >🚩</button>
-                  <span style={{fontSize:'.65rem',color:'var(--t3)',fontFamily:'var(--font-m)',minWidth:16,textAlign:'center'}}>{p.flagCount||0}</span>
-                </div>
-              </div>
-            )
-
-            return (
-              <>
-                {/* Pinned posts */}
-                {pinned.length>0&&(
-                  <>
-                    <div style={{padding:'6px 20px',background:'rgba(201,162,39,.06)',borderBottom:'1px solid rgba(201,162,39,.15)',fontSize:'.65rem',fontWeight:700,color:'var(--gold)',textTransform:'uppercase',letterSpacing:'.08em'}}>📌 Pinned</div>
-                    {[...pinned].sort((a:any,b:any)=>b.totalVotes-a.totalVotes).map(renderPost)}
-                  </>
-                )}
-                {/* Day-grouped posts */}
-                {Object.entries(grouped).map(([day,dayPosts])=>(
-                  <React.Fragment key={day}>
-                    <div style={{padding:'6px 20px',background:'var(--bg3)',borderBottom:'1px solid var(--b0)',borderTop:'1px solid var(--b0)',fontSize:'.65rem',fontWeight:700,color:'var(--t3)',textTransform:'uppercase',letterSpacing:'.08em',position:'sticky',top:0,zIndex:1}}>{day}</div>
-                    {(dayPosts as any[]).map(renderPost)}
-                  </React.Fragment>
-                ))}
-              </>
-            )
-          })()}
-        </div>
-      </div>
-      )}
     </div>
   )
 }
 
-// S162: surface a banner on the dashboard + Payments page when the
-// landlord hasn't completed Stripe Connect onboarding. Online rent
-// payment would fail at Stripe; better to tell the tenant up front
-// than to bounce them at submit. Boolean-only response from the API.
-function LandlordBankingBanner() {
-  const { data } = useQuery<{ ready: boolean }>(
-    'landlord-banking-status',
-    () => get<{ ready: boolean }>('/tenants/me/landlord-banking-status'),
-  )
-  const [nudgeStatus, setNudgeStatus] = useState<'idle' | 'sending' | 'sent' | 'too_soon' | 'error'>('idle')
-  const [nudgeMsg, setNudgeMsg] = useState<string | null>(null)
-
-  if (!data || data.ready) return null
-
-  const sendNudge = async () => {
-    setNudgeStatus('sending')
-    setNudgeMsg(null)
-    try {
-      await api.post('/tenants/me/nudge-landlord-banking')
-      setNudgeStatus('sent')
-    } catch (e: any) {
-      const status = e?.response?.status
-      const msg = e?.response?.data?.error?.message ?? 'Send failed.'
-      if (status === 429) { setNudgeStatus('too_soon'); setNudgeMsg(msg) }
-      else { setNudgeStatus('error'); setNudgeMsg(msg) }
-    }
-  }
-
-  return (
-    <div style={{
-      background: 'rgba(220,165,40,.08)',
-      border: '1px solid rgba(220,165,40,.3)',
-      borderRadius: 10,
-      padding: '12px 16px',
-      marginBottom: 16,
-      fontSize: '.82rem',
-      color: 'var(--t1)',
-    }}>
-      <div style={{ fontWeight: 600, color: 'var(--gold)', marginBottom: 4 }}>
-        Online rent payment temporarily unavailable
-      </div>
-      <div style={{ fontSize: '.78rem', color: 'var(--t2)', lineHeight: 1.5, marginBottom: 10 }}>
-        Your landlord hasn&apos;t finished setting up online banking with GAM yet.
-        Reach out and ask them to complete the Stripe banking setup so you can
-        start paying rent through GAM. You can still see your lease and
-        balance — just no online payment until they finish.
-      </div>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-        <button className="btn btn-primary"
-                style={{ fontSize: '.74rem', padding: '4px 12px' }}
-                disabled={nudgeStatus === 'sending' || nudgeStatus === 'sent' || nudgeStatus === 'too_soon'}
-                onClick={sendNudge}>
-          {nudgeStatus === 'sending' ? 'Sending…'
-            : nudgeStatus === 'sent' ? '✓ Notified your landlord'
-            : nudgeStatus === 'too_soon' ? '✓ Already sent'
-            : 'Notify my landlord'}
-        </button>
-        {nudgeMsg && nudgeStatus !== 'sent' && (
-          <span style={{ fontSize: '.72rem', color: 'var(--t3)' }}>{nudgeMsg}</span>
-        )}
-      </div>
-    </div>
-  )
-}
 
 // PaymentsPage moved to ./pages/PaymentsPage.tsx in S169 — now hosts the
 // real Pay Now flow + Stripe Financial Connections bank add via the
 // /api/payments/:id/pay destination charge backend.
 import { PaymentsPage as PaymentsPageImpl } from './pages/PaymentsPage'
 function PaymentsPage() {
-  return <PaymentsPageImpl Banner={LandlordBankingBanner} />
+  // S570 (Nic): removed the "landlord banking not ready" banner — tenant money
+  // sweeps to GAM's platform balance and is held until the landlord onboards,
+  // so payment is never actually blocked and the banner was misleading.
+  return <PaymentsPageImpl />
 }
 
 
@@ -1372,7 +1245,7 @@ function FlexPayInquireModal({ survey, onClose, onSuccess }: { survey?: boolean;
 }
 
 // FlexPay is a payment-scheduling subscription. Tenant picks a pull day
-// (1-28); fee is $5 + day-of-month ($6 to $33). Day 28 cap covers all
+// (1-28); fee is a FLAT $25/month (S562) — pull day is scheduling only. Day 28 cap covers all
 // U.S. social security payout windows (SSDI 4th-Wed-of-month). S314:
 // click-accept of the Subscription Terms is required + persisted.
 
@@ -1383,7 +1256,7 @@ function FlexPayModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: 
   const [fullTermsText, setFullTermsText] = useState<string | null>(null)
   const [loadingTerms, setLoadingTerms] = useState(false)
   const [error, setError] = useState('')
-  const fee = 5 + pullDay
+  const fee = 25  // S562: FlexPay is a flat $25/month (pull day is scheduling only)
 
   async function openFullTerms() {
     setLoadingTerms(true)
@@ -1425,7 +1298,7 @@ function FlexPayModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: 
       <div className="modal" onClick={e=>e.stopPropagation()} style={{maxWidth:520}}>
         <div className="modal-t">⚡ Enroll in FlexPay</div>
         <p style={{fontSize:'.82rem',color:'var(--t2)',marginBottom:20}}>
-          Pick the day of the month your rent gets pulled from your bank. Your fee is $5 plus the day number — pull on the 1st = $6, pull on the 11th = $16, pull on the 28th = $33.
+          Pick the day of the month your rent gets pulled from your bank — match it to when your income lands. Your FlexPay fee is a flat <strong>$25/month</strong> no matter which day you choose.
         </p>
 
         <div className="fg">
@@ -1443,7 +1316,7 @@ function FlexPayModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: 
             <span style={{fontWeight:700,color:'var(--t0)',fontSize:'.875rem'}}>Monthly FlexPay fee</span>
             <span style={{fontFamily:'var(--font-m)',fontSize:'1.4rem',fontWeight:800,color:'var(--gold)'}}>${fee}</span>
           </div>
-          <div style={{fontSize:'.7rem',color:'var(--t3)',marginTop:6}}>$5 base + ${pullDay} (day number)</div>
+          <div style={{fontSize:'.7rem',color:'var(--t3)',marginTop:6}}>Flat $25/month · day {pullDay} is just your pull schedule</div>
         </div>
 
         {error && <div className="alert a-warn" style={{marginBottom:12}}>{error}</div>}
@@ -1452,10 +1325,10 @@ function FlexPayModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: 
         <div style={{background:'var(--bg3)',border:'1px solid var(--b1)',borderRadius:8,padding:14,marginBottom:14,fontSize:'.72rem',color:'var(--t2)',lineHeight:1.5}}>
           <div style={{fontWeight:700,color:'var(--t0)',marginBottom:8,fontSize:'.78rem'}}>FlexPay Subscription Terms — please review</div>
           <p style={{marginBottom:8}}>
-            <strong style={{color:'var(--t1)'}}>Subscription, not a loan.</strong> FlexPay is a payment-date coordination subscription. GAM does not advance funds on your behalf. You authorize a recurring ACH pull from your verified bank account on the pull day you choose; your monthly fee is the date-based amount shown above.
+            <strong style={{color:'var(--t1)'}}>Subscription, not a loan.</strong> FlexPay is a payment-date coordination subscription. GAM does not advance funds on your behalf. You authorize a recurring ACH pull from your verified bank account on the pull day you choose; your monthly fee is a flat $25 regardless of that day.
           </p>
           <p style={{marginBottom:8}}>
-            <strong style={{color:'var(--t1)'}}>Failed pulls retry + re-price.</strong> ACH is all-or-nothing (banks reject the whole pull on insufficient funds). If your scheduled pull fails, GAM retries on a later day. The retry recalculates your monthly fee under the same formula at the retry day. Stripe's actual ACH-return fee is passed through to you at cost, with no GAM markup.
+            <strong style={{color:'var(--t1)'}}>Failed pulls retry.</strong> ACH is all-or-nothing (banks reject the whole pull on insufficient funds). If your scheduled pull fails, GAM retries on a later day. Your FlexPay fee stays a flat $25 — it does not change on a retry. Stripe's actual ACH-return fee (about $4) is passed through to you at cost, with no GAM markup.
           </p>
           <p style={{marginBottom:0}}>
             <strong style={{color:'var(--t1)'}}>Doesn't change your lease.</strong> FlexPay schedules when your ACH pull runs; it does not change the rent amount you owe or any landlord remedy (late fees, default notices) under your lease. A later pull day does not waive late-fee accrual against your rent due date.
@@ -1505,13 +1378,13 @@ function FlexPayModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: 
 // ── FLEXPAY CHANGE-PULL-DAY MODAL ─────────────────────────────────────────
 // Enrolled tenants can move their pull day; the change takes effect NEXT
 // cycle (the current cycle's pull is already scheduled). Fee recomputes to
-// $5 + the new day for future cycles.
+// flat $25/month; the new day is scheduling only.
 function FlexPayChangeDayModal({
   currentDay, onClose, onSuccess,
 }: { currentDay: number; onClose: () => void; onSuccess: () => void }) {
   const [pullDay, setPullDay] = useState(currentDay || 15)
   const [error, setError] = useState('')
-  const fee = 5 + pullDay
+  const fee = 25  // S562: FlexPay is a flat $25/month (pull day is scheduling only)
 
   const mut = useMutation(
     () => fetch((import.meta as any).env?.VITE_API_URL + '/api/tenants/flexpay/pull-day', {
@@ -1533,7 +1406,7 @@ function FlexPayChangeDayModal({
       <div className="modal" onClick={e=>e.stopPropagation()} style={{maxWidth:480}}>
         <div className="modal-t">⚡ Change FlexPay pull day</div>
         <p style={{fontSize:'.82rem',color:'var(--t2)',marginBottom:20}}>
-          Pick a new day of the month. This takes effect <strong>next billing cycle</strong> — your current cycle's pull is already scheduled. Your fee is $5 plus the day number.
+          Pick a new day of the month. This takes effect <strong>next billing cycle</strong> — your current cycle's pull is already scheduled. Your FlexPay fee stays a flat $25/month.
         </p>
         <div className="fg">
           <label className="fl">Pull day of month</label>
@@ -1548,7 +1421,7 @@ function FlexPayChangeDayModal({
             <span style={{fontWeight:700,color:'var(--t0)',fontSize:'.875rem'}}>New monthly fee (next cycle)</span>
             <span style={{fontFamily:'var(--font-m)',fontSize:'1.4rem',fontWeight:800,color:'var(--gold)'}}>${fee}</span>
           </div>
-          <div style={{fontSize:'.7rem',color:'var(--t3)',marginTop:6}}>$5 base + ${pullDay} (day number)</div>
+          <div style={{fontSize:'.7rem',color:'var(--t3)',marginTop:6}}>Flat $25/month · day {pullDay} is just your pull schedule</div>
         </div>
         {error && <div className="alert a-red" style={{marginBottom:12}}>{error}</div>}
         <div style={{display:'flex',gap:8,justifyContent:'flex-end'}}>
@@ -1557,6 +1430,69 @@ function FlexPayChangeDayModal({
             {mut.isLoading ? <span className="spinner"/> : 'Save (next cycle)'}
           </button>
         </div>
+      </div>
+    </div>
+  )
+}
+
+// ── FEATURE REQUEST MODAL (S571) ──────────────────────────────────────────
+// Real capture — replaces the old dead deep-link to a non-existent admin page.
+function FeatureRequestModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: () => void }) {
+  const [title, setTitle] = useState('')
+  const [description, setDescription] = useState('')
+  const [error, setError] = useState('')
+  const [done, setDone] = useState(false)
+
+  const mut = useMutation(
+    () => fetch((import.meta as any).env?.VITE_API_URL + '/api/feature-requests', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + localStorage.getItem('gam_tenant_token') },
+      body: JSON.stringify({ title, description }),
+    }).then(r => r.json()),
+    {
+      onSuccess: (data) => {
+        if (!data.success) { setError(data.error || 'Could not submit your request'); return }
+        setDone(true)
+      },
+      onError: () => setError('Could not submit your request. Please try again.'),
+    }
+  )
+
+  return (
+    <div className="modal-ov" onClick={onClose}>
+      <div className="modal" onClick={e=>e.stopPropagation()} style={{maxWidth:480}}>
+        <div className="modal-t">💡 Suggest a feature</div>
+        {done ? (
+          <>
+            <p style={{fontSize:'.85rem',color:'var(--t2)',margin:'8px 0 20px'}}>
+              Thanks — your idea went to the GAM team. We read every one.
+            </p>
+            <div style={{display:'flex',justifyContent:'flex-end'}}>
+              <button className="btn btn-p btn-sm" onClick={onSuccess}>Done</button>
+            </div>
+          </>
+        ) : (
+          <>
+            <p style={{fontSize:'.82rem',color:'var(--t2)',marginBottom:16}}>
+              Suggest a new service or an improvement. Requests go directly to the GAM team.
+            </p>
+            <div className="fg">
+              <label className="fl">Title</label>
+              <input className="input" placeholder="e.g. Pay rent in installments" value={title} onChange={e=>setTitle(e.target.value)} maxLength={140} autoFocus />
+            </div>
+            <div className="fg">
+              <label className="fl">Details</label>
+              <textarea className="input" rows={4} placeholder="Describe what you'd like and why it would help…" value={description} onChange={e=>setDescription(e.target.value)} maxLength={4000} style={{resize:'vertical'}} />
+            </div>
+            {error && <div className="alert a-red" style={{marginBottom:12}}>{error}</div>}
+            <div style={{display:'flex',gap:8,justifyContent:'flex-end'}}>
+              <button className="btn btn-g btn-sm" onClick={onClose}>Cancel</button>
+              <button className="btn btn-p btn-sm" disabled={mut.isLoading || title.trim().length<3 || description.trim().length<5} onClick={()=>{ setError(''); mut.mutate() }}>
+                {mut.isLoading ? <span className="spinner"/> : 'Submit request'}
+              </button>
+            </div>
+          </>
+        )}
       </div>
     </div>
   )
@@ -1908,6 +1844,7 @@ function ServicesPage() {
   const [flexPayInquireModal, setFlexPayInquireModal] = useState(false)
   const [flexPayChangeModal, setFlexPayChangeModal] = useState(false)
   const [flexDepositModal, setFlexDepositModal] = useState(false)
+  const [featureModal, setFeatureModal] = useState(false)
   const fd = useQuery('tenant-flexdeposit', () => get<any>('/tenants/flexdeposit'), { enabled: flexVis.flexdeposit })
   // S541: FlexPay demand-test — the inquiry disposition drives the card.
   const fp = useQuery('tenant-flexpay', () => get<any>('/tenants/flexpay'), { enabled: flexVis.flexpay })
@@ -1917,14 +1854,12 @@ function ServicesPage() {
   // interest survey; NO enrollment promises, no queue language.
   const fpLaunched = fp.data?.enrollmentOpen === true
 
-  // S310: OTP became landlord-only at S155; the tenant /enroll-on-time-pay
-  // route returns 410 Gone. The tenant portal must not surface OTP
-  // enrollment, status, or qualification copy per the FlexSuite/OTP
-  // portal-separation principle (memory: project_flexsuite_otp_hidden.md
-  // — "OTP inverse: landlord-only, never tenant"). The enrollment modal,
-  // mutation, and qualification-status card were removed here.
-
-  const creditMut = useMutation(() => post('/tenants/enroll-credit-reporting'), { onSuccess: () => qc2.refetch() })
+  // S565: FlexCredit is DEMAND-CAPTURE only (product not built/billed yet — no
+  // Esusu, no $5 charge; gated on the ~$500/mo provider breakeven). The card
+  // files an INTEREST inquiry, not an enrollment — same survey mode as FlexPay.
+  const fc = useQuery('tenant-flexcredit', () => get<any>('/tenants/flexcredit/inquiry'), { enabled: flexVis.flexcredit })
+  const fcInterested = !!fc.data?.interested
+  const flexCreditInquireMut = useMutation(() => post('/tenants/flexcredit/inquiry'), { onSuccess: () => fc.refetch() })
 
   const services = [
     {
@@ -1932,17 +1867,22 @@ function ServicesPage() {
       name: 'FlexCredit',
       desc: 'Report your on-time rent payments to all 3 bureaus — Experian, TransUnion & Equifax. Build credit just by paying rent.',
       price: '$5/month',
-      enrolled: me?.creditReportingEnrolled,
-      action: () => creditMut.mutate(),
-      loading: creditMut.isLoading,
-      highlight: '30% of tenants build 40+ credit score points in year 1',
+      // Survey mode: no enrollment yet — capture interest only.
+      enrolled: false,
+      action: () => flexCreditInquireMut.mutate(),
+      loading: flexCreditInquireMut.isLoading,
+      highlight: fcInterested
+        ? '✓ Interest recorded — we’ll announce availability'
+        : 'Coming soon — tap if you’d use it to build credit',
+      ctaLabel: 'I’m interested',
+      statusBadge: fcInterested ? { text: 'Interest recorded', tone: 'b-green' } : null,
     },
 
     {
       id: 'flexpay',
       name: 'FlexPay',
-      desc: 'Pick the day of the month your rent gets pulled from your bank. Your landlord gets paid on the lease grace-period day no matter what; you pay later.',
-      price: '$6–$33/month',
+      desc: 'Pick the day of the month your rent gets pulled from your bank — match it to when your income lands. Your landlord gets paid on the lease grace-period day no matter what; you pay later.',
+      price: '$25/month',
       enrolled: me?.flexpayEnrolled,
       // S544 survey mode (pre-launch): "coming soon" + interest
       // survey — no enrollment promises, no queue language, no
@@ -2068,14 +2008,6 @@ function ServicesPage() {
         </div>
       )}
 
-      {/* S310: OTP Qualification Status card removed — OTP is a
-          landlord-only product (S155) and the tenant portal must not
-          surface it. The deposit-funding and ACH-verification steps
-          shown here pulled double duty as OTP-qualification rungs;
-          those are now handled in their own dedicated surfaces
-          (FlexDeposit installment progress, the ACH verification
-          card above when !ach_verified). */}
-
     {flexPayModal && (
         <FlexPayModal
           onClose={() => setFlexPayModal(false)}
@@ -2101,6 +2033,12 @@ function ServicesPage() {
           eligibility={fd.data?.eligibility}
           onClose={() => setFlexDepositModal(false)}
           onSuccess={() => { qc2.refetch(); fd.refetch(); setFlexDepositModal(false) }}
+        />
+      )}
+      {featureModal && (
+        <FeatureRequestModal
+          onClose={() => setFeatureModal(false)}
+          onSuccess={() => setFeatureModal(false)}
         />
       )}
 
@@ -2140,10 +2078,10 @@ function ServicesPage() {
             <div style={{fontWeight:700,color:'var(--t0)',marginBottom:4}}>💡 Have a feature idea?</div>
             <div style={{fontSize:'.78rem',color:'var(--t3)',lineHeight:1.5}}>Suggest a new service or improvement. Requests go directly to the GAM team.</div>
           </div>
-          <a href={`${(import.meta as any).env?.VITE_ADMIN_APP_URL || 'http://localhost:3003'}/feature-requests`} target="_blank" rel="noreferrer"
-            style={{display:'inline-flex',alignItems:'center',gap:7,padding:'8px 16px',borderRadius:8,background:'rgba(59,130,246,.12)',border:'1px solid rgba(59,130,246,.3)',color:'#93c5fd',fontWeight:600,fontSize:'.78rem',textDecoration:'none',whiteSpace:'nowrap'}}>
+          <button onClick={()=>setFeatureModal(true)}
+            style={{display:'inline-flex',alignItems:'center',gap:7,padding:'8px 16px',borderRadius:8,background:'rgba(59,130,246,.12)',border:'1px solid rgba(59,130,246,.3)',color:'#93c5fd',fontWeight:600,fontSize:'.78rem',cursor:'pointer',whiteSpace:'nowrap'}}>
             Submit Request →
-          </a>
+          </button>
         </div>
       </div>
     </div>
@@ -2228,6 +2166,11 @@ function TenantInspectionDetailPage() {
     ['tenant-inspection', id],
     () => get<any>(`/inspections/${id}`),
   )
+  // S573: which areas still need a photo before this walkthrough can be submitted.
+  const { data: completeness } = useQuery<any>(
+    ['tenant-inspection-completeness', id],
+    () => get<any>(`/inspections/${id}/completeness`),
+  )
   const signMut = useMutation(
     () => post(`/inspections/${id}/sign`),
     {
@@ -2243,6 +2186,7 @@ function TenantInspectionDetailPage() {
     },
   )
   const [camera, setCamera] = useState<null | 'photo' | 'video'>(null)
+  const [areaCaptureItemId, setAreaCaptureItemId] = useState<string | null>(null)
   const [videoSaved, setVideoSaved] = useState(false)
   const photoMut = useMutation(
     ({ file, live, itemId }: { file: File; live?: boolean; itemId?: string }) => {
@@ -2250,7 +2194,7 @@ function TenantInspectionDetailPage() {
       if (itemId) fd.append('itemId', itemId)
       return api.post(`/inspections/${id}/photos`, fd, { headers: { 'Content-Type': 'multipart/form-data' } }).then(r => r.data)
     },
-    { onSuccess: () => qc.invalidateQueries(['tenant-inspection', id]), onError: (e: any) => setError(e?.response?.data?.error || 'Upload failed') },
+    { onSuccess: () => { setAreaCaptureItemId(null); qc.invalidateQueries(['tenant-inspection', id]); qc.invalidateQueries(['tenant-inspection-completeness', id]) }, onError: (e: any) => setError(e?.response?.data?.error || 'Upload failed') },
   )
   // S550 (Nic): on-the-go issue reporting — "bedroom window is broken" +
   // an immediate photo, recorded as its own checklist finding.
@@ -2258,7 +2202,7 @@ function TenantInspectionDetailPage() {
   const [issueItemId, setIssueItemId] = useState<string | null>(null)
   const addIssueMut = useMutation(
     (label: string) => post<{ id: string }>(`/inspections/${id}/items`, {
-      area: 'Reported issues', itemLabel: label, condition: 'damaged', notes: label,
+      area: 'Reported issues', itemLabel: label, condition: 'damaged_missing', notes: label,
     }),
     {
       onSuccess: (r: any) => {
@@ -2287,6 +2231,18 @@ function TenantInspectionDetailPage() {
   const tenantSigned = signatures.some(s => s.signerRole === 'tenant')
   const editable = insp.status !== 'finalized' && insp.status !== 'cancelled'
 
+  // S573: group by area + which areas already have a photo (photo → item → area).
+  const itemAreaById = new Map(items.map((i: any) => [i.id, i.area]))
+  const photographedAreas = new Set<string>()
+  for (const p of photos) if (p.itemId && itemAreaById.has(p.itemId)) photographedAreas.add(itemAreaById.get(p.itemId) as string)
+  const areaOrder: string[] = []
+  const areaItems = new Map<string, any[]>()
+  for (const it of items) {
+    if (!areaItems.has(it.area)) { areaItems.set(it.area, []); areaOrder.push(it.area) }
+    areaItems.get(it.area)!.push(it)
+  }
+  const areasNeedingPhoto: string[] = completeness?.areasMissingPhoto ?? []
+
   return (
     <div>
       <div className="ph">
@@ -2311,17 +2267,37 @@ function TenantInspectionDetailPage() {
           <table className="tbl" style={{ minWidth: 600 }}>
             <thead><tr><th>Area</th><th>Item</th><th>Condition</th><th>Notes</th></tr></thead>
             <tbody>
-              {items.map(it => (
-                <tr key={it.id}>
-                  <td>{it.area}</td>
-                  <td style={{ color: 'var(--t0)' }}>{it.itemLabel}</td>
-                  <td><span className={`badge ${
-                    it.condition === 'good' ? 'b-green' :
-                    it.condition === 'fair' ? 'b-amber' :
-                    it.condition === 'damaged' || it.condition === 'missing' ? 'b-red' : 'b-muted'
-                  }`}>{it.condition}</span></td>
-                  <td style={{ fontSize: '.8rem', color: 'var(--t2)' }}>{it.notes || '—'}</td>
-                </tr>
+              {areaOrder.map(area => (
+                <React.Fragment key={area}>
+                  <tr style={{ background: 'var(--bg3)' }}>
+                    <td colSpan={4} style={{ padding: '8px 12px' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                        <strong style={{ color: 'var(--t0)', fontSize: '.85rem' }}>{area}</strong>
+                        {photographedAreas.has(area)
+                          ? <span className="badge b-green" style={{ fontSize: '.62rem' }}>✓ photo</span>
+                          : <span className="badge b-amber" style={{ fontSize: '.62rem' }}>photo needed</span>}
+                        {editable && (
+                          <button className="btn btn-g btn-sm" style={{ padding: '1px 10px' }}
+                            onClick={() => { setAreaCaptureItemId(areaItems.get(area)![0].id); setCamera('photo') }}>
+                            📷 {photographedAreas.has(area) ? 'Add photo' : 'Take photo'}
+                          </button>
+                        )}
+                      </div>
+                    </td>
+                  </tr>
+                  {areaItems.get(area)!.map(it => (
+                    <tr key={it.id}>
+                      <td />
+                      <td style={{ color: 'var(--t0)' }}>{it.itemLabel}</td>
+                      <td>{it.condition ? <span className={`badge ${
+                        it.condition === 'excellent' || it.condition === 'good' ? 'b-green' :
+                        it.condition === 'fair' ? 'b-amber' :
+                        it.condition === 'damaged_missing' ? 'b-red' : 'b-muted'
+                      }`}>{INSPECTION_ITEM_CONDITION_LABEL[it.condition as keyof typeof INSPECTION_ITEM_CONDITION_LABEL] ?? it.condition}</span> : <span className="badge b-muted">Not inspected</span>}</td>
+                      <td style={{ fontSize: '.8rem', color: 'var(--t2)' }}>{it.notes || '—'}</td>
+                    </tr>
+                  ))}
+                </React.Fragment>
               ))}
             </tbody>
           </table>
@@ -2415,13 +2391,13 @@ function TenantInspectionDetailPage() {
           <button
             className="btn btn-p"
             onClick={() => submitMut.mutate()}
-            disabled={submitMut.isLoading || photos.length === 0}
+            disabled={submitMut.isLoading || areasNeedingPhoto.length > 0}
           >
             {submitMut.isLoading ? 'Submitting…' : 'Submit walkthrough'}
           </button>
-          {photos.length === 0 && (
-            <div style={{ fontSize: '.75rem', color: 'var(--t3)', marginTop: 6 }}>
-              Add at least one photo first.
+          {areasNeedingPhoto.length > 0 && (
+            <div style={{ fontSize: '.75rem', color: 'var(--amber)', marginTop: 6 }}>
+              Photo still needed for: {areasNeedingPhoto.slice(0, 6).join(', ')}{areasNeedingPhoto.length > 6 ? '…' : ''}
             </div>
           )}
         </div>
@@ -2448,9 +2424,9 @@ function TenantInspectionDetailPage() {
       {camera && (
         <CameraCapture
           mode={camera}
-          onClose={() => { setCamera(null); setIssueItemId(null) }}
+          onClose={() => { setCamera(null); setIssueItemId(null); setAreaCaptureItemId(null) }}
           onCapture={(file) => {
-            if (camera === 'photo') photoMut.mutate({ file, live: true, itemId: issueItemId ?? undefined })
+            if (camera === 'photo') photoMut.mutate({ file, live: true, itemId: issueItemId ?? areaCaptureItemId ?? undefined })
             else videoMut.mutate({ file, live: true })
             setIssueItemId(null)
           }}
@@ -2466,36 +2442,108 @@ function TenantInspectionDetailPage() {
 // Every walkthrough video the tenant has recorded, across all their units
 // over the years (self-scoped via GET /inspections/videos/mine).
 function TenantMyWalkthroughsPage() {
-  const { data = [], isLoading } = useQuery<any[]>('tenant-my-walkthroughs', () =>
-    get<any[]>('/inspections/videos/mine'),
-  )
-  if (isLoading) return <div style={{ padding: 32, color: 'var(--t3)' }}>Loading…</div>
+  const qc = useQueryClient()
+  // S571: the tenant's OWN manually-captured walkthroughs (photos/video).
+  const { data: mine = [] } = useQuery<any[]>('tenant-walkthrough-mine', () =>
+    get<any[]>('/tenant-walkthroughs/mine'))
+  // Walkthrough videos recorded DURING inspections (existing, read-only).
+  const { data: fromInspections = [] } = useQuery<any[]>('tenant-my-walkthroughs', () =>
+    get<any[]>('/inspections/videos/mine'))
+
+  const [cameraMode, setCameraMode] = useState<null | 'photo' | 'video'>(null)
+  const [caption, setCaption] = useState('')
+  const [uploading, setUploading] = useState(false)
+  const [error, setError] = useState('')
+
+  const uploadOne = async (file: File) => {
+    setUploading(true); setError('')
+    try {
+      const fd = new FormData()
+      fd.append('file', file)
+      fd.append('capturedLive', 'true')
+      if (caption.trim()) fd.append('caption', caption.trim())
+      await api.post('/tenant-walkthroughs/media', fd)
+      setCaption('')
+      qc.invalidateQueries('tenant-walkthrough-mine')
+    } catch (e: any) {
+      setError(e?.response?.data?.error || 'Upload failed. Please try again.')
+    }
+    setUploading(false)
+  }
+
   return (
     <div>
       <div className="ph">
         <div>
           <h1 className="pt">My walkthroughs</h1>
-          <p className="ps">Every walkthrough video you’ve recorded, across your units.</p>
+          <p className="ps">Document your unit whenever you want — your own photos and video, kept as your record.</p>
         </div>
       </div>
-      {data.length === 0 ? (
-        <div className="card" style={{ padding: 24, textAlign: 'center', color: 'var(--t3)' }}>
-          No walkthrough videos yet. When you record one during an inspection, it shows up here.
+
+      {/* Start a new walkthrough */}
+      <div className="card" style={{ padding: 16, marginBottom: 16 }}>
+        <div style={{ fontSize: '.85rem', fontWeight: 700, color: 'var(--t0)', marginBottom: 4 }}>Start a new walkthrough</div>
+        <div style={{ fontSize: '.75rem', color: 'var(--t3)', marginBottom: 12, lineHeight: 1.5 }}>
+          Take photos or a video of your unit — move-in condition, a repair, anything you want on record. Captured live through your camera (not uploaded from your library). Your landlord can view it but can’t delete it.
         </div>
-      ) : (
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: 16 }}>
-          {data.map(v => (
-            <div key={v.id} className="card" style={{ padding: 12 }}>
-              <AuthedVideo path={v.videoUrl}
-                     style={{ width: '100%', borderRadius: 8, background: '#000', aspectRatio: '16/9' }} />
-              <div style={{ marginTop: 8, fontSize: '.82rem', color: 'var(--t0)' }}>
-                {labelType(v.inspectionType)} · Unit {v.unitNumber || '—'}
+        <input className="inp" placeholder="Optional note (e.g. 'kitchen — move-in condition')" value={caption} onChange={e => setCaption(e.target.value)} style={{ marginBottom: 10, maxWidth: 460 }} />
+        {error && <div className="alert a-warn" style={{ marginBottom: 10 }}>{error}</div>}
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+          <button className="btn btn-p" disabled={uploading} onClick={() => setCameraMode('photo')}>
+            {uploading ? <span className="spinner" /> : '📷 Take photo'}
+          </button>
+          <button className="btn btn-g" disabled={uploading} onClick={() => setCameraMode('video')}>
+            🎥 Record video
+          </button>
+        </div>
+      </div>
+
+      {cameraMode && (
+        <CameraCapture mode={cameraMode} onCapture={(file) => uploadOne(file)} onClose={() => setCameraMode(null)} />
+      )}
+
+      {/* The tenant's own uploads */}
+      {mine.length > 0 && (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: 12, marginBottom: 20 }}>
+          {mine.map((m: any) => (
+            <div key={m.id} className="card" style={{ padding: 10 }}>
+              {m.mediaType === 'video'
+                ? <AuthedVideo path={m.fileUrl} style={{ width: '100%', borderRadius: 8, background: '#000', aspectRatio: '16/9' }} />
+                : <AuthedImg path={m.fileUrl} alt={m.caption || 'walkthrough'} style={{ width: '100%', borderRadius: 8, aspectRatio: '16/9', objectFit: 'cover' }} />}
+              <div style={{ marginTop: 6, fontSize: '.75rem', color: 'var(--t2)' }}>
+                {m.caption || (m.mediaType === 'video' ? 'Video' : 'Photo')}
               </div>
-              <div style={{ fontSize: '.75rem', color: 'var(--t3)' }}>
-                {v.propertyName} · {new Date(v.uploadedAt).toLocaleDateString()}
+              <div style={{ fontSize: '.7rem', color: 'var(--t3)' }}>
+                {m.unitNumber ? `Unit ${m.unitNumber} · ` : ''}{new Date(m.createdAt).toLocaleDateString()}
               </div>
             </div>
           ))}
+        </div>
+      )}
+
+      {/* Recorded during inspections */}
+      {fromInspections.length > 0 && (
+        <>
+          <div className="nav-lbl" style={{ padding: '4px 0 8px' }}>From inspections</div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: 16 }}>
+            {fromInspections.map(v => (
+              <div key={v.id} className="card" style={{ padding: 12 }}>
+                <AuthedVideo path={v.videoUrl} style={{ width: '100%', borderRadius: 8, background: '#000', aspectRatio: '16/9' }} />
+                <div style={{ marginTop: 8, fontSize: '.82rem', color: 'var(--t0)' }}>
+                  {labelType(v.inspectionType)} · Unit {v.unitNumber || '—'}
+                </div>
+                <div style={{ fontSize: '.75rem', color: 'var(--t3)' }}>
+                  {v.propertyName} · {new Date(v.uploadedAt).toLocaleDateString()}
+                </div>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+
+      {mine.length === 0 && fromInspections.length === 0 && (
+        <div className="card" style={{ padding: 24, textAlign: 'center', color: 'var(--t3)' }}>
+          No walkthroughs yet. Use “Add photos or video” above to start your first one.
         </div>
       )}
     </div>
@@ -3470,27 +3518,52 @@ function TenantEntryRequestDetailPage() {
 // (the static /uploads mount no longer serves them). Browser <a> can't
 // carry the Bearer token, so the click handler fetches with auth and
 // opens a blob URL in a new tab — same S213 pattern as addendum PDFs.
-async function openDocumentFile(docId: string) {
+async function openAuthedUrl(fullOrRelUrl: string) {
   const token = localStorage.getItem('gam_tenant_token') || ''
-  const res = await fetch(`${API_URL}/api/documents/${docId}/file`, {
-    headers: { Authorization: 'Bearer ' + token },
-  })
+  const url = fullOrRelUrl.startsWith('http') ? fullOrRelUrl : `${API_URL}${fullOrRelUrl}`
+  const res = await fetch(url, { headers: { Authorization: 'Bearer ' + token } })
   if (!res.ok) { toast.error('Could not load document (status ' + res.status + ')'); return }
-  const blob = await res.blob()
-  window.open(URL.createObjectURL(blob), '_blank')
+  window.open(URL.createObjectURL(await res.blob()), '_blank')
 }
+const openDocumentFile = (docId: string) => openAuthedUrl(`/api/documents/${docId}/file`)
 
 function DocumentsPage() {
   const { data: docs = [], isLoading } = useQuery<any[]>('docs', () => get<any[]>('/documents'))
+  // S571: the signed lease PDF lives in e-sign (rendered in-browser on the Lease
+  // page); surface it here too as an easy download/print option, alongside the
+  // landlord's uploaded agreements, notices, receipts, etc.
+  const { data: leases = [] } = useQuery<any[]>('doc-leases', () => get<any[]>('/tenants/leases'))
+  // Tenants only reach the portal after signing, so a lease shown here is
+  // executed — never "pending signature." Exclude any not-yet-signed lease
+  // (awaiting-signature states); keep active AND expired/ended leases for the
+  // tenant's full history.
+  const AWAITING = new Set(['pending', 'draft', 'needs_review', 'awaiting_signature'])
+  const leaseDocs = (leases as any[]).filter(l => l.documentUrl && !AWAITING.has(l.status))
+  const isEmpty = !docs.length && !leaseDocs.length
+  const fmtD = (d: any) => d ? new Date(d).toLocaleDateString() : '—'
   return (
     <div>
-      <div className="ph"><div><h1 className="pt">Documents</h1><p className="ps">Your lease and agreements</p></div></div>
+      <div className="ph"><div><h1 className="pt">Documents</h1><p className="ps">Your lease, agreements, and notices — download or print</p></div></div>
       <div className="card" style={{padding:0,overflowX:'auto'}}>
         {isLoading ? <div style={{padding:32,color:'var(--t3)',textAlign:'center'}}>Loading…</div> : (
           <table className="tbl" style={{minWidth:640}}>
-            <thead><tr><th>Document</th><th>Type</th><th>Signed</th><th>Date</th><th></th></tr></thead>
+            <thead><tr><th>Document</th><th>Type</th><th>Status</th><th>Date</th><th></th></tr></thead>
             <tbody>
-              {docs.length ? docs.map((d:any)=>(
+              {leaseDocs.map((l:any)=>{
+                const active = l.status === 'active'
+                return (
+                <tr key={l.id}>
+                  <td style={{color:'var(--t0)'}}>
+                    Lease — {l.propertyName}{l.unitNumber?` · Unit ${l.unitNumber}`:''}
+                    <div style={{fontSize:'.72rem',color:'var(--t3)',marginTop:2}}>Term: {fmtD(l.startDate)} – {l.endDate?fmtD(l.endDate):'ongoing'}</div>
+                  </td>
+                  <td><span className="badge b-muted">Lease</span></td>
+                  <td><span className={`badge ${active?'b-green':'b-muted'}`}>{active?'Active':'Expired'}</span></td>
+                  <td className="mono" style={{fontSize:'.75rem',color:'var(--t3)'}}>{fmtD(l.signedAt || l.startDate)}</td>
+                  <td><button onClick={()=>openAuthedUrl(l.documentUrl)} className="btn btn-g btn-sm">Download</button></td>
+                </tr>
+              )})}
+              {docs.map((d:any)=>(
                 <tr key={d.id}>
                   <td style={{color:'var(--t0)'}}>{d.name}</td>
                   <td><span className="badge b-muted">{humanize(d.type)}</span></td>
@@ -3498,7 +3571,8 @@ function DocumentsPage() {
                   <td className="mono" style={{fontSize:'.75rem',color:'var(--t3)'}}>{new Date(d.createdAt).toLocaleDateString()}</td>
                   <td><button onClick={()=>openDocumentFile(d.id)} className="btn btn-g btn-sm">Download</button></td>
                 </tr>
-              )) : <tr><td colSpan={5} style={{textAlign:'center',color:'var(--t3)',padding:32}}>No documents yet.</td></tr>}
+              ))}
+              {isEmpty && <tr><td colSpan={5} style={{textAlign:'center',color:'var(--t3)',padding:32}}>No documents yet.</td></tr>}
             </tbody>
           </table>
         )}
@@ -3509,9 +3583,11 @@ function DocumentsPage() {
 
 // ── LOGIN ─────────────────────────────────────────────────────
 function LoginPage() {
-  const { login, loginWithTotp } = useAuth(); const navigate = useNavigate()
+  const { login, loginWithTotp, loginWithEmailOtp, resendEmailOtp } = useAuth(); const navigate = useNavigate()
   const [err, setErr] = useState(''); const [loading, setLoading] = useState(false)
   const [totpSession, setTotpSession] = useState<string|null>(null)
+  const [emailOtpSession, setEmailOtpSession] = useState<string|null>(null)
+  const [resent, setResent] = useState(false)
   const [code, setCode] = useState('')
   const { register, handleSubmit } = useForm<{email:string;password:string}>()
   const onSubmit = async(d:{email:string;password:string})=>{
@@ -3519,10 +3595,26 @@ function LoginPage() {
     try{
       const r = await login(d.email,d.password)
       if(r.kind==='totp_required'){setTotpSession(r.totpSession);setCode('')}
+      else if(r.kind==='email_otp_required'){setEmailOtpSession(r.emailOtpSession);setCode('');setResent(false)}
       else navigate('/home')
     }
     catch(e:any){setErr(e.response?.data?.error||'Login failed')}
     finally{setLoading(false)}
+  }
+  const onEmailOtpSubmit = async(e:React.FormEvent)=>{
+    e.preventDefault();setLoading(true);setErr('')
+    try{ await loginWithEmailOtp(emailOtpSession!,code.trim()); navigate('/home') }
+    catch(ex:any){
+      const msg=ex.response?.data?.error||'Invalid code.'
+      setErr(msg)
+      if(/session/i.test(msg)){setEmailOtpSession(null);setCode('')}
+    }
+    finally{setLoading(false)}
+  }
+  const onResend = async()=>{
+    setErr('')
+    try{ await resendEmailOtp(emailOtpSession!); setResent(true) }
+    catch{ setErr('Could not resend the code. Please try again.') }
   }
   const onTotpSubmit = async(e:React.FormEvent)=>{
     e.preventDefault();setLoading(true);setErr('')
@@ -3534,6 +3626,56 @@ function LoginPage() {
       if(/session/i.test(msg)){setTotpSession(null);setCode('')}
     }
     finally{setLoading(false)}
+  }
+
+  // ── Step 2 (email 2FA): emailed code ──────────────────────────
+  if(emailOtpSession){
+    return (
+      <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',background:'var(--bg0)',padding:20}}>
+        <div style={{width:'100%',maxWidth:400}}>
+          <div style={{textAlign:'center',marginBottom:40}}>
+            <div style={{fontFamily:'var(--font-d)',fontSize:'2rem',fontWeight:800,color:'var(--gold)',marginBottom:8}}>⚡ GAM</div>
+            <div style={{color:'var(--t2)',fontSize:'.875rem'}}>Two-factor authentication</div>
+          </div>
+          <div className="card" style={{padding:28}}>
+            <h2 style={{marginBottom:14}}>Check your email</h2>
+            <div style={{fontSize:'.85rem',color:'var(--t1)',marginBottom:16,lineHeight:1.6}}>
+              We sent a 6-digit code to your email. Enter it below to finish signing in.
+            </div>
+            {err && <div className="alert a-warn" style={{marginBottom:16}}>{err}</div>}
+            {resent && !err && <div className="alert a-green" style={{marginBottom:16}}>A new code is on its way.</div>}
+            <form onSubmit={onEmailOtpSubmit}>
+              <div className="fg">
+                <label className="fl">Code</label>
+                <input
+                  className="fi"
+                  type="text"
+                  value={code}
+                  onChange={e=>setCode(e.target.value)}
+                  autoFocus
+                  required
+                  autoComplete="one-time-code"
+                  inputMode="numeric"
+                  placeholder="123 456"
+                  style={{fontFamily:'var(--font-m)',letterSpacing:'.2em',textAlign:'center'}}
+                />
+              </div>
+              <button className="btn btn-p" type="submit" disabled={loading||!code.trim()} style={{width:'100%',justifyContent:'center',marginTop:8}}>
+                {loading?<span className="spinner"/>:'Verify'}
+              </button>
+            </form>
+            <div style={{marginTop:16,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+              <button onClick={()=>{setEmailOtpSession(null);setCode('');setErr('');setResent(false)}} style={{background:'none',border:'none',color:'var(--t2)',fontSize:'.85rem',cursor:'pointer',textDecoration:'underline'}}>
+                ← Back to sign in
+              </button>
+              <button onClick={onResend} style={{background:'none',border:'none',color:'var(--gold)',fontSize:'.85rem',cursor:'pointer',textDecoration:'underline'}}>
+                Resend code
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    )
   }
 
   // ── Step 2: TOTP code ─────────────────────────────────────────
@@ -3606,255 +3748,21 @@ function LoginPage() {
             </Link>
           </div>
         </div>
+        {/* S564: public renter-pool screening entry — no login/signup required. */}
+        <div className="card" style={{ padding: 20, marginTop: 16, textAlign: 'center' }}>
+          <div style={{ fontSize: '.9rem', fontWeight: 700, color: 'var(--gold)', marginBottom: 6 }}>Looking for a place to live?</div>
+          <div style={{ fontSize: '.8rem', color: 'var(--t1)', lineHeight: 1.6, marginBottom: 14 }}>
+            Get background-checked once and join the renter pool — landlords with open units find you. No account or chosen property needed to start.
+          </div>
+          <Link to="/background-check" className="btn btn-p" style={{ width: '100%', justifyContent: 'center', textDecoration: 'none' }}>
+            Get screened
+          </Link>
+        </div>
       </div>
     </div>
   )
 }
 
-// ── TOTP ENROLLMENT ───────────────────────────────────────────
-// S289: opt-in 2FA enrollment for tenants. Reached from the Security
-// page only — tenants are NOT in MANDATORY_TOTP_ROLES, so there's no
-// gate forcing this. Three states:
-//   loading   — fetching the secret + QR + recovery codes
-//   showCodes — user scans the QR / saves recovery codes / enters the
-//               first 6-digit token to confirm enrollment
-//   done      — confirm succeeded; refresh() pulled totpEnabled; back
-//               to Security
-function TotpEnrollPage() {
-  const { refresh } = useAuth()
-  const navigate = useNavigate()
-  const [state, setState] = useState<'loading'|'showCodes'|'done'|'error'>('loading')
-  const [err, setErr] = useState('')
-  const [qrDataUri, setQrDataUri] = useState('')
-  const [otpauthUrl, setOtpauthUrl] = useState('')
-  const [recoveryCodes, setRecoveryCodes] = useState<string[]>([])
-  const [code, setCode] = useState('')
-  const [submitting, setSubmitting] = useState(false)
-  const [savedAck, setSavedAck] = useState(false)
-
-  useEffect(()=>{
-    let cancelled=false
-    api.post('/auth/totp/enroll-start')
-      .then(r=>{
-        if(cancelled)return
-        const d=r.data.data
-        setQrDataUri(d.qrDataUri);setOtpauthUrl(d.otpauthUrl)
-        setRecoveryCodes(d.recoveryCodes||[])
-        setState('showCodes')
-      })
-      .catch((e:any)=>{
-        if(cancelled)return
-        // 409 if already enrolled — nothing to do, back to Security.
-        if(e.response?.status===409){navigate('/security',{replace:true});return}
-        setErr(e.response?.data?.error||'Could not start enrollment.')
-        setState('error')
-      })
-    return()=>{cancelled=true}
-  },[navigate])
-
-  const onConfirm=async(e:React.FormEvent)=>{
-    e.preventDefault();setSubmitting(true);setErr('')
-    try{
-      await api.post('/auth/totp/enroll-confirm',{token:code.trim()})
-      await refresh()
-      setState('done')
-      setTimeout(()=>navigate('/security',{replace:true}),700)
-    }catch(ex:any){
-      setErr(ex.response?.data?.error||'Verification failed. Try the current code from your app.')
-      setSubmitting(false)
-    }
-  }
-
-  if(state==='loading'){
-    return <div className="loading"><span className="spinner"/></div>
-  }
-  if(state==='error'){
-    return (
-      <div>
-        <div className="ph"><div><div className="pt">Set up two-factor</div></div></div>
-        <div className="card" style={{maxWidth:480}}>
-          <div style={{fontSize:32,marginBottom:12}}>⚠️</div>
-          <h3 style={{marginBottom:10}}>Couldn't start enrollment</h3>
-          <p style={{color:'var(--t2)',fontSize:'.85rem',lineHeight:1.6,marginBottom:16}}>{err}</p>
-          <button onClick={()=>navigate('/security')} className="btn btn-g">Back to Security</button>
-        </div>
-      </div>
-    )
-  }
-  if(state==='done'){
-    return (
-      <div>
-        <div className="card" style={{maxWidth:480,textAlign:'center',padding:28}}>
-          <div style={{fontSize:36,marginBottom:12}}>✅</div>
-          <h3 style={{marginBottom:10}}>Two-factor authentication enabled</h3>
-          <p style={{color:'var(--t2)',fontSize:'.85rem',lineHeight:1.6}}>Returning to Security…</p>
-        </div>
-      </div>
-    )
-  }
-
-  // Main enrollment screen
-  return (
-    <div>
-      <div className="ph">
-        <div><div className="pt">Set up two-factor authentication</div><div className="ps">Add an authenticator-app code to every sign-in</div></div>
-      </div>
-      <div className="card" style={{maxWidth:600}}>
-        <div style={{fontSize:'.85rem',color:'var(--t1)',marginBottom:16,lineHeight:1.6}}>
-          Two-factor authentication adds a one-time code to your sign-in, so a stolen password isn't enough to get into your account. This is optional.
-        </div>
-
-        <div style={{display:'grid',gridTemplateColumns:'auto 1fr',gap:16,alignItems:'start',marginBottom:18}}>
-          <div style={{padding:10,background:'#fff',borderRadius:8,lineHeight:0}}>
-            <img src={qrDataUri} alt="Scan this QR code with your authenticator app" style={{display:'block',width:180,height:180}}/>
-          </div>
-          <div style={{fontSize:'.85rem',color:'var(--t1)',lineHeight:1.6}}>
-            <div style={{fontWeight:700,color:'var(--t0)',marginBottom:6}}>1. Scan with your authenticator app</div>
-            <div style={{color:'var(--t2)',fontSize:'.8rem',marginBottom:10}}>Google Authenticator, Authy, 1Password, Bitwarden — any TOTP app works. Open the app, tap "Add account" or the + icon, then scan the QR code on the left.</div>
-            <div style={{fontSize:'.75rem',color:'var(--t3)'}}>Can't scan? <a href={otpauthUrl} style={{color:'var(--gold)',wordBreak:'break-all'}}>Tap to add manually →</a></div>
-          </div>
-        </div>
-
-        <div style={{marginBottom:18,padding:14,background:'rgba(245,158,11,.05)',border:'1px solid rgba(245,158,11,.2)',borderRadius:8}}>
-          <div style={{fontWeight:700,color:'var(--amber)',marginBottom:8,fontSize:'.88rem'}}>2. Save these recovery codes</div>
-          <div style={{fontSize:'.8rem',color:'var(--t2)',marginBottom:10,lineHeight:1.5}}>
-            If you ever lose access to your authenticator app, these one-time codes are the only way to get back in. Store them somewhere safe — a password manager works well.
-          </div>
-          <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:6,marginBottom:10}}>
-            {recoveryCodes.map(rc=>(
-              <div key={rc} style={{fontFamily:'var(--font-m)',fontSize:'.85rem',color:'var(--t0)',background:'var(--bg3)',padding:'5px 9px',borderRadius:5,letterSpacing:'.05em'}}>{rc}</div>
-            ))}
-          </div>
-          <label style={{display:'flex',alignItems:'center',gap:8,fontSize:'.8rem',color:'var(--t1)',cursor:'pointer'}}>
-            <input type="checkbox" checked={savedAck} onChange={e=>setSavedAck(e.target.checked)}/>
-            I've saved my recovery codes somewhere safe.
-          </label>
-        </div>
-
-        <form onSubmit={onConfirm}>
-          <div className="fg">
-            <label className="fl">3. Enter the 6-digit code from your app to confirm</label>
-            <input
-              className="fi"
-              type="text"
-              value={code}
-              onChange={e=>setCode(e.target.value)}
-              required
-              inputMode="numeric"
-              pattern="[0-9 ]*"
-              autoComplete="one-time-code"
-              placeholder="000000"
-              maxLength={7}
-              style={{fontFamily:'var(--font-m)',letterSpacing:'.2em',textAlign:'center'}}
-            />
-          </div>
-          {err && <div className="alert a-warn" style={{marginBottom:12}}>{err}</div>}
-          <div style={{display:'flex',gap:10}}>
-            <button className="btn btn-p" type="submit" disabled={submitting||!savedAck||code.trim().length<6} style={{justifyContent:'center'}}>
-              {submitting?<span className="spinner"/>:'Enable two-factor'}
-            </button>
-            <button type="button" className="btn btn-g" onClick={()=>navigate('/security')} disabled={submitting}>Cancel</button>
-          </div>
-          <div style={{marginTop:10,fontSize:'.75rem',color:'var(--t3)'}}>
-            Confirm the codes are saved before continuing — they're shown only once.
-          </div>
-        </form>
-      </div>
-    </div>
-  )
-}
-
-// ── SECURITY PAGE ─────────────────────────────────────────────
-// S289: tenant 2FA management. Opt-in enable (routes to /security/enroll)
-// and password-confirmed disable. Fully optional — no enrollment gate.
-function SecurityPage() {
-  const { user, refresh } = useAuth()
-  const navigate = useNavigate()
-  const [showConfirm, setShowConfirm] = useState(false)
-  const [password, setPassword] = useState('')
-  const [submitting, setSubmitting] = useState(false)
-  const [err, setErr] = useState('')
-  const [success, setSuccess] = useState('')
-
-  const onDisable=async(e:React.FormEvent)=>{
-    e.preventDefault();setSubmitting(true);setErr('')
-    try{
-      await api.post('/auth/totp/disable',{password})
-      await refresh()
-      setShowConfirm(false);setPassword('')
-      setSuccess('Two-factor authentication disabled.')
-    }catch(ex:any){
-      setErr(ex.response?.data?.error||'Could not disable 2FA. Check your password.')
-    }finally{
-      setSubmitting(false)
-    }
-  }
-
-  return (
-    <div>
-      <div className="ph">
-        <div><div className="pt">Security</div><div className="ps">Manage two-factor authentication</div></div>
-      </div>
-      <div className="card" style={{maxWidth:600,marginBottom:16}}>
-        <div className="kpi-l" style={{marginBottom:14}}>Two-factor authentication</div>
-        <div style={{display:'flex',alignItems:'center',gap:12,marginBottom:14}}>
-          <div style={{width:36,height:36,borderRadius:8,background:user?.totpEnabled?'rgba(34,197,94,.1)':'rgba(138,150,176,.1)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'1.2rem'}}>
-            {user?.totpEnabled?'✅':'🔓'}
-          </div>
-          <div>
-            <div style={{fontWeight:700,color:'var(--t0)',fontSize:'.95rem'}}>
-              {user?.totpEnabled?'Enabled':'Not enabled'}
-            </div>
-            <div style={{fontSize:'.8rem',color:'var(--t2)'}}>
-              {user?.totpEnabled
-                ?'You will be prompted for a 6-digit code on every sign-in.'
-                :'Add an authenticator-app code to your sign-in for extra protection. Optional.'}
-            </div>
-          </div>
-        </div>
-
-        {success && <div className="alert a-green" style={{marginBottom:12}}>{success}</div>}
-
-        {!user?.totpEnabled && (
-          <button className="btn btn-p" onClick={()=>{setSuccess('');navigate('/security/enroll')}}>
-            Enable two-factor
-          </button>
-        )}
-
-        {user?.totpEnabled && !showConfirm && (
-          <button className="btn btn-d" onClick={()=>{setShowConfirm(true);setSuccess('')}}>
-            Disable two-factor
-          </button>
-        )}
-
-        {user?.totpEnabled && showConfirm && (
-          <form onSubmit={onDisable} style={{marginTop:8,padding:14,background:'var(--bg1)',border:'1px solid var(--b1)',borderRadius:8}}>
-            <div style={{fontSize:'.82rem',color:'var(--t1)',marginBottom:10,lineHeight:1.5}}>
-              Confirm your password to disable 2FA. After disable, any saved recovery codes are invalidated.
-            </div>
-            <div className="fg">
-              <label className="fl">Password</label>
-              <input className="fi" type="password" value={password} onChange={e=>setPassword(e.target.value)} autoFocus required />
-            </div>
-            {err && <div className="alert a-warn" style={{marginBottom:10}}>{err}</div>}
-            <div style={{display:'flex',gap:8}}>
-              <button type="submit" className="btn btn-d" disabled={submitting||!password} style={{justifyContent:'center'}}>
-                {submitting?<span className="spinner"/>:'Disable two-factor'}
-              </button>
-              <button type="button" className="btn btn-g" onClick={()=>{setShowConfirm(false);setPassword('');setErr('')}} disabled={submitting}>
-                Cancel
-              </button>
-            </div>
-          </form>
-        )}
-      </div>
-
-      <div style={{fontSize:'.75rem',color:'var(--t3)',maxWidth:600,lineHeight:1.5}}>
-        If you lose your authenticator app, use one of your saved recovery codes to sign in, then disable and re-enable 2FA with the new app.
-      </div>
-    </div>
-  )
-}
 
 // ── APP ───────────────────────────────────────────────────────
 function App() {
@@ -3876,12 +3784,14 @@ function App() {
           <Route path="notifications"    element={<TenantNotificationsPage />} />
           <Route path="home"             element={<HomePage />} />
           <Route path="payments"         element={<PaymentsPage />} />
+          <Route path="communication"   element={<CommunicationPage />} />
           <Route path="maintenance"      element={<MaintenancePage />} />
           <Route path="lease"            element={<LeasePage />} />
           <Route path="sign/:documentId" element={<SignPage />} />
           <Route path="services"         element={<ServicesPage />} />
-          <Route path="documents"        element={<DocumentsPage />} />
-          <Route path="support"          element={<SupportPage />} />
+          {/* S571: Documents folded into the Communication dashboard (it's
+              landlord→tenant paperwork). Old deep-links redirect to the tab. */}
+          <Route path="documents"        element={<Navigate to="/communication?tab=documents" replace />} />
           <Route path="inspections"      element={<TenantInspectionsPage />} />
           <Route path="inspections/:id"  element={<TenantInspectionDetailPage />} />
           <Route path="walkthroughs"     element={<TenantMyWalkthroughsPage />} />
@@ -3893,8 +3803,10 @@ function App() {
           <Route path="my-disputes"         element={LAUNCH_HIDDEN.has('/my-disputes') ? <Navigate to="/home" replace /> : <MyDisputesPage />} />
           <Route path="notification-prefs"  element={<NotificationPrefsPage />} />
           <Route path="profile"          element={<ProfilePage />} />
-          <Route path="security"         element={<SecurityPage />} />
-          <Route path="security/enroll"  element={<TotpEnrollPage />} />
+          {/* S571: tenant 2FA moved into Profile → Security (email codes, no
+              authenticator). The old standalone pages are retired — redirect. */}
+          <Route path="security"         element={<Navigate to="/profile" replace />} />
+          <Route path="security/enroll"  element={<Navigate to="/profile" replace />} />
           <Route path="payouts"          element={<PayoutsPage />} />
         </Route>
       </Routes>

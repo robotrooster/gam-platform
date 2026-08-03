@@ -5,6 +5,7 @@ import { humanize, MANUAL_PAYMENT_METHODS, MANUAL_PAYMENT_METHOD_LABELS,
          MANUAL_PAYMENT_FEE, type ManualPaymentMethod } from '@gam/shared'
 import { apiGet, apiPost } from '../lib/api'
 import { usePerms } from '../lib/permissions'
+import { SearchBox, PropertySelect } from '../components/ListControls'
 import { X, AlertTriangle, CheckCircle, Clock, XCircle } from 'lucide-react'
 
 const fmt = (n: any) => n != null
@@ -69,6 +70,17 @@ function PaymentDetailModal({ payment: p, onClose, canRecord, onRecorded }: {
         setRecordMsg(waived
           ? 'Recorded. First rent payment — no manual-payment fee charged.'
           : `Recorded. A $${MANUAL_PAYMENT_FEE.toFixed(2)} manual-payment fee was billed to the tenant.`)
+        onRecorded()
+      },
+    })
+
+  // S568: first-invoice-only, imported-lease-only "paid via prior arrangement"
+  // during the onboarding-transition window. The server sets priorArrangementEligible.
+  const priorArrMut = useMutation(
+    () => apiPost(`/payments/${p.id}/record-prior-arrangement`, {}),
+    {
+      onSuccess: () => {
+        setRecordMsg('Marked as paid off-platform via prior arrangement. No fee charged.')
         onRecorded()
       },
     })
@@ -211,6 +223,34 @@ function PaymentDetailModal({ payment: p, onClose, canRecord, onRecorded }: {
           {row('Created', p.createdAt ? new Date(p.createdAt).toLocaleString() : null, { mono: true })}
         </div>
 
+        {/* S568: onboarding reconciliation window — during a landlord's move onto
+            GAM a tenant may still be auto-debited by the OLD system. The first GAM
+            invoice can be marked paid off-platform to avoid double-charging.
+            Fee-free, first invoice only; the server gates it to the landlord's
+            reconciliation window (new-vs-imported lease is irrelevant). */}
+        {isManualRecordable && p.priorArrangementEligible && !recordMsg && (
+          <div style={{ marginTop: 16, padding: '14px', borderTop: '1px solid var(--border-0)', background: 'rgba(201,162,39,.05)', borderRadius: 10 }}>
+            <div style={{ fontSize: '.75rem', fontWeight: 700, color: 'var(--gold)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 6 }}>
+              Onboarding reconciliation
+            </div>
+            <div style={{ fontSize: '.78rem', color: 'var(--text-2)', marginBottom: 10 }}>
+              Was this first rent payment already collected through your old system
+              (e.g. the tenant's autopay hadn't switched over yet)? Mark it paid so they
+              aren't double-charged — it comes off the books, no fee. First invoice only,
+              during your onboarding reconciliation window.
+            </div>
+            <button className="btn btn-primary btn-sm" disabled={priorArrMut.isLoading}
+              onClick={() => priorArrMut.mutate()}>
+              {priorArrMut.isLoading ? 'Marking…' : 'Already collected through my old system'}
+            </button>
+            {priorArrMut.isError && (
+              <div style={{ fontSize: '.75rem', color: 'var(--red)', marginTop: 8 }}>
+                {(priorArrMut.error as any)?.message || 'Could not mark the payment.'}
+              </div>
+            )}
+          </div>
+        )}
+
         {/* S562: record a manual (off-platform) rent payment */}
         {isManualRecordable && (
           <div style={{ marginTop: 16, padding: '14px 0', borderTop: '1px solid var(--border-0)' }}>
@@ -268,9 +308,26 @@ function PaymentDetailModal({ payment: p, onClose, canRecord, onRecorded }: {
 export function PaymentsPage() {
   const { data: payments = [], isLoading } = useQuery<any[]>('payments', () => apiGet('/payments'))
   const [selected, setSelected] = useState<any>(null)
+  const [search, setSearch] = useState('')
+  const [propertyName, setPropertyName] = useState('')
   const navigate = useNavigate()
   const { can } = usePerms()
   const queryClient = useQueryClient()
+
+  // S576: the /payments payload carries propertyName (not propertyId), so the
+  // dropdown keys on name — unique within a landlord's portfolio. Search spans
+  // tenant, unit, and property so "type a tenant name → their transactions".
+  const propertyOptions = (payments as any[]).map(p => ({ id: p.propertyName, name: p.propertyName }))
+  const q = search.trim().toLowerCase()
+  const filteredPayments = (payments as any[]).filter((p: any) => {
+    const matchProperty = propertyName === '' || p.propertyName === propertyName
+    if (!matchProperty) return false
+    if (q === '') return true
+    const tenant = `${p.tenantFirst ?? ''} ${p.tenantLast ?? ''}`.toLowerCase()
+    return tenant.includes(q)
+      || (p.unitNumber || '').toLowerCase().includes(q)
+      || (p.propertyName || '').toLowerCase().includes(q)
+  })
 
   return (
     <div>
@@ -284,6 +341,11 @@ export function PaymentsPage() {
             Import payment history
           </button>
         )}
+      </div>
+
+      <div className="filter-bar">
+        <SearchBox value={search} onChange={setSearch} placeholder="Search tenant, unit, property…" />
+        <PropertySelect value={propertyName} onChange={setPropertyName} properties={propertyOptions} />
       </div>
 
       <div className="card" style={{ padding: 0, overflowX: 'auto' }}>
@@ -304,7 +366,7 @@ export function PaymentsPage() {
               </tr>
             </thead>
             <tbody>
-              {(payments as any[]).length ? (payments as any[]).map((p: any) => {
+              {filteredPayments.length ? filteredPayments.map((p: any) => {
                 const partial = isPartial(p)
                 const net = netToBank(p)
                 return (
@@ -347,7 +409,7 @@ export function PaymentsPage() {
               )}) : (
                 <tr>
                   <td colSpan={8} style={{ textAlign: 'center', color: 'var(--text-3)', padding: 32 }}>
-                    No payments yet.
+                    {(payments as any[]).length ? 'No payments match your filters.' : 'No payments yet.'}
                   </td>
                 </tr>
               )}

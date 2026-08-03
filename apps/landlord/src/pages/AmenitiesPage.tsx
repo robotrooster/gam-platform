@@ -132,7 +132,7 @@ export function AmenitiesPage() {
 // ── New area ──────────────────────────────────────────────────────────
 function AreaModal({ propertyId, onClose, onSaved }: { propertyId: string; onClose: () => void; onSaved: () => void }) {
   const [f, setF] = useState({
-    name: '', description: '', reservable: true, requiresApproval: true,
+    name: '', description: '', reservable: false, requiresApproval: true,
     capacity: '', reservationFee: '', weekendFee: '', openTime: '', closeTime: '', maxReservationHours: '', advanceBookingDays: '', monthlyReservationLimit: '',
     // W-44: private-event posture (per area).
     eventsEnabled: false, eventDepositAmount: '', eventAnnounce: true, eventAutoRelease: true,
@@ -158,7 +158,7 @@ function AreaModal({ propertyId, onClose, onSaved }: { propertyId: string; onClo
       <Field label="Name"><input className="input" value={f.name} onChange={e => setF({ ...f, name: e.target.value })} placeholder="Clubhouse" /></Field>
       <Field label="Description"><input className="input" value={f.description} onChange={e => setF({ ...f, description: e.target.value })} /></Field>
       <div style={{ display: 'flex', gap: 16, margin: '8px 0' }}>
-        <label style={{ fontSize: '.8rem' }}><input type="checkbox" checked={f.reservable} onChange={e => setF({ ...f, reservable: e.target.checked })} /> Reservable</label>
+        <label style={{ fontSize: '.8rem' }} title="Turn on only for amenities residents book for private use (clubhouse, pavilion). Leave off for shared amenities like laundry or Wi-Fi — those aren't listed in the tenant reservation tab."><input type="checkbox" checked={f.reservable} onChange={e => setF({ ...f, reservable: e.target.checked })} /> Reservable for private use</label>
         <label style={{ fontSize: '.8rem' }}><input type="checkbox" checked={f.requiresApproval} onChange={e => setF({ ...f, requiresApproval: e.target.checked })} /> Require approval</label>
       </div>
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>

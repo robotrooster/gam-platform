@@ -49,6 +49,7 @@ export async function cleanupAllSchema(): Promise<void> {
   // come from migration seeds in prod, but the test DB is schema-only
   // — tests seed what they need inline.
   await db.query(`DELETE FROM admin_action_log`)
+  await db.query(`DELETE FROM feature_requests`)
   await db.query(`DELETE FROM system_features`)
   // S368: CSV review queue tables. csv_import_attempts CASCADEs on
   // landlords delete so wipes transitively, but platform_review_status
@@ -160,6 +161,15 @@ export async function cleanupAllSchema(): Promise<void> {
   // trigger and clears the FK refs so the unit_inspections DELETE below can
   // proceed. This is test-infra only; no app path can remove a video.
   await db.query(`TRUNCATE unit_inspection_videos`)
+  // S571: entry requests now FK maintenance_requests + unit_inspections
+  // (anchors), so clear them BEFORE those parents. Responses CASCADE on request
+  // delete, but explicit order keeps the chain obvious.
+  await db.query(`DELETE FROM unit_entry_request_responses`)
+  await db.query(`DELETE FROM unit_entry_requests`)
+  // documents FKs leases/units/tenants/landlords (NO cascade). S573: a
+  // finalized inspection now writes a summary-report documents row referencing
+  // its lease — clear documents BEFORE leases/units, not just before landlords.
+  await db.query(`DELETE FROM documents`)
   // unit_inspections FKs leases.id (children — items / photos /
   // signatures — cascade on parent delete per schema FKs).
   await db.query(`DELETE FROM unit_inspections`)
@@ -171,7 +181,9 @@ export async function cleanupAllSchema(): Promise<void> {
   // contractors FKs reverse — clear after maintenance_requests releases
   // its contractor_id refs.
   await db.query(`DELETE FROM maintenance_comments`)
+  await db.query(`DELETE FROM maintenance_media`)
   await db.query(`DELETE FROM maintenance_requests`)
+  await db.query(`DELETE FROM tenant_walkthrough_media`)
   await db.query(`DELETE FROM contractors`)
   // S355: unit_applications FK units (SET NULL) + landlords (SET NULL) —
   // rows survive parent deletes, so explicit cleanup is required to keep
@@ -180,14 +192,24 @@ export async function cleanupAllSchema(): Promise<void> {
   await db.query(`DELETE FROM unit_applications`)
   // S350: unit_bookings FK units RESTRICT; clear before units.
   await db.query(`DELETE FROM unit_bookings`)
-  // S351: entry-request rows FK units (request) + requests (response).
-  // Responses CASCADE on request delete, but explicit clear keeps the
-  // FK chain order obvious for future readers.
-  await db.query(`DELETE FROM unit_entry_request_responses`)
-  await db.query(`DELETE FROM unit_entry_requests`)
   // S381: work_trade_agreements FKs units (RESTRICT) and is the parent
   // for work_trade_logs (CASCADE on agreement delete). Clear before units.
   await db.query(`DELETE FROM work_trade_agreements`)
+  // S568: home_sale_contracts FK units (RESTRICT — protects the contract from
+  // unit deletion); installments CASCADE on contract delete. Clear before units.
+  await db.query(`DELETE FROM home_sale_contracts`)
+  // S568: home_ownerships FK units + users (RESTRICT). Clear before units/users.
+  await db.query(`DELETE FROM home_ownerships`)
+  // S570: bank feed. bank_transactions FK bank_connections + landlord_expenses;
+  // bank_connections + landlord_merchant_rules FK landlords/properties/units.
+  // Clear before landlord_expenses / units / properties / landlords below.
+  await db.query(`DELETE FROM bank_transactions`)
+  await db.query(`DELETE FROM bank_connections`)
+  await db.query(`DELETE FROM landlord_merchant_rules`)
+  // S568: lot_rent_charges FK units/properties/landlords. Clear before units.
+  await db.query(`DELETE FROM lot_rent_charges`)
+  // S568: landlord_expenses FK units/properties/landlords/users. Clear before units.
+  await db.query(`DELETE FROM landlord_expenses`)
   await db.query(`DELETE FROM units`)
   await db.query(`DELETE FROM property_allocation_rules`)
   // S338: POS chain. All landlord-FK'd with ON DELETE RESTRICT;
@@ -305,8 +327,6 @@ export async function cleanupAllSchema(): Promise<void> {
   await db.query(`DELETE FROM depots`)
   await db.query(`DELETE FROM dump_locations`)
   await db.query(`DELETE FROM businesses`)
-  // documents.landlord_id FKs landlords (no cascade) — clear before landlords.
-  await db.query(`DELETE FROM documents`)
   await db.query(`DELETE FROM landlords`)
   await db.query(`DELETE FROM tenants`)
   await db.query(`DELETE FROM users`)

@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { User, Check, AlertCircle } from 'lucide-react'
+import { isCriticalNotificationType } from '@gam/shared'
 
 import axios from 'axios'
 const API_URL = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
@@ -84,6 +85,11 @@ export function ProfilePage() {
     { onSuccess: () => { setPwCurrent(''); setPwNew(''); setPwConfirm(''); setSaved('pw'); setTimeout(() => setSaved(''), 2500) },
       onError: () => setPwError('Incorrect current password') }
   )
+
+  // ── Email-2FA (S571) ────────────────────────────────────────────────────
+  // Email 2FA is mandatory for every tenant, always. Codes go to the login
+  // email. This is informational only — it can't be turned off.
+  const { data: twoFa } = useQuery('tenant-2fa-status', () => get<any>('/auth/email-otp/status'))
 
   const getPref = (type: string, channel: 'email'|'in_app') => {
     const p = (notifPrefs as any[]).find((x: any) => x.type === type)
@@ -180,7 +186,10 @@ export function ProfilePage() {
                     <div key={n.type+ch} style={{ padding:'12px 16px', textAlign:'center', borderBottom: i<NOTIF_TYPES.length-1?'1px solid var(--border-0)':'none', display:'flex', alignItems:'center', justifyContent:'center' }}>
                       {ch === 'in_app'
                         ? <span title="In-app notifications are always on" style={{ color:'var(--green)', fontSize:'.85rem' }}>✓</span>
-                        : <input type="checkbox" checked={getPref(n.type, ch)} onChange={e => togglePref(n.type, ch, e.target.checked)} style={{ width:16, height:16, cursor:'pointer' }} />
+                        : isCriticalNotificationType(n.type)
+                          // S570 (Nic): critical alerts (e.g. failed payment) always email — can't be turned off.
+                          ? <span title="This alert is too important to turn off — it's always emailed." style={{ color:'var(--green)', fontSize:'.85rem' }}>✓</span>
+                          : <input type="checkbox" checked={getPref(n.type, ch)} onChange={e => togglePref(n.type, ch, e.target.checked)} style={{ width:16, height:16, cursor:'pointer' }} />
                       }
                     </div>
                   ))}
@@ -272,6 +281,22 @@ export function ProfilePage() {
 
       {tab === 'security' && (
         <div style={{ maxWidth:380 }}>
+          {/* ── Two-factor authentication (S571) — always on, informational ── */}
+          <div style={{ marginBottom:24, padding:16, background:'var(--bg-2)', border:'1px solid var(--border-0)', borderRadius:10 }}>
+            <div style={{ display:'flex', alignItems:'center', gap:10, marginBottom:8 }}>
+              <div style={{ width:34, height:34, borderRadius:8, background:'rgba(34,197,94,.12)', display:'flex', alignItems:'center', justifyContent:'center', fontSize:'1.05rem' }}>🔒</div>
+              <div>
+                <div style={{ fontWeight:700, color:'var(--text-0)', fontSize:'.9rem' }}>Two-factor authentication</div>
+                <div style={{ fontSize:'.78rem', color:'var(--green)', fontWeight:600, display:'flex', alignItems:'center', gap:4 }}>
+                  <Check size={12} /> On — always
+                </div>
+              </div>
+            </div>
+            <div style={{ fontSize:'.8rem', color:'var(--text-2)', lineHeight:1.6 }}>
+              To protect your lease and payment details, every sign-in requires a 6-digit code we email to <strong style={{ color:'var(--text-1)' }}>{twoFa?.email || 'your login email'}</strong>. The code always goes to your login email, so if you change your email below, it moves with it.
+            </div>
+          </div>
+
           {[
             { label:'Current Password', val:pwCurrent, set:setPwCurrent, type:'password' },
             { label:'New Password', val:pwNew, set:setPwNew, type:'password' },

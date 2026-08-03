@@ -5,18 +5,33 @@ import { apiGet } from '../lib/api'
 import { Plus, UserPlus } from 'lucide-react'
 import { InviteTenantModal } from './InviteTenantModal'
 import { usePerms } from '../lib/permissions'
+import { SearchBox, PropertySelect } from '../components/ListControls'
 
 export function TenantsPage() {
   const [showInvite, setShowInvite] = useState(false)
+  const [search, setSearch] = useState('')
+  const [propertyId, setPropertyId] = useState('')
   const navigate = useNavigate()
   const { data: units = [], isLoading } = useQuery<any[]>('units', () => apiGet('/units'))
-  const tenants = units.filter(u => u.tenantFirst)
   const { can } = usePerms()
+
+  const allTenants = units.filter(u => u.tenantFirst)
+  const propertyOptions = allTenants.map((u: any) => ({ id: u.propertyId, name: u.propertyName }))
+  const q = search.trim().toLowerCase()
+  const tenants = allTenants.filter((u: any) => {
+    const matchSearch = q === '' ||
+      `${u.tenantFirst} ${u.tenantLast}`.toLowerCase().includes(q) ||
+      u.tenantEmail?.toLowerCase().includes(q) ||
+      u.unitNumber?.toLowerCase().includes(q) ||
+      u.propertyName?.toLowerCase().includes(q)
+    const matchProperty = propertyId === '' || u.propertyId === propertyId
+    return matchSearch && matchProperty
+  })
 
   return (
     <div>
       <div className="page-header">
-        <div><h1 className="page-title">Tenants</h1><p className="page-subtitle">{tenants.length} active tenants</p></div>
+        <div><h1 className="page-title">Tenants</h1><p className="page-subtitle">{tenants.length === allTenants.length ? `${allTenants.length} active tenants` : `${tenants.length} of ${allTenants.length} active tenants`}</p></div>
         <div style={{ display: 'flex', gap: 8 }}>
           {can('tenants.onboard') && (
             <button className="btn btn-ghost" onClick={() => navigate('/tenant-onboarding')}>
@@ -30,6 +45,11 @@ export function TenantsPage() {
           )}
         </div>
       </div>
+      <div className="filter-bar">
+        <SearchBox value={search} onChange={setSearch} placeholder="Search tenants, units, properties…" />
+        <PropertySelect value={propertyId} onChange={setPropertyId} properties={propertyOptions} />
+      </div>
+
       {isLoading ? <div style={{color:'var(--text-3)',padding:32}}>Loading…</div> : (
         <div className="card" style={{padding:0,overflowX:'auto'}}>
           <table className="data-table" style={{minWidth:880}}>
@@ -45,7 +65,7 @@ export function TenantsPage() {
                   <td>{u.ssiSsdi ? <span className="badge badge-gold">SSI/SSDI</span> : <span style={{color:'var(--text-3)'}}>—</span>}</td>
                 </tr>
               )) : (
-                <tr><td colSpan={6} style={{textAlign:'center',color:'var(--text-3)',padding:32}}>No tenants yet.</td></tr>
+                <tr><td colSpan={6} style={{textAlign:'center',color:'var(--text-3)',padding:32}}>{allTenants.length ? 'No tenants match your filters.' : 'No tenants yet.'}</td></tr>
               )}
             </tbody>
           </table>

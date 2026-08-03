@@ -4,6 +4,7 @@ import { requireAuth, requirePerm } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { resolveLandlordIdForUser } from '../lib/scope'
 import { platformFeesByProperty, periodMonths } from '../services/platformFee'
+import { computeLandlordPL } from '../services/landlordPL'
 
 export const reportsRouter = Router()
 // S127: blanket requireLandlord lifted in favor of per-route perm gates.
@@ -256,55 +257,28 @@ reportsRouter.get('/monthly-pl', requirePerm('payments.view_all'), async (req, r
          AND p.settled_at >= $2 AND p.settled_at <= $3
        ORDER BY p.settled_at DESC`, [landlordId, start, end])
 
-    let grossRent = 0
-    let grossOther = 0
+    // Payment rows for the by-date drill-down (display only). The P&L TOTALS come
+    // from the single shared definition (computeLandlordPL) so this and the Books
+    // app can't diverge — deposits-out, categorized income, all expenses.
     const paymentRows = payments.map((p: any) => {
-      const amt = parseFloat(p.amount || 0)
-      if (p.type === 'rent') grossRent += amt
-      else grossOther += amt
       const method = p.ach_trace_number ? 'ACH'
         : (p.stripe_charge_id || p.stripe_payment_intent_id) ? 'Card'
         : '—'
       const tenantName = [p.tenant_first, p.tenant_last].filter(Boolean).join(' ') || null
       return {
-        id: p.id,
-        settledAt: p.settled_at,
-        amount: amt,
-        type: p.type,
-        method,
-        tenantName,
-        unitNumber: p.unit_number ?? null,
-        propertyName: p.property_name ?? null,
+        id: p.id, settledAt: p.settled_at, amount: parseFloat(p.amount || 0), type: p.type, method,
+        tenantName, unitNumber: p.unit_number ?? null, propertyName: p.property_name ?? null,
       }
     })
-    const grossTotal = round2(grossRent + grossOther)
 
-    // GAM platform fee — actual billed income for this month (accruals, with a
-    // live estimate for an un-accrued current month), summed across properties.
-    // NOT a current-occupancy snapshot, which read $0 on short-stay revenue and
-    // any property vacant at query time despite in-month earnings.
-    const feeMap = await platformFeesByProperty(landlordId, periodMonths(year, month))
-    const platformFee = round2(Array.from(feeMap.values()).reduce((s, v) => s + v, 0))
-
-    // Maintenance expense recognized by completion date in-month. The landlord
-    // pays only the actual cost — the maintenance platform fee (reserved for the
-    // future contractor marketplace) is never surfaced or deducted.
-    const maintRow = await queryOne<any>(`
-      SELECT COALESCE(SUM(actual_cost), 0)::numeric AS maint_cost
-        FROM maintenance_requests
-       WHERE landlord_id = $1
-         AND completed_at >= $2 AND completed_at <= $3
-         AND actual_cost IS NOT NULL`, [landlordId, start, end])
-    const maintenance = round2(parseFloat(maintRow?.maint_cost ?? '0'))
-
-    const expensesTotal = round2(platformFee + maintenance)
-    const net = round2(grossTotal - expensesTotal)
+    const pl = await computeLandlordPL(landlordId, String(start), String(end), periodMonths(year, month))
 
     res.json({ success: true, data: {
       period: { year, month, start, end },
-      gross: { rent: round2(grossRent), other: round2(grossOther), total: grossTotal },
-      expenses: { platformFee, maintenance, total: expensesTotal },
-      net,
+      gross: pl.gross,
+      depositsHeld: pl.depositsHeld,
+      expenses: pl.expenses,
+      net: pl.net,
       paymentCount: paymentRows.length,
       payments: paymentRows,
     } })

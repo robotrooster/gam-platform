@@ -154,10 +154,11 @@ posCustomerOnboardingRouter.post('/:token/start', async (req, res, next) => {
       const si = await stripe.setupIntents.create({
         customer:             stripeCustomerId,
         payment_method_types: ['us_bank_account'],
+        // S570 (Nic): microdeposit verification (free), NOT Financial Connections
+        // instant verification ($1.50/verification). See lib/stripe.ts.
         payment_method_options: {
           us_bank_account: {
-            financial_connections: { permissions: ['payment_method', 'balances'] },
-            verification_method:   'instant',
+            verification_method: 'microdeposits',
           },
         },
         metadata: {
@@ -214,8 +215,20 @@ posCustomerOnboardingRouter.post('/:token/complete', async (req, res, next) => {
     const si = await stripe.setupIntents.retrieve(inv.setup_intent_id, {
       expand: ['payment_method'],
     })
+    // S570: microdeposit verification is async — the SetupIntent stays in
+    // requires_action/processing for 1–3 days until the customer confirms the
+    // two deposits. It's NOT an error; the setup_intent.succeeded webhook stamps
+    // ach_verified when the deposits clear. Return a pending signal so the page
+    // shows "deposits on the way" instead of failing.
     if (si.status !== 'succeeded') {
-      throw new AppError(409, `SetupIntent status is ${si.status}, expected 'succeeded'`)
+      return res.json({
+        success: true,
+        data: {
+          status: 'pending',
+          verified: false,
+          message: 'We sent two small deposits to your bank. They arrive in 1–3 business days — check the email from Stripe and confirm the amounts to finish.',
+        },
+      })
     }
 
     // Extract bank last4 from the attached payment method

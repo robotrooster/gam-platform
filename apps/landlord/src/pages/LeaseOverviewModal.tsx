@@ -5,11 +5,12 @@
 // link to the full lease PDF (the W-29 /view route). Editing happens only
 // through the proper flows (renewal, bill-fee, termination), never here.
 // The editable path (needs-review import confirm) still uses LeaseFormModal.
-import { useQuery } from 'react-query'
+import { useState } from 'react'
+import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useNavigate } from 'react-router-dom'
-import { FileText, X } from 'lucide-react'
-import { humanize } from '@gam/shared'
-import { apiGet } from '../lib/api'
+import { FileText, X, Plus, Trash2 } from 'lucide-react'
+import { humanize, RENT_COMPONENT_KINDS, RENT_COMPONENT_KIND_LABEL } from '@gam/shared'
+import { apiGet, apiPut } from '../lib/api'
 
 const fmtMoney = (n: any) =>
   n != null && n !== '' ? `$${Number(n).toLocaleString('en-US', { minimumFractionDigits: 2 })}` : '—'
@@ -27,6 +28,97 @@ const ordinal = (n: number) => {
   const v = n % 100
   if (v >= 11 && v <= 13) return `${n}th`
   return `${n}${['th', 'st', 'nd', 'rd'][n % 10] || 'th'}`
+}
+
+// S568: itemize rent into named line items (space rent + trailer/home rent).
+// The components must sum to the lease rent — this splits the SAME total for
+// display + metrics (billing is unchanged). Handy for mobile-home / RV parks.
+type RentComp = { kind: string; label: string; amount: string }
+function RentBreakdownSection({ leaseId, rentAmount, components }: {
+  leaseId: string; rentAmount: number; components: any[]
+}) {
+  const qc = useQueryClient()
+  const [editing, setEditing] = useState(false)
+  const [rows, setRows] = useState<RentComp[]>([])
+  const [err, setErr] = useState<string | null>(null)
+
+  const startEdit = () => {
+    setRows(components.length
+      ? components.map((c: any) => ({ kind: c.kind, label: c.label, amount: String(c.amount) }))
+      : [{ kind: 'space', label: 'Space rent', amount: '' }, { kind: 'trailer', label: 'Trailer rent', amount: '' }])
+    setErr(null); setEditing(true)
+  }
+  const total = rows.reduce((s, r) => s + (Number(r.amount) || 0), 0)
+
+  const save = useMutation(
+    () => apiPut(`/leases/${leaseId}/rent-components`, {
+      components: rows.map(r => ({ kind: r.kind, label: r.label.trim(), amount: Number(r.amount) || 0 })),
+    }),
+    {
+      onSuccess: () => { qc.invalidateQueries(['lease-overview', leaseId]); setEditing(false) },
+      onError: (e: any) => setErr(e?.message || 'Could not save the split.'),
+    })
+  const clear = useMutation(
+    () => apiPut(`/leases/${leaseId}/rent-components`, { components: [] }),
+    { onSuccess: () => { qc.invalidateQueries(['lease-overview', leaseId]); setEditing(false) } })
+
+  if (!editing) {
+    return (
+      <>
+        {components.length > 0 && (
+          <div style={{ marginTop: 4, paddingLeft: 2 }}>
+            {components.map((c: any) => (
+              <div key={c.id} style={{ fontSize: '.78rem', color: 'var(--text-2)' }}>
+                • {c.label} — {fmtMoney(c.amount)}
+                <span style={{ color: 'var(--text-3)' }}> ({RENT_COMPONENT_KIND_LABEL[c.kind as keyof typeof RENT_COMPONENT_KIND_LABEL] || c.kind})</span>
+              </div>
+            ))}
+          </div>
+        )}
+        <button className="btn btn-ghost btn-sm" style={{ marginTop: 6, padding: '2px 8px', fontSize: '.72rem' }} onClick={startEdit}>
+          {components.length ? 'Edit rent breakdown' : 'Split rent (space / trailer)'}
+        </button>
+      </>
+    )
+  }
+
+  const sumOk = Math.abs(total - rentAmount) < 0.01
+  return (
+    <div style={{ marginTop: 8, padding: 12, background: 'var(--bg-2)', borderRadius: 10, border: '1px solid var(--border-0)' }}>
+      <div style={{ fontSize: '.72rem', fontWeight: 700, color: 'var(--gold)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 8 }}>
+        Rent breakdown — must total {fmtMoney(rentAmount)}
+      </div>
+      {rows.map((r, i) => (
+        <div key={i} style={{ display: 'flex', gap: 6, marginBottom: 6, alignItems: 'center' }}>
+          <select className="form-input" style={{ width: 130, fontSize: '.78rem' }} value={r.kind}
+            onChange={e => setRows(rows.map((x, j) => j === i ? { ...x, kind: e.target.value } : x))}>
+            {RENT_COMPONENT_KINDS.map(k => <option key={k} value={k}>{RENT_COMPONENT_KIND_LABEL[k]}</option>)}
+          </select>
+          <input className="form-input" style={{ flex: 1, fontSize: '.78rem' }} placeholder="Label"
+            value={r.label} onChange={e => setRows(rows.map((x, j) => j === i ? { ...x, label: e.target.value } : x))} />
+          <input className="form-input" style={{ width: 90, fontSize: '.78rem' }} placeholder="0.00" inputMode="decimal"
+            value={r.amount} onChange={e => setRows(rows.map((x, j) => j === i ? { ...x, amount: e.target.value } : x))} />
+          <button className="btn btn-ghost btn-sm" style={{ padding: 4 }} onClick={() => setRows(rows.filter((_, j) => j !== i))}><Trash2 size={13} /></button>
+        </div>
+      ))}
+      <button className="btn btn-ghost btn-sm" style={{ padding: '2px 8px', fontSize: '.72rem' }}
+        onClick={() => setRows([...rows, { kind: 'other', label: '', amount: '' }])}>
+        <Plus size={12} /> Add line
+      </button>
+      <div style={{ fontSize: '.74rem', marginTop: 8, color: sumOk ? 'var(--green)' : 'var(--amber)' }}>
+        Total: {fmtMoney(total)} {sumOk ? '✓' : `(needs ${fmtMoney(rentAmount)})`}
+      </div>
+      {err && <div style={{ fontSize: '.72rem', color: 'var(--red)', marginTop: 6 }}>{err}</div>}
+      <div style={{ display: 'flex', gap: 6, marginTop: 10 }}>
+        <button className="btn btn-primary btn-sm" disabled={!sumOk || save.isLoading || rows.some(r => !r.label.trim())}
+          onClick={() => save.mutate()}>{save.isLoading ? 'Saving…' : 'Save split'}</button>
+        {components.length > 0 && (
+          <button className="btn btn-ghost btn-sm" disabled={clear.isLoading} onClick={() => clear.mutate()}>Remove split</button>
+        )}
+        <button className="btn btn-ghost btn-sm" onClick={() => setEditing(false)}>Cancel</button>
+      </div>
+    </div>
+  )
 }
 
 export function LeaseOverviewModal({ leaseId, onClose }: { leaseId: string; onClose: () => void }) {
@@ -76,6 +168,7 @@ export function LeaseOverviewModal({ leaseId, onClose }: { leaseId: string; onCl
               <div>
                 <span style={{ color: 'var(--gold)', fontWeight: 600 }}>{fmtMoney(lease.rentAmount)}/mo</span>
                 <span style={{ color: 'var(--text-3)' }}> · due on the {ordinal(lease.rentDueDay)}</span>
+                <RentBreakdownSection leaseId={lease.id} rentAmount={Number(lease.rentAmount) || 0} components={lease.rentComponents || []} />
               </div>
 
               <div style={{ color: 'var(--text-3)' }}>Deposit</div>

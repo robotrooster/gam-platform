@@ -34,7 +34,10 @@ const post=<T,>(url:string,body?:any)=>api.post<{success:boolean;data:T;message?
 const patch=<T,>(url:string,body?:any)=>api.patch<{success:boolean;data:T}>(url,body).then(r=>r.data)
 const del=(url:string)=>api.delete(url).then(r=>r.data)
 
-const ALLOWED_ROLES=['admin','super_admin','landlord','bookkeeper']
+// S568 (Nic): NO admins in the customer Books portal — GAM's own platform
+// bookkeeping lives on the super-admin side. Books is for landlords + their
+// bookkeepers + business/POS operators.
+const ALLOWED_ROLES=['landlord','bookkeeper','business_owner','business_staff']
 interface AuthUser{id:string;email:string;role:string;firstName:string;lastName:string;landlordId?:string;activeClientId?:string;activeClientName?:string}
 interface AuthCtx{user:AuthUser|null;loading:boolean;activeClientId:string|null;activeClientName:string|null;setActiveClient:(id:string,name:string)=>void;login:(e:string,p:string)=>Promise<void>;logout:()=>void}
 const Ctx=createContext<AuthCtx>(null!)
@@ -61,7 +64,7 @@ function AuthProvider({children}:{children:React.ReactNode}){
   const login=async(email:string,password:string)=>{
     const res=await axios.post(`${API}/api/auth/login`,{email,password})
     const{token:tk,user:u}=res.data.data
-    if(!u||!ALLOWED_ROLES.includes(u.role))throw new Error('GAM Books requires Admin or Landlord access')
+    if(!u||!ALLOWED_ROLES.includes(u.role))throw new Error('GAM Books is for landlords, their bookkeepers, and business operators')
     localStorage.setItem('gam_books_token',tk)
     api.defaults.headers.common['Authorization']='Bearer '+tk
     setUser({id:u.id,email:u.email,role:u.role,firstName:u.firstName||u.firstName||'',lastName:u.lastName||u.lastName||'',landlordId:u.landlordId||u.landlordId})
@@ -88,15 +91,15 @@ const css=`
   --gold:#c9a227;--green:#22c55e;--red:#ef4444;--amber:#f59e0b;--blue:#3b82f6;--purple:#a855f7;--teal:#14b8a6;
   --font-d:'Syne',sans-serif;--font-b:'DM Sans',sans-serif;--font-m:'DM Mono',monospace
 }
-html{-webkit-font-smoothing:antialiased}
-body{font-family:var(--font-b);background:var(--bg0);color:var(--t1);line-height:1.6;min-height:100vh}
+html{-webkit-font-smoothing:antialiased;height:100%}
+body{font-family:var(--font-b);background:var(--bg0);color:var(--t1);line-height:1.6;height:100%;margin:0;overflow:hidden;overscroll-behavior:none}
 h1,h2,h3{font-family:var(--font-d);color:var(--t0);line-height:1.2}
 button{cursor:pointer;font-family:var(--font-b)}input,select,textarea{font-family:var(--font-b)}
-.shell{display:flex;min-height:100vh}
+.shell{display:flex;height:100vh;overflow:hidden}
 .sidebar{width:230px;flex-shrink:0;background:var(--bg1);border-right:1px solid var(--b0);position:fixed;top:0;left:0;bottom:0;z-index:50;display:flex;flex-direction:column;overflow-y:auto}
-.main{flex:1;margin-left:230px;min-height:100vh;display:flex;flex-direction:column}
-.topbar{height:52px;background:var(--bg1);border-bottom:1px solid var(--b0);display:flex;align-items:center;padding:0 24px;position:sticky;top:0;z-index:40;gap:12px}
-.page{flex:1;padding:28px;max-width:1600px;width:100%}
+.main{flex:1;margin-left:230px;height:100vh;display:flex;flex-direction:column;min-width:0;overflow:hidden}
+.topbar{height:52px;background:var(--bg1);border-bottom:1px solid var(--b0);display:flex;align-items:center;padding:0 24px;position:sticky;top:0;z-index:40;gap:12px;flex-shrink:0}
+.page{flex:1;min-height:0;padding:28px;max-width:1600px;width:100%;overflow-y:auto;overflow-x:hidden;overscroll-behavior:none}
 .logo{padding:18px;border-bottom:1px solid var(--b0)}
 .logo-n{font-family:var(--font-d);font-size:1.05rem;font-weight:800;color:var(--gold)}
 .logo-s{font-size:.65rem;color:var(--t3);margin-top:2px;text-transform:uppercase;letter-spacing:.1em}
@@ -1894,7 +1897,7 @@ function RentRoll(){
       <div className="card" style={{padding:0}}>
         {isLoading?<div style={{padding:32,color:'var(--t3)',textAlign:'center'}}><span className="spinner" style={{display:'inline-block'}}/></div>:(
           <table className="tbl">
-            <thead><tr><th>Unit</th><th>Property</th><th>Tenant</th><th>Rent</th><th>Collected MTD</th><th>Variance</th><th>Status</th><th>ACH</th><th>OTP</th></tr></thead>
+            <thead><tr><th>Unit</th><th>Property</th><th>Tenant</th><th>Rent</th><th>Collected MTD</th><th>Variance</th><th>Status</th><th>ACH</th></tr></thead>
             <tbody>
               {units.length?units.map((u:any)=>{
                 const variance=(+u.collectedMtd||0)-(u.status!=='vacant'?+u.rentAmount:0)
@@ -1908,10 +1911,9 @@ function RentRoll(){
                     <td className="mono" style={{color:variance>=0?'var(--green)':'var(--red)'}}>{u.status!=='vacant'?formatCurrency(variance):'—'}</td>
                     <td><span className={`badge ${u.status==='active'?'bg2':u.status==='delinquent'?'ba':u.status==='vacant'?'bmu':'br'}`}>{u.status}</span></td>
                     <td>{u.achVerified?<span className="badge bg2">✓</span>:<span style={{color:'var(--t3)'}}>—</span>}</td>
-                    <td>{u.onTimePayEnrolled?<span className="badge bgold">OTP</span>:<span style={{color:'var(--t3)'}}>—</span>}</td>
                   </tr>
                 )
-              }):<tr><td colSpan={9}><div className="empty">No units found.</div></td></tr>}
+              }):<tr><td colSpan={8}><div className="empty">No units found.</div></td></tr>}
             </tbody>
           </table>
         )}
@@ -2263,7 +2265,7 @@ function LoginPage(){
         </div>
         <div className="card" style={{padding:24}}>
           {err&&<div className="alert ae" style={{marginBottom:14}}>{err}</div>}
-          <div className="alert agold" style={{marginBottom:20,fontSize:'.75rem'}}>Sign in with your GAM Admin or Landlord credentials.</div>
+          <div className="alert agold" style={{marginBottom:20,fontSize:'.75rem'}}>Sign in with your GAM Landlord or Business credentials.</div>
           <form onSubmit={onSubmit}>
             <div className="frow"><label>Email</label><input type="email" value={email} onChange={e=>setEmail(e.target.value)} autoFocus required/></div>
             <div className="frow"><label>Password</label><input type="password" value={pw} onChange={e=>setPw(e.target.value)} required/></div>

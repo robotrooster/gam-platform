@@ -203,17 +203,21 @@ describe('POST /api/auth/login', () => {
     return { userId: u.id, landlordId }
   }
 
-  it('happy landlord: 200, token + user shape, mustEnrollTotp=false', async () => {
+  // S574: email-code 2FA is MANDATORY for every landlord (mirrors tenants). A
+  // landlord login no longer returns a full token — it gates on the emailed code
+  // and canonicalizes email_2fa_enabled=TRUE on first sign-in.
+  it('landlord: mandatory email 2FA — requiresEmailOtp, no full token, flag canonicalized', async () => {
     const email = `login-ll-${randomUUID()}@example.com`
-    const { landlordId } = await seedVerifiedUser({ email, role: 'landlord' })
+    const { userId } = await seedVerifiedUser({ email, role: 'landlord' })
     const res = await request(buildApp())
       .post('/api/auth/login').send({ email, password: 'super-strong-password-12!' })
     expect(res.status).toBe(200)
-    expect(res.body.data.token).toEqual(expect.any(String))
-    expect(res.body.data.user.role).toBe('landlord')
-    expect(res.body.data.user.profileId).toBe(landlordId)
-    expect(res.body.data.user.mustEnrollTotp).toBe(false)  // landlord not in MANDATORY_TOTP_ROLES
-    expect(res.body.data.user.directDepositEnabled).toBe(false)  // no scope row
+    expect(res.body.data.requiresEmailOtp).toBe(true)
+    expect(res.body.data.emailOtpSession).toBeTruthy()
+    expect(res.body.data.token).toBeUndefined()
+    // Login canonicalizes the flag so the Settings status card reads truthfully.
+    const flag = (await db.query(`SELECT email_2fa_enabled FROM users WHERE id=$1`, [userId])).rows[0]
+    expect(flag.email_2fa_enabled).toBe(true)
   })
 
   it('property_manager WITH scope: landlordId + permissions land on JWT + user', async () => {

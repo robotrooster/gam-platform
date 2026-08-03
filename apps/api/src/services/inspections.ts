@@ -25,6 +25,14 @@ export interface InsertInspectionParams {
   bathrooms?: number | null
   /** units.dwelling_ownership — drives site-only vs interior checklists (S550) */
   dwellingOwnership?: string | null
+  /** units.is_multi_level — adds the stairs & handrails area (S573) */
+  isMultiLevel?: boolean | null
+  /** units.is_ada_accessible — adds the accessibility area (S573) */
+  isAdaAccessible?: boolean | null
+  /** units.living_areas — repeats the living-area items (S573) */
+  livingAreas?: number | null
+  /** units.features (jsonb) — gates catalog items (S573) */
+  features?: Record<string, unknown> | null
   leaseId?: string | null
   tenantId?: string | null
   inspectionType: string
@@ -65,6 +73,10 @@ export async function insertInspectionWithChecklist(
     bedrooms: p.bedrooms,
     bathrooms: p.bathrooms ?? null,
     dwellingOwnership: p.dwellingOwnership ?? null,
+    isMultiLevel: p.isMultiLevel ?? null,
+    isAdaAccessible: p.isAdaAccessible ?? null,
+    livingAreas: p.livingAreas ?? null,
+    features: p.features ?? null,
   })
   const seedRows: string[] = []
   const seedParams: any[] = [inserted.id]
@@ -72,7 +84,7 @@ export async function insertInspectionWithChecklist(
     for (const label of areaDef.items) {
       const areaIdx = seedParams.push(areaDef.area)
       const labelIdx = seedParams.push(label)
-      seedRows.push(`($1, $${areaIdx}, $${labelIdx}, 'na')`)
+      seedRows.push(`($1, $${areaIdx}, $${labelIdx}, NULL)`)
     }
   }
   if (seedRows.length) {
@@ -102,7 +114,7 @@ export async function insertInspectionWithChecklist(
       await client.query(
         `INSERT INTO unit_inspection_items
            (inspection_id, area, item_label, condition, notes, lease_fee_id)
-         VALUES ($1, 'Lease conditions', $2, 'na', $3, $4)
+         VALUES ($1, 'Lease conditions', $2, NULL, $3, $4)
          ON CONFLICT (inspection_id, area, item_label) DO NOTHING`,
         [inserted.id, label.slice(0, 200), fee.condition_text.slice(0, 500), fee.id],
       )

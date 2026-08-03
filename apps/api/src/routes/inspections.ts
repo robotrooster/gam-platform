@@ -19,7 +19,8 @@ import { addBusinessDays } from '../services/moveOutInspections'
 import { logger } from '../lib/logger'
 import { resolveUploadPath } from '../lib/uploadPaths'
 import { insertInspectionWithChecklist } from '../services/inspections'
-import { INSPECTION_TYPES, INSPECTION_ITEM_CONDITIONS } from '@gam/shared'
+import { generateInspectionReportPdf } from '../services/inspectionReport'
+import { INSPECTION_TYPES, INSPECTION_ITEM_CONDITIONS, INSPECTION_CONDITION_RANK, buildInspectionChecklist } from '@gam/shared'
 
 // ============================================================
 // /api/inspections — move-in / move-out / periodic inspection
@@ -99,8 +100,8 @@ inspectionsRouter.post('/', requirePerm('inspections.create'), async (req, res, 
     const body = createSchema.parse(req.body)
     // unit_type + bedrooms drive the standard walkthrough checklist (single
     // source: buildInspectionChecklist) seeded below.
-    const unit = await queryOne<{ id: string; landlord_id: string; bedrooms: number | null; bathrooms: number | null; unit_type: string | null; dwelling_ownership: string | null; property_id: string }>(
-      `SELECT id, landlord_id, bedrooms, bathrooms, unit_type, dwelling_ownership, property_id FROM units WHERE id=$1`,
+    const unit = await queryOne<{ id: string; landlord_id: string; bedrooms: number | null; bathrooms: number | null; unit_type: string | null; dwelling_ownership: string | null; is_multi_level: boolean | null; is_ada_accessible: boolean | null; living_areas: number | null; features: Record<string, unknown> | null; property_id: string }>(
+      `SELECT id, landlord_id, bedrooms, bathrooms, unit_type, dwelling_ownership, is_multi_level, is_ada_accessible, living_areas, features, property_id FROM units WHERE id=$1`,
       [body.unitId],
     )
     if (!unit) throw new AppError(404, 'Unit not found')
@@ -122,6 +123,10 @@ inspectionsRouter.post('/', requirePerm('inspections.create'), async (req, res, 
       bedrooms: unit.bedrooms,
       bathrooms: unit.bathrooms,
       dwellingOwnership: unit.dwelling_ownership,
+      isMultiLevel: unit.is_multi_level,
+      isAdaAccessible: unit.is_ada_accessible,
+      livingAreas: unit.living_areas,
+      features: unit.features,
       leaseId: body.leaseId ?? null,
       tenantId: body.tenantId ?? null,
       inspectionType: body.inspectionType,
@@ -136,6 +141,81 @@ inspectionsRouter.post('/', requirePerm('inspections.create'), async (req, res, 
     next(e)
   } finally {
     client.release()
+  }
+})
+
+// ── GET /api/inspections/preview?unitId=…&inspectionType=… ─────
+// S573: the pre-inspection review. Resolves the master template against the
+// unit's CURRENT attributes WITHOUT creating anything — the landlord sees
+// exactly what will be inspected and can catch a mis-set unit (missing second
+// story, wrong ownership) and fix the UNIT first, then the checklist re-filters.
+// Registered before '/:id' so 'preview' isn't captured as an inspection id.
+inspectionsRouter.get('/preview', async (req, res, next) => {
+  try {
+    const unitId = String(req.query.unitId || '')
+    if (!unitId) throw new AppError(400, 'unitId required')
+    const inspectionType = req.query.inspectionType ? String(req.query.inspectionType) : null
+    if (inspectionType && !(INSPECTION_TYPES as readonly string[]).includes(inspectionType)) {
+      throw new AppError(400, `Invalid inspectionType '${inspectionType}'`)
+    }
+    const unit = await queryOne<{
+      id: string; landlord_id: string; property_id: string; unit_number: string | null
+      unit_type: string | null; bedrooms: number | null; bathrooms: number | null
+      dwelling_ownership: string | null; is_multi_level: boolean | null; is_ada_accessible: boolean | null; living_areas: number | null; features: Record<string, unknown> | null
+      property_name: string | null
+    }>(
+      `SELECT u.id, u.landlord_id, u.property_id, u.unit_number, u.unit_type, u.bedrooms, u.bathrooms,
+              u.dwelling_ownership, u.is_multi_level, u.is_ada_accessible, u.living_areas, u.features, p.name AS property_name
+         FROM units u JOIN properties p ON p.id = u.property_id
+        WHERE u.id = $1`,
+      [unitId],
+    )
+    if (!unit) throw new AppError(404, 'Unit not found')
+    if (!canAccessLandlordResource(req.user, unit.landlord_id)) throw new AppError(403, 'Forbidden')
+    const scoped = await getScopedPropertyIds(req.user)
+    if (scoped && !scoped.includes(unit.property_id)) throw new AppError(403, 'Property not in your assigned scope')
+
+    const checklist = buildInspectionChecklist({
+      unitType: unit.unit_type,
+      bedrooms: unit.bedrooms,
+      bathrooms: unit.bathrooms,
+      dwellingOwnership: unit.dwelling_ownership,
+      isMultiLevel: unit.is_multi_level,
+      isAdaAccessible: unit.is_ada_accessible,
+      livingAreas: unit.living_areas,
+      features: unit.features,
+    })
+    const itemCount = checklist.reduce((n, a) => n + a.items.length, 0)
+    res.json({
+      success: true,
+      data: {
+        unit: {
+          id: unit.id, unitNumber: unit.unit_number, propertyName: unit.property_name,
+          unitType: unit.unit_type, bedrooms: unit.bedrooms, bathrooms: unit.bathrooms,
+          dwellingOwnership: unit.dwelling_ownership,
+          isMultiLevel: !!unit.is_multi_level, isAdaAccessible: !!unit.is_ada_accessible,
+        },
+        inspectionType,
+        checklist,
+        areaCount: checklist.length,
+        itemCount,
+      },
+    })
+  } catch (e) {
+    next(e)
+  }
+})
+
+// ── GET /api/inspections/:id/completeness (S573) ───────────────
+// What still blocks submit/sign/finalize — items missing a condition, areas
+// missing a photo, fair/damaged items missing a note. Drives the conduct UI.
+inspectionsRouter.get('/:id/completeness', async (req, res, next) => {
+  try {
+    await loadInspectionRow(req.params.id, req) // authorizes access
+    const c = await getInspectionCompleteness(req.params.id)
+    res.json({ success: true, data: c })
+  } catch (e) {
+    next(e)
   }
 })
 
@@ -478,6 +558,37 @@ inspectionsRouter.get('/video-files/:filename', async (req, res, next) => {
   }
 })
 
+// GET /api/inspections/report-files/:filename (S573) — serve a finalized
+// inspection's summary PDF. Authorized per-row: the inspection's tenant (their
+// own report), or the landlord/scoped staff of the unit.
+inspectionsRouter.get('/report-files/:filename', async (req, res, next) => {
+  try {
+    const reportUrl = '/api/inspections/report-files/' + req.params.filename
+    const r = await queryOne<{ landlord_id: string; tenant_id: string | null; property_id: string }>(
+      `SELECT i.landlord_id, i.tenant_id, un.property_id
+         FROM unit_inspections i JOIN units un ON un.id = i.unit_id
+        WHERE i.report_url = $1`,
+      [reportUrl],
+    )
+    if (!r) throw new AppError(404, 'Not found')
+    const u = req.user!
+    if (u.role === 'tenant') {
+      if (r.tenant_id !== u.profileId) throw new AppError(403, 'Forbidden')
+    } else {
+      if (!canAccessLandlordResource(u, r.landlord_id)) throw new AppError(403, 'Forbidden')
+      const scoped = await getScopedPropertyIds(u)
+      if (scoped && !scoped.includes(r.property_id)) throw new AppError(403, 'Forbidden')
+    }
+    const fp = resolveUploadPath(inspectionPhotoDir, req.params.filename)
+    if (!fp) throw new AppError(400, 'Invalid filename')
+    if (!fs.existsSync(fp)) throw new AppError(404, 'Not found')
+    res.setHeader('Content-Type', 'application/pdf')
+    res.sendFile(fp)
+  } catch (e) {
+    next(e)
+  }
+})
+
 // GET /api/inspections/unit/:unitId/lifecycle — the unit's video story:
 // every inspection for the unit, oldest first, each with its videos.
 // (3-segment path — no collision with GET /:id.)
@@ -538,6 +649,10 @@ inspectionsRouter.post('/:id/sign', async (req, res, next) => {
       if (insp.inspection_type !== 'move_in') {
         throw new AppError(409, 'Tenant signature only applies to move-in inspections')
       }
+      // S573: the tenant certifies a COMPLETE walk — condition + photo per area
+      // + note on any fair/damaged item — before they can sign.
+      const signComplete = await getInspectionCompleteness(req.params.id)
+      if (!signComplete.complete) throw new AppError(409, completenessMessage(signComplete))
       signerRole = 'tenant'
     } else if (role === 'landlord' || role === 'property_manager' || role === 'onsite_manager') {
       if (!canManageLandlordResource(req.user, insp.landlord_id)) throw new AppError(403, 'Forbidden')
@@ -675,12 +790,15 @@ inspectionsRouter.post('/:id/submit', async (req, res, next) => {
       throw new AppError(409, 'Only periodic inspections are tenant-submitted')
     }
     if (insp.status !== 'draft') throw new AppError(409, `cannot submit in status ${insp.status}`)
-    const photoRow = await queryOne<{ n: string }>(
-      `SELECT COUNT(*)::text AS n FROM unit_inspection_photos WHERE inspection_id = $1`,
-      [req.params.id],
-    )
-    if (parseInt(photoRow?.n ?? '0', 10) === 0) {
-      throw new AppError(409, 'Add at least one photo before submitting')
+    // S573: a tenant's periodic self-walk is PHOTO documentation — require a
+    // photo per area (+ a note on anything they flagged damaged), but not a
+    // condition rating on every item (staff assess conditions on review).
+    const submitC = await getInspectionCompleteness(req.params.id)
+    if (submitC.areasMissingPhoto.length > 0 || submitC.itemsMissingNote > 0) {
+      const parts: string[] = []
+      if (submitC.areasMissingPhoto.length) parts.push(`${submitC.areasMissingPhoto.length} area(s) still need a photo (${submitC.areasMissingPhoto.slice(0, 4).join(', ')}${submitC.areasMissingPhoto.length > 4 ? '…' : ''})`)
+      if (submitC.itemsMissingNote) parts.push(`${submitC.itemsMissingNote} flagged item(s) need a note`)
+      throw new AppError(409, 'Not ready to submit — ' + parts.join('; ') + '.')
     }
 
     await query(
@@ -749,6 +867,10 @@ inspectionsRouter.post('/:id/finalize', requirePerm('inspections.manage'), async
     if (insp.status !== 'landlord_signed') {
       throw new AppError(409, `cannot finalize from status ${insp.status} (need both signatures)`)
     }
+    // S573: authoritative completeness gate — condition on every item, a photo
+    // per area, a note on every fair/damaged item.
+    const finalizeComplete = await getInspectionCompleteness(req.params.id)
+    if (!finalizeComplete.complete) throw new AppError(409, completenessMessage(finalizeComplete))
 
     // Compute move-out condition comparison (no-op for non-move-out).
     let matchesMoveIn = false
@@ -798,8 +920,8 @@ inspectionsRouter.post('/:id/finalize', requirePerm('inspections.manage'), async
       await client.query(
         `UPDATE lease_fees lf
             SET condition_result = CASE
-                  WHEN i.condition IN ('good', 'fair') THEN 'met'
-                  WHEN i.condition IN ('damaged', 'missing') THEN 'failed'
+                  WHEN i.condition IN ('excellent', 'good', 'fair') THEN 'met'
+                  WHEN i.condition = 'damaged_missing' THEN 'failed'
                 END,
                 condition_assessed_at = NOW(),
                 condition_assessed_by = $2,
@@ -807,7 +929,7 @@ inspectionsRouter.post('/:id/finalize', requirePerm('inspections.manage'), async
            FROM unit_inspection_items i
           WHERE i.inspection_id = $1
             AND i.lease_fee_id = lf.id
-            AND i.condition IN ('good', 'fair', 'damaged', 'missing')
+            AND i.condition IN ('excellent', 'good', 'fair', 'damaged_missing')
             AND lf.condition_result IS NULL`,
         [req.params.id, req.user!.userId],
       )
@@ -828,6 +950,26 @@ inspectionsRouter.post('/:id/finalize', requirePerm('inspections.manage'), async
       throw e
     } finally {
       client.release()
+    }
+
+    // S573: generate + file the summary report. Best-effort — a report failure
+    // must NEVER unwind a finalized inspection. report_url = landlord reporting;
+    // a documents row (tenant_id set) surfaces it in the tenant's Documents tab.
+    try {
+      const report = await generateInspectionReportPdf(req.params.id)
+      const docType = insp.inspection_type === 'move_in' ? 'move_in_checklist'
+        : insp.inspection_type === 'move_out' ? 'move_out_checklist' : 'other'
+      const TYPE_LABEL: Record<string, string> = { move_in: 'Move-in', move_out: 'Move-out', periodic: 'Periodic', turnover: 'Turnover' }
+      const un = await queryOne<{ unit_number: string | null }>(`SELECT unit_number FROM units WHERE id=$1`, [insp.unit_id])
+      const name = `${TYPE_LABEL[insp.inspection_type] ?? 'Inspection'} inspection — Unit ${un?.unit_number ?? ''} — ${finalizedAt.toLocaleDateString('en-US')}`.trim()
+      await query(`UPDATE unit_inspections SET report_url=$1, report_generated_at=NOW() WHERE id=$2`, [report.fileUrl, req.params.id])
+      await query(
+        `INSERT INTO documents (landlord_id, unit_id, tenant_id, lease_id, type, name, url, file_size, mime_type)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'application/pdf')`,
+        [insp.landlord_id, insp.unit_id, insp.tenant_id ?? null, insp.lease_id ?? null, docType, name.slice(0, 200), report.fileUrl, report.fileSize],
+      )
+    } catch (e) {
+      logger.error({ err: e, inspectionId: req.params.id }, 'inspection summary report generation failed')
     }
 
     // Best-effort post-finalize notification. Pings tenant + responsible
@@ -921,10 +1063,10 @@ inspectionsRouter.post('/:id/flag-suspicious', requirePerm('inspections.manage')
     if (insp.flagged_suspicious_at) throw new AppError(409, 'Already flagged')
 
     const unit = await queryOne<{
-      bedrooms: number | null; bathrooms: number | null; unit_type: string | null; dwelling_ownership: string | null
+      bedrooms: number | null; bathrooms: number | null; unit_type: string | null; dwelling_ownership: string | null; is_multi_level: boolean | null; is_ada_accessible: boolean | null; living_areas: number | null; features: Record<string, unknown> | null
       unit_number: string | null; property_id: string; property_name: string
     }>(
-      `SELECT u.bedrooms, u.bathrooms, u.unit_type, u.dwelling_ownership, u.unit_number, u.property_id,
+      `SELECT u.bedrooms, u.bathrooms, u.unit_type, u.dwelling_ownership, u.is_multi_level, u.is_ada_accessible, u.living_areas, u.features, u.unit_number, u.property_id,
               p.name AS property_name
          FROM units u JOIN properties p ON p.id = u.property_id
         WHERE u.id = $1`,
@@ -942,6 +1084,10 @@ inspectionsRouter.post('/:id/flag-suspicious', requirePerm('inspections.manage')
       bedrooms: unit.bedrooms,
       bathrooms: unit.bathrooms,
       dwellingOwnership: unit.dwelling_ownership,
+      isMultiLevel: unit.is_multi_level,
+      isAdaAccessible: unit.is_ada_accessible,
+      livingAreas: unit.living_areas,
+      features: unit.features,
       leaseId: insp.lease_id,
       tenantId: null,
       inspectionType: 'periodic',
@@ -1067,9 +1213,14 @@ async function loadInspectionRow(
             i.inspection_type, i.status, i.comparison_inspection_id,
             i.scheduled_for, i.conducted_at, i.finalized_at, i.notes,
             i.flagged_suspicious_at, i.flagged_by_user_id, i.flag_reason,
-            i.followup_inspection_id, un.property_id
+            i.followup_inspection_id, i.report_url, i.report_generated_at,
+            un.property_id, un.unit_number, un.unit_type, p.name AS property_name,
+            tu.first_name AS tenant_first_name, tu.last_name AS tenant_last_name
        FROM unit_inspections i
        JOIN units un ON un.id = i.unit_id
+       JOIN properties p ON p.id = un.property_id
+       LEFT JOIN tenants t ON t.id = i.tenant_id
+       LEFT JOIN users tu ON tu.id = t.user_id
       WHERE i.id = $1`,
     [id],
   )
@@ -1131,36 +1282,66 @@ async function loadInspection(
   return { row, items, photos, signatures }
 }
 
-const CONDITION_RANK: Record<string, number> = {
-  good: 0,
-  fair: 1,
-  damaged: 2,
-  missing: 3,
+// S573 (Nic): an inspection is COMPLETE (ready to submit / sign-off / finalize)
+// when every seeded item has a condition, every AREA has ≥1 photo, and every
+// Fair / Damaged-or-Missing item carries a note (the "what's wrong" context).
+// Photo is mandatory per area; the note rides the photo and is required only on
+// a non-good condition. Same standard for staff-in-person and tenant-remote.
+interface InspectionCompleteness {
+  complete: boolean
+  itemsMissingCondition: number
+  itemsMissingNote: number
+  areasMissingPhoto: string[]
+  totalAreas: number
+}
+async function getInspectionCompleteness(inspectionId: string): Promise<InspectionCompleteness> {
+  const items = await query<{ area: string; condition: string | null; notes: string | null }>(
+    `SELECT area, condition, notes FROM unit_inspection_items WHERE inspection_id = $1`, [inspectionId])
+  const photoAreas = await query<{ area: string }>(
+    `SELECT DISTINCT i.area FROM unit_inspection_items i
+       JOIN unit_inspection_photos p ON p.item_id = i.id
+      WHERE i.inspection_id = $1`, [inspectionId])
+  const areasWithPhoto = new Set(photoAreas.map(r => r.area))
+  const allAreas = Array.from(new Set(items.map(i => i.area)))
+  const itemsMissingCondition = items.filter(i => !i.condition).length
+  const itemsMissingNote = items.filter(i =>
+    (i.condition === 'fair' || i.condition === 'damaged_missing') && !(i.notes && i.notes.trim())).length
+  const areasMissingPhoto = allAreas.filter(a => !areasWithPhoto.has(a))
+  return {
+    complete: itemsMissingCondition === 0 && itemsMissingNote === 0 && areasMissingPhoto.length === 0,
+    itemsMissingCondition, itemsMissingNote, areasMissingPhoto, totalAreas: allAreas.length,
+  }
+}
+function completenessMessage(c: InspectionCompleteness): string {
+  const parts: string[] = []
+  if (c.itemsMissingCondition) parts.push(`${c.itemsMissingCondition} item(s) still need a condition`)
+  if (c.areasMissingPhoto.length) parts.push(`${c.areasMissingPhoto.length} area(s) need a photo (${c.areasMissingPhoto.slice(0, 4).join(', ')}${c.areasMissingPhoto.length > 4 ? '…' : ''})`)
+  if (c.itemsMissingNote) parts.push(`${c.itemsMissingNote} fair/damaged item(s) need a note`)
+  return 'Inspection not complete — ' + parts.join('; ') + '.'
 }
 
 async function compareMoveOutToMoveIn(
   moveOutId: string,
   moveInId: string,
 ): Promise<{ matches: boolean; mismatches: string[] }> {
-  const moveInItems = await query<{ area: string; item_label: string; condition: string }>(
+  const moveInItems = await query<{ area: string; item_label: string; condition: string | null }>(
     `SELECT area, item_label, condition FROM unit_inspection_items WHERE inspection_id = $1`,
     [moveInId],
   )
-  const moveOutItems = await query<{ area: string; item_label: string; condition: string }>(
+  const moveOutItems = await query<{ area: string; item_label: string; condition: string | null }>(
     `SELECT area, item_label, condition FROM unit_inspection_items WHERE inspection_id = $1`,
     [moveOutId],
   )
   const inMap = new Map<string, string>()
   for (const it of moveInItems) {
-    inMap.set(`${it.area}|${it.item_label}`, it.condition)
+    if (it.condition) inMap.set(`${it.area}|${it.item_label}`, it.condition)
   }
   const mismatches: string[] = []
   for (const out of moveOutItems) {
-    if (out.condition === 'na') continue
+    if (!out.condition) continue // not inspected — nothing to compare
     const inCond = inMap.get(`${out.area}|${out.item_label}`)
-    if (!inCond) continue // new item, not in comparison set
-    if (inCond === 'na') continue
-    if ((CONDITION_RANK[out.condition] ?? 0) > (CONDITION_RANK[inCond] ?? 0)) {
+    if (!inCond) continue // new / not-inspected at move-in
+    if ((INSPECTION_CONDITION_RANK[out.condition] ?? 0) > (INSPECTION_CONDITION_RANK[inCond] ?? 0)) {
       mismatches.push(`${out.area}|${out.item_label}`)
     }
   }

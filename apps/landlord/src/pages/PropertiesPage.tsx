@@ -2,12 +2,26 @@ import { useState, useRef } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { Link, useNavigate } from 'react-router-dom'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
-import { Building2, Plus, MapPin, DoorOpen, Users, DollarSign, X, Check, Edit2, Landmark } from 'lucide-react'
+import { Building2, Plus, MapPin, DoorOpen, Users, DollarSign, X, Check, Edit2, Landmark, Globe } from 'lucide-react'
 import { AddUnitModal } from './AddUnitModal'
 import { usePerms } from '../lib/permissions'
 import { LawWarningBanner, type LawFlag } from '../components/LawWarningBanner'
 import { UNIT_TYPES, UNIT_TYPE_LABEL, UNIT_TYPE_PREFIX, UNIT_TYPE_ICON, FEE_PAYER_VALUES, type FeePayer } from '@gam/shared'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
+
+// S574: the public per-property website — path-slug in dev, {slug}.gam.biz in
+// prod (mirrors the API's STOREFRONT_URL_TEMPLATE + SchedulePage). Every
+// onboarded property auto-publishes one, so we surface a "View website" link
+// on the card whenever it's live.
+// Explicit env override wins; otherwise localhost gets the dev path form and any
+// real host gets the prod subdomain ({slug}.gam.biz) — so the link is correct in
+// production without a build-time env var.
+const STOREFRONT_TEMPLATE = (import.meta as any).env?.VITE_STOREFRONT_URL_TEMPLATE
+  || (typeof location !== 'undefined' && /^(localhost|127\.|192\.168\.|10\.)/.test(location.hostname)
+        ? 'http://localhost:3015/{slug}'
+        : 'https://{slug}.gam.biz')
+const publicSiteUrl = (p: any): string | null =>
+  (p?.publicBookingEnabled && p?.bookingSlug) ? STOREFRONT_TEMPLATE.replace('{slug}', p.bookingSlug) : null
 
 const PROPERTY_TYPES = [
   { value: 'residential',  label: '🏠 Residential',     desc: 'Apartments, houses, condos' },
@@ -156,6 +170,10 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
     // on whether tenants at this property can request subleases at
     // all. AND'd with leases.subleasingAllowed in the request route.
     subleasingAllowed: property?.subleasingAllowed ?? false,
+    // S568 (Nic): does the operator own the land here? FALSE = homes-only
+    // external park — an investor operates their homes here without owning the
+    // park (park owner not on GAM). Drives lot-rent capture on units.
+    operatorOwnsLand: property?.operatorOwnsLand ?? true,
     // S251: optional landlord-uploaded sublease agreement template URL.
     // When set, overrides the GAM-default generated PDF at sublease
     // approval time. Stored as URL string — file upload handling is
@@ -506,6 +524,27 @@ function AddEditModal({ property, onClose }: { property?: any; onClose: () => vo
               by the property's lease document. Default OFF (opt-in).
               When on, individual leases can still further restrict via
               leases.subleasingAllowed. */}
+          {/* S568 (Nic): investor-operator model — do you own the land here? */}
+          <div style={{ marginBottom: 14, paddingTop: 10, borderTop: '1px solid var(--border-0)' }}>
+            <div style={{ fontSize: '.78rem', fontWeight: 600, marginBottom: 4, color: 'var(--text-2)' }}>
+              Land ownership
+            </div>
+            <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, padding: 12,
+              borderRadius: 8, border: `1px solid ${!form.operatorOwnsLand ? 'var(--gold)' : 'var(--border-0)'}`,
+              background: !form.operatorOwnsLand ? 'rgba(201,162,39,.06)' : 'var(--bg-2)', cursor: 'pointer', fontSize: '.78rem' }}>
+              <input type="checkbox" checked={!form.operatorOwnsLand}
+                onChange={e => setForm(f => ({ ...f, operatorOwnsLand: !e.target.checked }))} style={{ marginTop: 3 }} />
+              <div>
+                <div style={{ fontWeight: 600, color: 'var(--text-1)' }}>I don't own the land here (homes-only)</div>
+                <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 3, lineHeight: 1.5 }}>
+                  Check this if you own homes at a park you don't own — you operate here as an investor.
+                  You'll set the lot rent you pay the park on each home; your net is tenant rent minus lot rent.
+                  The park owner doesn't need a GAM account.
+                </div>
+              </div>
+            </label>
+          </div>
+
           <div style={{ marginBottom: 14, paddingTop: 10, borderTop: '1px solid var(--border-0)' }}>
             <div style={{ fontSize: '.78rem', fontWeight: 600, marginBottom: 4, color: 'var(--text-2)' }}>
               Subleasing policy
@@ -791,6 +830,14 @@ export function PropertiesPage() {
                       </div>
                     </div>
                     <div style={{ display: 'flex', gap: 6 }}>
+                      {publicSiteUrl(p) && (
+                        <a href={publicSiteUrl(p)!} target="_blank" rel="noreferrer"
+                          onClick={e => e.stopPropagation()}
+                          className="btn btn-ghost btn-sm" style={{ padding: '4px 8px', color: 'var(--gold)' }}
+                          title={`Your public website — ${publicSiteUrl(p)}`}>
+                          <Globe size={12} /> Website
+                        </a>
+                      )}
                       {can('properties.edit') && (
                         <button className="btn btn-ghost btn-sm" onClick={e => { e.stopPropagation(); setEditProp(p) }} style={{ padding: '4px 8px' }}>
                           <Edit2 size={12} />

@@ -1,6 +1,6 @@
 # ⚡ Gold Asset Management — Platform
 
-Full-stack SaaS property management platform with **On-Time Pay Disbursement SLA** — rent guaranteed to landlords on the 1st business day of every month.
+Full-stack, multi-portal property management SaaS for landlords, tenants, RV parks, and extended-stay operators — built for nationwide scale.
 
 ---
 
@@ -142,76 +142,34 @@ Events to handle (already wired in `apps/api/src/routes/webhooks.ts`):
 
 ## Key Business Logic
 
-### On-Time Pay SLA
-
-- Cron job runs last business day of month (`apps/api/src/jobs/scheduler.ts`)
-- Disbursements initiated regardless of tenant ACH settlement status
-- Gap funded from `reserve_fund_state` table if tenant hasn't settled
-- Standard tenants: ACH pulled on 28th, settles by 1st (3-day float)
-- SSI/SSDI tenants enrolled in On-Time Pay: ACH pulled on income arrival day
-
 ### Eviction Mode
 
-- Activated per unit by landlord in dashboard
-- Hard-blocks ALL tenant ACH at platform level
-- Legal basis: A.R.S. § 33-1371(A) — accepting any rent waives eviction right
-- `payment_block` field on `units` table, enforced in payment initiation jobs
+- Activated per unit by the landlord in the dashboard
+- Hard-blocks ALL tenant rent payment at the platform level (accepting rent can waive the right to evict — landlord-configurable with a generic "check your local laws" disclaimer; no state-specific citations)
+- `payment_block` field on `units`, enforced in the payment-initiation paths
 
-### Reserve Phases
+### NACHA return monitoring
 
-| Phase | Units       | Reserve Rate |
-|-------|-------------|-------------|
-| 1     | 0–1,000     | 100% of net |
-| 2     | 1,001–5,000 | 30% of net  |
-| 3     | 5,000+      | 15% of net  |
-
-### NACHA Compliance (June 22, 2026 deadline)
-
-Zero-tolerance return codes (immediate ACH suspension):
-- R05 — Unauthorized debit
-- R07 — Authorization revoked
-- R10 — Customer advises not authorized
-- R29 — Corporate customer advises not authorized
-
-Monitored via `ach_monitoring_log` table. Admin NACHA Monitor page tracks return rates.
+- Return rates tracked in `ach_monitoring_log`; the Admin **NACHA Monitor** page surfaces them
+- Zero-tolerance unauthorized codes (R05 / R07 / R10 / R29) flag for immediate ACH suspension
+- While on the Stripe rail, Stripe is the ACH originator and owns the NACHA relationship; GAM monitors to keep its own portfolio clean
 
 ---
 
-## Pending (Attorney Review Required)
+## Business Model, Pricing & Legal Posture
 
-Per locked model v3:
+**Single source of truth: `CLAUDE.md`** (loaded every session, kept current), plus the memory files and `LAUNCH.md`. Deliberately **not duplicated here** — a second, frozen copy of the strategy is exactly what let stale numbers resurface. Current-model orientation only:
 
-1. SLA structure — does it avoid insurance classification per A.R.S. § 20-103?
-2. Agent-of-payee structure — does it avoid money transmission licensing?
-3. Non-recourse design — does it avoid consumer lending regulation?
-4. $20 float fee — is it a finance charge under TILA?
-5. A.R.S. § 20-1095 service contracts — does it apply?
+- **Rent money flow** — platform-holds: every payment lands on GAM's Stripe platform balance, then batches to landlords weekly (lands by Friday). No advance, no guarantee. Detail in `MONEY_FLOW_REBUILD_SPEC.md`.
+- **Platform fee** — $2 per occupied unit / month, floored at $10 per property. Vacant units are never charged.
+- **Flex Suite** — custody / payment-coordination model; **GAM extends no credit**. FlexPay is a flat $25/mo. Full rules in `CLAUDE.md`.
+- **Legal** — ToS/Privacy live in `legal/`; lawyer review advised before broad public rollout (tracked in `LAUNCH.md`).
 
-**Do not launch in production without attorney sign-off on these five questions.**
+> **Removed 2026-07-28** — the prior "Locked Model v3" sections (On-Time Pay advance/SLA, per-unit economics at a $15/mo landlord fee + $20 float, Arizona § citations, the reserve-phase table). All superseded by the current custody / platform-holds model. Git history preserves the originals.
 
----
+## ODFI Transition (scale milestone, not a launch item)
 
-## Per-Unit Economics (Locked Model v3)
-
-| Item                        | Amount        |
-|-----------------------------|---------------|
-| Landlord fee (occupied)     | $15.00/mo     |
-| ACH pull (0.8% × rent, cap $5) | −$4.80/mo  |
-| Connect payout (0.25% + $0.25) | −$1.75/mo  |
-| Connect account fee         | −$0.04/mo     |
-| **Net before reserve**      | **$8.41/mo**  |
-| Phase 3 reserve (15%)       | −$1.26/mo     |
-| **Net kept (Phase 3)**      | **$7.15/mo**  |
-| All-source ARR per unit     | **$255/year** |
-
----
-
-## ODFI Transition (Month 24 target)
-
-At 2,000–3,000 units, transition from Stripe ACH to direct ODFI:
-- Stripe cost drops from $6.59/unit → $0.72/unit
-- Net per unit jumps from $8.41 → $14.28 before reserve
-- Begin ODFI conversations at 500 units (no cost, builds relationship)
+Direct-ODFI origination (moving off the Stripe ACH rail) is targeted at roughly **2,000–3,000 units**, with no-cost relationship-building conversations starting around **500 units** — it materially cuts per-transaction ACH cost at scale. A **SOC 2 (Type II)** report is effectively a prerequisite for a sponsor-bank/ODFI relationship (a security-posture credential, separate from NACHA return metrics). Superseded per-unit dollar figures removed 2026-07-28; see `CLAUDE.md` for current economics.
 
 ---
 

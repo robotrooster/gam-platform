@@ -1,4 +1,5 @@
 import { Router } from 'express'
+import { z } from 'zod'
 import { extractUploadFilename, resolveUploadPath } from '../lib/uploadPaths'
 import { cascadeLeaseTenantsOnVoid } from '../lib/leaseDocCascade'
 import {
@@ -14,6 +15,10 @@ import {
   FEE_ROW_SPECS,
   UTILITY_ROW_SPECS,
   validateLeaseDocumentForSend,
+  STANDALONE_DOCUMENT_TYPES,
+  NO_LEASE_DOCUMENT_TYPES,
+  LEASE_TEMPLATE_PURPOSES,
+  isValidSignerRole,
 } from '@gam/shared'
 import { query, queryOne, getClient } from '../db'
 import { generateMoveInInvoice } from '../jobs/moveInBundle'
@@ -1206,6 +1211,11 @@ esignRouter.get('/templates', requireAuth, requirePerm('leases.create'), async (
     // S535: ?propertyId narrows to templates usable AT that property
     // (locked to it + unlocked NULL templates).
     const propertyFilter = typeof req.query.propertyId === 'string' && req.query.propertyId ? req.query.propertyId : null
+    // S576 (B-8): ?purpose=lease|work_trade_addendum narrows by template kind so
+    // the renewal picker shows only lease forms, and the addendum resolver finds
+    // only work-trade forms. Omitted = all (the Templates management tab).
+    const purposeFilter = typeof req.query.purpose === 'string' && (LEASE_TEMPLATE_PURPOSES as readonly string[]).includes(req.query.purpose)
+      ? req.query.purpose : null
     const templates = await query<any>(`
       SELECT t.*, COUNT(f.id)::int as field_count, p.name AS property_name
       FROM lease_templates t
@@ -1214,15 +1224,22 @@ esignRouter.get('/templates', requireAuth, requirePerm('leases.create'), async (
       WHERE t.landlord_id = $1 AND t.is_active = TRUE
         AND ($2::text IS NULL OR t.unit_type IS NULL OR t.unit_type = $2)
         AND ($3::uuid IS NULL OR t.property_id IS NULL OR t.property_id = $3)
-      GROUP BY t.id, p.name ORDER BY t.created_at DESC`, [req.user!.profileId, unitTypeFilter, propertyFilter])
+        AND ($4::text IS NULL OR t.purpose = $4)
+      GROUP BY t.id, p.name ORDER BY t.created_at DESC`, [req.user!.profileId, unitTypeFilter, propertyFilter, purposeFilter])
     res.json({ success: true, data: templates })
   } catch (e) { next(e) }
 })
 
 esignRouter.post('/templates', requireAuth, requirePerm('esign.template_manage'), async (req, res, next) => {
   try {
-    const { name, description, basePdfUrl, pageCount, unitType, propertyId, depositMonths, defaultTermMonths } = req.body
+    const { name, description, basePdfUrl, pageCount, unitType, propertyId, depositMonths, defaultTermMonths, purpose } = req.body
     if (!name) throw new AppError(400, 'Template name required')
+    // S576 (B-8): 'lease' (default) or 'work_trade_addendum' — the landlord's
+    // own work-trade addendum form, auto-attached to a renewal on lease expiry.
+    const tmplPurpose = purpose || 'lease'
+    if (!(LEASE_TEMPLATE_PURPOSES as readonly string[]).includes(tmplPurpose)) {
+      throw new AppError(400, `purpose must be one of ${LEASE_TEMPLATE_PURPOSES.join(', ')}`)
+    }
     // S558: the deposit multiplier ("N months' rent") is a lease term on the
     // template. Optional (NULL = landlord fills the deposit manually); 0..12.
     const depMonths = depositMonths === undefined || depositMonths === null || depositMonths === ''
@@ -1251,9 +1268,9 @@ esignRouter.post('/templates', requireAuth, requirePerm('esign.template_manage')
       if (!prop) throw new AppError(404, 'Property not found')
     }
     const t = await queryOne<any>(`
-      INSERT INTO lease_templates (landlord_id, name, description, base_pdf_url, page_count, unit_type, property_id, deposit_months, default_term_months)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
-      [req.user!.profileId, name, description||null, basePdfUrl||null, pageCount||1, unitType||null, propertyId||null, depMonths, termMonths])
+      INSERT INTO lease_templates (landlord_id, name, description, base_pdf_url, page_count, unit_type, property_id, deposit_months, default_term_months, purpose)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+      [req.user!.profileId, name, description||null, basePdfUrl||null, pageCount||1, unitType||null, propertyId||null, depMonths, termMonths, tmplPurpose])
     res.status(201).json({ success: true, data: t })
   } catch (e) { next(e) }
 })
@@ -1357,7 +1374,10 @@ esignRouter.put('/templates/:id/fields', requireAuth, requirePerm('esign.templat
       if (f.leaseColumn && !(f.leaseColumn in LEASE_COLUMN_CATEGORY)) {
         throw new AppError(400, `Invalid lease_column: ${f.leaseColumn}`)
       }
-      if (f.signerRole && !(f.signerRole === 'landlord' || f.signerRole === 'witness' || isTenantRole(f.signerRole))) {
+      // S568: accept lease roles (landlord/witness/tenant) AND generic roles
+      // (seller/purchaser/party_N/custom) so one template engine serves both
+      // leases and standalone contracts. isValidSignerRole allows sane labels.
+      if (f.signerRole && !(f.signerRole === 'landlord' || isTenantRole(f.signerRole) || isValidSignerRole(f.signerRole))) {
         throw new AppError(400, `Invalid signer_role: ${f.signerRole}`)
       }
     }
@@ -1576,12 +1596,14 @@ esignRouter.post('/documents', requireAuth, requirePerm('leases.create'), async 
     let pdfUrl = basePdfUrl
     let tmplUnitType: string | null = null
     let tmplPropertyId: string | null = null
+    let tmplPurpose = 'lease'
     if (templateId) {
       const tmpl = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id=$2', [templateId, req.user!.profileId])
       if (!tmpl) throw new AppError(404, 'Template not found')
       pdfUrl = pdfUrl || tmpl.base_pdf_url
       tmplUnitType = tmpl.unit_type || null
       tmplPropertyId = tmpl.property_id || null
+      tmplPurpose = tmpl.purpose || 'lease'
     }
 
     // Unit resolver — if the template binds unit_number and the landlord filled
@@ -1605,26 +1627,152 @@ esignRouter.post('/documents', requireAuth, requirePerm('leases.create'), async 
       }
     }
 
+    // S576 (B-8): purpose-aware. A NON-lease template (a work-trade addendum
+    // form) AMENDS the tenant's existing active lease — so the normal e-sign
+    // send flow produces an addendum_terms document ON that lease, never a new
+    // original_lease (Nic: "picking the addendum template should just work").
+    // Falls back cleanly to a new lease for ordinary lease templates.
+    let docType: LeaseDocumentType = 'original_lease'
+    let docLeaseId: string | null = null
+    let wtAgreementId: string | null = null
+    if (tmplPurpose === 'work_trade_addendum') {
+      const primarySigner = (signers as any[]).find(s => s.role === 'primary')
+      if (!primarySigner?.userId) throw new AppError(400, 'An addendum needs the tenant on the existing lease as the primary signer.')
+      if (!finalUnitId) throw new AppError(400, 'Could not resolve which unit this addendum is for.')
+      const t = await queryOne<{ id: string }>('SELECT id FROM tenants WHERE user_id=$1', [primarySigner.userId])
+      if (!t) throw new AppError(400, 'Primary signer has no tenant profile.')
+      const activeLease = await queryOne<{ id: string }>(`
+        SELECT l.id FROM leases l JOIN lease_tenants lt ON lt.lease_id=l.id
+         WHERE l.unit_id=$1 AND lt.tenant_id=$2 AND l.status='active' AND lt.status='active'
+         ORDER BY l.start_date DESC LIMIT 1`, [finalUnitId, t.id])
+      if (!activeLease) throw new AppError(409, 'No active lease for this tenant on this unit — an addendum amends an existing lease, so add or renew the lease first.')
+      docType = 'addendum_terms'
+      docLeaseId = activeLease.id
+      // Link it to an active work-trade agreement if one exists (so the system
+      // knows it's THE work-trade addendum) — same stamp the dedicated flow uses.
+      const agr = await queryOne<{ id: string }>(
+        `SELECT id FROM work_trade_agreements WHERE unit_id=$1 AND tenant_id=$2 AND status='active' LIMIT 1`,
+        [finalUnitId, t.id])
+      wtAgreementId = agr?.id || null
+    }
+
     await client.query('BEGIN')
 
     const doc = await createDocumentRecord(client, {
       landlordId: req.user!.profileId,
       templateId: templateId || null,
       unitId: finalUnitId,
-      leaseId: null,
+      leaseId: docLeaseId,
       title,
       basePdfUrl: pdfUrl || null,
-      documentType: 'original_lease',
+      documentType: docType,
       targetLeaseTenantId: null,
       promoteLeaseTenantId: null,
       signers,
       prefillValues: prefillValues || {}
     } as any)
+    if (wtAgreementId) {
+      await client.query('UPDATE lease_documents SET work_trade_agreement_id=$1 WHERE id=$2', [wtAgreementId, doc.id])
+    }
 
     await client.query('COMMIT')
     res.status(201).json({ success: true, data: doc })
   } catch (e) {
     await client.query('ROLLBACK')
+    next(e)
+  } finally {
+    client.release()
+  }
+})
+
+// ─────────────────────────────────────────────────────────────
+// POST /api/esign/standalone-documents  — S568 (Nic): generic e-sign
+// ─────────────────────────────────────────────────────────────
+// Create a NON-lease document (purchase agreement, bill of sale, general
+// contract) with ARBITRARY signers + roles — the generic e-sign engine. Binds
+// to no lease/unit; reuses createDocumentRecord (its lease-only blocks are gated
+// on unitId/original_lease, so they're skipped) and the existing generic
+// /documents/:id/send + token signing flow. Enables financed-home purchase
+// agreements (seller=landlord, purchaser=tenant) and resident-to-resident sales
+// (landlord just facilitates). Signers must be existing GAM users for now
+// (userId required — the same rule leases use before signing); external-party-
+// by-email is the next increment.
+esignRouter.post('/standalone-documents', requireAuth, requirePerm('esign.template_manage'), async (req: any, res, next) => {
+  const client = await getClient()
+  try {
+    const body = z.object({
+      title:        z.string().trim().min(1).max(160),
+      documentType: z.enum(STANDALONE_DOCUMENT_TYPES as unknown as [string, ...string[]]),
+      templateId:   z.string().uuid().nullable().optional(),
+      basePdfUrl:   z.string().nullable().optional(),
+      // A signer is identified by email + name + role. No userId needed — every
+      // signer is resolved to (or minted as) a GAM account; raw emails never
+      // receive a document (anti-spam / consent gate). userId may be supplied to
+      // pin an existing account.
+      signers: z.array(z.object({
+        userId: z.string().uuid().optional(),
+        role:   z.string().trim().min(1).max(40),
+        name:   z.string().trim().min(1),
+        email:  z.string().email(),
+        phone:  z.string().max(40).nullable().optional(),
+        orderIndex: z.number().int().positive().optional(),
+      })).min(1).max(10),
+    }).parse(req.body)
+
+    const landlordId = req.user.role === 'landlord' ? req.user.profileId : req.user.landlordId
+    if (!landlordId) throw new AppError(403, 'A landlord context is required to create a document.')
+
+    for (const s of body.signers) {
+      if (!isValidSignerRole(s.role)) throw new AppError(400, `Invalid signer role: ${s.role}`)
+    }
+    // Distinct roles — the engine matches template fields to signers by role.
+    const roles = body.signers.map(s => s.role)
+    if (new Set(roles).size !== roles.length) throw new AppError(400, 'Each signer must have a distinct role.')
+
+    // If a template is supplied it must belong to this landlord.
+    if (body.templateId) {
+      const tmpl = await queryOne<any>('SELECT id FROM lease_templates WHERE id=$1 AND landlord_id=$2', [body.templateId, landlordId])
+      if (!tmpl) throw new AppError(404, 'Template not found')
+    }
+
+    await client.query('BEGIN')
+    // Resolve every signer to a GAM account — minting a free 'contact' (customer
+    // pool) when the email is new. Track the newly-minted ones to invite them.
+    const { resolveOrCreateSignerUser } = await import('../services/signerAccounts')
+    const newContacts: Array<{ email: string; name: string; inviteToken: string }> = []
+    const resolvedSigners = []
+    for (let i = 0; i < body.signers.length; i++) {
+      const s = body.signers[i]
+      let userId = s.userId
+      if (!userId) {
+        const r = await resolveOrCreateSignerUser(client as any, { email: s.email, name: s.name, phone: s.phone ?? null })
+        userId = r.userId
+        if (r.created && r.inviteToken) newContacts.push({ email: r.email, name: r.name, inviteToken: r.inviteToken })
+      }
+      resolvedSigners.push({ userId: userId!, role: s.role, name: s.name, email: s.email, orderIndex: s.orderIndex ?? i + 1 })
+    }
+
+    const doc = await createDocumentRecord(client, {
+      landlordId,
+      templateId: body.templateId ?? null,
+      unitId: null,
+      leaseId: null,
+      title: body.title,
+      basePdfUrl: body.basePdfUrl ?? null,
+      documentType: body.documentType as any,
+      targetLeaseTenantId: null,
+      promoteLeaseTenantId: null,
+      signers: resolvedSigners,
+    })
+    await client.query('COMMIT')
+
+    // The activation invite is NOT sent here — it fires when the landlord SENDS
+    // the document (POST /documents/:id/send), which routes an unactivated signer
+    // through /accept-invite (their tenant_invite_token) → set password → /sign.
+    // So creating the doc just mints the pooled contact accounts; sending invites.
+    res.json({ success: true, data: { ...doc, mintedContacts: newContacts.length } })
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
     next(e)
   } finally {
     client.release()
@@ -2432,6 +2580,151 @@ esignRouter.post('/documents/addendum-terms', requireAuth, requirePerm('leases.c
   }
 })
 
+// S576 (B-8): send a WORK-TRADE ADDENDUM. Because a work-trade agreement
+// requires an ACTIVE lease, the addendum is just a plain lease TERMS addendum on
+// that lease — the proven addendum_terms path (no standalone-completion issues).
+// Everything resolves server-side (lease + signers) so the landlord only picks
+// their addendum form and clicks send. The document is stamped with
+// work_trade_agreement_id so the system KNOWS it's this agreement's addendum
+// (no name-guessing) — powering the "addendum on file" surface + renewal
+// auto-carry. Create-only; the caller then POSTs /documents/:id/send.
+esignRouter.post('/documents/work-trade-addendum', requireAuth, requirePerm('leases.create'), async (req, res, next) => {
+  const client = await getClient()
+  try {
+    const { workTradeAgreementId, templateId } = req.body
+    if (!workTradeAgreementId) throw new AppError(400, 'workTradeAgreementId required')
+    if (!templateId) throw new AppError(400, 'templateId required — pick your work-trade addendum form')
+    const landlordId = req.user!.profileId
+
+    const agr = await queryOne<any>(`
+      SELECT wta.id, wta.unit_id, wta.tenant_id, wta.landlord_id, wta.status,
+             un.unit_number, p.name AS property_name
+        FROM work_trade_agreements wta
+        JOIN units un ON un.id = wta.unit_id
+        JOIN properties p ON p.id = un.property_id
+       WHERE wta.id=$1`, [workTradeAgreementId])
+    if (!agr) throw new AppError(404, 'Work-trade agreement not found')
+    if (!canManageLandlordResource(req.user, agr.landlord_id)) throw new AppError(403, 'Not your agreement')
+    if (agr.status !== 'active') throw new AppError(409, `Agreement is ${agr.status} — resume or renew the lease before sending an addendum`)
+
+    // The gate guarantees an active lease for this tenant on this unit.
+    const lease = await queryOne<any>(`
+      SELECT l.id, l.unit_id FROM leases l
+       JOIN lease_tenants lt ON lt.lease_id = l.id
+      WHERE l.unit_id=$1 AND lt.tenant_id=$2 AND l.status='active' AND lt.status='active'
+      ORDER BY l.start_date DESC LIMIT 1`, [agr.unit_id, agr.tenant_id])
+    if (!lease) throw new AppError(409, 'No active lease for this tenant on this unit — renew the lease first')
+
+    const tmpl = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id=$2', [templateId, landlordId])
+    if (!tmpl) throw new AppError(404, 'Template not found')
+    if (tmpl.purpose !== 'work_trade_addendum') throw new AppError(400, 'Pick a Work-Trade Addendum form (set Form Type = Work-Trade Addendum on the template)')
+    if (!tmpl.base_pdf_url) throw new AppError(400, 'That addendum form has no PDF — add one in the template editor')
+
+    const landlordUser = await queryOne<any>(`
+      SELECT u.id, u.first_name, u.last_name, u.email, u.phone
+        FROM landlords l JOIN users u ON u.id = l.user_id WHERE l.id=$1`, [landlordId])
+    if (!landlordUser) throw new AppError(500, 'Landlord user not found')
+    const roster = await query<any>(`
+      SELECT u.id AS user_id, u.first_name, u.last_name, u.email, u.phone, lt.role
+        FROM lease_tenants lt JOIN tenants t ON t.id = lt.tenant_id JOIN users u ON u.id = t.user_id
+       WHERE lt.lease_id=$1 AND lt.status='active'
+       ORDER BY CASE lt.role WHEN 'primary' THEN 0 ELSE 1 END`, [lease.id])
+    if ((roster as any[]).length === 0) throw new AppError(409, 'Lease has no active tenants to sign the addendum')
+    const signers = [
+      { userId: landlordUser.id, role: 'landlord', name: `${landlordUser.first_name} ${landlordUser.last_name}`, email: landlordUser.email, phone: landlordUser.phone, orderIndex: 1 },
+      ...(roster as any[]).map((r: any, i: number) => ({
+        userId: r.user_id, role: r.role, name: `${r.first_name} ${r.last_name}`,
+        email: r.email, phone: r.phone, orderIndex: i + 2,
+      })),
+    ]
+
+    await client.query('BEGIN')
+    const doc = await createDocumentRecord(client, {
+      landlordId, templateId, unitId: lease.unit_id, leaseId: lease.id,
+      title: `Work-Trade Addendum — Unit ${agr.unit_number}${agr.property_name ? ' — ' + agr.property_name : ''}`,
+      basePdfUrl: tmpl.base_pdf_url, documentType: 'addendum_terms',
+      targetLeaseTenantId: null, promoteLeaseTenantId: null, signers,
+    })
+    await client.query('UPDATE lease_documents SET work_trade_agreement_id=$1 WHERE id=$2', [workTradeAgreementId, doc.id])
+    await client.query('COMMIT')
+    res.status(201).json({ success: true, data: { ...doc, work_trade_agreement_id: workTradeAgreementId } })
+  } catch (e) {
+    await client.query('ROLLBACK')
+    next(e)
+  } finally {
+    client.release()
+  }
+})
+
+// S576 (B-8): after a RENEWAL completes, auto-DRAFT (never auto-send) a fresh
+// work-trade addendum on the new lease when the tenant's work-trade agreement is
+// still ACTIVE — the arrangement carries across the renewal, but the landlord
+// eyeballs the draft and sends it, exactly like the renewal itself (Nic). Leaves
+// it as an unsent `pending` document that the Work Trade page surfaces as
+// "review & send" + a dashboard to-do. Best-effort: never throws into the e-sign
+// completion flow. If the landlord has no work-trade addendum FORM, it drafts
+// nothing (the manual "Add a form" surface covers that).
+export async function autoDraftWorkTradeAddendumForRenewal(newLeaseId: string): Promise<void> {
+  const lease = await queryOne<any>(`
+    SELECT l.id, l.unit_id, l.landlord_id, u.unit_type, u.property_id, u.unit_number, p.name AS property_name
+      FROM leases l JOIN units u ON u.id=l.unit_id JOIN properties p ON p.id=u.property_id
+     WHERE l.id=$1`, [newLeaseId])
+  if (!lease) return
+  const agr = await queryOne<any>(`
+    SELECT wta.id FROM work_trade_agreements wta
+     WHERE wta.unit_id=$1 AND wta.status='active'
+       AND wta.tenant_id IN (SELECT tenant_id FROM lease_tenants WHERE lease_id=$2 AND status='active')
+     LIMIT 1`, [lease.unit_id, newLeaseId])
+  if (!agr) return
+  // Idempotent: don't re-draft if a live addendum already exists on this lease.
+  const dupe = await queryOne<any>(
+    `SELECT id FROM lease_documents WHERE work_trade_agreement_id=$1 AND lease_id=$2 AND status NOT IN ('voided') LIMIT 1`,
+    [agr.id, newLeaseId])
+  if (dupe) return
+  // Resolve the landlord's work-trade addendum form — most specific first
+  // (property match, then unit-type match, then universal), newest as tiebreak.
+  const tmpl = await queryOne<any>(`
+    SELECT * FROM lease_templates
+     WHERE landlord_id=$1 AND is_active=TRUE AND purpose='work_trade_addendum'
+       AND base_pdf_url IS NOT NULL
+       AND (unit_type IS NULL OR unit_type=$2)
+       AND (property_id IS NULL OR property_id=$3)
+     ORDER BY (property_id=$3) DESC NULLS LAST, (unit_type=$2) DESC NULLS LAST, created_at DESC
+     LIMIT 1`, [lease.landlord_id, lease.unit_type, lease.property_id])
+  if (!tmpl) return
+  const landlordUser = await queryOne<any>(
+    `SELECT u.id, u.first_name, u.last_name, u.email, u.phone FROM landlords l JOIN users u ON u.id=l.user_id WHERE l.id=$1`, [lease.landlord_id])
+  if (!landlordUser) return
+  const roster = await query<any>(`
+    SELECT u.id AS user_id, u.first_name, u.last_name, u.email, u.phone, lt.role
+      FROM lease_tenants lt JOIN tenants t ON t.id=lt.tenant_id JOIN users u ON u.id=t.user_id
+     WHERE lt.lease_id=$1 AND lt.status='active'
+     ORDER BY CASE lt.role WHEN 'primary' THEN 0 ELSE 1 END`, [newLeaseId])
+  if ((roster as any[]).length === 0) return
+  const signers = [
+    { userId: landlordUser.id, role: 'landlord', name: `${landlordUser.first_name} ${landlordUser.last_name}`, email: landlordUser.email, phone: landlordUser.phone, orderIndex: 1 },
+    ...(roster as any[]).map((r: any, i: number) => ({ userId: r.user_id, role: r.role, name: `${r.first_name} ${r.last_name}`, email: r.email, phone: r.phone, orderIndex: i + 2 })),
+  ]
+  const client = await getClient()
+  try {
+    await client.query('BEGIN')
+    const doc = await createDocumentRecord(client, {
+      landlordId: lease.landlord_id, templateId: tmpl.id, unitId: lease.unit_id, leaseId: newLeaseId,
+      title: `Work-Trade Addendum — Unit ${lease.unit_number}${lease.property_name ? ' — ' + lease.property_name : ''}`,
+      basePdfUrl: tmpl.base_pdf_url, documentType: 'addendum_terms',
+      targetLeaseTenantId: null, promoteLeaseTenantId: null, signers,
+    } as any)
+    await client.query('UPDATE lease_documents SET work_trade_agreement_id=$1 WHERE id=$2', [agr.id, doc.id])
+    await client.query('COMMIT')
+    logger.info(`[LeaseRenewal] Auto-drafted work-trade addendum ${doc.id} on renewed lease ${newLeaseId} (agreement ${agr.id}) — awaiting landlord review + send`)
+  } catch (e) {
+    await client.query('ROLLBACK')
+    logger.error({ err: e }, '[LeaseRenewal][wt-addendum-autodraft]')
+  } finally {
+    client.release()
+  }
+}
+
 esignRouter.get('/documents/:id', requireAuth, async (req, res, next) => {
   try {
     const doc = await queryOne<any>(`
@@ -2492,30 +2785,38 @@ esignRouter.post('/documents/:id/send', requireAuth, requirePerm('esign.send'), 
     const signers = await query<any>('SELECT * FROM lease_document_signers WHERE document_id=$1 ORDER BY order_index', [doc.id])
 
     // ────────────────────────────────────────────────────────────────────────
-    // S28: Landlord-first signer check.
+    // S28: Landlord-first signer check — LEASE documents only.
     // Landlord fills the writable/fee/utility values during template completion
     // and signs first to lock the inputs. Tenants then sign accepting those
     // values. If a tenant signed first, they would either sign blank fields
     // or the landlord could alter values after acceptance — both unacceptable.
+    // S568: standalone documents (purchase agreements, contracts) have no
+    // landlord party + no lease-value fields, so this ordering rule does not
+    // apply — they sign in whatever order the creator set.
     // ────────────────────────────────────────────────────────────────────────
-    const sortedSigners = [...(signers as any[])].sort(
-      (a, b) => (a.order_index ?? 0) - (b.order_index ?? 0)
-    )
-    const firstByOrder = sortedSigners[0]
-    if (!firstByOrder) throw new AppError(400, 'No signers configured')
-    if (firstByOrder.role !== 'landlord') {
-      throw new AppError(
-        400,
-        'Landlord must be the first signer. Reorder signers so the landlord signs first.'
+    const isStandaloneDoc = (STANDALONE_DOCUMENT_TYPES as readonly string[]).includes(doc.document_type)
+    if (!isStandaloneDoc) {
+      const sortedSigners = [...(signers as any[])].sort(
+        (a, b) => (a.order_index ?? 0) - (b.order_index ?? 0)
       )
-    }
-    // S535 (Nic): a tied order_index would let a tenant sign in parallel
-    // with the landlord — the landlord's slot must be strictly first.
-    const tenantAtOrBeforeLandlord = sortedSigners.some(
-      (sg: any) => sg.role !== 'landlord' && (sg.order_index ?? 0) <= (firstByOrder.order_index ?? 0)
-    )
-    if (tenantAtOrBeforeLandlord) {
-      throw new AppError(400, 'The landlord must sign before all other signers — no signer may share the landlord\'s signing position.')
+      const firstByOrder = sortedSigners[0]
+      if (!firstByOrder) throw new AppError(400, 'No signers configured')
+      if (firstByOrder.role !== 'landlord') {
+        throw new AppError(
+          400,
+          'Landlord must be the first signer. Reorder signers so the landlord signs first.'
+        )
+      }
+      // S535 (Nic): a tied order_index would let a tenant sign in parallel
+      // with the landlord — the landlord's slot must be strictly first.
+      const tenantAtOrBeforeLandlord = sortedSigners.some(
+        (sg: any) => sg.role !== 'landlord' && (sg.order_index ?? 0) <= (firstByOrder.order_index ?? 0)
+      )
+      if (tenantAtOrBeforeLandlord) {
+        throw new AppError(400, 'The landlord must sign before all other signers — no signer may share the landlord\'s signing position.')
+      }
+    } else if (signers.length === 0) {
+      throw new AppError(400, 'No signers configured')
     }
 
     // ────────────────────────────────────────────────────────────────────────
@@ -2993,45 +3294,69 @@ esignRouter.post('/sign/:documentId', requireAuth, async (req, res, next) => {
       // be a lie. Tenant frontend still gets completed:true (their work is
       // done); the failure is a landlord/admin-side issue surfaced in the
       // landlord dashboard via execution_failed status.
-      let leaseResult: { leaseId: string; status: string; primaryTenantId: string } | null = null
-      try {
-        leaseResult = await buildLeaseFromDocument(doc.id)
-      } catch (e: any) {
-        logger.error('[ESIGN] buildLeaseFromDocument failed for document', doc.id, '-', e.message)
-        // S132: critical — signed document but no lease materialized.
-        // Tenant signed a legal contract that didn't translate to an
-        // active lease in the system. Manual remediation needed.
-        await createAdminNotification({
-          severity: 'critical',
-          category: 'esign_lease_build_failed',
-          title:    `Lease build failed for signed document ${doc.id}`,
-          body:     e.message,
-          context:  { document_id: doc.id },
-        })
-        await query(
-          "UPDATE lease_documents SET status='execution_failed', execution_failed_at=NOW(), void_reason=$1, updated_at=NOW() WHERE id=$2",
-          [`Lease build failed: ${e.message}`, doc.id])
-        return res.json({ success: true, data: { completed: true, executionFailed: true, reason: e.message } })
-      }
+      // S576 (B-8): no-lease document types (standalone contracts +
+      // work_trade_addendum) produce NO lease record — the signed PDF is the
+      // legal instrument. buildLeaseFromDocument's switch has no case for them
+      // and would throw 'Unknown document_type', dumping a fully-signed doc into
+      // execution_failed. Skip the build entirely; these complete cleanly and
+      // still get their PDF stamped below. leaseResult stays null (no lease id).
+      const isNoLeaseDoc = (NO_LEASE_DOCUMENT_TYPES as readonly string[]).includes(doc.document_type)
 
-      // S119 post-commit: fire Stripe Transfer for any PM company leasing
-      // fee that landed on the ledger as a ghost. Only fires when the
-      // property is contracted to a PM company with leasing_fee_amount > 0.
-      try {
-        const { firePmTransfersForReference } = await import('../services/stripeConnect')
-        await firePmTransfersForReference('lease', leaseResult.leaseId)
-      } catch (e) {
-        logger.error({ err: e, ctx: leaseResult.leaseId }, '[pm_transfer] post-commit firing failed for lease')
-        await createAdminNotification({
-          severity: 'warn',
-          category: 'pm_transfer_post_commit_failed',
-          title:    `PM leasing fee transfer failed for lease ${leaseResult.leaseId}`,
-          body:     e instanceof Error ? e.message : String(e),
-          context:  { lease_id: leaseResult.leaseId, document_id: doc.id },
-        })
+      let leaseResult: { leaseId: string; status: string; primaryTenantId: string } | null = null
+      if (!isNoLeaseDoc) {
+        try {
+          leaseResult = await buildLeaseFromDocument(doc.id)
+        } catch (e: any) {
+          logger.error('[ESIGN] buildLeaseFromDocument failed for document', doc.id, '-', e.message)
+          // S132: critical — signed document but no lease materialized.
+          // Tenant signed a legal contract that didn't translate to an
+          // active lease in the system. Manual remediation needed.
+          await createAdminNotification({
+            severity: 'critical',
+            category: 'esign_lease_build_failed',
+            title:    `Lease build failed for signed document ${doc.id}`,
+            body:     e.message,
+            context:  { document_id: doc.id },
+          })
+          await query(
+            "UPDATE lease_documents SET status='execution_failed', execution_failed_at=NOW(), void_reason=$1, updated_at=NOW() WHERE id=$2",
+            [`Lease build failed: ${e.message}`, doc.id])
+          return res.json({ success: true, data: { completed: true, executionFailed: true, reason: e.message } })
+        }
+
+        // S119 post-commit: fire Stripe Transfer for any PM company leasing
+        // fee that landed on the ledger as a ghost. Only fires when the
+        // property is contracted to a PM company with leasing_fee_amount > 0.
+        // No-lease docs never reach here — there is no lease to attribute a
+        // leasing fee to (leaseResult is null).
+        try {
+          const { firePmTransfersForReference } = await import('../services/stripeConnect')
+          await firePmTransfersForReference('lease', leaseResult.leaseId)
+        } catch (e) {
+          logger.error({ err: e, ctx: leaseResult.leaseId }, '[pm_transfer] post-commit firing failed for lease')
+          await createAdminNotification({
+            severity: 'warn',
+            category: 'pm_transfer_post_commit_failed',
+            title:    `PM leasing fee transfer failed for lease ${leaseResult.leaseId}`,
+            body:     e instanceof Error ? e.message : String(e),
+            context:  { lease_id: leaseResult.leaseId, document_id: doc.id },
+          })
+        }
       }
 
       await query("UPDATE lease_documents SET status='completed', completed_at=NOW(), updated_at=NOW() WHERE id=$1", [doc.id])
+
+      // S576 (B-8): a completed RENEWAL means the new lease now exists — if the
+      // tenant's work-trade agreement is still active, auto-draft a fresh
+      // work-trade addendum on it for the landlord to review + send. Best-effort,
+      // post-commit: never affects the renewal's own completion.
+      if (doc.renews_lease_id && leaseResult?.leaseId) {
+        try {
+          await autoDraftWorkTradeAddendumForRenewal(leaseResult.leaseId)
+        } catch (e) {
+          logger.error({ err: e }, '[LeaseRenewal][wt-addendum-autodraft-call]')
+        }
+      }
 
       // Stamp PDF
       let executedUrl: string | null = null

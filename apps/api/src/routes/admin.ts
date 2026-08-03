@@ -4,15 +4,16 @@ import fs from 'fs'
 import { Router } from 'express'
 import { z } from 'zod'
 import { query, queryOne } from '../db'
-import { requireAuth, requireAdmin, requireSuperAdmin } from '../middleware/auth'
+import { requireAuth, requireAdmin, requireSuperAdmin, requireOwner, OWNER_EMAIL } from '../middleware/auth'
 import { latencyP95, sampleSize } from '../lib/apiMetrics'
 import { AppError } from '../middleware/errorHandler'
 import { logAdminAction } from '../lib/adminAudit'
 import { backfillInvoices } from '../jobs/invoiceGeneration'
-import { PropertyReviewStatus, PLATFORM_FEES, LAUNCH_PLATFORM_FEE, SALES_LEAD_STATUSES } from '@gam/shared'
+import { PropertyReviewStatus, PLATFORM_FEES, LAUNCH_PLATFORM_FEE, launchPlatformFeeForProperty, SALES_LEAD_STATUSES } from '@gam/shared'
 import { fetchAccountStatus } from '../services/stripeConnect'
 import { unproductiveTurnSql } from '../services/agents/turnBudget'
 import { emailTenantOnboarded, emailLandlordBankingSetup, emailTenantAchSetup } from '../services/email'
+import { getNexusDashboard, recomputeNexusTally, setStateRegistration } from '../services/nexusMonitor'
 
 export const adminRouter = Router()
 adminRouter.use(requireAuth)
@@ -24,7 +25,11 @@ adminRouter.use((req: any, res: any, next: any) => {
   next()
 })
 
-adminRouter.get('/overview', async (_req, res, next) => {
+// S570 (Nic): platform financials — income projection, reserve/float balances,
+// ARR — are super-admin only. The regular admin role (portfolio manager) must
+// never see platform projections. The detailed /income/* pies were already
+// requireSuperAdmin; /overview was the one hole.
+adminRouter.get('/overview', requireSuperAdmin, async (_req, res, next) => {
   try {
     const [platform] = await query<any>(`
       SELECT
@@ -36,6 +41,19 @@ adminRouter.get('/overview', async (_req, res, next) => {
         (SELECT COALESCE(SUM(rent_amount),0) FROM units WHERE status='active') AS monthly_rent_volume,
         (SELECT COALESCE(balance,0) FROM reserve_fund_state LIMIT 1) AS reserve_balance,
         (SELECT COALESCE(balance,0) FROM float_account_state LIMIT 1) AS float_balance,
+        -- FlexPay float BANKROLL NEEDED: total monthly rent of the distinct
+        -- tenants who inquired about FlexPay AND were INCOME-VERIFIED (inquiry
+        -- status='approved' → the admin confirmed qualifying benefit income and
+        -- set tenants.ssi_ssdi). Only verified tenants can actually enroll, so
+        -- only they represent real float GAM would front. This is the money the
+        -- platform is exposed to — the default reserve (3%) sizes off it, not
+        -- off total platform rent. (Forward-looking; FlexPay is demand-test gated.)
+        (
+          SELECT COALESCE(SUM(u.rent_amount), 0)
+            FROM (SELECT DISTINCT tenant_id FROM flexpay_inquiries WHERE status = 'approved') fi
+            JOIN v_unit_occupancy vuo ON vuo.primary_tenant_id = fi.tenant_id
+            JOIN units u ON u.id = vuo.unit_id AND u.status = 'active'
+        ) AS flexpay_bankroll,
         (SELECT COUNT(*)::int FROM payments WHERE status='pending') AS pending_payments,
         (SELECT COUNT(*)::int FROM disbursements WHERE status='pending') AS pending_disbursements,
         (SELECT COUNT(*)::int FROM maintenance_requests WHERE status='open') AS open_maintenance,
@@ -68,7 +86,7 @@ adminRouter.get('/overview', async (_req, res, next) => {
 // status; the overall verdict is the worst status across them. The game-plan
 // copy lives on the frontend panel. Admin-level (the whole adminRouter is
 // already admin/super_admin only) so the demo admin account can see it.
-adminRouter.get('/infra-readiness', async (_req, res, next) => {
+adminRouter.get('/infra-readiness', requireSuperAdmin, async (_req, res, next) => {
   try {
     const round2 = (n: number) => Math.round(n * 100) / 100
     // higher value = closer to needing a migration
@@ -151,78 +169,54 @@ adminRouter.get('/nacha/monitoring', async (_req, res, next) => {
   } catch (e) { next(e) }
 })
 
-// ── BULLETIN BOARD (super_admin) ──────────────────────────────
-
-adminRouter.get('/bulletin', requireSuperAdmin, async (req, res, next) => {
+// ── ECONOMIC-NEXUS MONITOR (super_admin) — S565 ───────────────
+// Read model: GAM own-revenue by customer state vs each state's economic-nexus
+// registration threshold + current registration status. MONITORING ONLY — the
+// register action flips tax collection, but the dashboard itself charges nothing.
+adminRouter.get('/nexus/dashboard', requireSuperAdmin, async (_req, res, next) => {
   try {
-    const { date } = req.query
-    const params: any[] = []
-    const dateFilter = date
-      ? `AND DATE(b.created_at) = $${params.push(date)}`
-      : ''
-    const posts = await query<any>(`
-      SELECT b.*,
-        p.name as property_name,
-        b.upvote_count as vote_count
-      FROM bulletin_posts b
-      LEFT JOIN properties p ON p.id = b.property_id
-      WHERE (b.is_removed IS NULL OR b.is_removed = FALSE)
-      ${dateFilter}
-      ORDER BY b.pinned DESC, b.created_at DESC
-      LIMIT 500`, params)
-    res.json({ success: true, data: posts })
+    const data = await getNexusDashboard()
+    res.json({ success: true, data })
   } catch (e) { next(e) }
 })
 
-adminRouter.get('/bulletin/:id/reveal', requireSuperAdmin, async (req, res, next) => {
+// Manual tally recompute (the same job the nightly cron runs) — for when an
+// admin wants fresh numbers without waiting for 3:20am.
+adminRouter.post('/nexus/recompute', requireSuperAdmin, async (req, res, next) => {
   try {
-
-    const post = await queryOne<any>('SELECT * FROM bulletin_posts WHERE id=$1', [req.params.id])
-    if (!post) throw new AppError(404, 'Post not found')
-
-    const tenant = await queryOne<any>(`
-      SELECT u.first_name, u.last_name, u.email, un.unit_number
-      FROM tenants t
-      JOIN users u ON u.id = t.user_id
-      LEFT JOIN lease_tenants lt ON lt.tenant_id = t.id AND lt.status = 'active'
-      LEFT JOIN leases l ON l.id = lt.lease_id AND l.status = 'active'
-      LEFT JOIN units un ON un.id = l.unit_id
-      WHERE t.id = $1`, [post.tenant_id])
-
-    if (!tenant) throw new AppError(404, 'Tenant not found')
-
-    // Log the reveal
-    await query(`INSERT INTO bulletin_reveal_log (post_id, revealed_by, admin_id)
-      VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
-      [post.id, post.tenant_id, req.user!.userId])
-
-    res.json({ success: true, data: { ...tenant, alias: post.alias } })
-  } catch (e) { next(e) }
-})
-
-adminRouter.post('/bulletin/:id/pin', requireSuperAdmin, async (req, res, next) => {
-  try {
-    const { pin } = req.body
-    await query('UPDATE bulletin_posts SET pinned=$1 WHERE id=$2', [pin, req.params.id])
+    const result = await recomputeNexusTally()
     await logAdminAction({
       adminUserId: req.user!.userId,
-      actionType: pin ? 'bulletin_pin' : 'bulletin_unpin',
-      targetId: req.params.id,
-      targetType: 'bulletin_post',
+      actionType: 'nexus_tally_recompute',
+      metadata: { years: result.years, rows: result.rows },
       ipAddress: req.ip ?? null,
     })
-    res.json({ success: true })
+    res.json({ success: true, data: result })
   } catch (e) { next(e) }
 })
 
-adminRouter.post('/bulletin/:id/remove', requireSuperAdmin, async (req, res, next) => {
+// Flip a state's registration status. Registering turns ON tax collection for
+// that state (subject to the tax catalog's taxable flag + rate). Super-admin +
+// audited — this is a real compliance action.
+adminRouter.post('/nexus/register', requireSuperAdmin, async (req, res, next) => {
   try {
-    await query('UPDATE bulletin_posts SET is_removed=TRUE, removed_at=NOW(), removed_by=$1 WHERE id=$2', [req.user!.userId, req.params.id])
+    const schema = z.object({
+      stateCode: z.string().length(2),
+      registered: z.boolean(),
+      registeredDate: z.string().optional().nullable(),
+      notes: z.string().max(500).optional().nullable(),
+    })
+    const body = schema.parse(req.body)
+    await setStateRegistration(body.stateCode, body.registered, {
+      registeredDate: body.registeredDate ?? undefined,
+      notes: body.notes ?? undefined,
+      source: 'manual',
+    })
     await logAdminAction({
       adminUserId: req.user!.userId,
-      actionType: 'bulletin_remove',
-      targetId: req.params.id,
-      targetType: 'bulletin_post',
+      actionType: 'nexus_state_registration',
+      targetType: 'state_tax_registration',
+      metadata: { state: body.stateCode.toUpperCase(), registered: body.registered },
       ipAddress: req.ip ?? null,
     })
     res.json({ success: true })
@@ -230,22 +224,48 @@ adminRouter.post('/bulletin/:id/remove', requireSuperAdmin, async (req, res, nex
 })
 
 // ── ONBOARDING OVERVIEW (regular admin) ──────────────────────
-adminRouter.get('/onboarding/overview', async (_req, res, next) => {
+adminRouter.get('/onboarding/overview', async (req: any, res, next) => {
   try {
+    // Portfolio scoping (S567): every count is scoped to the regular admin's
+    // portfolio (landlords they own + tenants/units under those landlords);
+    // super_admin ($1 NULL) gets the platform-wide totals.
+    const scopeId = req.user?.role === 'super_admin' ? null : req.user?.userId
     const [stats] = await query<any>(`
       SELECT
-        (SELECT COUNT(*)::int FROM landlords WHERE onboarding_complete=FALSE) AS landlords_incomplete,
+        (SELECT COUNT(*)::int FROM landlords l WHERE l.onboarding_complete=FALSE
+           AND ($1::uuid IS NULL OR l.portfolio_manager_id=$1::uuid OR l.service_manager_id=$1::uuid)) AS landlords_incomplete,
         (SELECT COUNT(*)::int FROM landlords l
           WHERE NOT EXISTS (
             SELECT 1 FROM user_bank_accounts ba
              WHERE ba.user_id = l.user_id AND ba.status = 'active'
           )
-        )::int AS landlords_no_bank,
-        (SELECT COUNT(*)::int FROM tenants WHERE ach_verified=FALSE) AS tenants_no_ach,
-        (SELECT COUNT(*)::int FROM tenants WHERE on_time_pay_enrolled=FALSE AND credit_reporting_enrolled=FALSE AND flex_deposit_enrolled=FALSE AND float_fee_active=FALSE) AS tenants_no_flex,
-        (SELECT COUNT(*)::int FROM units WHERE status='vacant') AS vacant_units,
-        (SELECT COUNT(*)::int FROM v_unit_occupancy WHERE NOT is_occupied) AS units_no_tenant
-    `)
+          AND ($1::uuid IS NULL OR l.portfolio_manager_id=$1::uuid OR l.service_manager_id=$1::uuid)
+        ) AS landlords_no_bank,
+        (SELECT COUNT(*)::int FROM tenants t WHERE t.ach_verified=FALSE
+           AND ($1::uuid IS NULL OR EXISTS (
+             SELECT 1 FROM v_lease_active_tenants vlat
+             JOIN leases le ON le.id=vlat.lease_id AND le.status='active'
+             JOIN units un ON un.id=le.unit_id
+             JOIN landlords ld ON ld.id=un.landlord_id
+             WHERE vlat.tenant_id=t.id AND (ld.portfolio_manager_id=$1::uuid OR ld.service_manager_id=$1::uuid)))) AS tenants_no_ach,
+        (SELECT COUNT(*)::int FROM tenants t
+           WHERE t.on_time_pay_enrolled=FALSE AND t.credit_reporting_enrolled=FALSE
+             AND t.flex_deposit_enrolled=FALSE AND t.float_fee_active=FALSE
+             AND ($1::uuid IS NULL OR EXISTS (
+               SELECT 1 FROM v_lease_active_tenants vlat
+               JOIN leases le ON le.id=vlat.lease_id AND le.status='active'
+               JOIN units un ON un.id=le.unit_id
+               JOIN landlords ld ON ld.id=un.landlord_id
+               WHERE vlat.tenant_id=t.id AND (ld.portfolio_manager_id=$1::uuid OR ld.service_manager_id=$1::uuid)))) AS tenants_no_flex,
+        (SELECT COUNT(*)::int FROM units un WHERE un.status='vacant'
+           AND ($1::uuid IS NULL OR EXISTS (
+             SELECT 1 FROM landlords ld WHERE ld.id=un.landlord_id
+              AND (ld.portfolio_manager_id=$1::uuid OR ld.service_manager_id=$1::uuid)))) AS vacant_units,
+        (SELECT COUNT(*)::int FROM v_unit_occupancy vuo WHERE NOT vuo.is_occupied
+           AND ($1::uuid IS NULL OR EXISTS (
+             SELECT 1 FROM units un JOIN landlords ld ON ld.id=un.landlord_id
+              WHERE un.id=vuo.unit_id AND (ld.portfolio_manager_id=$1::uuid OR ld.service_manager_id=$1::uuid)))) AS units_no_tenant
+    `, [scopeId])
     res.json({ success: true, data: stats })
   } catch (e) { next(e) }
 })
@@ -263,6 +283,14 @@ adminRouter.get('/onboarding/landlord/:id', async (req, res, next) => {
        WHERE l.id = $1`, [req.params.id]
     )
     if (!landlord) throw new Error('Landlord not found')
+    // Portfolio scoping (S567): a regular admin can open only a landlord they
+    // close or service. Unassigned leads are routed by super_admin.
+    if ((req as any).user?.role !== 'super_admin') {
+      const uid = (req as any).user?.userId
+      if (landlord.portfolio_manager_id !== uid && landlord.service_manager_id !== uid) {
+        throw new AppError(403, 'Outside your portfolio')
+      }
+    }
 
     const [counts] = await query<any>(
       `SELECT
@@ -296,13 +324,157 @@ adminRouter.get('/onboarding/landlord/:id', async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
+// ── PORTFOLIO-MANAGER ATTRIBUTION (S567) ──────────────────────
+// Two roles per landlord, each 25¢/occupied unit/mo:
+//   closing (portfolio_manager_id) — the rep who won the deal. Set by referral
+//     code at signup or super_admin assignment. A self-closed landlord (no
+//     closer) sends its closing 25¢ to the pot — it is NOT self-claimable, so
+//     nobody can grab credit for a deal they didn't close.
+//   service (service_manager_id)   — customer service, mandatory + always paid.
+//     When a closer exists the closer does their own CS (service_manager_id
+//     stays NULL, the accrual routes CS to the closer). Only a self-closed
+//     landlord takes a separate CS specialist, who may CLAIM it, or super_admin
+//     assigns. CS is never orphaned / never pots.
+
+// Roster of assignable portfolio managers (super_admin only — the assign UI).
+adminRouter.get('/portfolio-managers', requireSuperAdmin, async (_req, res, next) => {
+  try {
+    const pms = await query<any>(
+      `SELECT id, first_name, last_name, email, role
+         FROM users WHERE role IN ('admin','super_admin')
+        ORDER BY last_name, first_name`)
+    res.json({ success: true, data: pms })
+  } catch (e) { next(e) }
+})
+
+// super_admin assigns / reassigns / unassigns either role. A CS-only PM is
+// assigned the SERVICE role on self-signed-up (self-closed) landlords here —
+// there is no self-serve claim; closing + service otherwise stay together.
+adminRouter.post('/landlords/:id/assign', requireSuperAdmin, async (req: any, res, next) => {
+  try {
+    const schema = z.object({
+      role: z.enum(['closing', 'service']),
+      managerId: z.string().uuid().nullable(),
+    })
+    const { role, managerId } = schema.parse(req.body)
+    if (managerId) {
+      const pm = await queryOne<any>(
+        `SELECT id FROM users WHERE id=$1 AND role IN ('admin','super_admin')`, [managerId])
+      if (!pm) throw new AppError(400, 'Not a valid portfolio manager')
+    }
+    const ll = await queryOne<any>(`SELECT id FROM landlords WHERE id=$1`, [req.params.id])
+    if (!ll) throw new AppError(404, 'Landlord not found')
+    const col = role === 'closing' ? 'portfolio_manager_id' : 'service_manager_id'
+    await query(
+      `UPDATE landlords SET ${col}=$1, updated_at=now() WHERE id=$2`,
+      [managerId, req.params.id])
+    await logAdminAction({
+      adminUserId: req.user.userId,
+      actionType: `landlord_${role}_manager_assign`,
+      targetType: 'landlord', targetId: req.params.id,
+      metadata: { [col]: managerId },
+      ipAddress: req.ip ?? null,
+    })
+    res.json({ success: true })
+  } catch (e) { next(e) }
+})
+
+// The logged-in rep's personal referral code + shareable signup link. Lazily
+// generates the code on first request. Any admin/super_admin can have one.
+adminRouter.get('/my-referral', async (req: any, res, next) => {
+  try {
+    let row = await queryOne<any>(`SELECT referral_code FROM users WHERE id=$1`, [req.user.userId])
+    if (!row?.referral_code) {
+      // Derive a short, human-ish code from the user id; retry on the tiny
+      // chance of a collision against the UNIQUE constraint.
+      for (let attempt = 0; attempt < 5; attempt++) {
+        const code = (req.user.userId.replace(/-/g, '') + attempt).slice(0, 8).toUpperCase()
+        try {
+          await query(`UPDATE users SET referral_code=$1 WHERE id=$2`, [code, req.user.userId])
+          row = { referral_code: code }
+          break
+        } catch { /* collision — try next */ }
+      }
+    }
+    const base = process.env.LANDLORD_SIGNUP_URL || 'https://app.goldassetmanagement.com/signup'
+    res.json({ success: true, data: {
+      referralCode: row?.referral_code ?? null,
+      referralLink: row?.referral_code ? `${base}?ref=${row.referral_code}` : null,
+    }})
+  } catch (e) { next(e) }
+})
+
+// Commission earnings + pot summary. Regular admin → their own earnings;
+// super_admin → the pot balance + a per-manager breakdown too.
+adminRouter.get('/commissions/summary', async (req: any, res, next) => {
+  try {
+    const isSuper = req.user?.role === 'super_admin'
+    const uid = req.user.userId
+    const [mine] = await query<any>(
+      `SELECT
+         COALESCE(SUM(amount),0) AS all_time,
+         COALESCE(SUM(amount) FILTER (WHERE accrual_month = date_trunc('month', now())::date),0) AS this_month
+       FROM commission_accruals WHERE manager_id=$1 AND NOT to_pot`, [uid])
+    const data: any = { myEarnings: { allTime: +mine.all_time, thisMonth: +mine.this_month } }
+    // The requesting PM's own commission broken out by landlord (their units
+    // under management) — the only breakdown a portfolio manager sees.
+    data.myByLandlord = await query<any>(
+      `SELECT ca.landlord_id, lu.first_name, lu.last_name, l.business_name,
+              MAX(ca.occupied_units) AS occupied_units,
+              COALESCE(SUM(ca.amount),0) AS all_time,
+              COALESCE(SUM(ca.amount) FILTER (WHERE ca.accrual_month = date_trunc('month', now())::date),0) AS this_month
+         FROM commission_accruals ca
+         JOIN landlords l ON l.id = ca.landlord_id
+         JOIN users lu ON lu.id = l.user_id
+        WHERE ca.manager_id=$1 AND NOT ca.to_pot
+        GROUP BY ca.landlord_id, lu.first_name, lu.last_name, l.business_name
+        ORDER BY all_time DESC`, [uid])
+    if (isSuper) {
+      const [pot] = await query<any>(
+        `SELECT
+           COALESCE(SUM(amount),0) AS all_time,
+           COALESCE(SUM(amount) FILTER (WHERE accrual_month = date_trunc('month', now())::date),0) AS this_month
+         FROM commission_accruals WHERE to_pot`)
+      const byManager = await query<any>(
+        `SELECT ca.manager_id, u.first_name, u.last_name,
+                COALESCE(SUM(ca.amount),0) AS all_time,
+                COALESCE(SUM(ca.amount) FILTER (WHERE ca.accrual_month = date_trunc('month', now())::date),0) AS this_month
+           FROM commission_accruals ca JOIN users u ON u.id = ca.manager_id
+          WHERE NOT ca.to_pot
+          GROUP BY ca.manager_id, u.first_name, u.last_name
+          ORDER BY all_time DESC`)
+      data.pot = { allTime: +pot.all_time, thisMonth: +pot.this_month }
+      data.byManager = byManager
+    }
+    res.json({ success: true, data })
+  } catch (e) { next(e) }
+})
+
+// On-demand commission accrual for the current month (super_admin). The cron
+// runs this on the 1st; this lets an operator preview/backfill it.
+adminRouter.post('/commissions/accrue', requireSuperAdmin, async (req: any, res, next) => {
+  try {
+    const { processCommissionAccrual } = await import('../jobs/commissionAccrual')
+    const result = await processCommissionAccrual()
+    await logAdminAction({
+      adminUserId: req.user.userId,
+      actionType: 'commission_accrual_manual_run',
+      metadata: { month: result.monthScanned, accrued: result.landlordsAccrued },
+      ipAddress: req.ip ?? null,
+    })
+    res.json({ success: true, data: result })
+  } catch (e) { next(e) }
+})
+
 // ── TENANT ONBOARDING DETAIL ──────────────────────────────────
 adminRouter.get('/onboarding/tenant/:id', async (req, res, next) => {
   try {
     const tenant = await queryOne<any>(
       `SELECT t.*, u.first_name, u.last_name, u.email, u.phone,
               un.unit_number, p.name AS property_name,
-              l.first_name AS landlord_first, l.last_name AS landlord_last
+              l.first_name AS landlord_first, l.last_name AS landlord_last,
+              ld.portfolio_manager_id AS landlord_pm_id,
+              ld.service_manager_id AS landlord_sm_id
        FROM tenants t
        JOIN users u ON u.id = t.user_id
        LEFT JOIN LATERAL (
@@ -320,6 +492,14 @@ adminRouter.get('/onboarding/tenant/:id', async (req, res, next) => {
        WHERE t.id = $1`, [req.params.id]
     )
     if (!tenant) throw new Error('Tenant not found')
+    // Portfolio scoping (S567): a regular admin can only open tenants whose
+    // active lease sits under a landlord they close or service.
+    if ((req as any).user?.role !== 'super_admin') {
+      const uid = (req as any).user?.userId
+      if (tenant.landlord_pm_id !== uid && tenant.landlord_sm_id !== uid) {
+        throw new AppError(403, 'Outside your portfolio')
+      }
+    }
 
     const checklist = [
       { key: 'account_created',   label: 'Account created',         done: true },
@@ -470,8 +650,11 @@ adminRouter.post('/onboarding/resend', async (req, res, next) => {
 })
 
 // ── TENANTS LIST (with flex status) ──────────────────────────
-adminRouter.get('/tenants', async (_req, res, next) => {
+adminRouter.get('/tenants', async (req: any, res, next) => {
   try {
+    // Portfolio scoping (S567): a regular admin only sees tenants whose active
+    // lease sits under a landlord in their portfolio; super_admin sees all.
+    const scopeId = req.user?.role === 'super_admin' ? null : req.user?.userId
     const tenants = await query<any>(`
       SELECT t.id, t.ach_verified, t.bank_last4, t.on_time_pay_enrolled,
              t.credit_reporting_enrolled, t.flex_deposit_enrolled, t.float_fee_active,
@@ -493,14 +676,17 @@ adminRouter.get('/tenants', async (_req, res, next) => {
        LEFT JOIN properties p ON p.id = un.property_id
        LEFT JOIN landlords ld ON ld.id = un.landlord_id
        LEFT JOIN users lu ON lu.id = ld.user_id
+       WHERE $1::uuid IS NULL
+          OR ld.portfolio_manager_id = $1::uuid
+          OR ld.service_manager_id = $1::uuid
        ORDER BY u.last_name, u.first_name
-    `)
+    `, [scopeId])
     res.json({ success: true, data: tenants })
   } catch (e) { next(e) }
 })
 
 // ── PROJECTED PLATFORM INCOME ─────────────────────────────────
-adminRouter.get('/income/projection', async (_req, res, next) => {
+adminRouter.get('/income/projection', requireSuperAdmin, async (_req, res, next) => {
   try {
     // Unit counts
     const [units] = await query<any>(`
@@ -525,59 +711,254 @@ adminRouter.get('/income/projection', async (_req, res, next) => {
       FROM tenants
     `)
 
-    // Background checks this month
+    // Platform fee — RECURRING subscription revenue under the live model:
+    // $2 × occupied units, floored at the $10/PROPERTY minimum. The minimum is
+    // a FLOOR (max of the two), NEVER added on top of the per-unit fee.
+    // Computed PER PROPERTY via the canonical shared helper so this projection
+    // matches real billing (platformFeeAccrual.ts). "Based on current
+    // enrollment" → only properties with an occupied unit contribute; a fully
+    // vacant property has no enrollment to project here. Excludes GAM system
+    // properties (the renter-pool shell landlord).
+    const propRows = await query<{ occ: string }>(`
+      SELECT COUNT(*) FILTER (WHERE u.status='active')::int AS occ
+        FROM properties p
+        JOIN landlords l ON l.id = p.landlord_id
+        LEFT JOIN units u ON u.property_id = p.id
+       WHERE l.is_system IS NOT TRUE
+       GROUP BY p.id
+      HAVING COUNT(*) FILTER (WHERE u.status='active') > 0
+    `)
+    const platformUnitFees = propRows.reduce((sum, r) => sum + launchPlatformFeeForProperty(+r.occ), 0)
+
+    // FlexPay is also recurring subscription revenue. Background checks are
+    // ONE-TIME / transactional — intentionally EXCLUDED from this recurring,
+    // ×12-annualized projection (they are not "current enrollment" revenue).
+    const flexPayFees    = +flex.flex_pay * PLATFORM_FEES.FLOAT_FEE_MO
+
+    // RECURRING total = the ARR basis. One-time revenue is NEVER in here.
+    const totalMonthly   = +(platformUnitFees + flexPayFees).toFixed(2)
+    const totalAnnual    = +(totalMonthly * 12).toFixed(2)
+
+    // One-time / transactional revenue THIS MONTH — shown in the income-
+    // composition pie so the full picture is visible, but EXCLUDED from the
+    // recurring ARR above (per Nic: ARR must be cleanly recurring for valuation).
     const [bgChecks] = await query<any>(`
       SELECT COUNT(*)::int AS count FROM background_checks
       WHERE created_at >= date_trunc('month', CURRENT_DATE)
     `).catch(() => [{ count: 0 }])
+    const bgCheckRevenue = +(+bgChecks.count * PLATFORM_FEES.BG_CHECK_NET).toFixed(2)
 
-    // Fee constants. Launch model (walkthrough #34): the platform fee is a
-    // flat $2 per OCCUPIED unit — the old OTP ($15) vs direct-pay ($5) tiers
-    // are retired, so every occupied unit (OTP or direct) bills at the same
-    // per-occupied-unit rate. Vacant units never charged. The $10/property
-    // monthly minimum is a per-property accrual floor (platformFeeAccrual.ts);
-    // this platform-wide projection sums the per-unit rate and does not apply
-    // per-property floors. FLOAT_FEE_MO + BG_CHECK_NET unchanged.
-    const OCCUPIED_UNIT   = LAUNCH_PLATFORM_FEE.PER_OCCUPIED_UNIT
-    const FLOAT_FEE_MO    = PLATFORM_FEES.FLOAT_FEE_MO
-    const BG_CHECK_NET    = PLATFORM_FEES.BG_CHECK_NET
-
-    // Monthly projections. otpFees/directFees retain their separate fields for
-    // the admin KPI's count breakdown, but both now bill at the flat $2 rate.
-    const otpFees        = +units.otp_units    * OCCUPIED_UNIT
-    const directFees     = +units.direct_units * OCCUPIED_UNIT
-    const flexPayFees    = +flex.flex_pay       * FLOAT_FEE_MO
-    const bgCheckFees    = +bgChecks.count      * BG_CHECK_NET
-
-    const totalMonthly   = otpFees + directFees + flexPayFees + bgCheckFees
-    const totalAnnual    = totalMonthly * 12
+    // Full income composition for the pie (recurring + one-time). Each carries
+    // a `recurring` flag so the UI can label/segment them.
+    const incomeSources = [
+      { key: 'platform_unit',     label: 'Platform Unit Fees', amount: +platformUnitFees.toFixed(2), recurring: true },
+      { key: 'flexpay',           label: 'FlexPay',            amount: +flexPayFees.toFixed(2),      recurring: true },
+      { key: 'background_checks', label: 'Background Checks',  amount: bgCheckRevenue,               recurring: false },
+    ]
+    const grossMonthly = +incomeSources.reduce((s, x) => s + x.amount, 0).toFixed(2)
 
     res.json({
       success: true,
       data: {
         monthly: {
-          otp_unit_fees:    +otpFees.toFixed(2),
-          direct_unit_fees: +directFees.toFixed(2),
-          flex_pay_fees:    +flexPayFees.toFixed(2),
-          bg_check_fees:    +bgCheckFees.toFixed(2),
-          total:            +totalMonthly.toFixed(2),
+          platform_unit_fees: +platformUnitFees.toFixed(2),
+          flex_pay_fees:      +flexPayFees.toFixed(2),
+          total:              totalMonthly,          // recurring only (ARR basis)
         },
-        annual: +totalAnnual.toFixed(2),
+        annual: totalAnnual,                          // recurring × 12
+        gross_monthly: grossMonthly,                  // all sources incl. one-time
+        income_sources: incomeSources,
         counts: {
-          otp_units:    +units.otp_units,
-          direct_units: +units.direct_units,
-          active_units: +units.active_units,
-          flex_pay:     +flex.flex_pay,
-          bg_checks:    +bgChecks.count,
+          active_units:        +units.active_units,
+          billable_properties: propRows.length,
+          flex_pay:            +flex.flex_pay,
+          bg_checks:           +bgChecks.count,
         }
       }
     })
   } catch (e) { next(e) }
 })
 
+// Income composition = ACTUAL realized revenue by source within a time window
+// (the pie-chart data). Unlike the ARR snapshot above (forward recurring
+// run-rate), this varies by period. One exception: the current in-progress
+// month's platform fee accrues on the 1st, so mid-month there's no accrual row
+// yet — we fill it with the current run-rate so the current month isn't
+// understated. Past complete months use real accruals.
+const INCOME_WINDOWS: Record<string, { start: string; label: string }> = {
+  month:     { start: `date_trunc('month', CURRENT_DATE)`,     label: 'This month' },
+  quarter:   { start: `date_trunc('quarter', CURRENT_DATE)`,   label: 'This quarter' },
+  ytd:       { start: `date_trunc('year', CURRENT_DATE)`,      label: 'Year to date' },
+  rolling12: { start: `(CURRENT_DATE - INTERVAL '12 months')`, label: 'Rolling 12 months' },
+  all:       { start: `'1970-01-01'::timestamptz`,             label: 'All time' },
+}
+
+async function currentPlatformRunRate(): Promise<number> {
+  const propRows = await query<{ occ: string }>(`
+    SELECT COUNT(*) FILTER (WHERE u.status='active')::int AS occ
+      FROM properties p
+      JOIN landlords l ON l.id = p.landlord_id
+      LEFT JOIN units u ON u.property_id = p.id
+     WHERE l.is_system IS NOT TRUE
+     GROUP BY p.id
+    HAVING COUNT(*) FILTER (WHERE u.status='active') > 0
+  `)
+  return propRows.reduce((s, r) => s + launchPlatformFeeForProperty(+r.occ), 0)
+}
+
+async function computeComposition(key: string, startSql: string, label: string, platformRunRate: number) {
+  const [pfa] = await query<any>(`
+    SELECT COALESCE(SUM(pfa.total_amount), 0)::float AS amt
+      FROM platform_fee_accruals pfa JOIN landlords l ON l.id = pfa.landlord_id
+     WHERE l.is_system IS NOT TRUE
+       AND pfa.accrual_month >= ${startSql}
+       AND pfa.accrual_month <  date_trunc('month', CURRENT_DATE)
+  `).catch(() => [{ amt: 0 }])
+  const platform = +((pfa?.amt || 0) + platformRunRate).toFixed(2)
+  const [fp] = await query<any>(`
+    SELECT COALESCE(SUM(tenant_fee_amount), 0)::float AS amt
+      FROM flexpay_advances WHERE created_at >= ${startSql}
+  `).catch(() => [{ amt: 0 }])
+  const flexpay = +(fp?.amt || 0).toFixed(2)
+  const [bg] = await query<any>(`
+    SELECT COUNT(*)::int AS n FROM background_checks WHERE created_at >= ${startSql}
+  `).catch(() => [{ n: 0 }])
+  const bgRevenue = +((bg?.n || 0) * PLATFORM_FEES.BG_CHECK_NET).toFixed(2)
+  // Processing spread + instant-withdrawal + placement income — all live on the
+  // platform_revenue_ledger, keyed by type. (platform_fee_subscription is NOT
+  // pulled here — the platform fee is already counted above via run-rate +
+  // accruals; pulling it again would double-count.)
+  const [led] = await query<any>(`
+    SELECT
+      COALESCE(SUM(amount) FILTER (WHERE type='banking_spread'),       0)::float AS processing,
+      COALESCE(SUM(amount) FILTER (WHERE type='manual_withdrawal_fee'),0)::float AS withdrawals,
+      COALESCE(SUM(amount) FILTER (WHERE type='placement_fee_share'),  0)::float AS placement
+    FROM platform_revenue_ledger WHERE created_at >= ${startSql}
+  `).catch(() => [{ processing: 0, withdrawals: 0, placement: 0 }])
+  // Business/POS platform fees (month is 'YYYY-MM' text — lexicographic compare).
+  const [bpos] = await query<any>(`
+    SELECT COALESCE(SUM(amount),0)::float AS amt FROM business_platform_fee_accruals
+     WHERE month >= to_char((${startSql})::timestamptz, 'YYYY-MM')
+  `).catch(() => [{ amt: 0 }])
+  // FlexDeposit custody fee ($3/mo per FLEX_DEPOSIT_CUSTODY_FEE) while GAM holds
+  // a tenant's deposit in custody. Recurring GAM revenue.
+  const [fd] = await query<any>(`
+    SELECT COALESCE(SUM(amount),0)::float AS amt FROM flex_deposit_custody_charges
+     WHERE created_at >= ${startSql}
+  `).catch(() => [{ amt: 0 }])
+  // FlexCredit ($5/mo rent-reporting subscription). Wired but invisible until
+  // launch — $0 until the first enrollment. GROSS $5 shown here (the ~$1.50
+  // Esusu provider cost is COGS, tracked separately, not yet wired).
+  const [fc] = await query<any>(`
+    SELECT COALESCE(SUM(amount),0)::float AS amt FROM flexcredit_charges
+     WHERE created_at >= ${startSql}
+  `).catch(() => [{ amt: 0 }])
+
+  const sources = [
+    { key: 'platform_unit',       label: 'Platform Fees',        amount: platform,                        recurring: true },
+    { key: 'processing',          label: 'Processing / ACH',     amount: +(led?.processing || 0).toFixed(2), recurring: true },
+    { key: 'flexpay',             label: 'FlexPay',              amount: flexpay,                         recurring: true },
+    { key: 'flex_deposit',        label: 'FlexDeposit Custody',  amount: +(fd?.amt || 0).toFixed(2),      recurring: true },
+    { key: 'flex_credit',         label: 'FlexCredit',           amount: +(fc?.amt || 0).toFixed(2),      recurring: true },
+    { key: 'business_pos',        label: 'Business Fees' ,         amount: +(bpos?.amt || 0).toFixed(2),    recurring: true },
+    { key: 'placement',           label: 'Placement Fees',       amount: +(led?.placement || 0).toFixed(2),   recurring: false },
+    { key: 'instant_withdrawal',  label: 'Instant Withdrawals',  amount: +(led?.withdrawals || 0).toFixed(2), recurring: false },
+    { key: 'background_checks',   label: 'Background Checks',    amount: bgRevenue,                       recurring: false },
+  ]
+  const gross = +sources.reduce((s, x) => s + x.amount, 0).toFixed(2)
+  return { window: key, label, gross, sources }
+}
+
+// GET /api/admin/income/composition?window=month|quarter|ytd|rolling12|all
+adminRouter.get('/income/composition', requireSuperAdmin, async (req, res, next) => {
+  try {
+    const key = String(req.query.window || 'month')
+    const win = INCOME_WINDOWS[key] || INCOME_WINDOWS.month
+    const rr = await currentPlatformRunRate()
+    res.json({ success: true, data: await computeComposition(key, win.start, win.label, rr) })
+  } catch (e) { next(e) }
+})
+
+// GET /api/admin/income/composition/all — every window at once (the "wall of
+// clocks": one pie per period, all on the page together).
+adminRouter.get('/income/composition/all', requireSuperAdmin, async (_req, res, next) => {
+  try {
+    const rr = await currentPlatformRunRate()
+    const keys = ['month', 'quarter', 'ytd', 'rolling12', 'all']
+    const periods = await Promise.all(
+      keys.map(k => computeComposition(k, INCOME_WINDOWS[k].start, INCOME_WINDOWS[k].label, rr))
+    )
+    res.json({ success: true, data: { periods } })
+  } catch (e) { next(e) }
+})
+
+// GET /api/admin/income/breakdown?window=X — drill-down for one window: every
+// income stream with its actual line items (the transactions that made up the
+// pie). Feeds the click-through detail modal. Each stream's items are capped;
+// totals are computed from the items so the modal's gross matches the pie.
+adminRouter.get('/income/breakdown', requireSuperAdmin, async (req, res, next) => {
+  try {
+    const key = String(req.query.window || 'month')
+    const win = INCOME_WINDOWS[key] || INCOME_WINDOWS.month
+    const S = win.start
+    const runRate = await currentPlatformRunRate()
+    const q = (sql: string) => query<any>(sql).catch(() => [] as any[])
+
+    const [platform, processing, flexpay, bpos, placement, withdrawals, bgc, fdc, fcc] = await Promise.all([
+      q(`SELECT to_char(pfa.accrual_month,'Mon YYYY') AS date, p.name AS label, pfa.total_amount::float AS amount
+           FROM platform_fee_accruals pfa JOIN landlords l ON l.id=pfa.landlord_id JOIN properties p ON p.id=pfa.property_id
+          WHERE l.is_system IS NOT TRUE AND pfa.accrual_month >= ${S} AND pfa.accrual_month < date_trunc('month',CURRENT_DATE)
+          ORDER BY pfa.accrual_month DESC LIMIT 100`),
+      q(`SELECT to_char(created_at,'Mon DD') AS date, COALESCE(NULLIF(notes,''),'Processing spread') AS label, amount::float AS amount
+           FROM platform_revenue_ledger WHERE type='banking_spread' AND created_at >= ${S} ORDER BY created_at DESC LIMIT 100`),
+      q(`SELECT to_char(created_at,'Mon DD') AS date, 'FlexPay fee' AS label, tenant_fee_amount::float AS amount
+           FROM flexpay_advances WHERE created_at >= ${S} ORDER BY created_at DESC LIMIT 100`),
+      q(`SELECT bpfa.month AS date, 'Business POS fee' AS label, bpfa.amount::float AS amount
+           FROM business_platform_fee_accruals bpfa WHERE bpfa.month >= to_char((${S})::timestamptz,'YYYY-MM') ORDER BY bpfa.month DESC LIMIT 100`),
+      q(`SELECT to_char(created_at,'Mon DD') AS date, COALESCE(NULLIF(notes,''),'Placement fee') AS label, amount::float AS amount
+           FROM platform_revenue_ledger WHERE type='placement_fee_share' AND created_at >= ${S} ORDER BY created_at DESC LIMIT 100`),
+      q(`SELECT to_char(created_at,'Mon DD') AS date, COALESCE(NULLIF(notes,''),'Instant withdrawal') AS label, amount::float AS amount
+           FROM platform_revenue_ledger WHERE type='manual_withdrawal_fee' AND created_at >= ${S} ORDER BY created_at DESC LIMIT 100`),
+      q(`SELECT to_char(created_at,'Mon DD') AS date, TRIM(COALESCE(first_name,'')||' '||COALESCE(last_name,'')) AS label
+           FROM background_checks WHERE created_at >= ${S} ORDER BY created_at DESC LIMIT 100`),
+      q(`SELECT to_char(created_at,'Mon DD') AS date, 'FlexDeposit custody' AS label, amount::float AS amount
+           FROM flex_deposit_custody_charges WHERE created_at >= ${S} ORDER BY created_at DESC LIMIT 100`),
+      q(`SELECT to_char(created_at,'Mon DD') AS date, 'FlexCredit reporting' AS label, amount::float AS amount
+           FROM flexcredit_charges WHERE created_at >= ${S} ORDER BY created_at DESC LIMIT 100`),
+    ])
+
+    // Current-month platform fee accrues on the 1st — surface the in-progress
+    // run-rate as a synthetic "accruing" line so the total matches the pie.
+    const platItems = [
+      ...(runRate > 0 ? [{ date: 'This month', label: 'Current run-rate (accruing)', amount: runRate }] : []),
+      ...platform,
+    ]
+    const bgItems = bgc.map((r: any) => ({ date: r.date, label: r.label || 'Screening', amount: PLATFORM_FEES.BG_CHECK_NET }))
+
+    const sources = [
+      { key: 'platform_unit',      label: 'Platform Fees',       items: platItems },
+      { key: 'processing',         label: 'Processing / ACH',    items: processing },
+      { key: 'flexpay',            label: 'FlexPay',             items: flexpay },
+      { key: 'flex_deposit',       label: 'FlexDeposit Custody', items: fdc },
+      { key: 'flex_credit',        label: 'FlexCredit',          items: fcc },
+      { key: 'business_pos',       label: 'Business Fees' ,        items: bpos },
+      { key: 'placement',          label: 'Placement Fees',      items: placement },
+      { key: 'instant_withdrawal', label: 'Instant Withdrawals', items: withdrawals },
+      { key: 'background_checks',  label: 'Background Checks',    items: bgItems },
+    ].map(s => ({
+      ...s,
+      count: s.items.length,
+      amount: +s.items.reduce((a: number, x: any) => a + (x.amount || 0), 0).toFixed(2),
+    }))
+    const gross = +sources.reduce((a, s) => a + s.amount, 0).toFixed(2)
+
+    res.json({ success: true, data: { window: key, label: win.label, gross, sources } })
+  } catch (e) { next(e) }
+})
+
 
 // ─── PROPERTY DUPLICATE FLAGS ─────────────────────────────────
-adminRouter.get('/property-flags', async (req, res, next) => {
+adminRouter.get('/property-flags', requireSuperAdmin, async (req, res, next) => {
   try {
     const status = (req.query.status as string) || 'pending'
     let where = ''
@@ -611,7 +992,7 @@ adminRouter.get('/property-flags', async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
-adminRouter.post('/property-flags/:id/resolve', async (req: any, res, next) => {
+adminRouter.post('/property-flags/:id/resolve', requireSuperAdmin, async (req: any, res, next) => {
   try {
     const { resolution, notes } = req.body as { resolution: 'approved_separate'|'merged'|'rejected'; notes?: string }
     if (!['approved_separate','merged','rejected'].includes(resolution)) {
@@ -864,7 +1245,7 @@ adminRouter.post('/notifications/:id/acknowledge', async (req: any, res, next) =
 // Platform-level feature flags. List is admin-readable; toggle
 // is super_admin-only.
 // ─────────────────────────────────────────────────────────────
-adminRouter.get('/system-features', requireAdmin, async (_req, res, next) => {
+adminRouter.get('/system-features', requireOwner, async (_req, res, next) => {
   try {
     const { listFeatures } = await import('../services/systemFeatures')
     const rows = await listFeatures()
@@ -872,7 +1253,7 @@ adminRouter.get('/system-features', requireAdmin, async (_req, res, next) => {
   } catch (e) { next(e) }
 })
 
-adminRouter.patch('/system-features/:key', requireSuperAdmin, async (req, res, next) => {
+adminRouter.patch('/system-features/:key', requireOwner, async (req, res, next) => {
   try {
     const enabled = !!req.body.enabled
     const { setFeatureEnabled } = await import('../services/systemFeatures')
@@ -881,8 +1262,9 @@ adminRouter.patch('/system-features/:key', requireSuperAdmin, async (req, res, n
   } catch (e) { next(e) }
 })
 
-// PATCH /api/admin/landlords/:id/otp-rollout — toggle per-landlord beta
-adminRouter.patch('/landlords/:id/otp-rollout', requireSuperAdmin, async (req, res, next) => {
+// PATCH /api/admin/landlords/:id/otp-rollout — toggle per-landlord beta.
+// OTP is hidden/shelved (S567); owner-only so nobody else can touch it.
+adminRouter.patch('/landlords/:id/otp-rollout', requireOwner, async (req, res, next) => {
   try {
     const enabled = !!req.body.enabled
     await query('UPDATE landlords SET otp_rollout_enabled = $1 WHERE id = $2', [enabled, req.params.id])
@@ -898,7 +1280,7 @@ adminRouter.patch('/landlords/:id/otp-rollout', requireSuperAdmin, async (req, r
 // original Transfer if it actually succeeded behind a reported error
 // (e.g. network blip mid-response). Allowed for both admin and
 // super_admin since this is recovery / loss-mitigation work.
-adminRouter.post('/otp/advances/:id/retry-transfer', requireAdmin, async (req, res, next) => {
+adminRouter.post('/otp/advances/:id/retry-transfer', requireOwner, async (req, res, next) => {
   try {
     const adv = await queryOne<{
       id: string
@@ -963,7 +1345,7 @@ adminRouter.post('/flexcharge/statements/:id/retry-billing', requireAdmin, async
 // out-of-band (Stripe Dashboard reverse-Transfer, ACH, or another
 // channel) and confirms via the mark-transferred route here.
 
-adminRouter.get('/deposit-portability/pending', requireAdmin, async (_req, res, next) => {
+adminRouter.get('/deposit-portability/pending', requireSuperAdmin, async (_req, res, next) => {
   try {
     const rows = await query<any>(
       `SELECT sd.id, sd.tenant_id, sd.unit_id, sd.lease_id,
@@ -1004,7 +1386,7 @@ adminRouter.get('/deposit-portability/pending', requireAdmin, async (_req, res, 
   } catch (e) { next(e) }
 })
 
-adminRouter.post('/deposit-portability/:depositId/mark-transferred', requireAdmin, async (req: any, res, next) => {
+adminRouter.post('/deposit-portability/:depositId/mark-transferred', requireSuperAdmin, async (req: any, res, next) => {
   try {
     const { notes } = req.body || {}
     const dep = await queryOne<{ id: string; portability_status: string }>(
@@ -1041,7 +1423,7 @@ adminRouter.post('/deposit-portability/:depositId/mark-transferred', requireAdmi
 // services/flexpay.ts). Inquiry volume doubles as the demand signal
 // for whether outside capital is worth raising.
 
-adminRouter.get('/flexpay/inquiries', requireAdmin, async (req: any, res, next) => {
+adminRouter.get('/flexpay/inquiries', requireSuperAdmin, async (req: any, res, next) => {
   try {
     const status = ['pending', 'approved', 'declined'].includes(req.query.status)
       ? req.query.status : null
@@ -1135,7 +1517,7 @@ adminRouter.get('/flexpay/inquiries', requireAdmin, async (req: any, res, next) 
 // deposit history. Approving WITHOUT it is blocked: an approved tenant
 // who fails the ssi_ssdi eligibility check would be stuck in a
 // contradictory state.
-adminRouter.post('/flexpay/inquiries/:id/review', requireAdmin, async (req: any, res, next) => {
+adminRouter.post('/flexpay/inquiries/:id/review', requireSuperAdmin, async (req: any, res, next) => {
   try {
     const body = z.object({
       action:         z.enum(['approve', 'decline']),
@@ -1242,7 +1624,7 @@ adminRouter.post('/flexpay/inquiries/:id/review', requireAdmin, async (req: any,
 // how many raised a hand, how many are approved/enrolled, and the
 // monthly front commitment (sum of enrolled tenants' active-lease
 // rent = bankroll out the door each cycle).
-adminRouter.get('/flexpay/funnel', requireAdmin, async (_req, res, next) => {
+adminRouter.get('/flexpay/funnel', requireSuperAdmin, async (_req, res, next) => {
   try {
     const [q, i, other, enr] = await Promise.all([
       query<any>(`SELECT status, COUNT(*)::int AS n FROM tenant_questionnaires GROUP BY status`),
@@ -1282,11 +1664,41 @@ adminRouter.get('/flexpay/funnel', requireAdmin, async (_req, res, next) => {
 // removed same-session — non-SSI/SSDI interest now files TIER-2
 // inquiries directly into the main queue with an income hold.)
 
+// S565: FlexCredit demand funnel. Interest count + the units-to-breakeven read
+// (provider $500/mo min ÷ $1.50 rev-share = ~333 enrollments to fully absorb
+// the minimum; $500 ÷ $5 sell = 100 enrollments to cover the min on revenue).
+// interestRate = interested ÷ eligible active tenants → the real adoption signal
+// that sets the launch gate. No billing/Esusu wired yet.
+adminRouter.get('/flexcredit/funnel', requireAdmin, async (_req, res, next) => {
+  try {
+    const [byStatus, interested, eligible] = await Promise.all([
+      query<any>(`SELECT status, COUNT(*)::int AS n FROM flexcredit_inquiries GROUP BY status`),
+      queryOne<any>(`SELECT COUNT(*)::int AS n FROM flexcredit_inquiries WHERE status='interested'`),
+      // Denominator for the adoption rate: tenants on an active lease.
+      queryOne<any>(`SELECT COUNT(DISTINCT vuo.primary_tenant_id)::int AS n
+                       FROM v_unit_occupancy vuo
+                       JOIN units u ON u.id = vuo.unit_id AND u.status='active'
+                      WHERE vuo.primary_tenant_id IS NOT NULL`),
+    ])
+    const interestedN = interested?.n ?? 0
+    const eligibleN = eligible?.n ?? 0
+    res.json({ success: true, data: {
+      byStatus: Object.fromEntries(byStatus.map(r => [r.status, r.n])),
+      interested: interestedN,
+      eligibleTenants: eligibleN,
+      interestRatePct: eligibleN > 0 ? +((interestedN / eligibleN) * 100).toFixed(1) : 0,
+      breakevenEnrollments: 100,          // $500 min ÷ $5 sell (revenue covers the floor)
+      minFullyAbsorbedEnrollments: 333,   // $500 min ÷ $1.50 rev-share
+      wired: false,                        // billing/Esusu not built yet — demand capture only
+    } })
+  } catch (e) { next(e) }
+})
+
 // S545c: manual verification hold + release. Hold = silently out of
 // the working queue (no tenant-facing signal — their portal keeps the
 // normal pending copy). Release restores their original spot in line
 // automatically (created_at is the tiebreak and never changes).
-adminRouter.post('/flexpay/inquiries/:id/hold', requireAdmin, async (req: any, res, next) => {
+adminRouter.post('/flexpay/inquiries/:id/hold', requireSuperAdmin, async (req: any, res, next) => {
   try {
     const body = z.object({ reason: z.string().min(3).max(500) }).parse(req.body)
     const rows = await query<any>(
@@ -1304,7 +1716,7 @@ adminRouter.post('/flexpay/inquiries/:id/hold', requireAdmin, async (req: any, r
   } catch (e) { next(e) }
 })
 
-adminRouter.post('/flexpay/inquiries/:id/release-hold', requireAdmin, async (req: any, res, next) => {
+adminRouter.post('/flexpay/inquiries/:id/release-hold', requireSuperAdmin, async (req: any, res, next) => {
   try {
     const body = z.object({ notes: z.string().max(500).optional() }).parse(req.body ?? {})
     // S546: releasing a hold IS the manual verification — record
@@ -1334,7 +1746,7 @@ adminRouter.post('/flexpay/inquiries/:id/release-hold', requireAdmin, async (req
 // S543: capture/correct the benefit-arrival day during reach-out.
 // Pending inquiries only — the day drives float-need queue ordering,
 // and once reviewed the real pull day is chosen at enrollment.
-adminRouter.post('/flexpay/inquiries/:id/benefit-day', requireAdmin, async (req: any, res, next) => {
+adminRouter.post('/flexpay/inquiries/:id/benefit-day', requireSuperAdmin, async (req: any, res, next) => {
   try {
     const body = z.object({ benefitDay: z.number().int().min(1).max(28) }).parse(req.body)
     const rows = await query<any>(
@@ -1356,7 +1768,7 @@ adminRouter.post('/flexpay/inquiries/:id/benefit-day', requireAdmin, async (req:
 // S542b: admin view of a tenant's proof-of-income document. The
 // tenant uploaded it to the PLATFORM (never landlord-visible); the
 // reviewer opens it here before attesting income verification.
-adminRouter.get('/flexpay/inquiries/:id/proof-file', requireAdmin, async (req: any, res, next) => {
+adminRouter.get('/flexpay/inquiries/:id/proof-file', requireSuperAdmin, async (req: any, res, next) => {
   try {
     const inq = await queryOne<{ proof_file_path: string | null }>(
       `SELECT proof_file_path FROM flexpay_inquiries WHERE id = $1`,
@@ -1375,7 +1787,7 @@ adminRouter.get('/flexpay/inquiries/:id/proof-file', requireAdmin, async (req: a
 // legal requirement prevents offering FlexPay. Starts EMPTY (no state
 // identified); this is the mechanism per the S177 posture. Tenants in
 // a blocked state stay waitlisted with their queue place preserved.
-adminRouter.get('/flexpay/blocked-states', requireAdmin, async (_req, res, next) => {
+adminRouter.get('/flexpay/blocked-states', requireSuperAdmin, async (_req, res, next) => {
   try {
     const rows = await query<any>(
       `SELECT state, reason, created_at FROM flexpay_blocked_states ORDER BY state`)
@@ -1508,8 +1920,12 @@ adminRouter.post('/connect-readiness/backfill', async (req: any, res, next) => {
 // GET /api/admin/connect-readiness/accounts — list every Connect-bearing
 // account (user or pm_company), with cached readiness flags + last
 // synced_at. Drives the admin ConnectAccountsPage.
-adminRouter.get('/connect-readiness/accounts', async (_req, res, next) => {
+adminRouter.get('/connect-readiness/accounts', async (req: any, res, next) => {
   try {
+    // S567: super sees every Connect account; a regular admin (portfolio
+    // manager) sees only the landlords they close or service (and no PM
+    // companies — those are platform-level).
+    const scopeId = req.user?.role === 'super_admin' ? null : req.user?.userId
     const userRows = await query<any>(`
       SELECT 'user' AS entity_type,
              u.id AS entity_id,
@@ -1523,9 +1939,11 @@ adminRouter.get('/connect-readiness/accounts', async (_req, res, next) => {
              u.stripe_connect_status_synced_at
         FROM users u
        WHERE u.stripe_connect_account_id IS NOT NULL
+         AND ($1::uuid IS NULL OR u.id IN (
+           SELECT user_id FROM landlords WHERE portfolio_manager_id = $1 OR service_manager_id = $1))
        ORDER BY u.connect_payouts_enabled ASC, u.email ASC
-    `)
-    const pmRows = await query<any>(`
+    `, [scopeId])
+    const pmRows = scopeId ? [] : await query<any>(`
       SELECT 'pm_company' AS entity_type,
              c.id AS entity_id,
              c.name AS display_name,
@@ -1548,8 +1966,10 @@ adminRouter.get('/connect-readiness/accounts', async (_req, res, next) => {
 // emails sent (S163). Drives the admin Connect Accounts page sub-section
 // for support visibility into who's been blocked on which landlord's
 // onboarding completion. Pulls from email_send_log; no new table.
-adminRouter.get('/landlord-banking-nudges', async (_req, res, next) => {
+adminRouter.get('/landlord-banking-nudges', async (req: any, res, next) => {
   try {
+    // S567: scope banking nudges to the regular admin's portfolio; super sees all.
+    const scopeId = req.user?.role === 'super_admin' ? null : req.user?.userId
     const rows = await query<any>(`
       SELECT esl.id,
              esl.created_at,
@@ -1569,9 +1989,10 @@ adminRouter.get('/landlord-banking-nudges', async (_req, res, next) => {
    LEFT JOIN landlords ll       ON ll.id = esl.landlord_id
    LEFT JOIN users u_landlord   ON u_landlord.id = ll.user_id
        WHERE esl.category = 'landlord_banking_nudge'
+         AND ($1::uuid IS NULL OR ll.portfolio_manager_id = $1 OR ll.service_manager_id = $1)
        ORDER BY esl.created_at DESC
        LIMIT 200
-    `)
+    `, [scopeId])
     res.json({ success: true, data: rows })
   } catch (e) { next(e) }
 })
@@ -1643,7 +2064,7 @@ adminRouter.post('/connect-readiness/refresh/:entity/:id', async (req: any, res,
 //   ?platform=<key>  — filter by platform key
 //   ?import_type=tenant|property|payment
 //   ?limit=N         — default 50, max 200
-adminRouter.get('/csv-import-attempts', async (req, res, next) => {
+adminRouter.get('/csv-import-attempts', requireSuperAdmin, async (req, res, next) => {
   try {
     const statusFilter   = String(req.query.status || 'pending').toLowerCase()
     const platformFilter = req.query.platform ? String(req.query.platform).toLowerCase() : null
@@ -1805,7 +2226,7 @@ adminRouter.get('/csv-import-attempts/_stats/platforms', requireSuperAdmin, asyn
 // Returns every slot — verified rows from platform_review_status,
 // merged with commit-count stats from csv_import_attempts. Slots
 // with no row in platform_review_status default to 'unverified'.
-adminRouter.get('/platform-review-statuses', async (_req, res, next) => {
+adminRouter.get('/platform-review-statuses', requireSuperAdmin, async (_req, res, next) => {
   try {
     const rows = await query<any>(`
       WITH stats AS (
@@ -1971,7 +2392,7 @@ adminRouter.post('/platform-review-statuses/:platform_key/:import_type/unverify'
 // Admin OK. Returns normalized-name groups with claim counts +
 // per-import-type breakdown + sample raw spellings. Excludes
 // already-promoted names.
-adminRouter.get('/platform-claims/candidates', async (_req, res, next) => {
+adminRouter.get('/platform-claims/candidates', requireSuperAdmin, async (_req, res, next) => {
   try {
     const rows = await query<any>(`
       WITH normalized AS (
@@ -2004,7 +2425,7 @@ adminRouter.get('/platform-claims/candidates', async (_req, res, next) => {
 
 // GET /api/admin/platform-claims/promoted
 // Admin OK. Audit-trail view of previously-promoted claim names.
-adminRouter.get('/platform-claims/promoted', async (_req, res, next) => {
+adminRouter.get('/platform-claims/promoted', requireSuperAdmin, async (_req, res, next) => {
   try {
     const rows = await query<any>(`
       SELECT p.normalized_name,
@@ -2079,7 +2500,7 @@ adminRouter.post('/platform-claims/:normalized/promote', requireSuperAdmin, asyn
 // One call returns everything the admin page renders. `days` window is
 // clamped 1–90. Shed volume is the "buy bigger hardware" alarm: the turn
 // gate logs outcome='shed' when it rejects a turn under overload.
-adminRouter.get('/agent-analytics', async (req, res, next) => {
+adminRouter.get('/agent-analytics', requireSuperAdmin, async (req, res, next) => {
   try {
     const days = Math.min(90, Math.max(1, Number(req.query.days) || 30))
     const since = `now() - interval '1 day' * $1`
@@ -2161,7 +2582,7 @@ adminRouter.get('/agent-analytics', async (req, res, next) => {
 // the chat transcript that produced the lead (conversation_id →
 // agent_interaction_logs), so the Specialist reads the conversation before
 // the follow-up call.
-adminRouter.get('/leads', async (req, res, next) => {
+adminRouter.get('/leads', requireSuperAdmin, async (req, res, next) => {
   try {
     const status = typeof req.query.status === 'string' && (SALES_LEAD_STATUSES as readonly string[]).includes(req.query.status)
       ? req.query.status : null
@@ -2177,7 +2598,7 @@ adminRouter.get('/leads', async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
-adminRouter.patch('/leads/:id/status', async (req, res, next) => {
+adminRouter.patch('/leads/:id/status', requireSuperAdmin, async (req, res, next) => {
   try {
     const b = z.object({ status: z.enum(SALES_LEAD_STATUSES as unknown as [string, ...string[]]) }).parse(req.body)
     const row = await queryOne<any>(
@@ -2195,7 +2616,7 @@ adminRouter.patch('/leads/:id/status', async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
-adminRouter.get('/leads/:id/transcript', async (req, res, next) => {
+adminRouter.get('/leads/:id/transcript', requireSuperAdmin, async (req, res, next) => {
   try {
     const lead = await queryOne<any>(`SELECT id, conversation_id FROM sales_leads WHERE id = $1`, [req.params.id])
     if (!lead) throw new AppError(404, 'Lead not found')

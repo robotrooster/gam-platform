@@ -253,6 +253,17 @@ utilityRouter.delete('/meters/:id', requirePerm('properties.edit'), async (req, 
     if (!canAccessLandlordResource(req.user, meter.landlord_id)) {
       throw new AppError(403, 'Forbidden')
     }
+    // Retention guard (data-retention rule — reading history is permanent).
+    // The utility_meter_readings FK is ON DELETE CASCADE, so hard-deleting a
+    // meter would silently WIPE its whole reading history (point-in-time reads,
+    // turnover comparisons, leak checks). Block that: a meter that has ever been
+    // read is retired via `out_of_service`, never deleted. Only a mis-created
+    // meter with zero readings may be hard-deleted.
+    const readCount = await queryOne<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM utility_meter_readings WHERE meter_id = $1`, [req.params.id])
+    if (Number(readCount?.n ?? 0) > 0) {
+      throw new AppError(409, 'This meter has recorded readings and cannot be deleted — its reading history is kept permanently. Mark it out of service instead.')
+    }
     // RESTRICT FK from utility_bills will block delete if any bills
     // reference this meter — that's by design (bills are the legal record
     // of what was charged; meter delete with bills should fail loud).

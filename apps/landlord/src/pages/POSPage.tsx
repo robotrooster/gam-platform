@@ -616,8 +616,19 @@ export function POSPage() {
     setTerminalStatus('collecting'); setTerminalError('')
     let piId: string | null = null
     try {
+      // S554: mint the PI against the SERVER's authoritative total (same
+      // computeCartTotals /transactions runs), not the client-side total.
+      // Server tax can differ from item.tax_rate when a pos_tax_rates row is
+      // configured; without this the amounts diverge and the sale 400s AFTER
+      // the card is captured (money taken, no sale).
+      const quote = await apiPost<{ total: number }>('/pos/cart-quote', {
+        items: cart.map(i => ({ id: i.id.startsWith('open-') ? null : i.id, qty: i.qty, price: i.price, tax: i.tax })),
+        surcharge,
+        discountAmount: discountAmt,
+      })
+      const serverTotal = Number(quote.data?.total ?? total)
       const intent = await createTerminalIntent({
-        amountCents: Math.round(total * 100),
+        amountCents: Math.round(serverTotal * 100),
         propertyId:  registerProperty,
         description: 'GAM POS sale',
       })

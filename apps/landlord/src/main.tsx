@@ -32,11 +32,12 @@ function TelemetryPing() {
 }
 import { QueryClient, QueryClientProvider } from 'react-query'
 import { AuthProvider, useAuth } from './context/AuthContext'
-import { Layout, LAUNCH_HIDDEN, visibleNavItemsFor } from './components/layout/Layout'
+import { Layout, LAUNCH_HIDDEN, visibleNavItemsFor, HubTabLayout } from './components/layout/Layout'
 import { LoginPage }       from './pages/LoginPage'
 import { RegisterPage }    from './pages/RegisterPage'
 import { AcceptInvitePage } from './pages/AcceptInvitePage'
 import { DashboardPage }   from './pages/DashboardPage'
+import { ReferLandlordPage } from './pages/ReferLandlordPage'
 import { PropertiesPage }  from './pages/PropertiesPage'
 import { PropertyDetailPage } from './pages/PropertyDetailPage'
 import { PmInvitationsPage } from './pages/PmInvitationsPage'
@@ -50,6 +51,10 @@ import { BalancesPage }    from './pages/BalancesPage'
 import { RentRollPage }    from './pages/RentRollPage'
 import { UtilityMetersPage } from './pages/UtilityMetersPage'
 import { DisbursementsPage } from './pages/DisbursementsPage'
+import { LotRentPage } from './pages/LotRentPage'
+import { ExpensesPage } from './pages/ExpensesPage'
+import { BankReconciliationPage } from './pages/BankReconciliationPage'
+import { BankFeedPage }      from './pages/BankFeedPage'
 import { BankingPage }      from './pages/BankingPage'
 import { MaintenancePage } from './pages/MaintenancePage'
 import { DocumentsPage }   from './pages/DocumentsPage'
@@ -63,7 +68,6 @@ import { BackgroundChecksPage } from './pages/BackgroundChecksPage'
 import { SignPage } from './pages/SignPage'
 import { MaintenancePortalPage } from './pages/MaintenancePortalPage'
 import { SettingsPage } from './pages/SettingsPage'
-import { TotpEnrollPage } from './pages/TotpEnrollPage'
 import { ApplicantPoolPage } from './pages/ApplicantPoolPage'
 import { LeasesPage } from "./pages/LeasesPage"
 import { PdfViewerPage } from "./pages/PdfViewerPage"
@@ -160,6 +164,7 @@ export default function App() {
               <Route index element={<RoleRedirect />} />
               <Route path="welcome"        element={<NoAccessPage />} />
               <Route path="dashboard"      element={<DashboardPage />} />
+              <Route path="refer"          element={<ReferLandlordPage />} />
               <Route path="onboarding"     element={<OnboardingPage />} />
               <Route path="properties"     element={<PropertiesPage />} />
               <Route path="properties/:id"  element={<PropertyDetailPage />} />
@@ -177,20 +182,32 @@ export default function App() {
               <Route path="view"           element={<PdfViewerPage />} />
               <Route path="subleases"       element={LAUNCH_HIDDEN.has('/subleases') ? <Navigate to="/dashboard" replace /> : <SubleasesPage />} />
               <Route path="esign"          element={<ESignPage />} />
-              <Route path="background"     element={<BackgroundChecksPage />} />
-              <Route path="pool"            element={<ApplicantPoolPage />} />
               <Route path="settings"         element={<SettingsPage />} />
-              <Route path="totp/enroll"      element={<TotpEnrollPage />} />
               <Route path="maint-portal"    element={<MaintenancePortalPage />} />
               <Route path="sign/:token"    element={<SignPage />} />
-              <Route path="payments"       element={<PaymentsPage />} />
-              <Route path="balances"       element={<BalancesPage />} />
-              <Route path="rent-roll"      element={<RentRollPage />} />
               <Route path="utilities"      element={<UtilityMetersPage />} />
-              <Route path="disbursements"  element={<DisbursementsPage />} />
-              <Route path="banking"        element={<BankingPage />} />
               <Route path="maintenance"    element={<MaintenancePage />} />
-              <Route path="reports"        element={<ReportsPage />} />
+              {/* S575: Financials hub. Flat child paths are UNCHANGED so every
+                  existing deep link/redirect keeps working — the pathless layout
+                  route only wraps them in the shared sub-tab bar (HubTabLayout). */}
+              <Route element={<HubTabLayout hub="financials" />}>
+                <Route path="payments"       element={<PaymentsPage />} />
+                <Route path="balances"       element={<BalancesPage />} />
+                <Route path="rent-roll"      element={<RentRollPage />} />
+                <Route path="disbursements"  element={<DisbursementsPage />} />
+                <Route path="reports"        element={<ReportsPage />} />
+                <Route path="expenses"       element={<ExpensesPage />} />
+                <Route path="bank-feed"      element={<BankFeedPage />} />
+                <Route path="bank-reconciliation" element={<BankReconciliationPage />} />
+                <Route path="banking"        element={<BankingPage />} />
+                <Route path="lot-rent"       element={<LotRentPage />} />
+              </Route>
+              {/* S575: Screening hub — Applicant Pool / Background Checks / Rental History. */}
+              <Route element={<HubTabLayout hub="screening" />}>
+                <Route path="pool"            element={<ApplicantPoolPage />} />
+                <Route path="background"     element={<BackgroundChecksPage />} />
+                <Route path="screening"          element={<TenantScreeningPage />} />
+              </Route>
               <Route path="team"           element={<TeamPage />} />
               <Route path="team/:userId/permissions" element={<StaffPermissionsPage />} />
               <Route path="work-trade"     element={LAUNCH_HIDDEN.has('/work-trade') ? <Navigate to="/dashboard" replace /> : <WorkTradePage />} />
@@ -205,7 +222,6 @@ export default function App() {
               <Route path="entry-requests"     element={<EntryRequestsPage />} />
               <Route path="entry-requests/new" element={<NewEntryRequestPage />} />
               <Route path="entry-requests/:id" element={<EntryRequestDetailPage />} />
-              <Route path="screening"          element={<TenantScreeningPage />} />
               {/* W-53 (S531): prefs merged into Settings; deep links redirect */}
               <Route path="notification-prefs" element={<Navigate to="/settings" replace />} />
               <Route path="bookings"           element={<Navigate to="/schedule" replace />} />

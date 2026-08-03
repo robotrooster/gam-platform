@@ -31,7 +31,7 @@ async function activeLeaseCount(client: Client, unitId: string): Promise<number>
 /** Count unresolved (in-flight) pending intents on a unit. */
 async function openIntentCount(client: Client, unitId: string): Promise<number> {
   const r = await client.query(
-    `SELECT COUNT(*)::int AS n FROM pending_tenant_intents WHERE unit_id=$1 AND resolved_at IS NULL`, [unitId])
+    `SELECT COUNT(*)::int AS n FROM pending_tenant_intents WHERE unit_id=$1 AND resolved_at IS NULL AND cancelled_at IS NULL`, [unitId])
   return r.rows[0]?.n ?? 0
 }
 
@@ -88,7 +88,7 @@ async function loadRoster(client: Client, unitId: string): Promise<IntentRow[]> 
        FROM pending_tenant_intents pti
        JOIN tenants t ON t.id = pti.tenant_id
        JOIN users u ON u.id = t.user_id
-      WHERE pti.unit_id = $1 AND pti.resolved_at IS NULL
+      WHERE pti.unit_id = $1 AND pti.resolved_at IS NULL AND pti.cancelled_at IS NULL
       ORDER BY pti.created_at ASC`, [unitId]).then(r => r.rows as IntentRow[])
 }
 

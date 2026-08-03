@@ -192,16 +192,33 @@ export async function processAutoPayouts(now: Date = new Date()): Promise<Payout
 
   const today = localDateString(now, TZ)
 
-  // Build the candidate list: every Connect-ready user + pm_company.
+  // Build the candidate list: every Connect-ready landlord/user + pm_company.
   // Cached readiness flags (S159+) are webhook-fed; gating here matches
   // the same gate used at withdrawal time so a manual withdrawal and an
   // auto-Friday payout never disagree on eligibility.
+  //
+  // S554 re-anchor Stage 2: resolve each founding user's payout account as
+  // COALESCE(landlord ENTITY account, founding-user account) so an
+  // entity-anchored landlord (users.stripe_connect_account_id NULL, account on
+  // landlords) is actually swept — the pre-Stage-2 query scanned only `users`
+  // and silently stranded entity-anchored balances. entity_id stays the
+  // founding USER id: reconcilePlatformHeldPayments (which independently
+  // re-resolves the same COALESCE account), the disbursements audit row, and
+  // the 6-day pre-skip all key off it, so all downstream 'user' handling is
+  // unchanged. Readiness is gated on the SAME anchor that owns the account
+  // (CASE), never a mix of entity account + user readiness.
   const userRows = await query<{ entity_id: string; stripe_connect_account_id: string }>(
-    `SELECT id AS entity_id, stripe_connect_account_id
-       FROM users
-      WHERE stripe_connect_account_id IS NOT NULL
-        AND connect_payouts_enabled    = TRUE
-        AND connect_details_submitted  = TRUE`
+    `SELECT entity_id, stripe_connect_account_id FROM (
+       SELECT u.id AS entity_id,
+              COALESCE(l.stripe_connect_account_id, u.stripe_connect_account_id) AS stripe_connect_account_id,
+              CASE WHEN l.stripe_connect_account_id IS NOT NULL
+                   THEN COALESCE(l.connect_payouts_enabled, FALSE) AND COALESCE(l.connect_details_submitted, FALSE)
+                   ELSE COALESCE(u.connect_payouts_enabled, FALSE) AND COALESCE(u.connect_details_submitted, FALSE)
+              END AS ready
+         FROM users u
+         LEFT JOIN landlords l ON l.user_id = u.id
+     ) x
+     WHERE x.stripe_connect_account_id IS NOT NULL AND x.ready = TRUE`
   )
   const pmRows = await query<{ entity_id: string; stripe_connect_account_id: string }>(
     `SELECT id AS entity_id, stripe_connect_account_id

@@ -316,7 +316,12 @@ describe('DELETE /me/pending-tenants/:intentId', () => {
     expect(res.status).toBe(404)
   })
 
-  it('happy: safe-to-delete tenant/user → all three rows removed', async () => {
+  // Retention rule ("keep everything — a delete only hides a record from the
+  // owner, it never leaves our server"): canceling a pending invite is a
+  // SOFT-HIDE, not an erase. The intent row, tenant, user, and any PDF are all
+  // retained; the invite just drops out of the landlord's list and frees the
+  // person/unit for a re-invite.
+  it('cancel is soft-hide: intent + tenant + user all retained on server, invite leaves the landlord list', async () => {
     const f = await seedTOFixture()
     const email = `del-${randomUUID().slice(0,6)}@test.dev`
     const create = await request(buildApp())
@@ -331,18 +336,52 @@ describe('DELETE /me/pending-tenants/:intentId', () => {
       .delete(`/api/landlords/me/pending-tenants/${intentId}`)
       .set('Authorization', `Bearer ${f.landlordToken}`)
     expect(res.status).toBe(200)
-    expect(res.body.data.tenantDeleted).toBe(true)
-    expect(res.body.data.userDeleted).toBe(true)
+    expect(res.body.data.cancelled).toBe(true)
+    expect(res.body.data.tenantDeleted).toBe(false)
+    expect(res.body.data.userDeleted).toBe(false)
 
-    const intent = await db.query(`SELECT id FROM pending_tenant_intents WHERE id=$1`, [intentId])
-    expect(intent.rows.length).toBe(0)
+    // Nothing erased — all three rows persist, intent stamped cancelled_at.
+    const intent = await db.query(`SELECT id, cancelled_at FROM pending_tenant_intents WHERE id=$1`, [intentId])
+    expect(intent.rows.length).toBe(1)
+    expect(intent.rows[0].cancelled_at).not.toBeNull()
     const t = await db.query(`SELECT id FROM tenants WHERE id=$1`, [tenantId])
-    expect(t.rows.length).toBe(0)
+    expect(t.rows.length).toBe(1)
     const u = await db.query(`SELECT id FROM users WHERE id=$1`, [userId])
-    expect(u.rows.length).toBe(0)
+    expect(u.rows.length).toBe(1)
+
+    // But it's hidden from the landlord's pending list.
+    const list = await request(buildApp())
+      .get('/api/landlords/me/pending-tenants')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(list.status).toBe(200)
+    expect(list.body.data.find((r: any) => r.intentId === intentId)).toBeUndefined()
   })
 
-  it('tenant has OTHER lease_tenants link → tenant + user preserved, only intent removed', async () => {
+  it('cancel frees the person for re-invite (cancelled invite is not blocking)', async () => {
+    const f = await seedTOFixture()
+    const email = `reinvite-${randomUUID().slice(0,6)}@test.dev`
+    const create = await request(buildApp())
+      .post('/api/landlords/me/onboard-tenant-pending')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ firstName: 'Re', lastName: 'Invite', email, phone: '555' })
+    const intentId = create.body.data.intentId
+
+    await request(buildApp())
+      .delete(`/api/landlords/me/pending-tenants/${intentId}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .expect(200)
+
+    // Re-inviting the same person now succeeds (the cancelled invite doesn't
+    // trip the duplicate-pending guard).
+    const again = await request(buildApp())
+      .post('/api/landlords/me/onboard-tenant-pending')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ firstName: 'Re', lastName: 'Invite', email, phone: '555' })
+    expect(again.status).toBe(200)
+    expect(again.body.data.intentId).not.toBe(intentId)
+  })
+
+  it('tenant with a lease elsewhere: canceling an invite retains everything', async () => {
     const f = await seedTOFixture()
     const email = `keep-${randomUUID().slice(0,6)}@test.dev`
     const create = await request(buildApp())
@@ -353,7 +392,7 @@ describe('DELETE /me/pending-tenants/:intentId', () => {
     const tenantId = create.body.data.tenantId
     const userId = create.body.data.userId
 
-    // Add an unrelated lease_tenants link so the safe-to-delete check fails
+    // Unrelated lease elsewhere for the same tenant.
     const client = await db.connect()
     try {
       await client.query('BEGIN')
@@ -366,12 +405,12 @@ describe('DELETE /me/pending-tenants/:intentId', () => {
       .delete(`/api/landlords/me/pending-tenants/${intentId}`)
       .set('Authorization', `Bearer ${f.landlordToken}`)
     expect(res.status).toBe(200)
-    expect(res.body.data.tenantDeleted).toBe(false)
-    expect(res.body.data.userDeleted).toBe(false)
+    expect(res.body.data.cancelled).toBe(true)
 
-    // Intent gone, tenant+user preserved
-    const intent = await db.query(`SELECT id FROM pending_tenant_intents WHERE id=$1`, [intentId])
-    expect(intent.rows.length).toBe(0)
+    // Everything preserved; intent soft-cancelled, not deleted.
+    const intent = await db.query(`SELECT cancelled_at FROM pending_tenant_intents WHERE id=$1`, [intentId])
+    expect(intent.rows.length).toBe(1)
+    expect(intent.rows[0].cancelled_at).not.toBeNull()
     const t = await db.query(`SELECT id FROM tenants WHERE id=$1`, [tenantId])
     expect(t.rows.length).toBe(1)
     const u = await db.query(`SELECT id FROM users WHERE id=$1`, [userId])

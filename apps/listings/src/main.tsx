@@ -117,7 +117,7 @@ function App() {
   const [filtered, setFiltered] = useState<any[]>([])
   const [loading, setLoading] = useState(true)
   const [selected, setSelected] = useState<any>(null)
-  const [search, setSearch] = useState({ city: '', maxRent: '', beds: '' })
+  const [search, setSearch] = useState({ city: '', maxRent: '', beds: '', floor: '' })
   const [error, setError] = useState('')
 
   useEffect(() => {
@@ -132,6 +132,9 @@ function App() {
     if (search.city) f = f.filter(l => l.city?.toLowerCase().includes(search.city.toLowerCase()) || l.propertyName?.toLowerCase().includes(search.city.toLowerCase()))
     if (search.maxRent) f = f.filter(l => +l.rentAmount <= +search.maxRent)
     if (search.beds) f = f.filter(l => +l.bedrooms >= +search.beds)
+    // S573: floor placement — a renter needing ground floor never sees upstairs
+    // or basement units.
+    if (search.floor) f = f.filter(l => l.floorLevel === search.floor)
     setFiltered(f)
   }, [search, listings])
 
@@ -153,6 +156,12 @@ function App() {
             <option value="1">1+ beds</option>
             <option value="2">2+ beds</option>
             <option value="3">3+ beds</option>
+          </select>
+          <select value={search.floor} onChange={e => setSearch(s => ({ ...s, floor: e.target.value }))}>
+            <option value="">Any floor</option>
+            <option value="ground_floor">Ground floor</option>
+            <option value="upper_floor">Upper floor</option>
+            <option value="basement">Basement</option>
           </select>
           <input type="number" placeholder="Max rent" value={search.maxRent} onChange={e => setSearch(s => ({ ...s, maxRent: e.target.value }))} />
         </div>

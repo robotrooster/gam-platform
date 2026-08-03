@@ -234,16 +234,17 @@ describe('POST /api/pos-customer-onboarding/:token/start', () => {
     expect(res.body.data.setup_intent_id).toBe('seti_mock')
   })
 
-  it('SetupIntent created with Financial Connections + us_bank_account params', async () => {
+  it('SetupIntent created with microdeposit verification + us_bank_account params (S570: no FC instant, no $1.50 charge)', async () => {
     const f = await seed()
     await request(buildApp())
       .post(`/api/pos-customer-onboarding/${f.token}/start`)
     const call = stripeMocks.setupIntentsCreate.mock.calls[0][0] as any
     expect(call.payment_method_types).toEqual(['us_bank_account'])
     expect(call.payment_method_options.us_bank_account).toMatchObject({
-      financial_connections: { permissions: ['payment_method', 'balances'] },
-      verification_method:   'instant',
+      verification_method: 'microdeposits',
     })
+    // Must NOT request Financial Connections (that is the billable instant path).
+    expect(call.payment_method_options.us_bank_account.financial_connections).toBeUndefined()
     // GAM-attribution metadata is set.
     expect(call.metadata.gam_purpose).toBe('pos_customer_ach_onboarding')
     expect(call.metadata.gam_pos_customer_id).toBe(f.posCustId)
@@ -340,7 +341,7 @@ describe('POST /api/pos-customer-onboarding/:token/complete', () => {
     expect(res.body.error).toMatch(/start/)
   })
 
-  it('SetupIntent status not succeeded → 409', async () => {
+  it('S570 microdeposit pending: SetupIntent not succeeded → 200 pending (not 409), pos_customers stays unverified until webhook', async () => {
     const f = await seed({ status: 'in_progress', setupIntentId: 'seti_pending' })
     stripeMocks.setupIntentsRetrieve.mockResolvedValueOnce({
       id: 'seti_pending', status: 'requires_action',
@@ -348,8 +349,11 @@ describe('POST /api/pos-customer-onboarding/:token/complete', () => {
     } as any)
     const res = await request(buildApp())
       .post(`/api/pos-customer-onboarding/${f.token}/complete`)
-    expect(res.status).toBe(409)
-    // pos_customers row stays unverified.
+    expect(res.status).toBe(200)
+    expect(res.body.data.verified).toBe(false)
+    expect(res.body.data.status).toBe('pending')
+    // pos_customers row stays unverified — the setup_intent.succeeded webhook
+    // flips it once the customer confirms the microdeposits.
     const { rows: [pc] } = await db.query<any>(
       `SELECT ach_verified FROM pos_customers WHERE id=$1`, [f.posCustId])
     expect(pc.ach_verified).toBe(false)

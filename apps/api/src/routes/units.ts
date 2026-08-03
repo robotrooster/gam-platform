@@ -4,7 +4,7 @@ import { query, queryOne } from '../db'
 import { requireAuth, requireLandlord, requirePerm, getScopedPropertyIds, assertPropertyInScope } from '../middleware/auth'
 import { canAccessLandlordResource, canManageLandlordResource, canViewLandlordFinances } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
-import { UnitStatus, calcNetPerUnit, getReservePhase, LAUNCH_PLATFORM_FEE, UNIT_STATUSES, UNIT_TYPES, computeStayPrice, computeMonthlyStaySchedule, RV_SITE_LAYOUTS, RV_AMP_SERVICES, isSiteLayoutMismatch, isAmpServiceMismatch, SHORT_STAY_LOCKED_UNIT_TYPES, DWELLING_OWNERSHIP_VALUES, OCCUPANCY_MODES, dayDiff } from '@gam/shared'
+import { UnitStatus, calcNetPerUnit, getReservePhase, LAUNCH_PLATFORM_FEE, UNIT_STATUSES, UNIT_TYPES, computeStayPrice, computeMonthlyStaySchedule, RV_SITE_LAYOUTS, RV_AMP_SERVICES, isSiteLayoutMismatch, isAmpServiceMismatch, SHORT_STAY_LOCKED_UNIT_TYPES, DWELLING_OWNERSHIP_VALUES, OCCUPANCY_MODES, FLOOR_LEVELS, MAX_INSPECTION_LIVING_AREAS, UNIT_FEATURE_CATALOG, dayDiff } from '@gam/shared'
 import { findStayConflict, findAvailableUnits, STAY_CONFLICT_MESSAGE } from '../services/unitAvailability'
 import { formatUnitNumber } from '../lib/format'
 import { logger } from '../lib/logger'
@@ -27,7 +27,8 @@ unitsRouter.use(requireAuth)
 // GET /api/units  — landlord sees their units, admin sees all
 unitsRouter.get('/', async (req, res, next) => {
   try {
-    const isAdmin = req.user!.role === 'admin' || req.user!.role === 'super_admin'
+    const isSuper = req.user!.role === 'super_admin'
+    const isAdmin = req.user!.role === 'admin' || isSuper
     const params: any[] = []
     // S400 fix: pre-fix used req.user.profileId unconditionally, which is the
     // landlord_id for role=landlord but the user_id for team roles (PM /
@@ -37,8 +38,16 @@ unitsRouter.get('/', async (req, res, next) => {
     const callerLandlordId = req.user!.role === 'landlord'
       ? req.user!.profileId
       : req.user!.landlordId
-    const landlordFilter = isAdmin
-      ? '' : `AND u.landlord_id = $${params.push(callerLandlordId)}`
+    // S567 portfolio scoping: super sees all; a regular admin (portfolio
+    // manager) sees only units under landlords they close or service; a
+    // landlord/team member sees only their own.
+    let landlordFilter = ''
+    if (!isAdmin) {
+      landlordFilter = `AND u.landlord_id = $${params.push(callerLandlordId)}`
+    } else if (!isSuper) {
+      const i = params.push(req.user!.userId)
+      landlordFilter = `AND u.landlord_id IN (SELECT id FROM landlords WHERE portfolio_manager_id = $${i} OR service_manager_id = $${i})`
+    }
     const propertyFilter = req.query.propertyId
       ? `AND u.property_id = $${params.push(req.query.propertyId)}`
       : ''
@@ -115,7 +124,11 @@ unitsRouter.get('/:id', async (req, res, next) => {
         vuo.primary_email AS tenant_email,
         vuo.primary_phone AS tenant_phone,
         vuo.primary_tenant_id AS tenant_id,
-        vuo.tenant_count
+        vuo.tenant_count,
+        -- S573: unit settings lock while a lease is active/pending (rent is
+        -- committed to the signed doc). Free to edit only between leases.
+        EXISTS (SELECT 1 FROM leases le WHERE le.unit_id = u.id
+                  AND le.status IN ('active','pending')) AS has_active_lease
       FROM units u
       JOIN properties p ON p.id = u.property_id
       JOIN landlords l ON l.id = u.landlord_id
@@ -156,10 +169,23 @@ unitsRouter.post('/', requirePerm('properties.add_unit'), async (req, res, next)
       // (site-only for tenant-owned MH/RV vs full interior). Only meaningful
       // for rv_spot / mobile_home; defaulted below.
       dwellingOwnership: z.enum(DWELLING_OWNERSHIP_VALUES as unknown as [string, ...string[]]).optional(),
+      // S573: multi-level dwelling — adds the stairs & handrails inspection area.
+      // Only meaningful for interior residential types; ignored otherwise.
+      isMultiLevel:    z.boolean().optional(),
+      // S573: ADA-accessible unit — adds the accessibility inspection area.
+      isAdaAccessible: z.boolean().optional(),
+      // S573: floor placement for tenant search filtering (ground/upper/etc).
+      floorLevel:      z.enum(FLOOR_LEVELS as unknown as [string, ...string[]]).nullable().optional(),
+      // S573: living-area count + feature map (what the unit has → inspection).
+      livingAreas:     z.number().int().min(1).max(MAX_INSPECTION_LIVING_AREAS).optional(),
+      features:        z.record(z.boolean()).optional(),
       storageSize:     z.string().max(40).optional(),
       nightlyRate:     z.number().min(0).nullable().optional(),
       weeklyRate:      z.number().min(0).nullable().optional(),
       monthlyRate:     z.number().min(0).nullable().optional(),
+      // S568: monthly lot rent the operator pays an EXTERNAL park for this home's
+      // lot (homes-only properties; investor-operator model). 0 when land-owned.
+      lotRentAmount:   z.number().min(0).optional(),
       // S527 fix: the Add Unit modal always sent status but the schema
       // stripped it — the "Initial Status" picker was a silent no-op and
       // every unit was born vacant. Suspended stays excluded (eviction-mode
@@ -223,6 +249,21 @@ unitsRouter.post('/', requirePerm('properties.add_unit'), async (req, res, next)
     const dwellingOwnership = body.dwellingOwnership
       ?? sub?.dwelling_ownership
       ?? ((isRv || unitType === 'mobile_home') ? 'tenant' : 'landlord')
+    // S573: stairs & accessibility areas only exist on interior residential
+    // types. These flags on an RV pad / storage unit are meaningless — force
+    // false there so a mis-set flag never adds an irrelevant area.
+    const INTERIOR_RESIDENTIAL_TYPES = ['apartment', 'single_family', 'mobile_home']
+    const isInteriorResidential = INTERIOR_RESIDENTIAL_TYPES.includes(unitType)
+    const isMultiLevel = isInteriorResidential ? (body.isMultiLevel ?? false) : false
+    const isAdaAccessible = isInteriorResidential ? (body.isAdaAccessible ?? false) : false
+    // S573: floor placement — meaningful for building units only (not RV/storage).
+    const FLOOR_LEVEL_TYPES = ['apartment', 'single_family', 'mobile_home', 'hotel_room', 'commercial']
+    const floorLevel = FLOOR_LEVEL_TYPES.includes(unitType) ? (body.floorLevel ?? null) : null
+    // S573: living-area count + feature map (sanitized to keys offered for the type).
+    const livingAreas = isInteriorResidential ? (body.livingAreas ?? 1) : 1
+    const offeredKeys = new Set(UNIT_FEATURE_CATALOG.filter(f => f.types.includes(unitType)).map(f => f.key))
+    const features: Record<string, boolean> = {}
+    if (body.features) for (const [k, v] of Object.entries(body.features)) if (offeredKeys.has(k)) features[k] = !!v
 
     // quantity > 1: unitNumber is the PREFIX; continue numbering after the
     // highest existing "<prefix> <n>" on the property (old bulk-route logic).
@@ -256,9 +297,9 @@ unitsRouter.post('/', requirePerm('properties.add_unit'), async (req, res, next)
         INSERT INTO units (property_id, landlord_id, unit_number, unit_type, bedrooms, bathrooms, sqft,
                            rent_amount, security_deposit, rv_site_layout, rv_amp_service,
                            nightly_rate, weekly_rate, monthly_rate, storage_size, subtype_id, status,
-                           is_bookable, lease_types_allowed, dwelling_ownership, occupancy_mode)
+                           is_bookable, lease_types_allowed, dwelling_ownership, lot_rent_amount, is_multi_level, is_ada_accessible, floor_level, living_areas, features, occupancy_mode)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
-                $18, $19::text[], $20,
+                $18, $19::text[], $20, $21, $22, $23, $24, $25, $26::jsonb,
                 -- S558: new unit inherits the property's default occupancy mode
                 -- (a seed, not a governing setting — the unit owns it after).
                 (SELECT default_occupancy_mode FROM properties WHERE id=$1))
@@ -266,7 +307,7 @@ unitsRouter.post('/', requirePerm('properties.add_unit'), async (req, res, next)
         [body.propertyId, prop.landlord_id, unitNumber, unitType, bedrooms,
          bathrooms, body.sqft ?? null, rentAmount, securityDeposit, rvLayout, rvAmp,
          nightlyRate, weeklyRate, monthlyRate, storageSize, sub?.id ?? null, body.status,
-         isRv, leaseTypesAllowed, dwellingOwnership]
+         isRv, leaseTypesAllowed, dwellingOwnership, body.lotRentAmount ?? 0, isMultiLevel, isAdaAccessible, floorLevel, livingAreas, JSON.stringify(features)]
       )
       created.push(unit)
       } catch (err: any) {
@@ -430,7 +471,7 @@ unitsRouter.patch('/:id/type', requirePerm('schedule.configure_unit'), async (re
   try {
     const { unitType, nightlyRate, weeklyRate, monthlyRate, minStayNights, maxStayNights,
             checkInTime, checkOutTime, amenities, unitDescription, isBookable, rvSiteLayout, rvAmpService,
-            dwellingOwnership, occupancyMode } = req.body
+            dwellingOwnership, occupancyMode, lotRentAmount, isMultiLevel, isAdaAccessible } = req.body
 
     if (rvSiteLayout != null && !RV_SITE_LAYOUTS.includes(rvSiteLayout)) {
       throw new AppError(400, `Invalid rvSiteLayout '${rvSiteLayout}'`)
@@ -467,13 +508,19 @@ unitsRouter.patch('/:id/type', requirePerm('schedule.configure_unit'), async (re
       rv_site_layout=COALESCE($14,rv_site_layout),
       rv_amp_service=COALESCE($15,rv_amp_service),
       dwelling_ownership=COALESCE($16,dwelling_ownership),
-      occupancy_mode=COALESCE($17,occupancy_mode), updated_at=NOW()
+      occupancy_mode=COALESCE($17,occupancy_mode),
+      lot_rent_amount=COALESCE($18,lot_rent_amount),
+      is_multi_level=COALESCE($19,is_multi_level),
+      is_ada_accessible=COALESCE($20,is_ada_accessible), updated_at=NOW()
       WHERE id=$13 RETURNING *`,
       [unitType||'residential', leaseTypesAllowed, nightlyRate||null, weeklyRate||null,
        monthlyRate||null, minStayNights||1, maxStayNights||null,
        checkInTime||'15:00', checkOutTime||'11:00',
        amenities||[], unitDescription||null, isBookable??false, unit.id, rvSiteLayout ?? null, rvAmpService ?? null,
-       dwellingOwnership ?? null, occupancyMode ?? null])
+       dwellingOwnership ?? null, occupancyMode ?? null,
+       lotRentAmount == null ? null : Number(lotRentAmount),
+       typeof isMultiLevel === 'boolean' ? isMultiLevel : null,
+       typeof isAdaAccessible === 'boolean' ? isAdaAccessible : null])
 
     res.json({ success: true, data: updated })
   } catch (e) { next(e) }
@@ -497,6 +544,148 @@ unitsRouter.patch('/:id/occupancy-mode', requirePerm('schedule.configure_unit'),
       if ((n?.c ?? 0) > 1) throw new AppError(409, 'This unit has multiple active leases — end all but one before switching to whole-unit mode.')
     }
     const updated = await queryOne<any>(`UPDATE units SET occupancy_mode=$1, updated_at=NOW() WHERE id=$2 RETURNING *`, [occupancyMode, req.params.id])
+    res.json({ success: true, data: updated })
+  } catch (e) { next(e) }
+})
+
+// PATCH /api/units/:id/inspection-attributes (S573) — flip a single unit's
+// inspection-template filter flags (is_multi_level, is_ada_accessible).
+// Dedicated route (not /type) so a standalone toggle never clobbers the unit's
+// unit_type/rates. Each field is optional; COALESCE leaves the others untouched.
+unitsRouter.patch('/:id/inspection-attributes', requirePerm('schedule.configure_unit'), async (req, res, next) => {
+  try {
+    const { isMultiLevel, isAdaAccessible } = req.body
+    if (isMultiLevel != null && typeof isMultiLevel !== 'boolean') throw new AppError(400, 'isMultiLevel must be a boolean')
+    if (isAdaAccessible != null && typeof isAdaAccessible !== 'boolean') throw new AppError(400, 'isAdaAccessible must be a boolean')
+    if (isMultiLevel == null && isAdaAccessible == null) throw new AppError(400, 'Nothing to update')
+    const unit = await queryOne<any>('SELECT id, landlord_id FROM units WHERE id=$1', [req.params.id])
+    if (!unit) throw new AppError(404, 'Unit not found')
+    if (!canManageLandlordResource(req.user, unit.landlord_id)) throw new AppError(403, 'Forbidden')
+    const updated = await queryOne<any>(
+      `UPDATE units SET
+         is_multi_level=COALESCE($1, is_multi_level),
+         is_ada_accessible=COALESCE($2, is_ada_accessible),
+         updated_at=NOW()
+       WHERE id=$3 RETURNING *`,
+      [typeof isMultiLevel === 'boolean' ? isMultiLevel : null,
+       typeof isAdaAccessible === 'boolean' ? isAdaAccessible : null,
+       req.params.id])
+    res.json({ success: true, data: updated })
+  } catch (e) { next(e) }
+})
+
+// PATCH /api/units/:id/details (S573) — the SINGLE consolidated unit editor.
+// Every unit setting is editable here, but ONLY while the unit has no active/
+// pending lease. Once a lease is active/pending the settings freeze (rent is
+// committed to the signed doc; between-lease is when a landlord raises rent or
+// remodels bed/bath). Replaces the scattered listing/type/attribute edits.
+unitsRouter.patch('/:id/details', requirePerm('schedule.configure_unit'), async (req, res, next) => {
+  try {
+    const body = z.object({
+      unitType:        z.enum(UNIT_TYPES as unknown as [string, ...string[]]).optional(),
+      bedrooms:        z.number().int().min(0).max(30).optional(),
+      bathrooms:       z.number().min(0).max(30).optional(),
+      sqft:            z.number().int().min(0).nullable().optional(),
+      rentAmount:      z.number().min(0).optional(),
+      securityDeposit: z.number().min(0).optional(),
+      dwellingOwnership: z.enum(DWELLING_OWNERSHIP_VALUES as unknown as [string, ...string[]]).optional(),
+      isMultiLevel:    z.boolean().optional(),
+      isAdaAccessible: z.boolean().optional(),
+      floorLevel:      z.enum(FLOOR_LEVELS as unknown as [string, ...string[]]).nullable().optional(),
+      livingAreas:     z.number().int().min(1).max(MAX_INSPECTION_LIVING_AREAS).optional(),
+      features:        z.record(z.boolean()).optional(),
+      occupancyMode:   z.enum(OCCUPANCY_MODES as unknown as [string, ...string[]]).optional(),
+      rvSiteLayout:    z.enum(RV_SITE_LAYOUTS as unknown as [string, ...string[]]).optional(),
+      rvAmpService:    z.enum(RV_AMP_SERVICES as unknown as [string, ...string[]]).optional(),
+      storageSize:     z.string().max(40).nullable().optional(),
+      lotRentAmount:   z.number().min(0).optional(),
+      nightlyRate:     z.number().min(0).nullable().optional(),
+      weeklyRate:      z.number().min(0).nullable().optional(),
+      monthlyRate:     z.number().min(0).nullable().optional(),
+      isBookable:      z.boolean().optional(),
+    }).parse(req.body)
+
+    const unit = await queryOne<any>('SELECT * FROM units WHERE id=$1', [req.params.id])
+    if (!unit) throw new AppError(404, 'Unit not found')
+    if (!canManageLandlordResource(req.user, unit.landlord_id)) throw new AppError(403, 'Forbidden')
+
+    // Lease-lock — the whole point of this workflow (Nic): no edits while a
+    // lease is active/pending; everything is editable only between leases.
+    const leased = await queryOne<any>(
+      `SELECT 1 FROM leases WHERE unit_id=$1 AND status IN ('active','pending') LIMIT 1`, [req.params.id])
+    if (leased) {
+      throw new AppError(409,
+        'This unit has an active lease — its settings are locked until the lease ends. ' +
+        'Rent and terms are committed to the signed lease; edit unit settings between leases.')
+    }
+
+    const unitType = body.unitType ?? unit.unit_type ?? 'apartment'
+    // Same late-fee-decision gate as unit creation — no unit of an undecided
+    // class, so a type switch can't sneak past it.
+    if (body.unitType && body.unitType !== unit.unit_type) {
+      await assertLateFeeDecision(unit.property_id, unitType)
+    }
+
+    let isBookable = body.isBookable ?? unit.is_bookable
+    if ((SHORT_STAY_LOCKED_UNIT_TYPES as readonly string[]).includes(unitType) && isBookable) {
+      throw new AppError(400, 'Storage units cannot be made bookable for short-term stays')
+    }
+
+    const isRv = unitType === 'rv_spot'
+    const INTERIOR_RESIDENTIAL_TYPES = ['apartment', 'single_family', 'mobile_home']
+    const isInteriorResidential = INTERIOR_RESIDENTIAL_TYPES.includes(unitType)
+    // Normalize type-specific fields so a type switch never leaves stale attrs.
+    const rvLayout    = isRv ? (body.rvSiteLayout ?? unit.rv_site_layout ?? 'none') : 'none'
+    const rvAmp       = isRv ? (body.rvAmpService ?? unit.rv_amp_service ?? 'none') : 'none'
+    const storageSize = unitType === 'storage' ? ((body.storageSize ?? unit.storage_size) || null) : null
+    const isMultiLevel    = isInteriorResidential ? (body.isMultiLevel ?? unit.is_multi_level ?? false) : false
+    const isAdaAccessible = isInteriorResidential ? (body.isAdaAccessible ?? unit.is_ada_accessible ?? false) : false
+    const dwellingOwnership = (isRv || unitType === 'mobile_home')
+      ? (body.dwellingOwnership ?? unit.dwelling_ownership ?? 'tenant')
+      : 'landlord'
+    // Floor placement — building units only; cleared on RV/storage/parking.
+    const FLOOR_LEVEL_TYPES = ['apartment', 'single_family', 'mobile_home', 'hotel_room', 'commercial']
+    const floorLevel = FLOOR_LEVEL_TYPES.includes(unitType)
+      ? (body.floorLevel === undefined ? unit.floor_level : body.floorLevel)
+      : null
+    const leaseTypesAllowed = LEASE_TYPE_MATRIX[unitType] || LEASE_TYPE_MATRIX['residential']
+
+    const bedrooms   = body.bedrooms ?? unit.bedrooms
+    const bathrooms  = body.bathrooms ?? unit.bathrooms
+    const sqft       = body.sqft === undefined ? unit.sqft : body.sqft
+    const rentAmount = body.rentAmount ?? Number(unit.rent_amount)
+    const securityDeposit = body.securityDeposit ?? Number(unit.security_deposit)
+    const nightlyRate = body.nightlyRate === undefined ? unit.nightly_rate : body.nightlyRate
+    const weeklyRate  = body.weeklyRate  === undefined ? unit.weekly_rate  : body.weeklyRate
+    const monthlyRate = body.monthlyRate === undefined ? unit.monthly_rate : body.monthlyRate
+    const lotRentAmount = body.lotRentAmount ?? Number(unit.lot_rent_amount ?? 0)
+    const occupancyMode = body.occupancyMode ?? unit.occupancy_mode
+    // S573: living-area count (bedroom types only) + feature map (only keys the
+    // catalog offers for this type; drops stale keys on a type switch).
+    const livingAreas = INTERIOR_RESIDENTIAL_TYPES.includes(unitType)
+      ? (body.livingAreas ?? unit.living_areas ?? 1) : 1
+    let features = (unit.features ?? {}) as Record<string, boolean>
+    if (body.features) {
+      const offered = new Set(UNIT_FEATURE_CATALOG.filter(f => f.types.includes(unitType)).map(f => f.key))
+      const clean: Record<string, boolean> = {}
+      for (const [k, v] of Object.entries(body.features)) if (offered.has(k)) clean[k] = !!v
+      features = clean
+    }
+
+    const updated = await queryOne<any>(`
+      UPDATE units SET
+        unit_type=$1, bedrooms=$2, bathrooms=$3, sqft=$4,
+        rent_amount=$5, security_deposit=$6, dwelling_ownership=$7,
+        is_multi_level=$8, is_ada_accessible=$9, occupancy_mode=$10,
+        rv_site_layout=$11, rv_amp_service=$12, storage_size=$13,
+        lot_rent_amount=$14, nightly_rate=$15, weekly_rate=$16, monthly_rate=$17,
+        is_bookable=$18, lease_types_allowed=$19::text[], floor_level=$21,
+        living_areas=$22, features=$23::jsonb, updated_at=NOW()
+      WHERE id=$20 RETURNING *`,
+      [unitType, bedrooms, bathrooms, sqft, rentAmount, securityDeposit, dwellingOwnership,
+       isMultiLevel, isAdaAccessible, occupancyMode, rvLayout, rvAmp, storageSize,
+       lotRentAmount, nightlyRate, weeklyRate, monthlyRate, isBookable, leaseTypesAllowed,
+       req.params.id, floorLevel, livingAreas, JSON.stringify(features)])
     res.json({ success: true, data: updated })
   } catch (e) { next(e) }
 })

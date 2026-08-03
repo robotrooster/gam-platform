@@ -30,6 +30,10 @@ interface UnitRow {
   bathrooms: number | null
   unit_type: string | null
   dwelling_ownership: string | null
+  is_multi_level: boolean | null
+  is_ada_accessible: boolean | null
+  living_areas: number | null
+  features: Record<string, unknown> | null
 }
 
 export const createInspection: AgentTool = {
@@ -76,7 +80,7 @@ export const createInspection: AgentTool = {
 
     // Resolve the unit, hard-scoped to THIS landlord.
     const unit = await queryOne<UnitRow>(
-      `SELECT id, unit_number, bedrooms, bathrooms, unit_type, dwelling_ownership
+      `SELECT id, unit_number, bedrooms, bathrooms, unit_type, dwelling_ownership, is_multi_level, is_ada_accessible, living_areas, features
          FROM units WHERE unit_number ILIKE $1 AND landlord_id = $2
          ORDER BY unit_number LIMIT 1`,
       [unitArg, actor.profileId],
@@ -129,6 +133,10 @@ export const createInspection: AgentTool = {
         bedrooms: unit.bedrooms,
         bathrooms: unit.bathrooms,
         dwellingOwnership: unit.dwelling_ownership,
+        isMultiLevel: unit.is_multi_level,
+        isAdaAccessible: unit.is_ada_accessible,
+        livingAreas: unit.living_areas,
+        features: unit.features,
         leaseId,
         tenantId,
         inspectionType,

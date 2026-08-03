@@ -68,7 +68,6 @@ export async function processComplianceArchive(): Promise<{ stats: ArchiveStats[
   const targets: Array<{ table: string; extraWhere?: string }> = [
     { table: 'admin_action_log' },
     { table: 'audit_log' },
-    { table: 'bulletin_reveal_log' },
     { table: 'ach_monitoring_log' },
     { table: 'admin_notifications', extraWhere: 'acknowledged_at IS NOT NULL' },
     { table: 'email_send_log' },

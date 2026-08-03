@@ -1,11 +1,9 @@
 import { useState, useEffect, useRef } from 'react'
 import { useMutation, useQuery, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
-import { LeaseType, LEASE_TYPE_LABEL, AutoRenewMode, AUTO_RENEW_MODES, AUTO_RENEW_MODE_LABEL, LeaseStatus, ADDENDUM_DIFF_FIELD_LABEL, formatAddendumDiffValue } from '@gam/shared'
-const AUTO_RENEW_MODE_DESC: Record<AutoRenewMode, string> = {
-  extend_same_term:          'Add another term of the same length (e.g. a 12-month lease extends by 12 months)',
-  convert_to_month_to_month: 'Switch to month-to-month with no fixed end date',
-}
+import { LeaseType, LEASE_TYPE_LABEL, LeaseStatus, ADDENDUM_DIFF_FIELD_LABEL, formatAddendumDiffValue } from '@gam/shared'
+// S562: auto-renew RETIRED — renewal is a conscious decision made near expiration
+// (landlord offers → tenant responds), never an automatic extend/m2m. No mode UI.
 
 import { X, Check, DollarSign, AlertTriangle, Image as ImageIcon } from 'lucide-react'
 import { LawWarningBanner, type LawFlag } from '../components/LawWarningBanner'
@@ -76,8 +74,6 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
     endDate: '',
     rentAmount: '',
     securityDeposit: '',
-    autoRenew: false,
-    autoRenewMode: 'extend_same_term' as AutoRenewMode,
     noticeDaysRequired: '30',
     expirationNoticeDays: '60',
     lateFeeEnabled: true,
@@ -179,8 +175,6 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
         endDate: existingLease.endDate ? String(existingLease.endDate).slice(0, 10) : '',
         rentAmount: existingLease.rentAmount != null ? String(existingLease.rentAmount) : '',
         securityDeposit: existingLease.securityDeposit != null ? String(existingLease.securityDeposit) : '',
-        autoRenew: Boolean(existingLease.autoRenew),
-        autoRenewMode: existingLease.autoRenewMode || 'extend_same_term',
         noticeDaysRequired: String(existingLease.noticeDaysRequired ?? 30),
         expirationNoticeDays: String(existingLease.expirationNoticeDays ?? 60),
         lateFeeEnabled: existingLease.lateFeeEnabled !== false,
@@ -342,8 +336,8 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
       endDate: form.leaseType === 'month_to_month' ? null : form.endDate,
       rentAmount: Number(form.rentAmount),
       securityDeposit: Number(form.securityDeposit) || 0,
-      autoRenew: form.autoRenew,
-      autoRenewMode: form.autoRenew ? form.autoRenewMode : null,
+      autoRenew: false,      // S562: auto-renew retired — always off
+      autoRenewMode: null,
       noticeDaysRequired: Number(form.noticeDaysRequired) || 30,
       expirationNoticeDays: Number(form.expirationNoticeDays) || 60,
       lateFeeEnabled: form.lateFeeEnabled,
@@ -576,50 +570,11 @@ export function LeaseFormModal({ onClose, leaseId, preselectedUnitId, preselecte
 
           {/* RENEWAL */}
           <div style={SECTION_HEADER_STYLE}>Renewal</div>
-
-          <div style={{ marginBottom: 14 }}>
-            <label style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer' }}>
-              <input
-                type="checkbox"
-                checked={form.autoRenew}
-                onChange={e => set('autoRenew', e.target.checked)}
-                style={{ width: 16, height: 16, cursor: 'pointer' }}
-              />
-              <span style={{ fontSize: '.82rem', color: 'var(--text-1)', fontWeight: 500 }}>Enable auto-renew</span>
-            </label>
-            <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginTop: 4, marginLeft: 26 }}>
-              When the lease reaches its end date, it will renew automatically per the mode below.
-            </div>
+          <div style={{ marginBottom: 14, fontSize: '.72rem', color: 'var(--text-3)', lineHeight: 1.5 }}>
+            Leases do <strong>not</strong> auto-renew. Near the end date you'll decide whether to offer
+            a renewal; if you do, the tenant is asked whether they want to renew, and you proceed from
+            their response. No lease silently extends or reverts to month-to-month.
           </div>
-
-          {form.autoRenew && (
-            <div style={{ marginBottom: 14, marginLeft: 26 }}>
-              <label style={LABEL_STYLE}>Auto-Renew Mode</label>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                {[
-                  ...AUTO_RENEW_MODES.map(value => ({ value, label: AUTO_RENEW_MODE_LABEL[value], desc: AUTO_RENEW_MODE_DESC[value] })),
-                ].map(opt => (
-                  <div
-                    key={opt.value}
-                    onClick={() => set('autoRenewMode', opt.value)}
-                    style={{
-                      padding: '10px 12px',
-                      borderRadius: 8,
-                      cursor: 'pointer',
-                      transition: 'all .12s',
-                      border: '1px solid ' + (form.autoRenewMode === opt.value ? 'var(--gold)' : 'var(--border-0)'),
-                      background: form.autoRenewMode === opt.value ? 'rgba(201,162,39,.06)' : 'var(--bg-2)',
-                    }}
-                  >
-                    <div style={{ fontSize: '.78rem', fontWeight: 600, color: form.autoRenewMode === opt.value ? 'var(--gold)' : 'var(--text-1)' }}>
-                      {opt.label}
-                    </div>
-                    <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginTop: 2 }}>{opt.desc}</div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
 
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 14 }}>
             <div>

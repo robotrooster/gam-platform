@@ -26,6 +26,7 @@ import { db, query, queryOne } from '../db'
 import { requireAuth, requireRole } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { isDisposableEmail } from '../lib/email'
+import { mintAndSendVerifyEmail } from './auth'
 import {
   BUSINESS_TYPES,
   BUSINESS_STATUSES,
@@ -80,6 +81,13 @@ businessesRouter.post('/', async (req, res, next) => {
     if (exists) throw new AppError(409, 'An account with this email already exists. Please sign in.')
 
     const hash = await bcrypt.hash(body.password, 12)
+    // S574 (Nic): match /auth/register — require email verification in
+    // production, auto-verify in local dev so testing doesn't need the link.
+    // 'test' stays unverified so the verification suites exercise the real gate.
+    // Previously this path never sent a verification email at all (a spam email
+    // could create an inert row and even slip through its first session).
+    const env = process.env.NODE_ENV
+    const devAutoVerify = env !== 'production' && env !== 'test'
     const client = await db.connect()
     try {
       await client.query('BEGIN')
@@ -91,10 +99,10 @@ businessesRouter.post('/', async (req, res, next) => {
       }>(
         `INSERT INTO users
            (email, password_hash, role, first_name, last_name, phone,
-            accepted_tos_at, accepted_privacy_at)
-         VALUES ($1, $2, 'business_owner', $3, $4, $5, NOW(), NOW())
+            accepted_tos_at, accepted_privacy_at, email_verified, email_verified_at)
+         VALUES ($1, $2, 'business_owner', $3, $4, $5, NOW(), NOW(), $6, ${devAutoVerify ? 'NOW()' : 'NULL'})
          RETURNING id, email, first_name, last_name`,
-        [body.email, hash, body.firstName, body.lastName, body.phone ?? null])
+        [body.email, hash, body.firstName, body.lastName, body.phone ?? null, devAutoVerify])
 
       // 2) businesses row — owner_user_id ties it back. Business
       //    `email` defaults to the owner's email at signup; PATCH /me
@@ -119,6 +127,11 @@ businessesRouter.post('/', async (req, res, next) => {
          body.ein ?? null, defaultFeatures])
 
       await client.query('COMMIT')
+
+      // S574: mint + send the verification link AFTER commit (fire-and-forget;
+      // failure doesn't fail signup — resend via /api/auth/resend-verification).
+      // Skipped in dev where the account is already auto-verified.
+      if (!devAutoVerify) void mintAndSendVerifyEmail(user.id, user.email, user.first_name)
 
       const token = signToken({
         userId:     user.id,

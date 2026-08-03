@@ -102,6 +102,38 @@ describe('POST /api/properties — create', () => {
     expect(ar.rows[0].platform_fee_payer).toBe('landlord')
   })
 
+  it('S574: a new property auto-publishes a public website (slug + enabled)', async () => {
+    const f = await seedPropsFixture()
+    const res = await createProperty(f, 'Palm Grove RV')
+    expect(res.status).toBe(201)
+    // Response carries the published site so the UI can link it immediately.
+    expect(res.body.data.public_booking_enabled).toBe(true)
+    expect(res.body.data.booking_slug).toBeTruthy()
+    // Slug derives from the name (name-city form).
+    expect(res.body.data.booking_slug).toMatch(/^palm-grove-rv/)
+    // Persisted + resolvable by the public storefront (enabled + slug).
+    const row = await db.query<{ booking_slug: string; public_booking_enabled: boolean }>(
+      `SELECT booking_slug, public_booking_enabled FROM properties WHERE id=$1`, [res.body.data.id])
+    expect(row.rows[0].public_booking_enabled).toBe(true)
+    expect(row.rows[0].booking_slug).toBe(res.body.data.booking_slug)
+  })
+
+  it('S568: homes-only external park (operatorOwnsLand=false) persists', async () => {
+    const f = await seedPropsFixture()
+    const res = await request(buildApp())
+      .post('/api/properties')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ name: 'Riverside MHP (homes only)', street1: '9 Lot Ln', city: 'Phoenix', state: 'AZ', zip: '85001',
+              type: 'rv_longterm', operatorOwnsLand: false })
+    expect(res.status).toBe(201)
+    const row = await db.query<any>(`SELECT operator_owns_land FROM properties WHERE id=$1`, [res.body.data.id])
+    expect(row.rows[0].operator_owns_land).toBe(false)
+    // default stays TRUE when omitted
+    const owned = await createProperty(f, 'Owned Park')
+    const ownedRow = await db.query<any>(`SELECT operator_owns_land FROM properties WHERE id=$1`, [owned.body.data.id])
+    expect(ownedRow.rows[0].operator_owns_land).toBe(true)
+  })
+
   it('allocationRule with no fee payers → 201; ACH inherits landlord default, card locked tenant (S513 #2)', async () => {
     const f = await seedPropsFixture()
     const res = await request(buildApp())

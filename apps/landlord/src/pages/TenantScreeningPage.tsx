@@ -155,10 +155,11 @@ export function TenantScreeningPage() {
       <div className="page-header">
         <div>
           <h1 style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-            <UserSearch size={22} /> Tenant Screening
+            <UserSearch size={22} /> Rental History
           </h1>
           <div className="page-sub">
-            Network-visible behavioral record for prospective and current tenants
+            A tenant's rental track record across the GAM network — the payment,
+            lease, and tenancy events they've consented to share.
           </div>
         </div>
       </div>

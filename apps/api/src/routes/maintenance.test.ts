@@ -220,14 +220,29 @@ describe('POST /maintenance', () => {
     expect(res.body.data.priority).toBe('high')
   })
 
-  it('rejects malformed body (zod) — missing title', async () => {
+  // S571: title is now optional (derived from category). The still-required
+  // field is `description`; omitting it must be rejected by zod.
+  it('rejects malformed body (zod) — missing description', async () => {
     const f = await seedFixture()
     const res = await request(buildApp())
       .post('/api/maintenance')
       .set('Authorization', `Bearer ${f.tenantToken}`)
-      .send({ unitId: f.unitId, description: 'no title here' })
+      .send({ unitId: f.unitId, category: 'plumbing' })
     expect(res.status).toBeGreaterThanOrEqual(400)
     expect(res.status).toBeLessThan(500)
+  })
+
+  // S571: a tenant cannot self-assign priority — it is stripped and the agent
+  // recommendation is stored instead.
+  it('tenant priority is stripped; a recommendation is produced', async () => {
+    const f = await seedFixture()
+    const res = await request(buildApp())
+      .post('/api/maintenance')
+      .set('Authorization', `Bearer ${f.tenantToken}`)
+      .send({ unitId: f.unitId, category: 'plumbing', description: 'Sink is leaking badly', priority: 'low' })
+    expect(res.status).toBe(201)
+    expect(['agent','heuristic']).toContain(res.body.data.priority_source)
+    expect(res.body.data.recommended_priority).toBe(res.body.data.priority)
   })
 
   it('rejects invalid priority enum', async () => {
@@ -766,5 +781,72 @@ describe('POST /maintenance/:id/approve — per-manager ceiling', () => {
       .post(`/api/maintenance/${reqId}/approve`)
       .set('Authorization', `Bearer ${pm.token}`)
     expect(res.status).toBe(200)
+  })
+})
+
+// ── S571: tenant evidence media (photos/video), landlord-immutable ─────────
+describe('POST/GET /maintenance/:id/media', () => {
+  const jpg = () => Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46]) // JPEG magic
+  async function makeRequest(f: any): Promise<string> {
+    const res = await request(buildApp())
+      .post('/api/maintenance')
+      .set('Authorization', `Bearer ${f.tenantToken}`)
+      .send({ unitId: f.unitId, category: 'plumbing', description: 'Sink is leaking under the cabinet' })
+    return res.body.data.id
+  }
+
+  it('tenant on the request can upload a photo; both parties can list it', async () => {
+    const f = await seedFixture()
+    const reqId = await makeRequest(f)
+    const up = await request(buildApp())
+      .post(`/api/maintenance/${reqId}/media`)
+      .set('Authorization', `Bearer ${f.tenantToken}`)
+      .field('caption', 'still leaking after the "fix"')
+      .attach('file', jpg(), { filename: 'proof.jpg', contentType: 'image/jpeg' })
+    expect(up.status).toBe(201)
+    expect(up.body.data.media_type).toBe('photo')
+    expect(up.body.data.uploader_role).toBe('tenant')
+
+    // Landlord sees the tenant's evidence.
+    const list = await request(buildApp())
+      .get(`/api/maintenance/${reqId}/media`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(list.status).toBe(200)
+    expect(list.body.data).toHaveLength(1)
+    expect(list.body.data[0].caption).toContain('still leaking')
+  })
+
+  it('landlord/worker can upload their own fix photo (role landlord)', async () => {
+    const f = await seedFixture()
+    const reqId = await makeRequest(f)
+    const up = await request(buildApp())
+      .post(`/api/maintenance/${reqId}/media`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .attach('file', jpg(), { filename: 'fix.jpg', contentType: 'image/jpeg' })
+    expect(up.status).toBe(201)
+    expect(up.body.data.uploader_role).toBe('landlord')
+  })
+
+  it('a tenant NOT on the request cannot upload (403)', async () => {
+    const f = await seedFixture()
+    const reqId = await makeRequest(f)
+    const other = await seedExtraTenantOnUnit(f.unitId, f.landlordId) // different tenant
+    // Re-point: create a stranger by using a fresh fixture's tenant token on THIS request.
+    const stranger = await seedFixture({})
+    const res = await request(buildApp())
+      .post(`/api/maintenance/${reqId}/media`)
+      .set('Authorization', `Bearer ${stranger.tenantToken}`)
+      .attach('file', jpg(), { filename: 'x.jpg', contentType: 'image/jpeg' })
+    expect(res.status).toBe(403)
+    void other
+  })
+
+  it('is immutable — there is no delete route (404)', async () => {
+    const f = await seedFixture()
+    const reqId = await makeRequest(f)
+    const res = await request(buildApp())
+      .delete(`/api/maintenance/${reqId}/media/whatever`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(res.status).toBe(404)
   })
 })

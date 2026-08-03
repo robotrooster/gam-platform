@@ -725,8 +725,9 @@ interface PaymentRow {
 }
 interface MonthlyPL {
   period: { year: number; month: number; start: string; end: string }
-  gross: { rent: number; other: number; total: number }
-  expenses: { platformFee: number; maintenance: number; total: number }
+  gross: { rent: number; fees?: number; utilities?: number; homeSale?: number; other: number; total: number }
+  depositsHeld?: number
+  expenses: { platformFee: number; maintenance: number; lotRent?: number; enteredExpenses?: number; total: number }
   net: number
   paymentCount: number
   payments: PaymentRow[]
@@ -782,10 +783,19 @@ function MonthlyPLModal({ month, onClose }: { month: string; onClose: () => void
                 <div className="card-header"><span className="card-title">Breakdown</span></div>
                 <div style={{ padding: '6px 0' }}>
                   <PnLLine label="Rent collected" value={data.gross.rent} kind="income" />
-                  {data.gross.other > 0 && <PnLLine label="Other income (fees, utilities)" value={data.gross.other} kind="income" />}
+                  {!!data.gross.fees && data.gross.fees > 0 && <PnLLine label="Fees" value={data.gross.fees} kind="income" />}
+                  {!!data.gross.utilities && data.gross.utilities > 0 && <PnLLine label="Utilities" value={data.gross.utilities} kind="income" />}
+                  {!!data.gross.homeSale && data.gross.homeSale > 0 && <PnLLine label="Home-sale payments" value={data.gross.homeSale} kind="income" />}
                   <PnLLine label="GAM platform fee" value={data.expenses.platformFee} kind="expense" />
                   {data.expenses.maintenance > 0 && <PnLLine label="Maintenance" value={data.expenses.maintenance} kind="expense" />}
+                  {!!data.expenses.lotRent && data.expenses.lotRent > 0 && <PnLLine label="Lot rent" value={data.expenses.lotRent} kind="expense" />}
+                  {!!data.expenses.enteredExpenses && data.expenses.enteredExpenses > 0 && <PnLLine label="Your expenses" value={data.expenses.enteredExpenses} kind="expense" />}
                   <PnLLine label="Net to owner" value={data.net} kind="net" />
+                  {!!data.depositsHeld && data.depositsHeld > 0 && (
+                    <div style={{ fontSize: '.7rem', color: 'var(--text-3)', padding: '4px 14px' }}>
+                      + {fmt(data.depositsHeld)} deposits collected (held, not income)
+                    </div>
+                  )}
                 </div>
               </div>
 

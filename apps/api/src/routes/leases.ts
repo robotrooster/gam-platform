@@ -2,8 +2,9 @@ import { Router } from 'express'
 import { z } from 'zod'
 import path from 'path'
 import fs from 'fs'
-import { query, queryOne } from '../db'
-import { LEASE_TYPES, AUTO_RENEW_MODES, LEASE_STATUSES, MOVE_OUT_INSPECTION_REQUIRED_UNIT_TYPES } from '@gam/shared'
+import { query, queryOne, getClient } from '../db'
+import { LEASE_TYPES, AUTO_RENEW_MODES, LEASE_STATUSES, MOVE_OUT_INSPECTION_REQUIRED_UNIT_TYPES,
+         RENT_COMPONENT_KINDS } from '@gam/shared'
 import { requireAuth, requirePerm } from '../middleware/auth'
 import { canAccessLandlordResource, canManageLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
@@ -327,8 +328,72 @@ leasesRouter.get('/:id', async (req, res, next) => {
         ORDER BY due_timing, fee_type`,
       [lease.id],
     )
+    // S568: itemized rent breakdown (space rent + trailer rent + other). Empty
+    // when the landlord hasn't split this lease — the UI then shows one Rent line.
+    lease.rentComponents = await query<any>(
+      `SELECT id, kind, label, amount, sort_order
+         FROM lease_rent_components
+        WHERE lease_id = $1
+        ORDER BY sort_order, created_at`,
+      [lease.id],
+    )
     res.json({ success: true, data: lease })
   } catch (e) { next(e) }
+})
+
+// ─────────────────────────────────────────────────────────────
+// PUT /api/leases/:id/rent-components  — S568 (Nic)
+// ─────────────────────────────────────────────────────────────
+// Replace the itemized rent breakdown for a lease (space rent + trailer rent +
+// other). The components must SUM to the lease's rent_amount — they itemize the
+// existing single rent obligation, they don't change it. An empty array clears
+// the split (back to one "Rent" line). Billing is unaffected (still one rent
+// payment/cycle); this is the display + metrics breakdown.
+const rentComponentsSchema = z.object({
+  components: z.array(z.object({
+    kind:  z.enum(RENT_COMPONENT_KINDS as unknown as [string, ...string[]]),
+    label: z.string().trim().min(1).max(60),
+    amount: z.number().nonnegative(),
+  })).max(12),
+})
+leasesRouter.put('/:id/rent-components', requirePerm('leases.edit'), async (req, res, next) => {
+  const client = await getClient()
+  try {
+    const { components } = rentComponentsSchema.parse(req.body)
+    const lease = await queryOne<any>('SELECT id, landlord_id, rent_amount::float AS rent_amount FROM leases WHERE id=$1', [req.params.id])
+    if (!lease) throw new AppError(404, 'Lease not found')
+    if (!canManageLandlordResource(req.user, lease.landlord_id)) throw new AppError(403, 'Forbidden')
+
+    // Components itemize the rent — they must reconcile to the lease total. Skip
+    // the check only when clearing the split entirely (empty array).
+    if (components.length > 0) {
+      const sum = Math.round(components.reduce((s, c) => s + c.amount, 0) * 100) / 100
+      if (Math.abs(sum - lease.rent_amount) > 0.01) {
+        throw new AppError(400, `Rent components must add up to the lease rent ($${lease.rent_amount.toFixed(2)}). They currently total $${sum.toFixed(2)}.`)
+      }
+    }
+
+    await client.query('BEGIN')
+    await client.query('DELETE FROM lease_rent_components WHERE lease_id=$1', [lease.id])
+    for (let i = 0; i < components.length; i++) {
+      const c = components[i]
+      await client.query(
+        `INSERT INTO lease_rent_components (lease_id, kind, label, amount, sort_order)
+         VALUES ($1,$2,$3,$4,$5)`,
+        [lease.id, c.kind, c.label, c.amount.toFixed(2), i])
+    }
+    await client.query('COMMIT')
+
+    const saved = await query<any>(
+      `SELECT id, kind, label, amount, sort_order FROM lease_rent_components
+        WHERE lease_id=$1 ORDER BY sort_order, created_at`, [lease.id])
+    res.json({ success: true, data: saved })
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    next(e)
+  } finally {
+    client.release()
+  }
 })
 
 // ─────────────────────────────────────────────────────────────
@@ -1042,10 +1107,119 @@ leasesRouter.post('/:id/non-renewal', requirePerm('leases.edit'), async (req, re
   } catch (e) { next(e) }
 })
 
+// POST /api/leases/:id/offer-renewal — S562 (Nic): LANDLORD-FIRST renewal.
+// The landlord decides first whether they're even willing to renew (they may be
+// remodeling, re-letting, or have someone lined up). Only their offer RELEASES
+// the "do you want to renew?" survey to the tenant — there's no reason to ask
+// the tenant if the landlord doesn't plan to renew. After the tenant responds
+// yes, the landlord drafts the renewal lease via the existing e-sign flow.
+// Idempotent: re-offering just refreshes the timestamp.
+// S576 Snowbird Phase 1: hibernate / resume a seasonal lease. Hibernate flips
+// the lease dormant for the off-season — invoiceGeneration + platformFeeAccrual
+// gate on is_hibernating, so NO rent/utility invoices generate and NO platform
+// fee accrues; the deposit stays held; the tenancy record persists; and the ACH
+// mandate is UNTOUCHED (rent is invoice-driven, so no invoice = no pull → the
+// snowbird is never charged in the off-season). Any active work-trade agreement
+// for the unit+tenant pauses in lockstep. Resume clears the flag, reactivates
+// the work-trade, and billing restarts on the next cron.
+// Phase 1 FOLLOW-ON (not yet wired): settle the final arrears utility (final
+// read → bill → pull) BEFORE hibernating so nothing bills into the dead season;
+// and a precise paused_by_hibernation marker so resume only reactivates what
+// hibernation paused. See ~/gam/SNOWBIRD_SEASONAL_SPEC.md.
+leasesRouter.post('/:id/hibernate', requirePerm('leases.edit'), async (req, res, next) => {
+  const client = await getClient()
+  try {
+    const lease = await queryOne<any>(
+      `SELECT l.*, u.unit_number FROM leases l JOIN units u ON u.id=l.unit_id WHERE l.id=$1`, [req.params.id])
+    if (!lease) throw new AppError(404, 'Lease not found')
+    if (!canManageLandlordResource(req.user, lease.landlord_id)) throw new AppError(403, 'Forbidden')
+    if (lease.status !== 'active') throw new AppError(409, `Lease is ${lease.status}, not active — only an active lease can hibernate`)
+    if (lease.is_hibernating) throw new AppError(409, 'Lease is already hibernating')
+
+    await client.query('BEGIN')
+    await client.query(`UPDATE leases SET is_hibernating=TRUE, hibernated_at=NOW(), updated_at=NOW() WHERE id=$1`, [lease.id])
+    const paused = await client.query(
+      `UPDATE work_trade_agreements SET status='paused', updated_at=NOW()
+        WHERE unit_id=$1 AND status='active'
+          AND tenant_id IN (SELECT tenant_id FROM lease_tenants WHERE lease_id=$2 AND status='active')
+        RETURNING id`, [lease.unit_id, lease.id])
+    await client.query('COMMIT')
+    logger.info(`[hibernate] lease ${lease.id} (unit ${lease.unit_number}) → dormant; paused ${paused.rowCount} work-trade agreement(s)`)
+    res.json({ success: true, data: { id: lease.id, isHibernating: true, workTradePaused: paused.rowCount } })
+  } catch (e) { await client.query('ROLLBACK').catch(() => {}); next(e) } finally { client.release() }
+})
+
+leasesRouter.post('/:id/resume', requirePerm('leases.edit'), async (req, res, next) => {
+  const client = await getClient()
+  try {
+    const lease = await queryOne<any>(
+      `SELECT l.*, u.unit_number FROM leases l JOIN units u ON u.id=l.unit_id WHERE l.id=$1`, [req.params.id])
+    if (!lease) throw new AppError(404, 'Lease not found')
+    if (!canManageLandlordResource(req.user, lease.landlord_id)) throw new AppError(403, 'Forbidden')
+    if (!lease.is_hibernating) throw new AppError(409, 'Lease is not hibernating')
+
+    await client.query('BEGIN')
+    await client.query(`UPDATE leases SET is_hibernating=FALSE, hibernated_at=NULL, updated_at=NOW() WHERE id=$1`, [lease.id])
+    const resumed = await client.query(
+      `UPDATE work_trade_agreements SET status='active', updated_at=NOW()
+        WHERE unit_id=$1 AND status='paused'
+          AND tenant_id IN (SELECT tenant_id FROM lease_tenants WHERE lease_id=$2 AND status='active')
+        RETURNING id`, [lease.unit_id, lease.id])
+    await client.query('COMMIT')
+    logger.info(`[resume] lease ${lease.id} (unit ${lease.unit_number}) → active; reactivated ${resumed.rowCount} work-trade agreement(s)`)
+    res.json({ success: true, data: { id: lease.id, isHibernating: false, workTradeResumed: resumed.rowCount } })
+  } catch (e) { await client.query('ROLLBACK').catch(() => {}); next(e) } finally { client.release() }
+})
+
+leasesRouter.post('/:id/offer-renewal', requirePerm('leases.edit'), async (req, res, next) => {
+  try {
+    const lease = await queryOne<any>(`
+      SELECT l.id, l.landlord_id, l.status, l.end_date, u.unit_number, p.name AS property_name
+        FROM leases l
+        JOIN units u ON u.id = l.unit_id
+        JOIN properties p ON p.id = u.property_id
+       WHERE l.id = $1`, [req.params.id])
+    if (!lease) throw new AppError(404, 'Lease not found')
+    if (!canManageLandlordResource(req.user, lease.landlord_id)) throw new AppError(403, 'Forbidden')
+    if (lease.status !== 'active') throw new AppError(409, `Lease is ${lease.status}, not active`)
+
+    await query(
+      `UPDATE leases SET landlord_renewal_offered_at = NOW(), updated_at = NOW() WHERE id = $1`,
+      [lease.id])
+
+    // Release the survey to the tenant(s) — notify them their landlord is willing
+    // to renew and would like to know their plans.
+    const roster = await query<any>(`
+      SELECT u.id AS user_id, u.email FROM lease_tenants lt
+      JOIN tenants t ON t.id = lt.tenant_id
+      JOIN users u ON u.id = t.user_id
+      WHERE lt.lease_id = $1 AND lt.status = 'active'`, [lease.id])
+    const { createNotification } = await import('../services/notifications')
+    for (const r of roster as any[]) {
+      await createNotification({
+        userId: r.user_id,
+        landlordId: lease.landlord_id,
+        type: 'lease_renewal_offered',
+        title: `Renewal offered — Unit ${lease.unit_number}`,
+        body: `Your landlord at ${lease.property_name} is willing to renew your lease. Open your Lease page to let them know whether you'd like to renew.`,
+        data: { leaseId: lease.id },
+        actionUrl: '/lease',
+        sendEmail: true,
+        emailTo: r.email,
+        emailSubject: `Your landlord is offering to renew — Unit ${lease.unit_number}`,
+      })
+    }
+    res.json({ success: true, data: { leaseId: lease.id, offeredAt: new Date().toISOString(), notified: (roster as any[]).length } })
+  } catch (e) { next(e) }
+})
+
 // POST /api/leases/:id/renewal-intent — S556: the TENANT's answer to the
 // "do you plan to renew?" survey shown near lease expiry. Records the intent on
 // the lease (so the survey hides), opens a renewal request when they want to
 // renew, and notifies the landlord. Tenant-facing (mirrors terminate-early auth).
+// S562: gated — the tenant only SEES this survey after the landlord offers
+// renewal (landlord_renewal_offered_at set); the tenant UI enforces it, and the
+// landlord-first model means a bare 'yes' here always follows an offer.
 leasesRouter.post('/:id/renewal-intent', requireAuth, async (req, res, next) => {
   try {
     const u = req.user!
@@ -1090,13 +1264,20 @@ leasesRouter.post('/:id/renewal-intent', requireAuth, async (req, res, next) => 
       `SELECT u.id AS user_id, u.email FROM landlords la JOIN users u ON u.id = la.user_id WHERE la.id=$1`,
       [lease.landlord_id])
     if (landlord) {
-      const label = intent === 'yes' ? 'plans to renew' : intent === 'no' ? 'does NOT plan to renew' : 'is unsure about renewing'
+      // S562: "no" is BINDING written notice of non-renewal — auto-renew is
+      // retired system-wide, so the lease WILL expire at its end_date. Frame it
+      // as the formal notice it is (not a soft "response").
+      const label = intent === 'yes'
+        ? 'plans to renew'
+        : intent === 'no'
+          ? 'has given written notice they will NOT renew — the lease ends on its end date'
+          : 'is unsure about renewing'
       const { createNotification } = await import('../services/notifications')
       await createNotification({
         userId: landlord.user_id,
         landlordId: lease.landlord_id,
         type: 'tenant_renewal_intent',
-        title: `Renewal response — Unit ${lease.unit_number}`,
+        title: intent === 'no' ? `Non-Renewal Notice — Unit ${lease.unit_number}` : `Renewal response — Unit ${lease.unit_number}`,
         body: `Your tenant at ${lease.property_name} (Unit ${lease.unit_number}) ${label}.${notes ? ` Note: "${notes}"` : ''}`,
         data: { leaseId: lease.id, intent },
         actionUrl: '/leases',

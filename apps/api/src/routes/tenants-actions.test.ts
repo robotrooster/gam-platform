@@ -2,7 +2,6 @@
  * tenants.ts tenant-action slice — S376 (tenants.ts slice 3 of N).
  *
  * Covered routes (5):
- *   - POST /enroll-on-time-pay — deprecated 410 stub (S155)
  *   - POST /enroll-credit-reporting — credit_reporting_enrolled flag flip
  *   - GET  /payments — last 24 payments for the calling tenant
  *   - POST /me/deposit/portability/decline — service pass-through
@@ -103,28 +102,6 @@ async function seedFixture(): Promise<TFixture> {
   } catch (e) { await client.query('ROLLBACK'); throw e }
   finally { client.release() }
 }
-
-describe('OTP enrollment (deprecated S155)', () => {
-  it('POST /enroll-on-time-pay → 410 Gone with deprecation message; no DB write', async () => {
-    const f = await seedFixture()
-    // Pre-state: confirm the column starts FALSE so we can prove
-    // the 410 stub doesn't write.
-    const pre = await db.query<{ on_time_pay_enrolled: boolean }>(
-      `SELECT on_time_pay_enrolled FROM tenants WHERE id=$1`, [f.tenantId])
-    expect(pre.rows[0].on_time_pay_enrolled).toBe(false)
-
-    const res = await request(buildApp())
-      .post('/api/tenants/enroll-on-time-pay')
-      .set('Authorization', `Bearer ${f.token}`)
-    expect(res.status).toBe(410)
-    expect(res.body.success).toBe(false)
-    expect(res.body.error).toMatch(/deprecated/i)
-
-    const post = await db.query<{ on_time_pay_enrolled: boolean }>(
-      `SELECT on_time_pay_enrolled FROM tenants WHERE id=$1`, [f.tenantId])
-    expect(post.rows[0].on_time_pay_enrolled).toBe(false)
-  })
-})
 
 describe('Credit reporting enrollment (FlexCredit)', () => {
   it('flag OFF (default): does NOT flip the column, returns visible:false', async () => {

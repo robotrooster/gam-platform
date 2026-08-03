@@ -11,6 +11,7 @@ import {
   type ConnectEntity,
 } from '../services/stripeConnect'
 import { assertLiveLandlordMember } from '../services/landlordMembership'
+import { logger } from '../lib/logger'
 
 export const stripeRouter = Router()
 stripeRouter.use(requireAuth)
@@ -216,17 +217,24 @@ stripeRouter.post('/tenant/setup', async (req: any, res, next) => {
         ? {
             customer:             customerId!,
             payment_method_types: ['us_bank_account'],
+            // S570 (Nic): microdeposits, NOT Financial Connections instant
+            // verification — instant bills $1.50/verification (see lib/stripe.ts
+            // createTenantAchSetup). Free microdeposit verification instead.
             payment_method_options: {
               us_bank_account: {
-                financial_connections: { permissions: ['payment_method'] },
-                verification_method:   'instant',
+                verification_method: 'microdeposits',
               },
             },
+            metadata: { tenantId: req.user!.profileId },
           }
         : {
             customer:             customerId!,
             payment_method_types: ['card'],
             usage:                'off_session',
+            // S571: tag the card SetupIntent so the setup_intent.succeeded
+            // webhook can identify the tenant and turn on mandatory email 2FA
+            // (card = a saved payment method). ACH tags tenantId already.
+            metadata: { tenantId: req.user!.profileId, gam_purpose: 'tenant_card_setup' },
           }
     )
 
@@ -255,6 +263,13 @@ stripeRouter.post('/tenant/confirm-setup', async (req: any, res, next) => {
 
     const stripe = getStripe()
     const pm = await stripe.paymentMethods.retrieve(paymentMethodId)
+    // S570: with microdeposit verification the account is NOT verified at
+    // confirm time — the SetupIntent sits in requires_action/processing for
+    // 1–3 days until the deposits are confirmed, then setup_intent.succeeded
+    // (webhooks.ts) flips ach_verified. Only mark verified here if it already
+    // succeeded (e.g. a card, or an already-verified reuse).
+    const si = await stripe.setupIntents.retrieve(setupIntentId)
+    const verified = si.status === 'succeeded'
 
     // S406 fix #2: pre-fix took paymentMethodId from request body without
     // verifying ownership. A tenant could supply another tenant's PM id
@@ -274,19 +289,48 @@ stripeRouter.post('/tenant/confirm-setup', async (req: any, res, next) => {
     }
     const bank = pm.us_bank_account
 
+    // Stamp the bank metadata regardless (available on the PM once attached),
+    // but only flip ach_verified when the SetupIntent actually succeeded.
     await query(
-      `UPDATE tenants SET ach_verified = TRUE, bank_last4 = $1, bank_routing_last4 = $2 WHERE id = $3`,
-      [bank?.last4 || null, bank?.routing_number?.slice(-4) || null, req.user!.profileId]
+      `UPDATE tenants SET ach_verified = $1, bank_last4 = $2, bank_routing_last4 = $3 WHERE id = $4`,
+      [verified, bank?.last4 || null, bank?.routing_number?.slice(-4) || null, req.user!.profileId]
     )
 
-    // Log first-sender detection for NACHA monitoring
-    await query(`
-      INSERT INTO ach_monitoring_log (event_type, tenant_id, bank_fingerprint, notes)
-      VALUES ('first_sender', $1, $2, 'New bank account added — first-time sender tracking initiated')`,
-      [req.user!.profileId, `${bank?.routing_number}_${bank?.last4}`]
-    )
+    // S571: email 2FA is mandatory for every tenant from signup (enforced at
+    // login), so no payment-method-triggered flip is needed here.
 
-    res.json({ success: true, message: 'Bank account verified. ACH collections active.' })
+    // S571: exactly ONE bank on file — a new bank supersedes the old one (swap
+    // within type; card is untouched). And ACH becomes the DEFAULT method (Nic:
+    // ACH defaults when set up; the tenant can later switch to card).
+    try {
+      const banks = await stripe.paymentMethods.list({ customer: tenant.stripe_customer_id!, type: 'us_bank_account', limit: 20 })
+      for (const opm of banks.data) {
+        if (opm.id !== paymentMethodId) await stripe.paymentMethods.detach(opm.id)
+      }
+      await stripe.customers.update(tenant.stripe_customer_id!, {
+        invoice_settings: { default_payment_method: paymentMethodId },
+      })
+    } catch (e) {
+      logger.error({ err: e }, '[stripe] one-bank swap / default set failed')
+    }
+
+    if (verified) {
+      // Log first-sender detection for NACHA monitoring (only once verified;
+      // the microdeposit path logs this from the setup_intent.succeeded webhook).
+      await query(`
+        INSERT INTO ach_monitoring_log (event_type, tenant_id, bank_fingerprint, notes)
+        VALUES ('first_sender', $1, $2, 'New bank account added — first-time sender tracking initiated')`,
+        [req.user!.profileId, `${bank?.routing_number}_${bank?.last4}`]
+      )
+      return res.json({ success: true, verified: true, message: 'Bank account verified. ACH collections active.' })
+    }
+
+    res.json({
+      success: true,
+      verified: false,
+      status: si.status,
+      message: 'We sent two small deposits to your bank. They arrive in 1–3 business days — check the email from Stripe and confirm the amounts to finish setup.',
+    })
   } catch (e) { next(e) }
 })
 
@@ -300,8 +344,8 @@ stripeRouter.get('/tenant/payment-methods', async (req: any, res, next) => {
     if (req.user!.role !== 'tenant') {
       throw new AppError(403, 'Tenants only')
     }
-    const tenant = await queryOne<{ stripe_customer_id: string | null }>(
-      `SELECT stripe_customer_id FROM tenants WHERE id = $1`,
+    const tenant = await queryOne<{ stripe_customer_id: string | null; ach_verified: boolean }>(
+      `SELECT stripe_customer_id, ach_verified FROM tenants WHERE id = $1`,
       [req.user!.profileId]
     )
     if (!tenant) throw new AppError(404, 'Tenant not found')
@@ -309,7 +353,7 @@ stripeRouter.get('/tenant/payment-methods', async (req: any, res, next) => {
       return res.json({ success: true, data: [] })
     }
     const stripe = getStripe()
-    const [achList, cardList] = await Promise.all([
+    const [achList, cardList, customer] = await Promise.all([
       stripe.paymentMethods.list({
         customer: tenant.stripe_customer_id,
         type: 'us_bank_account',
@@ -320,12 +364,25 @@ stripeRouter.get('/tenant/payment-methods', async (req: any, res, next) => {
         type: 'card',
         limit: 20,
       }),
+      stripe.customers.retrieve(tenant.stripe_customer_id),
     ])
+    // S571: which method is the tenant's default (ACH by default; overridable).
+    const defaultPmId = (customer && !('deleted' in customer && customer.deleted))
+      ? ((customer as any).invoice_settings?.default_payment_method as string | null) ?? null
+      : null
+    // S570: `verified` gates whether a bank can actually be charged. With
+    // microdeposit verification a just-linked bank is attached but NOT yet
+    // verified — Stripe rejects a charge against it until the tenant confirms
+    // the two deposits (setup_intent.succeeded webhook flips ach_verified).
+    // Launch reality is one bank per tenant, so the tenant-level flag is the
+    // per-method signal; a multi-bank tenant is a post-launch refinement.
     const ach = achList.data.map((pm) => ({
-      id:       pm.id,
-      type:     'ach' as const,
-      bankName: pm.us_bank_account?.bank_name ?? null,
-      last4:    pm.us_bank_account?.last4 ?? null,
+      id:        pm.id,
+      type:      'ach' as const,
+      bankName:  pm.us_bank_account?.bank_name ?? null,
+      last4:     pm.us_bank_account?.last4 ?? null,
+      verified:  !!tenant.ach_verified,
+      isDefault: pm.id === defaultPmId,
     }))
     const card = cardList.data.map((pm) => ({
       id:        pm.id,
@@ -335,7 +392,66 @@ stripeRouter.get('/tenant/payment-methods', async (req: any, res, next) => {
       expMonth:  pm.card?.exp_month ?? null,
       expYear:   pm.card?.exp_year ?? null,
       country:   pm.card?.country ?? null,
+      verified:  true,   // cards are chargeable immediately
+      isDefault: pm.id === defaultPmId,
     }))
     res.json({ success: true, data: [...ach, ...card] })
+  } catch (e) { next(e) }
+})
+
+// POST /api/stripe/tenant/confirm-card — after a card SetupIntent succeeds the
+// frontend calls this so we enforce exactly ONE card on file (a new card
+// supersedes the old; the bank is untouched). Card becomes default only if the
+// tenant has no default yet — a saved ACH keeps priority (Nic).
+stripeRouter.post('/tenant/confirm-card', async (req: any, res, next) => {
+  try {
+    if (req.user!.role !== 'tenant') throw new AppError(403, 'Tenants only')
+    const { paymentMethodId } = z.object({ paymentMethodId: z.string() }).parse(req.body)
+    const tenant = await queryOne<{ stripe_customer_id: string | null }>(
+      `SELECT stripe_customer_id FROM tenants WHERE id = $1`, [req.user!.profileId])
+    if (!tenant?.stripe_customer_id) throw new AppError(409, 'Stripe customer not initialized')
+
+    const stripe = getStripe()
+    const pm = await stripe.paymentMethods.retrieve(paymentMethodId)
+    if (pm.customer !== tenant.stripe_customer_id || pm.type !== 'card') {
+      throw new AppError(403, 'Card does not belong to this tenant')
+    }
+    // Swap: detach any other card on file.
+    const cards = await stripe.paymentMethods.list({ customer: tenant.stripe_customer_id, type: 'card', limit: 20 })
+    for (const opm of cards.data) {
+      if (opm.id !== paymentMethodId) await stripe.paymentMethods.detach(opm.id)
+    }
+    // Default only if nothing is set yet (don't steal from ACH).
+    const customer = await stripe.customers.retrieve(tenant.stripe_customer_id)
+    const hasDefault = !('deleted' in customer && customer.deleted)
+      && !!(customer as any).invoice_settings?.default_payment_method
+    if (!hasDefault) {
+      await stripe.customers.update(tenant.stripe_customer_id, {
+        invoice_settings: { default_payment_method: paymentMethodId },
+      })
+    }
+    res.json({ success: true, data: { id: paymentMethodId } })
+  } catch (e) { next(e) }
+})
+
+// PATCH /api/stripe/tenant/default-payment-method — tenant chooses which saved
+// method is the default (e.g. switch from ACH to card, accepting card fees).
+stripeRouter.patch('/tenant/default-payment-method', async (req: any, res, next) => {
+  try {
+    if (req.user!.role !== 'tenant') throw new AppError(403, 'Tenants only')
+    const { paymentMethodId } = z.object({ paymentMethodId: z.string() }).parse(req.body)
+    const tenant = await queryOne<{ stripe_customer_id: string | null }>(
+      `SELECT stripe_customer_id FROM tenants WHERE id = $1`, [req.user!.profileId])
+    if (!tenant?.stripe_customer_id) throw new AppError(409, 'Stripe customer not initialized')
+
+    const stripe = getStripe()
+    const pm = await stripe.paymentMethods.retrieve(paymentMethodId)
+    if (pm.customer !== tenant.stripe_customer_id) {
+      throw new AppError(403, 'Payment method does not belong to this tenant')
+    }
+    await stripe.customers.update(tenant.stripe_customer_id, {
+      invoice_settings: { default_payment_method: paymentMethodId },
+    })
+    res.json({ success: true, data: { defaultPaymentMethodId: paymentMethodId } })
   } catch (e) { next(e) }
 })

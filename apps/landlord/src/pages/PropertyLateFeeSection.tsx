@@ -270,37 +270,7 @@ function UnitTypeRows({ propertyId, masterEnabled }: { propertyId: string; maste
 }
 
 
-// S537 (Nic): partial payments reset the eviction clock — the landlord
-// can refuse anything under the full outstanding balance, per property.
-// The tenant portal's single Pay Now enforces this server-side.
-export function PaymentAcceptanceCard({ property, onSaved }: { property: any; onSaved: () => void }) {
-  const qc = useQueryClient()
-  const [accept, setAccept] = useState(property?.acceptPartialPayments !== false)
-  const [err, setErr] = useState<string | null>(null)
-  useEffect(() => { setAccept(property?.acceptPartialPayments !== false) }, [property?.id, property?.acceptPartialPayments])
-  const mut = useMutation(
-    (on: boolean) => apiPatch(`/properties/${property.id}`, { acceptPartialPayments: on }),
-    { onSuccess: () => { setErr(null); qc.invalidateQueries('properties'); onSaved() },
-      onError: (e: any) => { setAccept(property?.acceptPartialPayments !== false); setErr(e?.response?.data?.error || 'Could not save') } }
-  )
-  return (
-    <div className="card" style={{ padding: 14, marginBottom: 20 }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
-        <Clock size={15} style={{ color: 'var(--gold)' }} />
-        <h2 style={{ fontSize: '1rem', fontWeight: 600, margin: 0 }}>Payment Acceptance</h2>
-      </div>
-      <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '.82rem', cursor: 'pointer' }}>
-        <input type="checkbox" checked={accept} disabled={mut.isLoading}
-          onChange={e => { setAccept(e.target.checked); mut.mutate(e.target.checked) }} />
-        Accept partial payments at this property
-      </label>
-      <div style={{ fontSize: '.75rem', color: 'var(--text-3)', lineHeight: 1.5, marginTop: 6 }}>
-        Tenants pay any amount toward their balance (applied oldest-first), including paying ahead.
-        Turn this OFF if you are preparing an eviction — accepting a partial payment can reset the
-        eviction clock. When off, the tenant&apos;s Pay Now requires the full outstanding balance.
-        Check your local laws.
-      </div>
-      {err && <div style={{ fontSize: '.76rem', color: 'var(--red, #dc2626)', marginTop: 6 }}>{err}</div>}
-    </div>
-  )
-}
+// PaymentAcceptanceCard (S537 accept-partial-payments toggle) REMOVED — Nic:
+// rent is pay-in-full only across the whole system, so there is no per-property
+// partial-payment setting. The tenant portal always requires the full balance
+// and /pay-balance enforces it server-side.

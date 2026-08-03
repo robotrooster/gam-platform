@@ -139,17 +139,24 @@ interface CreateOpts {
   windowEndIso?:  string
 }
 
+// S571: entry is anchored to a maintenance call. The helper seeds one on the
+// target unit (default the fixture's), then posts the entry with that anchor.
 async function createRequest(
   f: ERFixture, token: string, opts: CreateOpts = {},
 ) {
+  const unitId = opts.unitId ?? f.unitId
+  const tenantId = opts.tenantId ?? f.tenantId
+  const { rows: [u] } = await db.query<{ landlord_id: string }>(
+    `SELECT landlord_id FROM units WHERE id=$1`, [unitId])
+  const { rows: [mr] } = await db.query<{ id: string }>(
+    `INSERT INTO maintenance_requests (unit_id, tenant_id, landlord_id, title, description, category, priority)
+     VALUES ($1,$2,$3,'Test repair','Something to fix','plumbing','normal') RETURNING id`,
+    [unitId, tenantId, u.landlord_id])
   return request(buildApp())
     .post('/api/entry-requests')
     .set('Authorization', `Bearer ${token}`)
     .send({
-      unitId:                   opts.unitId   ?? f.unitId,
-      tenantId:                 opts.tenantId ?? f.tenantId,
-      reason:                   'Filter inspection',
-      reasonCategory:           opts.reasonCategory ?? 'inspection',
+      maintenanceRequestId:     mr.id,
       proposedEntryWindowStart: opts.windowStartIso ?? '2026-07-01T14:00:00Z',
       proposedEntryWindowEnd:   opts.windowEndIso   ?? '2026-07-01T16:00:00Z',
     })
@@ -173,7 +180,7 @@ describe('POST /api/entry-requests — create', () => {
       `SELECT status, reason_category FROM unit_entry_requests WHERE id=$1`,
       [res.body.data.id])
     expect(row.rows[0].status).toBe('pending')
-    expect(row.rows[0].reason_category).toBe('inspection')
+    expect(row.rows[0].reason_category).toBe('maintenance')
 
     expect(notifyEntryRequestNewMock).toHaveBeenCalledTimes(1)
   })
@@ -188,16 +195,32 @@ describe('POST /api/entry-requests — create', () => {
     expect(rows.rows.length).toBe(0)
   })
 
-  it('S351 F1: random tenantId UUID → 404 "Tenant not found" (post-S351 fix)', async () => {
-    // Pre-S351: 500 with raw postgres FK violation
-    // (unit_entry_requests_tenant_id_fkey). Post-S351 the route
-    // pre-checks tenant existence and returns 404 with a clean error.
+  it('S571: no anchor (neither maintenance call nor inspection) → 400', async () => {
     const f = await seedERFixture()
-    const res = await createRequest(f, f.landlordToken, { tenantId: randomUUID() })
-    expect(res.status).toBe(404)
-    expect(res.body.error).toMatch(/Tenant not found/)
+    const res = await request(buildApp())
+      .post('/api/entry-requests')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({
+        proposedEntryWindowStart: '2026-07-01T14:00:00Z',
+        proposedEntryWindowEnd:   '2026-07-01T16:00:00Z',
+      })
+    expect(res.status).toBeGreaterThanOrEqual(400)
+    expect(res.status).toBeLessThan(500)
     const rows = await db.query(`SELECT id FROM unit_entry_requests`)
     expect(rows.rows.length).toBe(0)
+  })
+
+  it('S571: an unknown maintenance-request anchor → 404', async () => {
+    const f = await seedERFixture()
+    const res = await request(buildApp())
+      .post('/api/entry-requests')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({
+        maintenanceRequestId:     randomUUID(),
+        proposedEntryWindowStart: '2026-07-01T14:00:00Z',
+        proposedEntryWindowEnd:   '2026-07-01T16:00:00Z',
+      })
+    expect(res.status).toBe(404)
   })
 
   it('window end before window start → 400', async () => {

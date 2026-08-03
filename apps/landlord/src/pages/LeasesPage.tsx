@@ -2,13 +2,14 @@ import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useSearchParams, useNavigate, Link } from 'react-router-dom'
 import { apiGet, apiPost } from '../lib/api'
-import { UserPlus, AlertTriangle, DollarSign, FileText, Eye, X } from 'lucide-react'
+import { UserPlus, AlertTriangle, DollarSign, FileText, Eye, X, Pause, Play } from 'lucide-react'
 import { LEASE_TYPE_LABEL, LeaseStatus, humanize } from '@gam/shared'
 import { toast, appConfirm } from '../components/dialogs'
 import { LeaseFormModal } from './LeaseFormModal'
 import { LeaseOverviewModal } from './LeaseOverviewModal'
 import { RenewalDecisionModal } from './RenewalDecisionModal'
 import { usePerms } from '../lib/permissions'
+import { SearchBox, PropertySelect } from '../components/ListControls'
 
 const fmt = (n: any) => n != null
   ? '$' + Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
@@ -38,8 +39,19 @@ export function LeasesPage() {
   // W-7 (S531): renewal decision form — deep-linked from the dashboard
   // to-do's expiring-lease items via ?renew=<leaseId>.
   const [renewalLeaseId, setRenewalLeaseId] = useState<string | null>(null)
+  const [search, setSearch] = useState('')
+  const [propertyId, setPropertyId] = useState('')
   const [searchParams, setSearchParams] = useSearchParams()
   const navigate = useNavigate()
+  const leasesQc = useQueryClient()
+  // S576 Snowbird Phase 1: hibernate (off-season) / resume a seasonal lease.
+  const hibernateMut = useMutation(
+    ({ id, action }: { id: string; action: 'hibernate' | 'resume' }) => apiPost(`/leases/${id}/${action}`, {}),
+    {
+      onSuccess: (_d, v) => { leasesQc.invalidateQueries('leases'); toast(v.action === 'hibernate' ? 'Lease hibernated — billing paused for the off-season.' : 'Lease resumed — billing restarts next cycle.') },
+      onError: (e: any) => toast.error(e?.response?.data?.error || e?.message || 'Could not update the lease'),
+    }
+  )
   const { can } = usePerms()
 
   // Deep-link: ?open=<leaseId> opens the edit modal directly
@@ -146,6 +158,20 @@ export function LeasesPage() {
         })
       : baseLeases
 
+  // S576: property dropdown + free-text search over the visible leases (unit,
+  // tenant names, property). Options derive from the full lease set.
+  const propertyOptions = (leases as any[]).map(l => ({ id: l.propertyId, name: l.propertyName }))
+  const q = search.trim().toLowerCase()
+  const displayLeases = visibleLeases.filter((l: any) => {
+    const matchProperty = propertyId === '' || l.propertyId === propertyId
+    if (!matchProperty) return false
+    if (q === '') return true
+    const tenantStr = (l.tenants || []).map((t: any) => `${t.firstName || ''} ${t.lastName || ''}`).join(' ').toLowerCase()
+    return (l.unitNumber || '').toLowerCase().includes(q)
+      || (l.propertyName || '').toLowerCase().includes(q)
+      || tenantStr.includes(q)
+  })
+
   return (
     <div>
       <div className="page-header">
@@ -202,6 +228,11 @@ export function LeasesPage() {
         </div>
       )}
 
+      <div className="filter-bar">
+        <SearchBox value={search} onChange={setSearch} placeholder="Search unit, tenant, property…" />
+        <PropertySelect value={propertyId} onChange={setPropertyId} properties={propertyOptions} />
+      </div>
+
       <div className="card" style={{ padding: 0, overflowX: 'auto' }}>
         {isLoading ? (
           <div style={{ padding: 32, color: 'var(--text-3)', textAlign: 'center' }}>Loading…</div>
@@ -220,7 +251,7 @@ export function LeasesPage() {
               </tr>
             </thead>
             <tbody>
-              {visibleLeases.length ? visibleLeases.map((l: any) => {
+              {displayLeases.length ? displayLeases.map((l: any) => {
                 // S527 fix: the API returns a tenants[] array (multi-tenant
                 // lease model); the old flat tenantFirst/tenantLast fields
                 // were never sent, so this column rendered "—" for every
@@ -309,6 +340,9 @@ export function LeasesPage() {
                       <span className={'badge ' + (STATUS_MAP[l.status as LeaseStatus] || 'badge-muted')}>
                         {humanize(l.status) || '—'}
                       </span>
+                      {l.isHibernating && (
+                        <span className="badge badge-amber" title="Seasonally paused — no rent billed, deposit held, spot bookable off-season" style={{ marginLeft: 4 }}>Hibernating</span>
+                      )}
                     </td>
                     <td onClick={e => e.stopPropagation()}>
                       <div style={{ display: 'flex', gap: 6 }}>
@@ -338,6 +372,19 @@ export function LeasesPage() {
                             style={{ padding: '3px 8px' }}
                           >
                             <DollarSign size={12} /> Move-out
+                          </button>
+                        )}
+                        {can('leases.edit') && l.status === 'active' && (
+                          <button
+                            className="btn btn-ghost btn-sm"
+                            title={l.isHibernating
+                              ? 'Resume this seasonal lease — restart billing'
+                              : 'Hibernate for the off-season — pause billing, hold the spot, deposit stays. Snowbirds.'}
+                            disabled={hibernateMut.isLoading}
+                            onClick={() => hibernateMut.mutate({ id: l.id, action: l.isHibernating ? 'resume' : 'hibernate' })}
+                            style={{ padding: '3px 8px' }}
+                          >
+                            {l.isHibernating ? <><Play size={12} /> Resume</> : <><Pause size={12} /> Hibernate</>}
                           </button>
                         )}
                       </div>

@@ -17,17 +17,27 @@ interface AuthUser {
   // property; else only propertyIds. Owners get allProperties implicitly.
   propertyIds?: string[] | null
   allProperties?: boolean
-  // 2FA state. The landlord role is NOT in the backend's
-  // MANDATORY_TOTP_ROLES, so mustEnrollTotp is always false here —
-  // 2FA is optional-with-prompts. totpEnabled drives the Settings
-  // surface + the dismissible nudge.
+  // S168: per-manager Connect opt-in — gates the /banking nav for managers.
+  directDepositEnabled?: boolean
+  // S575: true when the landlord owns ≥1 mobile-home unit — gates the
+  // "Lot Rent & Net" nav item (MH-only feature).
+  hasMobileHomeUnits?: boolean
+  // 2FA state. S574: email-code 2FA is MANDATORY for every landlord from
+  // signup (auth.ts enforces + canonicalizes email_2fa_enabled on login).
+  // The landlord portal exposes NO authenticator enrollment; totpEnabled is
+  // read-only backward-compat for any legacy TOTP account.
+  email2faEnabled?: boolean
   totpEnabled?: boolean
   mustEnrollTotp?: boolean
 }
 
-// login() returns a discriminated result so LoginPage can branch into
-// the TOTP second step when the backend gates on 2FA.
-type LoginResult = { kind: 'success' } | { kind: 'totp_required'; totpSession: string }
+// login() returns a discriminated result so LoginPage can branch into the
+// second factor. Landlords always hit email_otp_required; totp_required only
+// fires for legacy authenticator accounts (no new landlord can enroll one).
+type LoginResult =
+  | { kind: 'success' }
+  | { kind: 'totp_required'; totpSession: string }
+  | { kind: 'email_otp_required'; emailOtpSession: string }
 
 interface AuthCtx {
   user: AuthUser | null
@@ -35,6 +45,8 @@ interface AuthCtx {
   loading: boolean
   login:  (email: string, password: string) => Promise<LoginResult>
   loginWithTotp: (totpSession: string, code: string) => Promise<void>
+  loginWithEmailOtp: (emailOtpSession: string, code: string) => Promise<void>
+  resendEmailOtp: (emailOtpSession: string) => Promise<void>
   logout: () => void
   refresh: () => Promise<void>
 }
@@ -76,6 +88,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     if (data.requiresTotp) {
       return { kind: 'totp_required', totpSession: data.totpSession as string }
     }
+    // S574: mandatory email-code 2FA — the backend emailed a code and returned
+    // a pending session instead of the full token.
+    if (data.requiresEmailOtp) {
+      return { kind: 'email_otp_required', emailOtpSession: data.emailOtpSession as string }
+    }
     localStorage.setItem('gam_token', data.token)
     setToken(data.token)
     setUser(data.user ?? data)
@@ -94,5 +111,19 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     await refresh()
   }
 
-  return <Ctx.Provider value={{ user, token, loading, login, loginWithTotp, logout, refresh }}>{children}</Ctx.Provider>
+  // S574: email-code second-step exchange. Trades the pending email_otp_session
+  // JWT (from /login) plus the 6-digit emailed code for the full session JWT.
+  const loginWithEmailOtp = async (emailOtpSession: string, code: string): Promise<void> => {
+    const res = await apiPost<{ token: string }>('/auth/email-otp/verify', { emailOtpSession, code })
+    localStorage.setItem('gam_token', res.data!.token)
+    setToken(res.data!.token)
+    await refresh()
+  }
+
+  // Resend a fresh email code (supersedes the prior one) for the same pending session.
+  const resendEmailOtp = async (emailOtpSession: string): Promise<void> => {
+    await apiPost('/auth/email-otp/resend', { emailOtpSession })
+  }
+
+  return <Ctx.Provider value={{ user, token, loading, login, loginWithTotp, loginWithEmailOtp, resendEmailOtp, logout, refresh }}>{children}</Ctx.Provider>
 }

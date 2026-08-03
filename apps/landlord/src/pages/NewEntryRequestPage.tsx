@@ -1,8 +1,9 @@
 import { useState } from 'react'
 import { useQuery, useMutation } from 'react-query'
 import { useNavigate } from 'react-router-dom'
-import { DoorOpen, ArrowLeft, AlertTriangle, Check } from 'lucide-react'
+import { DoorOpen, ArrowLeft, AlertTriangle, Check, Wrench, ClipboardCheck } from 'lucide-react'
 import { apiGet, apiPost } from '../lib/api'
+import { humanize } from '@gam/shared'
 import { LawWarningBanner, type LawFlag } from '../components/LawWarningBanner'
 
 interface CreateResponseData {
@@ -16,10 +17,11 @@ interface CreateResponseData {
 
 export function NewEntryRequestPage() {
   const navigate = useNavigate()
-  const [unitId, setUnitId] = useState('')
-  const [tenantId, setTenantId] = useState('')
-  const [reason, setReason] = useState('')
-  const [reasonCategory, setReasonCategory] = useState<'maintenance' | 'inspection' | 'showing' | 'emergency' | 'other'>('maintenance')
+  // S571: entry is anchored to a real maintenance call OR a scheduled
+  // inspection — the unit/tenant/reason all derive from it. No free reason.
+  const [anchorType, setAnchorType] = useState<'maintenance' | 'inspection'>('maintenance')
+  const [maintenanceRequestId, setMaintenanceRequestId] = useState('')
+  const [inspectionId, setInspectionId] = useState('')
   const [windowStart, setWindowStart] = useState('')
   const [windowEnd, setWindowEnd] = useState('')
   const [error, setError] = useState<string | null>(null)
@@ -28,8 +30,12 @@ export function NewEntryRequestPage() {
   // landlord can read them before navigating to the request detail.
   const [submittedResult, setSubmittedResult] = useState<CreateResponseData | null>(null)
 
-  const { data: units = [] } = useQuery<any[]>('units', () => apiGet<any[]>('/units'))
-  const { data: tenants = [] } = useQuery<any[]>('tenants', () => apiGet<any[]>('/tenants'))
+  // Open maintenance calls the landlord could enter for.
+  const { data: maintenance = [] } = useQuery<any[]>('entry-maint', () => apiGet<any[]>('/maintenance'))
+  const openMaint = (maintenance as any[]).filter(m => m.status !== 'completed' && m.status !== 'cancelled')
+  // Scheduled / in-progress inspections that need access.
+  const { data: inspections = [] } = useQuery<any[]>('entry-inspections', () => apiGet<any[]>('/inspections'))
+  const openInspections = (inspections as any[]).filter(i => i.status !== 'finalized' && i.status !== 'cancelled')
 
   const createMut = useMutation(
     (body: any) => apiPost<CreateResponseData>('/entry-requests', body),
@@ -51,14 +57,12 @@ export function NewEntryRequestPage() {
   const onSubmit = (e: React.FormEvent) => {
     e.preventDefault()
     setError(null)
-    if (!unitId || !tenantId) { setError('Unit and tenant required'); return }
+    const anchorId = anchorType === 'maintenance' ? maintenanceRequestId : inspectionId
+    if (!anchorId) { setError(`Pick a ${anchorType === 'maintenance' ? 'maintenance call' : 'scheduled inspection'} to enter for`); return }
     if (!windowStart || !windowEnd) { setError('Window start/end required'); return }
     if (new Date(windowEnd) <= new Date(windowStart)) { setError('Window end must be after start'); return }
     createMut.mutate({
-      unitId: unitId,
-      tenantId: tenantId,
-      reason,
-      reasonCategory: reasonCategory,
+      ...(anchorType === 'maintenance' ? { maintenanceRequestId } : { inspectionId }),
       proposedEntryWindowStart: new Date(windowStart).toISOString(),
       proposedEntryWindowEnd:   new Date(windowEnd).toISOString(),
     })
@@ -139,44 +143,57 @@ export function NewEntryRequestPage() {
           </div>
         )}
 
-        <Field label="Unit">
-          <select value={unitId} onChange={e => setUnitId(e.target.value)} className="input" required>
-            <option value="">— pick a unit —</option>
-            {(units as any[]).map(u => (
-              <option key={u.id} value={u.id}>{u.unitNumber} — {u.propertyName}</option>
+        <div style={{ fontSize: '.78rem', color: 'var(--text-2)', marginBottom: 14, lineHeight: 1.5 }}>
+          Entry is tied to a specific reason the tenant can already see — pick a maintenance call or a scheduled inspection. The unit and tenant come from it automatically.
+        </div>
+
+        <Field label="Entry for">
+          <div style={{ display: 'flex', gap: 8 }}>
+            {([['maintenance', 'Maintenance call', Wrench], ['inspection', 'Scheduled inspection', ClipboardCheck]] as const).map(([val, label, Icon]) => (
+              <button key={val} type="button" onClick={() => { setAnchorType(val); setError(null) }}
+                style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 7, padding: '10px', borderRadius: 8, cursor: 'pointer', fontSize: '.82rem', fontWeight: 600,
+                  border: `1px solid ${anchorType === val ? 'var(--gold)' : 'var(--border-0)'}`,
+                  background: anchorType === val ? 'rgba(201,162,39,.08)' : 'var(--bg-2)',
+                  color: anchorType === val ? 'var(--gold)' : 'var(--text-3)' }}>
+                <Icon size={15} /> {label}
+              </button>
             ))}
-          </select>
+          </div>
         </Field>
 
-        <Field label="Tenant">
-          <select value={tenantId} onChange={e => setTenantId(e.target.value)} className="input" required>
-            <option value="">— pick a tenant —</option>
-            {(tenants as any[]).map(t => (
-              <option key={t.id} value={t.id}>{t.firstName} {t.lastName}</option>
-            ))}
-          </select>
-        </Field>
-
-        <Field label="Reason category">
-          <select value={reasonCategory} onChange={e => setReasonCategory(e.target.value as any)} className="input" required>
-            <option value="maintenance">Maintenance</option>
-            <option value="inspection">Inspection</option>
-            <option value="showing">Showing</option>
-            <option value="emergency">Emergency</option>
-            <option value="other">Other</option>
-          </select>
-        </Field>
-
-        <Field label="Reason details">
-          <textarea
-            value={reason}
-            onChange={e => setReason(e.target.value)}
-            className="input"
-            rows={3}
-            placeholder="What you'll be doing during the visit (visible to tenant)"
-            required
-          />
-        </Field>
+        {anchorType === 'maintenance' ? (
+          <Field label="Which maintenance call">
+            <select value={maintenanceRequestId} onChange={e => setMaintenanceRequestId(e.target.value)} className="input" required>
+              <option value="">— pick an open maintenance call —</option>
+              {openMaint.map(m => (
+                <option key={m.id} value={m.id}>
+                  Unit {m.unitNumber || '—'} · {m.title || 'Request'} ({humanize(m.status)})
+                </option>
+              ))}
+            </select>
+            {openMaint.length === 0 && (
+              <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 6 }}>
+                No open maintenance calls. Entry for a repair starts from a maintenance request.
+              </div>
+            )}
+          </Field>
+        ) : (
+          <Field label="Which inspection">
+            <select value={inspectionId} onChange={e => setInspectionId(e.target.value)} className="input" required>
+              <option value="">— pick a scheduled inspection —</option>
+              {openInspections.map(i => (
+                <option key={i.id} value={i.id}>
+                  Unit {i.unitNumber || '—'} · {humanize(i.inspectionType)}{i.scheduledFor ? ` · ${new Date(i.scheduledFor).toLocaleDateString()}` : ''}
+                </option>
+              ))}
+            </select>
+            {openInspections.length === 0 && (
+              <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 6 }}>
+                No scheduled inspections. Create one from the Inspections page first.
+              </div>
+            )}
+          </Field>
+        )}
 
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
           <Field label="Window start">

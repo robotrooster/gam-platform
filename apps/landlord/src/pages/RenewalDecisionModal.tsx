@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useNavigate } from 'react-router-dom'
 import { apiGet, apiPost } from '../lib/api'
-import { RefreshCw, CalendarX2, FileSignature } from 'lucide-react'
+import { RefreshCw, CalendarX2, FileSignature, Send } from 'lucide-react'
 import { appConfirm } from '../components/dialogs'
 
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
@@ -34,7 +34,7 @@ export function RenewalDecisionModal({ leaseId, onClose }: { leaseId: string; on
   const { data: ctx } = useQuery<any>(['renewal-context', leaseId],
     () => apiGet(`/esign/documents/renewal-context/${leaseId}`))
 
-  const [decision, setDecision] = useState<'renew'|'non_renew'|null>(null)
+  const [decision, setDecision] = useState<'offer'|'renew'|'non_renew'|null>(null)
   const [templateId, setTemplateId] = useState('')
   const [error, setError] = useState<string|null>(null)
   const [working, setWorking] = useState(false)
@@ -114,6 +114,15 @@ export function RenewalDecisionModal({ leaseId, onClose }: { leaseId: string; on
       onError: (e: any) => setError(e?.response?.data?.error || 'Could not record the non-renewal'),
     }
   )
+  // S562: landlord-first — offer renewal releases the "do you want to renew?"
+  // survey to the tenant. You draft the lease only after they say yes.
+  const offerMut = useMutation(
+    () => apiPost(`/leases/${leaseId}/offer-renewal`, {}),
+    {
+      onSuccess: () => { qc.invalidateQueries('landlord-todos'); qc.invalidateQueries(['lease', leaseId]); onClose() },
+      onError: (e: any) => setError(e?.response?.data?.error || 'Could not offer renewal'),
+    }
+  )
 
   const currentRent = lease?.rentAmount != null ? Number(lease.rentAmount) : null
   const canSubmitRenew = !!templateId
@@ -164,7 +173,8 @@ export function RenewalDecisionModal({ leaseId, onClose }: { leaseId: string; on
                 {/* Decision cards */}
                 <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:10, marginBottom:14 }}>
                   {[
-                    { key:'renew', icon:RefreshCw, label:'Renew', desc:'Reuse the lease template — type the new rent and dates into the lease and sign', color:'var(--gold)' },
+                    { key:'offer', icon:Send, label:'Offer Renewal', desc:'Ask the tenant first — releases a "do you want to renew?" survey to them', color:'var(--gold)' },
+                    { key:'renew', icon:RefreshCw, label:'Renew Now', desc:'Skip the survey — draft the renewal lease now and sign it', color:'var(--gold)' },
                     { key:'non_renew', icon:CalendarX2, label:"Don't Renew", desc:'Lease ends on its end date; tenants are notified now', color:'var(--red)' },
                   ].map((c:any) => (
                     <div key={c.key} onClick={()=>{ setDecision(c.key); setError(null) }}
@@ -193,6 +203,12 @@ export function RenewalDecisionModal({ leaseId, onClose }: { leaseId: string; on
                   </div>
                 )}
 
+                {decision === 'offer' && (
+                  <div style={{ background:'rgba(201,162,39,.06)', border:'1px solid rgba(201,162,39,.2)', borderRadius:10, padding:14, marginBottom:14, fontSize:'.78rem', lineHeight:1.5 }}>
+                    The tenant{(lease.tenants||[]).length > 1 ? 's are' : ' is'} asked whether they want to renew. You draft the new lease only after they say yes — so you never prepare a renewal they don't want. If they decline (or the lease reaches its end with no response), it ends on its end date.
+                  </div>
+                )}
+
                 {decision === 'non_renew' && (
                   <div style={{ background:'rgba(255,71,87,.06)', border:'1px solid rgba(255,71,87,.2)', borderRadius:10, padding:14, marginBottom:14, fontSize:'.78rem', lineHeight:1.5 }}>
                     The lease ends <strong>{fmtDate(lease.endDate)}</strong> and will not auto-renew. All tenants on the lease are notified immediately. On the end date the unit is vacated and the deposit-return process starts automatically. Check your local notice-period requirements — some jurisdictions require advance written notice.
@@ -203,6 +219,11 @@ export function RenewalDecisionModal({ leaseId, onClose }: { leaseId: string; on
 
                 <div className="modal-footer">
                   <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+                  {decision === 'offer' && (
+                    <button className="btn btn-primary" disabled={offerMut.isLoading} onClick={()=>offerMut.mutate()}>
+                      {offerMut.isLoading ? 'Offering…' : 'Offer Renewal to Tenant'}
+                    </button>
+                  )}
                   {decision === 'renew' && (
                     <button className="btn btn-primary" disabled={!canSubmitRenew || working} onClick={draftAndOpen}>
                       {working ? 'Drafting…' : 'Draft & Open for Signing'}

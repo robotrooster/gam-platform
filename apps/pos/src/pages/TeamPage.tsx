@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { apiGet, apiPost, apiPatch } from '../lib/api'
+import { apiGet, apiPost, apiPatch, apiPut } from '../lib/api'
 import { Modal } from '../components/Modal'
 import { appConfirm } from '../components/dialogs'
 import {
@@ -11,7 +11,7 @@ import {
   BUSINESS_STAFF_PERMISSIONS_BY_ROLE,
   BusinessStaffPermission,
 } from '@gam/shared'
-import { Settings, RotateCcw, UserX } from 'lucide-react'
+import { Settings, RotateCcw, UserX, KeyRound } from 'lucide-react'
 
 /**
  * S538 — POS-portal team management for standalone operators. Same
@@ -26,6 +26,8 @@ interface StaffRow {
   email: string
   firstName: string; lastName: string
   permissions: BusinessStaffPermission[] | null
+  // S574: whether this staff member has a register lock-screen passcode set.
+  hasPosPasscode?: boolean
 }
 interface PendingInvite {
   id: string
@@ -42,6 +44,7 @@ export function TeamPage() {
   const [inviteRole, setInviteRole] = useState<BusinessStaffRole>('office')
   const [inviting, setInviting] = useState(false)
   const [editing, setEditing] = useState<StaffRow | null>(null)
+  const [passcodeFor, setPasscodeFor] = useState<StaffRow | null>(null)
 
   const reload = async () => {
     try {
@@ -107,6 +110,7 @@ export function TeamPage() {
                   <th>Email</th>
                   <th>Role</th>
                   <th>Permissions</th>
+                  <th>Register passcode</th>
                   <th>Status</th>
                   <th></th>
                 </tr>
@@ -118,13 +122,19 @@ export function TeamPage() {
                     <td>{s.email}</td>
                     <td>{BUSINESS_STAFF_ROLE_LABEL[s.staffRole as BusinessStaffRole] ?? s.staffRole}</td>
                     <td><span style={{ fontSize: '.75rem', color: 'var(--text-3)' }}>{(s.permissions?.length ?? 0)} granted</span></td>
+                    <td>{s.hasPosPasscode
+                      ? <span className="badge badge-green">Set</span>
+                      : <span style={{ fontSize: '.75rem', color: 'var(--text-3)' }}>Not set</span>}</td>
                     <td>{s.status === 'active'
                       ? <span className="badge badge-green">Active</span>
                       : <span className="badge badge-muted" style={{ textTransform: 'capitalize' }}>{s.status}</span>}</td>
                     <td style={{ whiteSpace: 'nowrap' }}>
                       {s.status === 'active' && (
                         <>
-                          <button className="btn btn-ghost btn-sm" onClick={() => setEditing(s)}>
+                          <button className="btn btn-ghost btn-sm" onClick={() => setPasscodeFor(s)}>
+                            <KeyRound size={12} /> Passcode
+                          </button>
+                          <button className="btn btn-ghost btn-sm" style={{ marginLeft: 6 }} onClick={() => setEditing(s)}>
                             <Settings size={12} /> Permissions
                           </button>
                           <button className="btn btn-ghost btn-sm" style={{ color: 'var(--red)', marginLeft: 6 }} onClick={() => onRevoke(s)}>
@@ -198,7 +208,92 @@ export function TeamPage() {
           onClose={() => setEditing(null)}
           onSaved={() => { setEditing(null); reload() }} />
       )}
+
+      {passcodeFor && (
+        <PasscodeModal
+          staff={passcodeFor}
+          onClose={() => setPasscodeFor(null)}
+          onSaved={() => { setPasscodeFor(null); reload() }} />
+      )}
     </div>
+  )
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Register passcode editor (set / clear)
+// ─────────────────────────────────────────────────────────────────
+
+function PasscodeModal({
+  staff, onClose, onSaved,
+}: {
+  staff: StaffRow
+  onClose: () => void
+  onSaved: () => void
+}) {
+  const [passcode, setPasscode] = useState('')
+  const [confirm, setConfirm] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+
+  const valid = /^\d{4,6}$/.test(passcode)
+  const matches = passcode === confirm
+
+  const save = async () => {
+    if (!valid) { setErr('Passcode must be 4 to 6 digits.'); return }
+    if (!matches) { setErr('The two passcodes do not match.'); return }
+    setErr(null); setBusy(true)
+    try {
+      await apiPut(`/business-users/${staff.id}/passcode`, { passcode })
+      onSaved()
+    } catch (e: any) {
+      setErr(e?.response?.data?.error?.message || e?.response?.data?.error || 'Could not save passcode')
+    } finally { setBusy(false) }
+  }
+
+  const clear = async () => {
+    if (!(await appConfirm(`Remove ${staff.firstName}'s register passcode? They will no longer be able to unlock a register with it.`, { danger: true, confirmLabel: 'Remove passcode' }))) return
+    setErr(null); setBusy(true)
+    try {
+      await apiPut(`/business-users/${staff.id}/passcode`, { passcode: null })
+      onSaved()
+    } catch (e: any) {
+      setErr(e?.response?.data?.error?.message || e?.response?.data?.error || 'Could not remove passcode')
+    } finally { setBusy(false) }
+  }
+
+  return (
+    <Modal
+      title={`${staff.firstName} ${staff.lastName} — register passcode`}
+      onClose={onClose}
+      width={440}
+      footer={
+        <>
+          {staff.hasPosPasscode && (
+            <button className="btn btn-ghost btn-sm" style={{ color: 'var(--red)' }} onClick={clear} disabled={busy}>
+              Remove passcode
+            </button>
+          )}
+          <div style={{ flex: 1 }} />
+          <button className="btn btn-ghost btn-sm" onClick={onClose}>Cancel</button>
+          <button className="btn btn-primary btn-sm" onClick={save} disabled={busy || !valid || !matches}>
+            {busy ? 'Saving…' : (staff.hasPosPasscode ? 'Update passcode' : 'Set passcode')}
+          </button>
+        </>
+      }>
+      {err && <div style={errStyle}>{err}</div>}
+      <div style={{ fontSize: '.8rem', color: 'var(--text-2)', marginBottom: 16, lineHeight: 1.6 }}>
+        A 4–6 digit passcode lets {staff.firstName} unlock an activated register and ring up sales, take payment,
+        and process refunds — without seeing reports or other business data. Full access still needs their email sign-in.
+      </div>
+      <label style={labelStyle}>New passcode</label>
+      <input className="form-input" value={passcode} onChange={e => setPasscode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+        type="password" inputMode="numeric" autoComplete="off" autoFocus placeholder="4–6 digits"
+        style={{ width: '100%', letterSpacing: '.3em' }} />
+      <label style={labelStyle}>Confirm passcode</label>
+      <input className="form-input" value={confirm} onChange={e => setConfirm(e.target.value.replace(/\D/g, '').slice(0, 6))}
+        type="password" inputMode="numeric" autoComplete="off" placeholder="Re-enter"
+        style={{ width: '100%', letterSpacing: '.3em' }} />
+    </Modal>
   )
 }
 

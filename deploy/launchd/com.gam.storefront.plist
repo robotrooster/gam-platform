@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.gam.storefront</string>
+  <!-- S574: guest storefront (apps/storefront/server.js) — one deployment serves
+       every property by subdomain. Like marketing, it's a Node server on the Mac
+       behind the Cloudflare tunnel: wildcard *.gam.biz -> :3015. Static build
+       from dist/ (SPA fallback); the client picks the prod API URL at runtime, so
+       no API_URL injection is needed here. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/opt/node@22/bin/node</string>
+    <string>/Users/nicholasrhoades/gam/apps/storefront/server.js</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/nicholasrhoades/gam/apps/storefront</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/opt/node@22/bin:/usr/bin:/bin</string>
+    <key>NODE_ENV</key>
+    <string>production</string>
+    <key>PORT</key>
+    <string>3015</string>
+  </dict>
+  <key>KeepAlive</key>
+  <true/>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>/tmp/gam-storefront.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/gam-storefront.log</string>
+</dict>
+</plist>

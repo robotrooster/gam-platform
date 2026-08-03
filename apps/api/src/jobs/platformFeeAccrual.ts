@@ -130,6 +130,10 @@ async function accrueOneProperty(
         JOIN units u ON u.id = l.unit_id
        WHERE u.property_id = $1
          AND l.status = 'active'
+         -- S576 Snowbird: a hibernating (seasonally-paused) lease doesn't accrue
+         -- the per-occupied-unit fee — the tenant is gone and the spot earns
+         -- off-season reservation revenue (zero platform fee) instead.
+         AND l.is_hibernating = false
          AND l.start_date <= ($2::date + INTERVAL '1 month' - INTERVAL '1 day')
          AND (l.end_date IS NULL OR l.end_date >= $2::date)
     `, [propertyId, monthIso])

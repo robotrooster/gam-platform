@@ -17,7 +17,16 @@ export function getStripe() {
 // PaymentIntent helper here.
 
 // ── TENANT ACH SETUP ──────────────────────────────────────────
-// Creates a Financial Connections session for tenant bank account verification
+// Creates a SetupIntent for tenant bank-account verification via MICRODEPOSITS.
+//
+// S570 (Nic): we do NOT use Financial Connections instant verification here.
+// Instant verification bills $1.50 per successful verification (Stripe FC
+// pricing), which is underwater against the ~$2/occupied-unit/month platform
+// fee once closer + CS commissions are paid. Microdeposit verification is FREE
+// ("complimentary" on Stripe's pricing page) — Stripe drops two small deposits,
+// the tenant confirms them 1–3 days later, and the account verifies with no FC
+// charge. No `financial_connections` block (that IS the instant/FC path) and no
+// `balances` permission (we never read balance data). Card stays instant.
 export async function createTenantAchSetup({
   tenantId,
   email,
@@ -37,10 +46,7 @@ export async function createTenantAchSetup({
     payment_method_types: ['us_bank_account'],
     payment_method_options: {
       us_bank_account: {
-        financial_connections: {
-          permissions: ['payment_method', 'balances'],
-        },
-        verification_method: 'instant',
+        verification_method: 'microdeposits',
       },
     },
     metadata: { tenantId },

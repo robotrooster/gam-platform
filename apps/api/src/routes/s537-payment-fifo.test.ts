@@ -2,14 +2,14 @@
  * S537: FIFO payment application — ONE tenant "Pay now", oldest-first.
  *
  * Rules under test (Nic-locked):
+ *   - PAY-IN-FULL ONLY. There are no partial payments anywhere in the system
+ *     (a partial can reset a landlord's eviction clock). /pay-balance requires
+ *     the EXACT outstanding balance — under- OR over-payment → 422.
  *   - Every dollar applies to the oldest outstanding balance first; the
- *     tenant never picks targets (POST /payments/pay-balance).
- *   - Partial coverage SPLITS the charge row (propane pattern) so
- *     "short is short" late-fee mechanics stay truthful.
- *   - Landlords may reject partials per property (eviction-clock
- *     protection): amount < total → 422; pay-ahead stays allowed.
- *   - Pay-ahead remainder becomes a lease_prepaid_credit at webhook
- *     settle, and the next invoice generation consumes it.
+ *     tenant never picks targets, and the full-balance payment settles all
+ *     rows with no split and no remainder.
+ *   - (Prepaid credits still exist via invoice generation, but pay-ahead is
+ *     gone — the tenant UI has no amount field.)
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import express from 'express'
@@ -67,15 +67,12 @@ function tenantToken(userId: string, tenantId: string) {
     process.env.JWT_SECRET!, { expiresIn: '1h' })
 }
 
-async function fixture(opts: { acceptPartials?: boolean } = {}) {
+async function fixture() {
   const client = await db.connect()
   try {
     await client.query('BEGIN')
     const ll = await seedLandlord(client)
     const propertyId = await seedProperty(client, { landlordId: ll.landlordId, ownerUserId: ll.userId, managedByUserId: ll.userId })
-    if (opts.acceptPartials === false) {
-      await client.query(`UPDATE properties SET accept_partial_payments = FALSE WHERE id=$1`, [propertyId])
-    }
     const unitId = await seedUnit(client, { propertyId, landlordId: ll.landlordId, withLateFeeDecision: true })
     const tenantId = await seedTenant(client)
     const tu = await client.query<{ user_id: string }>(`SELECT user_id FROM tenants WHERE id=$1`, [tenantId])
@@ -150,7 +147,7 @@ describe('S562 POST /payments/pay-balance — processing-fee collection', () => 
 })
 
 describe('S537 POST /payments/pay-balance — FIFO application', () => {
-  it('oldest first: old late fee consumed in full, rent row split, remainder stays pending', async () => {
+  it('oldest-first: paying the FULL balance settles every row (pay-in-full, no split)', async () => {
     const f = await fixture()
     const feeId = await seedCharge(f, 'late_fee', 60, '2026-06-06')
     const rentId = await seedCharge(f, 'rent', 440, '2026-07-01')
@@ -158,97 +155,58 @@ describe('S537 POST /payments/pay-balance — FIFO application', () => {
     const failedId = await seedCharge(f, 'rent', 40, '2026-05-01')
     await db.query(`UPDATE payments SET status='failed', stripe_payment_intent_id='pi_old_fail' WHERE id=$1`, [failedId])
 
+    // Pay-in-full only: the tenant pays the ENTIRE balance (40 + 60 + 440 = 540).
     const res = await request(buildApp())
       .post('/api/payments/pay-balance')
       .set('Authorization', `Bearer ${tenantToken(f.tenantUserId, f.tenantId)}`)
-      .send({ amount: 480, paymentMethodId: 'pm_test', paymentMethodType: 'ach' })
+      .send({ amount: 540, paymentMethodId: 'pm_test', paymentMethodType: 'ach' })
     expect(res.status).toBe(200)
-    expect(res.body.data.appliedTotal).toBe(480)
+    expect(res.body.data.appliedTotal).toBe(540)
     expect(res.body.data.payAhead).toBe(0)
 
-    // The failed May rent is the OLDEST — covered first, back to processing.
-    const failed = await db.query<any>(`SELECT status, stripe_payment_intent_id FROM payments WHERE id=$1`, [failedId])
-    expect(failed.rows[0].status).toBe('processing')
-    expect(failed.rows[0].stripe_payment_intent_id).toBe('pi_fifo_test')
-
-    const fee = await db.query<any>(`SELECT status, amount::float AS amount, stripe_payment_intent_id FROM payments WHERE id=$1`, [feeId])
-    expect(fee.rows[0].status).toBe('processing')
-    expect(fee.rows[0].amount).toBe(60)
-    expect(fee.rows[0].stripe_payment_intent_id).toBe('pi_fifo_test')
-
-    // Rent row split: applied slice ($380) carries the PI; remainder ($60)
-    // is a fresh pending row — "short is short" stays truthful.
-    const rent = await db.query<any>(`SELECT status, amount::float AS amount FROM payments WHERE id=$1`, [rentId])
-    expect(rent.rows[0].status).toBe('processing')
-    expect(rent.rows[0].amount).toBe(380)
+    // Every row (oldest-first) carries the PI — none split, none left pending.
+    for (const id of [failedId, feeId, rentId]) {
+      const row = await db.query<any>(`SELECT status, amount::float AS amount, stripe_payment_intent_id FROM payments WHERE id=$1`, [id])
+      expect(row.rows[0].status).toBe('processing')
+      expect(row.rows[0].stripe_payment_intent_id).toBe('pi_fifo_test')
+    }
+    // Rent stays whole ($440) — no remainder row exists.
+    const rent = await db.query<any>(`SELECT amount::float AS amount FROM payments WHERE id=$1`, [rentId])
+    expect(rent.rows[0].amount).toBe(440)
     const remainder = await db.query<any>(
-      `SELECT amount::float AS amount, status, is_remainder FROM payments
-        WHERE lease_id=$1 AND type='rent' AND is_remainder`, [f.leaseId])
-    expect(remainder.rows.length).toBe(1)
-    expect(remainder.rows[0].amount).toBe(60)
-    expect(remainder.rows[0].status).toBe('pending')
-    expect(remainder.rows[0].is_remainder).toBe(true)
+      `SELECT 1 FROM payments WHERE lease_id=$1 AND is_remainder`, [f.leaseId])
+    expect(remainder.rows.length).toBe(0)
 
     const lines = await db.query<any>(
       `SELECT amount_applied::float AS a FROM remittance_applications ORDER BY a`)
-    expect(lines.rows.map((r: any) => r.a)).toEqual([40, 60, 380])
+    expect(lines.rows.map((r: any) => r.a)).toEqual([40, 60, 440])
   })
 
-  it('property rejects partials → 422 under total; exact total passes', async () => {
-    const f = await fixture({ acceptPartials: false })
+  it('pay-in-full enforced: under-payment AND over-payment both → 422; exact total passes', async () => {
+    const f = await fixture()
     await seedCharge(f, 'late_fee', 60, '2026-06-06')
-    await seedCharge(f, 'rent', 440, '2026-07-01')
+    await seedCharge(f, 'rent', 440, '2026-07-01')  // total = 500
 
-    const short = await request(buildApp())
+    const under = await request(buildApp())
       .post('/api/payments/pay-balance')
       .set('Authorization', `Bearer ${tenantToken(f.tenantUserId, f.tenantId)}`)
       .send({ amount: 100, paymentMethodId: 'pm_test', paymentMethodType: 'ach' })
-    expect(short.status).toBe(422)
-    expect(short.body.error).toMatch(/full outstanding balance/i)
+    expect(under.status).toBe(422)
+    expect(under.body.error).toMatch(/paid in full/i)
+
+    // No pay-ahead either — over the balance is rejected too.
+    const over = await request(buildApp())
+      .post('/api/payments/pay-balance')
+      .set('Authorization', `Bearer ${tenantToken(f.tenantUserId, f.tenantId)}`)
+      .send({ amount: 600, paymentMethodId: 'pm_test', paymentMethodType: 'ach' })
+    expect(over.status).toBe(422)
+    expect(over.body.error).toMatch(/paid in full/i)
 
     const full = await request(buildApp())
       .post('/api/payments/pay-balance')
       .set('Authorization', `Bearer ${tenantToken(f.tenantUserId, f.tenantId)}`)
       .send({ amount: 500, paymentMethodId: 'pm_test', paymentMethodType: 'ach' })
     expect(full.status).toBe(200)
-  })
-
-  it('pay-ahead: webhook settle banks the remainder as a prepaid credit', async () => {
-    const f = await fixture()
-    const feeId = await seedCharge(f, 'late_fee', 100, '2026-06-06')
-
-    const app = buildApp()
-    const res = await request(app)
-      .post('/api/payments/pay-balance')
-      .set('Authorization', `Bearer ${tenantToken(f.tenantUserId, f.tenantId)}`)
-      .send({ amount: 150, paymentMethodId: 'pm_test', paymentMethodType: 'ach' })
-    expect(res.status).toBe(200)
-    expect(res.body.data.payAhead).toBe(50)
-    const remittanceId = res.body.data.remittanceId
-
-    const event = {
-      type: 'payment_intent.succeeded',
-      data: { object: {
-        id: 'pi_fifo_test',
-        metadata: { gam_remittance_id: remittanceId, tenant_id: f.tenantId, landlord_id: f.landlordId },
-        latest_charge: { id: 'ch_mock', payment_method_details: { type: 'us_bank_account' } }, // S560: modern Stripe shape
-      } },
-    }
-    const hook = await request(app)
-      .post('/webhooks/stripe')
-      .set('stripe-signature', 'sig_mock')
-      .set('content-type', 'application/json')
-      .send(JSON.stringify(event))
-    expect(hook.status).toBe(200)
-
-    const fee = await db.query<any>(`SELECT status FROM payments WHERE id=$1`, [feeId])
-    expect(fee.rows[0].status).toBe('settled')
-    const rem = await db.query<any>(`SELECT status FROM tenant_remittances WHERE id=$1`, [remittanceId])
-    expect(rem.rows[0].status).toBe('settled')
-    const credit = await db.query<any>(
-      `SELECT amount_remaining::float AS remaining FROM lease_prepaid_credits WHERE lease_id=$1`, [f.leaseId])
-    expect(credit.rows.length).toBe(1)
-    expect(credit.rows[0].remaining).toBe(50)
   })
 
   it('invoice generation consumes prepaid credit oldest-first', async () => {
@@ -285,7 +243,7 @@ describe('S537 POST /payments/pay-balance — FIFO application', () => {
 // S539: the tenant-facing "where every dollar went" read — remittances
 // with their per-line applications + outstanding prepaid credit.
 describe('S539 GET /payments/remittances — per-line application display', () => {
-  it('returns lines oldest-first with charge context, pay-ahead, and prepaid credit', async () => {
+  it('returns lines oldest-first with charge context (full-balance payment)', async () => {
     const f = await fixture()
     // Settling a RENT row runs the allocation engine — it needs an
     // allocation rule + active processing rate (unlike the fee-only
@@ -315,11 +273,11 @@ describe('S539 GET /payments/remittances — per-line application display', () =
     const pay = await request(app)
       .post('/api/payments/pay-balance')
       .set('Authorization', `Bearer ${tenantToken(f.tenantUserId, f.tenantId)}`)
-      .send({ amount: 550, paymentMethodId: 'pm_test', paymentMethodType: 'ach' })
+      .send({ amount: 500, paymentMethodId: 'pm_test', paymentMethodType: 'ach' })  // full balance
     expect(pay.status).toBe(200)
     const remittanceId = pay.body.data.remittanceId
 
-    // Settle via webhook so the $50 pay-ahead becomes a prepaid credit.
+    // Settle via webhook so the remittance + its lines finalize.
     const event = {
       type: 'payment_intent.succeeded',
       data: { object: {
@@ -345,15 +303,15 @@ describe('S539 GET /payments/remittances — per-line application display', () =
     const r = remittances[0]
     expect(r.id).toBe(remittanceId)
     expect(r.status).toBe('settled')
-    expect(r.amount).toBe(550)
+    expect(r.amount).toBe(500)
     expect(r.applied_amount).toBe(500)
-    expect(r.unapplied_amount).toBe(50)
+    expect(r.unapplied_amount).toBe(0)
     // Lines come back oldest-first with the covered charge's context.
     expect(r.lines.map((ln: any) => [ln.type, ln.amount_applied])).toEqual(
       [['late_fee', 60], ['rent', 440]])
     expect(r.lines[0].due_date).toBe('2026-06-06')
     expect(r.lines.every((ln: any) => ln.payment_status === 'settled')).toBe(true)
-    expect(prepaidRemaining).toBe(50)
+    expect(prepaidRemaining).toBe(0)
   })
 
   it('rejects non-tenant callers', async () => {

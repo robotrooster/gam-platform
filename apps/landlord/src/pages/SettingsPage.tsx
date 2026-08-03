@@ -1,8 +1,7 @@
 import { useState, useEffect } from 'react'
-import { useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { api, apiGet, apiPatch } from '../lib/api'
-import { Check, DollarSign, X, ShieldCheck } from 'lucide-react'
+import { Check, DollarSign, X } from 'lucide-react'
 import { LAUNCH_HIDDEN } from '../components/layout/Layout'
 import { useAuth } from '../context/AuthContext'
 import { usePerms } from '../lib/permissions'
@@ -123,6 +122,8 @@ export function SettingsPage() {
           <p className="page-subtitle">Account and property configuration</p>
         </div>
       </div>
+
+      <FeatureRequestCard />
 
       {isLoading ? (
         <div style={{ padding: 32, color: 'var(--text-3)', textAlign: 'center' }}>Loading…</div>
@@ -306,101 +307,40 @@ export function SettingsPage() {
   )
 }
 
-// Two-factor authentication surface. Optional-with-prompts for the
-// landlord role: enable routes to the full enrollment page; disable
-// posts the password to /auth/totp/disable.
+// Two-factor authentication surface. S574: email-code 2FA is MANDATORY for
+// every landlord (enforced server-side at login), so this is a read-only status
+// card — no enable/disable, no authenticator enrollment. The code always goes to
+// the account's login email; changing that email changes the 2FA destination.
 function SecurityCard() {
-  const { user, refresh } = useAuth()
-  const navigate = useNavigate()
-  const [showConfirm, setShowConfirm] = useState(false)
-  const [password, setPassword] = useState('')
-  const [submitting, setSubmitting] = useState(false)
-  const [err, setErr] = useState('')
-  const [success, setSuccess] = useState('')
+  const { user } = useAuth()
 
-  const enabled = !!user?.totpEnabled
-
-  const onDisable = async (e: React.FormEvent) => {
-    e.preventDefault(); setSubmitting(true); setErr('')
-    try {
-      await api.post('/auth/totp/disable', { password })
-      await refresh()
-      setShowConfirm(false); setPassword('')
-      setSuccess('Two-factor disabled.')
-    } catch (ex: any) {
-      setErr(ex.response?.data?.error || 'Could not disable 2FA. Check your password.')
-    } finally {
-      setSubmitting(false)
-    }
-  }
+  // Legacy authenticator accounts (pre-S574) still verify via TOTP at login;
+  // note it here so the surface reads truthfully. No new landlord can enroll one.
+  const legacyTotp = !!user?.totpEnabled
 
   return (
     <div className="card">
       <div className="card-header"><span className="card-title">Two-Factor Authentication</span></div>
       <div style={{ marginTop: 12 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 14 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
           <div style={{
             width: 38, height: 38, borderRadius: 9,
-            background: enabled ? 'var(--green-bg)' : 'var(--amber-bg)',
+            background: 'var(--green-bg)',
             display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '1.2rem'
           }}>
-            {enabled ? '✅' : '⚠️'}
+            🔒
           </div>
           <div>
             <div style={{ fontWeight: 700, color: 'var(--text-0)', fontSize: '.95rem' }}>
-              {enabled ? 'Enabled' : 'Not enabled'}
+              On — email code
             </div>
-            <div style={{ fontSize: '.78rem', color: 'var(--text-2)' }}>
-              {enabled
-                ? 'You are prompted for a 6-digit code on every sign-in.'
-                : 'Protect your account with an authenticator-app code at sign-in.'}
+            <div style={{ fontSize: '.78rem', color: 'var(--text-2)', lineHeight: 1.5 }}>
+              {legacyTotp
+                ? 'Every sign-in requires your authenticator-app code. New accounts use an emailed 6-digit code.'
+                : `Every sign-in requires a 6-digit code sent to ${user?.email || 'your email'}. This protects your tenants' data and is always on.`}
             </div>
           </div>
         </div>
-
-        {success && (
-          <div className="alert alert-success" style={{ marginBottom: 12 }}>{success}</div>
-        )}
-
-        {!enabled && (
-          <button className="btn btn-primary" onClick={() => navigate('/totp/enroll')}>
-            <ShieldCheck size={15} /> Enable two-factor
-          </button>
-        )}
-
-        {enabled && !showConfirm && (
-          <button className="btn btn-danger" onClick={() => { setShowConfirm(true); setSuccess('') }}>
-            Disable two-factor
-          </button>
-        )}
-
-        {enabled && showConfirm && (
-          <form onSubmit={onDisable} style={{ marginTop: 8, padding: 14, background: 'var(--bg-1)', border: '1px solid var(--border-1)', borderRadius: 8 }}>
-            <div style={{ fontSize: '.82rem', color: 'var(--text-1)', marginBottom: 10, lineHeight: 1.5 }}>
-              Confirm your password to disable 2FA. After disable, any saved recovery codes are invalidated.
-            </div>
-            <div className="form-group" style={{ maxWidth: 320 }}>
-              <label className="form-label">Password</label>
-              <input
-                className="form-input"
-                type="password"
-                value={password}
-                onChange={e => setPassword(e.target.value)}
-                autoFocus
-                required
-              />
-            </div>
-            {err && <div className="alert alert-danger" style={{ marginBottom: 10 }}>{err}</div>}
-            <div style={{ display: 'flex', gap: 8 }}>
-              <button className="btn btn-danger" type="submit" disabled={submitting || !password}>
-                {submitting ? <span className="spinner" /> : 'Disable two-factor'}
-              </button>
-              <button className="btn btn-secondary" type="button" onClick={() => { setShowConfirm(false); setPassword(''); setErr('') }} disabled={submitting}>
-                Cancel
-              </button>
-            </div>
-          </form>
-        )}
       </div>
     </div>
   )
@@ -485,3 +425,74 @@ function DefaultPmCompanyCard({
   )
 }
 
+
+// ── FEATURE REQUEST (S571) ────────────────────────────────────────────────
+// Landlords submit ideas the same way tenants do (POST /feature-requests); the
+// GAM team reviews them in the admin portal. Input from both parties.
+function FeatureRequestCard() {
+  const [open, setOpen] = useState(false)
+  const [title, setTitle] = useState('')
+  const [description, setDescription] = useState('')
+  const [error, setError] = useState('')
+  const [done, setDone] = useState(false)
+  const [submitting, setSubmitting] = useState(false)
+
+  const submit = async () => {
+    setSubmitting(true); setError('')
+    try {
+      await api.post('/feature-requests', { title: title.trim(), description: description.trim() })
+      setDone(true)
+    } catch (e: any) {
+      setError(e?.response?.data?.error || 'Could not submit your request. Please try again.')
+    }
+    setSubmitting(false)
+  }
+  const reset = () => { setOpen(false); setTitle(''); setDescription(''); setError(''); setDone(false) }
+
+  return (
+    <div className="card" style={{ marginBottom: 16, background: 'rgba(59,130,246,.04)', border: '1px solid rgba(59,130,246,.2)' }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 12 }}>
+        <div>
+          <div style={{ fontWeight: 700, color: 'var(--text-0)', marginBottom: 4 }}>💡 Have a feature idea?</div>
+          <div style={{ fontSize: '.82rem', color: 'var(--text-3)', lineHeight: 1.5 }}>Suggest a new capability or improvement. Requests go directly to the GAM team.</div>
+        </div>
+        <button className="btn btn-primary" onClick={() => setOpen(true)}>Submit request →</button>
+      </div>
+
+      {open && (
+        <div className="modal-overlay" onClick={reset}>
+          <div className="modal" style={{ maxWidth: 480, width: '95vw' }} onClick={e => e.stopPropagation()}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+              <h3 style={{ margin: 0 }}>💡 Suggest a feature</h3>
+              <button className="btn btn-ghost btn-sm" onClick={reset} style={{ padding: 6 }}><X size={15} /></button>
+            </div>
+            {done ? (
+              <>
+                <p style={{ fontSize: '.85rem', color: 'var(--text-2)', margin: '4px 0 20px' }}>Thanks — your idea went to the GAM team. We read every one.</p>
+                <div style={{ display: 'flex', justifyContent: 'flex-end' }}><button className="btn btn-primary" onClick={reset}>Done</button></div>
+              </>
+            ) : (
+              <>
+                <div style={{ marginBottom: 12 }}>
+                  <label style={{ display: 'block', fontSize: '.72rem', fontWeight: 600, color: 'var(--text-2)', textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 6 }}>Title</label>
+                  <input className="input" value={title} onChange={e => setTitle(e.target.value)} maxLength={140} placeholder="e.g. Bulk-import maintenance history" autoFocus style={{ width: '100%' }} />
+                </div>
+                <div style={{ marginBottom: 16 }}>
+                  <label style={{ display: 'block', fontSize: '.72rem', fontWeight: 600, color: 'var(--text-2)', textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 6 }}>Details</label>
+                  <textarea className="input" rows={4} value={description} onChange={e => setDescription(e.target.value)} maxLength={4000} placeholder="Describe what you'd like and why it would help…" style={{ width: '100%', resize: 'vertical' }} />
+                </div>
+                {error && <div style={{ fontSize: '.78rem', color: 'var(--red)', marginBottom: 12 }}>{error}</div>}
+                <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+                  <button className="btn btn-ghost" onClick={reset}>Cancel</button>
+                  <button className="btn btn-primary" disabled={submitting || title.trim().length < 3 || description.trim().length < 5} onClick={submit}>
+                    {submitting ? 'Submitting…' : 'Submit request'}
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}

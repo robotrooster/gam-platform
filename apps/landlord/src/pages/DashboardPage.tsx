@@ -4,7 +4,7 @@ import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'rec
 import { humanize } from '@gam/shared'
 import { apiGet } from '../lib/api'
 import { useNavigate } from 'react-router-dom'
-import { AlertTriangle, CheckCircle, TrendingUp, ArrowDownToLine, Clock, FileText, CreditCard, Wrench, ChevronRight } from 'lucide-react'
+import { AlertTriangle, CheckCircle, TrendingUp, ArrowDownToLine, Clock, FileText, CreditCard, Wrench, ChevronRight, HeartHandshake } from 'lucide-react'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
 interface DashStats {
@@ -44,6 +44,10 @@ export function DashboardPage() {
     { select: (d: any) => d?.slice(0, 5) }
   )
 
+  // S574 (Nic): referral earnings for the platform-fee / referral / net trio.
+  // The platform-fee card is a gross COST; this is the income that offsets it.
+  const { data: referral } = useQuery<any>('referral-earnings', () => apiGet('/landlords/referral-earnings'))
+
   // Pad trend to always show 6 months
   const trendData = (() => {
     const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
@@ -64,6 +68,10 @@ export function DashboardPage() {
   // actually summed into that figure. (direct_pay retired W-15/S531.)
   const rentRollUnits = (stats?.activeUnits || 0) + (stats?.delinquentUnits || 0) + (stats?.suspendedUnits || 0)
   const platformFee = stats?.platformFee ?? 0
+  // S574: referral earnings offset the platform fee. Net > 0 = you still owe GAM
+  // that much this month; Net <= 0 = your referrals earn back more than you pay.
+  const referralThisMonth = Number(referral?.thisMonth ?? 0)
+  const netToGam = platformFee - referralThisMonth
   const platformFeeByProperty: { propertyId: string; name: string; fee: number }[] =
     (stats as any)?.platformFeeByProperty ?? []
 
@@ -157,13 +165,13 @@ export function DashboardPage() {
           <div className="kpi-value" style={{fontSize:'1.4rem'}}>{(stats as any)?.maintenance?.openRequests||0} open</div>
           <div className="kpi-sub">{(stats as any)?.maintenance?.inProgress||0} in progress · {(stats as any)?.maintenance?.completed30d||0} done this month</div>
         </div>
-        {/* Row 3 (span 4): applications, payout, fee */}
-        <div className="kpi-card" style={{gridColumn:'span 4',cursor:'pointer'}} onClick={()=>navigate('/background')}>
+        {/* Row 3 (span 6): applications + next payout */}
+        <div className="kpi-card" style={{gridColumn:'span 6',cursor:'pointer'}} onClick={()=>navigate('/background')}>
           <div className="kpi-label">Applications</div>
           <div className="kpi-value" style={{fontSize:'1.4rem',color:(stats as any)?.bgPending>0?'var(--amber)':'var(--green)'}}>{(stats as any)?.bgPending||0}</div>
           <div className="kpi-sub">{(stats as any)?.bgPending>0?'pending review':'no pending applications'}</div>
         </div>
-        <div className="kpi-card" style={{gridColumn:'span 4'}}>
+        <div className="kpi-card" style={{gridColumn:'span 6'}}>
           <div className="kpi-label">Next Disbursement</div>
           <div className="kpi-value" style={{fontSize:'1.4rem'}}>{fmt(stats?.upcomingDisbursement?.amount || 0)}</div>
           <div className="kpi-sub flex items-center gap-8">
@@ -171,10 +179,25 @@ export function DashboardPage() {
             Next payout {nextPayoutDate}
           </div>
         </div>
+        {/* Row 4 (span 4): your money with GAM — fee you pay, referral you earn, net.
+            S574 (Nic): kept as three separate cards (a cost, an income, the net)
+            rather than netting into one, so each reads clearly at a glance. */}
         <div className="kpi-card" style={{gridColumn:'span 4',cursor:'pointer'}} onClick={()=>setShowFeeModal(true)}>
           <div className="kpi-label">Platform Fee / Mo</div>
           <div className="kpi-value">{fmt(platformFee)}</div>
           <div className="kpi-sub">{rentRollUnits} occupied × $2/unit · $10/property min</div>
+        </div>
+        <div className="kpi-card" style={{gridColumn:'span 4',cursor:'pointer'}} onClick={()=>navigate('/refer')}>
+          <div className="kpi-label">Referral Earnings</div>
+          <div className="kpi-value green">{fmt(referralThisMonth)}</div>
+          <div className="kpi-sub">this month{referral?.referredCount ? ` · ${referral.referredCount} referred landlord${referral.referredCount === 1 ? '' : 's'}` : ''}</div>
+        </div>
+        <div className="kpi-card" style={{gridColumn:'span 4'}}>
+          <div className="kpi-label">Net Platform Cost</div>
+          <div className="kpi-value" style={{color: netToGam <= 0 ? 'var(--green)' : 'var(--text-0)'}}>
+            {netToGam < 0 ? `+${fmt(-netToGam)}` : fmt(netToGam)}
+          </div>
+          <div className="kpi-sub">{netToGam <= 0 ? 'referrals cover your fee' : 'fee − referral earnings'}</div>
         </div>
       </div>
 
@@ -282,16 +305,13 @@ export function DashboardPage() {
           </div>
         </div>
       )}
-
-      {/* Bulletin Board — hidden from landlord portal (toggle to re-enable) */}
-      {false && <BulletinBoard />}
     </div>
   )
 }
 
 function TodoCard() {
   const navigate = useNavigate()
-  const [expanded, setExpanded] = React.useState<{ leases: boolean; ach: boolean; maintenance: boolean }>({ leases: false, ach: false, maintenance: false })
+  const [expanded, setExpanded] = React.useState<{ leases: boolean; ach: boolean; maintenance: boolean; workTrade: boolean }>({ leases: false, ach: false, maintenance: false, workTrade: false })
 
   const { data: todos, isLoading } = useQuery<any>(
     'landlord-todos',
@@ -307,7 +327,7 @@ function TodoCard() {
     )
   }
 
-  const counts = todos?.counts || { leases: 0, ach: 0, maintenance: 0, total: 0 }
+  const counts = todos?.counts || { leases: 0, ach: 0, maintenance: 0, workTrade: 0, total: 0 }
 
   // All-clear state
   if (counts.total === 0) {
@@ -329,6 +349,7 @@ function TodoCard() {
     { key: 'leases', label: 'Lease Issues', icon: FileText, color: 'var(--gold)', items: todos?.leases || [] },
     { key: 'ach', label: 'ACH Issues', icon: CreditCard, color: 'var(--amber)', items: todos?.ach || [] },
     { key: 'maintenance', label: 'High-$ Maintenance', icon: Wrench, color: 'var(--blue)', items: todos?.maintenance || [] },
+    { key: 'workTrade', label: 'Work Trade', icon: HeartHandshake, color: 'var(--gold)', items: todos?.workTrade || [] },
   ]
 
   return (
@@ -416,86 +437,6 @@ function TodoCard() {
   )
 }
 
-function BulletinBoard() {
-  const API = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
-  const tok = () => localStorage.getItem('gam_token')
-  const [date, setDate] = React.useState(new Date().toISOString().split('T')[0])
-  const [search, setSearch] = React.useState('')
-  const [posts, setPosts] = React.useState<any[]>([])
-  const [loading, setLoading] = React.useState(false)
-
-  const fetchPosts = async (d = date, s = search) => {
-    setLoading(true)
-    try {
-      const params = new URLSearchParams({ date: d })
-      if (s) params.append('search', s)
-      const res = await fetch(`${API}/api/bulletin/landlord?${params}`, {
-        headers: { Authorization: `Bearer ${tok()}` }
-      })
-      const data = await res.json()
-      setPosts(data.data || [])
-    } catch { setPosts([]) }
-    finally { setLoading(false) }
-  }
-
-  React.useEffect(() => { fetchPosts() }, [date])
-
-  return (
-    <div className="card" style={{ marginTop: 24 }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16, flexWrap: 'wrap', gap: 10 }}>
-        <div>
-          <div className="card-title" style={{ marginBottom: 2 }}>Community Bulletin Board</div>
-          <div style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>Read-only · Posts from your tenants</div>
-        </div>
-        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-          <input type="date" value={date} onChange={e => setDate(e.target.value)}
-            style={{ background: 'var(--bg-2)', border: '1px solid var(--border-1)', borderRadius: 7, color: 'var(--text-0)', padding: '6px 10px', fontSize: '.78rem', outline: 'none' }} />
-          <button onClick={() => setDate(new Date().toISOString().split('T')[0])}
-            style={{ padding: '6px 12px', borderRadius: 7, border: '1px solid var(--border-1)', background: 'var(--bg-2)', color: 'var(--text-2)', fontSize: '.75rem', cursor: 'pointer' }}>
-            Today
-          </button>
-          <input type="text" placeholder="Search posts…" value={search} onChange={e => setSearch(e.target.value)}
-            onKeyDown={e => e.key === 'Enter' && fetchPosts(date, search)}
-            style={{ background: 'var(--bg-2)', border: '1px solid var(--border-1)', borderRadius: 7, color: 'var(--text-0)', padding: '6px 10px', fontSize: '.78rem', outline: 'none', width: 180 }} />
-          <button onClick={() => fetchPosts(date, search)}
-            style={{ padding: '6px 12px', borderRadius: 7, border: 'none', background: 'var(--gold)', color: '#060809', fontSize: '.75rem', fontWeight: 600, cursor: 'pointer' }}>
-            Search
-          </button>
-        </div>
-      </div>
-      {loading && <div style={{ padding: 32, textAlign: 'center', color: 'var(--text-3)' }}>Loading…</div>}
-      {!loading && posts.length === 0 && (
-        <div style={{ padding: 32, textAlign: 'center', color: 'var(--text-3)', fontSize: '.85rem' }}>
-          No posts for {new Date(date + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' })}
-        </div>
-      )}
-      {!loading && posts.length > 0 && (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-          {posts.map((post: any) => (
-            <div key={post.id} style={{ padding: '12px 14px', background: 'var(--bg-2)', border: '1px solid var(--border-0)', borderRadius: 10 }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
-                <span style={{ fontFamily: 'var(--font-mono)', fontSize: '.72rem', color: 'var(--gold)', fontWeight: 600 }}>{post.alias}</span>
-                {post.pinned && <span style={{ fontSize: '.65rem', color: 'var(--amber)' }}>📌 Pinned</span>}
-                <span style={{ fontSize: '.65rem', color: 'var(--text-3)', marginLeft: 'auto' }}>
-                  {new Date(post.createdAt).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })}
-                </span>
-              </div>
-              <div style={{ fontSize: '.85rem', color: 'var(--text-1)', lineHeight: 1.6, marginBottom: 6 }}>{post.content}</div>
-              <div style={{ display: 'flex', gap: 12, fontSize: '.7rem', color: 'var(--text-3)' }}>
-                <span>👍 {post.upvoteCount || 0}</span>
-                <span style={{ textTransform: 'capitalize' }}>📍 {post.scope}</span>
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  )
-}
-
-// S159: dashboard tile showing PM cut MTD vs net to owner. Hides itself
-// when no PM is contracted (no rows or all zeros). Pulls from the
-// existing /me/pm-impact endpoint with from/to set to current month.
 function PmCutThisMonthCard() {
   const navigate = useNavigate()
   const monthStart = (() => { const d = new Date(); d.setDate(1); return d.toISOString().slice(0,10) })()

@@ -388,7 +388,7 @@ describe('POST /api/tenants/verify-ach', () => {
     expect(res.status).toBe(200)
     expect(res.body.data.ach_verified).toBe(true)
     expect(res.body.data.deposit_fully_funded).toBe(true)
-    expect(res.body.data.message).toMatch(/OTP qualified/)
+    expect(res.body.data.message).toMatch(/Bank verified/)
 
     const row = await db.query<{ ach_verified: boolean; bank_last4: string }>(
       `SELECT ach_verified, bank_last4 FROM tenants WHERE id=$1`, [f.tenantId])
@@ -396,7 +396,7 @@ describe('POST /api/tenants/verify-ach', () => {
     expect(row.rows[0].bank_last4).toBe('4321')
   })
 
-  it('deposit NOT fully funded → ach_verified=true + activation-pending message', async () => {
+  it('deposit NOT fully funded → ach_verified=true + deposit-not-funded message', async () => {
     const f = await seedTFixture()
     const client = await db.connect()
     try {
@@ -413,6 +413,6 @@ describe('POST /api/tenants/verify-ach', () => {
     expect(res.status).toBe(200)
     expect(res.body.data.ach_verified).toBe(true)
     expect(res.body.data.deposit_fully_funded).toBe(false)
-    expect(res.body.data.message).toMatch(/OTP will activate once your deposit is fully funded/)
+    expect(res.body.data.message).toMatch(/deposit is not yet fully funded/)
   })
 })

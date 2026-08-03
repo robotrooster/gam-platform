@@ -5,7 +5,8 @@ import { requireAuth, requireAdmin, requirePerm } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { canManageLandlordResource } from '../middleware/scope'
 import { AchReturnCode, ACH_RETURN_CONFIG, PLATFORM_FEES,
-         MANUAL_PAYMENT_METHODS, MANUAL_PAYMENT_FEE } from '@gam/shared'
+         MANUAL_PAYMENT_METHODS, MANUAL_PAYMENT_FEE,
+         PRIOR_ARRANGEMENT_METHOD } from '@gam/shared'
 import { getStripe } from '../lib/stripe'
 import { computeApplicationFee, createRentPlatformCharge } from '../services/stripeConnect'
 import { createAdminNotification } from '../services/adminNotifications'
@@ -49,7 +50,12 @@ paymentsRouter.get('/', async (req, res, next) => {
       // Unknown role with no scope — empty rather than leak.
       return res.json({ success: true, data: [], total: 0, page: 1, totalPages: 0 })
     }
-    // admin/super_admin fall through with no role-based filter (full visibility).
+    // admin/super_admin fall through: super_admin sees everything; a regular
+    // admin (portfolio manager) is scoped to landlords they close or service.
+    if (role === 'admin') {
+      conditions.push(`p.landlord_id IN (SELECT id FROM landlords WHERE portfolio_manager_id = $${pi} OR service_manager_id = $${pi})`)
+      params.push(req.user!.userId); pi++
+    }
     if (status)  { conditions.push(`p.status = $${pi++}`);       params.push(status) }
     if (type)    { conditions.push(`p.type = $${pi++}`);         params.push(type) }
     if (from)    { conditions.push(`p.due_date >= $${pi++}`);    params.push(from) }
@@ -62,10 +68,22 @@ paymentsRouter.get('/', async (req, res, next) => {
     params.push(parseInt(limit), offset)
     const payments = await query<any>(`
       SELECT p.*, u.unit_number, pr.name AS property_name,
-        tu.first_name AS tenant_first, tu.last_name AS tenant_last
+        tu.first_name AS tenant_first, tu.last_name AS tenant_last,
+        -- S568: is this the FIRST open rent charge of a lease while the LANDLORD
+        -- is still inside their onboarding reconciliation window? If so the
+        -- landlord may mark it paid off-platform (old-system autopay overlap),
+        -- fee-free. Mirrors the route guard. New-vs-imported is irrelevant.
+        (p.type = 'rent' AND p.status IN ('pending', 'failed')
+          AND ld.reconciliation_until IS NOT NULL AND ld.reconciliation_until > NOW()
+          AND NOT EXISTS (
+            SELECT 1 FROM payments p2
+             WHERE p2.lease_id = p.lease_id AND p2.type = 'rent'
+               AND p2.status IN ('settled', 'paid_via_deposit') AND p2.id <> p.id)
+        ) AS prior_arrangement_eligible
       FROM payments p
       LEFT JOIN units u ON u.id = p.unit_id
       LEFT JOIN properties pr ON pr.id = u.property_id
+      LEFT JOIN landlords ld ON ld.id = p.landlord_id
       LEFT JOIN tenants t ON t.id = p.tenant_id
       LEFT JOIN users tu ON tu.id = t.user_id
       ${where}
@@ -217,6 +235,7 @@ paymentsRouter.post('/:id/handle-return', requireAdmin, async (req, res, next) =
         const { autoDisenrollFlexPayOnAchUnverified } = await import('../services/flexpay')
         await autoDisenrollFlexPayOnAchUnverified(payment.tenant_id)
       } catch (e) { logger.error({ err: e, tenant_id: payment.tenant_id }, '[ach-return] flexpay auto-disenroll failed') }
+      // OTP auto-disenroll (gated/no-op while OTP is hidden; kept for re-enable).
       try {
         const { autoDisenrollOnAchUnverified } = await import('../services/otp')
         await autoDisenrollOnAchUnverified(payment.tenant_id)
@@ -524,17 +543,16 @@ paymentsRouter.post('/:id/pay', async (req: any, res, next) => {
 // Any pay-ahead remainder is recorded on the remittance; the webhook
 // turns it into a lease_prepaid_credit on settlement.
 // S537: everything the tenant's Pay Now card needs in one fetch — the
-// outstanding oldest-first ledger, the total, and whether the property
-// accepts partials (eviction-clock protection).
+// outstanding oldest-first ledger + the total. Rent is pay-in-full only
+// (Nic) — no partial-payment concept, so nothing about partials is sent.
 paymentsRouter.get('/balance-context', async (req: any, res, next) => {
   try {
     if (req.user!.role !== 'tenant') throw new AppError(403, 'Only tenants can call this endpoint')
     const rows = await query<any>(
       `SELECT p.id, p.amount::float AS amount, p.due_date::text AS due_date, p.type,
-              p.entry_description, pr.accept_partial_payments, u.payment_block
+              p.entry_description, u.payment_block
          FROM payments p
          JOIN units u ON u.id = p.unit_id
-         JOIN properties pr ON pr.id = u.property_id
         WHERE p.tenant_id = $1
           AND ((p.status = 'pending' AND p.stripe_payment_intent_id IS NULL)
                OR p.status = 'failed')
@@ -543,7 +561,6 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
     const total = Math.round(rows.reduce((sum: number, r: any) => sum + r.amount, 0) * 100) / 100
     res.json({ success: true, data: {
       totalOutstanding: total,
-      acceptPartialPayments: rows.length ? rows[0].accept_partial_payments !== false : true,
       paymentBlocked: rows.length ? !!rows[0].payment_block : false,
       rows,
     } })
@@ -628,7 +645,6 @@ paymentsRouter.post('/pay-balance', async (req: any, res, next) => {
       `SELECT p.id, p.amount::float AS amount, p.due_date::text AS due_date, p.type,
               p.lease_id, p.unit_id, p.landlord_id,
               u.property_id, u.payment_block,
-              pr.accept_partial_payments,
               t.stripe_customer_id,
               l.user_id AS landlord_user_id,
               -- S554 Connect re-anchor: entity account + its flags preferred,
@@ -640,7 +656,6 @@ paymentsRouter.post('/pay-balance', async (req: any, res, next) => {
               par.ach_fee_payer, par.card_fee_payer
          FROM payments p
          JOIN units u ON u.id = p.unit_id
-         JOIN properties pr ON pr.id = u.property_id
          JOIN tenants t ON t.id = p.tenant_id
          JOIN landlords l ON l.id = p.landlord_id
          JOIN users lu ON lu.id = l.user_id
@@ -660,13 +675,15 @@ paymentsRouter.post('/pay-balance', async (req: any, res, next) => {
       throw new AppError(409, 'Tenant has no Stripe customer — complete ACH setup first')
     }
 
-    const totalOutstanding = rows.reduce((sum: number, r: any) => sum + r.amount, 0)
-    // S537: eviction-clock protection — partials refused when the
-    // property opts out. Paying MORE than the balance never resets a
-    // clock, so pay-ahead stays allowed.
-    if (!ctx.accept_partial_payments && body.amount < totalOutstanding - 0.005) {
+    const totalOutstanding = Math.round(rows.reduce((sum: number, r: any) => sum + r.amount, 0) * 100) / 100
+    // PAY-IN-FULL ONLY (Nic — supersedes the S537 per-property accept_partial
+    // toggle, now removed). Rent is ALWAYS the entire outstanding balance:
+    // reject any under-payment (a partial can reset a landlord's eviction clock)
+    // AND any over-payment (no pay-ahead — the UI has no amount field). The
+    // client sends the full balance; this is the server-side guarantee.
+    if (Math.abs(body.amount - totalOutstanding) > 0.005) {
       throw new AppError(422,
-        `This property does not accept partial payments — the full outstanding balance is $${totalOutstanding.toFixed(2)}.`)
+        `Rent must be paid in full — the outstanding balance is $${totalOutstanding.toFixed(2)}.`)
     }
 
     const plan = allocateOldestFirst(
@@ -880,9 +897,11 @@ paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (re
     const pmt = (await client.query<any>(
       `SELECT p.id, p.type, p.status, p.landlord_id, p.tenant_id, p.unit_id,
               p.lease_id, p.amount::float AS amount, p.due_date::text AS due_date,
-              u.payment_block
+              u.payment_block,
+              (pr.created_at > NOW() - INTERVAL '21 days') AS property_in_window
          FROM payments p
          JOIN units u ON u.id = p.unit_id
+         JOIN properties pr ON pr.id = u.property_id
         WHERE p.id = $1
           FOR UPDATE OF p`,
       [req.params.id])).rows[0]
@@ -902,8 +921,16 @@ paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (re
       throw new AppError(409, 'This unit is in eviction mode — recording a payment is paused. Contact the landlord.')
     }
 
-    // Waiver: is this the tenant's FIRST rent payment on the lease? Count prior
-    // SATISFIED rent rows (Stripe-settled or already recorded manual/deposit).
+    // Waiver (Nic, S570): the $10 manual fee is waived ONLY when BOTH hold:
+    //  (a) this is the tenant's FIRST satisfied rent on the lease, paid via THIS
+    //      manual recording — count prior SATISFIED rent rows (Stripe-settled or
+    //      already recorded manual/deposit). If they already paid an earlier
+    //      invoice (e.g. by card), priorPaid > 0 and there is no waiver on a later
+    //      manual payment; the waiver is first-invoice-and-paid-manually only.
+    //  (b) the property is inside its 21-day onboarding (migration) window. A
+    //      tenant who onboards after that window pays the fee even on their first
+    //      payment — the free pass is for the initial migration cohort, not for
+    //      every new tenant a landlord adds later.
     // Rent rows carry a lease_id in production; fall back to tenant_id if absent.
     const scopeCol = pmt.lease_id ? 'lease_id' : 'tenant_id'
     const scopeVal = pmt.lease_id ?? pmt.tenant_id
@@ -913,7 +940,7 @@ paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (re
           AND status IN ('settled', 'paid_via_deposit')
           AND id <> $2`,
       [scopeVal, pmt.id])).rows[0]
-    const feeWaived = parseInt(priorPaid.n, 10) === 0
+    const feeWaived = parseInt(priorPaid.n, 10) === 0 && pmt.property_in_window === true
 
     // Satisfy the rent obligation off-platform. platform_held stays FALSE.
     const refNote = body.reference ? ` (ref ${body.reference})` : ''
@@ -951,6 +978,82 @@ paymentsRouter.post('/:id/record-manual', requirePerm('take_payment'), async (re
         feePaymentId,
         firstPayment: feeWaived,
       },
+    })
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    next(e)
+  } finally {
+    client.release()
+  }
+})
+
+// POST /api/payments/:id/record-prior-arrangement — S568 (Nic).
+// Onboarding-transition ONLY: mark the FIRST rent charge of an IMPORTED lease as
+// paid via a prior off-platform arrangement. It comes off the books, no money
+// moves, and NO manual-payment fee is charged. Distinct from record-manual (a
+// cash/check received now) — this is "already paid before they came onto GAM."
+//
+// Hard gating (all enforced here, no landlord toggle): rent charge, still open,
+// lease_source='imported' (a brand-new GAM lease has no prior arrangement),
+// within PRIOR_ARRANGEMENT_TRANSITION_DAYS of onboarding, and it must be the
+// FIRST rent charge (no already-satisfied rent on the lease). Fee-free always.
+paymentsRouter.post('/:id/record-prior-arrangement', requirePerm('take_payment'), async (req: any, res, next) => {
+  const client = await getClient()
+  try {
+    await client.query('BEGIN')
+
+    const pmt = (await client.query<any>(
+      `SELECT p.id, p.type, p.status, p.landlord_id, p.tenant_id, p.lease_id,
+              p.due_date::text AS due_date, u.payment_block,
+              (ld.reconciliation_until IS NOT NULL AND ld.reconciliation_until > NOW()) AS within_window
+         FROM payments p
+         JOIN units u ON u.id = p.unit_id
+         JOIN landlords ld ON ld.id = p.landlord_id
+        WHERE p.id = $1
+          FOR UPDATE OF p`,
+      [req.params.id])).rows[0]
+    if (!pmt) throw new AppError(404, 'Payment not found')
+    if (!canManageLandlordResource(req.user, pmt.landlord_id)) {
+      throw new AppError(403, 'Forbidden')
+    }
+    if (pmt.type !== 'rent') {
+      throw new AppError(409, 'Only a rent charge can be marked as a prior arrangement')
+    }
+    if (pmt.status !== 'pending' && pmt.status !== 'failed') {
+      throw new AppError(409, `This charge is not open (status: ${pmt.status})`)
+    }
+    if (pmt.payment_block) {
+      throw new AppError(409, 'This unit is in eviction mode — recording a payment is paused.')
+    }
+    // Landlord onboarding reconciliation window only (old-system autopay overlap).
+    // New-vs-imported is irrelevant; what matters is the landlord still migrating.
+    if (!pmt.within_window) {
+      throw new AppError(409, 'The onboarding reconciliation window has closed for this landlord — record payments normally.')
+    }
+    // First rent charge only — no already-satisfied rent on the lease.
+    const priorPaid = (await client.query<{ n: string }>(
+      `SELECT COUNT(*) AS n FROM payments
+        WHERE lease_id = $1 AND type = 'rent'
+          AND status IN ('settled', 'paid_via_deposit') AND id <> $2`,
+      [pmt.lease_id, pmt.id])).rows[0]
+    if (parseInt(priorPaid.n, 10) > 0) {
+      throw new AppError(409, 'Prior-arrangement only applies to the first rent charge; a later rent charge has already been paid.')
+    }
+
+    // Satisfy the obligation off-platform. platform_held FALSE, no fee row.
+    await client.query(
+      `UPDATE payments
+          SET status = 'settled', settled_at = NOW(), manual_method = $2,
+              platform_held = FALSE,
+              notes = COALESCE(notes || ' — ', '') ||
+                      'Paid off-platform via prior arrangement (onboarding transition)'
+        WHERE id = $1`,
+      [pmt.id, PRIOR_ARRANGEMENT_METHOD])
+
+    await client.query('COMMIT')
+    res.json({
+      success: true,
+      data: { paymentId: pmt.id, status: 'settled', method: PRIOR_ARRANGEMENT_METHOD, feeCharged: false },
     })
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {})

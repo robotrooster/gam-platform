@@ -24,12 +24,16 @@ export const propertyBookingAdminRouter = Router()
 // the public, unauthenticated /api/sales and /api/guest agent endpoints
 // mounted after it. Per-route auth lets non-matching paths pass through.
 
-// S550 (Nic): suggested public web address — property names repeat in the
-// wild ("Oak Park" travels), so the DEFAULT slug is name + CITY
-// ("oak-park-yarnell"). Two same-named parks in the same city is where the
-// street NUMBER steps in ("oak-park-22658" — no two properties on one
-// street share a number). Last-resort: name-city-number. Landlord can still
-// type anything unique; this only prefills the blank field.
+// S550 / S574 (Nic): suggested public web address. The DEFAULT is name + STREET
+// NUMBER ("oak-park-22658") — a street number is the most stable, unambiguous
+// disambiguator (no two properties on one street share a number, and it doesn't
+// change if the property is re-tagged to a different city label). City steps in
+// only when there's no street number, or as the collision fallback. Last-resort:
+// name-city-number, then bare name. Landlord can still type anything unique; this
+// only prefills the blank field.
+// (S550 originally defaulted to name+CITY; S574 flipped the default to
+// name+street-number at Nic's direction — e.g. "Oak Park" at 22658 Highway 89,
+// Yarnell → "oak-park-22658", not "oak-park-yarnell".)
 function slugify(v: string): string {
   return String(v || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').replace(/--+/g, '-')
 }
@@ -38,10 +42,10 @@ export async function suggestBookingSlug(prop: { id: string; name: string; city:
   if (!name) return null
   const streetNum = String(prop.street1 ?? '').match(/\d{1,6}/)?.[0] ?? null
   const candidates = [
-    slugify(`${prop.name} ${prop.city ?? ''}`),
-    streetNum ? slugify(`${prop.name} ${streetNum}`) : null,
-    streetNum ? slugify(`${prop.name} ${prop.city ?? ''} ${streetNum}`) : null,
-    name,
+    streetNum ? slugify(`${prop.name} ${streetNum}`) : null,          // oak-park-22658 (default)
+    slugify(`${prop.name} ${prop.city ?? ''}`),                       // oak-park-yarnell (no street # / collision)
+    streetNum ? slugify(`${prop.name} ${prop.city ?? ''} ${streetNum}`) : null,  // oak-park-yarnell-22658
+    name,                                                             // oak-park (last resort)
   ].filter((c): c is string => !!c)
   for (const c of candidates) {
     const taken = await queryOne<{ id: string }>(

@@ -1,0 +1,12 @@
+-- S574 (Nic) — email 2FA is MANDATORY for every business_owner, from signup.
+-- The POS/business owner sees reports, sensitive business data, and the payout
+-- money flow, so their account carries the same second factor landlords and
+-- tenants already do (see 20260731090000_universal_landlord_email_2fa.sql).
+-- Login enforces it for all business owners (auth.ts, UNIVERSAL_EMAIL_2FA_ROLES)
+-- and canonicalizes the flag on first sign-in; this backfills existing owners so
+-- the flag matches reality.
+--
+-- Email-code ONLY (no authenticator). business_staff cashiers are deliberately
+-- NOT covered here — they authenticate with a transaction-scoped register
+-- passcode instead of a second factor.
+UPDATE users SET email_2fa_enabled = TRUE WHERE role = 'business_owner' AND email_2fa_enabled = FALSE;

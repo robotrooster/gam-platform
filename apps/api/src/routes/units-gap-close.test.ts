@@ -32,7 +32,7 @@ import jwt from 'jsonwebtoken'
 import { randomUUID } from 'crypto'
 import { db } from '../db'
 import {
-  cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedLateFeeDecision,
+  cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedLateFeeDecision, seedLease,
 } from '../test/dbHelpers'
 import { unitsRouter } from './units'
 import { errorHandler } from '../middleware/errorHandler'
@@ -58,7 +58,8 @@ interface Fixture {
   tokenA: string                    // role=landlord, profileId=aLid
   tokenB: string                    // role=landlord, profileId=bLid
   tokenPMa: string                  // role=property_manager, profileId=pmUserId, landlordId=aLid
-  tokenAdmin: string                // role=admin
+  tokenAdmin: string                // role=admin (S567: portfolio-scoped, NOT all)
+  tokenSuper: string                // role=super_admin (sees all landlords)
 }
 
 async function seed(): Promise<Fixture> {
@@ -117,6 +118,8 @@ async function seed(): Promise<Fixture> {
                        profileId: pmUserId, landlordId: aLid, permissions: ALL_PERMS }),
       tokenAdmin: sign({ userId: randomUUID(), role: 'admin', email: 'admin@t.dev',
                          profileId: randomUUID(), permissions: {} }),
+      tokenSuper: sign({ userId: randomUUID(), role: 'super_admin', email: 'super@t.dev',
+                         profileId: randomUUID(), permissions: {} }),
     }
   } catch (e) { await c.query('ROLLBACK'); throw e }
   finally { c.release() }
@@ -135,10 +138,12 @@ describe('GET /api/units', () => {
     expect(ids).not.toContain(f.bUnitId)
   })
 
-  it('admin sees units across all landlords', async () => {
+  it('super-admin sees units across all landlords', async () => {
+    // S567: a REGULAR admin is portfolio-scoped (sees only landlords they
+    // close/service); only super_admin sees every landlord's units.
     const f = await seed()
     const res = await request(buildApp()).get('/api/units')
-      .set('Authorization', `Bearer ${f.tokenAdmin}`)
+      .set('Authorization', `Bearer ${f.tokenSuper}`)
     expect(res.status).toBe(200)
     const ids = (res.body.data as any[]).map(u => u.id)
     expect(ids).toContain(f.aUnitId)
@@ -148,7 +153,7 @@ describe('GET /api/units', () => {
   it('propertyId filter narrows results', async () => {
     const f = await seed()
     const res = await request(buildApp()).get(`/api/units?propertyId=${f.aPropId}`)
-      .set('Authorization', `Bearer ${f.tokenAdmin}`)
+      .set('Authorization', `Bearer ${f.tokenSuper}`)
     expect(res.status).toBe(200)
     const ids = (res.body.data as any[]).map(u => u.id)
     expect(ids).toEqual([f.aUnitId])
@@ -276,6 +281,82 @@ describe('POST /api/units/:id/eviction-mode', () => {
       .post(`/api/units/${f.aUnitId}/eviction-mode`)
       .set('Authorization', `Bearer ${f.tokenPMa}`)
       .send({ enable: true, confirm: true })
+    expect(res.status).toBe(403)
+  })
+})
+
+// ─── PATCH /api/units/:id/details (S573 consolidated editor) ──────
+describe('PATCH /api/units/:id/details', () => {
+  it('vacant unit: updates rent, deposit, bed/bath, and inspection flags', async () => {
+    const f = await seed()
+    const res = await request(buildApp())
+      .patch(`/api/units/${f.aUnitId}/details`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ bedrooms: 3, bathrooms: 2, rentAmount: 1875, securityDeposit: 1875, isMultiLevel: true, isAdaAccessible: true, floorLevel: 'ground_floor' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.bedrooms).toBe(3)
+    expect(Number(res.body.data.rent_amount)).toBe(1875)
+    expect(res.body.data.is_multi_level).toBe(true)
+    expect(res.body.data.is_ada_accessible).toBe(true)
+    expect(res.body.data.floor_level).toBe('ground_floor')
+  })
+
+  it('S573: persists living_areas + features (sanitized to offered keys)', async () => {
+    const f = await seed()
+    const res = await request(buildApp())
+      .patch(`/api/units/${f.aUnitId}/details`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ livingAreas: 2, features: { fireplace: true, provides_dishwasher: true, bogus_key: true } })
+    expect(res.status).toBe(200)
+    expect(res.body.data.living_areas).toBe(2)
+    expect(res.body.data.features.fireplace).toBe(true)
+    expect(res.body.data.features.provides_dishwasher).toBe(true)
+    expect(res.body.data.features.bogus_key).toBeUndefined()  // not in the catalog → dropped
+  })
+
+  it('locks: 409 when the unit has an active lease', async () => {
+    const f = await seed()
+    const c = await db.connect()
+    try { await seedLease(c, { unitId: f.aUnitId, landlordId: f.aLid, status: 'active' }) }
+    finally { c.release() }
+    const res = await request(buildApp())
+      .patch(`/api/units/${f.aUnitId}/details`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ rentAmount: 2000 })
+    expect(res.status).toBe(409)
+  })
+
+  it('locks: 409 when the unit has a pending lease (rent already committed)', async () => {
+    const f = await seed()
+    const c = await db.connect()
+    try { await seedLease(c, { unitId: f.aUnitId, landlordId: f.aLid, status: 'pending' }) }
+    finally { c.release() }
+    const res = await request(buildApp())
+      .patch(`/api/units/${f.aUnitId}/details`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ bedrooms: 4 })
+    expect(res.status).toBe(409)
+  })
+
+  it('an expired lease does NOT lock (edit allowed between leases)', async () => {
+    const f = await seed()
+    const c = await db.connect()
+    try { await seedLease(c, { unitId: f.aUnitId, landlordId: f.aLid, status: 'expired' }) }
+    finally { c.release() }
+    const res = await request(buildApp())
+      .patch(`/api/units/${f.aUnitId}/details`)
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ rentAmount: 2100 })
+    expect(res.status).toBe(200)
+    expect(Number(res.body.data.rent_amount)).toBe(2100)
+  })
+
+  it('403s another landlord', async () => {
+    const f = await seed()
+    const res = await request(buildApp())
+      .patch(`/api/units/${f.aUnitId}/details`)
+      .set('Authorization', `Bearer ${f.tokenB}`)
+      .send({ rentAmount: 999 })
     expect(res.status).toBe(403)
   })
 })

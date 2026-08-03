@@ -12,8 +12,9 @@
 import { query, queryOne } from '../db'
 import { AppError } from '../middleware/errorHandler'
 import { routeMaintenanceNotification } from './notifications'
+import { recommendMaintenancePriority } from './maintenancePriority'
 import { logger } from '../lib/logger'
-import type { MaintenancePriority } from '@gam/shared'
+import { MAINTENANCE_CATEGORIES, MAINTENANCE_CATEGORY_LABEL, type MaintenanceCategory, type MaintenancePriority } from '@gam/shared'
 
 export interface MaintenanceActor {
   /** users.id of the caller */
@@ -26,8 +27,12 @@ export interface MaintenanceActor {
 
 export interface CreateMaintenanceRequestInput {
   unitId: string
-  title: string
+  /** Optional now: tenants pick a `category` and the title is derived from it
+   *  (S571). Landlord-filed requests may still pass an explicit title. */
+  title?: string
   description: string
+  category?: MaintenanceCategory
+  /** When omitted (tenant path), the in-house agent recommends the priority. */
   priority?: MaintenancePriority
   photos?: string[]
   actor: MaintenanceActor
@@ -41,7 +46,11 @@ export interface CreateMaintenanceRequestInput {
 export async function createMaintenanceRequest(
   input: CreateMaintenanceRequestInput
 ): Promise<any> {
-  const { unitId, title, description, priority = 'normal', photos = [], actor } = input
+  const { unitId, description, photos = [], actor } = input
+  const category: MaintenanceCategory =
+    input.category && MAINTENANCE_CATEGORIES.includes(input.category) ? input.category : 'general'
+  // S571: tenants pick a category, not a title — derive a sensible title.
+  const title = (input.title && input.title.trim()) || MAINTENANCE_CATEGORY_LABEL[category]
 
   const unit = await queryOne<any>('SELECT * FROM units WHERE id=$1', [unitId])
   if (!unit) throw new AppError(404, 'Unit not found')
@@ -69,11 +78,30 @@ export async function createMaintenanceRequest(
     tenantId = occ?.primary_tenant_id || null
   }
 
+  // Priority: if the caller supplied one (landlord path), it stands and is
+  // marked landlord-sourced. Otherwise (tenant path) the in-house agent
+  // recommends it; the recommendation is stored alongside the effective value
+  // so the landlord can see it and override later.
+  let effectivePriority: MaintenancePriority
+  let recommendedPriority: MaintenancePriority | null = null
+  let prioritySource: 'agent' | 'heuristic' | 'landlord'
+  if (input.priority) {
+    effectivePriority = input.priority
+    prioritySource = 'landlord'
+  } else {
+    const rec = await recommendMaintenancePriority({ category, title, description })
+    effectivePriority = rec.priority
+    recommendedPriority = rec.priority
+    prioritySource = rec.source
+  }
+
   const request = await queryOne<any>(
     `INSERT INTO maintenance_requests
-       (unit_id, tenant_id, landlord_id, title, description, priority, photos)
-     VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
-    [unitId, tenantId || null, unit.landlord_id, title, description, priority, photos]
+       (unit_id, tenant_id, landlord_id, title, description, category, priority,
+        recommended_priority, priority_source, photos)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+    [unitId, tenantId || null, unit.landlord_id, title, description, category,
+     effectivePriority, recommendedPriority, prioritySource, photos]
   )
 
   await query(

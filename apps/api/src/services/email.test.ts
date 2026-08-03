@@ -322,18 +322,7 @@ describe('emailLandlordBankingNudge', () => {
   })
 })
 
-describe('OTP + late payment senders', () => {
-  it('sendOnTimePayInvitation: subject + category + metadata.late_count', async () => {
-    await email.sendOnTimePayInvitation({
-      email: 'o@example.com', firstName: 'T', lateCount: 3, rentAmount: 1200,
-    })
-    const call = (resendSendMock.mock.calls[0] as any[])[0]
-    expect(call.subject).toBe('Never pay a late fee again — On-Time Pay invitation')
-    const log = await logRowFor('o@example.com')
-    expect(log.category).toBe('otp_invitation')
-    expect(log.metadata).toEqual({ late_count: 3 })
-  })
-
+describe('late payment sender', () => {
   it('sendLatePaymentNotice: subject contains daysLate; category=late_payment_notice; metadata captures amount', async () => {
     await email.sendLatePaymentNotice({
       landlordEmail: 'l@example.com', landlordName: 'L',

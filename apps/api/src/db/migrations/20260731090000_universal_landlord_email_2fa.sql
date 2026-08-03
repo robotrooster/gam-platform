@@ -1,0 +1,12 @@
+-- S574 (Nic) — email 2FA is MANDATORY for every landlord, always, from signup.
+-- A landlord account controls every one of that landlord's tenants' private
+-- data plus the rent money flow, so it warrants the same second factor tenants
+-- already carry (see 20260731003000_universal_tenant_email_2fa.sql). Login
+-- enforces it for all landlords (auth.ts) and canonicalizes the flag on first
+-- sign-in; this backfills existing landlords so the flag matches reality for the
+-- Settings → Security status card.
+--
+-- Email-code ONLY (no authenticator app): the landlord portal no longer exposes
+-- TOTP enrollment. Legacy landlords with totp_enabled still verify via TOTP at
+-- login (backward-compat), but no new landlord can enroll one.
+UPDATE users SET email_2fa_enabled = TRUE WHERE role = 'landlord' AND email_2fa_enabled = FALSE;

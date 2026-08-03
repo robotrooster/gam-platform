@@ -5,6 +5,7 @@ import { useNavigate, Link, useSearchParams } from 'react-router-dom'
 import { humanize } from '@gam/shared'
 import { apiGet, apiPatch } from '../lib/api'
 import { usePerms } from '../lib/permissions'
+import { PropertySelect } from '../components/ListControls'
 import { Search, AlertTriangle, Shield, DoorOpen } from 'lucide-react'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
@@ -28,8 +29,11 @@ export function UnitsPage() {
     if (s === 'eviction') return 'suspended'
     return s && s in STATUS_COLORS ? s : 'all'
   })
+  const [propertyId, setPropertyId] = useState('')
   const { data: units = [], isLoading } = useQuery<any[]>('units', () => apiGet('/units'))
   const { can } = usePerms()
+
+  const propertyOptions = units.map((u: any) => ({ id: u.propertyId, name: u.propertyName }))
 
   const setStatusMut = useMutation(
     ({ id, status }: { id: string; status: string }) => apiPatch(`/units/${id}/status`, { status }),
@@ -42,7 +46,8 @@ export function UnitsPage() {
       u.propertyName?.toLowerCase().includes(search.toLowerCase()) ||
       `${u.tenantFirst} ${u.tenantLast}`.toLowerCase().includes(search.toLowerCase())
     const matchFilter = filter === 'all' || u.status === filter
-    return matchSearch && matchFilter
+    const matchProperty = propertyId === '' || u.propertyId === propertyId
+    return matchSearch && matchFilter && matchProperty
   })
 
   const evictionUnits = units.filter((u: any) => u.paymentBlock)
@@ -68,6 +73,7 @@ export function UnitsPage() {
           <Search className="search-icon" />
           <input className="search-input" placeholder="Search units, properties, tenants..." value={search} onChange={e => setSearch(e.target.value)} />
         </div>
+        <PropertySelect value={propertyId} onChange={setPropertyId} properties={propertyOptions} />
         {['all', 'active', 'vacant', 'delinquent', 'suspended'].map(s => (
           <button key={s} className={`btn btn-sm ${filter === s ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setFilter(s)}>
             {s === 'all' ? 'All' : humanize(s)}

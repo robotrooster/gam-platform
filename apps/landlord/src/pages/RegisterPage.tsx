@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { useNavigate, Link } from 'react-router-dom'
+import { useNavigate, Link, useSearchParams } from 'react-router-dom'
 import { apiPost } from '../lib/api'
 import { useAuth } from '../context/AuthContext'
 import { Eye, EyeOff, Check, AlertCircle } from 'lucide-react'
@@ -39,6 +39,9 @@ function PasswordStrength({ password }: { password: string }) {
 export function RegisterPage() {
   const { login } = useAuth()
   const navigate = useNavigate()
+  // S567: portfolio-manager referral key — credits the rep as closing manager.
+  const [searchParams] = useSearchParams()
+  const referralCode = searchParams.get('ref') || undefined
   const [err, setErr] = useState('')
   const [loading, setLoading] = useState(false)
   const [showPw, setShowPw] = useState(false)
@@ -56,7 +59,7 @@ export function RegisterPage() {
     if (form.password.length < 8) { setErr('Password must be at least 8 characters'); return }
     setLoading(true); setErr('')
     try {
-      await apiPost('/auth/register', { ...form, role: 'landlord', acceptedTerms: true })
+      await apiPost('/auth/register', { ...form, role: 'landlord', acceptedTerms: true, referralCode })
       await login(form.email, form.password)
       navigate('/onboarding')
     } catch (e: any) {

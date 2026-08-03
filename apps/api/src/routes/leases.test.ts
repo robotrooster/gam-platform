@@ -166,6 +166,59 @@ async function seedFixture(opts: {
   finally { client.release() }
 }
 
+// ─── PUT /leases/:id/rent-components (S568) ─────────────────────
+describe('PUT /leases/:id/rent-components', () => {
+  it('sets components that sum to rent → saved + returned; GET /:id includes them', async () => {
+    const f = await seedFixture({ rentAmount: 1500 })
+    const res = await request(buildApp()).put(`/api/leases/${f.leaseId}/rent-components`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ components: [
+        { kind: 'space',   label: 'Space rent',  amount: 900 },
+        { kind: 'trailer', label: 'Trailer rent', amount: 600 },
+      ] })
+    expect(res.status).toBe(200)
+    expect(res.body.data).toHaveLength(2)
+    expect(res.body.data[0].label).toBe('Space rent')
+
+    const get = await request(buildApp()).get(`/api/leases/${f.leaseId}`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(get.status).toBe(200)
+    expect(get.body.data.rentComponents).toHaveLength(2)
+    expect(Number(get.body.data.rentComponents[0].amount) + Number(get.body.data.rentComponents[1].amount)).toBe(1500)
+  })
+
+  it('components that do NOT sum to rent → 400', async () => {
+    const f = await seedFixture({ rentAmount: 1500 })
+    const res = await request(buildApp()).put(`/api/leases/${f.leaseId}/rent-components`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ components: [
+        { kind: 'space',   label: 'Space rent',  amount: 900 },
+        { kind: 'trailer', label: 'Trailer rent', amount: 500 },  // 1400 ≠ 1500
+      ] })
+    expect(res.status).toBe(400)
+    expect(res.body.message || res.body.error).toMatch(/add up/i)
+  })
+
+  it('empty array clears the split', async () => {
+    const f = await seedFixture({ rentAmount: 1500 })
+    await request(buildApp()).put(`/api/leases/${f.leaseId}/rent-components`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ components: [{ kind: 'space', label: 'Space rent', amount: 1500 }] }).expect(200)
+    const res = await request(buildApp()).put(`/api/leases/${f.leaseId}/rent-components`)
+      .set('Authorization', `Bearer ${f.landlordToken}`).send({ components: [] })
+    expect(res.status).toBe(200)
+    expect(res.body.data).toHaveLength(0)
+  })
+
+  it('tenant cannot edit rent components → 403', async () => {
+    const f = await seedFixture({ rentAmount: 1500 })
+    const res = await request(buildApp()).put(`/api/leases/${f.leaseId}/rent-components`)
+      .set('Authorization', `Bearer ${f.tenantToken}`)
+      .send({ components: [{ kind: 'space', label: 'Space rent', amount: 1500 }] })
+    expect(res.status).toBe(403)
+  })
+})
+
 // ─── GET /leases — list scoping ─────────────────────────────────
 
 describe('POST /leases/:id/renewal-intent (S556 tenant survey)', () => {

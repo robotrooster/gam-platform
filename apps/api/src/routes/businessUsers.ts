@@ -329,6 +329,8 @@ businessUsersRouter.get('/', requireAuth, async (req, res, next) => {
     const staff = await query<any>(
       `SELECT bu.id, bu.user_id, bu.staff_role, bu.permissions, bu.status,
               bu.invited_at, bu.accepted_at, bu.revoked_at,
+              -- S574: never expose the hash; just whether a register passcode is set.
+              (bu.pos_passcode_hash IS NOT NULL) AS has_pos_passcode,
               u.email, u.first_name, u.last_name
          FROM business_users bu
          JOIN users u ON u.id = bu.user_id
@@ -425,5 +427,62 @@ businessUsersRouter.post('/:id/revoke', requireAuth, async (req, res, next) => {
       throw new AppError(404, 'Staff member not found')
     }
     res.json({ success: true, data: r[0] })
+  } catch (e) { next(e) }
+})
+
+// ═══════════════════════════════════════════════════════════════
+//  PUT /:id/passcode  (owner sets / clears a staff register passcode)
+// ═══════════════════════════════════════════════════════════════
+//
+// S574: the cashier's terminal-lock-screen passcode. 4–6 digits, bcrypt-hashed
+// (never stored plaintext). passcode:null clears it (staff can no longer use the
+// lock screen). Enforced unique within the business so an unlock resolves to
+// exactly one cashier.
+const passcodeSchema = z.object({
+  passcode: z.string().regex(/^\d{4,6}$/, 'Passcode must be 4 to 6 digits').nullable(),
+}).strict()
+
+businessUsersRouter.put('/:id/passcode', requireAuth, async (req, res, next) => {
+  try {
+    const businessId = await requireOwnerBusinessId(req)
+    const { passcode } = passcodeSchema.parse(req.body)
+
+    // Target must be an active staff member of this business.
+    const target = await queryOne<{ id: string }>(
+      `SELECT id FROM business_users
+        WHERE id = $1 AND business_id = $2 AND status = 'active'`,
+      [req.params.id, businessId])
+    if (!target) throw new AppError(404, 'Staff member not found')
+
+    if (passcode === null) {
+      await query(
+        `UPDATE business_users
+            SET pos_passcode_hash = NULL, pos_passcode_updated_at = NOW()
+          WHERE id = $1 AND business_id = $2`,
+        [req.params.id, businessId])
+      return res.json({ success: true, data: { id: req.params.id, hasPasscode: false } })
+    }
+
+    // Uniqueness: no two active staff in the same business may share a passcode,
+    // or an unlock couldn't tell them apart. Compare against every other active
+    // staff member that has one (bcrypt hashes differ even for equal plaintext).
+    const others = await query<{ id: string; pos_passcode_hash: string }>(
+      `SELECT id, pos_passcode_hash FROM business_users
+        WHERE business_id = $1 AND status = 'active'
+          AND id <> $2 AND pos_passcode_hash IS NOT NULL`,
+      [businessId, req.params.id])
+    for (const o of others) {
+      if (await bcrypt.compare(passcode, o.pos_passcode_hash)) {
+        throw new AppError(409, 'That passcode is already in use by another staff member. Choose a different one.')
+      }
+    }
+
+    const hash = await bcrypt.hash(passcode, 12)
+    await query(
+      `UPDATE business_users
+          SET pos_passcode_hash = $1, pos_passcode_updated_at = NOW()
+        WHERE id = $2 AND business_id = $3`,
+      [hash, req.params.id, businessId])
+    res.json({ success: true, data: { id: req.params.id, hasPasscode: true } })
   } catch (e) { next(e) }
 })

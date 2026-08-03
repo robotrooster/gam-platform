@@ -1,10 +1,10 @@
 import { useState, useRef, useEffect } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
-import { apiGet, apiPost, apiPatch, apiDelete } from '../lib/api'
+import { apiGet, apiPost, apiPatch, apiDelete, apiPut } from '../lib/api'
 import { usePerms } from '../lib/permissions'
-import { ArrowLeft, Shield, AlertTriangle, Camera, Trash2, ExternalLink } from 'lucide-react'
-import { UNIT_TYPE_LABEL, UNIT_TYPE_HAS_BEDROOMS, humanize, type UnitType } from '@gam/shared'
+import { ArrowLeft, Shield, AlertTriangle, Camera, Trash2, ExternalLink, Lock, Pencil } from 'lucide-react'
+import { UNIT_TYPE_LABEL, UNIT_TYPE_HAS_BEDROOMS, UNIT_TYPES, FLOOR_LEVELS, FLOOR_LEVEL_LABEL, MAX_INSPECTION_LIVING_AREAS, featuresForType, resolveUnitFeatures, humanize, type UnitType, type FloorLevel } from '@gam/shared'
 import { toast, appConfirm } from '../components/dialogs'
 
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
@@ -61,13 +61,65 @@ export function UnitDetailPage() {
     { onSuccess: () => { qc.invalidateQueries(['unit', id]); setActivateModal(false); setSchedLocal(''); setSchedChoice('now') } }
   )
   const cancelSchedMut = useMutation(() => apiPost('/units/' + id + '/cancel-scheduled-activation', {}), { onSuccess: () => qc.invalidateQueries(['unit', id]) })
-  // S558: flip this unit between whole-unit and by-room (authoritative per unit).
-  const [occError, setOccError] = useState('')
-  const occupancyModeMut = useMutation(
-    (m: string) => apiPatch('/units/' + id + '/occupancy-mode', { occupancyMode: m }),
-    { onSuccess: () => { setOccError(''); qc.invalidateQueries(['unit', id]) },
-      onError: (e: any) => setOccError(e?.response?.data?.message || e?.message || 'Could not change occupancy mode') },
+  // S573: ONE consolidated unit editor. Every setting is editable here, but only
+  // while the unit is between leases; an active/pending lease locks the whole card.
+  const [editing, setEditing] = useState(false)
+  const [editForm, setEditForm] = useState<any>(null)
+  const [detailsErr, setDetailsErr] = useState('')
+  const detailsMut = useMutation(
+    (body: any) => apiPatch('/units/' + id + '/details', body),
+    {
+      onSuccess: () => { setDetailsErr(''); setEditing(false); qc.invalidateQueries(['unit', id]) },
+      onError: (e: any) => setDetailsErr(e?.response?.data?.error || e?.response?.data?.message || 'Could not save unit settings'),
+    },
   )
+  const startEdit = () => {
+    if (!unit) return
+    setDetailsErr('')
+    setEditForm({
+      unitType: unit.unitType || 'apartment',
+      bedrooms: String(unit.bedrooms ?? ''),
+      bathrooms: String(unit.bathrooms ?? ''),
+      sqft: unit.sqft != null ? String(unit.sqft) : '',
+      rentAmount: unit.rentAmount != null ? String(unit.rentAmount) : '',
+      securityDeposit: unit.securityDeposit != null ? String(unit.securityDeposit) : '',
+      dwellingOwnership: unit.dwellingOwnership || 'tenant',
+      isMultiLevel: !!unit.isMultiLevel,
+      isAdaAccessible: !!unit.isAdaAccessible,
+      floorLevel: unit.floorLevel || '',
+      livingAreas: unit.livingAreas != null ? String(unit.livingAreas) : '1',
+      features: resolveUnitFeatures(unit.unitType, unit.features || {}),
+      occupancyMode: unit.occupancyMode || 'whole_unit',
+      rvSiteLayout: unit.rvSiteLayout || 'none',
+      rvAmpService: unit.rvAmpService || 'none',
+      storageSize: unit.storageSize || '',
+      lotRentAmount: unit.lotRentAmount != null ? String(unit.lotRentAmount) : '',
+    })
+    setEditing(true)
+  }
+  const saveDetails = () => {
+    const f = editForm
+    const num = (v: string) => v === '' ? undefined : Number(v)
+    detailsMut.mutate({
+      unitType: f.unitType,
+      bedrooms: num(f.bedrooms),
+      bathrooms: num(f.bathrooms),
+      sqft: f.sqft === '' ? null : Number(f.sqft),
+      rentAmount: num(f.rentAmount),
+      securityDeposit: num(f.securityDeposit),
+      dwellingOwnership: f.dwellingOwnership,
+      isMultiLevel: f.isMultiLevel,
+      isAdaAccessible: f.isAdaAccessible,
+      floorLevel: f.floorLevel || null,
+      livingAreas: f.livingAreas ? Number(f.livingAreas) : undefined,
+      features: f.features,
+      occupancyMode: f.occupancyMode,
+      rvSiteLayout: f.rvSiteLayout,
+      rvAmpService: f.rvAmpService,
+      storageSize: f.storageSize || null,
+      lotRentAmount: num(f.lotRentAmount),
+    })
+  }
 
   const { data: photos = [], refetch: refetchPhotos } = useQuery(['unit-photos', id], () => apiGet<any[]>('/properties/units/' + id + '/photos'))
 
@@ -89,13 +141,12 @@ export function UnitDetailPage() {
   const saveListing = async () => {
     setSavingListing(true); setListingMsg('')
     try {
+      // S573: bed/bath/sq-ft now live only in the consolidated Unit Details
+      // editor (lease-gated). The listing card manages marketing fields only.
       await apiPatch('/properties/units/' + id + '/listing', {
         availableDate: listingForm.availableDate || null,
         listingDescription: listingForm.listingDescription || null,
         listedVacant: listingForm.listedVacant,
-        bedrooms: listingForm.bedrooms ? +listingForm.bedrooms : null,
-        bathrooms: listingForm.bathrooms ? +listingForm.bathrooms : null,
-        sqft: listingForm.sqft ? +listingForm.sqft : null,
       })
       qc.invalidateQueries(['unit', id])
       setListingMsg('Listing saved')
@@ -194,38 +245,168 @@ export function UnitDetailPage() {
 
       <div className="grid-2">
         <div className="card">
-          <div className="card-title" style={{ marginBottom: 16 }}>Unit Details</div>
-          <div className="data-row"><span className="data-key">Status</span><span className={'badge badge-' + (unit.status === 'active' ? 'green' : unit.status === 'vacant' ? 'muted' : 'amber')}>{humanize(unit.status)}</span></div>
-          <div className="data-row"><span className="data-key">Type</span><span className="data-val">{UNIT_TYPE_LABEL[unit.unitType as UnitType] ?? unit.unitType}</span></div>
-          <div className="data-row">
-            <span className="data-key">Leasing</span>
-            {can('schedule.configure_unit') ? (
-              <select className="form-select" style={{ maxWidth: 220, fontSize: '.8rem', padding: '3px 8px' }}
-                value={unit.occupancyMode || 'whole_unit'}
-                onChange={e => occupancyModeMut.mutate(e.target.value)}>
-                <option value="whole_unit">Whole unit (one lease)</option>
-                <option value="by_room">By the room (separate leases)</option>
-              </select>
-            ) : (
-              <span className="data-val">{unit.occupancyMode === 'by_room' ? 'By the room' : 'Whole unit'}</span>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
+            <div className="card-title" style={{ margin: 0 }}>Unit Details</div>
+            {can('schedule.configure_unit') && !editing && (
+              unit.hasActiveLease
+                ? <span className="badge badge-amber" style={{ display: 'flex', alignItems: 'center', gap: 4 }} title="Locked while a lease is active"><Lock size={11} /> Locked (leased)</span>
+                : <button className="btn btn-sm btn-secondary" onClick={startEdit}><Pencil size={12} /> Edit</button>
             )}
           </div>
-          {occError && <div style={{ color: 'var(--red)', fontSize: '.74rem', marginBottom: 6 }}>{occError}</div>}
-          <div className="data-row"><span className="data-key">Rent</span><span className="data-val mono">{fmt(unit.rentAmount)}/mo</span></div>
-          <div className="data-row"><span className="data-key">Deposit</span><span className="data-val mono">{fmt(unit.securityDeposit)}</span></div>
-          {/* S527: type-appropriate facts — bedrooms only for bedroom types,
-              layout/amp for RV, size for storage (RV spots were showing
-              "Bedrooms 2" from their pre-typed seed shape). */}
-          {UNIT_TYPE_HAS_BEDROOMS[unit.unitType as UnitType] && <>
-            <div className="data-row"><span className="data-key">Bedrooms</span><span className="data-val">{unit.bedrooms}</span></div>
-            <div className="data-row"><span className="data-key">Bathrooms</span><span className="data-val">{unit.bathrooms}</span></div>
-          </>}
-          {unit.unitType === 'rv_spot' && <>
-            <div className="data-row"><span className="data-key">Site layout</span><span className="data-val">{unit.rvSiteLayout === 'pull_through' ? 'Pull-through' : unit.rvSiteLayout === 'back_in' ? 'Back-in' : '—'}</span></div>
-            <div className="data-row"><span className="data-key">Electrical</span><span className="data-val">{unit.rvAmpService && unit.rvAmpService !== 'none' ? (unit.rvAmpService === 'both' ? '30/50 amp' : `${unit.rvAmpService} amp`) : '—'}</span></div>
-          </>}
-          {unit.unitType === 'storage' && (
-            <div className="data-row"><span className="data-key">Size</span><span className="data-val">{unit.storageSize || '—'}</span></div>
+
+          {editing && editForm ? (
+            (() => {
+              const set = (k: string, v: any) => setEditForm((f: any) => ({ ...f, [k]: v }))
+              const hasBeds = !!UNIT_TYPE_HAS_BEDROOMS[editForm.unitType as UnitType]
+              const isInterior = ['apartment', 'single_family', 'mobile_home'].includes(editForm.unitType)
+              const isBuilding = !['rv_spot', 'storage', 'parking'].includes(editForm.unitType)
+              const isRv = editForm.unitType === 'rv_spot'
+              const selS = { className: 'form-select', style: { maxWidth: 220, fontSize: '.8rem', padding: '3px 8px' } as any }
+              const inpS = { className: 'input', style: { maxWidth: 140, fontSize: '.8rem', padding: '3px 8px' } as any }
+              return (
+                <div style={{ display: 'grid', gap: 8 }}>
+                  {detailsErr && <div style={{ color: 'var(--red)', fontSize: '.76rem', background: 'rgba(239,68,68,.08)', border: '1px solid rgba(239,68,68,.3)', borderRadius: 7, padding: '7px 10px' }}>{detailsErr}</div>}
+                  <div className="data-row"><span className="data-key">Type</span>
+                    <select {...selS} value={editForm.unitType} onChange={e => set('unitType', e.target.value)}>
+                      {(UNIT_TYPES as readonly string[]).map(t => <option key={t} value={t}>{UNIT_TYPE_LABEL[t as UnitType] ?? t}</option>)}
+                    </select>
+                  </div>
+                  {hasBeds && <>
+                    <div className="data-row"><span className="data-key">Bedrooms</span><input {...inpS} type="number" min={0} max={30} value={editForm.bedrooms} onChange={e => set('bedrooms', e.target.value)} /></div>
+                    <div className="data-row"><span className="data-key">Bathrooms</span><input {...inpS} type="number" min={0} step={0.5} value={editForm.bathrooms} onChange={e => set('bathrooms', e.target.value)} /></div>
+                    <div className="data-row"><span className="data-key">Sq ft</span><input {...inpS} type="number" min={0} value={editForm.sqft} onChange={e => set('sqft', e.target.value)} /></div>
+                  </>}
+                  <div className="data-row"><span className="data-key">Rent (/mo)</span><input {...inpS} type="number" min={0} value={editForm.rentAmount} onChange={e => set('rentAmount', e.target.value)} /></div>
+                  <div className="data-row"><span className="data-key">Deposit</span><input {...inpS} type="number" min={0} value={editForm.securityDeposit} onChange={e => set('securityDeposit', e.target.value)} /></div>
+                  {(isRv || editForm.unitType === 'mobile_home') && (
+                    <div className="data-row"><span className="data-key">{isRv ? 'RV owner' : 'Home owner'}</span>
+                      <select {...selS} value={editForm.dwellingOwnership} onChange={e => set('dwellingOwnership', e.target.value)}>
+                        <option value="tenant">Tenant-owned</option>
+                        <option value="landlord">Park/landlord-owned</option>
+                      </select>
+                    </div>
+                  )}
+                  {isInterior && <>
+                    <div className="data-row"><span className="data-key">Multi-level</span>
+                      <select {...selS} value={editForm.isMultiLevel ? 'yes' : 'no'} onChange={e => set('isMultiLevel', e.target.value === 'yes')}>
+                        <option value="no">Single level</option>
+                        <option value="yes">Multi-level (has stairs)</option>
+                      </select>
+                    </div>
+                    <div className="data-row"><span className="data-key">Accessible (ADA)</span>
+                      <select {...selS} value={editForm.isAdaAccessible ? 'yes' : 'no'} onChange={e => set('isAdaAccessible', e.target.value === 'yes')}>
+                        <option value="no">Standard unit</option>
+                        <option value="yes">Accessible (ADA)</option>
+                      </select>
+                    </div>
+                  </>}
+                  {isBuilding && (
+                    <div className="data-row"><span className="data-key">Floor placement</span>
+                      <select {...selS} value={editForm.floorLevel} onChange={e => set('floorLevel', e.target.value)}>
+                        <option value="">Unspecified</option>
+                        {(FLOOR_LEVELS as readonly string[]).map(fl => <option key={fl} value={fl}>{FLOOR_LEVEL_LABEL[fl as FloorLevel]}</option>)}
+                      </select>
+                    </div>
+                  )}
+                  {hasBeds && (
+                    <div className="data-row"><span className="data-key">Living areas</span>
+                      <select {...selS} value={editForm.livingAreas} onChange={e => set('livingAreas', e.target.value)}>
+                        {Array.from({ length: MAX_INSPECTION_LIVING_AREAS }, (_, i) => i + 1).map(n =>
+                          <option key={n} value={String(n)}>{n} {n === 1 ? 'living/dining' : 'living areas'}</option>)}
+                      </select>
+                    </div>
+                  )}
+                  {hasBeds && (
+                    <div className="data-row"><span className="data-key">Leasing</span>
+                      <select {...selS} value={editForm.occupancyMode} onChange={e => set('occupancyMode', e.target.value)}>
+                        <option value="whole_unit">Whole unit (one lease)</option>
+                        <option value="by_room">By the room (separate leases)</option>
+                      </select>
+                    </div>
+                  )}
+                  {isRv && <>
+                    <div className="data-row"><span className="data-key">Site layout</span>
+                      <select {...selS} value={editForm.rvSiteLayout} onChange={e => set('rvSiteLayout', e.target.value)}>
+                        <option value="none">—</option><option value="back_in">Back-in</option><option value="pull_through">Pull-through</option>
+                      </select>
+                    </div>
+                    <div className="data-row"><span className="data-key">Electrical</span>
+                      <select {...selS} value={editForm.rvAmpService} onChange={e => set('rvAmpService', e.target.value)}>
+                        <option value="none">—</option><option value="30">30 amp</option><option value="50">50 amp</option><option value="both">30/50 amp</option>
+                      </select>
+                    </div>
+                  </>}
+                  {editForm.unitType === 'storage' && (
+                    <div className="data-row"><span className="data-key">Size</span><input {...inpS} style={{ ...inpS.style, maxWidth: 160 }} placeholder="10x10" value={editForm.storageSize} onChange={e => set('storageSize', e.target.value)} /></div>
+                  )}
+                  {(editForm.unitType === 'mobile_home' || isRv) && (
+                    <div className="data-row"><span className="data-key">Lot rent (/mo)</span><input {...inpS} type="number" min={0} value={editForm.lotRentAmount} onChange={e => set('lotRentAmount', e.target.value)} /></div>
+                  )}
+                  {/* S573: what this unit HAS — gates which items appear on its
+                      inspections. Optional (presets cover a unit with zero config). */}
+                  {featuresForType(editForm.unitType).length > 0 && (() => {
+                    const offered = featuresForType(editForm.unitType)
+                    const groups = Array.from(new Set(offered.map(f => f.group)))
+                    const toggle = (k: string, v: boolean) => setEditForm((ef: any) => ({ ...ef, features: { ...ef.features, [k]: v } }))
+                    return (
+                      <div style={{ marginTop: 8, borderTop: '1px solid var(--border-0)', paddingTop: 10 }}>
+                        <div style={{ fontSize: '.72rem', fontWeight: 700, color: 'var(--text-2)', textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 2 }}>Features on this unit</div>
+                        <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginBottom: 8 }}>Optional — controls which items appear on this unit's inspections.</div>
+                        {groups.map(g => (
+                          <div key={g} style={{ marginBottom: 8 }}>
+                            <div style={{ fontSize: '.66rem', fontWeight: 700, color: 'var(--text-3)', marginBottom: 4 }}>{g}</div>
+                            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '3px 12px' }}>
+                              {offered.filter(f => f.group === g).map(f => {
+                                const on = !!editForm.features?.[f.key]
+                                return (
+                                  <label key={f.key} onClick={() => toggle(f.key, !on)} style={{ display: 'flex', alignItems: 'center', gap: 7, cursor: 'pointer', fontSize: '.76rem', color: 'var(--text-1)' }}>
+                                    <span style={{ width: 15, height: 15, borderRadius: 4, flexShrink: 0, border: `1px solid ${on ? 'var(--gold)' : 'var(--border-0)'}`, background: on ? 'var(--gold)' : 'var(--bg-2)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#000', fontSize: '.6rem', fontWeight: 700 }}>{on ? '✓' : ''}</span>
+                                    {f.label}
+                                  </label>
+                                )
+                              })}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )
+                  })()}
+                  <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 6 }}>
+                    <button className="btn btn-sm btn-ghost" onClick={() => { setEditing(false); setDetailsErr('') }}>Cancel</button>
+                    <button className="btn btn-sm btn-primary" onClick={saveDetails} disabled={detailsMut.isLoading}>{detailsMut.isLoading ? 'Saving…' : 'Save'}</button>
+                  </div>
+                </div>
+              )
+            })()
+          ) : (
+            <>
+              <div className="data-row"><span className="data-key">Status</span><span className={'badge badge-' + (unit.status === 'active' ? 'green' : unit.status === 'vacant' ? 'muted' : 'amber')}>{humanize(unit.status)}</span></div>
+              <div className="data-row"><span className="data-key">Type</span><span className="data-val">{UNIT_TYPE_LABEL[unit.unitType as UnitType] ?? unit.unitType}</span></div>
+              <div className="data-row"><span className="data-key">Leasing</span><span className="data-val">{unit.occupancyMode === 'by_room' ? 'By the room' : 'Whole unit'}</span></div>
+              <div className="data-row"><span className="data-key">Rent</span><span className="data-val mono">{fmt(unit.rentAmount)}/mo</span></div>
+              <div className="data-row"><span className="data-key">Deposit</span><span className="data-val mono">{fmt(unit.securityDeposit)}</span></div>
+              {UNIT_TYPE_HAS_BEDROOMS[unit.unitType as UnitType] && <>
+                <div className="data-row"><span className="data-key">Bedrooms</span><span className="data-val">{unit.bedrooms}</span></div>
+                <div className="data-row"><span className="data-key">Bathrooms</span><span className="data-val">{unit.bathrooms}</span></div>
+                <div className="data-row"><span className="data-key">Multi-level</span><span className="data-val">{unit.isMultiLevel ? 'Multi-level' : 'Single level'}</span></div>
+                <div className="data-row"><span className="data-key">Accessible (ADA)</span><span className="data-val">{unit.isAdaAccessible ? 'Accessible (ADA)' : 'Standard'}</span></div>
+              </>}
+              {!['rv_spot', 'storage', 'parking'].includes(unit.unitType) && (
+                <div className="data-row"><span className="data-key">Floor placement</span><span className="data-val">{unit.floorLevel ? FLOOR_LEVEL_LABEL[unit.floorLevel as FloorLevel] : 'Unspecified'}</span></div>
+              )}
+              {unit.unitType === 'rv_spot' && <>
+                <div className="data-row"><span className="data-key">Site layout</span><span className="data-val">{unit.rvSiteLayout === 'pull_through' ? 'Pull-through' : unit.rvSiteLayout === 'back_in' ? 'Back-in' : '—'}</span></div>
+                <div className="data-row"><span className="data-key">Electrical</span><span className="data-val">{unit.rvAmpService && unit.rvAmpService !== 'none' ? (unit.rvAmpService === 'both' ? '30/50 amp' : `${unit.rvAmpService} amp`) : '—'}</span></div>
+              </>}
+              {unit.unitType === 'storage' && (
+                <div className="data-row"><span className="data-key">Size</span><span className="data-val">{unit.storageSize || '—'}</span></div>
+              )}
+              {unit.hasActiveLease && can('schedule.configure_unit') && (
+                <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 10, display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <Lock size={12} /> Settings are locked while this unit has an active lease. Edit between leases.
+                </div>
+              )}
+            </>
           )}
         </div>
 
@@ -242,6 +423,14 @@ export function UnitDetailPage() {
             <div style={{ color: 'var(--text-3)', fontSize: '.875rem', padding: '16px 0' }}>No tenant assigned.</div>
           )}
         </div>
+
+        {(unit.unitType === 'mobile_home' || unit.unitType === 'rv_spot') && (
+          <HomeOwnerSection unitId={id!} />
+        )}
+
+        {(unit.unitType === 'mobile_home' || unit.unitType === 'rv_spot') && (
+          <FinancedSaleSection unitId={id!} />
+        )}
 
         <div className="card" style={{ gridColumn: "1 / -1" }}>
           <div className="card-title" style={{ marginBottom: 16 }}>Unit Economics</div>
@@ -317,24 +506,9 @@ export function UnitDetailPage() {
 
         {listingMsg && <div style={{ padding: '8px 12px', borderRadius: 7, marginBottom: 12, fontSize: '.78rem', background: listingMsg.startsWith('F') ? 'rgba(239,68,68,.08)' : 'rgba(34,197,94,.08)', color: listingMsg.startsWith('F') ? 'var(--red)' : 'var(--green)', border: `1px solid ${listingMsg.startsWith('F') ? 'rgba(239,68,68,.2)' : 'rgba(34,197,94,.2)'}` }}>{listingMsg}</div>}
 
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 16 }}>
-          <div style={{ display: 'grid', gridTemplateColumns: UNIT_TYPE_HAS_BEDROOMS[unit.unitType as UnitType] ? '1fr 1fr 1fr' : '1fr', gap: 10 }}>
-            {/* S527: bed/bath listing fields only for bedroom unit types. */}
-            {UNIT_TYPE_HAS_BEDROOMS[unit.unitType as UnitType] && <>
-            <div>
-              <label style={{ display: 'block', fontSize: '.68rem', fontWeight: 700, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 4 }}>Bedrooms</label>
-              <input type="number" min="0" step="1" value={listingForm.bedrooms} onChange={e => setListingForm(f => ({ ...f, bedrooms: e.target.value }))} style={{ width: '100%', background: 'var(--bg-2)', border: '1px solid var(--border-1)', borderRadius: 7, color: 'var(--text-0)', padding: '7px 10px', fontSize: '.875rem' }} />
-            </div>
-            <div>
-              <label style={{ display: 'block', fontSize: '.68rem', fontWeight: 700, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 4 }}>Bathrooms</label>
-              <input type="number" min="0" step="0.5" value={listingForm.bathrooms} onChange={e => setListingForm(f => ({ ...f, bathrooms: e.target.value }))} style={{ width: '100%', background: 'var(--bg-2)', border: '1px solid var(--border-1)', borderRadius: 7, color: 'var(--text-0)', padding: '7px 10px', fontSize: '.875rem' }} />
-            </div>
-            </>}
-            <div>
-              <label style={{ display: 'block', fontSize: '.68rem', fontWeight: 700, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 4 }}>Sq Ft</label>
-              <input type="number" min="0" value={listingForm.sqft} onChange={e => setListingForm(f => ({ ...f, sqft: e.target.value }))} style={{ width: '100%', background: 'var(--bg-2)', border: '1px solid var(--border-1)', borderRadius: 7, color: 'var(--text-0)', padding: '7px 10px', fontSize: '.875rem' }} />
-            </div>
-          </div>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: 16, marginBottom: 16 }}>
+          {/* S573: bed/bath/sq-ft moved to the consolidated Unit Details editor
+              (one source of truth, lease-gated). This card is marketing only. */}
           <div>
             <label style={{ display: 'block', fontSize: '.68rem', fontWeight: 700, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 4 }}>Available Date</label>
             <input type="date" value={listingForm.availableDate} onChange={e => setListingForm(f => ({ ...f, availableDate: e.target.value }))} style={{ width: '100%', background: 'var(--bg-2)', border: '1px solid var(--border-1)', borderRadius: 7, color: 'var(--text-0)', padding: '7px 10px', fontSize: '.875rem' }} />
@@ -596,6 +770,200 @@ function UnitMetersCard({ unitId, propertyId, unitNumber }: { unitId: string; pr
               onChange={e => { const v = e.target.value; if (v === '' || /^\d*\.?\d*$/.test(v)) setDraft(d => ({ ...d, sewerRate: v })) }} style={{ width: 170 }} />
           )}
           <button className="btn btn-primary btn-sm" disabled={addMut.isLoading} onClick={() => addMut.mutate()}>Add</button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// S568 (Nic): financed home/RV sale. A landlord sells a park-owned home to the
+// tenant, financed over N years — a separate amortized "home payment" that bills
+// alongside space rent, auto-stops at term, and flips the unit to tenant-owned on
+// payoff. Shows the contract + progress if one exists; otherwise offers setup.
+function FinancedSaleSection({ unitId }: { unitId: string }) {
+  const qc = useQueryClient()
+  const { data } = useQuery(['home-sale', unitId], () => apiGet<any>(`/home-sales/unit/${unitId}`))
+  const [open, setOpen] = useState(false)
+  const [form, setForm] = useState({ salePrice: '', downPayment: '0', annualInterestRate: '', termMonths: '', startMonth: new Date().toISOString().slice(0, 7) + '-01' })
+  const [err, setErr] = useState<string | null>(null)
+
+  const contract = data?.contract
+  const schedule: any[] = data?.schedule || []
+  const eligible = data?.eligibleLease
+  const canSetUp = !contract || contract.status !== 'active'
+
+  const create = useMutation(
+    () => apiPost(`/home-sales`, {
+      unitId, leaseId: eligible?.leaseId, tenantId: eligible?.primaryTenantId,
+      salePrice: Number(form.salePrice), downPayment: Number(form.downPayment || 0),
+      annualInterestRate: Number(form.annualInterestRate || 0), termMonths: Number(form.termMonths),
+      startMonth: form.startMonth,
+    }),
+    { onSuccess: () => { qc.invalidateQueries(['home-sale', unitId]); setOpen(false); toast('Financed sale set up.') },
+      onError: (e: any) => setErr(e?.response?.data?.message || e?.message || 'Could not create the contract.') })
+
+  const cancel = useMutation(
+    () => apiPost(`/home-sales/${contract.id}/cancel`, {}),
+    { onSuccess: () => { qc.invalidateQueries(['home-sale', unitId]); toast('Financed sale cancelled.') } })
+
+  return (
+    <div className="card" style={{ gridColumn: '1 / -1' }}>
+      <div className="card-title" style={{ marginBottom: 16 }}>Financed sale (home / RV)</div>
+
+      {contract && contract.status === 'active' && (
+        <>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 10, marginBottom: 14 }}>
+            {[['Monthly payment', fmt(contract.monthlyPayment)],
+              ['Financed', fmt(contract.financedAmount)],
+              ['Rate', `${Number(contract.annualInterestRate)}%`],
+              ['Progress', `${contract.installmentsPaid}/${contract.installmentsTotal} paid`]].map(([k, v]) => (
+              <div key={k} style={{ background: 'var(--bg-2)', border: '1px solid var(--border-0)', borderRadius: 10, padding: '12px 14px' }}>
+                <div style={{ fontSize: '.65rem', fontWeight: 700, color: 'var(--text-3)', textTransform: 'uppercase', marginBottom: 6 }}>{k}</div>
+                <div style={{ fontFamily: 'var(--font-mono)', fontSize: '.95rem', fontWeight: 700, color: 'var(--text-0)' }}>{v}</div>
+              </div>
+            ))}
+          </div>
+          <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginBottom: 10 }}>
+            Sale price {fmt(contract.salePrice)} · down {fmt(contract.downPayment)} · {contract.termMonths}-month term.
+            Billed as a separate “Home payment” each month alongside space rent; stops automatically at payoff, then the unit becomes tenant-owned.
+          </div>
+          {schedule.length > 0 && (
+            <div style={{ maxHeight: 180, overflowY: 'auto', border: '1px solid var(--border-0)', borderRadius: 8 }}>
+              <table style={{ width: '100%', fontSize: '.72rem', borderCollapse: 'collapse' }}>
+                <thead><tr style={{ color: 'var(--text-3)', textAlign: 'left' }}>
+                  <th style={{ padding: '6px 10px' }}>#</th><th>Month</th><th>Amount</th><th>Principal</th><th>Interest</th><th>Balance</th><th>Status</th>
+                </tr></thead>
+                <tbody>
+                  {schedule.map((s: any) => (
+                    <tr key={s.installmentNumber} style={{ borderTop: '1px solid var(--border-0)' }}>
+                      <td style={{ padding: '5px 10px' }}>{s.installmentNumber}</td>
+                      <td>{String(s.billingMonth).slice(0, 7)}</td>
+                      <td>{fmt(s.amount)}</td><td>{fmt(s.principalPortion)}</td><td>{fmt(s.interestPortion)}</td><td>{fmt(s.remainingBalance)}</td>
+                      <td>{s.paymentStatus ? humanize(s.paymentStatus) : (s.paymentId ? 'billed' : '—')}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          <button className="btn btn-ghost btn-sm" style={{ marginTop: 12 }} disabled={cancel.isLoading}
+            onClick={() => cancel.mutate()}>Cancel financing</button>
+        </>
+      )}
+
+      {contract && contract.status === 'paid_off' && (
+        <div style={{ color: 'var(--green)', fontSize: '.85rem' }}>Paid off — the home is now tenant-owned.</div>
+      )}
+
+      {canSetUp && (!contract || contract.status === 'cancelled') && (
+        data?.dwellingOwnership !== 'landlord' ? (
+          <div style={{ color: 'var(--text-3)', fontSize: '.82rem' }}>
+            This unit is tenant-owned — there’s no park-owned home to finance. Set the dwelling to park-owned first if you’re selling one.
+          </div>
+        ) : !eligible ? (
+          <div style={{ color: 'var(--text-3)', fontSize: '.82rem' }}>Assign a tenant on an active lease to set up a financed sale.</div>
+        ) : !open ? (
+          <button className="btn btn-primary btn-sm" onClick={() => setOpen(true)}>Set up financed sale</button>
+        ) : (
+          <div>
+            <div style={{ fontSize: '.78rem', color: 'var(--text-2)', marginBottom: 10 }}>
+              Buyer: {eligible.tenantFirst} {eligible.tenantLast}. Space rent stays on their lease; this adds the amortized home payment.
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2,1fr)', gap: 8, maxWidth: 460 }}>
+              {[['salePrice', 'Sale price'], ['downPayment', 'Down payment'], ['annualInterestRate', 'Interest rate (%/yr)'], ['termMonths', 'Term (months)']].map(([k, label]) => (
+                <label key={k} style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>{label}
+                  <input className="form-input" inputMode="decimal" value={(form as any)[k]}
+                    onChange={e => setForm({ ...form, [k]: e.target.value })} />
+                </label>
+              ))}
+              <label style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>First billing month
+                <input className="form-input" type="month" value={String(form.startMonth).slice(0, 7)}
+                  onChange={e => setForm({ ...form, startMonth: e.target.value + '-01' })} />
+              </label>
+            </div>
+            {err && <div style={{ fontSize: '.72rem', color: 'var(--red)', marginTop: 8 }}>{err}</div>}
+            <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
+              <button className="btn btn-primary btn-sm" disabled={create.isLoading || !form.salePrice || !form.termMonths}
+                onClick={() => { setErr(null); create.mutate() }}>{create.isLoading ? 'Creating…' : 'Create contract'}</button>
+              <button className="btn btn-ghost btn-sm" onClick={() => setOpen(false)}>Cancel</button>
+            </div>
+          </div>
+        )
+      )}
+    </div>
+  )
+}
+
+// S568 (Nic): who owns the tenant-owned home/RV on this lot — the economic
+// sublessor. May be the occupant, an in-park investor, or an EXTERNAL investor
+// who owns homes across many parks. Owner by email (existing account) or a new
+// name+email (mints a free 'contact' account). Transfers keep prior owners as
+// history so the park always has the record.
+function HomeOwnerSection({ unitId }: { unitId: string }) {
+  const qc = useQueryClient()
+  const { data } = useQuery(['home-owner', unitId], () => apiGet<any>(`/home-ownerships/unit/${unitId}`))
+  const [open, setOpen] = useState(false)
+  const [form, setForm] = useState({ ownerName: '', ownerEmail: '', acquiredVia: 'recorded', notes: '' })
+  const [err, setErr] = useState<string | null>(null)
+
+  const owner = data?.owner
+  const history: any[] = data?.history || []
+
+  const save = useMutation(
+    () => apiPut(`/home-ownerships/unit/${unitId}`, {
+      ownerName: form.ownerName.trim(), ownerEmail: form.ownerEmail.trim(),
+      acquiredVia: form.acquiredVia, notes: form.notes.trim() || null,
+    }),
+    { onSuccess: () => { qc.invalidateQueries(['home-owner', unitId]); qc.invalidateQueries(['unit', unitId]); setOpen(false); setForm({ ownerName: '', ownerEmail: '', acquiredVia: 'recorded', notes: '' }); toast('Home owner recorded.') },
+      onError: (e: any) => setErr(e?.response?.data?.message || e?.message || 'Could not record the owner.') })
+
+  return (
+    <div className="card" style={{ gridColumn: '1 / -1' }}>
+      <div className="card-title" style={{ marginBottom: 16 }}>Home owner</div>
+      {owner ? (
+        <div className="data-row"><span className="data-key">Current owner</span>
+          <span className="data-val">{owner.first_name} {owner.last_name} · {owner.email}
+            {owner.owner_role === 'contact' && <span style={{ color: 'var(--text-3)', fontSize: '.72rem' }}> (external)</span>}
+          </span>
+        </div>
+      ) : (
+        <div style={{ color: 'var(--text-3)', fontSize: '.82rem', marginBottom: 8 }}>
+          No owner recorded. If this home is tenant/investor-owned, record who owns it (they’re the sublessor).
+        </div>
+      )}
+
+      {history.length > 1 && (
+        <div style={{ marginTop: 6, marginBottom: 8 }}>
+          <div style={{ fontSize: '.68rem', fontWeight: 700, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 4 }}>Ownership history</div>
+          {history.map((h: any) => (
+            <div key={h.id} style={{ fontSize: '.74rem', color: h.status === 'active' ? 'var(--text-2)' : 'var(--text-3)' }}>
+              {h.first_name} {h.last_name} — {humanize(h.acquired_via)} {h.acquired_at ? new Date(h.acquired_at).toLocaleDateString() : ''} {h.status !== 'active' && '· transferred'}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {!open ? (
+        <button className="btn btn-ghost btn-sm" style={{ marginTop: 8 }} onClick={() => { setErr(null); setOpen(true) }}>
+          {owner ? 'Transfer / change owner' : 'Record home owner'}
+        </button>
+      ) : (
+        <div style={{ marginTop: 10, padding: 12, background: 'var(--bg-2)', borderRadius: 10, border: '1px solid var(--border-0)', maxWidth: 480 }}>
+          <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginBottom: 8 }}>
+            Enter the owner’s name + email. If they don’t have a GAM account, a free one is created and they’re invited — external investors welcome.
+          </div>
+          <input className="form-input" style={{ marginBottom: 6 }} placeholder="Owner full name" value={form.ownerName} onChange={e => setForm({ ...form, ownerName: e.target.value })} />
+          <input className="form-input" style={{ marginBottom: 6 }} placeholder="Owner email" value={form.ownerEmail} onChange={e => setForm({ ...form, ownerEmail: e.target.value })} />
+          <select className="form-input" style={{ marginBottom: 6 }} value={form.acquiredVia} onChange={e => setForm({ ...form, acquiredVia: e.target.value })}>
+            <option value="recorded">Recording current owner</option>
+            <option value="sale">Sale</option>
+            <option value="transfer">Transfer</option>
+          </select>
+          {err && <div style={{ fontSize: '.72rem', color: 'var(--red)', marginBottom: 6 }}>{err}</div>}
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button className="btn btn-primary btn-sm" disabled={save.isLoading || !form.ownerName.trim() || !/.+@.+\..+/.test(form.ownerEmail)} onClick={() => { setErr(null); save.mutate() }}>{save.isLoading ? 'Saving…' : 'Save owner'}</button>
+            <button className="btn btn-ghost btn-sm" onClick={() => setOpen(false)}>Cancel</button>
+          </div>
         </div>
       )}
     </div>

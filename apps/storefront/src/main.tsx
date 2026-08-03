@@ -29,7 +29,14 @@ import React, { useEffect, useMemo, useState } from 'react'
 import ReactDOM from 'react-dom/client'
 import axios from 'axios'
 
-const API = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
+// S574: explicit env override wins; else localhost → the dev API, and any real
+// host (a {slug}.gam.biz visitor) → the public production API. Without this a
+// guest's browser would fetch from ITS OWN localhost:4000 and the site would
+// load a blank shell with no property data.
+const API = (import.meta as any).env?.VITE_API_URL
+  || (typeof location !== 'undefined' && /^(localhost|127\.|192\.168\.|10\.)/.test(location.hostname)
+        ? 'http://localhost:4000'
+        : 'https://api.goldassetmanagement.com')
 const api = axios.create({ baseURL: `${API}/api/public` })
 
 // ── Slug + page + claim-token resolution (subdomain in prod, path in dev) ──

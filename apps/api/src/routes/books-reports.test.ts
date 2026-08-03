@@ -136,9 +136,11 @@ async function seedPortfolio(): Promise<PortfolioFixture> {
 }
 
 async function seedSettledPayment(f: PortfolioFixture, amount: number, dueDate = '2026-05-15') {
+  // The P&L recognizes income on the CASH (settled) date — a settled payment
+  // carries a settled_at (S568 shared computeLandlordPL, cash basis).
   await db.query(
-    `INSERT INTO payments (unit_id, tenant_id, landlord_id, type, amount, status, entry_description, due_date)
-     VALUES ($1, $2, $3, 'rent', $4, 'settled', 'RENT', $5)`,
+    `INSERT INTO payments (unit_id, tenant_id, landlord_id, type, amount, status, entry_description, due_date, settled_at)
+     VALUES ($1, $2, $3, 'rent', $4, 'settled', 'RENT', $5::date, $5::date)`,
     [f.unitAId, f.tenantAId, f.landlordAId, amount, dueDate])
 }
 

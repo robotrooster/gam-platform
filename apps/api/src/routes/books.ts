@@ -1277,14 +1277,29 @@ booksRouter.get('/reports/pl', requireBooksRead, async (req, res, next) => {
     // admin and bookkeeper callers (their user_id doesn't match any
     // landlord's user_id). Use lid directly — it IS the ${col}
     // (or NULL for admin = all).
-    const { rows: rentIncome } = await db.query(
-      `SELECT COALESCE(SUM(amount), 0) AS total
-       FROM payments
-       WHERE (landlord_id=$1 OR $1 IS NULL)
-         AND status = 'settled'
-         AND due_date BETWEEN $2 AND $3`,
-      [lid, start, end]
-    ).catch(() => ({ rows: [{ total: 0 }] }))
+    // S568 detangle: for a specific landlord, pull the GAM P&L from the SINGLE
+    // shared definition (computeLandlordPL) — categorized income, deposits
+    // EXCLUDED (they were wrongly counted as income here), same expenses as the
+    // landlord reports. Admin (all-landlords) keeps the legacy lumped sum.
+    let rentIncome: any[] = [{ total: 0 }]
+    let gamPL: any = null
+    if (col === 'landlord_id' && lid) {
+      const { computeLandlordPL } = await import('../services/landlordPL')
+      // platformFeesByProperty expects YYYY-MM-01 month keys (matches periodMonths).
+      const monthKeys: string[] = []
+      { const s = new Date(String(start) + 'T00:00:00'); const e = new Date(String(end) + 'T00:00:00')
+        for (let d = new Date(s.getFullYear(), s.getMonth(), 1); d <= e; d.setMonth(d.getMonth() + 1))
+          monthKeys.push(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-01`) }
+      gamPL = await computeLandlordPL(lid, String(start), String(end), monthKeys)
+      rentIncome = [{ total: gamPL.gross.total }]
+    } else {
+      const r = await db.query(
+        `SELECT COALESCE(SUM(amount), 0) AS total FROM payments
+          WHERE (landlord_id=$1 OR $1 IS NULL) AND status='settled' AND due_date BETWEEN $2 AND $3`,
+        [lid, start, end]
+      ).catch(() => ({ rows: [{ total: 0 }] }))
+      rentIncome = r.rows
+    }
 
     // S459: for a business owner, pull REAL collected revenue the platform
     // already tracks — completed POS sales + collected invoices — so the P&L
@@ -1321,6 +1336,9 @@ booksRouter.get('/reports/pl', requireBooksRead, async (req, res, next) => {
         totalExpenses,
         netIncome: totalIncome - totalExpenses,
         gamRentIncome: +rentIncome[0]?.total || 0,
+        // S568 detangle: the SAME shared P&L the landlord reports use (categorized
+        // income, deposits-out, all expenses). Null for admin/business callers.
+        gamPL,
         // Auto-pulled real sales (POS + collected invoices). Surfaced
         // separately so totalIncome/netIncome stay journal-only (no landlord
         // behavior change); business P&L UI folds this into its net.

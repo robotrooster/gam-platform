@@ -1,8 +1,10 @@
 import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useSearchParams, useNavigate } from 'react-router-dom'
-import { humanize } from '@gam/shared'
+import { humanize, MAINTENANCE_PRIORITIES, MAINTENANCE_PRIORITY_LABEL, MAINTENANCE_CATEGORY_LABEL } from '@gam/shared'
 import { apiGet, apiPost, apiPatch } from '../lib/api'
+import { AuthedImg, AuthedVideo } from '../components/AuthedMedia'
+import { CameraCapture } from '../components/CameraCapture'
 import { usePerms } from '../lib/permissions'
 import { EntryRequestsPage } from './EntryRequestsPage'
 import { ServiceInterruptionsPanel } from '../components/ServiceInterruptionsPanel'
@@ -79,7 +81,7 @@ function RequestDetailModal({ request: r, onClose }: { request: any; onClose: ()
             </div>
             <div style={{ fontFamily: 'var(--font-display)', fontSize: '1rem', fontWeight: 800, color: 'var(--text-0)' }}>{req.title}</div>
             <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 2 }}>
-              Unit {req.unitNumber} · {req.propertyName} · {req.tenantFirst} {req.tenantLast}
+              {req.category ? `${(MAINTENANCE_CATEGORY_LABEL as any)[req.category] || req.category} · ` : ''}Unit {req.unitNumber} · {req.propertyName} · {req.tenantFirst} {req.tenantLast}
             </div>
           </div>
           <button className="btn btn-ghost btn-sm" onClick={onClose} style={{ padding: 6, flexShrink: 0 }}><X size={15} /></button>
@@ -131,11 +133,30 @@ function RequestDetailModal({ request: r, onClose }: { request: any; onClose: ()
               ))}
             </div>
             <ReceiptsSection requestId={req.id} canUpload={can('maintenance.update')} />
+            <MaintenanceMediaSection requestId={req.id} canUpload={can('maintenance.update')} status={req.status} completedAt={req.completedAt} />
           </div>
 
           {/* Management */}
           <div>
             <div style={{ fontSize: '.68rem', fontWeight: 700, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '.08em', marginBottom: 8 }}>Management</div>
+
+            {/* S571: priority — agent-recommended, landlord-overridable */}
+            {can('maintenance.update') && (
+            <div style={{ marginBottom: 10 }}>
+              <label style={{ fontSize: '.68rem', color: 'var(--text-3)', display: 'block', marginBottom: 3 }}>Priority</label>
+              <select className="input" value={req.priority} onChange={e => updateMut.mutate({ priority: e.target.value })} style={{ width: '100%', fontSize: '.78rem' }}>
+                {MAINTENANCE_PRIORITIES.map(p => (
+                  <option key={p} value={p}>{MAINTENANCE_PRIORITY_LABEL[p]}</option>
+                ))}
+              </select>
+              {req.recommendedPriority && (
+                <div style={{ fontSize: '.66rem', color: 'var(--text-3)', marginTop: 3 }}>
+                  AI recommended: <span style={{ color: 'var(--text-2)', fontWeight: 600 }}>{(MAINTENANCE_PRIORITY_LABEL as any)[req.recommendedPriority] || req.recommendedPriority}</span>
+                  {req.prioritySource === 'heuristic' ? ' (fallback)' : ''}
+                </div>
+              )}
+            </div>
+            )}
 
             {/* Schedule */}
             {can('maintenance.update') && (
@@ -586,6 +607,72 @@ export function MaintenancePage() {
 // W-8 (S529): receipts on a request — uploaded here, stored as documents
 // rows auto-linked to the request's unit (they appear on the Documents tab
 // too). No manual linking where the source is known.
+// S571: tenant + worker evidence media (photos/video). Tenant uploads are
+// landlord-IMMUTABLE — there is no delete path. Landlord/worker may add their
+// own fix photos through the same endpoint.
+function MaintenanceMediaSection({ requestId, canUpload, status, completedAt }: { requestId: string; canUpload: boolean; status?: string; completedAt?: string | null }) {
+  const qc = useQueryClient()
+  const [error, setError] = useState<string | null>(null)
+  const [uploading, setUploading] = useState(false)
+  const [cameraMode, setCameraMode] = useState<null | 'photo' | 'video'>(null)
+  const { data: media = [] } = useQuery<any[]>(['maint-media', requestId], () => apiGet(`/maintenance/${requestId}/media`))
+  const upload = async (file: File) => {
+    setError(null); setUploading(true)
+    const fd = new FormData()
+    fd.append('file', file)
+    fd.append('capturedLive', 'true')
+    const API_BASE = (import.meta as any).env.VITE_API_URL || 'http://localhost:4000'
+    const res = await fetch(`${API_BASE}/api/maintenance/${requestId}/media`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + (localStorage.getItem('gam_token') || '') },
+      body: fd,
+    })
+    if (!res.ok) { const j = await res.json().catch(() => ({})); setError(j?.error || 'Upload failed') }
+    else { qc.invalidateQueries(['maint-media', requestId]) }
+    setUploading(false)
+  }
+  const label = (m: any) => m.uploaderRole === 'tenant' ? 'Tenant' : m.uploaderRole === 'maintenance' ? 'Maintenance' : 'You'
+  const isAfterClose = (m: any) => status === 'completed' && completedAt && new Date(m.createdAt).getTime() > new Date(completedAt).getTime()
+  return (
+    <div style={{ marginTop: 10 }}>
+      <div style={{ fontSize: '.65rem', color: 'var(--text-3)', marginBottom: 4, textTransform: 'uppercase', letterSpacing: '.06em', fontWeight: 700 }}>Photos &amp; video</div>
+      {media.length > 0 && (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill,minmax(88px,1fr))', gap: 6, marginBottom: 6 }}>
+          {media.map((m: any) => (
+            <div key={m.id} style={{ position: 'relative', borderRadius: 8, overflow: 'hidden', border: `1px solid ${isAfterClose(m) ? 'rgba(245,158,11,.5)' : 'var(--border-0)'}`, background: 'var(--bg-1)' }}>
+              {isAfterClose(m) && <div style={{ position: 'absolute', top: 3, left: 3, zIndex: 2, fontSize: '.5rem', fontWeight: 800, color: '#1a1206', background: 'var(--amber)', borderRadius: 4, padding: '1px 4px' }}>AFTER CLOSE</div>}
+              {m.mediaType === 'video'
+                ? <AuthedVideo path={m.fileUrl} style={{ width: '100%', height: 88, objectFit: 'cover', background: '#000' }} />
+                : <AuthedImg path={m.fileUrl} alt={m.caption || 'photo'} style={{ width: '100%', height: 88, objectFit: 'cover' }} />}
+              <div style={{ padding: '2px 5px', fontSize: '.56rem', fontWeight: 700, color: m.uploaderRole === 'tenant' ? 'var(--blue, #4a9eff)' : 'var(--gold)', background: 'var(--bg-2)' }}>
+                {label(m)} · {new Date(m.createdAt).toLocaleDateString()}{m.capturedLive ? ' · live' : ''}
+                {m.caption && <div style={{ color: 'var(--text-3)', fontWeight: 400, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{m.caption}</div>}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+      <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+        {canUpload && (
+          <>
+            <button type="button" onClick={() => setCameraMode('photo')} disabled={uploading}
+              style={{ fontSize: '.68rem', color: 'var(--text-2)', border: '1px dashed var(--border-2)', borderRadius: 6, padding: '3px 8px', cursor: 'pointer', background: 'none' }}>
+              {uploading ? 'Uploading…' : '📷 Take fix photo'}
+            </button>
+            <button type="button" onClick={() => setCameraMode('video')} disabled={uploading}
+              style={{ fontSize: '.68rem', color: 'var(--text-2)', border: '1px dashed var(--border-2)', borderRadius: 6, padding: '3px 8px', cursor: 'pointer', background: 'none' }}>
+              🎥 Record
+            </button>
+          </>
+        )}
+        {!media.length && !canUpload && <span style={{ fontSize: '.68rem', color: 'var(--text-3)' }}>None</span>}
+      </div>
+      {error && <div style={{ fontSize: '.68rem', color: 'var(--red)', marginTop: 3 }}>{error}</div>}
+      {cameraMode && <CameraCapture mode={cameraMode} onCapture={(f) => { upload(f); setCameraMode(null) }} onClose={() => setCameraMode(null)} />}
+    </div>
+  )
+}
+
 function ReceiptsSection({ requestId, canUpload }: { requestId: string; canUpload: boolean }) {
   const qc = useQueryClient()
   const navigate = useNavigate()

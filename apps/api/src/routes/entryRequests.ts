@@ -15,6 +15,7 @@ import {
 } from '../services/notifications'
 import { logger } from '../lib/logger'
 import { applyEntryRequestResponse } from '../services/entryRequestRespond'
+import { humanize, MAINTENANCE_CATEGORY_LABEL } from '@gam/shared'
 import { checkAgainstStatute, type LawFlag } from '../services/stateLaw'
 
 /**
@@ -103,40 +104,72 @@ async function computeEntryRequestWarnings(args: {
 export const entryRequestsRouter = Router()
 entryRequestsRouter.use(requireAuth)
 
+// S571: entry is anchored to exactly ONE of a maintenance call or a scheduled
+// inspection. Unit / tenant / lease / reason all derive from that anchor — the
+// landlord no longer types a free reason or picks the unit/tenant directly.
 const createSchema = z.object({
-  unitId: z.string().uuid(),
-  leaseId: z.string().uuid().optional(),
-  tenantId: z.string().uuid(),
-  reason: z.string().min(3),
-  reasonCategory: z.enum(['maintenance', 'inspection', 'showing', 'emergency', 'other']),
+  maintenanceRequestId: z.string().uuid().optional(),
+  inspectionId:         z.string().uuid().optional(),
   proposedEntryWindowStart: z.string(),
   proposedEntryWindowEnd: z.string(),
-})
+}).refine(
+  (b) => (!!b.maintenanceRequestId) !== (!!b.inspectionId),
+  { message: 'Provide exactly one of a maintenance call or a scheduled inspection' },
+)
 
 entryRequestsRouter.post('/', requirePerm('entry_requests.create'), async (req, res, next) => {
   try {
     const body = createSchema.parse(req.body)
-    const unit = await queryOne<{ id: string; landlord_id: string }>(
-      `SELECT id, landlord_id FROM units WHERE id=$1`,
-      [body.unitId],
-    )
-    if (!unit) throw new AppError(404, 'Unit not found')
-    if (!canManageLandlordResource(req.user, unit.landlord_id)) {
-      throw new AppError(403, 'Forbidden')
+
+    // Resolve the anchor → unit / tenant / lease / reason / category.
+    let unitId: string, landlordId: string, reason: string
+    let reasonCategory: 'maintenance' | 'inspection'
+    let tenantId: string | null, leaseId: string | null = null
+    let maintenanceRequestId: string | null = null, inspectionId: string | null = null
+
+    if (body.maintenanceRequestId) {
+      const mr = await queryOne<any>(
+        `SELECT mr.id, mr.unit_id, mr.landlord_id, mr.tenant_id, mr.category, mr.title
+           FROM maintenance_requests mr WHERE mr.id=$1`,
+        [body.maintenanceRequestId])
+      if (!mr) throw new AppError(404, 'Maintenance request not found')
+      if (!canManageLandlordResource(req.user, mr.landlord_id)) throw new AppError(403, 'Forbidden')
+      maintenanceRequestId = mr.id
+      unitId = mr.unit_id; landlordId = mr.landlord_id; tenantId = mr.tenant_id ?? null
+      reasonCategory = 'maintenance'
+      reason = `Maintenance: ${(MAINTENANCE_CATEGORY_LABEL as any)[mr.category] || mr.title || 'repair'}`
+    } else {
+      const insp = await queryOne<any>(
+        `SELECT id, unit_id, landlord_id, tenant_id, lease_id, inspection_type
+           FROM unit_inspections WHERE id=$1`,
+        [body.inspectionId])
+      if (!insp) throw new AppError(404, 'Inspection not found')
+      if (!canManageLandlordResource(req.user, insp.landlord_id)) throw new AppError(403, 'Forbidden')
+      inspectionId = insp.id
+      unitId = insp.unit_id; landlordId = insp.landlord_id
+      tenantId = insp.tenant_id ?? null; leaseId = insp.lease_id ?? null
+      reasonCategory = 'inspection'
+      reason = `Inspection: ${humanize(insp.inspection_type)}`
     }
 
-    // S351: validate tenantId exists before the INSERT. Pre-S351 a
-    // random/stale uuid produced a 500 with a raw postgres FK
-    // violation message (unit_entry_requests_tenant_id_fkey). Surface
-    // as a clean 404 so the landlord UI can show "tenant not found"
-    // instead of "Internal Server Error".
-    const tenantExists = await queryOne<{ id: string }>(
-      `SELECT id FROM tenants WHERE id=$1`, [body.tenantId])
-    if (!tenantExists) throw new AppError(404, 'Tenant not found')
+    // Fill any gaps from the unit's current occupancy / active lease.
+    if (!tenantId || !leaseId) {
+      const occ = await queryOne<any>(
+        `SELECT l.id AS lease_id, vlat.tenant_id
+           FROM leases l
+           LEFT JOIN v_lease_active_tenants vlat ON vlat.lease_id = l.id
+          WHERE l.unit_id = $1 AND l.status = 'active'
+          ORDER BY vlat.tenant_id NULLS LAST
+          LIMIT 1`,
+        [unitId])
+      tenantId = tenantId ?? occ?.tenant_id ?? null
+      leaseId = leaseId ?? occ?.lease_id ?? null
+    }
+    if (!tenantId) throw new AppError(400, 'No active tenant on this unit to notify of entry')
 
     const noticeHoursRow = await queryOne<{ default_entry_notice_hours: number }>(
       `SELECT default_entry_notice_hours FROM landlords WHERE id=$1`,
-      [unit.landlord_id],
+      [landlordId],
     )
     const defaultNoticeHours = noticeHoursRow?.default_entry_notice_hours ?? 24
 
@@ -150,7 +183,7 @@ entryRequestsRouter.post('/', requirePerm('entry_requests.create'), async (req, 
     // S475 + S476: outside-hours flag + state-law mismatch, all computed
     // by the shared helper so POST and GET return identical shapes.
     const warnings = await computeEntryRequestWarnings({
-      unitId:            body.unitId,
+      unitId,
       startIso:          start.toISOString(),
       noticeWindowHours,
     })
@@ -160,20 +193,22 @@ entryRequestsRouter.post('/', requirePerm('entry_requests.create'), async (req, 
          unit_id, lease_id, tenant_id, landlord_id,
          requested_by_user_id, reason, reason_category,
          proposed_entry_window_start, proposed_entry_window_end,
-         notice_window_hours
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         notice_window_hours, maintenance_request_id, inspection_id
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
        RETURNING id`,
       [
-        body.unitId,
-        body.leaseId ?? null,
-        body.tenantId,
-        unit.landlord_id,
+        unitId,
+        leaseId,
+        tenantId,
+        landlordId,
         req.user!.userId,
-        body.reason,
-        body.reasonCategory,
+        reason,
+        reasonCategory,
         start,
         end,
         noticeWindowHours,
+        maintenanceRequestId,
+        inspectionId,
       ],
     )
 
@@ -184,7 +219,7 @@ entryRequestsRouter.post('/', requirePerm('entry_requests.create'), async (req, 
            FROM tenants t JOIN users u ON u.id = t.user_id
            LEFT JOIN units un ON un.id = $2
           WHERE t.id = $1`,
-        [body.tenantId, body.unitId],
+        [tenantId, unitId],
       )
       if (t?.user_id && t?.email) {
         await notifyEntryRequestNew({
@@ -192,8 +227,8 @@ entryRequestsRouter.post('/', requirePerm('entry_requests.create'), async (req, 
           tenantEmail:        t.email,
           tenantPhone:        t.phone ?? undefined,
           requestId:          inserted!.id,
-          reason:             body.reason,
-          reasonCategory:     body.reasonCategory,
+          reason,
+          reasonCategory,
           windowStart:        start.toISOString(),
           windowEnd:          end.toISOString(),
           noticeWindowHours,
@@ -271,6 +306,7 @@ entryRequestsRouter.get('/', async (req, res, next) => {
               reason, reason_category, status,
               notice_given_at, proposed_entry_window_start,
               proposed_entry_window_end, entry_actual_at, notice_window_hours,
+              maintenance_request_id, inspection_id,
               created_at
          FROM unit_entry_requests
         WHERE ${where}
@@ -439,7 +475,7 @@ async function loadRequest(
             reason, reason_category, status,
             notice_given_at, proposed_entry_window_start,
             proposed_entry_window_end, entry_actual_at,
-            notice_window_hours, notes, created_at
+            notice_window_hours, notes, maintenance_request_id, inspection_id, created_at
        FROM unit_entry_requests
       WHERE id = $1`,
     [id],

@@ -15,7 +15,7 @@
 import { query } from '../../../db'
 import { AppError } from '../../../middleware/errorHandler'
 import { createMaintenanceRequest } from '../../maintenanceRequests'
-import { MAINTENANCE_PRIORITIES } from '@gam/shared'
+import { MAINTENANCE_CATEGORIES, type MaintenanceCategory } from '@gam/shared'
 import type { AgentTool, AgentActor } from './types'
 
 interface ActiveUnit {
@@ -50,10 +50,10 @@ export const fileMaintenanceRequest: AgentTool = {
     properties: {
       title: { type: 'string', description: 'Short summary of the issue, e.g. "Leaking kitchen sink"' },
       description: { type: 'string', description: 'Details: what is wrong, where, since when' },
-      priority: {
+      category: {
         type: 'string',
-        enum: [...MAINTENANCE_PRIORITIES],
-        description: 'Urgency; default normal. Use emergency only for safety/major-damage issues.',
+        enum: [...MAINTENANCE_CATEGORIES],
+        description: 'Issue category, e.g. plumbing, electrical, hvac, appliance. Use general if unsure.',
       },
       unitId: {
         type: 'string',
@@ -70,9 +70,12 @@ export const fileMaintenanceRequest: AgentTool = {
     if (title.length < 3) return { ok: false, error: 'A title of at least 3 characters is required.' }
     if (description.length < 5) return { ok: false, error: 'A description of at least 5 characters is required.' }
 
-    const priority = MAINTENANCE_PRIORITIES.includes(args.priority as any)
-      ? (args.priority as (typeof MAINTENANCE_PRIORITIES)[number])
-      : 'normal'
+    // S571: the agent does NOT set priority — createMaintenanceRequest runs the
+    // in-house priority recommender for every tenant-originated request (one
+    // source of truth). The agent only supplies the category.
+    const category = MAINTENANCE_CATEGORIES.includes(args.category as MaintenanceCategory)
+      ? (args.category as MaintenanceCategory)
+      : undefined
 
     const units = await activeUnitsForTenant(actor.profileId)
     if (units.length === 0) {
@@ -103,7 +106,7 @@ export const fileMaintenanceRequest: AgentTool = {
         unitId,
         title,
         description,
-        priority,
+        category,
         actor: { userId: actor.userId, role: actor.role, profileId: actor.profileId },
       })
       const unit = units.find((u) => u.unit_id === unitId)

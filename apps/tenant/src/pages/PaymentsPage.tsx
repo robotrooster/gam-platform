@@ -12,7 +12,7 @@
  */
 import { useState } from 'react'
 import { useQuery, useQueryClient } from 'react-query'
-import { formatCurrency, humanize, humanizeEntryDescription, MANUAL_PAYMENT_FEE } from '@gam/shared'
+import { formatCurrency, humanize, humanizeEntryDescription } from '@gam/shared'
 import { apiGet } from '../lib/api'
 import {
   AddPaymentMethodModal,
@@ -72,7 +72,6 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
   )
   const { data: balanceCtx } = useQuery<{
     totalOutstanding: number
-    acceptPartialPayments: boolean
     paymentBlocked: boolean
     rows: { id: string; amount: number; due_date: string; type: string; entry_description: string }[]
   }>('balance-context', () => apiGet('/payments/balance-context'))
@@ -84,7 +83,6 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
 
   const [payTarget, setPayTarget] = useState<{ target: PayTarget } | null>(null)
   const [addMethodOpen, setAddMethodOpen] = useState<'ach' | 'card' | null>(null)
-  const [payAmount, setPayAmount] = useState<string>('')
 
   const refetchAll = () => {
     qc.invalidateQueries('payments')
@@ -94,18 +92,17 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
   }
 
   const total = balanceCtx?.totalOutstanding ?? 0
-  const mustPayFull = balanceCtx ? !balanceCtx.acceptPartialPayments : false
-  const effectiveAmount = mustPayFull ? total : (payAmount === '' ? total : Number(payAmount))
 
+  // Rent is PAY-IN-FULL ONLY (Nic) — no partial payments anywhere in the system.
+  // A partial payment can reset a landlord's eviction clock, so the tenant always
+  // pays the entire outstanding balance; there is no editable amount.
   const openPayBalance = () => {
-    if (!(effectiveAmount > 0)) return
+    if (!(total > 0)) return
     setPayTarget({
       target: {
-        amount:    Math.round(effectiveAmount * 100) / 100,
+        amount:    Math.round(total * 100) / 100,
         endpoint:  '/payments/pay-balance',
-        subheader: effectiveAmount > total + 0.005
-          ? `$${total.toFixed(2)} balance + $${(effectiveAmount - total).toFixed(2)} paid ahead`
-          : `applied to your oldest balance first`,
+        subheader: 'applied to your oldest balance first',
         kind:      'rent',
         sendAmountInBody: true,
       },
@@ -133,13 +130,9 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
 
       <SavedMethodsCard methods={methods} loading={methodsLoading} />
 
-      {/* S562: disclose the manual-payment fee. Your first rent payment is
-          fee-free; after that, paying by cash/check/money order (recorded by
-          your landlord) adds a $10 fee — paying through GAM avoids it. */}
-      <div style={{ fontSize: '.74rem', color: 'var(--t3)', marginTop: 12, padding: '10px 12px', background: 'var(--bg2)', border: '1px solid var(--b1)', borderRadius: 8 }}>
-        Paying rent by cash, check, or money order? Your first payment is free; after that a
-        ${MANUAL_PAYMENT_FEE.toFixed(2)} manual-payment fee applies. Pay through GAM to skip it.
-      </div>
+      {/* S570 (Nic): removed the cash/check/MO fee banner — a tenant can't
+          initiate a cash payment through the portal (they hand cash to the
+          landlord, who records it), so the tenant-facing banner was nonsensical. */}
 
       {/* S537: THE payment surface — one button, FIFO application. */}
       {balanceCtx && total > 0 && !balanceCtx.paymentBlocked && (
@@ -153,23 +146,13 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
                 {formatCurrency(total)}
               </div>
               <div style={{ fontSize: '.74rem', color: 'var(--t3)', marginTop: 4 }}>
-                Payments apply to your oldest balance first.
-                {mustPayFull
-                  ? ' This property requires the full balance.'
-                  : ' Pay any amount — paying extra credits your next bill.'}
+                Rent is paid in full — this covers your entire outstanding balance,
+                oldest charges first.
               </div>
             </div>
             <div style={{ display: 'flex', alignItems: 'flex-end', gap: 8 }}>
-              {!mustPayFull && (
-                <div>
-                  <span style={{ fontSize: '.68rem', color: 'var(--t3)', display: 'block', marginBottom: 4 }}>Amount</span>
-                  <input className="inp mono" inputMode="decimal" value={payAmount} placeholder={total.toFixed(2)}
-                    onChange={e => { const v = e.target.value; if (v === '' || /^\d*\.?\d*$/.test(v)) setPayAmount(v) }}
-                    style={{ width: 110 }} />
-                </div>
-              )}
-              <button className="btn btn-p" onClick={openPayBalance} disabled={!(effectiveAmount > 0)}>
-                Pay now
+              <button className="btn btn-p" onClick={openPayBalance} disabled={!(total > 0)}>
+                Pay {formatCurrency(total)}
               </button>
             </div>
           </div>
@@ -491,13 +474,13 @@ function SecurityDepositCard() {
             </>
           ) : (
             <>
-              Your landlord has set a {Number(data.rate.annualRatePct).toFixed(2)}% annual interest rate for {data.rate.stateCode} deposits ({data.rate.effectiveYear}). Interest accrues monthly and is paid out with your refund at move-out.
+              Your landlord pays {Number(data.rate.annualRatePct).toFixed(2)}% annual interest on your deposit ({data.rate.effectiveYear}). Interest accrues monthly and is paid out with your refund at move-out.
             </>
           )}
         </div>
       ) : (
         <div style={{ fontSize: '.74rem', color: 'var(--t3)', lineHeight: 1.5, padding: 10, background: 'var(--bg-2)', borderRadius: 6 }}>
-          {data.deposit.state ?? 'Your state'} has no statutory deposit-interest requirement. Your deposit is held in full and returned at move-out minus any deductions.
+          Your deposit is held in full and returned at move-out, minus any deductions. Where deposit interest is required, it's applied to your refund automatically.
         </div>
       )}
 

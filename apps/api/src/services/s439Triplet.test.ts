@@ -152,14 +152,30 @@ describe('createMaintenanceRequest', () => {
     expect(req.id).toBeTruthy()
   })
 
-  it('priority defaults to "normal" when omitted; photos default to []', async () => {
+  // S571: priority is agent-recommended when omitted (non-deterministic value),
+  // and photos still default to []. An explicit priority is respected verbatim.
+  it('omitted priority is agent-recommended (recommendation stored); photos default to []', async () => {
     const ctx = await seedMaintCtx()
     const req = await createMaintenanceRequest({
-      unitId: ctx.unitId, title: 'x', description: 'y',
+      unitId: ctx.unitId, category: 'plumbing', description: 'kitchen sink is leaking',
+      actor: { userId: ctx.tenantUserId, role: 'tenant', profileId: ctx.tenantId },
+    })
+    expect(['emergency','high','normal','low']).toContain(req.priority)
+    expect(req.recommended_priority).toBe(req.priority)
+    expect(['agent','heuristic']).toContain(req.priority_source)
+    expect(req.category).toBe('plumbing')
+    expect(req.photos).toEqual([])
+  })
+
+  it('explicit priority is respected and marked landlord-sourced', async () => {
+    const ctx = await seedMaintCtx()
+    const req = await createMaintenanceRequest({
+      unitId: ctx.unitId, title: 'x', description: 'y', priority: 'low',
       actor: { userId: ctx.landlordUserId, role: 'landlord', profileId: ctx.landlordId },
     })
-    expect(req.priority).toBe('normal')
-    expect(req.photos).toEqual([])
+    expect(req.priority).toBe('low')
+    expect(req.recommended_priority).toBeNull()
+    expect(req.priority_source).toBe('landlord')
   })
 })
 

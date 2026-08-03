@@ -16,7 +16,7 @@
  *   - GET /admin/platform-claims/candidates (S297 promotion candidates)
  *   - POST /admin/platform-claims/:normalized/promote (super_admin)
  *
- * Out of slice (next admin.ts session): income projection / bulletin
+ * Out of slice (next admin.ts session): income projection
  * moderation / OTP+FlexCharge retry / deposit-portability / connect-
  * readiness / onboarding detail / email failures / audit log viewer.
  */
@@ -109,7 +109,7 @@ describe('GET /api/admin/csv-import-attempts — list with filters', () => {
 
     const res = await request(buildApp())
       .get('/api/admin/csv-import-attempts')
-      .set('Authorization', `Bearer ${f.adminToken}`)
+      .set('Authorization', `Bearer ${f.superAdminToken}`)
     expect(res.status).toBe(200)
     const ids = res.body.data.rows.map((r: any) => r.id).sort()
     expect(ids).toEqual([a, b].sort())
@@ -124,7 +124,7 @@ describe('GET /api/admin/csv-import-attempts — list with filters', () => {
 
     const res = await request(buildApp())
       .get('/api/admin/csv-import-attempts?platform=doorloop&import_type=tenant')
-      .set('Authorization', `Bearer ${f.adminToken}`)
+      .set('Authorization', `Bearer ${f.superAdminToken}`)
     expect(res.status).toBe(200)
     expect(res.body.data.rows.length).toBe(1)
     expect(res.body.data.rows[0].id).toBe(targetId)
@@ -221,7 +221,7 @@ describe('GET /api/admin/platform-review-statuses', () => {
 
     const res = await request(buildApp())
       .get('/api/admin/platform-review-statuses')
-      .set('Authorization', `Bearer ${f.adminToken}`)
+      .set('Authorization', `Bearer ${f.superAdminToken}`)
     expect(res.status).toBe(200)
     const byKey = Object.fromEntries(res.body.data.rows.map((r: any) => [r.platform_key, r]))
     expect(byKey['unverified_plat'].mapping_status).toBe('unverified')
@@ -302,7 +302,7 @@ describe('GET /api/admin/platform-claims/candidates', () => {
 
     const res = await request(buildApp())
       .get('/api/admin/platform-claims/candidates')
-      .set('Authorization', `Bearer ${f1.adminToken}`)
+      .set('Authorization', `Bearer ${f1.superAdminToken}`)
     expect(res.status).toBe(200)
     const names = res.body.data.rows.map((r: any) => r.normalized_name)
     expect(names).toContain('rentmanager')

@@ -43,7 +43,12 @@ vi.mock('../services/email', async (importOriginal) => {
 vi.mock('stripe', () => {
   const transfersCreate = vi.fn(async () => ({ id: 'tr_mock' }))
   const customersRetrieve = vi.fn(async () => ({}))
+  const customersUpdate = vi.fn(async () => ({}))
   const paymentIntentsCreate = vi.fn(async () => ({ id: 'pi_mock' }))
+  // S570: setup_intent.succeeded handler retrieves the PM for bank last4.
+  const paymentMethodsRetrieve = vi.fn(async () => ({
+    id: 'pm_mock', us_bank_account: { last4: '6789', routing_number: '110000000' },
+  }))
   const constructEvent = (body: Buffer | string, _sig: any, _secret: string) => {
     const text = typeof body === 'string' ? body : body.toString('utf8')
     return JSON.parse(text)
@@ -51,10 +56,11 @@ vi.mock('stripe', () => {
   function FakeStripe(this: any) {
     this.webhooks = { constructEvent }
     this.transfers = { create: transfersCreate }
-    this.customers = { retrieve: customersRetrieve }
+    this.customers = { retrieve: customersRetrieve, update: customersUpdate }
     this.paymentIntents = { create: paymentIntentsCreate }
+    this.paymentMethods = { retrieve: paymentMethodsRetrieve }
   }
-  ;(FakeStripe as any).__mocks = { transfersCreate, customersRetrieve, paymentIntentsCreate, constructEvent }
+  ;(FakeStripe as any).__mocks = { transfersCreate, customersRetrieve, customersUpdate, paymentIntentsCreate, paymentMethodsRetrieve, constructEvent }
   return { default: FakeStripe }
 })
 
@@ -1134,5 +1140,80 @@ describe('POST /webhooks/stripe — account.updated', () => {
     // Synced_at still updates regardless of capability state — it's a
     // "last-seen" timestamp, not a "fully-ready" one.
     expect(row.rows[0].stripe_connect_status_synced_at).not.toBeNull()
+  })
+})
+
+// ── S570: setup_intent.succeeded — microdeposit ACH verification completes ──
+function buildSetupIntentSucceeded(metadata: Record<string, string>, opts: { customer?: string; paymentMethod?: string } = {}): string {
+  return JSON.stringify({
+    id: 'evt_si_' + (metadata.tenantId ?? metadata.gam_pos_customer_id ?? 'x'),
+    type: 'setup_intent.succeeded',
+    data: {
+      object: {
+        id: 'seti_' + (metadata.tenantId ?? metadata.gam_pos_customer_id ?? 'x'),
+        object: 'setup_intent',
+        customer: opts.customer ?? 'cus_mock',
+        payment_method: opts.paymentMethod ?? 'pm_mock',
+        metadata,
+      },
+    },
+  })
+}
+
+describe('POST /webhooks/stripe — setup_intent.succeeded (S570 microdeposit verify)', () => {
+  it('tenant path: flips ach_verified TRUE + stamps bank + logs first_sender (idempotent)', async () => {
+    const client = await getClient()
+    let tenantId: string
+    try {
+      tenantId = await seedTenant(client)
+      await client.query(`UPDATE tenants SET ach_verified=FALSE, stripe_customer_id='cus_tenant_md' WHERE id=$1`, [tenantId])
+    } finally { client.release() }
+
+    const app = buildApp()
+    const send = () => request(app).post('/webhooks/stripe')
+      .set('Content-Type', 'application/json').set('stripe-signature', 't=1,v1=stub')
+      .send(buildSetupIntentSucceeded({ tenantId: tenantId! }, { customer: 'cus_tenant_md' }))
+
+    expect((await send()).status).toBe(200)
+    const t = await db.query<any>(`SELECT ach_verified, bank_last4 FROM tenants WHERE id=$1`, [tenantId!])
+    expect(t.rows[0].ach_verified).toBe(true)
+    expect(t.rows[0].bank_last4).toBe('6789')
+    let log = await db.query<any>(`SELECT count(*)::int AS n FROM ach_monitoring_log WHERE tenant_id=$1 AND event_type='first_sender'`, [tenantId!])
+    expect(log.rows[0].n).toBe(1)
+
+    // Re-delivery is idempotent: no second first_sender row.
+    expect((await send()).status).toBe(200)
+    log = await db.query<any>(`SELECT count(*)::int AS n FROM ach_monitoring_log WHERE tenant_id=$1 AND event_type='first_sender'`, [tenantId!])
+    expect(log.rows[0].n).toBe(1)
+  })
+
+  it('POS path: flips pos_customers.ach_verified TRUE + marks invitation accepted', async () => {
+    const client = await getClient()
+    let posCustId: string, invId: string
+    try {
+      const { landlordId } = await seedLandlord(client)
+      const pc = await client.query(
+        `INSERT INTO pos_customers (landlord_id, first_name, last_name, email, ach_verified)
+         VALUES ($1,'Pat','Poser','pat@poser.dev',FALSE) RETURNING id`, [landlordId])
+      posCustId = pc.rows[0].id
+      const iv = await client.query(
+        `INSERT INTO pos_customer_invitations (pos_customer_id, landlord_id, token, status, setup_intent_id, expires_at)
+         VALUES ($1,$2,'tok_md','in_progress','seti_pos', NOW() + interval '7 days') RETURNING id`,
+        [posCustId, landlordId])
+      invId = iv.rows[0].id
+    } finally { client.release() }
+
+    const app = buildApp()
+    const res = await request(app).post('/webhooks/stripe')
+      .set('Content-Type', 'application/json').set('stripe-signature', 't=1,v1=stub')
+      .send(buildSetupIntentSucceeded(
+        { gam_purpose: 'pos_customer_ach_onboarding', gam_pos_customer_id: posCustId!, gam_invitation_id: invId! },
+        { customer: 'cus_pos_md' }))
+    expect(res.status).toBe(200)
+    const pc = await db.query<any>(`SELECT ach_verified, bank_last4 FROM pos_customers WHERE id=$1`, [posCustId!])
+    expect(pc.rows[0].ach_verified).toBe(true)
+    expect(pc.rows[0].bank_last4).toBe('6789')
+    const iv = await db.query<any>(`SELECT status FROM pos_customer_invitations WHERE id=$1`, [invId!])
+    expect(iv.rows[0].status).toBe('accepted')
   })
 })

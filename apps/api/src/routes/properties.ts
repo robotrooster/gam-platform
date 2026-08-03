@@ -9,6 +9,7 @@ import { db, query, queryOne, getClient } from '../db'
 import { requireAuth, requireLandlord, requirePerm } from '../middleware/auth'
 import { resolveUploadPath } from '../lib/uploadPaths'
 import { canAccessLandlordResource, canManageLandlordResource } from '../middleware/scope'
+import { suggestBookingSlug } from './propertyBookingAdmin'
 import { AppError } from '../middleware/errorHandler'
 import {
   FEE_PAYER_VALUES,
@@ -71,6 +72,9 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
       city: z.string(), state: z.string(), zip: z.string(),
       type: z.enum(['residential','rv_longterm','rv_weekly','rv_nightly','mixed']).default('residential').optional(),
       unitTypes: z.array(z.string()).optional(),
+      // S568: FALSE = homes-only external park (investor operates without owning
+      // the land; park owner not on GAM). Default TRUE (operator owns the park).
+      operatorOwnsLand: z.boolean().optional(),
       // S179 / B3: per-property booking acknowledgment toggle.
       requiresBookingAcknowledgment: z.boolean().optional(),
       // 16a: allocation rule required on every property creation.
@@ -180,17 +184,38 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
     const propRes = await client.query<any>(`
       INSERT INTO properties
         (landlord_id, name, street1, street2, city, state, zip, type, unit_types,
-         requires_booking_acknowledgment,
+         requires_booking_acknowledgment, operator_owns_land,
          owner_user_id, managed_by_user_id)
       VALUES
-        ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
+        ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,
          (SELECT user_id FROM landlords WHERE id=$1),
          (SELECT user_id FROM landlords WHERE id=$1))
       RETURNING *`,
       [req.user!.profileId, body.name, body.street1, body.street2 ?? null,
        body.city, body.state, body.zip, body.type || 'mixed', body.unitTypes || [],
-       body.requiresBookingAcknowledgment ?? false])
+       body.requiresBookingAcknowledgment ?? false, body.operatorOwnsLand ?? true])
     const prop = propRes.rows[0]
+
+    // S574 (Nic): every property gets a live public website the moment it's
+    // created — auto-assign a booking slug and publish it so the landlord has a
+    // shareable site immediately, with no separate "enable" step to hunt for.
+    // suggestBookingSlug derives name-city (→ name-street# → name on collision)
+    // and guarantees uniqueness. The landlord can rename the address or unpublish
+    // per-property on Schedule → Booking Page. Wrapped so a slug collision or any
+    // hiccup NEVER blocks property creation — worst case the site stays
+    // unpublished and the landlord enables it manually.
+    try {
+      const autoSlug = await suggestBookingSlug(prop)
+      if (autoSlug) {
+        await client.query(
+          `UPDATE properties SET booking_slug=$1, public_booking_enabled=TRUE WHERE id=$2`,
+          [autoSlug, prop.id])
+        prop.booking_slug = autoSlug
+        prop.public_booking_enabled = true
+      }
+    } catch (slugErr) {
+      logger.error({ err: slugErr, ctx: prop.id }, '[auto-slug] could not auto-publish property site')
+    }
 
     // S66: validate ownerBankAccountId (if provided) belongs to the
     // property's owner_user_id. The DB FK only enforces existence, not
@@ -826,6 +851,7 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
         weekly_lease_mode       = COALESCE($15, weekly_lease_mode),
         accept_partial_payments = COALESCE($17, accept_partial_payments),
         default_occupancy_mode  = COALESCE($18, default_occupancy_mode),
+        operator_owns_land      = COALESCE($19, operator_owns_land),
         updated_at  = NOW()
       WHERE id=$16 RETURNING *`,
       [name||null, street1||null, street2||null, city||null, state||null,
@@ -840,7 +866,8 @@ propertiesRouter.patch('/:id', requirePerm('properties.edit'), async (req, res, 
        weeklyLeaseMode === undefined ? null : weeklyLeaseMode,
        req.params.id,
        acceptPartialPayments === undefined ? null : acceptPartialPayments,
-       defaultOccupancyMode ?? null]
+       defaultOccupancyMode ?? null,
+       typeof raw.operatorOwnsLand === 'boolean' ? raw.operatorOwnsLand : null]
     )
 
     // S226: separate dynamic UPDATE for accrual + cap. The COALESCE
@@ -1329,6 +1356,7 @@ publicPropertiesRouter.get('/listings', requireAuth, async (req: any, res, next)
       SELECT
         u.id, u.unit_number, u.bedrooms, u.bathrooms, u.sqft,
         u.rent_amount, u.security_deposit, u.available_date, u.listing_description,
+        u.floor_level, u.is_ada_accessible,
         p.name AS property_name, p.street1, p.city, p.state, p.zip,
         p.type AS property_type,
         l.id AS landlord_id,

@@ -43,6 +43,11 @@ vi.mock('../lib/stripe', async () => {
   const setupIntentsCreate = vi.fn(async () => ({
     id: 'seti_mock', client_secret: 'seti_mock_secret',
   }))
+  // S570: confirm-setup gates ach_verified on the SetupIntent status.
+  // Default 'succeeded' (verified path); the microdeposit-pending test overrides.
+  const setupIntentsRetrieve = vi.fn(async () => ({
+    id: 'seti_mock', status: 'succeeded',
+  }))
   const paymentMethodsRetrieve = vi.fn(async () => ({
     id: 'pm_mock',
     customer: 'cus_mock_tenant',
@@ -60,17 +65,23 @@ vi.mock('../lib/stripe', async () => {
                card: { brand: 'visa', last4: '1111', exp_month: 12, exp_year: 2030, country: 'US' } }],
     }
   })
+  // S571: default payment method lives on the customer; swap detaches others.
+  const customersRetrieve = vi.fn(async (id: string) => ({
+    id, invoice_settings: { default_payment_method: 'pm_ach_1' },
+  }))
+  const customersUpdate = vi.fn(async (id: string, args: any) => ({ id, ...args }))
+  const paymentMethodsDetach = vi.fn(async (id: string) => ({ id }))
   const fakeStripe = {
-    customers: { create: customersCreate },
-    setupIntents: { create: setupIntentsCreate },
-    paymentMethods: { retrieve: paymentMethodsRetrieve, list: paymentMethodsList },
+    customers: { create: customersCreate, retrieve: customersRetrieve, update: customersUpdate },
+    setupIntents: { create: setupIntentsCreate, retrieve: setupIntentsRetrieve },
+    paymentMethods: { retrieve: paymentMethodsRetrieve, list: paymentMethodsList, detach: paymentMethodsDetach },
   }
   const createTenantAchSetup = vi.fn(async () => ({
     customerId: 'cus_mock_tenant', clientSecret: 'seti_mock_seed_secret',
   }))
   ;(globalThis as any).__stripeMocks = {
-    customersCreate, setupIntentsCreate, paymentMethodsRetrieve,
-    paymentMethodsList, createTenantAchSetup,
+    customersCreate, customersRetrieve, customersUpdate, setupIntentsCreate, setupIntentsRetrieve,
+    paymentMethodsRetrieve, paymentMethodsList, paymentMethodsDetach, createTenantAchSetup,
   }
   return {
     getStripe: () => fakeStripe,
@@ -101,8 +112,12 @@ function buildApp() {
 const stripeMocks = (globalThis as any).__stripeMocks as {
   customersCreate:        ReturnType<typeof vi.fn>
   setupIntentsCreate:     ReturnType<typeof vi.fn>
+  setupIntentsRetrieve:   ReturnType<typeof vi.fn>
   paymentMethodsRetrieve: ReturnType<typeof vi.fn>
   paymentMethodsList:     ReturnType<typeof vi.fn>
+  paymentMethodsDetach:   ReturnType<typeof vi.fn>
+  customersRetrieve:      ReturnType<typeof vi.fn>
+  customersUpdate:        ReturnType<typeof vi.fn>
   createTenantAchSetup:   ReturnType<typeof vi.fn>
 }
 
@@ -110,7 +125,9 @@ beforeEach(async () => {
   await cleanupAllSchema()
   process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_jwt_secret_stripe'
   ;[stripeMocks.customersCreate, stripeMocks.setupIntentsCreate,
+    stripeMocks.setupIntentsRetrieve,
     stripeMocks.paymentMethodsRetrieve, stripeMocks.paymentMethodsList,
+    stripeMocks.paymentMethodsDetach, stripeMocks.customersRetrieve, stripeMocks.customersUpdate,
     stripeMocks.createTenantAchSetup,
     stripeConnect.ensureConnectAccount as ReturnType<typeof vi.fn>,
     stripeConnect.createOnboardingSession as ReturnType<typeof vi.fn>,
@@ -121,6 +138,8 @@ beforeEach(async () => {
     customer: 'cus_mock_tenant',
     us_bank_account: { last4: '6789', routing_number: '110000000', bank_name: 'Test Bank' },
   } as any)
+  // S570: default SetupIntent status = succeeded (verified path).
+  stripeMocks.setupIntentsRetrieve.mockResolvedValue({ id: 'seti_mock', status: 'succeeded' } as any)
 })
 
 const sign = (claims: any) =>
@@ -456,6 +475,24 @@ describe('POST /api/stripe/tenant/confirm-setup', () => {
     expect(log[0].event_type).toBe('first_sender')
   })
 
+  it('S570 microdeposit pending: SetupIntent not succeeded → ach_verified stays FALSE, no first-sender log, stamps bank + returns verified:false', async () => {
+    const { tenantId, userId } = await seedTenantWithStripe()
+    stripeMocks.setupIntentsRetrieve.mockResolvedValueOnce({ id: 'seti_x', status: 'requires_action' } as any)
+    const token = sign({ userId, role: 'tenant', email: 't@t.dev', profileId: tenantId })
+    const res = await request(buildApp()).post('/api/stripe/tenant/confirm-setup')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ setupIntentId: 'seti_x', paymentMethodId: 'pm_x' })
+    expect(res.status).toBe(200)
+    expect(res.body.verified).toBe(false)
+    const { rows: [t] } = await db.query<any>(
+      `SELECT ach_verified, bank_last4 FROM tenants WHERE id=$1`, [tenantId])
+    expect(t.ach_verified).toBe(false)
+    expect(t.bank_last4).toBe('6789')       // bank metadata still stamped
+    const { rows: log } = await db.query<any>(
+      `SELECT event_type FROM ach_monitoring_log WHERE tenant_id=$1`, [tenantId])
+    expect(log).toHaveLength(0)             // first-sender waits for the webhook
+  })
+
   it('S406 fix: non-tenant caller → 403 (was 500 pre-fix from ach_monitoring_log FK)', async () => {
     const c = await db.connect()
     try {
@@ -585,5 +622,74 @@ describe('GET /api/stripe/tenant/payment-methods', () => {
     const res = await request(buildApp()).get('/api/stripe/tenant/payment-methods')
       .set('Authorization', `Bearer ${token}`)
     expect(res.status).toBe(404)
+  })
+
+  it('S571: marks the customer default method with isDefault', async () => {
+    const c = await db.connect()
+    let tenantId = ''; let userId = ''
+    try {
+      await c.query('BEGIN')
+      tenantId = await seedTenant(c)
+      const { rows: [{ user_id }] } = await c.query<{ user_id: string }>(`SELECT user_id FROM tenants WHERE id=$1`, [tenantId])
+      userId = user_id
+      await c.query(`UPDATE tenants SET stripe_customer_id='cus_mock_tenant' WHERE id=$1`, [tenantId])
+      await c.query('COMMIT')
+    } finally { c.release() }
+    // Mock customer default = pm_ach_1.
+    const token = sign({ userId, role: 'tenant', email: 't@t.dev', profileId: tenantId })
+    const res = await request(buildApp()).get('/api/stripe/tenant/payment-methods').set('Authorization', `Bearer ${token}`)
+    expect(res.status).toBe(200)
+    expect(res.body.data.find((p: any) => p.id === 'pm_ach_1').isDefault).toBe(true)
+    expect(res.body.data.find((p: any) => p.id === 'pm_card_1').isDefault).toBe(false)
+  })
+})
+
+// ─── S571: default + one-of-each swap ─────────────────────────
+describe('S571 payment-method default + swap', () => {
+  async function seedStripeTenant() {
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const tenantId = await seedTenant(c)
+      const { rows: [{ user_id }] } = await c.query<{ user_id: string }>(`SELECT user_id FROM tenants WHERE id=$1`, [tenantId])
+      await c.query(`UPDATE tenants SET stripe_customer_id='cus_mock_tenant' WHERE id=$1`, [tenantId])
+      await c.query('COMMIT')
+      return { tenantId, userId: user_id }
+    } finally { c.release() }
+  }
+
+  it('PATCH default-payment-method sets the customer default', async () => {
+    const { tenantId, userId } = await seedStripeTenant()
+    stripeMocks.paymentMethodsRetrieve.mockResolvedValueOnce({ id: 'pm_card_1', customer: 'cus_mock_tenant', type: 'card' })
+    const token = sign({ userId, role: 'tenant', email: 't@t.dev', profileId: tenantId })
+    const res = await request(buildApp()).patch('/api/stripe/tenant/default-payment-method')
+      .set('Authorization', `Bearer ${token}`).send({ paymentMethodId: 'pm_card_1' })
+    expect(res.status).toBe(200)
+    expect(stripeMocks.customersUpdate).toHaveBeenCalledWith('cus_mock_tenant', { invoice_settings: { default_payment_method: 'pm_card_1' } })
+  })
+
+  it('PATCH rejects a payment method that is not the tenant\'s', async () => {
+    const { tenantId, userId } = await seedStripeTenant()
+    stripeMocks.paymentMethodsRetrieve.mockResolvedValueOnce({ id: 'pm_x', customer: 'cus_someone_else', type: 'card' })
+    const token = sign({ userId, role: 'tenant', email: 't@t.dev', profileId: tenantId })
+    const res = await request(buildApp()).patch('/api/stripe/tenant/default-payment-method')
+      .set('Authorization', `Bearer ${token}`).send({ paymentMethodId: 'pm_x' })
+    expect(res.status).toBe(403)
+  })
+
+  it('confirm-card detaches the old card (one card on file), keeps ACH default', async () => {
+    const { tenantId, userId } = await seedStripeTenant()
+    // The new card:
+    stripeMocks.paymentMethodsRetrieve.mockResolvedValueOnce({ id: 'pm_card_new', customer: 'cus_mock_tenant', type: 'card' })
+    // Two cards currently attached — the old one must be detached.
+    stripeMocks.paymentMethodsList.mockResolvedValueOnce({ data: [{ id: 'pm_card_old' }, { id: 'pm_card_new' }] })
+    const token = sign({ userId, role: 'tenant', email: 't@t.dev', profileId: tenantId })
+    const res = await request(buildApp()).post('/api/stripe/tenant/confirm-card')
+      .set('Authorization', `Bearer ${token}`).send({ paymentMethodId: 'pm_card_new' })
+    expect(res.status).toBe(200)
+    expect(stripeMocks.paymentMethodsDetach).toHaveBeenCalledWith('pm_card_old')
+    expect(stripeMocks.paymentMethodsDetach).not.toHaveBeenCalledWith('pm_card_new')
+    // ACH already default (mock customersRetrieve) → confirm-card must NOT override it.
+    expect(stripeMocks.customersUpdate).not.toHaveBeenCalled()
   })
 })

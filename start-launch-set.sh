@@ -12,6 +12,10 @@
 #   bash ~/gam/start-launch-set.sh
 # Logs land in the usual /tmp/gam-<app>.log files; this script's own
 # log is /tmp/gam-launchset-startup.log.
+# S568: GAM Books (:3006) is in the set. S574: the guest storefront (:3015) is
+# NOT a dev server here — it's a production launchd service (com.gam.storefront,
+# static build) like marketing, fronted by the wildcard *.gam.biz tunnel route.
+# This script just kickstarts it (below) alongside marketing.
 
 export PATH="/opt/homebrew/opt/node@22/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 cd "$(dirname "$0")"
@@ -36,7 +40,7 @@ sleep 1
 # S550: :4000 is NOT in this list — the API is a production launchd
 # service (com.gam.api, KeepAlive); killing it here would just fight
 # launchd. Ports below are the local dev portal servers only.
-for port in 3001 3002 3003 3005 3009; do
+for port in 3001 3002 3003 3005 3006 3009; do
   pid=$(lsof -ti tcp:$port 2>/dev/null) || true
   [ -n "$pid" ] && kill -9 $pid 2>/dev/null && echo "  killed :$port (pid $pid)" || true
 done
@@ -58,12 +62,19 @@ nohup npm run dev --workspace=apps/tenant    > /tmp/gam-tenant.log    2>&1 &
 nohup npm run dev --workspace=apps/admin     > /tmp/gam-admin.log     2>&1 &
 nohup npm run dev --workspace=apps/pos       > /tmp/gam-pos.log       2>&1 &
 nohup npm run dev --workspace=apps/admin-ops > /tmp/gam-admin-ops.log 2>&1 &
+# S568 (Nic): GAM Books (:3006) — landlords reach it with the same login
+# (ALLOWED_ROLES includes landlord); bookkeepers/accountants also use it.
+nohup npm run dev --workspace=apps/books     > /tmp/gam-books.log     2>&1 &
 sleep 10
 
 # Make sure the production marketing service is up (it should be via
 # its own KeepAlive, but a kickstart is harmless and self-heals).
 launchctl kickstart gui/$(id -u)/com.gam.marketing 2>/dev/null || true
+# S574: same for the guest storefront (com.gam.storefront, static build served
+# behind the wildcard *.gam.biz tunnel route). KeepAlive owns it; kickstart
+# self-heals. Rebuild after storefront code changes: npm run build --workspace=apps/storefront
+launchctl kickstart gui/$(id -u)/com.gam.storefront 2>/dev/null || true
 
 echo "Listening ports:"
-lsof -nP -i tcp:3001,3002,3003,3004,3005,3009,4000 2>/dev/null | grep LISTEN | awk '{print "  " $9}' | sort -u
+lsof -nP -i tcp:3001,3002,3003,3004,3005,3006,3009,3015,4000 2>/dev/null | grep LISTEN | awk '{print "  " $9}' | sort -u
 echo "═══ done $(date) ═══"

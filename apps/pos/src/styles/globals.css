@@ -65,13 +65,17 @@
 
 /* ── RESET ──────────────────────────────────────────────── */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-html { font-size: 16px; -webkit-font-smoothing: antialiased; }
+html { font-size: 16px; -webkit-font-smoothing: antialiased; height: 100%; }
 body {
   font-family: var(--font-body);
   background: var(--bg-0);
   color: var(--text-1);
   line-height: 1.6;
-  min-height: 100vh;
+  /* S575: locked desktop shell — the page never scrolls or rubber-band bounces;
+     the only scroll region is .page-content. */
+  height: 100%;
+  overflow: hidden;
+  overscroll-behavior: none;
 }
 a { color: var(--gold); text-decoration: none; }
 a:hover { color: var(--text-0); }
@@ -97,7 +101,8 @@ h4 { font-size: 1rem;   font-weight: 600; }
 /* ── LAYOUT ─────────────────────────────────────────────── */
 .app-shell {
   display: flex;
-  min-height: 100vh;
+  height: 100vh;
+  overflow: hidden;
 }
 
 .sidebar {
@@ -116,9 +121,11 @@ h4 { font-size: 1rem;   font-weight: 600; }
 .main-content {
   flex: 1;
   margin-left: 240px;
-  min-height: 100vh;
+  height: 100vh;
   display: flex;
   flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
 }
 
 .topbar {
@@ -136,9 +143,13 @@ h4 { font-size: 1rem;   font-weight: 600; }
 
 .page-content {
   flex: 1;
+  min-height: 0;
   padding: 28px 28px 48px;
   max-width: 1400px;
   width: 100%;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: none;
 }
 
 /* ── SIDEBAR COMPONENTS ──────────────────────────────────── */

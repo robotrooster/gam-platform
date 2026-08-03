@@ -12,7 +12,6 @@
  *   - GET /notifications + POST /:id/acknowledge (idempotency)
  *
  * Out of scope (future slices):
- *   - Bulletin moderation (5 routes, super_admin)
  *   - NACHA monitoring
  *   - Onboarding landlord/tenant detail views
  *   - Income projection
@@ -105,11 +104,14 @@ describe('file-wide admin gating', () => {
 })
 
 describe('GET /api/admin/overview', () => {
-  it('happy path: returns rollup shape with all counter fields', async () => {
+  it('happy path (super_admin): returns rollup shape with all counter fields', async () => {
+    // S570: /overview carries platform financials (income projection, reserve/
+    // float balances) → super_admin only. A plain admin (portfolio manager) is
+    // now 403 here (see the plain-admin test below).
     const f = await seedAFixture()
     const res = await request(buildApp())
       .get('/api/admin/overview')
-      .set('Authorization', `Bearer ${f.adminToken}`)
+      .set('Authorization', `Bearer ${f.superAdminToken}`)
     expect(res.status).toBe(200)
     // Shape pin — every field present, all numeric
     const d = res.body.data
@@ -125,6 +127,14 @@ describe('GET /api/admin/overview', () => {
     expect(typeof d.csv_imports_pending_review).toBe('number')
     // Fixture has 1 landlord
     expect(d.total_landlords).toBe(1)
+  })
+
+  it('plain admin (portfolio manager) → 403 (financials are super_admin only)', async () => {
+    const f = await seedAFixture()
+    const res = await request(buildApp())
+      .get('/api/admin/overview')
+      .set('Authorization', `Bearer ${f.adminToken}`)
+    expect(res.status).toBe(403)
   })
 })
 

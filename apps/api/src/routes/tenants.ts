@@ -94,11 +94,14 @@ tenantsRouter.post('/accept-invite', async (req, res, next) => {
       await query('UPDATE tenants SET ssi_ssdi=$1 WHERE user_id=$2', [!!ssiSsdi, user.id])
     }
 
-    // Generate JWT
+    // Generate JWT. S568: role-aware — activate the account under the user's
+    // ACTUAL role. Real tenants keep role='tenant' (unchanged); an e-sign
+    // 'contact' (customer pool, no tenant profile) activates as 'contact' with
+    // a null profileId so they're never mis-issued a tenant identity.
     const jwt = require('jsonwebtoken')
     const tenant = await queryOne<any>('SELECT id FROM tenants WHERE user_id=$1', [user.id])
     const jwtToken = jwt.sign(
-      { userId: user.id, role: 'tenant', email: user.email, profileId: tenant?.id },
+      { userId: user.id, role: user.role, email: user.email, profileId: tenant?.id ?? null },
       process.env.JWT_SECRET!,
       { expiresIn: '7d' }
     )
@@ -110,7 +113,7 @@ tenantsRouter.post('/accept-invite', async (req, res, next) => {
       const intent = await queryOne<{ id: string; unit_id: string | null }>(
         `SELECT pti.id, pti.unit_id
            FROM pending_tenant_intents pti JOIN tenants t ON t.id = pti.tenant_id
-          WHERE t.user_id = $1 AND pti.resolved_at IS NULL AND pti.unit_id IS NOT NULL
+          WHERE t.user_id = $1 AND pti.resolved_at IS NULL AND pti.cancelled_at IS NULL AND pti.unit_id IS NOT NULL
           ORDER BY pti.created_at DESC LIMIT 1`, [user.id])
       if (intent?.unit_id) {
         const draftClient = await getClient()
@@ -186,7 +189,7 @@ tenantsRouter.post('/accept-invite', async (req, res, next) => {
       success: true,
       data: {
         token: jwtToken,
-        user: { id: user.id, email: user.email, role: 'tenant', firstName: user.first_name, lastName: user.last_name }
+        user: { id: user.id, email: user.email, role: user.role, firstName: user.first_name, lastName: user.last_name }
       }
     })
   } catch (e) { next(e) }
@@ -627,7 +630,7 @@ tenantsRouter.get('/me/deposit-interest', async (req, res, next) => {
 
 // ── POST /api/tenants/verify-ach ──────────────────────────────────────────
 // Simulates ACH verification (real impl would use Plaid/Stripe).
-// Sets ach_verified=true and stamps otp_qualified_at if deposit is also funded.
+// Sets ach_verified=true and reports whether the security deposit is fully funded.
 tenantsRouter.post('/verify-ach', async (req, res, next) => {
   try {
     const { bankName, last4 } = req.body
@@ -650,13 +653,6 @@ tenantsRouter.post('/verify-ach', async (req, res, next) => {
 
     const qualifies = row?.deposit_fully_funded === true
 
-    // S374 fix: pre-S374 the UPDATE referenced `otp_qualified_at`
-    // which doesn't exist on tenants — the column was replaced by
-    // dynamic qualification via services/otp.getQualificationStatus
-    // (per S365's landlords-otp.ts wire-up). Every verify-ach call
-    // crashed 500 with "column 'otp_qualified_at' does not exist."
-    // Drop the broken write; OTP qualification is now a runtime
-    // check, not a persisted timestamp.
     await query(`
       UPDATE tenants
          SET ach_verified = TRUE,
@@ -670,8 +666,8 @@ tenantsRouter.post('/verify-ach', async (req, res, next) => {
         ach_verified: true,
         deposit_fully_funded: qualifies,
         message: qualifies
-          ? 'Bank verified and OTP qualified!'
-          : 'Bank verified. OTP will activate once your deposit is fully funded.'
+          ? 'Bank verified!'
+          : 'Bank verified. Your security deposit is not yet fully funded.'
       }
     })
   } catch (e) { next(e) }
@@ -723,10 +719,6 @@ tenantsRouter.post('/flexcharge/dispute/:txId', async (req, res, next) => {
 // GAM fronts the rent to the landlord on the lease's grace-period-end
 // day; the tenant's ACH pull on their chosen day reimburses GAM and
 // collects the scheduling fee. See services/flexpay.ts for engine.
-//
-// Pre-S245 this route block targeted phantom columns (flexpay_tier,
-// flexpay_pull_pattern, otp_qualified_at) and gated on deposit-funded
-// (an OTP concern, not a FlexPay one). All replaced.
 
 // ── S542: platform-originated questionnaires (LANDLORD-INVISIBLE) ──
 // Tenant-only surfaces. No landlord route may ever expose this table.
@@ -1352,18 +1344,6 @@ tenantsRouter.delete('/flexdeposit', async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
-// DEPRECATED (S155): OTP is now a landlord-side product. Tenants
-// have no enrollment surface — landlord enrolls qualified tenants
-// via /api/landlords/me/otp/tenants/:tenantId/enable. This endpoint
-// returns 410 Gone to prevent any straggler client calls from
-// flipping the flag.
-tenantsRouter.post('/enroll-on-time-pay', async (_req, res) => {
-  res.status(410).json({
-    success: false,
-    error: 'Tenant-side OTP enrollment is deprecated. OTP is a landlord product as of S155.',
-  })
-})
-
 // POST /api/tenants/enroll-credit-reporting
 // FlexCredit (rent-payment reporting via Esusu). Gated on the
 // flexcredit_rollout_visible flag — OFF at launch. The product is NOT built
@@ -1377,6 +1357,43 @@ tenantsRouter.post('/enroll-credit-reporting', async (req, res, next) => {
     }
     await query(`UPDATE tenants SET credit_reporting_enrolled=TRUE WHERE id=$1`, [req.user!.profileId])
     res.json({ success: true, message: 'Credit reporting enrolled — $5/month reported to all 3 bureaus' })
+  } catch (e) { next(e) }
+})
+
+// ── S565: FlexCredit DEMAND-CAPTURE (interest survey) ────────────────
+// Separate from FlexPay (no income verification — credit reporting needs none).
+// Captures interest only; NO billing/Esusu enrollment happens here (that's the
+// later launch phase, gated on breakeven). Gated on flexcredit_rollout_visible
+// so it stays hidden until the demand test opens.
+
+// GET the tenant's own FlexCredit interest state (for the portal card).
+tenantsRouter.get('/flexcredit/inquiry', async (req, res, next) => {
+  try {
+    const { isFeatureEnabled } = await import('../services/systemFeatures')
+    const visible = await isFeatureEnabled('flexcredit_rollout_visible')
+    const inq = await queryOne<{ status: string; created_at: string }>(
+      `SELECT status, created_at FROM flexcredit_inquiries WHERE tenant_id = $1`,
+      [req.user!.profileId]
+    )
+    res.json({ success: true, data: { visible, interested: !!inq, status: inq?.status ?? null } })
+  } catch (e) { next(e) }
+})
+
+// POST — file (or re-affirm) interest. Idempotent per tenant.
+tenantsRouter.post('/flexcredit/inquiry', async (req, res, next) => {
+  try {
+    if (req.user!.role !== 'tenant') throw new AppError(403, 'Tenant only')
+    const { isFeatureEnabled } = await import('../services/systemFeatures')
+    if (!await isFeatureEnabled('flexcredit_rollout_visible')) {
+      return res.json({ success: true, data: { visible: false, inquiryFiled: false } })
+    }
+    await query(
+      `INSERT INTO flexcredit_inquiries (tenant_id, status)
+       VALUES ($1, 'interested')
+       ON CONFLICT (tenant_id) DO UPDATE SET updated_at = NOW()`,
+      [req.user!.profileId]
+    )
+    res.json({ success: true, data: { visible: true, inquiryFiled: true } })
   } catch (e) { next(e) }
 })
 

@@ -93,9 +93,13 @@ async function seed(): Promise<Fixture> {
     const { userId: aUid, landlordId: aId } = await seedLandlord(c)
     const { userId: bUid, landlordId: bId } = await seedLandlord(c)
     const tenantA = await seedTenant(c)
+    // super_admin: GET /api/landlords/ is portfolio-scoped for REGULAR admins
+    // (S567 — a regular admin only sees landlords they close/service). This
+    // list-shape test wants the full roster + counts, which is the super_admin
+    // view. Regular-admin scoping is covered by the portfolio-manager suite.
     const admin = await c.query<{ id: string }>(
       `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
-       VALUES ($1, 'x', 'admin', 'A', 'U', TRUE) RETURNING id`,
+       VALUES ($1, 'x', 'super_admin', 'A', 'U', TRUE) RETURNING id`,
       [`admin-${randomUUID()}@test.dev`])
     await c.query('COMMIT')
     const sign = (p: object) => jwt.sign(p, process.env.JWT_SECRET!, { expiresIn: '1h' })
@@ -103,7 +107,7 @@ async function seed(): Promise<Fixture> {
       landlordAUserId: aUid, landlordAId: aId,
       landlordBUserId: bUid, landlordBId: bId,
       tenantAId: tenantA,
-      adminToken: sign({ userId: admin.rows[0].id, role: 'admin', email: 'a@t.dev', profileId: null, permissions: {} }),
+      adminToken: sign({ userId: admin.rows[0].id, role: 'super_admin', email: 'a@t.dev', profileId: null, permissions: {} }),
       tokenA:     sign({ userId: aUid, role: 'landlord', email: 'la@t.dev', profileId: aId, permissions: {} }),
       tokenB:     sign({ userId: bUid, role: 'landlord', email: 'lb@t.dev', profileId: bId, permissions: {} }),
     }

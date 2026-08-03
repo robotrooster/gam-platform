@@ -97,14 +97,19 @@ workTradeRouter.post('/', requirePerm('work_trade.manage'), async (req, res, nex
     const unit = await queryOne<any>('SELECT * FROM units WHERE id=$1 AND landlord_id=$2', [body.unitId, landlordId])
     if (!unit) throw new AppError(404, 'Unit not found or access denied')
 
-    // S397: verify the tenant has a lease in caller's portfolio (no
-    // cross-tenant assignment).
+    // S397 → S576 (B-8): work trade is rent-for-labor, so it can only ride on a
+    // LIVE tenancy — require an ACTIVE lease for this tenant ON THIS UNIT (not
+    // just any lease anywhere in the portfolio). Without an active lease there's
+    // no rent obligation for the labor to offset. If the lease later expires,
+    // the 2am processor pauses the agreement (see scheduler.processLeaseEnds).
     const tenantLease = await queryOne<{ id: string }>(
       `SELECT l.id FROM leases l
        JOIN lease_tenants lt ON lt.lease_id = l.id
-       WHERE lt.tenant_id = $1 AND l.landlord_id = $2 LIMIT 1`,
-      [body.tenantId, landlordId])
-    if (!tenantLease) throw new AppError(404, 'Tenant has no lease under this landlord')
+       WHERE lt.tenant_id = $1 AND l.landlord_id = $2 AND l.unit_id = $3
+         AND l.status = 'active' AND lt.status = 'active'
+       LIMIT 1`,
+      [body.tenantId, landlordId, body.unitId])
+    if (!tenantLease) throw new AppError(400, 'This tenant has no active lease on this unit. Work trade requires an active tenancy — add or renew the lease first.')
 
     const propDefault = await queryOne<{ work_trade_hours_target: number }>(
       `SELECT p.work_trade_hours_target FROM properties p
@@ -311,7 +316,14 @@ workTradeRouter.get('/', requirePerm('work_trade.view'), async (req, res, next) 
           WHERE wtl.agreement_id=wta.id AND wtl.status='pending') as pending_count,
         (SELECT COALESCE(SUM(l.hours),0) FROM work_trade_logs l
           WHERE l.agreement_id=wta.id AND l.status='approved'
-            AND date_trunc('month', l.work_date) = date_trunc('month', CURRENT_DATE)) as hours_this_month
+            AND date_trunc('month', l.work_date) = date_trunc('month', CURRENT_DATE)) as hours_this_month,
+        -- S576 (B-8): the latest work-trade addendum document for this agreement
+        -- (stamped work_trade_agreement_id when sent). Drives the "addendum on
+        -- file / send addendum" surface on the row.
+        (SELECT json_build_object('id', d.id, 'status', d.status, 'title', d.title)
+           FROM lease_documents d
+          WHERE d.work_trade_agreement_id = wta.id
+          ORDER BY d.created_at DESC LIMIT 1) AS addendum_doc
       FROM work_trade_agreements wta
       JOIN tenants t ON t.id = wta.tenant_id
       JOIN users u ON u.id = t.user_id

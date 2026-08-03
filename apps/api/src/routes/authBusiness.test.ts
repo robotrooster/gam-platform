@@ -6,8 +6,9 @@
  *
  * Coverage:
  *   POST /api/auth/login
- *     - business_owner: profile_id resolves to businesses.id, JWT
- *       carries businessId, no scope dispatch needed
+ *     - business_owner: profile_id resolves to businesses.id, businessId
+ *       rides the pending email-2FA session JWT (S574 mandatory email 2FA),
+ *       no scope dispatch needed
  *     - business_staff with active scope row: businessId + staffRole +
  *       permissions all on response + JWT
  *     - business_staff WITHOUT scope row: 403 "deactivated" with the
@@ -125,42 +126,49 @@ async function seedBusinessStaff(args: {
 //  POST /api/auth/login — business_owner
 // ═══════════════════════════════════════════════════════════════
 
+// S574: email-code 2FA is MANDATORY for business_owner. A business_owner login
+// no longer returns a full token/user — it emails a code and returns a pending
+// session. The scope resolution (businessId, archived→null, no worker-deactivate)
+// still runs BEFORE the 2FA gate, and its result rides on the pending session
+// JWT — so we decode that JWT to keep the businessId-resolution coverage.
 describe('POST /api/auth/login — business_owner', () => {
-  it('happy: 200 + businessId on user object + JWT carries businessId', async () => {
+  it('happy: mandatory email 2FA — requiresEmailOtp, pending JWT carries businessId', async () => {
     const seed = await seedBusinessWithOwner()
     const res = await request(buildApp())
       .post('/api/auth/login').send({ email: seed.ownerEmail, password: seed.password })
     expect(res.status).toBe(200)
-    expect(res.body.data.user.role).toBe('business_owner')
-    expect(res.body.data.user.businessId).toBe(seed.businessId)
-    expect(res.body.data.user.profileId).toBe(seed.businessId)
-    expect(res.body.data.user.staffRole).toBeNull()
-    expect(res.body.data.user.landlordId).toBeNull()
+    expect(res.body.data.requiresEmailOtp).toBe(true)
+    expect(res.body.data.emailOtpSession).toBeTruthy()
+    expect(res.body.data.token).toBeUndefined()
+    expect(res.body.data.user).toBeUndefined()
 
-    const decoded = jwt.decode(res.body.data.token) as any
+    const decoded = jwt.decode(res.body.data.emailOtpSession) as any
+    expect(decoded.purpose).toBe('email_otp_pending')
     expect(decoded.role).toBe('business_owner')
     expect(decoded.businessId).toBe(seed.businessId)
     expect(decoded.profileId).toBe(seed.businessId)
     expect(decoded.staffRole).toBeNull()
   })
 
-  it('business archived → owner still logs in with businessId=null (no business attached)', async () => {
+  it('business archived → owner still reaches 2FA with businessId=null (no business attached)', async () => {
     const seed = await seedBusinessWithOwner()
     await db.query(`UPDATE businesses SET status='archived' WHERE id=$1`, [seed.businessId])
     const res = await request(buildApp())
       .post('/api/auth/login').send({ email: seed.ownerEmail, password: seed.password })
     expect(res.status).toBe(200)
-    // JOIN filters businesses.status='active', so business_id is null for
-    // the response. Owner can still log in — portal will show "your
-    // business has been archived" rather than a hard 403.
-    expect(res.body.data.user.businessId).toBeNull()
-    expect(res.body.data.user.profileId).toBeNull()
+    expect(res.body.data.requiresEmailOtp).toBe(true)
+    // JOIN filters businesses.status='active', so business_id is null on the
+    // pending session. Owner can still log in — portal will show "your business
+    // has been archived" rather than a hard 403.
+    const decoded = jwt.decode(res.body.data.emailOtpSession) as any
+    expect(decoded.businessId).toBeNull()
+    expect(decoded.profileId).toBeNull()
   })
 
   it('business_owner does NOT go through worker-scope dispatch (no deactivated 403)', async () => {
-    // Even with no businesses row at all, owner login succeeds (just with
-    // no businessId). Important: business_owner is NOT in the worker list,
-    // so the absence of a business doesn't deactivate them.
+    // Even with no businesses row at all, owner login succeeds (reaches the 2FA
+    // gate with no businessId). Important: business_owner is NOT in the worker
+    // list, so the absence of a business doesn't deactivate them with a 403.
     const password = 'super-strong-password-12!'
     const hash = await bcrypt.hash(password, 12)
     const email = `lonely-${randomUUID()}@example.com`
@@ -171,7 +179,9 @@ describe('POST /api/auth/login — business_owner', () => {
     const res = await request(buildApp())
       .post('/api/auth/login').send({ email, password })
     expect(res.status).toBe(200)
-    expect(res.body.data.user.businessId).toBeNull()
+    expect(res.body.data.requiresEmailOtp).toBe(true)
+    const decoded = jwt.decode(res.body.data.emailOtpSession) as any
+    expect(decoded.businessId).toBeNull()
   })
 })
 

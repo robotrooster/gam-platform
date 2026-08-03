@@ -1,16 +1,15 @@
 import { useState } from 'react'
-import { useQuery, useMutation, useQueryClient } from 'react-query'
+import { useQuery } from 'react-query'
 import { Link } from 'react-router-dom'
 import { humanize } from '@gam/shared'
-import { apiGet, apiPost } from '../lib/api'
+import { apiGet } from '../lib/api'
 import { usePerms } from '../lib/permissions'
-import { ArrowDownToLine, X, Landmark, Check } from 'lucide-react'
+import { X, Landmark } from 'lucide-react'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
 export function DisbursementsPage() {
   const { data: disbs = [], isLoading } = useQuery<any[]>('disbursements', () => apiGet('/disbursements'))
   const [selected, setSelected] = useState<any | null>(null)
-  const [withdrawBank, setWithdrawBank] = useState<any | null>(null)
   const { can } = usePerms()
 
   const totalSettled = (disbs as any[]).filter((d: any) => d.status === 'settled').reduce((sum: number, d: any) => sum + Number(d.amount), 0)
@@ -21,16 +20,11 @@ export function DisbursementsPage() {
       <div className="page-header">
         <div>
           <h1 className="page-title">Disbursements</h1>
-          <p className="page-subtitle">Auto-payouts of your available balance to your linked bank account</p>
+          <p className="page-subtitle">Your collected balance pays out automatically to your linked bank account</p>
         </div>
       </div>
 
-      <div className="alert alert-gold" style={{ marginBottom: 24 }}>
-        <ArrowDownToLine size={16} />
-        <span><strong>Auto-Friday payouts:</strong> Available balance pays out automatically every Friday (Monday if Friday is a US federal holiday). Need it sooner? Withdraw your available balance on demand.</span>
-      </div>
-
-      <BalanceWithdrawSection onWithdraw={() => setWithdrawBank({ open: true })} />
+      <BalanceWithdrawSection />
 
       {can('disbursements.pm_impact_view') && <PmImpactSection />}
 
@@ -93,11 +87,6 @@ export function DisbursementsPage() {
         )}
       </div>
 
-      {withdrawBank && (
-        <WithdrawNowModal onClose={() => setWithdrawBank(null)} />
-      )}
-
-
       {selected && (
         <div className="modal-overlay" onClick={() => setSelected(null)}>
           <div className="modal" style={{ maxWidth: 480 }} onClick={e => e.stopPropagation()}>
@@ -135,7 +124,10 @@ export function DisbursementsPage() {
   )
 }
 
-function BalanceWithdrawSection({ onWithdraw }: { onWithdraw: () => void }) {
+// S574 (Nic): on-demand withdrawal retired — the platform holds the balance and
+// pays it out on the automatic Friday batch, so this is a read-only balance
+// summary now (no "Withdraw Now" flow, no payout banner).
+function BalanceWithdrawSection() {
   const { data, isLoading } = useQuery<any>('me-finances-summary', () => apiGet('/users/me/finances?limit=1'))
   if (isLoading || !data) return null
 
@@ -149,7 +141,7 @@ function BalanceWithdrawSection({ onWithdraw }: { onWithdraw: () => void }) {
         <div className="kpi-card">
           <div className="kpi-label">Available Now</div>
           <div className="kpi-value gold">{fmt(balance)}</div>
-          <div className="kpi-sub">{connectReady ? 'Eligible to withdraw' : 'Link your bank account first'}</div>
+          <div className="kpi-sub">{connectReady ? 'Pays out on the next Friday batch' : 'Link your bank to get paid'}</div>
         </div>
         {pending > 0 && (
           <div className="kpi-card">
@@ -165,130 +157,9 @@ function BalanceWithdrawSection({ onWithdraw }: { onWithdraw: () => void }) {
           <Landmark size={14} color="var(--gold)" style={{ verticalAlign: 'middle', marginRight: 8 }} />
           Link your bank account at{' '}
           <Link to="/banking" style={{ color: 'var(--gold)' }}>Banking →</Link>
-          {' '}before you can withdraw.
+          {' '}to receive your automatic payouts.
         </div>
       )}
-
-      {/* W-32 (S531): the strip renders even before Connect KYC / first
-          balance so the on-demand promise has a visible workflow — the
-          button just disables until it's actually usable. */}
-      <div className="card" style={{ padding: '14px 16px', marginTop: 12, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '.82rem' }}>
-          <Landmark size={14} color="var(--gold)" />
-          <span style={{ fontWeight: 600 }}>Withdraw Now</span>
-          <span style={{ color: 'var(--text-3)', fontSize: '.72rem' }}>
-            · Skip the Friday batch — standard ACH free (1–2 days) or instant for 2% (min $5)
-          </span>
-        </div>
-        <button className="btn btn-primary btn-sm" onClick={onWithdraw} disabled={!connectReady || balance <= 0}
-          title={!connectReady ? 'Link your bank account first' : balance <= 0 ? 'No available balance' : undefined}>
-          Choose Method
-        </button>
-      </div>
-    </div>
-  )
-}
-
-function WithdrawNowModal({ onClose }: { onClose: () => void }) {
-  const qc = useQueryClient()
-  const [error, setError] = useState<string | null>(null)
-  const [method, setMethod] = useState<'standard' | 'instant'>('standard')
-
-  const { data: preview, isLoading: previewLoading } = useQuery<any>(
-    'withdraw-preview',
-    () => apiGet('/users/me/withdrawals/preview'),
-    { retry: false }
-  )
-
-  const mut = useMutation(
-    () => apiPost('/users/me/withdrawals', { method }),
-    {
-      onSuccess: () => {
-        qc.invalidateQueries('me-finances-summary')
-        qc.invalidateQueries('disbursements')
-        onClose()
-      },
-      onError: (e: any) => setError(e?.response?.data?.error || 'Withdrawal failed'),
-    }
-  )
-
-  const standard = preview?.standard
-  const instant  = preview?.instant
-  const chosen   = method === 'standard' ? standard : instant
-  const eligible = chosen?.eligible === true
-
-  return (
-    <div className="modal-overlay" onClick={onClose}>
-      <div className="modal" style={{ maxWidth: 480 }} onClick={e => e.stopPropagation()}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
-          <div className="modal-title" style={{ marginBottom: 0 }}>Withdraw Now</div>
-          <button className="btn btn-ghost btn-sm" onClick={onClose} style={{ padding: 6 }}><X size={15} /></button>
-        </div>
-
-        {previewLoading && <div style={{ color: 'var(--text-3)' }}>Loading…</div>}
-
-        {preview && (
-          <>
-            <div style={{ display: 'flex', gap: 8, marginBottom: 14 }}>
-              <button
-                className={'btn btn-sm ' + (method === 'standard' ? 'btn-primary' : 'btn-ghost')}
-                style={{ flex: 1 }}
-                onClick={() => setMethod('standard')}
-              >
-                Standard ACH
-              </button>
-              <button
-                className={'btn btn-sm ' + (method === 'instant' ? 'btn-primary' : 'btn-ghost')}
-                style={{ flex: 1 }}
-                onClick={() => setMethod('instant')}
-                disabled={!instant?.eligible}
-              >
-                Instant
-              </button>
-            </div>
-
-            <div style={{ background: 'var(--bg-3)', borderRadius: 10, padding: 14, marginBottom: 14 }}>
-              <div className="data-row">
-                <span className="data-key">Available</span>
-                <span className="data-val mono">{fmt(chosen?.available ?? 0)}</span>
-              </div>
-              {method === 'instant' && (
-                <div className="data-row">
-                  <span className="data-key">Instant fee (2%, min $5)</span>
-                  <span className="data-val mono" style={{ color: 'var(--red)' }}>−{fmt(instant?.fee ?? 0)}</span>
-                </div>
-              )}
-              <div className="data-row" style={{ borderTop: '1px solid var(--border-0)', paddingTop: 8, marginTop: 4 }}>
-                <span className="data-key" style={{ fontWeight: 600 }}>You'll receive</span>
-                <span className="data-val mono" style={{ color: 'var(--green)', fontWeight: 700 }}>
-                  {fmt(method === 'instant' ? (instant?.net ?? 0) : (standard?.available ?? 0))}
-                </span>
-              </div>
-            </div>
-
-            <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginBottom: 14, lineHeight: 1.5 }}>
-              {method === 'standard'
-                ? 'Standard ACH is free and typically settles in 1–2 business days.'
-                : 'Instant payouts arrive in minutes. A 2% fee (minimum $5) is deducted from the amount — that\'s the all-in cost, nothing else is charged.'}
-            </div>
-          </>
-        )}
-
-        {error && (
-          <div style={{ color: 'var(--red)', fontSize: '.78rem', background: 'rgba(255,71,87,.08)', border: '1px solid rgba(255,71,87,.2)', borderRadius: 8, padding: '8px 12px', marginBottom: 12 }}>
-            {error}
-          </div>
-        )}
-
-        <div className="modal-footer">
-          <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
-          <button className="btn btn-primary"
-            onClick={() => mut.mutate()}
-            disabled={!eligible || mut.isLoading}>
-            {mut.isLoading ? <span className="spinner" /> : <><Check size={14} /> Confirm Withdrawal</>}
-          </button>
-        </div>
-      </div>
     </div>
   )
 }

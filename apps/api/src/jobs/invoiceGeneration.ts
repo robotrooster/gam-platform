@@ -240,6 +240,11 @@ export async function generateInvoices(
     JOIN properties p ON p.id = u.property_id
     WHERE l.status = 'active'
       AND (l.needs_review IS NULL OR l.needs_review = false)
+      -- S576 Snowbird: a hibernating (seasonally-paused) lease generates NO
+      -- rent/utility invoices. No invoice → nothing pulled off the ACH mandate,
+      -- so the snowbird is never charged in the off-season. Resume clears the
+      -- flag and billing restarts.
+      AND l.is_hibernating = false
   `)
 
   return runGeneration(leases, nowUtc)
@@ -736,8 +741,15 @@ async function runGeneration(
         await client.query('COMMIT')
         invoicesInserted++
       } catch (e) {
-        await client.query('ROLLBACK')
-        throw e
+        // Per-lease isolation: a single malformed lease (e.g. a pre-existing
+        // orphan rent payment for this cycle that collides with
+        // ux_payments_rent_idempotent) must NOT abort the whole generation run
+        // and starve every other lease of its invoice. Roll back this lease,
+        // log with context, and continue. Was `throw e` — that made one bad
+        // lease fatal to the entire batch.
+        await client.query('ROLLBACK').catch(() => {})
+        logger.error({ err: e, leaseId: lease.id, dueDate }, '[InvoiceGen] lease skipped — generation continues')
+        continue
       } finally {
         client.release()
       }

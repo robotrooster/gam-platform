@@ -66,13 +66,20 @@
 
 /* ── RESET ──────────────────────────────────────────────── */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-html { font-size: 16px; -webkit-font-smoothing: antialiased; }
+html { font-size: 16px; -webkit-font-smoothing: antialiased; height: 100%; }
 body {
   font-family: var(--font-body);
   background: var(--bg-0);
   color: var(--text-1);
   line-height: 1.6;
-  min-height: 100vh;
+  /* Lock the document: the shell fills the viewport and the ONLY scroll region is
+     .page-content. height:100% + overflow:hidden stop the page from scrolling at
+     all, and overscroll-behavior:none kills the elastic rubber-band "bounce" you
+     otherwise get when trying to scroll a non-scrolling page (macOS / mobile). */
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  overscroll-behavior: none;
 }
 a { color: var(--gold); text-decoration: none; }
 a:hover { color: var(--text-0); }
@@ -98,7 +105,8 @@ h4 { font-size: 1rem;   font-weight: 600; }
 /* ── LAYOUT ─────────────────────────────────────────────── */
 .app-shell {
   display: flex;
-  min-height: 100vh;
+  height: 100vh;
+  overflow: hidden;   /* the shell fills the viewport; scrolling lives in .page-content */
 }
 
 .sidebar {
@@ -117,11 +125,11 @@ h4 { font-size: 1rem;   font-weight: 600; }
 .main-content {
   flex: 1;
   margin-left: 240px;
-  min-height: 100vh;
+  height: 100vh;      /* fixed to the viewport; the topbar stays put and .page-content scrolls */
   display: flex;
   flex-direction: column;
   min-width: 0;
-  overflow-x: hidden;
+  overflow: hidden;
 }
 
 .topbar {
@@ -139,14 +147,21 @@ h4 { font-size: 1rem;   font-weight: 600; }
 
 .page-content {
   flex: 1;
+  min-height: 0;        /* let it shrink so overflow-y actually scrolls inside the fixed shell */
   padding: 28px 28px 48px;
   max-width: 1400px;
   width: 100%;
   min-width: 0;
+  overflow-y: auto;     /* the ONE scroll region — page content scrolls, header stays fixed */
   overflow-x: hidden;
+  overscroll-behavior: none;   /* no rubber-band bounce at the scroll ends */
 }
 
-/* Full-bleed pages (e.g. the Master Schedule timeline) use the whole width. */
+/* Full-bleed pages (e.g. the Master Schedule timeline) use the whole width. The
+   timeline sub-view fills the height and manages its OWN inner scroll (only the
+   unit grid scrolls; toolbar + legend stay put) — that fill is done in
+   SchedulePage so the other sub-views (List/Units/History) still scroll normally
+   inside .page-content. */
 .page-content-wide {
   max-width: none;
 }

@@ -28,6 +28,7 @@ import { SignupPage } from './pages/SignupPage'
 import { POSPage } from './pages/POSPage'
 import { BusinessRegisterPage } from './pages/BusinessRegisterPage'
 import { TeamPage } from './pages/TeamPage'
+import { LockScreen } from './pages/LockScreen'
 import { ShelfLabelPage } from './pages/ShelfLabelPage'
 import { DialogHost } from './components/dialogs'
 import './styles/globals.css'
@@ -43,8 +44,11 @@ const BUSINESS_ROLES = ['business_owner', 'business_staff']
 const DENIED_ROLES   = ['tenant', 'fitness_user']
 
 function PrivateRoute({ children }: { children: React.ReactNode }) {
-  const { user, token, loading, logout } = useAuth()
+  const { user, token, terminalToken, loading, logout } = useAuth()
   if (loading) return <div className="loading-screen">Loading…</div>
+  // S574: a device bound to a register (terminal token) but with no active
+  // session shows the passcode lock screen, not the login page.
+  if (!token && terminalToken) return <LockScreen />
   if (!token) return <Navigate to="/login" replace />
   if (user && DENIED_ROLES.includes(user.role)) {
     return (
@@ -86,22 +90,40 @@ function AccountMenu({ name, role, onSignOut }: { name: string; role?: string; o
 }
 
 function POSLayout() {
-  const { user, logout } = useAuth()
+  const { user, logout, posLimited, terminalToken, lockRegister } = useAuth()
   // Business logins get the business-mode register (business-pos
   // backend, business-scoped inventory). Landlord teams get the
   // property-mode register. Same door, right room.
   const isBusiness = !!user && BUSINESS_ROLES.includes(user.role)
   // S538: team management is owner-only (the API's gate; staff get 403).
-  const isOwner = user?.role === 'business_owner'
+  // S574: a posLimited cashier session never sees Team/Inventory — register only.
+  const isOwner = user?.role === 'business_owner' && !posLimited
+  const onLock = () => { void lockRegister() }
   return (
     <div style={{minHeight:'100vh',background:'var(--bg-1)'}}>
       <header style={{background:'var(--bg-2)',borderBottom:'1px solid var(--border-1)',padding:'0 20px',height:56,display:'flex',alignItems:'center',justifyContent:'space-between',position:'sticky',top:0,zIndex:100}}>
         <div style={{fontWeight:700,fontSize:'1.1rem',color:'var(--gold)'}}>⚡ GAM POS</div>
         <div style={{display:'flex',gap:16,alignItems:'center'}}>
           <a href="/pos" style={{fontSize:'.88rem',fontWeight:500}}>Register</a>
-          {!isBusiness && <a href="/pos?tab=inventory" style={{fontSize:'.88rem',fontWeight:500}}>Inventory</a>}
+          {!isBusiness && !posLimited && <a href="/pos?tab=inventory" style={{fontSize:'.88rem',fontWeight:500}}>Inventory</a>}
           {isOwner && <a href="/team" style={{fontSize:'.88rem',fontWeight:500}}>Team</a>}
-          <AccountMenu name={`${user?.firstName ?? ''} ${user?.lastName ?? ''}`.trim()} role={user?.role} onSignOut={logout} />
+          {posLimited ? (
+            // Cashier session: name is read-only; "Lock" hands the register back.
+            <>
+              <span style={{fontSize:'.82rem',color:'var(--text-2)'}}>{`${user?.firstName ?? ''} ${user?.lastName ?? ''}`.trim()}</span>
+              <button className="btn btn-ghost btn-sm" onClick={onLock}>🔒 Lock</button>
+            </>
+          ) : (
+            <>
+              {isBusiness && (
+                <button className="btn btn-ghost btn-sm" onClick={onLock}
+                  title={terminalToken ? 'Lock the register for cashier passcode sign-in' : 'Activate this register and lock it for cashier passcode sign-in'}>
+                  🔒 {terminalToken ? 'Lock register' : 'Hand off to cashiers'}
+                </button>
+              )}
+              <AccountMenu name={`${user?.firstName ?? ''} ${user?.lastName ?? ''}`.trim()} role={user?.role} onSignOut={logout} />
+            </>
+          )}
         </div>
       </header>
       <div style={{padding:20}}>

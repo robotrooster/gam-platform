@@ -28,6 +28,13 @@ export const USER_ROLES = [
   // relationship" case. Auth on /api/fitness/* is plain requireAuth, so
   // every role (including this one) is accepted there.
   'fitness_user',
+  // S568 (Nic): the CONTACT / customer pool. A person given a free GAM account
+  // solely so a landlord can send them an e-sign document (purchase agreement,
+  // contract) — no landlord/tenant profile row. Requiring an account (vs mailing
+  // a doc to any raw email) is the anti-spam / consent gate: the recipient opts
+  // in by activating their free account before they can view or sign. Same
+  // "no other GAM relationship" shape as fitness_user.
+  'contact',
 ] as const
 
 export type UserRole = typeof USER_ROLES[number]
@@ -109,6 +116,13 @@ export const AGENT_REVENUE_CAPABILITY_LABEL: Record<AgentRevenueCapability, stri
 export const LEASE_RENEWAL_REQUEST_STATUSES = ['requested', 'approved', 'declined', 'cancelled', 'completed'] as const
 export type LeaseRenewalRequestStatus = typeof LEASE_RENEWAL_REQUEST_STATUSES[number]
 
+// S565: FlexCredit (rent-payment credit reporting) demand-capture inquiry
+// status. Demand-test only for now — 'interested' is the sole live state; the
+// others are reserved for when the product actually launches (past the $500/mo
+// provider breakeven). No billing/Esusu wired yet.
+export const FLEXCREDIT_INQUIRY_STATUSES = ['interested', 'enrolled', 'declined'] as const
+export type FlexCreditInquiryStatus = typeof FLEXCREDIT_INQUIRY_STATUSES[number]
+
 // Booking-guest change requests. A no-account booking guest (RV/STR/extended-
 // stay) asks the guest agent for a stay change; the HOST finalizes it — the
 // agent only records the request (draft-with-approval, never auto-committed).
@@ -133,10 +147,22 @@ export const INSPECTION_TYPES = ['move_in', 'move_out', 'periodic', 'turnover'] 
 export type InspectionType = typeof INSPECTION_TYPES[number]
 
 // Per-item condition rating on an inspection checklist item. Single source
-// for the route + agent-tool validators; mirrors the existing
-// unit_inspection_items.condition CHECK (same five values).
-export const INSPECTION_ITEM_CONDITIONS = ['good', 'fair', 'damaged', 'missing', 'na'] as const
+// for the route + agent-tool validators. S573 (Nic): Excellent / Good / Fair /
+// Damaged-or-Missing — NO "N/A" (applicability comes from the unit's setup, an
+// un-inspected item is NULL, not a condition). These are the SELECTABLE values
+// during a walkthrough; the column also allows NULL = not yet inspected.
+export const INSPECTION_ITEM_CONDITIONS = ['excellent', 'good', 'fair', 'damaged_missing'] as const
 export type InspectionItemCondition = typeof INSPECTION_ITEM_CONDITIONS[number]
+export const INSPECTION_ITEM_CONDITION_LABEL: Record<InspectionItemCondition, string> = {
+  excellent:       'Excellent',
+  good:            'Good',
+  fair:            'Fair',
+  damaged_missing: 'Damaged / Missing',
+}
+// Worse-than ordering for the move-out-vs-move-in comparison (higher = worse).
+export const INSPECTION_CONDITION_RANK: Record<string, number> = {
+  excellent: 0, good: 1, fair: 2, damaged_missing: 3,
+}
 
 // ── Common areas & amenity reservations ───────────────────────────────
 // Property-level shared amenities (pool, clubhouse, gym, BBQ pavilion…)
@@ -231,6 +257,87 @@ export const SALES_LEAD_STATUS_LABELS: Record<SalesLeadStatus, string> = {
 }
 
 // ── Standard inspection walkthrough checklist (single source) ──────────
+// S573 (Nic): per-unit FEATURE catalog — "what does this unit actually have".
+// Gates which master-catalog inspection items appear (nothing is ever "N/A";
+// absent features = absent items). Stored in units.features (jsonb map); an
+// absent key falls back to the unit-type PRESET (`presetOn`), so a unit with
+// zero configuration still inspects correctly. New features need only a new
+// entry here — no migration (the product evolves via feature requests).
+export interface UnitFeatureDef {
+  key: string
+  label: string
+  group: string                 // UI grouping
+  types: readonly string[]      // unit types where this feature is offered
+  presetOn: readonly string[]   // subset of `types` where it defaults ON
+}
+const _DWELL = ['apartment', 'single_family', 'mobile_home'] as const
+const _SFH_MH = ['single_family', 'mobile_home'] as const
+export const UNIT_FEATURE_CATALOG: readonly UnitFeatureDef[] = [
+  // Appliances / kitchen
+  { key: 'provides_range',        label: 'Range / oven provided',        group: 'Appliances', types: _DWELL,  presetOn: _DWELL },
+  { key: 'provides_refrigerator', label: 'Refrigerator provided',        group: 'Appliances', types: _DWELL,  presetOn: _DWELL },
+  { key: 'provides_dishwasher',   label: 'Dishwasher provided',          group: 'Appliances', types: _DWELL,  presetOn: [] },
+  { key: 'provides_microwave',    label: 'Microwave provided',           group: 'Appliances', types: _DWELL,  presetOn: [] },
+  { key: 'garbage_disposal',      label: 'Garbage disposal',             group: 'Appliances', types: _DWELL,  presetOn: [] },
+  { key: 'pantry',                label: 'Pantry',                       group: 'Rooms',      types: _DWELL,  presetOn: [] },
+  // Rooms / interior extras
+  { key: 'provides_blinds',       label: 'Window coverings / blinds',    group: 'Rooms',      types: ['apartment', 'single_family', 'mobile_home', 'hotel_room'], presetOn: ['apartment', 'single_family', 'mobile_home', 'hotel_room'] },
+  { key: 'ceiling_fans',          label: 'Ceiling fan(s)',               group: 'Rooms',      types: _DWELL,  presetOn: [] },
+  { key: 'fireplace',             label: 'Fireplace',                    group: 'Rooms',      types: _DWELL,  presetOn: [] },
+  { key: 'hall_closet',           label: 'Coat / linen closet',          group: 'Rooms',      types: _DWELL,  presetOn: [] },
+  // Laundry
+  { key: 'in_unit_laundry',       label: 'In-unit laundry',              group: 'Laundry',    types: _DWELL,  presetOn: [] },
+  { key: 'provides_washer',       label: 'Washer provided',              group: 'Laundry',    types: _DWELL,  presetOn: [] },
+  { key: 'provides_dryer',        label: 'Dryer provided',               group: 'Laundry',    types: _DWELL,  presetOn: [] },
+  { key: 'utility_sink',          label: 'Utility sink',                 group: 'Laundry',    types: _DWELL,  presetOn: [] },
+  // Systems
+  { key: 'central_ac',            label: 'Central A/C',                  group: 'Systems',    types: _DWELL,  presetOn: [] },
+  { key: 'evap_cooler',           label: 'Evaporative cooler',           group: 'Systems',    types: _DWELL,  presetOn: [] },
+  { key: 'fire_extinguisher',     label: 'Fire extinguisher provided',   group: 'Systems',    types: _DWELL,  presetOn: [] },
+  // Doors
+  { key: 'back_door',             label: 'Back / rear door',             group: 'Doors',      types: _DWELL,  presetOn: _SFH_MH },
+  { key: 'screen_door',           label: 'Screen / storm door',          group: 'Doors',      types: _DWELL,  presetOn: [] },
+  { key: 'patio_door',            label: 'Sliding glass / patio door',   group: 'Doors',      types: _DWELL,  presetOn: [] },
+  { key: 'attached_garage',       label: 'Attached garage (interior door)', group: 'Doors',   types: ['single_family'], presetOn: [] },
+  { key: 'doorbell',              label: 'Doorbell / intercom',          group: 'Doors',      types: _DWELL,  presetOn: [] },
+  // Exterior / grounds (SFH + mobile home)
+  { key: 'patio_deck',            label: 'Patio / deck',                 group: 'Exterior',   types: _SFH_MH, presetOn: [] },
+  { key: 'balcony',               label: 'Balcony',                      group: 'Exterior',   types: ['apartment', 'single_family'], presetOn: [] },
+  { key: 'garage_carport',        label: 'Garage / carport',             group: 'Exterior',   types: _SFH_MH, presetOn: [] },
+  { key: 'fenced',                label: 'Fenced yard / gates',          group: 'Grounds',    types: _SFH_MH, presetOn: [] },
+  { key: 'sprinklers',            label: 'Sprinkler / irrigation',       group: 'Grounds',    types: _SFH_MH, presetOn: [] },
+  { key: 'shed',                  label: 'Shed / outbuilding',           group: 'Grounds',    types: _SFH_MH, presetOn: [] },
+  // RV site
+  { key: 'park_picnic_table',     label: 'Park-provided picnic table',   group: 'RV site',    types: ['rv_spot'], presetOn: [] },
+  { key: 'park_fire_ring',        label: 'Park-provided fire ring / grill', group: 'RV site', types: ['rv_spot'], presetOn: [] },
+  // Storage / handover
+  { key: 'rollup_door',           label: 'Roll-up door',                 group: 'Storage',    types: ['storage'], presetOn: [] },
+  { key: 'mailbox',              label: 'Mailbox / mailbox key',         group: 'Handover',   types: ['apartment', 'single_family', 'mobile_home'], presetOn: [] },
+  { key: 'gate_code',            label: 'Gate / access code',            group: 'Handover',   types: ['apartment', 'single_family', 'mobile_home', 'rv_spot', 'storage'], presetOn: [] },
+]
+
+// Effective feature map for a unit: stored value wins; else the type preset.
+// Only features offered for the type are included.
+export function resolveUnitFeatures(
+  unitType: string | null | undefined,
+  stored: Record<string, unknown> | null | undefined,
+): Record<string, boolean> {
+  const t = unitType ?? 'apartment'
+  const out: Record<string, boolean> = {}
+  for (const f of UNIT_FEATURE_CATALOG) {
+    if (!f.types.includes(t)) continue
+    const s = stored?.[f.key]
+    out[f.key] = typeof s === 'boolean' ? s : f.presetOn.includes(t)
+  }
+  return out
+}
+
+// The features offered for a unit type (for the setup UI), preset value filled.
+export function featuresForType(unitType: string | null | undefined): Array<UnitFeatureDef & { presetValue: boolean }> {
+  const t = unitType ?? 'apartment'
+  return UNIT_FEATURE_CATALOG.filter(f => f.types.includes(t)).map(f => ({ ...f, presetValue: f.presetOn.includes(t) }))
+}
+
 // The areas the agent walks a tenant/landlord through on a move-in / move-out
 // / periodic inspection. Each area expects at least one fresh camera photo;
 // any item rated 'damaged' or 'missing' forces its own close-up (the agent's
@@ -246,29 +353,42 @@ export interface InspectionChecklistArea {
 export const MAX_INSPECTION_BEDROOMS = 4
 export const MAX_INSPECTION_BATHROOMS = 4
 
-const BEDROOM_ITEMS = ['Walls', 'Flooring', 'Closet', 'Window', 'Lighting'] as const
-const BATHROOM_ITEMS = ['Toilet', 'Sink & vanity', 'Tub/shower', 'Tile & grout', 'Exhaust fan', 'Floor'] as const
+// S573: how many living/family areas the checklist repeats (like bedrooms).
+export const MAX_INSPECTION_LIVING_AREAS = 3
 
-// Residential base, MINUS bedrooms AND bathrooms — both are spliced in by
-// the builder, sized to the unit's REAL counts (S550: an inspector going
-// inside covers everything the unit actually has — every bathroom, the
-// kitchen, living/dining — never a room that doesn't exist).
-const RESIDENTIAL_INSPECTION_AREAS_BASE: readonly InspectionChecklistArea[] = [
-  { area: 'Kitchen', items: ['Countertops & cabinets', 'Sink & faucet', 'Stove/oven', 'Refrigerator', 'Dishwasher/microwave', 'Floor'] },
-  { area: 'Living / dining', items: ['Walls', 'Flooring', 'Ceiling', 'Windows & blinds', 'Doors', 'Dining area', 'Lighting & outlets'] },
-  { area: 'Systems & safety', items: ['HVAC/thermostat', 'Water heater', 'Smoke & CO detectors', 'Breaker panel'] },
-  { area: 'Laundry', items: ['Washer/dryer or hookups'] },
-  { area: 'Exterior / entry', items: ['Entry door & locks', 'Patio/balcony', 'Exterior walls/screens'] },
-  { area: 'Handover', items: ['Keys/remotes/access devices', 'Utility meter readings'] },
-]
+// S573 (Nic): accessible (ADA) units carry accommodation features the landlord
+// must keep functional. Added only when units.is_ada_accessible, for interior-
+// inspected residential types. GENERIC FEDERAL items only — per GAM's standing
+// no-state-specific-legal-logic rule, per-state accessibility variances are NOT
+// encoded here.
+const ACCESSIBILITY_INSPECTION_AREA: InspectionChecklistArea = {
+  area: 'Accessibility',
+  items: [
+    'Entry ramp / zero-step entry',
+    'Door widths & maneuvering clearance',
+    'Lever handles & reachable controls',
+    'Bathroom grab bars secure',
+    'Roll-in / accessible shower & seat',
+    'Accessible toilet height',
+    'Roll-under sink clearance (bath & kitchen)',
+    'Accessible parking & path of travel',
+    'Visual & audible alarms',
+    'Threshold transitions & flooring',
+  ],
+}
 
-const RV_SITE_INSPECTION_AREAS: readonly InspectionChecklistArea[] = [
-  { area: 'Pad & site', items: ['Pad surface', 'Leveling', 'Picnic table', 'Fire ring/grill'] },
-  { area: 'Hookups', items: ['Electric pedestal', 'Water connection', 'Sewer connection'] },
-  { area: 'Cleanliness', items: ['Trash removed', 'Site cleared'] },
-  { area: 'Surroundings', items: ['Landscaping/clearance', 'Site markers/signage'] },
-  { area: 'Handover', items: ['Gate/access code', 'Meter reading (if metered)'] },
-]
+// S573 (Nic): a unit's FLOOR PLACEMENT — for tenant search filtering
+// ("ground floor only"). Distinct from is_multi_level (internal stairs): a
+// single-level unit can still be entirely upstairs or in a basement. Backs
+// units.floor_level (nullable = unspecified; migration 20260731190000).
+export const FLOOR_LEVELS = ['ground_floor', 'upper_floor', 'basement', 'multi_floor'] as const
+export type FloorLevel = typeof FLOOR_LEVELS[number]
+export const FLOOR_LEVEL_LABEL: Record<FloorLevel, string> = {
+  ground_floor: 'Ground floor',
+  upper_floor:  'Upper floor',
+  basement:     'Basement',
+  multi_floor:  'Multiple floors',
+}
 
 // S550 (Nic): who owns the DWELLING on the unit. Backs units.dwelling_ownership
 // (migration 20260719160000). Only meaningful for rv_spot and mobile_home —
@@ -278,6 +398,71 @@ export type DwellingOwnership = typeof DWELLING_OWNERSHIP_VALUES[number]
 export const DWELLING_OWNERSHIP_LABEL: Record<DwellingOwnership, string> = {
   landlord: 'Park/landlord-owned',
   tenant:   'Tenant-owned',
+}
+
+// S568 (Nic): rent line-item split. A lease's rent can be itemized into named
+// components (space rent + trailer rent + other) that SUM to leases.rent_amount.
+// Billing stays one rent payment; the components are the display + metrics
+// breakdown. Backs lease_rent_components.kind (migration 20260730150000).
+// S568 (Nic): landlord-entered expense categories for bookkeeping. Curated set
+// + 'other'. Backs landlord_expenses.category (migration 20260730240000).
+export const EXPENSE_CATEGORIES = [
+  'maintenance', 'repairs', 'utilities', 'insurance', 'property_tax', 'management',
+  'supplies', 'landscaping', 'professional', 'mortgage_interest', 'hoa', 'advertising',
+  'lot_rent', 'bank_fees', 'other',
+] as const
+export type ExpenseCategory = typeof EXPENSE_CATEGORIES[number]
+export const EXPENSE_CATEGORY_LABEL: Record<ExpenseCategory, string> = {
+  maintenance: 'Maintenance', repairs: 'Repairs', utilities: 'Utilities', insurance: 'Insurance',
+  property_tax: 'Property tax', management: 'Management', supplies: 'Supplies', landscaping: 'Landscaping',
+  professional: 'Legal / professional', mortgage_interest: 'Mortgage interest', hoa: 'HOA', advertising: 'Advertising',
+  lot_rent: 'Lot rent', bank_fees: 'Bank fees / charges', other: 'Other',
+}
+
+// S570 (Nic): bank feed (Stripe Financial Connections). A landlord links their
+// operating bank read-only; transactions sync in and get categorized into the
+// landlord P&L. Back bank_connections / bank_transactions / landlord_merchant_rules
+// (migration 20260730250000).
+export const BANK_CONNECTION_PROVIDERS = ['stripe_fc', 'csv'] as const
+export type BankConnectionProvider = typeof BANK_CONNECTION_PROVIDERS[number]
+
+export const BANK_CONNECTION_STATUSES = ['active', 'disconnected', 'error'] as const
+export type BankConnectionStatus = typeof BANK_CONNECTION_STATUSES[number]
+
+// needs_review = surfaced for the landlord to categorize; matched = auto-linked to
+// GAM-known money (a disbursement/payment), hidden from the queue; categorized =
+// became a landlord_expenses row; ignored = dismissed by the landlord.
+export const BANK_TXN_STATUSES = ['needs_review', 'matched', 'categorized', 'ignored'] as const
+export type BankTxnStatus = typeof BANK_TXN_STATUSES[number]
+
+// How a categorized bank charge maps onto the expense model: to one unit, to the
+// property as a common cost, or to the property split across its units.
+export const MERCHANT_RULE_SCOPES = ['unit', 'property_common', 'property_allocate'] as const
+export type MerchantRuleScope = typeof MERCHANT_RULE_SCOPES[number]
+
+// S570 (Nic): notification types that are too important to silence. Email is
+// FORCED on for these regardless of the user's preference (they can't toggle it
+// off in the UI), because missing them causes real harm (a failed rent payment
+// slipping to a late fee / eviction clock). In-app is always on already.
+export const CRITICAL_NOTIFICATION_TYPES = ['payment_failed'] as const
+export type CriticalNotificationType = typeof CRITICAL_NOTIFICATION_TYPES[number]
+export const isCriticalNotificationType = (t: string): boolean =>
+  (CRITICAL_NOTIFICATION_TYPES as readonly string[]).includes(t)
+
+// S568 (Nic): home-ownership tracking (who owns a tenant-owned home/RV — the
+// economic sublessor). Backs home_ownerships (migration 20260730210000).
+export const HOME_OWNERSHIP_ACQUIRED_VIA = ['recorded', 'sale', 'transfer', 'financed_payoff'] as const
+export type HomeOwnershipAcquiredVia = typeof HOME_OWNERSHIP_ACQUIRED_VIA[number]
+export const HOME_OWNERSHIP_ACQUIRED_VIA_LABEL: Record<HomeOwnershipAcquiredVia, string> = {
+  recorded: 'Recorded', sale: 'Sale', transfer: 'Transfer', financed_payoff: 'Financed payoff',
+}
+
+export const RENT_COMPONENT_KINDS = ['space', 'trailer', 'other'] as const
+export type RentComponentKind = typeof RENT_COMPONENT_KINDS[number]
+export const RENT_COMPONENT_KIND_LABEL: Record<RentComponentKind, string> = {
+  space:   'Space rent',
+  trailer: 'Trailer/home rent',
+  other:   'Other',
 }
 
 // S558 (Nic): per-unit occupancy mode. whole_unit = one lease, co-tenants share
@@ -319,29 +504,6 @@ export const RV_UNIT_INSPECTION_AREAS: readonly InspectionChecklistArea[] = [
   { area: 'RV exterior', items: ['Body & roof', 'Windows & seals', 'Steps & handrails', 'Keys & locks'] },
 ]
 
-// Tenant-owned mobile home on a rented lot: the park owns the SPACE, not the
-// home — inspections never enter the tenant's dwelling. Space rent only.
-export const MH_SPACE_INSPECTION_AREAS: readonly InspectionChecklistArea[] = [
-  { area: 'Lot & pad', items: ['Pad/foundation piers', 'Driveway/parking', 'Steps & landings (park-owned)'] },
-  { area: 'Hookups', items: ['Electric service', 'Water connection', 'Sewer connection'] },
-  { area: 'Yard', items: ['Landscaping/clearance', 'Trash removed', 'Fencing (park-owned)'] },
-  { area: 'Handover', items: ['Gate/access code', 'Utility meter readings'] },
-]
-
-// S548 (Nic): storage/parking walkthroughs are deliberately tiny — empty,
-// and the door/latch in similar condition to move-in (the comparison
-// inspection has the move-in photos). No point walking a 10x20 like an
-// apartment.
-const STORAGE_INSPECTION_AREAS: readonly InspectionChecklistArea[] = [
-  { area: 'Contents', items: ['Unit completely empty', 'No debris left behind'] },
-  { area: 'Door & lock', items: ['Door operates', 'Latch/locking mechanism condition vs move-in', 'Lock removed/returned'] },
-]
-
-// Dwelling unit types that get bedroom areas. rv_spot uses the site list;
-// storage/parking use the tiny checklist; commercial gets the residential
-// base WITHOUT bedrooms.
-const BEDROOM_UNIT_TYPES = ['apartment', 'single_family', 'mobile_home']
-
 // S548: which unit types require a FINALIZED in-person move-out inspection
 // before a deposit return can begin. rv_spot deliberately absent — its
 // "walkthrough" is the mandatory pull-out meter read + same-day settlement.
@@ -364,55 +526,193 @@ export function buildInspectionChecklist(input: {
   unitType?: string | null
   bedrooms?: number | null
   bathrooms?: number | null
+  livingAreas?: number | null
   dwellingOwnership?: string | null
+  isMultiLevel?: boolean | null
+  isAdaAccessible?: boolean | null
+  /** units.features (jsonb) — resolved against type presets to gate items */
+  features?: Record<string, unknown> | null
 }): InspectionChecklistArea[] {
-  const ownership: DwellingOwnership =
-    input.dwellingOwnership === 'tenant' ? 'tenant' : 'landlord'
-  if (input.unitType === 'rv_spot') {
-    const site = RV_SITE_INSPECTION_AREAS.map((a) => ({ ...a }))
-    if (ownership === 'landlord') {
-      return [...site, ...RV_UNIT_INSPECTION_AREAS.map((a) => ({ ...a }))]
-    }
-    return site
+  const type = input.unitType ?? 'apartment'
+  const ownership: DwellingOwnership = input.dwellingOwnership === 'tenant' ? 'tenant' : 'landlord'
+  const F = resolveUnitFeatures(type, input.features)
+  const has = (k: string) => !!F[k]
+  const clamp = (v: any, max: number, min: number) => {
+    const n = Math.trunc(Number(v))
+    return Math.min(Math.max(Number.isFinite(n) ? n : min, min), max)
   }
-  if (input.unitType === 'mobile_home' && ownership === 'tenant') {
-    return MH_SPACE_INSPECTION_AREAS.map((a) => ({ ...a }))
+  const clone = (areas: InspectionChecklistArea[]) => areas.map(a => ({ area: a.area, items: [...a.items] }))
+
+  // ── RV spot: site (always) + rig (park-owned only). Never bedrooms. ──
+  if (type === 'rv_spot') {
+    const site: InspectionChecklistArea = { area: 'RV site', items: [
+      'Pad surface / condition', 'Site leveling', 'Electric pedestal / hookup',
+      'Water connection / spigot', 'Sewer connection', 'Weeds / vegetation',
+      'Trash / debris removed', 'Site marker / number',
+      ...(has('park_picnic_table') ? ['Picnic table'] : []),
+      ...(has('park_fire_ring') ? ['Fire ring / grill'] : []),
+    ] }
+    return clone(ownership === 'landlord' ? [site, ...RV_UNIT_INSPECTION_AREAS] : [site])
   }
-  if (input.unitType === 'storage' || input.unitType === 'parking') {
-    return STORAGE_INSPECTION_AREAS.map((a) => ({ ...a }))
+  if (type === 'storage') {
+    return clone([{ area: 'Storage unit', items: [
+      'Unit empty / cleared', 'Door operation', 'Latch / locking mechanism',
+      'Interior walls & floor', ...(has('rollup_door') ? ['Roll-up door'] : []),
+    ] }])
+  }
+  if (type === 'parking') {
+    return clone([{ area: 'Parking space', items: ['Space empty / cleared', 'Space markings / number', 'Surface condition'] }])
   }
 
-  // Bathrooms: one area per REAL bathroom (ceil — a 1.5-bath gets two areas,
-  // the fractional one labeled as the half bath). Applies to every
-  // interior-inspected type, not just bedroom types (a hotel room has a
-  // bathroom too). Defaults to 1 when unknown.
+  // ── Grounds (single-family + mobile home, incl. tenant-owned grounds-only) ──
+  const groundsAreas = (): InspectionChecklistArea[] => ([
+    { area: 'Exterior & structure', items: [
+      'Exterior walls / siding', 'Roof & gutters (visible)',
+      ...(type === 'mobile_home' ? ['Skirting', 'Foundation / piers'] : []),
+      'Exterior lighting', 'Exterior faucets / hose bibs', 'Porch / stoop / entry steps',
+      ...(has('patio_deck') ? ['Patio / deck'] : []),
+      ...(has('balcony') ? ['Balcony'] : []),
+      ...(has('garage_carport') ? ['Garage / carport'] : []),
+      'Driveway / parking pad',
+    ] },
+    { area: 'Yard & grounds', items: [
+      'Front yard — landscaping & condition', 'Back yard — landscaping & condition',
+      'Weeds / overgrowth', 'Trees / shrubs',
+      ...(has('fenced') ? ['Fencing & gates'] : []),
+      ...(has('sprinklers') ? ['Sprinkler / irrigation'] : []),
+      ...(has('shed') ? ['Shed / outbuilding'] : []),
+      'Trash / debris removed',
+    ] },
+  ])
+  const handover = (): InspectionChecklistArea => ({ area: 'Handover', items: [
+    'Keys / remotes / fobs',
+    ...(has('mailbox') ? ['Mailbox key'] : []),
+    ...(has('garage_carport') ? ['Garage-door opener'] : []),
+    ...(has('gate_code') ? ['Gate / access code'] : []),
+    'Utility meter readings',
+  ] })
+
+  // Tenant-owned mobile home: grounds/lot only — never inside their dwelling.
+  if (type === 'mobile_home' && ownership === 'tenant') {
+    return clone([...groundsAreas(), handover()])
+  }
+
+  // ── Interior dwellings (apartment / single-family / landlord MH / hotel / commercial) ──
+  const isDwelling = ['apartment', 'single_family', 'mobile_home'].includes(type)
+  const areas: InspectionChecklistArea[] = []
+
+  areas.push({ area: 'Kitchen', items: [
+    'Cabinets & drawers', 'Countertops', 'Sink & faucet', 'Backsplash',
+    ...(has('provides_range') ? ['Range / oven'] : []),
+    'Range hood / vent',
+    ...(has('provides_refrigerator') ? ['Refrigerator'] : []),
+    ...(has('provides_dishwasher') ? ['Dishwasher'] : []),
+    ...(has('provides_microwave') ? ['Microwave'] : []),
+    ...(has('garbage_disposal') ? ['Garbage disposal'] : []),
+    ...(has('pantry') ? ['Pantry'] : []),
+    'Flooring', 'Walls & ceiling', 'Outlets (incl. GFCI)', 'Lighting',
+  ] })
+
+  // Bathrooms — one per real bathroom (ceil; last is a half if fractional).
   const bathRaw = Number(input.bathrooms ?? 1)
-  const bathCount = Math.min(
-    Math.max(Number.isFinite(bathRaw) ? Math.ceil(bathRaw) : 1, 1),
-    MAX_INSPECTION_BATHROOMS,
-  )
+  const bathCount = Math.min(Math.max(Number.isFinite(bathRaw) ? Math.ceil(bathRaw) : 1, 1), MAX_INSPECTION_BATHROOMS)
   const hasHalf = Number.isFinite(bathRaw) && bathRaw > 0 && bathRaw % 1 !== 0
-  const bathrooms: InspectionChecklistArea[] = Array.from({ length: bathCount }, (_, i) => ({
-    area: bathCount === 1 ? 'Bathroom' : (hasHalf && i === bathCount - 1 ? `Bathroom ${i + 1} (half)` : `Bathroom ${i + 1}`),
-    items: [...BATHROOM_ITEMS],
-  }))
-
-  const base = RESIDENTIAL_INSPECTION_AREAS_BASE
-  const kitchenIdx = base.findIndex((a) => a.area === 'Kitchen')
-  const withBaths = [...base.slice(0, kitchenIdx + 1), ...bathrooms, ...base.slice(kitchenIdx + 1)]
-
-  if (!BEDROOM_UNIT_TYPES.includes(input.unitType ?? 'apartment')) {
-    return withBaths.map((a) => ({ ...a }))
+  for (let i = 0; i < bathCount; i++) {
+    const isHalf = hasHalf && i === bathCount - 1
+    areas.push({
+      area: bathCount === 1 ? 'Bathroom' : (isHalf ? `Bathroom ${i + 1} (half)` : `Bathroom ${i + 1}`),
+      items: [
+        'Toilet', 'Sink & vanity', 'Faucet & fixtures',
+        ...(!isHalf ? ['Tub / shower', 'Shower surround / tile & grout'] : []),
+        'Mirror / medicine cabinet', 'Exhaust fan / ventilation', 'Flooring',
+        'Walls & ceiling', 'GFCI outlet', 'Towel bars / accessories', 'Visible leaks / shutoffs',
+      ],
+    })
   }
 
-  const n = Math.trunc(Number(input.bedrooms ?? 1))
-  const bedroomCount = Math.min(Math.max(Number.isFinite(n) ? n : 1, 0), MAX_INSPECTION_BEDROOMS)
-  const bedrooms: InspectionChecklistArea[] = Array.from({ length: bedroomCount }, (_, i) => ({
-    area: `Bedroom ${i + 1}`,
-    items: [...BEDROOM_ITEMS],
-  }))
-  const idx = withBaths.findIndex((a) => a.area === 'Living / dining')
-  return [...withBaths.slice(0, idx + 1), ...bedrooms, ...withBaths.slice(idx + 1)].map((a) => ({ ...a }))
+  // Living areas — repeat per the unit's living-area count (dwellings only).
+  const livingCount = isDwelling ? clamp(input.livingAreas ?? 1, MAX_INSPECTION_LIVING_AREAS, 1) : 1
+  for (let i = 0; i < livingCount; i++) {
+    areas.push({
+      area: livingCount === 1 ? 'Living / dining' : `Living area ${i + 1}`,
+      items: [
+        'Walls & paint', 'Flooring', 'Ceiling', 'Windows & screens',
+        ...(has('provides_blinds') ? ['Blinds / window covering'] : []),
+        ...(has('ceiling_fans') ? ['Ceiling fan'] : []),
+        'Light fixtures', 'Outlets & switches',
+        ...(has('fireplace') ? ['Fireplace'] : []),
+        'Dining area',
+      ],
+    })
+  }
+
+  // Bedrooms — sized to the unit (dwellings only).
+  if (isDwelling) {
+    const n = clamp(input.bedrooms ?? 1, MAX_INSPECTION_BEDROOMS, 0)
+    for (let i = 0; i < n; i++) {
+      areas.push({ area: `Bedroom ${i + 1}`, items: [
+        'Walls & paint', 'Flooring', 'Ceiling', 'Closet & shelving',
+        'Window — operation, screen & lock',
+        ...(has('provides_blinds') ? ['Blinds / window covering'] : []),
+        'Outlets & light switches', 'Ceiling light fixture',
+        ...(has('ceiling_fans') ? ['Ceiling fan'] : []),
+        'Entry door', 'Smoke detector',
+      ] })
+    }
+  }
+
+  // Hallways & stairs
+  const hall = ['Hallway walls & flooring']
+  if (has('hall_closet')) hall.push('Coat / linen closet')
+  hall.push('Smoke / CO detector')
+  if (input.isMultiLevel) hall.push('Staircase & treads', 'Handrail — secure & sturdy', 'Landing', 'Stairwell lighting')
+  areas.push({ area: 'Hallways & stairs', items: hall })
+
+  // Laundry (only if in-unit)
+  if (has('in_unit_laundry')) {
+    areas.push({ area: 'Laundry', items: [
+      ...(has('provides_washer') ? ['Washer'] : []),
+      ...(has('provides_dryer') ? ['Dryer'] : []),
+      'Washer / dryer hookups', 'Dryer vent',
+      ...(has('utility_sink') ? ['Utility sink'] : []),
+      'Flooring & walls',
+    ] })
+  }
+
+  areas.push({ area: 'Systems & safety', items: [
+    'Heating — furnace / HVAC', 'Thermostat',
+    ...(has('central_ac') ? ['Cooling — A/C'] : []),
+    ...(has('evap_cooler') ? ['Cooling — evaporative cooler'] : []),
+    'Water heater', 'Electrical panel / breakers', 'Smoke detectors', 'Carbon-monoxide detectors',
+    ...(has('fire_extinguisher') ? ['Fire extinguisher'] : []),
+    'Plumbing — visible leaks / shutoffs', 'Vents / registers / ductwork',
+  ] })
+
+  areas.push({ area: 'Entry & doors', items: [
+    'Front door & deadbolt',
+    ...(has('back_door') ? ['Back / rear door'] : []),
+    ...(has('screen_door') ? ['Screen / storm door'] : []),
+    ...(has('patio_door') ? ['Sliding glass / patio door'] : []),
+    ...(has('attached_garage') ? ['Garage interior door'] : []),
+    ...(has('doorbell') ? ['Doorbell / intercom'] : []),
+  ] })
+
+  if (input.isAdaAccessible) areas.push(ACCESSIBILITY_INSPECTION_AREA)
+
+  // Exterior: SFH + landlord-owned mobile home get full grounds; an apartment
+  // shares building common areas; other interior types have no exterior area.
+  if (type === 'single_family' || type === 'mobile_home') {
+    areas.push(...groundsAreas())
+  } else if (type === 'apartment') {
+    areas.push({ area: 'Entry & common areas', items: [
+      'Building entry / lobby', 'Shared hallway / stairwell',
+      ...(has('balcony') ? ['Balcony'] : []),
+      'Assigned parking / storage',
+    ] })
+  }
+
+  areas.push(handover())
+  return clone(areas)
 }
 
 // Per-business staff positions. Single source of truth for the
@@ -972,7 +1272,6 @@ export const PROPERTY_MANAGER_SUB_PERMISSIONS = [
   'books.view',
   'books.edit',
   'notifications.send_bulk',
-  'bulletin.view',
   'work_trade.view',
   'work_trade.manage',
   'work_trade.reconcile',
@@ -990,7 +1289,6 @@ export const ONSITE_MANAGER_SUB_PERMISSIONS = [
   'guests.check_out',
   'units.view_status',
   'utility.read_meters',
-  'bulletin.view',
 ] as const
 export type OnsiteManagerSubPermission = typeof ONSITE_MANAGER_SUB_PERMISSIONS[number]
 
@@ -1038,7 +1336,6 @@ export const SUB_PERMISSION_LABEL: Record<AnySubPermission, string> = {
   'books.view':                        'View books',
   'books.edit':                        'Edit books',
   'notifications.send_bulk':           'Send bulk notifications',
-  'bulletin.view':                     'View tenant bulletin board',
   'work_trade.view':                   'View work-trade agreements',
   'work_trade.manage':                 'Create / update work-trade agreements',
   'work_trade.reconcile':              'Approve hours + reconcile periods',
@@ -1813,6 +2110,22 @@ export const MAINTENANCE_CATEGORIES = [
   'pest', 'cleaning', 'roofing', 'structural', 'pool', 'locksmith',
 ] as const
 export type MaintenanceCategory = typeof MAINTENANCE_CATEGORIES[number]
+// S571: tenant-facing category labels (no-raw-enums rule). The tenant picks a
+// category instead of typing a free-text title; the title is derived from this.
+export const MAINTENANCE_CATEGORY_LABEL: Record<MaintenanceCategory, string> = {
+  general:    'General / Other',
+  plumbing:   'Plumbing',
+  electrical: 'Electrical',
+  hvac:       'Heating & Cooling',
+  appliance:  'Appliance',
+  landscape:  'Landscaping / Grounds',
+  pest:       'Pest Control',
+  cleaning:   'Cleaning',
+  roofing:    'Roof / Ceiling',
+  structural: 'Structural',
+  pool:       'Pool / Spa',
+  locksmith:  'Locks & Keys',
+}
 export const MAINTENANCE_PRIORITY_LABEL: Record<MaintenancePriority, string> = {
   emergency: 'Emergency',
   high:      'High',
@@ -1846,14 +2159,70 @@ export const DOCUMENT_CATEGORY_LABEL: Record<DocumentCategory, string> = {
 
 // Lease document types on the `lease_documents` table (e-sign dispatcher).
 // Single source of truth for lease_documents.document_type CHECK constraint.
-export const LEASE_DOCUMENT_TYPES = ['original_lease', 'addendum_add', 'addendum_remove', 'addendum_terms', 'sublease_agreement'] as const
+// S568 (Nic): STANDALONE (non-lease) e-sign documents — the generic e-sign
+// engine. These bind to no lease/unit (lease_id/unit_id NULL); signers + roles
+// are arbitrary. Purchase agreements for financed home sales, resident-to-
+// resident sales (landlord not a party — just facilitating), business quotes/
+// bids. They share the lease_documents table + signing/token flow.
+export const STANDALONE_DOCUMENT_TYPES = ['purchase_agreement', 'bill_of_sale', 'general_contract'] as const
+export type StandaloneDocumentType = typeof STANDALONE_DOCUMENT_TYPES[number]
+
+// S576 (B-8): document types whose e-sign completion produces NO lease record —
+// the signed PDF itself is the legal instrument. The completion path must SKIP
+// buildLeaseFromDocument for these, mark the document `completed`, and still
+// stamp the executed PDF. Members: the standalone contract types (bind to no
+// lease/unit at all) + 'work_trade_addendum' (rides a lease send but mutates no
+// lease on its own — its signed PDF is the addendum). Adding a value here that
+// buildLeaseFromDocument's switch does not handle is exactly what this set
+// guards against — a fully-signed doc landing in execution_failed.
+export const NO_LEASE_DOCUMENT_TYPES = [...STANDALONE_DOCUMENT_TYPES, 'work_trade_addendum'] as const
+export type NoLeaseDocumentType = typeof NO_LEASE_DOCUMENT_TYPES[number]
+
+// S576 (B-8): a lease template's purpose. 'lease' = a normal lease form used
+// for original leases + renewals. 'work_trade_addendum' = the landlord's own
+// work-trade addendum form, auto-attached to a renewal when a paused work-trade
+// agreement needs a fresh tenancy. Landlords bring their own forms (Nic).
+export const LEASE_TEMPLATE_PURPOSES = ['lease', 'work_trade_addendum'] as const
+export type LeaseTemplatePurpose = typeof LEASE_TEMPLATE_PURPOSES[number]
+export const LEASE_TEMPLATE_PURPOSE_LABEL: Record<LeaseTemplatePurpose, string> = {
+  lease:               'Lease',
+  work_trade_addendum: 'Work-Trade Addendum',
+}
+
+export const LEASE_DOCUMENT_TYPES = ['original_lease', 'addendum_add', 'addendum_remove', 'addendum_terms', 'sublease_agreement',
+  ...STANDALONE_DOCUMENT_TYPES, 'work_trade_addendum'] as const
 export type LeaseDocumentType = typeof LEASE_DOCUMENT_TYPES[number]
 export const LEASE_DOCUMENT_TYPE_LABEL: Record<LeaseDocumentType, string> = {
-  original_lease:     'Original Lease',
-  addendum_add:       'Add Tenant',
-  addendum_remove:    'Remove Tenant',
-  addendum_terms:     'Change Lease Terms',
-  sublease_agreement: 'Sublease Agreement',
+  original_lease:      'Original Lease',
+  addendum_add:        'Add Tenant',
+  addendum_remove:     'Remove Tenant',
+  addendum_terms:      'Change Lease Terms',
+  sublease_agreement:  'Sublease Agreement',
+  purchase_agreement:  'Purchase Agreement',
+  bill_of_sale:        'Bill of Sale',
+  general_contract:    'Contract',
+  work_trade_addendum: 'Work-Trade Addendum',
+}
+
+// Generic signer roles for standalone documents. The e-sign engine matches a
+// template field's signer_role to a document signer's role, so ANY consistent
+// role string works — these are the common presets (+ labels for the UI). Lease
+// documents keep using landlord / witness / tenant roles.
+export const GENERIC_SIGNER_ROLES = ['seller', 'purchaser', 'party_1', 'party_2', 'witness'] as const
+export type GenericSignerRole = typeof GENERIC_SIGNER_ROLES[number]
+export const GENERIC_SIGNER_ROLE_LABEL: Record<GenericSignerRole, string> = {
+  seller:    'Seller',
+  purchaser: 'Purchaser',
+  party_1:   'Party 1',
+  party_2:   'Party 2',
+  witness:   'Witness',
+}
+// A signer role is valid if it's a known lease role, a generic role, or a sane
+// custom label (letters/digits/underscore/space, ≤40 chars) — the generic engine
+// allows arbitrary parties without an enum migration.
+export function isValidSignerRole(role: string): boolean {
+  if (!role || role.length > 40) return false
+  return /^[a-z0-9_][a-z0-9_ ]*$/i.test(role)
 }
 
 // S212: addendum diff display constants — shared by tenant LeasePage
@@ -3132,17 +3501,20 @@ export const PROCESSING_FEES = {
 } as const
 
 export const PLATFORM_FEES = {
-  // @deprecated S561 — RETIRED pre-launch tiers. The LIVE landlord fee is
-  // LAUNCH_PLATFORM_FEE.PER_OCCUPIED_UNIT ($2/occupied unit, $10/property min).
-  // No remaining callers (calcNetPerUnit now uses the live model); kept only so
-  // any stray reference still resolves. Do NOT use for new fee math.
+  // @deprecated S561 — the per-unit LANDLORD fee tiers below are RETIRED. The
+  // LIVE landlord fee is LAUNCH_PLATFORM_FEE.PER_OCCUPIED_UNIT ($2/occupied
+  // unit, $10/property min); calcNetPerUnit uses the live model. Do NOT use
+  // ACTIVE_UNIT/DIRECT_PAY_UNIT/VACANT_UNIT/LATE_FEE for new fee math.
   ACTIVE_UNIT:     15.00,
   DIRECT_PAY_UNIT: 5.00,
   VACANT_UNIT:     0.00,
   LATE_FEE:        15.00,
-  FLOAT_FEE_MO:    20.00,     // SSI/SSDI opt-in service fee
+  // ⚠️ STILL LIVE — the admin income projection (admin.ts /income/projection)
+  // reads FLOAT_FEE_MO + BG_CHECK_NET. Keep these in sync with their real
+  // sources of truth:
+  FLOAT_FEE_MO:    25.00,     // FlexPay monthly fee — matches FLEXPAY_MONTHLY_FEE (services/flexpay.ts, S562: flat $25). Was 20 (stale).
   REINSTATEMENT:   25.00,     // After FlexDeposit default
-  BG_CHECK_NET:    15.00,     // Platform nets $15, applicant pays $40
+  BG_CHECK_NET:     5.00,     // GAM's NET margin per background check — matches SCREENING_GAM_MARGIN_USD ($5). Applicant pays Checkr cost + $5 + processing (pass-through). Was 15 (stale — old model).
 
   // S536 (Nic): ALL money flows through GAM — business charges are
   // platform DESTINATION charges (GAM = merchant of record; gross
@@ -3189,6 +3561,32 @@ export const INSTANT_WITHDRAWAL_FEE = {
   PCT:     0.02,
   MIN_USD: 5.00,
 } as const
+
+// Portfolio-manager commission (S567). Per OCCUPIED unit/month:
+//   - CLOSING 25¢ + SERVICE 25¢ = the closing agent's $0.50 recurring
+//     commission, forever while the landlord stays on the platform. Closing and
+//     customer service are the SAME agent — NOT splittable — EXCEPT a
+//     self-closed landlord (organic signup, no closer):
+//       * closing 25¢ → POT (orphaned, nobody closed it)
+//       * service 25¢ → a customer-service-specialist PM who opts to take it,
+//         or POT if none
+//   - POT_ALWAYS 10¢ → the shared pot, EVERY occupied unit, EVERY month, no
+//     matter the situation. This is NOT commission.
+// The pot therefore = the always-10¢ + any orphaned closing/service 25¢ halves.
+// Source of truth for jobs/commissionAccrual.ts + every admin comp surface.
+export const COMMISSION_ROLES = ['closing', 'service', 'pot'] as const
+export type CommissionRole = typeof COMMISSION_ROLES[number]
+export const PORTFOLIO_COMMISSION = {
+  CLOSING:    0.25, // → closing agent, or pot when self-closed
+  SERVICE:    0.25, // → the same closing agent; a CS specialist or pot only when self-closed
+  POT_ALWAYS: 0.10, // → pot, always (not commission)
+  CLOSER_TOTAL: 0.50, // CLOSING + SERVICE — what one closing agent earns per occupied unit/mo
+} as const
+export const COMMISSION_ROLE_LABEL: Record<CommissionRole, string> = {
+  closing: 'Closing',
+  service: 'Customer Service',
+  pot:     'Pot (platform)',
+}
 
 /**
  * Monthly GAM platform fee for one property under the live model:
@@ -3237,6 +3635,15 @@ export const FLEX_DEPOSIT_TIERS = [
 ] as const
 
 export const FLEX_DEPOSIT_CUSTODY_FEE = 3       // $/month while GAM holds the deposit in custody
+// S565: FlexCredit (rent credit reporting) tenant subscription. Sell $5/mo;
+// ~$1.50/enrollment goes to the provider (Esusu) with a ~$500/mo provider
+// minimum → ~$3.50 GAM net/enrollment once past breakeven. FLEX_CREDIT_FEE is
+// what the TENANT is billed; FLEX_CREDIT_PROVIDER_COST is GAM's per-enrollment
+// cost to the provider (for net/COGS reporting — the actual Esusu payout is an
+// external integration, not wired yet).
+export const FLEX_CREDIT_FEE = 5
+export const FLEX_CREDIT_PROVIDER_COST = 1.5
+export const FLEX_CREDIT_PROVIDER_MIN_MONTHLY = 500
 // S514: the 60-day NSF cooldown was removed with the advance/default model.
 // Under the custody model (Consumer ToS § 9.1.5) a missed installment only
 // leaves the deposit under-funded; re-enrollment restriction is "until
@@ -3354,7 +3761,10 @@ export type InvoiceStatus = typeof INVOICE_STATUSES[number]
 export const PAYMENT_STATUSES = ['pending', 'processing', 'settled', 'failed', 'returned', 'paid_via_deposit'] as const
 export type PaymentStatus = typeof PAYMENT_STATUSES[number]
 
-export const PAYMENT_TYPES = ['rent', 'fee', 'deposit', 'utility', 'float_fee', 'late_fee', 'platform_fee'] as const
+// S568: 'home_payment' = amortized financed-home-sale installment (routes to the
+// landlord/seller like rent; billed as its own line, auto-stops at term). Kept
+// separate from 'rent' so rent late-fee/eviction/idempotency logic never applies.
+export const PAYMENT_TYPES = ['rent', 'fee', 'deposit', 'utility', 'float_fee', 'late_fee', 'platform_fee', 'home_payment'] as const
 export type PaymentType = typeof PAYMENT_TYPES[number]
 
 // NACHA CCD/PPD entry description field — uppercase, max 10 chars per spec.
@@ -3362,7 +3772,7 @@ export type PaymentType = typeof PAYMENT_TYPES[number]
 // ($4 ACH / $15 card) billed to the tenant on a post-settlement reversal.
 // S562: 'MANUALPAY' (9 chars) for the $10 manual-payment fee; 'FLEXPAY' added
 // to close a long-standing drift (the DB CHECK always carried it).
-export const PAYMENT_ENTRY_DESCRIPTIONS = ['RENT', 'SUBSCRIP', 'DEPOSIT', 'UTILITY', 'ONTIMEPAY', 'LATEFEE', 'FLEXPAY', 'PROPANE', 'RETURNFEE', 'MANUALPAY'] as const
+export const PAYMENT_ENTRY_DESCRIPTIONS = ['RENT', 'SUBSCRIP', 'DEPOSIT', 'UTILITY', 'ONTIMEPAY', 'LATEFEE', 'FLEXPAY', 'PROPANE', 'RETURNFEE', 'MANUALPAY', 'HOMEPMT'] as const
 export type PaymentEntryDescription = typeof PAYMENT_ENTRY_DESCRIPTIONS[number]
 
 // S562: manual (off-platform) rent payment recording. A landlord/staff records
@@ -3378,6 +3788,17 @@ export const MANUAL_PAYMENT_METHOD_LABELS: Record<ManualPaymentMethod, string> =
 }
 export const MANUAL_PAYMENT_FEE = 10.00
 
+// S568 (Nic): the onboarding-transition "prior arrangement" settlement. During
+// a landlord's move onto GAM, an IMPORTED tenant may have already paid the FIRST
+// period's rent through the prior software/arrangement, off-platform. The
+// landlord marks that first invoice as paid via prior arrangement — it comes off
+// the books, NO money moves, NO manual-payment fee. Gating (route-enforced):
+// FIRST rent charge only, lease_source='imported' only, within
+// PRIOR_ARRANGEMENT_TRANSITION_DAYS of onboarding. Not a general cash method —
+// it is its own `payments.manual_method` value, kept out of MANUAL_PAYMENT_METHODS.
+export const PRIOR_ARRANGEMENT_METHOD = 'prior_arrangement' as const
+export const PRIOR_ARRANGEMENT_TRANSITION_DAYS = 21
+
 // Friendly labels for NACHA entry-description codes shown to tenants (no raw
 // enums in the UI). Codes that just restate the payment type (RENT/DEPOSIT/…)
 // are omitted — callers already hide those; only the fee-style codes need a
@@ -3388,6 +3809,62 @@ export const PAYMENT_ENTRY_DESCRIPTION_LABELS: Partial<Record<PaymentEntryDescri
   MANUALPAY: 'Manual-payment fee',
   ONTIMEPAY: 'On-time pay',
   FLEXPAY:   'FlexPay',
+  HOMEPMT:   'Home payment',
+}
+
+// S568: financed home-sale contract lifecycle.
+export const HOME_SALE_STATUSES = ['active', 'paid_off', 'cancelled'] as const
+export type HomeSaleStatus = typeof HOME_SALE_STATUSES[number]
+
+// Level-payment amortization for a financed home/RV sale. Returns the monthly
+// payment and a per-installment principal/interest/balance schedule. The final
+// installment absorbs rounding so the ending balance is exactly 0. rate is an
+// ANNUAL percent (e.g. 7.5). termMonths > 0. Zero-interest → equal principal.
+export interface AmortizationRow {
+  installmentNumber: number
+  amount: number
+  principalPortion: number
+  interestPortion: number
+  remainingBalance: number
+}
+export function computeAmortization(financedAmount: number, annualRatePercent: number, termMonths: number): {
+  monthlyPayment: number
+  schedule: AmortizationRow[]
+} {
+  const P = Math.round(financedAmount * 100) / 100
+  const n = Math.max(1, Math.floor(termMonths))
+  const r = (annualRatePercent / 100) / 12
+  const round2 = (x: number) => Math.round(x * 100) / 100
+
+  let monthlyPayment: number
+  if (r === 0) {
+    monthlyPayment = round2(P / n)
+  } else {
+    monthlyPayment = round2((P * r) / (1 - Math.pow(1 + r, -n)))
+  }
+
+  const schedule: AmortizationRow[] = []
+  let balance = P
+  for (let i = 1; i <= n; i++) {
+    const interest = round2(balance * r)
+    let principal = round2(monthlyPayment - interest)
+    let amount = monthlyPayment
+    // Final installment: pay off whatever principal remains (absorb rounding).
+    if (i === n) {
+      principal = round2(balance)
+      amount = round2(principal + interest)
+    }
+    balance = round2(balance - principal)
+    if (balance < 0) balance = 0
+    schedule.push({
+      installmentNumber: i,
+      amount,
+      principalPortion: principal,
+      interestPortion: interest,
+      remainingBalance: balance,
+    })
+  }
+  return { monthlyPayment, schedule }
 }
 export function humanizeEntryDescription(code: string): string {
   return PAYMENT_ENTRY_DESCRIPTION_LABELS[code as PaymentEntryDescription] ?? code

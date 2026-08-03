@@ -35,6 +35,13 @@ export function PosCustomerOnboardingPage() {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState<{ bankLast4: string | null } | null>(null)
+  const [pending, setPending] = useState<string | null>(null)
+  // S570: microdeposit verification (no Financial Connections instant — that
+  // bills $1.50). Collect routing/account manually, Stripe sends two small
+  // deposits, the customer confirms them in 1–3 days.
+  const [routing, setRouting] = useState('')
+  const [account, setAccount] = useState('')
+  const [holderType, setHolderType] = useState<'individual' | 'company'>('individual')
 
   useEffect(() => {
     if (!token) return
@@ -49,6 +56,8 @@ export function PosCustomerOnboardingPage() {
 
   const startVerification = async () => {
     if (!token || !preview) return
+    if (!/^\d{9}$/.test(routing.trim())) { setError('Enter a valid 9-digit routing number.'); return }
+    if (account.trim().length < 4) { setError('Enter your account number.'); return }
     setBusy(true); setError(null)
     try {
       const stripe = await stripePromise
@@ -62,30 +71,36 @@ export function PosCustomerOnboardingPage() {
       const { clientSecret: client_secret } = startRes.data
       if (!client_secret) throw new Error('No client_secret returned')
 
-      // Collect bank via Stripe Financial Connections (FC modal).
-      const collectResult = await (stripe as any).collectBankAccountForSetup({
-        clientSecret: client_secret,
-        params: {
-          payment_method_type: 'us_bank_account',
-          payment_method_data: {
-            billing_details: {
-              name:  preview.customerFirstName + ' ' + preview.customerLastName,
-              email: preview.customerEmail,
-            },
+      // S570: confirm with manually-entered bank details (microdeposits, no FC).
+      // Stripe attaches the PM and initiates two small deposits; the SetupIntent
+      // sits in requires_action until the customer confirms them 1–3 days later.
+      const confirmResult = await (stripe as any).confirmUsBankAccountSetup(client_secret, {
+        payment_method: {
+          us_bank_account: {
+            routing_number:      routing.trim(),
+            account_number:      account.trim(),
+            account_holder_type: holderType,
+          },
+          billing_details: {
+            name:  preview.customerFirstName + ' ' + preview.customerLastName,
+            email: preview.customerEmail,
           },
         },
       })
-      if (collectResult.error) throw new Error(collectResult.error.message)
-
-      // Confirm the SetupIntent now that the payment method is attached.
-      const confirmResult = await (stripe as any).confirmUsBankAccountSetup(client_secret)
       if (confirmResult.error) throw new Error(confirmResult.error.message)
+      const si = confirmResult.setupIntent
 
-      // Tell the server to mark verified.
       const completeRes = await fetch(`${API_URL}/api/pos-customer-onboarding/${token}/complete`, { method: 'POST' })
         .then(r => r.json())
       if (!completeRes.success) throw new Error(completeRes.error?.message || completeRes.error || 'Completion failed')
-      setSuccess({ bankLast4: completeRes.data.bankLast4 })  // S554: camelized on the wire
+      // Verified immediately only if the SetupIntent already succeeded; otherwise
+      // microdeposits are pending (the webhook stamps verified when they clear).
+      if (completeRes.data?.verified === false || si?.status !== 'succeeded') {
+        setPending(completeRes.data?.message
+          ?? 'We sent two small deposits to your bank. They arrive in 1–3 business days — check the email from Stripe and confirm the amounts to finish.')
+      } else {
+        setSuccess({ bankLast4: completeRes.data.bankLast4 })  // S554: camelized on the wire
+      }
     } catch (e: any) {
       setError(e?.message || 'Verification failed')
     } finally {
@@ -103,6 +118,21 @@ export function PosCustomerOnboardingPage() {
   }
   if (!preview) {
     return <CenteredCard><p>Loading…</p></CenteredCard>
+  }
+
+  if (pending) {
+    return (
+      <CenteredCard>
+        <div style={{ fontSize: '2.2rem', textAlign: 'center', marginBottom: 12 }}>📨</div>
+        <h2 style={{ margin: '0 0 8px', textAlign: 'center' }}>Two small deposits are on the way</h2>
+        <p style={{ color: 'var(--t2)', textAlign: 'center', marginTop: 8, fontSize: '.88rem', lineHeight: 1.55 }}>
+          {pending}
+        </p>
+        <p style={{ color: 'var(--t3)', textAlign: 'center', marginTop: 14, fontSize: '.78rem', lineHeight: 1.5 }}>
+          Once you confirm the amounts, {preview.merchantName} can charge purchases to your FlexCharge tab. No fees for verifying.
+        </p>
+      </CenteredCard>
+    )
   }
 
   if (success) {
@@ -135,18 +165,38 @@ export function PosCustomerOnboardingPage() {
         <div style={{ fontSize: '.78rem', color: 'var(--t2)', lineHeight: 1.6 }}>
           <div style={{ fontWeight: 600, marginBottom: 6, color: 'var(--t0)' }}>What happens next</div>
           <ul style={{ margin: 0, paddingLeft: 18 }}>
-            <li>You'll sign in to your bank through Stripe's secure connector</li>
-            <li>GAM and {preview.merchantName} only see the last 4 digits of your account</li>
-            <li>Once verified, {preview.merchantName} can charge purchases to your tab</li>
-            <li>Statements pull automatically — 1.5% service fee + your purchases each month</li>
+            <li>Enter your bank's routing and account numbers below</li>
+            <li>Stripe sends two small deposits to your account (1–3 business days) — no fees</li>
+            <li>Confirm the amounts (Stripe emails you a link) to finish verifying</li>
+            <li>Then {preview.merchantName} can charge purchases to your tab; statements pull automatically — 1.5% service fee + your purchases each month</li>
           </ul>
         </div>
+      </div>
+
+      <div style={{ display: 'grid', gap: 10, marginBottom: 16 }}>
+        <label style={{ fontSize: '.72rem', color: 'var(--t2)' }}>Routing number
+          <input className="input" inputMode="numeric" maxLength={9} value={routing}
+            onChange={e => setRouting(e.target.value.replace(/\D/g, ''))}
+            placeholder="9 digits" style={{ width: '100%', marginTop: 4 }} />
+        </label>
+        <label style={{ fontSize: '.72rem', color: 'var(--t2)' }}>Account number
+          <input className="input" inputMode="numeric" value={account}
+            onChange={e => setAccount(e.target.value.replace(/\D/g, ''))}
+            placeholder="Your account number" style={{ width: '100%', marginTop: 4 }} />
+        </label>
+        <label style={{ fontSize: '.72rem', color: 'var(--t2)' }}>Account type
+          <select className="input" value={holderType} onChange={e => setHolderType(e.target.value as any)}
+            style={{ width: '100%', marginTop: 4 }}>
+            <option value="individual">Personal</option>
+            <option value="company">Business</option>
+          </select>
+        </label>
       </div>
 
       {error && <div className="alert a-warn" style={{ marginBottom: 12 }}>{error}</div>}
 
       <button className="btn btn-p" style={{ width: '100%' }} disabled={busy} onClick={startVerification}>
-        {busy ? 'Verifying…' : 'Verify my bank'}
+        {busy ? 'Linking…' : 'Link my bank'}
       </button>
 
       <p style={{ fontSize: '.7rem', color: 'var(--t3)', marginTop: 14, textAlign: 'center' }}>

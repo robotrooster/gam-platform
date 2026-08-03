@@ -1,11 +1,12 @@
-import { useState, useRef } from 'react'
+import { useState, useRef, Fragment } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { useParams, useNavigate } from 'react-router-dom'
 import {
   ClipboardCheck, ArrowLeft, Plus, Camera, Video, Film,
-  CheckCircle2, FileSignature, Calendar, AlertTriangle,
+  CheckCircle2, FileSignature, Calendar, AlertTriangle, FileText,
 } from 'lucide-react'
 import { api, apiGet, apiPatch, apiPost } from '../lib/api'
+import { INSPECTION_ITEM_CONDITIONS, INSPECTION_ITEM_CONDITION_LABEL } from '@gam/shared'
 import { inspectionStatusLabel } from './InspectionsPage'
 import { CameraCapture } from '../components/CameraCapture'
 import { AuthedImg, AuthedVideo } from '../components/AuthedMedia'
@@ -14,7 +15,7 @@ type Item = {
   id: string
   area: string
   itemLabel: string
-  condition: 'good' | 'fair' | 'damaged' | 'missing' | 'na'
+  condition: 'excellent' | 'good' | 'fair' | 'damaged_missing' | null
   notes: string | null
   estimatedRepairCost: string | null
 }
@@ -52,17 +53,22 @@ type Detail = {
   flaggedSuspiciousAt: string | null
   flagReason: string | null
   followupInspectionId: string | null
+  reportUrl: string | null
+  unitNumber: string | null
+  unitType: string | null
+  propertyName: string | null
+  tenantFirstName: string | null
+  tenantLastName: string | null
   items: Item[]
   photos: Photo[]
   signatures: Sig[]
 }
 
 const COND_BADGE: Record<string, string> = {
-  good:     'badge-green',
-  fair:     'badge-amber',
-  damaged:  'badge-red',
-  missing:  'badge-red',
-  na:       'badge-muted',
+  excellent:       'badge-green',
+  good:            'badge-green',
+  fair:            'badge-amber',
+  damaged_missing: 'badge-red',
 }
 
 const STATUS_BADGE: Record<string, string> = {
@@ -92,6 +98,14 @@ export function InspectionDetailPage() {
     () => apiGet<Detail>(`/inspections/${id}`),
   )
 
+  // S573: what still blocks submit/sign/finalize (items missing a condition,
+  // areas missing a photo, fair/damaged items missing a note).
+  type Completeness = { complete: boolean; itemsMissingCondition: number; itemsMissingNote: number; areasMissingPhoto: string[]; totalAreas: number }
+  const { data: completeness } = useQuery<Completeness>(
+    ['inspection-completeness', id],
+    () => apiGet<Completeness>(`/inspections/${id}/completeness`),
+  )
+
   // Walkthrough videos live on a separate endpoint (not in the detail payload).
   const { data: videos } = useQuery<Vid[]>(
     ['inspection-videos', id],
@@ -109,17 +123,44 @@ export function InspectionDetailPage() {
     },
   )
 
+  // S573: inline per-item edits during conduct (upsert by area+item_label —
+  // same endpoint as add-item). Lets staff/agent walk the checklist item by
+  // item without re-typing each area+item into a form.
+  const saveItemMut = useMutation(
+    (body: any) => apiPost(`/inspections/${id}/items`, body),
+    {
+      onSuccess: () => { qc.invalidateQueries(['inspection', id]); qc.invalidateQueries(['inspection-completeness', id]) },
+      onError: (e: any) => setError(e?.response?.data?.error || 'Failed to save item'),
+    },
+  )
+  const commitItem = (it: Item, patch: { condition?: string; notes?: string }) => {
+    // A condition is required to save (the note rides it). Editing a note before
+    // a condition is set is a no-op — pick the condition first.
+    const condition = patch.condition ?? it.condition
+    if (!condition) return
+    saveItemMut.mutate({
+      area: it.area,
+      itemLabel: it.itemLabel,
+      condition,
+      notes: patch.notes !== undefined ? patch.notes : (it.notes ?? ''),
+    })
+  }
+
+  // S573: capture a photo linked to a checklist ITEM (so it counts toward that
+  // AREA's required coverage). captureItemId tracks which area we're shooting.
+  const [captureItemId, setCaptureItemId] = useState<string | null>(null)
   const photoMut = useMutation(
-    ({ file, live }: { file: File; live?: boolean }) => {
+    ({ file, live, itemId }: { file: File; live?: boolean; itemId?: string | null }) => {
       const fd = new FormData()
       fd.append('file', file)
       if (live) fd.append('capturedLive', 'true')
+      if (itemId) fd.append('itemId', itemId)
       return api.post(`/inspections/${id}/photos`, fd, {
         headers: { 'Content-Type': 'multipart/form-data' },
       }).then(r => r.data)
     },
     {
-      onSuccess: () => qc.invalidateQueries(['inspection', id]),
+      onSuccess: () => { setCaptureItemId(null); qc.invalidateQueries(['inspection', id]); qc.invalidateQueries(['inspection-completeness', id]) },
       onError: (e: any) => setError(e?.response?.data?.error || 'Upload failed'),
     },
   )
@@ -158,6 +199,23 @@ export function InspectionDetailPage() {
     },
   )
 
+  // S573: fetch the summary-report PDF with auth (the file route needs the
+  // Bearer token, so open it via the api instance as a blob, not a bare <a>).
+  const [downloadingReport, setDownloadingReport] = useState(false)
+  const downloadReport = async (reportUrl: string) => {
+    setDownloadingReport(true)
+    try {
+      const res = await api.get(reportUrl.replace(/^\/api/, ''), { responseType: 'blob' })
+      const url = URL.createObjectURL(res.data as Blob)
+      window.open(url, '_blank')
+      setTimeout(() => URL.revokeObjectURL(url), 60000)
+    } catch {
+      setError('Could not open the report')
+    } finally {
+      setDownloadingReport(false)
+    }
+  }
+
   const rescheduleMut = useMutation(
     (newScheduledFor: string | null) => apiPatch(`/inspections/${id}`, { scheduledFor: newScheduledFor }),
     {
@@ -192,6 +250,18 @@ export function InspectionDetailPage() {
   // conditions). Periodic/move-out are staff-conducted under entry notice.
   const tenantSigRequired = insp.inspectionType === 'move_in' && !!insp.tenantId
 
+  // S573: group the checklist by area + which areas already have a photo (a
+  // photo counts for its item's area). Drives the per-area capture + coverage.
+  const itemAreaById = new Map(insp.items.map(i => [i.id, i.area]))
+  const photographedAreas = new Set<string>()
+  for (const p of insp.photos) if (p.itemId && itemAreaById.has(p.itemId)) photographedAreas.add(itemAreaById.get(p.itemId)!)
+  const areaOrder: string[] = []
+  const areaItems = new Map<string, Item[]>()
+  for (const it of insp.items) {
+    if (!areaItems.has(it.area)) { areaItems.set(it.area, []); areaOrder.push(it.area) }
+    areaItems.get(it.area)!.push(it)
+  }
+
   return (
     <div style={{ maxWidth: 960 }}>
       <div className="page-header">
@@ -209,9 +279,10 @@ export function InspectionDetailPage() {
                 </span>}
           </h1>
           <div className="page-sub">
-            Unit {insp.unitId.slice(0, 8)}…
-            {insp.tenantId && <> · Tenant {insp.tenantId.slice(0, 8)}…</>}
-            {insp.comparisonInspectionId && <> · Comparing against {insp.comparisonInspectionId.slice(0, 8)}…</>}
+            Unit {insp.unitNumber ?? insp.unitId.slice(0, 8)}
+            {insp.propertyName && <> · {insp.propertyName}</>}
+            {(insp.tenantFirstName || insp.tenantLastName) && <> · {[insp.tenantFirstName, insp.tenantLastName].filter(Boolean).join(' ')}</>}
+            {insp.comparisonInspectionId && <> · compared to the linked move-in</>}
           </div>
           <button
             className="btn btn-ghost btn-sm"
@@ -248,8 +319,8 @@ export function InspectionDetailPage() {
       {camera && (
         <CameraCapture
           mode={camera}
-          onClose={() => setCamera(null)}
-          onCapture={(file) => (camera === 'photo' ? photoMut : videoMut).mutate({ file, live: true })}
+          onClose={() => { setCamera(null); setCaptureItemId(null) }}
+          onCapture={(file) => (camera === 'photo' ? photoMut : videoMut).mutate({ file, live: true, itemId: captureItemId })}
         />
       )}
 
@@ -316,12 +387,44 @@ export function InspectionDetailPage() {
         </div>
       )}
 
+      {/* S573: summary report — generated at finalize, filed to the tenant's
+          Documents and available here for the landlord's records. */}
+      {insp.status === 'finalized' && insp.reportUrl && (
+        <div className="card" style={{ padding: 16, marginBottom: 16, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <FileText size={18} style={{ color: 'var(--gold)' }} />
+            <div>
+              <div style={{ fontWeight: 700, fontSize: '.9rem' }}>Inspection summary report</div>
+              <div style={{ fontSize: '.75rem', color: 'var(--text-3)' }}>Filed to the tenant's Documents. Includes conditions{insp.inspectionType === 'move_out' ? ', repair costs & the move-in comparison' : ' & photos'}.</div>
+            </div>
+          </div>
+          <button className="btn btn-primary btn-sm" onClick={() => downloadReport(insp.reportUrl!)} disabled={downloadingReport}>
+            {downloadingReport ? 'Opening…' : 'Download PDF'}
+          </button>
+        </div>
+      )}
+
       {/* CHECKLIST */}
       <div className="card" style={{ padding: 0, marginBottom: 16 }}>
         <div style={{ padding: 16, borderBottom: '1px solid var(--border-0)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
           <strong>Checklist ({insp.items.length})</strong>
           {!editable && <span className="badge badge-muted">read-only</span>}
         </div>
+        {editable && completeness && !completeness.complete && (
+          <div style={{ padding: '10px 16px', background: 'rgba(245,158,11,.08)', borderBottom: '1px solid var(--border-0)', fontSize: '.8rem', color: 'var(--text-2)' }}>
+            <strong style={{ color: 'var(--amber)' }}>To finish:</strong>{' '}
+            {[
+              completeness.itemsMissingCondition ? `${completeness.itemsMissingCondition} item(s) need a condition` : null,
+              completeness.areasMissingPhoto.length ? `${completeness.areasMissingPhoto.length} area(s) need a photo` : null,
+              completeness.itemsMissingNote ? `${completeness.itemsMissingNote} fair/damaged item(s) need a note` : null,
+            ].filter(Boolean).join('  ·  ')}
+          </div>
+        )}
+        {editable && completeness && completeness.complete && (
+          <div style={{ padding: '8px 16px', background: 'rgba(34,197,94,.08)', borderBottom: '1px solid var(--border-0)', fontSize: '.78rem', color: 'var(--green)' }}>
+            ✓ Complete — every area photographed, every item rated.
+          </div>
+        )}
         {insp.items.length === 0 ? (
           <div style={{ padding: 24, textAlign: 'center', color: 'var(--text-3)' }}>No items yet.</div>
         ) : (
@@ -333,18 +436,60 @@ export function InspectionDetailPage() {
                 <th>Item</th>
                 <th>Condition</th>
                 <th>Notes</th>
-                <th>Repair $</th>
               </tr>
             </thead>
             <tbody>
-              {insp.items.map(it => (
-                <tr key={it.id}>
-                  <td>{it.area}</td>
-                  <td><strong>{it.itemLabel}</strong></td>
-                  <td><span className={`badge ${COND_BADGE[it.condition]}`}>{it.condition}</span></td>
-                  <td style={{ fontSize: '.8rem', color: 'var(--text-2)' }}>{it.notes || '—'}</td>
-                  <td>{it.estimatedRepairCost ? `$${Number(it.estimatedRepairCost).toFixed(2)}` : '—'}</td>
-                </tr>
+              {areaOrder.map(area => (
+                <Fragment key={area}>
+                  <tr style={{ background: 'var(--bg-1)' }}>
+                    <td colSpan={4} style={{ padding: '8px 12px' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                        <strong style={{ fontSize: '.82rem' }}>{area}</strong>
+                        {photographedAreas.has(area)
+                          ? <span className="badge badge-green" style={{ fontSize: '.62rem' }}>✓ photo</span>
+                          : <span className="badge badge-amber" style={{ fontSize: '.62rem' }}>photo required</span>}
+                        {editable && (
+                          <button className="btn btn-ghost btn-sm" style={{ padding: '1px 8px' }}
+                            onClick={() => { setCaptureItemId(areaItems.get(area)![0].id); setCamera('photo') }}>
+                            <Camera size={12} /> {photographedAreas.has(area) ? 'Add photo' : 'Take photo'}
+                          </button>
+                        )}
+                      </div>
+                    </td>
+                  </tr>
+                  {areaItems.get(area)!.map(it => (
+                    <tr key={it.id}>
+                      <td />
+                      <td><strong>{it.itemLabel}</strong></td>
+                      {editable ? (
+                        <>
+                          <td>
+                            <select className="input" style={{ padding: '3px 6px', fontSize: '.8rem', minWidth: 130 }}
+                              value={it.condition ?? ''}
+                              onChange={e => commitItem(it, { condition: e.target.value })}>
+                              <option value="" disabled>— set condition —</option>
+                              {INSPECTION_ITEM_CONDITIONS.map(c => (
+                                <option key={c} value={c}>{INSPECTION_ITEM_CONDITION_LABEL[c]}</option>
+                              ))}
+                            </select>
+                          </td>
+                          <td>
+                            <input className="input" style={{ padding: '3px 6px', fontSize: '.8rem', width: '100%' }}
+                              defaultValue={it.notes ?? ''} placeholder={it.condition && it.condition !== 'excellent' && it.condition !== 'good' ? 'Note (required — what’s wrong)' : 'Note (optional)'}
+                              onBlur={e => { if (e.target.value !== (it.notes ?? '')) commitItem(it, { notes: e.target.value }) }} />
+                          </td>
+                        </>
+                      ) : (
+                        <>
+                          <td>{it.condition
+                            ? <span className={`badge ${COND_BADGE[it.condition]}`}>{INSPECTION_ITEM_CONDITION_LABEL[it.condition]}</span>
+                            : <span className="badge badge-muted">Not inspected</span>}</td>
+                          <td style={{ fontSize: '.8rem', color: 'var(--text-2)' }}>{it.notes || '—'}</td>
+                        </>
+                      )}
+                    </tr>
+                  ))}
+                </Fragment>
               ))}
             </tbody>
           </table>
@@ -366,15 +511,13 @@ export function InspectionDetailPage() {
                 className="input"
               />
               <select
-                value={newItem.condition}
+                value={newItem.condition ?? 'good'}
                 onChange={e => setNewItem({ ...newItem, condition: e.target.value as Item['condition'] })}
                 className="input"
               >
-                <option value="good">good</option>
-                <option value="fair">fair</option>
-                <option value="damaged">damaged</option>
-                <option value="missing">missing</option>
-                <option value="na">n/a</option>
+                {INSPECTION_ITEM_CONDITIONS.map(c => (
+                  <option key={c} value={c}>{INSPECTION_ITEM_CONDITION_LABEL[c]}</option>
+                ))}
               </select>
               <input
                 placeholder="Notes (optional)"

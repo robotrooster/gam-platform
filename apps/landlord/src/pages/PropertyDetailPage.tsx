@@ -12,7 +12,7 @@ import { usePerms } from '../lib/permissions'
 // creates them; nothing pre-baked.
 import { UnitSubtypesSection } from './UnitSubtypesSection'
 import { PropertyAgentPermissionsSection } from './PropertyAgentPermissionsSection'
-import { PropertyLateFeeSection, PaymentAcceptanceCard } from './PropertyLateFeeSection'
+import { PropertyLateFeeSection } from './PropertyLateFeeSection'
 import { LawWarningBanner } from '../components/LawWarningBanner'
 import { LAUNCH_HIDDEN } from '../components/layout/Layout'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
@@ -114,7 +114,6 @@ export function PropertyDetailPage() {
             lease template, deposit = rent × template.deposit_months), not a
             property setting — the S556 property-level section was removed. */}
       <OccupancyDefaultCard property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
-      <PaymentAcceptanceCard property={property} onSaved={() => qc.invalidateQueries(['property', id])} />
 
       {/* Occupancy bar */}
       <div style={{ marginBottom:24 }}>

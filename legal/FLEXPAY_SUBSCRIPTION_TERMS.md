@@ -49,33 +49,18 @@ The monthly subscription fee depends on the Scheduled Pull Date Subscriber selec
 
 **FlexPay does not modify any Landlord remedy** that the Landlord may have for unpaid or late rent under the lease, including without limitation late fees, default notices, or eviction proceedings. Subscriber selecting a later Scheduled Pull Date that falls after Subscriber's rent due date does not waive the Landlord's right to a late-fee accrual or other lease remedy based on the rent due date. The Landlord may, but is not required to, accept the FlexPay-scheduled date as the operative payment date for lease-remedy purposes.
 
-## 3. Monthly Subscription Fee — Date-Based Formula
+## 3. Monthly Subscription Fee — Flat $25
 
-The FlexPay monthly subscription fee is calculated as a function of the calendar day of the month on which Subscriber's Scheduled Pull Date falls.
+The FlexPay monthly subscription fee is a **flat $25.00 per month**, regardless of which Scheduled Pull Date Subscriber selects.
 
-**Formula:** Monthly Fee = **$5.00 + ($1.00 × Scheduled Pull Date)**, where the Scheduled Pull Date is a calendar day from the 1st through the 28th of the month.
-
-Worked examples:
-
-| Scheduled Pull Date | Monthly Fee |
-|---|---|
-| 1st | $6.00 |
-| 5th | $10.00 |
-| 11th | $16.00 |
-| 15th | $20.00 |
-| 20th | $25.00 |
-| 28th (latest available) | $33.00 |
-
-Subscriber's selected Scheduled Pull Date and the corresponding Monthly Fee at enrollment:
-
-- **Scheduled Pull Date:** the {{Scheduled_Pull_Day}} of each calendar month
-- **Monthly Fee:** **${{Selected_Monthly_Fee}}**
+- **Scheduled Pull Date:** the {{Scheduled_Pull_Day}} of each calendar month (a calendar day from the 1st through the 28th). The Scheduled Pull Date is a **scheduling** choice only — Subscriber selects it to align the rent pull with the day Subscriber's income lands. It does **not** affect the fee.
+- **Monthly Fee:** a flat **$25.00**.
 
 The Scheduled Pull Date is capped at the 28th calendar day of the month. The 29th, 30th, and 31st are not available because not every month contains those days, which would create an inconsistent pull schedule.
 
-**Changing the Scheduled Pull Date.** Subscriber may change the Scheduled Pull Date at any time through the in-platform FlexPay settings. The change takes effect on the next full billing cycle; the new Monthly Fee for the new Scheduled Pull Date applies from that cycle forward.
+**Changing the Scheduled Pull Date.** Subscriber may change the Scheduled Pull Date at any time through the in-platform FlexPay settings. The change takes effect on the next full billing cycle. The Monthly Fee remains a flat $25.00 and does not change with the Scheduled Pull Date.
 
-**GAM reserves the right to revise the pricing formula prospectively** with thirty (30) days' notice by email and in-platform notification. Subscriber's continued use of FlexPay after the effective date of a pricing change constitutes acceptance of the revised pricing; if Subscriber does not agree to the revised pricing, Subscriber may cancel under Section 7 before the effective date.
+**GAM reserves the right to revise the subscription fee prospectively** with thirty (30) days' notice by email and in-platform notification. Subscriber's continued use of FlexPay after the effective date of a pricing change constitutes acceptance of the revised pricing; if Subscriber does not agree to the revised pricing, Subscriber may cancel under Section 7 before the effective date.
 
 ## 4. Subscription Fee Authorization
 
@@ -85,21 +70,17 @@ Subscriber authorizes GAM, acting through Stripe, Inc., to initiate ACH debits f
 - Bank: {{Bank_Name}}
 - Account ending in: {{Account_Last_4}}
 
-### 4.1 Failed ACH Pull — Retry on a Later Day at a Recalculated Amount
+### 4.1 Failed ACH Pull — Retry on a Later Day
 
 If a scheduled ACH pull under this FlexPay subscription (the rent pull on Subscriber's Scheduled Pull Date, or the separate FlexPay subscription-fee pull if pulled separately) fails for a recoverable cause — including without limitation insufficient funds, account closed, account frozen, ODFI/RDFI rejection, or other Nacha return code — the Platform will automatically retry the pull on a later calendar date under GAM's standard failed-pull retry policy (typical cadence: one retry approximately three business days after the failure, and a second retry approximately five business days after the first retry if needed).
 
-**The retry pull is for a recalculated amount, not the original amount.** Because FlexPay's Monthly Fee is calculated under the date-based formula in Section 3 — Monthly Fee = $5 + ($1 × actual pull date) — the FlexPay Monthly Fee for the billing cycle is **recalculated** to reflect the calendar day on which the retry pull is initiated. The retry pulls:
+**The FlexPay Monthly Fee does not change on a retry.** The fee is a flat $25.00 and is not recalculated based on the retry date. The retry pulls:
 
 - **(a)** The rent amount (which does not change);
-- **(b)** The **recalculated FlexPay Monthly Fee** for the cycle, equal to $5 + ($1 × the calendar day of the retry pull), in lieu of the originally-scheduled FlexPay Monthly Fee; and
+- **(b)** The flat **$25.00** FlexPay Monthly Fee for the cycle, not re-priced, to the extent it was not already collected for that cycle; and
 - **(c)** The Stripe pass-through fees described in Section 4.2 below.
 
-Worked example: Subscriber's Scheduled Pull Date is the 11th, producing an originally-scheduled FlexPay Monthly Fee of $16. The pull on the 11th fails for insufficient funds. The Platform retries on the 15th. The retry pulls the rent amount + a recalculated FlexPay Monthly Fee of $20 ($5 + $15) + the applicable Stripe pass-through fee. If the retry on the 15th also fails, a second retry on the 22nd would recalculate to $5 + $22 = $27.
-
-The recalculated FlexPay Monthly Fee for the cycle is the fee applicable to that cycle, replacing the originally-scheduled amount in full; **Subscriber's prior payment of the originally-scheduled fee (if any was already collected) is credited toward the recalculated fee**, and only the incremental difference is added to the retry pull.
-
-If all retry attempts under GAM's failed-pull retry policy fail, the recalculated (last-retry-day) Monthly Fee and the Stripe pass-through fees are added to Subscriber's GAM-platform-side balance and subject to the GAM-First payment-routing rules in Consumer ToS § 5.5.
+If all retry attempts under GAM's failed-pull retry policy fail, the $25.00 Monthly Fee and the Stripe pass-through fees are added to Subscriber's GAM-platform-side balance and subject to the GAM-First payment-routing rules in Consumer ToS § 5.5.
 
 ### 4.2 Stripe Pass-Through Fees
 
@@ -206,7 +187,7 @@ By clicking [I AGREE] or by otherwise indicating affirmative assent at the Platf
 By electronically signing below, Subscriber **affirmatively consents** to:
 
 - These Subscription Terms in their entirety, including the express no-credit-extension paragraph in Section 9;
-- The Scheduled Pull Date selection in Section 3 and the corresponding monthly fee under the date-based pricing formula;
+- The Scheduled Pull Date selection in Section 3 and the flat $25.00 monthly fee;
 - The ACH-pull authorization in Section 4 for the monthly subscription fee;
 - The auto-renewal of the FlexPay subscription as described in Section 6;
 - The GAM-first payment-routing acknowledgment in Section 5;
@@ -217,7 +198,7 @@ By electronically signing below, Subscriber **affirmatively consents** to:
 | **Subscriber electronic signature:** | {{Tenant_Signature}} |
 | **Subscriber printed name:** | {{Tenant_Full_Legal_Name}} |
 | **Scheduled Pull Date:** | the {{Scheduled_Pull_Day}} of each calendar month |
-| **Monthly fee (per § 3 formula):** | ${{Selected_Monthly_Fee}} |
+| **Monthly fee (flat, per § 3):** | $25.00 |
 | **Effective Date:** | {{Signature_Date}} |
 | **IP address at signature:** | {{Tenant_IP_Address}} |
 | **User-agent at signature:** | {{Tenant_User_Agent}} |

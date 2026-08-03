@@ -6,9 +6,9 @@ import {
   LANDLORD_ASSIGNABLE_ROLE_LABEL,
   LandlordAssignableRole,
   BOOKKEEPER_ACCESS_LEVELS,
-  PERMISSION_PRESETS,
   humanize,
 } from '@gam/shared'
+import { PermissionCatalogEditor } from '../components/PermissionCatalogEditor'
 
 // S526: the old expandable-row permission grid (SUB_PERMISSIONS_BY_ROLE
 // checkboxes + inline ScopePicker) is RETIRED — the dedicated per-user page at
@@ -200,10 +200,11 @@ function InviteForm({ onSent }: { onSent: () => void }) {
   const [email, setEmail] = useState('')
   const [phone, setPhone] = useState('')
   // W-10 (S529): the property binding is chosen HERE and permanent from then
-  // on (re-invite is the move path). W-52: a preset can ride the invite so
-  // the person lands with the right access the moment they accept.
+  // on (re-invite is the move path). W-52 → S576 (B-10): the FULL permission
+  // catalog rides the invite (presets + granular toggles) so the person lands
+  // with exactly the right access the moment they accept — no second trip.
   const [propertyId, setPropertyId] = useState('')
-  const [presetId, setPresetId] = useState('')
+  const [perms, setPerms] = useState<Record<string, boolean>>({})
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState<string | null>(null)
   const { data: properties = [] } = useQuery<any[]>('properties-for-invite', () => apiGet('/properties'))
@@ -214,7 +215,7 @@ function InviteForm({ onSent }: { onSent: () => void }) {
     setEmail('')
     setPhone('')
     setPropertyId('')
-    setPresetId('')
+    setPerms({})
   }
 
   const mut = useMutation(
@@ -230,14 +231,15 @@ function InviteForm({ onSent }: { onSent: () => void }) {
       phone: phone.trim() || undefined,
       scope: {
         propertyIds: [propertyId], unitIds: [], allProperties: false,
+        // Only the ON keys ride the invite (false toggles are just noise).
         permissions: Object.fromEntries(
-          (PERMISSION_PRESETS.find(p => p.id === presetId)?.keys || []).map(k => [k, true])),
+          Object.entries(perms).filter(([, on]) => on).map(([k]) => [k, true])),
       },
     }),
     {
       onSuccess: () => {
         setError(null)
-        setSuccess(`Invitation emailed to ${email.trim()}. Set their permissions once they accept.`)
+        setSuccess(`Invitation emailed to ${email.trim()}. They'll land with the permissions you set — adjust anytime on their permissions page.`)
         reset()
         onSent()
         setTimeout(() => setSuccess(null), 5000)
@@ -274,7 +276,7 @@ function InviteForm({ onSent }: { onSent: () => void }) {
     <div className="card" style={{ padding: 16, marginBottom: 20 }}>
       <div style={{ fontSize: '.95rem', fontWeight: 600, marginBottom: 4 }}>Add a staff member</div>
       <div style={{ fontSize: '.75rem', color: 'var(--text-3)', marginBottom: 12, lineHeight: 1.5 }}>
-        Enter their details, pick their property, and optionally start them from a permission preset — they land with that access the moment they accept. The property is <strong>permanent</strong> (to move someone later, remove and re-invite them); permissions can be adjusted anytime on their permissions page.
+        Enter their details, pick their property, and set the permissions they start with — they land with exactly that access the moment they accept, so there's no second trip. The property is <strong>permanent</strong> (to move someone later, remove and re-invite them); permissions stay adjustable anytime on their permissions page.
       </div>
       <form onSubmit={submit} style={{ display: 'grid', gap: 10 }}>
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
@@ -334,24 +336,8 @@ function InviteForm({ onSent }: { onSent: () => void }) {
         </div>
 
         <div>
-          <label style={labelStyle}>Starting Permissions <span style={{ fontWeight: 400, textTransform: 'none', letterSpacing: 0 }}>(optional — applied when they accept)</span></label>
-          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-            <button type="button" onClick={() => setPresetId('')}
-              className={`btn btn-sm ${presetId === '' ? 'btn-primary' : 'btn-ghost'}`}>
-              None — Configure Later
-            </button>
-            {PERMISSION_PRESETS.map(p => (
-              <button key={p.id} type="button" title={p.description} onClick={() => setPresetId(p.id)}
-                className={`btn btn-sm ${presetId === p.id ? 'btn-primary' : 'btn-ghost'}`}>
-                {p.label}
-              </button>
-            ))}
-          </div>
-          {presetId && (
-            <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 4 }}>
-              {PERMISSION_PRESETS.find(p => p.id === presetId)?.description}
-            </div>
-          )}
+          <label style={labelStyle}>Starting Permissions <span style={{ fontWeight: 400, textTransform: 'none', letterSpacing: 0 }}>(optional — applied the moment they accept, editable anytime after)</span></label>
+          <PermissionCatalogEditor value={perms} onChange={setPerms} disabled={mut.isLoading} />
         </div>
 
         {error && (

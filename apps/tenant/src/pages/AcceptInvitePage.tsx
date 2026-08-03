@@ -10,7 +10,7 @@ export function AcceptInvitePage() {
   const [inviteInfo, setInviteInfo] = useState<any>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
-  const [form, setForm] = useState({ password: '', confirmPassword: '', phone: '', ssiSsdi: false, acceptedTerms: false })
+  const [form, setForm] = useState({ password: '', confirmPassword: '', phone: '', acceptedTerms: false })
   const [showPw, setShowPw] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [step, setStep] = useState(0)
@@ -32,7 +32,6 @@ export function AcceptInvitePage() {
       const res: any = await apiPost('/tenants/accept-invite', {
         token, password: form.password,
         phone: form.phone || undefined,
-        ssiSsdi: form.ssiSsdi,
         acceptedTerms: true,
       })
       // Store token under tenant portal's expected key + respect next= param
@@ -108,7 +107,6 @@ export function AcceptInvitePage() {
               { icon: '💳', title: 'Pay rent online', desc: 'ACH bank transfer — no checks' },
               { icon: '🔧', title: 'Maintenance requests', desc: 'Submit and track repairs instantly' },
               { icon: '📄', title: 'Your documents', desc: 'Leases and notices in one place' },
-              { icon: '⚡', title: 'On-Time Pay', desc: 'Protect your rental history' },
             ].map(item => (
               <div key={item.title} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '9px 0', borderBottom: '1px solid #1e2530', fontSize: '.78rem' }}>
                 <span style={{ fontSize: '1.1rem' }}>{item.icon}</span>
@@ -148,16 +146,6 @@ export function AcceptInvitePage() {
             <div style={{ marginBottom: 14 }}>
               <label style={labelStyle}>Phone <span style={{ fontWeight: 400, textTransform: 'none' }}>(optional)</span></label>
               <input type="tel" style={inputStyle} placeholder="(555) 000-0000" value={form.phone} onChange={e => setForm(f => ({ ...f, phone: e.target.value }))} />
-            </div>
-
-            <div style={{ marginBottom: 14, padding: '12px 14px', background: 'rgba(201,162,39,.06)', border: '1px solid rgba(201,162,39,.2)', borderRadius: 10 }}>
-              <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, cursor: 'pointer' }}>
-                <input type="checkbox" checked={form.ssiSsdi} onChange={e => setForm(f => ({ ...f, ssiSsdi: e.target.checked }))} style={{ marginTop: 2 }} />
-                <div>
-                  <div style={{ fontSize: '.78rem', fontWeight: 600, color: '#eef1f8' }}>I receive SSI or SSDI benefits</div>
-                  <div style={{ fontSize: '.7rem', color: '#7a8aaa', marginTop: 2, lineHeight: 1.5 }}>Enables On-Time Pay — we initiate rent on time even if your benefits arrive late. $20/month service fee.</div>
-                </div>
-              </label>
             </div>
 
             <div style={{ marginBottom: 20, padding: '12px 14px', background: form.acceptedTerms ? 'rgba(34,197,94,.06)' : '#141a22', border: '1px solid ' + (form.acceptedTerms ? 'rgba(34,197,94,.25)' : '#1e2530'), borderRadius: 10 }}>

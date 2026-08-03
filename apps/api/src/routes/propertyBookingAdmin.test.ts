@@ -145,8 +145,8 @@ describe('GET /units/:id/waitlist', () => {
 
 // ─── S550: suggested slug = name + city, street number on collision ─
 
-describe('S550 — suggestedSlug', () => {
-  it('suggests name-city; falls back to name-streetnumber when taken', async () => {
+describe('S574 — suggestedSlug (name + street number default)', () => {
+  it('suggests name-streetnumber; falls back to name-city when taken', async () => {
     const f = await seed()
     await db.query(
       `UPDATE properties SET name='Oak Park', city='Yarnell', street1='22658 Highway 89', booking_slug=NULL
@@ -155,16 +155,17 @@ describe('S550 — suggestedSlug', () => {
       .get(`/api/properties/${f.propertyId}/booking-config`)
       .set('Authorization', `Bearer ${f.tokenA}`)
     expect(first.status).toBe(200)
-    expect(first.body.data.suggestedSlug).toBe('oak-park-yarnell')
+    // S574 (Nic): default is name + street number, e.g. "oak-park-22658".
+    expect(first.body.data.suggestedSlug).toBe('oak-park-22658')
 
-    // A different property already holds oak-park-yarnell → street number.
+    // A different property already holds oak-park-22658 → fall back to city.
     await db.query(
       `INSERT INTO properties (landlord_id, name, street1, city, state, zip, booking_slug, owner_user_id, managed_by_user_id)
-       SELECT landlord_id, 'Oak Park Two', '9 Elm St', 'Yarnell', 'AZ', '85362', 'oak-park-yarnell', owner_user_id, managed_by_user_id
+       SELECT landlord_id, 'Oak Park Two', '9 Elm St', 'Yarnell', 'AZ', '85362', 'oak-park-22658', owner_user_id, managed_by_user_id
          FROM properties WHERE id=$1`, [f.propertyId])
     const second = await request(buildApp())
       .get(`/api/properties/${f.propertyId}/booking-config`)
       .set('Authorization', `Bearer ${f.tokenA}`)
-    expect(second.body.data.suggestedSlug).toBe('oak-park-22658')
+    expect(second.body.data.suggestedSlug).toBe('oak-park-yarnell')
   })
 })

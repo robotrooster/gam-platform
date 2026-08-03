@@ -3,6 +3,7 @@ import jwt from 'jsonwebtoken'
 import { UserRole, LandlordAssignableRole } from '@gam/shared'
 import { query } from '../db'
 import { AppError } from './errorHandler'
+import { isPosLimitedRequestAllowed } from '../lib/posLock'
 
 export interface AuthPayload {
   userId:      string
@@ -28,6 +29,10 @@ export interface AuthPayload {
   // from Record<string, boolean> so requireBooksRead/Write can read
   // the string-valued access_level without a cast.
   permissions?: Record<string, boolean | string> | null
+  // S574: true on a POS cashier session minted by the terminal lock screen.
+  // requireAuth constrains such sessions to the register surface (see
+  // isPosLimitedRequestAllowed). Absent/false on every normal session.
+  posLimited?: boolean
 }
 
 declare global {
@@ -56,6 +61,13 @@ export function requireAuth(req: Request, res: Response, next: NextFunction) {
     if ((payload as any).purpose) {
       return res.status(401).json({ success: false, error: 'Invalid or expired token' })
     }
+    // S574: a posLimited cashier session (minted by the POS terminal lock
+    // screen) is a real session but capability-locked to the register surface.
+    // Deny-by-default everywhere else so a cashier can never reach reports,
+    // settings, banking, or any sensitive endpoint with a passcode-only session.
+    if ((payload as any).posLimited && !isPosLimitedRequestAllowed(req.method, req.originalUrl)) {
+      return res.status(403).json({ success: false, error: 'This action requires a full sign-in, not a register passcode.' })
+    }
     req.user = payload
     next()
   } catch {
@@ -78,11 +90,22 @@ export const requireLandlord = requireRole('admin', 'super_admin', 'landlord')
 export const requireTenant   = requireRole('admin', 'super_admin', 'tenant')
 
 // super_admin is stricter than admin — only super_admin passes, not admin.
-// Used for platform-staff-only operations like the bulletin board moderation.
+// Used for platform-staff-only operations like NACHA monitoring.
 export function requireSuperAdmin(req: Request, res: Response, next: NextFunction) {
   if (!req.user) return res.status(401).json({ success: false, error: 'Unauthenticated' })
   if (req.user.role !== 'super_admin') {
     return res.status(403).json({ success: false, error: 'super_admin required' })
+  }
+  next()
+}
+
+// S567: the platform OWNER only. System Features (feature-flag toggles) is
+// locked to this single account so no other admin can flip a flag by accident.
+export const OWNER_EMAIL = process.env.OWNER_EMAIL || 'nic@golddoor.io'
+export function requireOwner(req: Request, res: Response, next: NextFunction) {
+  if (!req.user) return res.status(401).json({ success: false, error: 'Unauthenticated' })
+  if (req.user.email !== OWNER_EMAIL) {
+    return res.status(403).json({ success: false, error: 'Owner only' })
   }
   next()
 }

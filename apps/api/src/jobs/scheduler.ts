@@ -2,7 +2,7 @@ import cron from 'node-cron'
 import { notifyLeaseExpiring, notifyLowStock } from '../services/notifications'
 import {
   emailSigningReminder, emailDocumentAutoVoided,
-  sendLatePaymentNotice, sendOnTimePayInvitation,
+  sendLatePaymentNotice,
 } from '../services/email'
 import { query, queryOne } from '../db'
 import { cascadeLeaseTenantsOnVoid } from '../lib/leaseDocCascade'
@@ -15,7 +15,7 @@ import { logger } from '../lib/logger'
 
 // ============================================================
 // GAM PAYMENT SCHEDULER
-// All cron jobs that power the On-Time Pay SLA
+// All cron jobs that power payment processing + reminders.
 // ============================================================
 
 // ── LEASE EXPIRATION NOTICES ────────────────────────────────
@@ -95,7 +95,7 @@ export async function activatePendingLeases() {
 export async function processLeaseEnds() {
   try {
     const ended = await query<any>(`
-      SELECT l.*, un.id as unit_id_ref
+      SELECT l.*, un.id as unit_id_ref, un.unit_number
       FROM leases l
       JOIN units un ON un.id = l.unit_id
       WHERE l.status = 'active'
@@ -103,39 +103,13 @@ export async function processLeaseEnds() {
         AND l.end_date <= CURRENT_DATE
     `)
     for (const lease of ended) {
-      if (lease.auto_renew && lease.auto_renew_mode === 'extend_same_term') {
-        // Original term length in days
-        const termDays = await queryOne<any>(`
-          SELECT (end_date - start_date)::int as days FROM leases WHERE id=$1
-        `, [lease.id])
-        const days = termDays?.days || 365
-        await query(`
-          UPDATE leases
-          SET end_date = end_date + ($1 || ' days')::interval,
-              expiration_notice_sent_at = NULL
-          WHERE id = $2
-        `, [days, lease.id])
-        logger.info(`[LeaseEnd] Extended lease ${lease.id} by ${days} days (auto_renew: extend_same_term)`)
-
-        // Credit ledger: lease_renewed for every active tenant + landlord.
-        try {
-          await emitLeaseLifecycleEvent('renewed', lease.id, lease.landlord_id)
-        } catch (e) {
-          logger.error({ err: e }, '[LeaseEnd][credit-emit] renewed')
-        }
-      } else if (lease.auto_renew && lease.auto_renew_mode === 'convert_to_month_to_month') {
-        await query(`
-          UPDATE leases
-          SET lease_type = 'month_to_month',
-              end_date = NULL,
-              expiration_notice_sent_at = NULL,
-              auto_renew = false,
-              auto_renew_mode = NULL
-          WHERE id = $1
-        `, [lease.id])
-        logger.info(`[LeaseEnd] Converted lease ${lease.id} to month-to-month (auto_renew: convert)`)
-      } else {
-        // No auto-renew: expire the lease, cascade to lease_tenants, vacate the unit.
+      {
+        // Auto-renew RETIRED (Nic, S562): a lease NEVER auto-extends or reverts to
+        // month-to-month. Every lease expires at its end_date unless a signed
+        // successor renewal was explicitly drafted — renewal is always a conscious
+        // decision by both parties, so no tenant is "trapped" by forgetting a lease
+        // end. (The old extend_same_term / convert_to_month_to_month modes are dead.)
+        // Expire the lease, cascade to lease_tenants, vacate the unit.
         // W-7 (S531): unless a signed successor lease is queued on this unit
         // (a renewal drafted via the renewal-decision flow) — then this is a
         // HANDOFF, not a move-out: the unit stays occupied and no
@@ -203,6 +177,29 @@ export async function processLeaseEnds() {
           })
         } catch (e) {
           logger.error({ err: e }, '[LeaseEnd][deposit-return-draft]')
+        }
+
+        // S576 (B-8): work trade is rent-for-labor — it can't outlive the
+        // tenancy. This branch is a real move-out (no signed successor), so
+        // pause any active work-trade agreement for this unit's departing
+        // tenant(s). The landlord to-do (GET /me/todos) then surfaces it as
+        // "renew the lease — even month-to-month — with a work-trade addendum
+        // to resume." M2M leases never reach this processor (end_date IS NULL),
+        // so an ongoing month-to-month work-trade is left untouched, and a
+        // renewal HANDOFF above already `continue`d (work trade keeps running).
+        try {
+          const paused = await query<any>(
+            `UPDATE work_trade_agreements
+                SET status='paused', updated_at=NOW()
+              WHERE unit_id=$1 AND status='active'
+                AND tenant_id IN (SELECT tenant_id FROM lease_tenants WHERE lease_id=$2)
+              RETURNING id`,
+            [lease.unit_id, lease.id])
+          if (paused.length > 0) {
+            logger.info(`[LeaseEnd] Paused ${paused.length} work-trade agreement(s) on unit ${lease.unit_number ?? lease.unit_id} — lease ${lease.id} expired with no successor`)
+          }
+        } catch (e) {
+          logger.error({ err: e }, '[LeaseEnd][work-trade-pause]')
         }
       }
     }
@@ -636,13 +633,15 @@ async function checkServiceDue() {
   } catch(e) { logger.error({ err: e }, '[SCHEDULER] service due') }
 }
 
-// W-20 (S531): site reveal — the guest learns their site AN HOUR BEFORE
-// the check-in time (Nic: a previous-day extension can re-site the
-// incoming guest with zero visible movement, because nothing is promised
-// until this message). Runs every 15 minutes; reveals confirmed same-day
-// arrivals whose (check_in_time − 1h) has passed in the property's
-// timezone (check_in_time default 15:00). The stamp is THE movement
-// fence. Tentative (unpaid) holds are never revealed.
+// W-20 (S531): site reveal — the guest learns their site the MORNING OF
+// check-in, at 6:30am in the property's local timezone (Nic S576: gives the
+// guest a couple hours' notice before arrival). A previous-day (or pre-6:30am)
+// extension can still re-site the incoming guest with zero visible movement,
+// because nothing is promised until this message. Runs every 15 minutes;
+// reveals confirmed same-day arrivals once 6:30am local has passed. The stamp
+// (site_reveal_sent_at) is THE movement fence — once sent, the booking can't be
+// re-sited. Tentative (unpaid) holds are never revealed.
+const SITE_REVEAL_LOCAL_TIME = '06:30'
 export async function revealTodaysSites() {
   try {
     const due = await query<any>(`
@@ -656,7 +655,7 @@ export async function revealTodaysSites() {
          AND b.site_reveal_sent_at IS NULL
          AND b.guest_email IS NOT NULL
          AND (now() AT TIME ZONE COALESCE(p.timezone, 'America/Phoenix'))::time
-             >= COALESCE(u.check_in_time, '15:00'::time) - INTERVAL '1 hour'`)
+             >= $1::time`, [SITE_REVEAL_LOCAL_TIME])
     for (const b of due) {
       try {
         const { emailBookingSiteAssignment } = await import('../services/email')
@@ -821,9 +820,8 @@ async function pruneEmailSendLog() {
 // pos_inventory_log: >365 days. Standard retail inventory audit window.
 //
 // Compliance-sensitive tables (admin_action_log, audit_log,
-// bulletin_reveal_log, ach_monitoring_log) are deliberately NOT
-// included — those need explicit retention policy from Nic, not a
-// default.
+// ach_monitoring_log) are deliberately NOT included — those need
+// explicit retention policy from Nic, not a default.
 async function pruneOperationalLogs() {
   const READ_NOTIF_DAYS = 180
   const UNREAD_NOTIF_DAYS = 365
@@ -1035,6 +1033,36 @@ export function schedulerInit() {
     } catch (e) { logger.error({ err: e }, '[business-fees] fatal') }
   })
 
+  // S568 (Nic): financed home/RV sales. Daily bill any amortized home-sale
+  // installment whose billing month has arrived (a standalone type='home_payment'
+  // charge that rides the platform-holds batch to the landlord/seller), then
+  // reconcile — mark contracts paid off and flip the unit to tenant-owned once
+  // every installment has settled. Idempotent (installment.payment_id guard);
+  // daily cadence catches any month boundary regardless of property timezone.
+  cron.schedule('20 4 * * *', async () => {
+    try {
+      const { billDueHomeSaleInstallments, reconcileAllHomeSaleContracts } = await import('../services/homeSale')
+      const firstOfMonth = new Date()
+      const asOf = `${firstOfMonth.getFullYear()}-${String(firstOfMonth.getMonth() + 1).padStart(2, '0')}-01`
+      const billed = await billDueHomeSaleInstallments(asOf)
+      await reconcileAllHomeSaleContracts()
+      if (billed) logger.info({ billed, asOf }, '[home-sale-billing]')
+    } catch (e) { logger.error({ err: e }, '[home-sale-billing] fatal') }
+  })
+
+  // S568 (Nic): investor-operator lot rent. Daily accrue this month's lot-rent
+  // obligations for homes on homes-only external parks (one per unit/month,
+  // idempotent) so the investor's net (tenant rent − lot rent) stays current.
+  cron.schedule('25 4 * * *', async () => {
+    try {
+      const { accrueLotRentCharges } = await import('../services/lotRent')
+      const now = new Date()
+      const asOf = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`
+      const accrued = await accrueLotRentCharges(asOf)
+      if (accrued) logger.info({ accrued, asOf }, '[lot-rent-accrual]')
+    } catch (e) { logger.error({ err: e }, '[lot-rent-accrual] fatal') }
+  })
+
   cron.schedule('45 1 * * *', async () => {
     try {
       const { processRouteCleanup } = await import('./routeCleanup')
@@ -1211,6 +1239,21 @@ export function schedulerInit() {
       logger.info(sweep, '[screening-fee-sweep]')
     } catch (e) {
       logger.error({ err: e }, '[platform-fee-accrual] fatal')
+    }
+  }, { timezone: 'America/Phoenix' })
+
+  // S567: portfolio-manager commission accrual. Fires 1st of each month at
+  // 1:45am Phoenix (after platform-fee accrual at 1:30). Writes commission_
+  // accruals rows per occupied unit — 25¢ closing + 25¢ service to the closing
+  // agent (or a CS specialist / the pot when self-closed) + 10¢ always to the
+  // pot. Idempotent per (landlord, month, role).
+  cron.schedule('45 1 1 * *', async () => {
+    try {
+      const { processCommissionAccrual } = await import('./commissionAccrual')
+      const result = await processCommissionAccrual()
+      logger.info(result, '[commission-accrual]')
+    } catch (e) {
+      logger.error({ err: e }, '[commission-accrual] fatal')
     }
   }, { timezone: 'America/Phoenix' })
 
@@ -1412,9 +1455,8 @@ export function schedulerInit() {
 
   // OTP rent advance — daily tick at 3pm Phoenix; runs the
   // monthly advance only when today is the last business day of
-  // the month (so ACH initiated today clears in landlord's bank
-  // by the 1st). Gated by system_features.otp_rollout_visible
-  // inside the service; safe to leave in scheduler permanently.
+  // the month. Gated by system_features.otp_rollout_visible inside
+  // the service (no-op while OTP is hidden; kept for re-enable).
   cron.schedule('0 15 * * *', async () => {
     try {
       const { isLastBusinessDayOfMonth, processMonthlyAdvance } = await import('../services/otp')
@@ -1428,8 +1470,7 @@ export function schedulerInit() {
 
   // S245: FlexPay grace-period-end advance — daily at 3am Phoenix.
   // Fronts rent to landlord on the day rent_due_day + grace_days
-  // matches today's day-of-month. Suppressed automatically when OTP
-  // already advanced this cycle (no double-front). Gated by
+  // matches today's day-of-month. Gated by
   // system_features.flexpay_rollout_visible inside the service.
   cron.schedule('0 3 * * *', async () => {
     try {
@@ -1483,6 +1524,20 @@ export function schedulerInit() {
       logger.info(result, '[flexdeposit-custody]')
     } catch (e) {
       logger.error({ err: e }, '[flexdeposit-custody] fatal')
+    }
+  }, { timezone: 'America/Phoenix' })
+
+  // S565: FlexCredit reporting fee — monthly on the 1st at 7:05am Phoenix.
+  // $5 charge per credit_reporting_enrolled tenant. Idempotent via
+  // UNIQUE (cycle_month, tenant_id). No-ops while flexcredit_rollout_visible
+  // is OFF (no tenant can be enrolled), so it's dormant until launch.
+  cron.schedule('5 7 1 * *', async () => {
+    try {
+      const { processFlexCreditFee } = await import('../services/flexCredit')
+      const result = await processFlexCreditFee()
+      logger.info(result, '[flexcredit-fee]')
+    } catch (e) {
+      logger.error({ err: e }, '[flexcredit-fee] fatal')
     }
   }, { timezone: 'America/Phoenix' })
 
@@ -1540,6 +1595,18 @@ export function schedulerInit() {
   })
   // Background check 6-month freshness expiry. 3 AM daily, low-contention window.
   cron.schedule('0 3 * * *', processBackgroundCheckExpiry)
+
+  // S565: nightly economic-nexus tally. 3:20am, after the 3am low-contention
+  // jobs. Sums GAM's own revenue by customer state (current + prior calendar
+  // year) → nexus_revenue_tally, feeding the admin nexus dashboard. Monitoring
+  // only — never collects tax.
+  cron.schedule('20 3 * * *', async () => {
+    try {
+      const { recomputeNexusTally } = await import('../services/nexusMonitor')
+      const { rows } = await recomputeNexusTally()
+      logger.info(`[SCHEDULER] nexus tally recomputed — ${rows} state-year rows`)
+    } catch (e) { logger.error({ err: e }, '[SCHEDULER] nexus tally') }
+  })
 
   // ── LEASE END PROCESSOR ─────────────────────────────────────
   // Daily at 2am — activate signed pending leases whose start date arrived
@@ -1652,10 +1719,6 @@ export function schedulerInit() {
   //     cron has no engine. Rebuild when the tenant-side rent-collection
   //     orchestration lands (separate from FlexPay).
   //
-  //   - On-Time Pay disbursement SLA (TODO: disburse from reserve). OTP
-  //     enablement is DEFERRED Item 16 batch 3+. Re-add when SetupIntent
-  //     enrollment + Stripe Connect payout flow are wired together.
-  //
   //   - Reserve fund contribution (TODO: calculate prior-month net). The
   //     reserve_fund_state table exists but the contribution math is part
   //     of the post-launch chargeback-coverage subsystem (16a flagged as
@@ -1725,31 +1788,6 @@ export function schedulerInit() {
               ctx:           { landlordId: payment.landlord_id, paymentId: payment.id },
             })
           } catch (e) { logger.error({ err: e }, '[EMAIL late_payment]') }
-        }
-
-        // After 2 late payments — invite tenant to On-Time Pay (one-shot
-        // per tenant via on_time_pay_invite_sent_at sentinel).
-        if (payment.late_payment_count >= 1) { // Already incremented above, so this is 2+
-          const tenant = await queryOne<any>(
-            `SELECT * FROM tenants WHERE id = $1`, [payment.tenant_id]
-          )
-          if (tenant && !tenant.on_time_pay_enrolled && !tenant.on_time_pay_invite_sent_at) {
-            await query(
-              `UPDATE tenants SET on_time_pay_invite_sent_at = NOW() WHERE id = $1`,
-              [payment.tenant_id]
-            )
-            if (payment.tenant_email) {
-              try {
-                await sendOnTimePayInvitation({
-                  email:      payment.tenant_email,
-                  firstName:  payment.tenant_first || 'there',
-                  lateCount:  payment.late_payment_count + 1,
-                  rentAmount: Number(payment.amount || 0),
-                  ctx:        { landlordId: payment.landlord_id, tenantId: payment.tenant_id },
-                })
-              } catch (e) { logger.error({ err: e }, '[EMAIL otp_invite]') }
-            }
-          }
         }
       }
 

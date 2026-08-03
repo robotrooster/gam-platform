@@ -42,23 +42,39 @@ import {
 export const landlordsRouter = Router()
 landlordsRouter.use(requireAuth)
 
-landlordsRouter.get('/', requireAdmin, async (_req, res, next) => {
+landlordsRouter.get('/', requireAdmin, async (req: any, res, next) => {
   try {
+    // Portfolio scoping (S567): super_admin sees every landlord; a regular
+    // admin (portfolio manager) sees ONLY their own book — landlords they close
+    // or service. Unassigned/self-closed leads are routed by super_admin, not
+    // browsed from a pool.
+    const scopeId = req.user?.role === 'super_admin' ? null : req.user?.userId
     const landlords = await query<any>(`
       SELECT l.*, u.first_name, u.last_name, u.email, u.phone,
+        pmu.first_name AS pm_first_name, pmu.last_name AS pm_last_name,
+        smu.first_name AS sm_first_name, smu.last_name AS sm_last_name,
+        rbu.first_name AS referrer_first_name, rbu.last_name AS referrer_last_name,
         COUNT(DISTINCT p.id)::int AS property_count,
         COUNT(DISTINCT u2.id)::int AS unit_count,
-        COUNT(DISTINCT u2.id) FILTER (WHERE u2.status='active')::int AS occupied_count,
+        COUNT(DISTINCT u2.id) FILTER (WHERE u2.status <> 'vacant')::int AS occupied_count,
         EXISTS (
           SELECT 1 FROM user_bank_accounts ba
            WHERE ba.user_id = l.user_id AND ba.status = 'active'
         ) AS bank_account_ready
       FROM landlords l
       JOIN users u ON u.id = l.user_id
+      LEFT JOIN users pmu ON pmu.id = l.portfolio_manager_id
+      LEFT JOIN users smu ON smu.id = l.service_manager_id
+      LEFT JOIN users rbu ON rbu.id = l.referred_by_user_id
       LEFT JOIN properties p ON p.landlord_id = l.id
       LEFT JOIN units u2 ON u2.landlord_id = l.id
-      GROUP BY l.id, l.user_id, u.first_name, u.last_name, u.email, u.phone
-      ORDER BY u.last_name`)
+      WHERE $1::uuid IS NULL
+         OR l.portfolio_manager_id = $1::uuid
+         OR l.service_manager_id = $1::uuid
+      GROUP BY l.id, l.user_id, u.first_name, u.last_name, u.email, u.phone,
+               pmu.first_name, pmu.last_name, smu.first_name, smu.last_name,
+               rbu.first_name, rbu.last_name
+      ORDER BY u.last_name`, [scopeId])
     res.json({ success: true, data: landlords })
   } catch (e) { next(e) }
 })
@@ -77,6 +93,55 @@ landlordsRouter.get('/', requireAdmin, async (_req, res, next) => {
 // both tenant-customers and non-tenant pos_customers, with per-
 // (customer, property) account semantics. Engine + statement math
 // live in services/flexCharge.ts.
+
+// ── landlord referral (S567) ──────────────────────────────────────
+// A landlord's own referral code + shareable signup link. Referring another
+// landlord makes the referrer the CLOSER on that landlord — a 25¢/occupied
+// unit/month residual, identical to a PM closer (customer service still routes
+// to a PM). Lazily generates the code on first request.
+landlordsRouter.get('/my-referral', requireAuth, requireLandlord, async (req: any, res, next) => {
+  try {
+    const uid = req.user.userId
+    let row = await queryOne<any>(`SELECT referral_code FROM users WHERE id=$1`, [uid])
+    if (!row?.referral_code) {
+      for (let attempt = 0; attempt < 5; attempt++) {
+        const code = ('L' + uid.replace(/-/g, '') + attempt).slice(0, 8).toUpperCase()
+        try { await query(`UPDATE users SET referral_code=$1 WHERE id=$2`, [code, uid]); row = { referral_code: code }; break }
+        catch { /* unique collision — try next */ }
+      }
+    }
+    const base = process.env.LANDLORD_SIGNUP_URL || 'https://app.goldassetmanagement.com/signup'
+    res.json({ success: true, data: {
+      referralCode: row?.referral_code ?? null,
+      referralLink: row?.referral_code ? `${base}?ref=${row.referral_code}` : null,
+    }})
+  } catch (e) { next(e) }
+})
+
+// The landlord's referral earnings — closing commission on landlords they
+// referred (they are the closing manager on those accruals).
+landlordsRouter.get('/referral-earnings', requireAuth, requireLandlord, async (req: any, res, next) => {
+  try {
+    const uid = req.user.userId
+    const [tot] = await query<any>(
+      `SELECT COALESCE(SUM(amount),0) AS all_time,
+              COALESCE(SUM(amount) FILTER (WHERE accrual_month = date_trunc('month', now())::date),0) AS this_month
+         FROM commission_accruals WHERE manager_id=$1 AND role='closing' AND NOT to_pot`, [uid])
+    const byLandlord = await query<any>(
+      `SELECT ca.landlord_id, lu.first_name, lu.last_name, l.business_name,
+              MAX(ca.occupied_units) AS occupied_units,
+              COALESCE(SUM(ca.amount),0) AS all_time,
+              COALESCE(SUM(ca.amount) FILTER (WHERE ca.accrual_month = date_trunc('month', now())::date),0) AS this_month
+         FROM commission_accruals ca
+         JOIN landlords l ON l.id = ca.landlord_id
+         JOIN users lu ON lu.id = l.user_id
+        WHERE ca.manager_id=$1 AND ca.role='closing' AND NOT ca.to_pot
+        GROUP BY ca.landlord_id, lu.first_name, lu.last_name, l.business_name
+        ORDER BY all_time DESC`, [uid])
+    const [ref] = await query<any>(`SELECT COUNT(*)::int AS n FROM landlords WHERE referred_by_user_id=$1`, [uid])
+    res.json({ success: true, data: { thisMonth: +tot.this_month, allTime: +tot.all_time, referredCount: ref.n, byLandlord } })
+  } catch (e) { next(e) }
+})
 
 // ── pos_customers — merchant-owned non-tenant roster ──────────────
 landlordsRouter.get('/pos-customers', requireAuth, requireLandlord, async (req, res, next) => {
@@ -961,17 +1026,75 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
       href: '/maintenance?open=' + m.id,
     }))
 
+    // S576 (B-8): work-trade agreements the 2am processor PAUSED because their
+    // lease expired (rent-for-labor can't outlive the tenancy). We surface only
+    // paused agreements whose tenant now has NO active lease on that unit — that
+    // distinguishes a lease-ended pause (needs a renewal) from a landlord's
+    // deliberate seasonal/manual pause (tenant still has an active lease → left
+    // alone). The action is to renew the lease, even month-to-month, with a
+    // work-trade addendum, which reactivates the arrangement.
+    const wtRows = await query<any>(`
+      SELECT wta.id, un.unit_number, p.name AS property_name,
+             u.first_name, u.last_name
+      FROM work_trade_agreements wta
+      JOIN tenants t ON t.id = wta.tenant_id
+      JOIN users u ON u.id = t.user_id
+      JOIN units un ON un.id = wta.unit_id
+      JOIN properties p ON p.id = un.property_id
+      WHERE wta.landlord_id = $1
+        AND wta.status = 'paused'
+        AND NOT EXISTS (
+          SELECT 1 FROM leases l
+          JOIN lease_tenants lt ON lt.lease_id = l.id
+          WHERE l.unit_id = wta.unit_id AND lt.tenant_id = wta.tenant_id
+            AND l.status = 'active' AND lt.status = 'active')
+      ORDER BY wta.updated_at DESC
+    `, [landlordId])
+
+    const workTrade = wtRows.map((w: any) => ({
+      id: w.id,
+      type: 'work_trade_paused',
+      title: 'Work trade paused — Unit ' + w.unit_number,
+      subtitle: [w.first_name, w.last_name].filter(Boolean).join(' ')
+        + '’s lease ended. Renew (even month-to-month) with a work-trade addendum to resume.',
+      href: '/work-trade',
+    }))
+
+    // S576 (B-8): work-trade addendums the renewal auto-carry DRAFTED but the
+    // landlord hasn't sent yet (Nic: auto-draft, eyeball, then it goes out).
+    // Unsent = status 'pending'; only those linked to a work-trade agreement.
+    const wtAddendumRows = await query<any>(`
+      SELECT d.id, un.unit_number
+      FROM lease_documents d
+      JOIN work_trade_agreements wta ON wta.id = d.work_trade_agreement_id
+      JOIN units un ON un.id = d.unit_id
+      WHERE d.landlord_id = $1 AND d.status = 'pending'
+        AND d.work_trade_agreement_id IS NOT NULL
+      ORDER BY d.created_at DESC
+    `, [landlordId])
+    for (const a of wtAddendumRows as any[]) {
+      workTrade.push({
+        id: a.id,
+        type: 'work_trade_addendum_draft',
+        title: 'Work-trade addendum ready — Unit ' + a.unit_number,
+        subtitle: 'Drafted on the renewed lease. Review and send it for signature.',
+        href: '/work-trade',
+      })
+    }
+
     res.json({
       success: true,
       data: {
         leases,
         ach,
         maintenance,
+        workTrade,
         counts: {
           leases: leases.length,
           ach: ach.length,
           maintenance: maintenance.length,
-          total: leases.length + ach.length + maintenance.length,
+          workTrade: workTrade.length,
+          total: leases.length + ach.length + maintenance.length + workTrade.length,
         },
       },
     })
@@ -1251,7 +1374,7 @@ landlordsRouter.post('/me/onboard-new-lease-tenant', requirePerm('tenants.onboar
     if (unit.occupancy_mode !== 'by_room') {
       const draft = await client.query(
         `SELECT draft_document_id FROM pending_tenant_intents
-          WHERE unit_id=$1 AND resolved_at IS NULL AND draft_document_id IS NOT NULL LIMIT 1`,
+          WHERE unit_id=$1 AND resolved_at IS NULL AND cancelled_at IS NULL AND draft_document_id IS NOT NULL LIMIT 1`,
         [unitId]).then((r: any) => r.rows[0])
       if (draft?.draft_document_id) {
         const tenantSigned = await client.query(
@@ -1291,12 +1414,15 @@ landlordsRouter.post('/me/onboard-new-lease-tenant', requirePerm('tenants.onboar
       tenantId = t.rows[0].id
     }
 
-    // Unit-bound intent (the roster slot). One per tenant (UNIQUE) — re-invite
-    // updates it back to open on this unit.
+    // Unit-bound intent (the roster slot). At most one LIVE intent per tenant
+    // (partial unique on tenant_id WHERE cancelled_at IS NULL). Re-inviting a
+    // tenant whose only prior intent was cancelled inserts a FRESH row — the
+    // cancelled one is retained as history and falls outside the arbiter; a
+    // tenant with an existing live intent updates it back to open on this unit.
     await client.query(
       `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, unit_id)
        VALUES ($1, $2, 'not_uploaded', $3)
-       ON CONFLICT (tenant_id) DO UPDATE SET unit_id=EXCLUDED.unit_id, resolved_at=NULL,
+       ON CONFLICT (tenant_id) WHERE cancelled_at IS NULL DO UPDATE SET unit_id=EXCLUDED.unit_id, resolved_at=NULL,
              accepted_at=NULL, draft_document_id=NULL, updated_at=NOW()`,
       [landlordId, tenantId, unitId])
 
@@ -1423,9 +1549,10 @@ landlordsRouter.post('/me/onboard-tenant-pending', requirePerm('tenants.create')
       }
 
       // Existing pending intent for this tenant — refuse a duplicate. Landlord
-      // should resume the existing one or delete it first.
+      // should resume the existing one or cancel it first. A cancelled invite
+      // (cancelled_at set) is retained but not blocking — re-invite is allowed.
       const existingIntent = await queryOne<any>(
-        `SELECT id FROM pending_tenant_intents WHERE tenant_id = $1 AND resolved_at IS NULL LIMIT 1`,
+        `SELECT id FROM pending_tenant_intents WHERE tenant_id = $1 AND resolved_at IS NULL AND cancelled_at IS NULL LIMIT 1`,
         [existingUser.tenant_id]
       )
       if (existingIntent) {
@@ -1443,7 +1570,7 @@ landlordsRouter.post('/me/onboard-tenant-pending', requirePerm('tenants.create')
       // decision for that unit's class (unbound intents gate at resolve).
       await assertLateFeeDecisionForUnit(unitId)
       const held = await queryOne<any>(
-        'SELECT id FROM pending_tenant_intents WHERE unit_id=$1 AND resolved_at IS NULL', [unitId])
+        'SELECT id FROM pending_tenant_intents WHERE unit_id=$1 AND resolved_at IS NULL AND cancelled_at IS NULL', [unitId])
       if (held) throw new AppError(409, 'That unit is already held by another pending tenant')
     }
 
@@ -1603,7 +1730,7 @@ landlordsRouter.post('/me/onboard-tenants-csv/commit-pending', requirePerm('tena
           // duplicate emails WITHIN a single CSV — row N+1 sees the intent
           // that row N just inserted and rejects.
           const existingIntent = await queryOne<any>(
-            `SELECT id FROM pending_tenant_intents WHERE tenant_id = $1 AND resolved_at IS NULL LIMIT 1`,
+            `SELECT id FROM pending_tenant_intents WHERE tenant_id = $1 AND resolved_at IS NULL AND cancelled_at IS NULL LIMIT 1`,
             [existingUser.tenant_id]
           )
           if (existingIntent) {
@@ -1726,6 +1853,7 @@ landlordsRouter.get('/me/pending-tenants', requirePerm('tenants.create'), async 
        LEFT JOIN properties pr ON pr.id = un.property_id
        WHERE pti.landlord_id = $1
          AND pti.resolved_at IS NULL
+         AND pti.cancelled_at IS NULL
        ORDER BY pti.created_at DESC`,
       [landlordId]
     )
@@ -1756,85 +1884,48 @@ landlordsRouter.get('/me/pending-tenants', requirePerm('tenants.create'), async 
 
 
 // DELETE /api/landlords/me/pending-tenants/:intentId
-// Cleanup is full-cascade: drop the intent, the tenant row, the user row,
-// and the stored PDF. Safe because a pending intent has no lease, no
-// lease_tenants link, no payments, no anything downstream.
+// SOFT-HIDE, not erase (data-retention rule — "keep everything; a delete only
+// hides a record from the owner, it never leaves our server"). Canceling a
+// pending invite stamps cancelled_at: the intent drops out of the landlord's
+// pending list and the held unit is released for a new invite, but the intent
+// row, the tenant + user rows (their contact info), and any uploaded lease PDF
+// are ALL retained on the server. This is the invite-level counterpart to the
+// lease-template soft-delete (is_active=FALSE) and status-change move-outs.
 //
-// Edge case: if a user/tenant somehow has OTHER active records (the
-// existing-user reuse path on /onboard-tenant-pending wires this up — that
-// person was already a tenant elsewhere), we keep them. Detected by checking
-// for any active lease_tenants row before deleting user/tenant.
+// NOTE: this used to hard-delete tenant + user + PDF for no-history invites.
+// That was the ONE runtime path that erased a person from the platform; it is
+// deliberately gone. Retention is the whole point.
 landlordsRouter.delete('/me/pending-tenants/:intentId', requirePerm('tenant_onboarding.pending_manage'), async (req, res, next) => {
-  const client = await getClient()
   try {
     const { intentId } = req.params
     const landlordId = req.user!.profileId
 
-    // Verify ownership and get tenant_id + user_id + pdf_url before delete.
-    const intent = await queryOne<any>(
-      `SELECT pti.id, pti.tenant_id, pti.imported_pdf_url, t.user_id
-       FROM pending_tenant_intents pti
-       JOIN tenants t ON t.id = pti.tenant_id
-       WHERE pti.id = $1 AND pti.landlord_id = $2 AND pti.resolved_at IS NULL`,
+    // Only an open (not-yet-resolved, not-already-cancelled) invite owned by
+    // this landlord can be canceled. Nothing is deleted — we just stamp it.
+    const updated = await queryOne<any>(
+      `UPDATE pending_tenant_intents
+          SET cancelled_at = NOW(), updated_at = NOW()
+        WHERE id = $1 AND landlord_id = $2
+          AND resolved_at IS NULL AND cancelled_at IS NULL
+        RETURNING id`,
       [intentId, landlordId]
     )
-    if (!intent) {
-      throw new AppError(404, 'Pending tenant not found, already resolved, or not owned by you')
-    }
-
-    // Decide whether the user/tenant rows are safe to delete. They are safe
-    // ONLY IF this intent is the only thing referencing them — i.e. they have
-    // no other active lease_tenants links and no other pending intents.
-    const otherLeases = await queryOne<any>(
-      `SELECT 1 FROM lease_tenants WHERE tenant_id = $1 LIMIT 1`,
-      [intent.tenant_id]
-    )
-    const otherIntents = await queryOne<any>(
-      `SELECT 1 FROM pending_tenant_intents WHERE tenant_id = $1 AND id != $2 LIMIT 1`,
-      [intent.tenant_id, intentId]
-    )
-    const safeToDeleteTenant = !otherLeases && !otherIntents
-
-    await client.query('BEGIN')
-
-    // Always delete the intent row first (cascades aren't needed — no children).
-    await client.query('DELETE FROM pending_tenant_intents WHERE id=$1', [intentId])
-
-    // If safe, drop tenant + user. tenants.user_id has ON DELETE CASCADE on
-    // the user FK so deleting the user kills the tenant; we delete tenant
-    // first explicitly to keep the order honest.
-    if (safeToDeleteTenant) {
-      await client.query('DELETE FROM tenants WHERE id=$1', [intent.tenant_id])
-      await client.query('DELETE FROM users WHERE id=$1', [intent.user_id])
-    }
-
-    await client.query('COMMIT')
-
-    // PDF cleanup is best-effort, post-commit. Failure here doesn't roll back
-    // the deletion — the row is gone, the file is just orphaned. TODO when
-    // storage backend is finalized: surface orphans to admin cleanup job.
-    if (intent.imported_pdf_url) {
-      const filename = extractUploadFilename(intent.imported_pdf_url)
-      if (filename) {
-        const filePath = path.join(pendingPdfDir, filename)
-        try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath) }
-        catch (e) { logger.error({ err: e, ctx: filePath }, '[PENDING DELETE] Failed to remove PDF') }
-      }
+    if (!updated) {
+      throw new AppError(404, 'Pending tenant not found, already resolved/cancelled, or not owned by you')
     }
 
     res.json({
       success: true,
       data: {
         intentId,
-        tenantDeleted: safeToDeleteTenant,
-        userDeleted: safeToDeleteTenant,
+        cancelled: true,
+        // Retained on purpose — the person and their PDF stay on our server.
+        tenantDeleted: false,
+        userDeleted: false,
       },
     })
   } catch (e) {
-    await client.query('ROLLBACK').catch(() => {})
     next(e)
-  } finally {
-    client.release()
   }
 })
 
@@ -1887,7 +1978,7 @@ landlordsRouter.post(
       const intent = await queryOne<any>(
         `SELECT id, parser_status, imported_pdf_url
          FROM pending_tenant_intents
-         WHERE id = $1 AND landlord_id = $2 AND resolved_at IS NULL`,
+         WHERE id = $1 AND landlord_id = $2 AND resolved_at IS NULL AND cancelled_at IS NULL`,
         [intentId, landlordId]
       )
       if (!intent) {

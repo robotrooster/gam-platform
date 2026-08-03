@@ -3,9 +3,11 @@ import { useState, useRef, useCallback, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPatch, apiDelete, apiPut } from '../lib/api'
 import { loadPdfjs } from '../lib/pdfjs'
-import { LEASE_COLUMNS, LEASE_COLUMN_LABEL, LEASE_COLUMN_INPUT, humanize, isLateFeeColumn } from '@gam/shared'
+import { LEASE_COLUMNS, LEASE_COLUMN_LABEL, LEASE_COLUMN_INPUT, humanize, isLateFeeColumn,
+  STANDALONE_DOCUMENT_TYPES, LEASE_DOCUMENT_TYPE_LABEL, GENERIC_SIGNER_ROLES, GENERIC_SIGNER_ROLE_LABEL } from '@gam/shared'
 import { useAuth } from '../context/AuthContext'
 import { usePerms } from '../lib/permissions'
+import { SearchBox, PropertySelect } from '../components/ListControls'
 import { Plus, X, FileText, Send, Settings, Eye, Trash2, ChevronRight, Check, AlertCircle, Download, MoreVertical } from 'lucide-react'
 import { toast, appConfirm } from '../components/dialogs'
 
@@ -20,7 +22,10 @@ const FIELD_TYPES = [
   { type:'radio_group',label:'Multiple Choice', icon:'🔘', color:'#ec4899', w:16, h:16 },
 ]
 
-const SIGNER_ROLES = ['landlord','primary','co_tenant_1','co_tenant_2','co_tenant_3','witness']
+// Lease roles + S568 generic roles (standalone contracts: purchase agreements,
+// bills of sale, general contracts — the field editor can place boxes for these).
+const SIGNER_ROLES = ['landlord','primary','co_tenant_1','co_tenant_2','co_tenant_3','witness',
+  'seller','purchaser','party_1','party_2']
 
 // DATA_LABELS derived from the shared lease_column registry. Single source
 // of truth is @gam/shared — adding a value there automatically surfaces it
@@ -35,7 +40,8 @@ const DATA_LABELS: Record<string, Array<{value:string; label:string}>> = {
     .map(c => ({ value: c, label: LEASE_COLUMN_LABEL[c] })),
 }
 const ROLE_COLORS: Record<string,string> = {
-  landlord:'#c9a227', primary:'#22c55e', co_tenant_1:'#4a9eff', co_tenant_2:'#a78bfa', co_tenant_3:'#f472b6', witness:'#f59e0b'
+  landlord:'#c9a227', primary:'#22c55e', co_tenant_1:'#4a9eff', co_tenant_2:'#a78bfa', co_tenant_3:'#f472b6', witness:'#f59e0b',
+  seller:'#c9a227', purchaser:'#22c55e', party_1:'#4a9eff', party_2:'#a78bfa'
 }
 
 // ── FIELD ITEM ON CANVAS ──────────────────────────────────────
@@ -711,8 +717,15 @@ function SendDocumentModal({ onClose }) {
           <label style={{ fontSize:'.72rem', fontWeight:600, color:'var(--text-3)', textTransform:'uppercase', letterSpacing:'.06em', display:'block', marginBottom:6 }}>Template *</label>
           <select className='input' style={{ width:'100%' }} value={templateId} onChange={e => onTemplateChange(e.target.value)} autoFocus>
             <option value=''>Select a template…</option>
-            {templates.map(t => <option key={t.id} value={t.id}>{t.name} ({t.fieldCount} fields)</option>)}
+            {templates.map(t => <option key={t.id} value={t.id}>{t.name}{t.purpose === 'work_trade_addendum' ? ' · Addendum' : ''} ({t.fieldCount} fields)</option>)}
           </select>
+          {/* S576 (B-8): an addendum template AMENDS the existing lease — it never
+              spins up a new one. Make that explicit so the landlord isn't surprised. */}
+          {selectedTemplate?.purpose === 'work_trade_addendum' && (
+            <div style={{ fontSize:'.7rem', color:'var(--gold)', marginTop:5 }}>
+              This is an addendum — it amends the recipients' active lease (no new lease is created).
+            </div>
+          )}
         </div>
 
         {/* W-33: recipient mode — unit (default) / whole property / manual */}
@@ -837,14 +850,117 @@ function SendDocumentModal({ onClose }) {
   )
 }
 
+// S568 (Nic): create + send a STANDALONE document (purchase agreement, bill of
+// sale, contract) with arbitrary signers/roles. Any signer emailed who isn't
+// already a GAM user is minted a free 'contact' account (customer pool) and
+// invited to activate + sign — no raw-email delivery. Reuses the generic e-sign
+// engine (a template supplies the signable fields).
+function StandaloneDocModal({ templates, onClose, onDone }: { templates: any[]; onClose: () => void; onDone: () => void }) {
+  const [docType, setDocType] = useState<string>(STANDALONE_DOCUMENT_TYPES[0])
+  const [title, setTitle] = useState('')
+  const [templateId, setTemplateId] = useState('')
+  const [signers, setSigners] = useState<Array<{ name: string; email: string; role: string }>>([
+    { name: '', email: '', role: 'seller' },
+    { name: '', email: '', role: 'purchaser' },
+  ])
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+
+  const setSigner = (i: number, patch: Partial<{ name: string; email: string; role: string }>) =>
+    setSigners(prev => prev.map((s, j) => j === i ? { ...s, ...patch } : s))
+
+  const roleOptions = GENERIC_SIGNER_ROLES
+  const validEmails = signers.every(s => /.+@.+\..+/.test(s.email) && s.name.trim())
+  const distinctRoles = new Set(signers.map(s => s.role)).size === signers.length
+  const canSubmit = title.trim() && templateId && signers.length >= 1 && validEmails && distinctRoles && !busy
+
+  const submit = async () => {
+    setBusy(true); setError('')
+    try {
+      const created: any = await apiPost('/esign/standalone-documents', {
+        title: title.trim(), documentType: docType, templateId,
+        signers: signers.map(s => ({ name: s.name.trim(), email: s.email.trim(), role: s.role })),
+      })
+      // Send it so signers get their activate-and-sign invite.
+      await apiPost(`/esign/documents/${created.data.id}/send`, {})
+      toast('Contract created and sent for signature.')
+      onDone()
+    } catch (e: any) {
+      setError(e?.response?.data?.message || e?.message || 'Could not create the document.')
+    } finally { setBusy(false) }
+  }
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" style={{ maxWidth: 600, width: '95vw', maxHeight: '90vh', overflowY: 'auto' }} onClick={e => e.stopPropagation()}>
+        <div className="modal-header">
+          <div className="modal-title" style={{ marginBottom: 0 }}>New Contract</div>
+          <button className="btn btn-ghost btn-sm" onClick={onClose}><X size={14} /></button>
+        </div>
+        <div style={{ padding: '4px 20px 20px', display: 'grid', gap: 12 }}>
+          <label style={{ fontSize: '.75rem', color: 'var(--text-3)' }}>Document type
+            <select className="form-input" value={docType} onChange={e => setDocType(e.target.value)}>
+              {STANDALONE_DOCUMENT_TYPES.map(t => <option key={t} value={t}>{LEASE_DOCUMENT_TYPE_LABEL[t]}</option>)}
+            </select>
+          </label>
+          <label style={{ fontSize: '.75rem', color: 'var(--text-3)' }}>Title
+            <input className="form-input" value={title} onChange={e => setTitle(e.target.value)} placeholder="e.g. Home purchase agreement — Unit 12" />
+          </label>
+          <label style={{ fontSize: '.75rem', color: 'var(--text-3)' }}>Template (supplies the signature fields)
+            <select className="form-input" value={templateId} onChange={e => setTemplateId(e.target.value)}>
+              <option value="">Select a template…</option>
+              {templates.map((t: any) => <option key={t.id} value={t.id}>{t.name} ({t.fieldCount} fields)</option>)}
+            </select>
+            {templates.length === 0 && (
+              <span style={{ fontSize: '.7rem', color: 'var(--amber)' }}>No templates yet — build one in the Templates tab (add seller/purchaser fields), then come back.</span>
+            )}
+          </label>
+
+          <div>
+            <div style={{ fontSize: '.72rem', fontWeight: 700, color: 'var(--gold)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 6 }}>Signers</div>
+            <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginBottom: 8 }}>
+              Anyone without a GAM account gets a free account + an invite to activate and sign — nothing is emailed to an unverified address.
+            </div>
+            {signers.map((s, i) => (
+              <div key={i} style={{ display: 'flex', gap: 6, marginBottom: 6, alignItems: 'center' }}>
+                <select className="form-input" style={{ width: 120, fontSize: '.78rem' }} value={s.role} onChange={e => setSigner(i, { role: e.target.value })}>
+                  {roleOptions.map(r => <option key={r} value={r}>{GENERIC_SIGNER_ROLE_LABEL[r]}</option>)}
+                </select>
+                <input className="form-input" style={{ flex: 1, fontSize: '.78rem' }} placeholder="Full name" value={s.name} onChange={e => setSigner(i, { name: e.target.value })} />
+                <input className="form-input" style={{ flex: 1.3, fontSize: '.78rem' }} placeholder="Email" value={s.email} onChange={e => setSigner(i, { email: e.target.value })} />
+                {signers.length > 1 && <button className="btn btn-ghost btn-sm" style={{ padding: 4 }} onClick={() => setSigners(prev => prev.filter((_, j) => j !== i))}><X size={13} /></button>}
+              </div>
+            ))}
+            {signers.length < 6 && (
+              <button className="btn btn-ghost btn-sm" style={{ padding: '2px 8px', fontSize: '.72rem' }}
+                onClick={() => setSigners(prev => [...prev, { name: '', email: '', role: 'party_1' }])}><Plus size={12} /> Add signer</button>
+            )}
+            {!distinctRoles && <div style={{ fontSize: '.7rem', color: 'var(--amber)', marginTop: 4 }}>Each signer needs a distinct role.</div>}
+          </div>
+
+          {error && <div style={{ fontSize: '.75rem', color: 'var(--red)' }}>{error}</div>}
+        </div>
+        <div className="modal-footer" style={{ padding: '0 20px 20px', display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+          <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+          <button className="btn btn-primary" disabled={!canSubmit} onClick={submit}>{busy ? 'Sending…' : 'Create & Send'}</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 export function ESignPage() {
   const qc = useQueryClient()
   const { can } = usePerms()
   const [tab, setTab]           = useState<'documents'|'templates'>('documents')
   const [editTemplate, setEditTemplate] = useState<any>(null)
   const [showSend, setShowSend] = useState(false)
+  const [showStandalone, setShowStandalone] = useState(false)
   const [showNewTemplate, setShowNewTemplate] = useState(false)
   const [newTmplName, setNewTmplName] = useState('')
+  // S576 (B-8): template purpose — 'lease' (default) or 'work_trade_addendum'
+  // (the landlord's own work-trade addendum form).
+  const [newTmplPurpose, setNewTmplPurpose] = useState('lease')
   // S535: templates are per unit type ('' = universal)
   const [newTmplUnitType, setNewTmplUnitType] = useState('')
   // S535: optional PROPERTY lock — auto-set when the uploaded PDF's text
@@ -865,6 +981,23 @@ export function ESignPage() {
   const { data: templates = [], isLoading: tmplLoading } = useQuery<any[]>('esign-templates', () => apiGet('/esign/templates'))
   const { data: documents = [], isLoading: docLoading  } = useQuery<any[]>('esign-documents',  () => apiGet('/esign/documents'))
 
+  // S576: search + property dropdown over the Documents tab. Keys on
+  // propertyName (the docs payload has no propertyId); standalone contracts
+  // have no property and fall out of a property-filtered view by design.
+  const [docSearch, setDocSearch] = useState('')
+  const [docPropertyName, setDocPropertyName] = useState('')
+  const docPropertyOptions = (documents as any[]).map(d => ({ id: d.propertyName, name: d.propertyName }))
+  const dq = docSearch.trim().toLowerCase()
+  const filteredDocs = (documents as any[]).filter(d => {
+    const matchProperty = docPropertyName === '' || d.propertyName === docPropertyName
+    if (!matchProperty) return false
+    if (dq === '') return true
+    return (d.title || '').toLowerCase().includes(dq)
+      || (d.unitNumber || '').toLowerCase().includes(dq)
+      || (d.propertyName || '').toLowerCase().includes(dq)
+      || (d.documentType ? humanize(d.documentType).toLowerCase().includes(dq) : false)
+  })
+
   const deleteTemplateMut = useMutation(
     (id: string) => apiDelete('/esign/templates/' + id),
     { onSuccess: () => qc.invalidateQueries('esign-templates') }
@@ -880,7 +1013,7 @@ export function ESignPage() {
   )
 
   const createTemplateMut = useMutation(
-    () => apiPost('/esign/templates', { name: newTmplName, pageCount: tmplPageCount, basePdfUrl: newTmplPdf||null, unitType: newTmplUnitType === 'all' ? null : newTmplUnitType || null, propertyId: newTmplPropertyId || null, depositMonths: newTmplDepositMonths === '' ? null : Number(newTmplDepositMonths), defaultTermMonths: newTmplTermMonths === '' ? null : Number(newTmplTermMonths) }),
+    () => apiPost('/esign/templates', { name: newTmplName, pageCount: tmplPageCount, basePdfUrl: newTmplPdf||null, purpose: newTmplPurpose, unitType: newTmplUnitType === 'all' ? null : newTmplUnitType || null, propertyId: newTmplPropertyId || null, depositMonths: newTmplDepositMonths === '' ? null : Number(newTmplDepositMonths), defaultTermMonths: newTmplTermMonths === '' ? null : Number(newTmplTermMonths) }),
     { onSuccess: async (res: any) => {
       qc.invalidateQueries('esign-templates')
       setShowNewTemplate(false)
@@ -923,6 +1056,7 @@ export function ESignPage() {
           <p className="page-subtitle">Send documents for electronic signature</p>
         </div>
         <div style={{ display:'flex', gap:8 }}>
+          {tab === 'documents' && can('esign.template_manage') && <button className="btn btn-ghost" onClick={() => setShowStandalone(true)} title="Purchase agreement, bill of sale, or other contract with any signers"><FileText size={15} /> New Contract</button>}
           {tab === 'documents' && can('esign.send') && <button className="btn btn-primary" onClick={() => setShowSend(true)}><Send size={15} /> Send Document</button>}
           {tab === 'templates' && can('esign.template_manage') && <button className="btn btn-primary" onClick={() => setShowNewTemplate(true)}><Plus size={15} /> New Template</button>}
         </div>
@@ -933,6 +1067,14 @@ export function ESignPage() {
           <button key={t.id} onClick={() => setTab(t.id as any)} className={`btn btn-sm ${tab===t.id?'btn-primary':'btn-ghost'}`}>{t.label}</button>
         ))}
       </div>
+
+      {/* Documents */}
+      {tab === 'documents' && (documents as any[]).length > 0 && (
+        <div className="filter-bar">
+          <SearchBox value={docSearch} onChange={setDocSearch} placeholder="Search document, unit, property…" />
+          <PropertySelect value={docPropertyName} onChange={setDocPropertyName} properties={docPropertyOptions} />
+        </div>
+      )}
 
       {/* Documents */}
       {tab === 'documents' && (
@@ -949,10 +1091,12 @@ export function ESignPage() {
             <table className="data-table">
               <thead><tr><th>Document</th><th>Unit</th><th>Status</th><th>Signers</th><th>Sent</th><th>Completed</th><th></th></tr></thead>
               <tbody>
-                {(documents as any[]).map(d => (
+                {filteredDocs.length === 0 ? (
+                  <tr><td colSpan={7} style={{ textAlign:'center', color:'var(--text-3)', padding:32 }}>No documents match your filters.</td></tr>
+                ) : filteredDocs.map(d => (
                   <tr key={d.id}>
                     <td style={{ fontWeight:600, color:'var(--text-0)' }}>{d.title}</td>
-                    <td style={{ fontSize:'.75rem' }}>{d.propertyName} · Unit {d.unitNumber}</td>
+                    <td style={{ fontSize:'.75rem' }}>{d.unitNumber ? `${d.propertyName} · Unit ${d.unitNumber}` : (d.documentType ? humanize(d.documentType) : '—')}</td>
                     <td><span className={`badge ${STATUS_COLORS[d.status]||'badge-muted'}`}>{humanize(d.status)}</span></td>
                     <td style={{ fontSize:'.75rem' }}>{d.signedCount}/{d.signerCount} signed</td>
                     <td style={{ fontSize:'.72rem', color:'var(--text-3)' }}>{d.sentAt ? new Date(d.sentAt).toLocaleDateString() : '—'}</td>
@@ -992,15 +1136,20 @@ export function ESignPage() {
                     <div>
                       <div style={{ display:'flex', alignItems:'center', gap:6, marginBottom:2 }}>
                         <span style={{ fontWeight:700, color:'var(--text-0)' }}>{t.name}</span>
+                        {t.purpose === 'work_trade_addendum' && (
+                          <span title="Attaches to a renewal when a work-trade tenant needs a fresh tenancy" style={{ fontSize:'.6rem', fontWeight:700, textTransform:'uppercase' as const, letterSpacing:'.05em', color:'var(--text-1)', border:'1px solid var(--border-1)', borderRadius:4, padding:'1px 5px' }}>Work-Trade Addendum</span>
+                        )}
                         {t.isUnitTypeDefault && (
                           <span title={`Default lease for ${t.unitType ? humanize(t.unitType) : 'this unit type'}`} style={{ fontSize:'.6rem', fontWeight:700, textTransform:'uppercase' as const, letterSpacing:'.05em', color:'var(--gold)', border:'1px solid var(--gold)', borderRadius:4, padding:'1px 5px' }}>Default</span>
                         )}
                       </div>
                       <div style={{ fontSize:'.72rem', color:'var(--text-3)' }}>{t.fieldCount} fields · {t.pageCount} pages · {t.unitType ? humanize(t.unitType) : 'any unit type'} · {t.propertyName || 'any property'}</div>
-                      <div style={{ fontSize:'.72rem', color:'var(--text-3)', marginTop:2 }}>
-                        {t.defaultTermMonths ? `${t.defaultTermMonths}-mo term` : 'Month-to-month'}
-                        {t.depositMonths != null ? ` · deposit ${Number(t.depositMonths)}× rent` : ' · deposit set on lease'}
-                      </div>
+                      {t.purpose !== 'work_trade_addendum' && (
+                        <div style={{ fontSize:'.72rem', color:'var(--text-3)', marginTop:2 }}>
+                          {t.defaultTermMonths ? `${t.defaultTermMonths}-mo term` : 'Month-to-month'}
+                          {t.depositMonths != null ? ` · deposit ${Number(t.depositMonths)}× rent` : ' · deposit set on lease'}
+                        </div>
+                      )}
                     </div>
                     <FileText size={18} style={{ color:'var(--text-3)' }} />
                   </div>
@@ -1013,7 +1162,7 @@ export function ESignPage() {
                       }}>
                         <Settings size={12} /> Edit Fields
                       </button>
-                      {t.unitType && !t.isUnitTypeDefault && (
+                      {t.purpose !== 'work_trade_addendum' && t.unitType && !t.isUnitTypeDefault && (
                         <button className="btn btn-ghost btn-sm" disabled={setDefaultTemplateMut.isLoading} onClick={() => setDefaultTemplateMut.mutate(t.id)}>
                           Make default
                         </button>
@@ -1042,6 +1191,18 @@ export function ESignPage() {
               <input className="input" placeholder="Standard 12-Month Lease" value={newTmplName} onChange={e => setNewTmplName(e.target.value)} style={{ width:'100%' }} autoFocus />
             </div>
             <div style={{ marginBottom:12 }}>
+              <label style={{ fontSize:'.72rem', fontWeight:600, color:'var(--text-3)', textTransform:'uppercase' as const, letterSpacing:'.06em', display:'block', marginBottom:5 }}>Form Type</label>
+              <select className="form-select" value={newTmplPurpose} onChange={e => setNewTmplPurpose(e.target.value)} style={{ width:'100%' }}>
+                <option value="lease">Lease (original + renewals)</option>
+                <option value="work_trade_addendum">Work-Trade Addendum</option>
+              </select>
+              <div style={{ fontSize:'.65rem', color:'var(--text-3)', marginTop:3 }}>
+                {newTmplPurpose === 'work_trade_addendum'
+                  ? 'Your own work-trade addendum form — attaches to a lease renewal when a work-trade tenant needs a fresh tenancy.'
+                  : 'A normal lease form, used for original leases and renewals.'}
+              </div>
+            </div>
+            <div style={{ marginBottom:12 }}>
               <label style={{ fontSize:'.72rem', fontWeight:600, color:'var(--text-3)', textTransform:'uppercase' as const, letterSpacing:'.06em', display:'block', marginBottom:5 }}>Unit Type</label>
               <select className="form-select" value={newTmplUnitType} onChange={e => setNewTmplUnitType(e.target.value)} style={{ width:'100%' }}>
                 <option value="" disabled>Select unit type…</option>
@@ -1067,6 +1228,7 @@ export function ESignPage() {
                 <div style={{ fontSize:'.65rem', color:'var(--text-3)', marginTop:3 }}>Lease forms name their property — locking prevents sending the wrong property&apos;s form.</div>
               )}
             </div>
+            {newTmplPurpose === 'lease' && <>
             <div style={{ marginBottom:12 }}>
               <label style={{ fontSize:'.72rem', fontWeight:600, color:'var(--text-3)', textTransform:'uppercase' as const, letterSpacing:'.06em', display:'block', marginBottom:5 }}>Security Deposit</label>
               <select className="form-select" value={newTmplDepositMonths} onChange={e => setNewTmplDepositMonths(e.target.value)} style={{ width:'100%' }}>
@@ -1087,6 +1249,7 @@ export function ESignPage() {
               </select>
               <div style={{ fontSize:'.65rem', color:'var(--text-3)', marginTop:3 }}>Auto-fills the lease dates when drafting off a unit (start today, end + this term). Storage/RV are usually month-to-month; apartments a year.</div>
             </div>
+            </>}
 <div style={{ marginBottom:16 }}>
               <label style={{ fontSize:'.72rem', fontWeight:600, color:'var(--text-3)', textTransform:'uppercase' as const, letterSpacing:'.06em', display:'block', marginBottom:5 }}>Base PDF URL (optional)</label>
               <div style={{ display:'flex', gap:8, alignItems:'center' }}>
@@ -1131,6 +1294,7 @@ export function ESignPage() {
       )}
 
       {showSend && <SendDocumentModal onClose={() => setShowSend(false)} />}
+      {showStandalone && <StandaloneDocModal templates={templates} onClose={() => setShowStandalone(false)} onDone={() => { qc.invalidateQueries('esign-documents'); setShowStandalone(false) }} />}
     </div>
   )
 }

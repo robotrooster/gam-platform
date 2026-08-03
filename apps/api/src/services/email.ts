@@ -67,7 +67,14 @@ async function send(
   // Suppressed sends still WRITE the email_send_log row below, so tests that
   // assert on the log keep passing; only the network call is skipped.
   const nodeEnv = process.env.NODE_ENV || 'development'
-  const willSend = nodeEnv === 'production' || process.env.EMAIL_SEND_LIVE === '1'
+  // S571 (Nic): never fire a REAL send to a seed/test domain — those addresses
+  // don't exist, so every send bounces (damaging Resend reputation) and no code
+  // ever arrives. Suppressing them is strictly better AND lets test logins work:
+  // the suppressed branch logs the subject, which for a login code contains the
+  // code, so it's retrievable from /tmp/gam-api.log. Applies in every env.
+  const TEST_DOMAINS = ['@tenant.dev', '@demo.dev', '@test.dev', '@x.dev', '@poser.dev', '@gam.dev']
+  const isTestAddress = TEST_DOMAINS.some((d) => (to || '').toLowerCase().endsWith(d))
+  const willSend = (nodeEnv === 'production' || process.env.EMAIL_SEND_LIVE === '1') && !isTestAddress
   let status: 'sent' | 'failed' = 'sent'
   let errorMessage: string | null = null
   let messageId: string | null = null
@@ -788,36 +795,6 @@ export async function sendPosCustomerOnboarding({
   )
 }
 
-export async function sendOnTimePayInvitation({
-  email, firstName, lateCount, rentAmount, ctx,
-}: { email: string; firstName: string; lateCount: number; rentAmount: number; ctx?: { landlordId?: string; tenantId?: string } }) {
-  void rentAmount  // reserved for future per-tenant fee tier display
-  await send(email, 'Never pay a late fee again — On-Time Pay invitation',
-    base(
-      h('Never pay a late fee again') +
-      p(`Hi ${firstName},`) +
-      p(`We noticed your last ${lateCount} rent payments arrived after the 1st. If your income arrives mid-month — Social Security, disability, pension, or similar — we can help.`) +
-      `<div style="background:#0a0f14;border-radius:8px;padding:16px;margin:12px 0">
-        <div style="font-weight:700;color:#c9a227;margin-bottom:8px">On-Time Pay — $20/month</div>
-        <ul style="color:#b8c4d8;font-size:.82rem;padding-left:18px;line-height:1.7;margin:0">
-          <li>Your landlord gets paid on the 1st — automatically</li>
-          <li>Your payment is collected on your income date</li>
-          <li>No late fees. Ever.</li>
-          <li>Not a loan — this is a payment timing service</li>
-        </ul>
-      </div>` +
-      p('Most tenants save $30–55/month in late fees. This invitation expires in 14 days.')
-    ),
-    {
-      category: 'otp_invitation',
-      landlordId: ctx?.landlordId ?? null,
-      relatedEntityType: ctx?.tenantId ? 'tenant' : null,
-      relatedEntityId: ctx?.tenantId ?? null,
-      metadata: { late_count: lateCount },
-    }
-  )
-}
-
 export async function sendLatePaymentNotice({
   landlordEmail, landlordName, tenantName, unitNumber, propertyName, daysLate, amount, ctx,
 }: { landlordEmail: string; landlordName: string; tenantName: string; unitNumber: string; propertyName: string; daysLate: number; amount: number; ctx?: { landlordId?: string; paymentId?: string } }) {
@@ -827,7 +804,6 @@ export async function sendLatePaymentNotice({
       h('Late Payment Alert') +
       p(`Hi ${landlordName},`) +
       p(`Tenant <strong style="color:#eef1f8">${tenantName}</strong> at <strong style="color:#eef1f8">${propertyName} Unit ${unitNumber}</strong> has not paid rent of <strong style="color:#eef1f8">$${amount.toLocaleString()}</strong> — now ${daysLate} days overdue.`) +
-      p('Your On-Time Pay disbursement was funded from the platform reserve. We are continuing to attempt ACH collection. You will be notified when payment settles.') +
       `<div style="margin-top:14px;font-size:.75rem;color:#4a5568">If you wish to file for eviction, activate Eviction Mode in your dashboard first — this hard-blocks all ACH. Check your local laws before accepting any payment during an eviction process.</div>`
     ),
     {
@@ -902,6 +878,33 @@ export async function emailTenantOnboarded(
 
 // S281 — email verification at registration. Sent after a successful
 // signup; the link consumes the token via POST /api/auth/verify-email.
+// S565 — email 2FA login code. Second factor for admin logins that don't use
+// an authenticator app. Short-lived numeric code, entered on the second step.
+export async function emailLoginCode(
+  to: string,
+  code: string,
+  ttlMinutes: number,
+  ctx?: { userId?: string },
+): Promise<string | null> {
+  return send(
+    to,
+    `Your GAM sign-in code: ${code}`,
+    base(
+      h('Your sign-in code') +
+      p('Use this code to finish signing in to GAM:') +
+      `<div style="margin:18px 0;padding:16px;background:#0a0f14;border-radius:8px;border-left:3px solid #c9a227;text-align:center">
+        <div style="font-family:monospace;font-size:2rem;font-weight:800;letter-spacing:.35em;color:#eef1f8">${code}</div>
+      </div>` +
+      p(`This code expires in <strong style="color:#eef1f8">${ttlMinutes} minutes</strong> and can be used once.`) +
+      p(`If you didn't try to sign in, you can ignore this email — your account is safe.`)
+    ),
+    {
+      category: 'login_2fa_code',
+      metadata: ctx?.userId ? { user_id: ctx.userId } : undefined,
+    },
+  )
+}
+
 export async function sendEmailVerification(
   to: string,
   firstName: string | null,

@@ -58,6 +58,11 @@ export function BackgroundCheckPage() {
   const priceLandlordId = (me as any)?.landlordId || new URLSearchParams(window.location.search).get('landlordId') || ''
   const priceUnitId = (me as any)?.unitId || new URLSearchParams(window.location.search).get('unitId') || ''
   const { data: price } = useQuery(['bg-price', priceLandlordId, priceUnitId], () => get(`/background/price?landlordId=${priceLandlordId}&unitId=${priceUnitId}`))
+  // S564: no landlord/property in scope → renter-pool intake. The applicant pays
+  // GAM directly for their own portable report (the landlord route instead bills
+  // the landlord, who owns the state-cap pass-through). Pool intake requires the
+  // share authorization.
+  const isSpeculative = !priceLandlordId
   const providerCollectsPii = !!(price as any)?.providerCollectsPii
   const handleIdUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0];
@@ -314,7 +319,7 @@ export function BackgroundCheckPage() {
     !!(form.street1.length>=5&&form.city.length>=2&&validZip&&(addrVerified||addrWarn)),
     !!(validPrev&&validIncome&&incomeFiles.length>=2&&form.income&&((['employed','part_time','self_employed'].includes(form.empStatus)?(form.employer&&form.empPhone):true))),
     !!(providerCollectsPii||idUrl),
-    !!(form.consentCredit&&form.consentCriminal&&form.acceptedTerms),
+    !!(form.consentCredit&&form.consentCriminal&&form.acceptedTerms&&(!isSpeculative||form.consentPool)),
     paid,
   ]
   if((status as any)?.status==='submitted'){
@@ -560,11 +565,11 @@ export function BackgroundCheckPage() {
               <div><div style={{fontSize:'.82rem',fontWeight:700,color:'#eef1f8',marginBottom:4}}>{consent.l}</div><div style={{fontSize:'.75rem',color:'#4a5568',lineHeight:1.5}}>{consent.b}</div></div>
             </label>
           ))}
-          <label style={{display:'flex',alignItems:'flex-start',gap:12,cursor:'pointer',marginBottom:14,padding:'14px 16px',background:form.consentPool?'rgba(201,162,39,.06)':'#141a22',border:'1px solid '+(form.consentPool?'rgba(201,162,39,.25)':'#1e2530'),borderRadius:10}}>
+          <label style={{display:'flex',alignItems:'flex-start',gap:12,cursor:'pointer',marginBottom:14,padding:'14px 16px',background:form.consentPool?'rgba(201,162,39,.08)':'#141a22',border:'1px solid '+(form.consentPool?'rgba(201,162,39,.35)':(isSpeculative?'rgba(201,162,39,.4)':'#1e2530')),borderRadius:10}}>
               <input type="checkbox" checked={form.consentPool} onChange={e=>set('consentPool',e.target.checked)} style={{width:18,height:18,marginTop:2,flexShrink:0}}/>
               <div>
-                <div style={{fontSize:'.82rem',fontWeight:700,color:'#eef1f8',marginBottom:4}}>GAM Vacancy Matching <span style={{fontSize:'.7rem',fontWeight:400,color:'#c9a227'}}>(optional)</span></div>
-                <div style={{fontSize:'.75rem',color:'#4a5568',lineHeight:1.5}}>I consent to GAM notifying me of matching vacancies from other landlords on the platform. My report will only be shared after I confirm interest and authorize access. I pay nothing additional.</div>
+                <div style={{fontSize:'.82rem',fontWeight:700,color:'#eef1f8',marginBottom:4}}>Share my screening with landlords {isSpeculative?<span style={{fontSize:'.7rem',fontWeight:700,color:'#c9a227'}}>(required)</span>:<span style={{fontSize:'.7rem',fontWeight:400,color:'#c9a227'}}>(optional)</span>}</div>
+                <div style={{fontSize:'.75rem',color:'#4a5568',lineHeight:1.5}}>{isSpeculative?'I authorize GAM to share my completed screening with landlords in the renter pool so they can offer me a place to live. I confirm this to process my check.':'I consent to GAM notifying me of matching vacancies from other landlords on the platform. My report is only shared after I confirm interest and authorize access.'}</div>
               </div>
             </label>
             <label style={{display:'flex',alignItems:'flex-start',gap:12,cursor:'pointer',marginBottom:14,padding:'14px 16px',background:form.acceptedTerms?'rgba(34,197,94,.06)':'#141a22',border:'1px solid '+(form.acceptedTerms?'rgba(34,197,94,.25)':'#1e2530'),borderRadius:10}}>

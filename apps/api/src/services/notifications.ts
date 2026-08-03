@@ -1,6 +1,7 @@
 import { query, queryOne } from '../db'
 import { sendNotificationEmail } from './email'
 import { logger } from '../lib/logger'
+import { isCriticalNotificationType } from '@gam/shared'
 
 // S536 (Nic): SMS is REMOVED platform-wide — notifications and
 // receipts go by email or in-app only. Do not reintroduce an SMS
@@ -39,7 +40,9 @@ export async function createNotification(p: {
 }) {
   try {
     const prefs = await queryOne<any>('SELECT * FROM notification_preferences WHERE user_id=$1 AND type=$2', [p.userId, p.type])
-    const emailOk = prefs ? prefs.email_enabled : true
+    // S570 (Nic): critical types (e.g. failed rent payment) always email — the
+    // pref can't turn it off (UI locks it too). Missing these causes real harm.
+    const emailOk = isCriticalNotificationType(p.type) ? true : (prefs ? prefs.email_enabled : true)
     const inAppOk = prefs ? prefs.in_app_enabled : true
 
     // Capture the inserted notification id so the post-send flag updates can

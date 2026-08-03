@@ -1,4 +1,6 @@
 import { useState, useEffect } from 'react'
+import type { KeyboardEvent as ReactKeyboardEvent, ClipboardEvent as ReactClipboardEvent } from 'react'
+import { useAuth } from '../context/AuthContext'
 import {
   discoverReaders, connectReader, collectCardPayment, cancelCurrentPayment,
   createTerminalIntent, processIntentOnReader, pollPiUntilTerminal,
@@ -8,9 +10,9 @@ import {
 } from '../lib/terminal'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPatch, apiDel } from '../lib/api'
-import { toast, appConfirm, appPrompt } from '../components/dialogs'
-import { enqueue as enqueueSync, preloadMapping, mintClientId } from '../lib/syncQueue'
 import { humanize } from '@gam/shared'
+import { enqueue as enqueueSync, preloadMapping, mintClientId } from '../lib/syncQueue'
+import { toast, appConfirm, appPrompt } from '../components/dialogs'
 
 // S243: Active reader for the terminal flow. Two paths:
 //   - 'smart'     — server-driven (S700, WisePOS E, etc.) registered
@@ -44,16 +46,20 @@ const TAX_TYPES = ['state','city','county','special']
 interface CartItem { id:string; name:string; price:number; qty:number; tax:number; cat:string; icon:string; chargeEligible:boolean }
 
 
+// POS money/quantity fields are never negative. Spread {...nonNeg} into every
+// numeric input to block a value < 0 three ways: typing '-'/'+'/'e', spinner-
+// stepping below 0 (min=0), and pasting a string containing '-'.
+const blockNeg = (e: ReactKeyboardEvent<HTMLInputElement>) => {
+  if (e.key === '-' || e.key === '+' || e.key === 'e' || e.key === 'E') e.preventDefault()
+}
+const blockNegPaste = (e: ReactClipboardEvent<HTMLInputElement>) => {
+  if (e.clipboardData.getData('text').includes('-')) e.preventDefault()
+}
+const nonNeg = { min: 0, onKeyDown: blockNeg, onPaste: blockNegPaste }
+
 export function POSPage() {
   const qc = useQueryClient()
-  // S536 (Nic): the header's Inventory link deep-links the POS stock
-  // tab (?tab=inventory) — POS stock lives HERE, not in the general
-  // property-supplies system.
-  const [tab, setTab] = useState<'register'|'history'|'items'|'categories'|'taxes'|'discounts'|'vendors'|'orders'|'inventory'|'readers'>(() => {
-    const p = new URLSearchParams(window.location.search).get('tab')
-    const valid = ['register','history','items','categories','taxes','discounts','vendors','orders','inventory','readers']
-    return (p && valid.includes(p) ? p : 'register') as any
-  })
+  const [tab, setTab] = useState<'register'|'history'|'items'|'categories'|'taxes'|'discounts'|'vendors'|'orders'|'inventory'|'readers'>('register')
 
   const [cart, setCart] = useState<CartItem[]>([])
   // S536: browser-neutral — no native alert(); transient in-app notice.
@@ -78,8 +84,6 @@ export function POSPage() {
   const [posCustomerId, setPosCustomerId] = useState('')
   const [cashGiven, setCashGiven] = useState('')
   const [filterCat, setFilterCat] = useState('all')
-  // S216: items-tab property filter. 'all' = no filter, 'company-wide'
-  // = items with NULL property_id, or a specific property uuid.
   const [receipt, setReceipt] = useState<any>(null)
   const [appliedDiscount, setAppliedDiscount] = useState<any>(null)
   const [discountCode, setDiscountCode] = useState('')
@@ -153,8 +157,21 @@ export function POSPage() {
   const { data: posCategoriesAll = [] } = useQuery<any[]>(['pos-categories-all', registerProperty], () => apiGet(`/pos/categories?all=1${registerProperty ? '&propertyId='+registerProperty : ''}`), { enabled: tab==='categories' })
   const { data: tenants = [] } = useQuery<any[]>('tenants', () => apiGet('/tenants'))
   // S192: per-property POS — properties list feeds the property
-  // selector on item create/edit.
-  const { data: properties = [] } = useQuery<any[]>('properties', () => apiGet('/properties'))
+  // selector on item create/edit. NotificationBell already pulls
+  // /properties so this is in cache.
+  const { data: allProperties = [] } = useQuery<any[]>('properties', () => apiGet('/properties'))
+  // Property lock: a scoped worker (cashier) only sees the register properties
+  // in their scope. Owners + allProperties=true see everything. Backend enforces
+  // the same via assertPropertyInScope; this just keeps the UI honest so they
+  // can't pick — and accidentally charge — the wrong property.
+  const { user } = useAuth()
+  // Owners send propertyIds=null (→ see all); a scoped worker always sends an
+  // array (even empty), so key off Array.isArray — a mis-assigned worker with
+  // [] correctly sees none rather than falling through to all.
+  const isScoped = !!user && !user.allProperties && Array.isArray(user.propertyIds)
+  const properties = isScoped
+    ? (allProperties as any[]).filter((p: any) => user!.propertyIds!.includes(p.id))
+    : allProperties
   // S254: pos_customers roster for FlexCharge non-tenant picker
   const { data: posCustomers = [] } = useQuery<any[]>('pos-customers', () => apiGet('/landlords/pos-customers'), { enabled: method==='charge' })
   const { data: taxRates = [] } = useQuery<any[]>(['pos-tax-rates', registerProperty], () => apiGet(`/pos/tax-rates${propQ}`), { enabled: tab==='taxes'||tab==='register' })
@@ -449,8 +466,8 @@ export function POSPage() {
       // S254: charge mode posts customer + property scoping for FlexCharge
       tenantId: tenantId||null,
       posCustomerId: method==='charge' ? (posCustomerId||null) : null,
-      // W-12 (S531): every sale carries its property (backend rejects
-      // property-less sales — per-property books/EOD/history).
+      // Always send the register's property (not just for FlexCharge) so every
+      // sale is tied to a property — required for cashier property-lock scoping.
       propertyId: registerProperty || null,
       subtotal:discountedSubtotal, taxAmount, surcharge, total, changeGiven:changeDue,
       discountAmount:discountAmt, discountReason:appliedDiscount?.name||null,
@@ -544,6 +561,8 @@ export function POSPage() {
     { onSuccess: invalCats }
   )
 
+  // W-12: '' in the form means "All locations" — an explicit choice; the
+  // form's default is the page property (synced by the effect below).
   const createTaxMut = useMutation(() => apiPost('/pos/tax-rates', { ...newTax, propertyId: newTax.propertyId || null, rate:Number(newTax.rate)/100, taxType:newTax.taxType, appliesTo:newTax.appliesTo==='all'?['all']:[newTax.appliesTo] }), { onSuccess: () => { qc.invalidateQueries('pos-tax-rates'); setNewTax({ name:'', rate:'', taxType:'state', appliesTo:'all', propertyId:'' }) } })
   const deleteTaxMut = useMutation((id:string) => apiDel(`/pos/tax-rates/${id}`), { onSuccess: () => qc.invalidateQueries('pos-tax-rates') })
   // Tax categories: add + edit-rate. Rates entered as % in the UI, stored as decimals.
@@ -656,18 +675,25 @@ export function POSPage() {
     { onSuccess: () => qc.invalidateQueries('pos-terminal-readers') },
   )
 
+  // Every POS tab is its own permission (`pos.tab.*`) so an owner can grant a
+  // staff member exactly the tabs they need — one cashier gets Register only,
+  // another also gets Discounts, etc. Owners (landlord/admin) see all tabs.
+  // Staff see only tabs whose permission they hold. These keys are toggled on
+  // the per-user permissions page.
+  const isOwner = !!user && ['landlord', 'admin', 'super_admin'].includes(user.role)
+  const canSeeTab = (perm: string) => isOwner || (user?.permissions as any)?.[perm] === true
   const TABS = [
-    { key:'register',  label:'Register' },
-    { key:'history',   label:'History' },
-    { key:'items',     label:'Items' },
-    { key:'categories',label:'Categories' },
-    { key:'taxes',     label:'Tax Rates' },
-    { key:'discounts', label:'Discounts' },
-    { key:'vendors',   label:'Vendors' },
-    { key:'orders',    label:'Orders' },
-    { key:'inventory', label:'Inventory' },
-    { key:'readers',   label:'Readers' },
-  ]
+    { key:'register',  label:'Register',   perm:'pos.tab.register' },
+    { key:'history',   label:'History',    perm:'pos.tab.history' },
+    { key:'items',     label:'Items',      perm:'pos.tab.items' },
+    { key:'categories',label:'Categories', perm:'pos.tab.categories' },
+    { key:'taxes',     label:'Tax Rates',  perm:'pos.tab.taxes' },
+    { key:'discounts', label:'Discounts',  perm:'pos.tab.discounts' },
+    { key:'vendors',   label:'Vendors',    perm:'pos.tab.vendors' },
+    { key:'orders',    label:'Orders',     perm:'pos.tab.orders' },
+    { key:'inventory', label:'Inventory',  perm:'pos.tab.inventory' },
+    { key:'readers',   label:'Readers',    perm:'pos.tab.readers' },
+  ].filter(t => canSeeTab(t.perm))
 
   // S536 (Nic): consolidate configuration under one Settings tab —
   // Register / History / Inventory are daily-use and stay top-level;
@@ -679,6 +705,15 @@ export function POSPage() {
   const settingsTabs = TABS.filter(t => SETTINGS_KEYS.includes(t.key))
   const primaryTabs  = TABS.filter(t => !SETTINGS_KEYS.includes(t.key))
   const inSettings   = SETTINGS_KEYS.includes(tab)
+
+  // If the active tab isn't one this user can see (e.g. a cashier without the
+  // default Register tab), snap to their first available tab so content and
+  // the tab bar stay in sync.
+  const visibleTabKeys = TABS.map(t => t.key).join(',')
+  useEffect(() => {
+    if (TABS.length && !TABS.some(t => t.key === tab)) setTab(TABS[0].key as any)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visibleTabKeys])
 
   if (receipt) return (
     <div>
@@ -713,7 +748,8 @@ export function POSPage() {
         <div style={{display:'flex',alignItems:'center',gap:14}}>
           <h1 className="page-title" style={{margin:0}}>Point of Sale</h1>
           {/* W-12 (S531): ONE property context for the whole POS surface —
-              every tab reads and writes within this property. */}
+              every tab (register, history, items, taxes, …) reads and
+              writes within this property. No cross-property mixing. */}
           {(properties as any[]).length > 1 && (
             <select className="form-select" value={registerProperty} onChange={e=>{ setRegisterProperty(e.target.value); setTenantId(''); setPosCustomerId('') }} style={{width:'auto',minWidth:200}}>
               <option value="" disabled>Select a property…</option>
@@ -837,7 +873,7 @@ export function POSPage() {
               </div>
             </div>
             {method==='cash'&&(<div style={{marginBottom:10}}>
-              <input className="form-input" type="number" placeholder="Cash given" value={cashGiven} onChange={e=>setCashGiven(e.target.value)} style={{width:'100%'}} />
+              <input className="form-input" type="number" {...nonNeg} placeholder="Cash given" value={cashGiven} onChange={e=>setCashGiven(e.target.value)} style={{width:'100%'}} />
               {cashGiven&&Number(cashGiven)>=total&&<div style={{fontSize:'.82rem',color:'var(--green)',fontWeight:600,marginTop:4}}>Change: {fmt(changeDue)}</div>}
             </div>)}
             {method==='charge'&&(<div style={{marginBottom:10,display:'grid',gap:6}}>
@@ -907,7 +943,7 @@ export function POSPage() {
                   <td className="mono">{fmt(t.subtotal)}</td>
                   <td className="mono" style={{fontWeight:600}}>{fmt(t.total)}</td>
                   <td><span className={"badge "+(METHOD_MAP[t.paymentMethod]||'badge-muted')}>{humanize(t.paymentMethod)}</span></td>
-                  <td><span className={"badge "+(STATUS_MAP[t.status]||'badge-muted')}>{humanize(t.status||'completed')}</span></td>
+                  <td><span className={"badge "+(STATUS_MAP[t.status]||'badge-muted')}>{t.status||'completed'}</span></td>
                   <td>{t.status==='completed'&&(<div style={{display:'flex',gap:6}}>
                     <button className="btn btn-ghost btn-sm" onClick={()=>setRefundModal({show:true,tx:t})}>Refund</button>
                     <button className="btn btn-ghost btn-sm" style={{color:'var(--red)'}} onClick={()=>voidMut.mutate(t.id)}>Void</button>
@@ -928,7 +964,7 @@ export function POSPage() {
               <span className="card-title">Add Item</span>
               <div style={{display:'flex',alignItems:'center',gap:6}}>
                 <span style={{fontSize:'.72rem',color:'var(--text-3)'}}>Default margin %</span>
-                <input className="form-input" type="number" style={{width:80}} value={marginEdit}
+                <input className="form-input" type="number" {...nonNeg} style={{width:80}} value={marginEdit}
                   placeholder={defaultMarginPct!=null?String(defaultMarginPct):'none'}
                   onChange={e=>setMarginEdit(e.target.value)} />
                 <button className="btn btn-ghost btn-sm" disabled={saveMarginMut.isLoading}
@@ -938,11 +974,11 @@ export function POSPage() {
             <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:12,marginTop:12}}>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Name</div><input className="form-input" value={newItem.name} onChange={e=>setNewItem(s=>({...s,name:e.target.value}))} style={{width:'100%'}} /></div>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Category</div><select className="form-select" value={newItem.categoryId} onChange={e=>setNewItem(s=>({...s,categoryId:e.target.value}))} style={{width:'100%'}}>{categoriesForProperty(registerProperty).map(c=><option key={c.id} value={c.id}>{c.name}</option>)}</select></div>
-              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Cost Price</div><input className="form-input" type="number" value={newItem.costPrice} onChange={e=>setItemCost(e.target.value)} style={{width:'100%'}} /></div>
-              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Margin %{defaultMarginPct!=null?` (default ${defaultMarginPct})`:''}</div><input className="form-input" type="number" value={newItem.marginPct} onChange={e=>setItemMargin(e.target.value)} placeholder={defaultMarginPct!=null?String(defaultMarginPct):'—'} style={{width:'100%'}} /></div>
-              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Sell Price{newItem.costPrice&&newItem.marginPct?' (auto)':''}</div><input className="form-input" type="number" value={newItem.sellPrice} onChange={e=>setItemSell(e.target.value)} style={{width:'100%'}} /></div>
+              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Cost Price</div><input className="form-input" type="number" {...nonNeg} value={newItem.costPrice} onChange={e=>setItemCost(e.target.value)} style={{width:'100%'}} /></div>
+              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Margin %{defaultMarginPct!=null?` (default ${defaultMarginPct})`:''}</div><input className="form-input" type="number" {...nonNeg} value={newItem.marginPct} onChange={e=>setItemMargin(e.target.value)} placeholder={defaultMarginPct!=null?String(defaultMarginPct):'—'} style={{width:'100%'}} /></div>
+              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Sell Price{newItem.costPrice&&newItem.marginPct?' (auto)':''}</div><input className="form-input" type="number" {...nonNeg} value={newItem.sellPrice} onChange={e=>setItemSell(e.target.value)} style={{width:'100%'}} /></div>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Tax Category</div><select className="form-select" value={newItem.taxCategoryId} onChange={e=>setNewItem(s=>({...s,taxCategoryId:e.target.value}))} style={{width:'100%'}}><option value="">— none (0%) —</option>{(posTaxCategories as any[]).map((t:any)=><option key={t.id} value={t.id}>{t.name} ({(Number(t.rate)*100).toFixed(2)}%)</option>)}</select></div>
-              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Stock Qty</div><input className="form-input" type="number" value={newItem.stockQty} onChange={e=>setNewItem(s=>({...s,stockQty:e.target.value}))} style={{width:'100%'}} /></div>
+              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Stock Qty</div><input className="form-input" type="number" {...nonNeg} value={newItem.stockQty} onChange={e=>setNewItem(s=>({...s,stockQty:e.target.value}))} style={{width:'100%'}} /></div>
               {!LAUNCH_HIDE_CHARGE && <div style={{display:'flex',alignItems:'center',gap:8,paddingTop:20}}><input type="checkbox" id="ce" checked={newItem.chargeEligible} onChange={e=>setNewItem(s=>({...s,chargeEligible:e.target.checked}))} /><label htmlFor="ce" style={{fontSize:'.82rem'}}>Charge eligible</label></div>}
               {/* S192: property selector. Empty = company-wide. */}
             </div>
@@ -1101,7 +1137,7 @@ export function POSPage() {
                 {(posTaxCategories as any[]).map((t:any)=>(
                   <tr key={t.id}>
                     <td style={{fontWeight:500}}>{t.name}</td>
-                    <td><input className="form-input" type="number" step="0.01" key={t.rate} defaultValue={(Number(t.rate)*100).toFixed(2)} onBlur={e=>{const v=Number(e.target.value)/100; if(v!==Number(t.rate)) updateTaxCatMut.mutate({id:t.id,rate:v})}} style={{width:100}} /></td>
+                    <td><input className="form-input" type="number" {...nonNeg} step="0.01" key={t.rate} defaultValue={(Number(t.rate)*100).toFixed(2)} onBlur={e=>{const v=Number(e.target.value)/100; if(v!==Number(t.rate)) updateTaxCatMut.mutate({id:t.id,rate:v})}} style={{width:100}} /></td>
                     <td><button onClick={()=>updateTaxCatMut.mutate({id:t.id,isActive:!t.isActive})} style={{background:'var(--bg-2)',border:'1px solid var(--border-1)',borderRadius:4,padding:'2px 8px',cursor:'pointer',fontSize:'.75rem',color:t.isActive?'var(--green)':'var(--text-3)'}}>{t.isActive?'Active':'Off'}</button></td>
                   </tr>
                 ))}
@@ -1109,7 +1145,7 @@ export function POSPage() {
             </table>
             <div style={{display:'flex',gap:8,marginTop:12,alignItems:'center'}}>
               <input className="form-input" placeholder="New tax category (e.g. Candy)" value={newTaxCat.name} onChange={e=>setNewTaxCat(s=>({...s,name:e.target.value}))} style={{flex:1}} />
-              <input className="form-input" type="number" step="0.01" placeholder="Rate %" value={newTaxCat.ratePct} onChange={e=>setNewTaxCat(s=>({...s,ratePct:e.target.value}))} style={{width:110}} />
+              <input className="form-input" type="number" {...nonNeg} step="0.01" placeholder="Rate %" value={newTaxCat.ratePct} onChange={e=>setNewTaxCat(s=>({...s,ratePct:e.target.value}))} style={{width:110}} />
               <button className="btn btn-primary" onClick={()=>createTaxCatMut.mutate()} disabled={!newTaxCat.name||createTaxCatMut.isLoading}>{createTaxCatMut.isLoading?'Adding…':'Add'}</button>
             </div>
           </div>
@@ -1117,7 +1153,7 @@ export function POSPage() {
             <div className="card-header"><span className="card-title">Add Tax Rate</span></div>
             <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:12,marginTop:12}}>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Name</div><input className="form-input" placeholder="State Tax" value={newTax.name} onChange={e=>setNewTax(s=>({...s,name:e.target.value}))} style={{width:'100%'}} /></div>
-              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Rate %</div><input className="form-input" type="number" value={newTax.rate} onChange={e=>setNewTax(s=>({...s,rate:e.target.value}))} style={{width:'100%'}} /></div>
+              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Rate %</div><input className="form-input" type="number" {...nonNeg} value={newTax.rate} onChange={e=>setNewTax(s=>({...s,rate:e.target.value}))} style={{width:'100%'}} /></div>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Type</div><select className="form-select" value={newTax.taxType} onChange={e=>setNewTax(s=>({...s,taxType:e.target.value}))} style={{width:'100%'}}>{TAX_TYPES.map(t=><option key={t} value={t}>{humanize(t)}</option>)}</select></div>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Applies To</div><select className="form-select" value={newTax.appliesTo} onChange={e=>setNewTax(s=>({...s,appliesTo:e.target.value}))} style={{width:'100%'}}><option value="all">All categories</option>{categoriesForProperty(newTax.propertyId).map(c=><option key={c.name} value={c.name}>{c.name}</option>)}</select></div>
               {/* S217: property selector. Empty = company-wide library. */}
@@ -1185,7 +1221,7 @@ export function POSPage() {
             <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:12,marginTop:12}}>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Name</div><input className="form-input" placeholder="Senior Discount" value={newDiscount.name} onChange={e=>setNewDiscount(s=>({...s,name:e.target.value}))} style={{width:'100%'}} /></div>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Type</div><select className="form-select" value={newDiscount.type} onChange={e=>setNewDiscount(s=>({...s,type:e.target.value}))} style={{width:'100%'}}><option value="percent">Percent %</option><option value="fixed">Fixed $</option></select></div>
-              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Value</div><input className="form-input" type="number" value={newDiscount.value} onChange={e=>setNewDiscount(s=>({...s,value:e.target.value}))} style={{width:'100%'}} /></div>
+              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Value</div><input className="form-input" type="number" {...nonNeg} value={newDiscount.value} onChange={e=>setNewDiscount(s=>({...s,value:e.target.value}))} style={{width:'100%'}} /></div>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Code (optional)</div><input className="form-input" placeholder="SENIOR10" value={newDiscount.code} onChange={e=>setNewDiscount(s=>({...s,code:e.target.value}))} style={{width:'100%'}} /></div>
             </div>
             <button className="btn btn-primary" style={{marginTop:12}} onClick={()=>createDiscountMut.mutate()} disabled={!newDiscount.name||!newDiscount.value}>Add Discount</button>
@@ -1195,7 +1231,7 @@ export function POSPage() {
               <thead><tr><th>Name</th><th>Type</th><th>Value</th><th>Code</th><th></th></tr></thead>
               <tbody>
                 {(discounts as any[]).length?(discounts as any[]).map((d:any)=>(<tr key={d.id}>
-                  <td style={{fontWeight:500}}>{d.name}</td><td><span className="badge badge-muted">{d.type}</span></td>
+                  <td style={{fontWeight:500}}>{d.name}</td><td><span className="badge badge-muted">{humanize(d.type)}</span></td>
                   <td className="mono">{d.type==='percent'?d.value+"%":fmt(d.value)}</td>
                   <td className="mono" style={{color:'var(--gold)'}}>{d.code||'—'}</td>
                   <td><button className="btn btn-ghost btn-sm" style={{color:'var(--red)'}} onClick={()=>deleteDiscountMut.mutate(d.id)}>Remove</button></td>
@@ -1216,7 +1252,7 @@ export function POSPage() {
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Email</div><input className="form-input" style={{width:'100%'}} placeholder="orders@vendor.com" value={newVendor.email} onChange={e=>setNewVendor(s=>({...s,email:e.target.value}))} /></div>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Phone</div><input className="form-input" style={{width:'100%'}} placeholder="(555) 000-0000" value={newVendor.phone} onChange={e=>setNewVendor(s=>({...s,phone:e.target.value}))} /></div>
               <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Address</div><input className="form-input" style={{width:'100%'}} placeholder="123 Main St" value={newVendor.address} onChange={e=>setNewVendor(s=>({...s,address:e.target.value}))} /></div>
-              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Lead Time (days)</div><input className="form-input" type="number" style={{width:'100%'}} value={newVendor.leadTimeDays} onChange={e=>setNewVendor(s=>({...s,leadTimeDays:e.target.value}))} /></div>
+              <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Lead Time (days)</div><input className="form-input" type="number" {...nonNeg} style={{width:'100%'}} value={newVendor.leadTimeDays} onChange={e=>setNewVendor(s=>({...s,leadTimeDays:e.target.value}))} /></div>
               <div style={{gridColumn:'1/-1'}}><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Notes</div><input className="form-input" style={{width:'100%'}} placeholder="Optional notes" value={newVendor.notes} onChange={e=>setNewVendor(s=>({...s,notes:e.target.value}))} /></div>
             </div>
             <button className="btn btn-primary" style={{marginTop:12}} onClick={()=>createVendorMut.mutate()} disabled={!newVendor.name||createVendorMut.isLoading}>Add Vendor</button>
@@ -1263,8 +1299,8 @@ export function POSPage() {
                     {(items as any[]).map((i:any)=><option key={i.id} value={i.id}>{i.name}</option>)}
                   </select>
                 </div>
-                <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:3}}>Qty</div><input className="form-input" type="number" style={{width:'100%'}} value={poItemRow.qtyOrdered} onChange={e=>setPoItemRow(s=>({...s,qtyOrdered:e.target.value}))} /></div>
-                <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:3}}>Unit Cost</div><input className="form-input" type="number" style={{width:'100%'}} value={poItemRow.unitCost} onChange={e=>setPoItemRow(s=>({...s,unitCost:e.target.value}))} /></div>
+                <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:3}}>Qty</div><input className="form-input" type="number" {...nonNeg} style={{width:'100%'}} value={poItemRow.qtyOrdered} onChange={e=>setPoItemRow(s=>({...s,qtyOrdered:e.target.value}))} /></div>
+                <div><div style={{fontSize:'.72rem',color:'var(--text-3)',marginBottom:3}}>Unit Cost</div><input className="form-input" type="number" {...nonNeg} style={{width:'100%'}} value={poItemRow.unitCost} onChange={e=>setPoItemRow(s=>({...s,unitCost:e.target.value}))} /></div>
                 <button className="btn btn-ghost" style={{height:36}} onClick={()=>{
                   const it=(items as any[]).find((x:any)=>x.id===poItemRow.itemId)
                   setPoItems(p=>[...p,{itemId:poItemRow.itemId,itemName:it?.name||'Custom Item',qtyOrdered:Number(poItemRow.qtyOrdered)||1,unitCost:Number(poItemRow.unitCost)||0}])
@@ -1298,7 +1334,7 @@ export function POSPage() {
                     <td style={{fontWeight:500}}>{po.vendorName}</td>
                     <td className="mono">{po.itemCount}</td>
                     <td className="mono">{fmt(po.subtotal)}</td>
-                    <td><span className={"badge "+(po.status==='received'?'badge-green':po.status==='draft'?'badge-muted':po.status==='sent'?'badge-blue':'badge-amber')}>{po.status}</span></td>
+                    <td><span className={"badge "+(po.status==='received'?'badge-green':po.status==='draft'?'badge-muted':po.status==='sent'?'badge-blue':'badge-amber')}>{humanize(po.status)}</span></td>
                     <td style={{fontSize:'.82rem',color:'var(--text-3)'}}>{po.expectedDate?new Date(po.expectedDate).toLocaleDateString():'—'}</td>
                     <td><div style={{display:'flex',gap:6}} onClick={e=>e.stopPropagation()}>
                       {po.status==='draft'&&<button className="btn btn-ghost btn-sm" onClick={()=>updatePOMut.mutate({id:po.id,status:'sent'})}>Mark Sent</button>}
@@ -1456,11 +1492,11 @@ export function POSPage() {
         <div style={{padding:'0 24px 24px',display:'grid',gridTemplateColumns:'1fr 1fr',gap:12}}>
           <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Name</div><input className="form-input" style={{width:'100%'}} value={editItem.name} onChange={e=>setEditItem((s:any)=>({...s,name:e.target.value}))} /></div>
           <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Category</div><select className="form-select" style={{width:'100%'}} value={editItem.categoryId} onChange={e=>setEditItem((s:any)=>({...s,categoryId:e.target.value}))}>{categoriesForProperty(editItem.propertyId).map(c=><option key={c.id} value={c.id}>{c.name}</option>)}</select></div>
-          <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Sell Price</div><input className="form-input" style={{width:'100%'}} type="number" value={editItem._sell} onChange={e=>setEditItem((s:any)=>({...s,_sell:e.target.value}))} /></div>
-          <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Cost Price</div><input className="form-input" style={{width:'100%'}} type="number" value={editItem._cost} onChange={e=>setEditItem((s:any)=>({...s,_cost:e.target.value}))} /></div>
+          <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Sell Price</div><input className="form-input" style={{width:'100%'}} type="number" {...nonNeg} value={editItem._sell} onChange={e=>setEditItem((s:any)=>({...s,_sell:e.target.value}))} /></div>
+          <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Cost Price</div><input className="form-input" style={{width:'100%'}} type="number" {...nonNeg} value={editItem._cost} onChange={e=>setEditItem((s:any)=>({...s,_cost:e.target.value}))} /></div>
           <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Tax Category</div><select className="form-select" style={{width:'100%'}} value={editItem._taxCategoryId} onChange={e=>setEditItem((s:any)=>({...s,_taxCategoryId:e.target.value}))}><option value="">— none (0%) —</option>{(posTaxCategories as any[]).map((t:any)=><option key={t.id} value={t.id}>{t.name} ({(Number(t.rate)*100).toFixed(2)}%)</option>)}</select></div>
-          <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Stock Qty</div><input className="form-input" style={{width:'100%'}} type="number" value={editItem._stock} onChange={e=>setEditItem((s:any)=>({...s,_stock:e.target.value}))} /></div>
-          <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Stock Min</div><input className="form-input" style={{width:'100%'}} type="number" value={editItem._min} onChange={e=>setEditItem((s:any)=>({...s,_min:e.target.value}))} /></div>
+          <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Stock Qty</div><input className="form-input" style={{width:'100%'}} type="number" {...nonNeg} value={editItem._stock} onChange={e=>setEditItem((s:any)=>({...s,_stock:e.target.value}))} /></div>
+          <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Stock Min</div><input className="form-input" style={{width:'100%'}} type="number" {...nonNeg} value={editItem._min} onChange={e=>setEditItem((s:any)=>({...s,_min:e.target.value}))} /></div>
           {/* S192: property reassignment. null = company-wide. */}
           <div style={{gridColumn:'1/-1'}}>
             <div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>
@@ -1533,7 +1569,7 @@ export function POSPage() {
           <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Contact</div><input className="form-input" style={{width:'100%'}} value={editVendor.contactName||''} onChange={e=>setEditVendor((s:any)=>({...s,contactName:e.target.value}))} /></div>
           <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Email</div><input className="form-input" style={{width:'100%'}} value={editVendor.email||''} onChange={e=>setEditVendor((s:any)=>({...s,email:e.target.value}))} /></div>
           <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Phone</div><input className="form-input" style={{width:'100%'}} value={editVendor.phone||''} onChange={e=>setEditVendor((s:any)=>({...s,phone:e.target.value}))} /></div>
-          <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Lead Time (days)</div><input className="form-input" type="number" style={{width:'100%'}} value={editVendor.leadTimeDays||3} onChange={e=>setEditVendor((s:any)=>({...s,leadTimeDays:Number(e.target.value)}))} /></div>
+          <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Lead Time (days)</div><input className="form-input" type="number" {...nonNeg} style={{width:'100%'}} value={editVendor.leadTimeDays||3} onChange={e=>setEditVendor((s:any)=>({...s,leadTimeDays:Number(e.target.value)}))} /></div>
           <div style={{display:'flex',alignItems:'center',gap:8,paddingTop:20}}><input type="checkbox" id="va" checked={editVendor.isActive} onChange={e=>setEditVendor((s:any)=>({...s,isActive:e.target.checked}))} /><label htmlFor="va" style={{fontSize:'.82rem'}}>Active</label></div>
           <div style={{gridColumn:'1/-1',marginTop:8}}><button className="btn btn-primary" style={{width:'100%'}} onClick={()=>updateVendorMut.mutate({name:editVendor.name,contactName:editVendor.contactName,email:editVendor.email,phone:editVendor.phone,leadTimeDays:editVendor.leadTimeDays,isActive:editVendor.isActive})} disabled={updateVendorMut.isLoading}>{updateVendorMut.isLoading?'Saving...':'Save Changes'}</button></div>
         </div>
@@ -1576,7 +1612,7 @@ export function POSPage() {
         <div className="modal-header"><span className="modal-title">Open Item</span><button className="btn btn-ghost btn-sm" onClick={()=>setOpenItem(o=>({...o,show:false}))}>x</button></div>
         <div style={{padding:'0 24px 24px',display:'grid',gap:12}}>
           <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Description</div><input className="form-input" style={{width:'100%'}} placeholder="Item name" value={openItem.name} onChange={e=>setOpenItem(o=>({...o,name:e.target.value}))} /></div>
-          <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Price</div><input className="form-input" style={{width:'100%'}} type="number" value={openItem.price} onChange={e=>setOpenItem(o=>({...o,price:e.target.value}))} /></div>
+          <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Price</div><input className="form-input" style={{width:'100%'}} type="number" {...nonNeg} value={openItem.price} onChange={e=>setOpenItem(o=>({...o,price:e.target.value}))} /></div>
           <button className="btn btn-primary" onClick={addOpenItem} disabled={!openItem.name||!openItem.price}>Add to Cart</button>
         </div>
       </div></div>)}
@@ -1585,7 +1621,7 @@ export function POSPage() {
         <div className="modal-header"><span className="modal-title">Refund Transaction</span><button className="btn btn-ghost btn-sm" onClick={()=>setRefundModal({show:false,tx:null})}>x</button></div>
         <div style={{padding:'0 24px 24px',display:'grid',gap:12}}>
           <div style={{fontSize:'.85rem',color:'var(--text-3)'}}>Original total: <strong style={{color:'var(--text-0)'}}>{fmt(refundModal.tx?.total)}</strong></div>
-          <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Refund Amount (blank for full refund)</div><input className="form-input" style={{width:'100%'}} type="number" value={refundAmt} onChange={e=>setRefundAmt(e.target.value)} /></div>
+          <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Refund Amount (blank for full refund)</div><input className="form-input" style={{width:'100%'}} type="number" {...nonNeg} value={refundAmt} onChange={e=>setRefundAmt(e.target.value)} /></div>
           <div><div style={{fontSize:'.75rem',color:'var(--text-3)',marginBottom:4}}>Reason</div><input className="form-input" style={{width:'100%'}} value={refundReason} onChange={e=>setRefundReason(e.target.value)} /></div>
           {!LAUNCH_HIDE_CHARGE && refundModal.tx?.paymentMethod === 'charge' ? (
             <div style={{fontSize:'.8rem',color:'var(--text-3)',padding:'8px 12px',background:'var(--bg-2)',borderRadius:4}}>Reverses on FlexCharge account (no cash payout).</div>

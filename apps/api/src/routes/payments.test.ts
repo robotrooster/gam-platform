@@ -120,7 +120,10 @@ async function seed(): Promise<Fixture> {
                               profileId: bLid, permissions: {} }),
       tokenTenant1: sign({ userId: tenant1UserId, role: 'tenant', email: 't1@t.dev',
                             profileId: tenant1Id }),
-      tokenAdmin: sign({ userId: randomUUID(), role: 'admin', email: 'admin@t.dev',
+      // super_admin: GET /api/payments is portfolio-scoped for REGULAR admins
+      // (S567) — a plain admin only sees payments of landlords they close/service.
+      // These tests assert the full/unscoped view, which is the super_admin lens.
+      tokenAdmin: sign({ userId: randomUUID(), role: 'super_admin', email: 'admin@t.dev',
                           profileId: randomUUID() }),
     }
   } catch (e) { await c.query('ROLLBACK'); throw e }
@@ -710,6 +713,20 @@ describe('POST /api/payments/:id/record-manual', () => {
     expect(fee.entry_description).toBe('MANUALPAY')
   })
 
+  it('S570 21-day window: first payment on a property onboarded >21 days ago → fee NOT waived', async () => {
+    const f = await seed()
+    // Push the property's onboarding date outside the 21-day migration window.
+    await db.query(`UPDATE properties SET created_at = NOW() - INTERVAL '30 days' WHERE id=$1`, [f.aPropId])
+    const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, amount: 1000 })
+    const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+      .send({ method: 'check' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.feeWaived).toBe(false)   // outside window → no free pass even on first payment
+    expect(res.body.data.feeAmount).toBe(10)
+    expect(res.body.data.feePaymentId).toBeTruthy()
+  })
+
   it('non-rent charge → 409', async () => {
     const f = await seed()
     const pid = await seedPayment({ unitId: f.aUnitId, tenantId: f.tenant1Id, landlordId: f.aLid, type: 'utility', amount: 50 })
@@ -750,5 +767,85 @@ describe('POST /api/payments/:id/record-manual', () => {
     const res = await request(buildApp()).post(`/api/payments/${pid}/record-manual`)
       .set('Authorization', `Bearer ${f.tokenLandlordA}`).send({ method: 'venmo' })
     expect(res.status).toBe(400)
+  })
+})
+
+// ─── POST /api/payments/:id/record-prior-arrangement (S568) ──────────────
+// Onboarding reconciliation: FIRST rent charge of a lease, while the LANDLORD is
+// still inside their reconciliation window, paid off-platform (old-system autopay
+// overlap). Fee-free, one-time. New-vs-imported lease is irrelevant.
+describe('POST /api/payments/:id/record-prior-arrangement', () => {
+  // Set the landlord's reconciliation window open/closed, and insert a
+  // lease-linked rent payment on the fixture's lease.
+  async function seedLeaseRent(f: any, opts: { windowOpen?: boolean } = {}) {
+    await db.query(
+      `UPDATE landlords SET reconciliation_until = NOW() + ($2::int) * INTERVAL '1 day' WHERE id = $1`,
+      [f.aLid, opts.windowOpen === false ? -1 : 10])
+    const { rows: [{ id }] } = await db.query<{ id: string }>(
+      `INSERT INTO payments (unit_id, tenant_id, landlord_id, lease_id, type, amount, status, entry_description, due_date)
+       VALUES ($1,$2,$3,$4,'rent',1000,'pending','RENT',CURRENT_DATE) RETURNING id`,
+      [f.aUnitId, f.tenant1Id, f.aLid, f.lease1Id])
+    return id
+  }
+
+  it('first rent while reconciliation window open → settled off-platform, NO fee', async () => {
+    const f = await seed()
+    const pid = await seedLeaseRent(f, { windowOpen: true })
+    const res = await request(buildApp()).post(`/api/payments/${pid}/record-prior-arrangement`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`).send({})
+    expect(res.status).toBe(200)
+    expect(res.body.data.feeCharged).toBe(false)
+    const { rows: [p] } = await db.query<any>(
+      `SELECT status, manual_method, platform_held FROM payments WHERE id=$1`, [pid])
+    expect(p.status).toBe('settled')
+    expect(p.manual_method).toBe('prior_arrangement')
+    expect(p.platform_held).toBe(false)
+    const { rows: fees } = await db.query<any>(
+      `SELECT id FROM payments WHERE type='fee' AND tenant_id=$1`, [f.tenant1Id])
+    expect(fees.length).toBe(0)   // never a fee
+  })
+
+  it('works regardless of lease_source (new e-signed lease still eligible)', async () => {
+    const f = await seed()
+    await db.query(`UPDATE leases SET lease_source='esigned' WHERE id=$1`, [f.lease1Id])
+    const pid = await seedLeaseRent(f, { windowOpen: true })
+    const res = await request(buildApp()).post(`/api/payments/${pid}/record-prior-arrangement`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`).send({})
+    expect(res.status).toBe(200)
+  })
+
+  it('landlord reconciliation window closed → 409', async () => {
+    const f = await seed()
+    const pid = await seedLeaseRent(f, { windowOpen: false })
+    const res = await request(buildApp()).post(`/api/payments/${pid}/record-prior-arrangement`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`).send({})
+    expect(res.status).toBe(409)
+    expect(res.body.message || res.body.error).toMatch(/reconciliation window has closed/i)
+  })
+
+  it('not the first rent (a later rent already paid) → 409', async () => {
+    const f = await seed()
+    await db.query(
+      `INSERT INTO payments (unit_id, tenant_id, landlord_id, lease_id, type, amount, status, entry_description, due_date, settled_at)
+       VALUES ($1,$2,$3,$4,'rent',1000,'settled','RENT',CURRENT_DATE - INTERVAL '1 month', NOW())`,
+      [f.aUnitId, f.tenant1Id, f.aLid, f.lease1Id])
+    const pid = await seedLeaseRent(f, { windowOpen: true })
+    const res = await request(buildApp()).post(`/api/payments/${pid}/record-prior-arrangement`)
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`).send({})
+    expect(res.status).toBe(409)
+    expect(res.body.message || res.body.error).toMatch(/first rent/i)
+  })
+
+  it('GET /payments exposes priorArrangementEligible on the eligible first rent', async () => {
+    const f = await seed()
+    const pid = await seedLeaseRent(f, { windowOpen: true })
+    const res = await request(buildApp()).get('/api/payments')
+      .set('Authorization', `Bearer ${f.tokenLandlordA}`)
+    expect(res.status).toBe(200)
+    // buildApp() here does NOT mount the global camel-case middleware (that's on
+    // the real app in index.ts), so the key is snake_case in this test. In prod
+    // the response is camelized → priorArrangementEligible, which the UI reads.
+    const row = res.body.data.find((r: any) => r.id === pid)
+    expect(row.prior_arrangement_eligible).toBe(true)
   })
 })

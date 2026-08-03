@@ -20,6 +20,10 @@ export interface InspectionUnitRow {
   bathrooms?: number | null
   unit_type: string | null
   dwelling_ownership?: string | null
+  is_multi_level?: boolean | null
+  is_ada_accessible?: boolean | null
+  living_areas?: number | null
+  features?: Record<string, unknown> | null
   guided_walkthrough_declined?: boolean
 }
 
@@ -37,6 +41,10 @@ export async function checklistProgress(insp: InspectionUnitRow): Promise<Checkl
     bedrooms: insp.bedrooms,
     bathrooms: insp.bathrooms ?? null,
     dwellingOwnership: insp.dwelling_ownership ?? null,
+    isMultiLevel: insp.is_multi_level ?? null,
+    isAdaAccessible: insp.is_ada_accessible ?? null,
+    livingAreas: insp.living_areas ?? null,
+    features: insp.features ?? null,
   })
   // Areas that already have at least one photo. Case-insensitive so an ad-hoc
   // "kitchen" item still counts toward the standard "Kitchen" area.
