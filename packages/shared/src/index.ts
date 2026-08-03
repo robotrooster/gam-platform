@@ -2009,6 +2009,20 @@ export const UNIT_TYPE_HAS_BEDROOMS: Record<UnitType, boolean> = {
   commercial:    false,
 }
 
+// ---------- Landlord-issued tenant account credits (S577 — Nic) ----------
+// A landlord issues a credit to a tenant for any reason; it's applied to the
+// tenant's next rent invoice (funded by the landlord = less rent received).
+// Single source of truth for the tenant_credits.category CHECK.
+export const TENANT_CREDIT_CATEGORIES = ['screening_cap', 'late_fee_refund', 'overcharge', 'goodwill', 'other'] as const
+export type TenantCreditCategory = typeof TENANT_CREDIT_CATEGORIES[number]
+export const TENANT_CREDIT_CATEGORY_LABEL: Record<TenantCreditCategory, string> = {
+  screening_cap:   'Screening fee (state cap)',
+  late_fee_refund: 'Late fee refund',
+  overcharge:      'Overcharge correction',
+  goodwill:        'Goodwill',
+  other:           'Other',
+}
+
 // ---------- Property-scoped tenant surveys (S577 — Nic) ----------
 // A landlord-authored, Google-Forms-style questionnaire sent to the tenants of
 // ONE property. Responses are never mixed across properties; "same survey at

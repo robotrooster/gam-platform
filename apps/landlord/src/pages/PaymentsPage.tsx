@@ -2,11 +2,12 @@ import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { humanize, MANUAL_PAYMENT_METHODS, MANUAL_PAYMENT_METHOD_LABELS,
-         MANUAL_PAYMENT_FEE, type ManualPaymentMethod } from '@gam/shared'
+         MANUAL_PAYMENT_FEE, type ManualPaymentMethod,
+         TENANT_CREDIT_CATEGORIES, TENANT_CREDIT_CATEGORY_LABEL } from '@gam/shared'
 import { apiGet, apiPost } from '../lib/api'
 import { usePerms } from '../lib/permissions'
 import { SearchBox, PropertySelect } from '../components/ListControls'
-import { X, AlertTriangle, CheckCircle, Clock, XCircle } from 'lucide-react'
+import { X, AlertTriangle, CheckCircle, Clock, XCircle, Gift } from 'lucide-react'
 
 const fmt = (n: any) => n != null
   ? '$' + Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
@@ -305,11 +306,81 @@ function PaymentDetailModal({ payment: p, onClose, canRecord, onRecorded }: {
   )
 }
 
+// S577: landlord issues a credit to a tenant (screening cap, late-fee refund,
+// overcharge, goodwill). Applied to the tenant's next rent invoice; funded by
+// the landlord (they receive less rent). Independent of work-trade.
+function IssueCreditModal({ onClose, onDone }: { onClose: () => void; onDone: (msg: string) => void }) {
+  const { data: leases = [] } = useQuery<any[]>('leases', () => apiGet('/leases'))
+  const activeLeases = (leases as any[]).filter((l: any) => l.status === 'active')
+  const [leaseId, setLeaseId] = useState('')
+  const [amount, setAmount] = useState('')
+  const [category, setCategory] = useState<string>('goodwill')
+  const [reason, setReason] = useState('')
+  const [error, setError] = useState<string | null>(null)
+  const mut = useMutation(
+    () => apiPost('/tenant-credits', { leaseId, amount: Number(amount), category, reason: reason || null }),
+    { onSuccess: () => onDone(`Credit of $${Number(amount).toFixed(2)} issued — it will apply to the tenant's next rent.`),
+      onError: (e: any) => setError(e?.response?.data?.error || 'Could not issue the credit') })
+  const valid = leaseId && amount !== '' && Number(amount) > 0
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.6)', display: 'flex', alignItems: 'flex-start', justifyContent: 'center', padding: 24, zIndex: 100, overflowY: 'auto' }} onClick={onClose}>
+      <div className="card" style={{ width: '100%', maxWidth: 460, padding: 20 }} onClick={e => e.stopPropagation()}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
+          <h2 style={{ fontSize: '1.05rem', fontWeight: 700, margin: 0, display: 'flex', alignItems: 'center', gap: 8 }}><Gift size={17} style={{ color: 'var(--gold)' }} /> Issue Credit</h2>
+          <button className="btn btn-ghost btn-sm" onClick={onClose}><X size={16} /></button>
+        </div>
+        <p style={{ fontSize: '.78rem', color: 'var(--text-3)', marginBottom: 14, lineHeight: 1.5 }}>
+          The credit applies to the tenant's next rent invoice — you receive that much less rent. Use it for a
+          refund, an overcharge correction, a capped-state screening difference, or goodwill.
+        </p>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+          <div>
+            <span style={{ fontSize: '.72rem', color: 'var(--text-3)', display: 'block', marginBottom: 4 }}>Lease / tenant</span>
+            <select className="form-select" value={leaseId} onChange={e => setLeaseId(e.target.value)} style={{ width: '100%' }}>
+              <option value="" disabled>Select a lease…</option>
+              {activeLeases.map((l: any) => (
+                <option key={l.id} value={l.id}>{(l.unitNumber || l.unit_number || 'Unit')} · {(l.propertyName || l.property_name || '')}</option>
+              ))}
+            </select>
+          </div>
+          <div style={{ display: 'flex', gap: 10 }}>
+            <div style={{ flex: 1 }}>
+              <span style={{ fontSize: '.72rem', color: 'var(--text-3)', display: 'block', marginBottom: 4 }}>Amount ($)</span>
+              <input className="form-input mono" type="text" inputMode="decimal" value={amount}
+                onChange={e => { const v = e.target.value; if (v === '' || /^\d*\.?\d*$/.test(v)) setAmount(v) }}
+                placeholder="0.00" style={{ width: '100%' }} />
+            </div>
+            <div style={{ flex: 1 }}>
+              <span style={{ fontSize: '.72rem', color: 'var(--text-3)', display: 'block', marginBottom: 4 }}>Reason</span>
+              <select className="form-select" value={category} onChange={e => setCategory(e.target.value)} style={{ width: '100%' }}>
+                {TENANT_CREDIT_CATEGORIES.map(c => <option key={c} value={c}>{TENANT_CREDIT_CATEGORY_LABEL[c]}</option>)}
+              </select>
+            </div>
+          </div>
+          <div>
+            <span style={{ fontSize: '.72rem', color: 'var(--text-3)', display: 'block', marginBottom: 4 }}>Note (optional)</span>
+            <input className="form-input" value={reason} onChange={e => setReason(e.target.value)} placeholder="e.g. refunded May late fee" style={{ width: '100%' }} />
+          </div>
+          {error && <div style={{ color: 'var(--red, #dc2626)', fontSize: '.8rem' }}>{error}</div>}
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 4 }}>
+            <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+            <button className="btn btn-primary" disabled={!valid || mut.isLoading} onClick={() => { setError(null); mut.mutate() }}>
+              {mut.isLoading ? 'Issuing…' : 'Issue Credit'}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 export function PaymentsPage() {
   const { data: payments = [], isLoading } = useQuery<any[]>('payments', () => apiGet('/payments'))
   const [selected, setSelected] = useState<any>(null)
   const [search, setSearch] = useState('')
   const [propertyName, setPropertyName] = useState('')
+  const [creditOpen, setCreditOpen] = useState(false)
+  const [creditNotice, setCreditNotice] = useState<string | null>(null)
   const navigate = useNavigate()
   const { can } = usePerms()
   const queryClient = useQueryClient()
@@ -336,12 +407,24 @@ export function PaymentsPage() {
           <h1 className="page-title">Payments</h1>
           <p className="page-subtitle">Tenant ACH collections</p>
         </div>
-        {can('payments.import_history') && (
-          <button className="btn btn-ghost" onClick={() => navigate('/payment-history-onboarding')}>
-            Import payment history
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button className="btn btn-primary" onClick={() => setCreditOpen(true)}>
+            <Gift size={15} /> Issue Credit
           </button>
-        )}
+          {can('payments.import_history') && (
+            <button className="btn btn-ghost" onClick={() => navigate('/payment-history-onboarding')}>
+              Import payment history
+            </button>
+          )}
+        </div>
       </div>
+
+      {creditNotice && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, background: 'rgba(22,163,74,.1)', border: '1px solid #16a34a', borderRadius: 8, padding: '8px 12px', fontSize: '.8rem', marginBottom: 14 }}>
+          <CheckCircle size={15} style={{ color: '#16a34a' }} /> {creditNotice}
+          <button className="btn btn-ghost btn-sm" style={{ marginLeft: 'auto' }} onClick={() => setCreditNotice(null)}><X size={13} /></button>
+        </div>
+      )}
 
       <div className="filter-bar">
         <SearchBox value={search} onChange={setSearch} placeholder="Search tenant, unit, property…" />
@@ -421,6 +504,8 @@ export function PaymentsPage() {
       {selected && <PaymentDetailModal payment={selected} onClose={() => setSelected(null)}
         canRecord={can('take_payment')}
         onRecorded={() => queryClient.invalidateQueries('payments')} />}
+      {creditOpen && <IssueCreditModal onClose={() => setCreditOpen(false)}
+        onDone={(msg) => { setCreditOpen(false); setCreditNotice(msg) }} />}
     </div>
   )
 }

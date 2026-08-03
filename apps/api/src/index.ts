@@ -91,6 +91,7 @@ import { esignRouter }        from './routes/esign'
 import { backgroundRouter }   from './routes/background'
 import { announcementsRouter }  from './routes/announcements'
 import { surveysRouter }        from './routes/surveys'
+import { tenantCreditsRouter }  from './routes/tenantCredits'
 import { propertyTaxRouter } from './routes/propertyTax'
 import { realEstateLawRouter } from './routes/realEstateLaw'
 import { booksRouter } from './routes/books'
@@ -354,6 +355,7 @@ app.use('/api/maint-portal', maintenancePortalRouter)
 app.use('/api/esign',         esignRouter)
 app.use('/api/announcements',  announcementsRouter)
 app.use('/api/surveys',        surveysRouter)
+app.use('/api/tenant-credits', tenantCreditsRouter)
 app.use('/api/property-tax',   propertyTaxRouter)
 app.use('/api/real-estate-law', realEstateLawRouter)
   app.use('/api/background',    backgroundRouter)

@@ -21,7 +21,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict R7ES3s48b8hzRBaP2bN8azSJeqfobnOLXDvqK4W7R3eYY9NH4yvFKpuKzXwWPsH
+\restrict hwLO64S8uvM4LNiy3zeaJQJSUPljicyPcnbOuOIJXKGtBW9yKaTQ5j7qkWNIE5O
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -6903,6 +6903,31 @@ CREATE TABLE public.system_features (
 
 
 --
+-- Name: tenant_credits; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.tenant_credits (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    landlord_id uuid NOT NULL,
+    tenant_id uuid NOT NULL,
+    lease_id uuid,
+    amount_original numeric(12,2) NOT NULL,
+    amount_remaining numeric(12,2) NOT NULL,
+    category text DEFAULT 'other'::text NOT NULL,
+    reason text,
+    status text DEFAULT 'active'::text NOT NULL,
+    created_by uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    voided_at timestamp with time zone,
+    CONSTRAINT tenant_credits_amount_original_check CHECK ((amount_original > (0)::numeric)),
+    CONSTRAINT tenant_credits_amount_remaining_check CHECK ((amount_remaining >= (0)::numeric)),
+    CONSTRAINT tenant_credits_category_check CHECK ((category = ANY (ARRAY['screening_cap'::text, 'late_fee_refund'::text, 'overcharge'::text, 'goodwill'::text, 'other'::text]))),
+    CONSTRAINT tenant_credits_status_check CHECK ((status = ANY (ARRAY['active'::text, 'void'::text])))
+);
+
+
+--
 -- Name: tenant_identifications; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -10374,6 +10399,14 @@ ALTER TABLE ONLY public.system_features
 
 
 --
+-- Name: tenant_credits tenant_credits_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_credits
+    ADD CONSTRAINT tenant_credits_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: tenant_identifications tenant_identifications_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -13724,6 +13757,27 @@ CREATE INDEX idx_surveys_landlord ON public.surveys USING btree (landlord_id) WH
 --
 
 CREATE INDEX idx_surveys_property ON public.surveys USING btree (property_id) WHERE is_active;
+
+
+--
+-- Name: idx_tenant_credits_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_tenant_credits_landlord ON public.tenant_credits USING btree (landlord_id);
+
+
+--
+-- Name: idx_tenant_credits_lease_active; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_tenant_credits_lease_active ON public.tenant_credits USING btree (lease_id) WHERE ((status = 'active'::text) AND (amount_remaining > (0)::numeric));
+
+
+--
+-- Name: idx_tenant_credits_tenant; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_tenant_credits_tenant ON public.tenant_credits USING btree (tenant_id);
 
 
 --
@@ -20176,6 +20230,38 @@ ALTER TABLE ONLY public.system_features
 
 
 --
+-- Name: tenant_credits tenant_credits_created_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_credits
+    ADD CONSTRAINT tenant_credits_created_by_fkey FOREIGN KEY (created_by) REFERENCES public.users(id);
+
+
+--
+-- Name: tenant_credits tenant_credits_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_credits
+    ADD CONSTRAINT tenant_credits_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: tenant_credits tenant_credits_lease_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_credits
+    ADD CONSTRAINT tenant_credits_lease_id_fkey FOREIGN KEY (lease_id) REFERENCES public.leases(id) ON DELETE SET NULL;
+
+
+--
+-- Name: tenant_credits tenant_credits_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tenant_credits
+    ADD CONSTRAINT tenant_credits_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id) ON DELETE CASCADE;
+
+
+--
 -- Name: tenant_identifications tenant_identifications_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -20891,5 +20977,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict R7ES3s48b8hzRBaP2bN8azSJeqfobnOLXDvqK4W7R3eYY9NH4yvFKpuKzXwWPsH
+\unrestrict hwLO64S8uvM4LNiy3zeaJQJSUPljicyPcnbOuOIJXKGtBW9yKaTQ5j7qkWNIE5O
 

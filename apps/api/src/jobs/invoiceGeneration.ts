@@ -738,6 +738,67 @@ async function runGeneration(
           }
         }
 
+        // S577: landlord-issued account credits (tenant_credits) — applied to
+        // whatever pending rows REMAIN after prepaid credits, oldest-first. Same
+        // application mechanism, SEPARATE source. Funded by the landlord (the
+        // tenant simply owes less → less rent received). INDEPENDENT of
+        // work-trade (which is hours-logging only; a landlord adjusts approved
+        // hours there, never a credit).
+        {
+          const lcredits = await client.query<{ id: string; amount_remaining: string }>(
+            `SELECT id, amount_remaining::text FROM tenant_credits
+              WHERE lease_id = $1 AND status = 'active' AND amount_remaining > 0
+              ORDER BY created_at ASC
+              FOR UPDATE`,
+            [lease.id])
+          let available = lcredits.rows.reduce((sum, c) => sum + Number(c.amount_remaining), 0)
+          if (available > 0) {
+            const fresh = await client.query<{ id: string; amount: string }>(
+              `SELECT id, amount::text FROM payments
+                WHERE invoice_id = $1 AND status = 'pending'
+                ORDER BY due_date ASC, created_at ASC`,
+              [invoiceId])
+            let consumed = 0
+            for (const row of fresh.rows) {
+              if (available <= 0.005) break
+              const rowAmt = Number(row.amount)
+              const apply = Math.min(rowAmt, available)
+              if (apply >= rowAmt - 0.005) {
+                await client.query(
+                  `UPDATE payments SET status='settled', settled_at=NOW(),
+                          notes = COALESCE(notes || ' — ', '') || 'covered by account credit'
+                    WHERE id = $1`, [row.id])
+              } else {
+                const remainder = Math.round((rowAmt - apply) * 100) / 100
+                await client.query(
+                  `UPDATE payments SET amount = $2::numeric, status='settled', settled_at=NOW(),
+                          notes = COALESCE(notes || ' — ', '') || 'partially covered by account credit'
+                    WHERE id = $1`, [row.id, apply.toFixed(2)])
+                await client.query(
+                  `INSERT INTO payments (invoice_id, unit_id, lease_id, tenant_id, landlord_id,
+                                         type, amount, status, due_date, entry_description, notes, is_remainder)
+                   SELECT invoice_id, unit_id, lease_id, tenant_id, landlord_id,
+                          type, $2::numeric, 'pending', due_date, entry_description,
+                          'Remainder after account credit application', TRUE
+                     FROM payments WHERE id = $1`,
+                  [row.id, remainder.toFixed(2)])
+              }
+              available -= apply
+              consumed += apply
+            }
+            let toDraw = consumed
+            for (const c of lcredits.rows) {
+              if (toDraw <= 0.005) break
+              const draw = Math.min(Number(c.amount_remaining), toDraw)
+              await client.query(
+                `UPDATE tenant_credits
+                    SET amount_remaining = amount_remaining - $2::numeric, updated_at = NOW()
+                  WHERE id = $1`, [c.id, draw.toFixed(2)])
+              toDraw -= draw
+            }
+          }
+        }
+
         await client.query('COMMIT')
         invoicesInserted++
       } catch (e) {
