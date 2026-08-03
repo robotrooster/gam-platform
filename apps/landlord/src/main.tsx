@@ -75,6 +75,7 @@ import { SubleasesPage } from "./pages/SubleasesPage"
 import { TeamPage } from './pages/TeamPage'
 import { StaffPermissionsPage } from './pages/StaffPermissionsPage'
 import { WorkTradePage } from './pages/WorkTradePage'
+import { SurveysPage } from './pages/SurveysPage'
 import { POSPage } from './pages/POSPage'
 import { InventoryPage } from './pages/InventoryPage'
 import { SchedulePage } from './pages/SchedulePage'
@@ -211,6 +212,7 @@ export default function App() {
               <Route path="team"           element={<TeamPage />} />
               <Route path="team/:userId/permissions" element={<StaffPermissionsPage />} />
               <Route path="work-trade"     element={LAUNCH_HIDDEN.has('/work-trade') ? <Navigate to="/dashboard" replace /> : <WorkTradePage />} />
+              <Route path="surveys"        element={<SurveysPage />} />
               <Route path="pos"            element={<POSPage />} />
               <Route path="inventory"       element={<InventoryPage />} />
               <Route path="schedule"       element={<SchedulePage />} />

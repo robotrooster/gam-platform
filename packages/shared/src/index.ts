@@ -1918,57 +1918,114 @@ export const UNIT_STATUS_LABEL: Record<UnitStatus, string> = {
 // S538: hotel_room added (Nic) — small hotel/motel operators are a target
 // market (Oak Park Motel is customer #1); their short-stays bill the 5%
 // STR fee like every non-RV type (maps to the Airbnb-competitor pricing).
-export const UNIT_TYPES = ['apartment', 'single_family', 'rv_spot', 'mobile_home', 'hotel_room', 'storage', 'commercial'] as const
+// S577: parking, boat_slip, land_lot added (Nic) — "accommodate any space
+// people rent to other people." parking splits OUT of storage (self-storage
+// stays 'storage'); both are short-stay-locked. boat_slip = wet slips/moorings
+// at a marina/pier (an aquatic RV spot). land_lot = raw land / a leased lot
+// beyond the mobile-home lot-rent case. Short-term / vacation rentals are NOT
+// a unit type — they're a short-stay BOOKING on any existing unit (Nic S577).
+// S577: campsite added (Nic) — tent / primitive campground site (no hookups),
+// distinct from an RV site. Bookable like an RV spot. (Cabins are NOT a type —
+// a cabin is a dwelling; landlords name it as a subtype.)
+export const UNIT_TYPES = ['apartment', 'single_family', 'rv_spot', 'campsite', 'mobile_home', 'hotel_room', 'storage', 'parking', 'boat_slip', 'land_lot', 'commercial'] as const
 export type UnitType = typeof UNIT_TYPES[number]
 export const UNIT_TYPE_LABEL: Record<UnitType, string> = {
   apartment:     'Apartment',
   single_family: 'Single Family Home',
   rv_spot:       'RV Spot',
+  campsite:      'Campsite / Tent Site',
   mobile_home:   'Mobile Home',
   hotel_room:    'Hotel / Motel Room',
   storage:       'Storage',
+  parking:       'Parking / Vehicle Space',
+  boat_slip:     'Boat Slip / Marina',
+  land_lot:      'Land / Lot',
   commercial:    'Commercial',
 }
 export const UNIT_TYPE_PREFIX: Record<UnitType, string> = {
   apartment:     'APT',
   single_family: 'SFH',
   rv_spot:       'RV',
+  campsite:      'CMP',
   mobile_home:   'MH',
   hotel_room:    'RM',
   storage:       'STG',
+  parking:       'PKG',
+  boat_slip:     'SLIP',
+  land_lot:      'LOT',
   commercial:    'COM',
 }
 export const UNIT_TYPE_ICON: Record<UnitType, string> = {
   apartment:     '🏢',
   single_family: '🏠',
   rv_spot:       '🚐',
+  campsite:      '⛺',
   mobile_home:   '🏡',
   hotel_room:    '🛏️',
   storage:       '📦',
+  parking:       '🅿️',
+  boat_slip:     '⛵',
+  land_lot:      '🌾',
   commercial:    '🏪',
 }
-// S538 STR pricing (Nic-locked). The $2 x CEIL(nights/30) aggregation is
-// ONLY for RV spots — the space is just there, the landlord coordinates
-// nothing. A short-stay booking on ANY other unit type (apartment, house,
-// mobile home, …) is a coordinated stay and bills str_fee_pct (default 5%,
-// platform_fee_config) of booking revenue instead. New unit types default
-// to the 5% side. Consumed by jobs/platformFeeAccrual.ts and
-// services/platformFee.ts.
-export const NIGHTS_AGGREGATION_UNIT_TYPES = ['rv_spot'] as const
+// Platform-fee rule (Nic-locked; S538 + S577). The fee is by PRODUCT / SERVICE
+// LEVEL (S577 basis decision), so like products pay alike:
+//   • Occupied monthly (lease / month-to-month), ANY type → $2 per occupied
+//     unit / month (min $10/property). Vacant = $0.
+//   • BARE LODGING SITES (rv_spot, campsite, boat_slip) → short stays aggregate
+//     at $2 x CEIL(nights/30) (the monthly $2 prorated). A bare site costs ~$2/
+//     space/month however it's rented, so an RV park, campground, and marina are
+//     priced identically and there's no monthly-vs-nightly arbitrage.
+//   • FURNISHED / SERVICED LODGING (apartment, single_family, mobile_home,
+//     hotel_room) → 5% of booking revenue short-term (the Airbnb-competitor
+//     lane, higher value + more GAM does). A motel room is FURNISHED, not a bare
+//     site → 5%, same category as a cabin/apartment STR (Nic S577). The gap vs
+//     monthly $2 is intentional and guarded by the auto-lease-at-threshold rule.
+//   • NON-LODGING space (parking, land_lot, commercial) → monthly $2; the rare
+//     short-term booking bills 5% (5% never gouges cheap space, whereas a $2/30
+//     minimum would — e.g. 25¢ on a $5 parking day). Truly hourly casual space
+//     (parking-by-the-hour, dump/laundry) rides the self-service QR pay page
+//     later, not this engine. storage is never short-term bookable.
+// Consumed by jobs/platformFeeAccrual.ts and services/platformFee.ts.
+export const NIGHTS_AGGREGATION_UNIT_TYPES = ['rv_spot', 'campsite', 'boat_slip'] as const
 // S538 (Nic-locked): storage units can NEVER be short-term bookable — no
 // nightly/weekly bookings, no public booking page, no subtype override.
 // Enforced at unit create (allow-list), unit type config (isBookable),
-// manual reservation create, and the public bookStay flow.
+// manual reservation create, and the public bookStay flow. (S577: parking is
+// NOT locked — it's bookable by the day at 5%, or rented monthly at $2/unit.)
 export const SHORT_STAY_LOCKED_UNIT_TYPES = ['storage'] as const
 // Whether this unit type conceptually has bedrooms (affects UI rendering).
 export const UNIT_TYPE_HAS_BEDROOMS: Record<UnitType, boolean> = {
   apartment:     true,
   single_family: true,
   rv_spot:       false,
+  campsite:      false,
   mobile_home:   true,
   hotel_room:    false,
   storage:       false,
+  parking:       false,
+  boat_slip:     false,
+  land_lot:      false,
   commercial:    false,
+}
+
+// ---------- Property-scoped tenant surveys (S577 — Nic) ----------
+// A landlord-authored, Google-Forms-style questionnaire sent to the tenants of
+// ONE property. Responses are never mixed across properties; "same survey at
+// another property" is a COPY. Question types are intentionally minimal.
+// Single source of truth for the survey CHECK constraints.
+export const SURVEY_QUESTION_TYPES = ['multiple_choice', 'text'] as const
+export type SurveyQuestionType = typeof SURVEY_QUESTION_TYPES[number]
+export const SURVEY_QUESTION_TYPE_LABEL: Record<SurveyQuestionType, string> = {
+  multiple_choice: 'Multiple choice',
+  text:            'Written answer',
+}
+export const SURVEY_STATUSES = ['draft', 'sent', 'closed'] as const
+export type SurveyStatus = typeof SURVEY_STATUSES[number]
+export const SURVEY_STATUS_LABEL: Record<SurveyStatus, string> = {
+  draft:  'Draft',
+  sent:   'Sent',
+  closed: 'Closed',
 }
 
 // ---------- Owner-defined unit subtypes (S527 — replaces S526 subtype_key model) ----------

@@ -27,6 +27,10 @@ interface LeasePdfContext {
   late_fee_initial_amount: number | null
   late_fee_initial_type:   string | null
   late_fee_grace_days:     number | null
+  late_fee_accrual_amount: number | null
+  late_fee_accrual_type:   string | null
+  late_fee_accrual_period: string | null
+  late_fee_accrual_from:   string | null
   security_deposit: number | null
   other_fees:      Array<{ label: string; amount: number; timing: string }>
   signed_by_landlord: boolean
@@ -90,6 +94,10 @@ async function loadContext(leaseId: string): Promise<LeasePdfContext> {
     late_fee_initial_amount: l.late_fee_initial_amount != null ? Number(l.late_fee_initial_amount) : null,
     late_fee_initial_type:   l.late_fee_initial_type,
     late_fee_grace_days:     l.late_fee_grace_days != null ? Number(l.late_fee_grace_days) : null,
+    late_fee_accrual_amount: l.late_fee_accrual_amount != null ? Number(l.late_fee_accrual_amount) : null,
+    late_fee_accrual_type:   l.late_fee_accrual_type,
+    late_fee_accrual_period: l.late_fee_accrual_period,
+    late_fee_accrual_from:   l.late_fee_accrual_from,
     security_deposit: depositRow ? Number(depositRow.amount) : null,
     other_fees:    otherFees,
     signed_by_landlord: l.signed_by_landlord ?? false,
@@ -181,10 +189,32 @@ export async function generateLeasePdfBytes(leaseId: string): Promise<Uint8Array
   kv('Monthly rent:', money(ctx.rent_amount))
   kv('Due day:', ctx.rent_due_day != null ? `Day ${ctx.rent_due_day} of each month` : '—')
   if (ctx.late_fee_enabled) {
-    const lf = ctx.late_fee_initial_type === 'percent'
-      ? `${ctx.late_fee_initial_amount ?? 0}% of rent`
-      : money(ctx.late_fee_initial_amount)
-    kv('Late fee:', `${lf}${ctx.late_fee_grace_days != null ? ` after a ${ctx.late_fee_grace_days}-day grace period` : ''}`)
+    // S577: full late-fee clause — initial + daily/period accrual + retroactive
+    // qualifier — so the SIGNED document carries the exact billed terms
+    // (document-first). Retroactive modes charge only the accrual (no initial).
+    const isPct = (t: string | null) => t === 'percent_of_rent' || t === 'percent'
+    const retro = !!ctx.late_fee_accrual_from && ctx.late_fee_accrual_from !== 'grace_end'
+    const hasAccrual = ctx.late_fee_accrual_amount != null && !!ctx.late_fee_accrual_period
+    const parts: string[] = []
+    if (!(retro && hasAccrual) && (ctx.late_fee_initial_amount ?? 0) > 0) {
+      parts.push(isPct(ctx.late_fee_initial_type)
+        ? `${ctx.late_fee_initial_amount}% of rent`
+        : `${money(ctx.late_fee_initial_amount)}`)
+    }
+    if (hasAccrual) {
+      const per = ctx.late_fee_accrual_period === 'daily' ? 'day'
+        : ctx.late_fee_accrual_period === 'weekly' ? 'week' : 'month'
+      const amt = isPct(ctx.late_fee_accrual_type)
+        ? `${ctx.late_fee_accrual_amount}% of rent` : money(ctx.late_fee_accrual_amount)
+      parts.push(`${amt} per ${per}`)
+    }
+    const grace = ctx.late_fee_grace_days != null ? ` after a ${ctx.late_fee_grace_days}-day grace period` : ''
+    const retroText = (retro && hasAccrual)
+      ? (ctx.late_fee_accrual_from === 'due_date_inclusive'
+          ? ', charged back to the rent due date (including the due date) once the grace period passes'
+          : ', charged back to the day after the rent due date once the grace period passes')
+      : ''
+    kv('Late fee:', `${parts.join(' + ') || money(0)}${grace}${retroText}`)
   }
 
   // ── DEPOSIT & FEES ──

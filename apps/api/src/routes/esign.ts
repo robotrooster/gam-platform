@@ -632,6 +632,21 @@ async function executeOriginalLease(client: any, doc: any): Promise<{ leaseId: s
     [...writableValues, ...tailValues]
   ).then((r: any) => r.rows[0])
 
+  // S577: stamp late_fee_accrual_from onto the lease from the (property, unit_type)
+  // policy. It's a computation QUALIFIER on the daily-accrual clause, not a
+  // fillable box — so it rides directly from the policy rather than a template
+  // field (keeping existing late-fee templates draftable / document-first intact).
+  // The retroactive nature is rendered into the late-fee clause text the tenant
+  // signs (services/leasePdf.ts). Resolved at sign-completion; policy rarely
+  // changes between draft and sign, and existing signed leases keep 'grace_end'.
+  {
+    const plf = await resolveLateFeePolicyForUnit(doc.unit_id, client)
+    if (plf && plf.late_fee_accrual_from && plf.late_fee_accrual_from !== 'grace_end') {
+      await client.query('UPDATE leases SET late_fee_accrual_from=$1 WHERE id=$2',
+        [plf.late_fee_accrual_from, lease.id])
+    }
+  }
+
   // S196: security_deposit is now part of FEE_ROW_SPECS, which the
   // loop below iterates and inserts into lease_fees automatically.
   // The S195 dual-write helper call has been removed here — FEE_ROW

@@ -661,6 +661,10 @@ propertiesRouter.put('/:id/late-fee-overrides', requirePerm('properties.edit'), 
         accrualAmount: z.number().min(0).nullish(),
         accrualType:   z.enum(['flat', 'percent_of_rent']).nullish(),
         accrualPeriod: z.enum(['daily', 'weekly', 'monthly']).nullish(),
+        // S577: where the accrual counts from once grace is crossed. Default
+        // due_date_inclusive (fits the first cohort; landlord-configurable,
+        // neutral copy). grace_end = accrual starts after grace (prior behavior).
+        accrualFrom:   z.enum(['grace_end', 'due_date', 'due_date_inclusive']).default('due_date_inclusive'),
         capAmount:     z.number().min(0).nullish(),
         capType:       z.enum(['flat', 'percent_of_rent']).nullish(),
       }),
@@ -679,18 +683,24 @@ propertiesRouter.put('/:id/late-fee-overrides', requirePerm('properties.edit'), 
     const prop = await queryOne<any>('SELECT id, landlord_id FROM properties WHERE id=$1', [req.params.id])
     if (!prop) throw new AppError(404, 'Property not found')
     if (!canManageLandlordResource(req.user, prop.landlord_id, ['property_manager'])) throw new AppError(403, 'Forbidden')
+    // S577: retroactive modes charge only the accrual — force no initial fee
+    // when accrual_from is retroactive AND an accrual is configured.
+    const retroWithAccrual = !body.noLateFee && body.accrualFrom !== 'grace_end' && body.accrualAmount != null
     const vals = body.noLateFee
-      ? { grace: null, amount: null, type: null, accA: null, accT: null, accP: null, capA: null, capT: null }
-      : { grace: body.graceDays, amount: body.initialAmount.toFixed(2), type: body.initialType,
+      ? { grace: null, amount: null, type: null, accA: null, accT: null, accP: null, accFrom: 'grace_end', capA: null, capT: null }
+      : { grace: body.graceDays,
+          amount: (retroWithAccrual ? 0 : body.initialAmount).toFixed(2),
+          type: body.initialType,
           accA: body.accrualAmount != null ? body.accrualAmount.toFixed(2) : null,
           accT: body.accrualType ?? null, accP: body.accrualPeriod ?? null,
+          accFrom: body.accrualFrom,
           capA: body.capAmount != null ? body.capAmount.toFixed(2) : null,
           capT: body.capType ?? null }
     const row = await queryOne<any>(`
       INSERT INTO property_unit_type_late_fees
         (property_id, unit_type, no_late_fee, late_fee_grace_days, late_fee_initial_amount, late_fee_initial_type,
-         late_fee_accrual_amount, late_fee_accrual_type, late_fee_accrual_period, late_fee_cap_amount, late_fee_cap_type)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         late_fee_accrual_amount, late_fee_accrual_type, late_fee_accrual_period, late_fee_accrual_from, late_fee_cap_amount, late_fee_cap_type)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
       ON CONFLICT (property_id, unit_type) DO UPDATE SET
         no_late_fee = EXCLUDED.no_late_fee,
         late_fee_grace_days = EXCLUDED.late_fee_grace_days,
@@ -699,12 +709,13 @@ propertiesRouter.put('/:id/late-fee-overrides', requirePerm('properties.edit'), 
         late_fee_accrual_amount = EXCLUDED.late_fee_accrual_amount,
         late_fee_accrual_type   = EXCLUDED.late_fee_accrual_type,
         late_fee_accrual_period = EXCLUDED.late_fee_accrual_period,
+        late_fee_accrual_from   = EXCLUDED.late_fee_accrual_from,
         late_fee_cap_amount     = EXCLUDED.late_fee_cap_amount,
         late_fee_cap_type       = EXCLUDED.late_fee_cap_type,
         updated_at = NOW()
       RETURNING *`,
       [req.params.id, body.unitType, body.noLateFee, vals.grace, vals.amount, vals.type,
-       vals.accA, vals.accT, vals.accP, vals.capA, vals.capT])
+       vals.accA, vals.accT, vals.accP, vals.accFrom, vals.capA, vals.capT])
     res.json({ success: true, data: row })
   } catch (e) { next(e) }
 })
@@ -720,17 +731,9 @@ propertiesRouter.delete('/:id/late-fee-overrides/:unitType', requirePerm('proper
     const prop = await queryOne<any>('SELECT id, landlord_id FROM properties WHERE id=$1', [req.params.id])
     if (!prop) throw new AppError(404, 'Property not found')
     if (!canManageLandlordResource(req.user, prop.landlord_id, ['property_manager'])) throw new AppError(403, 'Forbidden')
-    // S537: deleting a decision returns the class to UNDECIDED, which the
-    // gate forbids while units of the class exist — change the decision
-    // instead. Delete only cleans up classes with no units.
-    const inUse = await queryOne<any>(
-      `SELECT 1 FROM units WHERE property_id=$1 AND unit_type=$2 LIMIT 1`,
-      [req.params.id, req.params.unitType])
-    if (inUse) {
-      throw new AppError(409,
-        `Units of this type exist at the property — a late-fee decision must stay in place. ` +
-        `Edit the terms or switch it to "no late fee" instead of removing it.`)
-    }
+    // S577: the forced-decision gate is retired — no fee is the default, so
+    // removing a late fee simply reverts the class to no fee. Allowed anytime
+    // (existing signed leases keep their stamped terms; only new leases change).
     await query(`DELETE FROM property_unit_type_late_fees WHERE property_id=$1 AND unit_type=$2`,
       [req.params.id, req.params.unitType])
     res.json({ success: true })

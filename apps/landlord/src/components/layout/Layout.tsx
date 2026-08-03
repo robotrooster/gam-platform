@@ -12,7 +12,7 @@ import {
   ArrowDownToLine, Wrench, FileText, LogOut, Settings,
   ShoppingCart, Shield, Package, BarChart2, ScrollText,
   UserSearch, ClipboardList, HeartHandshake, PenTool, UserPlus,
-  Landmark, ClipboardCheck, CalendarClock, RefreshCw
+  Landmark, ClipboardCheck, CalendarClock, RefreshCw, MessageSquare
 } from 'lucide-react'
 
 // S82: each nav item has a `roles` admission list (which roles MAY see
@@ -83,6 +83,7 @@ const NAV_ITEMS: Array<{
   // category for staff visibility.
   { to: '/utilities',     icon: Package,          label: 'Utilities',        section: null,          category: 'units' },
   { to: '/work-trade',    icon: HeartHandshake,   label: 'Work Trade',       section: null },
+  { to: '/surveys',       icon: MessageSquare,    label: 'Surveys',          section: null },
   // Screening — S575: one "Screening" sidebar item, these render as sub-tabs.
   // S576 (Nic, B-9b): Background Checks leads — it's the day-to-day screening
   // action, so clicking the Screening nav icon lands there. Applicant Pool

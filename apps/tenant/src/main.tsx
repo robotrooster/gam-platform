@@ -40,6 +40,7 @@ import { MaintenancePage } from './pages/MaintenancePage'
 import { ProfilePage } from './pages/ProfilePage'
 import { PayoutsPage } from './pages/PayoutsPage'
 import { WorkTradePage } from './pages/WorkTradePage'
+import { TenantSurveysPage } from './pages/TenantSurveysPage'
 import { PosCustomerOnboardingPage } from './pages/PosCustomerOnboardingPage'
 import React, { useContext, useState, useEffect, useCallback } from 'react'
 import ReactDOM from 'react-dom/client'
@@ -50,7 +51,7 @@ import { BrowserRouter, Routes, Route, Navigate, NavLink, Outlet, useNavigate, u
 import {
   ShieldCheck, Home, Star, CreditCard, Wrench, ClipboardCheck,
   Video, DoorOpen, CalendarClock, HeartHandshake, BarChart3, Scale, ScrollText,
-  Bell, Landmark, User, Dumbbell, MessagesSquare, FileText,
+  Bell, Landmark, User, Dumbbell, MessagesSquare, FileText, ClipboardList,
 } from 'lucide-react'
 
 // S550: first-party product telemetry — one page_view per route change.
@@ -385,6 +386,7 @@ const COMMUNICATION_TABS = [
   { id: 'maintenance',  label: 'Maintenance',    icon: Wrench },
   { id: 'inspections',  label: 'Inspections',    icon: ClipboardCheck },
   { id: 'entry',        label: 'Entry Requests', icon: DoorOpen },
+  { id: 'surveys',      label: 'Surveys',        icon: ClipboardList },
   { id: 'documents',    label: 'Documents',      icon: FileText },
   { id: 'walkthroughs', label: 'My Walkthroughs', icon: Video },
 ] as const
@@ -418,6 +420,7 @@ function CommunicationPage() {
       {tab === 'maintenance'  && <MaintenancePage />}
       {tab === 'inspections'  && <TenantInspectionsPage />}
       {tab === 'entry'        && <TenantEntryRequestsPage />}
+      {tab === 'surveys'      && <TenantSurveysPage />}
       {tab === 'documents'    && <DocumentsPage />}
       {tab === 'walkthroughs' && <TenantMyWalkthroughsPage />}
     </div>

@@ -22,6 +22,7 @@ import {
   capRemaining,
   type LateFeeKind,
   type LateFeeAccrualPeriod,
+  type LateFeeAccrualFrom,
 } from '@gam/shared'
 import { registerEngine } from './timezoneCronManager'
 import { logger } from '../lib/logger'
@@ -41,6 +42,7 @@ interface QualifyingInvoice {
   late_fee_accrual_type: LateFeeKind | null
   late_fee_accrual_amount: string | null
   late_fee_accrual_period: LateFeeAccrualPeriod | null
+  late_fee_accrual_from: LateFeeAccrualFrom
   late_fee_cap_type: LateFeeKind | null
   late_fee_cap_amount: string | null
 }
@@ -77,6 +79,7 @@ function qualifyingInvoicesSql(rowFilter: string): string {
         l.late_fee_accrual_type,
         l.late_fee_accrual_amount::text AS late_fee_accrual_amount,
         l.late_fee_accrual_period,
+        COALESCE(l.late_fee_accrual_from, 'grace_end') AS late_fee_accrual_from,
         l.late_fee_cap_type,
         l.late_fee_cap_amount::text AS late_fee_cap_amount
       FROM invoices i
@@ -247,7 +250,18 @@ async function processInvoice(
   const graceDays = inv.late_fee_grace_days
   const initialDate = lateFeeStartDate(inv.due_date, graceDays)
 
-  if (!existingDates.has(initialDate)) {
+  // S577: retroactive modes (due_date / due_date_inclusive) charge ONLY the
+  // daily/period accrual, counted back to the due date — no separate flat
+  // "initial" fee. Guard applies only when an accrual is actually configured;
+  // a flat-fee-only policy still charges its flat fee regardless of anchor.
+  const accrualFrom = inv.late_fee_accrual_from || 'grace_end'
+  const hasAccrual =
+    inv.late_fee_accrual_type !== null &&
+    inv.late_fee_accrual_amount !== null &&
+    inv.late_fee_accrual_period !== null
+  const retroactiveNoInitial = accrualFrom !== 'grace_end' && hasAccrual
+
+  if (!retroactiveNoInitial && !existingDates.has(initialDate)) {
     const rawInitial = computeLateFeeAmount(
       inv.late_fee_initial_type,
       Number(inv.late_fee_initial_amount),
@@ -286,7 +300,7 @@ async function processInvoice(
 
   const MAX_OCCURRENCES = 5000
   for (let occ = 1; occ <= MAX_OCCURRENCES; occ++) {
-    const tickDate = nextAccrualDate(inv.due_date, graceDays, period, occ)
+    const tickDate = nextAccrualDate(inv.due_date, graceDays, period, occ, accrualFrom)
     if (tickDate > today) break
     if (existingDates.has(tickDate)) continue
 

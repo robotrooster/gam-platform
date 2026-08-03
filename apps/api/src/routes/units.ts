@@ -459,11 +459,19 @@ const LEASE_TYPE_MATRIX: Record<string, string[]> = {
   residential:     ['month_to_month', 'long_term'],
   rv_spot:         ['nightly', 'weekly', 'month_to_month', 'long_term'],
   storage:         ['month_to_month', 'long_term'],
+  // S577: parking is bookable at every stay length — daily bookings bill 5%,
+  // a monthly rental bills $2/unit. (Not short-stay-locked; that's storage only.)
   parking:         ['nightly', 'weekly', 'month_to_month', 'long_term'],
   short_term_cabin:['nightly', 'weekly', 'month_to_month'],
   // S538: hotel/motel rooms — every stay length (weekly-rate motels and
   // long-term room tenants like Oak Park's are both real).
   hotel_room:      ['nightly', 'weekly', 'month_to_month', 'long_term'],
+  // S577: boat slip + land/lot bookable at every stay length. Short-term = 5%;
+  // monthly = $2/unit. (Land short-term = event/vendor space.)
+  boat_slip:       ['nightly', 'weekly', 'month_to_month', 'long_term'],
+  land_lot:        ['nightly', 'weekly', 'month_to_month', 'long_term'],
+  // S577: campsite = tent/primitive site, bookable like an RV spot.
+  campsite:        ['nightly', 'weekly', 'month_to_month', 'long_term'],
 }
 
 // PATCH /api/units/:id/type — set unit type and rates

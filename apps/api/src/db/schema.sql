@@ -21,7 +21,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict DLq1F4mueWdp1CBC8zKFsATfsXQi591dcW9dc2mZbBvUmbegHG0SwN1VAPIg2Kd
+\restrict R7ES3s48b8hzRBaP2bN8azSJeqfobnOLXDvqK4W7R3eYY9NH4yvFKpuKzXwWPsH
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -3655,7 +3655,7 @@ CREATE TABLE public.landlords (
     default_pm_company_id uuid,
     flex_charge_disqualified_until timestamp with time zone,
     flex_charge_disqualified_reason text,
-    background_provider text DEFAULT 'mock'::text NOT NULL,
+    background_provider text DEFAULT 'checkr'::text NOT NULL,
     default_ach_fee_payer text DEFAULT 'tenant'::text NOT NULL,
     pos_default_margin_pct numeric(5,2),
     deposit_return_approval_threshold numeric(10,2) DEFAULT 500 NOT NULL,
@@ -4011,7 +4011,7 @@ CREATE TABLE public.lease_templates (
     CONSTRAINT lease_templates_default_term_months_check CHECK (((default_term_months IS NULL) OR ((default_term_months >= 1) AND (default_term_months <= 120)))),
     CONSTRAINT lease_templates_deposit_months_check CHECK (((deposit_months IS NULL) OR ((deposit_months >= (0)::numeric) AND (deposit_months <= (12)::numeric)))),
     CONSTRAINT lease_templates_purpose_check CHECK ((purpose = ANY (ARRAY['lease'::text, 'work_trade_addendum'::text]))),
-    CONSTRAINT lease_templates_unit_type_check CHECK (((unit_type IS NULL) OR (unit_type = ANY (ARRAY['apartment'::text, 'single_family'::text, 'rv_spot'::text, 'mobile_home'::text, 'hotel_room'::text, 'storage'::text, 'commercial'::text]))))
+    CONSTRAINT lease_templates_unit_type_check CHECK (((unit_type IS NULL) OR (unit_type = ANY (ARRAY['apartment'::text, 'single_family'::text, 'rv_spot'::text, 'campsite'::text, 'mobile_home'::text, 'hotel_room'::text, 'storage'::text, 'parking'::text, 'boat_slip'::text, 'land_lot'::text, 'commercial'::text]))))
 );
 
 
@@ -4172,8 +4172,10 @@ CREATE TABLE public.leases (
     landlord_renewal_offered_at timestamp with time zone,
     is_hibernating boolean DEFAULT false NOT NULL,
     hibernated_at timestamp with time zone,
+    late_fee_accrual_from text DEFAULT 'grace_end'::text NOT NULL,
     CONSTRAINT leases_auto_renew_mode_check CHECK (((auto_renew_mode IS NULL) OR (auto_renew_mode = ANY (ARRAY['extend_same_term'::text, 'convert_to_month_to_month'::text])))),
     CONSTRAINT leases_auto_renew_mode_required CHECK (((auto_renew = false) OR (auto_renew_mode IS NOT NULL))),
+    CONSTRAINT leases_late_fee_accrual_from_check CHECK ((late_fee_accrual_from = ANY (ARRAY['grace_end'::text, 'due_date'::text, 'due_date_inclusive'::text]))),
     CONSTRAINT leases_late_fee_accrual_period_check CHECK ((late_fee_accrual_period = ANY (ARRAY['daily'::text, 'weekly'::text, 'monthly'::text]))),
     CONSTRAINT leases_late_fee_accrual_type_check CHECK ((late_fee_accrual_type = ANY (ARRAY['flat'::text, 'percent_of_rent'::text]))),
     CONSTRAINT leases_late_fee_cap_type_check CHECK ((late_fee_cap_type = ANY (ARRAY['flat'::text, 'percent_of_rent'::text]))),
@@ -5951,7 +5953,7 @@ CREATE TABLE public.property_unit_subtypes (
     CONSTRAINT property_unit_subtypes_name_check CHECK (((length(TRIM(BOTH FROM name)) >= 1) AND (length(TRIM(BOTH FROM name)) <= 60))),
     CONSTRAINT property_unit_subtypes_rv_amp_service_check CHECK ((rv_amp_service = ANY (ARRAY['none'::text, '30'::text, '50'::text, 'both'::text]))),
     CONSTRAINT property_unit_subtypes_rv_site_layout_check CHECK ((rv_site_layout = ANY (ARRAY['none'::text, 'back_in'::text, 'pull_through'::text]))),
-    CONSTRAINT property_unit_subtypes_unit_type_check CHECK ((unit_type = ANY (ARRAY['apartment'::text, 'single_family'::text, 'rv_spot'::text, 'mobile_home'::text, 'hotel_room'::text, 'storage'::text, 'commercial'::text])))
+    CONSTRAINT property_unit_subtypes_unit_type_check CHECK ((unit_type = ANY (ARRAY['apartment'::text, 'single_family'::text, 'rv_spot'::text, 'campsite'::text, 'mobile_home'::text, 'hotel_room'::text, 'storage'::text, 'parking'::text, 'boat_slip'::text, 'land_lot'::text, 'commercial'::text])))
 );
 
 
@@ -5974,7 +5976,9 @@ CREATE TABLE public.property_unit_type_late_fees (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     no_late_fee boolean DEFAULT false NOT NULL,
+    late_fee_accrual_from text DEFAULT 'due_date_inclusive'::text NOT NULL,
     CONSTRAINT property_unit_type_late_fees_late_fee_accrual_amount_check CHECK (((late_fee_accrual_amount IS NULL) OR (late_fee_accrual_amount >= (0)::numeric))),
+    CONSTRAINT property_unit_type_late_fees_late_fee_accrual_from_check CHECK ((late_fee_accrual_from = ANY (ARRAY['grace_end'::text, 'due_date'::text, 'due_date_inclusive'::text]))),
     CONSTRAINT property_unit_type_late_fees_late_fee_accrual_period_check CHECK (((late_fee_accrual_period IS NULL) OR (late_fee_accrual_period = ANY (ARRAY['daily'::text, 'weekly'::text, 'monthly'::text])))),
     CONSTRAINT property_unit_type_late_fees_late_fee_accrual_type_check CHECK (((late_fee_accrual_type IS NULL) OR (late_fee_accrual_type = ANY (ARRAY['flat'::text, 'percent_of_rent'::text])))),
     CONSTRAINT property_unit_type_late_fees_late_fee_cap_amount_check CHECK (((late_fee_cap_amount IS NULL) OR (late_fee_cap_amount >= (0)::numeric))),
@@ -5982,7 +5986,7 @@ CREATE TABLE public.property_unit_type_late_fees (
     CONSTRAINT property_unit_type_late_fees_late_fee_grace_days_check CHECK ((late_fee_grace_days >= 0)),
     CONSTRAINT property_unit_type_late_fees_late_fee_initial_amount_check CHECK ((late_fee_initial_amount >= (0)::numeric)),
     CONSTRAINT property_unit_type_late_fees_late_fee_initial_type_check CHECK ((late_fee_initial_type = ANY (ARRAY['flat'::text, 'percent_of_rent'::text]))),
-    CONSTRAINT property_unit_type_late_fees_unit_type_check CHECK ((unit_type = ANY (ARRAY['apartment'::text, 'single_family'::text, 'rv_spot'::text, 'mobile_home'::text, 'hotel_room'::text, 'storage'::text, 'commercial'::text]))),
+    CONSTRAINT property_unit_type_late_fees_unit_type_check CHECK ((unit_type = ANY (ARRAY['apartment'::text, 'single_family'::text, 'rv_spot'::text, 'campsite'::text, 'mobile_home'::text, 'hotel_room'::text, 'storage'::text, 'parking'::text, 'boat_slip'::text, 'land_lot'::text, 'commercial'::text]))),
     CONSTRAINT put_late_fees_decision_shape CHECK ((((no_late_fee = true) AND (late_fee_grace_days IS NULL) AND (late_fee_initial_amount IS NULL) AND (late_fee_initial_type IS NULL) AND (late_fee_accrual_amount IS NULL) AND (late_fee_cap_amount IS NULL)) OR ((no_late_fee = false) AND (late_fee_grace_days IS NOT NULL) AND (late_fee_initial_amount IS NOT NULL) AND (late_fee_initial_type IS NOT NULL))))
 );
 
@@ -6825,6 +6829,67 @@ CREATE TABLE public.sublessor_credit_balances (
 
 
 --
+-- Name: survey_answers; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.survey_answers (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    response_id uuid NOT NULL,
+    question_id uuid NOT NULL,
+    answer_text text
+);
+
+
+--
+-- Name: survey_questions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.survey_questions (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    survey_id uuid NOT NULL,
+    "position" integer DEFAULT 0 NOT NULL,
+    question_type text NOT NULL,
+    prompt text NOT NULL,
+    options jsonb DEFAULT '[]'::jsonb NOT NULL,
+    required boolean DEFAULT false NOT NULL,
+    CONSTRAINT survey_questions_question_type_check CHECK ((question_type = ANY (ARRAY['multiple_choice'::text, 'text'::text])))
+);
+
+
+--
+-- Name: survey_responses; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.survey_responses (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    survey_id uuid NOT NULL,
+    tenant_id uuid NOT NULL,
+    submitted_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: surveys; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.surveys (
+    id uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    landlord_id uuid NOT NULL,
+    property_id uuid NOT NULL,
+    created_by uuid,
+    title text NOT NULL,
+    description text,
+    status text DEFAULT 'draft'::text NOT NULL,
+    anonymous boolean DEFAULT false NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    sent_at timestamp with time zone,
+    closed_at timestamp with time zone,
+    is_active boolean DEFAULT true NOT NULL,
+    CONSTRAINT surveys_status_check CHECK ((status = ANY (ARRAY['draft'::text, 'sent'::text, 'closed'::text])))
+);
+
+
+--
 -- Name: system_features; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -7326,7 +7391,7 @@ CREATE TABLE public.units (
     CONSTRAINT units_rv_amp_service_check CHECK ((rv_amp_service = ANY (ARRAY['none'::text, '30'::text, '50'::text, 'both'::text]))),
     CONSTRAINT units_rv_site_layout_check CHECK ((rv_site_layout = ANY (ARRAY['none'::text, 'back_in'::text, 'pull_through'::text]))),
     CONSTRAINT units_status_check CHECK ((status = ANY (ARRAY['vacant'::text, 'available'::text, 'active'::text, 'delinquent'::text, 'suspended'::text]))),
-    CONSTRAINT units_unit_type_check CHECK ((unit_type = ANY (ARRAY['apartment'::text, 'single_family'::text, 'rv_spot'::text, 'mobile_home'::text, 'hotel_room'::text, 'storage'::text, 'commercial'::text])))
+    CONSTRAINT units_unit_type_check CHECK ((unit_type = ANY (ARRAY['apartment'::text, 'single_family'::text, 'rv_spot'::text, 'campsite'::text, 'mobile_home'::text, 'hotel_room'::text, 'storage'::text, 'parking'::text, 'boat_slip'::text, 'land_lot'::text, 'commercial'::text])))
 );
 
 
@@ -10258,6 +10323,46 @@ ALTER TABLE ONLY public.sublessor_credit_balances
 
 ALTER TABLE ONLY public.sublessor_credit_balances
     ADD CONSTRAINT sublessor_credit_balances_sublease_uniq UNIQUE (sublease_id);
+
+
+--
+-- Name: survey_answers survey_answers_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_answers
+    ADD CONSTRAINT survey_answers_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: survey_questions survey_questions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_questions
+    ADD CONSTRAINT survey_questions_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: survey_responses survey_responses_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_responses
+    ADD CONSTRAINT survey_responses_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: survey_responses survey_responses_survey_id_tenant_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_responses
+    ADD CONSTRAINT survey_responses_survey_id_tenant_id_key UNIQUE (survey_id, tenant_id);
+
+
+--
+-- Name: surveys surveys_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.surveys
+    ADD CONSTRAINT surveys_pkey PRIMARY KEY (id);
 
 
 --
@@ -13577,6 +13682,48 @@ CREATE INDEX idx_sublessee_invitations_token ON public.sublessee_invitations USI
 --
 
 CREATE INDEX idx_sublessor_credit_balances_tenant ON public.sublessor_credit_balances USING btree (sublessor_tenant_id);
+
+
+--
+-- Name: idx_survey_answers_question; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_survey_answers_question ON public.survey_answers USING btree (question_id);
+
+
+--
+-- Name: idx_survey_answers_response; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_survey_answers_response ON public.survey_answers USING btree (response_id);
+
+
+--
+-- Name: idx_survey_questions_survey; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_survey_questions_survey ON public.survey_questions USING btree (survey_id);
+
+
+--
+-- Name: idx_survey_responses_survey; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_survey_responses_survey ON public.survey_responses USING btree (survey_id);
+
+
+--
+-- Name: idx_surveys_landlord; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_surveys_landlord ON public.surveys USING btree (landlord_id) WHERE is_active;
+
+
+--
+-- Name: idx_surveys_property; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_surveys_property ON public.surveys USING btree (property_id) WHERE is_active;
 
 
 --
@@ -19957,6 +20104,70 @@ ALTER TABLE ONLY public.sublessor_credit_balances
 
 
 --
+-- Name: survey_answers survey_answers_question_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_answers
+    ADD CONSTRAINT survey_answers_question_id_fkey FOREIGN KEY (question_id) REFERENCES public.survey_questions(id) ON DELETE CASCADE;
+
+
+--
+-- Name: survey_answers survey_answers_response_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_answers
+    ADD CONSTRAINT survey_answers_response_id_fkey FOREIGN KEY (response_id) REFERENCES public.survey_responses(id) ON DELETE CASCADE;
+
+
+--
+-- Name: survey_questions survey_questions_survey_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_questions
+    ADD CONSTRAINT survey_questions_survey_id_fkey FOREIGN KEY (survey_id) REFERENCES public.surveys(id) ON DELETE CASCADE;
+
+
+--
+-- Name: survey_responses survey_responses_survey_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_responses
+    ADD CONSTRAINT survey_responses_survey_id_fkey FOREIGN KEY (survey_id) REFERENCES public.surveys(id) ON DELETE CASCADE;
+
+
+--
+-- Name: survey_responses survey_responses_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.survey_responses
+    ADD CONSTRAINT survey_responses_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id) ON DELETE CASCADE;
+
+
+--
+-- Name: surveys surveys_created_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.surveys
+    ADD CONSTRAINT surveys_created_by_fkey FOREIGN KEY (created_by) REFERENCES public.users(id);
+
+
+--
+-- Name: surveys surveys_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.surveys
+    ADD CONSTRAINT surveys_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: surveys surveys_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.surveys
+    ADD CONSTRAINT surveys_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE CASCADE;
+
+
+--
 -- Name: system_features system_features_updated_by_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -20680,5 +20891,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict DLq1F4mueWdp1CBC8zKFsATfsXQi591dcW9dc2mZbBvUmbegHG0SwN1VAPIg2Kd
+\unrestrict R7ES3s48b8hzRBaP2bN8azSJeqfobnOLXDvqK4W7R3eYY9NH4yvFKpuKzXwWPsH
 

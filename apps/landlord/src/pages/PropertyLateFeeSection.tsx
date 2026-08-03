@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from 'react-query'
-import { AlertTriangle, Clock, Trash2, Ban } from 'lucide-react'
+import { Clock, Trash2 } from 'lucide-react'
 import { apiDelete, apiGet, apiPatch, apiPut } from '../lib/api'
 import { UNIT_TYPE_LABEL, humanize } from '@gam/shared'
 
@@ -26,7 +26,6 @@ const UNIT_TYPE_LABELS: Record<string, string> = UNIT_TYPE_LABEL
 // engine's rule: fee fires once the property-local date reaches
 // due_date + grace_days (due the 1st + 3-day grace → fee starts the 4th).
 
-const ord = (n: number) => n + (n % 10 === 1 && n % 100 !== 11 ? 'st' : n % 10 === 2 && n % 100 !== 12 ? 'nd' : n % 10 === 3 && n % 100 !== 13 ? 'rd' : 'th')
 const lbl = { fontSize: '.72rem', color: 'var(--text-3)', marginBottom: 4, display: 'block' } as const
 
 export function PropertyLateFeeSection({ property, onSaved }: { property: any; onSaved: () => void }) {
@@ -56,6 +55,17 @@ export function PropertyLateFeeSection({ property, onSaved }: { property: any; o
         tenants of that class have identical terms; signed leases keep the terms they signed, but
         are never billed more than the current decision allows.
       </div>
+      <div style={{ fontSize: '.75rem', color: 'var(--text-3)', lineHeight: 1.5, marginBottom: 12, background: 'var(--bg-2)', borderRadius: 8, padding: '10px 12px' }}>
+        <strong style={{ color: 'var(--text-1)' }}>How a fee is charged.</strong> The grace period always
+        applies first — no fee while the tenant is inside it. You can set a one-time fee, an ongoing
+        amount (per day/week/month), or both, plus an optional cap. The <strong>Counts&nbsp;from</strong> setting
+        decides where an ongoing amount starts once grace passes:
+        {' '}<strong>Due date (incl.)</strong> charges every day back to the due date;
+        {' '}<strong>Day after due date</strong> starts the day after;
+        {' '}<strong>End of grace period</strong> starts only after grace (no upfront fee is charged with the
+        two retroactive options). Charging back to the due date isn&apos;t permitted everywhere —
+        confirm it&apos;s allowed under your local laws.
+      </div>
 
       <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '.82rem', cursor: 'pointer', marginBottom: enabled ? 12 : 0 }}>
         <input type="checkbox" checked={enabled} disabled={toggleMut.isLoading}
@@ -78,30 +88,31 @@ function UnitTypeRows({ propertyId, masterEnabled }: { propertyId: string; maste
     ['late-fee-overrides', propertyId],
     () => apiGet(`/properties/${propertyId}/late-fee-overrides`),
     { enabled: !!propertyId })
-  const { data: units = [] } = useQuery<any[]>(
-    ['units-for-late-fee', propertyId],
-    () => apiGet(`/units?propertyId=${propertyId}`),
-    { enabled: !!propertyId })
   const [unitType, setUnitType] = useState('')
-  const [decision, setDecision] = useState<'fee' | 'none'>('fee')
   const [amount, setAmount] = useState('')
   const [kind, setKind] = useState('flat')
   const [grace, setGrace] = useState('5')
   // S537: accrual ("$5/day after") + optional cap are part of the decision.
   const [accrualAmount, setAccrualAmount] = useState('')
   const [accrualPeriod, setAccrualPeriod] = useState('daily')
+  // S577: where the accrual counts from once grace is crossed. Default
+  // due_date_inclusive; landlord-configurable, neutral legal copy.
+  const [accrualFrom, setAccrualFrom] = useState<'grace_end' | 'due_date' | 'due_date_inclusive'>('due_date_inclusive')
   const [capAmount, setCapAmount] = useState('')
-  const [showGraceInfo, setShowGraceInfo] = useState(false)
   const [rowError, setRowError] = useState<string | null>(null)
 
+  // Retroactive (counts back to the due date) + an accrual set = daily-only,
+  // no upfront fee (Nic). The server enforces this too.
+  const retroWithAccrual = accrualFrom !== 'grace_end' && accrualAmount !== ''
+
   const upsertMut = useMutation(
-    () => apiPut(`/properties/${propertyId}/late-fee-overrides`, decision === 'none'
-      ? { unitType, noLateFee: true }
-      : { unitType, graceDays: Math.trunc(Number(grace) || 0), initialAmount: Number(amount), initialType: kind,
-          ...(accrualAmount !== '' ? { accrualAmount: Number(accrualAmount), accrualType: 'flat', accrualPeriod } : {}),
-          ...(capAmount !== '' ? { capAmount: Number(capAmount), capType: 'flat' } : {}) }),
-    { onSuccess: () => { setRowError(null); qc.invalidateQueries(['late-fee-overrides', propertyId]); setUnitType(''); setAmount(''); setAccrualAmount(''); setCapAmount(''); setDecision('fee'); setShowGraceInfo(false) },
-      onError: (e: any) => setRowError(e?.response?.data?.error || 'Could not save the late-fee decision') }
+    () => apiPut(`/properties/${propertyId}/late-fee-overrides`,
+      { unitType, graceDays: Math.trunc(Number(grace) || 0),
+        initialAmount: retroWithAccrual ? 0 : Number(amount), initialType: kind,
+        ...(accrualAmount !== '' ? { accrualAmount: Number(accrualAmount), accrualType: 'flat', accrualPeriod, accrualFrom } : {}),
+        ...(capAmount !== '' ? { capAmount: Number(capAmount), capType: 'flat' } : {}) }),
+    { onSuccess: () => { setRowError(null); qc.invalidateQueries(['late-fee-overrides', propertyId]); setUnitType(''); setAmount(''); setAccrualAmount(''); setCapAmount(''); setAccrualFrom('due_date_inclusive') },
+      onError: (e: any) => setRowError(e?.response?.data?.error || 'Could not save the late fee') }
   )
   const removeMut = useMutation(
     (ut: string) => apiDelete(`/properties/${propertyId}/late-fee-overrides/${ut}`),
@@ -109,54 +120,41 @@ function UnitTypeRows({ propertyId, masterEnabled }: { propertyId: string; maste
       onError: (e: any) => setRowError(e?.response?.data?.error || 'Could not remove the decision') }
   )
 
-  const g = Math.max(0, Math.trunc(Number(grace) || 0))
-
-  // S537: surface UNDECIDED classes — unit types present at the property
-  // with no decision row. These block unit-adds and onboarding.
-  const decidedTypes = new Set((rows as any[]).map((o: any) => o.unitType))
-  const undecidedInUse = Array.from(new Set((units as any[]).map((u: any) => u.unitType).filter(Boolean)))
-    .filter(t => !decidedTypes.has(t as string)) as string[]
-
   return (
     <div>
-      {undecidedInUse.length > 0 && (
-        <div style={{ display: 'flex', gap: 8, background: 'rgba(245,158,11,.08)', border: '1px solid var(--amber, #d97706)', borderRadius: 8, padding: '8px 12px', fontSize: '.78rem', marginBottom: 12 }}>
-          <AlertTriangle size={14} style={{ color: 'var(--amber, #d97706)', flexShrink: 0, marginTop: 2 }} />
-          <div>
-            <strong>Undecided unit {undecidedInUse.length === 1 ? 'type' : 'types'}:</strong>{' '}
-            {undecidedInUse.map(t => UNIT_TYPE_LABELS[t] || humanize(t)).join(', ')} — existing units of
-            {undecidedInUse.length === 1 ? ' this type' : ' these types'} keep operating, but new units
-            and tenant onboarding are blocked until you decide below (set terms or choose No late fee).
-          </div>
-        </div>
-      )}
-
-      {(rows as any[]).length > 0 ? (
+      {(rows as any[]).filter((o: any) => !o.noLateFee).length > 0 ? (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 12 }}>
-          {(rows as any[]).map((o: any) => (
+          {(rows as any[]).filter((o: any) => !o.noLateFee).map((o: any) => (
             <div key={o.unitType} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '6px 10px', background: 'var(--bg-2)', borderRadius: 8, fontSize: '.8rem' }}>
               <span style={{ fontWeight: 600, flex: '0 0 110px' }}>{UNIT_TYPE_LABELS[o.unitType] || humanize(o.unitType)}</span>
-              {o.noLateFee ? (
-                <span style={{ display: 'flex', alignItems: 'center', gap: 6, color: 'var(--text-3)' }}>
-                  <Ban size={12} /> No late fee (explicit decision)
-                </span>
-              ) : (
+              {(() => {
+                const retro = o.lateFeeAccrualFrom && o.lateFeeAccrualFrom !== 'grace_end'
+                const hasAcc = o.lateFeeAccrualAmount != null
+                const per = String(o.lateFeeAccrualPeriod || '').replace('daily', 'day').replace('weekly', 'week').replace('monthly', 'month')
+                const accStr = hasAcc ? (o.lateFeeAccrualType === 'percent_of_rent' ? `${Number(o.lateFeeAccrualAmount)}% of rent` : `$${Number(o.lateFeeAccrualAmount).toFixed(2)}`) : ''
+                return (
                 <>
                   <span className="mono">
-                    {o.lateFeeInitialType === 'percent_of_rent'
-                      ? `${Number(o.lateFeeInitialAmount)}% of rent`
-                      : `$${Number(o.lateFeeInitialAmount).toFixed(2)}`}
+                    {retro && hasAcc
+                      ? `${accStr}/${per}`
+                      : o.lateFeeInitialType === 'percent_of_rent'
+                        ? `${Number(o.lateFeeInitialAmount)}% of rent`
+                        : `$${Number(o.lateFeeInitialAmount).toFixed(2)}`}
                   </span>
                   <span style={{ color: 'var(--text-3)', fontSize: '.74rem' }}>
-                    {o.lateFeeGraceDays}-day grace · fee starts day {1 + Number(o.lateFeeGraceDays)} when rent is due the 1st
-                    {o.lateFeeAccrualAmount != null && ` · +${o.lateFeeAccrualType === 'percent_of_rent' ? `${Number(o.lateFeeAccrualAmount)}% of rent` : `$${Number(o.lateFeeAccrualAmount).toFixed(2)}`}/${String(o.lateFeeAccrualPeriod || '').replace('daily', 'day').replace('weekly', 'week').replace('monthly', 'month')} after`}
+                    {o.lateFeeGraceDays}-day grace ·{' '}
+                    {retro && hasAcc
+                      ? `retroactive to the ${o.lateFeeAccrualFrom === 'due_date_inclusive' ? 'due date' : 'day after the due date'} once grace passes`
+                      : `fee starts day ${1 + Number(o.lateFeeGraceDays)} when rent is due the 1st`}
+                    {!retro && hasAcc && ` · +${accStr}/${per} after`}
                     {o.lateFeeCapAmount != null && ` · capped at ${o.lateFeeCapType === 'percent_of_rent' ? `${Number(o.lateFeeCapAmount)}% of rent` : `$${Number(o.lateFeeCapAmount).toFixed(2)}`}`}
                     {o.lateFeeCapAmount == null && ` · no cap`}
                   </span>
                 </>
-              )}
+                )
+              })()}
               <button className="btn btn-ghost btn-sm" style={{ marginLeft: 'auto', padding: '2px 8px' }}
-                title="Remove the decision — only possible while no units of this type exist"
+                title="Remove this late fee (reverts the type to no late fee)"
                 onClick={() => removeMut.mutate(o.unitType)}>
                 <Trash2 size={12} />
               </button>
@@ -164,9 +162,9 @@ function UnitTypeRows({ propertyId, masterEnabled }: { propertyId: string; maste
           ))}
         </div>
       ) : (
-        <div style={{ fontSize: '.76rem', color: 'var(--amber, #d97706)', marginBottom: 12 }}>
-          No unit types decided — units can&apos;t be added and tenants can&apos;t be onboarded at this
-          property until each unit type has a decision here.
+        <div style={{ fontSize: '.76rem', color: 'var(--text-3)', marginBottom: 12 }}>
+          No late fees set. By default no late fee is charged — add one below only for the unit
+          types you want to charge.
         </div>
       )}
 
@@ -185,19 +183,11 @@ function UnitTypeRows({ propertyId, masterEnabled }: { propertyId: string; maste
           </select>
         </div>
         <div>
-          <span style={lbl}>Decision</span>
-          <select className="form-select" value={decision} onChange={e => setDecision(e.target.value as 'fee' | 'none')} style={{ width: 130 }}>
-            <option value="fee">Charge a fee</option>
-            <option value="none">No late fee</option>
-          </select>
-        </div>
-        {decision === 'fee' && (
-          <>
-            <div>
-              <span style={lbl}>Fee</span>
-              <input className="form-input mono" type="text" inputMode="decimal" value={amount}
+          <span style={lbl}>{retroWithAccrual ? 'Fee (n/a)' : 'Fee'}</span>
+              <input className="form-input mono" type="text" inputMode="decimal"
+                value={retroWithAccrual ? '' : amount} disabled={retroWithAccrual}
                 onChange={e => { const v = e.target.value; if (v === '' || /^\d*\.?\d*$/.test(v)) setAmount(v) }}
-                placeholder="25" style={{ width: 80 }} />
+                placeholder={retroWithAccrual ? '$0' : '25'} style={{ width: 80, opacity: retroWithAccrual ? 0.5 : 1 }} />
             </div>
             <div>
               <span style={lbl}>Type</span>
@@ -209,60 +199,48 @@ function UnitTypeRows({ propertyId, masterEnabled }: { propertyId: string; maste
             <div>
               <span style={lbl}>Grace (days)</span>
               <input className="form-input mono" type="text" inputMode="numeric" value={grace}
-                onFocus={() => setShowGraceInfo(true)}
                 onChange={e => { const v = e.target.value; if (v === '' || /^\d+$/.test(v)) setGrace(v) }}
                 style={{ width: 70 }} />
             </div>
             <div>
-              <span style={lbl}>Then accrues $ (optional)</span>
+              <span style={lbl}>Ongoing $ (optional)</span>
               <input className="form-input mono" type="text" inputMode="decimal" value={accrualAmount}
                 onChange={e => { const v = e.target.value; if (v === '' || /^\d*\.?\d*$/.test(v)) setAccrualAmount(v) }}
-                placeholder="5" style={{ width: 70 }} />
+                placeholder="5" style={{ width: 90 }} />
             </div>
-            {accrualAmount !== '' && (
-              <div>
-                <span style={lbl}>Per</span>
-                <select className="form-select" value={accrualPeriod} onChange={e => setAccrualPeriod(e.target.value)} style={{ width: 90 }}>
-                  <option value="daily">Day</option>
-                  <option value="weekly">Week</option>
-                  <option value="monthly">Month</option>
-                </select>
-              </div>
-            )}
+            <div>
+              <span style={lbl}>Per</span>
+              <select className="form-select" value={accrualPeriod} onChange={e => setAccrualPeriod(e.target.value)} style={{ width: 90 }}>
+                <option value="daily">Day</option>
+                <option value="weekly">Week</option>
+                <option value="monthly">Month</option>
+              </select>
+            </div>
+            <div>
+              <span style={lbl}>Counts from</span>
+              <select className="form-select" value={accrualFrom} onChange={e => setAccrualFrom(e.target.value as any)} style={{ width: 190 }}>
+                <option value="due_date_inclusive">Due date (incl. due date)</option>
+                <option value="due_date">Day after due date</option>
+                <option value="grace_end">End of grace period</option>
+              </select>
+            </div>
             <div>
               <span style={lbl}>Cap $ (optional)</span>
               <input className="form-input mono" type="text" inputMode="decimal" value={capAmount}
                 onChange={e => { const v = e.target.value; if (v === '' || /^\d*\.?\d*$/.test(v)) setCapAmount(v) }}
                 placeholder="none" style={{ width: 80 }} />
             </div>
-          </>
-        )}
         <button className="btn btn-primary btn-sm"
-          disabled={!unitType || (decision === 'fee' && amount === '') || upsertMut.isLoading}
+          disabled={!unitType || (amount === '' && !retroWithAccrual) || upsertMut.isLoading}
           onClick={() => upsertMut.mutate()}>
-          {upsertMut.isLoading ? 'Saving…' : decision === 'none' ? 'Save Decision' : 'Add Late Fee'}
+          {upsertMut.isLoading ? 'Saving…' : 'Add Late Fee'}
         </button>
       </div>
 
-      {!masterEnabled && (rows as any[]).length > 0 && (
+      {!masterEnabled && (rows as any[]).filter((o: any) => !o.noLateFee).length > 0 && (
         <div style={{ fontSize: '.74rem', color: 'var(--text-3)', marginTop: 8 }}>
-          The property master toggle is off — decisions stay on record and still satisfy the
-          onboarding gate, but no late fees are charged or drafted while it&apos;s off.
-        </div>
-      )}
-
-      {/* S535 (Nic): the grace popup — the landlord sees exactly which day
-          the fee starts under what they picked. Engine rule: fee fires
-          when the local date reaches due date + grace days. */}
-      {showGraceInfo && decision === 'fee' && (
-        <div style={{ marginTop: 12, background: 'rgba(245,158,11,.08)', border: '1px solid var(--amber, #d97706)', borderRadius: 8, padding: '10px 12px', fontSize: '.78rem', color: 'var(--text-1)', lineHeight: 1.55, display: 'flex', gap: 8 }}>
-          <AlertTriangle size={14} style={{ color: 'var(--amber, #d97706)', flexShrink: 0, marginTop: 2 }} />
-          <div>
-            With a <strong>{g}-day</strong> grace period, a tenant whose rent is due on the <strong>1st</strong> can
-            pay through the <strong>{ord(Math.max(1, g))}</strong> without a fee — the late fee starts on
-            the <strong>{ord(1 + g)}</strong> of each month. (In general: the fee starts on the due day
-            + {g}; a lease due on the 5th starts accruing on the {ord(5 + g)}.)
-          </div>
+          The property master toggle is off — saved late fees stay on record but aren&apos;t
+          charged or drafted while it&apos;s off.
         </div>
       )}
     </div>

@@ -95,15 +95,14 @@ beforeEach(async () => {
 
 // ─── The onboarding gate ─────────────────────────────────────────────
 
-describe('S537 gate: explicit decision before units / onboarding', () => {
-  it('POST /units refuses an UNDECIDED unit class with 422', async () => {
+describe('S577: no late-fee gate — no fee is the default', () => {
+  it('POST /units succeeds for a class with NO late-fee decision (gate retired)', async () => {
     const f = await fixture()
     const res = await request(buildApp())
       .post('/api/units')
       .set('Authorization', `Bearer ${landlordToken(f.userId, f.landlordId)}`)
       .send({ propertyId: f.propertyId, unitNumber: 'A1', unitType: 'rv_spot', rentAmount: 900 })
-    expect(res.status).toBe(422)
-    expect(res.body.error).toMatch(/late-fee decision/i)
+    expect(res.status).toBe(201)
   })
 
   it('POST /units succeeds once the class has a FEE decision', async () => {
@@ -130,7 +129,7 @@ describe('S537 gate: explicit decision before units / onboarding', () => {
     expect(res.status).toBe(201)
   })
 
-  it('onboard-tenant refuses when the unit class lost its decision (422)', async () => {
+  it('onboard-tenant is NOT blocked by a missing late-fee decision (gate retired)', async () => {
     const f = await fixture()
     const client = await db.connect()
     let unitId: string
@@ -139,18 +138,16 @@ describe('S537 gate: explicit decision before units / onboarding', () => {
       unitId = await seedUnit(client, { propertyId: f.propertyId, landlordId: f.landlordId })
       await client.query('COMMIT')
     } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
-    // Simulate the undecided-with-units state directly (the API blocks
-    // producing it via DELETE, so force it in SQL).
     await db.query(`DELETE FROM property_unit_type_late_fees WHERE property_id=$1`, [f.propertyId])
     const res = await request(buildApp())
       .post('/api/landlords/me/onboard-tenant')
       .set('Authorization', `Bearer ${landlordToken(f.userId, f.landlordId)}`)
       .send({
-        firstName: 'Tess', lastName: 'Gate', email: 's537gate@test.dev', phone: '602-555-0001',
+        firstName: 'Tess', lastName: 'Gate', email: 's577gate@test.dev', phone: '602-555-0001',
         unitId, leaseStart: '2026-01-01', monthlyRent: 800,
       })
-    expect(res.status).toBe(422)
-    expect(res.body.error).toMatch(/late-fee decision/i)
+    // Whatever the outcome, it must NOT be the retired late-fee gate.
+    expect(res.body.error || '').not.toMatch(/late-fee decision/i)
   })
 })
 
@@ -245,7 +242,7 @@ describe('S558 billing: total = the signed lease stamp, policy ignored', () => {
 // ─── Decision row API shapes ─────────────────────────────────────────
 
 describe('S537 decision rows API', () => {
-  it('DELETE refuses while units of the class exist (409)', async () => {
+  it('DELETE succeeds even while units of the class exist (S577 — reverts to no fee)', async () => {
     const f = await fixture()
     const client = await db.connect()
     try { await seedUnit(client, { propertyId: f.propertyId, landlordId: f.landlordId, unitType: 'apartment' }) }
@@ -258,8 +255,7 @@ describe('S537 decision rows API', () => {
     const res = await request(app)
       .delete(`/api/properties/${f.propertyId}/late-fee-overrides/apartment`)
       .set('Authorization', `Bearer ${landlordToken(f.userId, f.landlordId)}`)
-    expect(res.status).toBe(409)
-    expect(res.body.error).toMatch(/decision must stay/i)
+    expect(res.status).toBe(200)
   })
 
   it('PUT accepts the no-fee decision shape', async () => {
@@ -332,14 +328,13 @@ describe('S537b CSV-first property import', () => {
     expect(res.body.error).toMatch(/not a GAM unit type/i)
   })
 
-  it('commit without a decision for a NEW property → 422 (gate holds)', async () => {
+  it('commit without a decision is NOT blocked by the retired late-fee gate (S577)', async () => {
     const f = await fixture()
     const res = await request(buildApp())
       .post('/api/landlords/me/onboard-properties-csv/commit')
       .set('Authorization', `Bearer ${landlordToken(f.userId, f.landlordId)}`)
       .send({ rows: [csvRow()], source: 'doorloop' })
-    expect(res.status).toBe(422)
-    expect(res.body.error).toMatch(/late-fee decision/i)
+    expect(res.body.error || '').not.toMatch(/late-fee decision/i)
   })
 
   it('commit with a lateFeeDecisions payload creates property + units + decision row', async () => {

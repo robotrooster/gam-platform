@@ -13,9 +13,14 @@ Use TINY amounts ($1–$5). This is real money.
 - [ ] A **test tenant** on a real lease with a real payment method:
   - ACH: added via **Financial Connections** (real bank login) — live, not the dev mock SetupIntent.
   - Card: a real card (yours), small charge.
-- [ ] Prod webhook endpoint registered in the Stripe **live** dashboard →
-  `https://api.goldassetmanagement.com/webhooks/stripe` (NOT `/api/webhooks/stripe`),
-  signing secret == `STRIPE_WEBHOOK_SECRET` in `.env`. (Confirm in Stripe → Developers → Webhooks, live mode.)
+- [x] Prod webhook endpoint registered in the Stripe **live** dashboard →
+  `https://api.goldassetmanagement.com/webhooks/stripe` (NOT `/api/webhooks/stripe`).
+  VERIFIED 2026-08-02 via Stripe API: TWO live endpoints on that one URL, both `enabled` —
+  the **platform** one (`we_1TvhBn…`, no application: payment_intent.*, charge.dispute.*,
+  checkout.session.completed) verified against `STRIPE_WEBHOOK_SECRET`, and the **Connect**
+  one (`we_1TwmXE…`, application `ca_Uweu…`: account.updated, payout.*) verified against
+  `STRIPE_CONNECT_WEBHOOK_SECRET`. Handler tries both secrets (`src/routes/webhooks.ts:32-41`).
+  Route enforces signature (POST returns 400, not 404). Prod API healthy 200 (local + tunnel).
 
 ## Test A — CARD (immediate proof)
 1. As the test tenant, Pay Now a small rent (e.g. $2) with the real card.

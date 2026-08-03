@@ -29,7 +29,6 @@
  * (explicit no-fee decision, master toggle off, or undecided).
  */
 import { queryOne } from '../db'
-import { AppError } from '../middleware/errorHandler'
 
 export interface ResolvedLateFeePolicy {
   source: 'unit_type_override'
@@ -41,6 +40,7 @@ export interface ResolvedLateFeePolicy {
   late_fee_accrual_amount: string | null
   late_fee_accrual_type: 'flat' | 'percent_of_rent' | null
   late_fee_accrual_period: 'daily' | 'weekly' | 'monthly' | null
+  late_fee_accrual_from: 'grace_end' | 'due_date' | 'due_date_inclusive'
   late_fee_cap_amount: string | null
   late_fee_cap_type: 'flat' | 'percent_of_rent' | null
 }
@@ -86,6 +86,7 @@ export async function resolveLateFeePolicyForUnit(
     late_fee_accrual_amount: override.late_fee_accrual_amount,
     late_fee_accrual_type: override.late_fee_accrual_type,
     late_fee_accrual_period: override.late_fee_accrual_period,
+    late_fee_accrual_from: override.late_fee_accrual_from || 'grace_end',
     late_fee_cap_amount: override.late_fee_cap_amount,
     late_fee_cap_type: override.late_fee_cap_type,
   }
@@ -107,35 +108,28 @@ export async function hasLateFeeDecision(
   return !!row
 }
 
-/** S537 gate: adding units / onboarding tenants for an undecided unit
- *  class refuses with a pointer to the settings surface. Uniformity rule:
- *  every tenant of a class gets identical, vetted late-fee terms — the
- *  decision must exist BEFORE anyone can occupy the class. */
+/** S577 (Nic): the S537 forced-decision GATE is RETIRED. No late fee is now the
+ *  automatic default — a (property, unit_type) with no row simply has no late
+ *  fee (billing already treats a missing row as null / no fee, and drafting
+ *  stamps nothing). A landlord creates a row only to CHARGE a fee. So these two
+ *  gate functions are intentional NO-OPS, kept (with their call sites intact) so
+ *  the change lives in one place. `hasLateFeeDecision` stays for anyone who
+ *  still wants to ask "is a fee configured?".
+ *  Removing the gate does NOT reintroduce fee divergence: billing = lease-stamp,
+ *  and a no-row class stamps no fee — uniform (everyone gets none). */
 export async function assertLateFeeDecision(
-  propertyId: string,
-  unitType: string,
-  client: Exec = null,
+  _propertyId: string,
+  _unitType: string,
+  _client: Exec = null,
 ): Promise<void> {
-  if (await hasLateFeeDecision(propertyId, unitType, client)) return
-  const label = unitType.replace(/_/g, ' ')
-  throw new AppError(422,
-    `No late-fee decision exists for ${label} units at this property. ` +
-    `Set the late-fee terms for ${label} — or explicitly choose "no late fee" — ` +
-    `in the property's Late Fees settings before adding ${label} units or onboarding tenants to them.`)
+  return
 }
 
-/** Same gate keyed by unit id (onboarding paths know the unit, not the
- *  type). No-op for units with no type on record. */
 export async function assertLateFeeDecisionForUnit(
-  unitId: string,
-  client: Exec = null,
+  _unitId: string,
+  _client: Exec = null,
 ): Promise<void> {
-  const one = async (sql: string, params: any[]) =>
-    client ? (await client.query(sql, params)).rows[0] ?? null : queryOne<any>(sql, params)
-  const unit = await one(
-    `SELECT property_id, unit_type FROM units WHERE id = $1`, [unitId])
-  if (!unit?.unit_type) return
-  await assertLateFeeDecision(unit.property_id, unit.unit_type, client)
+  return
 }
 
 /** Map a resolved policy onto the granular late-fee lease-column tags
