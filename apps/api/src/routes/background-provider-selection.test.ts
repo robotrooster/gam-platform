@@ -241,47 +241,36 @@ describe('POST /api/background/submit — S551 checkr no-SSN + property resoluti
 // S561: the applicant no longer pays for screening — GAM bills the LANDLORD
 // (Checkr cost passed through + a flat $5 margin). The 50-state applicant
 // fee-cap machinery was retired; there is no applicant payment step.
-describe('S561 landlord-billed screening', () => {
-  it('/price reports the applicant fee waived (applicant is never charged)', async () => {
+describe('S577 applicant-paid screening', () => {
+  it('/price reports the applicant fee (applicant pays on both routes)', async () => {
     const f = await seedFixture({ provider: 'checkr' })
     const res = await request(buildApp())
       .get(`/api/background/price?landlordId=${f.landlordId}&unitId=${f.unitId}`)
     expect(res.status).toBe(200)
-    expect(res.body.data).toMatchObject({ totalFee: 0, feeWaived: true, providerCollectsPii: true })
+    expect(res.body.data.feeWaived).toBe(false)
+    expect(res.body.data.totalFee).toBeGreaterThan(0)
+    expect(res.body.data.providerCollectsPii).toBe(true)
   })
 
-  it('submit succeeds with NO applicant payment intent', async () => {
+  it('submit REQUIRES an applicant payment intent (402 without)', async () => {
     const f = await seedFixture({ provider: 'mock' })
     const res = await request(buildApp())
       .post('/api/background/submit')
       .set('Authorization', `Bearer ${f.applicantToken}`)
       .send({ ...happyPayload({ landlordId: f.landlordId, unitId: f.unitId }), applicantPaymentIntentId: undefined })
-    expect(res.status).toBe(201)
-    const { rows: [row] } = await db.query<any>(
-      `SELECT applicant_payment_intent_id FROM background_checks WHERE id=$1`, [res.body.data.id])
-    expect(row.applicant_payment_intent_id).toBeNull()
+    expect(res.status).toBe(402)
   })
 
-  it('checkr submit writes the landlord accrual = Checkr cost + $5 margin', async () => {
+  it('checkr submit writes NO landlord accrual (applicant pays; landlord not billed)', async () => {
     const f = await seedFixture({ provider: 'checkr' })
     const res = await request(buildApp())
       .post('/api/background/submit')
       .set('Authorization', `Bearer ${f.applicantToken}`)
       .send({ ...happyPayload({ landlordId: f.landlordId, unitId: f.unitId }), ssn: undefined })
     expect(res.status).toBe(201)
-    const { rows: [acc] } = await db.query<any>(
-      `SELECT compliance_fee, standard_total, applicant_charged, shortfall, state
-         FROM screening_fee_accruals WHERE background_check_id=$1`, [res.body.data.id])
-    expect(acc).toBeTruthy()
-    // standard_total = Checkr cost passed through; compliance_fee = GAM's $5
-    // margin; landlord owes the sum ($42.94). applicant_charged/shortfall = 0.
-    const cost = parseFloat(process.env.SCREENING_CHECKR_COST_USD || '37.94')
-    const margin = parseFloat(process.env.SCREENING_GAM_MARGIN_USD || '5')
-    expect(parseFloat(acc.standard_total)).toBeCloseTo(cost, 2)
-    expect(parseFloat(acc.compliance_fee)).toBeCloseTo(margin, 2)
-    expect(parseFloat(acc.applicant_charged)).toBe(0)
-    expect(parseFloat(acc.shortfall)).toBe(0)
-    expect(acc.state).toBeNull()
+    const { rows } = await db.query<any>(
+      `SELECT id FROM screening_fee_accruals WHERE background_check_id=$1`, [res.body.data.id])
+    expect(rows.length).toBe(0)
   })
 
   it('mock-provider submit writes NO accrual', async () => {
@@ -301,7 +290,7 @@ describe('S561 landlord-billed screening', () => {
 // intents no-op on Stripe but still void the accrual) and the stale sweep
 // cancels + refunds checks stuck awaiting the applicant.
 describe('S552 screening refunds', () => {
-  it('applicant cancel voids the unbilled landlord accrual', async () => {
+  it('applicant cancel marks the check cancelled (S577: no landlord accrual exists)', async () => {
     const f = await seedFixture({ provider: 'checkr' })
     const res = await request(buildApp())
       .post('/api/background/submit')
@@ -309,19 +298,15 @@ describe('S552 screening refunds', () => {
       .send({ ...happyPayload({ landlordId: f.landlordId, unitId: f.unitId }), ssn: undefined })
     expect(res.status).toBe(201)
     const checkId = res.body.data.id
+    // S577: the landlord is never billed for screening → no accrual row exists.
     const { rows: pre } = await db.query<any>(
       `SELECT id FROM screening_fee_accruals WHERE background_check_id=$1`, [checkId])
-    expect(pre.length).toBe(1)
+    expect(pre.length).toBe(0)
 
     const cancel = await request(buildApp())
       .post(`/api/background/${checkId}/cancel`)
       .set('Authorization', `Bearer ${f.applicantToken}`)
     expect(cancel.status).toBe(200)
-    // Mock payment intent → no Stripe refund, but the accrual is voided.
-    expect(cancel.body.data.refunded).toBe(false)
-    const { rows: post } = await db.query<any>(
-      `SELECT id FROM screening_fee_accruals WHERE background_check_id=$1`, [checkId])
-    expect(post.length).toBe(0)
     const { rows: [chk] } = await db.query<any>(
       `SELECT status FROM background_checks WHERE id=$1`, [checkId])
     expect(chk.status).toBe('cancelled')

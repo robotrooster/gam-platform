@@ -210,9 +210,8 @@ backgroundRouter.get('/price', async (req, res) => {
   // S551: optional ?landlordId resolves that landlord's screening provider so
   // the intake form knows whether SSN/ID collection happens on GAM's form
   // (mock) or on Checkr's hosted consent flow (checkr → GAM never collects).
-  // S561: the applicant is never charged for screening (GAM bills the
-  // landlord), so the applicant-facing fee is always 0 / waived. The route
-  // stays for the provider + PII flags the intake form still needs.
+  // S577 (Nic): the APPLICANT pays on BOTH routes, so return the real fee +
+  // breakdown; the intake form shows the payment step accordingly.
   let provider = 'mock'
   const landlordId = (req.query.landlordId as string) || null
   if (landlordId) {
@@ -221,15 +220,18 @@ backgroundRouter.get('/price', async (req, res) => {
     ).catch(() => null)
     if (row) provider = row.background_provider
   }
+  const fee = await screeningIntakeFee((req.query.state as string) || null)
   res.json({
     success: true,
     data: {
-      applicantFee:  0,
-      processingFee: 0,
-      totalFee:      0,
+      applicantFee:  Math.round((fee.screening + fee.gamFee) * 100) / 100,
+      processingFee: fee.processing,
+      tax:           fee.tax,
+      totalFee:      fee.total,
+      breakdown:     fee,
       capApplied:    false,
       feeProhibited: false,
-      feeWaived:     true,
+      feeWaived:     false,
       provider,
       providerCollectsPii: provider === 'checkr',
       poolUnlockFee: POOL_REPORT_UNLOCK_USD,
@@ -242,20 +244,36 @@ backgroundRouter.get('/price', async (req, res) => {
 // for screening (GAM bills the landlord), so this always reports fee waived.
 backgroundRouter.post('/payment-intent', requireAuth, async (req, res, next) => {
   try {
-    // S564: two routes. LANDLORD route — the applicant is NOT charged here (GAM
-    // bills the landlord, who passes through per state law), so the fee is waived
-    // and the intake UI skips the card step. POOL (speculative, no landlordId)
-    // route — the applicant pays GAM directly for their own portable screen.
+    // S577 (Nic): the APPLICANT pays for the screen on BOTH routes, up front,
+    // before the check runs. LANDLORD route — the landlord is the property lock /
+    // merchant-of-record: the applicant's charge routes `on_behalf_of` the
+    // landlord's Connect (their applicant, FCRA permissible purpose, state-cap
+    // liability is theirs), funds settle to GAM (GAM pays Checkr + keeps its $5),
+    // landlord nets $0. POOL route (no landlordId) — applicant pays GAM directly
+    // for their own portable screen. Same flat national price either way.
     const landlordId = req.body?.landlordId || null
-    if (landlordId) {
-      return res.json({
-        success: true,
-        data: { clientSecret: null, intentId: null, amount: 0, feeWaived: true, testMode: !STRIPE_LIVE },
-      })
-    }
     const fee = await screeningIntakeFee(req.body?.state || null)
+
+    // LANDLORD route: resolve the landlord's Connect account for on_behalf_of.
+    // Screening can't start until the landlord has finished Connect (charges) —
+    // same account they use for rent.
+    let onBehalfOf: string | null = null
+    if (landlordId) {
+      const acct = await queryOne<{ acct: string | null; charges_ok: boolean }>(
+        `SELECT COALESCE(l.stripe_connect_account_id, u.stripe_connect_account_id) AS acct,
+                CASE WHEN l.stripe_connect_account_id IS NOT NULL
+                     THEN COALESCE(l.connect_charges_enabled, FALSE)
+                     ELSE COALESCE(u.connect_charges_enabled, FALSE) END AS charges_ok
+           FROM landlords l JOIN users u ON u.id = l.user_id
+          WHERE l.id = $1`, [landlordId])
+      if (!acct?.acct || !acct.charges_ok) {
+        throw new AppError(409, 'This property owner hasn’t finished payment setup yet, so screening can’t be started for it. Please try again once their account is ready.')
+      }
+      onBehalfOf = acct.acct
+    }
+
     if (!STRIPE_LIVE) {
-      const mockId = 'pi_bgc_mock_' + crypto.randomBytes(8).toString('hex')
+      const mockId = 'pi_intake_mock_' + crypto.randomBytes(8).toString('hex')
       return res.json({
         success: true,
         data: { clientSecret: mockId + '_secret', intentId: mockId, amount: fee.total, breakdown: fee, feeWaived: false, testMode: true },
@@ -265,8 +283,11 @@ backgroundRouter.post('/payment-intent', requireAuth, async (req, res, next) => 
       amount: Math.round(fee.total * 100),
       currency: 'usd',
       payment_method_types: ['card'],
-      description: 'GAM renter-pool background screening',
-      metadata: { kind: 'background_check_intake', userId: req.user!.userId, feeUsd: String(fee.total) },
+      description: landlordId ? 'GAM tenant background screening' : 'GAM renter-pool background screening',
+      metadata: { kind: 'background_check_intake', userId: req.user!.userId, feeUsd: String(fee.total), ...(landlordId ? { landlordId } : {}) },
+      // on_behalf_of makes the landlord the merchant of record; no transfer_data,
+      // so funds still settle to GAM (landlord nets $0).
+      ...(onBehalfOf ? { on_behalf_of: onBehalfOf } : {}),
     })
     res.json({
       success: true,
@@ -367,20 +388,18 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
     const providerCollectsPii = providerName === 'checkr'
     if (!providerCollectsPii && !ssn) throw new AppError(400, 'Required fields missing')
 
-    // S564: pool (speculative) applicants pay for their own portable screen —
-    // verify the intake payment BEFORE creating the check. Landlord-route checks
-    // carry no applicant payment (the landlord is billed).
-    if (isSpeculative) {
-      if (!applicantPaymentIntentId) throw new AppError(402, 'Payment required for renter-pool screening')
-      await verifyPaymentIntent(applicantPaymentIntentId, {
-        kind: 'background_check_intake',
-        amountUsd: (await screeningIntakeFee(state)).total,
-        userId: req.user!.userId,
-      })
-    }
-
-    // S561: no applicant payment step — GAM bills the landlord (below). The
-    // applicantPaymentIntentId field is accepted-but-ignored for old clients.
+    // S577 (Nic): the applicant pays for the screen up front on BOTH routes,
+    // verified BEFORE the check is created — no free checks, and the landlord is
+    // never billed (they're the property lock / merchant-of-record via
+    // on_behalf_of at payment time). Landlord handles any state fee-cap by
+    // issuing the tenant a credit (POST /:id/screening-credit); GAM never
+    // computes caps.
+    if (!applicantPaymentIntentId) throw new AppError(402, 'Payment required before screening can start')
+    await verifyPaymentIntent(applicantPaymentIntentId, {
+      kind: 'background_check_intake',
+      amountUsd: (await screeningIntakeFee(state)).total,
+      userId: req.user!.userId,
+    })
 
     let ssnClean: string | null = null
     let ssnLast4: string | null = null
@@ -524,39 +543,12 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
       providerStatus = 'failed'
     }
 
-    // ⚠️ INTERIM / SUPERSEDED — replaced in the Stripe/Connect block.
-    // Final model (gam-checkr-billing-model): the APPLICANT pays ~$44.60 at
-    // application ($37.94 Checkr + $5 GAM + card processing on top) via a
-    // destination charge to the LANDLORD's Connect account with application_fee
-    // = the full amount (landlord nets $0, GAM captured real-time, no float).
-    // That wiring waits for the Connect per-entity re-anchor. Until then this
-    // landlord-accrual path stays as a DORMANT stub (no real screenings run
-    // without live Checkr+Stripe keys anyway). Do NOT treat it as the live model.
-    //
-    // S561: landlord-side screening billing — GAM's actual Checkr cost passed
-    // through + a flat $5 margin, billed to the LANDLORD (never the applicant).
-    // Only for real (checkr) orders that actually initiated; failed initiates
-    // incur no Checkr cost and accrue nothing. Column mapping onto the existing
-    // accrual table: standard_total = Checkr cost passed through,
-    // compliance_fee = GAM's $5 margin, applicant_charged = 0 (applicant pays
-    // nothing now), shortfall = 0 (caps retired), state = null. The landlord
-    // owes standard_total + compliance_fee ($42.94). Collected by netting
-    // against the landlord's disbursement (via the money-flow rebuild batch —
-    // gam-money-flow-platform-holds); until that lands it rides the existing
-    // monthly screening-fee sweep. If Checkr ever bills a variable/taxed amount,
-    // set standard_total from the invoiced actual at completion instead of this
-    // module constant.
-    if (providerName === 'checkr' && providerStatus !== 'failed' && landlordId) {
-      try {
-        await query(
-          `INSERT INTO screening_fee_accruals
-             (background_check_id, landlord_id, accrual_month, compliance_fee,
-              standard_total, applicant_charged, shortfall, state)
-           VALUES ($1, $2, date_trunc('month', NOW())::date, $3, $4, 0, 0, NULL)
-           ON CONFLICT (background_check_id) DO NOTHING`,
-          [check!.id, landlordId, SCREENING_GAM_MARGIN_USD, SCREENING_CHECKR_COST_USD])
-      } catch (e) { logger.error({ err: e }, '[SCREENING ACCRUAL]') }
-    }
+    // S577 (Nic): the landlord is NEVER billed for screening — the APPLICANT paid
+    // up front (verified above), routed on_behalf_of the landlord so the landlord
+    // is merchant-of-record and nets $0. The S561 landlord-accrual
+    // (screening_fee_accruals) is RETIRED on this intake path. A state fee-cap is
+    // the landlord's to cure by issuing the tenant a credit
+    // (POST /:id/screening-credit); GAM never computes caps.
 
     if (tenant) {
       await query(

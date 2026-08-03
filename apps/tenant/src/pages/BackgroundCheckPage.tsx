@@ -1,14 +1,49 @@
 import { useState, useRef, useEffect } from 'react'
 import { useQuery, useMutation } from 'react-query'
 import { Shield, Upload, Check, AlertCircle, Lock, Clock, XCircle } from 'lucide-react'
+import { loadStripe } from '@stripe/stripe-js'
+import { Elements, PaymentElement, useStripe, useElements } from '@stripe/react-stripe-js'
 
 const API = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000'
 
-// S561: the applicant no longer pays for screening (GAM bills the landlord),
-// so the Stripe Elements intake-fee flow was removed. The step-5 effect still
-// creates the prospect account and then calls /background/payment-intent,
-// which now always reports the fee waived → the flow advances straight to
-// submit with no card step.
+// S577 (Nic): the APPLICANT pays for their own screen up front, on BOTH routes
+// (applying to a landlord = routed on_behalf_of the landlord, who is just the
+// property lock / merchant-of-record and nets $0; renter-pool = paid to GAM).
+// So the Stripe Elements card step is restored in step 5.
+const STRIPE_PK = (import.meta as any).env?.VITE_STRIPE_PUBLISHABLE_KEY || ''
+const stripePromise = STRIPE_PK ? loadStripe(STRIPE_PK) : null
+
+// Card form for the screening fee — mounted inside <Elements> with the
+// PaymentIntent client secret. On success, hands the confirmed intent id up.
+function ScreeningCardForm({ amountLabel, onPaid }: { amountLabel: string; onPaid: (intentId?: string) => void }) {
+  const stripe = useStripe()
+  const elements = useElements()
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+  const pay = async () => {
+    if (!stripe || !elements) return
+    setBusy(true); setErr(null)
+    const { error, paymentIntent } = await stripe.confirmPayment({ elements, redirect: 'if_required' })
+    setBusy(false)
+    if (error) { setErr(error.message || 'Payment failed'); return }
+    if (paymentIntent && (paymentIntent.status === 'succeeded' || paymentIntent.status === 'processing')) {
+      onPaid(paymentIntent.id)
+    } else {
+      setErr('Payment could not be completed — please try again.')
+    }
+  }
+  return (
+    <div style={{ textAlign: 'left' }}>
+      <PaymentElement />
+      {err && <div style={{ color: '#ef4444', fontSize: '.78rem', marginTop: 8 }}>{err}</div>}
+      <button onClick={pay} disabled={busy || !stripe}
+        style={{ width: '100%', marginTop: 14, padding: '12px', borderRadius: 8, border: 'none', background: busy ? '#141a22' : '#c9a227', color: busy ? '#4a5568' : '#060809', fontWeight: 700, cursor: busy ? 'not-allowed' : 'pointer', fontSize: '.88rem' }}>
+        {busy ? 'Processing…' : `Pay ${amountLabel}`}
+      </button>
+    </div>
+  )
+}
+
 const tok = () => localStorage.getItem('gam_tenant_token')
 const get = (p: string) => fetch(`${API}/api${p}`,{headers:{Authorization:`Bearer ${tok()}`}}).then(r=>r.json()).then(r=>r.data??r)
 const uploadFile = async (p: string, file: File) => { const fd=new FormData(); fd.append('file',file); return fetch(`${API}/api${p}`,{method:'POST',headers:{Authorization:`Bearer ${tok()}`},body:fd}).then(r=>r.json()) }
@@ -33,6 +68,7 @@ export function BackgroundCheckPage() {
   const [paid, setPaid] = useState(false)
   const [paymentIntentId, setPaymentIntentId] = useState<string>('')
   const [paymentClientSecret, setPaymentClientSecret] = useState<string>('')
+  const [paymentTestMode, setPaymentTestMode] = useState(false)
   const [paymentInitError, setPaymentInitError] = useState<string>('')
   const [startTime] = useState(Date.now())
   const [countdown, setCountdown] = useState('')
@@ -281,12 +317,13 @@ export function BackgroundCheckPage() {
           return
         }
         if (piRes.data.feeWaived) {
-          // Fee-prohibited state: no charge, no payment step.
+          // Legacy no-charge path (not used under S577; kept as a safety net).
           setPaid(true)
           return
         }
         setPaymentClientSecret(piRes.data.clientSecret)
         setPaymentIntentId(piRes.data.intentId)
+        setPaymentTestMode(!!piRes.data.testMode)
       } catch (e: any) {
         if (!cancelled) setPaymentInitError(e?.message || 'Failed to initialize payment')
       }
@@ -588,22 +625,39 @@ export function BackgroundCheckPage() {
         </div>}
         {step===5&&<div style={{textAlign:'center'}}>
           <div style={{fontSize:'2rem',marginBottom:8}}>🛡️</div>
-          <div style={{fontSize:'1.1rem',fontWeight:800,color:'#eef1f8',marginBottom:6}}>Review & Submit</div>
-          <div style={{fontSize:'.82rem',color:'#4a5568',marginBottom:20}}>There's no charge to you — your landlord covers the cost of screening.</div>
-          <div style={{background:'#141a22',border:'1px solid #1e2530',borderRadius:12,padding:20,marginBottom:20,textAlign:'left'}}>
-            <div style={{fontSize:'.82rem',color:'#b8c4d8',lineHeight:1.6}}>
-              Your landlord pays for this background check — you owe nothing.
-              {providerCollectsPii ? ' After you submit, Checkr emails you a secure link to finish identity verification — a quick photo of your ID and a selfie, right from your phone.' : ''}
+          <div style={{fontSize:'1.1rem',fontWeight:800,color:'#eef1f8',marginBottom:6}}>Review & Pay</div>
+          <div style={{fontSize:'.82rem',color:'#4a5568',marginBottom:16}}>You pay for your own screening. {providerCollectsPii ? 'After payment, Checkr emails you a secure link to finish identity verification — a quick photo of your ID and a selfie, right from your phone.' : ''}</div>
+          {price && (
+            <div style={{background:'#141a22',border:'1px solid #1e2530',borderRadius:12,padding:16,marginBottom:16,textAlign:'left',fontSize:'.82rem',color:'#b8c4d8'}}>
+              <div style={{display:'flex',justifyContent:'space-between',marginBottom:4}}><span>Background & credit screening</span><span>${Number((price as any).breakdown?.screening ?? 0).toFixed(2)}</span></div>
+              <div style={{display:'flex',justifyContent:'space-between',marginBottom:4}}><span>Service fee</span><span>${Number((price as any).breakdown?.gamFee ?? 0).toFixed(2)}</span></div>
+              {Number((price as any).breakdown?.tax ?? 0) > 0 && <div style={{display:'flex',justifyContent:'space-between',marginBottom:4}}><span>Tax</span><span>${Number((price as any).breakdown?.tax).toFixed(2)}</span></div>}
+              <div style={{display:'flex',justifyContent:'space-between',marginBottom:4}}><span>Card processing</span><span>${Number((price as any).breakdown?.processing ?? 0).toFixed(2)}</span></div>
+              <div style={{display:'flex',justifyContent:'space-between',fontWeight:800,color:'#eef1f8',borderTop:'1px solid #1e2530',paddingTop:8,marginTop:4}}><span>Total</span><span>${Number((price as any).totalFee ?? 0).toFixed(2)}</span></div>
             </div>
-          </div>
+          )}
           {paymentInitError && (
             <div style={{padding:'10px 14px',background:'rgba(239,68,68,.06)',border:'1px solid rgba(239,68,68,.25)',borderRadius:8,color:'#ef4444',fontSize:'.78rem',marginBottom:12}}>{paymentInitError}</div>
           )}
-          {!paid && !paymentInitError && (
-            <div style={{fontSize:'.78rem',color:'#4a5568',marginBottom:12}}>Setting up your application…</div>
+          {!paid && !paymentInitError && !paymentClientSecret && (
+            <div style={{fontSize:'.78rem',color:'#4a5568',marginBottom:12}}>Setting up your payment…</div>
+          )}
+          {!paid && paymentClientSecret && paymentTestMode && (
+            <button onClick={()=>setPaid(true)}
+              style={{width:'100%',padding:'12px',borderRadius:8,border:'none',background:'#c9a227',color:'#060809',fontWeight:700,cursor:'pointer',fontSize:'.88rem'}}>
+              Pay ${Number((price as any)?.totalFee ?? 0).toFixed(2)} (test mode)
+            </button>
+          )}
+          {!paid && paymentClientSecret && !paymentTestMode && stripePromise && (
+            <Elements stripe={stripePromise} options={{clientSecret:paymentClientSecret}}>
+              <ScreeningCardForm amountLabel={`$${Number((price as any)?.totalFee ?? 0).toFixed(2)}`} onPaid={(id)=>{ if(id) setPaymentIntentId(id); setPaid(true) }} />
+            </Elements>
+          )}
+          {!paid && paymentClientSecret && !paymentTestMode && !stripePromise && (
+            <div style={{fontSize:'.78rem',color:'#ef4444',marginBottom:12}}>Card payment isn't configured — please contact support.</div>
           )}
           {paid && (
-            <div style={{display:'flex',alignItems:'center',justifyContent:'center',gap:8,padding:'12px 20px',background:'rgba(34,197,94,.08)',border:'1px solid rgba(34,197,94,.25)',borderRadius:10,color:'#22c55e',fontWeight:700}}><Check size={18}/> Ready — click Submit below</div>
+            <div style={{display:'flex',alignItems:'center',justifyContent:'center',gap:8,padding:'12px 20px',background:'rgba(34,197,94,.08)',border:'1px solid rgba(34,197,94,.25)',borderRadius:10,color:'#22c55e',fontWeight:700}}><Check size={18}/> Paid — click Submit below</div>
           )}
           {submitMut.isError&&<div style={{color:'#ef4444',fontSize:'.75rem',marginTop:10,display:'flex',gap:6,justifyContent:'center'}}><AlertCircle size={12}/> Submission failed — please try again</div>}
         </div>}
