@@ -1095,3 +1095,48 @@ describe('GET /leases/:id/move-in-photos', () => {
     expect(res.status).toBe(403)
   })
 })
+
+// ─── POST /leases/:id/hibernate + /resume — work-trade pause provenance (S594) ───
+describe('lease hibernation ↔ work-trade pause provenance', () => {
+  async function seedWorkTrade(unitId: string, tenantId: string, landlordId: string, status = 'active') {
+    const r = await db.query<{ id: string }>(
+      `INSERT INTO work_trade_agreements (unit_id, tenant_id, landlord_id, start_date, status, monthly_hours_target)
+       VALUES ($1,$2,$3,'2026-01-01',$4,80) RETURNING id`, [unitId, tenantId, landlordId, status])
+    return r.rows[0].id
+  }
+  const wtRow = async (id: string) =>
+    (await db.query<any>(`SELECT status, paused_by_hibernation FROM work_trade_agreements WHERE id=$1`, [id])).rows[0]
+
+  it('hibernate pauses the active agreement (marked); resume reactivates it', async () => {
+    const f = await seedFixture()
+    const wtId = await seedWorkTrade(f.unitId, f.tenantId, f.landlordId, 'active')
+
+    await request(buildApp()).post(`/api/leases/${f.leaseId}/hibernate`)
+      .set('Authorization', `Bearer ${f.landlordToken}`).expect(200)
+    let wt = await wtRow(wtId)
+    expect(wt.status).toBe('paused')
+    expect(wt.paused_by_hibernation).toBe(true)
+
+    await request(buildApp()).post(`/api/leases/${f.leaseId}/resume`)
+      .set('Authorization', `Bearer ${f.landlordToken}`).expect(200)
+    wt = await wtRow(wtId)
+    expect(wt.status).toBe('active')
+    expect(wt.paused_by_hibernation).toBe(false)
+  })
+
+  it('resume does NOT reactivate a hand-paused agreement (the S594 fix)', async () => {
+    const f = await seedFixture()
+    // Landlord paused this by hand (not hibernation).
+    const manualId = await seedWorkTrade(f.unitId, f.tenantId, f.landlordId, 'paused')
+
+    // Hibernate (nothing active to pause) then resume.
+    await request(buildApp()).post(`/api/leases/${f.leaseId}/hibernate`)
+      .set('Authorization', `Bearer ${f.landlordToken}`).expect(200)
+    await request(buildApp()).post(`/api/leases/${f.leaseId}/resume`)
+      .set('Authorization', `Bearer ${f.landlordToken}`).expect(200)
+
+    const wt = await wtRow(manualId)
+    expect(wt.status).toBe('paused')            // still paused — resume left the hand-pause alone
+    expect(wt.paused_by_hibernation).toBe(false)
+  })
+})

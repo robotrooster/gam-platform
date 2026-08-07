@@ -77,8 +77,8 @@ export function SurveysPage() {
                     </span>
                   </div>
                   <div style={{ fontSize: '.74rem', color: 'var(--text-3)', marginTop: 3 }}>
-                    {s.property_name} · {s.question_count} question{s.question_count === 1 ? '' : 's'}
-                    {s.status !== 'draft' && ` · ${s.response_count} response${s.response_count === 1 ? '' : 's'}`}
+                    {s.propertyName} · {s.questionCount} question{s.questionCount === 1 ? '' : 's'}
+                    {s.status !== 'draft' && ` · ${s.responseCount} response${s.responseCount === 1 ? '' : 's'}`}
                     {s.anonymous && ' · anonymous'}
                   </div>
                 </div>
@@ -220,7 +220,7 @@ function ResultsModal({ id, onClose }: { id: string; onClose: () => void }) {
           {data.results.map((q: any) => (
             <div key={q.id} className="card" style={{ padding: 14 }}>
               <div style={{ fontWeight: 600, fontSize: '.88rem', marginBottom: 10 }}>{q.prompt}</div>
-              {q.question_type === 'multiple_choice' ? (
+              {q.questionType === 'multiple_choice' ? (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                   {(() => { const total = q.tally.reduce((s: number, t: any) => s + t.count, 0) || 1
                     return q.tally.map((t: any) => (
@@ -254,7 +254,7 @@ function ResultsModal({ id, onClose }: { id: string; onClose: () => void }) {
 
 // ── Copy ─────────────────────────────────────────────────────
 function CopyModal({ survey, properties, onClose, onCopied }: { survey: any; properties: any[]; onClose: () => void; onCopied: () => void }) {
-  const others = properties.filter(p => p.id !== survey.property_id)
+  const others = properties.filter(p => p.id !== survey.propertyId)
   const [target, setTarget] = useState(others[0]?.id ?? '')
   const [error, setError] = useState<string | null>(null)
   const copyMut = useMutation(() => apiPost(`/surveys/${survey.id}/copy`, { targetPropertyId: target }),

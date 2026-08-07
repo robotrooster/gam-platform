@@ -72,6 +72,9 @@ propaneRouter.post('/fills', requirePerm('properties.edit'), async (req, res, ne
       gallons:        z.number().positive().max(9999),
       pricePerGallon: z.number().nonnegative().max(999),
       installments:   z.number().int().refine(n => [1, 2, 4].includes(n), 'installments must be 1, 2, or 4'),
+      // Idempotency key: one per "Record fill" intent (money path). A repeat
+      // submission with the same key is a no-op — see the tx below.
+      clientKey:      z.string().uuid().optional(),
     }).parse(req.body)
 
     const unit = await queryOne<any>(
@@ -130,15 +133,28 @@ propaneRouter.post('/fills', requirePerm('properties.edit'), async (req, res, ne
     const client = await getClient()
     try {
       await client.query('BEGIN')
+      // Idempotency (money path): serialize concurrent submits for this unit,
+      // then short-circuit a repeat of the same fill intent. Without this a
+      // lost-response retry / second open tab records a second fill and
+      // double-charges the tenant (the immediate installment-#1 charge + the
+      // prior-balance acceleration both re-fire). See migration 20260806150000.
+      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`propane_fill:${body.unitId}`])
+      if (body.clientKey) {
+        const dupe = await client.query<any>('SELECT * FROM propane_fills WHERE client_key = $1', [body.clientKey])
+        if (dupe.rows.length) {
+          await client.query('COMMIT')
+          return res.status(200).json({ success: true, data: dupe.rows[0], idempotent: true })
+        }
+      }
       const fill = await client.query<any>(
         `INSERT INTO propane_fills
            (property_id, landlord_id, unit_id, lease_id, tenant_id, gallons,
             price_per_gallon, total_amount, installment_count, created_by_user_id,
-            tax_rate_pct, tax_amount)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
+            tax_rate_pct, tax_amount, client_key)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
         [unit.property_id, unit.landlord_id, body.unitId, lt.lease_id, lt.tenant_id,
          body.gallons, body.pricePerGallon, total, body.installments, req.user!.userId,
-         taxRatePct, taxAmount])
+         taxRatePct, taxAmount, body.clientKey ?? null])
       const fillId = fill.rows[0].id
       const cycle0 = monthStart(new Date())
 

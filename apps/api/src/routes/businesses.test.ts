@@ -97,12 +97,16 @@ async function seedAdmin(): Promise<{ userId: string; token: string }> {
 // ═══════════════════════════════════════════════════════════════
 
 describe('POST /api/businesses', () => {
-  it('happy: 201 + token + user + business; users row has role=business_owner + ToS stamps', async () => {
+  it('happy: 201 + requiresEmailOtp (mandatory 2FA) + user + business; users row has role + ToS', async () => {
     const body = validSignup()
     const res = await request(buildApp())
       .post('/api/businesses').send(body)
     expect(res.status).toBe(201)
-    expect(res.body.data.token).toEqual(expect.any(String))
+    // S578: mandatory email-2FA at signup — a pending session + emailed code,
+    // never a full token.
+    expect(res.body.data.requiresEmailOtp).toBe(true)
+    expect(res.body.data.emailOtpSession).toEqual(expect.any(String))
+    expect(res.body.data.token).toBeUndefined()
     expect(res.body.data.user.role).toBe('business_owner')
     expect(res.body.data.user.businessId).toEqual(expect.any(String))
     expect(res.body.data.user.profileId).toBe(res.body.data.user.businessId)
@@ -111,18 +115,19 @@ describe('POST /api/businesses', () => {
     expect(res.body.data.business.status).toBe('active')
 
     const { rows: [u] } = await db.query<any>(
-      `SELECT role, accepted_tos_at, accepted_privacy_at FROM users WHERE email=$1`,
+      `SELECT role, email_2fa_enabled, accepted_tos_at, accepted_privacy_at FROM users WHERE email=$1`,
       [body.email])
     expect(u.role).toBe('business_owner')
+    expect(u.email_2fa_enabled).toBe(true)
     expect(u.accepted_tos_at).not.toBeNull()
     expect(u.accepted_privacy_at).not.toBeNull()
   })
 
-  it('JWT carries businessId + staffRole=null', async () => {
+  it('pending-2FA session carries businessId + staffRole=null', async () => {
     const body = validSignup()
     const res = await request(buildApp())
       .post('/api/businesses').send(body)
-    const decoded = jwt.decode(res.body.data.token) as any
+    const decoded = jwt.decode(res.body.data.emailOtpSession) as any
     expect(decoded.role).toBe('business_owner')
     expect(decoded.businessId).toBe(res.body.data.business.id)
     expect(decoded.staffRole).toBeNull()

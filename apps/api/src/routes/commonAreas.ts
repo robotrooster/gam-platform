@@ -311,10 +311,13 @@ commonAreasRouter.post('/reservations/:rid/decide', requirePerm('amenities.revie
     if (r.status !== 'pending') throw new AppError(400, `Reservation is already ${r.status}`)
 
     if (!b.approve) {
-      await query(
+      // Atomic transition guard: only a still-pending row flips (a concurrent
+      // decide that already resolved it must not re-notify).
+      const rej = await query(
         `UPDATE common_area_reservations
             SET status='rejected', decided_by_user_id=$2, decided_at=now(), decision_note=$3, updated_at=now()
-          WHERE id=$1`, [r.id, u.userId, b.note ?? null])
+          WHERE id=$1 AND status='pending' RETURNING id`, [r.id, u.userId, b.note ?? null])
+      if (rej.length === 0) throw new AppError(409, 'Reservation was already decided')
     } else {
       const client = await getClient()
       try {
@@ -322,10 +325,14 @@ commonAreasRouter.post('/reservations/:rid/decide', requirePerm('amenities.revie
         await lockArea(client, r.common_area_id)
         const conflict = await findApprovedConflict(client, r.common_area_id, r.starts_at, r.ends_at, r.id)
         if (conflict) throw new AppError(409, 'Another reservation now occupies that window — decline or adjust')
-        await client.query(
+        // Atomic transition guard under the area lock: only ONE concurrent
+        // approve flips pending→approved, so the fee is billed exactly once
+        // (billReservationFee runs post-commit, outside the lock).
+        const upd = await client.query(
           `UPDATE common_area_reservations
               SET status='approved', decided_by_user_id=$2, decided_at=now(), decision_note=$3, updated_at=now()
-            WHERE id=$1`, [r.id, u.userId, b.note ?? null])
+            WHERE id=$1 AND status='pending' RETURNING id`, [r.id, u.userId, b.note ?? null])
+        if (upd.rows.length === 0) throw new AppError(409, 'Reservation was already decided')
         await client.query('COMMIT')
       } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
     }

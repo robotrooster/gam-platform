@@ -3,7 +3,7 @@ import { useState, useRef, useCallback, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { apiGet, apiPost, apiPatch, apiDelete, apiPut } from '../lib/api'
 import { loadPdfjs } from '../lib/pdfjs'
-import { LEASE_COLUMNS, LEASE_COLUMN_LABEL, LEASE_COLUMN_INPUT, humanize, isLateFeeColumn,
+import { LEASE_COLUMNS, LEASE_COLUMN_LABEL, LEASE_COLUMN_INPUT, humanize, isLockedLeaseColumn,
   STANDALONE_DOCUMENT_TYPES, LEASE_DOCUMENT_TYPE_LABEL, GENERIC_SIGNER_ROLES, GENERIC_SIGNER_ROLE_LABEL } from '@gam/shared'
 import { useAuth } from '../context/AuthContext'
 import { usePerms } from '../lib/permissions'
@@ -31,12 +31,16 @@ const SIGNER_ROLES = ['landlord','primary','co_tenant_1','co_tenant_2','co_tenan
 // of truth is @gam/shared — adding a value there automatically surfaces it
 // (or not, if LEASE_COLUMN_INPUT is 'implicit'). No local drift possible.
 // Signature/initial bindings are 'implicit' (field type + signer role).
+// S582: rent_due_day is PLATFORM-LOCKED to the 1st (see @gam/shared
+// WRITABLE_LEASE_COLUMN_SPECS) — never offer it as a placeable field, so no
+// signed lease can state a due day the billing engine won't honor.
+const PALETTE_EXCLUDED = new Set(['rent_due_day'])
 const DATA_LABELS: Record<string, Array<{value:string; label:string}>> = {
   text: LEASE_COLUMNS
-    .filter(c => LEASE_COLUMN_INPUT[c] === 'text')
+    .filter(c => LEASE_COLUMN_INPUT[c] === 'text' && !PALETTE_EXCLUDED.has(c))
     .map(c => ({ value: c, label: LEASE_COLUMN_LABEL[c] })),
   date: LEASE_COLUMNS
-    .filter(c => LEASE_COLUMN_INPUT[c] === 'date')
+    .filter(c => LEASE_COLUMN_INPUT[c] === 'date' && !PALETTE_EXCLUDED.has(c))
     .map(c => ({ value: c, label: LEASE_COLUMN_LABEL[c] })),
 }
 const ROLE_COLORS: Record<string,string> = {
@@ -51,8 +55,9 @@ function FieldItem({ field, selected, onSelect, onMove, onDelete, onResize, scal
   const dragRef = useRef<{startX:number;startY:number;fieldX:number;fieldY:number}|null>(null)
   // S558 (Nic): late-fee boxes are policy-controlled — locked from move / resize
   // / delete / edit so the landlord can't tamper with the stamped fee (anti-
-  // discrimination; the signed lease is the legal charge).
-  const locked = isLateFeeColumn(field.leaseColumn)
+  // discrimination; the signed lease is the legal charge). S582: same lock covers
+  // rent_due_day (platform-locked to the 1st).
+  const locked = isLockedLeaseColumn(field.leaseColumn)
 
   const onResizeMouseDown = (e: React.MouseEvent, handle: string) => {
     e.stopPropagation(); e.preventDefault()
@@ -246,14 +251,29 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
     { onSuccess: () => { qc.invalidateQueries('esign-templates'); onClose() } }
   )
 
-  // S556: auto-place fields from the raw lease PDF (detection + in-house
-  // model tagging). Loads proposals into the editor for review/adjust; nothing
-  // is saved until "Save Fields". Re-running replaces the current set.
+  // S556 + S582: auto-place fields from the raw lease PDF (detection + in-house
+  // model tagging). ASYNC — POST starts a job on the model box, then we poll for
+  // the result on a separate call, so no request is held open long enough for
+  // Cloudflare's ~100s edge timeout to bite. Loads proposals into the editor for
+  // review/adjust; nothing is saved until "Save Fields". Re-running replaces the set.
   const autoMut = useMutation(
-    () => apiPost(`/esign/templates/${template.id}/auto-fields`, {}),
+    async () => {
+      const start: any = await apiPost(`/esign/templates/${template.id}/auto-fields`, {})
+      const jobId = start?.data?.jobId
+      if (!jobId) throw new Error('Could not start auto-placement')
+      const deadline = Date.now() + 240000 // client safety cap (4 min)
+      for (;;) {
+        await new Promise(r => setTimeout(r, 2500))
+        const s: any = await apiGet(`/esign/templates/${template.id}/auto-fields/${jobId}`)
+        const st = s?.data?.status
+        if (st === 'done') return s.data.result
+        if (st === 'error') throw new Error(s?.data?.error || 'Auto-placement failed')
+        if (Date.now() > deadline) throw new Error('Auto-placement is taking too long — please try again')
+      }
+    },
     {
-      onSuccess: (res: any) => {
-        const raw = res?.data?.fields || []
+      onSuccess: (result: any) => {
+        const raw = result?.fields || []
         // First pass: assign editor ids + remember each proposal's radio key.
         const keyToId: Record<string,string> = {}
         const proposed = raw.map((f: any, i: number) => {
@@ -275,7 +295,14 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
         }
         setFields(proposed)
         setSelectedField(null)
-        toast(`Placed ${proposed.length} field${proposed.length === 1 ? '' : 's'} — review and adjust, then Save`)
+        // S582: when the AI labeling couldn't run (model offline), boxes are still
+        // placed by pattern detection — tell the landlord to double-check labels
+        // rather than trust silent guesses.
+        if (result?.modelUsed === false) {
+          toast(`Placed ${proposed.length} field${proposed.length === 1 ? '' : 's'} by pattern detection (smart labeling was unavailable) — double-check each label before saving`)
+        } else {
+          toast(`Placed ${proposed.length} field${proposed.length === 1 ? '' : 's'} — review and adjust, then Save`)
+        }
       },
       onError: (e: any) => toast.error(e?.message || 'Auto-placement failed'),
     }
@@ -343,19 +370,25 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
           )}
 
           {/* Selected field properties */}
-          {sel && isLateFeeColumn(sel.leaseColumn) && (
+          {sel && isLockedLeaseColumn(sel.leaseColumn) && (
             <div style={{ marginTop:16, borderTop:'1px solid var(--border-0)', paddingTop:12 }}>
               <div style={{ fontSize:'.68rem', fontWeight:700, color:'var(--text-3)', textTransform:'uppercase', letterSpacing:'.08em', marginBottom:8 }}>Field Properties</div>
               <div style={{ padding:'10px 12px', background:'rgba(201,162,39,.08)', border:'1px solid rgba(201,162,39,.25)', borderRadius:8, fontSize:'.72rem', color:'var(--text-2)', lineHeight:1.5 }}>
                 🔒 <b>{LEASE_COLUMN_LABEL[sel.leaseColumn as keyof typeof LEASE_COLUMN_LABEL] || sel.leaseColumn}</b> — locked.
-                Late fees come from the property&apos;s <b>Late Fees</b> policy for this unit type. The amount is
-                stamped into the lease at signing and can&apos;t be edited, moved, or deleted here — that keeps the
-                charge identical for every tenant of the class and matching the signed document. To change late
-                fees, update the property settings; changes apply to new leases at signing/renewal.
+                {sel.leaseColumn === 'rent_due_day' ? (
+                  <> Rent is due on the <b>1st of each month</b> on every GAM lease — a mid-month move-in is prorated
+                  automatically. This box stamps &ldquo;the 1st&rdquo; into the signed lease and can&apos;t be edited,
+                  moved, or deleted; the landlord doesn&apos;t choose the due day.</>
+                ) : (
+                  <> Late fees come from the property&apos;s <b>Late Fees</b> policy for this unit type. The amount is
+                  stamped into the lease at signing and can&apos;t be edited, moved, or deleted here — that keeps the
+                  charge identical for every tenant of the class and matching the signed document. To change late
+                  fees, update the property settings; changes apply to new leases at signing/renewal.</>
+                )}
               </div>
             </div>
           )}
-          {sel && !isLateFeeColumn(sel.leaseColumn) && (
+          {sel && !isLockedLeaseColumn(sel.leaseColumn) && (
             <div style={{ marginTop:16, borderTop:'1px solid var(--border-0)', paddingTop:12 }}>
               <div style={{ fontSize:'.68rem', fontWeight:700, color:'var(--text-3)', textTransform:'uppercase', letterSpacing:'.08em', marginBottom:8 }}>Field Properties</div>
               <div style={{ marginBottom:8 }}>
@@ -478,7 +511,7 @@ function TemplateEditor({ template, onClose }: { template: any; onClose: () => v
                 <FieldItem key={f.id} field={f} selected={selectedField===f.id}
                   onSelect={setSelectedField} onMove={moveField}
                   onResize={resizeField}
-                  onDelete={(id: string) => { setFields(prev => prev.filter(x => x.id !== id || isLateFeeColumn(x.leaseColumn))); setSelectedField(null) }}
+                  onDelete={(id: string) => { setFields(prev => prev.filter(x => x.id !== id || isLockedLeaseColumn(x.leaseColumn))); setSelectedField(null) }}
                   scale={scale} />
               ))}
             </div>

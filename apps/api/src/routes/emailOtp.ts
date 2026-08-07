@@ -149,6 +149,19 @@ emailOtpRouter.post('/verify', async (req, res, next) => {
 
     await query(`UPDATE login_email_otps SET consumed_at = NOW() WHERE id = $1`, [otp.id])
 
+    // S578: completing an emailed code proves the user controls the address, so
+    // it doubles as email verification. This lets signup's mandatory-2FA step
+    // also verify the email (no separate link), and is a harmless no-op for an
+    // already-verified login.
+    await query(
+      `UPDATE users
+          SET email_verified = TRUE,
+              email_verified_at = COALESCE(email_verified_at, NOW()),
+              updated_at = NOW()
+        WHERE id = $1 AND email_verified IS NOT TRUE`,
+      [userId],
+    )
+
     const token = signFullToken({
       userId:      session.userId,
       role:        session.role,

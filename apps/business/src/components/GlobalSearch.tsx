@@ -57,7 +57,7 @@ interface SearchResults {
     customers?:    CustomerHit[]
     invoices?:     InvoiceHit[]
     quotes?:       QuoteHit[]
-    work_orders?:  WorkOrderHit[]
+    workOrders?:   WorkOrderHit[]
     appointments?: AppointmentHit[]
   }
 }
@@ -251,9 +251,9 @@ export function GlobalSearch() {
                   ))}
                 </Group>
               )}
-              {results.results.work_orders && results.results.work_orders.length > 0 && (
+              {results.results.workOrders && results.results.workOrders.length > 0 && (
                 <Group title="Work orders" icon={<Wrench size={11} />}>
-                  {results.results.work_orders.map(w => {
+                  {results.results.workOrders.map(w => {
                     const ymm = [w.vehicleYear, w.vehicleMake, w.vehicleModel].filter(Boolean).join(' ')
                     return (
                       <Result key={w.id} onClick={() => go(`/work-orders`)}>

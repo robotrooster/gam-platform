@@ -16,6 +16,7 @@ import { AppError } from '../middleware/errorHandler'
 import { BY_ROOM_LEASES_PER_BEDROOM } from '@gam/shared'
 import { resolveDefaultTemplateForUnit } from './templateResolve'
 import { createNotification } from './notifications'
+import { computeLeaseStart, computeLeaseEnd } from './leaseDates'
 
 type Client = { query: (sql: string, params: any[]) => Promise<{ rows: any[] }> }
 
@@ -61,18 +62,17 @@ export async function assertUnitCanAcceptNewLease(client: Client, unitId: string
   }
 }
 
-/** Term-date prefill from the template's default_term_months. start = today. */
-function termPrefill(defaultTermMonths: number | null): Record<string, string> {
-  const start = new Date(); start.setHours(0, 0, 0, 0)
-  const iso = (d: Date) => d.toISOString().slice(0, 10)
-  const out: Record<string, string> = { start_date: iso(start) }
-  if (defaultTermMonths && defaultTermMonths > 0) {
-    const end = new Date(start); end.setMonth(end.getMonth() + defaultTermMonths)
-    out.end_date = iso(end)
-    out.lease_type = 'fixed_term'
-  } else {
-    out.lease_type = 'month_to_month'
-  }
+/**
+ * S582: term-date prefill. start = the unit's available_date (if future) else
+ * today; end = month-end snap of the template's default_term_months (null → M2M).
+ * Rules live in services/leaseDates.ts.
+ */
+function termPrefill(defaultTermMonths: number | null, availableDate: string | Date | null): Record<string, string> {
+  const start = computeLeaseStart(availableDate)
+  const out: Record<string, string> = { start_date: start }
+  const end = computeLeaseEnd(start, defaultTermMonths)
+  if (end) { out.end_date = end; out.lease_type = 'fixed_term' }
+  else { out.lease_type = 'month_to_month' }
   return out
 }
 
@@ -113,7 +113,7 @@ export async function autoDraftLeasesForUnit(
   createDocumentRecord: (client: any, opts: any) => Promise<any>,
 ): Promise<{ draftedDocumentIds: string[] }> {
   const unit = await client.query(
-    `SELECT u.id, u.occupancy_mode, u.unit_number, p.landlord_id, p.name AS property_name
+    `SELECT u.id, u.occupancy_mode, u.unit_number, u.available_date, p.landlord_id, p.name AS property_name
        FROM units u JOIN properties p ON p.id = u.property_id WHERE u.id=$1`, [unitId]).then(r => r.rows[0])
   if (!unit) throw new AppError(404, 'Unit not found')
 
@@ -130,7 +130,7 @@ export async function autoDraftLeasesForUnit(
   }
   if (!tmpl) { await notifyNeedsTemplate(); return { draftedDocumentIds: [] } }
 
-  const term = termPrefill(tmpl.default_term_months)
+  const term = termPrefill(tmpl.default_term_months, unit.available_date)
   const roster = await loadRoster(client, unitId)
   const drafted: string[] = []
 
@@ -141,23 +141,44 @@ export async function autoDraftLeasesForUnit(
       name: `${m.first_name} ${m.last_name}`.trim(),
       email: m.email,
     }))
-    const doc = await createDocumentRecord(client, {
-      landlordId: unit.landlord_id, templateId: tmpl.id, unitId, leaseId: null,
-      title, basePdfUrl: null, documentType: 'original_lease',
-      targetLeaseTenantId: null, promoteLeaseTenantId: null,
-      signers: [landlord, ...tenantSigners],
-      prefillValues: { ...term },
-    })
-    await client.query(
-      `UPDATE pending_tenant_intents SET draft_document_id=$1, updated_at=NOW() WHERE id = ANY($2)`,
-      [doc.id, members.map(m => m.id)])
-    await createNotification({
-      userId: landlord.userId, type: 'lease_ready_to_sign',
-      title: 'Lease drafted — ready for your signature',
-      body: `The lease for Unit ${unit.unit_number} — ${unit.property_name} is drafted and ready. Review and sign, then it goes to the tenant(s).`,
-      data: { documentId: doc.id, unitId }, sendEmail: false,
-    }).catch(() => {})
-    drafted.push(doc.id)
+    // S582: contain a per-group draft failure inside a SAVEPOINT. This is
+    // called on the tenant's accept transaction — if createDocumentRecord
+    // THROWS (e.g. the unit's default template is missing the property's
+    // late-fee fields, so drafting is correctly refused), letting it propagate
+    // would abort the WHOLE accept transaction and silently roll back the
+    // tenant's `accepted_at` (their acceptance is lost, with no signal and no
+    // re-draft trigger). Instead: roll back just this draft, keep the accept
+    // transaction healthy, and NOTIFY the landlord with the reason so it's
+    // visible and fixable (draft manually / fix the template).
+    await client.query('SAVEPOINT draft_one', [])
+    try {
+      const doc = await createDocumentRecord(client, {
+        landlordId: unit.landlord_id, templateId: tmpl.id, unitId, leaseId: null,
+        title, basePdfUrl: null, documentType: 'original_lease',
+        targetLeaseTenantId: null, promoteLeaseTenantId: null,
+        signers: [landlord, ...tenantSigners],
+        prefillValues: { ...term },
+      })
+      await client.query(
+        `UPDATE pending_tenant_intents SET draft_document_id=$1, updated_at=NOW() WHERE id = ANY($2)`,
+        [doc.id, members.map(m => m.id)])
+      await client.query('RELEASE SAVEPOINT draft_one', [])
+      await createNotification({
+        userId: landlord.userId, type: 'lease_ready_to_sign',
+        title: 'Lease drafted — ready for your signature',
+        body: `The lease for Unit ${unit.unit_number} — ${unit.property_name} is drafted and ready. Review and sign, then it goes to the tenant(s).`,
+        data: { documentId: doc.id, unitId }, sendEmail: false,
+      }).catch(() => {})
+      drafted.push(doc.id)
+    } catch (err: any) {
+      await client.query('ROLLBACK TO SAVEPOINT draft_one', []).catch(() => {})
+      await createNotification({
+        userId: landlord.userId, type: 'lease_draft_blocked',
+        title: 'Lease could not be drafted automatically',
+        body: `A tenant accepted their invite for Unit ${unit.unit_number} — ${unit.property_name}, but the lease couldn't be auto-drafted: ${err?.message || 'unexpected error'}. This is usually the unit's default lease template missing a required field. Fix it, then draft the lease.`,
+        data: { unitId }, sendEmail: false,
+      }).catch(() => {})
+    }
   }
 
   if (unit.occupancy_mode === 'by_room') {

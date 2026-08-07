@@ -78,7 +78,9 @@ export async function renderFlexPayAcceptanceText(
     Bank_Name:              'Your verified bank account on file',
     Account_Last_4:         t.bank_last4 ?? '[Not on file]',
     Scheduled_Pull_Day:     String(ctx.pullDay),
-    Selected_Monthly_Fee:   `${ctx.fee}.00`,
+    // S562: the Subscription Terms hardcode the flat $25 fee in §3/§4 — there is
+    // no {{Selected_Monthly_Fee}} placeholder anymore. ctx.fee still flows into
+    // populatedContent below as the audit record of the fee accepted.
     Signature_Date:         isoDate(),
     Support_Phone_Number:   process.env.SUPPORT_PHONE_NUMBER || '[See support contact in app]',
     Tenant_Signature:       '[Click-accepted electronically; see audit record]',

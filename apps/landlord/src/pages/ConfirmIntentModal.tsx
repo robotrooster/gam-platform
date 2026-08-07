@@ -2,6 +2,7 @@ import { useState, useRef, useEffect, useMemo } from 'react'
 import { X, AlertCircle, AlertTriangle, CheckCircle2, Loader } from 'lucide-react'
 import { api, apiGet } from '../lib/api'
 import { loadPdfjs } from '../lib/pdfjs'
+import { appConfirm } from '../components/dialogs'
 import {
   AUTO_RENEW_MODES,
   AUTO_RENEW_MODE_LABEL,
@@ -60,6 +61,14 @@ type ResolveResponseData = {
   userId: string
   email: string
   activationUrl: string
+  supersededLeaseId?: string | null
+}
+// S582: resolving into an already-leased unit returns this instead of silently
+// ending the sitting lease — the landlord confirms, then we re-submit.
+type ResolveNeedsConfirm = {
+  needsSupersedeConfirm: true
+  supersedeLeaseId: string
+  supersedeTenantName: string | null
 }
 
 
@@ -360,7 +369,7 @@ function IdentityMismatchBanner({
   const idFlags = flags.filter(f => f.category === 'identity_mismatch' && f.severity === 'block')
   if (idFlags.length === 0) return null
 
-  const meta = PARSER_FLAG_CATEGORY_META.identity_mismatch
+  const meta = PARSER_FLAG_CATEGORY_META.identity_mismatch // wire-ok: local const map key, not an API response field
 
   return (
     <div style={{
@@ -699,12 +708,28 @@ export function ConfirmIntentModal({
         if (touched.has('identifications'))   materialized.tenants[0].identifications   = entityArrays.identifications
         if (touched.has('emergencyContacts')) materialized.tenants[0].emergencyContacts = entityArrays.emergencyContacts
       }
-      const body = { landlordOverrides: materialized }
-      const res = await api.post<{ success: boolean; data: ResolveResponseData; message?: string }>(
-        `/landlords/me/pending-tenants/${intentId}/resolve`,
-        body,
-      )
-      onResolved(res.data.data)
+      const doResolve = (confirmSupersede: boolean) =>
+        api.post<{ success: boolean; data: ResolveResponseData | ResolveNeedsConfirm; message?: string }>(
+          `/landlords/me/pending-tenants/${intentId}/resolve`,
+          confirmSupersede
+            ? { landlordOverrides: materialized, confirmSupersede: true }
+            : { landlordOverrides: materialized },
+        ).then(r => r.data.data)
+
+      let data = await doResolve(false)
+      // S582: the unit already has an active lease — confirm before ending it.
+      if ('needsSupersedeConfirm' in data) {
+        const who = data.supersedeTenantName ? ` for ${data.supersedeTenantName}` : ''
+        if (!(await appConfirm(
+          `This unit already has an active lease${who}. Building this imported lease will END that lease and replace it. Continue?`,
+        ))) return
+        data = await doResolve(true)
+      }
+      if ('needsSupersedeConfirm' in data) {
+        setSubmitError('Could not supersede the existing lease — please retry.')
+        return
+      }
+      onResolved(data)
     } catch (e: any) {
       setSubmitError(e?.response?.data?.message || e?.message || 'Build lease failed')
     } finally {

@@ -177,7 +177,36 @@ describe('POST /me/onboard-tenant — single-tenant manual onboarding', () => {
         leaseStart: '2026-01-01', monthlyRent: 1000,
       })
     expect(res.status).toBe(409)
-    expect(res.body.error).toMatch(/already occupied/)
+    // S582: whole-unit units block a 2nd lease (occupancy-mode gate).
+    expect(res.body.error).toMatch(/already has an active lease|whole-unit/i)
+  })
+
+  it('by_room: stacks an independent 2nd paper lease on the same unit (dorm/sober-living)', async () => {
+    // S582: a landlord importing a rooming house / dorm / sober-living unit has a
+    // SEPARATE paper lease per room, all on the same unit. whole_unit would 409;
+    // by_room allows independent leases up to 2×bedrooms.
+    const f = await seedTOFixture()
+    await db.query(`UPDATE units SET occupancy_mode='by_room', bedrooms=2 WHERE id=$1`, [f.unitId])
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      const t1 = await seedTenant(client)
+      const l1 = await seedLease(client, { unitId: f.unitId, landlordId: f.landlordId, status: 'active' })
+      await seedLeaseTenant(client, { leaseId: l1, tenantId: t1, role: 'primary' })
+      await client.query('COMMIT')
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+
+    const res = await request(buildApp())
+      .post('/api/landlords/me/onboard-tenant')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({
+        firstName: 'Room', lastName: 'Two', email: `r2-${randomUUID()}@test.dev`,
+        phone: '555', unitId: f.unitId,
+        leaseStart: '2026-01-01', monthlyRent: 500,
+      })
+    expect(res.status).toBe(200)  // whole_unit would 409 here
+    const leases = await db.query(`SELECT id FROM leases WHERE unit_id=$1 AND status='active'`, [f.unitId])
+    expect(leases.rows.length).toBe(2)
   })
 
   it('autoRenew=true with invalid mode → 400', async () => {

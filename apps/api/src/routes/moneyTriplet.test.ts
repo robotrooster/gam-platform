@@ -168,9 +168,11 @@ describe('GET /me/withdrawals/preview', () => {
     // (INSTANT_WITHDRAWAL_FEE in shared — this suite predated the change).
     expect(res.body.data.instant.available).toBe(50)
     expect(res.body.data.instant.fee).toBe(5)
-    // net under the W-32 margin model: payout = 50 − (5 − 0.75 Stripe-projected)
-    // = 45.75; Stripe's actual cut on that = 0.69 → net 45.06
-    expect(res.body.data.instant.net).toBe(45.06)
+    // S580 (Nic — no pre-pull): the landlord is paid their NET = available − all-in
+    // fee = 50 − 5 = 45. GAM's margin is recorded owed + collected at the next
+    // disbursement, never netted into this figure. (Supersedes the old W-32
+    // pre-pull math this suite asserted — 45.06.)
+    expect(res.body.data.instant.net).toBe(45)
     expect(res.body.data.instant.eligible).toBe(true)
   })
 
@@ -293,19 +295,30 @@ describe('POST /me/withdrawals', () => {
       .send({ method: 'instant' })
     expect(res.status).toBe(201)
     expect(res.body.data.amount).toBe(100)        // instant_available, not available
-    // S531: all-in fee = max(100 * 0.02, $5.00) = $5.00. Margin model:
-    // payout = 100 − (5 − 1.50) = 96.50; Stripe cut 1.45 → net 95.05.
+    // S580 (Nic — no pre-pull): all-in fee = max(100*0.02, $5) = $5. The landlord
+    // is paid their NET = 100 − 5 = 95. GAM's margin (5 − 1.50 Stripe-projected =
+    // 3.50) is recorded as OWED and collected at the next disbursement — NOT
+    // transferred here. (Supersedes the old W-32 pre-pull math: net 95.05 + a
+    // $3.50 margin Transfer at withdrawal time.)
     expect(res.body.data.fee_charged).toBe(5)
-    expect(res.body.data.net_to_user).toBe(95.05)
+    expect(res.body.data.net_to_user).toBe(95)
     expect(res.body.data.method).toBe('instant')
+    expect(res.body.data.margin_collection).toBe('next_disbursement')
 
     const call = (firePayoutMock.mock.calls[0] as any[])[0] as any
     expect(call.method).toBe('instant')
-    // W-32: GAM's margin ($3.50) is debited FIRST; the payout fires for the
-    // remainder — Stripe's own fee then comes out of that payout.
-    expect(call.amount).toBe(96.5)
-    expect(transfersCreateMock).toHaveBeenCalledTimes(1)
-    expect((transfersCreateMock.mock.calls[0] as any[])[0].amount).toBe(350) // $3.50 margin in cents
+    // Payout fires for the NET; NO margin pre-pull Transfer at withdrawal time.
+    expect(call.amount).toBe(95)
+    expect(transfersCreateMock).not.toHaveBeenCalled()
+
+    // The margin is recorded as an `owed` receivable tied to this disbursement.
+    const margin = await db.query<any>(
+      `SELECT amount::text AS amount, status FROM landlord_instant_margins
+        WHERE source_disbursement_id = $1`,
+      [res.body.data.disbursement_id])
+    expect(margin.rows).toHaveLength(1)
+    expect(margin.rows[0].status).toBe('owed')
+    expect(Number(margin.rows[0].amount)).toBe(3.5)
 
     const { rows } = await db.query<any>(
       `SELECT amount, fee_charged FROM disbursements WHERE id = $1`,
@@ -558,16 +571,25 @@ describe('GET /api/disbursements', () => {
     expect(ids).toEqual([mineId])
   })
 
-  it('admin sees all disbursements regardless of user_id', async () => {
+  it('S567: a regular admin sees ONLY disbursements to landlords they manage, not all', async () => {
+    // S567 (portfolio-manager scoping): a regular admin is a portfolio/service
+    // manager who sees only payouts to landlords they close or service — super
+    // sees all (covered by the next test). This supersedes the pre-S567 "admin
+    // sees every disbursement" behavior this test used to assert.
     const admin = await seedUser({ role: 'admin' })
-    const owner = await seedUser()
-    await seedDisbursement({ userId: admin.userId, amount: 100 })
-    await seedDisbursement({ userId: owner.userId, amount: 200 })
+    const managed = await seedUser()     // a landlord this admin manages
+    const unrelated = await seedUser()   // a landlord this admin does NOT manage
+    await db.query(`UPDATE landlords SET portfolio_manager_id = $1 WHERE id = $2`,
+      [admin.userId, managed.landlordId])
+    const managedDisb = await seedDisbursement({ userId: managed.userId, amount: 100 })
+    await seedDisbursement({ userId: unrelated.userId, amount: 200 })
+
     const res = await request(buildApp())
       .get('/api/disbursements')
       .set('Authorization', `Bearer ${admin.token}`)
     expect(res.status).toBe(200)
-    expect(res.body.data).toHaveLength(2)
+    const ids = (res.body.data as any[]).map(d => d.id)
+    expect(ids).toEqual([managedDisb])   // the managed landlord's payout only
   })
 
   it('super_admin sees all (same as admin)', async () => {

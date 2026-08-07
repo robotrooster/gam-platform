@@ -334,6 +334,29 @@ describe('POST /invitations/:token/accept', () => {
     expect(inv.rows[0].status).toBe('accepted')
   })
 
+  // S592 (Nic): landlords invite their own bookkeeper via this same email-link
+  // flow; the bookkeeper sets their OWN password on accept. Replaces the removed
+  // admin direct-create (/api/books/bookkeeper/invite).
+  it('S592: bookkeeper invite → accept creates a bookkeeper + bookkeeper_scopes with the chosen access level', async () => {
+    const f = await seedScopesFixture()
+    const email = `bk-${randomUUID()}@test.dev`
+    const token = await createPendingInvite(f, 'bookkeeper', email, { accessLevel: 'read_write' })
+
+    const res = await request(buildApp())
+      .post(`/api/invitations/${token}/accept`)
+      .send({ password: 'super_secure_12', firstName: 'Book', lastName: 'Keeper' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.role).toBe('bookkeeper')
+
+    const u = await db.query<{ role: string }>(
+      `SELECT role FROM users WHERE lower(email)=lower($1)`, [email])
+    expect(u.rows[0].role).toBe('bookkeeper')
+    const s = await db.query<{ access_level: string }>(
+      `SELECT access_level FROM bookkeeper_scopes WHERE user_id=$1`, [res.body.data.userId])
+    expect(s.rows.length).toBe(1)
+    expect(s.rows[0].access_level).toBe('read_write')
+  })
+
   it('expired invitation → 400 (no user / scope created)', async () => {
     const f = await seedScopesFixture()
     const email = `expired-${randomUUID()}@test.dev`

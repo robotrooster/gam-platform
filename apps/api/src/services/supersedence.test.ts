@@ -103,9 +103,9 @@ async function seedFlexChargeStatement(ctx: Ctx, opts: {
     [ctx.tenantId, property_id, ctx.landlordId])
   const { rows: [{ id: stmtId }] } = await db.query<{ id: string }>(
     `INSERT INTO flex_charge_statements
-       (account_id, cycle_month, balance, service_fee, total_due,
+       (account_id, cycle_month, balance, service_fee, total_due, new_balance, minimum_due,
         due_date, status)
-     VALUES ($1, $2::date, $3, 0, $3, $2::date, $4)
+     VALUES ($1, $2::date, $3, 0, $3, $3, $3, $2::date, $4)
      RETURNING id`,
     [accountId, opts.dueDate, opts.totalDue, opts.status ?? 'open'])
   return { accountId, stmtId }
@@ -211,9 +211,9 @@ describe('computeTenantGamOutstanding', () => {
     // account, so reuse the one we already have.)
     await db.query(
       `INSERT INTO flex_charge_statements
-         (account_id, cycle_month, balance, service_fee, total_due,
+         (account_id, cycle_month, balance, service_fee, total_due, new_balance, minimum_due,
           due_date, status)
-       VALUES ($1, '2025-12-01', 75, 0, 75, '2026-01-01', 'open')`,
+       VALUES ($1, '2025-12-01', 75, 0, 75, 75, 75, '2026-01-01', 'open')`,
       [accountId])
     const pastDue = await computeTenantGamOutstanding(ctx.tenantId)
     expect(pastDue).toHaveLength(1)

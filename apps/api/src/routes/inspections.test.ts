@@ -250,6 +250,37 @@ describe('GET /inspections/preview — pre-inspection review', () => {
   })
 })
 
+// ─── GET /inspections/photo-files/:filename — per-row authorization (S585) ───
+describe('photo-files serve authorization', () => {
+  it('scopes photo access to the inspection tenant / landlord; strangers 403; report bypass closed', async () => {
+    const f = await seedFixture()
+    const inspId = await createInspection(f, { inspectionType: 'move_in', tenantId: f.tenantId })
+    await db.query(
+      `INSERT INTO unit_inspection_photos (inspection_id, photo_url, uploaded_by)
+       VALUES ($1, '/api/inspections/photo-files/authtest.jpg', $2)`,
+      [inspId, f.landlordUserId],
+    )
+    const url = '/api/inspections/photo-files/authtest.jpg'
+    const stranger = (role: string) => jwt.sign(
+      { userId: randomUUID(), role, email: 'x@test.dev', profileId: randomUUID(), permissions: {} },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
+
+    // A different tenant and a different landlord are both blocked.
+    expect((await request(buildApp()).get(url).set('Authorization', `Bearer ${stranger('tenant')}`)).status).toBe(403)
+    expect((await request(buildApp()).get(url).set('Authorization', `Bearer ${stranger('landlord')}`)).status).toBe(403)
+
+    // The inspection's own tenant PASSES authorization (404 only because the
+    // file isn't on disk in the test) — proving the gate allows the right caller.
+    expect((await request(buildApp()).get(url).set('Authorization', `Bearer ${f.tenantToken}`)).status).toBe(404)
+
+    // A report PDF pulled through /photo-files/ matches no photo row → 404, so
+    // report-files' own per-row auth can no longer be bypassed via this path.
+    expect((await request(buildApp())
+      .get('/api/inspections/photo-files/inspection-report-deadbeef-cafe1234.pdf')
+      .set('Authorization', `Bearer ${stranger('tenant')}`)).status).toBe(404)
+  })
+})
+
 // ─── POST /inspections — create ───────────────────────────────────
 
 describe('POST /inspections', () => {

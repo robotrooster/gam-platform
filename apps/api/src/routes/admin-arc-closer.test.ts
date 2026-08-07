@@ -27,6 +27,7 @@ import {
   cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant,
   seedLease,
 } from '../test/dbHelpers'
+import { OWNER_EMAIL } from '../middleware/auth'
 
 const { fireOtpAdvanceTransferMock, retryFlexChargeStatementMock } = vi.hoisted(() => ({
   fireOtpAdvanceTransferMock:   vi.fn(async (..._args: any[]) => ({
@@ -70,6 +71,10 @@ interface AFixture {
   landlordId:     string
   adminUserId:    string
   adminToken:     string
+  // S592: OTP retry-transfer is owner-only (manual money movement); the
+  // portfolio-scoped detail routes are exercised via super_admin (sees all).
+  superAdminToken: string
+  ownerToken:      string
 }
 
 async function seedAFixture(): Promise<AFixture> {
@@ -81,13 +86,26 @@ async function seedAFixture(): Promise<AFixture> {
       `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
        VALUES ($1, 'x', 'admin', 'A', 'D', TRUE) RETURNING id`,
       [`admin-${randomUUID()}@test.dev`])
+    const superRes = await client.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+       VALUES ($1, 'x', 'super_admin', 'S', 'A', TRUE) RETURNING id`,
+      [`super-${randomUUID()}@test.dev`])
+    const ownerRes = await client.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+       VALUES ($1, 'x', 'super_admin', 'Gam', 'Owner', TRUE) RETURNING id`,
+      [OWNER_EMAIL])
     await client.query('COMMIT')
-    const adminToken = jwt.sign(
-      { userId: adminRes.rows[0].id, role: 'admin', email: 'a@test.dev',
-        profileId: adminRes.rows[0].id, permissions: {} },
+    const sign = (id: string, role: string, email: string) => jwt.sign(
+      { userId: id, role, email, profileId: id, permissions: {} },
       process.env.JWT_SECRET!, { expiresIn: '1h' },
     )
-    return { landlordUserId, landlordId, adminUserId: adminRes.rows[0].id, adminToken }
+    return {
+      landlordUserId, landlordId,
+      adminUserId:     adminRes.rows[0].id,
+      adminToken:      sign(adminRes.rows[0].id, 'admin', 'a@test.dev'),
+      superAdminToken: sign(superRes.rows[0].id, 'super_admin', 'super@test.dev'),
+      ownerToken:      sign(ownerRes.rows[0].id, 'super_admin', OWNER_EMAIL),
+    }
   } catch (e) { await client.query('ROLLBACK'); throw e }
   finally { client.release() }
 }
@@ -129,7 +147,7 @@ describe('POST /api/admin/otp/advances/:id/retry-transfer', () => {
     const f = await seedAFixture()
     const res = await request(buildApp())
       .post(`/api/admin/otp/advances/${randomUUID()}/retry-transfer`)
-      .set('Authorization', `Bearer ${f.adminToken}`).send({})
+      .set('Authorization', `Bearer ${f.ownerToken}`).send({})
     expect(res.status).toBe(404)
     expect(fireOtpAdvanceTransferMock).not.toHaveBeenCalled()
   })
@@ -139,7 +157,7 @@ describe('POST /api/admin/otp/advances/:id/retry-transfer', () => {
     const advId = await seedOtpAdvance(f, { stripeTransferId: 'tr_existing_abc' })
     const res = await request(buildApp())
       .post(`/api/admin/otp/advances/${advId}/retry-transfer`)
-      .set('Authorization', `Bearer ${f.adminToken}`).send({})
+      .set('Authorization', `Bearer ${f.ownerToken}`).send({})
     expect(res.status).toBe(409)
     expect(res.body.error).toMatch(/Already funded/)
     expect(fireOtpAdvanceTransferMock).not.toHaveBeenCalled()
@@ -150,7 +168,7 @@ describe('POST /api/admin/otp/advances/:id/retry-transfer', () => {
     const advId = await seedOtpAdvance(f, { landlordHasConnect: false })
     const res = await request(buildApp())
       .post(`/api/admin/otp/advances/${advId}/retry-transfer`)
-      .set('Authorization', `Bearer ${f.adminToken}`).send({})
+      .set('Authorization', `Bearer ${f.ownerToken}`).send({})
     expect(res.status).toBe(409)
     expect(res.body.error).toMatch(/no Stripe Connect account/)
     expect(fireOtpAdvanceTransferMock).not.toHaveBeenCalled()
@@ -161,7 +179,7 @@ describe('POST /api/admin/otp/advances/:id/retry-transfer', () => {
     const advId = await seedOtpAdvance(f)
     const res = await request(buildApp())
       .post(`/api/admin/otp/advances/${advId}/retry-transfer`)
-      .set('Authorization', `Bearer ${f.adminToken}`).send({})
+      .set('Authorization', `Bearer ${f.ownerToken}`).send({})
     expect(res.status).toBe(200)
     expect(fireOtpAdvanceTransferMock).toHaveBeenCalledTimes(1)
     const args = fireOtpAdvanceTransferMock.mock.calls[0]![0]
@@ -204,7 +222,9 @@ describe('GET /api/admin/onboarding/tenant/:id', () => {
 
     const res = await request(buildApp())
       .get(`/api/admin/onboarding/tenant/${tenantId}`)
-      .set('Authorization', `Bearer ${f.adminToken}`)
+      // super_admin sees all; a regular admin is portfolio-scoped (S567) and this
+      // seeded tenant has no active lease, so it would 403 for a scoped admin.
+      .set('Authorization', `Bearer ${f.superAdminToken}`)
     expect(res.status).toBe(200)
     expect(res.body.data.tenant.id).toBe(tenantId)
     const checklist = Object.fromEntries(
@@ -244,13 +264,28 @@ describe('GET /api/admin/tenants/:tenantId/flexsuite-acceptances', () => {
 
     const res = await request(buildApp())
       .get(`/api/admin/tenants/${tenantId}/flexsuite-acceptances`)
-      .set('Authorization', `Bearer ${f.adminToken}`)
+      // super_admin sees all; a regular admin is portfolio-scoped (see the 403 test below).
+      .set('Authorization', `Bearer ${f.superAdminToken}`)
     expect(res.status).toBe(200)
     expect(res.body.data.length).toBe(2)
     // accepted_at DESC: flexdeposit (now) first, flexpay (1d ago) second
     expect(res.body.data[0].product_type).toBe('flexdeposit')
     expect(res.body.data[1].product_type).toBe('flexpay')
     expect(res.body.data[0].accepter_email).toBeDefined()
+  })
+
+  // S592: FlexSuite enrollment is SSDI/SSI-gated (protected-class-adjacent), so a
+  // regular admin may only read acceptances for a tenant in their portfolio.
+  it('regular admin, tenant outside portfolio → 403', async () => {
+    const f = await seedAFixture()
+    const client = await db.connect()
+    let tenantId = ''
+    try { await client.query('BEGIN'); tenantId = await seedTenant(client); await client.query('COMMIT') }
+    finally { client.release() }
+    const res = await request(buildApp())
+      .get(`/api/admin/tenants/${tenantId}/flexsuite-acceptances`)
+      .set('Authorization', `Bearer ${f.adminToken}`)
+    expect(res.status).toBe(403)
   })
 })
 

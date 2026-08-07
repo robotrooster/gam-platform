@@ -127,11 +127,11 @@ label.fl{display:block;font-size:.75rem;color:var(--t3);text-transform:uppercase
 interface SiteType { id: string; name: string; siteCount: number; nightlyRate: number | null; weeklyRate: number | null; minStayNights: number | null; maxStayNights: number | null; checkInTime: string | null; checkOutTime: string | null }
 interface Amenity {
   id: string; name: string; description: string | null; capacity: number | null
-  open_time: string | null; close_time: string | null
-  reservable: boolean; requires_approval: boolean
-  reservation_fee: string | number | null; weekend_fee: string | number | null
-  events_enabled: boolean; event_deposit_amount: string | number | null
-  max_reservation_hours: number | null; advance_booking_days: number | null
+  openTime: string | null; closeTime: string | null
+  reservable: boolean; requiresApproval: boolean
+  reservationFee: string | number | null; weekendFee: string | number | null
+  eventsEnabled: boolean; eventDepositAmount: string | number | null
+  maxReservationHours: number | null; advanceBookingDays: number | null
 }
 interface SitePhoto { id: string; caption: string | null; url: string }
 interface Faq { id: string; question: string; answer: string }
@@ -621,8 +621,8 @@ function AmenityCard({ slug, a, stayToken }: { slug: string; a: Amenity; stayTok
   const [error, setError] = useState<string | null>(null)
   const [done, setDone] = useState<{ status: string; feeAmount: number } | null>(null)
 
-  const fee = Number(a.reservation_fee || 0)
-  const eventFee = Number(a.event_deposit_amount || 0)
+  const fee = Number(a.reservationFee || 0)
+  const eventFee = Number(a.eventDepositAmount || 0)
 
   const submit = async () => {
     setBusy(true); setError(null)
@@ -646,9 +646,9 @@ function AmenityCard({ slug, a, stayToken }: { slug: string; a: Amenity; stayTok
       <div style={{ fontFamily: 'var(--fd)', color: 'var(--t0)', fontWeight: 700 }}>{a.name}</div>
       {a.description && <div style={{ fontSize: '.88rem', marginTop: 6 }}>{a.description}</div>}
       <div className="rate" style={{ marginTop: 8 }}>
-        {hhmm(a.open_time) && hhmm(a.close_time) ? `Open ${hhmm(a.open_time)} – ${hhmm(a.close_time)}` : ''}
-        {a.capacity ? `${hhmm(a.open_time) ? ' · ' : ''}Up to ${a.capacity}` : ''}
-        {!stayToken && a.reservable ? `${hhmm(a.open_time) || a.capacity ? ' · ' : ''}Guests can reserve` : ''}
+        {hhmm(a.openTime) && hhmm(a.closeTime) ? `Open ${hhmm(a.openTime)} – ${hhmm(a.closeTime)}` : ''}
+        {a.capacity ? `${hhmm(a.openTime) ? ' · ' : ''}Up to ${a.capacity}` : ''}
+        {!stayToken && a.reservable ? `${hhmm(a.openTime) || a.capacity ? ' · ' : ''}Guests can reserve` : ''}
       </div>
       {stayToken && a.reservable && !done && (
         <div style={{ marginTop: 10 }}>
@@ -658,14 +658,14 @@ function AmenityCard({ slug, a, stayToken }: { slug: string; a: Amenity; stayTok
             </button>
           ) : (
             <div style={{ marginTop: 6 }}>
-              {a.requires_approval && <div className="rate" style={{ marginBottom: 8 }}>The office confirms each reservation.</div>}
+              {a.requiresApproval && <div className="rate" style={{ marginBottom: 8 }}>The office confirms each reservation.</div>}
               <div className="grid g2" style={{ gap: 8 }}>
                 <div><label className="fl">Date</label><input className="inp" type="date" value={f.date} onChange={e => setF({ ...f, date: e.target.value })} /></div>
                 <div><label className="fl">Guests (optional)</label><input className="inp" type="number" min={1} value={f.guestCount} onChange={e => setF({ ...f, guestCount: e.target.value })} /></div>
                 <div><label className="fl">From</label><input className="inp" type="time" value={f.start} onChange={e => setF({ ...f, start: e.target.value })} /></div>
                 <div><label className="fl">To</label><input className="inp" type="time" value={f.end} onChange={e => setF({ ...f, end: e.target.value })} /></div>
               </div>
-              {a.events_enabled && (
+              {a.eventsEnabled && (
                 <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 8, cursor: 'pointer', fontSize: '.88rem' }}>
                   <input type="checkbox" checked={f.isEvent} onChange={e => setF({ ...f, isEvent: e.target.checked })} />
                   <span>Private event (birthday, gathering){eventFee > 0 ? ` — ${money(eventFee)} deposit` : ''}</span>

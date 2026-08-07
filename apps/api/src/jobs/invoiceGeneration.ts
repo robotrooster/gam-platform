@@ -290,9 +290,20 @@ async function runGeneration(
     const candidateDueDates = dueDatesInRange(windowStart, windowEnd, lease.rent_due_day)
     if (candidateDueDates.length === 0) continue
 
-    // Move-in invoice (dated lease.start_date) is written by moveInBundle at finalize.
-    // Skip any candidate due date equal to lease.start_date to avoid competing with it.
-    const dueDates = candidateDueDates.filter(d => d !== lease.start_date)
+    // The move-in invoice (moveInBundle, dated lease.start_date) prorates rent
+    // for the ENTIRE start calendar month — start_date through month-end (a
+    // lease starting on the 1st bills the full month; a booking lease's arrival
+    // segment likewise runs to the day before its first 1st-of-month segment).
+    // So EVERY regular due date that falls in the start month is already covered
+    // by it. Skipping ONLY the date equal to start_date was a bug: a lease with
+    // a mid-month rent_due_day (e.g. due on the 15th — any rent_due_day > 1)
+    // would land a second full-month invoice inside the already-prorated move-in
+    // window and double-bill the first month. Skip the whole start month.
+    // (Candidates are always on/after start_date — the window floors at the
+    // lease start — so a start-month match is necessarily on/after move-in;
+    // it can never drop a legitimately earlier same-month cycle.)
+    const startMonth = lease.start_date.slice(0, 7)   // 'YYYY-MM'
+    const dueDates = candidateDueDates.filter(d => d.slice(0, 7) !== startMonth)
     if (dueDates.length === 0) continue
 
     // Load monthly fees once per lease

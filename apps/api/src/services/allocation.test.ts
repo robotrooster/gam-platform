@@ -281,6 +281,33 @@ describe('executeRentAllocation — ACH', () => {
     })
   })
 
+  it('S581: sublease markup subtracts from owner_share — landlord nets master_share, not the sub amount', async () => {
+    await withRollback(async (client) => {
+      const { userId: ownerUserId, landlordId } = await seedLandlord(client)
+      const tenantId = await seedTenant(client)
+      const propertyId = await seedProperty(client, {
+        landlordId, ownerUserId, managedByUserId: ownerUserId,   // self-managed → no manager fee
+      })
+      const unitId = await seedUnit(client, { propertyId, landlordId, rentAmount: 1000 })
+      await seedAllocationRule(client, { propertyId, achFeePayer: 'tenant' })
+      // A sublessee paid the sub_monthly_amount of 1200; master_share_amount is
+      // 1000, so 200 markup is stamped on the payment (as the pay route does).
+      const paymentId = await seedRentPayment(client, { unitId, tenantId, landlordId, amount: 1200 })
+      await client.query(`UPDATE payments SET sublease_markup_amount = 200 WHERE id = $1`, [paymentId])
+
+      await executeRentAllocation(client, paymentId, 'ach')
+
+      // splittable=1200 (tenant pays fee), no manager/pm, owner = 1200 - 200 = 1000.
+      // The 200 goes to the sublessor via creditSublessorMarkupForPayment — so the
+      // landlord no longer receives the markup on top of the sublessor's credit.
+      const owner = await client.query(
+        `SELECT amount::text AS amount FROM user_balance_ledger
+          WHERE reference_id=$1 AND type='allocation_owner_share'`,
+        [paymentId])
+      expect(owner.rows[0].amount).toBe('1000.00')
+    })
+  })
+
   it('is idempotent: second call on same paymentId is a no-op', async () => {
     await withRollback(async (client) => {
       const { userId: ownerUserId, landlordId } = await seedLandlord(client)

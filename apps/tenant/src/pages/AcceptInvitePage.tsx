@@ -14,6 +14,11 @@ export function AcceptInvitePage() {
   const [showPw, setShowPw] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [step, setStep] = useState(0)
+  // S578: mandatory email-2FA at activation. accept-invite returns a PENDING
+  // session; the code exchange at /auth/email-otp/verify yields the real token.
+  const [emailOtpSession, setEmailOtpSession] = useState<string | null>(null)
+  const [code, setCode] = useState('')
+  const [resent, setResent] = useState(false)
 
   useEffect(() => {
     if (!token) { setError('Invalid invite link'); setLoading(false); return }
@@ -23,7 +28,7 @@ export function AcceptInvitePage() {
   }, [token])
 
   const handleSubmit = async () => {
-    if (form.password.length < 8) { setError('Password must be at least 8 characters'); return }
+    if (form.password.length < 12) { setError('Password must be at least 12 characters'); return }
     if (form.password !== form.confirmPassword) { setError('Passwords do not match'); return }
     if (!form.acceptedTerms) { setError('You must accept the Terms of Service and Privacy Policy to continue'); return }
     setSubmitting(true)
@@ -34,14 +39,37 @@ export function AcceptInvitePage() {
         phone: form.phone || undefined,
         acceptedTerms: true,
       })
-      // Store token under tenant portal's expected key + respect next= param
-      localStorage.setItem('gam_tenant_token', res.data.token)
-      const next = params.get('next')
-      navigate(next || '/')
+      // S578: activation now issues a pending 2FA session. Move to the emailed-
+      // code step rather than logging straight in.
+      setEmailOtpSession(res.data.emailOtpSession)
+      setCode(''); setResent(false); setStep(2); setSubmitting(false)
     } catch (e: any) {
       setError(e?.response?.data?.error || 'Something went wrong. Please try again.')
       setSubmitting(false)
     }
+  }
+
+  const verifyCode = async () => {
+    if (!emailOtpSession) return
+    setSubmitting(true); setError('')
+    try {
+      const res: any = await apiPost('/auth/email-otp/verify', { emailOtpSession, code: code.trim() })
+      localStorage.setItem('gam_tenant_token', res.data.token)
+      const next = params.get('next')
+      navigate(next || '/')
+    } catch (e: any) {
+      const msg = e?.response?.data?.error || 'Invalid code.'
+      setError(msg)
+      if (/session/i.test(msg)) { setEmailOtpSession(null); setStep(1) }
+      setSubmitting(false)
+    }
+  }
+
+  const resendCode = async () => {
+    if (!emailOtpSession) return
+    setError('')
+    try { await apiPost('/auth/email-otp/resend', { emailOtpSession }); setResent(true) }
+    catch { setError('Could not resend the code. Please try again.') }
   }
 
   const fmt = (n: number) => n.toLocaleString('en-US', { style: 'currency', currency: 'USD' })
@@ -131,7 +159,7 @@ export function AcceptInvitePage() {
             <div style={{ marginBottom: 14 }}>
               <label style={labelStyle}>Password</label>
               <div style={{ position: 'relative' }}>
-                <input type={showPw ? 'text' : 'password'} style={{ ...inputStyle, paddingRight: 40 }} placeholder="Min 8 characters" value={form.password} onChange={e => setForm(f => ({ ...f, password: e.target.value }))} autoFocus />
+                <input type={showPw ? 'text' : 'password'} style={{ ...inputStyle, paddingRight: 40 }} placeholder="Min 12 characters" value={form.password} onChange={e => setForm(f => ({ ...f, password: e.target.value }))} autoFocus />
                 <button type="button" onClick={() => setShowPw(v => !v)} style={{ position: 'absolute', right: 10, top: '50%', transform: 'translateY(-50%)', background: 'none', border: 'none', cursor: 'pointer', color: '#7a8aaa' }}>
                   {showPw ? '🙈' : '👁️'}
                 </button>
@@ -176,8 +204,45 @@ export function AcceptInvitePage() {
                 disabled={submitting || !form.password || !form.confirmPassword || !form.acceptedTerms}
                 style={{ flex: 2, padding: 12, borderRadius: 10, border: 'none', background: submitting ? '#1a2028' : 'linear-gradient(135deg, #8a6c10, #c9a227)', color: '#060809', fontWeight: 700, cursor: submitting ? 'not-allowed' : 'pointer', opacity: (!form.password || !form.confirmPassword || !form.acceptedTerms) ? .5 : 1 }}
               >
-                {submitting ? '...' : 'Create Account & Sign In'}
+                {submitting ? '...' : 'Create Account →'}
               </button>
+            </div>
+          </div>
+        )}
+
+        {step === 2 && (
+          <div style={{ background: '#0a0d10', border: '1px solid #1e2530', borderRadius: 16, padding: 28 }}>
+            <div style={{ fontSize: '1.1rem', fontWeight: 800, color: '#eef1f8', marginBottom: 6 }}>Check your email</div>
+            <div style={{ fontSize: '.8rem', color: '#7a8aaa', marginBottom: 20, lineHeight: 1.6 }}>
+              We sent a 6-digit code to <strong style={{ color: '#b8c4d8' }}>{user?.email}</strong>. Enter it to finish activating your account.
+            </div>
+
+            <div style={{ marginBottom: 14 }}>
+              <label style={labelStyle}>Verification Code</label>
+              <input
+                style={{ ...inputStyle, fontFamily: 'monospace', letterSpacing: '.2em', textAlign: 'center', fontSize: '1rem' }}
+                value={code} onChange={e => setCode(e.target.value)} autoFocus
+                autoComplete="one-time-code" inputMode="numeric" placeholder="123 456"
+                onKeyDown={e => { if (e.key === 'Enter' && code.trim()) verifyCode() }}
+              />
+            </div>
+
+            {resent && !error && (
+              <div style={{ color: '#22c55e', fontSize: '.75rem', background: 'rgba(34,197,94,.08)', border: '1px solid rgba(34,197,94,.2)', borderRadius: 8, padding: '8px 12px', marginBottom: 14 }}>A new code is on its way.</div>
+            )}
+            {error && (
+              <div style={{ color: '#ff4757', fontSize: '.75rem', background: 'rgba(255,71,87,.08)', border: '1px solid rgba(255,71,87,.2)', borderRadius: 8, padding: '8px 12px', marginBottom: 14 }}>{error}</div>
+            )}
+
+            <button
+              onClick={verifyCode}
+              disabled={submitting || !code.trim()}
+              style={{ width: '100%', padding: 12, borderRadius: 10, border: 'none', background: submitting ? '#1a2028' : 'linear-gradient(135deg, #8a6c10, #c9a227)', color: '#060809', fontWeight: 700, cursor: submitting ? 'not-allowed' : 'pointer', opacity: !code.trim() ? .5 : 1 }}
+            >
+              {submitting ? '...' : 'Verify & Continue'}
+            </button>
+            <div style={{ marginTop: 16, textAlign: 'center' }}>
+              <button onClick={resendCode} style={{ background: 'none', border: 'none', color: '#c9a227', fontSize: '.8rem', cursor: 'pointer', textDecoration: 'underline' }}>Resend code</button>
             </div>
           </div>
         )}

@@ -6,7 +6,7 @@ import { Eye, EyeOff, Check, AlertCircle } from 'lucide-react'
 
 function PasswordStrength({ password }: { password: string }) {
   const checks = [
-    { label: '8+ characters', pass: password.length >= 8 },
+    { label: '12+ characters', pass: password.length >= 12 },
     { label: 'Uppercase letter', pass: /[A-Z]/.test(password) },
     { label: 'Number', pass: /\d/.test(password) },
   ]
@@ -37,7 +37,7 @@ function PasswordStrength({ password }: { password: string }) {
 }
 
 export function RegisterPage() {
-  const { login } = useAuth()
+  const { login, loginWithEmailOtp, resendEmailOtp } = useAuth()
   const navigate = useNavigate()
   // S567: portfolio-manager referral key — credits the rep as closing manager.
   const [searchParams] = useSearchParams()
@@ -50,21 +50,86 @@ export function RegisterPage() {
     firstName: '', lastName: '', email: '', phone: '',
     password: '', businessName: '', ein: '',
   })
+  // S578: mandatory email-2FA at signup — /auth/register returns a pending
+  // session + emails a 6-digit code; we verify it here before the account is
+  // usable (a landlord account controls every tenant's PII + banking).
+  const [emailOtpSession, setEmailOtpSession] = useState<string | null>(null)
+  const [code, setCode] = useState('')
+  const [resent, setResent] = useState(false)
 
   const set = (k: string, v: string) => setForm(f => ({ ...f, [k]: v }))
 
   const onSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!agreed) { setErr('Please agree to the terms to continue'); return }
-    if (form.password.length < 8) { setErr('Password must be at least 8 characters'); return }
+    if (form.password.length < 12) { setErr('Password must be at least 12 characters'); return }
     setLoading(true); setErr('')
     try {
-      await apiPost('/auth/register', { ...form, role: 'landlord', acceptedTerms: true, referralCode })
-      await login(form.email, form.password)
-      navigate('/onboarding')
+      const res = await apiPost<any>('/auth/register', { ...form, role: 'landlord', acceptedTerms: true, referralCode })
+      const data = res.data!
+      if (data.requiresEmailOtp && data.emailOtpSession) {
+        setEmailOtpSession(data.emailOtpSession as string); setCode(''); setResent(false)
+      } else {
+        // Fallback for any legacy no-2FA response.
+        await login(form.email, form.password)
+        navigate('/onboarding')
+      }
     } catch (e: any) {
       setErr(e.response?.data?.error || 'Registration failed. Please try again.')
     } finally { setLoading(false) }
+  }
+
+  const onEmailOtpSubmit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setLoading(true); setErr('')
+    try {
+      await loginWithEmailOtp(emailOtpSession!, code.trim())
+      navigate('/onboarding')
+    } catch (e: any) {
+      const msg = e.response?.data?.error || 'Invalid code.'
+      setErr(msg)
+      if (/session/i.test(msg)) { setEmailOtpSession(null); setCode('') }
+    } finally { setLoading(false) }
+  }
+
+  const onResend = async () => {
+    setErr(''); setResent(false)
+    try { await resendEmailOtp(emailOtpSession!); setResent(true) }
+    catch (e: any) { setErr(e.response?.data?.error || 'Could not resend the code.') }
+  }
+
+  // S578: step 2 — emailed 2FA code (mirrors LoginPage's email-OTP screen).
+  if (emailOtpSession) {
+    return (
+      <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',background:'var(--bg-0)',padding:20}}>
+        <div style={{width:'100%',maxWidth:420}}>
+          <div style={{textAlign:'center',marginBottom:40}}>
+            <div style={{fontFamily:'var(--font-display)',fontSize:'2rem',fontWeight:800,color:'var(--gold)',marginBottom:8}}>⚡ GAM</div>
+            <div style={{color:'var(--text-2)',fontSize:'.875rem'}}>Verify your email</div>
+          </div>
+          <div className="card" style={{padding:28}}>
+            <h2 style={{marginBottom:16,fontSize:'1.2rem'}}>Check your email</h2>
+            <div style={{fontSize:'.85rem',color:'var(--text-2)',marginBottom:16,lineHeight:1.6}}>
+              We sent a 6-digit code to <strong>{form.email}</strong>. Enter it to finish creating your account.
+            </div>
+            {err && <div className="alert alert-danger" style={{marginBottom:16}}>{err}</div>}
+            {resent && !err && <div className="alert alert-success" style={{marginBottom:16}}>A new code is on its way.</div>}
+            <form onSubmit={onEmailOtpSubmit}>
+              <div className="form-group">
+                <label className="form-label">Code</label>
+                <input className="form-input" type="text" value={code} onChange={e => setCode(e.target.value)} autoFocus required autoComplete="one-time-code" inputMode="numeric" placeholder="123 456" style={{textAlign:'center',letterSpacing:'.2em',fontFamily:'var(--font-mono)'}} />
+              </div>
+              <button className="btn btn-primary w-full" type="submit" disabled={loading || !code.trim()} style={{justifyContent:'center',marginTop:8}}>
+                {loading ? <span className="spinner" /> : 'Verify & continue'}
+              </button>
+            </form>
+            <div style={{marginTop:20,textAlign:'center'}}>
+              <button onClick={onResend} style={{background:'none',border:'none',color:'var(--gold)',fontSize:'.82rem',cursor:'pointer',textDecoration:'underline'}}>Resend code</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    )
   }
 
   return (

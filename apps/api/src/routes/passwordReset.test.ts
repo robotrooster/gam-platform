@@ -240,11 +240,12 @@ describe('end-to-end: reset → login with new password', () => {
       .send({ email: 'grace@test.dev', password: 'originalpass1234' })
     expect(stale.status).toBe(401)
 
-    // New password accepted; token returned.
+    // New password accepted; S578 universal 2FA then gates with an emailed code
+    // (verified tenant → requiresEmailOtp, not a full token).
     const fresh = await request(buildApp())
       .post('/api/auth/login')
       .send({ email: 'grace@test.dev', password: 'brandnew5678' })
     expect(fresh.status).toBe(200)
-    expect(typeof fresh.body.data.token).toBe('string')
+    expect(fresh.body.data.requiresEmailOtp).toBe(true)
   })
 })

@@ -135,7 +135,7 @@ export function RenewalDecisionModal({ leaseId, onClose }: { leaseId: string; on
           <>
             <div style={{ background:'var(--bg-3)', borderRadius:10, padding:14, marginBottom:14, fontSize:'.82rem' }}>
               <div className="data-row"><span className="data-key">Unit</span><span className="data-val">{lease.unitNumber} — {lease.propertyName}</span></div>
-              <div className="data-row"><span className="data-key">Tenant{(lease.tenants||[]).length > 1 ? 's' : ''}</span><span className="data-val">{(lease.tenants||[]).map((t:any)=>[t.firstName ?? t.first_name, t.lastName ?? t.last_name].filter(Boolean).join(' ')).join(', ') || '—'}</span></div>
+              <div className="data-row"><span className="data-key">Tenant{(lease.tenants||[]).length > 1 ? 's' : ''}</span><span className="data-val">{(lease.tenants||[]).map((t:any)=>[t.firstName, t.lastName].filter(Boolean).join(' ')).join(', ') || '—'}</span></div>
               <div className="data-row"><span className="data-key">Current rent</span><span className="data-val mono">{fmt(currentRent)}/mo</span></div>
               <div className="data-row"><span className="data-key">Lease ends</span><span className="data-val">{fmtDate(lease.endDate)}</span></div>
             </div>

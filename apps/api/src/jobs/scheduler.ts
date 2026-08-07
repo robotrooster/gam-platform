@@ -1012,6 +1012,34 @@ export function schedulerInit() {
     }
   })
 
+  // S581 (Nic): apply due scheduled money changes carried by signed terms
+  // addendums — a base-rent change (e.g. AZ mobile-home space rent) or a new
+  // recurring charge (parking/garage). Runs early (04:30) so a change effective
+  // today lands on leases.rent_amount / lease_fees BEFORE the 07:00-local invoice
+  // generation picks it up that day.
+  cron.schedule('30 4 * * *', async () => {
+    try {
+      const { applyDueScheduledChanges } = await import('../services/scheduledLeaseChanges')
+      const r = await applyDueScheduledChanges()
+      if (r.applied > 0 || r.cancelled > 0) logger.info(r, '[scheduled-lease-change]')
+    } catch (e) {
+      logger.error({ err: e }, '[scheduled-lease-change] fatal')
+    }
+  })
+
+  // S582 (Nic): tenant invite nudge — remind tenants BEFORE their 7-day invite
+  // lapses (reduces onboarding drop-off; the control tower alerts the landlord
+  // only after it expires). 10am daily; the job self-spaces reminders per intent.
+  cron.schedule('0 10 * * *', async () => {
+    try {
+      const { nudgeExpiringInvites } = await import('./inviteNudge')
+      const r = await nudgeExpiringInvites()
+      if (r.nudged > 0 || r.errors > 0) logger.info(r, '[invite-nudge]')
+    } catch (e) {
+      logger.error({ err: e }, '[invite-nudge] fatal')
+    }
+  })
+
   // S550 (Nic): daily growth snapshot — per-(state,city) + platform totals
   // (landlords/properties/units/occupancy/rent-roll). History starts the
   // day it landed; powers growth-velocity charts + the heat map over time.

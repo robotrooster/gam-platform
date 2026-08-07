@@ -41,7 +41,7 @@ export const approveMaintenanceRequest: AgentTool = {
       return { ok: false, error: `That request is "${request.status}", not awaiting approval.` }
     }
 
-    const nextStatus = request.contractor_id ? 'assigned' : 'open'
+    const nextStatus = request.assigned_to ? 'assigned' : 'open'
     const nowAssigned = nextStatus === 'assigned' ? ', assigned_at = COALESCE(assigned_at, NOW())' : ''
     // Self-scoped write: re-assert ownership + the awaiting_approval state in
     // the UPDATE itself, so it cannot mutate a row whose owner/state changed

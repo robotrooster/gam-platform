@@ -1139,7 +1139,7 @@ leasesRouter.post('/:id/hibernate', requirePerm('leases.edit'), async (req, res,
     await client.query('BEGIN')
     await client.query(`UPDATE leases SET is_hibernating=TRUE, hibernated_at=NOW(), updated_at=NOW() WHERE id=$1`, [lease.id])
     const paused = await client.query(
-      `UPDATE work_trade_agreements SET status='paused', updated_at=NOW()
+      `UPDATE work_trade_agreements SET status='paused', paused_by_hibernation=TRUE, updated_at=NOW()
         WHERE unit_id=$1 AND status='active'
           AND tenant_id IN (SELECT tenant_id FROM lease_tenants WHERE lease_id=$2 AND status='active')
         RETURNING id`, [lease.unit_id, lease.id])
@@ -1161,8 +1161,8 @@ leasesRouter.post('/:id/resume', requirePerm('leases.edit'), async (req, res, ne
     await client.query('BEGIN')
     await client.query(`UPDATE leases SET is_hibernating=FALSE, hibernated_at=NULL, updated_at=NOW() WHERE id=$1`, [lease.id])
     const resumed = await client.query(
-      `UPDATE work_trade_agreements SET status='active', updated_at=NOW()
-        WHERE unit_id=$1 AND status='paused'
+      `UPDATE work_trade_agreements SET status='active', paused_by_hibernation=FALSE, updated_at=NOW()
+        WHERE unit_id=$1 AND status='paused' AND paused_by_hibernation=TRUE
           AND tenant_id IN (SELECT tenant_id FROM lease_tenants WHERE lease_id=$2 AND status='active')
         RETURNING id`, [lease.unit_id, lease.id])
     await client.query('COMMIT')

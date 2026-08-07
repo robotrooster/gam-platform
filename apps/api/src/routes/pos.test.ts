@@ -1047,6 +1047,37 @@ describe('POST /api/pos/transactions/:id/refund', () => {
     expect(Number(tx.rows[0].refund_amount)).toBe(30)
   })
 
+  it('over-refund is capped: single refund above total → 400; cumulative partials cannot exceed total (S587)', async () => {
+    const f = await seedPosFixture()
+    const txId = await seedCompletedTransaction(f, { paymentMethod: 'cash', total: 100 })
+
+    // A single refund above the sale total is rejected.
+    const over = await request(buildApp())
+      .post(`/api/pos/transactions/${txId}/refund`)
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ amount: 150, refundMethod: 'cash' })
+    expect(over.status).toBe(400)
+    expect(over.body.error).toMatch(/exceeds the sale total/i)
+
+    // First partial of 70 succeeds (remaining 30).
+    await request(buildApp()).post(`/api/pos/transactions/${txId}/refund`)
+      .set('Authorization', `Bearer ${f.landlordToken}`).send({ amount: 70, refundMethod: 'cash' }).expect(200)
+
+    // A second partial of 40 exceeds the remaining 30 → 400.
+    const second = await request(buildApp()).post(`/api/pos/transactions/${txId}/refund`)
+      .set('Authorization', `Bearer ${f.landlordToken}`).send({ amount: 40, refundMethod: 'cash' })
+    expect(second.status).toBe(400)
+    expect(second.body.error).toMatch(/remaining refundable/i)
+
+    // Exactly the remaining 30 succeeds and closes it out (cumulative 100 → refunded).
+    await request(buildApp()).post(`/api/pos/transactions/${txId}/refund`)
+      .set('Authorization', `Bearer ${f.landlordToken}`).send({ amount: 30, refundMethod: 'cash' }).expect(200)
+    const tx = await db.query<{ status: string; refund_amount: string }>(
+      `SELECT status, refund_amount FROM pos_transactions WHERE id=$1`, [txId])
+    expect(tx.rows[0].status).toBe('refunded')
+    expect(Number(tx.rows[0].refund_amount)).toBe(100)  // cumulative 70 + 30
+  })
+
   it('refund a voided transaction → 400', async () => {
     const f = await seedPosFixture()
     const txId = await seedCompletedTransaction(f, { paymentMethod: 'cash' })

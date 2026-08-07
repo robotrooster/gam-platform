@@ -7,6 +7,7 @@ import { canAccessLandlordResource, canViewLandlordFinances, canManageLandlordRe
 import { AppError } from '../middleware/errorHandler'
 import { emailTenantOnboarded } from '../services/email'
 import { createNotification } from '../services/notifications'
+import { applyScreeningWaive, listOnboardingWindowsForLandlord } from '../services/onboardingWindow'
 import { scheduleParserJob } from '../jobs/leaseParser/runParserJob'
 import { resolveIntent } from '../jobs/leaseParser/resolveIntent'
 import { parse as parseCsv } from 'csv-parse/sync'
@@ -20,7 +21,7 @@ import {
   applyPaymentMapping, buildPaymentTemplateCsv, getPaymentPlatformConfig,
   type CsvImportPlatform,
 } from '../lib/csvImportMappings'
-import { AUTO_RENEW_MODES, PM_LINK_SCOPES, formatInvoiceNumber, UNIT_TYPES } from '@gam/shared'
+import { AUTO_RENEW_MODES, PM_LINK_SCOPES, formatInvoiceNumber, UNIT_TYPES, FLEX_CHARGE_MAX_FINANCE_PCT } from '@gam/shared'
 import { emailPmPropertyInvitation } from '../services/email'
 import { platformFeesByProperty, periodMonths } from '../services/platformFee'
 import {
@@ -42,7 +43,11 @@ import {
 export const landlordsRouter = Router()
 landlordsRouter.use(requireAuth)
 
-landlordsRouter.get('/', requireAdmin, async (req: any, res, next) => {
+// S592: exported so the scoped /api/portfolio router shares this EXACT handler
+// (already portfolio-scoped by req.user.userId — a portfolio_manager sees ONLY
+// their book; super_admin sees all). Registered below on /api/landlords for the
+// admin app, and on /api/portfolio/landlords for the PM portal.
+export const adminLandlordsListHandler = async (req: any, res: any, next: any) => {
   try {
     // Portfolio scoping (S567): super_admin sees every landlord; a regular
     // admin (portfolio manager) sees ONLY their own book — landlords they close
@@ -77,7 +82,8 @@ landlordsRouter.get('/', requireAdmin, async (req: any, res, next) => {
       ORDER BY u.last_name`, [scopeId])
     res.json({ success: true, data: landlords })
   } catch (e) { next(e) }
-})
+}
+landlordsRouter.get('/', requireAdmin, adminLandlordsListHandler)
 
 
 
@@ -289,6 +295,43 @@ landlordsRouter.get('/flex-charge/accounts/:id/statements', requireAuth, require
   } catch (e) { next(e) }
 })
 
+// S583: per-property FlexCharge merchant finance rate. The MERCHANT is the
+// lender — they set the finance charge (flat % of each monthly statement
+// balance) their customers pay, capped at FLEX_CHARGE_MAX_FINANCE_PCT. GAM's
+// separate 1.5% is a merchant subscription, not the borrower's cost. One rate
+// per property (Location), applied to every FlexCharge account there.
+landlordsRouter.get('/flex-charge/finance-rates', requireAuth, requireLandlord, async (req, res, next) => {
+  try {
+    const rows = await query(
+      `SELECT id AS property_id, name, flex_charge_finance_pct::float AS finance_pct
+         FROM properties
+        WHERE landlord_id = $1 AND flexcharge_enabled = TRUE
+        ORDER BY name`,
+      [req.user!.profileId])
+    res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
+landlordsRouter.patch('/flex-charge/finance-rate', requireAuth, requireLandlord, async (req, res, next) => {
+  try {
+    const { propertyId, financePct } = z.object({
+      propertyId: z.string().uuid(),
+      // Flat % of the statement balance (e.g. 0.05 = 5%). Server-enforced cap;
+      // the DB CHECK is the backstop. Merchant is responsible for a rate that
+      // is compliant with their local usury / retail-installment law.
+      financePct: z.number().min(0).max(FLEX_CHARGE_MAX_FINANCE_PCT),
+    }).parse(req.body)
+    const prop = await queryOne(
+      `UPDATE properties
+          SET flex_charge_finance_pct = $1, updated_at = NOW()
+        WHERE id = $2 AND landlord_id = $3
+        RETURNING id AS property_id, flex_charge_finance_pct::float AS finance_pct`,
+      [financePct, propertyId, req.user!.profileId])
+    if (!prop) throw new AppError(404, 'Property not found')
+    res.json({ success: true, data: prop })
+  } catch (e) { next(e) }
+})
+
 // ── GET /api/landlords/theme ───────────────────────────────────────────────
 landlordsRouter.get('/theme', requireAuth, async (req, res, next) => {
   try {
@@ -362,6 +405,19 @@ landlordsRouter.post('/members', async (req, res, next) => {
        ON CONFLICT (landlord_id, user_id) DO NOTHING RETURNING id`,
       [landlordId, target.id, u.userId])
     if (!row) throw new AppError(409, 'They are already an owner of this entity.')
+
+    // S592: a co-owner added with no upline of their own becomes the downline of
+    // this account's founding owner (the "primary" who signed up). Dormant — no
+    // money moves — until they later open their OWN account. First-touch wins: an
+    // existing upline is left untouched, and a self-add is a no-op.
+    const founding = await queryOne<{ user_id: string }>(
+      `SELECT user_id FROM landlords WHERE id = $1`, [landlordId])
+    if (founding && founding.user_id !== target.id) {
+      await query(
+        `UPDATE users SET referred_by_user_id = $1
+          WHERE id = $2 AND referred_by_user_id IS NULL`,
+        [founding.user_id, target.id])
+    }
 
     const entity = await queryOne<{ business_name: string | null }>(
       `SELECT business_name FROM landlords WHERE id = $1`, [landlordId])
@@ -1082,6 +1138,126 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
       })
     }
 
+    // ── ONBOARDING CONTROL TOWER (S582, Nic) ──────────────────
+    // Surface every in-progress onboarding that's STUCK on the landlord, so a
+    // multi-unit onboard (e.g. Oak Park's 32 units) never has tenants silently
+    // falling through the cracks. Each row is one action with a destination.
+    // Scoped by landlord_id (the pending pool is landlord-owned, like the
+    // pending-tenants list). Covers the pipeline's landlord-blocked states:
+    //   - parser upload needs review (parsed/mismatch/error)
+    //   - tenant accepted but the lease never drafted (auto-draft blocked)
+    //   - invite expired unaccepted (→ resend)
+    //   - lease drafted, awaiting the LANDLORD's signature (landlord signs first)
+    const onboarding: any[] = []
+
+    const intentRows = await query<any>(`
+      SELECT pti.id, pti.accepted_at, pti.draft_document_id, pti.parser_status,
+             pti.unit_id, usr.tenant_invite_expires_at,
+             un.unit_number, p.name AS property_name,
+             usr.first_name, usr.last_name
+        FROM pending_tenant_intents pti
+        JOIN tenants t ON t.id = pti.tenant_id
+        JOIN users usr ON usr.id = t.user_id
+        LEFT JOIN units un ON un.id = pti.unit_id
+        LEFT JOIN properties p ON p.id = un.property_id
+       WHERE pti.landlord_id = $1
+         AND pti.resolved_at IS NULL
+         AND pti.cancelled_at IS NULL
+       ORDER BY pti.created_at ASC
+    `, [landlordId])
+
+    for (const it of intentRows as any[]) {
+      const who = [it.first_name, it.last_name].filter(Boolean).join(' ') || 'Tenant'
+      const where = it.unit_number ? ' — Unit ' + it.unit_number + (it.property_name ? ' (' + it.property_name + ')' : '') : ''
+      // Uploaded-lease parser flow: needs the landlord's review before it builds.
+      if (['parsed', 'mismatch', 'error'].includes(it.parser_status)) {
+        onboarding.push({
+          id: 'intent-parse-' + it.id,
+          type: it.parser_status === 'error' ? 'parser_error' : 'parser_review',
+          title: 'Review imported lease' + where,
+          subtitle: it.parser_status === 'error'
+            ? 'The uploaded lease couldn’t be read — review and enter the terms for ' + who + '.'
+            : 'The uploaded lease is parsed and ready — review the terms and build ' + who + '’s lease.',
+          href: '/tenant-onboarding/pending',
+        })
+        continue
+      }
+      // Invite flow (no PDF). Only surface states the LANDLORD must act on.
+      if (it.unit_id && it.accepted_at && !it.draft_document_id) {
+        onboarding.push({
+          id: 'intent-draft-' + it.id,
+          type: 'lease_not_drafted',
+          title: who + ' accepted — lease not drafted yet' + where,
+          subtitle: 'They’re ready. If it didn’t auto-draft (often a missing template field), draft the lease.',
+          href: '/tenant-onboarding/pending',
+        })
+      } else if (it.unit_id && !it.accepted_at && it.tenant_invite_expires_at && new Date(it.tenant_invite_expires_at) < new Date()) {
+        onboarding.push({
+          id: 'intent-expired-' + it.id,
+          type: 'invite_expired',
+          title: 'Invite expired' + where,
+          subtitle: who + ' never accepted before the invite lapsed. Resend it.',
+          href: '/tenant-onboarding/pending',
+        })
+      }
+    }
+
+    // Leases drafted + sent but stalled on the LANDLORD's signature (landlord
+    // signs first, so an unsigned landlord row means it's the landlord's turn).
+    const awaitingSig = await query<any>(`
+      SELECT d.id, un.unit_number, p.name AS property_name
+        FROM lease_documents d
+        JOIN lease_document_signers s ON s.document_id = d.id AND s.role = 'landlord'
+        LEFT JOIN units un ON un.id = d.unit_id
+        LEFT JOIN properties p ON p.id = un.property_id
+       WHERE d.landlord_id = $1
+         AND d.status IN ('sent', 'in_progress')
+         AND s.status <> 'signed'
+       ORDER BY d.created_at ASC
+    `, [landlordId])
+    for (const d of awaitingSig as any[]) {
+      const where = d.unit_number ? ' — Unit ' + d.unit_number + (d.property_name ? ' (' + d.property_name + ')' : '') : ''
+      onboarding.push({
+        id: 'doc-sign-' + d.id,
+        type: 'awaiting_landlord_signature',
+        title: 'Sign the lease' + where,
+        subtitle: 'The lease is drafted and waiting on your signature before it goes to the tenant.',
+        href: '/sign/' + d.id,
+      })
+    }
+
+    // S593: listings-marketplace applicants (real accounts) with no lease drafted
+    // yet — the long-term acquisition channel joining the SAME onboarding funnel
+    // as invites + imports, so both public surfaces converge on one to-do list.
+    const applicantRows = await query<any>(`
+      SELECT a.id, a.first_name, a.last_name,
+             un.unit_number, p.name AS property_name,
+             t.background_check_status
+        FROM unit_applications a
+        JOIN units un ON un.id = a.unit_id
+        JOIN properties p ON p.id = un.property_id
+        LEFT JOIN tenants t ON t.user_id = a.applicant_user_id
+       WHERE a.landlord_id = $1
+         AND a.unit_id IS NOT NULL
+         AND a.applicant_user_id IS NOT NULL
+         AND NOT EXISTS (SELECT 1 FROM leases l WHERE l.source_application_id = a.id)
+       ORDER BY a.created_at ASC
+    `, [landlordId])
+    for (const a of applicantRows as any[]) {
+      const who = [a.first_name, a.last_name].filter(Boolean).join(' ') || 'Applicant'
+      const where = a.unit_number ? ' — Unit ' + a.unit_number + (a.property_name ? ' (' + a.property_name + ')' : '') : ''
+      const screened = ['approved', 'waived'].includes(a.background_check_status)
+      onboarding.push({
+        id: 'application-' + a.id,
+        type: 'new_applicant',
+        title: 'New applicant — start onboarding' + where,
+        subtitle: who + (screened
+          ? ' passed screening and applied. Draft their lease to begin.'
+          : ' applied. Screen them, then draft the lease.'),
+        href: '/applications',
+      })
+    }
+
     res.json({
       success: true,
       data: {
@@ -1089,12 +1265,14 @@ landlordsRouter.get('/me/todos', requireLandlord, async (req, res, next) => {
         ach,
         maintenance,
         workTrade,
+        onboarding,
         counts: {
           leases: leases.length,
           ach: ach.length,
           maintenance: maintenance.length,
           workTrade: workTrade.length,
-          total: leases.length + ach.length + maintenance.length + workTrade.length,
+          onboarding: onboarding.length,
+          total: leases.length + ach.length + maintenance.length + workTrade.length + onboarding.length,
         },
       },
     })
@@ -1155,14 +1333,14 @@ landlordsRouter.post('/me/onboard-tenant', requirePerm('tenants.onboard'), async
     // S537 gate: no onboarding onto an UNDECIDED late-fee class.
     await assertLateFeeDecisionForUnit(unit.id)
 
-    // --- Verify unit is not already occupied ---
-    const occ = await queryOne<any>(
-      `SELECT is_occupied FROM v_unit_occupancy WHERE unit_id = $1`,
-      [unitId]
-    )
-    if (occ?.is_occupied) {
-      throw new AppError(409, 'Unit is already occupied. Co-tenant additions to occupied units require consent and are not yet supported in this flow.')
-    }
+    // --- Occupancy-mode gate (S582) ---
+    // Was a flat "already occupied" block, which wrongly stopped by-room paper
+    // imports: a landlord onboarding a dorm / sober-living / rooming house often
+    // has a SEPARATE existing paper lease per ROOM that all attach to the same
+    // unit. assertUnitCanAcceptNewLease enforces the right cap per occupancy_mode
+    // — whole_unit still blocks a 2nd lease (co-tenants share one; add them to the
+    // existing lease instead), by_room allows independent leases up to 2×bedrooms.
+    await assertUnitCanAcceptNewLease(client, unitId)
 
     // --- Cross-landlord conflict check ---
     const existingUser = await queryOne<any>(
@@ -1319,6 +1497,15 @@ landlordsRouter.post('/me/onboard-tenant', requirePerm('tenants.onboard'), async
 })
 
 
+// GET /api/landlords/me/onboarding-windows — S579. Every property's onboarding-
+// window state, for the banner that lets the landlord see how long sitting
+// tenants can still be grandfathered and mark a property's onboarding complete.
+landlordsRouter.get('/me/onboarding-windows', requireLandlord, async (req, res, next) => {
+  try {
+    res.json({ success: true, data: await listOnboardingWindowsForLandlord(req.user!.profileId) })
+  } catch (e) { next(e) }
+})
+
 // POST /api/landlords/me/onboard-new-lease-tenant (S558, Flow B — new lease)
 // Invite a person to a UNIT for a lease they will SIGN (vs onboard-tenant, which
 // migrates an already-signed paper lease). Unit-linked invite: the unit rides on
@@ -1443,7 +1630,25 @@ landlordsRouter.post('/me/onboard-new-lease-tenant', requirePerm('tenants.onboar
       logger.info(`[ONBOARD-NEW-LEASE] Manual activation URL: ${activationUrl}`)
     }
 
-    res.json({ success: true, data: { userId, tenantId, email: emailNorm, unitId, activationUrl } })
+    // S579: this flow onboards a SITTING tenant (the page is explicitly "tenants
+    // who already live in your units"). If the landlord attests they're an
+    // existing resident AND the property's onboarding window is open, grandfather
+    // them past the background check (per-occupied-unit, audited); otherwise they
+    // screen like any new applicant. Post-commit, best-effort — a waive hiccup
+    // never rolls back the onboarding; the landlord can re-attest from the roster.
+    let screeningWaived = false
+    if (req.body?.existingResident === true) {
+      try {
+        const wr = await applyScreeningWaive({
+          tenantId, landlordId, propertyId: unit.property_id, unitId, byUserId: req.user!.userId,
+        })
+        screeningWaived = wr.waived
+      } catch (waiveErr) {
+        logger.error({ err: waiveErr, ctx: tenantId }, '[ONBOARD-NEW-LEASE] grandfather waive failed')
+      }
+    }
+
+    res.json({ success: true, data: { userId, tenantId, email: emailNorm, unitId, activationUrl, screeningWaived } })
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {})
     next(e)
@@ -1619,6 +1824,25 @@ landlordsRouter.post('/me/onboard-tenant-pending', requirePerm('tenants.create')
 
     await client.query('COMMIT')
 
+    // S579: grandfather a sitting tenant past the background check when the
+    // landlord attests they're an existing resident of the bound unit AND the
+    // property's onboarding window is open. Needs the unit (grandfather is
+    // per-occupied-unit). Post-commit, best-effort.
+    let screeningWaived = false
+    if (req.body?.existingResident === true && unitId) {
+      try {
+        const propRow = await queryOne<{ property_id: string }>(`SELECT property_id FROM units WHERE id=$1`, [unitId])
+        if (propRow) {
+          const wr = await applyScreeningWaive({
+            tenantId, landlordId, propertyId: propRow.property_id, unitId, byUserId: req.user!.userId,
+          })
+          screeningWaived = wr.waived
+        }
+      } catch (waiveErr) {
+        logger.error({ err: waiveErr, ctx: tenantId }, '[ONBOARD-PENDING] grandfather waive failed')
+      }
+    }
+
     res.json({
       success: true,
       data: {
@@ -1631,6 +1855,7 @@ landlordsRouter.post('/me/onboard-tenant-pending', requirePerm('tenants.create')
         phone,
         parserStatus: intent.rows[0].parser_status,
         createdAt: intent.rows[0].created_at,
+        screeningWaived,
       },
     })
   } catch (e) {
@@ -1729,12 +1954,18 @@ landlordsRouter.post('/me/onboard-tenants-csv/commit-pending', requirePerm('tena
           // Pending intent already exists. This is also the catch for
           // duplicate emails WITHIN a single CSV — row N+1 sees the intent
           // that row N just inserted and rejects.
+          // S582: match the partial unique index (tenant_id WHERE cancelled_at
+          // IS NULL) so a RESOLVED-but-not-cancelled intent is caught with a
+          // friendly message instead of surfacing the raw unique-constraint
+          // violation the INSERT below would throw.
           const existingIntent = await queryOne<any>(
-            `SELECT id FROM pending_tenant_intents WHERE tenant_id = $1 AND resolved_at IS NULL AND cancelled_at IS NULL LIMIT 1`,
+            `SELECT id, resolved_at FROM pending_tenant_intents WHERE tenant_id = $1 AND cancelled_at IS NULL LIMIT 1`,
             [existingUser.tenant_id]
           )
           if (existingIntent) {
-            throw new Error('This person is already in your pending pool.')
+            throw new Error(existingIntent.resolved_at
+              ? 'This person has already been onboarded with you.'
+              : 'This person is already in your pending pool.')
           }
         }
 
@@ -2165,7 +2396,10 @@ landlordsRouter.post(
       if (typeof overrides !== 'object' || Array.isArray(overrides) || overrides === null) {
         throw new AppError(400, 'landlordOverrides must be an object')
       }
-      const result = await resolveIntent(intentId, landlordId, overrides)
+      // S582: confirmSupersede lets the landlord acknowledge that resolving into
+      // an already-leased unit will END the sitting lease (parser migration case).
+      const confirmSupersede = req.body?.confirmSupersede === true
+      const result = await resolveIntent(intentId, landlordId, overrides, { confirmSupersede })
       res.json({ success: true, data: result })
     } catch (e) { next(e) }
   }
@@ -3218,6 +3452,13 @@ landlordsRouter.post('/me/onboard-tenants-csv/commit', requirePerm('tenants.crea
 
     for (const [unitId, groupRows] of groups.entries()) {
       const primary = groupRows[0]
+      // S582: server-side occupancy backstop. /validate blocks occupied units,
+      // but the commit must NOT trust the client ran it (same "trust nothing"
+      // principle as commit-pending). Without this, a direct call or a re-run
+      // that bypasses re-validation would create a SECOND active lease on a unit
+      // (whole_unit) — double-booking a 32-unit import. Mode-aware; throws +
+      // rolls back the whole import (all-or-nothing, like the late-fee gate above).
+      await assertUnitCanAcceptNewLease(client, unitId)
       const leaseType = primary.leaseEnd ? 'fixed_term' : 'month_to_month'
       const arBool = parseBool(primary.autoRenew) === true
       const arMode = arBool ? primary.autoRenewMode : null

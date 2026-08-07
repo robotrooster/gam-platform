@@ -3,22 +3,68 @@ import { useNavigate, Link } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
 
 export function LoginPage() {
-  const { login } = useAuth()
+  const { login, loginWithEmailOtp, resendEmailOtp } = useAuth()
   const navigate = useNavigate()
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [err, setErr] = useState<string | null>(null)
   const [pending, setPending] = useState(false)
+  // S578: mandatory email-2FA (business_owner) — the emailed-code second step.
+  const [emailOtpSession, setEmailOtpSession] = useState<string | null>(null)
+  const [code, setCode] = useState('')
+  const [resent, setResent] = useState(false)
 
   const onSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     setErr(null); setPending(true)
     try {
-      await login(email, password)
-      navigate('/dashboard')
+      const r = await login(email, password)
+      if (r.kind === 'email_otp_required') { setEmailOtpSession(r.emailOtpSession); setCode(''); setResent(false) }
+      else navigate('/dashboard')
     } catch (e: any) {
       setErr(e?.response?.data?.error || e?.message || 'Login failed')
     } finally { setPending(false) }
+  }
+
+  const onOtpSubmit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setErr(null); setPending(true)
+    try {
+      await loginWithEmailOtp(emailOtpSession!, code.trim())
+      navigate('/dashboard')
+    } catch (e: any) {
+      const msg = e?.response?.data?.error || e?.message || 'Invalid code.'
+      setErr(msg)
+      if (/session/i.test(msg)) { setEmailOtpSession(null); setCode('') }
+    } finally { setPending(false) }
+  }
+
+  const onResend = async () => {
+    setErr(null); setResent(false)
+    try { await resendEmailOtp(emailOtpSession!); setResent(true) }
+    catch (e: any) { setErr(e?.response?.data?.error || 'Could not resend the code.') }
+  }
+
+  // S578: step 2 — emailed 2FA code.
+  if (emailOtpSession) {
+    return (
+      <div style={{ minHeight: '100vh', display: 'grid', placeItems: 'center', background: 'var(--bg-0)', color: 'var(--text-0)' }}>
+        <form onSubmit={onOtpSubmit} style={{ width: 360, padding: 32, background: 'var(--bg-1)', border: '1px solid var(--border-0)', borderRadius: 12 }}>
+          <div style={{ fontFamily: 'var(--font-display)', fontSize: 24, color: 'var(--gold)' }}>GAM</div>
+          <div style={{ fontFamily: 'var(--font-body)', fontSize: 14, color: 'var(--text-2)', marginTop: 2, marginBottom: 20 }}>Two-factor authentication</div>
+          <div style={{ fontSize: 13, color: 'var(--text-2)', marginBottom: 16, lineHeight: 1.6 }}>We emailed a 6-digit code. Enter it to finish signing in.</div>
+          <label style={labelStyle}>Code</label>
+          <input value={code} onChange={e => setCode(e.target.value)} inputMode="numeric" autoComplete="one-time-code" autoFocus required placeholder="123 456" style={{ ...inputStyle, textAlign: 'center', letterSpacing: '.2em' }} />
+          {resent && !err && <div style={{ marginTop: 12, fontSize: 13, color: 'var(--green)' }}>A new code is on its way.</div>}
+          {err && <div style={errStyle}>{err}</div>}
+          <button type="submit" disabled={pending || !code.trim()} style={{ ...btnStyle, opacity: (pending || !code.trim()) ? 0.6 : 1 }}>{pending ? 'Verifying…' : 'Verify'}</button>
+          <div style={{ marginTop: 16, display: 'flex', justifyContent: 'space-between', fontSize: 13 }}>
+            <button type="button" onClick={() => { setEmailOtpSession(null); setCode(''); setErr(null); setResent(false) }} style={{ background: 'none', border: 'none', color: 'var(--text-2)', cursor: 'pointer', textDecoration: 'underline' }}>← Back</button>
+            <button type="button" onClick={onResend} style={{ background: 'none', border: 'none', color: 'var(--gold)', cursor: 'pointer', textDecoration: 'underline' }}>Resend code</button>
+          </div>
+        </form>
+      </div>
+    )
   }
 
   return (

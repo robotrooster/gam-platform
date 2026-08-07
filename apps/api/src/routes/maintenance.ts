@@ -57,7 +57,7 @@ maintenanceRouter.get('/', async (req, res, next) => {
       JOIN properties p ON p.id = u.property_id
       LEFT JOIN tenants t ON t.id = mr.tenant_id
       LEFT JOIN users tu ON tu.id = t.user_id
-      LEFT JOIN users au ON au.id = mr.contractor_id
+      LEFT JOIN users au ON au.id = mr.assigned_to
       WHERE 1=1 ${roleFilter} ${unitFilter}
       ORDER BY
         CASE mr.priority WHEN 'emergency' THEN 1 WHEN 'high' THEN 2 WHEN 'normal' THEN 3 ELSE 4 END,
@@ -80,7 +80,7 @@ maintenanceRouter.get('/:id', async (req, res, next) => {
       JOIN properties p ON p.id = u.property_id
       LEFT JOIN tenants t ON t.id = mr.tenant_id
       LEFT JOIN users tu ON tu.id = t.user_id
-      LEFT JOIN users au ON au.id = mr.contractor_id
+      LEFT JOIN users au ON au.id = mr.assigned_to
       WHERE mr.id = $1`, [req.params.id])
     if (!request) throw new AppError(404, 'Request not found')
 
@@ -124,6 +124,20 @@ maintenanceRouter.post('/', async (req, res, next) => {
     // A tenant may not self-assign priority — it's agent-recommended and
     // landlord-overridable. Strip any priority a tenant tries to send.
     const priority = req.user!.role === 'tenant' ? undefined : body.priority
+
+    // Ownership gate for NON-tenant callers. The tenant path is scoped inside
+    // the service (must be on the unit's active lease); a landlord/staff caller
+    // may only file against a unit whose landlord they manage. Pre-existing gap:
+    // GET/:id + PATCH got scope checks in S69, but POST create was missed — a
+    // landlord could inject a request into another landlord's queue.
+    if (req.user!.role !== 'tenant') {
+      const unit = await queryOne<{ landlord_id: string }>(
+        'SELECT landlord_id FROM units WHERE id=$1', [body.unitId])
+      if (!unit) throw new AppError(404, 'Unit not found')
+      if (!canManageLandlordResource(req.user, unit.landlord_id)) {
+        throw new AppError(403, 'Forbidden')
+      }
+    }
 
     // Create via the shared service (same path the agent's
     // file_maintenance_request tool uses — one source of truth).
@@ -183,7 +197,7 @@ maintenanceRouter.patch('/:id', requirePerm('maintenance.update'), async (req, r
     const updated = await queryOne<any>(`
       UPDATE maintenance_requests SET
         status         = COALESCE($1, status),
-        contractor_id  = COALESCE($2, contractor_id),
+        assigned_to    = COALESCE($2, assigned_to),
         assigned_at    = CASE WHEN $2 IS NOT NULL THEN NOW() ELSE assigned_at END,
         estimated_cost = COALESCE($3, estimated_cost),
         actual_cost    = COALESCE($4, actual_cost),
@@ -332,8 +346,9 @@ maintenanceRouter.post('/:id/approve', requirePerm('maintenance.approve'), async
       }
     }
 
-    // Flip to 'assigned' if a contractor is already set, otherwise back to 'open'
-    const nextStatus = request.contractor_id ? 'assigned' : 'open'
+    // Flip to 'assigned' if the request is already routed to someone (worker or
+    // contractor), otherwise back to 'open'
+    const nextStatus = request.assigned_to ? 'assigned' : 'open'
     const nowAssigned = nextStatus === 'assigned' ? ', assigned_at = COALESCE(assigned_at, NOW())' : ''
 
     const updated = await queryOne<any>(

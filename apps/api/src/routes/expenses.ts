@@ -6,8 +6,10 @@ import crypto from 'crypto'
 import multer from 'multer'
 import { z } from 'zod'
 import { requireAuth, requireLandlord } from '../middleware/auth'
+import { canAccessLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
 import { resolveUploadPath } from '../lib/uploadPaths'
+import { queryOne } from '../db'
 import { EXPENSE_CATEGORIES } from '@gam/shared'
 import { createLandlordExpense, listLandlordExpenses, voidLandlordExpense, attachExpenseReceipt } from '../services/landlordExpenses'
 
@@ -90,9 +92,19 @@ expensesRouter.post('/:id/receipt', requireLandlord, receiptUpload.single('recei
   } catch (e) { next(e) }
 })
 
-// GET /api/expenses/receipt-files/:filename — stream a receipt (authed).
+// GET /api/expenses/receipt-files/:filename — stream a receipt.
 expensesRouter.get('/receipt-files/:filename', async (req, res, next) => {
   try {
+    // S587: per-row authorization. This previously served ANY receipt file by
+    // filename behind only the router-level requireAuth — a cross-landlord leak
+    // of financial receipts (vendor invoices/amounts), the same class as the
+    // S586 inspection photo gap. Look up the expense the receipt belongs to and
+    // confirm the caller's landlord owns it (admins pass).
+    const receiptUrl = '/api/expenses/receipt-files/' + req.params.filename
+    const exp = await queryOne<{ landlord_id: string }>(
+      `SELECT landlord_id FROM landlord_expenses WHERE receipt_url = $1`, [receiptUrl])
+    if (!exp) throw new AppError(404, 'Not found')
+    if (!canAccessLandlordResource(req.user, exp.landlord_id)) throw new AppError(403, 'Forbidden')
     const fp = resolveUploadPath(receiptDir, req.params.filename)
     if (!fp) throw new AppError(400, 'Invalid filename')
     if (!fs.existsSync(fp)) throw new AppError(404, 'Not found')

@@ -88,6 +88,32 @@ describe('landlord members CRUD', () => {
     expect(rmAdded.status).toBe(200)
   })
 
+  // S592: a co-owner with no upline of their own is captured as the founder's
+  // downline (dormant until they later go solo); an existing upline is untouched.
+  it('adding a co-owner sets their person-upline to the founder (first-touch wins)', async () => {
+    const oakPark = await seedEntity('Oak Park LLC')
+    const friend = await seedEntity('Friend WY Holdings')       // organic — no upline
+    const priorUpline = await seedEntity('Prior Upline Co')
+    const alreadyReferred = await seedEntity('Already Referred Co')
+    // alreadyReferred already has an upline → first-touch must leave it alone
+    await db.query(`UPDATE users SET referred_by_user_id=$1 WHERE id=$2`, [priorUpline.userId, alreadyReferred.userId])
+
+    const app = buildApp()
+    const a1 = await request(app).post('/api/landlords/members')
+      .set('Authorization', `Bearer ${tokenFor(oakPark)}`).send({ email: friend.email })
+    expect(a1.status).toBe(201)
+    const a2 = await request(app).post('/api/landlords/members')
+      .set('Authorization', `Bearer ${tokenFor(oakPark)}`).send({ email: alreadyReferred.email })
+    expect(a2.status).toBe(201)
+
+    // friend (no prior upline) → captured under Oak Park's founder
+    const f = await db.query<{ referred_by_user_id: string }>(`SELECT referred_by_user_id FROM users WHERE id=$1`, [friend.userId])
+    expect(f.rows[0].referred_by_user_id).toBe(oakPark.userId)
+    // alreadyReferred keeps their prior upline
+    const a = await db.query<{ referred_by_user_id: string }>(`SELECT referred_by_user_id FROM users WHERE id=$1`, [alreadyReferred.userId])
+    expect(a.rows[0].referred_by_user_id).toBe(priorUpline.userId)
+  })
+
   it('rejects unknown emails and duplicate adds', async () => {
     const oakPark = await seedEntity('Oak Park LLC')
     const friend = await seedEntity('Friend WY Holdings')

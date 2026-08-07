@@ -9,12 +9,12 @@ import { iconBtnStyle, cancelBtnStyle, saveBtnStyle } from './CustomersPage'
 interface VehicleRow {
   id: string
   name: string
-  plate_or_id: string | null
-  home_depot_id: string
-  home_depot_name: string
-  stops_per_dump: number
-  avg_speed_mph: number
-  avg_service_minutes: number
+  plateOrId: string | null
+  homeDepotId: string
+  homeDepotName: string
+  stopsPerDump: number
+  avgSpeedMph: number
+  avgServiceMinutes: number
   status: string
 }
 
@@ -85,11 +85,11 @@ export function VehiclesPage() {
   const startEdit = (r: VehicleRow) => {
     setEditing(r)
     setEditForm({
-      name: r.name, plateOrId: r.plate_or_id ?? '',
-      homeDepotId: r.home_depot_id,
-      stopsPerDump: String(r.stops_per_dump),
-      avgSpeedMph: String(r.avg_speed_mph),
-      avgServiceMinutes: String(r.avg_service_minutes),
+      name: r.name, plateOrId: r.plateOrId ?? '',
+      homeDepotId: r.homeDepotId,
+      stopsPerDump: String(r.stopsPerDump),
+      avgSpeedMph: String(r.avgSpeedMph),
+      avgServiceMinutes: String(r.avgServiceMinutes),
     })
   }
 
@@ -170,9 +170,9 @@ export function VehiclesPage() {
                 {rows.map(r => (
                   <tr key={r.id} style={{ borderBottom: '1px solid var(--border-0)' }}>
                     <td style={tdStyle}>{r.name}</td>
-                    <td style={tdStyle}>{r.plate_or_id ?? '—'}</td>
-                    <td style={tdStyle}>{r.home_depot_name}</td>
-                    <td style={tdStyle}>{r.stops_per_dump}</td>
+                    <td style={tdStyle}>{r.plateOrId ?? '—'}</td>
+                    <td style={tdStyle}>{r.homeDepotName}</td>
+                    <td style={tdStyle}>{r.stopsPerDump}</td>
                     <td style={tdStyle}>{humanize(r.status)}</td>
                     <td style={tdStyle}>
                       <div style={{ display: 'flex', gap: 6 }}>

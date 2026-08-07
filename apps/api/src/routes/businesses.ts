@@ -20,13 +20,12 @@
 
 import { Router } from 'express'
 import bcrypt from 'bcryptjs'
-import jwt from 'jsonwebtoken'
 import { z } from 'zod'
 import { db, query, queryOne } from '../db'
 import { requireAuth, requireRole } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { isDisposableEmail } from '../lib/email'
-import { mintAndSendVerifyEmail } from './auth'
+import { signEmailOtpSessionToken, issueEmailOtp } from './emailOtp'
 import {
   BUSINESS_TYPES,
   BUSINESS_STATUSES,
@@ -64,10 +63,6 @@ const signupSchema = z.object({
   zip:     z.string().optional(),
   ein:     z.string().optional(),
 })
-
-function signToken(payload: object) {
-  return jwt.sign(payload, process.env.JWT_SECRET!, { expiresIn: '7d' })
-}
 
 // POST /api/businesses — owner self-signup (public; no auth middleware)
 businessesRouter.post('/', async (req, res, next) => {
@@ -128,23 +123,22 @@ businessesRouter.post('/', async (req, res, next) => {
 
       await client.query('COMMIT')
 
-      // S574: mint + send the verification link AFTER commit (fire-and-forget;
-      // failure doesn't fail signup — resend via /api/auth/resend-verification).
-      // Skipped in dev where the account is already auto-verified.
-      if (!devAutoVerify) void mintAndSendVerifyEmail(user.id, user.email, user.first_name)
-
-      const token = signToken({
-        userId:     user.id,
-        role:       'business_owner',
-        email:      user.email,
-        profileId:  biz.id,
-        businessId: biz.id,
-        staffRole:  null,
+      // S578 (Nic): mandatory email-2FA at signup — no full session at
+      // registration. Email a 6-digit code + return a pending session (like
+      // /login); the client verifies at /api/auth/email-otp/verify, which also
+      // marks the email verified (no separate verification link needed). The
+      // business portal LOGIN + SIGNUP both handle the code step now.
+      await query(`UPDATE users SET email_2fa_enabled = TRUE WHERE id = $1`, [user.id])
+      const emailOtpSession = signEmailOtpSessionToken({
+        userId: user.id, role: 'business_owner', email: user.email,
+        profileId: biz.id, landlordId: null, landlordIds: null,
+        businessId: biz.id, staffRole: null, permissions: null,
       })
+      await issueEmailOtp(user.id, user.email)
       res.status(201).json({
         success: true,
         data: {
-          token,
+          requiresEmailOtp: true, emailOtpSession,
           user: {
             id: user.id, email: user.email, role: 'business_owner',
             firstName: user.first_name, lastName: user.last_name,

@@ -168,7 +168,7 @@ export function PosCustomerOnboardingPage() {
             <li>Enter your bank's routing and account numbers below</li>
             <li>Stripe sends two small deposits to your account (1–3 business days) — no fees</li>
             <li>Confirm the amounts (Stripe emails you a link) to finish verifying</li>
-            <li>Then {preview.merchantName} can charge purchases to your tab; statements pull automatically — 1.5% service fee + your purchases each month</li>
+            <li>Then {preview.merchantName} can charge purchases to your tab. Each month you get a statement; the <strong>minimum payment</strong> auto-pulls from your bank. Pay your full balance by the due date and you owe <strong>no interest</strong> — carry a balance and {preview.merchantName}'s interest rate (APR) applies. GAM never adds a fee to your bill.</li>
           </ul>
         </div>
       </div>

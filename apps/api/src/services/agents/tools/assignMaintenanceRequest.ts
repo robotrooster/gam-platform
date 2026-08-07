@@ -7,13 +7,14 @@
  *   - the worker must be on the SAME landlord's maintenance team
  *     (maintenance_worker_scopes.landlord_id = actor.profileId)
  * so the model can neither touch another landlord's request nor assign an
- * arbitrary user. maintenance_requests.contractor_id references users.id
- * (the team worker), NOT the platform `contractors` marketplace.
+ * arbitrary user. maintenance_requests.assigned_to references users.id (the
+ * team worker); this tool only ever assigns to the landlord's OWN in-house
+ * team — outside-contractor routing is a separate (future) flow.
  *
  * The model gives the worker by NAME (it never sees user ids); we resolve
  * it within the team and ask to disambiguate on multiple matches — the
  * same shape as lookup_tenant_payment_status. Mirrors the assign path of
- * PATCH /api/maintenance/:id: set contractor_id + assigned_at, move
+ * PATCH /api/maintenance/:id: set assigned_to + assigned_at, move
  * open→assigned (an awaiting_approval request keeps that status — the
  * worker is recorded and approval then auto-flips it to assigned), add an
  * assignment comment, notify the worker (and the tenant when it goes live).
@@ -108,7 +109,7 @@ export const assignMaintenanceRequest: AgentTool = {
     }
 
     // 3) open → assigned. awaiting_approval keeps its status (recording the
-    //    worker; the approve step flips it to assigned because contractor_id
+    //    worker; the approve step flips it to assigned because assigned_to
     //    is now set). assigned / in_progress = a reassignment, status kept.
     const newStatus = request.status === 'open' ? 'assigned' : request.status
 
@@ -117,7 +118,7 @@ export const assignMaintenanceRequest: AgentTool = {
     // be mutated, and a concurrent close finds no matching row.
     const updated = await queryOne<any>(
       `UPDATE maintenance_requests
-          SET contractor_id = $1, status = $2, assigned_at = NOW(), updated_at = NOW()
+          SET assigned_to = $1, status = $2, assigned_at = NOW(), updated_at = NOW()
         WHERE id = $3 AND landlord_id = $4 AND status NOT IN ('completed','cancelled')
         RETURNING *`,
       [worker.user_id, newStatus, requestId, actor.profileId]

@@ -43,6 +43,7 @@ interface PaymentRow {
   amount: string
   status: string
   gam_supersedence_amount: string
+  sublease_markup_amount: string
 }
 
 interface PropertyAndRuleRow {
@@ -150,6 +151,16 @@ export async function executeRentAllocation(
   // bank, not the gross.
   const supersedenceAmount = round2(parseFloat(payment.gam_supersedence_amount || '0'))
 
+  // S581: sublease markup. When a SUBLESSEE paid, the invoice was for
+  // sub_monthly_amount but the LANDLORD is only owed master_share_amount — the
+  // difference (markup) goes to the SUBLESSOR (creditSublessorMarkupForPayment
+  // credits it that same stamped amount at settle). So it comes out of the owner
+  // share here, exactly like the GAM-supersedence boost: both are portions of the
+  // gross the landlord never receives. 0 for non-sublease / full-pass-through
+  // payments. (Pre-S581 this was dropped: owner_share was computed on the full
+  // sub amount AND the sublessor was credited — GAM ate the markup.)
+  const subleaseMarkup = round2(parseFloat(payment.sublease_markup_amount || '0'))
+
   // S110: PM company cut (third-party PM contracted on this property).
   // When properties.pm_company_id is set, the PM company REPLACES the
   // in-house manager fee — rent splits into (PM cut, owner share, banking
@@ -206,7 +217,7 @@ export async function executeRentAllocation(
     )
   }
 
-  const ownerShare = round2(splittable - managerFee - pmCompanyFee - supersedenceAmount)
+  const ownerShare = round2(splittable - managerFee - pmCompanyFee - supersedenceAmount - subleaseMarkup)
   if (ownerShare < 0) {
     // Supersedence boost exceeded the splittable minus fees. By design
     // we cap the boost at `amount` (the payment amount) at PI creation
@@ -217,7 +228,7 @@ export async function executeRentAllocation(
     // trail doesn't double-count.
     throw new AppError(409,
       `Allocation produced negative owner_share for payment ${payment.id} ` +
-      `(splittable=${splittable}, manager=${managerFee}, pm=${pmCompanyFee}, supersedence=${supersedenceAmount}). ` +
+      `(splittable=${splittable}, manager=${managerFee}, pm=${pmCompanyFee}, supersedence=${supersedenceAmount}, subleaseMarkup=${subleaseMarkup}). ` +
       `Property ${prop.property_id} fee config + supersedence boost combined to exceed splittable.`
     )
   }
@@ -291,7 +302,8 @@ export async function executeRentAllocation(
 async function fetchPayment(client: PoolClient, paymentId: string): Promise<PaymentRow> {
   const res = await client.query<PaymentRow>(
     `SELECT id, unit_id, type, amount::text AS amount, status,
-            gam_supersedence_amount::text AS gam_supersedence_amount
+            gam_supersedence_amount::text AS gam_supersedence_amount,
+            sublease_markup_amount::text AS sublease_markup_amount
        FROM payments WHERE id=$1 FOR UPDATE`,
     [paymentId]
   )

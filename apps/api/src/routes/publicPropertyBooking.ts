@@ -1,4 +1,5 @@
 import { Router } from 'express'
+import rateLimit from 'express-rate-limit'
 import { z } from 'zod'
 import path from 'path'
 import { DateTime } from 'luxon'
@@ -26,6 +27,22 @@ export { computeStayTotal }
 // ============================================================
 
 export const publicPropertyBookingRouter = Router()
+
+// Tighter than the global /api limiter (3000/15min): these public, unauthed
+// endpoints send email on every call (landlord inquiry notification / guest
+// stay-link) or mint a Stripe checkout session + DB rows (/book), so they're an
+// abuse + Resend-sender-reputation vector. A real guest sends 1–2; 8/15min/IP is
+// generous for a human, brutal for a bot. Keyed by IP (default), so it caps an
+// attacker across every property slug at once. Read endpoints (availability
+// polling) stay on the global limiter — only these writes are throttled.
+const publicWriteLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 8,
+  message: { success: false, error: 'Too many requests. Please try again in a few minutes.' },
+  // No-op under the test runner (same idiom as lib/logger.ts) so a suite firing
+  // many writes from one IP never 429-flakes; always active in dev/prod.
+  skip: () => process.env.NODE_ENV === 'test' || !!process.env.VITEST_POOL_ID,
+})
 
 interface PropertyRow {
   id: string
@@ -226,7 +243,7 @@ publicPropertyBookingRouter.get('/property/:slug/photo/:photoId', async (req, re
 // ── POST /property/:slug/inquiry — S544 storefront contact form ──
 // Anonymous guests asking about sites/amenities/availability. Stored
 // durably + landlord notification (with email) carrying the message.
-publicPropertyBookingRouter.post('/property/:slug/inquiry', async (req, res, next) => {
+publicPropertyBookingRouter.post('/property/:slug/inquiry', publicWriteLimiter, async (req, res, next) => {
   try {
     const b = z.object({
       name:    z.string().min(1).max(120),
@@ -302,7 +319,7 @@ publicPropertyBookingRouter.get('/property/:slug/stay/:token', async (req, res, 
 // POST /property/:slug/stay-link — "resend my stay link". Always answers
 // success (no email enumeration); live stays under the email get a fresh
 // tokened link by email.
-publicPropertyBookingRouter.post('/property/:slug/stay-link', async (req, res, next) => {
+publicPropertyBookingRouter.post('/property/:slug/stay-link', publicWriteLimiter, async (req, res, next) => {
   try {
     const b = z.object({ email: z.string().email().max(200) }).parse(req.body)
     const prop = await resolveProperty(req.params.slug)
@@ -451,13 +468,24 @@ publicPropertyBookingRouter.post('/property/:slug/stay/:token/amenity/:areaId/re
 async function typeAvailability(prop: PropertyRow, siteType: SiteType, nights: number, checkIn: string, checkOut: string) {
   let freeUnit: any = null
   for (const u of siteType.units) {
-    const conflict = await queryOne<{ id: string }>(
-      `SELECT id FROM unit_bookings
-        WHERE unit_id = $1
-          AND status <> 'cancelled'
-          AND NOT (status = 'tentative' AND hold_expires_at IS NOT NULL AND hold_expires_at < now())
-          AND check_in < $2::date AND check_out > $3::date
-        LIMIT 1`,
+    // S593: mirror the write-time guard (services/propertyBooking.hasConflict) —
+    // a unit is free only if NEITHER an overlapping booking NOR an overlapping
+    // ACTIVE long-term lease occupies it. Keeps the displayed availability from
+    // contradicting what a booking attempt will actually allow.
+    const conflict = await queryOne<{ x: number }>(
+      `SELECT 1 AS x WHERE
+         EXISTS (
+           SELECT 1 FROM unit_bookings
+            WHERE unit_id = $1 AND status <> 'cancelled'
+              AND NOT (status = 'tentative' AND hold_expires_at IS NOT NULL AND hold_expires_at < now())
+              AND check_in < $2::date AND check_out > $3::date
+         )
+         OR EXISTS (
+           SELECT 1 FROM leases
+            WHERE unit_id = $1 AND status IN ('active','pending')
+              AND start_date < $2::date AND (end_date IS NULL OR end_date > $3::date)
+         )
+       LIMIT 1`,
       [u.id, checkOut, checkIn])
     if (!conflict) { freeUnit = u; break }
   }
@@ -596,10 +624,10 @@ publicPropertyBookingRouter.get('/property/:slug/availability', async (req, res,
 
 // Guest-supplied booking details (the guest is not a GAM user).
 const guestBody = z.object({
-  siteTypeId: z.string(),
-  guestName: z.string().min(1),
-  guestEmail: z.string().email(),
-  guestPhone: z.string().optional(),
+  siteTypeId: z.string().max(100),
+  guestName: z.string().min(1).max(120),
+  guestEmail: z.string().email().max(200),
+  guestPhone: z.string().max(40).optional(),
   checkIn:   z.string(),
   checkOut:  z.string(),
   stayType:  z.enum(['nightly', 'weekly']).default('nightly'),
@@ -609,7 +637,7 @@ const guestBody = z.object({
 })
 
 // ── POST /property/:slug/book — tentative hold + Stripe deposit checkout ──
-publicPropertyBookingRouter.post('/property/:slug/book', async (req, res, next) => {
+publicPropertyBookingRouter.post('/property/:slug/book', publicWriteLimiter, async (req, res, next) => {
   try {
     const b = guestBody.parse(req.body)
     // W-20 (Nic): the system picks the site BEST-FIT — the stay slots into

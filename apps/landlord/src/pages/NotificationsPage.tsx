@@ -40,7 +40,7 @@ function deepLinkFor(n: Notification): string | null {
   const d = n.data ?? {}
   if (d.inspectionId) return `/inspections/${d.inspectionId}`
   if (d.entryRequestId) return `/entry-requests/${d.entryRequestId}`
-  if (d.maintenance_request_id || d.requestId) {
+  if (d.maintenanceRequestId || d.requestId) {
     return `/maintenance` // no per-request page; nav to inbox
   }
   if (d.leaseId) return '/leases'

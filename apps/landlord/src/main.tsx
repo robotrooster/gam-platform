@@ -89,6 +89,7 @@ import { EntryRequestsPage } from './pages/EntryRequestsPage'
 import { NewEntryRequestPage } from './pages/NewEntryRequestPage'
 import { EntryRequestDetailPage } from './pages/EntryRequestDetailPage'
 import { TenantScreeningPage } from './pages/TenantScreeningPage'
+import { ApplicationsPage } from './pages/ApplicationsPage'
 import { NotificationsPage } from './pages/NotificationsPage'
 import { DepositReturnPage } from './pages/DepositReturnPage'
 import { LeaseTerminationPage } from './pages/LeaseTerminationPage'
@@ -208,6 +209,7 @@ export default function App() {
                 <Route path="pool"            element={<ApplicantPoolPage />} />
                 <Route path="background"     element={<BackgroundChecksPage />} />
                 <Route path="screening"          element={<TenantScreeningPage />} />
+                <Route path="applications"       element={<ApplicationsPage />} />
               </Route>
               <Route path="team"           element={<TeamPage />} />
               <Route path="team/:userId/permissions" element={<StaffPermissionsPage />} />

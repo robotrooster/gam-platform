@@ -13,8 +13,12 @@ export function InviteTenantModal({ onClose }: Props) {
   const [step, setStep] = useState(0)
   const [form, setForm] = useState({ email: '', firstName: '', lastName: '', phone: '', unitId: '' })
   const [errors, setErrors] = useState<Record<string, string>>({})
-  const [inviteResult, setInviteResult] = useState<{ acceptUrl: string; email: string } | null>(null)
+  const [inviteResult, setInviteResult] = useState<{ acceptUrl: string; email: string; screened: boolean } | null>(null)
   const [copied, setCopied] = useState(false)
+  // S579: a person invited to a vacant unit is a NEW applicant by default — they
+  // create an account + complete a background check before a unit is assigned
+  // (property-level invite). Uncheck only for someone who doesn't need screening.
+  const [requireScreening, setRequireScreening] = useState(true)
 
   const { data: units = [] } = useQuery<any[]>('vacant-units', () =>
     apiGet('/units').then((all: any[]) => all.filter(u => !u.tenantId))
@@ -26,7 +30,7 @@ export function InviteTenantModal({ onClose }: Props) {
       onSuccess: (res: any) => {
         qc.invalidateQueries('tenants')
         qc.invalidateQueries('units')
-        setInviteResult({ acceptUrl: res.data.acceptUrl, email: res.data.email })
+        setInviteResult({ acceptUrl: res.data.acceptUrl, email: res.data.email, screened: requireScreening })
       }
     }
   )
@@ -54,13 +58,17 @@ export function InviteTenantModal({ onClose }: Props) {
   const back = () => setStep(s => s - 1)
 
   const submit = () => {
-    inviteMut.mutate({
+    const base = {
       email: form.email.trim(),
       firstName: form.firstName.trim(),
       lastName: form.lastName.trim(),
       phone: form.phone.trim() || undefined,
-      unitId: form.unitId,
-    })
+    }
+    // S579: screening → property-level invite (they screen, unit assigned later
+    // at lease). Otherwise the legacy unit-bound invite.
+    inviteMut.mutate(requireScreening && selectedUnit?.propertyId
+      ? { ...base, propertyId: selectedUnit.propertyId }
+      : { ...base, unitId: form.unitId })
   }
 
   const copyLink = () => {
@@ -100,7 +108,9 @@ export function InviteTenantModal({ onClose }: Props) {
           </div>
 
           <div style={{ fontSize: '.75rem', color: 'var(--text-3)', background: 'rgba(201,162,39,.06)', border: '1px solid rgba(201,162,39,.15)', borderRadius: 8, padding: '10px 12px', marginBottom: 20, lineHeight: 1.6 }}>
-            ⚡ Unit has been assigned. The tenant will appear as <strong style={{ color: 'var(--amber)' }}>Pending</strong> until they complete their account setup and verify their bank account.
+            {inviteResult.screened
+              ? <>⚡ They&apos;ll create an account and complete a <strong style={{ color: 'var(--amber)' }}>background check</strong>. Once it clears and you approve, assign them a unit and send the lease.</>
+              : <>⚡ Unit has been assigned. The tenant will appear as <strong style={{ color: 'var(--amber)' }}>Pending</strong> until they complete their account setup and verify their bank account.</>}
           </div>
 
           <button className="btn btn-primary" style={{ width: '100%' }} onClick={onClose}>Done</button>
@@ -226,6 +236,18 @@ export function InviteTenantModal({ onClose }: Props) {
               </div>
             )}
             {errors.unitId && <div style={{ color: 'var(--red)', fontSize: '.72rem', marginTop: 8 }}>{errors.unitId}</div>}
+
+            {form.unitId && (
+              <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, cursor: 'pointer', marginTop: 14, padding: '12px 14px', background: 'var(--bg-2)', border: '1px solid var(--border-0)', borderRadius: 10 }}>
+                <input type="checkbox" checked={requireScreening} onChange={e => setRequireScreening(e.target.checked)} style={{ marginTop: 2, flexShrink: 0 }} />
+                <div>
+                  <div style={{ fontSize: '.82rem', fontWeight: 700, color: 'var(--text-0)' }}>Require background check (new applicant)</div>
+                  <div style={{ fontSize: '.74rem', color: 'var(--text-3)', lineHeight: 1.5, marginTop: 2 }}>
+                    They create an account and complete a background check before you assign the unit. Uncheck only for someone who doesn&apos;t need screening.
+                  </div>
+                </div>
+              </label>
+            )}
           </div>
         )}
 

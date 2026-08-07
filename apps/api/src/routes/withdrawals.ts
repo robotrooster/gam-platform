@@ -38,7 +38,9 @@ import {
   firePayoutForConnectAccount,
   getConnectBalance,
 } from '../services/connectPayouts'
-import { getStripe } from '../lib/stripe'
+import {
+  isInstantDisabled, recordInstantFailure, recordInstantSuccess, recordInstantMarginOwed,
+} from '../services/instantWithdrawalMargin'
 import { INSTANT_WITHDRAWAL_FEE } from '@gam/shared'
 import { logger } from '../lib/logger'
 
@@ -53,26 +55,25 @@ const STRIPE_INSTANT_MIN_USD = 0.50
 /**
  * W-32 (S531, Nic-set pricing): the user-facing instant fee is 2% of the
  * available amount, $5 minimum, ALL-IN (INSTANT_WITHDRAWAL_FEE in shared).
- * Stripe's 1.5%/$0.50 comes out of that; GAM keeps the spread.
+ * Stripe's 1.5%/$0.50 comes out of that; GAM keeps the spread (`gamMargin`).
  *
- * Mechanics: GAM's margin is pulled off the Connect balance FIRST via an
- * account-debit transfer (connected account → platform), then the instant
- * payout fires for the remainder and Stripe deducts its fee from that
- * payout. Because Stripe's fee is then computed on the post-margin amount
- * (slightly smaller than the full available), the user's actual net lands
- * a hair ABOVE available − totalFee — rounding drift goes in the user's
- * favor, never GAM's.
+ * S580 model (Nic — no pre-pull): the instant payout pays the landlord their
+ * `net` (= available − all-in fee). Stripe deducts its own instant fee from the
+ * Connect balance; GAM's margin is NOT pulled here — it's recorded as an owed
+ * receivable and collected Connect→platform at the next disbursement
+ * (services/instantWithdrawalMargin.ts), so a failed payout can never leave the
+ * landlord charged-for-nothing. GAM collects exactly `gamMargin`; any Stripe-fee
+ * rounding residual stays on the balance and sweeps to the landlord — drift in
+ * the landlord's favor, never GAM's.
  */
 export function instantFeeBreakdown(available: number): {
-  totalFee: number; gamMargin: number; payoutAmount: number; stripeFee: number; net: number
+  totalFee: number; gamMargin: number; net: number
 } {
-  const totalFee     = round2(Math.max(available * INSTANT_WITHDRAWAL_FEE.PCT, INSTANT_WITHDRAWAL_FEE.MIN_USD))
+  const totalFee           = round2(Math.max(available * INSTANT_WITHDRAWAL_FEE.PCT, INSTANT_WITHDRAWAL_FEE.MIN_USD))
   const stripeFeeProjected = round2(Math.max(available * STRIPE_INSTANT_PCT, STRIPE_INSTANT_MIN_USD))
-  const gamMargin    = round2(Math.max(totalFee - stripeFeeProjected, 0))
-  const payoutAmount = round2(available - gamMargin)
-  const stripeFee    = payoutAmount > 0 ? round2(Math.max(payoutAmount * STRIPE_INSTANT_PCT, STRIPE_INSTANT_MIN_USD)) : 0
-  const net          = round2(payoutAmount - stripeFee)
-  return { totalFee, gamMargin, payoutAmount, stripeFee, net }
+  const gamMargin          = round2(Math.max(totalFee - stripeFeeProjected, 0))
+  const net                = round2(available - totalFee)  // what the landlord's bank receives
+  return { totalFee, gamMargin, net }
 }
 
 // S554 re-anchor Stage 2: resolve which Connect account a caller withdraws.
@@ -179,7 +180,7 @@ withdrawalsRouter.post('/me/withdrawals', async (req, res, next) => {
   try {
     const userId = req.user!.userId
     const body   = withdrawalSchema.parse(req.body ?? {})
-    const method = body.method ?? 'standard'
+    const requestedMethod = body.method ?? 'standard'
 
     const target = await resolveWithdrawalTarget(userId)
     if (!target.account) {
@@ -187,6 +188,16 @@ withdrawalsRouter.post('/me/withdrawals', async (req, res, next) => {
     }
     if (!target.payoutsEnabled || !target.detailsSubmitted) {
       throw new AppError(409, 'Stripe Connect onboarding incomplete — finish KYC at /banking before withdrawing.')
+    }
+
+    // S580 circuit breaker: if instant has been auto-disabled for this account
+    // (repeated instant-payout failures), fall back to the FREE standard payout
+    // automatically — the landlord still gets paid, the flaky path stays isolated.
+    let method: 'standard' | 'instant' = requestedMethod
+    let instantFellBack = false
+    if (method === 'instant' && (await isInstantDisabled(target.account))) {
+      method = 'standard'
+      instantFellBack = true
     }
 
     const bal = await getConnectBalance(target.account)
@@ -198,99 +209,78 @@ withdrawalsRouter.post('/me/withdrawals', async (req, res, next) => {
       throw new AppError(400, `No ${method} balance available`)
     }
 
-    // Idempotency key: deterministic per (account, method, ms-truncated-second)
-    // so a double-click within the same second deduplicates at Stripe.
+    // Idempotency key: deterministic per (account, method, second).
     const idempotencyKey = `manual_${method}_${target.account}_${Math.floor(Date.now() / 1000)}`
 
-    // W-32 instant pricing: pull GAM's margin off the Connect balance FIRST
-    // (account-debit transfer to platform), then fire the instant payout for
-    // the remainder — Stripe's own fee comes out of that payout. Standard
-    // payouts skip all of this (free, full available).
-    const breakdown = method === 'instant' ? instantFeeBreakdown(availableUsd) : null
-    if (breakdown && breakdown.net <= 0) {
-      throw new AppError(400, `Instant balance too small to withdraw after the ${INSTANT_WITHDRAWAL_FEE.PCT * 100}% (min $${INSTANT_WITHDRAWAL_FEE.MIN_USD.toFixed(2)}) instant fee — use Standard instead.`)
-    }
-    const payoutAmount = breakdown ? breakdown.payoutAmount : availableUsd
-
-    let marginTransferId: string | null = null
-    if (breakdown && breakdown.gamMargin > 0) {
-      const stripe = getStripe()
-      // Platform account id resolves dynamically (cached) — the transfer is
-      // created ON the connected account with the platform as destination
-      // (Stripe "account debit").
-      const platformAccountId = await getPlatformAccountId()
-      const marginTransfer = await stripe.transfers.create(
-        {
-          amount:      Math.round(breakdown.gamMargin * 100),
-          currency:    'usd',
-          destination: platformAccountId,
-          description: 'GAM instant withdrawal fee (margin over Stripe cost)',
-          metadata: {
-            gam_purpose:   'instant_withdrawal_fee_margin',
-            gam_entity:    target.entity,
-            gam_entity_id: target.entityId,
-            gam_total_fee: breakdown.totalFee.toFixed(2),
-          },
+    // ── STANDARD — free, full available. No fee, no margin, no state to unwind.
+    if (method === 'standard') {
+      const payout = await firePayoutForConnectAccount({
+        connectAccountId: target.account, amount: availableUsd, method: 'standard', idempotencyKey,
+        metadata: { gam_trigger: 'manual_on_demand', gam_entity: target.entity, gam_entity_id: target.entityId, gam_method: 'standard' },
+        description: 'GAM manual payout',
+      })
+      const dispRes = await query<{ id: string }>(
+        `INSERT INTO disbursements (user_id, trigger_type, amount, status, stripe_payout_id, initiated_at, fee_charged)
+         VALUES ($1, 'manual_on_demand', $2, 'processing', $3, NOW(), 0) RETURNING id`,
+        [userId, availableUsd, payout.id])
+      return res.status(201).json({
+        success: true,
+        data: {
+          disbursement_id: dispRes[0].id, stripe_payout_id: payout.id,
+          amount: availableUsd, method: 'standard', fee_charged: 0, net_to_user: availableUsd,
+          ...(instantFellBack ? { instant_unavailable: true } : {}),
         },
-        { stripeAccount: target.account, idempotencyKey: `${idempotencyKey}_margin` },
-      )
-      marginTransferId = marginTransfer.id
+      })
+    }
+
+    // ── INSTANT — S580 (Nic): NEVER pre-pull GAM's margin. Pay the landlord their
+    // NET; a failed payout moves NO money (nothing to reverse). GAM's margin is
+    // recorded as an `owed` receivable and collected Connect→platform at the next
+    // disbursement. Repeated failures trip the circuit → future requests fall back
+    // to standard automatically. No manual recovery, ever.
+    const breakdown = instantFeeBreakdown(availableUsd)
+    if (breakdown.net <= 0) {
+      throw new AppError(400, `Instant balance too small to withdraw after the ${INSTANT_WITHDRAWAL_FEE.PCT * 100}% (min $${INSTANT_WITHDRAWAL_FEE.MIN_USD.toFixed(2)}) instant fee — use Standard instead.`)
     }
 
     let payout
     try {
       payout = await firePayoutForConnectAccount({
-        connectAccountId: target.account,
-        amount:           payoutAmount,
-        method,
-        idempotencyKey,
-        metadata: {
-          gam_trigger:   'manual_on_demand',
-          gam_entity:    target.entity,
-          gam_entity_id: target.entityId,
-          gam_method:    method,
-        },
-        description: method === 'instant' ? 'GAM instant payout' : 'GAM manual payout',
+        connectAccountId: target.account, amount: breakdown.net, method: 'instant', idempotencyKey,
+        metadata: { gam_trigger: 'manual_on_demand', gam_entity: target.entity, gam_entity_id: target.entityId, gam_method: 'instant' },
+        description: 'GAM instant payout',
       })
     } catch (payoutErr) {
-      // Margin taken but no payout delivered — reverse the debit so the
-      // user is made whole, then rethrow. Reversal failure is logged for
-      // manual recovery rather than masking the original error.
-      if (marginTransferId) {
-        try {
-          const stripe = getStripe()
-          await stripe.transfers.createReversal(
-            marginTransferId,
-            {},
-            { stripeAccount: target.account, idempotencyKey: `${idempotencyKey}_margin_reversal` },
-          )
-        } catch (reversalErr) {
-          logger.error({ err: reversalErr, marginTransferId, userId }, '[WITHDRAWALS] margin reversal failed after payout error — manual recovery needed')
-        }
-      }
-      throw payoutErr
+      const { disabled } = await recordInstantFailure(target.account, payoutErr instanceof Error ? payoutErr.message : String(payoutErr))
+      logger.error({ err: payoutErr, account: target.account, disabled }, '[WITHDRAWALS] instant payout failed (no money moved)')
+      throw new AppError(502, disabled
+        ? 'Instant payout is temporarily unavailable for this account — your balance is untouched. Use Standard (free); it lands in 1–2 business days.'
+        : 'Instant payout could not be completed right now — your balance is untouched. Try again, or use Standard.')
     }
 
-    // Audit row. fee_charged stamps the user-facing ALL-IN instant fee
-    // (GAM margin + Stripe's cut). Standard payouts have no fee.
-    const feeCharged = breakdown ? breakdown.totalFee : 0
+    await recordInstantSuccess(target.account)
+
     const dispRes = await query<{ id: string }>(
-      `INSERT INTO disbursements
-         (user_id, trigger_type, amount, status, stripe_payout_id, initiated_at, fee_charged)
-       VALUES ($1, 'manual_on_demand', $2, 'processing', $3, NOW(), $4)
-       RETURNING id`,
-      [userId, availableUsd, payout.id, feeCharged]
-    )
+      `INSERT INTO disbursements (user_id, trigger_type, amount, status, stripe_payout_id, initiated_at, fee_charged)
+       VALUES ($1, 'manual_on_demand', $2, 'processing', $3, NOW(), $4) RETURNING id`,
+      [userId, availableUsd, payout.id, breakdown.totalFee])
+
+    // Record GAM's margin as owed — collected at the next disbursement (never
+    // pre-pulled). Only entity-landlord withdrawals carry a landlord_id.
+    await recordInstantMarginOwed({
+      landlordId:       target.entity === 'landlord' ? target.entityId : null,
+      connectAccountId: target.account,
+      amount:           breakdown.gamMargin,
+      disbursementId:   dispRes[0].id,
+    })
 
     res.status(201).json({
       success: true,
       data: {
-        disbursement_id:   dispRes[0].id,
-        stripe_payout_id:  payout.id,
-        amount:            availableUsd,
-        method,
-        fee_charged:       feeCharged,
-        net_to_user:       breakdown ? breakdown.net : availableUsd,
+        disbursement_id: dispRes[0].id, stripe_payout_id: payout.id,
+        amount: availableUsd, method: 'instant',
+        fee_charged: breakdown.totalFee, net_to_user: breakdown.net,
+        margin_collection: 'next_disbursement',
       },
     })
   } catch (e) { next(e) }
@@ -298,15 +288,4 @@ withdrawalsRouter.post('/me/withdrawals', async (req, res, next) => {
 
 function round2(n: number): number {
   return Math.round(n * 100) / 100
-}
-
-// Platform Stripe account id, resolved once per process. Used as the
-// destination for instant-fee margin account-debits.
-let platformAccountIdCache: string | null = null
-async function getPlatformAccountId(): Promise<string> {
-  if (platformAccountIdCache) return platformAccountIdCache
-  const stripe = getStripe()
-  const acct = await stripe.accounts.retrieve()
-  platformAccountIdCache = acct.id
-  return acct.id
 }

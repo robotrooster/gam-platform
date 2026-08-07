@@ -417,6 +417,32 @@ inspectionsRouter.post('/:id/photos', photoUpload.single('file'), async (req: an
 
 inspectionsRouter.get('/photo-files/:filename', async (req, res, next) => {
   try {
+    // S585: per-row authorization (mirrors report-files / video-files). Photos
+    // live in the SAME dir as the report PDFs, and this route previously served
+    // any file in it to ANY authenticated user by filename — which (a) exposed
+    // one tenant's inspection photos to another and (b) let a report PDF be
+    // pulled through /photo-files/, bypassing report-files' own auth. Look up the
+    // photo's inspection and scope the caller: the inspection's tenant, or the
+    // landlord/scoped staff of the unit. A non-photo filename (e.g. a report)
+    // matches no photo row → 404, which also closes the report bypass.
+    const photoUrl = '/api/inspections/photo-files/' + req.params.filename
+    const p = await queryOne<{ landlord_id: string; tenant_id: string | null; property_id: string }>(
+      `SELECT i.landlord_id, i.tenant_id, un.property_id
+         FROM unit_inspection_photos ph
+         JOIN unit_inspections i ON i.id = ph.inspection_id
+         JOIN units un ON un.id = i.unit_id
+        WHERE ph.photo_url = $1`,
+      [photoUrl],
+    )
+    if (!p) throw new AppError(404, 'Not found')
+    const u = req.user!
+    if (u.role === 'tenant') {
+      if (p.tenant_id !== u.profileId) throw new AppError(403, 'Forbidden')
+    } else {
+      if (!canAccessLandlordResource(u, p.landlord_id)) throw new AppError(403, 'Forbidden')
+      const scoped = await getScopedPropertyIds(u)
+      if (scoped && !scoped.includes(p.property_id)) throw new AppError(403, 'Forbidden')
+    }
     // S535: resolveUploadPath, not a raw path.join — an encoded slash
     // (%2F) decodes into the route param, so '..%2F..%2F...' would
     // traverse out of the photos dir. Same class as the S380 avatar

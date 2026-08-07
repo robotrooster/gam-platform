@@ -339,7 +339,7 @@ function IssueCreditModal({ onClose, onDone }: { onClose: () => void; onDone: (m
             <select className="form-select" value={leaseId} onChange={e => setLeaseId(e.target.value)} style={{ width: '100%' }}>
               <option value="" disabled>Select a lease…</option>
               {activeLeases.map((l: any) => (
-                <option key={l.id} value={l.id}>{(l.unitNumber || l.unit_number || 'Unit')} · {(l.propertyName || l.property_name || '')}</option>
+                <option key={l.id} value={l.id}>{(l.unitNumber || 'Unit')} · {(l.propertyName || '')}</option>
               ))}
             </select>
           </div>

@@ -529,3 +529,63 @@ describe('PATCH /categories/:id', () => {
     expect(res.body.error).toMatch(/not belong/i)
   })
 })
+
+// ───────────────────────────────────────────────────────────────────
+// Purchase orders — cross-landlord item scope (S590)
+// A PO line that links another landlord's pos_item would, on receive,
+// restock that foreign item. Both insert paths must reject it, and the
+// receive restock is landlord-scoped as defense in depth.
+// ───────────────────────────────────────────────────────────────────
+describe('purchase orders — cross-landlord item scope (S590)', () => {
+  async function seedBItem(f: Fixture): Promise<{ bItemId: string; bStock: number }> {
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const propB = await seedProperty(c, { landlordId: f.landlordBId, ownerUserId: f.landlordBUserId, managedByUserId: f.landlordBUserId })
+      const catB = await c.query<{ id: string }>(
+        `INSERT INTO pos_categories (landlord_id, name) VALUES ($1, $2) RETURNING id`,
+        [f.landlordBId, `BCat-po-${randomUUID().slice(0, 6)}`])
+      const it = await c.query<{ id: string }>(
+        `INSERT INTO pos_items (landlord_id, property_id, category_id, name, sell_price, stock_qty, stock_min, stock_max, is_active)
+         VALUES ($1,$2,$3,'B-item',10,7,1,50,TRUE) RETURNING id`,
+        [f.landlordBId, propB, catB.rows[0].id])
+      await c.query('COMMIT')
+      return { bItemId: it.rows[0].id, bStock: 7 }
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+  }
+
+  it('create: a PO line linking another landlord\'s item → 400, no PO created', async () => {
+    const f = await seed()
+    const { bItemId } = await seedBItem(f)
+    const res = await request(buildApp())
+      .post('/api/pos/purchase-orders')
+      .set('Authorization', `Bearer ${f.tokenA}`)
+      .send({ vendorId: f.vendorAId, items: [{ itemId: bItemId, itemName: 'B item', qtyOrdered: 5, unitCost: 2 }] })
+    expect(res.status).toBe(400)
+    expect(res.body.error).toMatch(/not belong/i)
+    const pos = await db.query(`SELECT id FROM pos_purchase_orders WHERE landlord_id=$1`, [f.landlordAId])
+    expect(pos.rows).toHaveLength(0)
+  })
+
+  it('add-items → 400; and receive cannot restock a foreign item (defense in depth)', async () => {
+    const f = await seed()
+    const { bItemId, bStock } = await seedBItem(f)
+    // A creates a legit empty draft PO.
+    const po = await request(buildApp()).post('/api/pos/purchase-orders')
+      .set('Authorization', `Bearer ${f.tokenA}`).send({ vendorId: f.vendorAId })
+    expect(po.status).toBe(201)
+    const poId = po.body.data.id
+    // Adding B's item to it is rejected.
+    const add = await request(buildApp()).post(`/api/pos/purchase-orders/${poId}/items`)
+      .set('Authorization', `Bearer ${f.tokenA}`).send({ itemId: bItemId, itemName: 'B', qtyOrdered: 9, unitCost: 1 })
+    expect(add.status).toBe(400)
+    // Even a directly-injected foreign line must not restock B on receive.
+    await db.query(
+      `INSERT INTO pos_purchase_order_items (po_id, item_id, item_name, qty_ordered, unit_cost, subtotal)
+       VALUES ($1,$2,'sneak',100,1,100)`, [poId, bItemId])
+    await request(buildApp()).patch(`/api/pos/purchase-orders/${poId}`)
+      .set('Authorization', `Bearer ${f.tokenA}`).send({ status: 'received' }).expect(200)
+    const b = await db.query<{ stock_qty: number }>(`SELECT stock_qty FROM pos_items WHERE id=$1`, [bItemId])
+    expect(Number(b.rows[0].stock_qty)).toBe(bStock)  // unchanged — foreign item not restocked
+  })
+})

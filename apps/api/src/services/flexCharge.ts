@@ -7,6 +7,10 @@ import { createRentPlatformCharge } from './stripeConnect'
 import { computeTenantGamOutstandingTotal } from './supersedence'
 import {
   FLEX_CHARGE_STATEMENT_FEE_PCT,
+  FLEX_CHARGE_MAX_FINANCE_PCT,
+  FLEX_CHARGE_MIN_PAYMENT_PCT,
+  FLEX_CHARGE_MIN_PAYMENT_FLOOR,
+  FLEX_CHARGE_LATE_FEE,
   FLEX_CHARGE_DEFAULT_CREDIT_LIMIT,
   type FlexChargeAccountStatus,
 } from '@gam/shared'
@@ -21,8 +25,10 @@ const LANDLORD_DISPUTE_THRESHOLD_DAYS = 90        // rolling window
 // A POS merchant (landlord OR standalone POS operator) extends a
 // FlexCharge tab to a known customer (tenant OR pos_customer) at
 // one of their properties. Charges accumulate over the month →
-// monthly statement → ACH auto-pull for the balance + a 1.5% service
-// fee. No interest. No revolving balance. Auto-pay required.
+// monthly statement → ACH auto-pull for the balance. GAM's 1.5% is a
+// MERCHANT subscription (flat % of credit volume), deducted from the
+// merchant's payout — never charged to the borrower. No interest (GAM
+// is not the lender — the merchant is). No revolving balance. Auto-pay required.
 //
 // This service exposes:
 //   - pos_customer CRUD (merchant-owned customer roster)
@@ -116,6 +122,7 @@ export interface FlexChargeAccountRow {
   property_id:         string
   landlord_id:         string
   credit_limit:        string
+  current_balance:     string   // S583 revolving: running balance (carried, net of payments); source of truth for exposure
   status:              FlexChargeAccountStatus
   disqualified_until:  string | null
   disqualified_reason: string | null
@@ -243,12 +250,17 @@ export async function listFlexChargeAccounts(args: {
               pc.first_name || ' ' || pc.last_name
             ) AS customer_name,
             COALESCE(tu.email, pc.email) AS customer_email,
-            COALESCE((
+            -- S583 revolving: true current exposure = the running carried balance
+            -- (already net of credited payments + accrued interest/fees) PLUS this
+            -- cycle's open pending purchases not yet rolled into a statement. Billed
+            -- transactions are NOT re-summed — they're already inside current_balance
+            -- (the pre-revolving SUM(pending,billed) never dropped as customers paid).
+            (a.current_balance + COALESCE((
               SELECT SUM(t.amount)
                 FROM flex_charge_transactions t
                WHERE t.account_id = a.id
-                 AND t.status IN ('pending', 'billed')
-            ), 0)::float AS balance
+                 AND t.status = 'pending'
+            ), 0))::float AS balance
        FROM flex_charge_accounts a
        LEFT JOIN tenants     t   ON t.id = a.tenant_id
        LEFT JOIN users       tu  ON tu.id = t.user_id
@@ -301,17 +313,24 @@ export async function updateFlexChargeAccount(args: {
 }
 
 export interface AccountStatementRow {
-  id:             string
-  cycle_month:    string
-  balance:        string
-  service_fee:    string
-  total_due:      string
-  due_date:       string
-  status:         'open' | 'billed' | 'paid' | 'failed' | 'voided'
-  billed_at:      string | null
-  settled_at:     string | null
-  failed_reason:  string | null
-  created_at:     string
+  id:                string
+  cycle_month:       string
+  previous_balance:  string
+  new_purchases:     string
+  finance_charge:    string   // interest this cycle
+  late_fee:          string
+  payments_credited: string
+  service_fee:       string   // GAM's 1.5%/12 cut (off the merchant)
+  new_balance:       string
+  total_due:         string
+  minimum_due:       string
+  amount_paid:       string
+  due_date:          string
+  status:            'open' | 'billed' | 'paid' | 'failed' | 'voided'
+  billed_at:         string | null
+  settled_at:        string | null
+  failed_reason:     string | null
+  created_at:        string
 }
 
 export interface DisputedTransactionRow {
@@ -339,9 +358,10 @@ export async function listAccountStatements(args: {
   )
   if (!acct) throw new AppError(404, 'Account not found')
   const statements = await query<AccountStatementRow>(
-    `SELECT id, cycle_month::text, balance::text, service_fee::text,
-            total_due::text, due_date::text, status,
-            billed_at, settled_at, failed_reason, created_at
+    `SELECT id, cycle_month::text, previous_balance::text, new_purchases::text,
+            finance_charge::text, late_fee::text, payments_credited::text, service_fee::text,
+            new_balance::text, total_due::text, minimum_due::text, amount_paid::text,
+            due_date::text, status, billed_at, settled_at, failed_reason, created_at
        FROM flex_charge_statements
       WHERE account_id = $1
       ORDER BY cycle_month DESC, created_at DESC`,
@@ -420,14 +440,21 @@ export async function postFlexChargeTransaction(
   try {
     if (ownsClient) await client.query('BEGIN')
 
-    const acct = await client.query<FlexChargeAccountRow & { balance: string; landlord_disqualified_until: string | null }>(
+    const acct = await client.query<FlexChargeAccountRow & { pending_sum: string; landlord_disqualified_until: string | null }>(
+      // S583 revolving: gate on the running carried balance (net of payments +
+      // inclusive of accrued interest/fees) PLUS this cycle's open pending
+      // purchases. The old SUM(pending,billed) basis over-counted a paid-down
+      // customer (billed txns never leave 'billed' now → the sum never fell as
+      // they paid) and under-counted interest, permanently blocking further
+      // charges after a full pay-off. current_balance already contains billed
+      // purchases, so only pending is added here.
       `SELECT a.*,
               COALESCE((
                 SELECT SUM(t.amount)
                   FROM flex_charge_transactions t
                  WHERE t.account_id = a.id
-                   AND t.status IN ('pending', 'billed')
-              ), 0)::text AS balance,
+                   AND t.status = 'pending'
+              ), 0)::text AS pending_sum,
               l.flex_charge_disqualified_until::text AS landlord_disqualified_until
          FROM flex_charge_accounts a
          JOIN landlords l ON l.id = a.landlord_id
@@ -442,7 +469,7 @@ export async function postFlexChargeTransaction(
     if (acct.landlord_disqualified_until && new Date(acct.landlord_disqualified_until).getTime() > Date.now()) {
       throw new AppError(409, 'The merchant is currently blocked from offering FlexCharge')
     }
-    const currentBalance = Number(acct.balance)
+    const currentBalance = fcRound2(Number(acct.current_balance) + Number(acct.pending_sum))
     const limit = Number(acct.credit_limit)
     if (currentBalance + args.amount > limit) {
       throw new AppError(409, `Charge would exceed credit limit ($${limit.toFixed(2)}); current balance $${currentBalance.toFixed(2)}`)
@@ -525,15 +552,23 @@ export async function postFlexChargeRefund(
 // ── Statement generation ────────────────────────────────────────
 
 export interface GenerateStatementResult {
-  statement_id:  string
-  account_id:    string
-  cycle_month:   string
-  balance:       number
-  service_fee:   number
-  total_due:     number
-  due_date:      string
-  tx_count:      number
+  statement_id:      string
+  account_id:        string
+  cycle_month:       string
+  previous_balance:  number
+  new_purchases:     number
+  payments_credited: number
+  finance_charge:    number   // S583 revolving: INTEREST this cycle (merchant APR/12 on the carried balance)
+  late_fee:          number   // $10 if the previous minimum wasn't met
+  service_fee:       number   // GAM's 1.5%/YEAR, monthly (off the merchant, never the borrower)
+  new_balance:       number   // ending balance (== total_due)
+  total_due:         number   // full balance to clear
+  minimum_due:       number   // greater of $25 or 3% of new_balance
+  due_date:          string
+  tx_count:          number
 }
+
+const fcRound2 = (n: number) => Math.round(n * 100) / 100
 
 /**
  * Generate the monthly statement for a single account. Aggregates all
@@ -562,14 +597,39 @@ export async function generateMonthlyStatement(args: {
   try {
     await client.query('BEGIN')
 
-    const acct = await client.query<{ id: string; status: string }>(
-      `SELECT id, status FROM flex_charge_accounts WHERE id = $1 FOR UPDATE`,
+    // Account + the merchant's per-property APR (they are the lender).
+    const acct = await client.query<{ id: string; status: string; apr: string }>(
+      `SELECT a.id, a.status, p.flex_charge_finance_pct::text AS apr
+         FROM flex_charge_accounts a
+         JOIN properties p ON p.id = a.property_id
+        WHERE a.id = $1
+        FOR UPDATE OF a`,
       [args.accountId],
     ).then(r => r.rows[0])
     if (!acct) throw new AppError(404, 'Account not found')
+    // APR is an ANNUAL rate; the monthly periodic rate is APR/12 (how cards do it).
+    const apr = Math.min(Math.max(Number(acct.apr) || 0, 0), FLEX_CHARGE_MAX_FINANCE_PCT)
+    const monthlyRate = apr / 12
 
-    // Find all pending transactions in this cycle window.
     const cycleStart = args.cycleMonth.slice(0, 10)
+
+    // Prior statement → the carried balance, the payments credited against it
+    // (amount_paid), and its minimum (for the late fee).
+    const prev = await client.query<{ new_balance: string; minimum_due: string; amount_paid: string }>(
+      `SELECT new_balance::text, minimum_due::text, amount_paid::text
+         FROM flex_charge_statements
+        WHERE account_id = $1 AND cycle_month < $2::date
+        ORDER BY cycle_month DESC LIMIT 1`,
+      [args.accountId, cycleStart],
+    ).then(r => r.rows[0])
+    const previousBalance  = prev ? Number(prev.new_balance) : 0
+    const paymentsCredited = prev ? Number(prev.amount_paid) : 0
+    // Unpaid part of the previous balance = what accrues interest. If the prior
+    // statement was paid in full, this is 0 → no interest (the grace period,
+    // automatic — no separate flag needed).
+    const carriedBalance = Math.max(0, fcRound2(previousBalance - paymentsCredited))
+
+    // New purchases this cycle (pending txns in the window).
     const txs = await client.query<{ id: string; amount: string }>(
       `SELECT id, amount::text
          FROM flex_charge_transactions
@@ -579,30 +639,40 @@ export async function generateMonthlyStatement(args: {
           AND created_at <  ($2::date + INTERVAL '1 month')`,
       [args.accountId, cycleStart],
     )
+    const newPurchases = fcRound2(txs.rows.reduce((s, r) => s + Number(r.amount), 0))
 
-    if (txs.rows.length === 0) {
+    // Nothing owed and nothing bought → no statement this cycle.
+    if (newPurchases === 0 && carriedBalance === 0) {
       await client.query('ROLLBACK')
       return null
     }
 
-    const balance = txs.rows.reduce((s, r) => s + Number(r.amount), 0)
-    const serviceFee = Math.round(balance * FLEX_CHARGE_STATEMENT_FEE_PCT * 100) / 100
-    const totalDue = Math.round((balance + serviceFee) * 100) / 100
+    const interest = fcRound2(carriedBalance * monthlyRate)
+    // Late fee if the customer paid LESS than the previous minimum by now.
+    const lateFee = prev && paymentsCredited + 0.005 < Number(prev.minimum_due) ? FLEX_CHARGE_LATE_FEE : 0
+    const newBalance = fcRound2(previousBalance + newPurchases + interest + lateFee - paymentsCredited)
+    const minimumDue = newBalance <= 0 ? 0
+      : Math.min(newBalance, fcRound2(Math.max(FLEX_CHARGE_MIN_PAYMENT_FLOOR, newBalance * FLEX_CHARGE_MIN_PAYMENT_PCT)))
+    // GAM's 1.5%/YEAR subscription, monthly, on the ending balance — off the merchant.
+    const serviceFee = fcRound2(Math.max(0, newBalance) * (FLEX_CHARGE_STATEMENT_FEE_PCT / 12))
 
-    // Due date = 15th of the next month
+    // Due date = 15th of the next month.
     const cycleDate = new Date(cycleStart + 'T00:00:00Z')
     const dueDate = new Date(Date.UTC(cycleDate.getUTCFullYear(), cycleDate.getUTCMonth() + 1, 15))
       .toISOString().slice(0, 10)
 
-    // Insert statement. UNIQUE catches the double-run case.
     let stmtId: string
     try {
       const stmt = await client.query<{ id: string }>(
         `INSERT INTO flex_charge_statements
-           (account_id, cycle_month, balance, service_fee, total_due, due_date)
-         VALUES ($1, $2, $3, $4, $5, $6)
+           (account_id, cycle_month, previous_balance, new_purchases, payments_credited,
+            finance_charge, late_fee, service_fee, new_balance, total_due, minimum_due,
+            balance, due_date)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
          RETURNING id`,
-        [args.accountId, cycleStart, balance.toFixed(2), serviceFee.toFixed(2), totalDue.toFixed(2), dueDate],
+        [args.accountId, cycleStart, previousBalance.toFixed(2), newPurchases.toFixed(2), paymentsCredited.toFixed(2),
+         interest.toFixed(2), lateFee.toFixed(2), serviceFee.toFixed(2), newBalance.toFixed(2), newBalance.toFixed(2),
+         minimumDue.toFixed(2), newPurchases.toFixed(2), dueDate],
       )
       stmtId = stmt.rows[0].id
     } catch (e: any) {
@@ -613,27 +683,39 @@ export async function generateMonthlyStatement(args: {
       throw e
     }
 
-    // Flip the included transactions to 'billed' with statement_id stamped.
+    // Flip this cycle's purchases to 'billed'.
     const txIds = txs.rows.map(r => r.id)
+    if (txIds.length > 0) {
+      await client.query(
+        `UPDATE flex_charge_transactions
+            SET status = 'billed', statement_id = $1, updated_at = NOW()
+          WHERE id = ANY($2::uuid[])`,
+        [stmtId, txIds],
+      )
+    }
+
+    // Reset the running account balance to the statement's new balance.
     await client.query(
-      `UPDATE flex_charge_transactions
-          SET status       = 'billed',
-              statement_id = $1,
-              updated_at   = NOW()
-        WHERE id = ANY($2::uuid[])`,
-      [stmtId, txIds],
+      `UPDATE flex_charge_accounts SET current_balance = $1, updated_at = NOW() WHERE id = $2`,
+      [newBalance.toFixed(2), args.accountId],
     )
 
     await client.query('COMMIT')
     return {
-      statement_id: stmtId,
-      account_id:   args.accountId,
-      cycle_month:  cycleStart,
-      balance,
-      service_fee:  serviceFee,
-      total_due:    totalDue,
-      due_date:     dueDate,
-      tx_count:     txIds.length,
+      statement_id:      stmtId,
+      account_id:        args.accountId,
+      cycle_month:       cycleStart,
+      previous_balance:  previousBalance,
+      new_purchases:     newPurchases,
+      payments_credited: paymentsCredited,
+      finance_charge:    interest,
+      late_fee:          lateFee,
+      service_fee:       serviceFee,
+      new_balance:       newBalance,
+      total_due:         newBalance,
+      minimum_due:       minimumDue,
+      due_date:          dueDate,
+      tx_count:          txIds.length,
     }
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {})
@@ -650,18 +732,28 @@ export async function generateMonthlyStatement(args: {
  * current balances + recent statements. Powers the tenant view.
  */
 export async function getFlexChargeAccountsForTenant(tenantId: string) {
+  // S583 revolving: `balance` is the running current_balance (source of truth);
+  // the latest statement supplies the minimum + due date + how much is already
+  // paid, for the pay-down UI. `apr` is the merchant's annual rate.
   const accounts = await query<any>(
     `SELECT a.id, a.property_id, a.credit_limit::text, a.status,
             a.disqualified_until::text, a.disqualified_reason,
+            a.current_balance::text AS balance,
             p.name AS property_name,
-            COALESCE((
-              SELECT SUM(t.amount)
-                FROM flex_charge_transactions t
-               WHERE t.account_id = a.id
-                 AND t.status IN ('pending', 'billed')
-            ), 0)::text AS balance
+            p.flex_charge_finance_pct::float AS apr,
+            ls.minimum_due::text AS minimum_due,
+            ls.new_balance::text AS statement_balance,
+            ls.amount_paid::text AS amount_paid,
+            ls.due_date::text    AS due_date,
+            ls.status            AS statement_status
        FROM flex_charge_accounts a
        JOIN properties p ON p.id = a.property_id
+       LEFT JOIN LATERAL (
+         SELECT minimum_due, new_balance, amount_paid, due_date, status
+           FROM flex_charge_statements s
+          WHERE s.account_id = a.id
+          ORDER BY s.cycle_month DESC LIMIT 1
+       ) ls ON TRUE
       WHERE a.tenant_id = $1
       ORDER BY a.created_at DESC`,
     [tenantId],
@@ -767,10 +859,12 @@ export interface StatementBillingResult {
  * webhook payment_intent.succeeded → status='paid' + merchant
  * Transfer fires.
  *
- * Gross lands on platform balance (GAM collects merchant's deferred
- * receivable + the 1.5% service fee in one pull). The
- * merchant-share Transfer fires post-success so GAM doesn't pre-pay
- * the merchant before customer ACH clears.
+ * The customer's ACH pull is the statement balance only — their
+ * transactions (incl. any finance charge the MERCHANT set); GAM's 1.5%
+ * is NOT added to the borrower. Gross lands on the platform balance; the
+ * merchant-share Transfer (balance − GAM's 1.5%) fires post-success so
+ * GAM doesn't pre-pay the merchant before the customer ACH clears, and
+ * GAM retains the 1.5% as its merchant subscription.
  *
  * Errors land the row in 'failed' status (NSF flow handled in the
  * NACHA retry pipeline + handleFlexChargeStatementNsf webhook hook).
@@ -784,7 +878,8 @@ export async function processFlexChargeStatementBilling(now: Date = new Date()):
     statement_id:        string
     account_id:          string
     cycle_month:         string
-    total_due:           string
+    minimum_due:         string
+    amount_paid:         string
     landlord_id:         string
     property_id:         string
     tenant_id:           string | null
@@ -793,7 +888,7 @@ export async function processFlexChargeStatementBilling(now: Date = new Date()):
     customer_label:      string
   }>(
     `SELECT s.id AS statement_id, s.account_id, s.cycle_month::text AS cycle_month,
-            s.total_due::text  AS total_due,
+            s.minimum_due::text AS minimum_due, s.amount_paid::text AS amount_paid,
             a.landlord_id, a.property_id, a.tenant_id, a.pos_customer_id,
             COALESCE(t.stripe_customer_id, pc.stripe_customer_id) AS customer_stripe_id,
             COALESCE(
@@ -836,7 +931,20 @@ export async function processFlexChargeStatementBilling(now: Date = new Date()):
         continue
       }
 
-      const baseAmount = Number(r.total_due)
+      // S583 revolving: auto-pull the remaining MINIMUM (greater of $25 or 3%),
+      // net of any early pay-downs. If the minimum is already covered, mark the
+      // statement met and skip — no double-charge. The rest of the balance carries.
+      const shortfall = fcRound2(Math.max(0, Number(r.minimum_due) - Number(r.amount_paid)))
+      if (shortfall < 0.01) {
+        await query(
+          `UPDATE flex_charge_statements
+              SET status = 'paid', settled_at = COALESCE(settled_at, NOW()), updated_at = NOW()
+            WHERE id = $1`,
+          [r.statement_id])
+        out.skipped += 1
+        continue
+      }
+      const baseAmount = shortfall
       // S261: supersedence boost. tenant_id is NULL for pos_customer
       // accounts — no boost (no leaseable-tenant context). This
       // statement is itself in the FIFO list (status='open' AND
@@ -951,10 +1059,12 @@ export async function retryFlexChargeStatement(statementId: string): Promise<{ b
 
 /**
  * Called from webhooks payment_intent.succeeded for a
- * FLEXCHARGE_STMT-tagged payment. Flips the linked statement +
- * its included transactions to 'paid', then fires the merchant
- * Transfer (balance amount only; the 1.5% fee stays on platform
- * as GAM revenue).
+ * FLEXCHARGE_STMT-tagged payment. S583 revolving: the auto-pull collected the
+ * statement MINIMUM, so this credits that minimum to amount_paid, reduces the
+ * running current_balance, and flips the statement to 'paid' (= its minimum was
+ * collected, NOT that the balance is zero — purchases stay 'billed' and carry).
+ * Then fires the merchant Transfer (the collected minimum minus GAM's 1.5%/12
+ * subscription, which stays on platform as GAM revenue — never on the borrower).
  *
  * Merchant transfer goes to landlords.user_id → users.stripe_connect_account_id.
  * If the landlord's Connect isn't onboarded, the transfer fails and
@@ -971,10 +1081,10 @@ export async function reconcileSettledFlexChargeStatement(paymentId: string): Pr
   if (!p || p.entry_description !== 'SUBSCRIP') return  // self-gate
 
   const stmt = await queryOne<{
-    id: string; account_id: string; balance: string; service_fee: string;
+    id: string; account_id: string; minimum_due: string; service_fee: string;
     landlord_user_id: string | null; landlord_id: string;
   }>(
-    `SELECT s.id, s.account_id, s.balance::text, s.service_fee::text,
+    `SELECT s.id, s.account_id, s.minimum_due::text, s.service_fee::text,
             u.id AS landlord_user_id, l.id AS landlord_id
        FROM flex_charge_statements s
        JOIN flex_charge_accounts a ON a.id = s.account_id
@@ -985,24 +1095,37 @@ export async function reconcileSettledFlexChargeStatement(paymentId: string): Pr
   )
   if (!stmt) return
 
+  // S583 revolving: the auto-pull collected the MINIMUM. Credit it to the
+  // statement (amount_paid — drives next cycle's carried balance + late-fee
+  // check) and reduce the running account balance; the rest carries. The
+  // statement is 'paid' = its minimum was collected, NOT that the balance is zero.
+  let takeGamFee = false
   const client = await getClient()
   try {
     await client.query('BEGIN')
     await client.query(
       `UPDATE flex_charge_statements
-          SET status     = 'paid',
-              settled_at = NOW(),
-              updated_at = NOW()
+          SET status      = 'paid',
+              settled_at  = NOW(),
+              amount_paid = amount_paid + $2,
+              updated_at  = NOW()
         WHERE id = $1`,
-      [stmt.id],
+      [stmt.id, stmt.minimum_due],
     )
     await client.query(
-      `UPDATE flex_charge_transactions
-          SET status     = 'paid',
-              updated_at = NOW()
-        WHERE statement_id = $1 AND status = 'billed'`,
+      `UPDATE flex_charge_accounts
+          SET current_balance = GREATEST(0, current_balance - $2), updated_at = NOW()
+        WHERE id = $1`,
+      [stmt.account_id, stmt.minimum_due],
+    )
+    // Claim GAM's monthly cut exactly once per statement (whether the first
+    // dollar came via this auto-pull or an earlier pay-down). Atomic → safe.
+    const feeClaim = await client.query(
+      `UPDATE flex_charge_statements SET gam_fee_settled = TRUE, updated_at = NOW()
+        WHERE id = $1 AND gam_fee_settled = FALSE RETURNING id`,
       [stmt.id],
     )
+    takeGamFee = feeClaim.rows.length > 0
     await client.query('COMMIT')
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {})
@@ -1030,11 +1153,17 @@ export async function reconcileSettledFlexChargeStatement(paymentId: string): Pr
       })
       return
     }
-    const balance = Number(stmt.balance)
+    // S583 revolving: the merchant receives the collected MINIMUM minus GAM's
+    // monthly 1.5%/12 subscription — but only if this payment claimed GAM's cut
+    // (once per statement; a pay-down may have already taken it). GAM keeps
+    // service_fee on the platform balance.
+    const merchantPayout = takeGamFee
+      ? Math.max(0, fcRound2(Number(stmt.minimum_due) - Number(stmt.service_fee)))
+      : fcRound2(Number(stmt.minimum_due))
     const stripe = getStripe()
     await stripe.transfers.create(
       {
-        amount:      Math.round(balance * 100),
+        amount:      Math.round(merchantPayout * 100),
         currency:    'usd',
         destination: connect.stripe_connect_account_id,
         description: `FlexCharge merchant payout — statement ${stmt.id}`,
@@ -1049,6 +1178,164 @@ export async function reconcileSettledFlexChargeStatement(paymentId: string): Pr
     )
   } catch (e) {
     logger.error({ err: e, ctx: stmt.id }, '[flexcharge][merchant-transfer]')
+  }
+}
+
+/**
+ * S583 revolving: charge a customer pay-DOWN against their FlexCharge balance
+ * (more than the auto-pulled minimum, up to paying in full → interest-free grace
+ * next cycle). Charges the customer's default method on the platform rail; the
+ * balance credit + merchant transfer happen on settle (reconcileFlexChargePaydown).
+ */
+export async function payDownFlexCharge(args: {
+  accountId: string
+  tenantId:  string
+  amount:    number
+}): Promise<{ paymentId: string; amount: number; paymentIntentId: string }> {
+  if (!await isFlexChargeVisible()) throw new AppError(403, 'FlexCharge is not available')
+  const amount = fcRound2(args.amount)
+  if (!(amount > 0)) throw new AppError(400, 'Enter an amount greater than zero')
+
+  const acct = await queryOne<{
+    id: string; current_balance: string; landlord_id: string;
+    tenant_stripe: string | null; open_stmt: string | null;
+  }>(
+    `SELECT a.id, a.current_balance::text, a.landlord_id,
+            t.stripe_customer_id AS tenant_stripe,
+            (SELECT s.id FROM flex_charge_statements s
+              WHERE s.account_id = a.id AND s.status IN ('open','billed','paid')
+              ORDER BY s.cycle_month DESC LIMIT 1) AS open_stmt
+       FROM flex_charge_accounts a
+       JOIN tenants t ON t.id = a.tenant_id
+      WHERE a.id = $1 AND a.tenant_id = $2`,
+    [args.accountId, args.tenantId])
+  if (!acct) throw new AppError(404, 'FlexCharge account not found')
+  if (!acct.open_stmt) throw new AppError(409, 'No statement to pay down yet')
+  if (!acct.tenant_stripe) throw new AppError(409, 'Add and verify a payment method first')
+  const balance = Number(acct.current_balance)
+  if (amount > balance + 0.005) throw new AppError(400, `That is more than your balance of $${balance.toFixed(2)}`)
+
+  const stripe = getStripe()
+  let paymentMethodId: string | null = null
+  try {
+    const cust = await stripe.customers.retrieve(acct.tenant_stripe)
+    if (cust && !(cust as any).deleted) {
+      const c = cust as any
+      paymentMethodId = c.invoice_settings?.default_payment_method ?? c.default_source ?? null
+    }
+  } catch {}
+  if (!paymentMethodId) throw new AppError(409, 'No default payment method on file')
+
+  const intent = await createRentPlatformCharge({
+    amount,
+    stripeCustomerId:   acct.tenant_stripe,
+    paymentMethodId,
+    paymentMethodTypes: ['us_bank_account', 'card'],
+    entryDescription:   'FCPAYDOWN',
+    metadata: {
+      gam_purpose:      'flexcharge_paydown',
+      gam_account_id:   args.accountId,
+      gam_statement_id: acct.open_stmt,
+    },
+  })
+  const pay = await queryOne<{ id: string }>(
+    `INSERT INTO payments
+       (landlord_id, tenant_id, lease_id, unit_id, type, amount, status,
+        entry_description, due_date, stripe_payment_intent_id, notes)
+     VALUES ($1, $2, NULL, NULL, 'fee', $3, 'pending', 'FCPAYDOWN',
+             CURRENT_DATE, $4, 'FlexCharge pay-down')
+     RETURNING id`,
+    [acct.landlord_id, args.tenantId, amount.toFixed(2), intent.id])
+  return { paymentId: pay!.id, amount, paymentIntentId: intent.id }
+}
+
+/**
+ * On settle of a FCPAYDOWN payment: credit the amount to the statement's
+ * amount_paid, reduce the running balance, claim GAM's monthly cut if not yet
+ * taken (once per statement), and transfer the rest to the merchant.
+ */
+export async function reconcileFlexChargePaydown(
+  paymentId: string,
+  metadata: Record<string, string>,
+): Promise<void> {
+  const statementId = metadata.gam_statement_id
+  if (!statementId) return
+
+  const pay = await queryOne<{ amount: string; entry_description: string | null }>(
+    `SELECT amount::text, entry_description FROM payments WHERE id = $1`, [paymentId])
+  if (!pay || pay.entry_description !== 'FCPAYDOWN') return
+  const amount = fcRound2(Number(pay.amount))
+
+  const stmt = await queryOne<{
+    id: string; account_id: string; service_fee: string;
+    landlord_user_id: string | null; landlord_id: string;
+  }>(
+    `SELECT s.id, s.account_id, s.service_fee::text,
+            u.id AS landlord_user_id, l.id AS landlord_id
+       FROM flex_charge_statements s
+       JOIN flex_charge_accounts a ON a.id = s.account_id
+       JOIN landlords l ON l.id = a.landlord_id
+       JOIN users     u ON u.id = l.user_id
+      WHERE s.id = $1`,
+    [statementId])
+  if (!stmt) return
+
+  let takeGamFee = false
+  const client = await getClient()
+  try {
+    await client.query('BEGIN')
+    await client.query(
+      `UPDATE flex_charge_statements SET amount_paid = amount_paid + $2, updated_at = NOW() WHERE id = $1`,
+      [stmt.id, amount])
+    await client.query(
+      `UPDATE flex_charge_accounts SET current_balance = GREATEST(0, current_balance - $2), updated_at = NOW() WHERE id = $1`,
+      [stmt.account_id, amount])
+    const feeClaim = await client.query(
+      `UPDATE flex_charge_statements SET gam_fee_settled = TRUE, updated_at = NOW()
+        WHERE id = $1 AND gam_fee_settled = FALSE RETURNING id`, [stmt.id])
+    takeGamFee = feeClaim.rows.length > 0
+    await client.query('COMMIT')
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw e
+  } finally { client.release() }
+
+  try {
+    const connect = await queryOne<{ stripe_connect_account_id: string | null }>(
+      `SELECT stripe_connect_account_id FROM users WHERE id = $1`, [stmt.landlord_user_id!])
+    if (!connect?.stripe_connect_account_id) {
+      const { createAdminNotification } = await import('./adminNotifications')
+      await createAdminNotification({
+        severity: 'warn', category: 'flexcharge_merchant_transfer_pending',
+        title: `FlexCharge pay-down waiting — landlord ${stmt.landlord_id} has no Connect`,
+        body:  `Pay-down on statement ${stmt.id} settled; merchant share on platform balance pending Connect.`,
+        context: { statement_id: stmt.id, landlord_id: stmt.landlord_id },
+      })
+      return
+    }
+    const merchantPayout = takeGamFee
+      ? Math.max(0, fcRound2(amount - Number(stmt.service_fee)))
+      : amount
+    if (merchantPayout <= 0) return
+    const stripe = getStripe()
+    await stripe.transfers.create(
+      {
+        amount:      Math.round(merchantPayout * 100),
+        currency:    'usd',
+        destination: connect.stripe_connect_account_id,
+        description: `FlexCharge pay-down payout — statement ${stmt.id}`,
+        metadata: {
+          gam_purpose:      'flexcharge_merchant_payout',
+          gam_statement_id: stmt.id,
+          gam_account_id:   stmt.account_id,
+          gam_landlord_id:  stmt.landlord_id,
+          gam_paydown:      'true',
+        },
+      },
+      { idempotencyKey: `flexcharge_paydown_${paymentId}` },
+    )
+  } catch (e) {
+    logger.error({ err: e, ctx: stmt.id }, '[flexcharge][paydown-transfer]')
   }
 }
 

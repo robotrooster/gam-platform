@@ -224,18 +224,18 @@ describe('POST /accept-invite — tenant activates account', () => {
     expect(res.body.error).toMatch(/password.*required/i)
   })
 
-  it('password < 8 chars → 400', async () => {
+  it('password < 12 chars → 400', async () => {
     const res = await request(buildApp())
       .post('/api/tenants/accept-invite')
       .send({ token: 'tok', password: 'short', acceptedTerms: true })
     expect(res.status).toBe(400)
-    expect(res.body.error).toMatch(/at least 8/i)
+    expect(res.body.error).toMatch(/at least 12/i)
   })
 
   it('acceptedTerms !== true → 400', async () => {
     const res = await request(buildApp())
       .post('/api/tenants/accept-invite')
-      .send({ token: 'tok', password: 'longenough', acceptedTerms: false })
+      .send({ token: 'tok', password: 'longenoughpwd', acceptedTerms: false })
     expect(res.status).toBe(400)
     expect(res.body.error).toMatch(/accept.*terms/i)
   })
@@ -243,24 +243,27 @@ describe('POST /accept-invite — tenant activates account', () => {
   it('invalid token → 404', async () => {
     const res = await request(buildApp())
       .post('/api/tenants/accept-invite')
-      .send({ token: 'nope_does_not_exist', password: 'longenough', acceptedTerms: true })
+      .send({ token: 'nope_does_not_exist', password: 'longenoughpwd', acceptedTerms: true })
     expect(res.status).toBe(404)
     expect(res.body.error).toMatch(/invalid.*expired/i)
   })
 
-  it('happy: sets password, clears token, stamps tos+privacy+verified, returns JWT', async () => {
+  it('happy: sets password, clears token, stamps tos+privacy+verified, returns pending 2FA session', async () => {
     const { token, userId, tenantId } = await seedPendingInvite()
     const res = await request(buildApp())
       .post('/api/tenants/accept-invite')
       .send({ token, password: 'newpass8chars', phone: '5555550199', acceptedTerms: true })
 
     expect(res.status).toBe(200)
-    expect(res.body.data.token).toBeTruthy()
-    // JWT is decodable and binds to our user.
-    const decoded = jwt.verify(res.body.data.token, process.env.JWT_SECRET!) as any
+    // S578: mandatory email-2FA at activation — a PENDING session, not a full
+    // token. The client trades the emailed code at /email-otp/verify.
+    expect(res.body.data.requiresEmailOtp).toBe(true)
+    expect(res.body.data.emailOtpSession).toBeTruthy()
+    const decoded = jwt.verify(res.body.data.emailOtpSession, process.env.JWT_SECRET!) as any
     expect(decoded.userId).toBe(userId)
     expect(decoded.profileId).toBe(tenantId)
     expect(decoded.role).toBe('tenant')
+    expect(decoded.purpose).toBe('email_otp_pending')
 
     // S410 (S377): accept clears tenant_invite_token + expiry. Email
     // verification column is independent.

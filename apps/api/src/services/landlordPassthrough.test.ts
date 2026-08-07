@@ -28,7 +28,7 @@ vi.mock('./adminNotifications', () => ({
 
 import { db } from '../db'
 import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedTenant } from '../test/dbHelpers'
-import { reconcilePlatformHeldPayments, tryReconcileForLandlordUserId } from './landlordPassthrough'
+import { reconcilePlatformHeldPayments, tryReconcileForLandlordUserId, recoverPendingPlatformTransfers } from './landlordPassthrough'
 
 beforeEach(async () => {
   await cleanupAllSchema()
@@ -218,20 +218,59 @@ describe('reconcilePlatformHeldPayments', () => {
     expect(transferMock).toHaveBeenCalledWith(expect.objectContaining({ amount: 450 }))
   })
 
-  it('Stripe Transfer failure → admin-notification + re-throw', async () => {
+  it('S580: Transfer failure → batch RESERVED (platform_held=false) + intent left pending; no throw, no double-pay', async () => {
     const ctx = await seedCtx()
     await seedOwnerShareLedger(ctx, 950)
     transferMock.mockRejectedValueOnce(new Error('Stripe is down'))
-    await expect(reconcilePlatformHeldPayments(ctx.landlordUserId))
-      .rejects.toThrow(/Stripe is down/)
-    expect(adminNotifyMock).toHaveBeenCalledWith(expect.objectContaining({
-      severity: 'critical',
-      category: 'platform_held_reconciliation_failed',
+    const res = await reconcilePlatformHeldPayments(ctx.landlordUserId)
+    // Reserved: attempted, but the Transfer is pending (id null) — money is safe.
+    expect(res.attempted).toBe(true)
+    expect(res.transfer_id).toBeNull()
+    expect(res.amount).toBe(950)
+    // platform_held flipped FALSE (reserved) so it can't be re-summed into a 2nd transfer.
+    const { rows: [p] } = await db.query<any>(`SELECT platform_held FROM payments WHERE id=$1`, [ctx.paymentId])
+    expect(p.platform_held).toBe(false)
+    // Owner-share carries the intent sentinel, NOT a real transfer id.
+    const { rows: [l] } = await db.query<any>(`SELECT stripe_transfer_id FROM user_balance_ledger WHERE user_id=$1 AND type='allocation_owner_share'`, [ctx.landlordUserId])
+    expect(l.stripe_transfer_id).toMatch(/^intent:/)
+    // A durable pending intent exists with the owed amount + a recorded attempt.
+    const { rows: [intent] } = await db.query<any>(`SELECT status, amount, attempts FROM platform_transfer_intents WHERE landlord_id=$1`, [ctx.landlordId])
+    expect(intent.status).toBe('pending')
+    expect(Number(intent.amount)).toBe(950)
+    expect(intent.attempts).toBe(1)
+    // First failure is recoverable → no critical notification yet.
+    expect(adminNotifyMock).not.toHaveBeenCalled()
+  })
+
+  it('S580: no double-pay — a second reconcile after a reserved batch fires no new transfer', async () => {
+    const ctx = await seedCtx()
+    await seedOwnerShareLedger(ctx, 950)
+    transferMock.mockRejectedValueOnce(new Error('Stripe down'))
+    await reconcilePlatformHeldPayments(ctx.landlordUserId) // reserves; transfer fails → pending
+    transferMock.mockClear()
+    const res2 = await reconcilePlatformHeldPayments(ctx.landlordUserId)
+    expect(res2.attempted).toBe(false)          // owner-share already reserved → nothing to do
+    expect(transferMock).not.toHaveBeenCalled()
+    const { rows } = await db.query<any>(`SELECT COUNT(*)::int AS n FROM platform_transfer_intents WHERE landlord_id=$1`, [ctx.landlordId])
+    expect(rows[0].n).toBe(1)                    // still exactly one intent
+  })
+
+  it('S580: recovery re-fires a stuck pending intent with the same idempotency key', async () => {
+    const ctx = await seedCtx()
+    await seedOwnerShareLedger(ctx, 950)
+    transferMock.mockRejectedValueOnce(new Error('Stripe down'))
+    await reconcilePlatformHeldPayments(ctx.landlordUserId) // → pending
+    const { rows: [intent0] } = await db.query<any>(`SELECT id FROM platform_transfer_intents WHERE landlord_id=$1`, [ctx.landlordId])
+    transferMock.mockResolvedValueOnce({ id: 'tr_recovered' } as any)
+    const rec = await recoverPendingPlatformTransfers(0) // grace 0 → include the fresh intent
+    expect(rec.recovered).toBe(1)
+    expect(transferMock).toHaveBeenCalledWith(expect.objectContaining({
+      idempotencyKey: `platform_passthrough_${intent0.id}`, amount: 950,
     }))
-    // payments.platform_held stays TRUE because the transaction rolled back.
-    const { rows: [p] } = await db.query<any>(
-      `SELECT platform_held FROM payments WHERE id=$1`, [ctx.paymentId])
-    expect(p.platform_held).toBe(true)
+    const { rows: [intent] } = await db.query<any>(`SELECT status, stripe_transfer_id FROM platform_transfer_intents WHERE id=$1`, [intent0.id])
+    expect(intent).toMatchObject({ status: 'transferred', stripe_transfer_id: 'tr_recovered' })
+    const { rows: [l] } = await db.query<any>(`SELECT stripe_transfer_id FROM user_balance_ledger WHERE user_id=$1 AND type='allocation_owner_share'`, [ctx.landlordUserId])
+    expect(l.stripe_transfer_id).toBe('tr_recovered')
   })
 })
 

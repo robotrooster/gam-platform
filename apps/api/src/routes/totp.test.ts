@@ -508,8 +508,8 @@ describe('S560: totp_pending token is not a full session', () => {
 
 // ── S560 regression: mandatory-2FA admin, not yet enrolled, gets an ──────────
 // ENROLLMENT-ONLY pass — rejected on normal routes, accepted only to enroll.
-describe('S560: un-enrolled mandatory-2FA admin gets an enroll-only session', () => {
-  it('login pass is rejected by /me but works for enroll-start', async () => {
+describe('S578: un-enrolled admin gets universal email 2FA (supersedes forced TOTP enroll)', () => {
+  it('login returns requiresEmailOtp (emailed code), not a forced-enroll session', async () => {
     await seedUser({
       email: 'newadmin@test.dev', password: 'password1234',
       role: 'admin', totpEnabled: false,
@@ -518,21 +518,12 @@ describe('S560: un-enrolled mandatory-2FA admin gets an enroll-only session', ()
       .post('/api/auth/login')
       .send({ email: 'newadmin@test.dev', password: 'password1234' })
     expect(login.status).toBe(200)
-    expect(login.body.data.user.mustEnrollTotp).toBe(true)
-    const tok = login.body.data.token as string
-    expect(typeof tok).toBe('string')
-
-    // The enroll-only pass must NOT work on a normal requireAuth route.
-    const me = await request(buildApp())
-      .get('/api/auth/me')
-      .set('Authorization', `Bearer ${tok}`)
-    expect(me.status).toBe(401)
-
-    // But it MUST let them enroll.
-    const start = await request(buildApp())
-      .post('/api/auth/totp/enroll-start')
-      .set('Authorization', `Bearer ${tok}`)
-    expect(start.status).toBe(200)
-    expect(typeof start.body.data.otpauthUrl).toBe('string')
+    // Universal 2FA: an admin without an authenticator gets an emailed code
+    // rather than being forced through TOTP enrollment at login. (They may
+    // still opt into an authenticator later via /totp/enroll-start once signed
+    // in — that flow is unchanged, just no longer forced.)
+    expect(login.body.data.requiresEmailOtp).toBe(true)
+    expect(login.body.data.emailOtpSession).toBeTruthy()
+    expect(login.body.data.token).toBeUndefined()
   })
 })

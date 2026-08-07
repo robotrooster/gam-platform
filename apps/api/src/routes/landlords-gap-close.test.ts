@@ -422,7 +422,7 @@ describe('POST /me/pending-tenants/:intentId/resolve', () => {
       .send({ landlordOverrides: { rent_amount: 1600 } })
     expect(res.status).toBe(200)
     expect(res.body.data.leaseId).toBe('mock-lease-id')
-    expect(resolveIntentMock).toHaveBeenCalledWith(id, f.landlordAId, { rent_amount: 1600 })
+    expect(resolveIntentMock).toHaveBeenCalledWith(id, f.landlordAId, { rent_amount: 1600 }, { confirmSupersede: false })
   })
 
   it('empty body: resolveIntent called with empty overrides', async () => {
@@ -433,6 +433,6 @@ describe('POST /me/pending-tenants/:intentId/resolve', () => {
       .set('Authorization', `Bearer ${f.tokenA}`)
       .send({})
     expect(res.status).toBe(200)
-    expect(resolveIntentMock).toHaveBeenCalledWith(id, f.landlordAId, {})
+    expect(resolveIntentMock).toHaveBeenCalledWith(id, f.landlordAId, {}, { confirmSupersede: false })
   })
 })

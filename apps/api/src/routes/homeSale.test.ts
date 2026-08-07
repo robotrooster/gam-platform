@@ -3,7 +3,7 @@ import express from 'express'
 import request from 'supertest'
 import jwt from 'jsonwebtoken'
 import { db } from '../db'
-import { cleanupAllSchema, seedLandlord, seedTenant, seedProperty, seedUnit, seedLease } from '../test/dbHelpers'
+import { cleanupAllSchema, seedLandlord, seedTenant, seedProperty, seedUnit, seedLease, seedLeaseTenant } from '../test/dbHelpers'
 import { computeAmortization } from '@gam/shared'
 import { billDueHomeSaleInstallments, reconcileHomeSaleContract } from '../services/homeSale'
 import { homeSaleRouter } from './homeSale'
@@ -31,6 +31,7 @@ async function seed() {
     const propertyId = await seedProperty(c, { landlordId, ownerUserId: llUser, managedByUserId: llUser })
     const unitId = await seedUnit(c, { propertyId, landlordId })       // dwelling_ownership defaults 'landlord'
     const leaseId = await seedLease(c, { unitId, landlordId, rentAmount: 400 })
+    await seedLeaseTenant(c, { leaseId, tenantId, role: 'primary' })   // the buyer occupies the space
     await c.query('COMMIT')
     const token = jwt.sign({ userId: llUser, role: 'landlord', email: 'll@t.dev', profileId: landlordId, permissions: {} },
       process.env.JWT_SECRET!, { expiresIn: '1h' })
@@ -69,6 +70,32 @@ describe('POST /api/home-sales', () => {
     expect(Number(res.body.data.schedule[59].remaining_balance)).toBe(0)
   })
 
+  it('flat plan: monthly × N, zero interest, ends after N payments', async () => {
+    const f = await seed()
+    const res = await request(buildApp()).post('/api/home-sales')
+      .set('Authorization', `Bearer ${f.token}`)
+      .send({ unitId: f.unitId, leaseId: f.leaseId, tenantId: f.tenantId,
+              planType: 'flat', monthlyAmount: 500, numberOfPayments: 12, startMonth: '2026-08-01' })
+    expect(res.status).toBe(200)
+    expect(res.body.data.contract.plan_type).toBe('flat')
+    expect(Number(res.body.data.contract.sale_price)).toBe(6000)          // 500 × 12
+    expect(Number(res.body.data.contract.annual_interest_rate)).toBe(0)
+    expect(res.body.data.schedule).toHaveLength(12)
+    expect(Number(res.body.data.schedule[0].amount)).toBe(500)
+    expect(Number(res.body.data.schedule[11].amount)).toBe(500)
+    expect(Number(res.body.data.schedule[11].interest_portion)).toBe(0)
+    expect(Number(res.body.data.schedule[11].remaining_balance)).toBe(0)
+  })
+
+  it('flat plan rejects missing monthlyAmount/numberOfPayments → 400', async () => {
+    const f = await seed()
+    const res = await request(buildApp()).post('/api/home-sales')
+      .set('Authorization', `Bearer ${f.token}`)
+      .send({ unitId: f.unitId, leaseId: f.leaseId, tenantId: f.tenantId,
+              planType: 'flat', startMonth: '2026-08-01' })
+    expect(res.status).toBe(400)
+  })
+
   it('rejects a second active contract on the same unit → 409', async () => {
     const f = await seed()
     const mk = () => request(buildApp()).post('/api/home-sales').set('Authorization', `Bearer ${f.token}`)
@@ -86,6 +113,46 @@ describe('POST /api/home-sales', () => {
       .send({ unitId: f.unitId, leaseId: f.leaseId, tenantId: f.tenantId,
               salePrice: 30000, downPayment: 0, annualInterestRate: 5, termMonths: 48, startMonth: '2026-08-01' })
     expect(res.status).toBe(409)
+  })
+
+  it('rejects a buyer who is not a tenant on the lease → 400 (write-scope)', async () => {
+    const f = await seed()
+    const c = await db.connect()
+    let strangerTenantId: string
+    try { strangerTenantId = await seedTenant(c) } finally { c.release() }
+    const res = await request(buildApp()).post('/api/home-sales').set('Authorization', `Bearer ${f.token}`)
+      .send({ unitId: f.unitId, leaseId: f.leaseId, tenantId: strangerTenantId,
+              salePrice: 30000, downPayment: 0, annualInterestRate: 5, termMonths: 48, startMonth: '2026-08-01' })
+    expect(res.status).toBe(400)
+  })
+})
+
+describe('GET /api/home-sales/unit/:unitId — tenant scoping', () => {
+  it('never leaks another buyer\'s cancelled contract to an unrelated tenant', async () => {
+    const f = await seed()
+    // Landlord creates then cancels a contract for the real buyer (f.tenantId).
+    const create = await request(buildApp()).post('/api/home-sales').set('Authorization', `Bearer ${f.token}`)
+      .send({ unitId: f.unitId, leaseId: f.leaseId, tenantId: f.tenantId,
+              salePrice: 30000, downPayment: 0, annualInterestRate: 5, termMonths: 48, startMonth: '2026-08-01' })
+      .expect(200)
+    const contractId = create.body.data.contract.id
+    await request(buildApp()).post(`/api/home-sales/${contractId}/cancel`).set('Authorization', `Bearer ${f.token}`).expect(200)
+
+    // A stranger tenant queries the same unit → must get null, NOT the contract.
+    const c = await db.connect()
+    let strangerTenantId: string
+    try { strangerTenantId = await seedTenant(c) } finally { c.release() }
+    const strangerToken = jwt.sign({ userId: strangerTenantId, role: 'tenant', email: 's@t.dev', profileId: strangerTenantId, permissions: {} },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
+    const strangerRes = await request(buildApp()).get(`/api/home-sales/unit/${f.unitId}`).set('Authorization', `Bearer ${strangerToken}`)
+    expect(strangerRes.status).toBe(200)
+    expect(strangerRes.body.data).toBeNull()
+
+    // The real buyer still sees their own (cancelled) contract.
+    const buyerToken = jwt.sign({ userId: f.tenantId, role: 'tenant', email: 'b@t.dev', profileId: f.tenantId, permissions: {} },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
+    const buyerRes = await request(buildApp()).get(`/api/home-sales/unit/${f.unitId}`).set('Authorization', `Bearer ${buyerToken}`)
+    expect(buyerRes.body.data?.contract?.id).toBe(contractId)
   })
 })
 
@@ -109,6 +176,31 @@ describe('home-sale billing + payoff', () => {
     // Re-run → no double billing.
     const again = await billDueHomeSaleInstallments('2000-04-01')
     expect(again).toBe(0)
+  })
+
+  it('the unique index blocks a duplicate home_payment for the same installment (idempotency backstop)', async () => {
+    const f = await seed()
+    await request(buildApp()).post('/api/home-sales').set('Authorization', `Bearer ${f.token}`)
+      .send({ unitId: f.unitId, leaseId: f.leaseId, tenantId: f.tenantId,
+              salePrice: 3000, downPayment: 0, annualInterestRate: 0, termMonths: 3, startMonth: '2000-01-01' })
+      .expect(200)
+    await billDueHomeSaleInstallments('2000-04-01')
+
+    // Exactly one payment carries each billed installment id.
+    const inst = await db.query<any>(`SELECT id FROM home_sale_installments WHERE payment_id IS NOT NULL LIMIT 1`)
+    const instId = inst.rows[0].id
+    const n = await db.query<any>(`SELECT count(*)::int n FROM payments WHERE home_sale_installment_id=$1`, [instId])
+    expect(n.rows[0].n).toBe(1)
+
+    // A second charge for the same installment (what a concurrent second cron
+    // instance would attempt) is rejected by the partial-unique index.
+    await expect(db.query(
+      `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status,
+                             due_date, entry_description, home_sale_installment_id)
+       SELECT unit_id, lease_id, tenant_id, landlord_id, 'home_payment', 100, 'pending',
+              due_date, 'HOMEPMT', $1
+         FROM payments WHERE home_sale_installment_id=$1`, [instId]
+    )).rejects.toThrow()
   })
 
   it('marks paid_off and flips the unit to tenant-owned once all installments settle', async () => {

@@ -384,13 +384,15 @@ paymentsRouter.post('/:id/pay', async (req: any, res, next) => {
       (sum, r) => sum + parseFloat(r.total_amount), 0
     )
 
-    // S248: sublease markup detection. When this payment is for a unit
-    // with an active sublease where the payer is the sublessee, the
-    // landlord receives `master_share_amount` (not `sub_monthly_amount`).
-    // The difference (markup) stays on platform balance and credits the
-    // sublessor via subleaseAllocation on webhook success. Implementation:
-    // add the markup to application_fee_amount so Stripe routes only
-    // (gross - app_fee - markup) to landlord.
+    // S248/S581: sublease markup detection. When this payment is for a unit
+    // with an active sublease where the payer is the sublessee, the landlord is
+    // owed `master_share_amount`, not `sub_monthly_amount` — the difference
+    // (markup) goes to the sublessor. Under platform-holds (S560) it is STAMPED
+    // on the payment (sublease_markup_amount) so services/allocation.ts subtracts
+    // it from owner_share and creditSublessorMarkupForPayment credits the
+    // sublessor that same amount at settle. (Pre-S581 it was added only to the
+    // now-dead application_fee_amount — see the migration: the markup was dropped
+    // from the landlord's payout, so GAM ate it.)
     let subleaseMarkup = 0
     if (pmt.type === 'rent') {
       const sub = await queryOne<{ sub: string; master: string }>(
@@ -492,9 +494,10 @@ paymentsRouter.post('/:id/pay', async (req: any, res, next) => {
           SET status = 'processing',
               stripe_payment_intent_id = $1,
               platform_held = TRUE,
-              gam_supersedence_amount = $3
+              gam_supersedence_amount = $3,
+              sublease_markup_amount = $4
         WHERE id = $2`,
-      [intent.id, pmt.id, gamSupersedenceAmount.toFixed(2)]
+      [intent.id, pmt.id, gamSupersedenceAmount.toFixed(2), subleaseMarkup.toFixed(2)]
     )
 
     // S121: claim the unpaid tenant-payer accruals atomically. The filter
@@ -550,18 +553,43 @@ paymentsRouter.get('/balance-context', async (req: any, res, next) => {
     if (req.user!.role !== 'tenant') throw new AppError(403, 'Only tenants can call this endpoint')
     const rows = await query<any>(
       `SELECT p.id, p.amount::float AS amount, p.due_date::text AS due_date, p.type,
-              p.entry_description, u.payment_block
+              p.entry_description, p.lease_id, u.payment_block,
+              u.unit_number, pr.name AS property_name
          FROM payments p
          JOIN units u ON u.id = p.unit_id
+         JOIN properties pr ON pr.id = u.property_id
         WHERE p.tenant_id = $1
           AND ((p.status = 'pending' AND p.stripe_payment_intent_id IS NULL)
                OR p.status = 'failed')
         ORDER BY p.due_date ASC, p.created_at ASC`,
       [req.user!.profileId])
     const total = Math.round(rows.reduce((sum: number, r: any) => sum + r.amount, 0) * 100) / 100
+
+    // S581 (Nic): group the ledger BY LEASE. Each lease is paid as its own
+    // charge (see /pay-balance), so the portal renders one Pay button per
+    // lease. A tenant with a single lease (launch norm) gets exactly one group.
+    const byLease = new Map<string, {
+      leaseId: string; propertyName: string; unitNumber: string
+      paymentBlocked: boolean; outstanding: number; rows: any[]
+    }>()
+    for (const r of rows) {
+      let g = byLease.get(r.lease_id)
+      if (!g) {
+        g = { leaseId: r.lease_id, propertyName: r.property_name, unitNumber: r.unit_number,
+              paymentBlocked: !!r.payment_block, outstanding: 0, rows: [] }
+        byLease.set(r.lease_id, g)
+      }
+      g.outstanding = Math.round((g.outstanding + r.amount) * 100) / 100
+      g.rows.push(r)
+    }
+    const leases = [...byLease.values()]
+
     res.json({ success: true, data: {
       totalOutstanding: total,
-      paymentBlocked: rows.length ? !!rows[0].payment_block : false,
+      // Legacy scalar retained for older clients: blocked only if EVERY lease
+      // is blocked (a per-lease `leases[].paymentBlocked` is the real signal).
+      paymentBlocked: leases.length ? leases.every(l => l.paymentBlocked) : false,
+      leases,
       rows,
     } })
   } catch (e) { next(e) }
@@ -631,6 +659,17 @@ paymentsRouter.post('/pay-balance', async (req: any, res, next) => {
       amount:            z.number().positive(),
       paymentMethodId:   z.string().min(1),
       paymentMethodType: z.enum(['ach', 'card']),
+      // S581 (Nic): ONE lease per charge. A tenant with two leases (an overlap
+      // while moving to a bigger place, or two different landlords) pays each
+      // lease as its OWN ACH/card charge with its OWN receipt. Separate charges
+      // mean: (a) a bank shortfall fails only that lease, not both — the other
+      // still has a chance to clear; (b) the capped processing fee is charged
+      // per lease (one combined charge would let two people sharing a bank
+      // account share a single capped fee — a revenue leak AND a scam vector);
+      // (c) an eviction hold on one landlord's lease never blocks paying an
+      // unrelated landlord's lease. Omitted for the single-lease case (launch
+      // norm) — the one outstanding lease is resolved automatically.
+      leaseId:           z.string().uuid().optional(),
     }).parse(req.body)
 
     if (req.user!.role !== 'tenant') {
@@ -638,9 +677,32 @@ paymentsRouter.post('/pay-balance', async (req: any, res, next) => {
     }
     const tenantId = req.user!.profileId
 
-    // The tenant's outstanding landlord-bound ledger, oldest first. One
-    // active lease context per remittance (multi-lease tenants are not a
-    // launch case; rows resolve through the newest active lease).
+    // Resolve the ONE lease this charge settles. With an explicit leaseId, pay
+    // that lease; without one, fall back to the tenant's single outstanding
+    // lease (legacy one-button path) and refuse when they span several — the
+    // client must pick which lease to pay so each gets its own charge + receipt.
+    const outstandingLeases = await query<{ lease_id: string }>(
+      `SELECT DISTINCT p.lease_id
+         FROM payments p
+        WHERE p.tenant_id = $1
+          AND ((p.status = 'pending' AND p.stripe_payment_intent_id IS NULL)
+               OR p.status = 'failed')`,
+      [tenantId])
+    if (outstandingLeases.length === 0) throw new AppError(409, 'Nothing outstanding to pay')
+    let targetLeaseId = body.leaseId ?? null
+    if (targetLeaseId) {
+      if (!outstandingLeases.some(l => l.lease_id === targetLeaseId)) {
+        throw new AppError(409, 'That lease has nothing outstanding to pay')
+      }
+    } else if (outstandingLeases.length === 1) {
+      targetLeaseId = outstandingLeases[0].lease_id
+    } else {
+      throw new AppError(400, 'You have balances on more than one lease — pay each one separately.')
+    }
+
+    // The tenant's outstanding ledger FOR THIS LEASE, oldest first. Every row
+    // shares one lease → one unit → one landlord → one property, so ctx (row 0)
+    // is representative of the whole charge (incl. the eviction-hold check).
     const rows = await query<any>(
       `SELECT p.id, p.amount::float AS amount, p.due_date::text AS due_date, p.type,
               p.lease_id, p.unit_id, p.landlord_id,
@@ -661,10 +723,11 @@ paymentsRouter.post('/pay-balance', async (req: any, res, next) => {
          JOIN users lu ON lu.id = l.user_id
          LEFT JOIN property_allocation_rules par ON par.property_id = u.property_id
         WHERE p.tenant_id = $1
+          AND p.lease_id = $2
           AND ((p.status = 'pending' AND p.stripe_payment_intent_id IS NULL)
                OR p.status = 'failed')
         ORDER BY p.due_date ASC, p.created_at ASC`,
-      [tenantId]
+      [tenantId, targetLeaseId]
     )
     if (rows.length === 0) throw new AppError(409, 'Nothing outstanding to pay')
     const ctx = rows[0]
@@ -720,10 +783,18 @@ paymentsRouter.post('/pay-balance', async (req: any, res, next) => {
     )
     const passthroughAmount = unpaidAccruals.reduce((sum, r) => sum + parseFloat(r.total_amount), 0)
 
-    // Sublease markup — applies per covered RENT dollar, same rule as
-    // the per-row flow (rare; sublessee pays marked-up rent, the markup
-    // stays on platform and credits the sublessor at settle).
+    // Sublease markup — applies per covered RENT month (rare; sublessee pays
+    // marked-up rent, the markup goes to the sublessor at settle). S581: the
+    // per-month markup is STAMPED on each covered rent row below
+    // (sublease_markup_amount) so allocation subtracts it from the landlord's
+    // owner_share and the sublessor is credited that same amount — see the
+    // migration + the /:id/pay note. The aggregate here feeds display only.
     let subleaseMarkup = 0
+    let subleasePerMonth = 0
+    const coveredRentIds: string[] = plan.lines
+      .filter(ln => rowById.get(ln.payment_id)?.type === 'rent'
+        && Math.abs(ln.amount_applied - rowById.get(ln.payment_id)!.amount) < 0.005)
+      .map(ln => ln.payment_id)
     {
       const sub = await queryOne<{ sub: string; master: string }>(
         `SELECT s.sub_monthly_amount::text AS sub, s.master_share_amount::text AS master
@@ -733,10 +804,8 @@ paymentsRouter.post('/pay-balance', async (req: any, res, next) => {
         [ctx.unit_id, tenantId],
       )
       if (sub) {
-        const perMonth = Math.max(0, parseFloat(sub.sub) - parseFloat(sub.master))
-        const coveredRentMonths = plan.lines.filter(ln => rowById.get(ln.payment_id)?.type === 'rent'
-          && Math.abs(ln.amount_applied - rowById.get(ln.payment_id)!.amount) < 0.005).length
-        subleaseMarkup = perMonth * coveredRentMonths
+        subleasePerMonth = Math.max(0, parseFloat(sub.sub) - parseFloat(sub.master))
+        subleaseMarkup = subleasePerMonth * coveredRentIds.length
       }
     }
 
@@ -819,6 +888,14 @@ paymentsRouter.post('/pay-balance', async (req: any, res, next) => {
               platform_held = TRUE
         WHERE id = ANY($2::uuid[])`,
       [intent.id, fullyCoveredIds])
+    // S581: stamp the per-month sublease markup on each covered rent row so
+    // allocation nets it out of the landlord's owner_share (the sublessor is
+    // credited the same amount at settle). No-op when there's no markup.
+    if (subleasePerMonth > 0 && coveredRentIds.length > 0) {
+      await client.query(
+        `UPDATE payments SET sublease_markup_amount = $1 WHERE id = ANY($2::uuid[])`,
+        [subleasePerMonth.toFixed(2), coveredRentIds])
+    }
     await client.query(
       `UPDATE tenant_remittances SET stripe_payment_intent_id = $1, updated_at = NOW() WHERE id = $2`,
       [intent.id, remittanceId])

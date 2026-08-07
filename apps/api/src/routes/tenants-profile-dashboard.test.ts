@@ -199,6 +199,35 @@ describe('GET /api/tenants/me', () => {
     expect(Number(res.body.data.deposit_total)).toBe(1500)
     expect(res.body.data.deposit_fully_funded).toBe(true)
   })
+
+  it('S581: flexpay_paused_multi_lease is true only when enrolled AND on 2+ active leases', async () => {
+    const f = await seedTFixture()  // one active lease
+    const client = await db.connect()
+    let lease2: string
+    try {
+      const unit2 = await seedUnit(client, { propertyId: f.propertyId, landlordId: f.landlordId })
+      lease2 = await seedLease(client, { unitId: unit2, landlordId: f.landlordId })
+      await seedLeaseTenant(client, { leaseId: lease2, tenantId: f.tenantId, role: 'primary' })
+    } finally { client.release() }
+
+    const fetchMe = () => request(buildApp())
+      .get('/api/tenants/me')
+      .set('Authorization', `Bearer ${f.tenantToken}`)
+
+    // Two active leases but NOT enrolled → not paused (nothing to pause).
+    let res = await fetchMe()
+    expect(res.body.data.flexpay_paused_multi_lease).toBe(false)
+
+    // Enrolled + two active leases → paused (the single-lease gate).
+    await db.query(`UPDATE tenants SET flexpay_enrolled=true, flexpay_pull_day=5 WHERE id=$1`, [f.tenantId])
+    res = await fetchMe()
+    expect(res.body.data.flexpay_paused_multi_lease).toBe(true)
+
+    // Second lease ends → back to one active lease → un-paused automatically.
+    await db.query(`UPDATE leases SET status='terminated' WHERE id=$1`, [lease2])
+    res = await fetchMe()
+    expect(res.body.data.flexpay_paused_multi_lease).toBe(false)
+  })
 })
 
 describe('GET /api/tenants/me/payment-health', () => {

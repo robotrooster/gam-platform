@@ -30,6 +30,19 @@ import { db, getClient } from '../db'
  * rows in place is correct.
  */
 export async function cleanupAllSchema(): Promise<void> {
+  // SAFETY RAIL (S578): this function DELETEs from ~every table. If a test run
+  // is ever pointed at a non-test database (e.g. `vitest` invoked without
+  // DB_NAME=gam_test, which defaults to `gam` per db/index.ts), it would wipe
+  // dev/prod data. Refuse unless the LIVE connection is a *_test database —
+  // check current_database(), not just env, so nothing can slip past.
+  const who = await db.query<{ db: string }>(`SELECT current_database() AS db`)
+  const dbName = who.rows[0]?.db ?? ''
+  if (!dbName.endsWith('_test')) {
+    throw new Error(
+      `cleanupAllSchema REFUSED: connected to "${dbName}", not a *_test database. ` +
+      `Tests must run with DB_NAME=gam_test (use \`npm test\` from apps/api). ` +
+      `This guard exists because a stray run once wiped the dev DB.`)
+  }
   // S553: call slots FK sales_leads — clear child first. Availability has
   // no FKs but tests seed their own windows.
   await db.query(`DELETE FROM sales_call_slots`)
@@ -41,6 +54,9 @@ export async function cleanupAllSchema(): Promise<void> {
   await db.query(`DELETE FROM credit_hardship_contexts`)
   await db.query(`DELETE FROM credit_scores`)
   await db.query(`DELETE FROM credit_stats`)
+  // credit_merkle_anchors.earliest_event_id FKs credit_events (NO ACTION) —
+  // clear anchors before events or the events delete violates the FK.
+  await db.query(`DELETE FROM credit_merkle_anchors`)
   await db.query(`DELETE FROM credit_events`)
   await db.query(`DELETE FROM credit_subjects`)
   await db.query(`DELETE FROM admin_notifications`)
@@ -101,6 +117,16 @@ export async function cleanupAllSchema(): Promise<void> {
   await db.query(`DELETE FROM flex_deposit_installments`)
   await db.query(`DELETE FROM screening_fee_accruals`)
   await db.query(`DELETE FROM background_checks`)
+  // S579: pending_tenant_intents FKs properties + units (property_id +
+  // screening_waived_unit_id) with NO ACTION. Property-level intents have a
+  // NULL unit_id so the unit-delete cascade never reaches them — delete the
+  // intents explicitly before properties/units are wiped below.
+  await db.query(`DELETE FROM pending_tenant_intents`)
+  // S580: platform_transfer_intents FKs landlords + users — clear before them.
+  await db.query(`DELETE FROM platform_transfer_intents`)
+  // S580: instant-withdrawal margin FKs landlords + disbursements; circuit is standalone.
+  await db.query(`DELETE FROM landlord_instant_margins`)
+  await db.query(`DELETE FROM connect_instant_circuit`)
   await db.query(`DELETE FROM state_application_fee_caps`)
   await db.query(`DELETE FROM security_deposits`)
   // Accrual tables FK to user_balance_ledger / platform_revenue_ledger
@@ -166,6 +192,9 @@ export async function cleanupAllSchema(): Promise<void> {
   // delete, but explicit order keeps the chain obvious.
   await db.query(`DELETE FROM unit_entry_request_responses`)
   await db.query(`DELETE FROM unit_entry_requests`)
+  // S594: resident_home_sales FKs units + users + documents (RESTRICT);
+  // installments CASCADE. Clear before documents/units/users below.
+  await db.query(`DELETE FROM resident_home_sales`)
   // documents FKs leases/units/tenants/landlords (NO cascade). S573: a
   // finalized inspection now writes a summary-report documents row referencing
   // its lease — clear documents BEFORE leases/units, not just before landlords.
@@ -177,9 +206,8 @@ export async function cleanupAllSchema(): Promise<void> {
   // cascade on parent delete.
   await db.query(`DELETE FROM lease_documents`)
   await db.query(`DELETE FROM leases`)
-  // Maintenance comments FK to maintenance_requests; both FK to units.
-  // contractors FKs reverse — clear after maintenance_requests releases
-  // its contractor_id refs.
+  // Maintenance comments + media FK to maintenance_requests, which FKs units.
+  // (assigned_to -> users is ON DELETE SET NULL, so no ordering constraint there.)
   await db.query(`DELETE FROM maintenance_comments`)
   await db.query(`DELETE FROM maintenance_media`)
   await db.query(`DELETE FROM maintenance_requests`)

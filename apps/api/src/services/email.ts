@@ -876,6 +876,38 @@ export async function emailTenantOnboarded(
   )
 }
 
+// S582 — reminder nudge for a tenant invite that hasn't been accepted and is
+// expiring soon. Sent by the daily invite-nudge job (jobs/inviteNudge.ts).
+export async function emailTenantInviteReminder(
+  to: string,
+  tenantName: string,
+  landlordName: string,
+  unitLabel: string,
+  activationUrl: string,
+  daysLeft: number,
+  ctx?: { landlordId?: string; tenantId?: string }
+) {
+  const window = daysLeft <= 1 ? 'tomorrow' : `in ${daysLeft} days`
+  await send(to, `Reminder: activate your GAM tenant account for ${unitLabel}`,
+    base(
+      h('Just a reminder') +
+      p(`Hi ${tenantName},`) +
+      p(`Your landlord <strong style="color:#eef1f8">${landlordName}</strong> invited you to GAM for <strong style="color:#eef1f8">${unitLabel}</strong>, but your account isn’t activated yet.`) +
+      p(`Your invite link expires <strong style="color:#eef1f8">${window}</strong>. Activate now to set your password, view your lease, and pay rent online.`) +
+      btn('Activate Your Account', activationUrl) +
+      `<div style="margin-top:16px;font-size:.75rem;color:#4a5568">If the link has expired, ask your landlord to resend it. Questions? Reach out to your landlord directly.</div>`
+    ),
+    {
+      category: 'tenant_invite_reminder',
+      landlordId: ctx?.landlordId ?? null,
+      relatedEntityType: ctx?.tenantId ? 'tenant' : null,
+      relatedEntityId: ctx?.tenantId ?? null,
+      metadata: { unit_label: unitLabel, days_left: daysLeft },
+    },
+    'support',
+  )
+}
+
 // S281 — email verification at registration. Sent after a successful
 // signup; the link consumes the token via POST /api/auth/verify-email.
 // S565 — email 2FA login code. Second factor for admin logins that don't use

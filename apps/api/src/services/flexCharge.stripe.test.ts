@@ -75,6 +75,7 @@ import {
   processFlexChargeStatementBilling,
   retryFlexChargeStatement,
   reconcileSettledFlexChargeStatement,
+  reconcileFlexChargePaydown,
   handleFlexChargeStatementNsf,
   disputeFlexChargeTransaction,
   checkAndDisqualifyLandlord,
@@ -186,28 +187,35 @@ async function seedTx(opts: {
 async function seedStatement(opts: {
   accountId:  string
   cycleMonth?: string
-  balance?:    number
-  serviceFee?: number
+  newBalance?: number     // S583 revolving: the ending balance (== total_due)
+  minimumDue?: number
+  serviceFee?: number     // GAM's monthly 1.5%/12 cut
+  amountPaid?: number
   status?:     'open' | 'billed' | 'paid' | 'failed' | 'voided'
   dueDate?:    string
   paymentId?:  string | null
 }): Promise<string> {
-  const balance = opts.balance ?? 100
+  const newBalance = opts.newBalance ?? 100
+  const minimumDue = opts.minimumDue ?? 25
   const serviceFee = opts.serviceFee ?? 1.5
-  const total = balance + serviceFee
   const { rows: [s] } = await db.query<{ id: string }>(
     `INSERT INTO flex_charge_statements
-       (account_id, cycle_month, balance, service_fee, total_due, due_date,
-        status, payment_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
+       (account_id, cycle_month, previous_balance, new_purchases, finance_charge,
+        service_fee, new_balance, total_due, minimum_due, balance, amount_paid,
+        due_date, status, payment_id)
+     VALUES ($1,$2,0,$3,0,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`,
     [opts.accountId,
      opts.cycleMonth ?? '2026-05-01',
-     balance.toFixed(2),
-     serviceFee.toFixed(2),
-     total.toFixed(2),
-     opts.dueDate ?? '2026-06-15',
-     opts.status ?? 'open',
-     opts.paymentId ?? null])
+     newBalance.toFixed(2),        // $3 new_purchases (treat as first-statement purchases)
+     serviceFee.toFixed(2),        // $4 service_fee
+     newBalance.toFixed(2),        // $5 new_balance
+     newBalance.toFixed(2),        // $6 total_due
+     minimumDue.toFixed(2),        // $7 minimum_due
+     newBalance.toFixed(2),        // $8 balance (legacy)
+     (opts.amountPaid ?? 0).toFixed(2), // $9 amount_paid
+     opts.dueDate ?? '2026-06-15', // $10 due_date
+     opts.status ?? 'open',        // $11 status
+     opts.paymentId ?? null])      // $12 payment_id
   return s.id
 }
 
@@ -239,38 +247,74 @@ describe('generateMonthlyStatement', () => {
     expect(rows).toHaveLength(0)
   })
 
-  it('happy: sums pending tx, computes 1.5% service fee, due-date = 15th of next month', async () => {
+  it('first statement: no carry → no interest; minimum = max($25,3%); GAM 1.5%/12; due 15th', async () => {
     await enablePlatform()
     const a = await seedAccount()
     await seedTx({ accountId: a.accountId, amount: 100, createdAt: '2026-05-05T00:00:00Z' })
     await seedTx({ accountId: a.accountId, amount: 50,  createdAt: '2026-05-20T00:00:00Z' })
 
-    const r = await generateMonthlyStatement({
-      accountId: a.accountId, cycleMonth: '2026-05-01',
-    })
+    const r = await generateMonthlyStatement({ accountId: a.accountId, cycleMonth: '2026-05-01' })
     expect(r).not.toBeNull()
-    expect(r!.balance).toBe(150)
-    expect(r!.service_fee).toBe(2.25)            // 150 * 0.015
-    expect(r!.total_due).toBe(152.25)
+    expect(r!.previous_balance).toBe(0)
+    expect(r!.new_purchases).toBe(150)
+    expect(r!.finance_charge).toBe(0)      // no carried balance yet → no interest
+    expect(r!.late_fee).toBe(0)
+    expect(r!.new_balance).toBe(150)
+    expect(r!.total_due).toBe(150)
+    expect(r!.minimum_due).toBe(25)        // max($25, 3%×150=$4.50) = $25
+    expect(r!.service_fee).toBe(0.19)      // 150 × 1.5%/12 = 0.1875 → 0.19 (GAM, off the merchant)
     expect(r!.due_date).toBe('2026-06-15')
     expect(r!.tx_count).toBe(2)
 
-    const { rows: [stmt] } = await db.query<any>(
-      `SELECT * FROM flex_charge_statements WHERE id = $1`, [r!.statement_id])
-    expect(stmt.balance).toBe('150.00')
-    expect(stmt.service_fee).toBe('2.25')
-    expect(stmt.total_due).toBe('152.25')
-    expect(stmt.status).toBe('open')
+    // Running account balance set to the statement balance.
+    const { rows: [acct] } = await db.query<any>(`SELECT current_balance FROM flex_charge_accounts WHERE id=$1`, [a.accountId])
+    expect(acct.current_balance).toBe('150.00')
+  })
 
-    // Both txs flipped to 'billed' with statement_id stamped.
-    const { rows: txs } = await db.query<any>(
-      `SELECT status, statement_id FROM flex_charge_transactions WHERE account_id = $1`,
-      [a.accountId])
-    expect(txs).toHaveLength(2)
-    for (const tx of txs) {
-      expect(tx.status).toBe('billed')
-      expect(tx.statement_id).toBe(r!.statement_id)
-    }
+  it('revolving: a carried balance accrues APR/12 interest; min met → no late fee', async () => {
+    await enablePlatform()
+    const a = await seedAccount()
+    await db.query(`UPDATE properties SET flex_charge_finance_pct = 0.06 WHERE id = $1`, [a.propertyId]) // 6% APR
+    await seedTx({ accountId: a.accountId, amount: 200, createdAt: '2026-05-10T00:00:00Z' })
+    const s1 = await generateMonthlyStatement({ accountId: a.accountId, cycleMonth: '2026-05-01' })
+    expect(s1!.new_balance).toBe(200)
+    expect(s1!.minimum_due).toBe(25)
+
+    // Customer paid only the minimum ($25) → carries $175.
+    await db.query(`UPDATE flex_charge_statements SET amount_paid = 25 WHERE id = $1`, [s1!.statement_id])
+
+    const s2 = await generateMonthlyStatement({ accountId: a.accountId, cycleMonth: '2026-06-01' })
+    expect(s2!.previous_balance).toBe(200)
+    expect(s2!.payments_credited).toBe(25)
+    expect(s2!.finance_charge).toBe(0.88)  // carried $175 × 6%/12 = 0.875 → 0.88
+    expect(s2!.late_fee).toBe(0)           // minimum was met
+    expect(s2!.new_balance).toBe(175.88)   // 200 + 0.88 − 25
+  })
+
+  it('revolving: paying in full → grace (next cycle zero interest)', async () => {
+    await enablePlatform()
+    const a = await seedAccount()
+    await db.query(`UPDATE properties SET flex_charge_finance_pct = 0.06 WHERE id = $1`, [a.propertyId])
+    await seedTx({ accountId: a.accountId, amount: 200, createdAt: '2026-05-10T00:00:00Z' })
+    const s1 = await generateMonthlyStatement({ accountId: a.accountId, cycleMonth: '2026-05-01' })
+    // Customer paid IN FULL.
+    await db.query(`UPDATE flex_charge_statements SET amount_paid = 200 WHERE id = $1`, [s1!.statement_id])
+    // New purchase next cycle.
+    await seedTx({ accountId: a.accountId, amount: 50, createdAt: '2026-06-10T00:00:00Z' })
+    const s2 = await generateMonthlyStatement({ accountId: a.accountId, cycleMonth: '2026-06-01' })
+    expect(s2!.finance_charge).toBe(0)     // carried $0 → grace, no interest
+    expect(s2!.new_balance).toBe(50)       // 200 + 50 − 200
+  })
+
+  it('revolving: underpaying the minimum → $10 late fee next cycle', async () => {
+    await enablePlatform()
+    const a = await seedAccount()
+    await seedTx({ accountId: a.accountId, amount: 200, createdAt: '2026-05-10T00:00:00Z' })
+    const s1 = await generateMonthlyStatement({ accountId: a.accountId, cycleMonth: '2026-05-01' })
+    expect(s1!.minimum_due).toBe(25)
+    await db.query(`UPDATE flex_charge_statements SET amount_paid = 10 WHERE id = $1`, [s1!.statement_id]) // < $25 minimum
+    const s2 = await generateMonthlyStatement({ accountId: a.accountId, cycleMonth: '2026-06-01' })
+    expect(s2!.late_fee).toBe(10)
   })
 
   it('account not found → throws 404', async () => {
@@ -380,7 +424,7 @@ describe('processFlexChargeStatementBilling', () => {
     const a = await seedAccount()
     const stmtId = await seedStatement({
       accountId: a.accountId, dueDate: '2026-06-01', status: 'open',
-      balance: 100, serviceFee: 1.5,
+      newBalance: 100, minimumDue: 25, serviceFee: 1.5,
     })
 
     const r = await processFlexChargeStatementBilling(new Date(Date.UTC(2026, 5, 15)))
@@ -391,7 +435,9 @@ describe('processFlexChargeStatementBilling', () => {
 
     expect(createRentPlatformChargeMock).toHaveBeenCalledTimes(1)
     const charge = createRentPlatformChargeMock.mock.calls[0][0]
-    expect(charge.amount).toBe(101.5)               // total_due
+    // S583 revolving: the auto-pull takes the MINIMUM ($25), not the full balance;
+    // the rest carries. GAM's fee is not added to the borrower's pull.
+    expect(charge.amount).toBe(25)
     expect(charge.stripeCustomerId).toBe('cus_flexcharge_test')
     expect(charge.paymentMethodId).toBe('pm_default')
     expect(charge.paymentMethodTypes).toEqual(['us_bank_account'])
@@ -414,7 +460,7 @@ describe('processFlexChargeStatementBilling', () => {
       `SELECT * FROM payments WHERE id = $1`, [stmt.payment_id])
     expect(pay.entry_description).toBe('SUBSCRIP')
     expect(pay.type).toBe('fee')
-    expect(pay.amount).toBe('101.50')
+    expect(pay.amount).toBe('25.00')   // the minimum due (revolving auto-pull)
     expect(pay.stripe_payment_intent_id).toBe('pi_flexcharge_mock')
   })
 
@@ -548,7 +594,7 @@ describe('retryFlexChargeStatement', () => {
     const a = await seedAccount()
     const stmtId = await seedStatement({
       accountId: a.accountId, status: 'failed',
-      dueDate: '2026-06-01', balance: 100, serviceFee: 1.5,
+      dueDate: '2026-06-01', newBalance: 100, minimumDue: 25, serviceFee: 1.5,
     })
     await db.query(
       `UPDATE flex_charge_statements SET failed_reason='prior failure' WHERE id=$1`,
@@ -590,12 +636,12 @@ describe('reconcileSettledFlexChargeStatement', () => {
     const { rows: [pay] } = await db.query<{ id: string }>(
       `INSERT INTO payments
          (landlord_id, tenant_id, type, amount, status, entry_description, due_date)
-       VALUES ($1, $2, 'fee', 101.5, 'settled', $3, '2026-06-01')
+       VALUES ($1, $2, 'fee', 100, 'settled', $3, '2026-06-01')
        RETURNING id`,
       [a.landlordId, a.tenantId, opts.entryDescription ?? 'SUBSCRIP'])
     const stmtId = await seedStatement({
       accountId: a.accountId, status: opts.statementStatus ?? 'billed',
-      balance: 100, serviceFee: 1.5, paymentId: pay.id,
+      newBalance: 100, minimumDue: 25, serviceFee: 1.5, paymentId: pay.id,
     })
     // Add a billed tx so we can verify the propagation.
     await seedTx({
@@ -611,27 +657,31 @@ describe('reconcileSettledFlexChargeStatement', () => {
     }
   }
 
-  it('happy: settles statement, propagates to txs, fires merchant Transfer', async () => {
+  it('happy: settles statement (minimum collected), credits amount_paid, fires merchant Transfer', async () => {
     const seed = await setup()
     stripeMocks.transfersCreate.mockResolvedValueOnce({ id: 'tr_fc_merchant' } as any)
 
     await reconcileSettledFlexChargeStatement(seed.paymentId)
 
     const { rows: [stmt] } = await db.query<any>(
-      `SELECT status, settled_at FROM flex_charge_statements WHERE id = $1`,
+      `SELECT status, settled_at, amount_paid FROM flex_charge_statements WHERE id = $1`,
       [seed.statementId])
-    expect(stmt.status).toBe('paid')
+    expect(stmt.status).toBe('paid')          // minimum collected
     expect(stmt.settled_at).not.toBeNull()
+    expect(stmt.amount_paid).toBe('25.00')    // the minimum was credited
 
+    // S583 revolving: purchases stay 'billed' — the balance carries, it's not cleared.
     const { rows: [tx] } = await db.query<any>(
       `SELECT status FROM flex_charge_transactions WHERE account_id = $1`,
       [seed.accountId])
-    expect(tx.status).toBe('paid')
+    expect(tx.status).toBe('billed')
 
     expect(stripeMocks.transfersCreate).toHaveBeenCalledTimes(1)
     const [body, callOpts] = stripeMocks.transfersCreate.mock.calls[0]
     expect(body).toMatchObject({
-      amount:      10000,   // balance $100 → 10,000¢ (service fee stays on platform)
+      // S583 revolving: merchant nets the collected MINIMUM − GAM's 1.5%/12.
+      // Seed: minimum_due $25, service_fee $1.50 → $23.50 → 2,350¢.
+      amount:      2350,
       currency:    'usd',
       destination: 'acct_fc_merchant',
     })
@@ -983,5 +1033,53 @@ describe('checkAndDisqualifyLandlord', () => {
 
     const r = await checkAndDisqualifyLandlord(a.landlordId)
     expect(r).toBe(false)  // only 1 distinct disputer (the same tenant)
+  })
+})
+
+describe('FlexCharge pay-down (S583 revolving)', () => {
+  it('reconcileFlexChargePaydown: credits amount_paid, reduces balance, pays merchant (minus GAM cut, once)', async () => {
+    await enablePlatform()
+    const a = await seedAccount()
+    await db.query(`UPDATE flex_charge_accounts SET current_balance = 200 WHERE id = $1`, [a.accountId])
+    const stmtId = await seedStatement({
+      accountId: a.accountId, newBalance: 200, minimumDue: 25, serviceFee: 0.25, status: 'open',
+    })
+    const { rows: [pay] } = await db.query<{ id: string }>(
+      `INSERT INTO payments (landlord_id, tenant_id, type, amount, status, entry_description, due_date)
+       VALUES ($1, $2, 'fee', 100, 'settled', 'FCPAYDOWN', '2026-06-01') RETURNING id`,
+      [a.landlordId, a.tenantId])
+    stripeMocks.transfersCreate.mockResolvedValueOnce({ id: 'tr_paydown' } as any)
+
+    await reconcileFlexChargePaydown(pay.id, {
+      gam_purpose: 'flexcharge_paydown', gam_account_id: a.accountId, gam_statement_id: stmtId,
+    })
+
+    const { rows: [stmt] } = await db.query<any>(
+      `SELECT amount_paid, gam_fee_settled FROM flex_charge_statements WHERE id = $1`, [stmtId])
+    expect(stmt.amount_paid).toBe('100.00')
+    expect(stmt.gam_fee_settled).toBe(true)
+
+    const { rows: [acct] } = await db.query<any>(
+      `SELECT current_balance FROM flex_charge_accounts WHERE id = $1`, [a.accountId])
+    expect(acct.current_balance).toBe('100.00')   // 200 − 100 paid down
+
+    // Merchant gets the pay-down minus GAM's cut (claimed here, once): 100 − 0.25 = 99.75.
+    const [body] = stripeMocks.transfersCreate.mock.calls[0]
+    expect(body.amount).toBe(9975)
+  })
+
+  it('billing cron skips a statement whose minimum is already covered by a pay-down', async () => {
+    await enablePlatform()
+    const a = await seedAccount()
+    const stmtId = await seedStatement({
+      accountId: a.accountId, newBalance: 200, minimumDue: 25, amountPaid: 25,
+      dueDate: '2026-06-01', status: 'open',
+    })
+    const r = await processFlexChargeStatementBilling(new Date(Date.UTC(2026, 5, 15)))
+    expect(createRentPlatformChargeMock).not.toHaveBeenCalled()
+    expect(r.skipped).toBe(1)
+    const { rows: [stmt] } = await db.query<any>(
+      `SELECT status FROM flex_charge_statements WHERE id = $1`, [stmtId])
+    expect(stmt.status).toBe('paid')
   })
 })

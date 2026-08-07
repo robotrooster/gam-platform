@@ -44,7 +44,9 @@
 import { query } from '../db'
 import { firePayoutForConnectAccount, getAvailableUsdBalance } from '../services/connectPayouts'
 import { createAdminNotification } from '../services/adminNotifications'
-import { reconcilePlatformHeldPayments } from '../services/landlordPassthrough'
+import { reconcilePlatformHeldPayments, recoverPendingPlatformTransfers } from '../services/landlordPassthrough'
+import { collectOwedInstantMargins } from '../services/instantWithdrawalMargin'
+import { logger } from '../lib/logger'
 
 // US federal holidays 2026-2027. Refresh annually before each calendar year.
 // "Observed" dates used when the actual holiday falls on a weekend.
@@ -192,6 +194,26 @@ export async function processAutoPayouts(now: Date = new Date()): Promise<Payout
 
   const today = localDateString(now, TZ)
 
+  // S580: retry any platform→Connect passthrough intent stuck in `pending` (its
+  // RESERVE committed but the Transfer never confirmed — e.g. Stripe was down).
+  // The idempotency key dedupes, so this never double-pays; it just lands the
+  // owed owner-share on the landlord's Connect BEFORE the per-candidate balance
+  // sweep below picks it up. Best-effort — a failure here never blocks payouts.
+  try {
+    const rec = await recoverPendingPlatformTransfers()
+    if (rec.recovered > 0 || rec.stillPending > 0) {
+      await createAdminNotification({
+        severity: rec.stillPending > 0 ? 'warn' : 'info',
+        category: 'platform_held_transfer_recovery',
+        title:    `Passthrough recovery: ${rec.recovered} recovered, ${rec.stillPending} still pending`,
+        body:     `Scanned ${rec.scanned} pending platform→Connect transfer intents on ${today}.`,
+        context:  rec,
+      }).catch(() => {})
+    }
+  } catch (e) {
+    logger.error({ err: e }, '[auto_payouts] passthrough recovery failed')
+  }
+
   // Build the candidate list: every Connect-ready landlord/user + pm_company.
   // Cached readiness flags (S159+) are webhook-fed; gating here matches
   // the same gate used at withdrawal time so a manual withdrawal and an
@@ -296,6 +318,17 @@ async function processOneCandidate(cand: Candidate, today: string): Promise<OneC
   //     lands on their own Connect at allocation/charge time.
   if (cand.kind === 'user') {
     await reconcilePlatformHeldPayments(cand.entity_id)
+  }
+
+  // 1c. S580: collect any owed instant-withdrawal margin Connect→platform BEFORE
+  //     the bank sweep — i.e. net GAM's instant-fee margin against this
+  //     disbursement (never pre-pulled at withdrawal time). Idempotent; an
+  //     uncollectable margin (balance withdrawn) stays owed for a future influx.
+  //     Best-effort — never blocks the payout.
+  try {
+    await collectOwedInstantMargins(cand.stripe_connect_account_id)
+  } catch (e) {
+    logger.error({ err: e, account: cand.stripe_connect_account_id }, '[auto_payouts] instant-margin collection failed (will retry next batch)')
   }
 
   // 2. Read live Stripe available USD balance.

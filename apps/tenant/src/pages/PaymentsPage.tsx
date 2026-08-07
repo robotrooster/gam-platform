@@ -73,7 +73,12 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
   const { data: balanceCtx } = useQuery<{
     totalOutstanding: number
     paymentBlocked: boolean
-    rows: { id: string; amount: number; due_date: string; type: string; entry_description: string }[]
+    // S581: one entry per lease — each is paid as its own charge.
+    leases: {
+      leaseId: string; propertyName: string; unitNumber: string
+      paymentBlocked: boolean; outstanding: number
+    }[]
+    rows: { id: string; amount: number; dueDate: string; type: string; entryDescription: string }[]
   }>('balance-context', () => apiGet('/payments/balance-context'))
   const { data: methods = [], isLoading: methodsLoading } = useTenantPaymentMethods()
   const { data: remitData } = useQuery<{ remittances: Remittance[]; prepaidRemaining: number }>(
@@ -91,23 +96,66 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
     qc.invalidateQueries('remittances')
   }
 
-  const total = balanceCtx?.totalOutstanding ?? 0
+  const leaseGroups = balanceCtx?.leases ?? []
 
   // Rent is PAY-IN-FULL ONLY (Nic) — no partial payments anywhere in the system.
   // A partial payment can reset a landlord's eviction clock, so the tenant always
   // pays the entire outstanding balance; there is no editable amount.
-  const openPayBalance = () => {
-    if (!(total > 0)) return
+  // S581: each LEASE is paid as its own charge (separate ACH/card + receipt), so
+  // a tenant with two leases (overlap move, or two landlords) pays each on its
+  // own — a shortfall or an eviction hold on one never blocks the other.
+  const openPayLease = (leaseId: string, outstanding: number) => {
+    if (!(outstanding > 0)) return
     setPayTarget({
       target: {
-        amount:    Math.round(total * 100) / 100,
+        amount:    Math.round(outstanding * 100) / 100,
         endpoint:  '/payments/pay-balance',
         subheader: 'applied to your oldest balance first',
         kind:      'rent',
         sendAmountInBody: true,
+        leaseId,
       },
     })
   }
+
+  // S581: leases the tenant can actually pay right now (unblocked, non-zero).
+  const payable = leaseGroups.filter((l) => !l.paymentBlocked && l.outstanding > 0)
+  const payableTotal = Math.round(payable.reduce((s, l) => s + l.outstanding, 0) * 100) / 100
+
+  // "Pay all" — ONLY when there are 2+ payable leases (any mix: two units, a
+  // unit + a parking spot, two parking spots…). One method, a separate charge
+  // per lease. A single lease never shows it (that lease's own Pay button is it).
+  const openPayAll = () => {
+    if (payable.length < 2) return
+    setPayTarget({
+      target: {
+        amount:    payableTotal,
+        endpoint:  '/payments/pay-balance',
+        subheader: `across your ${payable.length} leases — each paid separately, oldest charges first`,
+        kind:      'rent',
+        batch:     payable.map((l) => ({ leaseId: l.leaseId, amount: Math.round(l.outstanding * 100) / 100 })),
+      },
+    })
+  }
+
+  // S582: first-rent readiness. If the tenant OWES rent but their only payment
+  // method is a bank still verifying (microdeposits ~1–3 biz days), reassure them
+  // so the "log in and pay" moment never feels broken — card is instant if they
+  // want to pay today, and we surface when rent is actually due so they know they
+  // have time.
+  const hasPendingBank = methods.some((m: any) => m.type === 'ach' && m.verified === false)
+  const hasInstantMethod = methods.some((m: any) => m.type === 'card' || (m.type === 'ach' && m.verified !== false))
+  const showVerifyingNotice = payable.length > 0 && hasPendingBank && !hasInstantMethod
+  const fmtDue = (ymd?: string): string | null => {
+    const m = ymd && /^(\d{4})-(\d{2})-(\d{2})/.exec(ymd)
+    if (!m) return null
+    const MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December']
+    return `${MONTHS[+m[2] - 1]} ${+m[3]}`
+  }
+  // S583: wire format is camelCase (API global camelize middleware) — reading
+  // r.due_date left earliestDue null, silently dropping the "rent is due X, you
+  // have time" reassurance line in the S582 verifying-bank notice below.
+  const earliestDue = fmtDue([...(balanceCtx?.rows ?? [])].map(r => r.dueDate).filter(Boolean).sort()[0])
 
   return (
     <div>
@@ -128,41 +176,80 @@ export function PaymentsPage({ Banner }: { Banner?: React.ComponentType }) {
 
       {Banner ? <Banner /> : null}
 
+      {showVerifyingNotice && (
+        <div className="card" style={{ borderLeft: '3px solid var(--gold)', padding: '12px 16px', marginBottom: 12 }}>
+          <div style={{ fontWeight: 700, color: 'var(--t0)', marginBottom: 2 }}>Your bank is still verifying</div>
+          <div style={{ fontSize: '.82rem', color: 'var(--t2)', lineHeight: 1.5 }}>
+            This usually takes <strong>1–3 business days</strong> — we’ll email you the moment it’s ready, then you can pay by bank.
+            {earliestDue ? <> Your rent is due <strong>{earliestDue}</strong>, so you have time.</> : null}
+            {' '}Want to pay today? <button className="btn-link" style={{ padding: 0, font: 'inherit', color: 'var(--gold)', cursor: 'pointer', background: 'none', border: 'none' }} onClick={() => setAddMethodOpen('card')}>Add a card</button> — card payments are instant.
+          </div>
+        </div>
+      )}
+
       <SavedMethodsCard methods={methods} loading={methodsLoading} />
 
       {/* S570 (Nic): removed the cash/check/MO fee banner — a tenant can't
           initiate a cash payment through the portal (they hand cash to the
           landlord, who records it), so the tenant-facing banner was nonsensical. */}
 
-      {/* S537: THE payment surface — one button, FIFO application. */}
-      {balanceCtx && total > 0 && !balanceCtx.paymentBlocked && (
-        <div className="card" style={{ padding: 16, marginTop: 16 }}>
+      {/* S581: "Pay all" — only with 2+ payable leases. One method, a separate
+          charge per lease. */}
+      {payable.length >= 2 && (
+        <div className="card" style={{ padding: 16, marginTop: 16, borderColor: 'var(--gold)' }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
             <div>
               <div style={{ fontSize: '.72rem', fontWeight: 700, color: 'var(--t3)', textTransform: 'uppercase', letterSpacing: '.08em', marginBottom: 4 }}>
-                Outstanding balance
+                All leases · {payable.length}
               </div>
               <div style={{ fontFamily: 'var(--font-mono)', fontWeight: 700, fontSize: '1.4rem', color: 'var(--t0)' }}>
-                {formatCurrency(total)}
+                {formatCurrency(payableTotal)}
               </div>
               <div style={{ fontSize: '.74rem', color: 'var(--t3)', marginTop: 4 }}>
-                Rent is paid in full — this covers your entire outstanding balance,
-                oldest charges first.
+                Pays every lease at once — each is charged separately, so one clearing
+                doesn&apos;t depend on the others.
               </div>
             </div>
             <div style={{ display: 'flex', alignItems: 'flex-end', gap: 8 }}>
-              <button className="btn btn-p" onClick={openPayBalance} disabled={!(total > 0)}>
-                Pay {formatCurrency(total)}
+              <button className="btn btn-p" onClick={openPayAll}>
+                Pay all {formatCurrency(payableTotal)}
               </button>
             </div>
           </div>
         </div>
       )}
-      {balanceCtx?.paymentBlocked && (
-        <div className="card" style={{ padding: 14, marginTop: 16, fontSize: '.8rem', color: 'var(--t1)' }}>
-          Payments to your landlord are currently paused for this unit. Contact your landlord.
-        </div>
-      )}
+
+      {/* S537 → S581: the payment surface — one Pay card PER LEASE (each lease
+          is charged separately, in full). A single-lease tenant sees one card. */}
+      {leaseGroups.map((lg) => (
+        lg.paymentBlocked ? (
+          <div key={lg.leaseId} className="card" style={{ padding: 14, marginTop: 16, fontSize: '.8rem', color: 'var(--t1)' }}>
+            Payments for {lg.propertyName} · Unit {lg.unitNumber} are currently paused. Contact your landlord.
+          </div>
+        ) : lg.outstanding > 0 ? (
+          <div key={lg.leaseId} className="card" style={{ padding: 16, marginTop: 16 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
+              <div>
+                <div style={{ fontSize: '.72rem', fontWeight: 700, color: 'var(--t3)', textTransform: 'uppercase', letterSpacing: '.08em', marginBottom: 4 }}>
+                  Outstanding balance{leaseGroups.length > 1 ? ` — ${lg.propertyName} · Unit ${lg.unitNumber}` : ''}
+                </div>
+                <div style={{ fontFamily: 'var(--font-mono)', fontWeight: 700, fontSize: '1.4rem', color: 'var(--t0)' }}>
+                  {formatCurrency(lg.outstanding)}
+                </div>
+                <div style={{ fontSize: '.74rem', color: 'var(--t3)', marginTop: 4 }}>
+                  Rent is paid in full — this covers your entire balance on this lease,
+                  oldest charges first.
+                </div>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'flex-end', gap: 8 }}>
+                <button className="btn btn-p" onClick={() => openPayLease(lg.leaseId, lg.outstanding)}>
+                  Pay {formatCurrency(lg.outstanding)}
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : null
+      ))}
 
       <SecurityDepositCard />
 

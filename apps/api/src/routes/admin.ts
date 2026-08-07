@@ -80,6 +80,48 @@ adminRouter.get('/overview', requireSuperAdmin, async (_req, res, next) => {
   } catch (e) { next(e) }
 })
 
+// GET /api/admin/onboarding-metrics — S579. How fast properties onboard onto GAM
+// (initial property creation → onboarding-complete), split by e-sign vs
+// imported-PDF leases, attributed to the closer/PM. The standard is DAYS, not
+// weeks (onboarding overlap = the landlord paying for two softwares) — slow
+// onboards surface here as an ops exception. See memory
+// gam-screening-grandfather-onboarding-window.
+adminRouter.get('/onboarding-metrics', requireAdmin, async (_req, res, next) => {
+  try {
+    const rows = await query<any>(`
+      SELECT
+        p.id AS property_id, p.name AS property_name,
+        p.onboarding_started_at, p.onboarding_completed_at,
+        CASE WHEN p.onboarding_completed_at IS NOT NULL
+             THEN ROUND(EXTRACT(EPOCH FROM (p.onboarding_completed_at - p.onboarding_started_at)) / 86400.0, 1)
+             ELSE NULL END AS duration_days,
+        (lu.first_name || ' ' || lu.last_name) AS landlord_name,
+        CASE WHEN pmu.id IS NOT NULL THEN (pmu.first_name || ' ' || pmu.last_name) ELSE NULL END AS closer_name,
+        (SELECT COUNT(*)::int FROM units u WHERE u.property_id = p.id) AS unit_count,
+        (SELECT COUNT(*)::int FROM lease_documents ld JOIN units u2 ON u2.id = ld.unit_id
+           WHERE u2.property_id = p.id AND ld.document_type = 'original_lease') AS esign_lease_count,
+        (SELECT COUNT(*)::int FROM pending_tenant_intents pti LEFT JOIN units u3 ON u3.id = pti.unit_id
+           WHERE pti.imported_pdf_url IS NOT NULL AND (pti.property_id = p.id OR u3.property_id = p.id)) AS imported_pdf_count
+      FROM properties p
+      JOIN landlords l ON l.id = p.landlord_id
+      JOIN users lu ON lu.id = l.user_id
+      LEFT JOIN users pmu ON pmu.id = l.portfolio_manager_id
+      WHERE p.onboarding_started_at IS NOT NULL
+      ORDER BY p.onboarding_started_at DESC`)
+    const completed = rows.filter((r: any) => r.duration_days != null)
+    const avgDurationDays = completed.length
+      ? Math.round((completed.reduce((s: number, r: any) => s + Number(r.duration_days), 0) / completed.length) * 10) / 10
+      : null
+    res.json({
+      success: true,
+      data: {
+        properties: rows,
+        summary: { total: rows.length, completed: completed.length, ongoing: rows.length - completed.length, avgDurationDays },
+      },
+    })
+  } catch (e) { next(e) }
+})
+
 // ── SCALING READINESS (super-admin) ───────────────────────────
 // Live trackers for the "stay on the Mac vs. move Postgres/API to Render"
 // decision. Each metric reports its value + the watch/move thresholds + a
@@ -142,7 +184,12 @@ adminRouter.get('/infra-readiness', requireSuperAdmin, async (_req, res, next) =
   } catch (e) { next(e) }
 })
 
-adminRouter.get('/nacha/monitoring', async (_req, res, next) => {
+// S592: NACHA/ACH-compliance monitoring is platform-staff-only (super_admin) —
+// requireSuperAdmin's own contract names it as such. Pre-fix this route carried
+// only the router-level admin gate, so a regular admin (portfolio manager) could
+// read the platform-wide ACH monitoring log (return codes, zero-tolerance/
+// velocity flags, tenant names). Match the documented tier.
+adminRouter.get('/nacha/monitoring', requireSuperAdmin, async (_req, res, next) => {
   try {
     const logs = await query<any>(`
       SELECT aml.*, tu.first_name, tu.last_name
@@ -224,7 +271,9 @@ adminRouter.post('/nexus/register', requireSuperAdmin, async (req, res, next) =>
 })
 
 // ── ONBOARDING OVERVIEW (regular admin) ──────────────────────
-adminRouter.get('/onboarding/overview', async (req: any, res, next) => {
+// S592: exported for the scoped /api/portfolio router — caller-scoped by userId
+// (super_admin → platform-wide), identical for a portfolio_manager.
+export const onboardingOverviewHandler = async (req: any, res: any, next: any) => {
   try {
     // Portfolio scoping (S567): every count is scoped to the regular admin's
     // portfolio (landlords they own + tenants/units under those landlords);
@@ -268,10 +317,14 @@ adminRouter.get('/onboarding/overview', async (req: any, res, next) => {
     `, [scopeId])
     res.json({ success: true, data: stats })
   } catch (e) { next(e) }
-})
+}
+adminRouter.get('/onboarding/overview', onboardingOverviewHandler)
 
 // ── LANDLORD ONBOARDING DETAIL ────────────────────────────────
-adminRouter.get('/onboarding/landlord/:id', async (req, res, next) => {
+// S592: exported for the scoped /api/portfolio router (portfolio-scope guard
+// is inside the handler — a regular admin / PM can only open a landlord they
+// close or service).
+export const onboardingLandlordDetailHandler = async (req: any, res: any, next: any) => {
   try {
     const landlord = await queryOne<any>(
       `SELECT l.*, u.first_name, u.last_name, u.email, u.phone,
@@ -322,7 +375,8 @@ adminRouter.get('/onboarding/landlord/:id', async (req, res, next) => {
 
     res.json({ success: true, data: { landlord, counts, checklist } })
   } catch (e) { next(e) }
-})
+}
+adminRouter.get('/onboarding/landlord/:id', onboardingLandlordDetailHandler)
 
 // ── PORTFOLIO-MANAGER ATTRIBUTION (S567) ──────────────────────
 // Two roles per landlord, each 25¢/occupied unit/mo:
@@ -341,7 +395,7 @@ adminRouter.get('/portfolio-managers', requireSuperAdmin, async (_req, res, next
   try {
     const pms = await query<any>(
       `SELECT id, first_name, last_name, email, role
-         FROM users WHERE role IN ('admin','super_admin')
+         FROM users WHERE role IN ('admin','super_admin','portfolio_manager')
         ORDER BY last_name, first_name`)
     res.json({ success: true, data: pms })
   } catch (e) { next(e) }
@@ -359,7 +413,7 @@ adminRouter.post('/landlords/:id/assign', requireSuperAdmin, async (req: any, re
     const { role, managerId } = schema.parse(req.body)
     if (managerId) {
       const pm = await queryOne<any>(
-        `SELECT id FROM users WHERE id=$1 AND role IN ('admin','super_admin')`, [managerId])
+        `SELECT id FROM users WHERE id=$1 AND role IN ('admin','super_admin','portfolio_manager')`, [managerId])
       if (!pm) throw new AppError(400, 'Not a valid portfolio manager')
     }
     const ll = await queryOne<any>(`SELECT id FROM landlords WHERE id=$1`, [req.params.id])
@@ -379,9 +433,41 @@ adminRouter.post('/landlords/:id/assign', requireSuperAdmin, async (req: any, re
   } catch (e) { next(e) }
 })
 
+// S592: manual re-attach backstop for the PERSON-level referral upline
+// (users.referred_by_user_id). The link is normally set automatically (signup
+// ref code / co-owner capture) and survives 1031s / new entities, but super_admin
+// can correct it here — e.g. re-slot someone into a chain, or fix a bad capture.
+// Single-tier is preserved: one upline, no self-reference. Pass null to detach.
+adminRouter.post('/users/:userId/referral-upline', requireSuperAdmin, async (req: any, res, next) => {
+  try {
+    const { uplineUserId } = z.object({ uplineUserId: z.string().uuid().nullable() }).parse(req.body)
+    if (uplineUserId === req.params.userId) throw new AppError(400, 'A person cannot be their own upline')
+    const target = await queryOne<{ id: string }>(`SELECT id FROM users WHERE id=$1`, [req.params.userId])
+    if (!target) throw new AppError(404, 'User not found')
+    if (uplineUserId) {
+      const upline = await queryOne<{ id: string }>(
+        `SELECT id FROM users WHERE id=$1 AND role IN ('landlord','admin','super_admin','portfolio_manager')`,
+        [uplineUserId])
+      if (!upline) throw new AppError(400, 'Upline must be a landlord or a GAM rep')
+    }
+    await query(`UPDATE users SET referred_by_user_id=$1 WHERE id=$2`, [uplineUserId, req.params.userId])
+    await logAdminAction({
+      adminUserId: req.user.userId,
+      actionType: 'referral_upline_reattach',
+      targetType: 'user', targetId: req.params.userId,
+      metadata: { upline_user_id: uplineUserId },
+      ipAddress: req.ip ?? null,
+    })
+    res.json({ success: true })
+  } catch (e) { next(e) }
+})
+
 // The logged-in rep's personal referral code + shareable signup link. Lazily
-// generates the code on first request. Any admin/super_admin can have one.
-adminRouter.get('/my-referral', async (req: any, res, next) => {
+// generates the code on first request. Any admin/super_admin/portfolio_manager.
+// S592: exported so the scoped /api/portfolio router shares this EXACT handler
+// (no duplication) — the logic is caller-scoped by req.user.userId, identical
+// for a portfolio_manager.
+export const myReferralHandler = async (req: any, res: any, next: any) => {
   try {
     let row = await queryOne<any>(`SELECT referral_code FROM users WHERE id=$1`, [req.user.userId])
     if (!row?.referral_code) {
@@ -402,11 +488,15 @@ adminRouter.get('/my-referral', async (req: any, res, next) => {
       referralLink: row?.referral_code ? `${base}?ref=${row.referral_code}` : null,
     }})
   } catch (e) { next(e) }
-})
+}
+adminRouter.get('/my-referral', myReferralHandler)
 
-// Commission earnings + pot summary. Regular admin → their own earnings;
-// super_admin → the pot balance + a per-manager breakdown too.
-adminRouter.get('/commissions/summary', async (req: any, res, next) => {
+// Commission earnings + pot summary. Regular admin / portfolio_manager → their
+// OWN earnings only (myEarnings + myByLandlord); super_admin additionally sees
+// the pot balance + a per-manager breakdown. A portfolio_manager is not super,
+// so they never see the pot or other managers — safe to share. S592: exported
+// for the scoped /api/portfolio router.
+export const commissionsSummaryHandler = async (req: any, res: any, next: any) => {
   try {
     const isSuper = req.user?.role === 'super_admin'
     const uid = req.user.userId
@@ -448,7 +538,8 @@ adminRouter.get('/commissions/summary', async (req: any, res, next) => {
     }
     res.json({ success: true, data })
   } catch (e) { next(e) }
-})
+}
+adminRouter.get('/commissions/summary', commissionsSummaryHandler)
 
 // On-demand commission accrual for the current month (super_admin). The cron
 // runs this on the 1st; this lets an operator preview/backfill it.
@@ -467,7 +558,8 @@ adminRouter.post('/commissions/accrue', requireSuperAdmin, async (req: any, res,
 })
 
 // ── TENANT ONBOARDING DETAIL ──────────────────────────────────
-adminRouter.get('/onboarding/tenant/:id', async (req, res, next) => {
+// S592: exported for the scoped /api/portfolio router (portfolio-scope guard inside).
+export const onboardingTenantDetailHandler = async (req: any, res: any, next: any) => {
   try {
     const tenant = await queryOne<any>(
       `SELECT t.*, u.first_name, u.last_name, u.email, u.phone,
@@ -519,15 +611,34 @@ adminRouter.get('/onboarding/tenant/:id', async (req, res, next) => {
 
     res.json({ success: true, data: { tenant, checklist } })
   } catch (e) { next(e) }
-})
+}
+adminRouter.get('/onboarding/tenant/:id', onboardingTenantDetailHandler)
 
 // ── FLEXSUITE ENROLLMENT ACCEPTANCES (S315) ──────────────────
 // List the click-accept audit rows for a tenant. Used by the admin
 // Tenants detail panel to render the per-enrollment evidence + open
 // the full populated terms text on click. Records are immutable
 // (insert-only at enrollment via services/flexsuiteAcceptance.ts).
-adminRouter.get('/tenants/:tenantId/flexsuite-acceptances', async (req, res, next) => {
+adminRouter.get('/tenants/:tenantId/flexsuite-acceptances', async (req: any, res, next) => {
   try {
+    // Portfolio scoping (S592 — parity with /onboarding/tenant/:id): a regular
+    // admin can only read acceptances for a tenant under a landlord they close
+    // or service. FlexSuite enrollment is SSDI/SSI-gated, so a cross-portfolio
+    // read would expose protected-class-adjacent status. super_admin sees all.
+    if (req.user?.role !== 'super_admin') {
+      const uid = req.user?.userId
+      const scoped = await queryOne<{ ok: boolean }>(
+        `SELECT EXISTS (
+           SELECT 1 FROM v_lease_active_tenants vlat
+           JOIN leases le ON le.id = vlat.lease_id AND le.status='active'
+           JOIN units un ON un.id = le.unit_id
+           JOIN landlords ld ON ld.id = un.landlord_id
+           WHERE vlat.tenant_id = $1
+             AND (ld.portfolio_manager_id = $2 OR ld.service_manager_id = $2)
+         ) AS ok`,
+        [req.params.tenantId, uid])
+      if (!scoped?.ok) throw new AppError(403, 'Outside your portfolio')
+    }
     const rows = await query<{
       id:                  string
       product_type:        'flexpay' | 'flexdeposit'
@@ -555,10 +666,28 @@ adminRouter.get('/tenants/:tenantId/flexsuite-acceptances', async (req, res, nex
 })
 
 // ── RESEND ACTIONS ────────────────────────────────────────────
-adminRouter.post('/onboarding/resend', async (req, res, next) => {
+// S592: exported for the scoped /api/portfolio router, with a portfolio-scope
+// guard — every wired resend type targets a TENANT (by targetId), so a
+// non-super caller (regular admin / portfolio_manager) may only resend to a
+// tenant in their own book. super_admin resends to anyone.
+export const onboardingResendHandler = async (req: any, res: any, next: any) => {
   try {
     const { type, targetId } = req.body
     if (!targetId) throw new AppError(400, 'targetId is required')
+
+    if (req.user?.role !== 'super_admin') {
+      const uid = req.user?.userId
+      const inBook = await queryOne<{ ok: boolean }>(
+        `SELECT EXISTS (
+           SELECT 1 FROM v_lease_active_tenants vlat
+           JOIN leases le ON le.id = vlat.lease_id AND le.status='active'
+           JOIN units un ON un.id = le.unit_id
+           JOIN landlords ld ON ld.id = un.landlord_id
+           WHERE vlat.tenant_id = $1
+             AND (ld.portfolio_manager_id = $2 OR ld.service_manager_id = $2)
+         ) AS ok`, [targetId, uid])
+      if (!inBook?.ok) throw new AppError(403, 'Outside your portfolio')
+    }
 
     // S553: this endpoint was a STUB — it logged an audit row and returned
     // "queued" while sending NOTHING, so an admin recovering a failed
@@ -583,6 +712,17 @@ adminRouter.post('/onboarding/resend', async (req, res, next) => {
           ORDER BY lt.added_at DESC NULLS LAST
           LIMIT 1`, [targetId])
       if (!t) throw new AppError(404, 'Tenant not found')
+      // Portfolio scoping (S592 — parity with the other tenant routes): a
+      // regular admin may only resend for a tenant under a landlord they close
+      // or service. Prevents a portfolio manager from resetting another
+      // portfolio's pending invite token.
+      if ((req as any).user?.role !== 'super_admin') {
+        const uid = (req as any).user?.userId
+        const scoped = await queryOne<{ ok: boolean }>(
+          `SELECT (ld.portfolio_manager_id = $2 OR ld.service_manager_id = $2) AS ok
+             FROM landlords ld WHERE ld.id = $1`, [t.landlord_id, uid])
+        if (!scoped?.ok) throw new AppError(403, 'Outside your portfolio')
+      }
       if (t.email_verified) throw new AppError(409, 'This tenant has already activated their account — no invite to resend.')
 
       // Fresh token resets the 7-day expiry (mirrors the onboard route).
@@ -647,10 +787,12 @@ adminRouter.post('/onboarding/resend', async (req, res, next) => {
     // admin "setup invite" concept). Honest failure rather than a fake success.
     throw new AppError(501, `Resend for "${type}" isn't available. Tenant invites, bank verification, and ACH enrollment can be resent; landlords self-register (no setup invite to resend).`)
   } catch (e) { next(e) }
-})
+}
+adminRouter.post('/onboarding/resend', onboardingResendHandler)
 
 // ── TENANTS LIST (with flex status) ──────────────────────────
-adminRouter.get('/tenants', async (req: any, res, next) => {
+// S592: exported for the scoped /api/portfolio router (caller-scoped by userId).
+export const tenantsListHandler = async (req: any, res: any, next: any) => {
   try {
     // Portfolio scoping (S567): a regular admin only sees tenants whose active
     // lease sits under a landlord in their portfolio; super_admin sees all.
@@ -683,7 +825,8 @@ adminRouter.get('/tenants', async (req: any, res, next) => {
     `, [scopeId])
     res.json({ success: true, data: tenants })
   } catch (e) { next(e) }
-})
+}
+adminRouter.get('/tenants', tenantsListHandler)
 
 // ── PROJECTED PLATFORM INCOME ─────────────────────────────────
 adminRouter.get('/income/projection', requireSuperAdmin, async (_req, res, next) => {
@@ -1466,6 +1609,16 @@ adminRouter.get('/flexpay/inquiries', requireSuperAdmin, async (req: any, res, n
               fi.proof_original_name, fi.proof_uploaded_at,
               fi.auto_verification,
               t.flexpay_prequal->>'status' AS prequal_status,
+              -- S578: prior FlexPay default → "returner". A defaulted advance
+              -- means the tenant already consumed float and broke the pull;
+              -- the 90-day lockout is only the FLOOR — on re-entry they go to
+              -- the BACK of the queue, behind every first-time inquiry (in high
+              -- demand that can be a year+, which is the intended deterrent).
+              -- Permanent for now (any lifetime default marks them a returner).
+              (EXISTS (SELECT 1 FROM flexpay_advances fa
+                        WHERE fa.tenant_id = fi.tenant_id
+                          AND fa.status = 'defaulted')
+               AND NOT COALESCE(t.flexpay_returner_cleared, false)) AS is_flexpay_returner,
               -- S545c: lease-holder names for the document-name check.
               (SELECT string_agg(u2.first_name || ' ' || u2.last_name, ', ' ORDER BY u2.last_name)
                  FROM lease_tenants lt2
@@ -1477,6 +1630,13 @@ adminRouter.get('/flexpay/inquiries', requireSuperAdmin, async (req: any, res, n
               -- release restores their spot automatically).
               CASE WHEN fi.status = 'pending' AND fi.held_at IS NULL THEN
                 (ROW_NUMBER() OVER (PARTITION BY (fi.status = 'pending' AND fi.held_at IS NULL) ORDER BY
+                  -- S578: first-timers ahead of returners (false<true → ASC);
+                  -- a returner who completed 12 clean pulls (cleared) drops back
+                  -- to first-timer standing and is no longer demoted.
+                  (EXISTS (SELECT 1 FROM flexpay_advances fa
+                            WHERE fa.tenant_id = fi.tenant_id
+                              AND fa.status = 'defaulted')
+                   AND NOT COALESCE(t.flexpay_returner_cleared, false)) ASC,
                   (fi.claimed_income_source IN ('ssi', 'ssdi')) DESC,
                   CASE WHEN fi.desired_pull_day IS NULL THEN NULL
                        ELSE GREATEST(0, fi.desired_pull_day - COALESCE(l.late_fee_grace_days, 5))
@@ -1500,6 +1660,8 @@ adminRouter.get('/flexpay/inquiries', requireSuperAdmin, async (req: any, res, n
     LEFT JOIN users ru ON ru.id = fi.reviewed_by_user_id
         WHERE ($1::text IS NULL OR fi.status = $1)
         ORDER BY (fi.status = 'pending') DESC,
+                 -- S578: returners demoted behind all first-timers (see column above).
+                 is_flexpay_returner ASC,
                  (fi.claimed_income_source IN ('ssi', 'ssdi')) DESC,
                  CASE WHEN fi.desired_pull_day IS NULL THEN NULL
                       ELSE GREATEST(0, fi.desired_pull_day - COALESCE(l.late_fee_grace_days, 5))

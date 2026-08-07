@@ -142,10 +142,27 @@ async function landlordConnect(landlordId: string): Promise<string | null> {
 /** True if a live booking (not cancelled, not an expired hold) overlaps the range. */
 async function hasConflict(client: PoolClient, unitId: string, checkIn: string, checkOut: string): Promise<boolean> {
   const c = await client.query(
-    `SELECT 1 FROM unit_bookings
-      WHERE unit_id=$1 AND status<>'cancelled'
-        AND NOT (status='tentative' AND hold_expires_at IS NOT NULL AND hold_expires_at < now())
-        AND check_in < $2::date AND check_out > $3::date LIMIT 1`,
+    // S593: the Master Schedule is the single occupancy source of truth — a unit
+    // can be offered on BOTH public channels (short-term booking + long-term
+    // listing), so availability must respect BOTH. A short-term booking is
+    // blocked by an overlapping booking OR an overlapping active/pending
+    // long-term lease (end_date NULL = open-ended m2m) — the same active+pending
+    // occupancy model the best-fit ranker uses. This closes the write-time gap
+    // for paths that bypass the ranker (e.g. claimWaitlistSpot → bookStay) and
+    // stops the two surfaces from contradicting into a double-occupancy.
+    `SELECT 1 WHERE
+       EXISTS (
+         SELECT 1 FROM unit_bookings
+          WHERE unit_id=$1 AND status<>'cancelled'
+            AND NOT (status='tentative' AND hold_expires_at IS NOT NULL AND hold_expires_at < now())
+            AND check_in < $2::date AND check_out > $3::date
+       )
+       OR EXISTS (
+         SELECT 1 FROM leases
+          WHERE unit_id=$1 AND status IN ('active','pending')
+            AND start_date < $2::date AND (end_date IS NULL OR end_date > $3::date)
+       )
+     LIMIT 1`,
     [unitId, checkOut, checkIn])
   return c.rows.length > 0
 }

@@ -103,15 +103,17 @@ export async function computeTenantGamOutstanding(
     })
   }
 
+  // S583 revolving: GAM-first routing satisfies the FlexCharge MINIMUM due (not
+  // the full balance — the customer is entitled to carry the rest).
   const fcStmts = await exec<{
-    id: string; total_due: string; due_date: string;
+    id: string; minimum_due: string; due_date: string;
   }>(
-    `SELECT s.id, s.total_due::text, s.due_date::text
+    `SELECT s.id, s.minimum_due::text, s.due_date::text
        FROM flex_charge_statements s
        JOIN flex_charge_accounts a ON a.id = s.account_id
       WHERE a.tenant_id = $1
         AND s.status IN ('open', 'failed')
-        AND s.total_due > 0
+        AND s.minimum_due > 0
         AND s.due_date <= CURRENT_DATE`,
     [tenantId],
   )
@@ -119,7 +121,7 @@ export async function computeTenantGamOutstanding(
     out.push({
       source:      'flexcharge_statement',
       ref_id:      r.id,
-      amount:      Number(r.total_due),
+      amount:      Number(r.minimum_due),
       unpaid_date: r.due_date,
     })
   }
@@ -350,8 +352,11 @@ async function satisfyFlexChargeStatement(
   statementId: string,
   payerPaymentId: string,
 ): Promise<{ satisfied: boolean; transfer: PostCommitTransfer | null }> {
+  // S583 revolving: GAM-first routing collects the MINIMUM due — credit it to the
+  // statement (amount_paid) and reduce the running account balance; the rest carries.
   const r = await client.query<{
-    balance:           string;
+    minimum_due:       string;
+    service_fee:       string;
     account_id:        string;
     landlord_id:       string;
     landlord_user_id:  string;
@@ -359,14 +364,15 @@ async function satisfyFlexChargeStatement(
   }>(
     `WITH upd AS (
        UPDATE flex_charge_statements
-          SET status     = 'paid',
-              settled_at = NOW(),
-              payment_id = COALESCE(payment_id, $2),
-              updated_at = NOW()
+          SET status      = 'paid',
+              settled_at  = NOW(),
+              payment_id  = COALESCE(payment_id, $2),
+              amount_paid = amount_paid + minimum_due,
+              updated_at  = NOW()
         WHERE id = $1 AND status IN ('open', 'failed', 'billed')
-        RETURNING id, balance::text, account_id
+        RETURNING id, minimum_due::text, service_fee::text, account_id
      )
-     SELECT u.balance, u.account_id,
+     SELECT u.minimum_due, u.service_fee, u.account_id,
             a.landlord_id,
             usr.id  AS landlord_user_id,
             usr.stripe_connect_account_id AS connect_account
@@ -379,22 +385,24 @@ async function satisfyFlexChargeStatement(
   if (r.rows.length === 0) return { satisfied: false, transfer: null }
   const row = r.rows[0]
 
+  const minimumDue = Number(row.minimum_due)
   await client.query(
-    `UPDATE flex_charge_transactions
-        SET status = 'paid', updated_at = NOW()
-      WHERE statement_id = $1 AND status IN ('pending', 'billed')`,
-    [statementId],
+    `UPDATE flex_charge_accounts
+        SET current_balance = GREATEST(0, current_balance - $2), updated_at = NOW()
+      WHERE id = $1`,
+    [row.account_id, minimumDue],
   )
 
-  const balance = Number(row.balance)
-  if (balance <= 0) return { satisfied: true, transfer: null }
+  if (minimumDue <= 0) return { satisfied: true, transfer: null }
+  // Merchant receives the collected minimum MINUS GAM's 1.5%/12 subscription.
+  const merchantPayout = round2(Math.max(0, minimumDue - Number(row.service_fee)))
 
   return {
     satisfied: true,
     transfer: {
       source:                       'flexcharge_statement',
       ref_id:                       statementId,
-      amount:                       balance,
+      amount:                       merchantPayout,
       landlord_user_id:             row.landlord_user_id,
       destination_connect_account:  row.connect_account,
     },

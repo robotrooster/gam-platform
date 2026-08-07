@@ -39,7 +39,7 @@ export function ExpensesPage() {
   const [receipt, setReceipt] = useState<File | null>(null)
   const set = (patch: Partial<typeof form>) => setForm(f => ({ ...f, ...patch }))
 
-  const propUnits = (units as any[]).filter(u => u.propertyId === form.propertyId || u.property_id === form.propertyId)
+  const propUnits = (units as any[]).filter(u => u.propertyId === form.propertyId)
 
   const create = useMutation(
     async () => {
@@ -105,7 +105,7 @@ export function ExpensesPage() {
             <label style={{ fontSize: '.75rem', color: 'var(--text-3)' }}>Unit
               <select className="form-input" value={form.unitId} onChange={e => set({ unitId: e.target.value })} disabled={!form.propertyId}>
                 <option value="">Select a unit…</option>
-                {propUnits.map(u => <option key={u.id} value={u.id}>Unit {u.unitNumber ?? u.unit_number}</option>)}
+                {propUnits.map(u => <option key={u.id} value={u.id}>Unit {u.unitNumber}</option>)}
               </select>
             </label>
           ) : (

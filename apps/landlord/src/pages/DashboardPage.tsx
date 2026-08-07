@@ -1,10 +1,9 @@
-import React, { useState } from 'react'
+import React, { useState, useRef } from 'react'
 import { useQuery } from 'react-query'
-import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
 import { humanize } from '@gam/shared'
 import { apiGet } from '../lib/api'
 import { useNavigate } from 'react-router-dom'
-import { AlertTriangle, CheckCircle, TrendingUp, ArrowDownToLine, Clock, FileText, CreditCard, Wrench, ChevronRight, HeartHandshake } from 'lucide-react'
+import { AlertTriangle, CheckCircle, Activity, ArrowDownToLine, Clock, FileText, CreditCard, Wrench, ChevronRight, HeartHandshake, UserPlus } from 'lucide-react'
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
 interface DashStats {
@@ -206,32 +205,9 @@ export function DashboardPage() {
       <PmCutThisMonthCard />
 
       <div className="grid-2" style={{gap:20}}>
-        {/* Revenue trend */}
-        <div className="card">
-          <div className="card-header">
-            <span className="card-title">Rent Collected — last 6 months</span>
-            <TrendingUp size={16} style={{color:'var(--text-3)'}} />
-          </div>
-          <ResponsiveContainer width="100%" height={180}>
-            <AreaChart data={trendData} margin={{top:0,right:0,left:-20,bottom:0}}>
-              <defs>
-                <linearGradient id="gold-grad" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%"  stopColor="#c9a227" stopOpacity={0.3} />
-                  <stop offset="95%" stopColor="#c9a227" stopOpacity={0} />
-                </linearGradient>
-              </defs>
-              <XAxis dataKey="month" tick={{fill:'var(--text-3)',fontSize:11}} axisLine={false} tickLine={false} />
-              <YAxis tick={{fill:'var(--text-3)',fontSize:11}} axisLine={false} tickLine={false}
-                tickFormatter={v => `$${(v/1000).toFixed(0)}k`} />
-              <Tooltip
-                contentStyle={{background:'var(--bg-3)',border:'1px solid var(--border-2)',borderRadius:8,color:'var(--text-0)'}}
-                formatter={(v: any) => [fmt(v), 'Rent Volume']}
-              />
-              <Area type="monotone" dataKey="revenue" stroke="#c9a227" strokeWidth={2}
-                fill="url(#gold-grad)" />
-            </AreaChart>
-          </ResponsiveContainer>
-        </div>
+        {/* Property health — an animated ECG whose 6 beats are the last 6
+            months of rent collected (taller beat = stronger month). */}
+        <PropertyHealthMonitor months={trendData} expected={stats?.monthlyRentVolume} collected={stats?.collectedMtd} />
 
         {/* Recent disbursements */}
         <div className="card">
@@ -311,7 +287,7 @@ export function DashboardPage() {
 
 function TodoCard() {
   const navigate = useNavigate()
-  const [expanded, setExpanded] = React.useState<{ leases: boolean; ach: boolean; maintenance: boolean; workTrade: boolean }>({ leases: false, ach: false, maintenance: false, workTrade: false })
+  const [expanded, setExpanded] = React.useState<{ onboarding: boolean; leases: boolean; ach: boolean; maintenance: boolean; workTrade: boolean }>({ onboarding: false, leases: false, ach: false, maintenance: false, workTrade: false })
 
   const { data: todos, isLoading } = useQuery<any>(
     'landlord-todos',
@@ -327,7 +303,7 @@ function TodoCard() {
     )
   }
 
-  const counts = todos?.counts || { leases: 0, ach: 0, maintenance: 0, workTrade: 0, total: 0 }
+  const counts = todos?.counts || { onboarding: 0, leases: 0, ach: 0, maintenance: 0, workTrade: 0, total: 0 }
 
   // All-clear state
   if (counts.total === 0) {
@@ -346,6 +322,7 @@ function TodoCard() {
   }
 
   const sections = [
+    { key: 'onboarding', label: 'Onboarding', icon: UserPlus, color: 'var(--green)', items: todos?.onboarding || [] },
     { key: 'leases', label: 'Lease Issues', icon: FileText, color: 'var(--gold)', items: todos?.leases || [] },
     { key: 'ach', label: 'ACH Issues', icon: CreditCard, color: 'var(--amber)', items: todos?.ach || [] },
     { key: 'maintenance', label: 'High-$ Maintenance', icon: Wrench, color: 'var(--blue)', items: todos?.maintenance || [] },
@@ -483,6 +460,144 @@ function PmCutThisMonthCard() {
           <div className="kpi-sub">owner share after PM + GAM fees</div>
         </div>
       </div>
+    </div>
+  )
+}
+// Property Health — an animated ECG/"heartbeat monitor". Each of the last 6
+// months of rent collected is one PQRST beat; the R-spike height scales with
+// that month's collection relative to the strongest month (0 → flatline). A
+// sweeping scan bar + glow give the live-monitor feel. Falls back to a static
+// trace when the viewer prefers reduced motion.
+function PropertyHealthMonitor({ months, expected, collected }: { months: { month: string; revenue: number }[]; expected?: number; collected?: number }) {
+  const W = 640, H = 190
+  const data = months.length ? months : Array.from({ length: 6 }, () => ({ month: '', revenue: 0 }))
+  const vals = data.map(m => Math.max(0, Number(m.revenue) || 0))
+  const max = Math.max(1, ...vals)
+  const baseY = H * 0.62
+  const spk = H * 0.40           // max R-spike height
+  const bw = W / data.length     // beat width
+
+  // Build the ECG polyline: per month, a flat baseline with a PQRST complex
+  // whose amplitude `a` is that month's collection ÷ the strongest month.
+  const pts: [number, number][] = [[0, baseY]]
+  data.forEach((_, i) => {
+    const x0 = i * bw
+    const a = vals[i] / max
+    const at = (f: number) => x0 + f * bw
+    const y = (up: number) => baseY - up * spk * a   // up>0 = above baseline
+    pts.push(
+      [at(0.30), baseY],
+      [at(0.36), y(0.08)], [at(0.42), baseY],        // P wave
+      [at(0.48), y(-0.10)],                          // Q
+      [at(0.53), y(1.0)],                            // R spike
+      [at(0.58), y(-0.22)],                          // S
+      [at(0.63), baseY],
+      [at(0.76), y(0.20)], [at(0.86), baseY],        // T wave
+      [at(1.0), baseY],
+    )
+  })
+  const dPath = 'M ' + pts.map(p => `${p[0].toFixed(1)} ${p[1].toFixed(1)}`).join(' L ')
+
+  // Health = how much of this month's EXPECTED lease rent has come in. A high
+  // outstanding balance (far from expected) reads red; as collections approach
+  // the expected monthly rent it goes green; at 100% it's gold. Lease rent only
+  // — short-term / walk-in reservation income isn't counted here.
+  const expectedN = Math.max(0, Number(expected) || 0)
+  const collectedN = Math.max(0, Number(collected) || 0)
+  const rate = expectedN > 0 ? collectedN / expectedN : null   // fraction of expected rent collected
+  const pct = rate == null ? null : Math.round(rate * 100)
+  // Clean red → green → gold (no amber — it'd read as the gold at a glance).
+  const status = rate == null
+    ? { label: 'Awaiting data',     color: 'var(--text-3)' }
+    : rate >= 1    ? { label: 'Fully collected', color: 'var(--gold)' }
+    : rate >= 0.85 ? { label: 'Healthy',         color: 'var(--green)' }
+    :                { label: 'Needs attention', color: 'var(--red)' }
+
+  // Hover: map the cursor to a month and surface that beat's details.
+  const peaks = data.map((_, i) => ({ x: (i + 0.53) * bw, y: baseY - spk * (vals[i] / max) }))
+  const [hoverIdx, setHoverIdx] = useState<number | null>(null)
+  const screenRef = useRef<HTMLDivElement>(null)
+  const onMove = (e: React.MouseEvent) => {
+    const el = screenRef.current
+    if (!el) return
+    const r = el.getBoundingClientRect()
+    const f = (e.clientX - r.left) / r.width
+    setHoverIdx(Math.max(0, Math.min(data.length - 1, Math.floor(f * data.length))))
+  }
+
+  return (
+    <div className="card">
+      <div className="card-header">
+        <span className="card-title">Property Health — last 6 months</span>
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: '.72rem', fontWeight: 700, color: status.color }}>
+          <Activity size={15} /> {status.label}
+        </span>
+      </div>
+      <div className="phm-screen" ref={screenRef} onMouseMove={onMove} onMouseLeave={() => setHoverIdx(null)}>
+        {hoverIdx == null ? (
+          <div className="phm-readout">
+            <span className="phm-readout-label">rent collected · this month</span>
+            <span className="phm-readout-value" style={{ color: status.color }}>{pct == null ? '—' : `${pct}%`}</span>
+          </div>
+        ) : (
+          <div className="phm-tip" style={{ left: `clamp(62px, ${((hoverIdx + 0.53) / data.length) * 100}%, calc(100% - 62px))` }}>
+            <div className="phm-tip-month">{data[hoverIdx].month || '—'}</div>
+            <div className="phm-tip-val" style={{ color: status.color }}>{fmt(vals[hoverIdx])}</div>
+            <div className="phm-tip-sub">collected · {Math.round((vals[hoverIdx] / max) * 100)}% of peak</div>
+          </div>
+        )}
+        <svg viewBox={`0 0 ${W} ${H}`} width="100%" height={190} preserveAspectRatio="none"
+             role="img" aria-label={`Rent collection health, last 6 months: ${status.label}`}>
+          <defs>
+            <linearGradient id="phm-sweep-grad" x1="0" y1="0" x2="1" y2="0">
+              <stop offset="0%"   stopColor={status.color} stopOpacity="0" />
+              <stop offset="72%"  stopColor={status.color} stopOpacity="0.08" />
+              <stop offset="100%" stopColor={status.color} stopOpacity="0.30" />
+            </linearGradient>
+          </defs>
+          <g className="phm-grid">
+            {Array.from({ length: data.length + 1 }, (_, i) => <line key={'v' + i} x1={i * bw} y1={0} x2={i * bw} y2={H} />)}
+            {Array.from({ length: 5 }, (_, i) => <line key={'h' + i} x1={0} y1={i * H / 4} x2={W} y2={i * H / 4} />)}
+          </g>
+          <line x1={0} y1={baseY} x2={W} y2={baseY} className="phm-base" />
+          <path d={dPath} className="phm-trace" style={{ stroke: status.color }} fill="none" />
+          <g className="phm-sweepwrap">
+            <rect x={0} y={0} width={100} height={H} fill="url(#phm-sweep-grad)" />
+          </g>
+          {hoverIdx != null && (
+            <g style={{ color: status.color }}>
+              <line className="phm-hoverline" x1={(hoverIdx + 0.53) * bw} y1={0} x2={(hoverIdx + 0.53) * bw} y2={H} />
+              <circle className="phm-hoverdot" cx={peaks[hoverIdx].x} cy={peaks[hoverIdx].y} r={4.5} />
+            </g>
+          )}
+        </svg>
+        <div className="phm-months">
+          {data.map((m, i) => <span key={i}>{m.month}</span>)}
+        </div>
+      </div>
+      <style>{`
+        .phm-screen { position: relative; background: radial-gradient(120% 90% at 50% 30%, rgba(20,26,22,.55), var(--bg-2)); border: 1px solid var(--border-0); border-radius: 10px; padding: 8px; overflow: hidden; cursor: crosshair; }
+        .phm-hoverline { stroke: currentColor; stroke-width: 1; opacity: .55; stroke-dasharray: 3 3; }
+        .phm-hoverdot { fill: currentColor; filter: drop-shadow(0 0 5px currentColor); }
+        .phm-tip { position: absolute; top: 8px; z-index: 2; transform: translateX(-50%); background: var(--bg-3); border: 1px solid var(--border-1, var(--border-0)); border-radius: 8px; padding: 5px 10px; text-align: center; white-space: nowrap; pointer-events: none; box-shadow: 0 6px 18px rgba(0,0,0,.4); }
+        .phm-tip-month { font-size: .58rem; text-transform: uppercase; letter-spacing: .07em; color: var(--text-3); }
+        .phm-tip-val { font-family: var(--font-mono); font-size: .98rem; font-weight: 700; }
+        .phm-tip-sub { font-size: .58rem; color: var(--text-3); margin-top: 1px; }
+        .phm-grid line { stroke: var(--border-0); stroke-width: 1; opacity: .3; }
+        .phm-base { stroke: var(--border-1, var(--border-0)); stroke-width: 1; opacity: .45; }
+        .phm-trace { stroke-width: 2.25; stroke-linejoin: round; stroke-linecap: round; filter: drop-shadow(0 0 4px currentColor); }
+        .phm-sweepwrap { opacity: 0; }
+        .phm-readout { position: absolute; top: 8px; right: 12px; z-index: 1; display: flex; flex-direction: column; align-items: flex-end; line-height: 1.1; pointer-events: none; }
+        .phm-readout-label { font-size: .58rem; text-transform: uppercase; letter-spacing: .08em; color: var(--text-3); }
+        .phm-readout-value { font-family: var(--font-mono); font-size: 1.05rem; font-weight: 700; }
+        .phm-months { display: flex; justify-content: space-around; margin-top: 4px; font-size: .66rem; color: var(--text-3); font-family: var(--font-mono); }
+        @media (prefers-reduced-motion: no-preference) {
+          .phm-sweepwrap { opacity: 1; animation: phm-sweep 3.4s linear infinite; }
+          .phm-trace { animation: phm-glow 2.2s ease-in-out infinite; }
+          @keyframes phm-sweep { from { transform: translateX(-100px); } to { transform: translateX(${W}px); } }
+          @keyframes phm-glow { 0%, 100% { opacity: .82; } 50% { opacity: 1; } }
+        }
+      `}</style>
     </div>
   )
 }

@@ -27,12 +27,21 @@ interface BusinessSummary {
   tipsEnabled?: boolean
 }
 
+// S578: business_owner has mandatory email-2FA (S574) — login can require an
+// emailed code before the full session, exactly like the landlord/tenant
+// portals. business_staff (passcode-scoped) still logs in with a token.
+export type LoginResult =
+  | { kind: 'success' }
+  | { kind: 'email_otp_required'; emailOtpSession: string }
+
 interface AuthCtx {
   user: AuthUser | null
   token: string | null
   loading: boolean
   business: BusinessSummary | null
-  login: (email: string, password: string) => Promise<void>
+  login: (email: string, password: string) => Promise<LoginResult>
+  loginWithEmailOtp: (emailOtpSession: string, code: string) => Promise<void>
+  resendEmailOtp: (emailOtpSession: string) => Promise<void>
   logout: () => void
   refresh: () => Promise<void>
   refreshBusiness: () => Promise<void>
@@ -64,9 +73,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setBusiness({
         id:              biz.id,
         name:            biz.name,
-        businessType:    biz.businessType ?? biz.business_type,
-        enabledFeatures: biz.enabledFeatures ?? biz.enabled_features ?? [],
-        tipsEnabled:     biz.tipsEnabled ?? biz.tips_enabled ?? true,
+        businessType:    biz.businessType,
+        enabledFeatures: biz.enabledFeatures ?? [],
+        tipsEnabled:     biz.tipsEnabled ?? true,
       })
     } catch {
       setBusiness(null)
@@ -100,22 +109,47 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => { token ? refresh() : setLoading(false) }, [token, refresh])
 
-  const login = async (email: string, password: string) => {
-    const res = await apiPost<{ token: string; user: AuthUser; business?: BusinessSummary }>(
-      '/auth/login', { email, password })
-    if (res.data!.user.role !== 'business_owner' && res.data!.user.role !== 'business_staff') {
+  const login = async (email: string, password: string): Promise<LoginResult> => {
+    const res = await apiPost<any>('/auth/login', { email, password })
+    const data = res.data!
+    // S578: mandatory email-2FA (business_owner) — a pending session, no token yet.
+    // Previously this path read data.user.role and CRASHED on the OTP response.
+    if (data.requiresEmailOtp) {
+      return { kind: 'email_otp_required', emailOtpSession: data.emailOtpSession as string }
+    }
+    // Token path (business_staff — register passcode, no second factor).
+    if (data.user.role !== 'business_owner' && data.user.role !== 'business_staff') {
+      throw new Error('This portal is for service-business operators. Please use the appropriate portal for your account.')
+    }
+    localStorage.setItem('gam_business_token', data.token)
+    setToken(data.token)
+    setUser(data.user)
+    await fetchBusiness(data.user.role)
+    return { kind: 'success' }
+  }
+
+  // S578: email-code second step — trades the pending session + emailed code for
+  // the full session, then confirms the account belongs in this portal.
+  const loginWithEmailOtp = async (emailOtpSession: string, code: string): Promise<void> => {
+    const res = await apiPost<{ token: string; user: AuthUser }>(
+      '/auth/email-otp/verify', { emailOtpSession, code })
+    const role = res.data!.user.role
+    if (role !== 'business_owner' && role !== 'business_staff') {
       throw new Error('This portal is for service-business operators. Please use the appropriate portal for your account.')
     }
     localStorage.setItem('gam_business_token', res.data!.token)
     setToken(res.data!.token)
-    setUser(res.data!.user)
-    await fetchBusiness(res.data!.user.role)
+    await refresh()
+  }
+
+  const resendEmailOtp = async (emailOtpSession: string): Promise<void> => {
+    await apiPost('/auth/email-otp/resend', { emailOtpSession })
   }
 
   return (
     <Ctx.Provider value={{
       user, token, loading, business,
-      login, logout, refresh, refreshBusiness,
+      login, loginWithEmailOtp, resendEmailOtp, logout, refresh, refreshBusiness,
     }}>
       {children}
     </Ctx.Provider>

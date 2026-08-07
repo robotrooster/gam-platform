@@ -14,8 +14,9 @@ import { logger } from '../lib/logger'
 // ============================================================
 // FlexPay — tenant-paid payment-scheduling product.
 //
-// The tenant picks a rent pull day (1-28) and pays a $5 + day fee
-// each cycle ($6 to $33). In exchange, GAM fronts the rent to the
+// The tenant picks a rent pull day (1-28) and pays a FLAT $25/month
+// subscription (S562 — the pull day is scheduling only, it does NOT
+// affect the price). In exchange, GAM fronts the rent to the
 // landlord on the lease's grace-period-end day so the landlord
 // receives funds without waiting on the tenant's chosen pull day.
 //
@@ -65,6 +66,10 @@ import { logger } from '../lib/logger'
 export const FLEXPAY_MONTHLY_FEE = 25        // dollars, flat
 export const FLEXPAY_MAX_PULL_DAY = 28       // SSDI 4th-Wednesday cap
 export const FLEXPAY_NSF_COOLDOWN_DAYS = 90  // matches Consumer ToS § (re-enroll lockout after a FlexPay failure)
+// S578: a returner (one prior default) sheds the queue demotion only after this
+// many CONSECUTIVE on-time, first-attempt (zero-retry) pulls in the current
+// tenancy. Any retry — even one that then clears — resets the count to 0.
+export const FLEXPAY_REHAB_CLEAN_PULLS = 12
 // Stripe ACH-return fee passed through to the tenant at cost on a retry pull
 // (Consumer ToS § 4.2 / 9.2). Constant approximates Stripe's published ACH
 // failure fee; reconcile to the live fee schedule once Stripe keys are live.
@@ -109,9 +114,11 @@ export interface FlexPayEligibility {
     | 'ach_unverified'
     | 'tenant_suspended_nsf'
     | 'no_active_lease'
+    | 'multiple_leases'
     | 'tenant_not_found'
     | 'flex_deposit_active'
     | 'not_ssi_ssdi'
+    | 'permanently_banned'
   >
   suspended_until: string | null
 }
@@ -137,8 +144,9 @@ export async function getFlexPayEligibility(tenantId: string): Promise<FlexPayEl
     ach_verified: boolean
     ssi_ssdi: boolean
     flexpay_disqualified_until: string | null
+    flexpay_permanently_banned: boolean
   }>(
-    `SELECT ach_verified, ssi_ssdi, flexpay_disqualified_until
+    `SELECT ach_verified, ssi_ssdi, flexpay_disqualified_until, flexpay_permanently_banned
        FROM tenants
       WHERE id = $1`,
     [tenantId],
@@ -148,6 +156,8 @@ export async function getFlexPayEligibility(tenantId: string): Promise<FlexPayEl
   const blockers: FlexPayEligibility['blockers'] = []
   let suspendedUntil: string | null = null
 
+  // S578: 2nd lifetime default is terminal — no cooldown clears it.
+  if (row.flexpay_permanently_banned) blockers.push('permanently_banned')
   if (!row.ach_verified) blockers.push('ach_unverified')
   // S512: FlexPay is an SSDI/SSI service tier (income verified at onboarding,
   // not a credit decision). Same field/gate FlexDeposit uses (tenants.ssi_ssdi).
@@ -174,17 +184,27 @@ export async function getFlexPayEligibility(tenantId: string): Promise<FlexPayEl
   )
   if (activeDepositPlan) blockers.push('flex_deposit_active')
 
-  const lease = await queryOne(
-    `SELECT 1
+  // S581 (Nic): FlexPay is a SINGLE-LEASE product — a tenant holding more than
+  // one active lease (e.g. an apartment + a parking spot, or two units during a
+  // move) can NEVER enroll, no exceptions. FlexPay is tenant-level (one pull day,
+  // one fee, one advance per cycle keyed on (cycle, tenant)); with two leases the
+  // advance engine can only front ONE of them and would silently drop the other.
+  // Gate it here so the enrollment path (enrollFlexPay → getFlexPayEligibility)
+  // and the eligibility/inquiry UI both refuse, and keep the advance cron in
+  // lock-step (it also excludes multi-lease tenants). If they drop back to one
+  // active lease, FlexPay is available again.
+  const leaseCount = await queryOne<{ n: string }>(
+    `SELECT COUNT(*)::text AS n
        FROM lease_tenants lt
        JOIN leases l ON l.id = lt.lease_id
       WHERE lt.tenant_id = $1
         AND lt.status = 'active'
-        AND l.status IN ('active', 'pending')
-      LIMIT 1`,
+        AND l.status IN ('active', 'pending')`,
     [tenantId],
   )
-  if (!lease) blockers.push('no_active_lease')
+  const activeLeases = Number(leaseCount?.n ?? 0)
+  if (activeLeases === 0) blockers.push('no_active_lease')
+  else if (activeLeases > 1) blockers.push('multiple_leases')
 
   return { eligible: blockers.length === 0, blockers, suspended_until: suspendedUntil }
 }
@@ -243,6 +263,10 @@ export async function enrollFlexPay(args: {
 
   const elig = await getFlexPayEligibility(args.tenantId)
   if (!elig.eligible) {
+    // S581: single-lease-only gets a plain-language reason (never a raw enum).
+    if (elig.blockers.includes('multiple_leases')) {
+      return { ok: false, reason: 'FlexPay covers a single lease. Because you currently hold more than one lease, FlexPay isn’t available on your account.' }
+    }
     return { ok: false, reason: `Not eligible: ${elig.blockers.join(', ')}` }
   }
 
@@ -281,6 +305,10 @@ export async function enrollFlexPay(args: {
               flexpay_pull_day     = $1,
               flexpay_monthly_fee  = $2,
               flexpay_enrolled_at  = NOW(),
+              -- S578: a new tenancy starts the rehab clock over. A returner
+              -- (prior default) must earn all 12 clean pulls fresh; their
+              -- flexpay_returner_cleared flag persists from any prior clearance.
+              flexpay_clean_streak = 0,
               updated_at           = NOW()
         WHERE id = $3`,
       [args.pullDay, fee, args.tenantId],
@@ -333,10 +361,10 @@ export interface ChangePullDayResult {
  * Change an enrolled tenant's FlexPay pull day. Takes effect NEXT cycle (Nic
  * 2026-06-27): the current cycle's advance already snapshotted its pull_day +
  * fee at grace-end, so this never disturbs or lets a tenant dodge an in-flight
- * pull — it only changes which day (and therefore the fee = $5 + day) the NEXT
- * grace-end advance uses. No outstanding-balance block is needed for that
- * reason. `flexpay_monthly_fee` is the display value, recomputed here; the
- * authoritative per-cycle fee is computed from pull_day at grace-end.
+ * pull — it only changes which day the NEXT grace-end advance uses. The fee is
+ * a FLAT $25 regardless of day (S562), so changing the day never changes the
+ * price. No outstanding-balance block is needed for that reason.
+ * `flexpay_monthly_fee` is the stored display value (always $25).
  */
 export async function changeFlexPayPullDay(tenantId: string, newPullDay: number): Promise<ChangePullDayResult> {
   if (!await isFlexPayVisible()) return { ok: false, reason: 'FlexPay is not enabled on this platform' }
@@ -425,7 +453,20 @@ export async function processGracePeriodAdvance(now: Date = new Date()): Promise
        JOIN users u          ON u.id = la.user_id
       WHERE t.flexpay_enrolled = TRUE
         AND t.flexpay_pull_day IS NOT NULL
-        AND (l.rent_due_day + COALESCE(l.late_fee_grace_days, $1)) = $2`,
+        AND (l.rent_due_day + COALESCE(l.late_fee_grace_days, $1)) = $2
+        -- S581 (Nic): FlexPay is single-lease ONLY. If an enrolled tenant now
+        -- holds more than one active lease, front NOTHING — the (cycle, tenant)
+        -- advance can't represent two leases and would silently drop one. This
+        -- mirrors the enrollment gate (getFlexPayEligibility 'multiple_leases');
+        -- fronting resumes automatically once they're back to a single lease.
+        AND (
+          SELECT COUNT(*)
+            FROM lease_tenants lt2
+            JOIN leases l2 ON l2.id = lt2.lease_id
+           WHERE lt2.tenant_id = t.id
+             AND lt2.status = 'active'
+             AND l2.status IN ('active', 'pending')
+        ) = 1`,
     [FLEXPAY_DEFAULT_GRACE_DAYS, dayOfMonth],
   )
   out.candidates_scanned = candidates.length
@@ -774,12 +815,11 @@ export async function processFlexPayPullDay(now: Date = new Date()): Promise<Pul
 
 /**
  * Re-price a FlexPay cycle's pull right before an ACH RETRY fires (Consumer
- * ToS § 4.1 + § 4.2): the monthly fee recalculates under the formula at the
- * RETRY day (e.g. a pull that bounced on the 11th and retries on the 15th
- * recomputes $16 → $20), and the bounced attempt's Stripe ACH-return fee
- * passes through at cost. The original pull is all-or-nothing ACH, so the
- * failed attempt collected nothing — the recomputed fee REPLACES the prior
- * one (no double charge).
+ * ToS § 4.1 + § 4.2): the monthly fee stays the FLAT $25 (S562 — retries do
+ * NOT re-price by day), and the bounced attempt's Stripe ACH-return fee
+ * ($4) passes through on top at cost. So a retry pulls rent + $25 + $4. The
+ * original pull is all-or-nothing ACH, so the failed attempt collected
+ * nothing — this recomputed total REPLACES the prior one (no double charge).
  *
  * Mutates the EXISTING PaymentIntent's amount (+ the advance fee + payment
  * row) so the generic achRetry confirm re-pulls the corrected total. Called
@@ -840,6 +880,33 @@ export async function repriceFlexPayRetryPayment(paymentId: string): Promise<voi
 // ── Webhook reconciliation hooks ────────────────────────────────
 
 /**
+ * S578: advance a returner's rehab clock on a settled FlexPay pull. A returner
+ * (one prior default) sheds the queue demotion only after
+ * FLEXPAY_REHAB_CLEAN_PULLS consecutive on-time, FIRST-attempt pulls. A clean
+ * pull (retryCount 0) increments the streak; ANY retry (retryCount >= 1) — even
+ * one that ultimately cleared — resets the streak to 0. No-op for first-timers
+ * (no prior default), the permanently banned, and already-cleared returners.
+ */
+export async function applyFlexPayRehabProgress(tenantId: string, retryCount: number): Promise<void> {
+  const clean = retryCount === 0
+  await query(
+    `UPDATE tenants t
+        SET flexpay_clean_streak =
+              CASE WHEN $2 THEN LEAST(t.flexpay_clean_streak + 1, $3) ELSE 0 END,
+            flexpay_returner_cleared =
+              CASE WHEN $2 AND t.flexpay_clean_streak + 1 >= $3 THEN TRUE
+                   ELSE t.flexpay_returner_cleared END,
+            updated_at = NOW()
+      WHERE t.id = $1
+        AND t.flexpay_permanently_banned = FALSE
+        AND t.flexpay_returner_cleared   = FALSE
+        AND EXISTS (SELECT 1 FROM flexpay_advances fa
+                     WHERE fa.tenant_id = t.id AND fa.status = 'defaulted')`,
+    [tenantId, clean, FLEXPAY_REHAB_CLEAN_PULLS],
+  )
+}
+
+/**
  * Called from webhooks when a `payment_intent.succeeded` lands for a
  * FlexPay-tagged rent payment. Flips both the payments row and the
  * linked flexpay_advances row to settled/reconciled. Idempotent.
@@ -849,15 +916,16 @@ export async function reconcileSettledFlexPayPayment(paymentId: string): Promise
     tenant_id: string
     due_date: string
     entry_description: string | null
+    retry_count: number | null
   }>(
-    `SELECT tenant_id, due_date, entry_description
+    `SELECT tenant_id, due_date, entry_description, retry_count
        FROM payments WHERE id = $1`,
     [paymentId],
   )
   if (!payment || payment.entry_description !== 'FLEXPAY') return
 
   const cycle = cycleMonthForDate(new Date(payment.due_date))
-  await query(
+  const flipped = await query<{ id: string }>(
     `UPDATE flexpay_advances
         SET status         = 'reconciled',
             reconciled_at  = NOW(),
@@ -865,9 +933,16 @@ export async function reconcileSettledFlexPayPayment(paymentId: string): Promise
       WHERE tenant_id      = $1
         AND cycle_month    = $2
         AND rent_payment_id = $3
-        AND status         = 'pulled'`,
+        AND status         = 'pulled'
+      RETURNING id`,
     [payment.tenant_id, cycle, paymentId],
   )
+  // S578: rehab progress runs ONLY when this call performed the flip, so
+  // repeated success webhooks (idempotent — they find status='reconciled')
+  // never double-count the streak.
+  if (flipped.length > 0) {
+    await applyFlexPayRehabProgress(payment.tenant_id, payment.retry_count ?? 0)
+  }
 }
 
 /**
@@ -912,6 +987,10 @@ export async function handleFlexPayPaymentNsf(paymentId: string): Promise<void> 
   )
   if (!adv) return
 
+  // S578: is this the tenant's SECOND lifetime default? The advance flip below
+  // makes it count, so query after. 2nd default → permanent ban replaces the
+  // 90-day cooldown.
+  let permanent = false
   const client = await getClient()
   try {
     await client.query('BEGIN')
@@ -924,16 +1003,41 @@ export async function handleFlexPayPaymentNsf(paymentId: string): Promise<void> 
         WHERE id = $1`,
       [adv.id],
     )
-    await client.query(
-      `UPDATE tenants
-          SET flexpay_enrolled            = FALSE,
-              flexpay_pull_day            = NULL,
-              flexpay_monthly_fee         = NULL,
-              flexpay_disqualified_until  = NOW() + INTERVAL '${FLEXPAY_NSF_COOLDOWN_DAYS} days',
-              flexpay_disqualified_reason = 'nsf_second_failure'
-        WHERE id = $1`,
+    const dcount = await client.query<{ n: number }>(
+      `SELECT COUNT(*)::int AS n FROM flexpay_advances
+        WHERE tenant_id = $1 AND status = 'defaulted'`,
       [payment.tenant_id],
     )
+    permanent = Number(dcount.rows[0]?.n ?? 0) >= 2
+    if (permanent) {
+      // 2nd lifetime default → terminal. The ban flag is the gate; clear
+      // disqualified_until so nothing reads it as a cooldown that "expires".
+      await client.query(
+        `UPDATE tenants
+            SET flexpay_enrolled            = FALSE,
+                flexpay_pull_day            = NULL,
+                flexpay_monthly_fee         = NULL,
+                flexpay_clean_streak        = 0,
+                flexpay_permanently_banned  = TRUE,
+                flexpay_disqualified_until  = NULL,
+                flexpay_disqualified_reason = 'permanent_second_default'
+          WHERE id = $1`,
+        [payment.tenant_id],
+      )
+    } else {
+      // 1st default → 90-day re-enroll FLOOR (a demoted returner afterward).
+      await client.query(
+        `UPDATE tenants
+            SET flexpay_enrolled            = FALSE,
+                flexpay_pull_day            = NULL,
+                flexpay_monthly_fee         = NULL,
+                flexpay_clean_streak        = 0,
+                flexpay_disqualified_until  = NOW() + INTERVAL '${FLEXPAY_NSF_COOLDOWN_DAYS} days',
+                flexpay_disqualified_reason = 'nsf_second_failure'
+          WHERE id = $1`,
+        [payment.tenant_id],
+      )
+    }
     await client.query('COMMIT')
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {})
@@ -947,8 +1051,12 @@ export async function handleFlexPayPaymentNsf(paymentId: string): Promise<void> 
     await createAdminNotification({
       severity: 'warn',
       category: 'flexpay_advance_defaulted',
-      title:    `FlexPay defaulted (2nd NSF) — ${cycle}`,
-      body:     `Tenant ${payment.tenant_id} NSF'd twice on FlexPay cycle ${cycle}; advance ${adv.id} written off. Tenant suspended ${FLEXPAY_NSF_COOLDOWN_DAYS} days.`,
+      title:    permanent
+        ? `FlexPay PERMANENT removal (2nd lifetime default) — ${cycle}`
+        : `FlexPay defaulted (2nd NSF) — ${cycle}`,
+      body:     permanent
+        ? `Tenant ${payment.tenant_id} hit their 2nd lifetime FlexPay default (cycle ${cycle}); advance ${adv.id} written off. Tenant is PERMANENTLY removed from FlexPay — no re-enrollment.`
+        : `Tenant ${payment.tenant_id} NSF'd twice on FlexPay cycle ${cycle}; advance ${adv.id} written off. Tenant suspended ${FLEXPAY_NSF_COOLDOWN_DAYS} days (1st default → demoted returner on re-entry).`,
       context: { advance_id: adv.id, payment_id: paymentId, cycle, tenant_id: payment.tenant_id },
     })
   } catch (e) {

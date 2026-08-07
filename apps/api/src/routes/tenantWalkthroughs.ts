@@ -13,6 +13,7 @@ import crypto from 'crypto'
 import multer from 'multer'
 import { query, queryOne } from '../db'
 import { requireAuth } from '../middleware/auth'
+import { canAccessLandlordResource } from '../middleware/scope'
 import { AppError } from '../middleware/errorHandler'
 import { resolveUploadPath } from '../lib/uploadPaths'
 
@@ -83,9 +84,25 @@ tenantWalkthroughsRouter.get('/mine', async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
-// GET /api/tenant-walkthroughs/media-files/:filename — stream a file (authed).
+// GET /api/tenant-walkthroughs/media-files/:filename — stream a file.
 tenantWalkthroughsRouter.get('/media-files/:filename', async (req, res, next) => {
   try {
+    // S587: per-row authorization. This previously served ANY walkthrough file
+    // by filename behind only the router-level requireAuth — any authed user
+    // could pull another tenant's walkthrough photos/videos of their unit (same
+    // class as the S586 inspection gap). The owning tenant, or the landlord/
+    // scoped staff of the unit, may view it.
+    const fileUrl = '/api/tenant-walkthroughs/media-files/' + req.params.filename
+    const m = await queryOne<{ tenant_id: string; landlord_id: string | null }>(
+      `SELECT twm.tenant_id, u.landlord_id
+         FROM tenant_walkthrough_media twm
+         LEFT JOIN units u ON u.id = twm.unit_id
+        WHERE twm.file_url = $1`, [fileUrl])
+    if (!m) throw new AppError(404, 'Not found')
+    const allowed = req.user!.role === 'tenant'
+      ? m.tenant_id === req.user!.profileId
+      : (m.landlord_id != null && canAccessLandlordResource(req.user, m.landlord_id))
+    if (!allowed) throw new AppError(403, 'Forbidden')
     const fp = resolveUploadPath(dir, req.params.filename)
     if (!fp) throw new AppError(400, 'Invalid filename')
     if (!fs.existsSync(fp)) throw new AppError(404, 'Not found')

@@ -85,7 +85,7 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
               const meterRes: any = await apiPost('/utility/meters', {
                 propertyId: form.propertyId,
                 utilityType: utility,
-                label: `${u.unitNumber ?? u.unit_number} ${utility}`,
+                label: `${u.unitNumber} ${utility}`,
                 billingMethod: 'submeter',
                 ratePerUnit: m.rate === '' ? null : Number(m.rate),
                 baseFee: 0,
@@ -94,7 +94,7 @@ export function AddUnitModal({ onClose, preselectedPropertyId }: Props) {
               })
               await apiPost(`/utility/meters/${meterRes.data.id}/units`, { unitId: u.id })
             } catch (e: any) {
-              toast.error(e?.response?.data?.error || `Could not create the ${utility} meter for ${u.unitNumber ?? u.unit_number}`)
+              toast.error(e?.response?.data?.error || `Could not create the ${utility} meter for ${u.unitNumber}`)
             }
           }
         }

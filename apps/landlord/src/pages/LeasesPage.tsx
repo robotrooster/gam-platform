@@ -36,6 +36,9 @@ export function LeasesPage() {
   // S181 / A2: bill-fee modal state. Holds the lease object to bill against,
   // or null when the modal is closed.
   const [billFeeLease, setBillFeeLease] = useState<any | null>(null)
+  // S581: money add-on / notice modal (recurring charge or rent change that
+  // reaches billing on a landlord-set date).
+  const [addonLease, setAddonLease] = useState<any | null>(null)
   // W-7 (S531): renewal decision form — deep-linked from the dashboard
   // to-do's expiring-lease items via ?renew=<leaseId>.
   const [renewalLeaseId, setRenewalLeaseId] = useState<string | null>(null)
@@ -364,6 +367,16 @@ export function LeasesPage() {
                             <FileText size={12} /> Bill fee
                           </button>
                         )}
+                        {can('leases.create') && l.status === 'active' && (
+                          <button
+                            className="btn btn-ghost btn-sm"
+                            title="Add a recurring charge (parking, storage) or change the rent — as an agreement the tenant signs, or a notice you issue. Takes effect on the date you set."
+                            onClick={() => setAddonLease(l)}
+                            style={{ padding: '3px 8px' }}
+                          >
+                            <DollarSign size={12} /> Add-on / rent change
+                          </button>
+                        )}
                         {can('leases.deposit_return') && (l.status === 'active' || l.status === 'expired' || l.status === 'terminated') && (
                           <button
                             className="btn btn-ghost btn-sm"
@@ -423,6 +436,151 @@ export function LeasesPage() {
           onClose={() => setBillFeeLease(null)}
         />
       )}
+
+      {addonLease && (
+        <MoneyAddonModal
+          lease={addonLease}
+          onClose={() => setAddonLease(null)}
+        />
+      )}
+    </div>
+  )
+}
+
+// S581 (Nic): create a MONEY add-on on a lease — a recurring charge (parking,
+// storage) or a rent change — that reaches billing on a landlord-set date.
+// Two modes: 'agreement' (tenant signs to accept — parking) and 'notice' (landlord
+// issues, tenant can't refuse — e.g. a mobile-home space-rent increase; no tenant
+// signature, they get a blocking portal acknowledgment). The backend resolves
+// signers from the lease, so this form only sends leaseId + mode + the change.
+const RECURRING_FEE_OPTIONS: Array<{ v: string; label: string }> = [
+  { v: 'parking_rent', label: 'Parking' },
+  { v: 'storage_rent', label: 'Storage' },
+  { v: 'pet_rent', label: 'Pet rent' },
+  { v: 'amenity_fee_monthly', label: 'Amenity' },
+  { v: 'trash_fee', label: 'Trash' },
+  { v: 'pest_control_fee', label: 'Pest control' },
+  { v: 'technology_fee', label: 'Technology' },
+  { v: 'other_fee', label: 'Other monthly charge' },
+]
+function MoneyAddonModal({ lease, onClose }: { lease: any; onClose: () => void }) {
+  const qc = useQueryClient()
+  const [mode, setMode] = useState<'agreement' | 'notice'>('agreement')
+  const [changeType, setChangeType] = useState<'rent' | 'recurring_fee'>('recurring_fee')
+  const [effectiveDate, setEffectiveDate] = useState('')
+  const [newRent, setNewRent] = useState('')
+  const [feeType, setFeeType] = useState('parking_rent')
+  const [feeAmount, setFeeAmount] = useState('')
+  const [feeDescription, setFeeDescription] = useState('')
+  const [error, setError] = useState('')
+
+  const valid = effectiveDate && (changeType === 'rent'
+    ? Number(newRent) > 0
+    : Number(feeAmount) > 0)
+
+  const mut = useMutation(
+    async () => {
+      const change = changeType === 'rent'
+        ? { changeType: 'rent', effectiveDate, newRentAmount: Number(newRent) }
+        : { changeType: 'recurring_fee', effectiveDate, feeType, feeAmount: Number(feeAmount),
+            ...(feeDescription ? { feeDescription } : {}) }
+      const title = changeType === 'rent'
+        ? (mode === 'notice' ? 'Rent Change Notice' : 'Rent Change Agreement')
+        : `${RECURRING_FEE_OPTIONS.find(o => o.v === feeType)?.label ?? 'Charge'} — ${mode === 'notice' ? 'Notice' : 'Agreement'}`
+      const res = await apiPost('/esign/documents/addendum-terms', {
+        leaseId: lease.id, title, mode, scheduledChanges: [change],
+      })
+      // Send it out immediately (landlord signs first; for agreement the tenant
+      // then signs — for a notice landlord-only completes it).
+      await apiPost(`/esign/documents/${res.data.id}/send`, {})
+      return res
+    },
+    {
+      onSuccess: () => {
+        qc.invalidateQueries('esign-documents')
+        onClose()
+      },
+      onError: (e: any) => setError(e?.response?.data?.error?.message || e?.response?.data?.error || 'Could not create it. Try again.'),
+    },
+  )
+
+  return (
+    <div className="modal-ov" onClick={onClose}>
+      <div className="modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 540 }}>
+        <div className="modal-t"><DollarSign size={16} /> Add-on or rent change</div>
+        <p style={{ fontSize: '.8rem', color: 'var(--text-2)', marginBottom: 14 }}>
+          Add a recurring charge or change the rent on this lease. It takes effect on the date you set.
+        </p>
+
+        {/* Mode */}
+        <label className="lbl" style={{ display: 'block', marginBottom: 6 }}>How does it take effect?</label>
+        <div style={{ display: 'flex', gap: 8, marginBottom: 14 }}>
+          <button type="button" className={`btn btn-sm ${mode === 'agreement' ? 'btn-primary' : 'btn-ghost'}`}
+            style={{ flex: 1 }} onClick={() => setMode('agreement')}>Agreement (tenant signs)</button>
+          <button type="button" className={`btn btn-sm ${mode === 'notice' ? 'btn-primary' : 'btn-ghost'}`}
+            style={{ flex: 1 }} onClick={() => setMode('notice')}>Notice (you issue)</button>
+        </div>
+        <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginBottom: 16 }}>
+          {mode === 'agreement'
+            ? 'The tenant must sign to accept (e.g. opting into a parking spot). Check your local laws.'
+            : 'You issue it; the tenant is notified and must acknowledge it, but does not sign (e.g. a rent increase you have the right to make with notice). Check your local laws.'}
+        </div>
+
+        {/* Change type */}
+        <label className="lbl" style={{ display: 'block', marginBottom: 6 }}>What is changing?</label>
+        <div style={{ display: 'flex', gap: 8, marginBottom: 14 }}>
+          <button type="button" className={`btn btn-sm ${changeType === 'recurring_fee' ? 'btn-primary' : 'btn-ghost'}`}
+            style={{ flex: 1 }} onClick={() => setChangeType('recurring_fee')}>Add a recurring charge</button>
+          <button type="button" className={`btn btn-sm ${changeType === 'rent' ? 'btn-primary' : 'btn-ghost'}`}
+            style={{ flex: 1 }} onClick={() => setChangeType('rent')}>Change the rent</button>
+        </div>
+
+        {changeType === 'rent' ? (
+          <div style={{ marginBottom: 14 }}>
+            <label className="lbl">New monthly rent ($)</label>
+            <input className="inp" type="number" min="0" step="0.01" value={newRent}
+              onChange={e => setNewRent(e.target.value)} placeholder="e.g. 1300.00" />
+          </div>
+        ) : (
+          <>
+            <div style={{ display: 'flex', gap: 10, marginBottom: 14 }}>
+              <div style={{ flex: 1 }}>
+                <label className="lbl">Charge type</label>
+                <select className="inp" value={feeType} onChange={e => setFeeType(e.target.value)}>
+                  {RECURRING_FEE_OPTIONS.map(o => <option key={o.v} value={o.v}>{o.label}</option>)}
+                </select>
+              </div>
+              <div style={{ flex: 1 }}>
+                <label className="lbl">Amount ($/mo)</label>
+                <input className="inp" type="number" min="0" step="0.01" value={feeAmount}
+                  onChange={e => setFeeAmount(e.target.value)} placeholder="e.g. 50.00" />
+              </div>
+            </div>
+            <div style={{ marginBottom: 14 }}>
+              <label className="lbl">Description (optional)</label>
+              <input className="inp" value={feeDescription} maxLength={200}
+                onChange={e => setFeeDescription(e.target.value)} placeholder="e.g. Reserved spot #12" />
+            </div>
+          </>
+        )}
+
+        <div style={{ marginBottom: 16 }}>
+          <label className="lbl">Effective date</label>
+          <input className="inp" type="date" value={effectiveDate} onChange={e => setEffectiveDate(e.target.value)} />
+          <div style={{ fontSize: '.7rem', color: 'var(--text-3)', marginTop: 4 }}>
+            Billing switches on this date. For a notice with a required notice period, pick a date past it.
+          </div>
+        </div>
+
+        {error && <div className="alert a-warn" style={{ marginBottom: 12 }}>{error}</div>}
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button className="btn btn-ghost" style={{ flex: 1 }} onClick={onClose}>Cancel</button>
+          <button className="btn btn-primary" style={{ flex: 1 }} disabled={!valid || mut.isLoading}
+            onClick={() => { setError(''); mut.mutate() }}>
+            {mut.isLoading ? 'Sending…' : mode === 'notice' ? 'Issue notice' : 'Send for signature'}
+          </button>
+        </div>
+      </div>
     </div>
   )
 }

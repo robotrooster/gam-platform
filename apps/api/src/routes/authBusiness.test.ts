@@ -200,18 +200,17 @@ describe('POST /api/auth/login — business_staff', () => {
     const res = await request(buildApp())
       .post('/api/auth/login').send({ email: staff.email, password: staff.password })
     expect(res.status).toBe(200)
-    expect(res.body.data.user.role).toBe('business_staff')
-    expect(res.body.data.user.businessId).toBe(owner.businessId)
-    expect(res.body.data.user.staffRole).toBe('manager')
-    expect(res.body.data.user.permissions).toMatchObject({
-      routes: { view_all: true }, customers: { edit: true },
-    })
-    expect(res.body.data.user.landlordId).toBeNull()
-
-    const decoded = jwt.decode(res.body.data.token) as any
+    // S578: universal 2FA — business_staff full login gets an emailed code too
+    // (the register-passcode / terminal unlock is a separate, capability-scoped
+    // flow). The scope claims ride the pending-session JWT + the full token
+    // after verify.
+    expect(res.body.data.requiresEmailOtp).toBe(true)
+    const decoded = jwt.decode(res.body.data.emailOtpSession) as any
+    expect(decoded.role).toBe('business_staff')
     expect(decoded.businessId).toBe(owner.businessId)
     expect(decoded.staffRole).toBe('manager')
-    expect(decoded.permissions).toMatchObject({ routes: { view_all: true } })
+    expect(decoded.permissions).toMatchObject({ routes: { view_all: true }, customers: { edit: true } })
+    expect(decoded.landlordId ?? null).toBeNull()
   })
 
   it('staff role variants: each resolves into staffRole correctly', async () => {
@@ -223,7 +222,9 @@ describe('POST /api/auth/login — business_staff', () => {
       const res = await request(buildApp())
         .post('/api/auth/login').send({ email: staff.email, password: staff.password })
       expect(res.status).toBe(200)
-      expect(res.body.data.user.staffRole).toBe(role)
+      // S578: universal 2FA — staffRole rides the pending-session JWT.
+      const decoded = jwt.decode(res.body.data.emailOtpSession) as any
+      expect(decoded.staffRole).toBe(role)
     }
   })
 

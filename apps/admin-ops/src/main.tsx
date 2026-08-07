@@ -30,12 +30,14 @@ const post = <T,>(url: string, body?: any) => api.post<{success:boolean;data:T;m
 interface AuthUser { id:string; email:string; role:string; firstName:string; lastName:string; totpEnabled?:boolean; mustEnrollTotp?:boolean }
 // S289: login() returns a discriminated result so LoginPage can branch
 // into the TOTP second step when the backend gates on 2FA.
-type LoginResult = { kind:'success' } | { kind:'totp_required'; totpSession:string }
+type LoginResult = { kind:'success' } | { kind:'totp_required'; totpSession:string } | { kind:'email_otp_required'; emailOtpSession:string }
 interface AuthCtx {
   user:AuthUser|null
   loading:boolean
   login:(e:string,p:string)=>Promise<LoginResult>
   loginWithTotp:(totpSession:string,code:string)=>Promise<void>
+  loginWithEmailOtp:(emailOtpSession:string,code:string)=>Promise<void>
+  resendEmailOtp:(emailOtpSession:string)=>Promise<void>
   refresh:()=>Promise<void>
   logout:()=>void
 }
@@ -54,7 +56,7 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
     try {
       const res = await fetchAuthMeWithRetry(() => api.get('/auth/me'))
       const u = res.data.data
-      if (!u || (u.role !== 'admin' && u.role !== 'super_admin')) { logout(); return }
+      if (!u || (u.role !== 'admin' && u.role !== 'super_admin' && u.role !== 'portfolio_manager')) { logout(); return }
       setUser({ id:u.id, email:u.email, role:u.role, firstName:u.firstName||'', lastName:u.lastName||'', totpEnabled:!!u.totpEnabled, mustEnrollTotp:!!u.mustEnrollTotp })
     } catch (e) { if (isAuthRejection(e)) logout() }  // S540: transient failures keep the token
     finally { setLoading(false) }
@@ -72,8 +74,12 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
     if (data.requiresTotp) {
       return { kind: 'totp_required', totpSession: data.totpSession as string }
     }
+    // S578: universal email-2FA.
+    if (data.requiresEmailOtp) {
+      return { kind: 'email_otp_required', emailOtpSession: data.emailOtpSession as string }
+    }
     const { token: tk, user: u } = data
-    if (!u || (u.role !== 'admin' && u.role !== 'super_admin')) throw new Error('Admin access required')
+    if (!u || (u.role !== 'admin' && u.role !== 'super_admin' && u.role !== 'portfolio_manager')) throw new Error('Admin access required')
     localStorage.setItem(TOKEN, tk)
     api.defaults.headers.common['Authorization'] = 'Bearer ' + tk
     setUser({ id:u.id, email:u.email, role:u.role, firstName:u.firstName||'', lastName:u.lastName||'', totpEnabled:!!u.totpEnabled, mustEnrollTotp:!!u.mustEnrollTotp })
@@ -86,14 +92,28 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
   const loginWithTotp = async (totpSession: string, code: string): Promise<void> => {
     const res = await axios.post(`${API}/api/auth/totp/verify`, { totpSession, code })
     const { token: tk, user: u } = res.data.data
-    if (!u || (u.role !== 'admin' && u.role !== 'super_admin')) throw new Error('Admin access required')
+    if (!u || (u.role !== 'admin' && u.role !== 'super_admin' && u.role !== 'portfolio_manager')) throw new Error('Admin access required')
     localStorage.setItem(TOKEN, tk)
     api.defaults.headers.common['Authorization'] = 'Bearer ' + tk
     setUser({ id:u.id, email:u.email, role:u.role, firstName:'', lastName:'' })
     await refresh()
   }
 
-  return <Ctx.Provider value={{ user, loading, login, loginWithTotp, refresh, logout }}>{children}</Ctx.Provider>
+  // S578: universal email-2FA second step.
+  const loginWithEmailOtp = async (emailOtpSession: string, code: string): Promise<void> => {
+    const res = await axios.post(`${API}/api/auth/email-otp/verify`, { emailOtpSession, code })
+    const { token: tk, user: u } = res.data.data
+    if (!u || (u.role !== 'admin' && u.role !== 'super_admin' && u.role !== 'portfolio_manager')) throw new Error('Admin access required')
+    localStorage.setItem(TOKEN, tk)
+    api.defaults.headers.common['Authorization'] = 'Bearer ' + tk
+    setUser({ id:u.id, email:u.email, role:u.role, firstName:'', lastName:'' })
+    await refresh()
+  }
+  const resendEmailOtp = async (emailOtpSession: string): Promise<void> => {
+    await axios.post(`${API}/api/auth/email-otp/resend`, { emailOtpSession })
+  }
+
+  return <Ctx.Provider value={{ user, loading, login, loginWithTotp, loginWithEmailOtp, resendEmailOtp, refresh, logout }}>{children}</Ctx.Provider>
 }
 
 const qc = new QueryClient({ defaultOptions: { queries: { retry:1, staleTime:30000, refetchOnWindowFocus:false } } })
@@ -192,19 +212,24 @@ function Layout() {
         <nav className="nav">
           <div className="nl">Onboarding</div>
           <NavLink to="/onboarding" className={({isActive})=>`ni${isActive?' active':''}`}>🚀 Onboarding</NavLink>
-          <div className="nl" style={{marginTop:8}}>Platform</div>
+          <NavLink to="/commissions" className={({isActive})=>`ni${isActive?' active':''}`}>💰 Commissions</NavLink>
+          <div className="nl" style={{marginTop:8}}>{user?.role==='portfolio_manager'?'My Book':'Platform'}</div>
           <NavLink to="/landlords" className={({isActive})=>`ni${isActive?' active':''}`}>🏢 Landlords</NavLink>
           <NavLink to="/tenants"   className={({isActive})=>`ni${isActive?' active':''}`}>👤 Tenants</NavLink>
-          <NavLink to="/property-reviews" className={({isActive})=>`ni${isActive?' active':''}`}>📋 Property Reviews</NavLink>
-          <NavLink to="/units"     className={({isActive})=>`ni${isActive?' active':''}`}>🚪 Units</NavLink>
-          <NavLink to="/payments"  className={({isActive})=>`ni${isActive?' active':''}`}>💳 Payments</NavLink>
+          {/* S592: platform-wide surfaces (super_admin routes) — hidden from a
+              portfolio_manager, who is walled off from /api/admin. */}
+          {user?.role!=='portfolio_manager' && <>
+            <NavLink to="/property-reviews" className={({isActive})=>`ni${isActive?' active':''}`}>📋 Property Reviews</NavLink>
+            <NavLink to="/units"     className={({isActive})=>`ni${isActive?' active':''}`}>🚪 Units</NavLink>
+            <NavLink to="/payments"  className={({isActive})=>`ni${isActive?' active':''}`}>💳 Payments</NavLink>
+          </>}
           <div className="nl" style={{marginTop:8}}>Account</div>
           <NavLink to="/security"  className={({isActive})=>`ni${isActive?' active':''}`}>🔐 Security</NavLink>
         </nav>
         <div className="sfooter">
           <div style={{padding:'6px 10px',marginBottom:4}}>
             <div style={{fontWeight:600,color:'var(--t0)',fontSize:'.78rem'}}>{user?.firstName} {user?.lastName}</div>
-            <div style={{fontSize:'.65rem',color:'var(--t3)'}}>Support Staff</div>
+            <div style={{fontSize:'.65rem',color:'var(--t3)'}}>{user?.role==='portfolio_manager'?'Portfolio Manager':'Support Staff'}</div>
           </div>
           <button className="ni" onClick={()=>{logout();navigate('/login')}} style={{color:'var(--red)'}}>🚪 Sign out</button>
         </div>
@@ -234,9 +259,9 @@ function DetailEmpty() {
 // ── ONBOARDING ────────────────────────────────────────────────
 function Onboarding() {
   const { user } = useAuth()
-  const { data: stats } = useQuery('ops-overview', () => get<any>('/admin/onboarding/overview'), { enabled: !!user })
-  const { data: landlords = [] } = useQuery('ops-landlords', () => get<any[]>('/landlords'), { enabled: !!user })
-  const { data: tenants = [] } = useQuery('ops-tenants', () => get<any[]>('/admin/tenants'), { enabled: !!user })
+  const { data: stats } = useQuery('ops-overview', () => get<any>('/portfolio/onboarding/overview'), { enabled: !!user })
+  const { data: landlords = [] } = useQuery('ops-landlords', () => get<any[]>('/portfolio/landlords'), { enabled: !!user })
+  const { data: tenants = [] } = useQuery('ops-tenants', () => get<any[]>('/portfolio/tenants'), { enabled: !!user })
   const [tab, setTab] = useState<'landlords'|'tenants'>('landlords')
   // Operations #1: the No-Flex KPI drills into the tenants with zero flex products.
   const hasNoFlex = (t:any) => !(t.creditReportingEnrolled||t.flexDepositEnrolled||t.floatFeeActive)
@@ -245,8 +270,8 @@ function Onboarding() {
   const [selected, setSelected] = useState<any>(null)
   const { data: detail } = useQuery(['ops-detail', selected?.id, tab], () =>
     tab === 'landlords'
-      ? get<any>('/admin/onboarding/landlord/' + selected.id)
-      : get<any>('/admin/onboarding/tenant/' + selected.id),
+      ? get<any>('/portfolio/onboarding/landlord/' + selected.id)
+      : get<any>('/portfolio/onboarding/tenant/' + selected.id),
     { enabled: !!selected?.id, staleTime: 15000 }
   )
   const [resending, setResending] = useState<string|null>(null)
@@ -254,7 +279,7 @@ function Onboarding() {
 
   const resend = async (type: string, id: string) => {
     setResending(type)
-    try { const r = await post<{message?:string}>('/admin/onboarding/resend', { type, targetId: id }); setMsg(r?.data?.message||'Sent'); setTimeout(()=>setMsg(''),4000) }
+    try { const r = await post<{message?:string}>('/portfolio/onboarding/resend', { type, targetId: id }); setMsg(r?.data?.message||'Sent'); setTimeout(()=>setMsg(''),4000) }
     catch (e: any) { setMsg('Failed: ' + (e?.response?.data?.error || e.message)) }
     finally { setResending(null) }
   }
@@ -397,10 +422,10 @@ function Onboarding() {
 // ── LANDLORDS ─────────────────────────────────────────────────
 function Landlords() {
   const { user } = useAuth()
-  const { data: landlords = [], isLoading } = useQuery<any[]>('ops-ll', () => get('/landlords'), { enabled: !!user })
+  const { data: landlords = [], isLoading } = useQuery<any[]>('ops-ll', () => get('/portfolio/landlords'), { enabled: !!user })
   const [search, setSearch] = useState('')
   const [selected, setSelected] = useState<any>(null)
-  const { data: detail } = useQuery(['ops-ll-detail', selected?.id], () => get<any>('/admin/onboarding/landlord/' + selected.id), { enabled: !!selected?.id })
+  const { data: detail } = useQuery(['ops-ll-detail', selected?.id], () => get<any>('/portfolio/onboarding/landlord/' + selected.id), { enabled: !!selected?.id })
   const sorted = React.useMemo(() => [...(landlords as any[])].sort((a,b)=>(!a.bankAccountReady?0:1)-(!b.bankAccountReady?0:1)), [landlords])
   const filtered = React.useMemo(() => search ? sorted.filter((l:any)=>`${l.firstName} ${l.lastName} ${l.email} ${l.businessName||''}`.toLowerCase().includes(search.toLowerCase())) : sorted, [sorted,search])
   return (
@@ -462,10 +487,10 @@ function Landlords() {
 // ── TENANTS ───────────────────────────────────────────────────
 function Tenants() {
   const { user } = useAuth()
-  const { data: tenants = [], isLoading } = useQuery<any[]>('ops-tenants', () => get('/admin/tenants'), { enabled: !!user })
+  const { data: tenants = [], isLoading } = useQuery<any[]>('ops-tenants', () => get('/portfolio/tenants'), { enabled: !!user })
   const [search, setSearch] = useState('')
   const [selected, setSelected] = useState<any>(null)
-  const { data: detail } = useQuery(['ops-t-detail', selected?.id], () => get<any>('/admin/onboarding/tenant/' + selected.id), { enabled: !!selected?.id })
+  const { data: detail } = useQuery(['ops-t-detail', selected?.id], () => get<any>('/portfolio/onboarding/tenant/' + selected.id), { enabled: !!selected?.id })
   const sorted = React.useMemo(() => [...(tenants as any[])].sort((a,b)=>(!a.achVerified?0:1)-(!b.achVerified?0:1)), [tenants])
   const filtered = React.useMemo(() => search ? sorted.filter((t:any)=>`${t.firstName} ${t.lastName} ${t.email} ${t.unitNumber||''} ${t.propertyName||''}`.toLowerCase().includes(search.toLowerCase())) : sorted, [sorted,search])
   return (
@@ -641,7 +666,7 @@ function Payments() {
 // gates on 2FA the credentials call returns a totp_session and we
 // pivot to step 2 (6-digit authenticator code or a recovery code).
 function LoginPage() {
-  const { login, loginWithTotp } = useAuth()
+  const { login, loginWithTotp, loginWithEmailOtp, resendEmailOtp } = useAuth()
   const navigate = useNavigate()
   React.useEffect(() => {
     localStorage.removeItem(TOKEN)
@@ -652,6 +677,9 @@ function LoginPage() {
   const [err, setErr] = useState('')
   const [loading, setLoading] = useState(false)
   const [totpSession, setTotpSession] = useState<string|null>(null)
+  // S578: universal email-2FA second step.
+  const [emailOtpSession, setEmailOtpSession] = useState<string|null>(null)
+  const [resent, setResent] = useState(false)
   const [code, setCode] = useState('')
 
   const onCredentialsSubmit = async (e: React.FormEvent) => {
@@ -659,27 +687,38 @@ function LoginPage() {
     try {
       const r = await login(email, pw)
       if (r.kind === 'totp_required') { setTotpSession(r.totpSession); setCode('') }
+      else if (r.kind === 'email_otp_required') { setEmailOtpSession(r.emailOtpSession); setCode(''); setResent(false) }
       else navigate('/onboarding')
     }
     catch (ex: any) { setErr(ex.response?.data?.error || ex.message || 'Login failed') }
     finally { setLoading(false) }
   }
 
-  const onTotpSubmit = async (e: React.FormEvent) => {
+  const onCodeSubmit = async (e: React.FormEvent) => {
     e.preventDefault(); setLoading(true); setErr('')
-    try { await loginWithTotp(totpSession!, code.trim()); navigate('/onboarding') }
+    try {
+      if (emailOtpSession) await loginWithEmailOtp(emailOtpSession, code.trim())
+      else await loginWithTotp(totpSession!, code.trim())
+      navigate('/onboarding')
+    }
     catch (ex: any) {
       const msg = ex.response?.data?.error || 'Invalid code.'
       setErr(msg)
-      if (/session/i.test(msg)) { setTotpSession(null); setCode(''); setPw('') }
+      if (/session/i.test(msg)) { setTotpSession(null); setEmailOtpSession(null); setCode(''); setPw('') }
     }
     finally { setLoading(false) }
   }
 
-  const onBackToCredentials = () => { setTotpSession(null); setCode(''); setErr(''); setPw('') }
+  const onResend = async () => {
+    setErr(''); setResent(false)
+    try { await resendEmailOtp(emailOtpSession!); setResent(true) }
+    catch (ex: any) { setErr(ex.response?.data?.error || 'Could not resend the code.') }
+  }
 
-  // ── Step 2: TOTP code ───────────────────────────────────────
-  if (totpSession) {
+  const onBackToCredentials = () => { setTotpSession(null); setEmailOtpSession(null); setResent(false); setCode(''); setErr(''); setPw('') }
+
+  // ── Step 2: 2FA code (authenticator OR emailed code) ─────────
+  if (totpSession || emailOtpSession) {
     return (
       <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',background:'var(--bg0)',padding:20}}>
         <div style={{width:'100%',maxWidth:380}}>
@@ -689,10 +728,13 @@ function LoginPage() {
           </div>
           <div className="card" style={{padding:24}}>
             <div style={{fontSize:'.85rem',color:'var(--t1)',marginBottom:14,lineHeight:1.6}}>
-              Enter the 6-digit code from your authenticator app, or one of your recovery codes.
+              {emailOtpSession
+                ? 'Enter the 6-digit code we emailed you.'
+                : 'Enter the 6-digit code from your authenticator app, or one of your recovery codes.'}
             </div>
+            {resent && !err && <div style={{marginBottom:14,fontSize:'.8rem',color:'var(--green)'}}>A new code is on its way.</div>}
             {err&&<div className="alert ae" style={{marginBottom:14}}>{err}</div>}
-            <form onSubmit={onTotpSubmit}>
+            <form onSubmit={onCodeSubmit}>
               <div style={{marginBottom:16}}>
                 <label style={{display:'block',fontSize:'.72rem',fontWeight:600,color:'var(--t3)',marginBottom:5,textTransform:'uppercase',letterSpacing:'.06em'}}>Code</label>
                 <input
@@ -711,10 +753,13 @@ function LoginPage() {
                 {loading?<span className="spinner"/>:'Verify'}
               </button>
             </form>
-            <div style={{marginTop:14,textAlign:'center'}}>
+            <div style={{marginTop:14,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
               <button onClick={onBackToCredentials} style={{background:'none',border:'none',color:'var(--t2)',fontSize:'.82rem',cursor:'pointer',textDecoration:'underline'}}>
                 ← Back to sign in
               </button>
+              {emailOtpSession && (
+                <button onClick={onResend} style={{background:'none',border:'none',color:'var(--gold)',fontSize:'.82rem',cursor:'pointer',textDecoration:'underline'}}>Resend code</button>
+              )}
             </div>
           </div>
         </div>
@@ -1030,6 +1075,7 @@ function App() {
         <Route path="/" element={user ? <MustEnrollTotpGate><Layout/></MustEnrollTotpGate> : <Navigate to="/login" replace/>}>
           <Route index element={<Navigate to="/onboarding" replace/>}/>
           <Route path="onboarding" element={<Onboarding/>}/>
+          <Route path="commissions" element={<Commissions/>}/>
           <Route path="landlords"  element={<Landlords/>}/>
           <Route path="tenants"    element={<Tenants/>}/>
           <Route path="property-reviews" element={<PropertyReviews/>}/>
@@ -1039,6 +1085,61 @@ function App() {
         </Route>
       </Routes>
     </BrowserRouter>
+  )
+}
+
+// ── COMMISSIONS & REFERRAL (the portfolio manager's own money) ────
+// S592: surfaces /api/portfolio/commissions/summary + /my-referral. A PM sees
+// ONLY their own earnings (the backend never returns the pot / other managers
+// to a non-super caller).
+function Commissions(){
+  const { user } = useAuth()
+  const { data: sum } = useQuery('pm-commissions', () => get<any>('/portfolio/commissions/summary'), { enabled: !!user })
+  const { data: ref } = useQuery('pm-referral', () => get<any>('/portfolio/my-referral'), { enabled: !!user })
+  const [copied, setCopied] = useState(false)
+  const copy = async () => {
+    if (!ref?.referralLink) return
+    try { await navigator.clipboard.writeText(ref.referralLink); setCopied(true); setTimeout(()=>setCopied(false),2000) } catch { /* clipboard blocked */ }
+  }
+  const rows = (sum?.myByLandlord as any[]) || []
+  return (
+    <div>
+      <div className="ph"><div><h1 className="pt">Commissions</h1><p className="ps">Your earnings across the accounts you close &amp; service — 50¢ per occupied unit each month</p></div></div>
+
+      <div className="grid2" style={{gap:16,marginBottom:16}}>
+        <div className="kpi"><div className="kl">This month</div><div className="kv" style={{fontSize:'1.6rem'}}>{fmt(sum?.myEarnings?.thisMonth)}</div><div className="ks">Accrued so far</div></div>
+        <div className="kpi"><div className="kl">All time</div><div className="kv" style={{fontSize:'1.6rem'}}>{fmt(sum?.myEarnings?.allTime)}</div><div className="ks">Since you started</div></div>
+      </div>
+
+      <div className="card" style={{marginBottom:16}}>
+        <div className="ct">Your referral link</div>
+        <p style={{fontSize:'.78rem',color:'var(--t3)',marginBottom:10,lineHeight:1.5}}>Share this link. A landlord who signs up through it is attributed to you, and you earn on every occupied unit they put on the platform — for as long as they stay, even if they sell and 1031 into a new property.</p>
+        {ref?.referralCode ? (
+          <div style={{display:'flex',gap:8,alignItems:'center'}}>
+            <code style={{flex:1,padding:'8px 12px',border:'1px solid var(--b1)',borderRadius:8,fontSize:'.8rem',overflowX:'auto',whiteSpace:'nowrap'}}>{ref.referralLink}</code>
+            <button className="btn b-gold" onClick={copy}>{copied?'Copied ✓':'Copy'}</button>
+          </div>
+        ) : <div style={{color:'var(--t3)',fontSize:'.8rem'}}>Generating your code…</div>}
+      </div>
+
+      <div className="card" style={{padding:0}}>
+        <div style={{padding:'12px 16px',borderBottom:'1px solid var(--b1)'}}><div className="ct" style={{marginBottom:0}}>By account</div></div>
+        <table className="tbl">
+          <thead><tr><th>Landlord</th><th>Occupied units</th><th>This month</th><th>All time</th></tr></thead>
+          <tbody>
+            {rows.map((r:any)=>(
+              <tr key={r.landlordId}>
+                <td><div style={{fontWeight:600,color:'var(--t0)'}}>{r.businessName || `${r.firstName||''} ${r.lastName||''}`.trim() || '—'}</div></td>
+                <td className="mono">{r.occupiedUnits ?? 0}</td>
+                <td className="mono">{fmt(r.thisMonth)}</td>
+                <td className="mono" style={{color:'var(--gold)',fontWeight:600}}>{fmt(r.allTime)}</td>
+              </tr>
+            ))}
+            {rows.length===0 && <tr><td colSpan={4}><div className="empty">No commissions yet — they accrue monthly on each occupied unit in your book.</div></td></tr>}
+          </tbody>
+        </table>
+      </div>
+    </div>
   )
 }
 

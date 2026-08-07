@@ -151,7 +151,7 @@ export function SettingsPage() {
       {biz && <TaxSection biz={biz} setBiz={setBiz} />}
       {biz && <ServiceTimeSection biz={biz} setBiz={setBiz} />}
       {biz && <PublicBookingSection biz={biz} setBiz={setBiz} />}
-      {biz && ((biz.enabledFeatures ?? biz.enabled_features ?? []) as string[]).includes('appointments') &&
+      {biz && ((biz.enabledFeatures ?? []) as string[]).includes('appointments') &&
         <AppointmentRemindersSection biz={biz} setBiz={setBiz} />}
       {biz && <TipsSection biz={biz} setBiz={setBiz} />}
       {biz && <CardFeesSection biz={biz} setBiz={setBiz} />}
@@ -165,7 +165,7 @@ export function SettingsPage() {
 // from their payout; default) or the customer (auto surcharge added
 // to every card transaction at the register).
 function CardFeesSection({ biz, setBiz }: { biz: any; setBiz: (b: any) => void }) {
-  const current = (biz.cardFeesPaidBy ?? biz.card_fees_paid_by ?? 'business') as string
+  const current = (biz.cardFeesPaidBy ?? 'business') as string
   const [who, setWho] = useState<string>(current)
   const [saving, setSaving] = useState(false)
   const [err, setErr] = useState<string | null>(null)
@@ -286,7 +286,7 @@ function CardReadersSection() {
 // S536 (Nic): tips are a per-business choice — hidden at the register
 // for operators who don't want or need them. Default ON.
 function TipsSection({ biz, setBiz }: { biz: any; setBiz: (b: any) => void }) {
-  const current = biz.tipsEnabled ?? biz.tips_enabled ?? true
+  const current = biz.tipsEnabled ?? true
   const [enabled, setEnabled] = useState<boolean>(!!current)
   const [saving, setSaving] = useState(false)
   const [err, setErr] = useState<string | null>(null)
@@ -342,7 +342,7 @@ function TipsSection({ biz, setBiz }: { biz: any; setBiz: (b: any) => void }) {
 // 'appointments' feature is on. Default ON; turning it off stops the 24h-
 // before reminder emails to this business's customers.
 function AppointmentRemindersSection({ biz, setBiz }: { biz: any; setBiz: (b: any) => void }) {
-  const current = biz.appointmentRemindersEnabled ?? biz.appointment_reminders_enabled ?? true
+  const current = biz.appointmentRemindersEnabled ?? true
   const [enabled, setEnabled] = useState<boolean>(!!current)
   const [saving, setSaving] = useState(false)
   const [err, setErr] = useState<string | null>(null)
@@ -712,9 +712,9 @@ function StripeConnectSection({ biz: _biz }: { biz: any }) {
   const [initErr, setInitErr] = useState<string | null>(null)
   const [status, setStatus] = useState<{
     accountId: string | null
-    payouts_enabled: boolean
-    details_submitted: boolean
-    requirements_currently_due: string[]
+    payoutsEnabled: boolean
+    detailsSubmitted: boolean
+    requirementsCurrentlyDue: string[]
   } | null>(null)
   const [statusLoading, setStatusLoading] = useState(true)
 
@@ -724,14 +724,14 @@ function StripeConnectSection({ biz: _biz }: { biz: any }) {
       setStatus(r)
     } catch {
       setStatus({
-        accountId: null, payouts_enabled: false,
-        details_submitted: false, requirements_currently_due: [],
+        accountId: null, payoutsEnabled: false,
+        detailsSubmitted: false, requirementsCurrentlyDue: [],
       })
     } finally { setStatusLoading(false) }
   }
   useEffect(() => { fetchStatus() }, [])
 
-  const ready = status?.payouts_enabled && status?.details_submitted
+  const ready = status?.payoutsEnabled && status?.detailsSubmitted
 
   // Poll while the onboarding sheet is open so we see the flip.
   useEffect(() => {
@@ -763,7 +763,7 @@ function StripeConnectSection({ biz: _biz }: { biz: any }) {
   const label = ready
     ? 'Ready'
     : status?.accountId
-      ? (status.details_submitted ? 'Verifying…' : 'Onboarding incomplete')
+      ? (status.detailsSubmitted ? 'Verifying…' : 'Onboarding incomplete')
       : 'Not started'
 
   return (
@@ -793,14 +793,14 @@ function StripeConnectSection({ biz: _biz }: { biz: any }) {
         }}>{statusLoading ? '...' : label}</span>
       </div>
 
-      {(status?.requirements_currently_due ?? []).length > 0 && (
+      {(status?.requirementsCurrentlyDue ?? []).length > 0 && (
         <div style={{
           marginTop: 14, padding: 10,
           background: 'var(--bg-2)', borderRadius: 6,
           fontSize: 12, color: 'var(--text-2)',
         }}>
           <strong style={{ color: 'var(--amber)' }}>Outstanding requirements:</strong>{' '}
-          {(status?.requirements_currently_due ?? []).join(', ')}
+          {(status?.requirementsCurrentlyDue ?? []).join(', ')}
         </div>
       )}
 
@@ -849,7 +849,7 @@ function StripeConnectSection({ biz: _biz }: { biz: any }) {
 function FeaturesSection({ biz, setBiz }: { biz: any; setBiz: (b: any) => void }) {
   const { refreshBusiness } = useAuth()
   const initial: Set<BusinessFeature> = new Set(
-    (biz.enabledFeatures ?? biz.enabled_features ?? []) as BusinessFeature[],
+    (biz.enabledFeatures ?? []) as BusinessFeature[],
   )
   const [selected, setSelected] = useState<Set<BusinessFeature>>(initial)
   const [saving, setSaving] = useState(false)
@@ -880,8 +880,8 @@ function FeaturesSection({ biz, setBiz }: { biz: any; setBiz: (b: any) => void }
       const r = await apiPatch<any>('/businesses/me/features', {
         enabledFeatures: Array.from(selected),
       })
-      const updated = r.enabled_features ?? r.enabledFeatures ?? Array.from(selected)
-      setBiz({ ...biz, enabled_features: updated, enabledFeatures: updated })
+      const updated = r.enabledFeatures ?? Array.from(selected)
+      setBiz({ ...biz, enabledFeatures: updated })
       setOk(true)
       await refreshBusiness()  // refresh Layout nav
     } catch (e: any) {

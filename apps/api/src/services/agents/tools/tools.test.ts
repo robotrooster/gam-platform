@@ -548,7 +548,7 @@ describe('read tools scope to the actor', () => {
 
     it('approve_maintenance_request only touches a request owned by the landlord', async () => {
       ;(mockQueryOne as any)
-        .mockResolvedValueOnce({ id: 'r1', landlord_id: 'L1', status: 'awaiting_approval', contractor_id: null, tenant_id: 't9', unit_id: 'u9', title: 'Leak' }) // ownership-scoped fetch
+        .mockResolvedValueOnce({ id: 'r1', landlord_id: 'L1', status: 'awaiting_approval', assigned_to: null, tenant_id: 't9', unit_id: 'u9', title: 'Leak' }) // ownership-scoped fetch
         .mockResolvedValueOnce({ id: 'r1', status: 'open' }) // the UPDATE
         .mockResolvedValueOnce(null) // tenant notify lookup
       const res: any = await approveMaintenanceRequest.execute({ requestId: 'r1' }, LANDLORD_ACTOR)
@@ -571,7 +571,7 @@ describe('read tools scope to the actor', () => {
 
     it('approve_maintenance_request handles a concurrent change (self-scoped UPDATE matches nothing)', async () => {
       ;(mockQueryOne as any)
-        .mockResolvedValueOnce({ id: 'r1', landlord_id: 'L1', status: 'awaiting_approval', contractor_id: null, tenant_id: 't9', unit_id: 'u9', title: 'Leak' })
+        .mockResolvedValueOnce({ id: 'r1', landlord_id: 'L1', status: 'awaiting_approval', assigned_to: null, tenant_id: 't9', unit_id: 'u9', title: 'Leak' })
         .mockResolvedValueOnce(null) // the self-scoped UPDATE no longer matched (raced)
       const res: any = await approveMaintenanceRequest.execute({ requestId: 'r1' }, LANDLORD_ACTOR)
       expect(res.ok).toBe(false)
@@ -1292,7 +1292,7 @@ describe('get_inspection_checklist (tenant, agent-guided walkthrough)', () => {
     ;(query as any).mockResolvedValueOnce([])
     const res: any = await getInspectionChecklist.execute({}, TENANT_ACTOR)
     const areaNames = res.areas.map((a: any) => a.area)
-    expect(areaNames).toContain('Hookups')
+    expect(areaNames).toContain('RV site')
     expect(areaNames.some((n: string) => n.startsWith('Bedroom'))).toBe(false)
   })
 
@@ -1364,7 +1364,7 @@ describe('get_inspection_progress (landlord-run walkthrough)', () => {
     const res: any = await getInspectionProgress.execute({ unit: '12' }, LANDLORD_ACTOR)
     expect((mockQueryOne as any).mock.calls[0][1][0]).toBe('L1')
     expect(res.ok).toBe(true)
-    expect(res.areas.map((a: any) => a.area)).toContain('Hookups')
+    expect(res.areas.map((a: any) => a.area)).toContain('RV site')
   })
 
   it('lists open inspections when no selector is given', async () => {

@@ -25,6 +25,7 @@ import { randomUUID } from 'crypto'
 import { db } from '../db'
 import { cleanupAllSchema, seedLandlord, seedProperty } from '../test/dbHelpers'
 import { adminRouter } from './admin'
+import { OWNER_EMAIL } from '../middleware/auth'
 import { errorHandler } from '../middleware/errorHandler'
 
 function buildApp() {
@@ -47,6 +48,7 @@ interface AFixture {
   superAdminUserId: string
   adminToken:     string
   superAdminToken: string
+  ownerToken:     string   // super_admin whose email === OWNER_EMAIL (otp-rollout is owner-only, S567)
 }
 
 async function seedAFixture(): Promise<AFixture> {
@@ -62,9 +64,13 @@ async function seedAFixture(): Promise<AFixture> {
       `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
        VALUES ($1, 'x', 'super_admin', 'S', 'U', TRUE) RETURNING id`,
       [`super-${randomUUID()}@test.dev`])
+    const ownerRes = await client.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+       VALUES ($1, 'x', 'super_admin', 'Gam', 'Owner', TRUE) RETURNING id`,
+      [OWNER_EMAIL])
     await client.query('COMMIT')
-    const sign = (id: string, role: string) => jwt.sign(
-      { userId: id, role, email: 'x@test.dev', profileId: id, permissions: {} },
+    const sign = (id: string, role: string, email = 'x@test.dev') => jwt.sign(
+      { userId: id, role, email, profileId: id, permissions: {} },
       process.env.JWT_SECRET!, { expiresIn: '1h' },
     )
     return {
@@ -73,6 +79,7 @@ async function seedAFixture(): Promise<AFixture> {
       superAdminUserId: superAdminRes.rows[0].id,
       adminToken:       sign(adminRes.rows[0].id, 'admin'),
       superAdminToken:  sign(superAdminRes.rows[0].id, 'super_admin'),
+      ownerToken:       sign(ownerRes.rows[0].id, 'super_admin', OWNER_EMAIL),
     }
   } catch (e) { await client.query('ROLLBACK'); throw e }
   finally { client.release() }
@@ -114,7 +121,7 @@ describe('GET /api/admin/property-flags', () => {
 
     const res = await request(buildApp())
       .get('/api/admin/property-flags')
-      .set('Authorization', `Bearer ${f.adminToken}`)
+      .set('Authorization', `Bearer ${f.superAdminToken}`)
     expect(res.status).toBe(200)
     expect(res.body.data.length).toBe(1)
     expect(res.body.data[0].id).toBe(pendingId)
@@ -131,7 +138,7 @@ describe('GET /api/admin/property-flags', () => {
 
     const res = await request(buildApp())
       .get('/api/admin/property-flags?status=resolved')
-      .set('Authorization', `Bearer ${f.adminToken}`)
+      .set('Authorization', `Bearer ${f.superAdminToken}`)
     expect(res.status).toBe(200)
     expect(res.body.data.length).toBe(1)
     expect(res.body.data[0].id).toBe(resolvedId)
@@ -139,8 +146,10 @@ describe('GET /api/admin/property-flags', () => {
   })
 })
 
+// S567: OTP rollout per-landlord is OWNER-only (requireOwner), not merely
+// super_admin — the owner controls where the OTP rent-advance product rolls out.
 describe('PATCH /api/admin/landlords/:id/otp-rollout', () => {
-  it('plain admin → 403 (super_admin only)', async () => {
+  it('plain admin → 403 (owner only)', async () => {
     const f = await seedAFixture()
     const res = await request(buildApp())
       .patch(`/api/admin/landlords/${f.landlordId}/otp-rollout`)
@@ -153,11 +162,20 @@ describe('PATCH /api/admin/landlords/:id/otp-rollout', () => {
     expect(row.rows[0].otp_rollout_enabled).toBe(false)
   })
 
-  it('super_admin happy: flips otp_rollout_enabled', async () => {
+  it('non-owner super_admin → 403 (owner only, not just super_admin)', async () => {
     const f = await seedAFixture()
     const res = await request(buildApp())
       .patch(`/api/admin/landlords/${f.landlordId}/otp-rollout`)
       .set('Authorization', `Bearer ${f.superAdminToken}`)
+      .send({ enabled: true })
+    expect(res.status).toBe(403)
+  })
+
+  it('owner happy: flips otp_rollout_enabled', async () => {
+    const f = await seedAFixture()
+    const res = await request(buildApp())
+      .patch(`/api/admin/landlords/${f.landlordId}/otp-rollout`)
+      .set('Authorization', `Bearer ${f.ownerToken}`)
       .send({ enabled: true })
     expect(res.status).toBe(200)
     const row = await db.query<{ otp_rollout_enabled: boolean }>(
@@ -214,7 +232,7 @@ describe('GET /api/admin/platform-claims/promoted', () => {
 
     const res = await request(buildApp())
       .get('/api/admin/platform-claims/promoted')
-      .set('Authorization', `Bearer ${f.adminToken}`)
+      .set('Authorization', `Bearer ${f.superAdminToken}`)
     expect(res.status).toBe(200)
     expect(res.body.data.rows.length).toBe(2)
     // DESC order: buildiumpro (now) first, rentmanager (1d ago) second

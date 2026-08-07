@@ -886,7 +886,10 @@ posRouter.patch('/purchase-orders/:id', requirePerm('pos.manage_inventory'), asy
       const items = await query<any>('SELECT * FROM pos_purchase_order_items WHERE po_id=$1', [po.id])
       for (const item of items) {
         if (!item.item_id) continue
-        const dbItem = await queryOne<any>('SELECT * FROM pos_items WHERE id=$1', [item.item_id])
+        // S590: scope the restock lookup to the PO's landlord — defense in depth
+        // so a line that somehow references another landlord's item can never
+        // restock it (the insert paths also validate ownership up-front now).
+        const dbItem = await queryOne<any>('SELECT * FROM pos_items WHERE id=$1 AND landlord_id=$2', [item.item_id, po.landlord_id])
         if (!dbItem) continue
         const qty = Number(item.qty_ordered)
         const newQty = dbItem.stock_qty + qty
@@ -1268,7 +1271,6 @@ posRouter.post('/transactions/:id/refund', requirePerm('pos.refund'), async (req
     const refundAmt = Number(amount ?? tx.total)
     if (!Number.isFinite(refundAmt) || refundAmt <= 0) throw new AppError(400, 'Refund amount must be positive')
     const txTotalNum = Number(tx.total)
-    const isFullRefund = refundAmt >= txTotalNum
 
     // S340: FlexCharge reversal needs the originating flex_charge_transactions
     // account_id; look it up before the writes so we can fail fast outside
@@ -1293,13 +1295,32 @@ posRouter.post('/transactions/:id/refund', requirePerm('pos.refund'), async (req
     await client.query('BEGIN')
     txnOpen = true
 
+    // S587: cap the refund at the remaining refundable amount (sale total −
+    // already refunded), computed inside the txn with the transaction row locked
+    // so two concurrent refunds can't both slip past. Without this a cashier
+    // could pay out MORE than the sale — a physical drawer loss on cash/check,
+    // or a negative FlexCharge balance on 'charge'. Refunds accumulate across
+    // multiple partials; refund_amount is the cumulative total, not the last one.
+    await client.query('SELECT 1 FROM pos_transactions WHERE id=$1 FOR UPDATE', [tx.id])
+    const priorRefunded = Number((await client.query<{ s: string }>(
+      `SELECT COALESCE(SUM(amount),0)::text AS s FROM pos_refunds WHERE transaction_id=$1`,
+      [tx.id])).rows[0].s)
+    const remaining = Math.round((txTotalNum - priorRefunded) * 100) / 100
+    if (refundAmt > remaining + 0.005) {
+      throw new AppError(400, priorRefunded > 0
+        ? `Refund exceeds the remaining refundable amount ($${remaining.toFixed(2)}; $${priorRefunded.toFixed(2)} already refunded).`
+        : `Refund exceeds the sale total ($${txTotalNum.toFixed(2)}).`)
+    }
+    const cumulativeRefunded = Math.round((priorRefunded + refundAmt) * 100) / 100
+    const isFullRefund = cumulativeRefunded >= txTotalNum - 0.005
+
     await client.query(`INSERT INTO pos_refunds (transaction_id,landlord_id,amount,reason,items,refund_method)
       VALUES ($1,$2,$3,$4,$5,$6)`,
       [tx.id, req.user!.profileId, refundAmt, reason||null, items ? JSON.stringify(items) : null, resolvedMethod])
 
     await client.query(`UPDATE pos_transactions SET
       status=$1, refund_amount=$2, refunded_at=NOW() WHERE id=$3`,
-      [isFullRefund ? 'refunded' : 'partial_refund', refundAmt, tx.id])
+      [isFullRefund ? 'refunded' : 'partial_refund', cumulativeRefunded, tx.id])
 
     if (resolvedMethod === 'charge' && flexChargeAccountId) {
       const { postFlexChargeRefund } = await import('../services/flexCharge')
@@ -1367,6 +1388,21 @@ posRouter.post('/purchase-orders', requirePerm('pos.manage_inventory'), async (r
       const owned = await queryOne('SELECT id FROM properties WHERE id=$1 AND landlord_id=$2', [propertyId, req.user!.profileId])
       if (!owned) throw new AppError(400, 'propertyId does not belong to this landlord')
     }
+    // S590: every linked itemId must be the landlord's OWN pos_item — otherwise a
+    // PO could reference (and, on receive, restock) another landlord's inventory.
+    // Free-text lines (no itemId) are fine. Validated up-front so a bad line never
+    // creates a partial PO.
+    if (Array.isArray(items)) {
+      const linkedIds = Array.from(new Set(items.map((it: any) => it?.itemId).filter(Boolean).map(String)))
+      if (linkedIds.length > 0) {
+        const owned = await query<{ id: string }>(
+          'SELECT id FROM pos_items WHERE landlord_id=$1 AND id = ANY($2::uuid[])',
+          [req.user!.profileId, linkedIds])
+        if (owned.length !== linkedIds.length) {
+          throw new AppError(400, 'A purchase-order line references an item that does not belong to this landlord')
+        }
+      }
+    }
 
     const poNumber = 'PO-' + Date.now().toString(36).toUpperCase()
     const po = await queryOne<any>(`INSERT INTO pos_purchase_orders
@@ -1400,6 +1436,11 @@ posRouter.post('/purchase-orders/:id/items', requirePerm('pos.manage_inventory')
     const po = await queryOne<any>('SELECT * FROM pos_purchase_orders WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
     if (!po) throw new AppError(404, 'PO not found')
     if (po.status !== 'draft') throw new AppError(400, 'Can only add items to draft POs')
+    // S590: a linked itemId must be the landlord's own pos_item (see the create route).
+    if (itemId) {
+      const owned = await queryOne('SELECT id FROM pos_items WHERE id=$1 AND landlord_id=$2', [itemId, req.user!.profileId])
+      if (!owned) throw new AppError(400, 'This item does not belong to this landlord')
+    }
 
     const lineTotal = (unitCost||0) * (qtyOrdered||1)
     const item = await queryOne<any>(`INSERT INTO pos_purchase_order_items

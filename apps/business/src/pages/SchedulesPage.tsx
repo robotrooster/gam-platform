@@ -7,14 +7,14 @@ import { iconBtnStyle, cancelBtnStyle, saveBtnStyle } from './CustomersPage'
 
 interface ScheduleRow {
   id: string
-  customer_id: string
-  service_type: string
+  customerId: string
+  serviceType: string
   rrule: string
-  time_of_day: string
-  start_date: string
-  end_date: string | null
+  timeOfDay: string
+  startDate: string
+  endDate: string | null
   status: string
-  first_name: string; last_name: string; company_name: string | null
+  firstName: string; lastName: string; companyName: string | null
 }
 
 interface CustomerLite {
@@ -158,10 +158,10 @@ export function SchedulesPage() {
     setEditing(r)
     const parsed = parseRrule(r.rrule)
     setEditForm({
-      serviceType: r.service_type,
+      serviceType: r.serviceType,
       freq: parsed.freq, days: parsed.days, monthDay: parsed.monthDay,
-      timeOfDay: r.time_of_day,
-      endDate: r.end_date ?? '',
+      timeOfDay: r.timeOfDay,
+      endDate: r.endDate ?? '',
     })
   }
 
@@ -252,16 +252,16 @@ export function SchedulesPage() {
                 {rows.map(r => (
                   <tr key={r.id} style={{ borderBottom: '1px solid var(--border-0)' }}>
                     <td style={tdStyle}>
-                      {r.first_name} {r.last_name}
-                      {r.company_name && (
-                        <div style={{ fontSize: 12, color: 'var(--text-2)' }}>{r.company_name}</div>
+                      {r.firstName} {r.lastName}
+                      {r.companyName && (
+                        <div style={{ fontSize: 12, color: 'var(--text-2)' }}>{r.companyName}</div>
                       )}
                     </td>
-                    <td style={tdStyle}>{humanizeServiceType(r.service_type)}</td>
+                    <td style={tdStyle}>{humanizeServiceType(r.serviceType)}</td>
                     <td style={tdStyle}>
                       <div>{describeRrule(r.rrule)}</div>
                       <div style={{ fontSize: 12, color: 'var(--text-2)' }}>
-                        at {r.time_of_day}
+                        at {r.timeOfDay}
                       </div>
                     </td>
                     <td style={tdStyle}>{humanize(r.status)}</td>
@@ -390,8 +390,8 @@ export function SchedulesPage() {
             <div style={{ padding: 12, background: 'var(--bg-2)', borderRadius: 8, marginBottom: 8, fontSize: 13, color: 'var(--text-2)' }}>
               Editing schedule for{' '}
               <strong style={{ color: 'var(--text-0)' }}>
-                {editing.first_name} {editing.last_name}
-                {editing.company_name ? ` — ${editing.company_name}` : ''}
+                {editing.firstName} {editing.lastName}
+                {editing.companyName ? ` — ${editing.companyName}` : ''}
               </strong>
               . Customer + start date can't change; create a new schedule
               if either needs to differ.

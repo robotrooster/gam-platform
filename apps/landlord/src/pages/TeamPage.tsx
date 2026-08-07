@@ -86,6 +86,11 @@ export function TeamPage() {
           permissions page after they accept. */}
       <InviteForm onSent={() => qc.invalidateQueries('team')} />
 
+      {/* S592: bookkeepers are invited here too, via the email-link flow (they
+          set their own password). Distinct from staff — no property, no
+          permission catalog, just an access level. */}
+      <BookkeeperInviteForm onSent={() => qc.invalidateQueries('team')} />
+
       {isLoading ? (
         <div className="card" style={{ padding: 32, color: 'var(--text-3)', textAlign: 'center' }}>Loading…</div>
       ) : (
@@ -357,6 +362,94 @@ function InviteForm({ onSent }: { onSent: () => void }) {
             className="btn btn-primary"
             disabled={mut.isLoading || !email.trim()}
           >
+            {mut.isLoading ? 'Sending…' : 'Send invitation'}
+          </button>
+        </div>
+      </form>
+    </div>
+  )
+}
+
+// S592 (Nic): landlords invite their OWN bookkeeper here, via the same
+// canonical email-link flow (POST /api/scopes/bookkeeper/invite → accept page
+// where the bookkeeper sets their OWN password). Bookkeepers are books-only and
+// portfolio-wide, so — unlike staff — there's no property binding and no
+// permission catalog, just a read-only vs read-write access level. GAM admins
+// no longer create bookkeeper accounts.
+function BookkeeperInviteForm({ onSent }: { onSent: () => void }) {
+  const [firstName, setFirstName] = useState('')
+  const [lastName, setLastName] = useState('')
+  const [email, setEmail] = useState('')
+  const [accessLevel, setAccessLevel] = useState<string>(BOOKKEEPER_ACCESS_LEVELS[0])
+  const [error, setError] = useState<string | null>(null)
+  const [success, setSuccess] = useState<string | null>(null)
+
+  const mut = useMutation(
+    () => apiPost('/scopes/bookkeeper/invite', {
+      email: email.trim(),
+      firstName: firstName.trim() || undefined,
+      lastName: lastName.trim() || undefined,
+      scope: { accessLevel },
+    }),
+    {
+      onSuccess: () => {
+        setError(null)
+        setSuccess(`Invitation emailed to ${email.trim()}. They set their own password from the link, then land with ${humanize(accessLevel)} access to your books.`)
+        setFirstName(''); setLastName(''); setEmail(''); setAccessLevel(BOOKKEEPER_ACCESS_LEVELS[0])
+        onSent()
+        setTimeout(() => setSuccess(null), 6000)
+      },
+      onError: (e: any) => {
+        setSuccess(null)
+        setError(e?.response?.data?.message || e?.response?.data?.error || e?.message || 'Could not send invitation')
+      },
+    },
+  )
+
+  const submit = (e: React.FormEvent) => {
+    e.preventDefault()
+    setError(null)
+    if (!firstName.trim() || !lastName.trim()) { setError('First and last name are required'); return }
+    if (!email.trim()) { setError('Email is required'); return }
+    mut.mutate()
+  }
+
+  const labelStyle = { fontSize: '.72rem', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase' as const, letterSpacing: '.05em', display: 'block', marginBottom: 4 }
+  const inputStyle = { width: '100%', padding: '8px 12px', borderRadius: 8, border: '1px solid var(--border-0)', background: 'var(--bg-2)', fontSize: '.85rem', boxSizing: 'border-box' as const }
+
+  return (
+    <div className="card" style={{ padding: 16, marginBottom: 20 }}>
+      <div style={{ fontSize: '.95rem', fontWeight: 600, marginBottom: 4 }}>Invite a bookkeeper</div>
+      <div style={{ fontSize: '.75rem', color: 'var(--text-3)', marginBottom: 12, lineHeight: 1.5 }}>
+        A bookkeeper gets access to your GAM Books — accounts, payroll, and reports — across all your properties. They set their own password from the email link. You can change their access level or remove them anytime below.
+      </div>
+      <form onSubmit={submit} style={{ display: 'grid', gap: 10 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+          <div>
+            <label style={labelStyle}>First name</label>
+            <input type="text" required value={firstName} onChange={e => setFirstName(e.target.value)} placeholder="Jane" style={inputStyle} />
+          </div>
+          <div>
+            <label style={labelStyle}>Last name</label>
+            <input type="text" required value={lastName} onChange={e => setLastName(e.target.value)} placeholder="Doe" style={inputStyle} />
+          </div>
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: 10 }}>
+          <div>
+            <label style={labelStyle}>Email</label>
+            <input type="email" required value={email} onChange={e => setEmail(e.target.value)} placeholder="name@example.com" style={inputStyle} />
+          </div>
+          <div>
+            <label style={labelStyle}>Access</label>
+            <select value={accessLevel} onChange={e => setAccessLevel(e.target.value)} style={inputStyle}>
+              {BOOKKEEPER_ACCESS_LEVELS.map(lv => <option key={lv} value={lv}>{humanize(lv)}</option>)}
+            </select>
+          </div>
+        </div>
+        {error && (<div style={{ padding: '8px 12px', borderRadius: 6, background: 'rgba(220,76,76,.08)', border: '1px solid rgba(220,76,76,.25)', color: 'var(--red, #dc4c4c)', fontSize: '.78rem' }}>{error}</div>)}
+        {success && (<div style={{ padding: '8px 12px', borderRadius: 6, background: 'rgba(46,163,90,.08)', border: '1px solid rgba(46,163,90,.25)', color: 'var(--green, #2ea35a)', fontSize: '.78rem' }}>{success}</div>)}
+        <div>
+          <button type="submit" className="btn btn-primary" disabled={mut.isLoading || !email.trim()}>
             {mut.isLoading ? 'Sending…' : 'Send invitation'}
           </button>
         </div>

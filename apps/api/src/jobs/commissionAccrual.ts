@@ -7,9 +7,12 @@
  *   closing (25¢) → the closing agent: the referring LANDLORD
  *                   (landlords.referred_by_user_id) if this was a landlord
  *                   referral, else the PM who closed it
- *                   (landlords.portfolio_manager_id). If neither (organic
- *                   self-closed) → POT. A landlord referrer earns this residual
- *                   exactly like a PM closer, but does NOT do CS (see below).
+ *                   (landlords.portfolio_manager_id), else (S592) the OWNER's
+ *                   PERSON-level upline (users.referred_by_user_id) — the
+ *                   fallback that survives 1031s / new LLCs and pays a co-owner's
+ *                   captured primary. If STILL none (truly organic self-closed)
+ *                   → POT. A landlord referrer earns this residual exactly like a
+ *                   PM closer, but does NOT do CS (see below).
  *   service (25¢) → customer service — ALWAYS paid to a person, NEVER the pot.
  *                   Closing and CS are the same agent, so when a closer exists
  *                   it pays the closer (they do their own CS). When self-closed
@@ -70,12 +73,21 @@ export async function processCommissionAccrual(now: Date = new Date()): Promise<
     portfolio_manager_id: string | null
     service_manager_id: string | null
     referred_by_user_id: string | null
+    owner_upline_id: string | null
+    owner_upline_role: string | null
     occupied: number
   }>(`
     SELECT l.id, l.portfolio_manager_id, l.service_manager_id, l.referred_by_user_id,
+      -- S592: the founding owner's PERSON-level upline (+ its role), the fallback
+      -- closer when the entity has no explicit attribution (survives 1031s /
+      -- new LLCs; pays a co-owner's captured primary).
+      ou.referred_by_user_id AS owner_upline_id,
+      up.role                AS owner_upline_role,
       (SELECT COUNT(*)::int FROM units u
         WHERE u.landlord_id = l.id AND u.status <> 'vacant') AS occupied
     FROM landlords l
+    JOIN users ou      ON ou.id = l.user_id
+    LEFT JOIN users up ON up.id = ou.referred_by_user_id
   `)
 
   for (const l of landlords) {
@@ -98,7 +110,7 @@ export async function processCommissionAccrual(now: Date = new Date()): Promise<
 interface AccrueOutcome { commission: number; pot: number; insertedAny: boolean; csUnassigned: boolean }
 
 async function accrueOneLandlord(
-  l: { id: string; portfolio_manager_id: string | null; service_manager_id: string | null; referred_by_user_id: string | null; occupied: number },
+  l: { id: string; portfolio_manager_id: string | null; service_manager_id: string | null; referred_by_user_id: string | null; owner_upline_id: string | null; owner_upline_role: string | null; occupied: number },
   monthIso: string,
 ): Promise<AccrueOutcome> {
   const client: PoolClient = await getClient()
@@ -110,12 +122,22 @@ async function accrueOneLandlord(
     )
 
     const round2 = (n: number) => Math.round(n * 100) / 100
-    // Closer = the referring landlord (referral) OR the PM who closed it.
-    const closerId = l.referred_by_user_id ?? l.portfolio_manager_id
-    // A PM closer does their own CS (both halves). A LANDLORD referrer cannot do
-    // platform CS, so CS breaks off to the assigned service manager — the same
-    // as an organic self-closed landlord.
-    const closerDoesCs = !l.referred_by_user_id && !!l.portfolio_manager_id
+    // Closer = the referring landlord (referral) OR the PM who closed it, falling
+    // back to the OWNER's PERSON-level upline (S592) when the entity carries no
+    // explicit attribution. The fallback is what makes the referral survive a
+    // 1031 / new LLC and pays a co-owner's captured primary on their own account.
+    const entityCloser = l.referred_by_user_id ?? l.portfolio_manager_id
+    const closerId = entityCloser ?? l.owner_upline_id
+    // A rep closer (portfolio_manager / admin) does their own CS (both halves). A
+    // LANDLORD referrer cannot do platform CS, so CS breaks off to the assigned
+    // service manager — the same as an organic self-closed landlord. For the
+    // fallback closer, the upline's role decides.
+    const REP_ROLES = ['portfolio_manager', 'admin', 'super_admin']
+    const closerDoesCs =
+      l.referred_by_user_id ? false
+      : l.portfolio_manager_id ? true
+      : l.owner_upline_id ? REP_ROLES.includes(l.owner_upline_role ?? '')
+      : false
     const csManager = closerDoesCs ? closerId : l.service_manager_id
 
     // role → { manager, toPot }. Service NEVER pots. Closing pots only when

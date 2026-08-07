@@ -791,6 +791,10 @@ function RunPayroll(){
   const[step,setStep]=useState<'setup'|'review'|'done'>('setup')
   const[selectedIds,setSelectedIds]=useState<string[]>([])
   const[hoursMap,setHoursMap]=useState<Record<string,string>>({})
+  // Bookkeeper enters federal + state income-tax withholding per employee (GAM
+  // auto-fills only SS + Medicare). Keyed by employee id.
+  const[taxMap,setTaxMap]=useState<Record<string,{federal:string,state:string}>>({})
+  const setTax=(id:string,k:'federal'|'state',v:string)=>setTaxMap(m=>({...m,[id]:{federal:m[id]?.federal||'',state:m[id]?.state||'',[k]:v}}))
   const[freq,setFreq]=useState('biweekly')
   const[periodStart,setPeriodStart]=useState('')
   const[periodEnd,setPeriodEnd]=useState('')
@@ -809,7 +813,8 @@ function RunPayroll(){
       const r=await post<any>('/books/payroll/runs',{
         periodStart,periodEnd,payDate,payFrequency:freq,
         employeeIds:selectedIds,
-        hoursMap:Object.fromEntries(Object.entries(hoursMap).map(([k,v])=>[k,+v]))
+        hoursMap:Object.fromEntries(Object.entries(hoursMap).map(([k,v])=>[k,+v])),
+        taxMap:Object.fromEntries(selectedIds.map(id=>[id,{federal:+(taxMap[id]?.federal||0),state:+(taxMap[id]?.state||0)}]))
       })
       setDraftRun(r.data)
       setStep('review')
@@ -867,11 +872,11 @@ function RunPayroll(){
 
             <div className="card">
               <div className="ct">Deduction Summary (per paycheck)</div>
-              <div className="dr"><span className="dk">Social Security</span><span className="dv mono">6.2% (up to $168,600/yr)</span></div>
-              <div className="dr"><span className="dk">Medicare</span><span className="dv mono">1.45% (+0.9% over $200k)</span></div>
-              <div className="dr"><span className="dk">State (flat)</span><span className="dv mono">Per-employee setting</span></div>
-              <div className="dr"><span className="dk">Federal W/H</span><span className="dv mono">Per filing status</span></div>
-              <div style={{marginTop:10,fontSize:'.72rem',color:'var(--t3)'}}>Federal withholding uses simplified rate tables. Production should use IRS Publication 15-T bracket tables.</div>
+              <div className="dr"><span className="dk">Social Security</span><span className="dv mono">6.2% (up to $168,600/yr) — auto</span></div>
+              <div className="dr"><span className="dk">Medicare</span><span className="dv mono">1.45% (+0.9% over $200k) — auto</span></div>
+              <div className="dr"><span className="dk">Federal W/H</span><span className="dv mono">You enter, per employee</span></div>
+              <div className="dr"><span className="dk">State W/H</span><span className="dv mono">You enter, per employee</span></div>
+              <div style={{marginTop:10,fontSize:'.72rem',color:'var(--t3)'}}>GAM auto-calculates Social Security &amp; Medicare (fixed statutory rates). Enter federal &amp; state income-tax withholding for each employee below — leave blank for $0.</div>
             </div>
           </div>
 
@@ -882,7 +887,7 @@ function RunPayroll(){
             </div>
             {active.length===0?<div className="empty">No active employees. Add employees first.</div>:(
               <table className="tbl">
-                <thead><tr><th style={{width:40}}></th><th>Employee</th><th>Type</th><th>Rate</th><th>Hours (if hourly)</th><th>Est. Gross</th></tr></thead>
+                <thead><tr><th style={{width:40}}></th><th>Employee</th><th>Type</th><th>Rate</th><th>Hours (if hourly)</th><th>Est. Gross</th><th>Federal W/H</th><th>State W/H</th></tr></thead>
                 <tbody>
                   {active.map((emp:any)=>{
                     const periods:Record<string,number>={weekly:52,biweekly:26,semimonthly:24,monthly:12}
@@ -899,6 +904,8 @@ function RunPayroll(){
                           <input type="number" min="0" step="0.5" style={{width:80}} value={hoursMap[emp.id]||'80'} onChange={e=>setHoursMap(m=>({...m,[emp.id]:e.target.value}))} disabled={!selectedIds.includes(emp.id)}/>
                         ):<span style={{color:'var(--t3)'}}>—</span>}</td>
                         <td className="mono" style={{color:'var(--green)'}}>{formatCurrency(gross)}</td>
+                        <td><input type="number" min="0" step="0.01" style={{width:90}} placeholder="0.00" value={taxMap[emp.id]?.federal||''} onChange={e=>setTax(emp.id,'federal',e.target.value)} disabled={!selectedIds.includes(emp.id)}/></td>
+                        <td><input type="number" min="0" step="0.01" style={{width:90}} placeholder="0.00" value={taxMap[emp.id]?.state||''} onChange={e=>setTax(emp.id,'state',e.target.value)} disabled={!selectedIds.includes(emp.id)}/></td>
                       </tr>
                     )
                   })}
@@ -2111,23 +2118,7 @@ function MyClients(){
   const isAdmin=user?.role==='admin'||user?.role==='super_admin'
   const{data:clients=[],isLoading,refetch}=useQuery('bk-clients',()=>get<any[]>('/books/bookkeeper/clients'))
   const{data:allBookkeepers=[]}=useQuery('all-bk',()=>get<any[]>('/books/bookkeeper/all'),{enabled:isAdmin})
-  const[showInvite,setShowInvite]=useState(false)
-  const[inviteForm,setInviteForm]=useState({email:'',firstName:'',lastName:'',password:'',landlordIds:[] as string[]})
-  const[saving,setSaving]=useState(false)
-  const[err,setErr]=useState('')
   const qc=useQueryClient()
-
-  const invite=async(e:React.FormEvent)=>{
-    e.preventDefault();setSaving(true);setErr('')
-    try{
-      await post('/books/bookkeeper/invite',inviteForm)
-      qc.invalidateQueries('bk-clients')
-      qc.invalidateQueries('all-bk')
-      setShowInvite(false)
-      setInviteForm({email:'',firstName:'',lastName:'',password:'',landlordIds:[]})
-    }catch(ex:any){setErr(ex.response?.data?.error||'Failed')}
-    finally{setSaving(false)}
-  }
 
   const revoke=async(bookkeeperUserId:string,landlordId:string)=>{
     if(!(await appConfirm('Revoke this bookkeeper access?', { danger: true, confirmLabel: 'Revoke' })))return
@@ -2145,7 +2136,6 @@ function MyClients(){
           <h1 className="pt">🏢 {isAdmin?'All Bookkeeper Clients':'My Clients'}</h1>
           <p className="ps">{(clients as any[]).length} client{(clients as any[]).length!==1?'s':''} assigned</p>
         </div>
-        {isAdmin&&<button className="btn bp" onClick={()=>setShowInvite(true)}>+ Invite Bookkeeper</button>}
       </div>
 
       {(clients as any[]).length===0&&!isLoading&&(
@@ -2153,7 +2143,7 @@ function MyClients(){
           <div style={{fontSize:'3rem',marginBottom:16}}>🏢</div>
           <h2 style={{color:'var(--t0)',marginBottom:8}}>No clients assigned yet</h2>
           <p style={{color:'var(--t3)',fontSize:'.85rem',maxWidth:380,margin:'0 auto'}}>
-            {isAdmin?'Invite a bookkeeper and assign them to landlord accounts.':"Your account hasn't been assigned to any clients yet. Contact your administrator."}
+            {isAdmin?'Bookkeepers are invited by landlords from their own Team page. Assigned clients will appear here.':"Your account hasn't been assigned to any clients yet. Contact your administrator."}
           </p>
         </div>
       )}
@@ -2208,24 +2198,6 @@ function MyClients(){
         </div>
       )}
 
-      {showInvite&&(
-        <Modal title="Invite Bookkeeper" onClose={()=>setShowInvite(false)}>
-          {err&&<div className="alert ae">{err}</div>}
-          <form onSubmit={invite}>
-            <div className="frow2">
-              <div><label>First Name</label><input type="text" value={inviteForm.firstName} onChange={e=>setInviteForm(f=>({...f,firstName:e.target.value}))} required/></div>
-              <div><label>Last Name</label><input type="text" value={inviteForm.lastName} onChange={e=>setInviteForm(f=>({...f,lastName:e.target.value}))} required/></div>
-            </div>
-            <div className="frow"><label>Email</label><input type="email" value={inviteForm.email} onChange={e=>setInviteForm(f=>({...f,email:e.target.value}))} required/></div>
-            <div className="frow"><label>Temporary Password</label><input type="text" value={inviteForm.password} onChange={e=>setInviteForm(f=>({...f,password:e.target.value}))} required placeholder="They should change this on first login"/></div>
-            <div className="alert agold" style={{fontSize:'.75rem'}}>After creating the account, use the Assign button on each client to link them.</div>
-            <div className="factions">
-              <button type="button" className="btn bg-btn" onClick={()=>setShowInvite(false)}>Cancel</button>
-              <button type="submit" className="btn bp" disabled={saving}>{saving?<><span className="spinner"/>Creating…</>:'Create Bookkeeper Account'}</button>
-            </div>
-          </form>
-        </Modal>
-      )}
     </div>
   )
 }

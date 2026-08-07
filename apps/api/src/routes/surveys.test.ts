@@ -16,6 +16,7 @@ import {
 } from '../test/dbHelpers'
 import { surveysRouter } from './surveys'
 import { errorHandler } from '../middleware/errorHandler'
+import { camelCaseKeys } from '../lib/caseConversion'
 
 function buildApp() {
   const app = express()
@@ -25,6 +26,25 @@ function buildApp() {
   return app
 }
 const app = buildApp()
+
+// S583: prod serves every response through the global camelCase middleware
+// (index.ts) — the frontend reads camelCase keys. The bare `app` above skips
+// that, so route tests that assert snake_case pass while the tenant portal
+// (which reads e.g. questionType / questionCount) silently breaks. This app
+// mirrors prod's wire format so the contract the frontend depends on is pinned.
+function buildAppCamel() {
+  const a = express()
+  a.use(express.json({ limit: '2mb' }))
+  a.use((_req, res, next) => {
+    const originalJson = res.json.bind(res)
+    res.json = (body: any) => originalJson(camelCaseKeys(body))
+    next()
+  })
+  a.use('/api/surveys', surveysRouter)
+  a.use(errorHandler)
+  return a
+}
+const appCamel = buildAppCamel()
 
 beforeEach(async () => {
   await cleanupAllSchema()
@@ -183,5 +203,32 @@ describe('surveys — scoping', () => {
     expect(newResults.body.data.responseCount).toBe(0)
     expect(newResults.body.data.survey.property_id).toBe(f.propA2)
     expect(newResults.body.data.survey.status).toBe('draft')
+  })
+})
+
+// S583: the tenant portal reads camelCase keys off these endpoints. Assert the
+// prod wire format (camelize middleware) so a server-side rename can't silently
+// break the TenantSurveysPage — where question_type-vs-questionType decided
+// whether a multiple-choice question rendered as radios or a (rejected) textbox.
+describe('surveys — tenant wire contract is camelCase', () => {
+  it('/tenant/mine exposes questionCount (not question_count)', async () => {
+    const f = await seed()
+    await createAndSend(f)
+    const mine = await request(appCamel).get('/api/surveys/tenant/mine').set(auth(f.tenantAToken))
+    expect(mine.status).toBe(200)
+    expect(mine.body.data[0].questionCount).toBe(2)
+    expect(mine.body.data[0].question_count).toBeUndefined()
+  })
+
+  it('/tenant/:id questions expose questionType (not question_type)', async () => {
+    const f = await seed()
+    const id = await createAndSend(f)
+    const detail = await request(appCamel).get(`/api/surveys/tenant/${id}`).set(auth(f.tenantAToken))
+    expect(detail.status).toBe(200)
+    const qs = detail.body.data.questions
+    const mcq = qs.find((q: any) => q.questionType === 'multiple_choice')
+    expect(mcq).toBeTruthy()
+    expect(mcq.options).toEqual(['June 1', 'June 8'])
+    expect(qs.every((q: any) => q.question_type === undefined)).toBe(true)
   })
 })

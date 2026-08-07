@@ -25,10 +25,10 @@ import jwt from 'jsonwebtoken'
 import { randomUUID } from 'crypto'
 import { db } from '../db'
 import {
-  cleanupAllSchema, seedLandlord, seedProperty, seedManager,
+  cleanupAllSchema, seedLandlord, seedProperty, seedManager, seedUnit,
   seedUserBankAccount,
 } from '../test/dbHelpers'
-import { propertiesRouter } from './properties'
+import { propertiesRouter, publicPropertiesRouter } from './properties'
 import { errorHandler } from '../middleware/errorHandler'
 
 function buildApp() {
@@ -718,5 +718,75 @@ describe('S550 — duplicate property identity', () => {
     expect((await withSuite(f2, 'Main St Plaza — West', 'Suite B')).status).toBe(201)
     // Same suite as an existing owner → blocked.
     expect((await withSuite(f2, 'Plaza Clone', 'Suite A')).status).toBe(409)
+  })
+})
+
+// S592: the public /apply intake resolves the landlord AUTHORITATIVELY. It has
+// no auth (it's a public form) and unit_applications has no FKs, so the route
+// itself must reject bogus/mismatched landlord ids.
+describe('POST /api/public/properties/apply — landlord resolution', () => {
+  function buildPublicApp() {
+    const app = express()
+    app.use(express.json({ limit: '2mb' }))
+    app.use('/api/public/properties', publicPropertiesRouter)
+    app.use(errorHandler)
+    return app
+  }
+
+  // Landlord A owns a property + unit; landlord B owns nothing here.
+  async function seedTwoLandlordsWithUnit() {
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      const a = await seedLandlord(client)
+      const b = await seedLandlord(client)
+      const propertyId = await seedProperty(client, {
+        landlordId: a.landlordId, ownerUserId: a.userId, managedByUserId: a.userId })
+      const unitId = await seedUnit(client, { propertyId, landlordId: a.landlordId })
+      await client.query('COMMIT')
+      return { landlordA: a.landlordId, landlordB: b.landlordId, unitId }
+    } catch (e) { await client.query('ROLLBACK'); throw e }
+    finally { client.release() }
+  }
+
+  const applicant = { firstName: 'Pat', lastName: 'Guest', email: 'pat@guest.dev' }
+
+  it('happy path: unitId → application stamped with the UNIT owner', async () => {
+    const { landlordA, unitId } = await seedTwoLandlordsWithUnit()
+    const res = await request(buildPublicApp())
+      .post('/api/public/properties/apply')
+      .send({ unitId, ...applicant })
+    expect(res.status).toBe(201)
+    expect(res.body.data.landlord_id).toBe(landlordA)
+    expect(res.body.data.unit_id).toBe(unitId)
+  })
+
+  it('cross-landlord: unit of A + landlordId of B → 400, nothing inserted', async () => {
+    const { landlordB, unitId } = await seedTwoLandlordsWithUnit()
+    const res = await request(buildPublicApp())
+      .post('/api/public/properties/apply')
+      .send({ unitId, landlordId: landlordB, ...applicant })
+    expect(res.status).toBe(400)
+    const rows = await db.query(`SELECT id FROM unit_applications`)
+    expect(rows.rows.length).toBe(0)
+  })
+
+  it('bogus landlordId (no unit) → 404, nothing inserted', async () => {
+    const res = await request(buildPublicApp())
+      .post('/api/public/properties/apply')
+      .send({ landlordId: randomUUID(), ...applicant })
+    expect(res.status).toBe(404)
+    const rows = await db.query(`SELECT id FROM unit_applications`)
+    expect(rows.rows.length).toBe(0)
+  })
+
+  it('landlord-only application with a REAL landlordId → 201', async () => {
+    const { landlordB } = await seedTwoLandlordsWithUnit()
+    const res = await request(buildPublicApp())
+      .post('/api/public/properties/apply')
+      .send({ landlordId: landlordB, ...applicant })
+    expect(res.status).toBe(201)
+    expect(res.body.data.landlord_id).toBe(landlordB)
+    expect(res.body.data.unit_id).toBeNull()
   })
 })

@@ -29,7 +29,6 @@ import { stampPdf } from '../services/pdfStamp'
 import { resolveLateFeePolicyForUnit, lateFeePolicyToPrefills } from '../services/lateFeePolicy'
 import { suggestUnitPrefill } from '../services/leasePrefill'
 import { detectPropertyFromPdf } from '../services/templatePropertyDetect'
-import { autoPlaceFields } from '../services/autoFieldPlacement'
 import { createAdminNotification } from '../services/adminNotifications'
 import { emailSigningRequest, emailSigningCompleted } from '../services/email'
 import { createNotification } from '../services/notifications'
@@ -286,6 +285,10 @@ export async function createDocumentRecord(client: any, opts: {
     for (const [col, val] of Object.entries(suggested)) {
       if (val && (pv[col] == null || pv[col] === '')) pv[col] = val // caller-supplied wins
     }
+    // S582: rent due day is PLATFORM-LOCKED to the 1st — force the value so any
+    // placed rent_due_day box renders "the 1st" in the signed lease (the landlord
+    // never chooses it). Overrides any caller value on purpose.
+    pv.rent_due_day = '1st'
   }
 
   // Copy template fields — match by signer_role, prune unused role slots
@@ -402,16 +405,59 @@ async function resolveUnitsToApplicableLeases(
   return result.rows;
 }
 
-async function buildLeaseFromDocument(documentId: string): Promise<{ leaseId: string; status: string; primaryTenantId: string }> {
+export async function buildLeaseFromDocument(documentId: string): Promise<{ leaseId: string; status: string; primaryTenantId: string; alreadyBuilt: boolean }> {
   const client = await getClient()
   try {
     await client.query('BEGIN')
+
+    // S581 (sweep, Nic): serialize finalization of THIS document. Completion is
+    // detected POST-commit with a check-then-act COUNT (see the sign route), so
+    // a duplicate or racing final signature — a double-click, or two tied-order
+    // co-tenants both submitting last — can have two requests each observe "all
+    // signed" and both land here. The lease INSERT below has NO DB backstop
+    // (there is no unique link document→lease, and no one-active-lease-per-unit
+    // constraint), so the second build materialized a SECOND lease + a SECOND
+    // move-in invoice: double deposit + double first-month rent + double PM
+    // leasing fee. This xact advisory lock makes the second builder wait for the
+    // first to COMMIT; the already-built short-circuit below then no-ops it.
+    await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`esign_finalize:${documentId}`])
 
     const doc = await client.query(
       `SELECT d.*, u.unit_type
        FROM lease_documents d LEFT JOIN units u ON u.id = d.unit_id
        WHERE d.id=$1`, [documentId]).then(r => r.rows[0])
     if (!doc) throw new AppError(404, 'Document not found')
+
+    // Idempotent finalization for EVERY document_type. finalized_at is stamped
+    // at the END of a successful build below, inside THIS txn — so it commits
+    // before the advisory lock releases. A duplicate/concurrent finalization that
+    // acquires the lock next sees it set and returns the already-built result
+    // instead of applying the document a SECOND time: a second lease + move-in
+    // invoice (original_lease), a re-added/removed tenant or re-applied term
+    // change (addendums), or a re-activated sublease. The duplicate caller skips
+    // all one-time side effects, so the returned ids only need to identify the
+    // built artifact (lease for lease/addendum docs, subleases row for subleases).
+    if (doc.finalized_at) {
+      let leaseId = doc.lease_id ?? ''
+      let status = 'active'
+      let primaryTenantId = ''
+      if (doc.document_type === 'sublease_agreement') {
+        const sub = await client.query(
+          `SELECT id, status, sublessor_tenant_id FROM subleases WHERE sublease_document_id = $1 LIMIT 1`,
+          [documentId]).then((r: any) => r.rows[0])
+        if (sub) { leaseId = sub.id; status = sub.status; primaryTenantId = sub.sublessor_tenant_id ?? '' }
+      } else if (doc.lease_id) {
+        const ex = await client.query(
+          `SELECT l.status,
+                  (SELECT lt.tenant_id FROM lease_tenants lt
+                    WHERE lt.lease_id = l.id AND lt.role = 'primary' AND lt.status = 'active'
+                    ORDER BY lt.added_at LIMIT 1) AS primary_tenant_id
+             FROM leases l WHERE l.id = $1`, [doc.lease_id]).then((r: any) => r.rows[0])
+        if (ex) { status = ex.status; primaryTenantId = ex.primary_tenant_id ?? '' }
+      }
+      await client.query('COMMIT')
+      return { leaseId, status, primaryTenantId, alreadyBuilt: true }
+    }
 
     let result: { leaseId: string; status: string; primaryTenantId: string }
     switch (doc.document_type) {
@@ -454,8 +500,11 @@ async function buildLeaseFromDocument(documentId: string): Promise<{ leaseId: st
         throw new AppError(400, `Unknown document_type: ${doc.document_type}`)
     }
 
+    // S581: mark the document finalized so a duplicate/concurrent build no-ops
+    // (checked under the advisory lock at the top). Same txn as the build.
+    await client.query('UPDATE lease_documents SET finalized_at = NOW() WHERE id = $1', [documentId])
     await client.query('COMMIT')
-    return result
+    return { ...result, alreadyBuilt: false }
   } catch (e) {
     await client.query('ROLLBACK')
     throw e
@@ -1129,6 +1178,23 @@ async function executeAddendumTerms(client: any, doc: any): Promise<{ leaseId: s
     [lease.id]).then((r: any) => r.rows[0])
   if (!primary) throw new AppError(500, 'Lease has no active primary for addendum_terms completion')
 
+  // S581 (Nic): a terms addendum can carry a MONEY change (an optional recurring
+  // charge like parking, or a base-rent change like an AZ mobile-home space-rent
+  // increase). Those were drafted as pending scheduled_lease_changes at creation;
+  // now that both parties have signed, promote them to 'scheduled' so the nightly
+  // job applies them to billing on the landlord-set effective date. No-op for a
+  // non-money addendum.
+  const { activateScheduledChangesForDocument, createLeaseNoticesForDocument } =
+    await import('../services/scheduledLeaseChanges')
+  await activateScheduledChangesForDocument(client, doc.id)
+
+  // S581: a NOTICE addendum (landlord-issued, no tenant signature) gives each
+  // active tenant a blocking portal notice to view + acknowledge — proof they were
+  // noticed of a change they didn't have to agree to.
+  if (doc.delivery_mode === 'notice') {
+    await createLeaseNoticesForDocument(client, doc.id, lease.id)
+  }
+
   return { leaseId: lease.id, status: lease.status, primaryTenantId: primary.tenant_id }
 }
 
@@ -1431,19 +1497,36 @@ esignRouter.put('/templates/:id/fields', requireAuth, requirePerm('esign.templat
 // RETURNS proposed fields (does NOT save). The landlord loads them into the
 // editor, adjusts, then the existing PUT /fields persists. Spec:
 // ~/gam/AUTO_FIELD_PLACEMENT_SPEC.md.
+// S582: ASYNC. Validate + enqueue a job, fire the model run WITHOUT awaiting, and
+// return the jobId immediately. The editor polls the GET below until it leaves
+// 'processing'. Decoupling the model work from the HTTP request means no request
+// is ever held open long enough for Cloudflare's ~100s edge timeout to bite, and
+// the model can take its natural time (better labels, never truncated).
 esignRouter.post('/templates/:id/auto-fields', requireAuth, requirePerm('esign.template_manage'), async (req, res, next) => {
   try {
     const template = await queryOne<any>('SELECT * FROM lease_templates WHERE id=$1 AND landlord_id=$2', [req.params.id, req.user!.profileId])
     if (!template) throw new AppError(404, 'Template not found')
     if (!template.base_pdf_url) throw new AppError(400, 'Template has no base PDF — upload one first')
-
     const filename = extractUploadFilename(template.base_pdf_url)
     if (!filename) throw new AppError(400, 'Template PDF path is not a local upload')
-    const pdfPath = path.join(uploadDir, filename)
-    if (!fs.existsSync(pdfPath)) throw new AppError(404, 'Template PDF file not found on disk')
+    if (!fs.existsSync(path.join(uploadDir, filename))) throw new AppError(404, 'Template PDF file not found on disk')
 
-    const result = await autoPlaceFields(fs.readFileSync(pdfPath))
-    res.json({ success: true, data: result })
+    const { createAutoFieldJob, runAutoFieldJob } = await import('../services/autoFieldJobs')
+    const jobId = await createAutoFieldJob(template.id, req.user!.profileId)
+    // Detached — runAutoFieldJob catches its own errors onto the job row.
+    void runAutoFieldJob(jobId)
+    res.status(202).json({ success: true, data: { jobId, status: 'processing' } })
+  } catch (e) { next(e) }
+})
+
+// S582: poll the placement job. Returns { status, result?, error? }; the editor
+// loads result.fields once status === 'done'.
+esignRouter.get('/templates/:id/auto-fields/:jobId', requireAuth, requirePerm('esign.template_manage'), async (req, res, next) => {
+  try {
+    const { getAutoFieldJob } = await import('../services/autoFieldJobs')
+    const job = await getAutoFieldJob(req.params.jobId, req.user!.profileId)
+    if (!job || job.template_id !== req.params.id) throw new AppError(404, 'Job not found')
+    res.json({ success: true, data: { status: job.status, result: job.result, error: job.error } })
   } catch (e) { next(e) }
 })
 
@@ -2492,9 +2575,45 @@ esignRouter.post('/documents/addendum-terms/batch', requireAuth, requirePerm('le
 esignRouter.post('/documents/addendum-terms', requireAuth, requirePerm('leases.create'), async (req, res, next) => {
   const client = await getClient()
   try {
-    const { leaseId, templateId, title, signers, basePdfUrl } = req.body
+    const { leaseId, templateId, title, basePdfUrl } = req.body
+    // S581: signers may be OMITTED — the money-add-on flow lets the backend resolve
+    // them from the lease (landlord + tenants), so the landlord screen just says
+    // "leaseId + mode + changes". Explicit signers still supported (the send flow).
+    let signers = req.body.signers as any[] | undefined
     if (!leaseId) throw new AppError(400, 'leaseId required for addendum_terms')
-    if (!title || !signers?.length) throw new AppError(400, 'title and signers required')
+    if (!title) throw new AppError(400, 'title required')
+
+    // S581: delivery mode determined up-front (drives auto-signer resolution).
+    // 'agreement' = tenant opts in + signs; 'notice' = landlord issues, no tenant
+    // signature. Landlord chooses per add-on, per their local law (never GAM by state).
+    const mode: 'agreement' | 'notice' = req.body.mode === 'notice' ? 'notice' : 'agreement'
+
+    // S581 (Nic): optional MONEY changes this addendum carries — an added recurring
+    // charge (parking/garage) or a base-rent change (e.g. AZ mobile-home space rent).
+    // Each has a landlord-set effective_date; on completion the nightly job applies
+    // it to billing on that date (auto-apply). Validated + stored as pending
+    // 'draft' rows below, activated when both parties sign.
+    const scheduledChanges = (req.body.scheduledChanges ?? []) as any[]
+    const changesSpec = z.array(z.discriminatedUnion('changeType', [
+      z.object({
+        changeType:    z.literal('rent'),
+        effectiveDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+        newRentAmount: z.number().nonnegative(),
+      }),
+      z.object({
+        changeType:     z.literal('recurring_fee'),
+        effectiveDate:  z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+        // Must be a RECURRING (monthly_ongoing) lease_fees fee_type — the value
+        // the apply job writes into lease_fees, which is CHECK-constrained. Only
+        // the recurring subset is valid here (deposits / one-time fees excluded).
+        feeType:        z.enum([
+          'pet_rent', 'parking_rent', 'storage_rent', 'amenity_fee_monthly',
+          'trash_fee', 'pest_control_fee', 'technology_fee', 'other_fee',
+        ]),
+        feeAmount:      z.number().nonnegative(),
+        feeDescription: z.string().max(200).optional(),
+      }),
+    ])).parse(scheduledChanges)
 
     // 1. Lease exists, landlord owns it. Status restriction intentionally omitted —
     //    terms amendments are valid on any lease status (pending/active alike).
@@ -2508,16 +2627,46 @@ esignRouter.post('/documents/addendum-terms', requireAuth, requirePerm('leases.c
       throw new AppError(409, `Cannot amend terms: lease is ${lease.status}`)
     }
 
-    // 2. Current active roster — every active tenant must sign a terms change
+    // 2. Current active roster — every active tenant must sign a terms change.
+    //    (name/email included so we can auto-assemble signers below.)
     const currentRoster = await query<any>(`
-      SELECT lt.id as lt_id, lt.tenant_id, t.user_id
+      SELECT lt.id as lt_id, lt.tenant_id, t.user_id,
+             u.first_name, u.last_name, u.email
       FROM lease_tenants lt
       JOIN tenants t ON t.id = lt.tenant_id
+      JOIN users u ON u.id = t.user_id
       WHERE lt.lease_id=$1 AND lt.status='active'`,
       [leaseId])
     const rosterRows = currentRoster as any[]
     if (rosterRows.length === 0) {
       throw new AppError(500, 'Lease has no active tenants — data integrity issue')
+    }
+
+    // S581: auto-resolve signers when the caller omits them (money-add-on flow).
+    // Landlord always signs. AGREEMENT also needs every active tenant to sign;
+    // a NOTICE is landlord-only (no tenant signature). Roles: first tenant is
+    // 'primary', the rest 'co_tenant' — matching the addendum signer contract.
+    if (!signers?.length) {
+      const ll = await queryOne<{ user_id: string; first_name: string; last_name: string; email: string }>(
+        `SELECT u.id AS user_id, u.first_name, u.last_name, u.email
+           FROM landlords la JOIN users u ON u.id = la.user_id WHERE la.id = $1`,
+        [lease.landlord_id])
+      if (!ll) throw new AppError(500, 'Landlord account not found')
+      const built: any[] = [{
+        userId: ll.user_id, role: 'landlord',
+        name: `${ll.first_name ?? ''} ${ll.last_name ?? ''}`.trim() || ll.email, email: ll.email,
+      }]
+      if (mode === 'agreement') {
+        // Signer roles MUST match TENANT_ROLE_PATTERN /^(primary|co_tenant_\d+)$/ —
+        // the literal 'co_tenant' is NOT a valid signer role and would trip the
+        // "Invalid signer role" guard below, so a 2+-tenant agreement addendum
+        // would 400. First tenant = primary, the rest = co_tenant_1, co_tenant_2, …
+        rosterRows.forEach((r: any, i: number) => built.push({
+          userId: r.user_id, role: i === 0 ? 'primary' : `co_tenant_${i}`,
+          name: `${r.first_name ?? ''} ${r.last_name ?? ''}`.trim() || r.email, email: r.email,
+        }))
+      }
+      signers = built
     }
 
     // 3. Signer shape validation
@@ -2538,13 +2687,18 @@ esignRouter.post('/documents/addendum-terms', requireAuth, requirePerm('leases.c
       if (!t) throw new AppError(400, `Signer ${s.email} has no tenant profile — cannot sign as tenant`)
       tenantSigners.push({ userId: s.userId, tenantId: t.id, role: s.role, email: s.email, name: s.name })
     }
-    if (tenantSigners.length === 0) throw new AppError(400, 'At least one tenant signer required')
-
-    // 5. Signer composition — all current active tenants must sign, no outsiders
-    const signerUserIds = new Set(tenantSigners.map(t => t.userId))
-    for (const r of rosterRows) {
-      if (!signerUserIds.has(r.user_id)) {
-        throw new AppError(400, `Current tenant (user ${r.user_id}) must sign terms addendum — all active tenants sign rule changes`)
+    // S581: a NOTICE is landlord-issued and NOT optional, so it needs no tenant
+    // signature. AGREEMENT mode keeps the "every active tenant must sign" rule
+    // (a rule the tenant is agreeing to). For a notice the affected tenants are
+    // still notified — a blocking portal notice is created on completion.
+    if (mode === 'agreement') {
+      if (tenantSigners.length === 0) throw new AppError(400, 'At least one tenant signer required')
+      // 5. Signer composition — all current active tenants must sign, no outsiders
+      const signerUserIds = new Set(tenantSigners.map(t => t.userId))
+      for (const r of rosterRows) {
+        if (!signerUserIds.has(r.user_id)) {
+          throw new AppError(400, `Current tenant (user ${r.user_id}) must sign terms addendum — all active tenants sign rule changes`)
+        }
       }
     }
     for (const t of tenantSigners) {
@@ -2569,6 +2723,26 @@ esignRouter.post('/documents/addendum-terms', requireAuth, requirePerm('leases.c
       pdfUrl = pdfUrl || tmpl.base_pdf_url
     }
 
+    // S582: document-first for money add-ons. When the addendum carries a money
+    // change and the landlord supplied NO base PDF/template (the MoneyAddonModal
+    // path), GENERATE an addendum PDF that PRINTS the exact change + effective
+    // date + signature fields — so the tenant signs a document that states the
+    // term (memory gam-document-first-enforcement: courts enforce the document,
+    // not the software config). The field boxes come back to be persisted below.
+    let generatedFields: import('../services/moneyAddonPdf').MoneyAddonFieldBox[] = []
+    if (changesSpec.length > 0 && !pdfUrl) {
+      const { generateMoneyAddonPdf } = await import('../services/moneyAddonPdf')
+      const gen = await generateMoneyAddonPdf({
+        leaseId: lease.id,
+        title,
+        mode,
+        changes: changesSpec as any,
+        signers: signers.map((s: any) => ({ role: s.role, name: s.name })),
+      })
+      pdfUrl = gen.fileUrl
+      generatedFields = gen.fields
+    }
+
     // Transaction: just create the document. No lease_tenants mutation for terms addendums.
     await client.query('BEGIN')
 
@@ -2584,6 +2758,44 @@ esignRouter.post('/documents/addendum-terms', requireAuth, requirePerm('leases.c
       promoteLeaseTenantId: null,
       signers
     })
+
+    // S581: mark a landlord-issued NOTICE so completion creates the tenant
+    // blocking-notice (and no tenant signature is expected). Agreement is default.
+    if (mode === 'notice') {
+      await client.query(`UPDATE lease_documents SET delivery_mode='notice' WHERE id=$1`, [doc.id])
+    }
+
+    // S582: persist the generated PDF's signature/date fields, bound to each
+    // signer row (roles are 1:1 with signers here — landlord + primary +
+    // co_tenant_N). Skips any field whose role isn't a signer on this document
+    // (a notice generates only a landlord block, so nothing is skipped there).
+    if (generatedFields.length > 0) {
+      const signerRows = await client.query(
+        'SELECT id, role FROM lease_document_signers WHERE document_id=$1', [doc.id],
+      ).then((r: any) => r.rows as Array<{ id: string; role: string }>)
+      const idByRole = new Map(signerRows.map(s => [s.role, s.id]))
+      for (const f of generatedFields) {
+        const signerId = idByRole.get(f.signerRole)
+        if (!signerId) continue
+        await client.query(`
+          INSERT INTO lease_document_fields
+            (document_id, signer_id, field_type, signer_role, label, lease_column,
+             page, x, y, width, height, required)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+          [doc.id, signerId, f.fieldType, f.signerRole, f.label, f.leaseColumn,
+           f.page, f.x, f.y, f.width, f.height, f.required])
+      }
+    }
+
+    // S581: record the money changes as pending 'draft' rows tied to this
+    // addendum. They activate to 'scheduled' when both parties sign (see
+    // executeAddendumTerms) and apply on their effective date. Same txn as the doc.
+    if (changesSpec.length > 0) {
+      const { createDraftScheduledChange } = await import('../services/scheduledLeaseChanges')
+      for (const ch of changesSpec) {
+        await createDraftScheduledChange(client, lease.id, doc.id, ch as any)
+      }
+    }
 
     await client.query('COMMIT')
     res.status(201).json({ success: true, data: doc })
@@ -2926,6 +3138,13 @@ esignRouter.post('/documents/:id/void', requireAuth, requirePerm('esign.void'), 
     await client.query(
       "UPDATE lease_documents SET status='voided', voided_at=NOW(), void_reason=$1, updated_at=NOW() WHERE id=$2",
       [reason || null, doc.id])
+
+    // S581: a voided addendum's pending money changes (scheduled rent / recurring
+    // fee) must NEVER reach billing — cancel them atomically with the void.
+    await client.query(
+      `UPDATE scheduled_lease_changes SET status='cancelled', updated_at=NOW()
+        WHERE source_document_id=$1 AND status IN ('draft','scheduled')`,
+      [doc.id])
 
     await client.query('COMMIT')
     res.json({ success: true })
@@ -3317,7 +3536,7 @@ esignRouter.post('/sign/:documentId', requireAuth, async (req, res, next) => {
       // still get their PDF stamped below. leaseResult stays null (no lease id).
       const isNoLeaseDoc = (NO_LEASE_DOCUMENT_TYPES as readonly string[]).includes(doc.document_type)
 
-      let leaseResult: { leaseId: string; status: string; primaryTenantId: string } | null = null
+      let leaseResult: { leaseId: string; status: string; primaryTenantId: string; alreadyBuilt: boolean } | null = null
       if (!isNoLeaseDoc) {
         try {
           leaseResult = await buildLeaseFromDocument(doc.id)
@@ -3337,6 +3556,14 @@ esignRouter.post('/sign/:documentId', requireAuth, async (req, res, next) => {
             "UPDATE lease_documents SET status='execution_failed', execution_failed_at=NOW(), void_reason=$1, updated_at=NOW() WHERE id=$2",
             [`Lease build failed: ${e.message}`, doc.id])
           return res.json({ success: true, data: { completed: true, executionFailed: true, reason: e.message } })
+        }
+
+        // S581: a deduped (already-built) result means a concurrent final
+        // signature won the finalization race — the winner already ran the
+        // one-time side effects (PM transfer, PDF stamp, completion emails) and
+        // marked the doc completed. Do NOT re-run them; just report done.
+        if (leaseResult?.alreadyBuilt) {
+          return res.json({ success: true, data: { completed: true, leaseId: leaseResult.leaseId, deduped: true } })
         }
 
         // S119 post-commit: fire Stripe Transfer for any PM company leasing

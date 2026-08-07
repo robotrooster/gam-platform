@@ -62,8 +62,10 @@ const server = http.createServer((req, res) => {
   catch { res.writeHead(400); return res.end('Bad request') }
 
   // Resolve within dist/; anything that escapes → SPA fallback (never the FS).
+  // startsWith must include the separator so a sibling dir whose name merely
+  // begins with "dist" (e.g. dist-backup) can never be served.
   const candidate = path.normalize(path.join(DIST_DIR, urlPath))
-  if (candidate.startsWith(DIST_DIR) && urlPath !== '/' && fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+  if ((candidate === DIST_DIR || candidate.startsWith(DIST_DIR + path.sep)) && urlPath !== '/' && fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
     return sendFile(res, candidate)
   }
   // SPA fallback — every route (and every subdomain) gets the app shell.

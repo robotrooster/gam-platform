@@ -19,7 +19,10 @@ interface AuthUser {
 
 // login() returns a discriminated result so LoginPage can branch into
 // the TOTP second step when the backend gates on 2FA.
-type LoginResult = { kind: 'success' } | { kind: 'totp_required'; totpSession: string }
+type LoginResult =
+  | { kind: 'success' }
+  | { kind: 'totp_required'; totpSession: string }
+  | { kind: 'email_otp_required'; emailOtpSession: string }   // S578: universal email 2FA
 
 /** A pm_staff membership: which pm_company the current user belongs to,
  *  and at what role. Populated lazily after auth (one /api/pm/companies
@@ -42,6 +45,8 @@ interface AuthCtx {
   setActivePmCompany: (c: ActivePmCompany) => void
   login:  (email: string, password: string) => Promise<LoginResult>
   loginWithTotp: (totpSession: string, code: string) => Promise<void>
+  loginWithEmailOtp: (emailOtpSession: string, code: string) => Promise<void>
+  resendEmailOtp: (emailOtpSession: string) => Promise<void>
   logout: () => void
   refresh: () => Promise<void>
 }
@@ -108,10 +113,25 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     if (data.requiresTotp) {
       return { kind: 'totp_required', totpSession: data.totpSession as string }
     }
+    // S578: universal email-2FA — a pending session, no token until the code.
+    if (data.requiresEmailOtp) {
+      return { kind: 'email_otp_required', emailOtpSession: data.emailOtpSession as string }
+    }
     localStorage.setItem('gam_token', data.token)
     setToken(data.token)
     setUser(data.user ?? data)
     return { kind: 'success' }
+  }
+
+  // S578: email-code second-step exchange (universal 2FA).
+  const loginWithEmailOtp = async (emailOtpSession: string, code: string): Promise<void> => {
+    const res = await apiPost<{ token: string }>('/auth/email-otp/verify', { emailOtpSession, code })
+    localStorage.setItem('gam_token', res.data!.token)
+    setToken(res.data!.token)
+    await refresh()
+  }
+  const resendEmailOtp = async (emailOtpSession: string): Promise<void> => {
+    await apiPost('/auth/email-otp/resend', { emailOtpSession })
   }
 
   // TOTP second-step exchange. Trades the short-lived totp_session JWT
@@ -129,7 +149,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     <Ctx.Provider value={{
       user, token, loading,
       pmCompanies, activePmCompany, setActivePmCompany,
-      login, loginWithTotp, logout, refresh,
+      login, loginWithTotp, loginWithEmailOtp, resendEmailOtp, logout, refresh,
     }}>
       {children}
     </Ctx.Provider>

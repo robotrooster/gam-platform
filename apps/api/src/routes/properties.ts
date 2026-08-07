@@ -10,6 +10,8 @@ import { requireAuth, requireLandlord, requirePerm } from '../middleware/auth'
 import { resolveUploadPath } from '../lib/uploadPaths'
 import { canAccessLandlordResource, canManageLandlordResource } from '../middleware/scope'
 import { suggestBookingSlug } from './propertyBookingAdmin'
+import { openOnboardingWindow, getOnboardingWindow, closeOnboardingWindow } from '../services/onboardingWindow'
+import { draftLeaseFromApplication } from '../services/applicationLeaseDraft'
 import { AppError } from '../middleware/errorHandler'
 import {
   FEE_PAYER_VALUES,
@@ -196,6 +198,13 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
        body.requiresBookingAcknowledgment ?? false, body.operatorOwnsLand ?? true])
     const prop = propRes.rows[0]
 
+    // S579: open the property's onboarding window. While it's open the landlord
+    // can grandfather sitting tenants past the background check (per occupied
+    // unit, attested); after it closes every new tenant must screen. Length is
+    // recomputed against unit count on read, so units added next extend it
+    // (within the 30-day cap). See services/onboardingWindow.ts.
+    await openOnboardingWindow(prop.id, client)
+
     // S574 (Nic): every property gets a live public website the moment it's
     // created — auto-assign a booking slug and publish it so the landlord has a
     // shareable site immediately, with no separate "enable" step to hunt for.
@@ -333,15 +342,36 @@ propertiesRouter.post('/', requirePerm('properties.create'), async (req, res, ne
 propertiesRouter.get('/applications', requirePerm('tenants.create'), async (req, res, next) => {
   try {
     const { rows } = await db.query(
-      `SELECT ua.*, u.unit_number, p.name AS property_name
+      `SELECT ua.*, u.unit_number, p.name AS property_name,
+              t.background_check_status,
+              EXISTS (SELECT 1 FROM leases l WHERE l.source_application_id = ua.id) AS lease_drafted
        FROM unit_applications ua
        LEFT JOIN units u ON u.id = ua.unit_id
        LEFT JOIN properties p ON p.id = u.property_id
+       LEFT JOIN tenants t ON t.user_id = ua.applicant_user_id
        WHERE ua.landlord_id = $1
        ORDER BY ua.created_at DESC`,
       [req.user!.profileId]
     )
     res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
+// POST /api/properties/applications/:id/onboard — S593 defrag bridge.
+// The landlord converts a listings-marketplace application into a draft lease
+// (→ the Master Schedule), the long-term mirror of the booking→lease bridge.
+// The applicant already has an account + (usually) a cleared background check;
+// this drafts a pending/needs-review lease they can review + send for signing.
+propertiesRouter.post('/applications/:id/onboard', requirePerm('tenants.create'), async (req: any, res, next) => {
+  try {
+    const app = await queryOne<{ id: string; landlord_id: string; unit_id: string | null }>(
+      'SELECT id, landlord_id, unit_id FROM unit_applications WHERE id=$1', [req.params.id])
+    if (!app) throw new AppError(404, 'Application not found')
+    if (!canManageLandlordResource(req.user, app.landlord_id)) throw new AppError(403, 'Forbidden')
+    if (!app.unit_id) throw new AppError(400, 'This application is not tied to a specific unit — assign a unit first.')
+    const result = await draftLeaseFromApplication(req.params.id)
+    if (!result.leaseId) throw new AppError(400, 'Could not draft a lease from this application.')
+    res.status(201).json({ success: true, data: { leaseId: result.leaseId, alreadyDrafted: !result.drafted } })
   } catch (e) { next(e) }
 })
 
@@ -737,6 +767,29 @@ propertiesRouter.delete('/:id/late-fee-overrides/:unitType', requirePerm('proper
     await query(`DELETE FROM property_unit_type_late_fees WHERE property_id=$1 AND unit_type=$2`,
       [req.params.id, req.params.unitType])
     res.json({ success: true })
+  } catch (e) { next(e) }
+})
+
+// S579: onboarding-window status for the grandfather UI — how long the window
+// is open, whether sitting tenants can still be waived past screening.
+propertiesRouter.get('/:id/onboarding-window', async (req, res, next) => {
+  try {
+    const prop = await queryOne<{ landlord_id: string }>(`SELECT landlord_id FROM properties WHERE id=$1`, [req.params.id])
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canAccessLandlordResource(req.user, prop.landlord_id)) throw new AppError(403, 'Forbidden')
+    res.json({ success: true, data: await getOnboardingWindow(req.params.id) })
+  } catch (e) { next(e) }
+})
+
+// S579: landlord marks onboarding complete — closes the grandfather window
+// early. After this, every new tenant on the property must screen.
+propertiesRouter.post('/:id/onboarding-complete', requirePerm('properties.edit'), async (req, res, next) => {
+  try {
+    const prop = await queryOne<{ landlord_id: string }>(`SELECT landlord_id FROM properties WHERE id=$1`, [req.params.id])
+    if (!prop) throw new AppError(404, 'Property not found')
+    if (!canManageLandlordResource(req.user, prop.landlord_id)) throw new AppError(403, 'Forbidden')
+    await closeOnboardingWindow(req.params.id)
+    res.json({ success: true, data: await getOnboardingWindow(req.params.id) })
   } catch (e) { next(e) }
 })
 
@@ -1345,16 +1398,90 @@ const upload = multer({ storage, limits: { fileSize: 10 * 1024 * 1024 }, fileFil
 // Landlord/staff/admin roles pass on auth alone. The /api/public prefix
 // is kept so the listings app URL doesn't move; rename when that
 // surface gets its real sign-in flow.
-publicPropertiesRouter.get('/listings', requireAuth, async (req: any, res, next) => {
+// ── The public listings marketplace (S593 — 3-tier funnel) ──────────────
+// Tier 1 (anonymous): teaser cards — approximate location + price + specs + a
+//   few photos. NO exact address, NO property name, NO landlord identity.
+// Tier 2 (free account): full details — exact address, all photos, full
+//   description. Still NO landlord contact.
+// Tier 3 (background-check approved): POST .../apply files the application and
+//   reveals the landlord contact — the ONLY path that ever does. See below.
+// A unit is listable only when vacant + explicitly listed + has beds/baths +
+// at least 5 photos. Neither read exposes the landlord (contact = tier 3), so
+// the landlords/users join is gone from both.
+const LISTABLE_FILTER = `
+      FROM units u
+      JOIN properties p ON p.id = u.property_id
+      LEFT JOIN unit_photos up ON up.unit_id = u.id
+      WHERE u.status = 'vacant' AND u.listed_vacant = TRUE
+        AND u.bedrooms IS NOT NULL AND u.bathrooms IS NOT NULL
+      GROUP BY u.id, p.id
+      HAVING COUNT(up.id) >= 5
+      ORDER BY u.rent_amount ASC`
+
+// GET /api/public/properties/listing-photo/:filename — PUBLIC unit photo.
+// S593 (Nic): unit listing photos are marketing images a prospective renter
+// can see with NO account. But only photos belonging to a CURRENTLY-LISTED
+// vacancy are public here — every other unit photo stays behind the authed
+// /unit-photo-files route. Path traversal guarded by resolveUploadPath.
+publicPropertiesRouter.get('/listing-photo/:filename', async (req, res, next) => {
   try {
-    const u = req.user!
-    if (u.role === 'tenant') {
-      const t = await queryOne<{ background_check_status: string }>(
-        'SELECT background_check_status FROM tenants WHERE id=$1', [u.profileId])
-      if (t?.background_check_status !== 'approved') {
-        throw new AppError(403, 'Listings require an approved background check')
-      }
-    }
+    const fp = resolveUploadPath(uploadDir, req.params.filename)
+    if (!fp) throw new AppError(400, 'Invalid filename')
+    const row = await queryOne<{ id: string }>(
+      `SELECT up.id FROM unit_photos up
+         JOIN units u ON u.id = up.unit_id
+        WHERE up.url = ANY($1)
+          AND u.status = 'vacant' AND u.listed_vacant = TRUE
+        LIMIT 1`,
+      [[`/api/properties/unit-photo-files/${req.params.filename}`,
+        `/uploads/unit-photos/${req.params.filename}`]])
+    if (!row) throw new AppError(404, 'Photo not found')
+    if (!fs.existsSync(fp)) throw new AppError(404, 'Photo not found')
+    res.setHeader('Content-Type', EXT_TO_MIME[path.extname(fp).toLowerCase()] ?? 'image/jpeg')
+    res.setHeader('X-Content-Type-Options', 'nosniff')
+    // Public marketing image — allow the listings storefront's cross-origin <img>.
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin')
+    res.sendFile(fp)
+  } catch (e) { next(e) }
+})
+
+// Listing photos serve publicly via /listing-photo above; rewrite the stored
+// authed path to that public route so anonymous + logged-in reads both load.
+const toPublicPhoto = (u: string): string => u
+  .replace('/api/properties/unit-photo-files/', '/api/public/properties/listing-photo/')
+  .replace('/uploads/unit-photos/', '/api/public/properties/listing-photo/')
+
+// Tier 1 — GET /api/public/properties/listings/browse (NO AUTH).
+// The teaser a stranger sees: general area (city/state), rent, specs, and up to
+// 3 photos. Deliberately withholds exact address, property name, and any
+// landlord info — those are the account / bg-check tiers below.
+publicPropertiesRouter.get('/listings/browse', async (_req, res, next) => {
+  try {
+    const { rows } = await db.query(`
+      SELECT
+        u.id, u.bedrooms, u.bathrooms, u.sqft, u.rent_amount, u.available_date,
+        u.floor_level, u.is_ada_accessible,
+        p.city, p.state, p.type AS property_type,
+        COALESCE(
+          json_agg(up.url ORDER BY up.sort_order ASC) FILTER (WHERE up.id IS NOT NULL),
+          '[]'
+        ) AS photos,
+        COUNT(up.id)::int AS photo_count
+      ${LISTABLE_FILTER}
+    `)
+    // Only the first 3 photos travel to an anonymous viewer, via the public route.
+    const teasers = rows.map((r: any) => ({ ...r, photos: (r.photos || []).slice(0, 3).map(toPublicPhoto) }))
+    res.json({ success: true, data: teasers })
+  } catch (e) { next(e) }
+})
+
+// Tier 2 — GET /api/public/properties/listings (LOGGED-IN, any account).
+// The S593 redesign removes the old approved-background-check gate from
+// BROWSING (it now gates the Apply/Contact action instead). A free account sees
+// full details — exact address, all photos, description — but the landlord's
+// identity/contact is still withheld until tier 3.
+publicPropertiesRouter.get('/listings', requireAuth, async (_req, res, next) => {
+  try {
     const { rows } = await db.query(`
       SELECT
         u.id, u.unit_number, u.bedrooms, u.bathrooms, u.sqft,
@@ -1362,26 +1489,89 @@ publicPropertiesRouter.get('/listings', requireAuth, async (req: any, res, next)
         u.floor_level, u.is_ada_accessible,
         p.name AS property_name, p.street1, p.city, p.state, p.zip,
         p.type AS property_type,
-        l.id AS landlord_id,
-        lu.first_name AS landlord_first, lu.last_name AS landlord_last,
-        lu.phone AS landlord_phone,
         COALESCE(
           json_agg(up.url ORDER BY up.sort_order ASC) FILTER (WHERE up.id IS NOT NULL),
           '[]'
         ) AS photos,
         COUNT(up.id)::int AS photo_count
-      FROM units u
-      JOIN properties p ON p.id = u.property_id
-      JOIN landlords l ON l.id = u.landlord_id
-      JOIN users lu ON lu.id = l.user_id
-      LEFT JOIN unit_photos up ON up.unit_id = u.id
-      WHERE u.status = 'vacant' AND u.listed_vacant = TRUE
-        AND u.bedrooms IS NOT NULL AND u.bathrooms IS NOT NULL
-      GROUP BY u.id, p.id, l.id, lu.id
-      HAVING COUNT(up.id) >= 5
-      ORDER BY u.rent_amount ASC
+      ${LISTABLE_FILTER}
     `)
-    res.json({ success: true, data: rows })
+    const out = rows.map((r: any) => ({ ...r, photos: (r.photos || []).map(toPublicPhoto) }))
+    res.json({ success: true, data: out })
+  } catch (e) { next(e) }
+})
+
+// Tier 3 — POST /api/public/properties/listings/:unitId/apply (LOGGED-IN).
+// The background check is the ONE hard gate: only an approved/waived renter can
+// apply, and applying is the ONLY thing that reveals the landlord's contact
+// (anti-circumvention — no landlord↔renter contact before screening).
+// Renter-initiated + inbound to the landlord's own listing → FREE (the $1
+// contact charge applies only to landlord-initiated pool reach-out).
+publicPropertiesRouter.post('/listings/:unitId/apply', requireAuth, async (req: any, res, next) => {
+  try {
+    const u = req.user!
+    if (u.role !== 'tenant') throw new AppError(403, 'Sign in with a renter account to apply')
+    if (!z.string().uuid().safeParse(req.params.unitId).success) throw new AppError(404, 'Listing not found')
+    const body = z.object({ message: z.string().max(5000).nullish() }).parse(req.body ?? {})
+
+    // The one hard gate. 403 here is what the frontend turns into "start your
+    // background check" — the server never trusts the client to have gated it.
+    const t = await queryOne<{ background_check_status: string }>(
+      'SELECT background_check_status FROM tenants WHERE user_id=$1', [u.userId])
+    if (!t || !['approved', 'waived'].includes(t.background_check_status)) {
+      throw new AppError(403, 'A completed background check is required to contact a landlord')
+    }
+
+    const unit = await queryOne<any>(`
+      SELECT u.id, u.unit_number, u.landlord_id, p.name AS property_name,
+             lu.id AS landlord_user_id, lu.first_name AS landlord_first,
+             lu.last_name AS landlord_last, lu.email AS landlord_email, lu.phone AS landlord_phone
+        FROM units u
+        JOIN properties p ON p.id = u.property_id
+        JOIN landlords l ON l.id = u.landlord_id
+        JOIN users lu ON lu.id = l.user_id
+       WHERE u.id=$1 AND u.status='vacant' AND u.listed_vacant=TRUE`, [req.params.unitId])
+    if (!unit) throw new AppError(404, 'Listing not found')
+
+    const me = await queryOne<any>(
+      'SELECT first_name, last_name, email, phone FROM users WHERE id=$1', [u.userId])
+
+    // Idempotent: one application per (listing, renter). A second click just
+    // re-reveals the contact instead of stacking duplicate rows.
+    let app = await queryOne<{ id: string }>(
+      'SELECT id FROM unit_applications WHERE unit_id=$1 AND applicant_user_id=$2', [unit.id, u.userId])
+    if (!app) {
+      app = await queryOne<{ id: string }>(
+        `INSERT INTO unit_applications
+           (unit_id, landlord_id, applicant_user_id, first_name, last_name, email, phone, message)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
+        [unit.id, unit.landlord_id, u.userId, me.first_name, me.last_name, me.email, me.phone ?? null,
+         body.message ?? null])
+      const { createNotification } = await import('../services/notifications')
+      await createNotification({
+        userId: unit.landlord_user_id,
+        landlordId: unit.landlord_id,
+        type: 'unit_application',
+        title: `New application — ${unit.property_name} · Unit ${unit.unit_number}`,
+        body: `${me.first_name} ${me.last_name} (background check cleared) applied to your listing.`,
+        data: { application_id: app!.id, unit_id: unit.id, applicant_user_id: u.userId },
+        sendEmail: true,
+        emailTo: unit.landlord_email,
+        emailSubject: `New application — ${unit.property_name} · Unit ${unit.unit_number}`,
+      }).catch(() => {})
+    }
+
+    res.status(201).json({
+      success: true,
+      data: {
+        applicationId: app!.id,
+        landlord: {
+          name: `${unit.landlord_first ?? ''} ${unit.landlord_last ?? ''}`.trim() || null,
+          email: unit.landlord_email,
+          phone: unit.landlord_phone,
+        },
+      },
+    })
   } catch (e) { next(e) }
 })
 
@@ -1530,26 +1720,50 @@ propertiesRouter.patch('/units/:id/listing', requirePerm('units.edit_listing'), 
 })
 
 // POST /api/properties/apply — submit application (public)
+// S592: resolve the landlord AUTHORITATIVELY — never trust a body-supplied
+// landlordId as-is. unit_applications has NO foreign keys, so the DB won't
+// reject a bogus id or a unit/landlord mismatch: a public submitter could
+// otherwise file an application into another landlord's inbox, or reference a
+// unit they don't own (cross-landlord). When a unit is named, its owner is the
+// source of truth and any supplied landlordId must match it; a landlord-only
+// application must reference a landlord that actually exists.
+const publicApplySchema = z.object({
+  unitId:         z.string().uuid().optional(),
+  landlordId:     z.string().uuid().optional(),
+  firstName:      z.string().trim().min(1).max(120),
+  lastName:       z.string().trim().min(1).max(120),
+  email:          z.string().email().max(200),
+  phone:          z.string().max(40).nullish(),
+  moveInDate:     z.string().max(40).nullish(),
+  monthlyIncome:  z.number().nonnegative().nullish(),
+  occupants:      z.number().int().positive().max(50).optional(),
+  hasPets:        z.boolean().optional(),
+  petDescription: z.string().max(2000).nullish(),
+  message:        z.string().max(5000).nullish(),
+})
 publicPropertiesRouter.post('/apply', async (req, res, next) => {
   try {
-    const { unitId, landlordId, firstName, lastName, email, phone, moveInDate, monthlyIncome, occupants, hasPets, petDescription, message } = req.body
-    if (!firstName || !lastName || !email) throw new AppError(400, 'firstName, lastName, email required')
-    if (!unitId && !landlordId) throw new AppError(400, 'unitId or landlordId required')
+    const b = publicApplySchema.parse(req.body)
+    if (!b.unitId && !b.landlordId) throw new AppError(400, 'unitId or landlordId required')
 
-    // Get landlordId from unit if not provided
-    let lid = landlordId
-    if (unitId && !lid) {
-      const unit = await queryOne<any>('SELECT landlord_id FROM units WHERE id=$1', [unitId])
+    let lid: string
+    if (b.unitId) {
+      const unit = await queryOne<{ landlord_id: string }>('SELECT landlord_id FROM units WHERE id=$1', [b.unitId])
       if (!unit) throw new AppError(404, 'Unit not found')
+      if (b.landlordId && b.landlordId !== unit.landlord_id) throw new AppError(400, 'Unit does not belong to that landlord')
       lid = unit.landlord_id
+    } else {
+      const landlord = await queryOne<{ id: string }>('SELECT id FROM landlords WHERE id=$1', [b.landlordId!])
+      if (!landlord) throw new AppError(404, 'Landlord not found')
+      lid = b.landlordId!
     }
 
     const { rows: [app] } = await db.query(
       `INSERT INTO unit_applications
          (unit_id, landlord_id, first_name, last_name, email, phone, move_in_date, monthly_income, occupants, has_pets, pet_description, message)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
-      [unitId||null, lid, firstName, lastName, email, phone||null, moveInDate||null,
-       monthlyIncome||null, occupants||1, hasPets||false, petDescription||null, message||null]
+      [b.unitId ?? null, lid, b.firstName, b.lastName, b.email, b.phone ?? null, b.moveInDate ?? null,
+       b.monthlyIncome ?? null, b.occupants ?? 1, b.hasPets ?? false, b.petDescription ?? null, b.message ?? null]
     )
     res.status(201).json({ success: true, data: app })
   } catch (e) { next(e) }

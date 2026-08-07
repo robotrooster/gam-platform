@@ -90,23 +90,29 @@ const validProspect = (over: Record<string, any> = {}) => ({
 // ═══════════════════════════════════════════════════════════════
 
 describe('POST /api/auth/register', () => {
-  it('happy landlord: 201 with token + user + landlord profile row', async () => {
+  it('happy landlord: 201 with requiresEmailOtp (mandatory 2FA at signup) + landlord profile row', async () => {
     const body = validRegister({ role: 'landlord' })
     const res = await request(buildApp())
       .post('/api/auth/register').send(body)
     expect(res.status).toBe(201)
     expect(res.body.success).toBe(true)
-    expect(res.body.data.token).toEqual(expect.any(String))
+    // S578: mandatory email-2FA at signup — a pending session + emailed code,
+    // never a full token.
+    expect(res.body.data.requiresEmailOtp).toBe(true)
+    expect(res.body.data.emailOtpSession).toEqual(expect.any(String))
+    expect(res.body.data.token).toBeUndefined()
     expect(res.body.data.user.role).toBe('landlord')
     expect(res.body.data.user.email).toBe(body.email)
     expect(res.body.data.user.profileId).toEqual(expect.any(String))
 
     // Side effects: landlord row, accepted_tos_at + accepted_privacy_at
-    // stamped, email_verified defaults to FALSE (no auto-verify on register).
+    // stamped, email_2fa_enabled canonicalized TRUE, email_verified still FALSE
+    // (it flips when the emailed code is entered at /email-otp/verify).
     const { rows: [u] } = await db.query<any>(
-      `SELECT email_verified, accepted_tos_at, accepted_privacy_at
+      `SELECT email_verified, email_2fa_enabled, accepted_tos_at, accepted_privacy_at
          FROM users WHERE email = $1`, [body.email])
     expect(u.email_verified).toBe(false)
+    expect(u.email_2fa_enabled).toBe(true)
     expect(u.accepted_tos_at).not.toBeNull()
     expect(u.accepted_privacy_at).not.toBeNull()
 
@@ -115,13 +121,14 @@ describe('POST /api/auth/register', () => {
     expect(ll).toHaveLength(1)
   })
 
-  it('happy tenant: 201 with tenant profile row, role=tenant in token', async () => {
+  it('happy tenant: 201 with requiresEmailOtp + tenant profile row, role=tenant', async () => {
     const body = validRegister({ role: 'tenant' })
     const res = await request(buildApp())
       .post('/api/auth/register').send(body)
     expect(res.status).toBe(201)
-    const decoded = jwt.decode(res.body.data.token) as any
-    expect(decoded.role).toBe('tenant')
+    expect(res.body.data.requiresEmailOtp).toBe(true)
+    expect(res.body.data.token).toBeUndefined()
+    expect(res.body.data.user.role).toBe('tenant')
 
     const { rows: t } = await db.query<any>(
       `SELECT id FROM tenants WHERE id = $1`, [res.body.data.user.profileId])
@@ -164,16 +171,21 @@ describe('POST /api/auth/register', () => {
     expect(res.status).toBe(400)
   })
 
-  it('verification email fired AFTER commit (best-effort, doesn\'t fail the request)', async () => {
+  it('S578: signup issues an email 2FA code (login_email_otps row), not a verify link', async () => {
     const body = validRegister()
     const res = await request(buildApp())
       .post('/api/auth/register').send(body)
     expect(res.status).toBe(201)
-    // Allow the void/fire-and-forget call to flush.
+    expect(res.body.data.requiresEmailOtp).toBe(true)
+    // Allow the void/fire-and-forget flush.
     await new Promise(r => setTimeout(r, 50))
-    expect(sendVerifyMock).toHaveBeenCalled()
-    const args = sendVerifyMock.mock.calls[0] as any[]
-    expect(args[0]).toBe(body.email)
+    // No separate verification LINK — the emailed 2FA code doubles as
+    // verification once entered.
+    expect(sendVerifyMock).not.toHaveBeenCalled()
+    const { rows: otps } = await db.query<any>(
+      `SELECT o.id FROM login_email_otps o JOIN users u ON u.id = o.user_id
+        WHERE u.email = $1 AND o.consumed_at IS NULL`, [body.email])
+    expect(otps.length).toBeGreaterThanOrEqual(1)
   })
 })
 
@@ -242,12 +254,11 @@ describe('POST /api/auth/login', () => {
     const res = await request(buildApp())
       .post('/api/auth/login').send({ email, password: 'super-strong-password-12!' })
     expect(res.status).toBe(200)
-    expect(res.body.data.user.landlordId).toBe(landlordId)
-    expect(res.body.data.user.permissions).toMatchObject({ payments: { view_all: true } })
-    expect(res.body.data.user.directDepositEnabled).toBe(true)
-
-    // JWT carries the same claims (so downstream requireAuth has them).
-    const decoded = jwt.decode(res.body.data.token) as any
+    // S578: universal 2FA — worker roles get an emailed code too. The scope
+    // claims ride the pending-session JWT (and the full token after verify), so
+    // downstream requireAuth has them once the code is entered.
+    expect(res.body.data.requiresEmailOtp).toBe(true)
+    const decoded = jwt.decode(res.body.data.emailOtpSession) as any
     expect(decoded.landlordId).toBe(landlordId)
     expect(decoded.permissions).toMatchObject({ payments: { view_all: true } })
   })
@@ -262,7 +273,7 @@ describe('POST /api/auth/login', () => {
     expect(res.body.error).toMatch(/deactivated/i)
   })
 
-  it('mustEnrollTotp=false for non-mandatory roles (MANDATORY_TOTP_ROLES = admin / super_admin only)', async () => {
+  it('S578: non-admin worker roles also get mandatory email 2FA (not a TOTP-enroll session)', async () => {
     const email = `login-pmtotp-${randomUUID()}@example.com`
     const { userId } = await seedVerifiedUser({ email, role: 'property_manager' })
     const c = await db.connect()
@@ -279,7 +290,10 @@ describe('POST /api/auth/login', () => {
     const res = await request(buildApp())
       .post('/api/auth/login').send({ email, password: 'super-strong-password-12!' })
     expect(res.status).toBe(200)
-    expect(res.body.data.user.mustEnrollTotp).toBe(false)
+    // Universal 2FA supersedes the old mustEnrollTotp path — a worker gets an
+    // emailed code, never a full token and never a forced authenticator enroll.
+    expect(res.body.data.requiresEmailOtp).toBe(true)
+    expect(res.body.data.token).toBeUndefined()
   })
 
   it('bcrypt mismatch → 401 generic, NO email_verified leak', async () => {
@@ -524,13 +538,14 @@ describe('PATCH /api/auth/me', () => {
 // ═══════════════════════════════════════════════════════════════
 
 describe('POST /api/auth/register-prospect', () => {
-  it('happy: 201 with token + tenant profile + ToS timestamps', async () => {
+  it('happy: 201 with requiresEmailOtp (mandatory 2FA at signup) + tenant profile + ToS timestamps', async () => {
     const body = validProspect()
     const res = await request(buildApp())
       .post('/api/auth/register-prospect').send(body)
     expect(res.status).toBe(201)
     expect(res.body.data.user.role).toBe('tenant')
-    expect(res.body.data.token).toEqual(expect.any(String))
+    expect(res.body.data.requiresEmailOtp).toBe(true)
+    expect(res.body.data.emailOtpSession).toEqual(expect.any(String))
 
     const { rows: [u] } = await db.query<any>(
       `SELECT role, email_verified, accepted_tos_at FROM users WHERE email = $1`, [body.email])
@@ -543,7 +558,7 @@ describe('POST /api/auth/register-prospect', () => {
     expect(t).toHaveLength(1)
   })
 
-  it('landlordId in body stamps JWT (for downstream lease attribution)', async () => {
+  it('landlordId in body stamps the pending 2FA session (for downstream lease attribution)', async () => {
     const c = await db.connect()
     let landlordId = ''
     try {
@@ -555,15 +570,15 @@ describe('POST /api/auth/register-prospect', () => {
     const res = await request(buildApp())
       .post('/api/auth/register-prospect').send(validProspect({ landlordId }))
     expect(res.status).toBe(201)
-    const decoded = jwt.decode(res.body.data.token) as any
+    const decoded = jwt.decode(res.body.data.emailOtpSession) as any
     expect(decoded.landlordId).toBe(landlordId)
   })
 
-  it('no landlordId → JWT carries landlordId=null (does not throw)', async () => {
+  it('no landlordId → pending session carries landlordId=null (does not throw)', async () => {
     const res = await request(buildApp())
       .post('/api/auth/register-prospect').send(validProspect())
     expect(res.status).toBe(201)
-    const decoded = jwt.decode(res.body.data.token) as any
+    const decoded = jwt.decode(res.body.data.emailOtpSession) as any
     expect(decoded.landlordId).toBeNull()
   })
 
@@ -597,11 +612,17 @@ describe('POST /api/auth/register-prospect', () => {
     expect(res.body.error).toMatch(/required/i)
   })
 
-  it('verification email fired (best-effort)', async () => {
+  it('S578: issues an email 2FA code (login_email_otps row), not a verify link', async () => {
     const body = validProspect()
     await request(buildApp())
       .post('/api/auth/register-prospect').send(body)
     await new Promise(r => setTimeout(r, 50))
-    expect(sendVerifyMock).toHaveBeenCalled()
+    // The emailed 2FA code doubles as verification once entered — no separate
+    // verification-LINK email is sent at signup.
+    expect(sendVerifyMock).not.toHaveBeenCalled()
+    const { rows: otps } = await db.query<any>(
+      `SELECT o.id FROM login_email_otps o JOIN users u ON u.id = o.user_id
+        WHERE u.email = $1 AND o.consumed_at IS NULL`, [body.email])
+    expect(otps.length).toBeGreaterThanOrEqual(1)
   })
 })

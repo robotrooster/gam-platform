@@ -3,7 +3,7 @@ import { Navigate, useNavigate, Link } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
 
 export function LoginPage() {
-  const { login, loginWithTotp, user, loading } = useAuth()
+  const { login, loginWithTotp, loginWithEmailOtp, resendEmailOtp, user, loading } = useAuth()
   const navigate = useNavigate()
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
@@ -13,6 +13,9 @@ export function LoginPage() {
   // TOTP second step. When /login returns requiresTotp, we stash the
   // short-lived session token and flip to the code-entry view.
   const [totpSession, setTotpSession] = useState<string | null>(null)
+  // S578: universal email-2FA second step.
+  const [emailOtpSession, setEmailOtpSession] = useState<string | null>(null)
+  const [resent, setResent] = useState(false)
   const [code, setCode] = useState('')
 
   if (loading) return <div style={{ padding: 32, color: 'var(--text-3)' }}>Loading…</div>
@@ -28,22 +31,34 @@ export function LoginPage() {
         setBusy(false)
         return
       }
+      if (res.kind === 'email_otp_required') {
+        setEmailOtpSession(res.emailOtpSession)
+        setBusy(false)
+        return
+      }
       navigate('/')
     }
     catch (ex: any) { setErr(ex?.response?.data?.error || 'Login failed.'); setBusy(false) }
   }
 
-  const submitTotp = async (e: React.FormEvent) => {
+  const submitCode = async (e: React.FormEvent) => {
     e.preventDefault()
     setErr(null); setBusy(true)
     try {
-      await loginWithTotp(totpSession!, code.trim())
+      if (emailOtpSession) await loginWithEmailOtp(emailOtpSession, code.trim())
+      else await loginWithTotp(totpSession!, code.trim())
       navigate('/')
     }
     catch (ex: any) {
       setErr(ex?.response?.data?.error || 'Verification failed.')
       setBusy(false)
     }
+  }
+
+  const resend = async () => {
+    setErr(null); setResent(false)
+    try { await resendEmailOtp(emailOtpSession!); setResent(true) }
+    catch (ex: any) { setErr(ex?.response?.data?.error || 'Could not resend the code.') }
   }
 
   return (
@@ -56,7 +71,7 @@ export function LoginPage() {
           </div>
         </div>
 
-        {!totpSession ? (
+        {(!totpSession && !emailOtpSession) ? (
           <>
             <form onSubmit={submit}>
               <div style={{ marginBottom: 12 }}>
@@ -86,12 +101,19 @@ export function LoginPage() {
             </div>
           </>
         ) : (
-          <form onSubmit={submitTotp}>
+          <form onSubmit={submitCode}>
             <div style={{ marginBottom: 16, fontSize: '.78rem', color: 'var(--text-2)', textAlign: 'center' }}>
-              Enter the 6-digit code from your authenticator app.
-              <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 4 }}>
-                Lost your device? Enter a recovery code instead.
-              </div>
+              {emailOtpSession
+                ? 'Enter the 6-digit code we emailed you.'
+                : 'Enter the 6-digit code from your authenticator app.'}
+              {!emailOtpSession && (
+                <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 4 }}>
+                  Lost your device? Enter a recovery code instead.
+                </div>
+              )}
+              {emailOtpSession && resent && (
+                <div style={{ fontSize: '.72rem', color: 'var(--green, #46a758)', marginTop: 4 }}>A new code is on its way.</div>
+              )}
             </div>
 
             <div style={{ marginBottom: 16 }}>
@@ -120,11 +142,17 @@ export function LoginPage() {
               {busy ? 'Verifying…' : 'Verify & sign in'}
             </button>
 
+            {emailOtpSession && (
+              <button type="button" className="btn btn-ghost" disabled={busy} onClick={resend} style={{ width: '100%', marginTop: 8 }}>
+                Resend code
+              </button>
+            )}
+
             <button
               type="button"
               className="btn btn-ghost"
               disabled={busy}
-              onClick={() => { setTotpSession(null); setCode(''); setErr(null) }}
+              onClick={() => { setTotpSession(null); setEmailOtpSession(null); setResent(false); setCode(''); setErr(null) }}
               style={{ width: '100%', marginTop: 8 }}
             >
               Back

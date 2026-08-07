@@ -216,7 +216,7 @@ describe('GET /api/admin/nacha/monitoring', () => {
     const f = await seedAFixture()
     const res = await request(buildApp())
       .get('/api/admin/nacha/monitoring')
-      .set('Authorization', `Bearer ${f.adminToken}`)
+      .set('Authorization', `Bearer ${f.superAdminToken}`)
     expect(res.status).toBe(200)
     expect(res.body.data.logs).toEqual([])
     expect(Number(res.body.data.stats.total_returns)).toBe(0)
@@ -234,12 +234,22 @@ describe('GET /api/admin/nacha/monitoring', () => {
 
     const res = await request(buildApp())
       .get('/api/admin/nacha/monitoring')
-      .set('Authorization', `Bearer ${f.adminToken}`)
+      .set('Authorization', `Bearer ${f.superAdminToken}`)
     expect(res.status).toBe(200)
     expect(res.body.data.logs.length).toBe(3)
     expect(Number(res.body.data.stats.total_returns)).toBe(1)  // 1 row has return_code
     expect(Number(res.body.data.stats.zero_tolerance_events)).toBeGreaterThanOrEqual(1)
     expect(Number(res.body.data.stats.first_senders_30d)).toBe(1)
     expect(Number(res.body.data.stats.velocity_flags_30d)).toBe(1)
+  })
+
+  // S592: NACHA/ACH monitoring is super_admin-only (platform-staff). A plain
+  // admin (portfolio manager) must not see the platform-wide ACH compliance log.
+  it('plain admin → 403 (super_admin only)', async () => {
+    const f = await seedAFixture()
+    const res = await request(buildApp())
+      .get('/api/admin/nacha/monitoring')
+      .set('Authorization', `Bearer ${f.adminToken}`)
+    expect(res.status).toBe(403)
   })
 })

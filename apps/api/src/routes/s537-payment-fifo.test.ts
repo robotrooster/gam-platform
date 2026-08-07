@@ -240,6 +240,120 @@ describe('S537 POST /payments/pay-balance — FIFO application', () => {
   })
 })
 
+// S581 (Nic): ONE lease per charge. A tenant with balances on two leases (an
+// overlap move, or two different landlords) pays each lease as its OWN charge +
+// receipt — separate ACH means a shortfall/eviction-hold on one never blocks the
+// other, and the capped processing fee is charged per lease (no shared-bank-
+// account fee dodge).
+describe('S581 POST /payments/pay-balance — per-lease charges', () => {
+  // One tenant, TWO landlords, one lease each: the strongest separation case.
+  async function twoLeaseFixture() {
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      const tenantId = await seedTenant(client)
+      const tu = await client.query<{ user_id: string }>(`SELECT user_id FROM tenants WHERE id=$1`, [tenantId])
+      await client.query(`UPDATE tenants SET stripe_customer_id='cus_test_multi' WHERE id=$1`, [tenantId])
+
+      const a = await seedLandlord(client)
+      const propA = await seedProperty(client, { landlordId: a.landlordId, ownerUserId: a.userId, managedByUserId: a.userId })
+      const unitA = await seedUnit(client, { propertyId: propA, landlordId: a.landlordId, withLateFeeDecision: true })
+      const leaseA = await seedLease(client, { unitId: unitA, landlordId: a.landlordId, rentAmount: 440 })
+      await seedLeaseTenant(client, { leaseId: leaseA, tenantId })
+
+      const b = await seedLandlord(client)
+      const propB = await seedProperty(client, { landlordId: b.landlordId, ownerUserId: b.userId, managedByUserId: b.userId })
+      const unitB = await seedUnit(client, { propertyId: propB, landlordId: b.landlordId, withLateFeeDecision: true })
+      const leaseB = await seedLease(client, { unitId: unitB, landlordId: b.landlordId, rentAmount: 300 })
+      await seedLeaseTenant(client, { leaseId: leaseB, tenantId })
+      await client.query('COMMIT')
+      return {
+        tenantId, tenantUserId: tu.rows[0].user_id,
+        A: { landlordId: a.landlordId, unitId: unitA, leaseId: leaseA },
+        B: { landlordId: b.landlordId, unitId: unitB, leaseId: leaseB },
+      }
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+  }
+
+  async function chargeFor(g: any, tenantId: string, amount: number, dueDate: string): Promise<string> {
+    const r = await db.query<{ id: string }>(
+      `INSERT INTO payments (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, due_date, entry_description)
+       VALUES ($1, $2, $3, $4, 'rent', $5, 'pending', $6, 'RENT') RETURNING id`,
+      [g.unitId, g.leaseId, tenantId, g.landlordId, amount.toFixed(2), dueDate])
+    return r.rows[0].id
+  }
+
+  it('refuses to pay when the tenant spans two leases without choosing one', async () => {
+    const f = await twoLeaseFixture()
+    await chargeFor(f.A, f.tenantId, 440, '2026-07-01')
+    await chargeFor(f.B, f.tenantId, 300, '2026-07-01')
+    const res = await request(buildApp())
+      .post('/api/payments/pay-balance')
+      .set('Authorization', `Bearer ${tenantToken(f.tenantUserId, f.tenantId)}`)
+      .send({ amount: 440, paymentMethodId: 'pm_test', paymentMethodType: 'ach' })
+    expect(res.status).toBe(400)
+    expect(res.body.error).toMatch(/more than one lease/i)
+  })
+
+  it('leaseId scopes the charge to ONE lease; the other lease is untouched', async () => {
+    const f = await twoLeaseFixture()
+    const aId = await chargeFor(f.A, f.tenantId, 440, '2026-07-01')
+    const bId = await chargeFor(f.B, f.tenantId, 300, '2026-07-01')
+
+    const res = await request(buildApp())
+      .post('/api/payments/pay-balance')
+      .set('Authorization', `Bearer ${tenantToken(f.tenantUserId, f.tenantId)}`)
+      .send({ amount: 440, leaseId: f.A.leaseId, paymentMethodId: 'pm_test', paymentMethodType: 'ach' })
+    expect(res.status).toBe(200)
+
+    // Lease A charged; lease B still fully pending, no PI.
+    const aRow = await db.query<any>(`SELECT status FROM payments WHERE id=$1`, [aId])
+    expect(aRow.rows[0].status).toBe('processing')
+    const bRow = await db.query<any>(`SELECT status, stripe_payment_intent_id FROM payments WHERE id=$1`, [bId])
+    expect(bRow.rows[0].status).toBe('pending')
+    expect(bRow.rows[0].stripe_payment_intent_id).toBeNull()
+
+    // Exactly one remittance, tied to lease A, for A's balance only.
+    const rem = await db.query<any>(`SELECT lease_id, amount::float AS amount FROM tenant_remittances`)
+    expect(rem.rows.length).toBe(1)
+    expect(rem.rows[0].lease_id).toBe(f.A.leaseId)
+    expect(rem.rows[0].amount).toBe(440)
+  })
+
+  it('an eviction hold on one landlord’s lease never blocks paying the other', async () => {
+    const f = await twoLeaseFixture()
+    await chargeFor(f.A, f.tenantId, 440, '2026-07-01')
+    await chargeFor(f.B, f.tenantId, 300, '2026-07-01')
+    // Landlord A puts their unit in eviction mode.
+    await db.query(`UPDATE units SET payment_block=true WHERE id=$1`, [f.A.unitId])
+
+    // balance-context reports the block PER LEASE (checked while both are still
+    // outstanding), not globally.
+    const ctx = await request(buildApp())
+      .get('/api/payments/balance-context')
+      .set('Authorization', `Bearer ${tenantToken(f.tenantUserId, f.tenantId)}`)
+    const byLease: Record<string, boolean> = {}
+    for (const l of ctx.body.data.leases) byLease[l.leaseId] = l.paymentBlocked
+    expect(byLease[f.A.leaseId]).toBe(true)
+    expect(byLease[f.B.leaseId]).toBe(false)
+    expect(ctx.body.data.paymentBlocked).toBe(false)  // legacy scalar: not ALL blocked
+
+    // Paying A is refused; paying B still goes through.
+    const blocked = await request(buildApp())
+      .post('/api/payments/pay-balance')
+      .set('Authorization', `Bearer ${tenantToken(f.tenantUserId, f.tenantId)}`)
+      .send({ amount: 440, leaseId: f.A.leaseId, paymentMethodId: 'pm_test', paymentMethodType: 'ach' })
+    expect(blocked.status).toBe(409)
+    expect(blocked.body.error).toMatch(/eviction/i)
+
+    const ok = await request(buildApp())
+      .post('/api/payments/pay-balance')
+      .set('Authorization', `Bearer ${tenantToken(f.tenantUserId, f.tenantId)}`)
+      .send({ amount: 300, leaseId: f.B.leaseId, paymentMethodId: 'pm_test', paymentMethodType: 'ach' })
+    expect(ok.status).toBe(200)
+  })
+})
+
 // S539: the tenant-facing "where every dollar went" read — remittances
 // with their per-line applications + outstanding prepaid credit.
 describe('S539 GET /payments/remittances — per-line application display', () => {

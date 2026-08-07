@@ -144,7 +144,7 @@ describe('S541 FlexPay demand-test gate', () => {
     const f = await fixture()
     const app = buildApp()
     const t = tok(f.tenantUserId, 'tenant', f.tenantId)
-    const a = tok(f.adminUserId, 'admin', f.adminUserId)
+    const a = tok(f.adminUserId, 'super_admin', f.adminUserId)
 
     await request(app).post('/api/tenants/flexpay/inquiry')
       .set('Authorization', `Bearer ${t}`).send({ incomeSource: 'ssi' })
@@ -192,7 +192,7 @@ describe('S541 FlexPay demand-test gate', () => {
     const enroll3 = await request(app).post('/api/tenants/flexpay/enroll')
       .set('Authorization', `Bearer ${t}`).send({ pullDay: 3, acceptedTerms: true })
     expect(enroll3.status).toBe(200)
-    expect(enroll3.body.data.fee).toBe(8)   // $5 + day 3
+    expect(enroll3.body.data.fee).toBe(25)  // S562: flat $25/mo (pull day is scheduling only)
 
     const enrolled = await db.query<any>(`SELECT flexpay_enrolled, flexpay_pull_day FROM tenants WHERE id=$1`, [f.tenantId])
     expect(enrolled.rows[0].flexpay_enrolled).toBe(true)
@@ -205,7 +205,7 @@ describe('S541 FlexPay demand-test gate', () => {
     const app = buildApp()
     const t1 = tok(f1.tenantUserId, 'tenant', f1.tenantId)
     const t2 = tok(f2.tenantUserId, 'tenant', f2.tenantId)
-    const a  = tok(f1.adminUserId, 'admin', f1.adminUserId)
+    const a  = tok(f1.adminUserId, 'super_admin', f1.adminUserId)
     const sa = jwt.sign({ userId: f1.adminUserId, role: 'super_admin', profileId: f1.adminUserId },
       process.env.JWT_SECRET!, { expiresIn: '1h' })
 
@@ -274,11 +274,58 @@ describe('S541 FlexPay demand-test gate', () => {
     expect(ok.status).toBe(200)
   })
 
+  it('S578: a prior default demotes a returner behind first-timers, overriding float-need', async () => {
+    // f1 = RETURNER (has a defaulted advance) with a SHORT float; f2 =
+    // FIRST-TIMER with a LONG float. Under pure S542c float-need ordering
+    // f1 sorts #1 — the returner demotion must flip it so every first-timer
+    // ranks ahead of any returner. Both SSI so that tier can't confound.
+    const f1 = await fixture()
+    const f2 = await fixture()
+    const app = buildApp()
+    const t1 = tok(f1.tenantUserId, 'tenant', f1.tenantId)
+    const t2 = tok(f2.tenantUserId, 'tenant', f2.tenantId)
+    const a  = tok(f1.adminUserId, 'super_admin', f1.adminUserId)
+
+    // Mark f1 a returner: a defaulted FlexPay advance on their record.
+    const ctx = await db.query<any>(
+      `SELECT l.id AS lease_id, l.unit_id, p.landlord_id
+         FROM leases l
+         JOIN lease_tenants lt ON lt.lease_id = l.id AND lt.status = 'active'
+         JOIN units u ON u.id = l.unit_id
+         JOIN properties p ON p.id = u.property_id
+        WHERE lt.tenant_id = $1 LIMIT 1`, [f1.tenantId])
+    const c = ctx.rows[0]
+    await db.query(
+      `INSERT INTO flexpay_advances
+         (cycle_month, tenant_id, landlord_id, unit_id, lease_id,
+          rent_amount, tenant_fee_amount, pull_day, status, defaulted_at)
+       VALUES ('2026-06-01', $1, $2, $3, $4, 440, 25, 10, 'defaulted', NOW())`,
+      [f1.tenantId, c.landlord_id, c.unit_id, c.lease_id])
+
+    // f1 SHORT float (day 6 → ~1d), f2 LONG float (day 25 → ~20d).
+    await request(app).post('/api/tenants/flexpay/inquiry')
+      .set('Authorization', `Bearer ${t1}`).send({ incomeSource: 'ssi', benefitDay: 6 })
+    await request(app).post('/api/tenants/flexpay/inquiry')
+      .set('Authorization', `Bearer ${t2}`).send({ incomeSource: 'ssi', benefitDay: 25 })
+
+    const list = await request(app).get('/api/admin/flexpay/inquiries')
+      .set('Authorization', `Bearer ${a}`)
+    const r1 = list.body.data.find((r: any) => r.tenant_id === f1.tenantId)
+    const r2 = list.body.data.find((r: any) => r.tenant_id === f2.tenantId)
+
+    // Returner flag exposed to admin; first-timer wins despite shorter-float returner.
+    expect(r1.is_flexpay_returner).toBe(true)
+    expect(r2.is_flexpay_returner).toBe(false)
+    expect(r2.queue_position).toBe(1)
+    expect(r1.queue_position).toBe(2)
+    expect(list.body.data.map((r: any) => r.tenant_id)).toEqual([f2.tenantId, f1.tenantId])
+  })
+
   it('S543: admin captures benefit day during reach-out; locked after review', async () => {
     const f = await fixture()
     const app = buildApp()
     const t = tok(f.tenantUserId, 'tenant', f.tenantId)
-    const a = tok(f.adminUserId, 'admin', f.adminUserId)
+    const a = tok(f.adminUserId, 'super_admin', f.adminUserId)
 
     // Inquiry WITHOUT a day (questionnaire-style) → float unknown.
     await request(app).post('/api/tenants/flexpay/inquiry')
@@ -311,7 +358,7 @@ describe('S541 FlexPay demand-test gate', () => {
     const f = await fixture()
     const app = buildApp()
     const t = tok(f.tenantUserId, 'tenant', f.tenantId)
-    const a = tok(f.adminUserId, 'admin', f.adminUserId)
+    const a = tok(f.adminUserId, 'super_admin', f.adminUserId)
 
     await db.query(`UPDATE system_features SET enabled = FALSE WHERE key = 'flexpay_enrollment_open'`)
 
@@ -343,7 +390,7 @@ describe('S541 FlexPay demand-test gate', () => {
     const app = buildApp()
     const t1 = tok(f1.tenantUserId, 'tenant', f1.tenantId)
     const t2 = tok(f2.tenantUserId, 'tenant', f2.tenantId)
-    const a  = tok(f1.adminUserId, 'admin', f1.adminUserId)
+    const a  = tok(f1.adminUserId, 'super_admin', f1.adminUserId)
     // Upsert, not UPDATE — gam_test's schema snapshot carries no seed
     // rows, so the flag row may not exist yet.
     await db.query(
@@ -391,7 +438,7 @@ describe('S541 FlexPay demand-test gate', () => {
     const f = await fixture()
     const app = buildApp()
     const t = tok(f.tenantUserId, 'tenant', f.tenantId)
-    const a = tok(f.adminUserId, 'admin', f.adminUserId)
+    const a = tok(f.adminUserId, 'super_admin', f.adminUserId)
 
     const res = await request(app).post('/api/tenants/flexpay/inquiry')
       .set('Authorization', `Bearer ${t}`)
@@ -410,7 +457,7 @@ describe('S541 FlexPay demand-test gate', () => {
     const f = await fixture()
     const app = buildApp()
     const t = tok(f.tenantUserId, 'tenant', f.tenantId)
-    const a = tok(f.adminUserId, 'admin', f.adminUserId)
+    const a = tok(f.adminUserId, 'super_admin', f.adminUserId)
     // Lease holder born on the 5th → SSDI pays the 2nd Wednesday.
     await db.query(`UPDATE tenants SET date_of_birth='1960-03-05' WHERE id=$1`, [f.tenantId])
 
@@ -467,7 +514,7 @@ describe('S541 FlexPay demand-test gate', () => {
   it('non-tenant cannot inquire; non-admin cannot review', async () => {
     const f = await fixture()
     const app = buildApp()
-    const a = tok(f.adminUserId, 'admin', f.adminUserId)
+    const a = tok(f.adminUserId, 'super_admin', f.adminUserId)
     const t = tok(f.tenantUserId, 'tenant', f.tenantId)
 
     const asAdmin = await request(app).post('/api/tenants/flexpay/inquiry')

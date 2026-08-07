@@ -241,6 +241,26 @@ describe('POST /api/sublease-invitations/:token/accept', () => {
     expect(arg.subMonthlyAmount).toBe(600)
   })
 
+  it('S581: sublease terminated after the invite → accept 409, no account created, not resurrected', async () => {
+    const f = await seedInvitation()
+    // The sublessor/landlord terminated the offer after the invite went out
+    // (the terminate route also cancels the invitation; here we exercise the
+    // race-safe accept-time backstop with the invitation still 'sent').
+    await db.query(`UPDATE subleases SET status='terminated' WHERE id=$1`, [f.subleaseId])
+
+    const res = await request(buildApp())
+      .post(`/api/sublease-invitations/${f.token}/accept`)
+      .send(acceptBody())
+    expect(res.status).toBe(409)
+    expect(res.body.error).toMatch(/no longer available/i)
+
+    // The account creation was rolled back, and the dead sublease stays dead.
+    const user = await db.query(`SELECT id FROM users WHERE LOWER(email)=LOWER($1)`, [f.sublesseeEmail])
+    expect(user.rows).toHaveLength(0)
+    const sub = await db.query<{ status: string }>(`SELECT status FROM subleases WHERE id=$1`, [f.subleaseId])
+    expect(sub.rows[0].status).toBe('terminated')
+  })
+
   it('missing firstName → 400', async () => {
     const f = await seedInvitation()
     const res = await request(buildApp())

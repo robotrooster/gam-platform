@@ -84,10 +84,14 @@ async function fixture() {
 
 const PLUS = (h: number) => new Date(Date.now() + h * 3_600_000).toISOString()
 
+// Reservation-flow tests need a *reservable* area (the create default is
+// reservable=false — "announce-only" — matching the landlord UI toggle, which
+// is off unless the landlord turns it on for a bookable amenity). Default the
+// helper to reservable:true; pass reservable:false to exercise announce-only.
 async function makeArea(llToken: string, propertyId: string, over: any = {}) {
   const res = await request(app).post('/api/common-areas')
     .set('Authorization', `Bearer ${llToken}`)
-    .send({ propertyId, name: 'Clubhouse', ...over })
+    .send({ propertyId, name: 'Clubhouse', reservable: true, ...over })
   return res
 }
 
@@ -116,6 +120,22 @@ describe('common areas — management', () => {
     const blocked = await request(app).get(`/api/common-areas?propertyId=${f.propertyId}`)
       .set('Authorization', `Bearer ${other.llToken}`)
     expect(blocked.status).toBe(403)
+  })
+
+  it('a newly-created area is NOT reservable by default (announce-only)', async () => {
+    const f = await fixture()
+    // No `reservable` in the body → the handler defaults it off, so the area is
+    // announce-only and never surfaces in the tenant reservation tab.
+    const create = await request(app).post('/api/common-areas')
+      .set('Authorization', `Bearer ${f.llToken}`)
+      .send({ propertyId: f.propertyId, name: 'Laundry room' })
+    expect(create.status).toBe(201)
+    expect(create.body.data.reservable).toBe(false)
+    // A tenant request against an announce-only area is refused.
+    const reqRes = await request(app).post(`/api/common-areas/${create.body.data.id}/request`)
+      .set('Authorization', `Bearer ${f.t1Token}`).send({ startsAt: PLUS(48), endsAt: PLUS(50) })
+    expect(reqRes.status).toBe(400)
+    expect(reqRes.body.error).toMatch(/not reservable/i)
   })
 })
 

@@ -17,6 +17,7 @@
  */
 import { query } from '../db'
 import { resolveDepositMonths, computeDeposit } from './depositPolicy'
+import { computeLeaseStart, computeLeaseEnd } from './leaseDates'
 
 type Exec = { query: (sql: string, params: any[]) => Promise<{ rows: any[] }> } | null
 
@@ -25,7 +26,7 @@ export async function suggestUnitPrefill(
   exec: Exec = null,
   templateId: string | null = null,
 ): Promise<Record<string, string>> {
-  const sql = `SELECT u.rent_amount, u.unit_number, u.unit_type, u.property_id,
+  const sql = `SELECT u.rent_amount, u.unit_number, u.unit_type, u.property_id, u.available_date,
                       p.name AS property_name, p.street1, p.street2, p.city, p.state, p.zip
                  FROM units u JOIN properties p ON p.id = u.property_id
                 WHERE u.id = $1`
@@ -48,5 +49,18 @@ export async function suggestUnitPrefill(
   if (u.property_name) out.property_name = u.property_name
   const addr = [u.street1, u.street2, u.city, u.state, u.zip].filter(Boolean).join(', ')
   if (addr) out.property_address = addr
+
+  // S582: start/end date defaults (same platform rules as the auto-draft path).
+  // start = the unit's available_date if future, else today; end snaps to
+  // month-end from the template's default_term_months (blank → month-to-month).
+  const start = computeLeaseStart(u.available_date)
+  out.start_date = start
+  if (templateId) {
+    const trow = exec
+      ? await exec.query(`SELECT default_term_months FROM lease_templates WHERE id=$1`, [templateId]).then(r => r.rows[0])
+      : (await query<any>(`SELECT default_term_months FROM lease_templates WHERE id=$1`, [templateId]))[0]
+    const end = computeLeaseEnd(start, trow?.default_term_months ?? null)
+    if (end) out.end_date = end
+  }
   return out
 }

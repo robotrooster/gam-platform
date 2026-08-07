@@ -15,8 +15,54 @@ import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { CreditCard, Plus } from 'lucide-react'
 import { apiGet, apiPost, apiPatch, apiDel } from '../lib/api'
-import { humanize } from '@gam/shared'
+import { humanize, FLEX_CHARGE_MAX_FINANCE_PCT } from '@gam/shared'
 import { appPrompt } from '../components/dialogs'
+
+// S583: per-property merchant finance rate. The merchant is the lender — they
+// set the flat % their customers pay on each monthly statement balance (capped
+// at FLEX_CHARGE_MAX_FINANCE_PCT). Stored as a decimal; shown/edited as a %.
+function FinanceRateSection() {
+  const qc = useQueryClient()
+  const { data: rates = [] } = useQuery<{ propertyId: string; name: string; financePct: number }[]>(
+    'flexcharge-finance-rates', () => apiGet('/landlords/flex-charge/finance-rates'))
+  const [draft, setDraft] = useState<Record<string, string>>({})
+  const [savedId, setSavedId] = useState<string | null>(null)
+  const save = useMutation(
+    (args: { propertyId: string; financePct: number }) => apiPatch('/landlords/flex-charge/finance-rate', args),
+    { onSuccess: (_d, v) => { setSavedId(v.propertyId); qc.invalidateQueries('flexcharge-finance-rates'); setTimeout(() => setSavedId(null), 2000) } })
+  const MAXPCT = Math.round(FLEX_CHARGE_MAX_FINANCE_PCT * 100)
+  if (rates.length === 0) return null
+  return (
+    <div className="card" style={{ marginBottom: 16 }}>
+      <div style={{ fontWeight: 700, marginBottom: 4 }}>Your finance rate — APR (per property)</div>
+      <div style={{ fontSize: '.75rem', color: 'var(--text-3)', marginBottom: 12, lineHeight: 1.5 }}>
+        The <b>annual</b> interest rate you charge on a <b>carried</b> balance — your credit revenue.
+        Max {MAXPCT}%/year; 0% = no interest. Pay-in-full = no interest (grace period). <b>You are the lender</b>:
+        set an APR compliant with your state's usury / lending laws. Takes effect with revolving billing (coming
+        soon); GAM's 1.5% comes out of your payout, never your customer.
+      </div>
+      {rates.map(r => {
+        const shown = draft[r.propertyId] ?? String(Math.round(r.financePct * 10000) / 100)
+        const num = parseFloat(shown)
+        const invalid = isNaN(num) || num < 0 || num > MAXPCT
+        return (
+          <div key={r.propertyId} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '6px 0', borderTop: '1px solid var(--border-0)' }}>
+            <div style={{ flex: 1, fontSize: '.85rem', color: 'var(--text-0)' }}>{r.name}</div>
+            <input type="number" step="0.1" min="0" max={MAXPCT} value={shown}
+              onChange={e => setDraft(d => ({ ...d, [r.propertyId]: e.target.value }))}
+              style={{ width: 80, padding: '6px 8px', borderRadius: 8, border: `1px solid ${invalid ? 'var(--red)' : 'var(--border-0)'}`, background: 'var(--bg-2)', color: 'var(--text-0)', textAlign: 'right' }} />
+            <span style={{ fontSize: '.8rem', color: 'var(--text-3)' }}>%</span>
+            <button className="btn btn-primary btn-sm" disabled={invalid || save.isLoading}
+              onClick={() => save.mutate({ propertyId: r.propertyId, financePct: Math.round(num * 100) / 10000 })}>
+              Save
+            </button>
+            {savedId === r.propertyId && <span style={{ color: 'var(--green)', fontSize: '.75rem' }}>✓ Saved</span>}
+          </div>
+        )
+      })}
+    </div>
+  )
+}
 
 interface AccountRow {
   id:                  string
@@ -95,7 +141,7 @@ export function FlexChargePage() {
           <h1 style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
             <CreditCard size={22} /> FlexCharge
           </h1>
-          <p className="page-sub">Per-property charge accounts for tenants and POS customers. The account holder pays a 1.5% finance charge on their outstanding monthly balance, paid to you (the account owner) — GAM provides the software, not the credit.</p>
+          <p className="page-sub">Per-property charge accounts for tenants and POS customers. <b>You are the lender</b> — you set a finance charge your customers pay on their monthly balance (their credit terms are yours). GAM provides the software for a flat <b>1.5% subscription on the balance, deducted from your payout</b> — never charged to your customers.</p>
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
           <button className="btn btn-ghost" onClick={() => setShowNewCustomer(true)}>+ POS Customer</button>
@@ -111,6 +157,7 @@ export function FlexChargePage() {
           </button>
         </div>
       </div>
+      <FinanceRateSection />
       {enabledProperties.length === 0 && properties.length > 0 && (
         <div style={{
           marginBottom: 14,
@@ -328,16 +375,22 @@ function AccountActions({ account, qc }: { account: AccountRow; qc: any }) {
 }
 
 interface StatementRow {
-  id:            string
-  cycleMonth:   string
-  balance:       string
-  serviceFee:   string
-  totalDue:     string
-  dueDate:      string
-  status:        'open' | 'billed' | 'paid' | 'failed' | 'voided'
-  billedAt:     string | null
-  settledAt:    string | null
-  failedReason: string | null
+  id:               string
+  cycleMonth:       string
+  previousBalance:  string
+  newPurchases:     string
+  financeCharge:    string   // interest this cycle
+  lateFee:          string
+  paymentsCredited: string
+  serviceFee:       string   // GAM's 1.5%/12 cut
+  newBalance:       string
+  minimumDue:       string
+  amountPaid:       string
+  dueDate:          string
+  status:           'open' | 'billed' | 'paid' | 'failed' | 'voided'
+  billedAt:         string | null
+  settledAt:        string | null
+  failedReason:     string | null
 }
 
 interface DisputeRow {
@@ -410,9 +463,12 @@ function StatementHistoryModal({ account, onClose }: { account: AccountRow; onCl
                   <thead>
                     <tr>
                       <th>Cycle</th>
-                      <th className="mono">Balance</th>
-                      <th className="mono">Fee</th>
-                      <th className="mono">Total</th>
+                      <th className="mono">Purchases</th>
+                      <th className="mono">Interest</th>
+                      <th className="mono">New balance</th>
+                      <th className="mono">Min due</th>
+                      <th className="mono">Paid</th>
+                      <th className="mono">GAM fee</th>
                       <th>Due</th>
                       <th>Status</th>
                       <th>Settled</th>
@@ -422,9 +478,12 @@ function StatementHistoryModal({ account, onClose }: { account: AccountRow; onCl
                     {statements.map(s => (
                       <tr key={s.id}>
                         <td>{fmtMonth(s.cycleMonth)}</td>
-                        <td className="mono">{fmt(s.balance)}</td>
+                        <td className="mono">{fmt(s.newPurchases)}</td>
+                        <td className="mono">{fmt(s.financeCharge)}</td>
+                        <td className="mono" style={{ fontWeight: 600 }}>{fmt(s.newBalance)}</td>
+                        <td className="mono">{fmt(s.minimumDue)}</td>
+                        <td className="mono">{fmt(s.amountPaid)}</td>
                         <td className="mono">{fmt(s.serviceFee)}</td>
-                        <td className="mono" style={{ fontWeight: 600 }}>{fmt(s.totalDue)}</td>
                         <td>{fmtDate(s.dueDate)}</td>
                         <td>
                           {statusBadge(s.status)}

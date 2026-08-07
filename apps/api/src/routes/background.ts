@@ -36,14 +36,18 @@ function isMockIntentId(id: string): boolean {
   return id.startsWith('pi_intake_mock_') || id.startsWith('pi_pool_mock_')
 }
 
-// S561 (Nic, Checkr call 7/27): the APPLICANT no longer pays for screening.
-// GAM bills the LANDLORD directly (landlord = Checkr's customer; landlord may
-// pass the cost to the tenant via a POS line item or the first invoice, and
-// owns adverse-action / state fee-cap legality). This RETIRED the whole
-// applicant-side intake-fee + 50-state cap machinery (state_application_fee_caps,
-// actual_cost_only, fee_prohibited, shortfall recovery) — moot once the payer
-// is the landlord and the charge is one flat national amount. See the landlord
-// screening-charge model below.
+// BILLING MODEL (S577 → S578, Nic — supersedes the stale S561 "landlord pays"
+// note that used to live here). The APPLICANT ALWAYS PAYS for the screen, up
+// front, on BOTH routes (landlord-targeted + renter-pool), at one flat national
+// price — verified before the check is created (see /submit). GAM does NOT split
+// the bill or charge the landlord: on the landlord route the applicant's card is
+// simply routed `on_behalf_of` the landlord's Connect (merchant of record / FCRA
+// permissible-purpose / cap liability), funds settle to GAM, landlord nets $0.
+// On states that cap what a tenant may be charged for screening, the LANDLORD
+// refunds the difference to the tenant OFF-PLATFORM (cash at application, a
+// Stripe balance transfer, or a first-rent credit — landlord's choice). GAM
+// never computes caps and never gets in the middle of the billing. The old
+// applicant-side 50-state cap machinery stays retired.
 
 export const backgroundRouter = Router()
 
@@ -355,8 +359,7 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
     const { landlordId, unitId } = req.body
     const isSpeculative = !landlordId
 
-    if (!firstName || !lastName || !dateOfBirth) throw new AppError(400, 'Required fields missing')
-    if (!consentCredit || !consentCriminal) throw new AppError(400, 'Both screening consents required')
+    if (!firstName || !lastName) throw new AppError(400, 'Required fields missing')
     if (isSpeculative && !consentPool) throw new AppError(400, 'Pool consent required for speculative applications')
 
     // S423: resolve the provider per-landlord (moved above SSN handling in
@@ -383,10 +386,18 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
       if (!landlordRow) throw new AppError(404, 'Landlord not found')
       providerName = landlordRow.background_provider
     }
-    // S551: Checkr Tenant collects DOB/SSN + FCRA consent on ITS hosted
-    // apply flow — GAM neither requires nor stores an SSN for those intakes.
+    // S578 (Nic): Checkr — the ONLY real provider — collects DOB, SSN, address,
+    // income AND FCRA consent on its OWN hosted apply flow. GAM's intake is just
+    // name + payment; on submit GAM creates the order and Checkr emails the
+    // applicant the apply link. So GAM neither requires nor stores any of that
+    // PII/consent for a Checkr intake. Only the mock/dev provider (the legacy
+    // GAM-owned intake) still requires the full set here.
     const providerCollectsPii = providerName === 'checkr'
-    if (!providerCollectsPii && !ssn) throw new AppError(400, 'Required fields missing')
+    if (!providerCollectsPii) {
+      if (!dateOfBirth) throw new AppError(400, 'Date of birth is required')
+      if (!ssn) throw new AppError(400, 'A full SSN is required')
+      if (!consentCredit || !consentCriminal) throw new AppError(400, 'Both screening consents are required')
+    }
 
     // S577 (Nic): the applicant pays for the screen up front on BOTH routes,
     // verified BEFORE the check is created — no free checks, and the landlord is
@@ -418,6 +429,17 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
       throw new AppError(403, 'Account is blocked from submitting applications')
     }
 
+    // S579: link the check to the PROPERTY it's for — from the chosen unit if
+    // any, else the live invite/onboarding intent's property binding. Lets the
+    // landlord see "this check was for Oak Park" even before a unit is assigned.
+    const effectivePropertyId =
+      (unitId ? (await queryOne<{ property_id: string }>(`SELECT property_id FROM units WHERE id=$1`, [unitId]))?.property_id : null)
+      || (tenant ? (await queryOne<{ property_id: string }>(
+            `SELECT property_id FROM pending_tenant_intents
+              WHERE tenant_id=$1 AND cancelled_at IS NULL AND property_id IS NOT NULL
+              ORDER BY created_at DESC LIMIT 1`, [tenant.id]))?.property_id : null)
+      || null
+
     let check: any
     try {
       check = await queryOne<any>(`
@@ -430,7 +452,7 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
           id_document_url, income_document_urls,
           consent_credit, consent_criminal, consent_pool, consent_signed_at, consent_ip,
           ip_address, user_agent, provider_name,
-          applicant_payment_intent_id
+          applicant_payment_intent_id, property_id
         ) VALUES (
           $1, $2, $3, $4, 'pending',
           $5, $6, $7, $8, $9,
@@ -440,7 +462,7 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
           $23, $24,
           $25, $26, $27, NOW(), $28,
           $29, $30, $31,
-          $32
+          $32, $33
         ) RETURNING id`,
         [
           tenant?.id || null, req.user!.userId, effectiveLandlordId, unitId || null,
@@ -452,6 +474,7 @@ backgroundRouter.post('/submit', requireAuth, async (req, res, next) => {
           !!consentCredit, !!consentCriminal, !!consentPool, ipAddr,
           ipAddr, ua, providerName,
           isSpeculative ? applicantPaymentIntentId : null, // S564: pool applicants pay; landlord route billed to landlord
+          effectivePropertyId,
         ])
     } catch (e: any) {
       // Postgres unique violation on background_checks_applicant_pi_uniq —

@@ -76,6 +76,7 @@ import {
   handleFlexPayPaymentNsf,
   repriceFlexPayRetryPayment,
   calculateFlexPayFee,
+  FLEXPAY_MONTHLY_FEE,
   FLEXPAY_NSF_COOLDOWN_DAYS,
   FLEXPAY_ACH_RETURN_FEE,
   FLEXPAY_MAX_PULL_DAY,
@@ -174,7 +175,7 @@ async function seedEnrolledTenant(opts: {
                 flexpay_monthly_fee = $3
           WHERE id = $1`,
         [tenantId, opts.pullDay ?? 15,
-         5 + (opts.pullDay ?? 15) /* calculateFlexPayFee */])
+         FLEXPAY_MONTHLY_FEE /* S562: flat $25, pull day is scheduling only */])
     }
     if (opts.stripeCustomerId !== null) {
       await c.query(
@@ -226,7 +227,7 @@ describe('processGracePeriodAdvance', () => {
     expect(adv.status).toBe('fronted')
     expect(adv.stripe_transfer_id).toBe('tr_flexpay_happy')
     expect(adv.rent_amount).toBe('1000.00')
-    expect(adv.tenant_fee_amount).toBe('20.00')   // 5 + 15
+    expect(adv.tenant_fee_amount).toBe('25.00')   // S562: flat $25
     expect(adv.pull_day).toBe(15)
     expect(adv.grace_advance_suppressed).toBe(false)
     expect(adv.fronted_at).not.toBeNull()

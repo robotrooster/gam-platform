@@ -87,6 +87,25 @@ const setTax = (app: express.Express, f: Fixture, utilityType: string, pct: numb
     .send({ propertyId: f.propertyAId, utilityType, taxRatePct: pct })
 
 describe('propane fills', () => {
+  it('idempotent: a repeat fill with the same clientKey records ONE fill + ONE charge', async () => {
+    const app = buildApp()
+    const f = await seed()
+    const key = '11111111-1111-4111-8111-111111111111'
+    const first = await postFill(app, f, { unitId: f.unitAId, gallons: 20, pricePerGallon: 3.5, installments: 1, clientKey: key })
+    expect(first.status).toBe(201)
+    // Same intent resubmitted (lost-response retry / second open tab).
+    const again = await postFill(app, f, { unitId: f.unitAId, gallons: 20, pricePerGallon: 3.5, installments: 1, clientKey: key })
+    expect(again.status).toBe(200)
+    expect(again.body.idempotent).toBe(true)
+    expect(again.body.data.id).toBe(first.body.data.id)
+    // Exactly one fill and one propane charge — no double-billing.
+    const fillsN = await db.query<{ n: number }>(`SELECT count(*)::int n FROM propane_fills WHERE unit_id=$1`, [f.unitAId])
+    expect(fillsN.rows[0].n).toBe(1)
+    const paysN = await db.query<{ n: number }>(
+      `SELECT count(*)::int n FROM payments WHERE unit_id=$1 AND type='utility' AND entry_description='PROPANE'`, [f.unitAId])
+    expect(paysN.rows[0].n).toBe(1)
+  })
+
   it('bills gallons × per-fill PPG + landlord propane tax; first payment due immediately', async () => {
     const app = buildApp()
     const f = await seed()

@@ -85,7 +85,7 @@ async function readVerify(userId: string): Promise<{
 }
 
 describe('POST /api/auth/register — verification email side effect', () => {
-  it('register: mints email_verify_token and fires verification email', async () => {
+  it('S578: register issues a 2FA code + pending session (no token, no verify link)', async () => {
     const res = await request(buildApp())
       .post('/api/auth/register')
       .send({
@@ -97,35 +97,30 @@ describe('POST /api/auth/register — verification email side effect', () => {
         acceptedTerms: true,
       })
     expect(res.status).toBe(201)
-    // Register still issues a JWT for the just-registered session.
-    expect(typeof res.body.data.token).toBe('string')
+    // Mandatory email-2FA at signup: a pending session + emailed code, never a
+    // full token.
+    expect(res.body.data.requiresEmailOtp).toBe(true)
+    expect(typeof res.body.data.emailOtpSession).toBe('string')
+    expect(res.body.data.token).toBeUndefined()
 
-    // Fire-and-forget — poll until the post-commit UPDATE lands.
-    let token: string | null = null
-    const deadline = Date.now() + 2000
-    while (Date.now() < deadline) {
-      const row = await db.query<{ email_verify_token: string | null }>(
-        `SELECT email_verify_token FROM users WHERE email='newuser@test.dev'`,
-      )
-      if (row.rows[0]?.email_verify_token) {
-        token = row.rows[0].email_verify_token
-        break
-      }
-      await new Promise((r) => setTimeout(r, 20))
-    }
-    expect(token).not.toBeNull()
-    expect(token!.length).toBe(64)
-
-    const verifyState = await db.query<{ email_verified: boolean }>(
-      `SELECT email_verified FROM users WHERE email='newuser@test.dev'`,
+    // email_verified stays false until the emailed code is entered (which flips
+    // it at /email-otp/verify); the 2FA flag is canonicalized TRUE.
+    const verifyState = await db.query<{ email_verified: boolean; email_2fa_enabled: boolean }>(
+      `SELECT email_verified, email_2fa_enabled FROM users WHERE email='newuser@test.dev'`,
     )
     expect(verifyState.rows[0].email_verified).toBe(false)
+    expect(verifyState.rows[0].email_2fa_enabled).toBe(true)
 
-    expect(sendVerifyMock).toHaveBeenCalledTimes(1)
-    const [to, firstName, url] = sendVerifyMock.mock.calls[0]
-    expect(to).toBe('newuser@test.dev')
-    expect(firstName).toBe('New')
-    expect(url).toContain(`token=${token}`)
+    // No separate verification LINK — the emailed code doubles as verification.
+    await new Promise((r) => setTimeout(r, 50))
+    expect(sendVerifyMock).not.toHaveBeenCalled()
+
+    // A live 2FA code row was issued.
+    const otps = await db.query<{ id: string }>(
+      `SELECT o.id FROM login_email_otps o JOIN users u ON u.id = o.user_id
+        WHERE u.email='newuser@test.dev' AND o.consumed_at IS NULL`,
+    )
+    expect(otps.rows.length).toBeGreaterThanOrEqual(1)
   })
 
   // Model C: in local dev the account auto-verifies and no email is sent;
@@ -299,7 +294,7 @@ describe('login gate on email_verified', () => {
     expect(sendVerifyMock).not.toHaveBeenCalled()
   })
 
-  it('verified user with correct password: 200 + JWT', async () => {
+  it('verified tenant with correct password: 200 + mandatory email-2FA (requiresEmailOtp, no token)', async () => {
     await seedUserPassword('h@test.dev', 'rightpass1234',
       { emailVerified: true })
 
@@ -307,6 +302,10 @@ describe('login gate on email_verified', () => {
       .post('/api/auth/login')
       .send({ email: 'h@test.dev', password: 'rightpass1234' })
     expect(res.status).toBe(200)
-    expect(typeof res.body.data.token).toBe('string')
+    // S571: tenants have mandatory email 2FA — once the password + email-verified
+    // gates pass, login returns a pending session, not a full token.
+    expect(res.body.data.requiresEmailOtp).toBe(true)
+    expect(typeof res.body.data.emailOtpSession).toBe('string')
+    expect(res.body.data.token).toBeUndefined()
   })
 })

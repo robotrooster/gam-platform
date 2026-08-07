@@ -43,16 +43,16 @@ export function BankFeedPage() {
   const { data: txns = [], isLoading } = useQuery<any[]>(
     ['bank-txns', view], () => apiGet(`/bank-feed/transactions?status=${view}`))
 
-  const propOf = (u: any) => u.propertyId || u.property_id
+  const propOf = (u: any) => u.propertyId
   const unitsForProp = (pid: string) => (units as any[]).filter(u => propOf(u) === pid)
 
   // Per-row categorize draft, pre-seeded from the merchant suggestion.
   const [drafts, setDrafts] = useState<Record<string, Draft>>({})
   const draftFor = (t: any): Draft => drafts[t.id] || {
-    category: t.suggested_category || 'repairs',
-    scopeKind: t.suggested_scope_kind || 'unit',
-    propertyId: t.suggested_property_id || '',
-    unitId: t.suggested_unit_id || '',
+    category: t.suggestedCategory || 'repairs',
+    scopeKind: t.suggestedScopeKind || 'unit',
+    propertyId: t.suggestedPropertyId || '',
+    unitId: t.suggestedUnitId || '',
   }
   const setDraft = (id: string, patch: Partial<Draft>) => {
     const row = (txns as any[]).find(t => t.id === id) || { id }
@@ -149,10 +149,10 @@ export function BankFeedPage() {
                 <div key={c.id} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '8px 0', borderBottom: '1px solid var(--border)' }}>
                   <Landmark size={18} style={{ color: 'var(--gold)' }} />
                   <div style={{ flex: 1 }}>
-                    <div style={{ fontWeight: 600 }}>{c.display_name || c.institution_name}</div>
+                    <div style={{ fontWeight: 600 }}>{c.displayName || c.institutionName}</div>
                     <div style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>
-                      {c.last_synced_at ? `Last synced ${fmtDate(c.last_synced_at)}` : 'Not yet synced'}
-                      {c.status === 'error' && c.last_sync_error ? ` · error: ${c.last_sync_error}` : ''}
+                      {c.lastSyncedAt ? `Last synced ${fmtDate(c.lastSyncedAt)}` : 'Not yet synced'}
+                      {c.status === 'error' && c.lastSyncError ? ` · error: ${c.lastSyncError}` : ''}
                     </div>
                   </div>
                   <button className="btn btn-ghost btn-sm" onClick={() => sync.mutate(c.id)} disabled={sync.isLoading}>
@@ -188,10 +188,10 @@ export function BankFeedPage() {
                   <div key={t.id} style={{ padding: '10px 0', borderBottom: '1px solid var(--border)' }}>
                     <div style={{ display: 'flex', alignItems: 'baseline', gap: 12 }}>
                       <div style={{ flex: 1 }}>
-                        <div style={{ fontWeight: 600 }}>{t.normalized_merchant || t.description || 'Transaction'}</div>
+                        <div style={{ fontWeight: 600 }}>{t.normalizedMerchant || t.description || 'Transaction'}</div>
                         <div style={{ fontSize: '.72rem', color: 'var(--text-3)' }}>
-                          {fmtDate(t.posted_date)} · {t.connection_name}
-                          {t.description && t.description !== t.normalized_merchant ? ` · ${t.description}` : ''}
+                          {fmtDate(t.postedDate)} · {t.connectionName}
+                          {t.description && t.description !== t.normalizedMerchant ? ` · ${t.description}` : ''}
                         </div>
                       </div>
                       <div style={{ fontWeight: 700, color: isExpense ? 'var(--text-0)' : 'var(--success, #3fb950)' }}>{fmt(t.amount)}</div>
@@ -213,7 +213,7 @@ export function BankFeedPage() {
                             </select>
                             <select className="input input-sm" value={d.unitId} onChange={e => setDraft(t.id, { unitId: e.target.value })} disabled={!d.propertyId}>
                               <option value="">Unit…</option>
-                              {unitsForProp(d.propertyId).map((u: any) => <option key={u.id} value={u.id}>{u.name || u.unit_number || u.label}</option>)}
+                              {unitsForProp(d.propertyId).map((u: any) => <option key={u.id} value={u.id}>{u.unitNumber || u.name || u.label}</option>)}
                             </select>
                           </>
                         ) : (
@@ -222,7 +222,7 @@ export function BankFeedPage() {
                             {properties.map((p: any) => <option key={p.id} value={p.id}>{p.name}</option>)}
                           </select>
                         )}
-                        {t.suggested_category && <span style={{ fontSize: '.68rem', color: 'var(--gold)' }}>suggested</span>}
+                        {t.suggestedCategory && <span style={{ fontSize: '.68rem', color: 'var(--gold)' }}>suggested</span>}
                         <button className="btn btn-primary btn-sm" onClick={() => submit(t)} disabled={categorize.isLoading}>
                           <Check size={14} /> Confirm
                         </button>

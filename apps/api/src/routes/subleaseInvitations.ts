@@ -184,14 +184,25 @@ subleaseInvitationsRouter.post('/:token/accept', async (req, res, next) => {
         [tenant.id, inv.id],
       )
 
-      await client.query(
+      // S581: the offer must still be OPEN. Guard on status='pending_invite' —
+      // if the sublessor (or landlord) terminated the sublease after the invite
+      // went out, the row is 'terminated' and accepting must NOT resurrect it to
+      // 'pending' NOR create a tenant account for a dead offer. 0 rows → abort
+      // the whole signup (the invitation SHOULD already be 'cancelled' by the
+      // terminate handler; this is the race-safe backstop).
+      const flipped = await client.query(
         `UPDATE subleases
             SET sublessee_tenant_id = $1,
                 status = 'pending',
                 updated_at = NOW()
-          WHERE id = $2`,
+          WHERE id = $2 AND status = 'pending_invite'
+          RETURNING id`,
         [tenant.id, inv.sublease_id],
       )
+      if (flipped.rowCount === 0) {
+        await client.query('ROLLBACK')
+        throw new AppError(409, 'This sublease offer is no longer available — it was cancelled or the lease ended.')
+      }
 
       await client.query('COMMIT')
 

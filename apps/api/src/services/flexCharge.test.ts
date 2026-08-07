@@ -32,7 +32,19 @@ import {
   listFlexChargeAccounts,
   updateFlexChargeAccount,
   getFlexChargeAccountsForTenant,
+  postFlexChargeTransaction,
 } from './flexCharge'
+
+// Minimal pos_transactions row so postFlexChargeTransaction's FK
+// (flex_charge_transactions.pos_transaction_id → pos_transactions.id) resolves.
+async function seedPosTx(landlordId: string): Promise<string> {
+  const { rows: [{ user_id }] } = await db.query<{ user_id: string }>(
+    `SELECT user_id FROM landlords WHERE id=$1`, [landlordId])
+  const { rows: [{ id }] } = await db.query<{ id: string }>(
+    `INSERT INTO pos_transactions (landlord_id, cashier_id, payment_method, subtotal, total)
+     VALUES ($1, $2, 'charge', 0, 0) RETURNING id`, [landlordId, user_id])
+  return id
+}
 
 beforeEach(async () => {
   // Pre-clean — cleanupAllSchema doesn't know about these tables;
@@ -318,6 +330,24 @@ describe('listFlexChargeAccounts', () => {
     expect(list[0].customer_name).toMatch(/Test Tenant/)
   })
 
+  it('balance = current_balance (carried, net of payments) + open pending; billed txns not re-counted', async () => {
+    // S583 revolving regression: post-conversion, billed transactions stay
+    // 'billed' forever (they carry). The roster balance must read the running
+    // current_balance + this cycle's pending, NOT SUM(pending,billed) — which
+    // would double-count the 500 billed row already reflected in current_balance.
+    const ctx = await seedCtx({ flexChargeEnabled: true })
+    const acct = await createFlexChargeAccount({
+      landlordId: ctx.landlordId, propertyId: ctx.propertyId,
+      tenantId: ctx.tenantId, creditLimit: 500,
+    })
+    await db.query(`UPDATE flex_charge_accounts SET current_balance = 100 WHERE id=$1`, [acct.id])
+    await db.query(
+      `INSERT INTO flex_charge_transactions (account_id, amount, status)
+       VALUES ($1, 500, 'billed'), ($1, 40, 'pending')`, [acct.id])
+    const list = await listFlexChargeAccounts({ landlordId: ctx.landlordId })
+    expect(list[0].balance).toBe(140)   // 100 carried + 40 pending (NOT + 500 billed)
+  })
+
   it('propertyId filter narrows results', async () => {
     const ctx = await seedCtx({ flexChargeEnabled: true })
     // Second property on same landlord — reuse the landlord's user_id
@@ -368,6 +398,78 @@ describe('listFlexChargeAccounts', () => {
     } finally { c.release() }
     const list = await listFlexChargeAccounts({ landlordId: bLandlordId })
     expect(list).toEqual([])
+  })
+})
+
+// ─── postFlexChargeTransaction — credit-limit gate (revolving) ─
+
+describe('postFlexChargeTransaction — credit-limit gate', () => {
+  it('charge within the limit inserts a pending transaction', async () => {
+    const ctx = await seedCtx({ flexChargeEnabled: true })
+    const acct = await createFlexChargeAccount({
+      landlordId: ctx.landlordId, propertyId: ctx.propertyId,
+      tenantId: ctx.tenantId, creditLimit: 500,
+    })
+    const posTx = await seedPosTx(ctx.landlordId)
+    const row = await postFlexChargeTransaction({
+      accountId: acct.id, posTransactionId: posTx, amount: 200,
+    })
+    expect(row.status).toBe('pending')
+    expect(Number(row.amount)).toBe(200)
+  })
+
+  it('charge that would exceed the limit → 409', async () => {
+    const ctx = await seedCtx({ flexChargeEnabled: true })
+    const acct = await createFlexChargeAccount({
+      landlordId: ctx.landlordId, propertyId: ctx.propertyId,
+      tenantId: ctx.tenantId, creditLimit: 500,
+    })
+    const posTx = await seedPosTx(ctx.landlordId)
+    await expect(postFlexChargeTransaction({
+      accountId: acct.id, posTransactionId: posTx, amount: 600,
+    })).rejects.toMatchObject({ statusCode: 409 })
+  })
+
+  it('gate reads current_balance, not lifetime-billed txns: a paid-down account keeps its limit', async () => {
+    // Regression for the revolving conversion. Customer charged 500 last cycle
+    // (now 'billed', carries forever) and paid 400 down → current_balance = 100.
+    // They owe 100, so a 350 charge (→ 450 ≤ 500) MUST succeed. The old
+    // SUM(pending,billed) basis saw 500 and would wrongly block them at $0 owed.
+    const ctx = await seedCtx({ flexChargeEnabled: true })
+    const acct = await createFlexChargeAccount({
+      landlordId: ctx.landlordId, propertyId: ctx.propertyId,
+      tenantId: ctx.tenantId, creditLimit: 500,
+    })
+    await db.query(
+      `INSERT INTO flex_charge_transactions (account_id, amount, status) VALUES ($1, 500, 'billed')`,
+      [acct.id])
+    await db.query(`UPDATE flex_charge_accounts SET current_balance = 100 WHERE id=$1`, [acct.id])
+
+    const posTx = await seedPosTx(ctx.landlordId)
+    const ok = await postFlexChargeTransaction({
+      accountId: acct.id, posTransactionId: posTx, amount: 350,
+    })
+    expect(ok.status).toBe('pending')
+
+    // Now the live exposure is 100 carried + 350 pending = 450; a further 100
+    // (→ 550) must exceed — proving pending is counted alongside current_balance.
+    const posTx2 = await seedPosTx(ctx.landlordId)
+    await expect(postFlexChargeTransaction({
+      accountId: acct.id, posTransactionId: posTx2, amount: 100.01,
+    })).rejects.toMatchObject({ statusCode: 409 })
+  })
+
+  it('suspended account → 409 (no new charges)', async () => {
+    const ctx = await seedCtx({ flexChargeEnabled: true })
+    const acct = await createFlexChargeAccount({
+      landlordId: ctx.landlordId, propertyId: ctx.propertyId,
+      tenantId: ctx.tenantId, creditLimit: 500,
+    })
+    await db.query(`UPDATE flex_charge_accounts SET status='suspended' WHERE id=$1`, [acct.id])
+    const posTx = await seedPosTx(ctx.landlordId)
+    await expect(postFlexChargeTransaction({
+      accountId: acct.id, posTransactionId: posTx, amount: 10,
+    })).rejects.toMatchObject({ statusCode: 409 })
   })
 })
 

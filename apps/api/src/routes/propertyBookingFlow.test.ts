@@ -118,6 +118,49 @@ describe('POST /book', () => {
     expect(res.status).toBe(409)
     expect(res.body.full).toBe(true)
   })
+
+  // S593 defrag: the Master Schedule is the single occupancy truth — a unit
+  // under an ACTIVE long-term lease can't be short-term-booked over it.
+  it('S593: dates under an active long-term lease → 409 full', async () => {
+    const s = await seedSite()
+    await db.query(
+      `INSERT INTO leases (unit_id, landlord_id, rent_amount, lease_type, status, start_date, end_date)
+       VALUES ($1,$2,1200,'fixed_term','active',$3,$4)`,
+      [s.unitId, s.landlordId, plusDays(20), plusDays(60)])
+    const res = await request(buildApp()).post('/api/public/property/sunny/book').send(guest(plusDays(31), plusDays(34)))
+    expect(res.status).toBe(409)
+    expect(res.body.full).toBe(true)
+  })
+
+  it('S593: an open-ended (month-to-month, null end) active lease also blocks', async () => {
+    const s = await seedSite()
+    await db.query(
+      `INSERT INTO leases (unit_id, landlord_id, rent_amount, lease_type, status, start_date, end_date)
+       VALUES ($1,$2,1200,'month_to_month','active',$3,NULL)`,
+      [s.unitId, s.landlordId, plusDays(1)])
+    const res = await request(buildApp()).post('/api/public/property/sunny/book').send(guest(plusDays(31), plusDays(34)))
+    expect(res.status).toBe(409)
+  })
+
+  it('S593: a PENDING draft lease also blocks (matches the ranker occupancy model)', async () => {
+    const s = await seedSite()
+    await db.query(
+      `INSERT INTO leases (unit_id, landlord_id, rent_amount, lease_type, status, start_date, end_date)
+       VALUES ($1,$2,1200,'fixed_term','pending',$3,$4)`,
+      [s.unitId, s.landlordId, plusDays(20), plusDays(60)])
+    const res = await request(buildApp()).post('/api/public/property/sunny/book').send(guest(plusDays(31), plusDays(34)))
+    expect(res.status).toBe(409)
+  })
+
+  it('S593: a terminated lease does NOT block bookings (only active/pending occupy)', async () => {
+    const s = await seedSite()
+    await db.query(
+      `INSERT INTO leases (unit_id, landlord_id, rent_amount, lease_type, status, start_date, end_date)
+       VALUES ($1,$2,1200,'fixed_term','terminated',$3,$4)`,
+      [s.unitId, s.landlordId, plusDays(20), plusDays(60)])
+    const res = await request(buildApp()).post('/api/public/property/sunny/book').send(guest(plusDays(31), plusDays(34)))
+    expect(res.status).toBe(200)
+  })
 })
 
 describe('deposit confirmation', () => {

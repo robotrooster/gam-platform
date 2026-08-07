@@ -1,5 +1,5 @@
 import { useState, useRef, useMemo } from 'react'
-import { useMutation, useQuery } from 'react-query'
+import { useMutation, useQuery, useQueryClient } from 'react-query'
 import { useNavigate } from 'react-router-dom'
 import { Upload, Download, FileText, AlertCircle, CheckCircle2, AlertTriangle, ArrowUp, X, Inbox } from 'lucide-react'
 import { api, apiPost, apiGet, apiPut } from '../lib/api'
@@ -85,6 +85,48 @@ const PLATFORM_OPTIONS = [
 
 type Mode = 'choose' | 'bulk' | 'single' | 'new_lease'
 
+// S579: shows every property whose onboarding window is still OPEN — how many
+// days sitting tenants can still be grandfathered past screening — and lets the
+// landlord close a property's window early. After close, every new tenant there
+// must pass a background check (no reopen). Uses an inline two-step confirm (no
+// native dialogs — Safari/webviews drop them).
+function OnboardingWindowsBanner() {
+  const qc = useQueryClient()
+  const [confirmingId, setConfirmingId] = useState<string | null>(null)
+  const { data: windows = [] } = useQuery<any[]>('onboarding-windows', () => apiGet('/landlords/me/onboarding-windows'))
+  const completeMut = useMutation(
+    (propertyId: string) => apiPost(`/properties/${propertyId}/onboarding-complete`, {}),
+    { onSuccess: () => { setConfirmingId(null); qc.invalidateQueries('onboarding-windows'); qc.invalidateQueries(['ob-window']) } },
+  )
+  const openWins = (windows as any[]).filter(w => w?.open)
+  if (openWins.length === 0) return null
+  return (
+    <div style={{ background: 'rgba(201,162,39,.06)', border: '1px solid rgba(201,162,39,.3)', borderRadius: 10, padding: '14px 16px', marginBottom: 20 }}>
+      <div style={{ fontSize: '.82rem', fontWeight: 700, color: 'var(--gold)', marginBottom: 8 }}>Onboarding window open</div>
+      <div style={{ fontSize: '.76rem', color: 'var(--text-2)', lineHeight: 1.5, marginBottom: 10 }}>
+        While a property&apos;s window is open you can grandfather existing residents past the background check. New applicants are always screened.
+      </div>
+      {openWins.map(w => (
+        <div key={w.propertyId} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, padding: '8px 0', borderTop: '1px solid var(--border-0)', flexWrap: 'wrap' }}>
+          <div style={{ fontSize: '.82rem', color: 'var(--text-1)' }}>
+            <strong style={{ color: 'var(--text-0)' }}>{w.propertyName}</strong>
+            {typeof w.daysRemaining === 'number' && <> — <span style={{ color: 'var(--gold)', fontWeight: 700 }}>{w.daysRemaining} day{w.daysRemaining === 1 ? '' : 's'}</span> left</>}
+          </div>
+          {confirmingId === w.propertyId ? (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span style={{ fontSize: '.74rem', color: 'var(--text-2)' }}>Close now? New tenants will be screened.</span>
+              <button className="btn btn-primary btn-sm" disabled={completeMut.isLoading} onClick={() => completeMut.mutate(w.propertyId)}>Confirm</button>
+              <button className="btn btn-ghost btn-sm" onClick={() => setConfirmingId(null)}>Cancel</button>
+            </div>
+          ) : (
+            <button className="btn btn-ghost btn-sm" onClick={() => setConfirmingId(w.propertyId)}>Mark onboarding complete</button>
+          )}
+        </div>
+      ))}
+    </div>
+  )
+}
+
 export function TenantOnboardingPage() {
   const [mode, setMode] = useState<Mode>('choose')
   const navigate = useNavigate()
@@ -108,10 +150,13 @@ export function TenantOnboardingPage() {
           Tenant Onboarding
         </h1>
         <p style={{ fontSize: '.88rem', color: 'var(--text-2)', marginTop: 6, lineHeight: 1.5 }}>
-          Bring tenants who already live in your units onto GAM. No application or
-          background check is required because they are already living there.
+          Bring tenants who already live in your units onto GAM. During your property&apos;s
+          onboarding window you can grandfather existing residents past the background check —
+          after it closes, every new tenant is screened.
         </p>
       </div>
+
+      <OnboardingWindowsBanner />
 
       {mode === 'choose' && (
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: 16 }}>
@@ -195,8 +240,20 @@ function NewLeaseInviteMode({ onBack }: { onBack: () => void }) {
   const [invited, setInvited] = useState<string[]>([])
   const set = (k: keyof typeof form, v: string) => setForm(prev => ({ ...prev, [k]: v }))
 
+  // S579: the onboarding-window grandfather. This page is explicitly for tenants
+  // who ALREADY live in the unit, so a sitting tenant may skip the background
+  // check — but only while the property's onboarding window is open, and only
+  // with the landlord's attestation. After the window closes, they screen.
+  const propertyIdForWindow = (allUnits as any[]).find(u => u.id === unitId)?.propertyId
+  const { data: obWindow } = useQuery<any>(
+    ['ob-window', propertyIdForWindow],
+    () => apiGet(`/properties/${propertyIdForWindow}/onboarding-window`),
+    { enabled: !!propertyIdForWindow, staleTime: 60_000 })
+  const windowOpen = !!obWindow?.open
+  const [attestExisting, setAttestExisting] = useState(true)
+
   const submitMut = useMutation(
-    () => apiPost<any>('/landlords/me/onboard-new-lease-tenant', { ...form, unitId }),
+    () => apiPost<any>('/landlords/me/onboard-new-lease-tenant', { ...form, unitId, existingResident: windowOpen && attestExisting }),
     {
       onSuccess: () => {
         setInvited(prev => [...prev, `${form.firstName} ${form.lastName}`.trim() || form.email])
@@ -237,6 +294,29 @@ function NewLeaseInviteMode({ onBack }: { onBack: () => void }) {
               <option key={u.id} value={u.id}>Unit {u.unitNumber} — {u.propertyName}{u.occupancyMode === 'by_room' ? ' (by-room)' : ''}</option>
             ))}
           </select>
+
+          {/* S579: onboarding-window grandfather. Open → attest existing
+              resident to skip screening; closed → they must screen. */}
+          {unitId && obWindow && (windowOpen ? (
+            <div style={{ background: 'rgba(201,162,39,.06)', border: '1px solid rgba(201,162,39,.3)', borderRadius: 8, padding: '12px 14px', marginBottom: 12 }}>
+              <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, cursor: 'pointer' }}>
+                <input type="checkbox" checked={attestExisting} onChange={e => setAttestExisting(e.target.checked)} style={{ marginTop: 3, flexShrink: 0 }} />
+                <div>
+                  <div style={{ fontSize: '.82rem', fontWeight: 700, color: 'var(--text-0)' }}>Existing resident — skip background check</div>
+                  <div style={{ fontSize: '.74rem', color: 'var(--text-2)', lineHeight: 1.5, marginTop: 2 }}>
+                    I attest this person already lives in this unit. They&apos;ll sign the new lease without a background check.
+                    {typeof obWindow.daysRemaining === 'number' && <> Onboarding window closes in <strong style={{ color: 'var(--gold)' }}>{obWindow.daysRemaining} day{obWindow.daysRemaining === 1 ? '' : 's'}</strong>.</>}
+                  </div>
+                  {!attestExisting && <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 4 }}>Unchecked — this tenant will complete a background check before portal access.</div>}
+                </div>
+              </label>
+            </div>
+          ) : (
+            <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-0)', borderRadius: 8, padding: '10px 14px', marginBottom: 12, fontSize: '.76rem', color: 'var(--text-2)', lineHeight: 1.5 }}>
+              This property&apos;s onboarding window has closed — this tenant will complete a <strong style={{ color: 'var(--text-1)' }}>background check</strong> before portal access. Grandfathering existing residents is only available during onboarding.
+            </div>
+          ))}
+
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
             <input className="input" placeholder="First name" value={form.firstName} onChange={e => set('firstName', e.target.value)} />
             <input className="input" placeholder="Last name" value={form.lastName} onChange={e => set('lastName', e.target.value)} />
@@ -321,10 +401,19 @@ function SingleTenantMode({ onBack, onComplete }: { onBack: () => void; onComple
   const [uploading, setUploading] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
+  // S579: onboarding-window grandfather (only when a unit is bound — it's per unit).
+  const propertyIdForWindow = (allUnits as any[]).find(u => u.id === unitId)?.propertyId
+  const { data: obWindow } = useQuery<any>(
+    ['ob-window', propertyIdForWindow],
+    () => apiGet(`/properties/${propertyIdForWindow}/onboarding-window`),
+    { enabled: !!propertyIdForWindow, staleTime: 60_000 })
+  const windowOpen = !!obWindow?.open
+  const [attestExisting, setAttestExisting] = useState(true)
+
   const set = (k: keyof typeof form, v: string) => setForm(prev => ({ ...prev, [k]: v }))
 
   const submitMut = useMutation(
-    () => apiPost<any>('/landlords/me/onboard-tenant-pending', { ...form, unitId: unitId || undefined }),
+    () => apiPost<any>('/landlords/me/onboard-tenant-pending', { ...form, unitId: unitId || undefined, existingResident: !!unitId && windowOpen && attestExisting }),
     {
       onSuccess: (res: any) => {
         // Codebase convention: handlers return { success, data: { ... } }.
@@ -457,6 +546,27 @@ function SingleTenantMode({ onBack, onComplete }: { onBack: () => void; onComple
               Holds their spot: guests can't book this unit while onboarding completes.
             </div>
           </div>
+
+          {/* S579: grandfather — only when a unit is bound (per-occupied-unit). */}
+          {unitId && obWindow && (windowOpen ? (
+            <div style={{ background: 'rgba(201,162,39,.06)', border: '1px solid rgba(201,162,39,.3)', borderRadius: 8, padding: '12px 14px', marginBottom: 16 }}>
+              <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, cursor: 'pointer' }}>
+                <input type="checkbox" checked={attestExisting} onChange={e => setAttestExisting(e.target.checked)} style={{ marginTop: 3, flexShrink: 0 }} />
+                <div>
+                  <div style={{ fontSize: '.82rem', fontWeight: 700, color: 'var(--text-0)' }}>Existing resident — skip background check</div>
+                  <div style={{ fontSize: '.74rem', color: 'var(--text-2)', lineHeight: 1.5, marginTop: 2 }}>
+                    I attest this person already lives in this unit.
+                    {typeof obWindow.daysRemaining === 'number' && <> Onboarding window closes in <strong style={{ color: 'var(--gold)' }}>{obWindow.daysRemaining} day{obWindow.daysRemaining === 1 ? '' : 's'}</strong>.</>}
+                  </div>
+                  {!attestExisting && <div style={{ fontSize: '.72rem', color: 'var(--text-3)', marginTop: 4 }}>Unchecked — this tenant will complete a background check.</div>}
+                </div>
+              </label>
+            </div>
+          ) : (
+            <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border-0)', borderRadius: 8, padding: '10px 14px', marginBottom: 16, fontSize: '.76rem', color: 'var(--text-2)', lineHeight: 1.5 }}>
+              Onboarding window closed — this tenant will complete a <strong style={{ color: 'var(--text-1)' }}>background check</strong> before portal access.
+            </div>
+          ))}
 
           <button type="submit" disabled={submitMut.isLoading} className="btn btn-primary" style={{ width: '100%' }}>
             {submitMut.isLoading ? 'Adding...' : 'Add tenant to pending pool'}

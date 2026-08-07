@@ -65,11 +65,11 @@ export function LotRentPage() {
               <thead><tr><th>Home</th><th>Park</th><th>Tenant rent</th><th>Lot rent</th><th>Net</th></tr></thead>
               <tbody>
                 {homes.map(h => (
-                  <tr key={h.unit_id}>
-                    <td style={{ fontWeight: 600 }}>Unit {h.unit_number}</td>
-                    <td style={{ fontSize: '.8rem', color: 'var(--text-3)' }}>{h.property_name}</td>
-                    <td>{fmt(h.rent_amount)}</td>
-                    <td>{fmt(h.lot_rent_amount)}</td>
+                  <tr key={h.unitId}>
+                    <td style={{ fontWeight: 600 }}>Unit {h.unitNumber}</td>
+                    <td style={{ fontSize: '.8rem', color: 'var(--text-3)' }}>{h.propertyName}</td>
+                    <td>{fmt(h.rentAmount)}</td>
+                    <td>{fmt(h.lotRentAmount)}</td>
                     <td style={{ color: 'var(--green)', fontWeight: 600 }}>{fmt(h.net)}</td>
                   </tr>
                 ))}
@@ -85,9 +85,9 @@ export function LotRentPage() {
                 <tbody>
                   {charges.map(c => (
                     <tr key={c.id}>
-                      <td>{monthLabel(c.billing_month)}</td>
-                      <td>Unit {c.unit_number}</td>
-                      <td style={{ fontSize: '.8rem', color: 'var(--text-3)' }}>{c.property_name}</td>
+                      <td>{monthLabel(c.billingMonth)}</td>
+                      <td>Unit {c.unitNumber}</td>
+                      <td style={{ fontSize: '.8rem', color: 'var(--text-3)' }}>{c.propertyName}</td>
                       <td>{fmt(c.amount)}</td>
                       <td><button className="btn btn-primary btn-sm" disabled={payMut.isLoading} onClick={() => payMut.mutate(c.id)}>Mark paid</button></td>
                     </tr>

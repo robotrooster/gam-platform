@@ -22,7 +22,7 @@ import request from 'supertest'
 import jwt from 'jsonwebtoken'
 import { randomUUID } from 'crypto'
 import { db } from '../db'
-import { cleanupAllSchema, seedLandlord } from '../test/dbHelpers'
+import { cleanupAllSchema, seedLandlord, seedProperty } from '../test/dbHelpers'
 
 const {
   listPosCustomersMock, createPosCustomerMock, archivePosCustomerMock,
@@ -59,10 +59,22 @@ vi.mock('../services/email', async (importOriginal) => {
 
 import { landlordsRouter } from './landlords'
 import { errorHandler } from '../middleware/errorHandler'
+import { camelCaseKeys } from '../lib/caseConversion'
 
 function buildApp() {
   const app = express()
   app.use(express.json({ limit: '2mb' }))
+  app.use('/api/landlords', landlordsRouter)
+  app.use(errorHandler)
+  return app
+}
+
+// S583: prod serves camelCase (global middleware); the finance-rate frontend
+// reads financePct/propertyId. Mirror that so the test pins the real contract.
+function buildCamelApp() {
+  const app = express()
+  app.use(express.json({ limit: '2mb' }))
+  app.use((_req, res, next) => { const o = res.json.bind(res); res.json = (b: any) => o(camelCaseKeys(b)); next() })
   app.use('/api/landlords', landlordsRouter)
   app.use(errorHandler)
   return app
@@ -270,5 +282,59 @@ describe('FlexCharge accounts — GET/POST/PATCH/statements pass-through', () =>
       landlordId: f.landlordId, accountId,
       creditLimit: 1000, status: 'frozen', notes: undefined,
     })
+  })
+})
+
+describe('FlexCharge merchant finance rate (S583)', () => {
+  async function seedProp(f: PFFixture): Promise<string> {
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      const propertyId = await seedProperty(client, {
+        landlordId: f.landlordId, ownerUserId: f.landlordUserId, managedByUserId: f.landlordUserId,
+      })
+      await client.query('UPDATE properties SET flexcharge_enabled = TRUE WHERE id = $1', [propertyId])
+      await client.query('COMMIT')
+      return propertyId
+    } catch (e) { await client.query('ROLLBACK'); throw e } finally { client.release() }
+  }
+
+  it('PATCH sets a valid per-property rate; GET returns it (camelCase wire contract)', async () => {
+    const f = await seedPFFixture()
+    const propertyId = await seedProp(f)
+    const patch = await request(buildCamelApp())
+      .patch('/api/landlords/flex-charge/finance-rate')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ propertyId, financePct: 0.05 })
+    expect(patch.status).toBe(200)
+    expect(patch.body.data.financePct).toBeCloseTo(0.05)
+
+    const list = await request(buildCamelApp())
+      .get('/api/landlords/flex-charge/finance-rates')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+    expect(list.status).toBe(200)
+    expect(list.body.data).toHaveLength(1)
+    expect(list.body.data[0]).toMatchObject({ propertyId, financePct: 0.05 })
+  })
+
+  it('rejects a rate above the 6% cap (400) — usury guard', async () => {
+    const f = await seedPFFixture()
+    const propertyId = await seedProp(f)
+    const res = await request(buildApp())
+      .patch('/api/landlords/flex-charge/finance-rate')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ propertyId, financePct: 0.07 })
+    expect(res.status).toBe(400)
+  })
+
+  it("cannot set the rate on another landlord's property (404)", async () => {
+    const owner = await seedPFFixture()
+    const propertyId = await seedProp(owner)
+    const other = await seedPFFixture()
+    const res = await request(buildApp())
+      .patch('/api/landlords/flex-charge/finance-rate')
+      .set('Authorization', `Bearer ${other.landlordToken}`)
+      .send({ propertyId, financePct: 0.03 })
+    expect(res.status).toBe(404)
   })
 })

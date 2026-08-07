@@ -126,10 +126,13 @@ describe('POST /api/esign/standalone-documents', () => {
       }).expect(200)
     const { rows: [c] } = await db.query<any>(`SELECT tenant_invite_token FROM users WHERE LOWER(email)=$1`, [email])
     const act = await request(buildApp()).post('/api/tenants/accept-invite')
-      .send({ token: c.tenant_invite_token, password: 'password123', acceptedTerms: true })
+      .send({ token: c.tenant_invite_token, password: 'password1234', acceptedTerms: true })
     expect(act.status).toBe(200)
     expect(act.body.data.user.role).toBe('contact')       // NOT tenant
-    expect(act.body.data.token).toBeTruthy()               // can now reach /sign
+    // S578: mandatory email-2FA at activation — a pending session (the contact
+    // trades the emailed code at /email-otp/verify before reaching /sign).
+    expect(act.body.data.requiresEmailOtp).toBe(true)
+    expect(act.body.data.emailOtpSession).toBeTruthy()
     const activated = await db.query<any>(`SELECT email_verified, role FROM users WHERE LOWER(email)=$1`, [email])
     expect(activated.rows[0].email_verified).toBe(true)
     expect(activated.rows[0].role).toBe('contact')

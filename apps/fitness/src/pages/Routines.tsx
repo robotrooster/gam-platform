@@ -119,8 +119,8 @@ function Builder({ onCancel, onCreated }: { onCancel: () => void; onCreated: () 
         sections: d.sections.map(s => ({
           label: s.label,
           exercises: s.exercises.filter(e => e.name.trim()).map(e => ({
-            name: e.name, sets: Number(e.sets) || null, reps_min: Number(e.reps_min) || null,
-            reps_max: Number(e.reps_max) || null, notes: e.notes || null,
+            name: e.name, sets: Number(e.sets) || null, reps_min: Number(e.reps_min) || null, // wire-ok: request body — API reads snake req.body; e is local builder state
+            reps_max: Number(e.reps_max) || null, notes: e.notes || null, // wire-ok: request body — API reads snake req.body; e is local builder state
           })),
         })),
       })),
@@ -162,9 +162,9 @@ function Builder({ onCancel, onCreated }: { onCancel: () => void; onCreated: () 
                   <label className="field" style={{ marginBottom: 0 }}><span className="lbl">Sets</span>
                     <input value={ex.sets} onChange={e => upd(d => { d[di].sections[si].exercises[ei].sets = e.target.value })} /></label>
                   <label className="field" style={{ marginBottom: 0 }}><span className="lbl">Reps min</span>
-                    <input value={ex.reps_min} onChange={e => upd(d => { d[di].sections[si].exercises[ei].reps_min = e.target.value })} /></label>
+                    <input value={ex.reps_min} onChange={e => upd(d => { d[di].sections[si].exercises[ei].reps_min = e.target.value })} /></label>{/* wire-ok: ex is local builder state */}
                   <label className="field" style={{ marginBottom: 0 }}><span className="lbl">Reps max</span>
-                    <input value={ex.reps_max} onChange={e => upd(d => { d[di].sections[si].exercises[ei].reps_max = e.target.value })} /></label>
+                    <input value={ex.reps_max} onChange={e => upd(d => { d[di].sections[si].exercises[ei].reps_max = e.target.value })} /></label>{/* wire-ok: ex is local builder state */}
                   {sec.exercises.length > 1 && <button className="btn sm ghost" style={{ marginBottom: 0 }} onClick={() => upd(d => { d[di].sections[si].exercises.splice(ei, 1) })}>✕</button>}
                 </div>
               ))}

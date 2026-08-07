@@ -6,22 +6,22 @@ import { useAuth } from '../context/AuthContext'
 import { apiGet } from '../lib/api'
 
 interface OutcomeRow { outcome: string; count: number }
-interface AgentRow   { agent_name: string; count: number }
+interface AgentRow   { agentName: string; count: number }
 interface ToolRow    { tool: string; count: number }
 
 interface SummaryData {
   days: number
   totals: {
     total: number
-    tenant_count: number
-    landlord_count: number
-    escalated_count: number
-    grounded_count: number
-    avg_latency_ms: number | null
+    tenantCount: number
+    landlordCount: number
+    escalatedCount: number
+    groundedCount: number
+    avgLatencyMs: number | null
   }
-  by_outcome: OutcomeRow[]
-  by_agent:   AgentRow[]
-  by_tool:    ToolRow[]
+  byOutcome: OutcomeRow[]
+  byAgent:   AgentRow[]
+  byTool:    ToolRow[]
 }
 
 interface RecentRow {
@@ -136,20 +136,20 @@ export function AgentActivityPage() {
         <KpiTile
           icon={<MessageCircle size={16} />}
           label="From tenants"
-          value={summary?.totals.tenant_count ?? 0}
+          value={summary?.totals.tenantCount ?? 0}
         />
         <KpiTile
           icon={<AlertTriangle size={16} />}
           label="Escalated to human"
-          value={summary?.totals.escalated_count ?? 0}
-          accent={(summary?.totals.escalated_count ?? 0) > 0 ? 'amber' : 'gold'}
+          value={summary?.totals.escalatedCount ?? 0}
+          accent={(summary?.totals.escalatedCount ?? 0) > 0 ? 'amber' : 'gold'}
         />
         <KpiTile
           icon={<Zap size={16} />}
           label="Avg latency"
           value={
-            summary?.totals.avg_latency_ms != null
-              ? `${(summary.totals.avg_latency_ms / 1000).toFixed(1)}s`
+            summary?.totals.avgLatencyMs != null
+              ? `${(summary.totals.avgLatencyMs / 1000).toFixed(1)}s`
               : '—'
           }
         />
@@ -158,7 +158,7 @@ export function AgentActivityPage() {
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 16, marginBottom: 24 }}>
         <BreakdownCard
           title="By outcome"
-          rows={summary?.by_outcome ?? []}
+          rows={summary?.byOutcome ?? []}
           labelKey="outcome"
           labelFormatter={fmtOutcome}
           onRowClick={(label) => setOutcomeFilter(label === outcomeFilter ? '' : label)}
@@ -166,12 +166,12 @@ export function AgentActivityPage() {
         />
         <BreakdownCard
           title="By agent"
-          rows={summary?.by_agent ?? []}
-          labelKey="agent_name"
+          rows={summary?.byAgent ?? []}
+          labelKey="agentName"
         />
         <BreakdownCard
           title="Top tools"
-          rows={summary?.by_tool ?? []}
+          rows={summary?.byTool ?? []}
           labelKey="tool"
           icon={<WrenchIcon size={11} />}
         />

@@ -13,16 +13,6 @@ import { signTotpSessionToken, signTotpEnrollToken } from './totp'
 import { MANDATORY_TOTP_ROLES } from '../lib/totp'
 import { signEmailOtpSessionToken, issueEmailOtp } from './emailOtp'
 
-// S574 (Nic): roles for which email-code 2FA is MANDATORY at every login,
-// canonicalized on first sign-in and backfilled by migration. These accounts
-// each control private data + money flow (a tenant's lease, a landlord's whole
-// portfolio, a business owner's reports + payouts), so a second factor is
-// non-negotiable. Email-code ONLY — none of these portals expose authenticator
-// enrollment. business_staff cashiers are deliberately excluded (register
-// passcode, transaction-scoped). Legacy TOTP accounts still verify via the
-// authenticator branch above; no new account in these roles can enroll one.
-const UNIVERSAL_EMAIL_2FA_ROLES = new Set<string>(['tenant', 'landlord', 'business_owner'])
-
 // S80: scope-table dispatch for login / refresh JWT claims. Replaced the
 // pre-S80 team_members LEFT JOIN. Role-keyed lookup against the right
 // per-role scope table; bookkeeper returns its access_level packed into
@@ -175,11 +165,21 @@ authRouter.post('/register', async (req, res, next) => {
         if (body.referralCode) {
           const [ref] = await client.query(
             `SELECT id, role FROM users WHERE referral_code = $1
-              AND role IN ('admin','super_admin','landlord')`,
+              AND role IN ('admin','super_admin','landlord','portfolio_manager')`,
             [body.referralCode.toUpperCase()]
           ).then((r: any) => r.rows)
           if (ref?.role === 'landlord') referredByUserId = ref.id
           else if (ref) closerId = ref.id
+          // S592: persist the upline on the PERSON so it survives 1031s / new
+          // entities and auto-applies to any account they open. The landlord
+          // columns below are the derived copy the accrual job reads first; this
+          // is the durable source of truth.
+          const uplineId = referredByUserId || closerId
+          if (uplineId) {
+            await client.query(
+              `UPDATE users SET referred_by_user_id = $1 WHERE id = $2`,
+              [uplineId, user.id])
+          }
         }
         // S568: open the onboarding reconciliation window (21 days). While it's
         // open the landlord can mark a tenant's FIRST GAM invoice paid off-platform
@@ -204,22 +204,27 @@ authRouter.post('/register', async (req, res, next) => {
 
       await client.query('COMMIT')
 
-      // S281: mint + email verification token AFTER commit. Failure
-      // here doesn't fail the registration — the user can request a
-      // resend via /api/auth/resend-verification. Skipped in dev where
-      // the account is already auto-verified (model C).
-      if (!devAutoVerify) void mintAndSendVerifyEmail(user.id, user.email, user.first_name)
-
-      // S553: a fresh registration's only membership is the founding one
-      // the landlords-insert backfilled trigger-free — mirror it in the JWT.
-      const token = signToken({
+      // S578 (Nic): mandatory email-2FA IMMEDIATELY at signup. A new account
+      // will hold a lease (tenant PII) or a whole portfolio + everyone's
+      // banking data (landlord), so NO full session is issued at registration —
+      // we email a 6-digit code and return a PENDING session, exactly like
+      // /login does. The client trades the code at /api/auth/email-otp/verify
+      // for the real token, and that verify step also marks the email verified
+      // (the emailed code proves ownership), so no separate verification-link
+      // email is needed here.
+      await query(`UPDATE users SET email_2fa_enabled = TRUE WHERE id = $1`, [user.id])
+      const emailOtpSession = signEmailOtpSessionToken({
         userId: user.id, role: user.role, email: user.email, profileId,
-        ...(body.role === 'landlord' ? { landlordIds: [profileId] } : {}),
+        landlordId: null,
+        landlordIds: body.role === 'landlord' ? [profileId] : null,
+        businessId: null, staffRole: null, permissions: null,
       })
+      await issueEmailOtp(user.id, user.email)
       res.status(201).json({
         success: true,
-        data: { token, user: { id: user.id, email: user.email, role: user.role,
-          firstName: user.first_name, lastName: user.last_name, profileId } }
+        data: { requiresEmailOtp: true, emailOtpSession,
+          user: { id: user.id, email: user.email, role: user.role,
+            firstName: user.first_name, lastName: user.last_name, profileId } }
       })
     } catch (e) { await client.query('ROLLBACK'); throw e }
     finally { client.release() }
@@ -369,25 +374,18 @@ authRouter.post('/login', async (req, res, next) => {
       })
     }
 
-    // S565: EMAIL-CODE 2FA (alternative to the authenticator app). If the user
-    // opted into email 2FA and has no TOTP, email a 6-digit code and return a
-    // pending session instead of the full token. Satisfies the mandatory-2FA
-    // requirement without an authenticator app.
-    // S571 (Nic): email 2FA is MANDATORY for EVERY tenant, always — from signup,
-    // no matter what — to protect their private lease data. The role check makes
-    // it universal without needing every tenant-creation path to set the flag;
-    // we also canonicalize the flag here so status/UI reads it truthfully.
-    // S574 (Nic): landlords are held to the same bar — a landlord's account
-    // controls every tenant's private data + the money flow, so email 2FA is
-    // mandatory from signup for landlords too. Email-code ONLY (no authenticator):
-    // the landlord portal exposes no TOTP enrollment, and totp_enabled fires the
-    // branch above only for legacy accounts, never a new landlord.
-    // S574 (Nic): business_owner too — the POS/business owner sees reports +
-    // sensitive business data + the money flow, so their account gets mandatory
-    // email 2FA (mirrors landlord). business_staff (cashiers) are intentionally
-    // NOT here — they authenticate with a transaction-scoped register passcode
-    // instead of a second factor (less access, no sensitive-data exposure).
-    if (UNIVERSAL_EMAIL_2FA_ROLES.has(user.role) && !user.email_2fa_enabled) {
+    // S578 (Nic): MANDATORY 2FA for EVERY account on EVERY portal — no role is
+    // exempt, no matter what. The platform holds leases (tenant PII), banking
+    // data, and financials across every surface, so a second factor is required
+    // of everyone who signs in. Any login without an existing second factor (a
+    // legacy authenticator/TOTP is handled by the branch above; otherwise email
+    // code) gets email-code 2FA enabled here and is challenged below. This
+    // SUPERSEDES the prior per-role list (S571/S574 tenant/landlord/
+    // business_owner) — the list was the interim; universal is the rule.
+    // NOTE: the POS register-passcode / terminal-lock unlock is a separate,
+    // capability-scoped re-entry on an ALREADY-authenticated terminal, not a
+    // fresh account login — it is unaffected by this gate.
+    if (!user.totp_enabled && !user.email_2fa_enabled) {
       await query(`UPDATE users SET email_2fa_enabled = TRUE WHERE id = $1`, [user.id])
       user.email_2fa_enabled = true
     }
@@ -553,7 +551,12 @@ authRouter.patch('/me', requireAuth, async (req, res, next) => {
     const { firstName, lastName, phone } = req.body
     await query(`UPDATE users SET first_name=COALESCE($1,first_name), last_name=COALESCE($2,last_name), phone=COALESCE($3,phone), updated_at=NOW() WHERE id=$4`,
       [firstName||null, lastName||null, phone||null, req.user!.userId])
-    const user = await queryOne<any>('SELECT * FROM users WHERE id=$1', [req.user!.userId])
+    // Return ONLY safe columns — `SELECT *` here leaked password_hash, the
+    // reset/verify tokens, and 2FA fields back to the client on every profile
+    // save (GET /me already scopes its columns; this path did not).
+    const user = await queryOne<any>(
+      `SELECT id, email, role, first_name, last_name, phone, created_at, updated_at
+         FROM users WHERE id=$1`, [req.user!.userId])
     res.json({ success: true, data: user })
   } catch(e) { next(e) }
 })
@@ -606,21 +609,29 @@ authRouter.post('/register-prospect', async (req, res, next) => {
 
       await client.query('COMMIT')
 
-      // S281: mint + email verification token after commit.
-      void mintAndSendVerifyEmail(user.id, user.email, user.first_name)
+      // S578 (Nic): mandatory email-2FA IMMEDIATELY at signup — same as the
+      // landlord /register path. A prospect account will carry the applicant's
+      // PII into a background check, so NO full session is issued at
+      // registration; we email a 6-digit code and return a PENDING session. The
+      // client trades the code at /api/auth/email-otp/verify for the real token,
+      // and that verify step also marks the email verified (the emailed code
+      // proves ownership), so no separate verification-link email is sent here.
+      // Account creation is now its OWN step (a dedicated signup page), NOT
+      // inline in the background-check flow — the prospect signs up + verifies,
+      // lands in the gated portal, THEN completes the check.
+      await query(`UPDATE users SET email_2fa_enabled = TRUE WHERE id = $1`, [user.id])
+      const emailOtpSession = signEmailOtpSessionToken({
+        userId: user.id, role: 'tenant', email: user.email, profileId: tenant.id,
+        landlordId: landlordId || null,
+        landlordIds: null, businessId: null, staffRole: null, permissions: null,
+      })
+      await issueEmailOtp(user.id, user.email)
 
-      // Issue token. S277: dropped the `|| 'gam_dev_secret'` fallback —
-      // the literal string is committed to the repo, so it would
-      // forge tokens for any user if JWT_SECRET were ever unset in
-      // prod. Match the rest of the codebase: non-null assertion
-      // fails-closed when env is unset.
-      const token = jwt.sign(
-        { userId: user.id, role: 'tenant', profileId: tenant.id, landlordId: landlordId || null },
-        process.env.JWT_SECRET!,
-        { expiresIn: '7d' }
-      )
-
-      res.status(201).json({ success: true, data: { token, user: { id: user.id, email: user.email, firstName, lastName, role: 'tenant' } } })
+      res.status(201).json({
+        success: true,
+        data: { requiresEmailOtp: true, emailOtpSession,
+          user: { id: user.id, email: user.email, firstName, lastName, role: 'tenant', profileId: tenant.id } }
+      })
     } catch (e) { await client.query('ROLLBACK'); throw e }
     finally { client.release() }
   } catch (e) { next(e) }

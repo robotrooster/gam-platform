@@ -10,8 +10,8 @@ interface DumpRow {
   name: string
   street1: string; city: string; state: string; zip: string
   lat: string; lon: string
-  typical_dump_minutes: number
-  operating_hours: string | null
+  typicalDumpMinutes: number
+  operatingHours: string | null
   status: string
 }
 
@@ -72,8 +72,8 @@ export function DumpLocationsPage() {
     setEditForm({
       name: r.name, street1: r.street1, city: r.city, state: r.state, zip: r.zip,
       lat: String(r.lat), lon: String(r.lon),
-      typicalDumpMinutes: String(r.typical_dump_minutes),
-      operatingHours: r.operating_hours ?? '',
+      typicalDumpMinutes: String(r.typicalDumpMinutes),
+      operatingHours: r.operatingHours ?? '',
     })
   }
 
@@ -143,8 +143,8 @@ export function DumpLocationsPage() {
                   <tr key={r.id} style={{ borderBottom: '1px solid var(--border-0)' }}>
                     <td style={tdStyle}>{r.name}</td>
                     <td style={tdStyle}>{r.street1}, {r.city}</td>
-                    <td style={tdStyle}>{r.typical_dump_minutes} min</td>
-                    <td style={tdStyle}>{r.operating_hours ?? '24/7'}</td>
+                    <td style={tdStyle}>{r.typicalDumpMinutes} min</td>
+                    <td style={tdStyle}>{r.operatingHours ?? '24/7'}</td>
                     <td style={tdStyle}>
                       <div style={{ display: 'flex', gap: 6 }}>
                         <button onClick={() => startEdit(r)} style={iconBtnStyle('default', false)}>

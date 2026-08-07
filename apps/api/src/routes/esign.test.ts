@@ -107,7 +107,8 @@ vi.mock('../services/pdfStamp', async (importOriginal) => {
   return { ...actual, stampPdf: stampPdfMock }
 })
 
-import { esignRouter } from './esign'
+import { esignRouter, buildLeaseFromDocument } from './esign'
+import { WRITABLE_LEASE_COLUMN_SPECS } from '@gam/shared'
 import { errorHandler } from '../middleware/errorHandler'
 
 function buildApp() {
@@ -408,6 +409,31 @@ describe('POST /documents — auto-populate from unit (S556/S558)', () => {
     expect(vals.rent_amount).toBe('1000.00')
     expect(vals.security_deposit).toBe('1500.00') // 1000 × 1.5
     expect(vals.unit_number).toBeTruthy()
+  })
+
+  it('S582: rent_due_day is auto-filled to "1st" so the signed lease STATES the due day (document-first)', async () => {
+    const f = await seedFixture()
+    const tid = await seedTemplateWithFields(f.landlordId, ['rent_amount', 'rent_due_day'])
+    const res = await request(buildApp())
+      .post('/api/esign/documents')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({
+        title: 'Auto Lease', templateId: tid, unitId: f.unitId,
+        signers: [
+          { role: 'landlord', userId: f.landlordUserId, name: 'L L', email: 'l@x' },
+          { role: 'primary',  userId: f.tenantUserId,   name: 'T T', email: f.tenantEmail },
+        ],
+      })
+    expect(res.status).toBe(201)
+    const vals = await docFieldValues(res.body.data.id)
+    expect(vals.rent_due_day).toBe('1st') // landlord never chooses it — forced onto the doc
+  })
+
+  it('S582: rent_due_day billing is LOCKED to 1 regardless of any document value', () => {
+    const parse = (WRITABLE_LEASE_COLUMN_SPECS as any).rent_due_day.parse
+    expect(parse({ rent_due_day: '15' })).toEqual({ rent_due_day: 1 })
+    expect(parse({ rent_due_day: '1st' })).toEqual({ rent_due_day: 1 })
+    expect(parse({})).toEqual({ rent_due_day: 1 })
   })
 
   it('leaves the deposit BLANK when the template states no deposit_months (never invents one)', async () => {
@@ -1283,6 +1309,54 @@ describe('POST /sign/:documentId — completion handler (original_lease)', () =>
     // Tenant completion email + notification fired for both signers
     expect(emailSigningCompletedMock).toHaveBeenCalledTimes(2)
     expect(createNotificationMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('S581: a duplicate/racing finalization is idempotent — no second lease or move-in invoice', async () => {
+    const f = await seedFixture()
+    const { documentId } = await seedCompleteableDoc(f)
+
+    // Drive it to completion once: builds lease #1, stamps document.lease_id,
+    // fires exactly one move-in invoice.
+    const first = await request(buildApp())
+      .post(`/api/esign/sign/${documentId}`)
+      .set('Authorization', `Bearer ${f.tenantToken}`)
+      .send({ fieldValues: [] })
+    expect(first.status).toBe(200)
+    expect(first.body.data.completed).toBe(true)
+    const leaseId = (await db.query<{ id: string }>(
+      `SELECT id FROM leases WHERE unit_id = $1`, [f.unitId])).rows[0].id
+    expect(generateMoveInInvoiceMock).toHaveBeenCalledTimes(1)
+
+    // What two concurrent last-signature requests would each attempt: a second
+    // finalization of the same document. The completion route blocks a sequential
+    // re-sign at 'Already signed', so exercise the shared finalizer directly. It
+    // must short-circuit — advisory lock + already-built guard — not rebuild.
+    const again = await buildLeaseFromDocument(documentId)
+    expect(again.alreadyBuilt).toBe(true)
+    expect(again.leaseId).toBe(leaseId)
+
+    // Still exactly ONE lease and ONE move-in invoice — no double deposit / rent.
+    const leaseCount = await db.query<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM leases WHERE unit_id = $1`, [f.unitId])
+    expect(Number(leaseCount.rows[0].n)).toBe(1)
+    expect(generateMoveInInvoiceMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('S581: the finalize guard is uniform — a finalized addendum also no-ops (not just leases)', async () => {
+    const f = await seedFixture()
+    // A document already stamped finalized_at, as a completed build leaves it.
+    // The guard is type-agnostic, so re-finalizing a non-original_lease document
+    // (here an addendum_terms) must short-circuit without re-applying its effect.
+    const { documentId } = await seedDoc(f, {
+      documentType: 'addendum_terms',
+      status: 'completed',
+      landlordSignerStatus: 'signed',
+      tenantSignerStatus: 'signed',
+    })
+    await db.query(`UPDATE lease_documents SET finalized_at = NOW() WHERE id = $1`, [documentId])
+
+    const r = await buildLeaseFromDocument(documentId)
+    expect(r.alreadyBuilt).toBe(true)
   })
 
   it('future start_date → lease.status=pending, unit stays vacant', async () => {
@@ -3059,5 +3133,94 @@ describe('S535 template unit-type pairing', () => {
       .set('Authorization', `Bearer ${f.landlordToken}`)
       .send({ leaseId: oldLease, templateId: rightLock })
     expect(ok.status).toBe(201)
+  })
+})
+
+// ─── S582: money add-on document-first (POST /documents/addendum-terms) ───
+// The MoneyAddonModal path sends leaseId + mode + scheduledChanges and NO
+// template/base PDF. Two things this covers:
+//   1. co_tenant role bug: auto-resolved tenant signers must use co_tenant_N,
+//      not the literal 'co_tenant' (which fails TENANT_ROLE_PATTERN → 400).
+//   2. document-first: with no base PDF, a PDF is generated that PRINTS the
+//      money term, and signature/date fields are placed per signer so the
+//      tenant signs a real document (memory gam-document-first-enforcement).
+describe('POST /documents/addendum-terms — S582 money add-on', () => {
+  async function addCoTenant(leaseId: string): Promise<NewTenantSeed> {
+    const co = await seedNewTenant()
+    await db.query(
+      `INSERT INTO lease_tenants (lease_id, tenant_id, role, status, added_at, added_reason, financial_responsibility)
+       VALUES ($1, $2, 'co_tenant', 'active', NOW(), 'roommate_added', 'joint_several')`,
+      [leaseId, co.tenantId])
+    return co
+  }
+
+  it('agreement, 2 tenants: resolves primary + co_tenant_1 (no 400), generates PDF + signature fields', async () => {
+    const f = await seedFixture()
+    const leaseId = await seedParentLease(f)
+    await addCoTenant(leaseId)
+
+    const res = await request(buildApp())
+      .post('/api/esign/documents/addendum-terms')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({
+        leaseId, title: 'Parking Add-On', mode: 'agreement',
+        scheduledChanges: [{ changeType: 'recurring_fee', effectiveDate: '2026-09-01', feeType: 'parking_rent', feeAmount: 50 }],
+      })
+    // Pre-fix this 400'd with "Invalid signer role: co_tenant".
+    expect(res.status).toBe(201)
+    const docId = res.body.data.id
+
+    const signers = await db.query<{ role: string }>(
+      `SELECT role FROM lease_document_signers WHERE document_id = $1`, [docId])
+    expect(signers.rows.map(r => r.role).sort()).toEqual(['co_tenant_1', 'landlord', 'primary'])
+
+    // document-first: base PDF generated (not null)
+    const doc = await db.query<{ base_pdf_url: string }>(
+      `SELECT base_pdf_url FROM lease_documents WHERE id = $1`, [docId])
+    expect(doc.rows[0].base_pdf_url).toMatch(/addendum-money-.*\.pdf$/)
+
+    // one signature (required) + one date_signed field per signer
+    const fields = await db.query<{ signer_role: string; field_type: string; required: boolean; lease_column: string | null }>(
+      `SELECT signer_role, field_type, required, lease_column FROM lease_document_fields WHERE document_id = $1`, [docId])
+    const sigs = fields.rows.filter(r => r.field_type === 'signature')
+    expect(sigs.map(r => r.signer_role).sort()).toEqual(['co_tenant_1', 'landlord', 'primary'])
+    expect(sigs.every(r => r.required)).toBe(true)
+    const dates = fields.rows.filter(r => r.field_type === 'date')
+    expect(dates.length).toBe(3)
+    expect(dates.every(r => r.lease_column === 'date_signed')).toBe(true)
+
+    // change stored as a draft tied to this document
+    const sc = await db.query<{ change_type: string; status: string }>(
+      `SELECT change_type, status FROM scheduled_lease_changes WHERE source_document_id = $1`, [docId])
+    expect(sc.rows).toEqual([{ change_type: 'recurring_fee', status: 'draft' }])
+  })
+
+  it('notice, rent change: landlord-only signer, generated PDF, only a landlord signature field', async () => {
+    const f = await seedFixture()
+    const leaseId = await seedParentLease(f)
+    await addCoTenant(leaseId)   // tenants exist but do NOT sign a notice
+
+    const res = await request(buildApp())
+      .post('/api/esign/documents/addendum-terms')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({
+        leaseId, title: 'Space Rent Increase Notice', mode: 'notice',
+        scheduledChanges: [{ changeType: 'rent', effectiveDate: '2026-10-01', newRentAmount: 1200 }],
+      })
+    expect(res.status).toBe(201)
+    const docId = res.body.data.id
+
+    const signers = await db.query<{ role: string }>(
+      `SELECT role FROM lease_document_signers WHERE document_id = $1`, [docId])
+    expect(signers.rows.map(r => r.role)).toEqual(['landlord'])
+
+    const doc = await db.query<{ base_pdf_url: string; delivery_mode: string }>(
+      `SELECT base_pdf_url, delivery_mode FROM lease_documents WHERE id = $1`, [docId])
+    expect(doc.rows[0].delivery_mode).toBe('notice')
+    expect(doc.rows[0].base_pdf_url).toMatch(/addendum-money-.*\.pdf$/)
+
+    const sigs = await db.query<{ signer_role: string }>(
+      `SELECT signer_role FROM lease_document_fields WHERE document_id = $1 AND field_type = 'signature'`, [docId])
+    expect(sigs.rows.map(r => r.signer_role)).toEqual(['landlord'])
   })
 })

@@ -35,6 +35,13 @@ export const USER_ROLES = [
   // in by activating their free account before they can view or sign. Same
   // "no other GAM relationship" shape as fitness_user.
   'contact',
+  // S592 (Nic): GAM-side account manager / closing agent. Scoped to their own
+  // book of landlord accounts (portfolio_manager_id / service_manager_id) — NOT
+  // a platform role. Distinct from 'property_manager' (a landlord's in-house
+  // staff). Earns the closing + service commission on the accounts they close /
+  // service. Own scoped portal (the former admin-ops app); walled off from
+  // /api/admin. See PORTFOLIO_MANAGER_SPEC.md.
+  'portfolio_manager',
 ] as const
 
 export type UserRole = typeof USER_ROLES[number]
@@ -50,6 +57,14 @@ export type PlatformRole = typeof PLATFORM_ROLES[number]
 export const PLATFORM_ROLE_LABEL: Record<PlatformRole, string> = {
   admin:       'Platform Admin',
   super_admin: 'Super Admin',
+}
+
+// S592: GAM-side account manager / closing agent — its own category. Scoped to
+// their book (never platform-wide); see PORTFOLIO_MANAGER_SPEC.md.
+export const PORTFOLIO_MANAGER_ROLES = ['portfolio_manager'] as const
+export type PortfolioManagerRole = typeof PORTFOLIO_MANAGER_ROLES[number]
+export const PORTFOLIO_MANAGER_ROLE_LABEL: Record<PortfolioManagerRole, string> = {
+  portfolio_manager: 'Portfolio Manager',
 }
 
 export const LANDLORD_ROLES = ['landlord'] as const
@@ -492,6 +507,14 @@ export const LATE_FEE_LEASE_COLUMNS = [
 ] as const
 export function isLateFeeColumn(col: string | null | undefined): boolean {
   return !!col && (LATE_FEE_LEASE_COLUMNS as readonly string[]).includes(col)
+}
+
+// S582: platform-locked lease columns — auto-inserted, non-editable in the
+// template editor and at signing. late-fee columns (policy-controlled) +
+// rent_due_day (LOCKED to the 1st — see WRITABLE_LEASE_COLUMN_SPECS). The landlord
+// never chooses these; they're stamped so the signed doc states them verbatim.
+export function isLockedLeaseColumn(col: string | null | undefined): boolean {
+  return isLateFeeColumn(col) || col === 'rent_due_day'
 }
 
 // Park-owned RV rented as a unit: the site areas PLUS the rig itself.
@@ -2728,7 +2751,14 @@ export const WRITABLE_LEASE_COLUMN_SPECS: Record<WritableLeaseColumn, WritableLe
   // S196: security_deposit removed from WRITABLE specs. The fee_row
   // pipeline (FEE_ROW_SPECS) now handles it as a lease_fees row.
   rent_due_day: {
-    parse: (v) => ({ rent_due_day: parseInt(v.rent_due_day || '1') }),
+    // S582 (Nic): PLATFORM-LOCKED to the 1st. Rent is always due on the 1st of
+    // the month for every lease; a mid-month move-in is prorated (moveInBundle)
+    // and full months bill from the 1st. This removes per-lease due-day drift (a
+    // past double-billing bug class) and preserves FlexPay's value prop — a
+    // move-in-day due date would give a mid-month-paid tenant no reason to enroll.
+    // Ignores any document value on purpose (the rent_due_day box is no longer
+    // placed — see services/autoFieldPlacement.ts — so no signed doc conflicts).
+    parse: () => ({ rent_due_day: 1 }),
   },
   lease_type: {
     // S535 (Nic): no end date ('' or '-') ⇒ the lease IS month-to-month,
@@ -3440,11 +3470,11 @@ export interface MaintenanceRequest {
   description: string
   priority: MaintenancePriority
   status: MaintenanceStatus
-  contractorId?: string
+  assignedTo?: string            // users.id the request is routed to — in-house worker OR outside contractor (renamed from contractorId, S585)
   contractor?: Contractor
   estimatedCost?: number
   actualCost?: number
-  platformFee?: number           // 8% of actual cost
+  platformFee?: number           // 5% of job value — deferred contractor marketplace (see MAINTENANCE_PCT); not billed today
   scheduledAt?: Date
   completedAt?: Date
   photos?: string[]
@@ -3602,10 +3632,14 @@ export const PLATFORM_FEES = {
   // S536 (Nic): register is FREE; invoicing = $10/mo in any month the
   // business sends ≥1 invoice (usage-based). jobs/businessMonthlyFees.
   BUSINESS_INVOICING_MONTHLY:            10.00,
-  MAINTENANCE_PCT: 0.03,      // 3% of job value — reserved for the future on-platform
-                              // contractor marketplace (Angi competitor). NOT billed
-                              // today; never charged to the landlord, who pays only
-                              // actual maintenance cost. Kept out of all landlord surfaces.
+  MAINTENANCE_PCT: 0.05,      // 5% of job value — DEFERRED contractor-bid marketplace (Nic, S585).
+                              // Model: landlords post jobs to a board; outside contractors BID
+                              // directly on them; the winning contractor gives up 5% of the job
+                              // price for GAM coordinating the event. This is NOT an Angi-style
+                              // pay-for-leads model. NOT built + NOT billed today — landlords do
+                              // in-house maintenance or contract their own outside sources. The
+                              // fee is only pre-computed + stored (hidden); never charged to the
+                              // landlord, who pays only actual maintenance cost. Off all surfaces.
   DEPOSIT_XFER:    15.00,     // Deposit transfer between GAM properties
 } as const
 
@@ -3720,11 +3754,29 @@ export const FLEX_CREDIT_PROVIDER_MIN_MONTHLY = 500
 // leaves the deposit under-funded; re-enrollment restriction is "until
 // current," not a fixed cooldown. See getFlexDepositEligibility.
 
-// FlexCharge (S252+). Consolidated POS charge-account with monthly
-// statement + 1.5% service fee on the cycle balance. No interest;
-// no revolving balance — keeps the product classed as deferred-debit,
-// not credit extension (out of payday-lending regulatory territory).
+// FlexCharge (S252+). Consolidated POS charge-account with a monthly
+// statement. S583 (Nic) revenue/structure model:
+//  - GAM charges the MERCHANT a flat 1.5% SUBSCRIPTION on the cycle
+//    credit VOLUME (the purchase balance) — deducted from the merchant's
+//    payout, NEVER added to the borrower's statement. Flat % of volume,
+//    not APY/interest → GAM is the software vendor, not the lender.
+//  - The MERCHANT (the lender) may set their OWN finance charge, a flat
+//    per-statement % of the balance, capped at FLEX_CHARGE_MAX_FINANCE_PCT.
+//    The customer pays balance + that finance charge; the merchant keeps it
+//    (minus GAM's 1.5%). Merchants must set a rate compliant with their
+//    local usury / retail-installment law (no state logic baked in).
 export const FLEX_CHARGE_STATEMENT_FEE_PCT = 0.015
+// Hard cap on the merchant-set finance charge — an ANNUAL APR (S583 revolving
+// model). Mirrored by a CHECK on properties.flex_charge_finance_pct. 6%/YEAR is
+// under every state usury cap; the merchant is the lender and sets a compliant APR.
+export const FLEX_CHARGE_MAX_FINANCE_PCT = 0.06
+// S583 revolving-credit terms (see REVOLVING_CREDIT_SPEC.md).
+// Minimum payment each cycle = greater of the floor or MIN_PAYMENT_PCT × balance.
+export const FLEX_CHARGE_MIN_PAYMENT_PCT = 0.03
+export const FLEX_CHARGE_MIN_PAYMENT_FLOOR = 25
+// Flat late fee when the customer pays less than the minimum by the due date.
+// $10/mo is simple and legal everywhere.
+export const FLEX_CHARGE_LATE_FEE = 10
 export const FLEX_CHARGE_DEFAULT_CREDIT_LIMIT = 500
 export const FLEX_CHARGE_ACCOUNT_STATUSES = ['active', 'suspended', 'disqualified'] as const
 export type FlexChargeAccountStatus = typeof FLEX_CHARGE_ACCOUNT_STATUSES[number]
@@ -3843,7 +3895,8 @@ export type PaymentType = typeof PAYMENT_TYPES[number]
 // ($4 ACH / $15 card) billed to the tenant on a post-settlement reversal.
 // S562: 'MANUALPAY' (9 chars) for the $10 manual-payment fee; 'FLEXPAY' added
 // to close a long-standing drift (the DB CHECK always carried it).
-export const PAYMENT_ENTRY_DESCRIPTIONS = ['RENT', 'SUBSCRIP', 'DEPOSIT', 'UTILITY', 'ONTIMEPAY', 'LATEFEE', 'FLEXPAY', 'PROPANE', 'RETURNFEE', 'MANUALPAY', 'HOMEPMT'] as const
+// S583: 'FCPAYDOWN' — a customer FlexCharge revolving-balance pay-down.
+export const PAYMENT_ENTRY_DESCRIPTIONS = ['RENT', 'SUBSCRIP', 'DEPOSIT', 'UTILITY', 'ONTIMEPAY', 'LATEFEE', 'FLEXPAY', 'PROPANE', 'RETURNFEE', 'MANUALPAY', 'HOMEPMT', 'FCPAYDOWN'] as const
 export type PaymentEntryDescription = typeof PAYMENT_ENTRY_DESCRIPTIONS[number]
 
 // S562: manual (off-platform) rent payment recording. A landlord/staff records
@@ -3886,6 +3939,17 @@ export const PAYMENT_ENTRY_DESCRIPTION_LABELS: Partial<Record<PaymentEntryDescri
 // S568: financed home-sale contract lifecycle.
 export const HOME_SALE_STATUSES = ['active', 'paid_off', 'cancelled'] as const
 export type HomeSaleStatus = typeof HOME_SALE_STATUSES[number]
+
+// S594: how the landlord→tenant sale installments are shaped. 'amortized' =
+// classic price + interest + term (principal/interest split). 'flat' = a plain
+// recurring charge ($X × N payments, no interest) that auto-ends after N — the
+// "recurring invoice that ends after a set number of payments" model.
+export const HOME_SALE_PLAN_TYPES = ['amortized', 'flat'] as const
+export type HomeSalePlanType = typeof HOME_SALE_PLAN_TYPES[number]
+export const HOME_SALE_PLAN_TYPE_LABEL: Record<HomeSalePlanType, string> = {
+  amortized: 'Amortized (price + interest)',
+  flat: 'Flat monthly',
+}
 
 // Level-payment amortization for a financed home/RV sale. Returns the monthly
 // payment and a per-installment principal/interest/balance schedule. The final

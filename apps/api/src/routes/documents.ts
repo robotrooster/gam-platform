@@ -8,6 +8,7 @@ import { DOCUMENT_CATEGORIES } from '@gam/shared'
 import { query, queryOne } from '../db'
 import { requireAuth, requirePerm } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
+import { streamStoredFile } from '../lib/fileServe'
 
 export const documentsRouter = Router()
 documentsRouter.use(requireAuth)
@@ -82,14 +83,8 @@ documentsRouter.get('/:id/file', async (req, res, next) => {
       [...scope.params, req.params.id],
     )
     if (!doc) throw new AppError(404, 'Document not found')
-    if (!doc.url?.startsWith('/uploads/')) throw new AppError(404, 'Document has no stored file')
-    const uploadsRoot = path.join(process.cwd(), 'uploads')
-    const abs = path.resolve(uploadsRoot, doc.url.slice('/uploads/'.length))
-    // stay inside uploads/ even if a url row is malformed
-    if (!abs.startsWith(uploadsRoot + path.sep)) throw new AppError(400, 'Bad document path')
-    if (!fs.existsSync(abs)) throw new AppError(404, 'The file behind this document is missing')
-    if (doc.mime_type) res.type(doc.mime_type)
-    res.sendFile(abs)
+    // Authorized above (scopeFor); the helper owns path-safety + streaming.
+    streamStoredFile(res, doc.url, doc.mime_type)
   } catch (e) { next(e) }
 })
 

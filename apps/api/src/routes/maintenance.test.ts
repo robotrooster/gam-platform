@@ -28,6 +28,7 @@ import request from 'supertest'
 import jwt from 'jsonwebtoken'
 import { randomUUID } from 'crypto'
 import { db } from '../db'
+import { PLATFORM_FEES } from '@gam/shared'
 import {
   cleanupAllSchema,
   seedLandlord, seedTenant, seedProperty, seedUnit, seedLease, seedLeaseTenant,
@@ -158,16 +159,16 @@ async function seedExtraTenantOnUnit(unitId: string, landlordId: string): Promis
   }
 }
 
-async function createBaseRequest(f: SeedFixture, override: Partial<{ status: string; estimatedCost: number; contractorId: string | null }> = {}): Promise<string> {
+async function createBaseRequest(f: SeedFixture, override: Partial<{ status: string; estimatedCost: number; assignedTo: string | null }> = {}): Promise<string> {
   const res = await db.query<{ id: string }>(
     `INSERT INTO maintenance_requests
-       (unit_id, tenant_id, landlord_id, title, description, priority, status, estimated_cost, contractor_id)
+       (unit_id, tenant_id, landlord_id, title, description, priority, status, estimated_cost, assigned_to)
      VALUES ($1, $2, $3, 'Leak', 'Pipe under sink', 'normal', $4, $5, $6)
      RETURNING id`,
     [f.unitId, f.tenantId, f.landlordId,
      override.status ?? 'open',
      override.estimatedCost ?? null,
-     override.contractorId ?? null],
+     override.assignedTo ?? null],
   )
   return res.rows[0].id
 }
@@ -218,6 +219,25 @@ describe('POST /maintenance', () => {
     // Landlord-filed request gets attributed to the primary tenant on the unit.
     expect(res.body.data.tenant_id).toBe(f.tenantId)
     expect(res.body.data.priority).toBe('high')
+  })
+
+  it('landlord CANNOT create on another landlord\'s unit → 403', async () => {
+    const f = await seedFixture()
+    // Second landlord + unit; f's landlord does not manage it.
+    const client = await db.connect()
+    let otherUnitId = ''
+    try {
+      await client.query('BEGIN')
+      const { userId: otherUserId, landlordId: otherLandlordId } = await seedLandlord(client, { email: 'll3@test.dev' })
+      const otherProp = await seedProperty(client, { landlordId: otherLandlordId, ownerUserId: otherUserId, managedByUserId: otherUserId })
+      otherUnitId = await seedUnit(client, { propertyId: otherProp, landlordId: otherLandlordId })
+      await client.query('COMMIT')
+    } finally { client.release() }
+    const res = await request(buildApp())
+      .post('/api/maintenance')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ unitId: otherUnitId, title: 'Injected', description: 'Should be blocked', priority: 'high' })
+    expect(res.status).toBe(403)
   })
 
   // S571: title is now optional (derived from category). The still-required
@@ -351,6 +371,9 @@ describe('PATCH /maintenance/:id — auto-approval threshold gate', () => {
       .set('Authorization', `Bearer ${f.landlordToken}`)
       .send({ status: 'completed', actualCost: 500 })
     expect(res.status).toBe(200)
+    // Fee is computed off the shared constant (deferred contractor-marketplace
+    // rate) — pin it to the single source so an accidental rate drift is caught.
+    expect(Number(res.body.data.platform_fee)).toBeCloseTo(500 * PLATFORM_FEES.MAINTENANCE_PCT, 2)
     expect(Number(res.body.data.platform_fee)).toBeGreaterThan(0)
   })
 
@@ -375,15 +398,16 @@ describe('PATCH /maintenance/:id — auto-approval threshold gate', () => {
 describe('POST /maintenance/:id/approve', () => {
   it('flips awaiting_approval → assigned when a contractor is already set', async () => {
     const f = await seedFixture()
-    // S444: maintenance_requests.contractor_id FKs users(id), not the
+    // S444: maintenance_requests.assigned_to FKs users(id), not the
     // contractors directory — assignment hands the request to one of the
-    // landlord's own maintenance workers (per the 20260609130000 migration).
+    // landlord's own maintenance workers (per the 20260609130000 migration;
+    // column renamed contractor_id -> assigned_to in S585).
     const workerRes = await db.query<{ id: string }>(
       `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
        VALUES ($1, 'x', 'maintenance', 'Mtc', 'Worker', TRUE) RETURNING id`,
       [`mtc-${randomUUID()}@test.dev`],
     )
-    const id = await createBaseRequest(f, { status: 'awaiting_approval', estimatedCost: 800, contractorId: workerRes.rows[0].id })
+    const id = await createBaseRequest(f, { status: 'awaiting_approval', estimatedCost: 800, assignedTo: workerRes.rows[0].id })
     const res = await request(buildApp())
       .post(`/api/maintenance/${id}/approve`)
       .set('Authorization', `Bearer ${f.landlordToken}`)

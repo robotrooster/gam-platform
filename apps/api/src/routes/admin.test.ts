@@ -7,8 +7,8 @@
  *   - GET /overview + /onboarding/overview rollups (F1-class probe
  *     targets per the S355 + S358 SQL-drift pattern)
  *   - GET /tenants admin list
- *   - POST /property-flags/:id/resolve (audit log + status flip)
- *   - GET /system-features (admin readable) + PATCH (super_admin only)
+ *   - POST /property-flags/:id/resolve (super_admin — audit log + status flip)
+ *   - GET/PATCH /system-features (owner-only, S567)
  *   - GET /notifications + POST /:id/acknowledge (idempotency)
  *
  * Out of scope (future slices):
@@ -32,6 +32,7 @@ import {
   cleanupAllSchema, seedLandlord, seedProperty,
 } from '../test/dbHelpers'
 import { adminRouter } from './admin'
+import { OWNER_EMAIL } from '../middleware/auth'
 import { errorHandler } from '../middleware/errorHandler'
 
 function buildApp() {
@@ -50,10 +51,12 @@ beforeEach(async () => {
 interface AFixture {
   adminUserId:      string
   superAdminUserId: string
+  ownerUserId:      string
   landlordUserId:   string
   landlordId:       string
   adminToken:       string
   superAdminToken:  string
+  ownerToken:       string   // super_admin whose email === OWNER_EMAIL (System Features, S567)
   landlordToken:   string
 }
 
@@ -70,18 +73,26 @@ async function seedAFixture(): Promise<AFixture> {
       `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
        VALUES ($1, 'x', 'super_admin', 'Test', 'SuperAdmin', TRUE) RETURNING id`,
       [`super-${randomUUID()}@test.dev`])
+    // S567: System Features is locked to the platform OWNER (email === OWNER_EMAIL),
+    // not merely super_admin. Seed a real user with that email for requireOwner routes.
+    const ownerRes = await client.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+       VALUES ($1, 'x', 'super_admin', 'Gam', 'Owner', TRUE) RETURNING id`,
+      [OWNER_EMAIL])
     await client.query('COMMIT')
-    const sign = (u: { id: string }, role: string) => jwt.sign(
-      { userId: u.id, role, email: 'x@test.dev', profileId: u.id, permissions: {} },
+    const sign = (u: { id: string }, role: string, email = 'x@test.dev') => jwt.sign(
+      { userId: u.id, role, email, profileId: u.id, permissions: {} },
       process.env.JWT_SECRET!, { expiresIn: '1h' },
     )
     return {
       adminUserId:      adminRes.rows[0].id,
       superAdminUserId: superAdminRes.rows[0].id,
+      ownerUserId:      ownerRes.rows[0].id,
       landlordUserId,
       landlordId,
       adminToken:       sign(adminRes.rows[0], 'admin'),
       superAdminToken:  sign(superAdminRes.rows[0], 'super_admin'),
+      ownerToken:       sign(ownerRes.rows[0], 'super_admin', OWNER_EMAIL),
       landlordToken:    jwt.sign(
         { userId: landlordUserId, role: 'landlord', email: 'll@test.dev',
           profileId: landlordId, permissions: {} },
@@ -143,7 +154,9 @@ describe('GET /api/admin/onboarding/overview', () => {
     const f = await seedAFixture()
     const res = await request(buildApp())
       .get('/api/admin/onboarding/overview')
-      .set('Authorization', `Bearer ${f.adminToken}`)
+      // S567 scoped every count to the caller's portfolio; super_admin ($1 NULL)
+      // gets the platform-wide totals this shape/aggregation test asserts.
+      .set('Authorization', `Bearer ${f.superAdminToken}`)
     expect(res.status).toBe(200)
     const d = res.body.data
     expect(typeof d.landlords_incomplete).toBe('number')
@@ -166,6 +179,8 @@ describe('GET /api/admin/tenants', () => {
   })
 })
 
+// S567: property-duplicate-flag resolution is super_admin-only (it exposes both
+// landlords' PII for cross-landlord adjudication) — the tests use superAdminToken.
 describe('POST /api/admin/property-flags/:id/resolve', () => {
   it('happy path: status flips, audit log row written', async () => {
     const f = await seedAFixture()
@@ -195,14 +210,14 @@ describe('POST /api/admin/property-flags/:id/resolve', () => {
 
     const res = await request(buildApp())
       .post(`/api/admin/property-flags/${flagId}/resolve`)
-      .set('Authorization', `Bearer ${f.adminToken}`)
+      .set('Authorization', `Bearer ${f.superAdminToken}`)
       .send({ resolution: 'approved_separate', notes: 'distinct buildings' })
     expect(res.status).toBe(200)
 
     const flag = await db.query<{ resolution: string; resolved_by: string }>(
       `SELECT resolution, resolved_by FROM property_duplicate_flags WHERE id=$1`, [flagId])
     expect(flag.rows[0].resolution).toBe('approved_separate')
-    expect(flag.rows[0].resolved_by).toBe(f.adminUserId)
+    expect(flag.rows[0].resolved_by).toBe(f.superAdminUserId)
 
     const prop = await db.query<{ review_status: string }>(
       `SELECT review_status FROM properties WHERE id=$1`, [propertyId])
@@ -211,7 +226,7 @@ describe('POST /api/admin/property-flags/:id/resolve', () => {
     const log = await db.query<{ action_type: string; target_id: string }>(
       `SELECT action_type, target_id FROM admin_action_log
         WHERE admin_user_id=$1 AND target_type='property'`,
-      [f.adminUserId])
+      [f.superAdminUserId])
     expect(log.rows.length).toBe(1)
     expect(log.rows[0].action_type).toBe('property_flag_approved_separate')
     expect(log.rows[0].target_id).toBe(propertyId)
@@ -221,7 +236,7 @@ describe('POST /api/admin/property-flags/:id/resolve', () => {
     const f = await seedAFixture()
     const res = await request(buildApp())
       .post(`/api/admin/property-flags/${randomUUID()}/resolve`)
-      .set('Authorization', `Bearer ${f.adminToken}`)
+      .set('Authorization', `Bearer ${f.superAdminToken}`)
       .send({ resolution: 'i_am_the_law' })
     expect(res.status).toBe(400)
     expect(res.body.error).toMatch(/Invalid resolution/)
@@ -231,44 +246,55 @@ describe('POST /api/admin/property-flags/:id/resolve', () => {
     const f = await seedAFixture()
     const res = await request(buildApp())
       .post(`/api/admin/property-flags/${randomUUID()}/resolve`)
-      .set('Authorization', `Bearer ${f.adminToken}`)
+      .set('Authorization', `Bearer ${f.superAdminToken}`)
       .send({ resolution: 'approved_separate' })
     expect(res.status).toBe(404)
   })
 })
 
-describe('GET /api/admin/system-features + PATCH (super_admin)', () => {
-  it('GET returns rows; admin role allowed', async () => {
+// S567: System Features (feature flags) is locked to the platform OWNER
+// (email === OWNER_EMAIL), not just super_admin — so no other admin can flip a
+// flag by accident. GET + PATCH both require owner.
+describe('GET /api/admin/system-features + PATCH (owner-only, S567)', () => {
+  it('GET returns rows for the owner', async () => {
     const f = await seedAFixture()
     await db.query(
       `INSERT INTO system_features (key, enabled, description)
        VALUES ('test_feature', FALSE, 'Test feature flag')`)
     const res = await request(buildApp())
       .get('/api/admin/system-features')
-      .set('Authorization', `Bearer ${f.adminToken}`)
+      .set('Authorization', `Bearer ${f.ownerToken}`)
     expect(res.status).toBe(200)
     expect(res.body.data.length).toBe(1)
     expect(res.body.data[0].key).toBe('test_feature')
     expect(res.body.data[0].enabled).toBe(false)
   })
 
-  it('PATCH as super_admin flips enabled flag', async () => {
+  it('GET as a non-owner super_admin → 403', async () => {
+    const f = await seedAFixture()
+    const res = await request(buildApp())
+      .get('/api/admin/system-features')
+      .set('Authorization', `Bearer ${f.superAdminToken}`)
+    expect(res.status).toBe(403)
+  })
+
+  it('PATCH as owner flips enabled flag', async () => {
     const f = await seedAFixture()
     await db.query(
       `INSERT INTO system_features (key, enabled, description)
        VALUES ('toggle_test', FALSE, 'Toggle me')`)
     const res = await request(buildApp())
       .patch('/api/admin/system-features/toggle_test')
-      .set('Authorization', `Bearer ${f.superAdminToken}`)
+      .set('Authorization', `Bearer ${f.ownerToken}`)
       .send({ enabled: true })
     expect(res.status).toBe(200)
     const row = await db.query<{ enabled: boolean; updated_by_user_id: string }>(
       `SELECT enabled, updated_by_user_id FROM system_features WHERE key='toggle_test'`)
     expect(row.rows[0].enabled).toBe(true)
-    expect(row.rows[0].updated_by_user_id).toBe(f.superAdminUserId)
+    expect(row.rows[0].updated_by_user_id).toBe(f.ownerUserId)
   })
 
-  it('PATCH as plain admin → 403 (super_admin only)', async () => {
+  it('PATCH as plain admin → 403 (owner only)', async () => {
     const f = await seedAFixture()
     await db.query(
       `INSERT INTO system_features (key, enabled, description)
@@ -324,5 +350,75 @@ describe('GET /api/admin/notifications + POST /:id/acknowledge', () => {
       .set('Authorization', `Bearer ${f.adminToken}`).send({})
     expect(r2.status).toBe(404)
     expect(r2.body.error).toMatch(/already acknowledged/)
+  })
+})
+
+// S592: assignment + the manual referral re-attach accept the new
+// portfolio_manager role.
+describe('POST /api/admin/landlords/:id/assign — portfolio_manager role', () => {
+  it('assigns a portfolio_manager user as the closing manager', async () => {
+    const f = await seedAFixture()
+    const pm = await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+       VALUES ($1,'x','portfolio_manager','PM','Rep',TRUE) RETURNING id`, [`pm-${randomUUID()}@test.dev`])
+    const res = await request(buildApp())
+      .post(`/api/admin/landlords/${f.landlordId}/assign`)
+      .set('Authorization', `Bearer ${f.superAdminToken}`)
+      .send({ role: 'closing', managerId: pm.rows[0].id })
+    expect(res.status).toBe(200)
+    const row = await db.query<{ portfolio_manager_id: string }>(
+      `SELECT portfolio_manager_id FROM landlords WHERE id=$1`, [f.landlordId])
+    expect(row.rows[0].portfolio_manager_id).toBe(pm.rows[0].id)
+  })
+
+  it('rejects a non-rep (a landlord) as a manager → 400', async () => {
+    const f = await seedAFixture()
+    const res = await request(buildApp())
+      .post(`/api/admin/landlords/${f.landlordId}/assign`)
+      .set('Authorization', `Bearer ${f.superAdminToken}`)
+      .send({ role: 'closing', managerId: f.landlordUserId })
+    expect(res.status).toBe(400)
+    expect(res.body.error).toMatch(/valid portfolio manager/i)
+  })
+})
+
+describe('POST /api/admin/users/:userId/referral-upline — manual re-attach (super_admin)', () => {
+  it('sets a person\'s upline; self-reference → 400; non-rep/non-landlord upline → 400', async () => {
+    const f = await seedAFixture()
+    // happy: attach the landlord under the super_admin (a valid GAM rep upline)
+    const ok = await request(buildApp())
+      .post(`/api/admin/users/${f.landlordUserId}/referral-upline`)
+      .set('Authorization', `Bearer ${f.superAdminToken}`)
+      .send({ uplineUserId: f.superAdminUserId })
+    expect(ok.status).toBe(200)
+    const row = await db.query<{ referred_by_user_id: string }>(
+      `SELECT referred_by_user_id FROM users WHERE id=$1`, [f.landlordUserId])
+    expect(row.rows[0].referred_by_user_id).toBe(f.superAdminUserId)
+
+    // self-reference rejected
+    const self = await request(buildApp())
+      .post(`/api/admin/users/${f.landlordUserId}/referral-upline`)
+      .set('Authorization', `Bearer ${f.superAdminToken}`)
+      .send({ uplineUserId: f.landlordUserId })
+    expect(self.status).toBe(400)
+
+    // a tenant is neither a landlord nor a rep → invalid upline
+    const tenant = await db.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+       VALUES ($1,'x','tenant','T','U',TRUE) RETURNING id`, [`t-${randomUUID()}@test.dev`])
+    const bad = await request(buildApp())
+      .post(`/api/admin/users/${f.landlordUserId}/referral-upline`)
+      .set('Authorization', `Bearer ${f.superAdminToken}`)
+      .send({ uplineUserId: tenant.rows[0].id })
+    expect(bad.status).toBe(400)
+  })
+
+  it('plain admin (portfolio manager) → 403 (super_admin only)', async () => {
+    const f = await seedAFixture()
+    const res = await request(buildApp())
+      .post(`/api/admin/users/${f.landlordUserId}/referral-upline`)
+      .set('Authorization', `Bearer ${f.adminToken}`)
+      .send({ uplineUserId: f.superAdminUserId })
+    expect(res.status).toBe(403)
   })
 })

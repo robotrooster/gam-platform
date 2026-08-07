@@ -42,7 +42,7 @@ import { PayoutsPage } from './pages/PayoutsPage'
 import { WorkTradePage } from './pages/WorkTradePage'
 import { TenantSurveysPage } from './pages/TenantSurveysPage'
 import { PosCustomerOnboardingPage } from './pages/PosCustomerOnboardingPage'
-import React, { useContext, useState, useEffect, useCallback } from 'react'
+import React, { useContext, useState, useEffect, useCallback, useRef } from 'react'
 import ReactDOM from 'react-dom/client'
 import { BrowserRouter, Routes, Route, Navigate, NavLink, Outlet, useNavigate, useParams, Link, useLocation } from 'react-router-dom'
 // S562: tenant nav icons — monochrome lucide (inherit currentColor via .ni:
@@ -155,7 +155,8 @@ interface AuthUser { id:string;email:string;role:string;firstName:string;lastNam
 // S289: login() returns a discriminated result so LoginPage can branch
 // into the TOTP second step when the backend gates on 2FA.
 type LoginResult = { kind:'success' } | { kind:'totp_required'; totpSession:string } | { kind:'email_otp_required'; emailOtpSession:string }
-interface AuthCtx { user:AuthUser|null;token:string|null;loading:boolean;login:(e:string,p:string)=>Promise<LoginResult>;loginWithTotp:(totpSession:string,code:string)=>Promise<void>;loginWithEmailOtp:(emailOtpSession:string,code:string)=>Promise<void>;resendEmailOtp:(emailOtpSession:string)=>Promise<void>;refresh:()=>Promise<void>;logout:()=>void }
+type SignupInput = { firstName:string;lastName:string;email:string;password:string;acceptedTerms:boolean;landlordId?:string|null;unitId?:string|null }
+interface AuthCtx { user:AuthUser|null;token:string|null;loading:boolean;login:(e:string,p:string)=>Promise<LoginResult>;signup:(input:SignupInput)=>Promise<{emailOtpSession:string}>;loginWithTotp:(totpSession:string,code:string)=>Promise<void>;loginWithEmailOtp:(emailOtpSession:string,code:string)=>Promise<void>;resendEmailOtp:(emailOtpSession:string)=>Promise<void>;refresh:()=>Promise<void>;logout:()=>void }
 const Ctx = React.createContext<AuthCtx>(null!)
 const useAuth = () => useContext(Ctx)
 
@@ -213,7 +214,15 @@ function AuthProvider({children}:{children:React.ReactNode}) {
   const resendEmailOtp = async(emailOtpSession:string):Promise<void>=>{
     await post('/auth/email-otp/resend',{emailOtpSession})
   }
-  return <Ctx.Provider value={{user,token,loading,login,loginWithTotp,loginWithEmailOtp,resendEmailOtp,refresh,logout}}>{children}</Ctx.Provider>
+  // S578: prospect self-signup. Account is created FIRST (its own page), with
+  // mandatory email-2FA — register-prospect returns a PENDING session, never a
+  // full token. The SignupPage completes verification via loginWithEmailOtp,
+  // exactly like the login 2FA step, then lands in the gated portal.
+  const signup = async(input:SignupInput):Promise<{emailOtpSession:string}>=>{
+    const res=await post<any>('/auth/register-prospect',input)
+    return { emailOtpSession: res.data!.emailOtpSession as string }
+  }
+  return <Ctx.Provider value={{user,token,loading,login,signup,loginWithTotp,loginWithEmailOtp,resendEmailOtp,refresh,logout}}>{children}</Ctx.Provider>
 }
 
 // ── STYLES ────────────────────────────────────────────────────
@@ -546,6 +555,7 @@ function Layout() {
         <DialogHost />
       </div>
       {showFullNav && <FlexsuiteReAcceptanceGate />}
+      {showFullNav && <LeaseNoticeGate />}
       <AgentChatWidget />
     </div>
   )
@@ -632,7 +642,7 @@ function QuestionnairePrompt() {
     { onSuccess: refetch })
 
   if (!q) return null
-  const copy = QUESTIONNAIRE_COPY[q.triggerType] ?? QUESTIONNAIRE_COPY.ssi_ssdi_signal
+  const copy = QUESTIONNAIRE_COPY[q.triggerType] ?? QUESTIONNAIRE_COPY.ssi_ssdi_signal // wire-ok: local copy map keyed by trigger id, not an API response
   return (
     <>
       <div className="card" style={{marginBottom:24, border:'1px solid var(--gold)', background:'rgba(201,162,39,.05)'}}>
@@ -804,33 +814,21 @@ function HomePage() {
         )}
       </div>
 
-      {/* #12: Payment Health — the tenant's own view of the on-time-rate card
-          the landlord sees on TenantDetailPage. Only shown once there's a
-          payment history to summarize. */}
+      {/* S595 (Nic): Payment Health heartbeat — the tenant's ON-TIME payment
+          health as an animated ECG (mirrors the landlord dashboard monitor).
+          Health = % of billed obligations paid on time over the last 6 months
+          (NOT total paid): 100% gold, 80%+ green, below that red. */}
       {health && health.totalPayments > 0 && (() => {
-        const rate = health.onTimeRate as number
-        const color = rate >= 90 ? 'var(--green,#2fbf71)' : rate >= 75 ? 'var(--amber,#e0a93b)' : 'var(--red,#e25555)'
-        const label = rate >= 90 ? 'Excellent' : rate >= 75 ? 'Good' : 'Needs attention'
-        return (
-          <a href="/payments" className="card" style={{ display: 'block', textDecoration: 'none', padding: 18, marginBottom: 24 }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
-              <div>
-                <div style={{ fontWeight: 700, color: 'var(--t0)' }}>Payment Health</div>
-                <div className="ps" style={{ marginTop: 2 }}>
-                  {health.settledCount} of {health.totalPayments} payments settled
-                  {health.tenantMonths > 0 ? ` · ${health.tenantMonths} mo on platform` : ''}
-                </div>
-              </div>
-              <div style={{ textAlign: 'right' }}>
-                <div style={{ fontFamily: 'var(--font-mono,monospace)', fontSize: '1.6rem', fontWeight: 800, color }}>{rate}%</div>
-                <div style={{ fontSize: '.72rem', color }}>{label}</div>
-              </div>
-            </div>
-            <div style={{ marginTop: 12, height: 7, borderRadius: 4, background: 'var(--b1,#1e2530)', overflow: 'hidden' }}>
-              <div style={{ width: `${rate}%`, height: '100%', background: color }} />
-            </div>
-          </a>
-        )
+        const oh = health.onTime
+        const monthsAbbr = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
+        const now = new Date()
+        const months6 = Array.from({ length: 6 }, (_, i) => {
+          const d = new Date(now.getFullYear(), now.getMonth() - 5 + i, 1)
+          const ym = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
+          const found = (oh?.months || []).find((r: any) => r.ym === ym)
+          return { label: monthsAbbr[d.getMonth()], rate: found ? found.rate : null, total: found?.total || 0, onTime: found?.onTime || 0 }
+        })
+        return <PaymentHealthMonitor months={months6} pct={oh?.pct ?? null} />
       })()}
 
       <div className="grid2">
@@ -858,7 +856,7 @@ function HomePage() {
             <span style={{fontSize:'.72rem',color:'var(--t3)'}}>Manage →</span>
           </div>
           {flexVis.flexcredit && <div className="dr"><span className="dk">Credit Reporting</span><span className={`badge ${me?.creditReportingEnrolled?'b-green':'b-muted'}`}>{me?.creditReportingEnrolled?'Active — $5/mo':'Not enrolled'}</span></div>}
-          {flexVis.flexpay && <div className="dr"><span className="dk">FlexPay</span><span className={`badge ${me?.flexpayEnrolled?'b-green':'b-muted'}`}>{me?.flexpayEnrolled?`Active — day ${me.flexpayPullDay}`:'Not enrolled'}</span></div>}
+          {flexVis.flexpay && <div className="dr"><span className="dk">FlexPay</span><span className={`badge ${me?.flexpayPausedMultiLease?'b-amber':me?.flexpayEnrolled?'b-green':'b-muted'}`}>{me?.flexpayPausedMultiLease?'⏸ Paused — 2+ leases':me?.flexpayEnrolled?`Active — day ${me.flexpayPullDay}`:'Not enrolled'}</span></div>}
           {flexVis.flexdeposit && <div className="dr"><span className="dk">FlexDeposit</span><span className={`badge ${me?.flexDepositEnrolled?'b-green':'b-muted'}`}>{me?.flexDepositEnrolled?'Active — $3/mo':'Not enrolled'}</span></div>}
           <div style={{marginTop:16}}>
             <span className="btn btn-g btn-sm">Manage services →</span>
@@ -871,6 +869,137 @@ function HomePage() {
   )
 }
 
+
+// S595 (Nic): Payment Health — an animated ECG "heartbeat monitor" of the
+// tenant's ON-TIME payment health (mirrors the landlord dashboard monitor).
+// Each of the last 6 months is one beat whose height is that month's on-time
+// rate (a fully-on-time month = full beat; a no-bills-due month flatlines).
+// Color = the 6-month on-time rate: 100% gold, 80%+ green, below that red —
+// NOT total-paid (that metric is the landlord's collective view).
+function PaymentHealthMonitor({ months, pct }: { months: { label: string; rate: number | null; total: number; onTime: number }[]; pct: number | null }) {
+  const W = 640, H = 190
+  const data = months.length ? months : Array.from({ length: 6 }, () => ({ label: '', rate: null as number | null, total: 0, onTime: 0 }))
+  const baseY = H * 0.62
+  const spk = H * 0.40
+  const bw = W / data.length
+
+  // Beat amplitude = that month's on-time rate (absolute — full beat = 100% on
+  // time; a month with no bills due flatlines).
+  const amp = data.map(m => (m.rate == null ? 0 : Math.max(0, Math.min(1, m.rate))))
+  const pts: [number, number][] = [[0, baseY]]
+  data.forEach((_, i) => {
+    const x0 = i * bw
+    const a = amp[i]
+    const at = (f: number) => x0 + f * bw
+    const y = (up: number) => baseY - up * spk * a
+    pts.push(
+      [at(0.30), baseY],
+      [at(0.36), y(0.08)], [at(0.42), baseY],
+      [at(0.48), y(-0.10)],
+      [at(0.53), y(1.0)],
+      [at(0.58), y(-0.22)],
+      [at(0.63), baseY],
+      [at(0.76), y(0.20)], [at(0.86), baseY],
+      [at(1.0), baseY],
+    )
+  })
+  const dPath = 'M ' + pts.map(p => `${p[0].toFixed(1)} ${p[1].toFixed(1)}`).join(' L ')
+
+  // Color from the 6-month on-time rate: 100% gold, 80%+ green, else red.
+  const status = pct == null
+    ? { label: 'Awaiting data',           color: 'var(--t3,#8a93a5)' }
+    : pct >= 100 ? { label: 'Perfect — all on time', color: 'var(--gold,#c9a227)' }
+    : pct >= 80  ? { label: 'On track',              color: 'var(--green,#2fbf71)' }
+    :              { label: 'Needs attention',       color: 'var(--red,#e25555)' }
+
+  const peaks = data.map((_, i) => ({ x: (i + 0.53) * bw, y: baseY - spk * amp[i] }))
+  const [hoverIdx, setHoverIdx] = useState<number | null>(null)
+  const screenRef = useRef<HTMLDivElement>(null)
+  const onMove = (e: React.MouseEvent) => {
+    const el = screenRef.current
+    if (!el) return
+    const r = el.getBoundingClientRect()
+    setHoverIdx(Math.max(0, Math.min(data.length - 1, Math.floor(((e.clientX - r.left) / r.width) * data.length))))
+  }
+
+  return (
+    <div className="card" style={{ marginBottom: 24 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+        <div style={{ fontWeight: 700, color: 'var(--t0)' }}>Payment Health — last 6 months</div>
+        <span style={{ fontSize: '.72rem', fontWeight: 700, color: status.color }}>◆ {status.label}</span>
+      </div>
+      <div className="tphm-screen" ref={screenRef} onMouseMove={onMove} onMouseLeave={() => setHoverIdx(null)}>
+        {hoverIdx == null ? (
+          <div className="tphm-readout">
+            <span className="tphm-readout-label">on-time · last 6 mo</span>
+            <span className="tphm-readout-value" style={{ color: status.color }}>{pct == null ? '—' : `${pct}%`}</span>
+          </div>
+        ) : (
+          <div className="tphm-tip" style={{ left: `clamp(64px, ${((hoverIdx + 0.53) / data.length) * 100}%, calc(100% - 64px))` }}>
+            <div className="tphm-tip-month">{data[hoverIdx].label || '—'}</div>
+            <div className="tphm-tip-val" style={{ color: status.color }}>
+              {data[hoverIdx].rate == null ? 'no bills due' : `${Math.round((data[hoverIdx].rate as number) * 100)}% on time`}
+            </div>
+            {data[hoverIdx].total > 0 && (
+              <div className="tphm-tip-sub">{data[hoverIdx].onTime} of {data[hoverIdx].total} paid on time</div>
+            )}
+          </div>
+        )}
+        <svg viewBox={`0 0 ${W} ${H}`} width="100%" height={190} preserveAspectRatio="none"
+             role="img" aria-label={`On-time payment health, last 6 months: ${status.label}`}>
+          <defs>
+            <linearGradient id="tphm-sweep-grad" x1="0" y1="0" x2="1" y2="0">
+              <stop offset="0%"   stopColor={status.color} stopOpacity="0" />
+              <stop offset="72%"  stopColor={status.color} stopOpacity="0.08" />
+              <stop offset="100%" stopColor={status.color} stopOpacity="0.30" />
+            </linearGradient>
+          </defs>
+          <g className="tphm-grid">
+            {Array.from({ length: data.length + 1 }, (_, i) => <line key={'v' + i} x1={i * bw} y1={0} x2={i * bw} y2={H} />)}
+            {Array.from({ length: 5 }, (_, i) => <line key={'h' + i} x1={0} y1={i * H / 4} x2={W} y2={i * H / 4} />)}
+          </g>
+          <line x1={0} y1={baseY} x2={W} y2={baseY} className="tphm-base" />
+          <path d={dPath} className="tphm-trace" style={{ stroke: status.color }} fill="none" />
+          <g className="tphm-sweepwrap">
+            <rect x={0} y={0} width={100} height={H} fill="url(#tphm-sweep-grad)" />
+          </g>
+          {hoverIdx != null && (
+            <g style={{ color: status.color }}>
+              <line className="tphm-hoverline" x1={(hoverIdx + 0.53) * bw} y1={0} x2={(hoverIdx + 0.53) * bw} y2={H} />
+              <circle className="tphm-hoverdot" cx={peaks[hoverIdx].x} cy={peaks[hoverIdx].y} r={4.5} />
+            </g>
+          )}
+        </svg>
+        <div className="tphm-months">
+          {data.map((m, i) => <span key={i}>{m.label}</span>)}
+        </div>
+      </div>
+      <style>{`
+        .tphm-screen { position: relative; background: radial-gradient(120% 90% at 50% 30%, rgba(20,26,22,.55), rgba(11,15,20,.92)); border: 1px solid var(--b1,#1e2530); border-radius: 10px; padding: 8px; overflow: hidden; cursor: crosshair; }
+        .tphm-grid line { stroke: var(--b1,#1e2530); stroke-width: 1; opacity: .55; }
+        .tphm-base { stroke: var(--b1,#1e2530); stroke-width: 1; opacity: .8; }
+        .tphm-trace { stroke-width: 2.25; stroke-linejoin: round; stroke-linecap: round; filter: drop-shadow(0 0 4px currentColor); }
+        .tphm-sweepwrap { opacity: 0; }
+        .tphm-hoverline { stroke: currentColor; stroke-width: 1; opacity: .55; stroke-dasharray: 3 3; }
+        .tphm-hoverdot { fill: currentColor; filter: drop-shadow(0 0 5px currentColor); }
+        .tphm-readout { position: absolute; top: 8px; right: 12px; z-index: 1; display: flex; flex-direction: column; align-items: flex-end; line-height: 1.1; pointer-events: none; }
+        .tphm-readout-label { font-size: .58rem; text-transform: uppercase; letter-spacing: .08em; color: var(--t3,#8a93a5); }
+        .tphm-readout-value { font-family: var(--font-mono,monospace); font-size: 1.05rem; font-weight: 700; }
+        .tphm-tip { position: absolute; top: 8px; z-index: 2; transform: translateX(-50%); background: var(--b2,#141b24); border: 1px solid var(--b1,#1e2530); border-radius: 8px; padding: 5px 10px; text-align: center; white-space: nowrap; pointer-events: none; box-shadow: 0 6px 18px rgba(0,0,0,.5); }
+        .tphm-tip-month { font-size: .58rem; text-transform: uppercase; letter-spacing: .07em; color: var(--t3,#8a93a5); }
+        .tphm-tip-val { font-family: var(--font-mono,monospace); font-size: .9rem; font-weight: 700; }
+        .tphm-tip-sub { font-size: .58rem; color: var(--t3,#8a93a5); margin-top: 1px; }
+        .tphm-months { display: flex; justify-content: space-around; margin-top: 4px; font-size: .66rem; color: var(--t3,#8a93a5); font-family: var(--font-mono,monospace); }
+        @media (prefers-reduced-motion: no-preference) {
+          .tphm-sweepwrap { opacity: 1; animation: tphm-sweep 3.4s linear infinite; }
+          .tphm-trace { animation: tphm-glow 2.2s ease-in-out infinite; }
+          @keyframes tphm-sweep { from { transform: translateX(-100px); } to { transform: translateX(${W}px); } }
+          @keyframes tphm-glow { 0%, 100% { opacity: .82; } 50% { opacity: 1; } }
+        }
+      `}</style>
+    </div>
+  )
+}
 
 // PaymentsPage moved to ./pages/PaymentsPage.tsx in S169 — now hosts the
 // real Pay Now flow + Stripe Financial Connections bank add via the
@@ -943,6 +1072,63 @@ type PendingReAccept = {
   flexpayPullDay?:       number
   flexpayMonthlyFee?:    number
   flexdepositInstallmentCount?: number
+}
+
+// S581 (Nic): blocking pop-up for a landlord NOTICE (e.g. a rent-increase the
+// tenant can't refuse). Shows on login, is NOT dismissible by clicking away —
+// only "Acknowledge" closes it (which records that the tenant saw it). Multiple
+// notices queue one at a time.
+interface LeaseNotice {
+  id: string; title: string; body: string
+  // S583: the API camelCases every response key on the way out (index.ts global
+  // middleware), so the wire fields are camelCase — reading property_name /
+  // unit_number here left the notice's "Property · Unit N" subheader blank.
+  effectiveDate: string | null; propertyName: string; unitNumber: string
+}
+function LeaseNoticeGate() {
+  const qc = useQueryClient()
+  const { data } = useQuery<LeaseNotice[]>(
+    'lease-notices',
+    () => fetch((import.meta as any).env?.VITE_API_URL + '/api/tenants/lease-notices', {
+      headers: { Authorization: 'Bearer ' + localStorage.getItem('gam_tenant_token') },
+    }).then(r => r.json()).then(r => r.data),
+    { staleTime: 30000 },
+  )
+  const [error, setError] = useState('')
+  const current = (data ?? [])[0] ?? null
+  const ack = useMutation(
+    (id: string) => fetch((import.meta as any).env?.VITE_API_URL + `/api/tenants/lease-notices/${id}/acknowledge`, {
+      method: 'POST', headers: { Authorization: 'Bearer ' + localStorage.getItem('gam_tenant_token') },
+    }).then(r => r.json()),
+    {
+      onSuccess: (r: any) => {
+        if (!r?.success) { setError(r?.error || 'Could not save. Try again.'); return }
+        qc.invalidateQueries('lease-notices')
+      },
+      onError: () => setError('Could not save. Try again.'),
+    },
+  )
+  if (!current) return null
+  return (
+    // Blocking overlay: no onClick-to-dismiss — the tenant must Acknowledge.
+    <div className="modal-ov">
+      <div className="modal" style={{ maxWidth: 560 }} onClick={e => e.stopPropagation()}>
+        <div className="modal-t">📢 {current.title}</div>
+        <div style={{ fontSize: '.7rem', color: 'var(--t3)', marginBottom: 12 }}>
+          {current.propertyName}{current.unitNumber ? ` · Unit ${current.unitNumber}` : ''}
+        </div>
+        <p style={{ fontSize: '.92rem', color: 'var(--t1)', lineHeight: 1.6, marginBottom: 16 }}>{current.body}</p>
+        <div style={{ fontSize: '.74rem', color: 'var(--t3)', marginBottom: 16 }}>
+          This is a formal notice from your landlord. Acknowledging confirms you have seen it.
+        </div>
+        {error && <div className="alert a-warn" style={{ marginBottom: 12 }}>{error}</div>}
+        <button className="btn btn-p" style={{ width: '100%' }} disabled={ack.isLoading}
+          onClick={() => ack.mutate(current.id)}>
+          {ack.isLoading ? 'Saving…' : 'Acknowledge'}
+        </button>
+      </div>
+    </div>
+  )
 }
 
 function FlexsuiteReAcceptanceGate() {
@@ -1696,6 +1882,7 @@ function FlexChargeAccountsCard() {
     }).then(r => r.json()).then(r => r.data)
   )
   const [disputeTx, setDisputeTx] = useState<{ id: string; amount: string; property: string } | null>(null)
+  const [payAcct, setPayAcct] = useState<any | null>(null)
   const visible = fc.data?.visible !== false
   const accounts = (fc.data?.accounts || []) as any[]
   if (!visible || accounts.length === 0) return null
@@ -1704,7 +1891,7 @@ function FlexChargeAccountsCard() {
     <div className="card" style={{ marginTop: 24 }}>
       <h3 style={{ marginBottom: 4 }}>💳 FlexCharge accounts</h3>
       <p style={{ fontSize: '.78rem', color: 'var(--t3)', marginBottom: 16 }}>
-        Tabs you have at GAM-platform merchants. Charges accumulate over the month; the balance + 1.5% service fee auto-pulls from your bank on the 15th of the following month.
+        Tabs you have at GAM-platform merchants. Each month a statement is issued and the <strong>minimum payment</strong> auto-pulls from your bank on the due date. You can carry a balance — pay it down or in full anytime below. <strong>Pay your full balance by the due date and you owe no interest.</strong>
       </p>
       <div style={{ display: 'grid', gap: 10 }}>
         {accounts.map(a => (
@@ -1724,6 +1911,18 @@ function FlexChargeAccountsCard() {
             </span>
             {a.disqualifiedReason && (
               <div style={{ fontSize: '.7rem', color: 'var(--red)', marginTop: 4 }}>{a.disqualifiedReason}</div>
+            )}
+            {/* S583 revolving: minimum due + pay-down. */}
+            {Number(a.balance) > 0 && a.status === 'active' && (
+              <div style={{ marginTop: 8, display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
+                <div style={{ fontSize: '.72rem', color: 'var(--t2)' }}>
+                  {a.minimumDue != null && Number(a.minimumDue) > 0
+                    ? <>Minimum due <strong style={{ color: 'var(--t0)' }}>${Number(a.minimumDue).toFixed(2)}</strong>{a.dueDate ? <> by {new Date(a.dueDate + 'T00:00:00').toLocaleDateString()}</> : null}
+                        {a.apr ? <> · {(Number(a.apr) * 100).toFixed(2)}% APR on carried balance</> : null}</>
+                    : <>{a.apr ? <>{(Number(a.apr) * 100).toFixed(2)}% APR on any carried balance</> : 'No interest if paid in full'}</>}
+                </div>
+                <button className="btn btn-p btn-sm" onClick={() => setPayAcct(a)}>Pay toward balance</button>
+              </div>
             )}
             {Array.isArray(a.transactions) && a.transactions.length > 0 && (
               <div style={{ marginTop: 10, borderTop: '1px solid var(--bd1)', paddingTop: 8 }}>
@@ -1759,7 +1958,17 @@ function FlexChargeAccountsCard() {
           </div>
         ))}
       </div>
-      <div style={{ fontSize: '.7rem', color: 'var(--t3)', marginTop: 12 }}>
+      {/* S583: TILA-style truth-in-lending disclosure. The merchant is the
+          lender and sets the APR; GAM provides the software. */}
+      <div style={{ fontSize: '.68rem', color: 'var(--t3)', marginTop: 12, lineHeight: 1.6, borderTop: '1px solid var(--b0)', paddingTop: 10 }}>
+        <div style={{ fontWeight: 700, color: 'var(--t2)', marginBottom: 3 }}>How your FlexCharge account works</div>
+        Your merchant extends this credit and sets the interest rate (APR). Interest applies only to a balance
+        you <strong>carry past the due date</strong> — pay your full statement balance by the due date and you
+        owe <strong>no interest</strong>. Each month the minimum payment (the greater of $25 or 3% of your
+        balance) auto-pulls from your bank. Paying less than the minimum adds a $10 late fee. GAM charges the
+        merchant a service fee; it is never added to your bill.
+      </div>
+      <div style={{ fontSize: '.7rem', color: 'var(--t3)', marginTop: 10 }}>
         ⓘ Disputing a charge permanently closes your tab at that merchant. Use this only for charges you didn't authorize or that the merchant won't resolve directly.
       </div>
       {disputeTx && (
@@ -1769,6 +1978,74 @@ function FlexChargeAccountsCard() {
           onSuccess={() => { setDisputeTx(null); qc.invalidateQueries('tenant-flexcharge') }}
         />
       )}
+      {payAcct && (
+        <FlexChargePayDownModal
+          account={payAcct}
+          onClose={() => setPayAcct(null)}
+          onSuccess={() => { setPayAcct(null); qc.invalidateQueries('tenant-flexcharge') }}
+        />
+      )}
+    </div>
+  )
+}
+
+// S583 revolving: pay down (or pay off) a FlexCharge balance. Minimum, full, or
+// a custom amount; pay the full balance by the due date to avoid interest.
+function FlexChargePayDownModal({ account, onClose, onSuccess }: {
+  account: any
+  onClose: () => void
+  onSuccess: () => void
+}) {
+  const balance = Number(account.balance) || 0
+  const minimum = Math.min(balance, Number(account.minimumDue) || 0)
+  const [amount, setAmount] = useState<string>(minimum > 0 ? minimum.toFixed(2) : balance.toFixed(2))
+  const [err, setErr] = useState<string | null>(null)
+  const [done, setDone] = useState(false)
+  const num = parseFloat(amount)
+  const invalid = isNaN(num) || num <= 0 || num > balance + 0.005
+  const payMut = useMutation(
+    () => post(`/tenants/flexcharge/${account.id}/pay`, { amount: Math.round(num * 100) / 100 }),
+    { onSuccess: () => setDone(true),
+      onError: (e: any) => setErr(e?.response?.data?.error?.message || e?.response?.data?.error || 'Payment could not be started') },
+  )
+  return (
+    <div className="modal-ov" onClick={onClose}>
+      <div className="modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 420 }}>
+        <div className="modal-t">Pay toward your balance</div>
+        {done ? (
+          <>
+            <div className="alert a-green" style={{ marginBottom: 14 }}>
+              Payment started. It settles in 1–3 business days and will reduce your balance.
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+              <button className="btn btn-p" onClick={onSuccess}>Done</button>
+            </div>
+          </>
+        ) : (
+          <>
+            <div style={{ fontSize: '.8rem', color: 'var(--t2)', marginBottom: 12 }}>
+              {account.propertyName} · balance <strong style={{ color: 'var(--t0)' }}>${balance.toFixed(2)}</strong>
+              {minimum > 0 ? <> · minimum ${minimum.toFixed(2)}</> : null}
+            </div>
+            <div style={{ display: 'flex', gap: 8, marginBottom: 12, flexWrap: 'wrap' }}>
+              {minimum > 0 && <button type="button" className="btn btn-g btn-sm" onClick={() => setAmount(minimum.toFixed(2))}>Minimum ${minimum.toFixed(2)}</button>}
+              <button type="button" className="btn btn-g btn-sm" onClick={() => setAmount(balance.toFixed(2))}>Pay in full ${balance.toFixed(2)}</button>
+            </div>
+            <div className="fg">
+              <label className="fl">Amount</label>
+              <input className="fi" type="number" step="0.01" min="0" max={balance} value={amount}
+                onChange={e => { setAmount(e.target.value); setErr(null) }} />
+            </div>
+            {err && <div className="alert a-warn" style={{ marginTop: 10 }}>{err}</div>}
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, marginTop: 16 }}>
+              <button className="btn btn-g" onClick={onClose}>Cancel</button>
+              <button className="btn btn-p" disabled={invalid || payMut.isLoading} onClick={() => payMut.mutate()}>
+                {payMut.isLoading ? <span className="spinner" /> : `Pay $${isNaN(num) ? '0.00' : num.toFixed(2)}`}
+              </button>
+            </div>
+          </>
+        )}
+      </div>
     </div>
   )
 }
@@ -1856,6 +2133,12 @@ function ServicesPage() {
   // S544: survey mode — visible but not launched. "Coming soon" +
   // interest survey; NO enrollment promises, no queue language.
   const fpLaunched = fp.data?.enrollmentOpen === true
+  // S581: FlexPay is single-lease only. An already-enrolled tenant who picks up
+  // a SECOND lease (an overlap move, a parking spot) has their front paused
+  // server-side (the advance cron skips multi-lease tenants); surface that here
+  // so they aren't left wondering. Reads the ONE server-computed signal on
+  // /tenants/me (same flag the home dashboard row uses). Resumes at one lease.
+  const fpMultiLeasePaused = !!me?.flexpayPausedMultiLease
 
   // S565: FlexCredit is DEMAND-CAPTURE only (product not built/billed yet — no
   // Esusu, no $5 charge; gated on the ~$500/mo provider breakeven). The card
@@ -1887,6 +2170,10 @@ function ServicesPage() {
       desc: 'Pick the day of the month your rent gets pulled from your bank — match it to when your income lands. Your landlord gets paid on the lease grace-period day no matter what; you pay later.',
       price: '$25/month',
       enrolled: me?.flexpayEnrolled,
+      // S581: paused because the tenant now holds more than one lease.
+      warning: fpMultiLeasePaused
+        ? 'FlexPay is paused because you currently have more than one lease. FlexPay covers a single lease — your rent won’t be pulled on your chosen day while this is the case. It turns back on automatically once you’re down to one lease.'
+        : null,
       // S544 survey mode (pre-launch): "coming soon" + interest
       // survey — no enrollment promises, no queue language, no
       // reach-out commitments. Any recorded inquiry (whatever its
@@ -1962,12 +2249,13 @@ function ServicesPage() {
               <div style={{fontSize:'.82rem',color:'var(--t2)',lineHeight:1.5}}>{s.desc}</div>
             </div>
             {s.highlight && <div style={{fontSize:'.75rem',color:'var(--t3)',background:'var(--bg4)',padding:'6px 10px',borderRadius:6}}>{s.highlight}</div>}
+            {(s as any).warning && <div className="alert a-warn" style={{fontSize:'.75rem',margin:0,lineHeight:1.45}}>⏸ {(s as any).warning}</div>}
             <div className="dr" style={{border:'none',padding:0}}>
               <span className="price-tag">{s.price}</span>
               {s.enrolled
                 ? <span style={{display:'flex',gap:8,alignItems:'center'}}>
-                    <span className="badge b-green">✓ Active</span>
-                    {s.id==='flexpay' && <button className="btn btn-g btn-sm" onClick={()=>setFlexPayChangeModal(true)}>Change day</button>}
+                    <span className={`badge ${(s as any).warning ? 'b-amber' : 'b-green'}`}>{(s as any).warning ? '⏸ Paused' : '✓ Active'}</span>
+                    {s.id==='flexpay' && !(s as any).warning && <button className="btn btn-g btn-sm" onClick={()=>setFlexPayChangeModal(true)}>Change day</button>}
                   </span>
                 : (s as any).statusBadge
                 ? <span className={`badge ${(s as any).statusBadge.tone}`}>{(s as any).statusBadge.text}</span>
@@ -3745,21 +4033,144 @@ function LoginPage() {
               {loading?<span className="spinner"/>:'Sign in'}
             </button>
           </form>
-          <div style={{ marginTop: 16, textAlign: 'center' }}>
+          <div style={{ marginTop: 16, display:'flex', justifyContent:'space-between', alignItems:'center' }}>
             <Link to="/forgot-password" style={{ color: 'var(--gold)', fontSize: '.85rem', textDecoration: 'none' }}>
               Forgot password?
             </Link>
+            <Link to="/signup" style={{ color: 'var(--gold)', fontSize: '.85rem', textDecoration: 'none' }}>
+              Create account
+            </Link>
           </div>
         </div>
-        {/* S564: public renter-pool screening entry — no login/signup required. */}
+        {/* S578: renter-pool entry is now account-first — create an account
+            (with 2FA), then get screened from inside the gated portal. */}
         <div className="card" style={{ padding: 20, marginTop: 16, textAlign: 'center' }}>
           <div style={{ fontSize: '.9rem', fontWeight: 700, color: 'var(--gold)', marginBottom: 6 }}>Looking for a place to live?</div>
           <div style={{ fontSize: '.8rem', color: 'var(--t1)', lineHeight: 1.6, marginBottom: 14 }}>
-            Get background-checked once and join the renter pool — landlords with open units find you. No account or chosen property needed to start.
+            Create your account, get background-checked once, and join the renter pool — landlords with open units find you. No chosen property needed to start.
           </div>
-          <Link to="/background-check" className="btn btn-p" style={{ width: '100%', justifyContent: 'center', textDecoration: 'none' }}>
-            Get screened
+          <Link to="/signup" className="btn btn-p" style={{ width: '100%', justifyContent: 'center', textDecoration: 'none' }}>
+            Get started
           </Link>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// S578: prospect self-signup — account created FIRST, with mandatory email-2FA,
+// as its own step (NOT inline in the background check). name/email/password →
+// emailed 6-digit code → verify → land in the gated portal, which shows only
+// "complete your background check" until it's done. A landlordId/unitId in the
+// URL (from a landlord invite / listing) rides along for property attribution.
+function SignupPage() {
+  const { signup, loginWithEmailOtp, resendEmailOtp } = useAuth(); const navigate = useNavigate()
+  const params = new URLSearchParams(window.location.search)
+  const landlordId = params.get('landlordId'); const unitId = params.get('unitId')
+  const [err, setErr] = useState(''); const [loading, setLoading] = useState(false)
+  const [emailOtpSession, setEmailOtpSession] = useState<string|null>(null)
+  const [resent, setResent] = useState(false); const [code, setCode] = useState('')
+  const { register, handleSubmit, watch } = useForm<{firstName:string;lastName:string;email:string;password:string;confirmPassword:string;acceptedTerms:boolean}>()
+  const pw = watch('password')
+  const onSubmit = async(d:{firstName:string;lastName:string;email:string;password:string;confirmPassword:string;acceptedTerms:boolean})=>{
+    setErr('')
+    if(d.password!==d.confirmPassword){setErr('Passwords do not match');return}
+    if(d.password.length<12){setErr('Password must be at least 12 characters');return}
+    if(!d.acceptedTerms){setErr('You must accept the Terms of Service and Privacy Policy');return}
+    setLoading(true)
+    try{
+      const r = await signup({ firstName:d.firstName, lastName:d.lastName, email:d.email, password:d.password, acceptedTerms:true, landlordId, unitId })
+      setEmailOtpSession(r.emailOtpSession); setCode(''); setResent(false)
+    }
+    catch(e:any){setErr(e.response?.data?.error||'Could not create your account')}
+    finally{setLoading(false)}
+  }
+  const onEmailOtpSubmit = async(e:React.FormEvent)=>{
+    e.preventDefault();setLoading(true);setErr('')
+    try{ await loginWithEmailOtp(emailOtpSession!,code.trim()); navigate('/') }
+    catch(ex:any){
+      const msg=ex.response?.data?.error||'Invalid code.'
+      setErr(msg)
+      if(/session/i.test(msg)){setEmailOtpSession(null);setCode('')}
+    }
+    finally{setLoading(false)}
+  }
+  const onResend = async()=>{
+    setErr('')
+    try{ await resendEmailOtp(emailOtpSession!); setResent(true) }
+    catch{ setErr('Could not resend the code. Please try again.') }
+  }
+
+  // ── Step 2: emailed 2FA code ──────────────────────────────────
+  if(emailOtpSession){
+    return (
+      <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',background:'var(--bg0)',padding:20}}>
+        <div style={{width:'100%',maxWidth:400}}>
+          <div style={{textAlign:'center',marginBottom:40}}>
+            <div style={{fontFamily:'var(--font-d)',fontSize:'2rem',fontWeight:800,color:'var(--gold)',marginBottom:8}}>⚡ GAM</div>
+            <div style={{color:'var(--t2)',fontSize:'.875rem'}}>Verify your email</div>
+          </div>
+          <div className="card" style={{padding:28}}>
+            <h2 style={{marginBottom:14}}>Check your email</h2>
+            <div style={{fontSize:'.85rem',color:'var(--t1)',marginBottom:16,lineHeight:1.6}}>
+              We sent a 6-digit code to your email. Enter it to finish creating your account.
+            </div>
+            {err && <div className="alert a-warn" style={{marginBottom:16}}>{err}</div>}
+            {resent && !err && <div className="alert a-green" style={{marginBottom:16}}>A new code is on its way.</div>}
+            <form onSubmit={onEmailOtpSubmit}>
+              <div className="fg">
+                <label className="fl">Code</label>
+                <input className="fi" type="text" value={code} onChange={e=>setCode(e.target.value)} autoFocus required autoComplete="one-time-code" inputMode="numeric" placeholder="123 456" style={{fontFamily:'var(--font-m)',letterSpacing:'.2em',textAlign:'center'}} />
+              </div>
+              <button className="btn btn-p" type="submit" disabled={loading||!code.trim()} style={{width:'100%',justifyContent:'center',marginTop:8}}>
+                {loading?<span className="spinner"/>:'Verify'}
+              </button>
+            </form>
+            <div style={{marginTop:16,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+              <button onClick={()=>{setEmailOtpSession(null);setCode('');setErr('');setResent(false)}} style={{background:'none',border:'none',color:'var(--t2)',fontSize:'.85rem',cursor:'pointer',textDecoration:'underline'}}>← Back</button>
+              <button onClick={onResend} style={{background:'none',border:'none',color:'var(--gold)',fontSize:'.85rem',cursor:'pointer',textDecoration:'underline'}}>Resend code</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  // ── Step 1: account details ───────────────────────────────────
+  return (
+    <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',background:'var(--bg0)',padding:20}}>
+      <div style={{width:'100%',maxWidth:400}}>
+        <div style={{textAlign:'center',marginBottom:40}}>
+          <div style={{fontFamily:'var(--font-d)',fontSize:'2rem',fontWeight:800,color:'var(--gold)',marginBottom:8}}>⚡ GAM</div>
+          <div style={{color:'var(--t2)',fontSize:'.875rem'}}>Create your account</div>
+        </div>
+        <div className="card" style={{padding:28}}>
+          <h2 style={{marginBottom:20}}>Sign up</h2>
+          {err && <div className="alert a-warn" style={{marginBottom:16}}>{err}</div>}
+          <form onSubmit={handleSubmit(onSubmit)}>
+            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
+              <div className="fg"><label className="fl">First name</label><input className="fi" {...register('firstName',{required:true})} autoFocus /></div>
+              <div className="fg"><label className="fl">Last name</label><input className="fi" {...register('lastName',{required:true})} /></div>
+            </div>
+            <div className="fg"><label className="fl">Email</label><input className="fi" type="email" {...register('email',{required:true})} /></div>
+            <div className="fg"><label className="fl">Password</label><input className="fi" type="password" {...register('password',{required:true})} placeholder="At least 12 characters" /></div>
+            <div className="fg"><label className="fl">Confirm password</label><input className="fi" type="password" {...register('confirmPassword',{required:true})} /></div>
+            {pw && pw.length>0 && pw.length<12 && <div style={{fontSize:'.72rem',color:'var(--warn,#f59e0b)',marginTop:-6,marginBottom:10}}>{12-pw.length} more character{12-pw.length===1?'':'s'} required</div>}
+            <label style={{display:'flex',alignItems:'flex-start',gap:10,cursor:'pointer',fontSize:'.8rem',color:'var(--t1)',lineHeight:1.5,margin:'4px 0 12px'}}>
+              <input type="checkbox" {...register('acceptedTerms',{required:true})} style={{marginTop:2,flexShrink:0}} />
+              <span>I agree to the{' '}
+                <a href={`${(import.meta as any).env?.VITE_MARKETING_URL || 'http://localhost:3004'}/consumer/terms`} target="_blank" rel="noopener noreferrer" style={{color:'var(--gold)'}}>Terms of Service</a>
+                {' '}and{' '}
+                <a href={`${(import.meta as any).env?.VITE_MARKETING_URL || 'http://localhost:3004'}/consumer/privacy`} target="_blank" rel="noopener noreferrer" style={{color:'var(--gold)'}}>Privacy Policy</a>.
+              </span>
+            </label>
+            <button className="btn btn-p" type="submit" disabled={loading} style={{width:'100%',justifyContent:'center',marginTop:8}}>
+              {loading?<span className="spinner"/>:'Create account'}
+            </button>
+          </form>
+          <div style={{marginTop:16,textAlign:'center'}}>
+            <Link to="/login" style={{color:'var(--gold)',fontSize:'.85rem',textDecoration:'none'}}>Already have an account? Sign in</Link>
+          </div>
         </div>
       </div>
     </div>
@@ -3776,6 +4187,7 @@ function App() {
       <TelemetryPing />
       <Routes>
         <Route path="/login" element={<LoginPage />} />
+        <Route path="/signup" element={<SignupPage />} />
         <Route path="/forgot-password" element={<ForgotPasswordPage />} />
         <Route path="/reset-password" element={<ResetPasswordPage />} />
         <Route path="/verify-email" element={<VerifyEmailPage />} />

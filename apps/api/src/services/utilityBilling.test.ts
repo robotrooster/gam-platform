@@ -401,6 +401,32 @@ describe('generateBillsForMeter — rubs', () => {
     expect(Number(b2.charge_amount)).toBe(150)
   })
 
+  it('reconciles rounding: uneven split sums EXACTLY to the pool; remainder on the lowest bill (S587)', async () => {
+    const base = await seedBaseProperty()
+    const meterId = await seedRubsMeter(base, 'sqft')
+    await setMeterRateBase(meterId, 1, 0)  // rate 1, no base fee
+    const u1 = await seedUnitWithActiveTenant(base, { sqft: 100 })
+    const u2 = await seedUnitWithActiveTenant(base, { sqft: 150 })
+    const u3 = await seedUnitWithActiveTenant(base, { sqft: 151 })
+    await attachMeterToUnit(meterId, u1.unitId)
+    await attachMeterToUnit(meterId, u2.unitId)
+    await attachMeterToUnit(meterId, u3.unitId)
+    await seedReading(meterId, '2026-05-01', 100, base.landlordUserId)
+    // totalCharge = 100; total sqft 401. Naive round2 shares = 24.94 + 37.41 +
+    // 37.66 = 100.01, so reconciliation trims 0.01 off the LOWEST bill (u1) →
+    // 24.93, and the three bills sum to exactly 100.00 (no penny lost).
+    const res = await generateBillsForMeter(meterId, new Date(2026, 4, 1))
+    expect(res.billsCreated).toBe(3)
+    const { rows } = await db.query<any>(
+      `SELECT unit_id, charge_amount FROM utility_bills WHERE meter_id=$1`, [meterId])
+    const sum = rows.reduce((s: number, r: any) => s + Number(r.charge_amount), 0)
+    expect(Math.round(sum * 100) / 100).toBe(100)
+    const lowest = rows.reduce((lo: any, r: any) =>
+      Number(r.charge_amount) < Number(lo.charge_amount) ? r : lo, rows[0])
+    expect(lowest.unit_id).toBe(u1.unitId)
+    expect(Number(lowest.charge_amount)).toBe(24.93)
+  })
+
   it('bedrooms: bills split by bedroom ratio', async () => {
     const base = await seedBaseProperty()
     const meterId = await seedRubsMeter(base, 'bedrooms')

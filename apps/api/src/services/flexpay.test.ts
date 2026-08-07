@@ -42,11 +42,12 @@ import {
   seedLease, seedLeaseTenant,
 } from '../test/dbHelpers'
 import {
-  FLEXPAY_MONTHLY_FEE, FLEXPAY_MAX_PULL_DAY,
+  FLEXPAY_MONTHLY_FEE, FLEXPAY_MAX_PULL_DAY, FLEXPAY_REHAB_CLEAN_PULLS,
   calculateFlexPayFee, cycleMonthForDate,
   isFlexPayVisible, getFlexPayEligibility,
   enrollFlexPay, cancelFlexPay, changeFlexPayPullDay,
   autoDisenrollFlexPayOnAchUnverified,
+  applyFlexPayRehabProgress, handleFlexPayPaymentNsf,
 } from './flexpay'
 
 beforeEach(async () => {
@@ -220,6 +221,25 @@ describe('getFlexPayEligibility', () => {
     expect(r.eligible).toBe(true)
     expect(r.blockers).toEqual([])
     expect(r.suspended_until).toBeNull()
+  })
+
+  it('S581: a tenant on 2+ active leases → multiple_leases blocker (single-lease only)', async () => {
+    const { tenantId, landlordId } = await seedTenantWithLease()
+    // Same tenant, a SECOND active lease (e.g. a parking spot on another unit).
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const ownerUserId = (await c.query<{ user_id: string }>(`SELECT user_id FROM landlords WHERE id=$1`, [landlordId])).rows[0].user_id
+      const propertyId = await seedProperty(c, { landlordId, ownerUserId, managedByUserId: ownerUserId })
+      const unit2 = await seedUnit(c, { propertyId, landlordId })
+      const lease2 = await seedLease(c, { unitId: unit2, landlordId })
+      await seedLeaseTenant(c, { leaseId: lease2, tenantId, role: 'primary' })
+      await c.query('COMMIT')
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+
+    const r = await getFlexPayEligibility(tenantId)
+    expect(r.blockers).toContain('multiple_leases')
+    expect(r.eligible).toBe(false)
   })
 })
 
@@ -475,5 +495,89 @@ describe('changeFlexPayPullDay', () => {
     await db.query(`UPDATE system_features SET enabled=FALSE WHERE key='flexpay_rollout_visible'`)
     const out = await changeFlexPayPullDay(tenantId, 20)
     expect(out.ok).toBe(false)
+  })
+})
+
+// ─── S578: returner rehab clock + permanent (2nd-default) ban ─────
+describe('S578 FlexPay returner rehab + permanent ban', () => {
+  async function seed(): Promise<{ tenantId: string; landlordId: string; unitId: string; leaseId: string }> {
+    const c = await db.connect()
+    try {
+      await c.query('BEGIN')
+      const { userId, landlordId } = await seedLandlord(c)
+      const propertyId = await seedProperty(c, { landlordId, ownerUserId: userId, managedByUserId: userId })
+      const unitId = await seedUnit(c, { propertyId, landlordId })
+      const tenantId = await seedTenant(c)
+      const leaseId = await seedLease(c, { unitId, landlordId })
+      await seedLeaseTenant(c, { leaseId, tenantId, role: 'primary' })
+      await c.query(`UPDATE tenants SET ssi_ssdi=TRUE, ach_verified=TRUE WHERE id=$1`, [tenantId])
+      await c.query('COMMIT')
+      return { tenantId, landlordId, unitId, leaseId }
+    } catch (e) { await c.query('ROLLBACK'); throw e } finally { c.release() }
+  }
+  // A defaulted advance makes the tenant a "returner" (one prior default).
+  const seedDefaultedAdvance = (ctx: any, cycleMonth: string) => db.query(
+    `INSERT INTO flexpay_advances
+       (cycle_month, tenant_id, landlord_id, unit_id, lease_id, rent_amount, tenant_fee_amount, pull_day, status, defaulted_at)
+     VALUES ($1,$2,$3,$4,$5,440,25,10,'defaulted',NOW())`,
+    [cycleMonth, ctx.tenantId, ctx.landlordId, ctx.unitId, ctx.leaseId])
+  const tenantState = async (id: string) => (await db.query<{
+    flexpay_clean_streak: number; flexpay_returner_cleared: boolean; flexpay_permanently_banned: boolean; flexpay_disqualified_reason: string | null
+  }>(`SELECT flexpay_clean_streak, flexpay_returner_cleared, flexpay_permanently_banned, flexpay_disqualified_reason FROM tenants WHERE id=$1`, [id])).rows[0]
+
+  it('clean first-attempt pulls advance the streak; the 12th clears the returner mark', async () => {
+    const ctx = await seed()
+    await seedDefaultedAdvance(ctx, '2026-01-01')  // 1 prior default → returner
+    for (let i = 0; i < FLEXPAY_REHAB_CLEAN_PULLS - 1; i++) await applyFlexPayRehabProgress(ctx.tenantId, 0)
+    let s = await tenantState(ctx.tenantId)
+    expect(s.flexpay_clean_streak).toBe(FLEXPAY_REHAB_CLEAN_PULLS - 1)
+    expect(s.flexpay_returner_cleared).toBe(false)
+    await applyFlexPayRehabProgress(ctx.tenantId, 0)  // 12th clean pull
+    s = await tenantState(ctx.tenantId)
+    expect(s.flexpay_returner_cleared).toBe(true)
+  })
+
+  it('a retry (retry_count>=1) resets the streak even though the pull ultimately cleared', async () => {
+    const ctx = await seed()
+    await seedDefaultedAdvance(ctx, '2026-01-01')
+    for (let i = 0; i < 5; i++) await applyFlexPayRehabProgress(ctx.tenantId, 0)
+    expect((await tenantState(ctx.tenantId)).flexpay_clean_streak).toBe(5)
+    await applyFlexPayRehabProgress(ctx.tenantId, 1)  // a retry happened this cycle
+    const s = await tenantState(ctx.tenantId)
+    expect(s.flexpay_clean_streak).toBe(0)
+    expect(s.flexpay_returner_cleared).toBe(false)
+  })
+
+  it('first-timer (no prior default) never accrues a streak — nothing to rehab', async () => {
+    const ctx = await seed()
+    await applyFlexPayRehabProgress(ctx.tenantId, 0)
+    expect((await tenantState(ctx.tenantId)).flexpay_clean_streak).toBe(0)
+  })
+
+  it('permanently banned → eligibility blocker + enroll refused', async () => {
+    const ctx = await seed()
+    await db.query(`UPDATE tenants SET flexpay_permanently_banned=TRUE WHERE id=$1`, [ctx.tenantId])
+    const elig = await getFlexPayEligibility(ctx.tenantId)
+    expect(elig.eligible).toBe(false)
+    expect(elig.blockers).toContain('permanently_banned')
+  })
+
+  it('2nd lifetime default → permanent ban (1st is only a 90-day suspend)', async () => {
+    const ctx = await seed()
+    await seedDefaultedAdvance(ctx, '2026-01-01')  // the 1st default, already on record
+    // 2nd cycle sitting in 'pulled' whose retry payment just failed.
+    const cycle = '2026-02-01'
+    const pay = await db.query<{ id: string }>(
+      `INSERT INTO payments (landlord_id, tenant_id, lease_id, unit_id, type, amount, status, entry_description, due_date, retry_count)
+       VALUES ($1,$2,$3,$4,'rent',465,'failed','FLEXPAY',$5,1) RETURNING id`,
+      [ctx.landlordId, ctx.tenantId, ctx.leaseId, ctx.unitId, cycle])
+    await db.query(
+      `INSERT INTO flexpay_advances (cycle_month, tenant_id, landlord_id, unit_id, lease_id, rent_amount, tenant_fee_amount, pull_day, status, rent_payment_id)
+       VALUES ($1,$2,$3,$4,$5,440,25,10,'pulled',$6)`,
+      [cycle, ctx.tenantId, ctx.landlordId, ctx.unitId, ctx.leaseId, pay.rows[0].id])
+    await handleFlexPayPaymentNsf(pay.rows[0].id)
+    const s = await tenantState(ctx.tenantId)
+    expect(s.flexpay_permanently_banned).toBe(true)
+    expect(s.flexpay_disqualified_reason).toBe('permanent_second_default')
   })
 })

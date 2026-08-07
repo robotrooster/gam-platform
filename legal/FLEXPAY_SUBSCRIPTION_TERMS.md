@@ -43,7 +43,7 @@ FlexPay is a **payment-date coordination subscription**. Subscriber may use Flex
 - Align Scheduled Pull Dates with Subscriber's stated payday or income arrival pattern;
 - Configure additional scheduling features that GAM may add to FlexPay from time to time, disclosed at the enrollment surface.
 
-The monthly subscription fee depends on the Scheduled Pull Date Subscriber selects under Section 3.
+The monthly subscription fee is a flat $25.00 per month regardless of which Scheduled Pull Date Subscriber selects under Section 3.
 
 **FlexPay is a scheduling tool only.** It does not change the amount of rent or other charges Subscriber owes. It does not advance any amount on Subscriber's behalf. It does not guarantee that any Scheduled Pull will succeed; if the funds in Subscriber's authorized bank account are insufficient on the Scheduled Pull Date, the pull will fail and Subscriber's account will reflect the unpaid rent (or other unpaid amount) until brought current.
 

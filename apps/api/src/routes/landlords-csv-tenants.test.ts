@@ -337,6 +337,26 @@ describe('POST /api/landlords/me/onboard-tenants-csv/commit', () => {
     expect(res.body.error).toMatch(/not owned by this landlord/)
   })
 
+  it('defense-in-depth: commit into an already-leased unit → 409, no double-booking', async () => {
+    const f = await seedTFixture()
+    // First import creates the lease → the unit is now occupied.
+    const first = await request(buildApp())
+      .post('/api/landlords/me/onboard-tenants-csv/commit')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ rows: [baseRow(f)], source: 'generic', claimedPlatformName: 'TestPlatform' })
+    expect(first.status).toBe(200)
+    // A second commit for the SAME whole-unit must be refused server-side even
+    // though the client skipped re-/validate (which would have blocked it).
+    const second = await request(buildApp())
+      .post('/api/landlords/me/onboard-tenants-csv/commit')
+      .set('Authorization', `Bearer ${f.landlordToken}`)
+      .send({ rows: [baseRow(f)], source: 'generic', claimedPlatformName: 'TestPlatform' })
+    expect(second.status).toBe(409)
+    // Exactly ONE active lease on the unit — no double-booking.
+    const leases = await db.query(`SELECT id FROM leases WHERE unit_id=$1 AND status='active'`, [f.unitId])
+    expect(leases.rows.length).toBe(1)
+  })
+
   it('rows with remaining blockers → 400 + nothing committed', async () => {
     const f = await seedTFixture()
     const res = await request(buildApp())

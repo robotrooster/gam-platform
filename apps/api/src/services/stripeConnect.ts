@@ -317,6 +317,10 @@ interface CreatePmCompanyTransferOpts {
   sourceTransactionId?: string
   metadata: Record<string, string>
   description?: string
+  /** Deterministic key so a retried Transfer (same batch/intent) dedupes at
+   *  Stripe instead of double-paying. Pass the intent-derived key on any
+   *  fire-after-commit path (see services/landlordPassthrough.ts). */
+  idempotencyKey?: string
 }
 
 /**
@@ -333,7 +337,7 @@ export async function createPmCompanyTransfer(opts: CreatePmCompanyTransferOpts)
     ...(opts.sourceTransactionId ? { source_transaction: opts.sourceTransactionId } : {}),
     description: opts.description ?? 'PM company fee',
     metadata: opts.metadata,
-  })
+  }, opts.idempotencyKey ? { idempotencyKey: opts.idempotencyKey } : undefined)
 }
 
 /**

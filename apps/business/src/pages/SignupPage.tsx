@@ -1,9 +1,12 @@
 import { useState } from 'react'
-import { Link } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
 import { apiPost } from '../lib/api'
+import { useAuth } from '../context/AuthContext'
 import { BUSINESS_TYPES, BUSINESS_TYPE_LABEL, BusinessType } from '@gam/shared'
 
 export function SignupPage() {
+  const { loginWithEmailOtp, resendEmailOtp } = useAuth()
+  const navigate = useNavigate()
   const [form, setForm] = useState({
     businessName: '',
     businessType: 'trash_hauling' as BusinessType,
@@ -13,6 +16,11 @@ export function SignupPage() {
   })
   const [err, setErr] = useState<string | null>(null)
   const [pending, setPending] = useState(false)
+  // S578: mandatory email-2FA at signup — verify the emailed code before the
+  // account is usable (matches every other portal + the business login flow).
+  const [emailOtpSession, setEmailOtpSession] = useState<string | null>(null)
+  const [code, setCode] = useState('')
+  const [resent, setResent] = useState(false)
 
   const upd = <K extends keyof typeof form>(k: K, v: typeof form[K]) =>
     setForm(f => ({ ...f, [k]: v }))
@@ -21,18 +29,59 @@ export function SignupPage() {
     e.preventDefault()
     setErr(null); setPending(true)
     try {
-      const res = await apiPost<{ token: string; user: any }>('/businesses', form)
-      // Stash the token the same way AuthContext does + then re-login
-      // to populate state. (We can't use auth.login() because that
-      // hits /auth/login with a password; signup already minted us a
-      // JWT.)
-      localStorage.setItem('gam_business_token', res.data!.token)
-      // Forcing a refresh by full nav — AuthContext picks up the token
-      // from localStorage on next mount.
-      window.location.href = '/dashboard'
+      const res = await apiPost<any>('/businesses', form)
+      const data = res.data!
+      if (data.requiresEmailOtp && data.emailOtpSession) {
+        setEmailOtpSession(data.emailOtpSession as string); setCode(''); setResent(false)
+      } else {
+        // Fallback for any legacy no-2FA response.
+        localStorage.setItem('gam_business_token', data.token)
+        window.location.href = '/dashboard'
+      }
     } catch (e: any) {
       setErr(e?.response?.data?.error || e?.message || 'Signup failed')
     } finally { setPending(false) }
+  }
+
+  const onOtpSubmit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setErr(null); setPending(true)
+    try {
+      await loginWithEmailOtp(emailOtpSession!, code.trim())
+      navigate('/dashboard')
+    } catch (e: any) {
+      const msg = e?.response?.data?.error || e?.message || 'Invalid code.'
+      setErr(msg)
+      if (/session/i.test(msg)) { setEmailOtpSession(null); setCode('') }
+    } finally { setPending(false) }
+  }
+
+  const onResend = async () => {
+    setErr(null); setResent(false)
+    try { await resendEmailOtp(emailOtpSession!); setResent(true) }
+    catch (e: any) { setErr(e?.response?.data?.error || 'Could not resend the code.') }
+  }
+
+  // S578: step 2 — emailed 2FA code (finishes account creation).
+  if (emailOtpSession) {
+    return (
+      <div style={{ minHeight: '100vh', display: 'grid', placeItems: 'center', background: 'var(--bg-0)', color: 'var(--text-0)' }}>
+        <form onSubmit={onOtpSubmit} style={{ width: 400, padding: 32, background: 'var(--bg-1)', border: '1px solid var(--border-0)', borderRadius: 12 }}>
+          <div style={{ fontFamily: 'var(--font-display)', fontSize: 22, color: 'var(--gold)' }}>Verify your email</div>
+          <div style={{ fontSize: 14, color: 'var(--text-2)', marginTop: 4, marginBottom: 20 }}>
+            We emailed a 6-digit code to <strong>{form.email}</strong>. Enter it to finish creating your account.
+          </div>
+          <label style={labelStyle}>Code</label>
+          <input value={code} onChange={e => setCode(e.target.value)} inputMode="numeric" autoComplete="one-time-code" autoFocus required placeholder="123 456" style={{ ...inputStyle, textAlign: 'center', letterSpacing: '.2em' }} />
+          {resent && !err && <div style={{ marginTop: 12, fontSize: 13, color: 'var(--green)' }}>A new code is on its way.</div>}
+          {err && <div style={errStyle}>{err}</div>}
+          <button type="submit" disabled={pending || !code.trim()} style={{ ...btnStyle, opacity: (pending || !code.trim()) ? 0.6 : 1 }}>{pending ? 'Verifying…' : 'Verify & continue'}</button>
+          <div style={{ marginTop: 16, textAlign: 'center', fontSize: 13 }}>
+            <button type="button" onClick={onResend} style={{ background: 'none', border: 'none', color: 'var(--gold)', cursor: 'pointer', textDecoration: 'underline' }}>Resend code</button>
+          </div>
+        </form>
+      </div>
+    )
   }
 
   return (

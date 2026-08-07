@@ -246,6 +246,17 @@ webhooksRouter.post('/stripe', async (req, res) => {
               } catch (e) {
                 logger.error({ err: e, payment_id: row.id }, 'flexcharge reconcile-on-settle failed')
               }
+              // S583: FlexCharge pay-DOWN reconcile (customer paid more than the
+              // minimum). Self-gates on the PI metadata gam_purpose.
+              try {
+                const meta = (pi.metadata ?? {}) as Record<string, string>
+                if (meta.gam_purpose === 'flexcharge_paydown') {
+                  const { reconcileFlexChargePaydown } = await import('../services/flexCharge')
+                  await reconcileFlexChargePaydown(row.id, meta)
+                }
+              } catch (e) {
+                logger.error({ err: e, payment_id: row.id }, 'flexcharge paydown reconcile failed')
+              }
             }
           }
 
@@ -381,12 +392,12 @@ webhooksRouter.post('/stripe', async (req, res) => {
       }
 
       // S261 post-commit: fire FlexCharge merchant Transfers for any
-      // statements satisfied via supersedence. The merchant share
-      // (statement.balance, not total_due — the 1.5% service_fee stays
-      // on platform as GAM revenue) lands on the landlord's Connect
-      // account. Funded from GAM platform balance (where the
-      // supersedence boost landed). Residual amounts (boost > FIFO
-      // total) get an admin notification.
+      // statements satisfied via supersedence. The merchant share is
+      // (balance − GAM's 1.5% service_fee) — GAM keeps the 1.5% as its
+      // merchant subscription (S583, Nic: the fee is the merchant's cost,
+      // never the borrower's). Lands on the landlord's Connect account,
+      // funded from GAM platform balance (where the supersedence boost
+      // landed). Residual amounts (boost > FIFO total) get an admin notification.
       // S533 post-commit: tell the tenant exactly how their payment was
       // applied when accelerated propane took priority over rent.
       for (const r of propaneRedistributions) {

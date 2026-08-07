@@ -51,7 +51,11 @@ const uploadFile = async (p: string, file: File) => { const fd=new FormData(); f
 const inp = { width:'100%', padding:'9px 12px', border:'1px solid #1e2530', borderRadius:8, background:'#0a0d10', color:'#eef1f8', fontSize:'.85rem', outline:'none', boxSizing:'border-box' as const }
 const lbl = { fontSize:'.72rem', fontWeight:600 as const, color:'#4a5568', textTransform:'uppercase' as const, letterSpacing:'.06em', display:'block' as const, marginBottom:5 }
 const STATES = 'AL AK AZ AR CA CO CT DE FL GA HI ID IL IN IA KS KY LA ME MD MA MI MN MS MO MT NE NV NH NJ NM NY NC ND OH OK OR PA RI SC SD TN TX UT VT VA WA WV WI WY'.split(' ')
-const STEPS = ['Personal Info','Address','Employment','ID Upload','Consent','Review & Pay']
+// S579: STEPS are provider-aware and computed INSIDE the component (see below).
+// Checkr collects SSN/DOB/address/income/ID + FCRA consent on ITS OWN hosted
+// flow, so GAM's page is minimal for Checkr; the mock/dev provider keeps the
+// full legacy intake. The value below is only a fallback for the type.
+const MOCK_STEPS = ['Personal Info','Address','Employment','ID Upload','Consent','Review & Pay']
 
 export function BackgroundCheckPage() {
   const [step, setStep] = useState(0)
@@ -75,14 +79,14 @@ export function BackgroundCheckPage() {
   const [reapplyErr, setReapplyErr] = useState('')
   const fileRef = useRef<HTMLInputElement>(null)
   const idCameraRef = useRef<HTMLInputElement>(null)
-  const [suggestions, setSuggestions] = useState<any[]>([])
-  const [showSugg, setShowSugg] = useState(false)
+  // S583 (Nic): removed the Mapbox address-autocomplete — it sent the applicant's
+  // typed address to a third party (Mapbox), which GAM's no-external-data rule
+  // doesn't allow. Address is now plain manual entry, verified only by GAM's own
+  // /background/verify-address endpoint. (This whole legacy intake step is dropped
+  // entirely under Checkr, which collects the address on its hosted flow.)
   const [addrVerified, setAddrVerified] = useState(false)
-  const [userCoords, setUserCoords] = useState<{lat:number,lon:number}|null>(null)
-  const [locationDenied, setLocationDenied] = useState(false)
   const [addrChecking, setAddrChecking] = useState(false)
   const [addrWarn, setAddrWarn] = useState(false)
-  const searchTimer = useRef<any>(null)
   const verifyTimer = useRef<any>(null)
   const [form, setForm] = useState({ firstName:'', lastName:'', dob:'', ssn:'', email:'', password:'', confirmPassword:'', street1:'', street2:'', city:'', state:'', zip:'', years:'', empStatus:'employed', employer:'', empPhone:'', income:'', prevName:'', prevPhone:'', prevEmail:'', consentCredit:false, consentCriminal:false, consentPool:false, acceptedTerms:false })
   const set = (k: string, v: any) => setForm(f=>({...f,[k]:v}))
@@ -100,6 +104,23 @@ export function BackgroundCheckPage() {
   // share authorization.
   const isSpeculative = !priceLandlordId
   const providerCollectsPii = !!(price as any)?.providerCollectsPii
+  // S579: provider-aware step machine. Checkr → GAM only needs consent + payment
+  // (name comes from the account; Checkr collects the rest on its hosted flow).
+  // mock/dev → the full legacy intake.
+  const STEPS = providerCollectsPii
+    ? ['Consent', 'Review & Pay']
+    : MOCK_STEPS
+  // Checkr skips the "Personal Info" step, so seed the name the check needs from
+  // the signed-in account.
+  useEffect(() => {
+    if (providerCollectsPii && me) {
+      setForm(f => ({
+        ...f,
+        firstName: f.firstName || (me as any).firstName || '',
+        lastName:  f.lastName  || (me as any).lastName  || '',
+      }))
+    }
+  }, [providerCollectsPii, me])
   const handleIdUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0];
     if (!f) return;
@@ -124,7 +145,37 @@ export function BackgroundCheckPage() {
     return fetch(`${API}/api/background/submit`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-      body: JSON.stringify({ firstName:form.firstName, lastName:form.lastName, dateOfBirth:form.dob, ssn:providerCollectsPii?undefined:form.ssn.replace(/\D/g,''), street1:form.street1, street2:form.street2||null, city:form.city, state:form.state, zip:form.zip, yearsAtAddress:parseInt(form.years)||null, employmentStatus:form.empStatus, employerName:form.employer||null, employerPhone:form.empPhone||null, monthlyIncome:parseFloat(form.income)||null, prevLandlordName:form.prevName||null, prevLandlordPhone:form.prevPhone||null, prevLandlordEmail:form.prevEmail||null, idDocumentUrl:idUrl||null, incomeDocUrls:incomeFiles.map(f=>f.url), consentCredit:form.consentCredit, consentCriminal:form.consentCriminal, consentPool:form.consentPool, landlordId:(me as any)?.landlordId||null, unitId:(me as any)?.unitId||(new URLSearchParams(window.location.search).get('unitId'))||null, timeToComplete:Math.round((Date.now()-startTime)/1000), applicantPaymentIntentId:paymentIntentId })
+      // S579: for Checkr, GAM's intake is minimal — name + payment + pool/terms
+      // consent. Checkr collects DOB/SSN/address/income/ID + FCRA consent on its
+      // own hosted flow, so null all of that here (the backend requires only name
+      // + payment for Checkr). The mock/dev provider still sends the full set.
+      body: JSON.stringify({
+        firstName:form.firstName, lastName:form.lastName,
+        dateOfBirth: providerCollectsPii ? null : form.dob,
+        ssn: providerCollectsPii ? undefined : form.ssn.replace(/\D/g,''),
+        street1: providerCollectsPii ? null : form.street1,
+        street2: providerCollectsPii ? null : (form.street2||null),
+        city: providerCollectsPii ? null : form.city,
+        state: providerCollectsPii ? null : form.state,
+        zip: providerCollectsPii ? null : form.zip,
+        yearsAtAddress: providerCollectsPii ? null : (parseInt(form.years)||null),
+        employmentStatus: providerCollectsPii ? null : form.empStatus,
+        employerName: providerCollectsPii ? null : (form.employer||null),
+        employerPhone: providerCollectsPii ? null : (form.empPhone||null),
+        monthlyIncome: providerCollectsPii ? null : (parseFloat(form.income)||null),
+        prevLandlordName: providerCollectsPii ? null : (form.prevName||null),
+        prevLandlordPhone: providerCollectsPii ? null : (form.prevPhone||null),
+        prevLandlordEmail: providerCollectsPii ? null : (form.prevEmail||null),
+        idDocumentUrl: providerCollectsPii ? null : (idUrl||null),
+        incomeDocUrls: providerCollectsPii ? [] : incomeFiles.map(f=>f.url),
+        consentCredit: providerCollectsPii ? false : form.consentCredit,
+        consentCriminal: providerCollectsPii ? false : form.consentCriminal,
+        consentPool:form.consentPool,
+        landlordId:(me as any)?.landlordId||null,
+        unitId:(me as any)?.unitId||(new URLSearchParams(window.location.search).get('unitId'))||null,
+        timeToComplete:Math.round((Date.now()-startTime)/1000),
+        applicantPaymentIntentId:paymentIntentId,
+      })
     }).then(r => r.json())
   }, { onSuccess: () => refetch() })
   const ssnFmt = (d: string) => d.length<=3?d:d.length<=5?d.slice(0,3)+'-'+d.slice(3):d.slice(0,3)+'-'+d.slice(3,5)+'-'+d.slice(5)
@@ -175,7 +226,6 @@ export function BackgroundCheckPage() {
   })()
   const validIncome = !form.income||(parseFloat(form.income)>0&&parseFloat(form.income)<1000000)
   const validPrev = form.prevName.trim().split(' ').filter(Boolean).length>=2&&validName(form.prevName)&&!!form.prevPhone&&phoneValid
-  const MAPBOX_TOKEN = (import.meta as any).env?.VITE_MAPBOX_TOKEN || ''
 
   const fmtPhone = (v: string) => {
     const d = v.replace(/\D/g,'').slice(0,10)
@@ -214,29 +264,6 @@ export function BackgroundCheckPage() {
     setPhoneValid(true)
   }
 
-  const searchAddr = async (val: string) => {
-    if (val.length<3){setSuggestions([]);setShowSugg(false);return}
-    try {
-      const proximity = userCoords ? `&proximity=${userCoords.lon},${userCoords.lat}` : ''
-      const url = `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(val)}.json?access_token=${MAPBOX_TOKEN}&country=us&types=address&limit=6${proximity}`
-      console.log('[MAPBOX] fetching:', url.slice(0,80))
-      const res = await fetch(url)
-      const data = await res.json()
-      console.log('[MAPBOX] got features:', data.features?.length)
-      setSuggestions(data.features||[])
-      setShowSugg((data.features||[]).length>0)
-    } catch(e) { console.error('[MAPBOX]',e); setSuggestions([]); setShowSugg(false) }
-  }
-  const pickSuggestion = (s: any) => {
-    const ctx = s.context||[]
-    const getCtx = (id: string) => ctx.find((c: any)=>c.id.startsWith(id))?.text||''
-    const street = s.placeName ? s.placeName.split(',')[0] : s.text||''
-    const city = getCtx('place')
-    const stateShort = ctx.find((c: any)=>c.id.startsWith('region'))?.shortCode?.replace('US-','')||form.state
-    const zip = getCtx('postcode')
-    setForm(f=>({...f, street1:street||f.street1, city:city||f.city, state:stateShort||f.state, zip:zip||f.zip}))
-    setSuggestions([]); setShowSugg(false); setAddrVerified(true); setAddrWarn(false)
-  }
   const verifyAddr = async (street: string, city: string, state: string, zip: string) => {
     if(!street||!city||!zip||zip.replace(/\D/g,'').length<5)return
     setAddrChecking(true);setAddrVerified(false);setAddrWarn(false)
@@ -250,55 +277,43 @@ export function BackgroundCheckPage() {
     } catch(e){}
     setAddrChecking(false)
   }
-  // Request geolocation when on address step
+  // S578: this page is authenticated-only now. The account is created FIRST via
+  // the dedicated signup page (with mandatory email-2FA); a prospect reaches the
+  // check from INSIDE the gated portal. If we render without a session (e.g. a
+  // direct hit on the public /background-check link), send them to sign up,
+  // preserving any landlord/unit attribution in the URL.
   useEffect(()=>{
-    if(step===1 && !userCoords && !locationDenied){
-      navigator.geolocation.getCurrentPosition(
-        pos => setUserCoords({ lat: pos.coords.latitude, lon: pos.coords.longitude }),
-        () => setLocationDenied(true),
-        { timeout: 8000, maximumAge: 300000 }
-      )
+    if(!tok()){
+      const qs = window.location.search
+      window.location.replace('/signup' + qs)
     }
-  },[step])
-
+  },[])
+  // S583: re-verify (GAM's own endpoint) whenever any address field changes —
+  // street1 is now included since the Mapbox pick-to-verify path is gone.
   useEffect(()=>{
     if(form.city&&form.zip&&validZip&&form.street1){
       clearTimeout(verifyTimer.current)
       verifyTimer.current=setTimeout(()=>verifyAddr(form.street1,form.city,form.state,form.zip),1000)
     }
     return()=>clearTimeout(verifyTimer.current)
-  },[form.city,form.state,form.zip])
+  },[form.street1,form.city,form.state,form.zip])
   // S84: on entering step 5, ensure tenant account exists (so we have a
   // token), then mint a Stripe PaymentIntent. Both flows write into
   // paymentClientSecret + paymentIntentId; the Elements form uses the
   // clientSecret to confirm, and submit attaches the intentId.
   useEffect(() => {
-    if (step !== 5) return
+    if (STEPS[step] !== 'Review & Pay') return
     if (paymentClientSecret || paymentIntentId) return
     let cancelled = false
     ;(async () => {
       try {
-        let token = tok()
+        // S578: account is guaranteed to exist by now (created via signup/invite
+        // before the portal renders this page). No inline account creation.
+        const token = tok()
         if (!token) {
-          const params = new URLSearchParams(window.location.search)
-          const unitId = params.get('unitId')
-          const landlordId = params.get('landlordId')
-          const regRes = await fetch(`${API}/api/auth/register-prospect`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              firstName: form.firstName, lastName: form.lastName,
-              email: form.email, password: form.password,
-              unitId: unitId || null, landlordId: landlordId || null,
-              acceptedTerms: true,
-            }),
-          }).then(r => r.json())
-          if (!regRes.success) {
-            if (!cancelled) setPaymentInitError(regRes.error || 'Account creation failed')
-            return
-          }
-          token = regRes.data.token
-          localStorage.setItem('gam_tenant_token', token!)
+          const qs = window.location.search
+          window.location.replace('/signup' + qs)
+          return
         }
         const params = new URLSearchParams(window.location.search)
         const piRes = await fetch(`${API}/api/background/payment-intent`, {
@@ -351,14 +366,17 @@ export function BackgroundCheckPage() {
     return () => clearInterval(interval)
   }, [(status as any)?.status, (status as any)?.check?.decidedAt])
 
-  const canNext=[
-    !!(validName(form.firstName)&&validName(form.lastName)&&validDob&&(providerCollectsPii||validSsn)&&form.email.includes('@')&&form.password.length>=8&&form.password===(form as any).confirmPassword),
-    !!(form.street1.length>=5&&form.city.length>=2&&validZip&&(addrVerified||addrWarn)),
-    !!(validPrev&&validIncome&&incomeFiles.length>=2&&form.income&&((['employed','part_time','self_employed'].includes(form.empStatus)?(form.employer&&form.empPhone):true))),
-    !!(providerCollectsPii||idUrl),
-    !!(form.consentCredit&&form.consentCriminal&&form.acceptedTerms&&(!isSpeculative||form.consentPool)),
-    paid,
-  ]
+  // S579: keyed by step NAME so it works across both provider layouts.
+  const canNext: Record<string, boolean> = {
+    'Personal Info': !!(validName(form.firstName)&&validName(form.lastName)&&validDob&&(providerCollectsPii||validSsn)),
+    'Address': !!(form.street1.length>=5&&form.city.length>=2&&validZip&&(addrVerified||addrWarn)),
+    'Employment': !!(validPrev&&validIncome&&incomeFiles.length>=2&&form.income&&((['employed','part_time','self_employed'].includes(form.empStatus)?(form.employer&&form.empPhone):true))),
+    'ID Upload': !!(providerCollectsPii||idUrl),
+    // Checkr collects the FCRA credit/criminal consent on its OWN flow — GAM only
+    // needs the pool-share (if speculative) + platform terms here.
+    'Consent': !!((providerCollectsPii||(form.consentCredit&&form.consentCriminal))&&form.acceptedTerms&&(!isSpeculative||form.consentPool)),
+    'Review & Pay': paid,
+  }
   if((status as any)?.status==='submitted'){
     const chk = (status as any)?.check
     const applyUrl = chk?.status==='awaiting_applicant' ? (chk?.applicantRedirectUrl || null) : null
@@ -443,7 +461,7 @@ export function BackgroundCheckPage() {
       <div style={{display:'flex',gap:4,marginBottom:8}}>{STEPS.map((_,i)=><div key={i} style={{flex:1,height:3,borderRadius:2,background:i<=step?'#c9a227':'#141a22',transition:'background .2s'}}/>)}</div>
       <div style={{fontSize:'.7rem',color:'#4a5568',textAlign:'center',marginBottom:20}}>Step {step+1} of {STEPS.length} — {STEPS[step]}</div>
       <div style={{background:'#0a0d10',border:'1px solid #1e2530',borderRadius:12,padding:24,marginBottom:16}}>
-        {step===0&&<div>
+        {STEPS[step]==='Personal Info'&&<div>
           {providerCollectsPii
             ? <div style={{background:'rgba(201,162,39,.06)',border:'1px solid rgba(201,162,39,.2)',borderRadius:8,padding:'8px 12px',marginBottom:14,fontSize:'.72rem',color:'#c9a227',display:'flex',gap:6}}><Lock size={12} style={{flexShrink:0,marginTop:1}}/> Sensitive details (SSN) are collected securely by Checkr, our screening partner — never by this form</div>
             : <div style={{background:'rgba(239,68,68,.06)',border:'1px solid rgba(239,68,68,.2)',borderRadius:8,padding:'8px 12px',marginBottom:14,fontSize:'.72rem',color:'#ef4444',display:'flex',gap:6}}><Lock size={12} style={{flexShrink:0,marginTop:1}}/> SSN encrypted with AES-256 — never stored in plaintext</div>}
@@ -452,37 +470,12 @@ export function BackgroundCheckPage() {
             <div><label style={lbl}>Last Name *</label><input style={{...inp,borderColor:form.lastName&&!validName(form.lastName)?'#ef4444':undefined}} value={form.lastName} onChange={e=>set('lastName',e.target.value.replace(/[^a-zA-Z\-' ]/g,''))} placeholder="Smith"/></div>
           </div>
           <div style={{marginBottom:10}}><label style={lbl}>Date of Birth * (18+)</label><input style={{...inp,borderColor:form.dob&&!validDob?'#ef4444':undefined,colorScheme:'dark',cursor:'pointer'}} type="date" value={form.dob} onChange={e=>set('dob',e.target.value)} max={minDob.toISOString().split('T')[0]}/>{form.dob&&!validDob&&<div style={{color:'#ef4444',fontSize:'.68rem',marginTop:3}}>Must be at least 18 years old</div>}</div>
-          <div style={{marginBottom:10}}><label style={lbl}>Email Address *</label><input style={inp} type="email" value={form.email} onChange={e=>set('email',e.target.value)} placeholder="jane@email.com" required/></div>
-          <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:10}}>
-            <div><label style={lbl}>Password *</label><input style={inp} type="password" value={form.password} onChange={e=>set('password',e.target.value)} placeholder="Min 8 characters"/></div>
-            <div><label style={lbl}>Confirm Password *</label><input style={{...inp,borderColor:form.password&&form.confirmPassword&&form.password!==form.confirmPassword?'#ef4444':undefined}} type="password" value={(form as any).confirmPassword||''} onChange={e=>set('confirmPassword',e.target.value)} placeholder="Repeat password"/></div>
-          </div>
           {!providerCollectsPii&&<div><label style={lbl}>Social Security Number *</label><div style={{position:'relative'}}><input style={{...inp,borderColor:form.ssn&&!validSsn?'#ef4444':undefined}} type="text" inputMode="numeric" value={ssnDisplay()} onChange={e=>{const d=e.target.value.replace(/\D/g,'');set('ssn',d.slice(0,9))}} onFocus={()=>setShowSsn(true)} onBlur={()=>setShowSsn(false)} placeholder="XXX-XX-XXXX"/><span style={{position:'absolute',right:10,top:'50%',transform:'translateY(-50%)',fontSize:'.75rem',color:'#4a5568',cursor:'pointer'}} onClick={()=>setShowSsn(s=>!s)}>{showSsn?'🙈':'👁'}</span></div>{form.ssn&&!validSsn&&<div style={{color:'#ef4444',fontSize:'.68rem',marginTop:3}}>{ssnDigits.length<9?(9-ssnDigits.length)+' more digits required':'Invalid SSN format'}</div>}{validSsn&&<div style={{color:'#22c55e',fontSize:'.68rem',marginTop:3}}>✓ Format verified — stored encrypted</div>}</div>}
         </div>}
-        {step===1&&<div>
-          {!userCoords && !locationDenied && (
-            <div style={{marginBottom:12,padding:'10px 14px',background:'rgba(201,162,39,.06)',border:'1px solid rgba(201,162,39,.2)',borderRadius:8,fontSize:'.75rem',color:'#c9a227',display:'flex',alignItems:'center',gap:8}}>
-              <span>📍</span> Allow location access for more accurate address suggestions
-            </div>
-          )}
-          {locationDenied && (
-            <div style={{marginBottom:12,padding:'8px 14px',background:'rgba(74,86,104,.08)',border:'1px solid #1e2530',borderRadius:8,fontSize:'.72rem',color:'#4a5568'}}>
-              Location access denied — type your full address including city and state for best results
-            </div>
-          )}
-          <div style={{marginBottom:10,position:'relative'}}>
+        {STEPS[step]==='Address'&&<div>
+          <div style={{marginBottom:10}}>
             <label style={lbl}>Street Address *</label>
-            <input style={{...inp,borderColor:addrVerified?'#22c55e':addrWarn?'#f59e0b':undefined}} value={form.street1} onChange={e=>{const v=e.target.value;set('street1',v);setAddrVerified(false);setAddrWarn(false);clearTimeout(searchTimer.current);searchTimer.current=setTimeout(()=>{console.log('[SEARCH] calling searchAddr with:', v);searchAddr(v)},250)}} onBlur={()=>setTimeout(()=>setShowSugg(false),400)} placeholder="2843 East Frontage Rd"/>
-            {showSugg&&suggestions.length>0&&(
-              <div style={{position:'absolute',top:'100%',left:0,right:0,background:'#0f1319',border:'1px solid #1e2530',borderRadius:8,zIndex:100,overflow:'hidden',boxShadow:'0 8px 24px rgba(0,0,0,.5)'}}>
-                {suggestions.slice(0,5).map((s,i)=>(
-                  <div key={i} onMouseDown={()=>pickSuggestion(s)} style={{padding:'9px 12px',cursor:'pointer',borderBottom:i<4?'1px solid #1e2530':'none'}} onMouseEnter={e=>(e.currentTarget as HTMLElement).style.background='#1a2030'} onMouseLeave={e=>(e.currentTarget as HTMLElement).style.background=''}>
-                    <div style={{fontSize:'.8rem',fontWeight:600,color:'#eef1f8'}}>{s.placeName ? s.placeName.split(',')[0] : s.text || ''}</div>
-                    <div style={{fontSize:'.7rem',color:'#4a5568',marginTop:2}}>{s.placeName ? s.placeName.split(',').slice(1,3).join(',').trim() : ''}</div>
-                  </div>
-                ))}
-              </div>
-            )}
+            <input style={{...inp,borderColor:addrVerified?'#22c55e':addrWarn?'#f59e0b':undefined}} value={form.street1} onChange={e=>{set('street1',e.target.value);setAddrVerified(false);setAddrWarn(false)}} placeholder="2843 East Frontage Rd"/>
             <div style={{minHeight:18,marginTop:4}}>
               {addrChecking&&<div style={{fontSize:'.7rem',color:'#4a5568'}}>Verifying address...</div>}
               {addrVerified&&!addrChecking&&<div style={{fontSize:'.72rem',color:'#22c55e'}}>✓ Address verified</div>}
@@ -497,7 +490,7 @@ export function BackgroundCheckPage() {
           </div>
           <div><label style={lbl}>Years at Address</label><input style={inp} type="number" min="0" value={form.years} onChange={e=>set('years',e.target.value)} placeholder="2"/></div>
         </div>}
-        {step===2&&<div>
+        {STEPS[step]==='Employment'&&<div>
           <div style={{marginBottom:10}}><label style={lbl}>Income Source *</label><select style={inp} value={form.empStatus} onChange={e=>set('empStatus',e.target.value)}>{[['employed','Employment — Full-time'],['part_time','Employment — Part-time'],['self_employed','Self-Employment / Business'],['retired','Retirement / Pension'],['ssi_ssdi','SSI / SSDI / Disability'],['investment','Investment / Passive Income'],['student','Student Loans / Grants'],['other','Other Income Source']].map(([v,l])=><option key={v} value={v}>{l}</option>)}</select></div>
           {['employed','part_time','self_employed'].includes(form.empStatus)&&<>
             <div style={{marginBottom:10}}><label style={lbl}>Employer Name *</label><input style={{...inp,borderColor:form.employer===''&&['employed','part_time','self_employed'].includes(form.empStatus)?'#ef4444':undefined}} value={form.employer} onChange={e=>set('employer',e.target.value)} placeholder="Acme Corp"/></div>
@@ -557,7 +550,7 @@ export function BackgroundCheckPage() {
                 {form.prevName&&!form.prevPhone&&<div style={{color:'#ef4444',fontSize:'.68rem',marginTop:3}}>Required if previous landlord provided</div>}
               </div><div><label style={lbl}>Email</label><input style={inp} type="email" value={form.prevEmail} onChange={e=>set('prevEmail',e.target.value)}/></div></div></div>
         </div>}
-        {step===3&&<div>
+        {STEPS[step]==='ID Upload'&&<div>
           {providerCollectsPii
             ? <div style={{fontSize:'.82rem',color:'#b8c4d8',marginBottom:16,lineHeight:1.6}}>Identity verification is handled by Checkr, our screening partner, during their secure application step. Uploading an ID here is <strong style={{color:'#c9a227'}}>optional</strong> — it can speed up your landlord's review.</div>
             : <div style={{fontSize:'.82rem',color:'#b8c4d8',marginBottom:16,lineHeight:1.6}}>Upload a photo of your government-issued ID (driver's license, state ID, or passport). <strong style={{color:'#c9a227'}}>Required.</strong> Your name will be verified against this document.</div>}
@@ -595,8 +588,10 @@ export function BackgroundCheckPage() {
               and the submit route ignored the result. ID is verified manually
               by staff downstream. */}
         </div>}
-        {step===4&&<div>
-          {[{k:'consentCredit',l:'Credit Check',b:'I authorize my landlord and/or GAM to obtain a consumer credit report as part of my rental application.'},{k:'consentCriminal',l:'Criminal Background Check',b:'I authorize my landlord and/or GAM to conduct a criminal background check. All information I have provided is true and accurate.'}].map(consent=>(
+        {STEPS[step]==='Consent'&&<div>
+          {providerCollectsPii
+            ? <div style={{background:'rgba(201,162,39,.06)',border:'1px solid rgba(201,162,39,.2)',borderRadius:8,padding:'10px 14px',marginBottom:14,fontSize:'.75rem',color:'#b8c4d8',lineHeight:1.5}}>Your credit &amp; criminal screening authorization is collected securely by <strong style={{color:'#c9a227'}}>Checkr</strong>, our screening partner, on the next step (after payment). Here we just need the items below.</div>
+            : [{k:'consentCredit',l:'Credit Check',b:'I authorize my landlord and/or GAM to obtain a consumer credit report as part of my rental application.'},{k:'consentCriminal',l:'Criminal Background Check',b:'I authorize my landlord and/or GAM to conduct a criminal background check. All information I have provided is true and accurate.'}].map(consent=>(
             <label key={consent.k} style={{display:'flex',alignItems:'flex-start',gap:12,cursor:'pointer',marginBottom:14,padding:'14px 16px',background:(form as any)[consent.k]?'rgba(34,197,94,.06)':'#141a22',border:'1px solid '+((form as any)[consent.k]?'rgba(34,197,94,.25)':'#1e2530'),borderRadius:10}}>
               <input type="checkbox" checked={(form as any)[consent.k]} onChange={e=>set(consent.k,e.target.checked)} style={{width:18,height:18,marginTop:2,flexShrink:0}}/>
               <div><div style={{fontSize:'.82rem',fontWeight:700,color:'#eef1f8',marginBottom:4}}>{consent.l}</div><div style={{fontSize:'.75rem',color:'#4a5568',lineHeight:1.5}}>{consent.b}</div></div>
@@ -623,7 +618,7 @@ export function BackgroundCheckPage() {
             </label>
             <div style={{padding:'10px 14px',background:'#141a22',border:'1px solid #1e2530',borderRadius:8,fontSize:'.72rem',color:'#4a5568',lineHeight:1.5}}>By continuing I certify all information provided is accurate. Providing false information is grounds for immediate denial.</div>
         </div>}
-        {step===5&&<div style={{textAlign:'center'}}>
+        {STEPS[step]==='Review & Pay'&&<div style={{textAlign:'center'}}>
           <div style={{fontSize:'2rem',marginBottom:8}}>🛡️</div>
           <div style={{fontSize:'1.1rem',fontWeight:800,color:'#eef1f8',marginBottom:6}}>Review & Pay</div>
           <div style={{fontSize:'.82rem',color:'#4a5568',marginBottom:16}}>You pay for your own screening. {providerCollectsPii ? 'After payment, Checkr emails you a secure link to finish identity verification — a quick photo of your ID and a selfie, right from your phone.' : ''}</div>
@@ -664,7 +659,7 @@ export function BackgroundCheckPage() {
       </div>
       <div style={{display:'flex',gap:10}}>
         <button onClick={()=>step>0&&setStep(s=>s-1)} disabled={step===0} style={{padding:'10px 20px',borderRadius:8,border:'1px solid #1e2530',background:'transparent',color:step===0?'#4a5568':'#b8c4d8',cursor:step===0?'not-allowed':'pointer',fontSize:'.85rem'}}>← Back</button>
-        {step<STEPS.length-1?<button onClick={()=>setStep(s=>s+1)} disabled={!canNext[step]} style={{flex:1,padding:'12px',borderRadius:8,border:'none',background:canNext[step]?'#c9a227':'#141a22',color:canNext[step]?'#060809':'#4a5568',fontWeight:700,cursor:canNext[step]?'pointer':'not-allowed',fontSize:'.88rem'}}>Continue →</button>:<button onClick={()=>submitMut.mutate()} disabled={!paid||submitMut.isLoading} style={{flex:1,padding:'12px',borderRadius:8,border:'none',background:paid?'#c9a227':'#141a22',color:paid?'#060809':'#4a5568',fontWeight:700,cursor:paid?'pointer':'not-allowed',fontSize:'.88rem'}}>{submitMut.isLoading?'Submitting...':'🔒 Submit Application'}</button>}
+        {step<STEPS.length-1?<button onClick={()=>setStep(s=>s+1)} disabled={!canNext[STEPS[step]]} style={{flex:1,padding:'12px',borderRadius:8,border:'none',background:canNext[STEPS[step]]?'#c9a227':'#141a22',color:canNext[STEPS[step]]?'#060809':'#4a5568',fontWeight:700,cursor:canNext[STEPS[step]]?'pointer':'not-allowed',fontSize:'.88rem'}}>Continue →</button>:<button onClick={()=>submitMut.mutate()} disabled={!paid||submitMut.isLoading} style={{flex:1,padding:'12px',borderRadius:8,border:'none',background:paid?'#c9a227':'#141a22',color:paid?'#060809':'#4a5568',fontWeight:700,cursor:paid?'pointer':'not-allowed',fontSize:'.88rem'}}>{submitMut.isLoading?'Submitting...':'🔒 Submit Application'}</button>}
       </div>
     </div>
   )

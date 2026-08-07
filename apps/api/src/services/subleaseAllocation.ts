@@ -68,6 +68,11 @@ export async function creditSublessorMarkupForPayment(paymentId: string): Promis
   )
   if (!sublease) return
 
+  // The markup credited to the sublessor is sub_monthly_amount − master_share_amount.
+  // S581: these amounts are IMMUTABLE after sublease creation (no route updates
+  // them), so this equals the sublease_markup_amount stamped on the payment at pay
+  // time — the same figure services/allocation.ts nets out of the landlord's
+  // owner_share. So "removed from the landlord == credited to the sublessor" holds.
   const sub = Number(sublease.sub_monthly_amount)
   const master = Number(sublease.master_share_amount)
   const markup = Math.round((sub - master) * 100) / 100

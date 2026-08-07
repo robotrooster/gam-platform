@@ -64,6 +64,7 @@ import { telemetryRouter } from './routes/telemetry'
 import { leasesRouter }       from './routes/leases'
 import { homeSaleRouter }     from './routes/homeSale'
 import { homeOwnershipRouter } from './routes/homeOwnership'
+import { residentHomeSaleRouter } from './routes/residentHomeSale'
 import { lotRentRouter }      from './routes/lotRent'
 import { expensesRouter }     from './routes/expenses'
 import { bankReconciliationRouter } from './routes/bankReconciliation'
@@ -81,6 +82,7 @@ import { documentsRouter }    from './routes/documents'
 import { utilityRouter }      from './routes/utility'
 import { propaneRouter }      from './routes/propane'
 import { adminRouter }        from './routes/admin'
+import { portfolioRouter }    from './routes/portfolio'
 import { webhooksRouter }     from './routes/webhooks'
 import { stripeRouter }       from './routes/stripe'
 import { workTradeRouter }    from './routes/workTrade'
@@ -318,6 +320,7 @@ app.use('/api',               telemetryRouter)
 app.use('/api/leases',        leasesRouter)
 app.use('/api/home-sales',    homeSaleRouter)
 app.use('/api/home-ownerships', homeOwnershipRouter)
+app.use('/api/resident-home-sales', residentHomeSaleRouter)
 app.use('/api/lot-rent',      lotRentRouter)
 app.use('/api/expenses',      expensesRouter)
 app.use('/api/bank-reconciliations', bankReconciliationRouter)
@@ -335,6 +338,7 @@ app.use('/api/documents',     documentsRouter)
 app.use('/api/utility',       utilityRouter)
 app.use('/api/propane',       propaneRouter)
 app.use('/api/admin',         adminRouter)
+app.use('/api/portfolio',     portfolioRouter)  // S592: PM-scoped surface (allow-list)
 app.use('/api/work-trade',    workTradeRouter)
 app.use('/api/stripe',        stripeRouter)
 app.use('/api/pos',           posRouter)

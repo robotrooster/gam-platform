@@ -543,42 +543,32 @@ booksRouter.patch('/vendors/:id', requireBooksWrite, async (req, res, next) => {
 // PAYROLL RUNS
 // ════════════════════════════════════════
 
-// Tax calculation helper.
-// statePct is read off the employee's state_withholding_pct column;
-// the math here treats it as a flat percent, which works for any
-// state with a flat rate (or as an approximation for tiered states
-// at the per-payroll level — landlord configures the rate on the
-// employee row). State-specific quarterly forms (CA DE-9, NY NYS-45,
-// AZ A1-QRT, etc.) are NOT generated here — they live in the
-// landlord-configurable tax-form catalog (S91).
-function calcTaxes(grossPay: number, filingStatus: string, statePct: number, ytdGross: number) {
-  // Federal withholding — simplified % by filing status (production would use IRS tables)
-  const fedRates: Record<string, number> = {
-    single: 0.12, married: 0.10, married_higher: 0.12, head_of_household: 0.10
-  }
-  const fedRate = fedRates[filingStatus] || 0.12
-  const federalTax = Math.max(0, grossPay * fedRate)
-
+// Payroll tax helper.
+// S592 (Nic): federal + state income-tax withholding are ENTERED BY THE
+// BOOKKEEPER per employee — GAM does NOT compute income-tax withholding, so it
+// stays out of tax-withholding decisions (and the friction/liability of getting
+// IRS/state tables wrong). Social Security (6.2% up to the annual wage base) and
+// Medicare (1.45% + 0.9% over $200k) ARE auto-computed here: those are fixed
+// statutory rates, identical for everyone, so calculating them is arithmetic,
+// not a withholding judgment. Net = gross − federal − state − SS − Medicare.
+// State-specific quarterly forms (CA DE-9, NY NYS-45, AZ A1-QRT, etc.) are NOT
+// generated here — they live in the landlord-configurable tax-form catalog (S91).
+function payrollTaxes(grossPay: number, ytdGross: number, federalTax: number, stateTax: number) {
   // Social Security: 6.2% up to $168,600 annual wage base
   const SS_WAGE_BASE = 168600
   const ssEligible = Math.max(0, Math.min(grossPay, SS_WAGE_BASE - ytdGross))
-  const ssTax = ssEligible * 0.062
+  const ssTax = +(ssEligible * 0.062).toFixed(2)
 
   // Medicare: 1.45% (+ 0.9% over $200k)
-  const medicareTax = grossPay * 0.0145 + (ytdGross + grossPay > 200000 ? grossPay * 0.009 : 0)
+  const medicareTax = +(grossPay * 0.0145 + (ytdGross + grossPay > 200000 ? grossPay * 0.009 : 0)).toFixed(2)
 
-  // State withholding — flat-percent applied to gross
-  const stateTax = grossPay * (statePct / 100)
+  // Federal + state: bookkeeper-supplied dollar amounts (default 0 if omitted).
+  const fed   = +(Math.max(0, +federalTax || 0)).toFixed(2)
+  const state = +(Math.max(0, +stateTax   || 0)).toFixed(2)
 
-  const netPay = grossPay - federalTax - ssTax - medicareTax - stateTax
+  const netPay = +(grossPay - fed - state - ssTax - medicareTax).toFixed(2)
 
-  return {
-    federalTax: +federalTax.toFixed(2),
-    ssTax: +ssTax.toFixed(2),
-    medicareTax: +medicareTax.toFixed(2),
-    stateTax: +stateTax.toFixed(2),
-    netPay: +netPay.toFixed(2),
-  }
+  return { federalTax: fed, stateTax: state, ssTax, medicareTax, netPay }
 }
 
 // GET /api/books/payroll/runs
@@ -623,7 +613,10 @@ booksRouter.get('/payroll/runs/:id', requireBooksRead, async (req, res, next) =>
 booksRouter.post('/payroll/runs', requireBooksWrite, async (req, res, next) => {
   try {
     const { col, id: lid } = ownerScope(req.user)
-    const { periodStart, periodEnd, payDate, payFrequency, employeeIds, hoursMap = {} } = req.body
+    // taxMap: bookkeeper-entered withholding per employee — { [employeeId]:
+    // { federal, state } }. Absent employees default to 0 withholding (SS +
+    // Medicare are still auto-computed).
+    const { periodStart, periodEnd, payDate, payFrequency, employeeIds, hoursMap = {}, taxMap = {} } = req.body
     if (!periodStart || !periodEnd || !payDate || !payFrequency || !employeeIds?.length)
       throw new AppError(400, 'periodStart, periodEnd, payDate, payFrequency, employeeIds required')
 
@@ -662,7 +655,11 @@ booksRouter.post('/payroll/runs', requireBooksWrite, async (req, res, next) => {
         }
         grossPay = +grossPay.toFixed(2)
 
-        const taxes = calcTaxes(grossPay, emp.filing_status || 'single', +emp.state_withholding_pct || 0, +emp.ytd_gross || 0)
+        const empTax = (taxMap as Record<string, any>)[emp.id] || {}
+        const taxes = payrollTaxes(grossPay, +emp.ytd_gross || 0, +empTax.federal || 0, +empTax.state || 0)
+        if (taxes.netPay < 0) {
+          throw new AppError(400, `Withholding entered for ${emp.first_name} ${emp.last_name} exceeds their gross pay`)
+        }
 
         await client.query(
           `INSERT INTO payroll_run_lines
@@ -862,64 +859,14 @@ booksRouter.get('/bookkeeper/all', requireLandlord, async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
-// POST /api/books/bookkeeper/invite — admin/landlord: create bookkeeper user + scope rows
-// Direct-create variant (sets a password rather than emailing an invite).
-// Use POST /api/scopes/bookkeeper/invite for the standard invitation
-// token flow with email delivery.
-// S131: stays requireLandlord. Granting bookkeeper access is the
-// landlord's call, not delegable to a PM (today). If a landlord wants
-// the PM to onboard their bookkeeper, that's a future product call.
-booksRouter.post('/bookkeeper/invite', requireLandlord, async (req, res, next) => {
-  try {
-    if (req.user?.role !== 'admin' && req.user?.role !== 'super_admin' && req.user?.role !== 'landlord')
-      throw new AppError(403, 'Admin or Landlord required')
-
-    const { email, firstName, lastName, password, landlordIds, accessLevel } = req.body
-    if (!email || !firstName || !lastName || !password)
-      throw new AppError(400, 'email, firstName, lastName, password required')
-
-    // S385 fix: cross-landlord scope-grant blocker. Pre-fix, a landlord
-    // could pass landlordIds = [<other-landlord-id>] and create a
-    // bookkeeper_scopes row granting a proxy bookkeeper access to a
-    // landlord they don't own. Admins retain cross-landlord authority.
-    if (req.user.role === 'landlord') {
-      const ownId = req.user.profileId
-      const ids = Array.isArray(landlordIds) ? landlordIds : []
-      if (ids.some(id => id !== ownId)) {
-        throw new AppError(403, 'Landlords can only assign bookkeepers to their own books')
-      }
-    }
-
-    const level = (accessLevel === 'read_write' ? 'read_write' : 'read_only') as 'read_only' | 'read_write'
-
-    const bcrypt = require('bcryptjs')
-    const hash = await bcrypt.hash(password, 12)
-    const client = await db.connect()
-    try {
-      await client.query('BEGIN')
-      const { rows: [user] } = await client.query(
-        `INSERT INTO users (email, password_hash, role, first_name, last_name)
-         VALUES ($1,$2,'bookkeeper',$3,$4)
-         ON CONFLICT (email) DO UPDATE SET role='bookkeeper', first_name=$3, last_name=$4
-         RETURNING id, email, first_name, last_name, role`,
-        [email, hash, firstName, lastName]
-      )
-      const assigned: string[] = []
-      for (const lid of (landlordIds || [])) {
-        await client.query(
-          `INSERT INTO bookkeeper_scopes (user_id, landlord_id, access_level)
-           VALUES ($1,$2,$3)
-           ON CONFLICT (user_id, landlord_id) DO UPDATE SET access_level=EXCLUDED.access_level, updated_at=NOW()`,
-          [user.id, lid, level]
-        )
-        assigned.push(lid)
-      }
-      await client.query('COMMIT')
-      res.status(201).json({ success: true, data: { user, clientsAssigned: assigned.length } })
-    } catch (e) { await client.query('ROLLBACK'); throw e }
-    finally { client.release() }
-  } catch (e) { next(e) }
-})
+// POST /api/books/bookkeeper/invite — REMOVED S592 (Nic). This was a
+// direct-create variant that set a password FOR the bookkeeper. A bookkeeper
+// must set their OWN password via the email-link invite, and the LANDLORD owns
+// that relationship — so bookkeepers are now invited from the landlord Team page
+// (apps/landlord TeamPage → POST /api/scopes/bookkeeper/invite → accept page).
+// GAM admins no longer provision bookkeeper accounts. Attaching an EXISTING
+// bookkeeper to a client still lives at /bookkeeper/assign below (no password,
+// no account creation).
 
 // POST /api/books/bookkeeper/assign — assign existing bookkeeper to a landlord
 // S131: stays requireLandlord. Same posture as /bookkeeper/invite —
@@ -936,6 +883,14 @@ booksRouter.post('/bookkeeper/assign', requireLandlord, async (req, res, next) =
     if (req.user.role === 'landlord' && landlordId !== req.user.profileId) {
       throw new AppError(403, 'Landlords can only assign bookkeepers to their own books')
     }
+    // S592 ([[gam-foreign-ref-write-scope]]): the target MUST already be a
+    // bookkeeper. Pre-fix, any user id was accepted, writing a bookkeeper_scopes
+    // row against an arbitrary user (e.g. a tenant). That row is dormant while
+    // their role isn't 'bookkeeper', but if they later became one they'd inherit
+    // access nobody re-granted — so reject a non-bookkeeper target up front.
+    const bk = await queryOne<{ id: string }>(
+      `SELECT id FROM users WHERE id=$1 AND role='bookkeeper'`, [bookkeeperUserId])
+    if (!bk) throw new AppError(404, 'Bookkeeper not found')
     const level = (accessLevel === 'read_write' ? 'read_write' : 'read_only')
     const { rows: [access] } = await db.query(
       `INSERT INTO bookkeeper_scopes (user_id, landlord_id, access_level)

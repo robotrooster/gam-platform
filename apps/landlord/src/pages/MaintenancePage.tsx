@@ -211,7 +211,7 @@ function RequestDetailModal({ request: r, onClose }: { request: any; onClose: ()
                 <div style={{ display: 'flex', gap: 6 }}>
                   <select
                     className="input"
-                    value={editAssignee || req.contractorId || ''}
+                    value={editAssignee || req.assignedTo || ''}
                     onChange={e => setEditAssignee(e.target.value)}
                     style={{ flex: 1, fontSize: '.78rem' }}
                   >
@@ -227,7 +227,7 @@ function RequestDetailModal({ request: r, onClose }: { request: any; onClose: ()
                     onClick={() => updateMut.mutate({
                       assignedTo: editAssignee || null,
                     })}
-                    disabled={editAssignee === (req.contractorId || '')}
+                    disabled={editAssignee === (req.assignedTo || '')}
                     title="Save assignment"
                   ><Check size={12} /></button>
                 </div>

@@ -60,6 +60,14 @@ export interface PayTarget {
   // S537: pay-balance sends the tenant-chosen amount in the body (FIFO
   // application server-side). Per-row endpoints ignore it.
   sendAmountInBody?: boolean
+  // S581: pay-balance scopes the charge to one lease (each lease is its own
+  // ACH/card charge + receipt). Sent when paying a specific lease's balance.
+  leaseId?: string
+  // S581 "Pay all": settle several leases with the ONE chosen method — each
+  // entry becomes its own pay-balance charge (separate PI + receipt + capped
+  // fee). When set, `amount` is the aggregate shown in the header; the per-lease
+  // amounts come from here. Overrides leaseId/sendAmountInBody.
+  batch?: { leaseId: string; amount: number }[]
 }
 
 interface PayResponse {
@@ -202,11 +210,55 @@ export function PayNowModal({
     setSubmitting(true)
     setError(null)
     setSuccess(null)
+    const errMsg = (e: any) =>
+      e?.response?.data?.error?.message ||
+      e?.response?.data?.error ||
+      e?.message ||
+      'Payment failed. Try again or contact support.'
     try {
+      // S581 "Pay all": one method, a separate pay-balance charge per lease.
+      // Fired sequentially so a mid-batch failure leaves the already-charged
+      // leases paid (the whole point — partial success beats all-or-nothing).
+      if (target.batch && target.batch.length > 0) {
+        let paid = 0
+        let firstErr: string | null = null
+        for (const b of target.batch) {
+          try {
+            await apiPost<PayResponse>(target.endpoint, {
+              paymentMethodId:   selectedMethod.id,
+              paymentMethodType: selectedMethod.type,
+              amount:            b.amount,
+              leaseId:           b.leaseId,
+            })
+            paid++
+          } catch (e: any) {
+            if (!firstErr) firstErr = errMsg(e)
+          }
+        }
+        const n = target.batch.length
+        if (paid === n) {
+          setSuccess(
+            selectedMethod.type === 'card'
+              ? `All ${n} leases charged. Receipts emailed.`
+              : `All ${n} payments submitted. ACH typically settles in 3–5 business days.`,
+          )
+          setTimeout(onPaid, 1500)
+        } else if (paid > 0) {
+          // Partial success — refresh so the paid leases drop off and the
+          // tenant can retry only what's left.
+          setError(`${paid} of ${n} paid. ${firstErr ?? 'The rest could not be charged.'} Reopen to retry the remaining lease${n - paid === 1 ? '' : 's'}.`)
+          setTimeout(onPaid, 2600)
+        } else {
+          setError(firstErr ?? 'Payment failed. Try again or contact support.')
+        }
+        return
+      }
+
       const res = await apiPost<PayResponse>(target.endpoint, {
         paymentMethodId:   selectedMethod.id,
         paymentMethodType: selectedMethod.type,
         ...(target.sendAmountInBody ? { amount: target.amount } : {}),
+        ...(target.leaseId ? { leaseId: target.leaseId } : {}),
       })
       const status = (res as any)?.data?.status
       // S534 (Nic): no propane-priority disclosure here — warning the
@@ -224,12 +276,7 @@ export function PayNowModal({
       )
       setTimeout(onPaid, 1500)
     } catch (e: any) {
-      setError(
-        e?.response?.data?.error?.message ||
-          e?.response?.data?.error ||
-          e?.message ||
-          'Payment failed. Try again or contact support.',
-      )
+      setError(errMsg(e))
     } finally {
       setSubmitting(false)
     }

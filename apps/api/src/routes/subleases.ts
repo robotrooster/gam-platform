@@ -536,6 +536,17 @@ subleasesRouter.patch('/:id/terminate', async (req, res, next) => {
       [row.id, reasonPrefix, body.reason],
     )
 
+    // S581: if this sublease was still an open invite (terminated before the
+    // sublessee onboarded), cancel the outstanding invitation too. Otherwise it
+    // stays 'sent' — the invitee could still open the offer and (racing the
+    // accept guard) try to accept a dead sublease.
+    await query(
+      `UPDATE sublessee_invitations
+          SET status = 'cancelled', updated_at = NOW()
+        WHERE sublease_id = $1 AND status = 'sent'`,
+      [row.id],
+    )
+
     // S199: credit-ledger event for early termination. Distinct from
     // the auto-termination cron (sublease_completed_natural) which
     // emits when end_date is reached as planned.

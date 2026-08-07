@@ -93,7 +93,7 @@ export function BankReconciliationPage() {
           <div style={{ marginTop: 12 }}>
             {bankCharges.map(c => (
               <div key={c.id} style={{ fontSize: '.76rem', color: 'var(--text-2)', display: 'flex', justifyContent: 'space-between', padding: '3px 0' }}>
-                <span>{new Date(String(c.expense_date).slice(0, 10) + 'T12:00:00').toLocaleDateString()} · {c.description}</span>
+                <span>{new Date(String(c.expenseDate).slice(0, 10) + 'T12:00:00').toLocaleDateString()} · {c.description}</span>
                 <span>{fmt(c.amount)}</span>
               </div>
             ))}
@@ -124,9 +124,9 @@ export function BankReconciliationPage() {
             <tbody>
               {history.map(r => (
                 <tr key={r.id}>
-                  <td style={{ fontSize: '.8rem' }}>{new Date(String(r.period_start).slice(0, 10) + 'T12:00:00').toLocaleDateString('en-US', { month: 'short', year: 'numeric' })}</td>
-                  <td>{fmt(r.statement_balance)}</td>
-                  <td>{fmt(r.book_balance)}</td>
+                  <td style={{ fontSize: '.8rem' }}>{new Date(String(r.periodStart).slice(0, 10) + 'T12:00:00').toLocaleDateString('en-US', { month: 'short', year: 'numeric' })}</td>
+                  <td>{fmt(r.statementBalance)}</td>
+                  <td>{fmt(r.bookBalance)}</td>
                   <td style={{ color: r.difference === 0 ? 'var(--green)' : 'var(--amber)' }}>{fmt(r.difference)}</td>
                 </tr>
               ))}

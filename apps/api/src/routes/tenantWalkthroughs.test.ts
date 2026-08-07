@@ -69,6 +69,24 @@ describe('tenant walkthroughs', () => {
     expect(res.status).toBe(403)
   })
 
+  it('media-files: only the owning tenant can fetch their media; another tenant 403 (S587)', async () => {
+    const t = await seedTenantOnUnit()
+    await request(buildApp()).post('/api/tenant-walkthroughs/media').set('Authorization', `Bearer ${t.token}`)
+      .attach('file', jpg(), { filename: 'w.jpg', contentType: 'image/jpeg' }).expect(201)
+    const mine = await request(buildApp()).get('/api/tenant-walkthroughs/mine').set('Authorization', `Bearer ${t.token}`)
+    const url: string = mine.body.data[0].file_url
+    expect(url).toMatch(/\/api\/tenant-walkthroughs\/media-files\//)
+
+    // Owning tenant → 200 (the file exists on disk).
+    await request(buildApp()).get(url).set('Authorization', `Bearer ${t.token}`).expect(200)
+
+    // A different tenant → 403 (not their walkthrough).
+    const other = jwt.sign(
+      { userId: '00000000-0000-0000-0000-0000000000a1', role: 'tenant', email: 'o@test.dev', profileId: '00000000-0000-0000-0000-0000000000a2', permissions: {} },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
+    await request(buildApp()).get(url).set('Authorization', `Bearer ${other}`).expect(403)
+  })
+
   it('is immutable — no delete route (404)', async () => {
     const t = await seedTenantOnUnit()
     const res = await request(buildApp())

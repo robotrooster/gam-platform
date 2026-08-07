@@ -431,19 +431,41 @@ export async function generateBillsForMeter(
       reason: `RUBS basis sums to zero (allocation_method=${meter.rubs_allocation_method}) — no bills generated` }
   }
 
-  for (const ub of unitBases) {
-    if (ub.basis === 0) { unitsSkipped++; continue }
+  // S587 (Nic): reconcile rounding so the per-unit bills sum EXACTLY to the pool
+  // charge. Rounding each share to the cent otherwise drops a penny or two per
+  // cycle (e.g. $100 across 3 units = $33.33×3 = $99.99). The leftover (±) is
+  // placed on the LOWEST bill. Fully deterministic — a re-run recomputes the
+  // identical split — so it stays safe with the engine's re-runnable design.
+  // basis-0 units (e.g. a vacant occupant_count unit) never bill; counted as
+  // skipped and excluded from the split.
+  const billable = unitBases.filter(ub => ub.basis > 0)
+  unitsSkipped += unitBases.length - billable.length
+  const alloc = billable.map(ub => {
     const share = ub.basis / totalBasis
+    return {
+      unitId:       ub.unitId,
+      basis:        ub.basis,
+      baseFeeShare: round2(totalBaseFee * share),
+      chargeAmount: round2(totalCharge * share),
+    }
+  })
+  const residual = round2(totalCharge - alloc.reduce((s, a) => s + a.chargeAmount, 0))
+  if (residual !== 0 && alloc.length > 0) {
+    let lo = alloc[0]
+    for (const a of alloc) if (a.chargeAmount < lo.chargeAmount) lo = a
+    lo.chargeAmount = round2(lo.chargeAmount + residual)
+  }
+  for (const a of alloc) {
     const inserted = await tryInsertBill({
-      meterId, unitId: ub.unitId, landlordId,
+      meterId, unitId: a.unitId, landlordId,
       utilityType: meter.utility_type,
       cycleMonth: cycleIso,
       usageAmount: null,
       allocationMethod: meter.rubs_allocation_method,
-      allocationBasis: ub.basis,
+      allocationBasis: a.basis,
       ratePerUnit,
-      baseFeeShare: round2(totalBaseFee * share),
-      chargeAmount: round2(totalCharge * share),
+      baseFeeShare: a.baseFeeShare,
+      chargeAmount: a.chargeAmount,
       taxRatePct,
     })
     if (inserted) billsCreated++

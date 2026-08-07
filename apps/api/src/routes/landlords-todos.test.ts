@@ -332,3 +332,73 @@ describe('GET /api/landlords/me/todos', () => {
     expect(res.body.data.workTrade.length).toBe(0)
   })
 })
+
+// S582: the onboarding control tower — every landlord-blocked onboarding stage
+// surfaces as a to-do so a multi-unit onboard never loses a tenant silently.
+describe('GET /api/landlords/me/todos — onboarding control tower', () => {
+  const types = (res: any) => res.body.data.onboarding.map((o: any) => o.type)
+
+  it('parsed upload → parser_review item + counted', async () => {
+    const f = await seedTFixture()
+    await db.query(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status) VALUES ($1,$2,'parsed')`,
+      [f.landlordId, f.tenantId])
+    const res = await getTodos(f.landlordToken)
+    expect(types(res)).toContain('parser_review')
+    expect(res.body.data.counts.onboarding).toBe(1)
+    expect(res.body.data.counts.total).toBeGreaterThanOrEqual(1)
+  })
+
+  it('accepted but no draft → lease_not_drafted item', async () => {
+    const f = await seedTFixture()
+    await db.query(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, unit_id, accepted_at)
+       VALUES ($1,$2,'not_uploaded',$3, NOW())`,
+      [f.landlordId, f.tenantId, f.unitId])
+    const res = await getTodos(f.landlordToken)
+    expect(types(res)).toContain('lease_not_drafted')
+  })
+
+  it('invite lapsed unaccepted → invite_expired item', async () => {
+    const f = await seedTFixture()
+    await db.query(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, unit_id)
+       VALUES ($1,$2,'not_uploaded',$3)`,
+      [f.landlordId, f.tenantId, f.unitId])
+    // expire the tenant's invite
+    await db.query(
+      `UPDATE users SET tenant_invite_expires_at = NOW() - INTERVAL '1 day'
+        WHERE id = (SELECT user_id FROM tenants WHERE id=$1)`, [f.tenantId])
+    const res = await getTodos(f.landlordToken)
+    expect(types(res)).toContain('invite_expired')
+  })
+
+  it('a still-pending (accepted, not expired) invite is NOT an action item', async () => {
+    const f = await seedTFixture()
+    // accepted, draft already exists → nothing for the landlord to do
+    const doc = await db.query<{ id: string }>(
+      `INSERT INTO lease_documents (landlord_id, unit_id, title, document_type, status)
+       VALUES ($1,$2,'D','original_lease','pending') RETURNING id`, [f.landlordId, f.unitId])
+    await db.query(
+      `INSERT INTO pending_tenant_intents (landlord_id, tenant_id, parser_status, unit_id, accepted_at, draft_document_id)
+       VALUES ($1,$2,'not_uploaded',$3, NOW(), $4)`,
+      [f.landlordId, f.tenantId, f.unitId, doc.rows[0].id])
+    const res = await getTodos(f.landlordToken)
+    expect(res.body.data.onboarding).toEqual([])
+  })
+
+  it('lease drafted + sent, landlord not signed → awaiting_landlord_signature item', async () => {
+    const f = await seedTFixture()
+    const doc = await db.query<{ id: string }>(
+      `INSERT INTO lease_documents (landlord_id, unit_id, title, document_type, status)
+       VALUES ($1,$2,'Lease','original_lease','sent') RETURNING id`, [f.landlordId, f.unitId])
+    await db.query(
+      `INSERT INTO lease_document_signers (document_id, user_id, role, name, email, order_index, token, status)
+       VALUES ($1,$2,'landlord','L L','ll@test.dev',1,$3,'sent')`,
+      [doc.rows[0].id, f.landlordUserId, 'tok-' + doc.rows[0].id])
+    const res = await getTodos(f.landlordToken)
+    const item = res.body.data.onboarding.find((o: any) => o.type === 'awaiting_landlord_signature')
+    expect(item).toBeTruthy()
+    expect(item.href).toBe('/sign/' + doc.rows[0].id)
+  })
+})

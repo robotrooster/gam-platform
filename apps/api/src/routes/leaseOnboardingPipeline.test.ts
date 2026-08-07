@@ -17,6 +17,7 @@ import jwt from 'jsonwebtoken'
 import { randomUUID } from 'crypto'
 import { db } from '../db'
 import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit, seedLateFeeDecision, seedTenant, seedLease } from '../test/dbHelpers'
+import { autoDraftLeasesForUnit } from '../services/leaseOnboarding'
 
 const { emailTenantOnboardedMock } = vi.hoisted(() => ({
   emailTenantOnboardedMock: vi.fn(async (..._a: any[]) => 'msg_mock'),
@@ -97,7 +98,7 @@ async function inviteToken(email: string): Promise<string> {
 }
 
 async function accept(token: string) {
-  return request(buildApp()).post('/api/tenants/accept-invite').send({ token, password: 'password123', acceptedTerms: true })
+  return request(buildApp()).post('/api/tenants/accept-invite').send({ token, password: 'password1234', acceptedTerms: true })
 }
 
 async function draftsForUnit(unitId: string) {
@@ -215,5 +216,47 @@ describe('accept → auto-draft', () => {
     expect(live.length).toBe(1)
     const roles = await signerRoles(live[0].id)
     expect(roles).toContain('co_tenant_2')
+  })
+})
+
+// S582: a draft failure during accept must NOT abort the accept transaction
+// (which would silently roll back the tenant's acceptance) and must NOT fail
+// silently — it's contained in a SAVEPOINT and the landlord is notified.
+describe('accept → auto-draft: draft failure is contained', () => {
+  it('createDocumentRecord throw → no throw, txn survives, landlord notified, acceptance kept', async () => {
+    const f = await seedBase('whole_unit')
+    await seedDefaultTemplate(f.landlordId, 1.5, 12) // resolveDefaultTemplate returns a template
+    const email = `fail-${randomUUID().slice(0, 6)}@x.dev`
+    await onboard(f, email) // creates the unit-bound pending intent (+ user + tenant)
+
+    const client = await db.connect()
+    try {
+      await client.query('BEGIN')
+      // Stamp acceptance in the SAME transaction the auto-draft runs in — this
+      // is what would be lost if the draft failure aborted the whole txn.
+      await client.query(
+        `UPDATE pending_tenant_intents SET accepted_at=NOW() WHERE unit_id=$1 AND resolved_at IS NULL`,
+        [f.unitId])
+
+      const throwingCreateDoc = async () => { throw new Error('template missing required late-fee field') }
+      const res = await autoDraftLeasesForUnit(client as any, f.unitId, throwingCreateDoc)
+
+      // Contained: it did NOT throw, and nothing was drafted.
+      expect(res.draftedDocumentIds).toEqual([])
+      // The transaction is still healthy (SAVEPOINT rollback, not a full abort).
+      const ping = await client.query('SELECT 1 AS ok')
+      expect(ping.rows[0].ok).toBe(1)
+      // Acceptance survives the commit.
+      await client.query('COMMIT')
+    } finally { client.release() }
+
+    const acc = await db.query<{ accepted_at: string | null }>(
+      `SELECT accepted_at FROM pending_tenant_intents WHERE unit_id=$1`, [f.unitId])
+    expect(acc.rows[0].accepted_at).not.toBeNull()
+
+    // Landlord got a visible blocked-draft notification (not a silent dead-end).
+    const notif = await db.query<{ type: string }>(
+      `SELECT type FROM notifications WHERE user_id=$1 AND type='lease_draft_blocked'`, [f.landlordUserId])
+    expect(notif.rows.length).toBeGreaterThanOrEqual(1)
   })
 })

@@ -29,7 +29,7 @@ function SurveyList({ onOpen }: { onOpen: (id: string) => void }) {
           <div style={{ flex: 1 }}>
             <div style={{ fontWeight: 600, color: 'var(--t0)' }}>{s.title}</div>
             {s.description && <div style={{ fontSize: '.78rem', color: 'var(--t3)', marginTop: 2 }}>{s.description}</div>}
-            <div style={{ fontSize: '.74rem', color: 'var(--t3)', marginTop: 3 }}>{s.question_count} question{s.question_count === 1 ? '' : 's'}</div>
+            <div style={{ fontSize: '.74rem', color: 'var(--t3)', marginTop: 3 }}>{s.questionCount} question{s.questionCount === 1 ? '' : 's'}</div>
           </div>
           {s.responded
             ? <span style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: '.74rem', color: '#16a34a', fontWeight: 600 }}><CheckCircle2 size={15} /> Done</span>
@@ -85,7 +85,11 @@ function SurveyForm({ id, onBack }: { id: string; onBack: () => void }) {
             <div style={{ fontWeight: 600, color: 'var(--t0)', marginBottom: 10 }}>
               {i + 1}. {q.prompt} {q.required && <span style={{ color: 'var(--gold)' }}>*</span>}
             </div>
-            {q.question_type === 'multiple_choice' ? (
+            {/* S583: wire format is camelCase (API global camelize) — reading
+                q.question_type made this always false, so multiple-choice
+                questions rendered as a free-text box; the tenant's typed answer
+                then failed the server's "must be one of the options" check. */}
+            {q.questionType === 'multiple_choice' ? (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                 {(Array.isArray(q.options) ? q.options : []).map((o: string) => (
                   <label key={o} style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: '.88rem', color: 'var(--t1)', cursor: 'pointer' }}>

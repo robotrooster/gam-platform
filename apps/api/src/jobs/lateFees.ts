@@ -211,13 +211,22 @@ async function processInvoice(
 ): Promise<void> {
   const today = inv.today_local
 
-  const { rows: rentRows } = await client.query<{ amount: string }>(`
-    SELECT amount::text AS amount
+  // Percent-of-rent late fees base on the FULL month's rent (Nic, S581 — "% of
+  // the whole rent"). SUM the live rent rows rather than grabbing one: a rent
+  // row split by a partial credit becomes a reduced original + a remainder row
+  // that together equal the full rent, and a reversal reopen adds a fresh rent
+  // row alongside the old one. Restricting to pending/processing/settled counts
+  // the current obligation exactly once — it excludes the 'returned' half of a
+  // reopen (double-count) and 'failed'/'paid_via_deposit' artifacts. The old
+  // `LIMIT 1` picked ONE piece arbitrarily (even the already-paid slice),
+  // under-basing the fee whenever the rent had been split.
+  const { rows: rentRows } = await client.query<{ total: string }>(`
+    SELECT COALESCE(SUM(amount), 0)::text AS total
     FROM payments
     WHERE invoice_id = $1 AND type = 'rent'
-    LIMIT 1
+      AND status IN ('pending', 'processing', 'settled')
   `, [inv.invoice_id])
-  const rentAmount = rentRows.length > 0 ? Number(rentRows[0].amount) : 0
+  const rentAmount = Number(rentRows[0].total)
 
   // S558 (Nic): billing = PURE lease-stamp. Every parameter comes from the
   // SIGNED lease (inv.late_fee_*) — the current property policy has NO effect on

@@ -881,37 +881,12 @@ export async function routeMaintenanceNotification(requestId: string) {
       })
     }
 
-    // 4. Multi-unit — notify all affected tenants
-    if (req.affects_multiple_units && req.affected_unit_ids?.length > 0) {
-      // S107: same units.tenant_id drift as sendBulkNotification.
-      // Active-tenant lookup goes through v_unit_occupancy, which gives
-      // the primary tenant per unit when one is occupying.
-      const affectedTenants = await query<any>(`
-        SELECT t.user_id        AS user_id,
-               vuo.primary_email AS email,
-               vuo.primary_phone AS phone,
-               un.unit_number
-        FROM units un
-        JOIN v_unit_occupancy vuo ON vuo.unit_id = un.id
-        JOIN tenants t ON t.id = vuo.primary_tenant_id
-        WHERE un.id = ANY($1::uuid[])
-          AND un.id != $2
-          AND vuo.is_occupied = true`,
-        [req.affected_unit_ids, req.unit_id])
-
-      for (const tenant of affectedTenants) {
-        await createNotification({
-          userId: tenant.user_id,
-          type: 'maintenance_building_notice',
-          title: `Building Maintenance Notice — ${req.property_name}`,
-          body: `Maintenance work affecting your unit: "${req.title}". We'll keep you updated on timing.`,
-          data: { requestId, propertyName: req.property_name },
-          sendEmail: true, emailTo: tenant.email,
-          emailSubject: `Building Maintenance Notice — ${req.property_name}`,
-          emailHtml: `Maintenance work is being performed that may affect Unit ${tenant.unit_number}: "${req.title}". You will be notified of scheduling.`,
-        })
-      }
-    }
+    // (Removed S585: a "multi-unit / building maintenance notice" fan-out that
+    // gated on req.affects_multiple_units + req.affected_unit_ids — columns that
+    // exist in NO schema or migration. SELECT mr.* never produced them, so the
+    // branch was always false = dead code for a feature that was never built.
+    // If building-wide maintenance notices are wanted later, add the columns +
+    // a real UI first, then reinstate.)
   } catch(e) { logger.error({ err: e }, '[NOTIFY] routeMaintenanceNotification:') }
 }
 

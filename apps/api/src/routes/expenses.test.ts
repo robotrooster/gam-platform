@@ -4,6 +4,7 @@ import { describe, it, expect, beforeEach } from 'vitest'
 import express from 'express'
 import request from 'supertest'
 import jwt from 'jsonwebtoken'
+import { randomUUID } from 'crypto'
 import { db } from '../db'
 import { cleanupAllSchema, seedLandlord, seedProperty, seedUnit } from '../test/dbHelpers'
 import { landlordExpensesTotal, unitAllocatedExpenses } from '../services/landlordExpenses'
@@ -48,6 +49,27 @@ describe('landlord expenses', () => {
     expect(res.status).toBe(200)
     expect(res.body.data.unit_id).toBe(f.unitA)
     expect(res.body.data.is_common).toBe(false)
+  })
+
+  it('receipt-files: only the owning landlord fetches a receipt; another landlord 403 (S587)', async () => {
+    const f = await seed()
+    const created = await request(buildApp()).post('/api/expenses').set('Authorization', `Bearer ${f.token}`)
+      .send(mk({ unitId: f.unitA, category: 'repairs', amount: 100, description: 'Parts' })).expect(200)
+    const att = await request(buildApp())
+      .post(`/api/expenses/${created.body.data.id}/receipt`).set('Authorization', `Bearer ${f.token}`)
+      .attach('receipt', Buffer.from('invoice-bytes'), { filename: 'inv.pdf', contentType: 'application/pdf' })
+    expect(att.status).toBe(200)
+    const url: string = att.body.data.receipt_url
+    expect(url).toMatch(/\/api\/expenses\/receipt-files\//)
+
+    // Owning landlord → 200 (the file exists on disk).
+    await request(buildApp()).get(url).set('Authorization', `Bearer ${f.token}`).expect(200)
+
+    // A different landlord → 403 (not their receipt).
+    const other = jwt.sign(
+      { userId: randomUUID(), role: 'landlord', email: 'o@t.dev', profileId: randomUUID(), permissions: {} },
+      process.env.JWT_SECRET!, { expiresIn: '1h' })
+    await request(buildApp()).get(url).set('Authorization', `Bearer ${other}`).expect(403)
   })
 
   it('creates a common expense allocated per unit; unit share = amount / unit count', async () => {

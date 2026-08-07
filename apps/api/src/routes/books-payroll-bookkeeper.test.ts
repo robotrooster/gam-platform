@@ -1,25 +1,23 @@
 /**
  * books.ts slice 3 — S385. Continues the books.ts test arc.
  *
- * Covered routes (10):
+ * Covered routes:
  *   - GET    /api/books/payroll/runs
  *   - GET    /api/books/payroll/runs/:id
- *   - POST   /api/books/payroll/runs              (calculate draft)
+ *   - POST   /api/books/payroll/runs              (calculate draft; S592 manual tax)
  *   - POST   /api/books/payroll/runs/:id/approve  (finalize + YTD update)
  *   - POST   /api/books/payroll/runs/:id/void     (reverse YTD if approved)
  *   - GET    /api/books/bookkeeper/clients
  *   - GET    /api/books/bookkeeper/all
- *   - POST   /api/books/bookkeeper/invite
  *   - POST   /api/books/bookkeeper/assign
  *   - DELETE /api/books/bookkeeper/revoke
  *
- * After this slice: 24 of 40 books.ts routes covered (60%).
+ * S592 (Nic): POST /api/books/bookkeeper/invite was REMOVED — bookkeepers are
+ * now invited by the landlord from their Team page (canonical email-link flow,
+ * /api/scopes/bookkeeper/invite), where the bookkeeper sets their own password.
+ * That block's tests were removed with it.
  *
- * Production bugs fixed in this slice (3):
- *   - **POST /bookkeeper/invite**: landlord caller could pass
- *     landlordIds = [<other-landlord-id>] and create a bookkeeper_scopes
- *     row granting a proxy bookkeeper access to a landlord they don't
- *     own. Cross-landlord privilege escalation.
+ * Production bugs fixed in the S385 arc (retained assign/revoke):
  *   - **POST /bookkeeper/assign**: same flaw — landlord A could assign
  *     any bookkeeper to landlord B's books.
  *   - **DELETE /bookkeeper/revoke**: same flaw — landlord A could
@@ -246,6 +244,65 @@ describe('POST /payroll/runs (calculate draft)', () => {
     expect(Number(res.body.data.lines[0].gross_pay)).toBe(2000)
     expect(Number(res.body.data.lines[0].hours_worked)).toBe(80)
   })
+
+  // S592 (Nic): federal + state withholding are entered by the bookkeeper;
+  // GAM auto-computes only SS + Medicare (fixed statutory rates).
+  it('S592: bookkeeper-entered federal + state stored verbatim; SS/Medicare auto; net correct', async () => {
+    const f = await seedPortfolio()
+    const empId = await seedEmployee(f.landlordAId, { payType: 'salary', payRate: 52000 })
+    const res = await request(buildApp())
+      .post('/api/books/payroll/runs')
+      .set('Authorization', `Bearer ${f.landlordAToken}`)
+      .send({
+        periodStart: '2026-01-01', periodEnd: '2026-01-14',
+        payDate: '2026-01-20', payFrequency: 'biweekly',
+        employeeIds: [empId],
+        taxMap: { [empId]: { federal: 180, state: 40 } },
+      })
+    expect(res.status).toBe(201)
+    const line = res.body.data.lines[0]
+    expect(Number(line.gross_pay)).toBe(2000)
+    expect(Number(line.federal_tax)).toBe(180)  // entered, NOT computed
+    expect(Number(line.state_tax)).toBe(40)      // entered, NOT computed
+    expect(Number(line.ss_tax)).toBe(124)        // 2000 × 6.2% auto
+    expect(Number(line.medicare_tax)).toBe(29)   // 2000 × 1.45% auto
+    expect(Number(line.net_pay)).toBe(1627)      // 2000 − 180 − 40 − 124 − 29
+  })
+
+  it('S592: omitting taxMap defaults federal & state to 0 (SS/Medicare still auto)', async () => {
+    const f = await seedPortfolio()
+    const empId = await seedEmployee(f.landlordAId, { payType: 'salary', payRate: 52000 })
+    const res = await request(buildApp())
+      .post('/api/books/payroll/runs')
+      .set('Authorization', `Bearer ${f.landlordAToken}`)
+      .send({
+        periodStart: '2026-01-01', periodEnd: '2026-01-14',
+        payDate: '2026-01-20', payFrequency: 'biweekly',
+        employeeIds: [empId],
+      })
+    expect(res.status).toBe(201)
+    const line = res.body.data.lines[0]
+    expect(Number(line.federal_tax)).toBe(0)
+    expect(Number(line.state_tax)).toBe(0)
+    expect(Number(line.ss_tax)).toBe(124)
+    expect(Number(line.net_pay)).toBe(2000 - 124 - 29)  // 1847
+  })
+
+  it('S592: withholding exceeding gross → 400', async () => {
+    const f = await seedPortfolio()
+    const empId = await seedEmployee(f.landlordAId, { payType: 'salary', payRate: 52000 })
+    const res = await request(buildApp())
+      .post('/api/books/payroll/runs')
+      .set('Authorization', `Bearer ${f.landlordAToken}`)
+      .send({
+        periodStart: '2026-01-01', periodEnd: '2026-01-14',
+        payDate: '2026-01-20', payFrequency: 'biweekly',
+        employeeIds: [empId],
+        taxMap: { [empId]: { federal: 5000, state: 0 } },  // > 2000 gross
+      })
+    expect(res.status).toBe(400)
+    expect(res.body.error).toMatch(/exceeds their gross pay/i)
+  })
 })
 
 describe('POST /payroll/runs/:id/approve', () => {
@@ -398,76 +455,6 @@ describe('GET /bookkeeper/all', () => {
   })
 })
 
-describe('POST /bookkeeper/invite — S385 cross-landlord fix', () => {
-  it('missing required fields → 400', async () => {
-    const f = await seedPortfolio()
-    const res = await request(buildApp())
-      .post('/api/books/bookkeeper/invite')
-      .set('Authorization', `Bearer ${f.landlordAToken}`)
-      .send({ email: 'x@y.com' })
-    expect(res.status).toBe(400)
-    expect(res.body.error).toMatch(/required/i)
-  })
-
-  it('landlord A inviting bookkeeper into landlord B → 403 (was: cross-tenant grant)', async () => {
-    const f = await seedPortfolio()
-    const res = await request(buildApp())
-      .post('/api/books/bookkeeper/invite')
-      .set('Authorization', `Bearer ${f.landlordAToken}`)
-      .send({
-        email: `bkx-${randomUUID()}@t.dev`, firstName: 'B', lastName: 'K',
-        password: 'longpass1234',
-        landlordIds: [f.landlordBId],  // not landlord A
-        accessLevel: 'read_write',
-      })
-    expect(res.status).toBe(403)
-    expect(res.body.error).toMatch(/their own books/i)
-    // Confirm no scope row was created.
-    const scopes = await db.query(
-      `SELECT id FROM bookkeeper_scopes WHERE landlord_id=$1 AND access_level='read_write'`,
-      [f.landlordBId])
-    expect(scopes.rows.filter((r: any) => r.id).length).toBe(0)
-  })
-
-  it('landlord A inviting bookkeeper into their own landlord A → happy 201', async () => {
-    const f = await seedPortfolio()
-    const email = `bky-${randomUUID()}@t.dev`
-    const res = await request(buildApp())
-      .post('/api/books/bookkeeper/invite')
-      .set('Authorization', `Bearer ${f.landlordAToken}`)
-      .send({
-        email, firstName: 'B', lastName: 'K',
-        password: 'longpass1234',
-        landlordIds: [f.landlordAId],
-        accessLevel: 'read_write',
-      })
-    expect(res.status).toBe(201)
-    expect(res.body.data.clientsAssigned).toBe(1)
-    // Confirm scope row exists.
-    const u = await db.query<{ id: string }>(`SELECT id FROM users WHERE email=$1`, [email])
-    const scopes = await db.query(
-      `SELECT access_level FROM bookkeeper_scopes WHERE user_id=$1 AND landlord_id=$2`,
-      [u.rows[0].id, f.landlordAId])
-    expect(scopes.rows).toHaveLength(1)
-  })
-
-  it('admin can invite into any landlord (retains cross-landlord authority)', async () => {
-    const f = await seedPortfolio()
-    const email = `bkz-${randomUUID()}@t.dev`
-    const res = await request(buildApp())
-      .post('/api/books/bookkeeper/invite')
-      .set('Authorization', `Bearer ${f.adminToken}`)
-      .send({
-        email, firstName: 'B', lastName: 'K',
-        password: 'longpass1234',
-        landlordIds: [f.landlordAId, f.landlordBId],
-        accessLevel: 'read_only',
-      })
-    expect(res.status).toBe(201)
-    expect(res.body.data.clientsAssigned).toBe(2)
-  })
-})
-
 describe('POST /bookkeeper/assign — S385 cross-landlord fix', () => {
   it('landlord A assigning to landlord B → 403', async () => {
     const f = await seedPortfolio()
@@ -495,6 +482,20 @@ describe('POST /bookkeeper/assign — S385 cross-landlord fix', () => {
       `SELECT access_level FROM bookkeeper_scopes WHERE user_id=$1 AND landlord_id=$2`,
       [f.bookkeeperUserId, f.landlordAId])
     expect(scopes.rows[0].access_level).toBe('read_only')
+  })
+
+  // S592: the target must already be a bookkeeper — assigning an arbitrary user
+  // (here landlord A's own user id, into their own books so the scope guard
+  // passes) is rejected, and no dormant scope row is written.
+  it('S592: assigning a NON-bookkeeper user → 404, no scope row', async () => {
+    const f = await seedPortfolio()
+    const res = await request(buildApp())
+      .post('/api/books/bookkeeper/assign')
+      .set('Authorization', `Bearer ${f.landlordAToken}`)
+      .send({ bookkeeperUserId: f.landlordAUserId, landlordId: f.landlordAId, accessLevel: 'read_write' })
+    expect(res.status).toBe(404)
+    const scopes = await db.query(`SELECT id FROM bookkeeper_scopes WHERE user_id=$1`, [f.landlordAUserId])
+    expect(scopes.rows).toHaveLength(0)
   })
 })
 

@@ -131,7 +131,10 @@ describe('login lockout', () => {
     )
     const res = await attemptLogin('d@test.dev', 'rightpass123')
     expect(res.status).toBe(200)
-    expect(typeof res.body.data.token).toBe('string')
+    // S571/S578: universal 2FA — a correct password past an expired lockout
+    // proceeds to the emailed-code step. The failure counter still resets first
+    // (that happens before the 2FA branch), which is what this test guards.
+    expect(res.body.data.requiresEmailOtp).toBe(true)
 
     const state = await readLockoutState(id)
     expect(state.failed_login_count).toBe(0)

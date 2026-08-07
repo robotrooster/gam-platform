@@ -336,6 +336,9 @@ function AdminOnboardingOverview(){
   const{data:stats}=useQuery('onboarding-overview',()=>get<any>('/admin/onboarding/overview'),{enabled:!!user,staleTime:30000,refetchOnWindowFocus:false})
   const{data:tenants=[],isLoading:tLoading}=useQuery<any[]>('admin-tenants',()=>get('/admin/tenants'),{enabled:!!user,staleTime:30000,refetchOnWindowFocus:false})
   const{data:allLandlords=[],isLoading:lLoading}=useQuery<any[]>('onboarding-landlords',()=>get('/landlords'),{enabled:!!user,staleTime:30000,refetchOnWindowFocus:false})
+  // S579: onboarding-speed telemetry — property creation → complete, by lease
+  // source, attributed to the closer. Target is DAYS not weeks.
+  const{data:speed}=useQuery<any>('onboarding-metrics',()=>get<any>('/admin/onboarding-metrics'),{enabled:!!user,staleTime:60000,refetchOnWindowFocus:false})
   // Onboarding = the PM's OWN deals to onboard (closer or CS = them), NOT the
   // self-closed claim pool that /landlords also returns; super sees everyone.
   const landlords=React.useMemo(()=>user?.role==='super_admin'?(allLandlords as any[]):(allLandlords as any[]).filter((l:any)=>l.portfolioManagerId===user?.id||l.serviceManagerId===user?.id),[allLandlords,user])
@@ -364,6 +367,49 @@ function AdminOnboardingOverview(){
       </div>
 
       {resendMsg&&<div className={`alert ${resendMsg.startsWith('Failed')?'ae':'ag'}`} style={{marginBottom:12}}>{resendMsg}</div>}
+
+      {/* S579: onboarding-speed telemetry. Standard is DAYS — slow onboards
+          (dual-software overlap) surface here. */}
+      {speed?.properties?.length>0&&(
+        <div className="kpi" style={{marginBottom:20,cursor:'default'}}>
+          <div style={{display:'flex',alignItems:'baseline',justifyContent:'space-between',marginBottom:10,flexWrap:'wrap',gap:8}}>
+            <div className="kl">Onboarding Speed</div>
+            <div style={{display:'flex',gap:16,fontSize:'.78rem',color:'var(--t2)'}}>
+              <span>Avg <strong style={{color:(speed.summary?.avgDurationDays!=null&&speed.summary.avgDurationDays<=7)?'var(--green)':'var(--gold)'}}>{speed.summary?.avgDurationDays!=null?`${speed.summary.avgDurationDays}d`:'—'}</strong></span>
+              <span>Done <strong style={{color:'var(--t0)'}}>{speed.summary?.completed||0}</strong></span>
+              <span>Ongoing <strong style={{color:'var(--t0)'}}>{speed.summary?.ongoing||0}</strong></span>
+            </div>
+          </div>
+          <div style={{overflowX:'auto'}}>
+            <table style={{width:'100%',borderCollapse:'collapse',fontSize:'.78rem'}}>
+              <thead>
+                <tr style={{textAlign:'left',color:'var(--t2)',borderBottom:'1px solid var(--b1)'}}>
+                  <th style={{padding:'6px 8px'}}>Property</th><th style={{padding:'6px 8px'}}>Landlord</th><th style={{padding:'6px 8px'}}>Closer</th>
+                  <th style={{padding:'6px 8px',textAlign:'right'}}>Units</th><th style={{padding:'6px 8px',textAlign:'right'}}>e-Sign</th><th style={{padding:'6px 8px',textAlign:'right'}}>PDF</th><th style={{padding:'6px 8px',textAlign:'right'}}>Days</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(speed.properties as any[]).map((p:any)=>{
+                  const days=p.durationDays
+                  const ongoing=days==null
+                  const slow=!ongoing&&Number(days)>7
+                  return(
+                    <tr key={p.propertyId} style={{borderBottom:'1px solid var(--b1)'}}>
+                      <td style={{padding:'6px 8px',color:'var(--t0)'}}>{p.propertyName}</td>
+                      <td style={{padding:'6px 8px',color:'var(--t1)'}}>{p.landlordName}</td>
+                      <td style={{padding:'6px 8px',color:'var(--t2)'}}>{p.closerName||'—'}</td>
+                      <td style={{padding:'6px 8px',textAlign:'right',color:'var(--t1)'}}>{p.unitCount}</td>
+                      <td style={{padding:'6px 8px',textAlign:'right',color:'var(--t1)'}}>{p.esignLeaseCount}</td>
+                      <td style={{padding:'6px 8px',textAlign:'right',color:'var(--t1)'}}>{p.importedPdfCount}</td>
+                      <td style={{padding:'6px 8px',textAlign:'right',fontWeight:700,color:ongoing?'var(--gold)':slow?'var(--red)':'var(--green)'}}>{ongoing?'open':`${days}d`}</td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
 
       <div className="grid4" style={{marginBottom:20}}>
         <div className="kpi" style={{cursor:'pointer',borderColor:tab==='landlords'?'var(--gold)':'var(--b1)'}} onClick={()=>setTab('landlords')}>

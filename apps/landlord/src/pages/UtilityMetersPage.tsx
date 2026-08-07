@@ -707,6 +707,9 @@ function PropaneFillModal({ propertyId, units, allowSplits, splitMin, splitFourM
   const [gallons, setGallons] = useState('')
   const [ppg, setPpg] = useState('')
   const [installments, setInstallments] = useState(1)
+  // One stable idempotency key per fill intent (this modal mount). Reused across
+  // any retry/re-click so the server records the fill — and its charge — once.
+  const [clientKey] = useState(() => crypto.randomUUID())
   const { data: taxRates = [] } = useQuery<any[]>(
     ['utility-tax-rates', propertyId], () => apiGet(`/utility/tax-rates?propertyId=${propertyId}`))
   const taxPct = Number((taxRates as any[]).find((r:any)=>r.utilityType==='propane')?.taxRatePct || 0)
@@ -719,7 +722,7 @@ function PropaneFillModal({ propertyId, units, allowSplits, splitMin, splitFourM
   useEffect(() => { if (!splitOpts.includes(installments)) setInstallments(1) }, [gallons, allowSplits])
 
   const mut = useMutation(
-    () => apiPost('/propane/fills', { unitId, gallons: g, pricePerGallon: Number(ppg), installments }),
+    () => apiPost('/propane/fills', { unitId, gallons: g, pricePerGallon: Number(ppg), installments, clientKey }),
     { onSuccess: onClose, onError: (e: any) => toast.error(e?.response?.data?.error || 'Could not record fill') }
   )
 

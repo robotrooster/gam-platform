@@ -65,6 +65,10 @@ interface AFixture {
   landlordId:     string
   adminUserId:    string
   adminToken:     string
+  // S592: deposit-portability is super_admin-only; connect-readiness/accounts +
+  // banking-nudges are portfolio-scoped (a regular admin sees only their own
+  // portfolio), so platform-wide assertions run as super_admin.
+  superAdminToken: string
 }
 
 async function seedAFixture(): Promise<AFixture> {
@@ -76,13 +80,20 @@ async function seedAFixture(): Promise<AFixture> {
       `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
        VALUES ($1, 'x', 'admin', 'A', 'D', TRUE) RETURNING id`,
       [`admin-${randomUUID()}@test.dev`])
+    const superRes = await client.query<{ id: string }>(
+      `INSERT INTO users (email, password_hash, role, first_name, last_name, email_verified)
+       VALUES ($1, 'x', 'super_admin', 'S', 'A', TRUE) RETURNING id`,
+      [`super-${randomUUID()}@test.dev`])
     await client.query('COMMIT')
-    const adminToken = jwt.sign(
-      { userId: adminRes.rows[0].id, role: 'admin', email: 'a@test.dev',
-        profileId: adminRes.rows[0].id, permissions: {} },
+    const sign = (id: string, role: string) => jwt.sign(
+      { userId: id, role, email: 'a@test.dev', profileId: id, permissions: {} },
       process.env.JWT_SECRET!, { expiresIn: '1h' },
     )
-    return { landlordUserId, landlordId, adminUserId: adminRes.rows[0].id, adminToken }
+    return {
+      landlordUserId, landlordId, adminUserId: adminRes.rows[0].id,
+      adminToken:      sign(adminRes.rows[0].id, 'admin'),
+      superAdminToken: sign(superRes.rows[0].id, 'super_admin'),
+    }
   } catch (e) { await client.query('ROLLBACK'); throw e }
   finally { client.release() }
 }
@@ -117,7 +128,7 @@ describe('GET /api/admin/deposit-portability/pending', () => {
     const depositId = await seedPortableDeposit(f)
     const res = await request(buildApp())
       .get('/api/admin/deposit-portability/pending')
-      .set('Authorization', `Bearer ${f.adminToken}`)
+      .set('Authorization', `Bearer ${f.superAdminToken}`)
     expect(res.status).toBe(200)
     expect(res.body.data.length).toBe(1)
     expect(res.body.data[0].id).toBe(depositId)
@@ -132,7 +143,7 @@ describe('POST /api/admin/deposit-portability/:id/mark-transferred', () => {
     const f = await seedAFixture()
     const res = await request(buildApp())
       .post(`/api/admin/deposit-portability/${randomUUID()}/mark-transferred`)
-      .set('Authorization', `Bearer ${f.adminToken}`).send({})
+      .set('Authorization', `Bearer ${f.superAdminToken}`).send({})
     expect(res.status).toBe(404)
   })
 
@@ -143,7 +154,7 @@ describe('POST /api/admin/deposit-portability/:id/mark-transferred', () => {
     await db.query(`UPDATE security_deposits SET portability_status='carried_forward' WHERE id=$1`, [depositId])
     const res = await request(buildApp())
       .post(`/api/admin/deposit-portability/${depositId}/mark-transferred`)
-      .set('Authorization', `Bearer ${f.adminToken}`).send({})
+      .set('Authorization', `Bearer ${f.superAdminToken}`).send({})
     expect(res.status).toBe(409)
     expect(res.body.error).toMatch(/can only mark-transferred from 'pending_transfer'/)
   })
@@ -153,7 +164,7 @@ describe('POST /api/admin/deposit-portability/:id/mark-transferred', () => {
     const depositId = await seedPortableDeposit(f)
     const res = await request(buildApp())
       .post(`/api/admin/deposit-portability/${depositId}/mark-transferred`)
-      .set('Authorization', `Bearer ${f.adminToken}`)
+      .set('Authorization', `Bearer ${f.superAdminToken}`)
       .send({ notes: 'wire confirmed' })
     expect(res.status).toBe(200)
     expect(res.body.data.status).toBe('carried_forward')
@@ -249,7 +260,7 @@ describe('GET /api/admin/connect-readiness/accounts', () => {
 
     const res = await request(buildApp())
       .get('/api/admin/connect-readiness/accounts')
-      .set('Authorization', `Bearer ${f.adminToken}`)
+      .set('Authorization', `Bearer ${f.superAdminToken}`)
     expect(res.status).toBe(200)
     expect(res.body.data.length).toBe(2)
     const types = res.body.data.map((r: any) => r.entity_type).sort()
@@ -266,7 +277,7 @@ describe('GET /api/admin/landlord-banking-nudges', () => {
          ('ll@x.dev', 'unrelated', 'tx', 'sent')`)
     const res = await request(buildApp())
       .get('/api/admin/landlord-banking-nudges')
-      .set('Authorization', `Bearer ${f.adminToken}`)
+      .set('Authorization', `Bearer ${f.superAdminToken}`)
     expect(res.status).toBe(200)
     expect(res.body.data.length).toBe(1)
     expect(res.body.data[0].landlord_email).toBe('ll@x.dev')

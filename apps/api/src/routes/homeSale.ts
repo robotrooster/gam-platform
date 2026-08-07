@@ -12,15 +12,23 @@ import { createHomeSaleContract } from '../services/homeSale'
 export const homeSaleRouter = Router()
 homeSaleRouter.use(requireAuth)
 
+// planType defaults to 'amortized' so existing callers (no planType) are
+// unchanged. 'flat' takes monthlyAmount + numberOfPayments instead of
+// price/interest/term; the handler derives the 0%-amortization inputs from them.
 const createSchema = z.object({
   unitId:             z.string().uuid(),
   leaseId:            z.string().uuid(),
   tenantId:           z.string().uuid(),
-  salePrice:          z.number().positive(),
+  startMonth:         z.string().regex(/^\d{4}-\d{2}-01$/),  // first billing cycle
+  planType:           z.enum(['amortized', 'flat']).default('amortized'),
+  // amortized inputs
+  salePrice:          z.number().positive().optional(),
   downPayment:        z.number().min(0).default(0),
   annualInterestRate: z.number().min(0).max(60).default(0),  // percent
-  termMonths:         z.number().int().positive().max(600),
-  startMonth:         z.string().regex(/^\d{4}-\d{2}-01$/),  // first billing cycle
+  termMonths:         z.number().int().positive().max(600).optional(),
+  // flat inputs
+  monthlyAmount:      z.number().positive().optional(),
+  numberOfPayments:   z.number().int().positive().max(600).optional(),
 })
 
 // POST /api/home-sales — create a financing contract + amortization schedule.
@@ -41,12 +49,37 @@ homeSaleRouter.post('/', requireLandlord, requirePerm('leases.edit'), async (req
     }
     const lease = await queryOne<any>(`SELECT id, landlord_id, unit_id FROM leases WHERE id=$1`, [body.leaseId])
     if (!lease || lease.unit_id !== body.unitId) throw new AppError(400, 'Lease does not belong to this unit')
+    // The buyer must be an active tenant on this lease — never trust an arbitrary
+    // body-supplied tenantId (it becomes the billed obligor on every installment).
+    const onLease = await queryOne<any>(
+      `SELECT 1 FROM v_lease_active_tenants WHERE lease_id=$1 AND tenant_id=$2 LIMIT 1`, [body.leaseId, body.tenantId])
+    if (!onLease) throw new AppError(400, 'Buyer must be an active tenant on this lease.')
+
+    // Resolve the plan into the amortization inputs. A flat plan is 0% interest
+    // with each installment equal to the flat monthly amount; the total sale
+    // price is that amount × the number of payments.
+    let salePrice: number, downPayment: number, annualInterestRate: number, termMonths: number
+    if (body.planType === 'flat') {
+      if (body.monthlyAmount == null || body.numberOfPayments == null)
+        throw new AppError(400, 'A flat plan needs a monthly amount and a number of payments.')
+      salePrice = Math.round(body.monthlyAmount * body.numberOfPayments * 100) / 100
+      downPayment = 0
+      annualInterestRate = 0
+      termMonths = body.numberOfPayments
+    } else {
+      if (body.salePrice == null || body.termMonths == null)
+        throw new AppError(400, 'An amortized plan needs a sale price and a term.')
+      salePrice = body.salePrice
+      downPayment = body.downPayment
+      annualInterestRate = body.annualInterestRate
+      termMonths = body.termMonths
+    }
 
     await client.query('BEGIN')
     const contract = await createHomeSaleContract(client, {
       unitId: body.unitId, leaseId: body.leaseId, tenantId: body.tenantId, landlordId: unit.landlord_id,
-      salePrice: body.salePrice, downPayment: body.downPayment,
-      annualInterestRate: body.annualInterestRate, termMonths: body.termMonths, startMonth: body.startMonth,
+      salePrice, downPayment, annualInterestRate, termMonths, startMonth: body.startMonth,
+      planType: body.planType,
     })
     await client.query('COMMIT')
 
@@ -72,8 +105,12 @@ homeSaleRouter.get('/unit/:unitId', async (req: any, res, next) => {
       `SELECT * FROM home_sale_contracts WHERE unit_id=$1 ORDER BY (status='active') DESC, created_at DESC LIMIT 1`,
       [req.params.unitId])
     if (!contract || contract.status !== 'active') {
-      // Landlord-only setup context. Tenants get null here.
-      if (req.user.role === 'tenant') return res.json({ success: true, data: contract ? { contract, schedule: [] } : null })
+      // Landlord-only setup context. A tenant only ever sees their OWN contract
+      // (even a cancelled/paid-off one) — never another buyer's terms.
+      if (req.user.role === 'tenant') {
+        const ownsIt = !!contract && contract.tenant_id === req.user.profileId
+        return res.json({ success: true, data: ownsIt ? { contract, schedule: [] } : null })
+      }
       const unit = await queryOne<any>(`SELECT id, landlord_id, dwelling_ownership FROM units WHERE id=$1`, [req.params.unitId])
       if (!unit) return res.json({ success: true, data: null })
       if (!canAccessLandlordResource(req.user, unit.landlord_id)) throw new AppError(403, 'Forbidden')

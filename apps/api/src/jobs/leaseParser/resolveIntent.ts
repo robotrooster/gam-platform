@@ -49,13 +49,23 @@ interface IntentRow {
   imported_pdf_url: string | null
 }
 
-interface ResolveResult {
+interface ResolveSuccess {
   leaseId: string
   tenantId: string
   userId: string
   email: string
   activationUrl: string
+  supersededLeaseId?: string | null   // S582: set when this resolve ended a prior active lease
 }
+// S582: when the resolved unit already has an active lease, resolve does NOT
+// silently end it — it returns this so the landlord explicitly confirms, then
+// re-submits with confirmSupersede.
+interface ResolveNeedsConfirm {
+  needsSupersedeConfirm: true
+  supersedeLeaseId: string
+  supersedeTenantName: string | null
+}
+type ResolveResult = ResolveSuccess | ResolveNeedsConfirm
 
 /**
  * S550 (Nic): street-number address safety. Property names repeat in the
@@ -108,6 +118,7 @@ export async function resolveIntent(
   intentId: string,
   landlordId: string,
   landlordOverrides: Partial<ParserOutput>,
+  opts: { confirmSupersede?: boolean } = {},
 ): Promise<ResolveResult> {
   const tenantAppUrl = process.env.TENANT_APP_URL || 'http://localhost:3002'
 
@@ -218,6 +229,28 @@ export async function resolveIntent(
     }
   }
 
+  // S582: NEVER silently end an active lease. If the resolved unit already has
+  // an active lease and the landlord hasn't confirmed, surface it (with the
+  // sitting tenant's name) so they explicitly acknowledge before it's ended —
+  // the actual supersede happens in the txn below once confirmed. (CSV/manual/
+  // Flow-B onboarding BLOCK an occupied unit; the parser migration case is
+  // supersede-on-confirm.)
+  if (!opts.confirmSupersede) {
+    const prior = await queryOne<{ id: string; name: string | null }>(
+      `SELECT l.id,
+              (SELECT u2.first_name || ' ' || u2.last_name
+                 FROM lease_tenants lt JOIN tenants t ON t.id = lt.tenant_id JOIN users u2 ON u2.id = t.user_id
+                WHERE lt.lease_id = l.id AND lt.status = 'active'
+                ORDER BY lt.created_at LIMIT 1) AS name
+         FROM leases l
+        WHERE l.unit_id = $1 AND l.landlord_id = $2 AND l.status = 'active'
+        LIMIT 1`,
+      [unit.id, landlordId])
+    if (prior) {
+      return { needsSupersedeConfirm: true, supersedeLeaseId: prior.id, supersedeTenantName: prior.name }
+    }
+  }
+
   // 5. Begin TX. Everything from here is rolled back on failure.
   const client = await getClient()
   let result: ResolveResult
@@ -307,14 +340,20 @@ export async function resolveIntent(
       )
     }
 
-    // 5c. Close the superseded lease if present
+    // 5c. Close the superseded lease if present.
+    // S582 BUGFIX: was status='ended' (leases) + 'inactive' (lease_tenants) — NEITHER
+    // is a valid CHECK value, so this UPDATE threw a constraint violation on EVERY
+    // supersede, meaning resolving an import into an already-leased unit failed
+    // outright. Use the real terminal values: 'terminated' + terminated_at, and
+    // 'removed' for the tenant rows (matching the lease-end cascade).
     if (oldLeaseToSupersede) {
       await client.query(
-        `UPDATE leases SET status='ended', end_date=COALESCE(end_date, CURRENT_DATE), updated_at=NOW() WHERE id=$1`,
+        `UPDATE leases SET status='terminated', end_date=COALESCE(end_date, CURRENT_DATE),
+                           terminated_at=COALESCE(terminated_at, NOW()), updated_at=NOW() WHERE id=$1`,
         [oldLeaseToSupersede]
       )
       await client.query(
-        `UPDATE lease_tenants SET status='inactive', removed_at=NOW(), removed_reason='superseded' WHERE lease_id=$1 AND status='active'`,
+        `UPDATE lease_tenants SET status='removed', removed_at=NOW(), removed_reason='replaced' WHERE lease_id=$1 AND status='active'`,
         [oldLeaseToSupersede]
       )
     }
@@ -418,7 +457,7 @@ export async function resolveIntent(
     const unitLabel = `${unit.property_name} - Unit ${unit.unit_number}`
     const activationUrl = `${tenantAppUrl}/accept-invite?token=${inviteToken}`
 
-    result = { leaseId, tenantId, userId, email: emailNorm, activationUrl }
+    result = { leaseId, tenantId, userId, email: emailNorm, activationUrl, supersededLeaseId: oldLeaseToSupersede }
 
     // 7. Send activation email (post-commit; failure logged but does not roll back)
     try {

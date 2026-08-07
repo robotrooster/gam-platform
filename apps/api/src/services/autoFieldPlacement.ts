@@ -32,7 +32,11 @@ import { logger } from '../lib/logger'
 const MODEL_URL = process.env.AUTO_FIELD_MODEL_URL || 'http://localhost:8080'
 const MODEL_NAME =
   process.env.AUTO_FIELD_MODEL_NAME || '/Users/nicholasrhoades/models/Hermes-4.3-36B-6bit-mlx'
-const MODEL_TIMEOUT_MS = Number(process.env.AUTO_FIELD_MODEL_TIMEOUT_MS || 120000)
+// S582: placement now runs as a DETACHED job (services/autoFieldJobs.ts), so the
+// Cloudflare ~100s edge timeout no longer applies — the model gets its natural
+// time. This is just a sanity ceiling so a wedged model can't hang a job forever
+// (real runs are ~30s on a 5-page lease). Env-overridable.
+const MODEL_TIMEOUT_MS = Number(process.env.AUTO_FIELD_MODEL_TIMEOUT_MS || 180000)
 const MODEL_ENABLED = (process.env.AUTO_FIELD_MODEL_ENABLED || 'true') !== 'false'
 
 // Tenant signer roles the send-time pruner understands (esign.ts:44,281).
@@ -79,6 +83,10 @@ function columnFor(ctx: string): string | null {
   if (/apartment\s*#|apt\.?\s*#|space no\.?|unit\s*#|lot\s*#/.test(c)) return 'unit_number'
   if (/beginning on|commencing|commence/.test(c)) return 'start_date'
   if (/ending on|ending upon|ending|expir/.test(c)) return 'end_date'
+  // S582: rent-due-day blank ("due on the ___ day of the month", "due date:").
+  // Checked BEFORE rent_amount so "rent is due on the ___" tags the due day, not
+  // the amount. Platform-locked to the 1st + auto-filled downstream.
+  if (/due (on|by) the|day of (the |each )?month|\bdue date\b|payable (on|by) the/.test(c)) return 'rent_due_day'
   if (/installments of|monthly installments|rental rate|monthly rent|first month.?s rent/.test(c)) return 'rent_amount'
   if (/security deposit/.test(c)) return 'security_deposit'
   if (/pet deposit/.test(c)) return 'pet_deposit'
@@ -433,8 +441,11 @@ For EACH target return an object keyed by its id:
 Output STRICT JSON only, no prose:
 { "1": {"keep":true,"fieldType":"text","signerRole":"primary","leaseColumn":"tenant_name","split":"per_tenant","label":"Tenant name"}, ... }`
 
-async function modelClassify(targets: RawTarget[]): Promise<Map<number, Classification> | null> {
-  if (!MODEL_ENABLED || targets.length === 0) return null
+// Classify ONE chunk of targets via the model. Returns a map for the targets it
+// resolved (model tags + per-target heuristic fallback for any the model omits),
+// or null if the model CALL itself fails/times out — the caller then falls back
+// to heuristic for this chunk's targets. Assumes targets.length > 0.
+async function classifyChunk(targets: RawTarget[]): Promise<Map<number, Classification> | null> {
   const allowed = Array.from(VALID_COLUMNS).join(', ')
   const lines = targets.map((t) => {
     const ctx = {
@@ -451,8 +462,8 @@ async function modelClassify(targets: RawTarget[]): Promise<Map<number, Classifi
     lines.join('\n')
 
   // Dev-only cache of the raw model response, keyed by the prompt hash. Lets
-  // iteration on the deterministic sanitize/geometry layers skip the ~100s
-  // model call. Gated by AUTO_FIELD_MODEL_CACHE (a directory); unset in prod.
+  // iteration on the deterministic sanitize/geometry layers skip the model call.
+  // Gated by AUTO_FIELD_MODEL_CACHE (a directory); unset in prod.
   const cacheDir = process.env.AUTO_FIELD_MODEL_CACHE
   const cacheKey = crypto.createHash('sha256').update(MODEL_SYSTEM + '\n' + user).digest('hex').slice(0, 32)
   const cacheFile = cacheDir ? path.join(cacheDir, `afp_${cacheKey}.json`) : null
@@ -491,19 +502,37 @@ async function modelClassify(targets: RawTarget[]): Promise<Map<number, Classifi
     const map = new Map<number, Classification>()
     for (const t of targets) {
       const r = parsed[String(t.id)]
-      if (!r) {
-        map.set(t.id, heuristicClassify(t)) // model omitted it — keep it (comprehensiveness)
-        continue
-      }
-      map.set(t.id, sanitize(r, t))
+      map.set(t.id, r ? sanitize(r, t) : heuristicClassify(t)) // model omitted it → heuristic (comprehensiveness)
     }
     return map
   } catch (e: any) {
-    logger.warn({ err: e?.message }, 'autoFieldPlacement: model classify failed, using heuristic')
+    logger.warn({ err: e?.message }, 'autoFieldPlacement: model chunk failed, using heuristic for this page')
     return null
   } finally {
     clearTimeout(timer)
   }
+}
+
+// S582: classify PER PAGE so a slow/failed page only loses ITS labels (the other
+// pages keep their AI tags) and each call is smaller + faster. Sequential — the
+// local model serves one request at a time, so parallel calls would only contend.
+// A page whose call fails contributes nothing to the map; those targets fall back
+// to heuristic in autoPlaceFields (boxes are still placed — only labels degrade).
+async function modelClassify(targets: RawTarget[]): Promise<Map<number, Classification> | null> {
+  if (!MODEL_ENABLED || targets.length === 0) return null
+  const byPage = new Map<number, RawTarget[]>()
+  for (const t of targets) {
+    const arr = byPage.get(t.page)
+    if (arr) arr.push(t)
+    else byPage.set(t.page, [t])
+  }
+  const combined = new Map<number, Classification>()
+  let anySuccess = false
+  for (const pageTargets of byPage.values()) {
+    const m = await classifyChunk(pageTargets)
+    if (m) { anySuccess = true; for (const [id, c] of m) combined.set(id, c) }
+  }
+  return anySuccess ? combined : null
 }
 
 // Constrain model output to valid enums; fall back to heuristic per-field.

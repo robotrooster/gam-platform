@@ -25,6 +25,7 @@ export interface CreateHomeSaleInput {
   annualInterestRate: number  // percent, e.g. 7.5
   termMonths: number
   startMonth: string          // 'YYYY-MM-01'
+  planType?: 'amortized' | 'flat'  // S594: how the deal is shaped (default amortized)
 }
 
 /**
@@ -45,12 +46,12 @@ export async function createHomeSaleContract(client: Client, input: CreateHomeSa
   const contract = (await client.query<any>(
     `INSERT INTO home_sale_contracts
        (unit_id, lease_id, tenant_id, landlord_id, sale_price, down_payment, financed_amount,
-        annual_interest_rate, term_months, monthly_payment, start_month, installments_total)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+        annual_interest_rate, term_months, monthly_payment, start_month, installments_total, plan_type)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
      RETURNING *`,
     [input.unitId, input.leaseId, input.tenantId, input.landlordId, input.salePrice.toFixed(2),
      input.downPayment.toFixed(2), financed.toFixed(2), input.annualInterestRate, input.termMonths,
-     monthlyPayment.toFixed(2), input.startMonth, schedule.length])).rows[0]
+     monthlyPayment.toFixed(2), input.startMonth, schedule.length, input.planType ?? 'amortized'])).rows[0]
 
   // Precompute the billing month per installment (start_month + (n-1) months).
   for (const row of schedule) {
@@ -137,18 +138,35 @@ export async function billDueHomeSaleInstallments(asOfMonth: string): Promise<nu
   let billed = 0
   const touchedContracts = new Set<string>()
   for (const d of due) {
-    // Create the charge, then stamp the installment. If the stamp races, the
-    // unbilled filter on the next run prevents a duplicate.
-    const pay = await queryOne<{ id: string }>(
-      `INSERT INTO payments
-         (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, entry_description, due_date, notes)
-       VALUES ($1,$2,$3,$4,'home_payment',$5,'pending','HOMEPMT',$6,$7)
-       RETURNING id`,
-      [d.unit_id, d.lease_id, d.tenant_id, d.landlord_id, Number(d.amount).toFixed(2), d.billing_month,
-       `Home payment ${d.installment_number} of ${d.installments_total}`])
-    await query(`UPDATE home_sale_installments SET payment_id=$1 WHERE id=$2 AND payment_id IS NULL`, [pay!.id, d.installment_id])
-    billed++
-    touchedContracts.add(d.contract_id)
+    // Bill each installment atomically: create the charge stamped with the
+    // driving installment id, then stamp the installment — in one transaction.
+    // The partial-unique index on payments.home_sale_installment_id makes a
+    // concurrent/overlapping run (or a second cron-enabled instance) a no-op
+    // via ON CONFLICT DO NOTHING, so an installment is billed at most once and
+    // the tenant is never double-charged.
+    const client = await getClient()
+    try {
+      await client.query('BEGIN')
+      const ins = await client.query<{ id: string }>(
+        `INSERT INTO payments
+           (unit_id, lease_id, tenant_id, landlord_id, type, amount, status, entry_description, due_date, notes,
+            home_sale_installment_id)
+         VALUES ($1,$2,$3,$4,'home_payment',$5,'pending','HOMEPMT',$6,$7,$8)
+         ON CONFLICT (home_sale_installment_id) WHERE home_sale_installment_id IS NOT NULL DO NOTHING
+         RETURNING id`,
+        [d.unit_id, d.lease_id, d.tenant_id, d.landlord_id, Number(d.amount).toFixed(2), d.billing_month,
+         `Home payment ${d.installment_number} of ${d.installments_total}`, d.installment_id])
+      if (ins.rows.length) {
+        await client.query(`UPDATE home_sale_installments SET payment_id=$1 WHERE id=$2 AND payment_id IS NULL`,
+          [ins.rows[0].id, d.installment_id])
+        billed++
+        touchedContracts.add(d.contract_id)
+      }
+      await client.query('COMMIT')
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {})
+      throw e
+    } finally { client.release() }
   }
   for (const cid of touchedContracts) await reconcileHomeSaleContract(cid)
   return billed

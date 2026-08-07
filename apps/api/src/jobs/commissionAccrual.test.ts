@@ -32,6 +32,8 @@ async function seedRep(role: 'admin' | 'super_admin' = 'admin'): Promise<string>
 // referring landlord.
 async function seedLandlordWithUnits(opts: {
   occupied: number; vacant?: number; closerId?: string | null; serviceId?: string | null; referredBy?: string | null
+  // S592: set the founding owner's PERSON-level upline (the accrual fallback).
+  ownerUpline?: string | null
 }): Promise<string> {
   const client = await getClient()
   try {
@@ -39,6 +41,9 @@ async function seedLandlordWithUnits(opts: {
     await client.query(
       `UPDATE landlords SET portfolio_manager_id=$1, service_manager_id=$2, referred_by_user_id=$3 WHERE id=$4`,
       [opts.closerId ?? null, opts.serviceId ?? null, opts.referredBy ?? null, landlordId])
+    if (opts.ownerUpline !== undefined) {
+      await client.query(`UPDATE users SET referred_by_user_id=$1 WHERE id=$2`, [opts.ownerUpline, userId])
+    }
     const propertyId = await seedProperty(client, {
       landlordId, ownerUserId: userId, managedByUserId: userId })
     for (let i = 0; i < opts.occupied; i++) {
@@ -139,5 +144,42 @@ describe('commission accrual', () => {
     expect(await sum('manager_id=$1 AND NOT to_pot', [cs])).toBe(0.50) // 2 × 0.25
     // Closing (0.50) + always (0.20) already potted on run 1; unchanged.
     expect(await sum('to_pot')).toBe(0.70)
+  })
+
+  // S592: person-level upline fallback (survives 1031/new-LLC; pays a co-owner's
+  // captured primary on their own account).
+  it('fallback: no entity closer but owner has a LANDLORD upline → closing pays the upline, service to the CS specialist', async () => {
+    const client = await getClient()
+    let upline = ''
+    try { ({ userId: upline } = await seedLandlord(client)) } finally { client.release() }
+    const cs = await seedRep()
+    await seedLandlordWithUnits({ occupied: 2, closerId: null, referredBy: null, serviceId: cs, ownerUpline: upline })
+    await processCommissionAccrual(MONTH)
+
+    // closing 0.50 → the upline (a landlord referrer → does NOT do CS, so it did NOT pot)
+    expect(await sum('manager_id=$1 AND role=$2 AND NOT to_pot', [upline, 'closing'])).toBe(0.50)
+    // service 0.50 → the CS specialist
+    expect(await sum('manager_id=$1 AND role=$2 AND NOT to_pot', [cs, 'service'])).toBe(0.50)
+    // pot = only the always-10¢ × 2
+    expect(await sum('to_pot')).toBe(0.20)
+  })
+
+  it('fallback: owner upline is a REP → closer does CS, both halves pay the rep', async () => {
+    const rep = await seedRep()
+    await seedLandlordWithUnits({ occupied: 2, closerId: null, referredBy: null, ownerUpline: rep })
+    await processCommissionAccrual(MONTH)
+    expect(await sum('manager_id=$1 AND NOT to_pot', [rep])).toBe(1.00) // both halves
+    expect(await sum('to_pot')).toBe(0.20)
+  })
+
+  it('an explicit entity closer WINS over the owner person-upline', async () => {
+    const explicitCloser = await seedRep()
+    const client = await getClient()
+    let upline = ''
+    try { ({ userId: upline } = await seedLandlord(client)) } finally { client.release() }
+    await seedLandlordWithUnits({ occupied: 2, closerId: explicitCloser, ownerUpline: upline })
+    await processCommissionAccrual(MONTH)
+    expect(await sum('manager_id=$1 AND NOT to_pot', [explicitCloser])).toBe(1.00)
+    expect(await sum('manager_id=$1', [upline])).toBe(0)
   })
 })
