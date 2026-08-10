@@ -111,6 +111,13 @@ export function BookingSitePage() {
   const { data: faqs = [] } = useQuery<any[]>(['property-faqs', propId], () => apiGet(`/properties/${propId}/faqs`), { enabled: !!propId })
   const [faqDraft, setFaqDraft] = useState({ question: '', answer: '' })
   const [uploading, setUploading] = useState(false)
+  // Site importer (S601): bring in an existing website as an editable template.
+  const [importUrl, setImportUrl] = useState('')
+  const [importing, setImporting] = useState(false)
+  const [importResult, setImportResult] = useState<any>(null)   // { importId, finalUrl, extracted }
+  const [importErr, setImportErr] = useState('')
+  const [pickedPhotos, setPickedPhotos] = useState<Set<string>>(new Set())
+  const [importingPhotos, setImportingPhotos] = useState(false)
 
   const uploadPhotos = async (files: FileList | null) => {
     if (!files?.length || !propId) return
@@ -153,6 +160,47 @@ export function BookingSitePage() {
   const makeCover = (photoId: string) => {
     const rest = photos.map((p: any) => p.id).filter((id: string) => id !== photoId)
     return reorderPhotos([photoId, ...rest])
+  }
+
+  // Import an existing website → editable template. The server fetches (SSRF-safe)
+  // and extracts; we pre-fill the text fields (landlord reviews + Saves) and offer
+  // the found photos to bring over.
+  const runImport = async () => {
+    if (!propId || !importUrl.trim()) return
+    setImporting(true); setImportErr(''); setMsg('')
+    try {
+      const r: any = await apiPost(`/properties/${propId}/site-import`, { url: importUrl.trim() })
+      setImportResult(r)
+      setPickedPhotos(new Set<string>(r.extracted?.imageUrls ?? []))
+      const ex = r.extracted || {}
+      setCfg((c: any) => c ? {
+        ...c,
+        intro: ex.intro ?? c.intro,
+        about: ex.about ?? c.about,
+        officePhone: ex.phone ?? c.officePhone,
+        officeEmail: ex.email ?? c.officeEmail,
+      } : c)
+      setMsg('Imported — review the pre-filled text above and Save, then add any photos below.')
+    } catch (e: any) {
+      setImportErr(e?.response?.data?.error || 'Could not import that website')
+    }
+    setImporting(false)
+  }
+  const togglePicked = (url: string) => setPickedPhotos(s => {
+    const n = new Set(s); n.has(url) ? n.delete(url) : n.add(url); return n
+  })
+  const importPickedPhotos = async () => {
+    if (!importResult || pickedPhotos.size === 0) return
+    setImportingPhotos(true); setImportErr('')
+    try {
+      await apiPost(`/properties/${propId}/site-import/${importResult.importId}/photos`, { photoUrls: [...pickedPhotos] })
+      qc.invalidateQueries(['site-photos', propId])
+      setImportResult(null); setImportUrl(''); setPickedPhotos(new Set())
+      setMsg('Photos imported.')
+    } catch (e: any) {
+      setImportErr(e?.response?.data?.error || 'Could not import those photos')
+    }
+    setImportingPhotos(false)
   }
   const addFaq = async () => {
     if (!faqDraft.question.trim() || !faqDraft.answer.trim()) return
@@ -294,6 +342,49 @@ export function BookingSitePage() {
           </>
         )}
       </div>
+
+      {/* Import an existing website → editable template */}
+      {cfg && can('booking_sites.edit') && (
+        <div className="card" style={{ padding: 16, maxWidth: 620, marginTop: 14 }}>
+          <div style={{ fontWeight: 600, marginBottom: 4 }}>Import from your existing website</div>
+          <div style={{ color: 'var(--text-3)', fontSize: '.8rem', marginBottom: 12 }}>
+            Already have a site? Paste its address and we'll pull in your welcome text, story, contact info, and photos to start from — you review and edit before anything goes live.
+          </div>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            <input className="input" style={{ flex: 1, minWidth: 220 }} placeholder="https://your-existing-site.com"
+              value={importUrl} onChange={e => setImportUrl(e.target.value)} />
+            <button className="btn" disabled={importing || !importUrl.trim()} onClick={runImport}>
+              {importing ? 'Importing…' : 'Import'}
+            </button>
+          </div>
+          {importErr && <div style={{ color: 'var(--danger, #e57373)', fontSize: '.8rem', marginTop: 8 }}>{importErr}</div>}
+          {importResult && (
+            <div style={{ marginTop: 14 }}>
+              <div style={{ fontSize: '.8rem', color: 'var(--text-3)', marginBottom: 8 }}>
+                Pre-filled your text from <strong>{importResult.finalUrl}</strong> — review above and Save. Pick photos to bring over:
+              </div>
+              {((importResult.extracted?.imageUrls ?? []) as string[]).length === 0 ? (
+                <div style={{ color: 'var(--text-3)', fontSize: '.8rem' }}>No photos found on that page.</div>
+              ) : (
+                <>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 8 }}>
+                    {(importResult.extracted.imageUrls as string[]).map(u => (
+                      <label key={u} style={{ position: 'relative', cursor: 'pointer', display: 'block', border: pickedPhotos.has(u) ? '2px solid var(--gold)' : '2px solid transparent', borderRadius: 8, overflow: 'hidden' }}>
+                        <img src={u} alt="" loading="lazy" style={{ width: '100%', height: 90, objectFit: 'cover', display: 'block' }} />
+                        <input type="checkbox" checked={pickedPhotos.has(u)} onChange={() => togglePicked(u)}
+                          style={{ position: 'absolute', top: 6, left: 6 }} />
+                      </label>
+                    ))}
+                  </div>
+                  <button className="btn" style={{ marginTop: 10 }} disabled={importingPhotos || pickedPhotos.size === 0} onClick={importPickedPhotos}>
+                    {importingPhotos ? 'Adding…' : `Add ${pickedPhotos.size} photo${pickedPhotos.size === 1 ? '' : 's'}`}
+                  </button>
+                </>
+              )}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Website photos */}
       {cfg && (

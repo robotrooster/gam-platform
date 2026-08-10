@@ -9,6 +9,7 @@ import { requireAuth, requirePerm } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { canManageLandlordResource } from '../middleware/scope'
 import { resolveUploadPath } from '../lib/uploadPaths'
+import { importSite, downloadImage } from '../services/siteImport'
 
 // ============================================================
 // S517 / Walkthrough #11 — landlord-facing booking-site config + waitlist
@@ -325,6 +326,63 @@ propertyBookingAdminRouter.delete('/properties/:id/site-photos/:photoId', requir
     if (!row) throw new AppError(404, 'Photo not found')
     fs.promises.unlink(path.join(sitePhotoDir, path.basename(row.filename))).catch(() => {})
     res.json({ success: true })
+  } catch (e) { next(e) }
+})
+
+// ── Booking-site importer (S601) ─────────────────────────────────────────────
+// POST /api/properties/:id/site-import — fetch the landlord's EXISTING website,
+// extract its content into an editable-template preview, and capture the raw page
+// (data collection). SSRF-safe (services/siteImport). Nothing is applied until the
+// landlord confirms: text via the normal booking-config save, photos via the
+// endpoint below.
+propertyBookingAdminRouter.post('/properties/:id/site-import', requireAuth, requirePerm('booking_sites.edit'), async (req, res, next) => {
+  try {
+    const { url } = z.object({ url: z.string().min(4).max(2048) }).parse(req.body)
+    const prop = await getOwnedProperty(req.params.id, req.user)
+    const { finalUrl, rawHtml, extracted } = await importSite(url)
+    const row = await queryOne<{ id: string }>(
+      `INSERT INTO property_site_imports (property_id, landlord_id, source_url, final_url, raw_html, extracted, imported_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
+      [prop.id, prop.landlord_id, url, finalUrl, rawHtml, JSON.stringify(extracted), req.user!.userId])
+    res.json({ success: true, data: { importId: row!.id, finalUrl, extracted } })
+  } catch (e) { next(e) }
+})
+
+// POST /api/properties/:id/site-import/:importId/photos — download the chosen
+// candidate images server-side (SSRF-safe) and append them to the site's photos.
+// Only URLs this import actually surfaced are accepted; a single bad image is
+// skipped, not fatal.
+propertyBookingAdminRouter.post('/properties/:id/site-import/:importId/photos', requireAuth, requirePerm('booking_sites.edit'), async (req, res, next) => {
+  try {
+    const { photoUrls } = z.object({ photoUrls: z.array(z.string().url()).min(1).max(12) }).parse(req.body)
+    const prop = await getOwnedProperty(req.params.id, req.user)
+    const imp = await queryOne<{ extracted: any }>(
+      `SELECT extracted FROM property_site_imports WHERE id=$1 AND property_id=$2`,
+      [req.params.importId, prop.id])
+    if (!imp) throw new AppError(404, 'Import not found')
+    const allowed = new Set<string>(imp.extracted?.imageUrls ?? [])
+    const chosen = photoUrls.filter(u => allowed.has(u))
+    if (chosen.length === 0) throw new AppError(400, 'None of those images came from this import.')
+
+    const base = await queryOne<{ mx: number }>(
+      `SELECT COALESCE(MAX(sort_order), -1) AS mx FROM property_site_photos WHERE property_id=$1`, [prop.id])
+    let order = Number(base?.mx ?? -1)
+    const out: any[] = []
+    for (const u of chosen) {
+      try {
+        const { buffer, ext } = await downloadImage(u)
+        const filename = `${crypto.randomBytes(16).toString('hex')}${ext}`
+        await fs.promises.writeFile(path.join(sitePhotoDir, filename), buffer)
+        order += 1
+        const photo = await queryOne<any>(
+          `INSERT INTO property_site_photos (property_id, landlord_id, filename, sort_order)
+           VALUES ($1,$2,$3,$4) RETURNING id, caption, sort_order, created_at`,
+          [prop.id, prop.landlord_id, filename, order])
+        out.push(photo)
+      } catch { /* skip an image that won't download; import the rest */ }
+    }
+    await query(`UPDATE property_site_imports SET status='applied', applied_at=now() WHERE id=$1`, [req.params.importId])
+    res.status(201).json({ success: true, data: { imported: out.length, photos: out } })
   } catch (e) { next(e) }
 })
 

@@ -21,7 +21,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict dbZLOx6ZmCmWUx9yftKfLPKM4aBYWpHToVMEdwJdrS3nqf4crs7fawFkpyC9xpg
+\restrict tikMjdcKK8AHPQUgGYRgBQbzXgpgQMDeFjfpnYoBOvzIVY344DcPmsrsQwkfHTw
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -6092,6 +6092,26 @@ CREATE TABLE public.property_manager_scopes (
 
 
 --
+-- Name: property_site_imports; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.property_site_imports (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    property_id uuid NOT NULL,
+    landlord_id uuid NOT NULL,
+    source_url text NOT NULL,
+    final_url text NOT NULL,
+    raw_html text NOT NULL,
+    extracted jsonb NOT NULL,
+    status text DEFAULT 'pending'::text NOT NULL,
+    imported_by uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    applied_at timestamp with time zone,
+    CONSTRAINT property_site_imports_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'applied'::text, 'discarded'::text])))
+);
+
+
+--
 -- Name: property_site_photos; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -10341,6 +10361,14 @@ ALTER TABLE ONLY public.property_manager_scopes
 
 ALTER TABLE ONLY public.property_manager_scopes
     ADD CONSTRAINT property_manager_scopes_user_id_landlord_id_key UNIQUE (user_id, landlord_id);
+
+
+--
+-- Name: property_site_imports property_site_imports_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_site_imports
+    ADD CONSTRAINT property_site_imports_pkey PRIMARY KEY (id);
 
 
 --
@@ -15056,6 +15084,13 @@ CREATE INDEX property_growth_snapshots_date_idx ON public.property_growth_snapsh
 --
 
 CREATE INDEX property_growth_snapshots_landlord_idx ON public.property_growth_snapshots USING btree (landlord_id, snapshot_date);
+
+
+--
+-- Name: property_site_imports_property_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX property_site_imports_property_id_idx ON public.property_site_imports USING btree (property_id, created_at DESC);
 
 
 --
@@ -20427,6 +20462,30 @@ ALTER TABLE ONLY public.property_manager_scopes
 
 
 --
+-- Name: property_site_imports property_site_imports_imported_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_site_imports
+    ADD CONSTRAINT property_site_imports_imported_by_fkey FOREIGN KEY (imported_by) REFERENCES public.users(id);
+
+
+--
+-- Name: property_site_imports property_site_imports_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_site_imports
+    ADD CONSTRAINT property_site_imports_landlord_id_fkey FOREIGN KEY (landlord_id) REFERENCES public.landlords(id) ON DELETE CASCADE;
+
+
+--
+-- Name: property_site_imports property_site_imports_property_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.property_site_imports
+    ADD CONSTRAINT property_site_imports_property_id_fkey FOREIGN KEY (property_id) REFERENCES public.properties(id) ON DELETE CASCADE;
+
+
+--
 -- Name: property_site_photos property_site_photos_landlord_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -21726,5 +21785,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict dbZLOx6ZmCmWUx9yftKfLPKM4aBYWpHToVMEdwJdrS3nqf4crs7fawFkpyC9xpg
+\unrestrict tikMjdcKK8AHPQUgGYRgBQbzXgpgQMDeFjfpnYoBOvzIVY344DcPmsrsQwkfHTw
 
