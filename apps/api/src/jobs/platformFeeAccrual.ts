@@ -46,7 +46,7 @@
  */
 
 import { getClient, query } from '../db'
-import { NIGHTS_AGGREGATION_UNIT_TYPES } from '@gam/shared'
+import { NIGHTS_AGGREGATION_UNIT_TYPES, PLATFORM_FEE_GRACE_CYCLES } from '@gam/shared'
 import type { PoolClient } from 'pg'
 
 interface AccrualResult {
@@ -55,6 +55,7 @@ interface AccrualResult {
   feesAccrued: number
   skippedZero: number
   skippedAlreadyAccrued: number
+  skippedPreBilling: number
   errors: { property_id: string; error: string }[]
 }
 
@@ -69,6 +70,7 @@ export async function processPlatformFeeAccrual(now: Date = new Date()): Promise
     feesAccrued: 0,
     skippedZero: 0,
     skippedAlreadyAccrued: 0,
+    skippedPreBilling: 0,
     errors: [],
   }
 
@@ -85,6 +87,7 @@ export async function processPlatformFeeAccrual(now: Date = new Date()): Promise
       if      (outcome === 'accrued')         result.feesAccrued++
       else if (outcome === 'zero')            result.skippedZero++
       else if (outcome === 'already_accrued') result.skippedAlreadyAccrued++
+      else if (outcome === 'pre_billing')     result.skippedPreBilling++
       result.propertiesProcessed++
     } catch (e: any) {
       result.errors.push({ property_id: prop.id, error: e?.message ?? String(e) })
@@ -94,7 +97,40 @@ export async function processPlatformFeeAccrual(now: Date = new Date()): Promise
   return result
 }
 
-type AccrualOutcome = 'accrued' | 'zero' | 'already_accrued'
+/**
+ * Daily grace-cap sweep (S600). A landlord in onboarding grace has
+ * billing_starts_at NULL. Once their grace cap month arrives, billing must begin
+ * even if they never took a rent payment — they've had the free setup + preview
+ * window (setup cycle + PLATFORM_FEE_GRACE_CYCLES full cycles). Cap =
+ * billing_grace_until, falling back to first-of-month(created_at) +
+ * PLATFORM_FEE_GRACE_CYCLES months when unset (covers any landlord created
+ * before the app-code that stamps billing_grace_until at signup). Idempotent:
+ * only NULL rows whose cap month has arrived flip. Activation via first settled
+ * rent (webhooks.ts) always wins the race — it fills billing_starts_at earlier,
+ * so this sweep never touches an already-live landlord.
+ */
+export async function applyBillingGraceCaps(now: Date = new Date()): Promise<number> {
+  const flipped = await query<{ id: string }>(
+    `UPDATE landlords AS l
+        SET billing_starts_at = cap.cap_month, updated_at = now()
+       FROM (
+         SELECT id,
+                COALESCE(
+                  billing_grace_until,
+                  (date_trunc('month', created_at) + ($1::int * INTERVAL '1 month'))::date
+                ) AS cap_month
+           FROM landlords
+          WHERE billing_starts_at IS NULL
+       ) cap
+      WHERE l.id = cap.id
+        AND cap.cap_month <= date_trunc('month', $2::timestamptz)::date
+      RETURNING l.id`,
+    [PLATFORM_FEE_GRACE_CYCLES, now.toISOString()]
+  )
+  return flipped.length
+}
+
+type AccrualOutcome = 'accrued' | 'zero' | 'already_accrued' | 'pre_billing'
 
 async function accrueOneProperty(
   propertyId: string,
@@ -120,6 +156,21 @@ async function accrueOneProperty(
     if (existing.rowCount && existing.rowCount > 0) {
       await client.query('ROLLBACK')
       return 'already_accrued'
+    }
+
+    // ── No-double-bill onboarding grace (S600) ───────────────────────────
+    // A landlord isn't billed until they GO LIVE. billing_starts_at is NULL
+    // during setup/preview (in grace), then set to the current cycle on their
+    // first settled rent (activation), or to the grace cap by the daily
+    // grace-cap cron — whichever fires first. Bill only cycles on/after it.
+    const gate = await client.query<{ ok: boolean }>(
+      `SELECT (billing_starts_at IS NOT NULL AND billing_starts_at <= $2::date) AS ok
+         FROM landlords WHERE id = $1`,
+      [landlordId, monthIso]
+    )
+    if (!gate.rows[0]?.ok) {
+      await client.query('ROLLBACK')
+      return 'pre_billing'
     }
 
     // ── Long-term unit count ─────────────────────────────────────────────

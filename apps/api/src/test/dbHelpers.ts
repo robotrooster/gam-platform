@@ -389,7 +389,12 @@ export async function seedLandlord(
   )
   const userId = userRes.rows[0].id
   const llRes = await client.query<{ id: string }>(
-    `INSERT INTO landlords (user_id) VALUES ($1) RETURNING id`,
+    // S600: default test landlords to "live since the epoch" so the platform-fee
+    // accrual gate lets them bill for ANY accrual month — including the fixed past
+    // months (e.g. 2026-05) the platformFeeAccrual tests pass. Matches pre-grace
+    // behaviour. Grace-specific tests override billing_starts_at / billing_grace_until.
+    `INSERT INTO landlords (user_id, billing_starts_at)
+     VALUES ($1, DATE '2000-01-01') RETURNING id`,
     [userId]
   )
   return { userId, landlordId: llRes.rows[0].id }

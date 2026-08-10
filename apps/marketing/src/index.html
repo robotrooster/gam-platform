@@ -112,6 +112,11 @@ section{padding:100px 0}
 .price-features{margin-top:20px;display:flex;flex-direction:column;gap:10px}
 .price-feature{display:flex;gap:8px;font-size:.82rem;color:var(--muted);align-items:flex-start}
 .price-feature::before{content:'✓';color:var(--green);font-weight:700;flex-shrink:0}
+.star{color:var(--gold);font-weight:700;text-decoration:none;font-size:.7em;vertical-align:super;margin:0 1px}
+.price-note{max-width:640px;margin:22px auto 0;text-align:center;font-size:.76rem;color:var(--dim);line-height:1.6}
+.switch-promise{max-width:720px;margin:40px auto 0;background:rgba(201,162,39,.06);border:1px solid rgba(201,162,39,.25);border-radius:16px;padding:26px 30px;text-align:center}
+.switch-h{font-family:var(--fd);font-size:1.15rem;font-weight:800;color:var(--gold);margin-bottom:10px}
+.switch-p{font-size:.9rem;color:var(--muted);line-height:1.7;max-width:600px;margin:0 auto}
 
 /* COMPARISON */
 .compare-table{width:100%;border-collapse:collapse;margin-top:48px;font-size:.875rem}
@@ -205,7 +210,7 @@ footer{background:var(--bg2);border-top:1px solid var(--border);padding:48px 0 3
   <div class="container">
     <div class="hero-eyebrow">Property management for your entire portfolio</div>
     <h1 class="hero-title">Run your entire operation<br><span>from one platform.</span></h1>
-    <p class="hero-sub">Residential, commercial, RV parks, and extended-stay — every property and every unit in one place. Leasing, rent collection, maintenance, and payouts to your bank, at one flat price: <strong style="color:var(--text)">$2 per occupied unit, and nothing on vacancies.</strong></p>
+    <p class="hero-sub">Every property and every unit in one place — leasing, rent collection, maintenance, and payouts to your bank, at one flat price: <strong style="color:var(--text)">$2 per occupied unit<a href="#pricing-note" class="star">*</a> — and nothing on vacancies.</strong></p>
     <div class="hero-cta">
       <button class="btn-primary" onclick="gamRegister()">Get started →</button>
       <button class="btn-outline" onclick="window.gamOpenDemo&&window.gamOpenDemo()">Book a demo</button>
@@ -232,7 +237,7 @@ footer{background:var(--bg2);border-top:1px solid var(--border);padding:48px 0 3
         <div class="reason-num">01</div>
         <div>
           <div class="reason-h">Built for your day-to-day</div>
-          <p class="reason-p">Leases and month-to-month or nightly stays, every unit type, a booking calendar, maintenance, and a built-in store register — <strong>the way your operation actually runs, handled in one place.</strong></p>
+          <p class="reason-p">Leases and month-to-month or nightly stays, every unit type, a booking calendar, and maintenance — <strong>the way your operation actually runs, handled in one place.</strong></p>
         </div>
       </div>
       <div class="reason">
@@ -246,7 +251,7 @@ footer{background:var(--bg2);border-top:1px solid var(--border);padding:48px 0 3
         <div class="reason-num">03</div>
         <div>
           <div class="reason-h">One system of record</div>
-          <p class="reason-p">Rent, screening, leases and e-sign, maintenance, your on-site store, and payouts to your bank — <strong>one login, one ledger, every property and every unit in one place.</strong></p>
+          <p class="reason-p">Rent, screening, leases and e-sign, maintenance, and payouts to your bank — <strong>one login, one ledger, every property and every unit in one place.</strong></p>
         </div>
       </div>
     </div>
@@ -265,7 +270,7 @@ footer{background:var(--bg2);border-top:1px solid var(--border);padding:48px 0 3
       <div class="price-card featured">
         <div class="price-tier">Platform</div>
         <div class="price-units">Everything, one flat rate</div>
-        <div class="price-amount gold">$2<span style="font-size:1rem;color:var(--muted)">/occupied unit</span></div>
+        <div class="price-amount gold">$2<a href="#pricing-note" class="star">*</a><span style="font-size:1rem;color:var(--muted)">/occupied unit</span></div>
         <div class="price-period">per month · $10/property minimum · $0 on vacant</div>
         <div class="price-features">
           <div class="price-feature">$0 on vacant units, always</div>
@@ -288,6 +293,11 @@ footer{background:var(--bg2);border-top:1px solid var(--border);padding:48px 0 3
         <button class="btn-outline" style="width:100%;justify-content:center;margin-top:24px" onclick="window.gamOpenSalesChat&&window.gamOpenSalesChat()">Talk to sales →</button>
       </div>
     </div>
+    <div class="switch-promise">
+      <div class="switch-h">Switching platforms? You won't pay twice.</div>
+      <p class="switch-p">We set up your entire portfolio before you owe us a cent — and you're not billed until you're actually operating on GAM. Run your final month on your old platform, move over on your schedule, and cancel when you're ready. You'll never pay two platforms for the same month.</p>
+    </div>
+    <p id="pricing-note" class="price-note">* $2/occupied unit is the base rate for standard residential units. Other configurations and portfolio types may run higher or lower with size and mix — your GAM Portfolio Strategist confirms your rate.</p>
   </div>
 </section>
 
@@ -296,11 +306,7 @@ footer{background:var(--bg2);border-top:1px solid var(--border);padding:48px 0 3
   <div class="container">
     <div class="section-label">More inside</div>
     <h2 class="section-title">We'd rather show you than list it.</h2>
-    <p class="section-sub">The tools that make the day-to-day easier are best seen in context. Get set up in minutes — or let us walk you through everything on a short call.</p>
-    <div class="hero-cta" style="justify-content:center">
-      <button class="btn-primary" onclick="gamRegister()">Get started →</button>
-      <button class="btn-outline" onclick="window.gamOpenDemo&&window.gamOpenDemo()">Book a demo</button>
-    </div>
+    <p class="section-sub">The tools that make the day-to-day easier are best seen in context. And the setup is on us — we do the heavy lifting up front, standing up your properties, units, and rent flows the way you want them. Once it's all flowing, you take the wheel and change whatever you like, whenever you like.</p>
   </div>
 </section>
 
@@ -308,8 +314,8 @@ footer{background:var(--bg2);border-top:1px solid var(--border);padding:48px 0 3
 <section class="cta-section">
   <div class="container">
     <div class="section-label">Get started today</div>
-    <h2 class="section-title">Bring your property online.<br>Start collecting rent this week.</h2>
-    <p class="section-sub">Create your account, connect your bank, and add your units. Billing starts only on occupied units — no setup fee, nothing on vacancies, cancel anytime.</p>
+    <h2 class="section-title">Bring your entire operation online.</h2>
+    <p class="section-sub">Start your account or book a demo — and we'll help you get set up. Billing starts only on occupied units: no setup fee, nothing on vacancies, cancel anytime.</p>
     <div class="hero-cta" style="justify-content:center">
       <button class="btn-primary" onclick="gamRegister()">Create your account →</button>
       <button class="btn-outline" onclick="window.gamOpenDemo&&window.gamOpenDemo()">Book a demo</button>

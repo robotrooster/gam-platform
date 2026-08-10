@@ -231,7 +231,7 @@ function Layout() {
         <div className="sfooter">
           <div style={{padding:'6px 10px',marginBottom:4}}>
             <div style={{fontWeight:600,color:'var(--t0)',fontSize:'.78rem'}}>{user?.firstName} {user?.lastName}</div>
-            <div style={{fontSize:'.65rem',color:'var(--t3)'}}>{user?.role==='portfolio_manager'?'Portfolio Manager':'Support Staff'}</div>
+            <div style={{fontSize:'.65rem',color:'var(--t3)'}}>{user?.role==='portfolio_manager'?'Portfolio Strategist':'Support Staff'}</div>
           </div>
           <button className="ni" onClick={()=>{logout();navigate('/login')}} style={{color:'var(--red)'}}>🚪 Sign out</button>
         </div>

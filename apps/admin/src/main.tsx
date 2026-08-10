@@ -1902,11 +1902,11 @@ function Commissions(){
         {isSuper&&(
         <div className="card" style={{padding:0,marginBottom:14}}>
           <div style={{display:'flex',alignItems:'center',padding:'10px 14px',borderBottom:'1px solid var(--b0)'}}>
-            <div className="ct" style={{margin:0}}>Earnings by portfolio manager</div>
+            <div className="ct" style={{margin:0}}>Earnings by portfolio strategist</div>
             <button className="btn bg-btn" style={{marginLeft:'auto',padding:'5px 12px'}} disabled={running} onClick={runAccrual}>{running?'Running…':'Run accrual now'}</button>
           </div>
           <table className="tbl">
-            <thead><tr><th>Portfolio manager</th><th>This month</th><th>All time</th></tr></thead>
+            <thead><tr><th>Portfolio strategist</th><th>This month</th><th>All time</th></tr></thead>
             <tbody>
               {(data?.byManager||[]).length?(data.byManager as any[]).map((m:any)=>(
                 <tr key={m.managerId}><td style={{color:'var(--t0)'}}>{m.firstName} {m.lastName}</td><td className="mono">{formatCurrency(+m.thisMonth||0)}</td><td className="mono">{formatCurrency(+m.allTime||0)}</td></tr>

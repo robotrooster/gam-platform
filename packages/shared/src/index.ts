@@ -64,7 +64,7 @@ export const PLATFORM_ROLE_LABEL: Record<PlatformRole, string> = {
 export const PORTFOLIO_MANAGER_ROLES = ['portfolio_manager'] as const
 export type PortfolioManagerRole = typeof PORTFOLIO_MANAGER_ROLES[number]
 export const PORTFOLIO_MANAGER_ROLE_LABEL: Record<PortfolioManagerRole, string> = {
-  portfolio_manager: 'Portfolio Manager',
+  portfolio_manager: 'Portfolio Strategist',
 }
 
 export const LANDLORD_ROLES = ['landlord'] as const
@@ -3656,6 +3656,18 @@ export const LAUNCH_PLATFORM_FEE = {
   PROPERTY_MIN_MO:   10.00,
   VACANT_UNIT:       0.00,
 } as const
+
+// No-double-bill onboarding grace (Nic, S600): a new landlord isn't charged the
+// platform fee until they GO LIVE — the first rent settled through GAM (they're
+// operating) — OR the grace cap, whichever is first. Setup + preview is free, so a
+// switcher never pays two platforms for the same month. The cap is counted in
+// BILLING CYCLES, not floating days, so it can never bleed into a third free cycle
+// regardless of signup date: the signup (partial) cycle + this many full cycles are
+// free, then billing begins the next cycle boundary. 2 → ~31–61 raw days (targets
+// ~45 for a mid-month switcher; ~60-day natural ceiling). Public copy states the
+// PRINCIPLE only, never this number. The stored per-landlord billing_grace_until is
+// overridable (superadmin) when a large-portfolio setup runs long.
+export const PLATFORM_FEE_GRACE_CYCLES = 2
 
 // W-32 (S531, Nic-set): user-facing INSTANT withdrawal fee — 2% of the
 // withdrawn amount, $5 minimum, all-in. Stripe's instant-payout cost

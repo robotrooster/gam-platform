@@ -7,7 +7,9 @@ import { AddUnitModal } from './AddUnitModal'
 import { usePerms } from '../lib/permissions'
 import { LawWarningBanner, type LawFlag } from '../components/LawWarningBanner'
 import { UNIT_TYPES, UNIT_TYPE_LABEL, UNIT_TYPE_PREFIX, UNIT_TYPE_ICON, FEE_PAYER_VALUES, type FeePayer } from '@gam/shared'
-const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
+// Narrow KPI tiles use the compact format ($18,400 / $248.6K / $1.24M) so a
+// six-/seven-figure property (or portfolio sum) never overflows or resizes a card.
+import { fmtCompact as fmt } from '../lib/format'
 
 // S574: the public per-property website — path-slug in dev, {slug}.gam.biz in
 // prod (mirrors the API's STOREFRONT_URL_TEMPLATE + SchedulePage). Every
@@ -813,14 +815,17 @@ export function PropertiesPage() {
                 <div style={{ padding: 16 }}>
                   {/* Header */}
                   <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 12 }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 10, flex: 1, minWidth: 0 }}>
                       <div style={{ width: 40, height: 40, borderRadius: 10, background: `${typeColor}15`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
                         <Building2 size={18} style={{ color: typeColor }} />
                       </div>
-                      <div>
-                        <div style={{ fontSize: '.9rem', fontWeight: 700, color: 'var(--text-0)' }}>{p.name}</div>
-                        <div style={{ fontSize: '.7rem', color: 'var(--text-3)', display: 'flex', alignItems: 'center', gap: 3, marginTop: 1 }}>
-                          <MapPin size={9} /> {p.street1}, {p.city}
+                      <div style={{ minWidth: 0, flex: 1 }}>
+                        {/* Fixed 2-line name area + single-line address → every card's header is
+                            the same height, so the icon / metrics / occupancy line up across cards
+                            no matter how long the name is (e.g. "Sunset Palms RV Resort"). */}
+                        <div style={{ fontSize: '.9rem', fontWeight: 700, color: 'var(--text-0)', lineHeight: 1.25, height: '2.25rem', overflow: 'hidden' }} title={p.name}>{p.name}</div>
+                        <div style={{ fontSize: '.7rem', color: 'var(--text-3)', display: 'flex', alignItems: 'center', gap: 3, marginTop: 1, whiteSpace: 'nowrap', overflow: 'hidden' }}>
+                          <MapPin size={9} style={{ flexShrink: 0 }} /> <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', minWidth: 0 }}>{p.street1}, {p.city}</span>
                         </div>
                         {multiEntity && p.entityName && (
                           <div style={{ fontSize: '.62rem', color: 'var(--gold)', marginTop: 3, fontWeight: 600, letterSpacing: '.02em' }}>
@@ -829,13 +834,13 @@ export function PropertiesPage() {
                         )}
                       </div>
                     </div>
-                    <div style={{ display: 'flex', gap: 6 }}>
+                    <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
                       {publicSiteUrl(p) && (
                         <a href={publicSiteUrl(p)!} target="_blank" rel="noreferrer"
                           onClick={e => e.stopPropagation()}
                           className="btn btn-ghost btn-sm" style={{ padding: '4px 8px', color: 'var(--gold)' }}
                           title={`Your public website — ${publicSiteUrl(p)}`}>
-                          <Globe size={12} /> Website
+                          <Globe size={12} />
                         </a>
                       )}
                       {can('properties.edit') && (

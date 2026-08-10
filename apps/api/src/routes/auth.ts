@@ -4,7 +4,7 @@ import jwt from 'jsonwebtoken'
 import crypto from 'crypto'
 import { z } from 'zod'
 import { db, query, queryOne } from '../db'
-import { UserRole } from '@gam/shared'
+import { UserRole, PLATFORM_FEE_GRACE_CYCLES } from '@gam/shared'
 import { requireAuth } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { sendPasswordResetEmail, sendEmailVerification, sendLandlordSignupHeadsUp } from '../services/email'
@@ -186,10 +186,16 @@ authRouter.post('/register', async (req, res, next) => {
         // S568: open the onboarding reconciliation window (21 days). While it's
         // open the landlord can mark a tenant's FIRST GAM invoice paid off-platform
         // (old-system autopay overlap during a migration) — see landlords.reconciliation_until.
+        // S600: open the no-double-bill onboarding grace. billing_starts_at stays
+        // NULL (not billed) until the landlord goes live — first settled rent flips
+        // it (webhooks.ts), else the grace-cap cron flips it at billing_grace_until:
+        // first-of-month(signup) + PLATFORM_FEE_GRACE_CYCLES full cycles. Superadmin-
+        // extendable for long large-portfolio setups.
         const [l] = await client.query(
-          `INSERT INTO landlords (user_id, portfolio_manager_id, referred_by_user_id, reconciliation_until)
-           VALUES ($1, $2, $3, NOW() + INTERVAL '21 days') RETURNING id`,
-          [user.id, closerId, referredByUserId]
+          `INSERT INTO landlords (user_id, portfolio_manager_id, referred_by_user_id, reconciliation_until, billing_grace_until)
+           VALUES ($1, $2, $3, NOW() + INTERVAL '21 days',
+                   (date_trunc('month', NOW()) + ($4::int * INTERVAL '1 month'))::date) RETURNING id`,
+          [user.id, closerId, referredByUserId, PLATFORM_FEE_GRACE_CYCLES]
         ).then(r => r.rows)
         profileId = l.id
         // S553: founding owner-membership (multi-owner entities).

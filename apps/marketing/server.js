@@ -60,8 +60,6 @@ function wrapLegalPage(bodyHtml, title, audience) {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>${title} (${audienceLabel}) — Gold Asset Management</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&family=DM+Sans:ital,wght@0,300;0,400;0,500;0,600;1,400&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -69,7 +67,7 @@ function wrapLegalPage(bodyHtml, title, audience) {
   --border: #1e2435;
   --text: #f0f2f7; --muted: #8a96b0; --dim: #475060;
   --gold: #c9a227; --gold-dim: rgba(201,162,39,.12);
-  --fd: 'Syne',sans-serif; --fb: 'DM Sans',sans-serif; --fm: 'DM Mono',monospace;
+  --fd: -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif; --fb: -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif; --fm: ui-monospace,'SF Mono',SFMono-Regular,Menlo,Consolas,monospace;
 }
 html{-webkit-font-smoothing:antialiased;scroll-behavior:smooth}
 body{font-family:var(--fb);background:var(--bg);color:var(--muted);line-height:1.7;font-size:.95rem}
@@ -171,8 +169,6 @@ function audiencePicker(docKind /* 'terms' | 'privacy' */) {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>${docTitle} — Gold Asset Management</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&family=DM+Sans:ital,wght@0,300;0,400;0,500;0,600;1,400&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -180,7 +176,7 @@ function audiencePicker(docKind /* 'terms' | 'privacy' */) {
   --border: #1e2435;
   --text: #f0f2f7; --muted: #8a96b0; --dim: #475060;
   --gold: #c9a227; --gold-dim: rgba(201,162,39,.12);
-  --fd: 'Syne',sans-serif; --fb: 'DM Sans',sans-serif; --fm: 'DM Mono',monospace;
+  --fd: -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif; --fb: -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif; --fm: ui-monospace,'SF Mono',SFMono-Regular,Menlo,Consolas,monospace;
 }
 html{-webkit-font-smoothing:antialiased}
 body{font-family:var(--fb);background:var(--bg);color:var(--muted);line-height:1.6;font-size:.95rem;min-height:100vh;display:flex;flex-direction:column}
@@ -318,8 +314,6 @@ function renderBookingShell(slug) {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Book — Gold Asset Management</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&family=DM+Sans:ital,wght@0,300;0,400;0,500;0,600;1,400&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -328,7 +322,7 @@ function renderBookingShell(slug) {
   --text:#f0f2f7; --muted:#8a96b0; --dim:#475060;
   --gold:#c9a227; --gold-dim:rgba(201,162,39,.12);
   --green:#22c55e; --red:#ef4444;
-  --fd:'Syne',sans-serif; --fb:'DM Sans',sans-serif; --fm:'DM Mono',monospace;
+  --fd:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif; --fb:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif; --fm:ui-monospace,'SF Mono',SFMono-Regular,Menlo,Consolas,monospace;
 }
 body{font-family:var(--fb);background:var(--bg);color:var(--text);line-height:1.6;font-size:.95rem;min-height:100vh}
 a{color:var(--gold);text-decoration:none}
@@ -715,8 +709,6 @@ function renderCardUpdateShell(token) {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Update payment method — Gold Asset Management</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&family=DM+Sans:ital,wght@0,300;0,400;0,500;0,600&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
 <script src="https://js.stripe.com/v3/"></script>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
@@ -726,7 +718,7 @@ function renderCardUpdateShell(token) {
   --text:#f0f2f7; --muted:#8a96b0; --dim:#475060;
   --gold:#c9a227; --gold-dim:rgba(201,162,39,.12);
   --green:#22c55e; --red:#ef4444;
-  --fd:'Syne',sans-serif; --fb:'DM Sans',sans-serif; --fm:'DM Mono',monospace;
+  --fd:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif; --fb:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif; --fm:ui-monospace,'SF Mono',SFMono-Regular,Menlo,Consolas,monospace;
 }
 body{font-family:var(--fb);background:var(--bg);color:var(--text);line-height:1.6;font-size:.95rem;min-height:100vh}
 .shell{max-width:520px;margin:0 auto;padding:48px 24px 120px}
@@ -934,15 +926,13 @@ function renderCustomerPortalShell(token) {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Your account — Gold Asset Management</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&family=DM+Sans:ital,wght@0,300;0,400;0,500;0,600&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
   --bg:#080a0c;--bg2:#0d1014;--bg3:#141820;--border:#1e2435;
   --text:#f0f2f7;--muted:#8a96b0;--dim:#475060;
   --gold:#c9a227;--gold-dim:rgba(201,162,39,.12);--green:#22c55e;--red:#ef4444;--amber:#f59e0b;
-  --fd:'Syne',sans-serif;--fb:'DM Sans',sans-serif;--fm:'DM Mono',monospace;
+  --fd:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;--fb:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;--fm:ui-monospace,'SF Mono',SFMono-Regular,Menlo,Consolas,monospace;
 }
 body{font-family:var(--fb);background:var(--bg);color:var(--text);line-height:1.6;font-size:.95rem;min-height:100vh}
 .shell{max-width:560px;margin:0 auto;padding:48px 24px 120px}
@@ -1059,15 +1049,13 @@ function renderStayShell(token) {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Your stay — Gold Asset Management</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&family=DM+Sans:ital,wght@0,300;0,400;0,500;0,600&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
   --bg:#080a0c;--bg2:#0d1014;--bg3:#141820;--border:#1e2435;
   --text:#f0f2f7;--muted:#8a96b0;--dim:#475060;
   --gold:#c9a227;--gold-dim:rgba(201,162,39,.12);--green:#22c55e;--red:#ef4444;
-  --fd:'Syne',sans-serif;--fb:'DM Sans',sans-serif;--fm:'DM Mono',monospace;
+  --fd:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;--fb:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;--fm:ui-monospace,'SF Mono',SFMono-Regular,Menlo,Consolas,monospace;
 }
 html,body{height:100%}
 body{font-family:var(--fb);background:var(--bg);color:var(--text);line-height:1.6;font-size:.95rem;display:flex;flex-direction:column;min-height:100dvh}

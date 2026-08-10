@@ -1270,6 +1270,21 @@ export function schedulerInit() {
     }
   }, { timezone: 'America/Phoenix' })
 
+  // S600: no-double-bill onboarding grace — daily cap sweep. Runs 1:15am Phoenix,
+  // just BEFORE the monthly platform-fee accrual (1:30am on the 1st), so a landlord
+  // whose grace cap month has arrived is flipped to billing in time for that month's
+  // accrual. Cheap no-op on non-cap days (only un-activated rows past their cap move).
+  // First settled rent (webhooks.ts) activates earlier and this sweep skips them.
+  cron.schedule('15 1 * * *', async () => {
+    try {
+      const { applyBillingGraceCaps } = await import('./platformFeeAccrual')
+      const flipped = await applyBillingGraceCaps()
+      if (flipped > 0) logger.info({ flipped }, '[billing-grace-cap] landlords flipped to billing')
+    } catch (e) {
+      logger.error({ err: e }, '[billing-grace-cap] fatal')
+    }
+  }, { timezone: 'America/Phoenix' })
+
   // S567: portfolio-manager commission accrual. Fires 1st of each month at
   // 1:45am Phoenix (after platform-fee accrual at 1:30). Writes commission_
   // accruals rows per occupied unit — 25¢ closing + 25¢ service to the closing

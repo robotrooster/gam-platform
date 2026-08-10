@@ -4,6 +4,9 @@ import { humanize } from '@gam/shared'
 import { apiGet } from '../lib/api'
 import { useNavigate } from 'react-router-dom'
 import { AlertTriangle, CheckCircle, Activity, ArrowDownToLine, Clock, FileText, CreditCard, Wrench, ChevronRight, HeartHandshake, UserPlus } from 'lucide-react'
+import { fmtWhole } from '../lib/format'
+// KPI cards show full dollars without cents (fmtWhole). Tables below keep this
+// exact, with-cents `fmt` — precise figures belong in the tables.
 const fmt = (n: any) => n != null ? `$${Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—'
 
 interface DashStats {
@@ -127,18 +130,18 @@ export function DashboardPage() {
             the same formula as monthlyRentVolume. */}
         <div className="kpi-card" style={{gridColumn:'span 4',cursor:'pointer'}} onClick={()=>navigate('/rent-roll')}>
           <div className="kpi-label">Expected Monthly Rent</div>
-          <div className="kpi-value gold">{fmt(stats?.monthlyRentVolume || 0)}</div>
+          <div className="kpi-value gold">{fmtWhole(stats?.monthlyRentVolume || 0)}</div>
           <div className="kpi-sub">contracted across {rentRollUnits} occupied units</div>
         </div>
         <div className="kpi-card" style={{gridColumn:'span 4',cursor:'pointer'}} onClick={()=>navigate('/reports')}>
           <div className="kpi-label">Collected This Month</div>
-          <div className="kpi-value green">{fmt(stats?.collectedMtd || 0)}</div>
+          <div className="kpi-value green">{fmtWhole(stats?.collectedMtd || 0)}</div>
           <div className="kpi-sub">settled rent payments MTD</div>
         </div>
         {/* S527 W-3: outstanding → the who-owes-what list, not Reports. */}
         <div className="kpi-card" style={{gridColumn:'span 4',cursor:'pointer'}} onClick={()=>navigate('/balances')}>
           <div className="kpi-label">Outstanding</div>
-          <div className="kpi-value" style={{color:(stats?.outstanding||0)>0?'var(--amber)':'var(--text-0)'}}>{fmt(stats?.outstanding || 0)}</div>
+          <div className="kpi-value" style={{color:(stats?.outstanding||0)>0?'var(--amber)':'var(--text-0)'}}>{fmtWhole(stats?.outstanding || 0)}</div>
           <div className="kpi-sub">unpaid invoice balances</div>
         </div>
         {/* Row 2 (span 3): portfolio + operations */}
@@ -172,7 +175,7 @@ export function DashboardPage() {
         </div>
         <div className="kpi-card" style={{gridColumn:'span 6'}}>
           <div className="kpi-label">Next Disbursement</div>
-          <div className="kpi-value" style={{fontSize:'1.4rem'}}>{fmt(stats?.upcomingDisbursement?.amount || 0)}</div>
+          <div className="kpi-value" style={{fontSize:'1.4rem'}}>{fmtWhole(stats?.upcomingDisbursement?.amount || 0)}</div>
           <div className="kpi-sub flex items-center gap-8">
             <span className="status-dot dot-green" />
             Next payout {nextPayoutDate}
@@ -183,18 +186,18 @@ export function DashboardPage() {
             rather than netting into one, so each reads clearly at a glance. */}
         <div className="kpi-card" style={{gridColumn:'span 4',cursor:'pointer'}} onClick={()=>setShowFeeModal(true)}>
           <div className="kpi-label">Platform Fee / Mo</div>
-          <div className="kpi-value">{fmt(platformFee)}</div>
+          <div className="kpi-value">{fmtWhole(platformFee)}</div>
           <div className="kpi-sub">{rentRollUnits} occupied × $2/unit · $10/property min</div>
         </div>
         <div className="kpi-card" style={{gridColumn:'span 4',cursor:'pointer'}} onClick={()=>navigate('/refer')}>
           <div className="kpi-label">Referral Earnings</div>
-          <div className="kpi-value green">{fmt(referralThisMonth)}</div>
+          <div className="kpi-value green">{fmtWhole(referralThisMonth)}</div>
           <div className="kpi-sub">this month{referral?.referredCount ? ` · ${referral.referredCount} referred landlord${referral.referredCount === 1 ? '' : 's'}` : ''}</div>
         </div>
         <div className="kpi-card" style={{gridColumn:'span 4'}}>
           <div className="kpi-label">Net Platform Cost</div>
           <div className="kpi-value" style={{color: netToGam <= 0 ? 'var(--green)' : 'var(--text-0)'}}>
-            {netToGam < 0 ? `+${fmt(-netToGam)}` : fmt(netToGam)}
+            {netToGam < 0 ? `+${fmtWhole(-netToGam)}` : fmtWhole(netToGam)}
           </div>
           <div className="kpi-sub">{netToGam <= 0 ? 'referrals cover your fee' : 'fee − referral earnings'}</div>
         </div>
@@ -451,12 +454,12 @@ function PmCutThisMonthCard() {
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20 }}>
         <div>
           <div className="kpi-label">PM Cut</div>
-          <div className="kpi-value gold">{fmt(totals.cut)}</div>
+          <div className="kpi-value gold">{fmtWhole(totals.cut)}</div>
           <div className="kpi-sub">routed to your PM company</div>
         </div>
         <div>
           <div className="kpi-label">Net to You</div>
-          <div className="kpi-value green">{fmt(totals.net)}</div>
+          <div className="kpi-value green">{fmtWhole(totals.net)}</div>
           <div className="kpi-sub">owner share after PM + GAM fees</div>
         </div>
       </div>

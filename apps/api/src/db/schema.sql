@@ -21,7 +21,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict IJS3Yys3JL17Hv71pIm5cez7J8Wj8yaQkO2UalZdTxivZsKHJNXb4sb9cmbFQXU
+\restrict dbZLOx6ZmCmWUx9yftKfLPKM4aBYWpHToVMEdwJdrS3nqf4crs7fawFkpyC9xpg
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -3743,6 +3743,8 @@ CREATE TABLE public.landlords (
     referred_by_user_id uuid,
     reconciliation_until timestamp with time zone,
     stripe_fc_customer_id text,
+    billing_starts_at date,
+    billing_grace_until date,
     CONSTRAINT landlords_background_provider_check CHECK ((background_provider = ANY (ARRAY['mock'::text, 'checkr'::text]))),
     CONSTRAINT landlords_default_ach_fee_payer_check CHECK ((default_ach_fee_payer = ANY (ARRAY['landlord'::text, 'tenant'::text]))),
     CONSTRAINT landlords_network_tier_check CHECK ((network_tier = 'tier_2_full'::text)),
@@ -3791,6 +3793,20 @@ COMMENT ON COLUMN public.landlords.referred_by_user_id IS 'The referring LANDLOR
 --
 
 COMMENT ON COLUMN public.landlords.reconciliation_until IS 'S568: end of the landlord''s onboarding reconciliation window. While NOW() < this, the FIRST rent invoice of any of the landlord''s leases may be marked paid off-platform (old-system autopay overlap) fee-free. Default now()+21d at creation; admin-extendable.';
+
+
+--
+-- Name: COLUMN landlords.billing_starts_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.landlords.billing_starts_at IS 'First billing cycle (first-of-month) platformFeeAccrual bills this landlord. NULL = in onboarding grace / not yet activated (no platform fee). Set to the current cycle on first settled rent (operating), or to the grace cap by the daily grace-cap cron. See PLATFORM_FEE_GRACE_CYCLES.';
+
+
+--
+-- Name: COLUMN landlords.billing_grace_until; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.landlords.billing_grace_until IS 'Cap cycle (first-of-month) at which platform-fee billing must begin if the landlord never activates. Set at signup to first-of-month(signup) + PLATFORM_FEE_GRACE_CYCLES months; superadmin-overridable for long setups. NULL falls back to created_at + 2 months in the cron.';
 
 
 --
@@ -21710,5 +21726,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict IJS3Yys3JL17Hv71pIm5cez7J8Wj8yaQkO2UalZdTxivZsKHJNXb4sb9cmbFQXU
+\unrestrict dbZLOx6ZmCmWUx9yftKfLPKM4aBYWpHToVMEdwJdrS3nqf4crs7fawFkpyC9xpg
 

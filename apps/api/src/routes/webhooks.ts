@@ -10,6 +10,7 @@ import {
 import { createAdminNotification } from '../services/adminNotifications'
 import { confirmBookingDeposit } from '../services/propertyBooking'
 import { applyTenantSupersedence, type PostCommitTransfer } from '../services/supersedence'
+import { activateBillingForSettledRent } from '../services/billingActivation'
 import {
   emitPaymentSettledEvent,
   emitPaymentFailedEvent,
@@ -124,6 +125,13 @@ webhooksRouter.post('/stripe', async (req, res) => {
         // must NOT drive the post-commit PM-transfer / rent-collected paths (a
         // re-payment, not a fresh collection) — exclude them from settledRows.
         settledRows = settled.rows.filter((r) => !r.reversal_id).map((r) => ({ id: r.id, type: r.type }))
+
+        // S600 no-double-bill grace: first settled RENT = the landlord GOES LIVE.
+        // Ends their onboarding grace so the platform fee begins from this cycle.
+        await activateBillingForSettledRent(
+          client,
+          settled.rows.filter((r) => !r.reversal_id && r.type === 'rent').map((r) => r.id)
+        )
 
         // Run allocation for every settled rent OR utility payment in this
         // batch. Utility payments use the same allocation engine as rent
