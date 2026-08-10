@@ -88,6 +88,7 @@ publicPropertyBookingRouter.get('/property/:slug', async (req, res, next) => {
       return {
         id: t.id,
         name: t.name,
+        unitType: t.unitType,
         siteCount: t.units.length,
         nightlyRate: rates.nightly,
         weeklyRate: rates.weekly,
@@ -403,6 +404,7 @@ publicPropertyBookingRouter.get('/property/:slug/availability', async (req, res,
       siteTypes.push({
         id: t.id,
         name: t.name,
+        unitType: t.unitType,
         minStayNights: t.units[0].min_stay_nights,
         checkInTime: t.units[0].check_in_time,
         checkOutTime: t.units[0].check_out_time,

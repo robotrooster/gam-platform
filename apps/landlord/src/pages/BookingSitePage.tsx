@@ -136,6 +136,24 @@ export function BookingSitePage() {
     await apiPatch(`/properties/${propId}/site-photos/${photoId}`, { caption: caption || null })
     qc.invalidateQueries(['site-photos', propId])
   }
+  // Reorder: the FIRST photo is the cover (hero on the booking site). One call
+  // sends the full order; move ← → nudges a photo, "Make cover" jumps it to front.
+  const reorderPhotos = async (orderedIds: string[]) => {
+    if (!propId) return
+    await apiPatch(`/properties/${propId}/site-photos-order`, { orderedIds })
+    qc.invalidateQueries(['site-photos', propId])
+  }
+  const movePhoto = (photoId: string, dir: -1 | 1) => {
+    const ids = photos.map((p: any) => p.id)
+    const i = ids.indexOf(photoId), j = i + dir
+    if (i < 0 || j < 0 || j >= ids.length) return
+    ;[ids[i], ids[j]] = [ids[j], ids[i]]
+    return reorderPhotos(ids)
+  }
+  const makeCover = (photoId: string) => {
+    const rest = photos.map((p: any) => p.id).filter((id: string) => id !== photoId)
+    return reorderPhotos([photoId, ...rest])
+  }
   const addFaq = async () => {
     if (!faqDraft.question.trim() || !faqDraft.answer.trim()) return
     await apiPost(`/properties/${propId}/faqs`, { question: faqDraft.question.trim(), answer: faqDraft.answer.trim() })
@@ -295,20 +313,35 @@ export function BookingSitePage() {
           {photos.length === 0 ? (
             <div style={{ color: 'var(--text-3)', fontSize: '.85rem' }}>No photos yet.</div>
           ) : (
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 10 }}>
-              {photos.map((ph: any) => (
-                <div key={ph.id}>
-                  <AuthThumb url={`/properties/${propId}/site-photos/${ph.id}/file`} />
-                  <div style={{ fontSize: '.72rem', color: 'var(--text-3)', margin: '4px 0', minHeight: 14, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{ph.caption || '—'}</div>
-                  {can('booking_sites.edit') && (
-                    <div style={{ display: 'flex', gap: 8 }}>
-                      <button className="btn btn-ghost" style={{ padding: '2px 8px', fontSize: '.72rem' }} onClick={() => captionPhoto(ph.id, ph.caption)}>Caption</button>
-                      <button className="btn btn-ghost" style={{ padding: '2px 8px', fontSize: '.72rem' }} onClick={() => deletePhoto(ph.id)}>Remove</button>
-                    </div>
-                  )}
+            <>
+              {can('booking_sites.edit') && photos.length > 1 && (
+                <div style={{ fontSize: '.75rem', color: 'var(--text-3)', marginBottom: 8 }}>
+                  The first photo is your <strong style={{ color: 'var(--gold)' }}>cover</strong> — it leads the website. Reorder with ← → or “Make cover”.
                 </div>
-              ))}
-            </div>
+              )}
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 10 }}>
+                {photos.map((ph: any, idx: number) => (
+                  <div key={ph.id}>
+                    <div style={{ position: 'relative' }}>
+                      <AuthThumb url={`/properties/${propId}/site-photos/${ph.id}/file`} />
+                      {idx === 0 && (
+                        <span style={{ position: 'absolute', top: 6, left: 6, background: 'var(--gold)', color: '#14100a', fontSize: '.6rem', fontWeight: 700, padding: '2px 7px', borderRadius: 20, letterSpacing: '.04em' }}>COVER</span>
+                      )}
+                    </div>
+                    <div style={{ fontSize: '.72rem', color: 'var(--text-3)', margin: '4px 0', minHeight: 14, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{ph.caption || '—'}</div>
+                    {can('booking_sites.edit') && (
+                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                        <button className="btn btn-ghost" style={{ padding: '2px 7px', fontSize: '.72rem' }} disabled={idx === 0} onClick={() => movePhoto(ph.id, -1)} title="Move earlier">←</button>
+                        <button className="btn btn-ghost" style={{ padding: '2px 7px', fontSize: '.72rem' }} disabled={idx === photos.length - 1} onClick={() => movePhoto(ph.id, 1)} title="Move later">→</button>
+                        {idx !== 0 && <button className="btn btn-ghost" style={{ padding: '2px 7px', fontSize: '.72rem' }} onClick={() => makeCover(ph.id)}>Make cover</button>}
+                        <button className="btn btn-ghost" style={{ padding: '2px 7px', fontSize: '.72rem' }} onClick={() => captionPhoto(ph.id, ph.caption)}>Caption</button>
+                        <button className="btn btn-ghost" style={{ padding: '2px 7px', fontSize: '.72rem' }} onClick={() => deletePhoto(ph.id)}>Remove</button>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </>
           )}
         </div>
       )}

@@ -294,6 +294,27 @@ propertyBookingAdminRouter.patch('/properties/:id/site-photos/:photoId', require
   } catch (e) { next(e) }
 })
 
+// PATCH /api/properties/:id/site-photos-order — set the full display order in
+// one call. sort_order = position; the FIRST photo is the cover (rendered as the
+// booking-site hero). Drives drag / move-up-down / "Make cover" from the editor.
+// Only photos owned by this property are touched; stray ids are ignored.
+propertyBookingAdminRouter.patch('/properties/:id/site-photos-order', requireAuth, requirePerm('booking_sites.edit'), async (req, res, next) => {
+  try {
+    const body = z.object({ orderedIds: z.array(z.string().uuid()).min(1).max(200) }).parse(req.body)
+    const prop = await getOwnedProperty(req.params.id, req.user)
+    await query(
+      `UPDATE property_site_photos AS p
+          SET sort_order = v.ord - 1
+         FROM unnest($1::uuid[]) WITH ORDINALITY AS v(id, ord)
+        WHERE p.id = v.id AND p.property_id = $2`,
+      [body.orderedIds, prop.id])
+    const rows = await query(
+      `SELECT id, caption, sort_order FROM property_site_photos
+        WHERE property_id=$1 ORDER BY sort_order ASC, created_at ASC`, [prop.id])
+    res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
 // DELETE /api/properties/:id/site-photos/:photoId
 propertyBookingAdminRouter.delete('/properties/:id/site-photos/:photoId', requireAuth, requirePerm('booking_sites.edit'), async (req, res, next) => {
   try {

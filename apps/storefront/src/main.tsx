@@ -120,6 +120,7 @@ label.fl{display:block;font-size:.75rem;color:var(--t3);text-transform:uppercase
 .strip{display:grid;gap:10px;grid-template-columns:repeat(2,1fr)}
 @media(min-width:720px){.strip{grid-template-columns:repeat(3,1fr)}}
 .strip img{width:100%;height:150px;object-fit:cover;border-radius:10px;border:1px solid var(--border);display:block}
+.cover{width:100%;height:min(46vh,440px);object-fit:cover;display:block;border-bottom:1px solid var(--border)}
 .faq-q{font-family:var(--fd);color:var(--t0);font-weight:700;margin-bottom:6px}
 .faq-a{font-size:.95rem;white-space:pre-wrap}
 /* Skye — the pre-booking property agent (floating chat) */
@@ -150,7 +151,7 @@ label.fl{display:block;font-size:.75rem;color:var(--t3);text-transform:uppercase
 @media(max-width:480px){.pc-panel{width:calc(100vw - 20px);height:calc(100dvh - 30px);bottom:10px;right:10px}}
 `
 
-interface SiteType { id: string; name: string; siteCount: number; nightlyRate: number | null; weeklyRate: number | null; minStayNights: number | null; maxStayNights: number | null; checkInTime: string | null; checkOutTime: string | null }
+interface SiteType { id: string; name: string; unitType: string; siteCount: number; nightlyRate: number | null; weeklyRate: number | null; minStayNights: number | null; maxStayNights: number | null; checkInTime: string | null; checkOutTime: string | null }
 interface Amenity {
   id: string; name: string; description: string | null; capacity: number | null
   openTime: string | null; closeTime: string | null
@@ -237,6 +238,9 @@ function HomePage({ slug, profile }: { slug: string; profile: Profile }) {
   const p = profile.property
   return (
     <>
+      {profile.photos.length > 0 && (
+        <img className="cover" src={photoSrc(profile.photos[0])} alt={profile.photos[0].caption ?? p.name} />
+      )}
       <div className="hero wrap">
         <div className="loc">{[p.city, p.state].filter(Boolean).join(', ') || 'Welcome'}</div>
         <h1>{p.name}</h1>
@@ -245,15 +249,15 @@ function HomePage({ slug, profile }: { slug: string; profile: Profile }) {
           <a className="btn btn-p" style={{ textDecoration: 'none' }} href={pageHref(slug, 'book')}>Check availability &amp; book</a>
         </p>
       </div>
-      {profile.photos.length > 0 && (
+      {profile.photos.length > 1 && (
         <section className="wrap">
           <h2>Take a look around</h2>
           <div className="strip">
-            {profile.photos.slice(0, 6).map(ph => (
+            {profile.photos.slice(1, 7).map(ph => (
               <a key={ph.id} href={pageHref(slug, 'gallery')}><img src={photoSrc(ph)} alt={ph.caption ?? p.name} loading="lazy" /></a>
             ))}
           </div>
-          {profile.photos.length > 6 && (
+          {profile.photos.length > 7 && (
             <p style={{ marginTop: 12 }}><a href={pageHref(slug, 'gallery')} style={{ color: 'var(--gold)' }}>See the full gallery →</a></p>
           )}
         </section>
@@ -322,7 +326,7 @@ function Shell({ children }: { children: React.ReactNode }) {
 // render as pick-cards, full ones dim to a waitlist option.
 interface BillingSegment { from: string; to: string; nights: number; amount: number; fullMonth: boolean }
 interface TypeAvail {
-  id: string; name: string
+  id: string; name: string; unitType: string
   available: boolean; unavailableReason: string | null
   total: number | null; tax: number; depositAmount: number | null
   minStayNights: number | null; checkInTime: string | null; checkOutTime: string | null
@@ -331,6 +335,16 @@ interface TypeAvail {
 }
 const monthDay = (iso: string) => new Date(iso + 'T12:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
 interface AvailResult { nights: number; depositPct: number; utilitiesBilled: boolean; siteTypes: TypeAvail[] }
+
+// Plural section labels for booking-page grouping (mirror @gam/shared
+// UNIT_TYPE_LABEL; kept local so this anonymous public app needs no workspace dep).
+const UNIT_TYPE_GROUP_LABEL: Record<string, string> = {
+  rv_spot: 'RV Sites', campsite: 'Campsites', hotel_room: 'Rooms',
+  mobile_home: 'Mobile Homes', apartment: 'Apartments', single_family: 'Homes',
+  storage: 'Storage', parking: 'Parking', boat_slip: 'Boat Slips',
+  land_lot: 'Lots', commercial: 'Commercial',
+}
+const groupLabel = (ut: string) => UNIT_TYPE_GROUP_LABEL[ut] || 'Other'
 
 function BookingSection({ slug, profile }: { slug: string; profile: Profile }) {
   const today = new Date().toISOString().slice(0, 10)
@@ -396,6 +410,73 @@ function BookingSection({ slug, profile }: { slug: string; profile: Profile }) {
   const anyOpen = !!avail && avail.siteTypes.some(t => t.available)
   const nightsLabel = avail ? `${avail.nights} night${avail.nights === 1 ? '' : 's'}` : ''
 
+  // Group available types by unit type so RV sites cluster, rooms cluster, etc.
+  // (Nic S600). A single-type property falls through to a flat grid — no heading.
+  const typeGroups = useMemo(() => {
+    if (!avail) return [] as { ut: string; types: TypeAvail[] }[]
+    const order: string[] = []
+    const map = new Map<string, TypeAvail[]>()
+    for (const t of avail.siteTypes) {
+      const ut = t.unitType || 'other'
+      if (!map.has(ut)) { map.set(ut, []); order.push(ut) }
+      map.get(ut)!.push(t)
+    }
+    return order.map(ut => ({ ut, types: map.get(ut)! }))
+  }, [avail])
+
+  const renderTypeCard = (t: TypeAvail) => {
+    const selectable = t.available || t.unavailableReason === 'booked'
+    return (
+      <div key={t.id}
+        className={`card st-card${t.id === typeId ? ' sel' : ''}`}
+        style={selectable ? undefined : { opacity: .55, cursor: 'default' }}
+        onClick={() => { if (selectable) { setTypeId(t.id); setJustFilled(false); setWaitlisted(false) } }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 8 }}>
+          <div style={{ fontFamily: 'var(--fd)', color: 'var(--t0)', fontWeight: 700 }}>{t.name}</div>
+          {t.available
+            ? <span className="badge b-green">Available</span>
+            : t.unavailableReason === 'booked'
+            ? <span className="badge b-red">Full</span>
+            : null}
+        </div>
+        <div className="rate" style={{ marginTop: 8 }}>
+          {t.available && t.total != null ? (
+            <>
+              {t.monthlyBilling ? (
+                <>
+                  <span className="price" style={{ fontSize: '1.05rem', fontWeight: 700 }}>{money(t.monthlyBilling.monthlyRate)}/month</span>
+                  {avail!.utilitiesBilled && <> plus utilities</>} · {nightsLabel}
+                </>
+              ) : (
+                <>
+                  <span className="price" style={{ fontSize: '1.05rem', fontWeight: 700 }}>{money(t.total)}</span> · {nightsLabel}
+                  {t.tax > 0 && <><br />incl. {money(t.tax)} lodging tax</>}
+                </>
+              )}
+              <br />Due now: {money(t.depositAmount)} deposit
+            </>
+          ) : t.unavailableReason === 'booked' ? (
+            <>
+              Full for these dates — join the waitlist
+              {t.altStay && (
+                <div style={{ marginTop: 8 }}>
+                  <button className="btn btn-g" style={{ padding: '5px 10px', fontSize: '.8rem' }}
+                    onClick={e => { e.stopPropagation(); setCheckOut(t.altStay!.checkOut); check(t.altStay!.checkOut) }}>
+                    Open until {monthDay(t.altStay.checkOut)} — shorten to {t.altStay.nights} night{t.altStay.nights === 1 ? '' : 's'}
+                  </button>
+                </div>
+              )}
+            </>
+          ) : t.unavailableReason === 'rate_unavailable' ? (
+            <>Online rates aren’t set for this stay — contact us from the home page</>
+          ) : (
+            <>{t.unavailableReason}</>
+          )}
+        </div>
+      </div>
+    )
+  }
+
   return (
     <section className="wrap" id="book">
       <h2>Book your stay</h2>
@@ -431,63 +512,18 @@ function BookingSection({ slug, profile }: { slug: string; profile: Profile }) {
                   We’re full for {checkIn} → {checkOut}. Pick a spot below to join the waitlist — we’ll email you the moment those dates open — or try different dates.
                 </div>
               )}
-              <div className="grid g3" style={{ marginTop: 14 }}>
-                {avail.siteTypes.map(t => {
-                  const selectable = t.available || t.unavailableReason === 'booked'
-                  return (
-                    <div key={t.id}
-                      className={`card st-card${t.id === typeId ? ' sel' : ''}`}
-                      style={selectable ? undefined : { opacity: .55, cursor: 'default' }}
-                      onClick={() => { if (selectable) { setTypeId(t.id); setJustFilled(false); setWaitlisted(false) } }}>
-                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 8 }}>
-                        <div style={{ fontFamily: 'var(--fd)', color: 'var(--t0)', fontWeight: 700 }}>{t.name}</div>
-                        {t.available
-                          ? <span className="badge b-green">Available</span>
-                          : t.unavailableReason === 'booked'
-                          ? <span className="badge b-red">Full</span>
-                          : null}
-                      </div>
-                      <div className="rate" style={{ marginTop: 8 }}>
-                        {t.available && t.total != null ? (
-                          <>
-                            {t.monthlyBilling ? (
-                              // S547 (Nic): monthly stays show rate + deposit
-                              // ONLY — no lump-sum total (off-putting), and
-                              // utilities flagged when billed back.
-                              <>
-                                <span className="price" style={{ fontSize: '1.05rem', fontWeight: 700 }}>{money(t.monthlyBilling.monthlyRate)}/month</span>
-                                {avail!.utilitiesBilled && <> plus utilities</>} · {nightsLabel}
-                              </>
-                            ) : (
-                              <>
-                                <span className="price" style={{ fontSize: '1.05rem', fontWeight: 700 }}>{money(t.total)}</span> · {nightsLabel}
-                                {t.tax > 0 && <><br />incl. {money(t.tax)} lodging tax</>}
-                              </>
-                            )}
-                            <br />Due now: {money(t.depositAmount)} deposit
-                          </>
-                        ) : t.unavailableReason === 'booked' ? (
-                          <>
-                            Full for these dates — join the waitlist
-                            {t.altStay && (
-                              <div style={{ marginTop: 8 }}>
-                                <button className="btn btn-g" style={{ padding: '5px 10px', fontSize: '.8rem' }}
-                                  onClick={e => { e.stopPropagation(); setCheckOut(t.altStay!.checkOut); check(t.altStay!.checkOut) }}>
-                                  Open until {monthDay(t.altStay.checkOut)} — shorten to {t.altStay.nights} night{t.altStay.nights === 1 ? '' : 's'}
-                                </button>
-                              </div>
-                            )}
-                          </>
-                        ) : t.unavailableReason === 'rate_unavailable' ? (
-                          <>Online rates aren’t set for this stay — contact us from the home page</>
-                        ) : (
-                          <>{t.unavailableReason}</>
-                        )}
-                      </div>
-                    </div>
-                  )
-                })}
-              </div>
+              {typeGroups.length <= 1 ? (
+                <div className="grid g3" style={{ marginTop: 14 }}>
+                  {avail.siteTypes.map(renderTypeCard)}
+                </div>
+              ) : (
+                typeGroups.map(g => (
+                  <div key={g.ut} style={{ marginTop: 18 }}>
+                    <h3 style={{ fontFamily: 'var(--fd)', color: 'var(--t2)', fontSize: '1.05rem', margin: '0 0 10px' }}>{groupLabel(g.ut)}</h3>
+                    <div className="grid g3">{g.types.map(renderTypeCard)}</div>
+                  </div>
+                ))
+              )}
 
               {sel && !waitlisted && (
                 <div className="card" style={{ marginTop: 14 }}>

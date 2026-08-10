@@ -69,10 +69,10 @@ export async function resolvePropertyById(propertyId: string): Promise<PropertyR
 /** Units that the public can book: bookable + allow a short-term stay type. */
 export async function bookableUnits(propertyId: string) {
   return query<any>(
-    `SELECT u.id, u.unit_number, u.nightly_rate, u.weekly_rate, u.monthly_rate,
+    `SELECT u.id, u.unit_number, u.unit_type, u.nightly_rate, u.weekly_rate, u.monthly_rate,
             u.min_stay_nights, u.max_stay_nights, u.check_in_time, u.check_out_time,
             u.lease_types_allowed, u.subtype_id,
-            s.name AS subtype_name, s.rv_site_layout AS subtype_layout,
+            s.name AS subtype_name, s.unit_type AS subtype_unit_type, s.rv_site_layout AS subtype_layout,
             s.rv_amp_service AS subtype_amp,
             s.nightly_rate AS subtype_nightly, s.weekly_rate AS subtype_weekly,
             s.monthly_rate AS subtype_monthly
@@ -88,6 +88,7 @@ export async function bookableUnits(propertyId: string) {
 export interface SiteType {
   id: string            // subtype uuid, or 'general'
   name: string
+  unitType: string      // rv_spot | hotel_room | mobile_home | … — for booking-page grouping
   requiredLayout: string | null
   requiredAmp: string | null
   units: any[]          // candidate units, unit_number order
@@ -101,6 +102,7 @@ export function groupSiteTypes(units: any[]): SiteType[] {
       t = {
         id: key,
         name: u.subtype_id ? u.subtype_name : 'RV Site',
+        unitType: u.subtype_id ? (u.subtype_unit_type ?? 'rv_spot') : (u.unit_type ?? 'rv_spot'),
         requiredLayout: u.subtype_id ? (u.subtype_layout ?? null) : null,
         requiredAmp: u.subtype_id ? (u.subtype_amp ?? null) : null,
         units: [],
