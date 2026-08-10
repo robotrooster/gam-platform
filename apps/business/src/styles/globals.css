@@ -63,9 +63,45 @@
   --shadow-gold: 0 0 24px rgba(201,162,39,.2);
 }
 
+/* ── LIGHT THEME (S595) ──────────────────────────────────────
+   Opt-in via <html data-theme="light"> — toggled from the topbar, persisted
+   per-device in localStorage['gam_theme']. Redefines the palette TOKENS only;
+   everything downstream is built on these vars, so it flips automatically.
+   Gold splits into a bright FILL and a darker text 'ink'; shadows soften. */
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg-0:#f4f5f7; --bg-1:#ffffff; --bg-2:#ffffff; --bg-3:#eef0f4; --bg-4:#e5e8ee; --bg-5:#d9dde5;
+  --border-0:#e7e9ef; --border-1:#dde0e8; --border-2:#ccd2de;
+  --text-0:#12151c; --text-1:#333b49; --text-2:#5b6474; --text-3:#8a93a5;
+  --gold-ink:#7a5f0f;
+  --green:#15803d; --green-bg:rgba(34,197,94,.14);
+  --red:#dc2626;   --red-bg:rgba(239,68,68,.12);
+  --amber:#b45309; --amber-bg:rgba(245,158,11,.18);
+  --blue:#2563eb;  --blue-bg:rgba(59,130,246,.12);
+  --shadow-sm:0 1px 3px rgba(20,30,60,.08);
+  --shadow-md:0 4px 16px rgba(20,30,60,.10);
+  --shadow-lg:0 8px 28px rgba(20,30,60,.14);
+  --shadow-gold:0 0 24px rgba(201,162,39,.20);
+}
+/* Gold as TEXT switches to the darker ink on light; gold FILLS keep the bright
+   brand/accent value (so buttons stay high-contrast with their dark text). */
+:root[data-theme="light"] a,
+:root[data-theme="light"] .sidebar-logo-mark,
+:root[data-theme="light"] .badge-gold,
+:root[data-theme="light"] .kpi-value.gold,
+:root[data-theme="light"] .alert-gold { color:var(--gold-ink); }
+:root[data-theme="light"] .nav-item.active { color:var(--gold-ink); background:rgba(201,162,39,.12); border-color:rgba(201,162,39,.32); }
+:root[data-theme="light"] .tab-btn.active { color:var(--gold-ink); border-bottom-color:var(--gold-ink); }
+:root[data-theme="light"] .data-table tr:hover td { background:rgba(0,0,0,.025); }
+:root[data-theme="light"] .alert-danger  { color:#b91c1c; }
+:root[data-theme="light"] .alert-warn    { color:#92400e; }
+:root[data-theme="light"] .alert-info    { color:#1d4ed8; }
+:root[data-theme="light"] .alert-success { color:#15803d; }
+
 /* ── RESET ──────────────────────────────────────────────── */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-html { font-size: 16px; -webkit-font-smoothing: antialiased; }
+/* S595: base lifted 16->17px, uniform ~6% bump (see landlord globals). */
+html { font-size: 17px; -webkit-font-smoothing: antialiased; }
 body {
   font-family: var(--font-body);
   background: var(--bg-0);
@@ -394,7 +430,13 @@ h4 { font-size: 1rem;   font-weight: 600; }
   text-transform: uppercase;
   letter-spacing: .05em;
 }
-.form-input, .form-select, .form-textarea {
+/* .input / .select / .textarea are the ORIGINAL class names; the rule was
+   later renamed to .form-* but many fields still say className="input".
+   Un-aliased, every one fell back to the raw browser control — a WHITE box,
+   black text, no padding, square corners — on the dark UI (unreadable gray
+   when disabled). Alias them so no field ever renders unstyled. (S595) */
+.form-input, .form-select, .form-textarea,
+.input, .select, .textarea {
   width: 100%;
   background: var(--bg-3);
   border: 1px solid var(--border-1);
@@ -406,13 +448,30 @@ h4 { font-size: 1rem;   font-weight: 600; }
   transition: border-color .15s;
   outline: none;
 }
-.form-input:focus, .form-select:focus, .form-textarea:focus {
+.form-input:focus, .form-select:focus, .form-textarea:focus,
+.input:focus, .select:focus, .textarea:focus {
   border-color: var(--gold);
   box-shadow: 0 0 0 2px var(--gold-glow);
 }
-.form-input::placeholder { color: var(--text-3); }
-.form-select { appearance: none; cursor: pointer; }
-.form-textarea { resize: vertical; min-height: 80px; }
+.form-input::placeholder, .input::placeholder, .textarea::placeholder { color: var(--text-3); }
+.form-select, .select, select.input { appearance: none; cursor: pointer; }
+.form-textarea, .textarea { resize: vertical; min-height: 80px; }
+.input-sm { padding: 6px 10px; font-size: .82rem; }
+
+/* Disabled / read-only must stay LEGIBLE — keep the text near-full contrast
+   instead of the browser's washed-out gray on the dark ground. (S595) */
+.form-input:disabled, .form-select:disabled, .form-textarea:disabled,
+.input:disabled, .select:disabled, .textarea:disabled,
+input:disabled, select:disabled, textarea:disabled,
+.form-input[readonly], .input[readonly], input[readonly], textarea[readonly] {
+  background: var(--bg-2);
+  border-color: var(--border-0);
+  color: var(--text-1);
+  -webkit-text-fill-color: var(--text-1);
+  opacity: 1;
+  cursor: not-allowed;
+}
+fieldset:disabled { opacity: 1; }
 .form-error {
   font-size: .72rem;
   color: var(--red);

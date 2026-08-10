@@ -99,11 +99,15 @@ function POSLayout() {
   // S574: a posLimited cashier session never sees Team/Inventory — register only.
   const isOwner = user?.role === 'business_owner' && !posLimited
   const onLock = () => { void lockRegister() }
+  // S595: per-device light/dark toggle (initial value applied pre-paint by index.html).
+  const [theme, setTheme] = useState<'dark' | 'light'>(() => document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark')
+  const toggleTheme = () => { const n = theme === 'dark' ? 'light' : 'dark'; document.documentElement.setAttribute('data-theme', n); try { localStorage.setItem('gam_theme', n) } catch {}; setTheme(n) }
   return (
     <div style={{minHeight:'100vh',background:'var(--bg-1)'}}>
       <header style={{background:'var(--bg-2)',borderBottom:'1px solid var(--border-1)',padding:'0 20px',height:56,display:'flex',alignItems:'center',justifyContent:'space-between',position:'sticky',top:0,zIndex:100}}>
         <div style={{fontWeight:700,fontSize:'1.1rem',color:'var(--gold)'}}>⚡ GAM POS</div>
         <div style={{display:'flex',gap:16,alignItems:'center'}}>
+          <button onClick={toggleTheme} title={theme==='dark'?'Switch to light mode':'Switch to dark mode'} aria-label="Toggle light/dark theme" style={{background:'transparent',border:'none',cursor:'pointer',fontSize:'1rem',lineHeight:1,padding:'4px 6px'}}>{theme==='dark'?'☀️':'🌙'}</button>
           <a href="/pos" style={{fontSize:'.88rem',fontWeight:500}}>Register</a>
           {!isBusiness && !posLimited && <a href="/pos?tab=inventory" style={{fontSize:'.88rem',fontWeight:500}}>Inventory</a>}
           {isOwner && <a href="/team" style={{fontSize:'.88rem',fontWeight:500}}>Team</a>}

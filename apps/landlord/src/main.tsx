@@ -79,6 +79,7 @@ import { SurveysPage } from './pages/SurveysPage'
 import { POSPage } from './pages/POSPage'
 import { InventoryPage } from './pages/InventoryPage'
 import { SchedulePage } from './pages/SchedulePage'
+import { BookingSitePage } from './pages/BookingSitePage'
 import { ShelfLabelPage } from './pages/ShelfLabelPage'
 import { InspectionsPage } from './pages/InspectionsPage'
 import { AmenitiesPage } from './pages/AmenitiesPage'
@@ -229,7 +230,7 @@ export default function App() {
               {/* W-53 (S531): prefs merged into Settings; deep links redirect */}
               <Route path="notification-prefs" element={<Navigate to="/settings" replace />} />
               <Route path="bookings"           element={<Navigate to="/schedule" replace />} />
-              <Route path="booking-sites"      element={<Navigate to="/schedule" replace />} />
+              <Route path="booking-sites"      element={<BookingSitePage />} />
               <Route path="notifications"     element={<NotificationsPage />} />
               <Route path="leases/:id/deposit-return" element={<DepositReturnPage />} />
               <Route path="leases/:id/termination"   element={<LeaseTerminationPage />} />

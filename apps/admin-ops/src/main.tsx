@@ -163,6 +163,8 @@ input,select,textarea{font-family:var(--font-b)}
 .ks{font-size:.7rem;color:var(--t3)}
 .kv.g{color:var(--green)}.kv.r{color:var(--red)}.kv.a{color:var(--amber)}.kv.gold{color:var(--gold)}.kv.b{color:var(--blue)}
 .btn{display:inline-flex;align-items:center;gap:6px;padding:7px 14px;border-radius:7px;font-size:.78rem;font-weight:600;border:none;cursor:pointer;transition:all .12s;font-family:var(--font-b)}
+.b-gold{background:var(--gold);color:#080a0c}
+.b-gold:hover{filter:brightness(1.08)}
 .bp{background:var(--gold);color:#080a0c}.bp:hover{background:#d9af3a}
 .bg{background:var(--bg4);color:var(--t1);border:1px solid var(--b2)}.bg:hover{background:var(--bg3)}
 .bsm{padding:4px 9px;font-size:.72rem}

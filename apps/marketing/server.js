@@ -7,6 +7,25 @@ const PORT = 3004
 
 const HTML = fs.readFileSync(path.join(__dirname, 'src/index.html'), 'utf8')
 
+// The marketing site and the API live on DIFFERENT hosts in prod
+// (goldassetmanagement.com vs api.goldassetmanagement.com), so the homepage's
+// same-origin '/api' would hit THIS static server, not the API. Inject the API
+// origin (API_URL) as window.GAM_API_BASE so the homepage client JS — Lucy's
+// sales chat AND the demo-booking modal — reaches the API. Dev falls back to
+// localhost:4000. (This mirrors how the booking/payment/customer/guest shells
+// already inject apiBase; the homepage was the one that never did.)
+const API_BASE = process.env.API_URL || 'http://localhost:4000'
+// The landlord signup/app lives on its own host in prod
+// (landlord.goldassetmanagement.com). Inject it so the homepage's "Get started"
+// CTAs land on the real register page instead of a hardcoded localhost. Derive
+// from the API host when LANDLORD_URL isn't set explicitly; dev falls back to :3001.
+const LANDLORD_URL = process.env.LANDLORD_URL ||
+  (API_BASE.includes('goldassetmanagement.com') ? 'https://landlord.goldassetmanagement.com' : 'http://localhost:3001')
+const HTML_WITH_API = HTML.replace(
+  '</head>',
+  `<script>window.GAM_API_BASE=${JSON.stringify(API_BASE)};window.GAM_LANDLORD_URL=${JSON.stringify(LANDLORD_URL)}</script>\n</head>`
+)
+
 // Legal docs live in /legal at repo root. Resolve from this server.js
 // file at apps/marketing/.
 const LEGAL_DIR = path.join(__dirname, '..', '..', 'legal')
@@ -285,7 +304,7 @@ http.createServer((req, res) => {
 
   // Default: the marketing landing page
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
-  res.end(HTML)
+  res.end(HTML_WITH_API)
 }).listen(PORT, () => console.log(`Marketing site: http://localhost:${PORT}`))
 
 // S507: booking page shell. All logic + state lives in inline JS that
@@ -1113,13 +1132,25 @@ function addMsg(role, text){
   return d;
 }
 function showTyping(){
+  if(document.getElementById('stay-typing')) return;
   const d = document.createElement('div');
   d.className = 'msg typing';
+  d.id = 'stay-typing';
   d.innerHTML = '<span class="dot"></span><span class="dot"></span><span class="dot"></span>';
   CHAT.appendChild(d);
   scrollDown();
-  return d;
 }
+function hideTyping(){ const t = document.getElementById('stay-typing'); if(t) t.remove(); }
+function showRead(){
+  if(document.getElementById('stay-read')) return;
+  const r = document.createElement('div');
+  r.id = 'stay-read';
+  r.style.cssText = 'align-self:flex-end;font-size:.68rem;color:var(--dim);margin:-8px 4px 0 0';
+  r.textContent = 'Read';
+  CHAT.appendChild(r);
+  scrollDown();
+}
+function hideRead(){ const e = document.getElementById('stay-read'); if(e) e.remove(); }
 function setError(msg){
   ALERT.innerHTML = msg ? '<div class="box">' + esc(msg) + '</div>' : '';
 }
@@ -1144,7 +1175,45 @@ async function send(){
   autosize();
   addMsg('me', text);
   sending = true; SEND.disabled = true;
-  const typing = showTyping();
+
+  // Human texting cadence (mirrors Lucy's marketing widget): the message sits
+  // "Read" for a beat sized to its length, then "typing" starts and runs while
+  // Skye works, then the reply lands as SEPARATE bubbles (blank-line split),
+  // each typed at its own pace with a read gap between them — never dumped as
+  // one wall of text.
+  const startedAt = Date.now();
+  const readMs = Math.min(4500, 1100 + text.length * 40);
+  let typingSince = 0;
+  const readTimer = setTimeout(showRead, readMs);
+  const typeTimer = setTimeout(function(){ hideRead(); showTyping(); typingSince = Date.now(); }, readMs + 800);
+  function stopBeats(){ clearTimeout(readTimer); clearTimeout(typeTimer); hideRead(); hideTyping(); }
+  function done(){ sending = false; if(!locked){ SEND.disabled = false; INPUT.focus(); } }
+
+  function reveal(reply){
+    clearTimeout(readTimer); clearTimeout(typeTimer);
+    const parts = String(reply).split(/\\n{2,}/).map(function(s){ return s.trim(); }).filter(Boolean);
+    if(!parts.length) parts.push(String(reply));
+    let i = 0;
+    function step(){
+      if(i >= parts.length){ done(); return; }
+      const part = parts[i++];
+      const typeMs = Math.min(9000, Math.max(1800, part.length * 55));
+      hideRead();
+      if(!typingSince){ showTyping(); typingSince = Date.now(); }
+      const held = Date.now() - typingSince;
+      setTimeout(function(){
+        hideTyping(); typingSince = 0;
+        addMsg('bot', part);
+        if(i < parts.length){
+          const readGap = Math.min(5000, Math.max(1400, part.length * 18));
+          setTimeout(function(){ showTyping(); typingSince = Date.now(); step(); }, readGap);
+        } else { done(); }
+      }, Math.max(0, typeMs - held));
+    }
+    // Never start revealing before the read beat has been felt.
+    setTimeout(step, Math.max(0, (startedAt + readMs + 800) - Date.now()));
+  }
+
   try{
     const r = await fetch(API + '/api/guest/chat', {
       method: 'POST',
@@ -1152,23 +1221,21 @@ async function send(){
       body: JSON.stringify({ token: TOKEN, message: text, conversationId: conversationId || undefined }),
     });
     const j = await r.json().catch(() => ({ error: 'Something went wrong. Please try again.' }));
-    typing.remove();
     if(r.status === 401){
-      lock();
+      stopBeats(); lock();
       setError(j.error || 'This stay link is invalid or has expired. Ask your host for a new one.');
+      sending = false;
       return;
     }
     if(!r.ok || !j.success){
       throw new Error(j.error || 'Something went wrong. Please try again.');
     }
     conversationId = j.data.conversationId || conversationId;
-    addMsg('bot', j.data.reply);
+    reveal(j.data.reply);
   }catch(e){
-    typing.remove();
+    stopBeats();
     setError(e.message || 'Network error — please try again.');
-  }finally{
-    sending = false;
-    if(!locked){ SEND.disabled = false; INPUT.focus(); }
+    done();
   }
 }
 

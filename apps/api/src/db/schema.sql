@@ -21,7 +21,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict 1KdD618Pip13FY5XcSfDrdQ26U1aiGYxAil8mLELpoxUO14RcopcJ2xkp3V2hZe
+\restrict IJS3Yys3JL17Hv71pIm5cez7J8Wj8yaQkO2UalZdTxivZsKHJNXb4sb9cmbFQXU
 
 -- Dumped from database version 16.14 (Homebrew)
 -- Dumped by pg_dump version 16.14 (Homebrew)
@@ -524,7 +524,7 @@ CREATE TABLE public.agent_interaction_logs (
     metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT agent_interaction_logs_agent_type_check CHECK ((agent_type = ANY (ARRAY['customer_service'::text, 'sales'::text, 'booking'::text]))),
-    CONSTRAINT agent_interaction_logs_audience_check CHECK ((audience = ANY (ARRAY['tenant'::text, 'landlord'::text, 'prospect'::text, 'guest'::text]))),
+    CONSTRAINT agent_interaction_logs_audience_check CHECK ((audience = ANY (ARRAY['tenant'::text, 'landlord'::text, 'prospect'::text, 'guest'::text, 'visitor'::text]))),
     CONSTRAINT agent_interaction_logs_handled_by_tier_check CHECK ((handled_by_tier = ANY (ARRAY['entry'::text, 'escalation'::text, 'human'::text]))),
     CONSTRAINT agent_interaction_logs_outcome_check CHECK ((outcome = ANY (ARRAY['answered_entry'::text, 'answered_escalation'::text, 'action_taken'::text, 'escalated_to_senior'::text, 'escalated_to_human'::text, 'abandoned'::text, 'error'::text, 'shed'::text, 'rate_limited'::text])))
 );
@@ -5851,6 +5851,8 @@ CREATE TABLE public.properties (
     onboarding_window_until timestamp with time zone,
     onboarding_completed_at timestamp with time zone,
     flex_charge_finance_pct numeric(5,4) DEFAULT 0 NOT NULL,
+    booking_about text,
+    booking_area text,
     CONSTRAINT properties_address_verification_check CHECK ((address_verification = ANY (ARRAY['unverified'::text, 'geocoded'::text, 'parcel'::text]))),
     CONSTRAINT properties_booking_deposit_pct_range CHECK (((booking_deposit_pct >= (0)::numeric) AND (booking_deposit_pct <= (100)::numeric))),
     CONSTRAINT properties_booking_slug_format CHECK (((booking_slug IS NULL) OR ((booking_slug ~ '^[a-z0-9][a-z0-9-]{1,60}$'::text) AND (booking_slug !~ '--'::text)))),
@@ -5891,6 +5893,20 @@ COMMENT ON COLUMN public.properties.flexcharge_enabled IS 'S309: per-Location Fl
 --
 
 COMMENT ON COLUMN public.properties.operator_owns_land IS 'S568: FALSE = homes-only external park (investor operates here without owning the land; park owner not on GAM). TRUE = operator owns the park.';
+
+
+--
+-- Name: COLUMN properties.booking_about; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.properties.booking_about IS 'S602 public booking site — the landlord''s story / about-us section (who they are, family-owned, years running). Free text, rendered on the subdomain site.';
+
+
+--
+-- Name: COLUMN properties.booking_area; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.properties.booking_area IS 'S602 public booking site — local area & things-to-do section. Free text, rendered on the subdomain site.';
 
 
 --
@@ -6380,6 +6396,20 @@ CREATE TABLE public.rvs (
 
 
 --
+-- Name: sales_calendar_feed; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.sales_calendar_feed (
+    id boolean DEFAULT true NOT NULL,
+    feed_token uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    busy_feed_token uuid DEFAULT public.gen_random_uuid() NOT NULL,
+    CONSTRAINT sales_calendar_feed_singleton CHECK (id)
+);
+
+
+--
 -- Name: sales_call_availability; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -6391,7 +6421,9 @@ CREATE TABLE public.sales_call_availability (
     active boolean DEFAULT true NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    kind text DEFAULT 'demo'::text NOT NULL,
     CONSTRAINT sales_call_availability_check CHECK ((end_time > start_time)),
+    CONSTRAINT sales_call_availability_kind_check CHECK ((kind = ANY (ARRAY['demo'::text, 'onboarding'::text]))),
     CONSTRAINT sales_call_availability_weekday_check CHECK (((weekday >= 0) AND (weekday <= 6)))
 );
 
@@ -6414,6 +6446,10 @@ CREATE TABLE public.sales_call_slots (
     reminded_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    kind text DEFAULT 'demo'::text NOT NULL,
+    meeting_url text,
+    prospect_timezone text,
+    CONSTRAINT sales_call_slots_kind_check CHECK ((kind = ANY (ARRAY['demo'::text, 'onboarding'::text]))),
     CONSTRAINT sales_call_slots_mode_check CHECK ((mode = ANY (ARRAY['video'::text, 'phone'::text]))),
     CONSTRAINT sales_call_slots_status_check CHECK ((status = ANY (ARRAY['booked'::text, 'completed'::text, 'cancelled'::text, 'no_show'::text])))
 );
@@ -10433,6 +10469,14 @@ ALTER TABLE ONLY public.route_stops
 
 ALTER TABLE ONLY public.rvs
     ADD CONSTRAINT rvs_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: sales_calendar_feed sales_calendar_feed_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.sales_calendar_feed
+    ADD CONSTRAINT sales_calendar_feed_pkey PRIMARY KEY (id);
 
 
 --
@@ -21666,5 +21710,5 @@ ALTER TABLE ONLY public.work_trade_logs
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 1KdD618Pip13FY5XcSfDrdQ26U1aiGYxAil8mLELpoxUO14RcopcJ2xkp3V2hZe
+\unrestrict IJS3Yys3JL17Hv71pIm5cez7J8Wj8yaQkO2UalZdTxivZsKHJNXb4sb9cmbFQXU
 

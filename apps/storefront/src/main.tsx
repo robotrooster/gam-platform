@@ -122,6 +122,32 @@ label.fl{display:block;font-size:.75rem;color:var(--t3);text-transform:uppercase
 .strip img{width:100%;height:150px;object-fit:cover;border-radius:10px;border:1px solid var(--border);display:block}
 .faq-q{font-family:var(--fd);color:var(--t0);font-weight:700;margin-bottom:6px}
 .faq-a{font-size:.95rem;white-space:pre-wrap}
+/* Skye — the pre-booking property agent (floating chat) */
+.pc-bubble{position:fixed;bottom:20px;right:20px;z-index:1000;width:56px;height:56px;border-radius:50%;background:var(--gold);color:#14100a;border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:1.35rem;box-shadow:0 8px 24px rgba(0,0,0,.45)}
+.pc-panel{position:fixed;bottom:20px;right:20px;z-index:1001;width:380px;max-width:calc(100vw - 32px);height:560px;max-height:calc(100vh - 40px);background:var(--bg2);border:1px solid var(--border);border-radius:16px;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 18px 50px rgba(0,0,0,.55)}
+.pc-head{display:flex;align-items:center;gap:10px;padding:12px 14px;border-bottom:1px solid var(--border);background:var(--bg3)}
+.pc-av{width:38px;height:38px;border-radius:50%;background:linear-gradient(135deg,var(--gold),#e6c45a);color:#14100a;display:flex;align-items:center;justify-content:center;font-weight:800;font-family:var(--fd);flex-shrink:0}
+.pc-name{font-family:var(--fd);font-weight:700;color:var(--t0);font-size:.95rem;line-height:1.1}
+.pc-sub{font-size:.72rem;color:var(--t3)}
+.pc-x{margin-left:auto;background:none;border:none;color:var(--t3);cursor:pointer;font-size:1.2rem;line-height:1}
+.pc-msgs{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:10px}
+.pc-row{display:flex;gap:8px;align-items:flex-end}
+.pc-row.me{flex-direction:row-reverse}
+.pc-mav{width:26px;height:26px;border-radius:50%;background:linear-gradient(135deg,var(--gold),#e6c45a);color:#14100a;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:.72rem;flex-shrink:0}
+.pc-b{max-width:78%;padding:9px 12px;border-radius:12px;font-size:.9rem;line-height:1.45;white-space:pre-wrap;word-break:break-word}
+.pc-b.them{background:var(--bg3);color:var(--t0);border-bottom-left-radius:3px}
+.pc-b.me{background:var(--gold);color:#14100a;border-bottom-right-radius:3px}
+.pc-read{font-size:.66rem;color:var(--dim);text-align:right;margin:-4px 4px 0 0}
+.pc-typing{display:inline-flex;gap:4px;align-items:center;padding:11px 13px;background:var(--bg3);border-radius:12px;border-bottom-left-radius:3px}
+.pc-typing i{width:5px;height:5px;border-radius:50%;background:var(--t3);animation:pcdot 1.2s infinite ease-in-out}
+.pc-typing i:nth-child(2){animation-delay:.2s}.pc-typing i:nth-child(3){animation-delay:.4s}
+@keyframes pcdot{0%,60%,100%{opacity:.3}30%{opacity:1}}
+.pc-in{display:flex;gap:8px;padding:12px;border-top:1px solid var(--border);background:var(--bg3)}
+.pc-in textarea{flex:1;resize:none;max-height:96px;padding:9px 11px;border-radius:9px;background:var(--bg);border:1px solid var(--border);color:var(--t0);font-family:inherit;font-size:.9rem;outline:none}
+.pc-in button{width:40px;flex-shrink:0;border-radius:9px;background:var(--gold);color:#14100a;border:none;cursor:pointer;font-size:1.1rem}
+.pc-in button:disabled{opacity:.4;cursor:not-allowed}
+@media(prefers-reduced-motion:reduce){.pc-typing i{animation:none;opacity:.55}}
+@media(max-width:480px){.pc-panel{width:calc(100vw - 20px);height:calc(100dvh - 30px);bottom:10px;right:10px}}
 `
 
 interface SiteType { id: string; name: string; siteCount: number; nightlyRate: number | null; weeklyRate: number | null; minStayNights: number | null; maxStayNights: number | null; checkInTime: string | null; checkOutTime: string | null }
@@ -137,6 +163,7 @@ interface SitePhoto { id: string; caption: string | null; url: string }
 interface Faq { id: string; question: string; answer: string }
 interface PropertyInfo {
   name: string; city: string | null; state: string | null; intro: string | null; depositPct: number
+  about: string | null; area: string | null
   street1: string | null; zip: string | null
   officePhone: string | null; officeEmail: string | null; officeHours: string | null
 }
@@ -200,6 +227,7 @@ function App() {
         <HomePage slug={s} profile={profile} />
       )}
       <div className="footer wrap">Reservations powered by Gold Asset Management</div>
+      <PropertyChat slug={s} propertyName={p.name} />
     </Shell>
   )
 }
@@ -228,6 +256,18 @@ function HomePage({ slug, profile }: { slug: string; profile: Profile }) {
           {profile.photos.length > 6 && (
             <p style={{ marginTop: 12 }}><a href={pageHref(slug, 'gallery')} style={{ color: 'var(--gold)' }}>See the full gallery →</a></p>
           )}
+        </section>
+      )}
+      {p.about && (
+        <section className="wrap">
+          <h2>Our story</h2>
+          <p style={{ whiteSpace: 'pre-wrap' }}>{p.about}</p>
+        </section>
+      )}
+      {p.area && (
+        <section className="wrap">
+          <h2>The area &amp; things to do</h2>
+          <p style={{ whiteSpace: 'pre-wrap' }}>{p.area}</p>
         </section>
       )}
       {profile.amenities.length > 0 && <AmenitiesSection slug={slug} amenities={profile.amenities} />}
@@ -866,6 +906,139 @@ function ClaimView({ slug, token }: { slug: string; token: string }) {
         )}
       </div>
     </section>
+  )
+}
+
+// ── Skye — the pre-booking property agent (floating chat) ──
+// Talks to POST /api/property/:slug/agent/chat: a public, property-scoped agent
+// that answers pricing/availability/amenities for THIS property and can start a
+// reservation. Human texting cadence (Read receipt → typing → paced reply
+// bubbles) mirrors the platform's other agents. History persists per-property in
+// localStorage so a visitor doesn't lose the thread while browsing the site.
+const chatSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
+interface ChatMsg { role: 'user' | 'agent'; text: string }
+
+function ChatRow({ role, text }: { role: 'user' | 'agent'; text: string }) {
+  const me = role === 'user'
+  return (
+    <div className={`pc-row${me ? ' me' : ''}`}>
+      {!me && <div className="pc-mav">S</div>}
+      <div className={`pc-b ${me ? 'me' : 'them'}`}>{text}</div>
+    </div>
+  )
+}
+
+function PropertyChat({ slug, propertyName }: { slug: string; propertyName: string }) {
+  const KEY = `gam_property_chat_${slug}`
+  const GREETING = `Hi! I'm Skye, the booking host for ${propertyName}. Ask me anything — rates, availability, or what's here — and I can get you booked.`
+  const [open, setOpen] = useState(false)
+  const [messages, setMessages] = useState<ChatMsg[]>([])
+  const [conversationId, setConversationId] = useState<string | undefined>()
+  const [input, setInput] = useState('')
+  const [sending, setSending] = useState(false)
+  const [indicator, setIndicator] = useState<'none' | 'read' | 'typing'>('none')
+  const scrollRef = React.useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(KEY)
+      if (raw) {
+        const s = JSON.parse(raw)
+        if (Array.isArray(s.messages)) setMessages(s.messages)
+        if (typeof s.conversationId === 'string') setConversationId(s.conversationId)
+      }
+    } catch { /* ignore corrupt cache */ }
+  }, [])
+
+  useEffect(() => {
+    try { localStorage.setItem(KEY, JSON.stringify({ messages: messages.slice(-60), conversationId })) } catch { /* quota */ }
+    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' })
+  }, [messages, conversationId, indicator, sending])
+
+  async function send() {
+    const text = input.trim()
+    if (!text || sending) return
+    setInput('')
+    setMessages((m) => [...m, { role: 'user', text }])
+    setSending(true)
+
+    // History = prior turns only; current message rides separately. Runs in
+    // parallel with the read/typing beats and never throws, so the cadence
+    // always completes.
+    const priorHistory = messages
+      .map((m) => ({ role: m.role === 'user' ? 'user' : 'assistant', content: String(m.text).slice(0, 8000) }))
+      .slice(-30)
+    const replyPromise: Promise<string> = (async () => {
+      try {
+        const r = await axios.post(`${API}/api/property/${slug}/agent/chat`,
+          conversationId ? { message: text, conversationId, history: priorHistory } : { message: text, history: priorHistory })
+        const d = r.data?.data || {}
+        if (typeof d.conversationId === 'string') setConversationId(d.conversationId)
+        return d.reply || "Sorry — I didn't catch that. Could you say it another way?"
+      } catch (e: any) {
+        return e?.response?.status === 429
+          ? "You're sending those a little quickly — give me a moment and try again."
+          : "I'm having trouble connecting right now. Please try again in a moment."
+      }
+    })()
+
+    // Read receipt → typing → the reply lands as separate, paced bubbles.
+    const readMs = Math.min(4500, 1100 + text.length * 40)
+    await chatSleep(readMs); setIndicator('read')
+    await chatSleep(800); setIndicator('typing')
+    let since = Date.now()
+
+    const reply = await replyPromise
+    const parts = String(reply).split(/\n{2,}/).map((s) => s.trim()).filter(Boolean)
+    if (!parts.length) parts.push(String(reply))
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i]
+      const typeMs = Math.min(9000, Math.max(1800, part.length * 55))
+      const held = Date.now() - since
+      await chatSleep(Math.max(0, typeMs - held))
+      setIndicator('none')
+      setMessages((m) => [...m, { role: 'agent', text: part }])
+      if (i < parts.length - 1) {
+        const readGap = Math.min(5000, Math.max(1400, part.length * 18))
+        await chatSleep(readGap)
+        setIndicator('typing'); since = Date.now()
+      }
+    }
+    setIndicator('none'); setSending(false)
+  }
+
+  if (!open) {
+    return <button className="pc-bubble" aria-label="Chat with the booking host" onClick={() => setOpen(true)}>💬</button>
+  }
+  return (
+    <div className="pc-panel" role="dialog" aria-label="Booking assistant">
+      <div className="pc-head">
+        <div className="pc-av">S</div>
+        <div>
+          <div className="pc-name">Skye</div>
+          <div className="pc-sub">Booking host · {propertyName}</div>
+        </div>
+        <button className="pc-x" aria-label="Close chat" onClick={() => setOpen(false)}>▾</button>
+      </div>
+      <div className="pc-msgs" ref={scrollRef}>
+        <ChatRow role="agent" text={GREETING} />
+        {messages.map((m, i) => <ChatRow key={i} role={m.role} text={m.text} />)}
+        {indicator === 'read' && <div className="pc-read">Read</div>}
+        {indicator === 'typing' && (
+          <div className="pc-row"><div className="pc-mav">S</div><div className="pc-typing"><i /><i /><i /></div></div>
+        )}
+      </div>
+      <div className="pc-in">
+        <textarea
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() } }}
+          placeholder="Ask about rates, availability…"
+          rows={1}
+        />
+        <button onClick={send} disabled={!input.trim() || sending} aria-label="Send">↑</button>
+      </div>
+    </div>
   )
 }
 

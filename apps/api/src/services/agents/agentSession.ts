@@ -109,7 +109,7 @@ export async function runAgentSession(input: AgentSessionInput): Promise<AgentSe
   // agree, or a misconfigured caller could surface one audience's tools
   // against the other's identity. Fail fast on a mismatch.
   if (
-    (actor.role === 'tenant' || actor.role === 'landlord' || actor.role === 'guest') &&
+    (actor.role === 'tenant' || actor.role === 'landlord' || actor.role === 'guest' || actor.role === 'visitor') &&
     actor.role !== audience
   ) {
     throw new Error(`agent session: audience '${audience}' does not match actor.role '${actor.role}'`)
@@ -136,7 +136,12 @@ export async function runAgentSession(input: AgentSessionInput): Promise<AgentSe
   // FAQ answer cache: only for a first-turn (no history) question we can
   // cache. The cache KEY is built up front; the store happens after a turn
   // that qualifies as cacheable (no tools/escalation, grounded answer).
-  const answerKey = answerCacheEnabled && baseHistory.length === 0 ? `${audience}|${normalizeQuestion(message)}` : null
+  // The 'visitor' (property agent) audience is NEVER answer-cached: its replies
+  // are property-specific, and a key of audience+question alone would risk
+  // serving one property's answer on a different property's site. (Its answers
+  // are tool-backed anyway, so the store guard already skips them — this makes
+  // the isolation explicit rather than incidental.)
+  const answerKey = answerCacheEnabled && audience !== 'visitor' && baseHistory.length === 0 ? `${audience}|${normalizeQuestion(message)}` : null
 
   // Single tail: fire-and-forget the log (best-effort) and return the reply
   // immediately — never make the tenant wait on the interaction-log write.

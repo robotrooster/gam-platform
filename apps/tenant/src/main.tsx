@@ -51,7 +51,7 @@ import { BrowserRouter, Routes, Route, Navigate, NavLink, Outlet, useNavigate, u
 import {
   ShieldCheck, Home, Star, CreditCard, Wrench, ClipboardCheck,
   Video, DoorOpen, CalendarClock, HeartHandshake, BarChart3, Scale, ScrollText,
-  Bell, Landmark, User, Dumbbell, MessagesSquare, FileText, ClipboardList,
+  Bell, Landmark, User, Dumbbell, MessagesSquare, FileText, ClipboardList, Sun, Moon,
 } from 'lucide-react'
 
 // S550: first-party product telemetry — one page_view per route change.
@@ -289,6 +289,7 @@ input,select,textarea{font-family:var(--font-b)}
 .alert{display:flex;align-items:flex-start;gap:12px;padding:12px 16px;border-radius:8px;font-size:.82rem;margin-bottom:16px}
 .a-gold{background:rgba(201,162,39,.08);border:1px solid rgba(201,162,39,.2);color:var(--gold)}
 .a-green{background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.2);color:#86efac}
+.a-red{background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.2);color:#fca5a5}
 .a-warn{background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.2);color:#fcd34d}
 .a-blue{background:rgba(59,130,246,.08);border:1px solid rgba(59,130,246,.2);color:#93c5fd}
 .modal-ov,.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.75);display:flex;align-items:center;justify-content:center;z-index:100;padding:20px;backdrop-filter:blur(4px)}
@@ -300,9 +301,20 @@ input,select,textarea{font-family:var(--font-b)}
 .fl{display:block;font-size:.75rem;font-weight:600;color:var(--t2);margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em}
 /* S544: .inp was used in 5 places but never defined — fields rendered
    browser-default white on the dark theme. */
-.inp,.form-input{width:100%;background:var(--bg3);border:1px solid var(--b1);border-radius:8px;color:var(--t0);padding:10px 12px;font-size:.9rem;color-scheme:dark}
-.inp:focus,.form-input:focus{outline:none;border-color:var(--gold)}
+.inp,.input,.form-input{width:100%;background:var(--bg3);border:1px solid var(--b1);border-radius:8px;color:var(--t0);padding:10px 12px;font-size:.9rem;color-scheme:dark}
+.inp:focus,.input:focus,.form-input:focus{outline:none;border-color:var(--gold)}
 textarea.inp{resize:vertical}
+/* S595: same drift as .inp (S544) — className="input" fields were never aliased,
+   so they fell back to white browser boxes. Alias + uniform +6% type lift +
+   readable disabled (overrides the blanket :disabled{opacity:.4} so disabled
+   field VALUES stay legible instead of washing out). */
+html{font-size:17px}
+.inp:disabled,.input:disabled,.form-input:disabled,.fi:disabled,.fs:disabled,.fta:disabled,input:disabled,select:disabled,textarea:disabled,input[readonly],textarea[readonly]{background:var(--bg2);border-color:var(--b0);color:var(--t1);-webkit-text-fill-color:var(--t1);opacity:1;cursor:not-allowed}
+/* S595 LIGHT THEME (short token names; hyphenated aliases map to these so both flip). */
+:root[data-theme="light"]{color-scheme:light;--bg0:#f4f5f7;--bg1:#ffffff;--bg2:#ffffff;--bg3:#eef0f4;--bg4:#e5e8ee;--b0:#e7e9ef;--b1:#dde0e8;--b2:#ccd2de;--t0:#12151c;--t1:#333b49;--t2:#5b6474;--t3:#8a93a5;--gold-ink:#7a5f0f}
+:root[data-theme="light"] .inp,:root[data-theme="light"] .input,:root[data-theme="light"] .form-input,:root[data-theme="light"] .fi,:root[data-theme="light"] .fs,:root[data-theme="light"] .fta{color-scheme:light}
+:root[data-theme="light"] a,:root[data-theme="light"] .logo-name{color:var(--gold-ink)}
+:root[data-theme="light"] .ni.active{color:var(--gold-ink);background:rgba(201,162,39,.12);border-color:rgba(201,162,39,.32)}
 .fi,.fs,.fta{width:100%;background:var(--bg3);border:1px solid var(--b1);border-radius:8px;color:var(--t0);padding:9px 12px;font-size:.875rem;font-family:var(--font-b);outline:none;transition:border-color .15s}
 .fi:focus,.fs:focus,.fta:focus{border-color:var(--gold)}
 .fi::placeholder{color:var(--t3)}
@@ -452,6 +464,9 @@ function Layout() {
   const fontKey = tenantMe?.fontStyle || 'default'
   const fontFamily = FONTS[fontKey] || FONTS.default
   const fontImport = FONT_IMPORTS[fontKey] || ''
+  // S595: per-device light/dark toggle (initial value applied pre-paint by index.html).
+  const [theme, setTheme] = useState<'dark' | 'light'>(() => document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark')
+  const toggleTheme = () => { const n = theme === 'dark' ? 'light' : 'dark'; document.documentElement.setAttribute('data-theme', n); try { localStorage.setItem('gam_theme', n) } catch {}; setTheme(n) }
   const themeCss = fontImport + `:root {
     --gold: ${accent};
     --font-b: ${fontFamily};
@@ -550,7 +565,11 @@ function Layout() {
         </div>
       </aside>
       <div className="main">
-        <header className="topbar" />
+        <header className="topbar">
+          <button onClick={toggleTheme} title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'} aria-label="Toggle light/dark theme" style={{ marginLeft: 'auto', background: 'transparent', border: 'none', cursor: 'pointer', color: 'var(--t2)', padding: 6, display: 'inline-flex', alignItems: 'center', borderRadius: 6 }}>
+            {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
+          </button>
+        </header>
         <div className="page">{moveInLocked ? <MoveInLockout gate={moveInGate} /> : <Outlet />}</div>
         <DialogHost />
       </div>

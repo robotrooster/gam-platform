@@ -1,9 +1,10 @@
+import { useState } from 'react'
 import { Outlet, NavLink, useNavigate } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
 import { TotpNudge } from './TotpNudge'
 import {
   LayoutDashboard, Building2, Users, Banknote,
-  HeartHandshake, Receipt, LogOut, Settings,
+  HeartHandshake, Receipt, LogOut, Settings, Sun, Moon,
 } from 'lucide-react'
 
 const NAV: Array<{ to: string; icon: any; label: string; section: string | null }> = [
@@ -21,6 +22,10 @@ export function Layout() {
   const navigate = useNavigate()
 
   const handleLogout = () => { logout(); navigate('/login') }
+
+  // S595: per-device light/dark toggle (initial value applied pre-paint by index.html).
+  const [theme, setTheme] = useState<'dark' | 'light'>(() => document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark')
+  const toggleTheme = () => { const n = theme === 'dark' ? 'light' : 'dark'; document.documentElement.setAttribute('data-theme', n); try { localStorage.setItem('gam_theme', n) } catch {}; setTheme(n) }
 
   const renderedSections = new Set<string>()
 
@@ -76,9 +81,14 @@ export function Layout() {
           <div style={{ fontSize: '.68rem', color: 'var(--text-3)', marginBottom: 8 }}>
             {activePmCompany?.myRole ?? '—'} · {user?.email}
           </div>
-          <button className="btn btn-ghost btn-sm" onClick={handleLogout} style={{ width: '100%' }}>
-            <LogOut size={12} style={{ marginRight: 6 }} /> Sign out
-          </button>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button className="btn btn-ghost btn-sm" onClick={toggleTheme} title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'} aria-label="Toggle light/dark theme" style={{ padding: '6px' }}>
+              {theme === 'dark' ? <Sun size={14} /> : <Moon size={14} />}
+            </button>
+            <button className="btn btn-ghost btn-sm" onClick={handleLogout} style={{ flex: 1 }}>
+              <LogOut size={12} style={{ marginRight: 6 }} /> Sign out
+            </button>
+          </div>
         </div>
       </aside>
 

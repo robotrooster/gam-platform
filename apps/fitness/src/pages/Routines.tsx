@@ -14,6 +14,7 @@ const blankDay = (): Day => ({ title: '', subtitle: '', sections: [blankSection(
 export function RoutinesPage() {
   const [routines, setRoutines] = useState<any[]>([])
   const [openId, setOpenId] = useState<string | null>(null)
+  const [confirmId, setConfirmId] = useState<string | null>(null)
   const [full, setFull] = useState<Record<string, any>>({})
   const [building, setBuilding] = useState(false)
   const toast = useToast()
@@ -23,6 +24,7 @@ export function RoutinesPage() {
   useEffect(() => { reload() }, [])
 
   async function open(id: string) {
+    setConfirmId(null)
     if (openId === id) { setOpenId(null); return }
     setOpenId(id)
     if (!full[id]) {
@@ -37,8 +39,11 @@ export function RoutinesPage() {
     else toast(res.error || 'Could not start workout')
   }
 
+  // S595: no native confirm() (standing rule) — inline two-step confirm instead.
+  // First Delete arms it; a second tap deletes. Any other View/open resets it.
   async function remove(id: string) {
-    if (!confirm('Delete this routine? This cannot be undone.')) return
+    if (confirmId !== id) { setConfirmId(id); toast('Tap Delete again to confirm'); return }
+    setConfirmId(null)
     await apiDelete(`/fitness/routines/${id}`)
     setOpenId(null)
     reload()
@@ -65,7 +70,7 @@ export function RoutinesPage() {
               </div>
               <div className="row" style={{ gap: 8, flex: 'none' }}>
                 <button className="btn sm ghost" onClick={() => open(r.id)}>{openId === r.id ? 'Hide' : 'View'}</button>
-                <button className="btn sm danger" onClick={() => remove(r.id)}>Delete</button>
+                <button className="btn sm danger" onClick={() => remove(r.id)}>{confirmId === r.id ? 'Confirm?' : 'Delete'}</button>
               </div>
             </div>
 

@@ -4,6 +4,11 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>GAM — Landlord Portal</title>
+  <script>
+    /* S595: apply the saved light/dark choice before first paint (no flash).
+       The visible toggle lives in the topbar (Layout.tsx). */
+    try { var t = localStorage.getItem('gam_theme'); if (t) document.documentElement.setAttribute('data-theme', t); } catch (e) {}
+  </script>
 </head>
 <body>
   <div id="root"></div>

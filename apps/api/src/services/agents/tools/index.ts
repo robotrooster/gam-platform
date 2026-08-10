@@ -77,6 +77,10 @@ import { createInspection } from './createInspection'
 import { setInspectionItemCondition } from './setInspectionItemCondition'
 import { getGuestBooking } from './getGuestBooking'
 import { requestBookingChange } from './requestBookingChange'
+import { getPropertyInfo } from './getPropertyInfo'
+import { getPropertyPricing } from './getPropertyPricing'
+import { checkPropertyAvailability } from './checkPropertyAvailability'
+import { createBookingCheckout } from './createBookingCheckout'
 import type { AgentTool } from './types'
 import type { AgentProfile } from '../types'
 import type { ToolSchema } from '../engine'
@@ -152,6 +156,11 @@ export const ALL_TOOLS: readonly AgentTool[] = [
   requestBookingChange,
   getGuestAmenities,
   requestGuestAmenityReservation,
+  // property visitor (slug-scoped, pre-booking)
+  getPropertyInfo,
+  getPropertyPricing,
+  checkPropertyAvailability,
+  createBookingCheckout,
   // both
   getApplicableLaws,
   searchStateLaw,

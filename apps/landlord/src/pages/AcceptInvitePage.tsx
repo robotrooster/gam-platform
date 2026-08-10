@@ -19,8 +19,8 @@ interface InviteInfo {
 
 const wrap: React.CSSProperties = { minHeight: '100vh', background: '#060809', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 24, fontFamily: 'system-ui' }
 const card: React.CSSProperties = { background: '#0a0d10', border: '1px solid #1e2530', borderRadius: 16, padding: 28, width: '100%', maxWidth: 460 }
-const inputStyle: React.CSSProperties = { width: '100%', padding: '10px 12px', background: '#141920', border: '1px solid #252e3d', borderRadius: 8, color: '#eef1f8', fontSize: '.85rem', outline: 'none', boxSizing: 'border-box' }
-const labelStyle: React.CSSProperties = { fontSize: '.72rem', fontWeight: 600, color: '#7a8aaa', textTransform: 'uppercase', letterSpacing: '.06em', display: 'block', marginBottom: 5 }
+const inputStyle: React.CSSProperties = { width: '100%', padding: '10px 12px', background: '#141920', border: '1px solid #252e3d', borderRadius: 8, color: 'var(--text-0)', fontSize: '.85rem', outline: 'none', boxSizing: 'border-box' }
+const labelStyle: React.CSSProperties = { fontSize: '.72rem', fontWeight: 600, color: 'var(--text-2)', textTransform: 'uppercase', letterSpacing: '.06em', display: 'block', marginBottom: 5 }
 
 export function AcceptInvitePage() {
   const { token } = useParams<{ token: string }>()
@@ -78,8 +78,8 @@ export function AcceptInvitePage() {
     <div style={wrap}>
       <div style={{ ...card, textAlign: 'center' }}>
         <div style={{ fontSize: 48, marginBottom: 16 }}>⚠️</div>
-        <div style={{ fontSize: '1.2rem', fontWeight: 800, color: '#eef1f8', marginBottom: 8 }}>Invitation unavailable</div>
-        <div style={{ fontSize: '.85rem', color: '#b8c4d8', lineHeight: 1.6 }}>{error}</div>
+        <div style={{ fontSize: '1.2rem', fontWeight: 800, color: 'var(--text-0)', marginBottom: 8 }}>Invitation unavailable</div>
+        <div style={{ fontSize: '.85rem', color: 'var(--text-1)', lineHeight: 1.6 }}>{error}</div>
         <div style={{ fontSize: '.75rem', color: '#3d4d68', marginTop: 12 }}>Ask your employer to send a new invite link.</div>
       </div>
     </div>
@@ -89,8 +89,8 @@ export function AcceptInvitePage() {
     <div style={wrap}>
       <div style={{ ...card, textAlign: 'center' }}>
         <div style={{ fontSize: 48, marginBottom: 12 }}>✅</div>
-        <div style={{ fontSize: '1.2rem', fontWeight: 800, color: '#eef1f8', marginBottom: 8 }}>You're all set</div>
-        <div style={{ fontSize: '.85rem', color: '#b8c4d8', lineHeight: 1.6, marginBottom: 20 }}>
+        <div style={{ fontSize: '1.2rem', fontWeight: 800, color: 'var(--text-0)', marginBottom: 8 }}>You're all set</div>
+        <div style={{ fontSize: '.85rem', color: 'var(--text-1)', lineHeight: 1.6, marginBottom: 20 }}>
           Your account is ready. Sign in to get started — your employer will set what you can access.
         </div>
         <button onClick={() => navigate('/login')} style={{ padding: '12px 28px', borderRadius: 10, border: 'none', background: 'linear-gradient(135deg, #8a6c10, #c9a227)', color: '#060809', fontWeight: 700, fontSize: '.9rem', cursor: 'pointer' }}>
@@ -108,16 +108,16 @@ export function AcceptInvitePage() {
           <div style={{ fontSize: '.75rem', color: '#3d4d68', marginTop: 2 }}>Gold Asset Management</div>
         </div>
         <div style={card}>
-          <div style={{ fontSize: '1.1rem', fontWeight: 800, color: '#eef1f8', marginBottom: 6 }}>
+          <div style={{ fontSize: '1.1rem', fontWeight: 800, color: 'var(--text-0)', marginBottom: 6 }}>
             {info?.userExists ? 'Join the team' : 'Create your account'}
           </div>
-          <div style={{ fontSize: '.82rem', color: '#7a8aaa', marginBottom: 20, lineHeight: 1.6 }}>
-            <strong style={{ color: '#b8c4d8' }}>{info?.inviterName}</strong> invited you to join their team on GAM.
-            {' '}Signing in as <strong style={{ color: '#b8c4d8' }}>{info?.email}</strong>.
+          <div style={{ fontSize: '.82rem', color: 'var(--text-2)', marginBottom: 20, lineHeight: 1.6 }}>
+            <strong style={{ color: 'var(--text-1)' }}>{info?.inviterName}</strong> invited you to join their team on GAM.
+            {' '}Signing in as <strong style={{ color: 'var(--text-1)' }}>{info?.email}</strong>.
           </div>
 
           {info?.userExists ? (
-            <div style={{ fontSize: '.8rem', color: '#b8c4d8', marginBottom: 20, lineHeight: 1.6 }}>
+            <div style={{ fontSize: '.8rem', color: 'var(--text-1)', marginBottom: 20, lineHeight: 1.6 }}>
               You already have a GAM account with this email. Accept to join this team — you'll sign in with your existing password.
             </div>
           ) : (

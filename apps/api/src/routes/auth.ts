@@ -7,8 +7,9 @@ import { db, query, queryOne } from '../db'
 import { UserRole } from '@gam/shared'
 import { requireAuth } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
-import { sendPasswordResetEmail, sendEmailVerification } from '../services/email'
+import { sendPasswordResetEmail, sendEmailVerification, sendLandlordSignupHeadsUp } from '../services/email'
 import { isDisposableEmail } from '../lib/email'
+import { logger } from '../lib/logger'
 import { signTotpSessionToken, signTotpEnrollToken } from './totp'
 import { MANDATORY_TOTP_ROLES } from '../lib/totp'
 import { signEmailOtpSessionToken, issueEmailOtp } from './emailOtp'
@@ -155,13 +156,14 @@ authRouter.post('/register', async (req, res, next) => {
       ).then(r => r.rows)
 
       let profileId: string
+      // Hoisted so the post-commit signup alert can read closer attribution.
+      let closerId: string | null = null
+      let referredByUserId: string | null = null
       if (body.role === 'landlord') {
         // S567: resolve a referral code. A rep's code (admin/super_admin) sets
         // the closing portfolio manager; a LANDLORD's code sets referred_by
         // (that landlord earns the closing residual, CS routes to a PM).
         // Unknown codes are ignored (self-closed), never an error.
-        let closerId: string | null = null
-        let referredByUserId: string | null = null
         if (body.referralCode) {
           const [ref] = await client.query(
             `SELECT id, role FROM users WHERE referral_code = $1
@@ -220,6 +222,31 @@ authRouter.post('/register', async (req, res, next) => {
         businessId: null, staffRole: null, permissions: null,
       })
       await issueEmailOtp(user.id, user.email)
+
+      // S598: alert on every landlord signup — silence was the §8 gap. Organic
+      // (no referral code → no closer) signups also start the 24h CS-assignment
+      // clock. Best-effort + fire-and-forget: never blocks or fails registration.
+      if (body.role === 'landlord') {
+        const organic = !closerId
+        query(
+          `INSERT INTO admin_notifications (severity, category, title, body, context)
+           VALUES ($1, 'landlord_signup', $2, $3, $4::jsonb)`,
+          [organic ? 'warn' : 'info',
+           `New landlord signup: ${user.first_name} ${user.last_name}`.trim(),
+           organic
+             ? `Organic signup (no referral code) — assign a CS rep within 24h. ${user.email}`
+             : `Signup attributed to a closer via referral code. ${user.email}`,
+           JSON.stringify({ userId: user.id, landlordId: profileId, email: user.email,
+             organic, closerId: closerId ?? null, referredByUserId: referredByUserId ?? null,
+             referralCode: body.referralCode ?? null })]
+        ).catch((err) => logger.error({ err, userId: user.id }, '[signup] admin notify failed'))
+        sendLandlordSignupHeadsUp({
+          name: `${user.first_name} ${user.last_name}`.trim(),
+          email: user.email, phone: body.phone ?? null,
+          organic, referralCode: body.referralCode ?? null,
+        }).catch((err) => logger.error({ err, userId: user.id }, '[signup] signup heads-up email failed'))
+      }
+
       res.status(201).json({
         success: true,
         data: { requiresEmailOtp: true, emailOtpSession,

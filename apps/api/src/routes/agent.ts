@@ -21,9 +21,10 @@ import { requireAuth } from '../middleware/auth'
 import { AppError } from '../middleware/errorHandler'
 import { runAgentSession } from '../services/agents/agentSession'
 import { isAssistantHidden } from '../services/agents/turnBudget'
-import { listAvailableSlots, formatSlotForHumans, bookSalesCall } from '../services/salesCalls'
+import { listAvailableSlots, formatSlotForHumans, bookSalesCall, groupSlotsByDay } from '../services/salesCalls'
 import { loadConversationHistory, loadGuestConversationHistory } from '../services/agents/conversationHistory'
 import { resolveBookingGuestToken } from '../services/bookingGuestTokens'
+import { resolveProperty } from '../services/propertyBookingQuote'
 import type { AgentAudience, ChatMessage } from '../services/agents/types'
 
 export const agentRouter = Router()
@@ -210,6 +211,60 @@ salesAgentRouter.post('/call-slots/book', async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
+// ── S596: demo booking (marketing "Book a demo" modal) ────────────────
+// Survey → pick a 30-min slot → onto the owner's subscribed calendar. Public +
+// unauthenticated; the POST rides a dedicated tight limiter (on top of the
+// sales limiter) so a bot can't spray the calendar.
+const demoBookLimiter = rateLimit({
+  windowMs: Number(process.env.DEMO_BOOK_RATE_WINDOW_MS) || 10 * 60_000,
+  max: () => Number(process.env.DEMO_BOOK_RATE_MAX) || 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, error: 'Too many booking attempts — please wait a few minutes.' },
+})
+
+// GET /api/sales/demo/slots — open 30-min demo slots, grouped by day.
+salesAgentRouter.get('/demo/slots', async (_req, res, next) => {
+  try {
+    const slots = await listAvailableSlots('demo')
+    res.json({ success: true, data: { days: groupSlotsByDay(slots) } })
+  } catch (e) { next(e) }
+})
+
+const demoBookSchema = z.object({
+  startsAt:      z.string().datetime(),
+  name:          z.string().trim().min(1).max(120),
+  email:         z.string().trim().email().max(254),
+  phone:         z.string().trim().max(40).optional(),
+  timezone:      z.string().trim().max(64).optional(),
+  propertyTypes: z.array(z.string().trim().min(1).max(60)).max(12).optional(),
+  unitRange:     z.string().trim().max(40).optional(),
+  painPoints:    z.array(z.string().trim().min(1).max(80)).max(20).optional(),
+  lookingFor:    z.string().trim().max(2000).optional(),
+  conversationId: z.string().uuid().optional(),
+})
+
+// POST /api/sales/demo — book a demo. Availability + lead-time are re-checked
+// server-side inside bookSalesCall; the client's slot choice is never trusted.
+salesAgentRouter.post('/demo', demoBookLimiter, async (req, res, next) => {
+  try {
+    const b = demoBookSchema.parse(req.body)
+    const result = await bookSalesCall({
+      startsAt: b.startsAt, kind: 'demo', mode: 'video',
+      name: b.name, email: b.email, phone: b.phone ?? null,
+      timezone: b.timezone ?? null,
+      conversationId: b.conversationId ?? null,
+      propertyTypes: b.propertyTypes, unitRange: b.unitRange ?? null,
+      painPoints: b.painPoints, lookingFor: b.lookingFor ?? null,
+    })
+    if (!result.ok) throw new AppError(409, result.error)
+    res.status(201).json({
+      success: true,
+      data: { startsAt: result.startsAt, when: result.when, meetingUrl: result.meetingUrl },
+    })
+  } catch (e) { next(e) }
+})
+
 // ── Booking-guest agent (NO login — bearer token) ─────────────────────
 // A no-account booking guest reaches their stay assistant via a per-booking
 // access token (delivered by email-link or on-site QR). The token IS the
@@ -272,6 +327,67 @@ guestAgentRouter.post('/chat', async (req, res, next) => {
       message: body.message,
       conversationId,
       history,
+    })
+
+    res.json({
+      success: true,
+      data: {
+        reply: result.reply,
+        conversationId,
+        ...(result.shed ? { shed: true } : {}),
+      },
+    })
+  } catch (e) {
+    next(e)
+  }
+})
+
+// ── Public property agent (a landlord's booking subdomain — NO auth) ──
+// The pre-booking property host (Skye): a visitor browsing ONE property's public
+// booking site asks about pricing/availability and can start a reservation.
+// Unauthenticated + IP-rate-limited; the actor is synthetic (the chat session
+// id) and HARD-SCOPED to the property the slug resolves to, so the agent can
+// only ever read/book that one property — never a neighboring one. History is
+// client-supplied (localStorage), same posture as the sales door.
+export const propertyAgentRouter = Router()
+
+const propertyAgentLimiter = rateLimit({
+  windowMs: Number(process.env.PROPERTY_AGENT_RATE_WINDOW_MS) || 60_000,
+  max: () => Number(process.env.PROPERTY_AGENT_RATE_MAX) || 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, error: 'Too many messages — please wait a moment.' },
+})
+propertyAgentRouter.use(propertyAgentLimiter)
+
+const propertyChatSchema = z.object({
+  message: z.string().trim().min(1).max(4000),
+  conversationId: z.string().uuid().optional(),
+  history: z
+    .array(z.object({ role: z.enum(['user', 'assistant']), content: z.string().min(1).max(8000) }))
+    .max(40)
+    .optional(),
+})
+
+// POST /api/property/:slug/agent/chat — one property-agent turn (public).
+propertyAgentRouter.post('/:slug/agent/chat', async (req, res, next) => {
+  try {
+    const body = propertyChatSchema.parse(req.body)
+    // Resolve slug → property FIRST. resolveProperty 404s unless the booking
+    // site is published, so a disabled/unknown slug can never open a chat.
+    const prop = await resolveProperty(req.params.slug)
+    const conversationId = body.conversationId ?? randomUUID()
+    // Anonymous visitor actor, HARD-SCOPED to this property: the session id is
+    // the identity; profileId + propertyId are the property id, so every
+    // property tool binds to this one property and nothing else.
+    const actor = { userId: conversationId, role: 'visitor', profileId: prop.id, propertyId: prop.id }
+
+    const result = await runAgentSession({
+      audience: 'visitor',
+      actor,
+      message: body.message,
+      conversationId,
+      history: body.history,
     })
 
     res.json({

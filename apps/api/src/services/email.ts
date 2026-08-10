@@ -2,6 +2,7 @@ import { Resend } from 'resend'
 import { LandlordAssignableRole, LANDLORD_ASSIGNABLE_ROLE_LABEL } from '@gam/shared'
 import { query } from '../db'
 import { logger } from '../lib/logger'
+import { buildDemoBookingIcs } from './demoCalendar'
 
 const resend = new Resend(process.env.RESEND_API_KEY)
 // S288: two senders, picked per email kind. NOREPLY is the default
@@ -1468,7 +1469,7 @@ export async function emailPosReceipt(
 export async function sendSalesCallConfirmation({ to, name, when, mode }: {
   to: string; name: string; when: string; mode: 'video' | 'phone'
 }) {
-  const first = name.trim().split(/\s+/)[0] || 'there'
+  const first = escapeHtml(name.trim().split(/\s+/)[0] || 'there')
   await send(to, `Your GAM call is booked — ${when}`,
     base(
       h(`You're on the calendar`) +
@@ -1487,7 +1488,7 @@ export async function sendSalesCallConfirmation({ to, name, when, mode }: {
 export async function sendSalesCallReminder({ to, name, when, mode }: {
   to: string; name: string; when: string; mode: 'video' | 'phone'
 }) {
-  const first = name.trim().split(/\s+/)[0] || 'there'
+  const first = escapeHtml(name.trim().split(/\s+/)[0] || 'there')
   await send(to, `Reminder: your GAM call is coming up — ${when}`,
     base(
       h(`See you soon`) +
@@ -1499,5 +1500,111 @@ export async function sendSalesCallReminder({ to, name, when, mode }: {
     ),
     { category: 'sales_call_reminder', landlordId: null },
     'support',
+  )
+}
+
+// ── S596: demo booking (marketing "Book a demo" funnel) ───────────────
+// Prospect confirmation — carries the Jitsi join link + a .ics attachment so
+// the single call drops onto their calendar on open. Best-effort; the booking
+// already committed before this fires.
+export async function sendDemoBookingConfirmation({
+  to, name, when, slotId, startsAt, durationMinutes, meetingUrl, kind,
+}: {
+  to: string; name: string; when: string; slotId: string
+  startsAt: string; durationMinutes: number; meetingUrl: string | null; kind: string
+}) {
+  const first = escapeHtml(name.trim().split(/\s+/)[0] || 'there')
+  const ics = buildDemoBookingIcs({
+    slotId, startsAt, durationMinutes, meetingUrl, kind, now: new Date(),
+  })
+  const joinBlock = meetingUrl
+    ? btn('Join the demo', meetingUrl) +
+      `<p style="margin:10px 0 0;font-size:.72rem;color:#4a5568;word-break:break-all">${meetingUrl}</p>`
+    : p('Your host will send the video link before the call.')
+  await send(to, `Your GAM demo is booked — ${when}`,
+    base(
+      h(`You're on the calendar`) +
+      p(`Hi ${first} — your ${durationMinutes}-minute demo with Gold Asset Management is confirmed:`) +
+      `<div style="background:#0a0f14;border-radius:8px;padding:16px;margin:12px 0">
+        <div style="font-weight:700;color:#c9a227;margin-bottom:4px">${when}</div>
+        <div style="color:#b8c4d8;font-size:.82rem">${durationMinutes}-minute video demo. We'll show you the platform live and answer anything specific to your properties.</div>
+      </div>` +
+      joinBlock +
+      p(`We've attached a calendar invite so it lands on your calendar. Need to reschedule? Just reply to this email.`)
+    ),
+    { category: 'demo_booking_confirmation', landlordId: null },
+    'support',
+    [{ filename: 'gam-demo.ics', content: Buffer.from(ics, 'utf-8') }],
+  )
+}
+
+// Instant owner heads-up so awareness never waits on the calendar-feed refresh.
+// Routed to the monitored owner inbox; carries the survey brief for pre-call prep.
+export async function sendDemoBookingHeadsUp({
+  name, email, phone, when, meetingUrl, kind, timezone, propertyTypes, unitRange, painPoints, lookingFor,
+}: {
+  name: string; email: string; phone: string | null; when: string
+  meetingUrl: string | null; kind: string; timezone?: string | null
+  propertyTypes: string[]; unitRange: string | null; painPoints: string[]; lookingFor: string | null
+}) {
+  const to = process.env.SALES_NOTIFY_EMAIL || 'nic@golddoor.io'
+  const label = kind === 'onboarding' ? 'onboarding call' : 'demo'
+  const row = (k: string, v: string) =>
+    `<tr><td style="padding:4px 12px 4px 0;color:#4a5568;font-size:.78rem;white-space:nowrap;vertical-align:top">${k}</td><td style="padding:4px 0;color:#eef1f8;font-size:.82rem">${escapeHtml(v)}</td></tr>`
+  const rows = [
+    row('When (your time)', when),
+    row('Name', name),
+    row('Email', email),
+    phone ? row('Phone', phone) : '',
+    timezone ? row('Their timezone', timezone) : '',
+    propertyTypes.length ? row('Manages', propertyTypes.join(', ')) : '',
+    unitRange ? row('Units (rough)', unitRange) : '',
+    painPoints.length ? row('Pain points', painPoints.join(', ')) : '',
+    lookingFor ? row('In their words', lookingFor) : '',
+    meetingUrl ? row('Join link', meetingUrl) : '',
+  ].join('')
+  await send(to, `New ${label} booked — ${name} · ${when}`,
+    base(
+      h(`New ${label} booked`) +
+      p(`A prospect just booked a ${label}. It's on your subscribed GAM Demos calendar; here's the brief:`) +
+      `<table style="border-collapse:collapse;margin:8px 0 4px">${rows}</table>`
+    ),
+    { category: 'demo_booking_headsup', landlordId: null },
+    'noreply',
+  )
+}
+
+// ── S598: new landlord signup heads-up (the §8 "nobody gets told" gap) ─────
+// Owner alert on every landlord signup. Organic (no referral code → no closer)
+// signups also flag the 24h CS-assignment clock.
+export async function sendLandlordSignupHeadsUp({
+  name, email, phone, organic, referralCode,
+}: {
+  name: string; email: string; phone: string | null
+  organic: boolean; referralCode: string | null
+}) {
+  const to = process.env.SALES_NOTIFY_EMAIL || 'nic@golddoor.io'
+  const row = (k: string, v: string) =>
+    `<tr><td style="padding:4px 12px 4px 0;color:#4a5568;font-size:.78rem;white-space:nowrap;vertical-align:top">${k}</td><td style="padding:4px 0;color:#eef1f8;font-size:.82rem">${escapeHtml(v)}</td></tr>`
+  const rows = [
+    row('Name', name || '—'),
+    row('Email', email),
+    phone ? row('Phone', phone) : '',
+    row('Closer', organic
+      ? 'None — organic signup'
+      : `Attributed via referral code${referralCode ? ` (${referralCode})` : ''}`),
+  ].join('')
+  const banner = organic
+    ? `<div style="margin:10px 0 2px;padding:10px 14px;background:#0a0f14;border-radius:8px;border-left:3px solid #c9a227;color:#eef1f8;font-size:.85rem">No closer on this one — <strong>assign a CS rep within 24 hours.</strong></div>`
+    : ''
+  await send(to, `New landlord signup — ${name || email}`,
+    base(
+      h(`New landlord signup`) +
+      p(`A new landlord just created an account on the platform.`) +
+      `<table style="border-collapse:collapse;margin:8px 0 4px">${rows}</table>` +
+      banner
+    ),
+    { category: 'landlord_signup', landlordId: null },
+    'noreply',
   )
 }

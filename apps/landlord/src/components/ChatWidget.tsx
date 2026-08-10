@@ -16,6 +16,8 @@ import { useState, useRef, useEffect } from 'react'
 import { MessageCircle, Send, X, ChevronDown } from 'lucide-react'
 import { apiGet, apiPost } from '../lib/api'
 
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
+
 interface AgentProfile { title: string; c1: string; c2: string }
 
 // Reviewable copy — the support team's public profiles. Edit freely.
@@ -67,6 +69,9 @@ export function ChatPanel({ onClose, embedded = false, initialInput }: { onClose
   const [conversationId, setConversationId] = useState<string | undefined>()
   const [input, setInput] = useState('')
   const [sending, setSending] = useState(false)
+  // Human texting cadence: a 'read' receipt → 'typing' → the reply lands as
+  // separate bubbles. Mirrors Lucy's marketing widget so every agent feels alike.
+  const [indicator, setIndicator] = useState<'none' | 'read' | 'typing'>('none')
   // Prefill (never auto-send) when opened from a "Start walkthrough"-style CTA;
   // the landlord reviews the suggested message and sends it themselves.
   useEffect(() => { if (initialInput) setInput(initialInput) }, [initialInput])
@@ -87,7 +92,7 @@ export function ChatPanel({ onClose, embedded = false, initialInput }: { onClose
   useEffect(() => {
     try { localStorage.setItem(STORAGE_KEY, JSON.stringify({ messages, conversationId, agent })) } catch { /* quota */ }
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' })
-  }, [messages, conversationId, agent, sending])
+  }, [messages, conversationId, agent, sending, indicator])
 
   async function send() {
     const text = input.trim()
@@ -95,25 +100,56 @@ export function ChatPanel({ onClose, embedded = false, initialInput }: { onClose
     setInput('')
     setMessages((m) => [...m, { role: 'user', text }])
     setSending(true)
-    try {
-      const res = await apiPost<any>('/agent/chat', conversationId ? { message: text, conversationId } : { message: text })
-      const d = res.data
-      if (d?.handledBy?.name) setAgent(d.handledBy.name)
-      if (d?.conversationId) setConversationId(d.conversationId)
-      setMessages((m) => [...m, { role: 'agent', text: d?.reply || "Sorry, I didn't catch that — could you say it another way?" }])
-    } catch (e: any) {
-      const status = e?.response?.status
-      // No system/infra language — it gives away that this isn't a person. The
-      // 180s server timeout keeps the turn pending until the model answers, so
-      // this only fires on a genuine failure.
-      const msg =
-        status === 429
+
+    // The request rides in parallel with the read/typing beats. It resolves to
+    // reply text (or a human fallback) and never throws, so the cadence below
+    // always runs to completion. No system/infra language — it gives away that
+    // this isn't a person. The 180s server timeout keeps the turn pending
+    // (typing indicator) until the model answers, so the fallback only fires on
+    // a genuine failure.
+    const replyPromise: Promise<string> = (async () => {
+      try {
+        const res = await apiPost<any>('/agent/chat', conversationId ? { message: text, conversationId } : { message: text })
+        const d = res.data
+        if (d?.handledBy?.name) setAgent(d.handledBy.name)
+        if (d?.conversationId) setConversationId(d.conversationId)
+        return d?.reply || "Sorry, I didn't catch that — could you say it another way?"
+      } catch (e: any) {
+        return e?.response?.status === 429
           ? "You're sending messages a little quickly — give me just a moment and try again."
           : "Sorry, that one took me longer than expected — mind sending it to me once more?"
-      setMessages((m) => [...m, { role: 'agent', text: msg }])
-    } finally {
-      setSending(false)
+      }
+    })()
+
+    // (1) the message sits with a visible "Read" for a beat sized to how long
+    // it'd take to read it, (2) "typing" starts a moment later and runs while
+    // the model works, then (3) the reply lands as SEPARATE bubbles (blank-line
+    // split), each with its own typing beat + a read gap between them — paced
+    // and typed, never dumped instantly.
+    const readMs = Math.min(4500, 1100 + text.length * 40)
+    await sleep(readMs); setIndicator('read')
+    await sleep(800); setIndicator('typing')
+    let since = Date.now()
+
+    const reply = await replyPromise
+    const parts = String(reply).split(/\n{2,}/).map((s) => s.trim()).filter(Boolean)
+    if (!parts.length) parts.push(String(reply))
+
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i]
+      const typeMs = Math.min(9000, Math.max(1800, part.length * 55))
+      const held = Date.now() - since   // time already spent "typing" (absorbs model latency)
+      await sleep(Math.max(0, typeMs - held))
+      setIndicator('none')
+      setMessages((m) => [...m, { role: 'agent', text: part }])
+      if (i < parts.length - 1) {
+        const readGap = Math.min(5000, Math.max(1400, part.length * 18))
+        await sleep(readGap)
+        setIndicator('typing'); since = Date.now()
+      }
     }
+    setIndicator('none')
+    setSending(false)
   }
 
   const p = profileFor(agent)
@@ -136,7 +172,8 @@ export function ChatPanel({ onClose, embedded = false, initialInput }: { onClose
       <div ref={scrollRef} style={{ flex: 1, overflowY: 'auto', padding: 14, display: 'flex', flexDirection: 'column', gap: 10 }}>
         <Bubble role="agent" text={GREETING} agent={agent} />
         {messages.map((m, i) => <Bubble key={i} role={m.role} text={m.text} agent={agent} />)}
-        {sending && <Working agent={agent} />}
+        {indicator === 'read' && <ReadMarker />}
+        {indicator === 'typing' && <Working agent={agent} />}
       </div>
 
       <div style={{ display: 'flex', gap: 8, padding: 12, borderTop: '1px solid var(--border-1)', background: 'var(--bg-1)' }}>
@@ -180,12 +217,17 @@ function Bubble({ role, text, agent }: { role: 'user' | 'agent'; text: string; a
   )
 }
 
+/** Right-aligned "Read" receipt shown under the user's message for one beat. */
+function ReadMarker() {
+  return <div style={{ fontSize: 11, color: 'var(--text-2)', textAlign: 'right', margin: '-4px 4px 0 0' }}>Read</div>
+}
+
 function Working({ agent }: { agent: string }) {
   return (
     <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
       <Avatar name={agent} size={26} />
       <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '9px 12px', borderRadius: 12, background: 'var(--bg-3)', color: 'var(--text-2)', fontSize: 13, fontStyle: 'italic' }}>
-        {agent} is looking into that
+        {agent} is typing
         <span className="agent-dots"><i /><i /><i /></span>
       </div>
     </div>

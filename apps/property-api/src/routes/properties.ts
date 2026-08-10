@@ -28,6 +28,10 @@ router.get('/search', async (req: Request, res: Response) => {
       offset = '0'
     } = req.query;
 
+    // S595: cap limit (an unbounded LIMIT was a memory/DoS lever) + floor offset.
+    const lim = Math.min(Math.max(1, Number(limit) || 50), 200);
+    const off = Math.max(0, Number(offset) || 0);
+
     const conditions: string[] = [];
     const params: any[] = [];
     let i = 1;
@@ -93,25 +97,25 @@ router.get('/search', async (req: Request, res: Response) => {
         p.situs_address, p.situs_city, p.situs_zip, p.situs_state,
         p.county, p.last_sale_price, p.last_sale_date,
         p.unit_count, p.property_type_std, p.property_type_raw,
-        p.assessed_value, p.year_built, p.lot_size_sqft, p.lot_size_sqft,
+        p.assessed_value, p.year_built, p.lot_size_sqft,
         p.portfolio_sale_flag, p.portfolio_sale_id,
         p.owner_mailing_address, p.owner_mailing_city, p.owner_mailing_state, p.owner_mailing_zip,
         p.lat, p.lon
       FROM parcels p ${where}
       ORDER BY ${orderBy}
       LIMIT $${i} OFFSET $${i + 1}`,
-      [...params, Number(limit), Number(offset)]
+      [...params, lim, off]
     );
 
     res.json({
       total: Number(countResult.rows[0].count),
-      limit: Number(limit),
-      offset: Number(offset),
+      limit: lim,
+      offset: off,
       results: dataResult.rows
     });
   } catch (err: any) {
-    console.error(err);
-    console.error("BULK UPDATE ERROR:", err.message, err.detail || ""); res.status(500).json({ error: err.message });
+    console.error('[property-api] request failed:', err.message, err.detail || '');
+    res.status(500).json({ error: 'Internal error' });
   }
 });
 
@@ -130,8 +134,8 @@ router.get('/:apn', async (req: Request, res: Response) => {
     if (!result.rows.length) return res.status(404).json({ error: 'Parcel not found' });
     res.json(result.rows[0]);
   } catch (err: any) {
-    console.error(err);
-    console.error("BULK UPDATE ERROR:", err.message, err.detail || ""); res.status(500).json({ error: err.message });
+    console.error('[property-api] request failed:', err.message, err.detail || '');
+    res.status(500).json({ error: 'Internal error' });
   }
 });
 
@@ -153,8 +157,8 @@ router.get('/:apn/businesses', async (req: Request, res: Response) => {
     );
     res.json({ count: result.rows.length, results: result.rows });
   } catch (err: any) {
-    console.error(err);
-    console.error("BULK UPDATE ERROR:", err.message, err.detail || ""); res.status(500).json({ error: err.message });
+    console.error('[property-api] request failed:', err.message, err.detail || '');
+    res.status(500).json({ error: 'Internal error' });
   }
 });
 
@@ -162,6 +166,8 @@ router.get('/:apn/businesses', async (req: Request, res: Response) => {
 router.get('/mobile-homes/search', async (req: Request, res: Response) => {
   try {
     const { q, limit = '50', offset = '0' } = req.query;
+    const lim = Math.min(Math.max(1, Number(limit) || 50), 200);
+    const off = Math.max(0, Number(offset) || 0);
     const conditions: string[] = [
       `(b.business_name ILIKE '%mobile home%' OR b.business_name ILIKE '%manufactured home%' OR b.business_name ILIKE '%mobile village%' OR b.business_name ILIKE '%mobile ranch%' OR b.business_name ILIKE '%trailer park%' OR b.business_name ILIKE '%trailer village%' OR b.business_name ILIKE '%rv park%' OR b.business_name ILIKE '%rv village%' OR b.business_name ILIKE '%mobile estate%' OR b.business_name ILIKE '%mobile manor%' OR b.business_name ILIKE '%mobile park%')`
     ];
@@ -200,24 +206,28 @@ router.get('/mobile-homes/search', async (req: Request, res: Response) => {
        ${where}
        ORDER BY b.full_cash_value DESC NULLS LAST
        LIMIT $${i} OFFSET $${i+1}`,
-      [...params, Number(limit), Number(offset)]
+      [...params, lim, off]
     );
 
     res.json({
       total: Number(countResult.rows[0].count),
-      limit: Number(limit),
-      offset: Number(offset),
+      limit: lim,
+      offset: off,
       source: 'businesses',
       results: dataResult.rows
     });
   } catch (err: any) {
-    console.error(err);
-    console.error("BULK UPDATE ERROR:", err.message, err.detail || ""); res.status(500).json({ error: err.message });
+    console.error('[property-api] request failed:', err.message, err.detail || '');
+    res.status(500).json({ error: 'Internal error' });
   }
 });
 
 router.post('/bulk-update', async (req: Request, res: Response) => {
   try {
+    // S595: writing to the shared parcel DB is admin-only. requireAuth also
+    // admits landlord/bookkeeper (read roles) — they must not mutate parcels.
+    const role = (req as any).user?.role;
+    if (role !== 'admin' && role !== 'super_admin') return res.status(403).json({ error: 'Forbidden' });
     const { rows } = req.body;
     if (!rows?.length) return res.json({ updated: 0 });
     const client = await pool.connect();
@@ -250,7 +260,8 @@ router.post('/bulk-update', async (req: Request, res: Response) => {
     }
     res.json({ updated: rows.length });
   } catch (err: any) {
-    console.error("BULK UPDATE ERROR:", err.message, err.detail || ""); res.status(500).json({ error: err.message });
+    console.error('[property-api] bulk-update failed:', err.message, err.detail || '');
+    res.status(500).json({ error: 'Internal error' });
   }
 });
 export default router;

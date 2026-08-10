@@ -1285,6 +1285,21 @@ export function schedulerInit() {
     }
   }, { timezone: 'America/Phoenix' })
 
+  // S598: customer-service 24h assignment SLA. Hourly — any landlord that needs
+  // its own CS specialist (self-closed) and is still unassigned >24h after signup
+  // is auto-assigned to the owner (the default/sole CS rep today) so the mandatory
+  // CS commission always has a payee. A future claim/round-robin layer slots in
+  // ahead of this backstop.
+  cron.schedule('20 * * * *', async () => {
+    try {
+      const { processCsAssignmentSla } = await import('./csAssignmentSla')
+      const r = await processCsAssignmentSla()
+      if (r.assigned > 0) logger.info(r, '[cs-sla]')
+    } catch (e) {
+      logger.error({ err: e }, '[cs-sla] fatal')
+    }
+  }, { timezone: 'America/Phoenix' })
+
   // S199: end-of-term sublease auto-termination. Fires daily at 2:30am
   // Phoenix to flip active subleases to terminated when their end_date
   // has passed. Emits sublease_completed_natural credit-ledger event

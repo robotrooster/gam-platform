@@ -1,7 +1,7 @@
 import os from 'os'
 import path from 'path'
 import fs from 'fs'
-import { Router } from 'express'
+import { Router, type Request } from 'express'
 import { z } from 'zod'
 import { query, queryOne } from '../db'
 import { requireAuth, requireAdmin, requireSuperAdmin, requireOwner, OWNER_EMAIL } from '../middleware/auth'
@@ -9,7 +9,7 @@ import { latencyP95, sampleSize } from '../lib/apiMetrics'
 import { AppError } from '../middleware/errorHandler'
 import { logAdminAction } from '../lib/adminAudit'
 import { backfillInvoices } from '../jobs/invoiceGeneration'
-import { PropertyReviewStatus, PLATFORM_FEES, LAUNCH_PLATFORM_FEE, launchPlatformFeeForProperty, SALES_LEAD_STATUSES } from '@gam/shared'
+import { PropertyReviewStatus, PLATFORM_FEES, LAUNCH_PLATFORM_FEE, launchPlatformFeeForProperty, SALES_LEAD_STATUSES, SALES_BOOKING_KIND_VALUES } from '@gam/shared'
 import { fetchAccountStatus } from '../services/stripeConnect'
 import { unproductiveTurnSql } from '../services/agents/turnBudget'
 import { emailTenantOnboarded, emailLandlordBankingSetup, emailTenantAchSetup } from '../services/email'
@@ -2792,13 +2792,13 @@ adminRouter.get('/leads/:id/transcript', requireSuperAdmin, async (req, res, nex
   } catch (e) { next(e) }
 })
 
-// ── S553: Specialist call calendar + availability ────────────────────
+// ── S553/S596: demo + specialist call calendar + availability ────────
 adminRouter.get('/call-slots', async (_req, res, next) => {
   try {
     const rows = await query(
-      `SELECT s.id, s.lead_id, s.starts_at, s.duration_minutes, s.mode, s.status,
-              s.prospect_name, s.prospect_email, s.prospect_phone, s.notes, s.reminded_at,
-              l.states, l.portfolio_size, l.property_type
+      `SELECT s.id, s.lead_id, s.starts_at, s.duration_minutes, s.kind, s.mode, s.status,
+              s.prospect_name, s.prospect_email, s.prospect_phone, s.notes, s.meeting_url, s.reminded_at,
+              l.states, l.portfolio_size, l.property_type, l.metadata
          FROM sales_call_slots s
          LEFT JOIN sales_leads l ON l.id = s.lead_id
         WHERE s.starts_at >= now() - interval '1 day'
@@ -2818,18 +2818,25 @@ adminRouter.patch('/call-slots/:id/status', async (req, res, next) => {
   } catch (e) { next(e) }
 })
 
-adminRouter.get('/call-availability', async (_req, res, next) => {
+const availKindSchema = z.enum(SALES_BOOKING_KIND_VALUES)
+
+adminRouter.get('/call-availability', async (req, res, next) => {
   try {
+    const kind = availKindSchema.catch('demo').parse(req.query.kind)
     const rows = await query(
-      `SELECT id, weekday, start_time, end_time, active FROM sales_call_availability ORDER BY weekday, start_time`)
+      `SELECT id, weekday, start_time, end_time, active, kind FROM sales_call_availability
+        WHERE kind = $1 ORDER BY weekday, start_time`, [kind])
     res.json({ success: true, data: rows })
   } catch (e) { next(e) }
 })
 
-// Replace-all editor: the admin page sends the full desired window list.
+// Replace-all editor — SCOPED BY KIND so editing the demo window can never wipe
+// the onboarding window (and vice-versa). Only the given kind's rows are
+// deleted + re-inserted.
 adminRouter.put('/call-availability', async (req, res, next) => {
   try {
     const b = z.object({
+      kind: availKindSchema.default('demo'),
       windows: z.array(z.object({
         weekday: z.number().int().min(0).max(6),
         startTime: z.string().regex(/^\d{2}:\d{2}$/),
@@ -2839,13 +2846,60 @@ adminRouter.put('/call-availability', async (req, res, next) => {
     for (const w of b.windows) {
       if (w.endTime <= w.startTime) throw new AppError(400, 'Each window must end after it starts')
     }
-    await query(`DELETE FROM sales_call_availability`)
+    await query(`DELETE FROM sales_call_availability WHERE kind = $1`, [b.kind])
     for (const w of b.windows) {
       await query(
-        `INSERT INTO sales_call_availability (weekday, start_time, end_time) VALUES ($1, $2, $3)`,
-        [w.weekday, w.startTime, w.endTime])
+        `INSERT INTO sales_call_availability (weekday, start_time, end_time, kind) VALUES ($1, $2, $3, $4)`,
+        [w.weekday, w.startTime, w.endTime, b.kind])
     }
-    const rows = await query(`SELECT id, weekday, start_time, end_time, active FROM sales_call_availability ORDER BY weekday, start_time`)
+    const rows = await query(
+      `SELECT id, weekday, start_time, end_time, active, kind FROM sales_call_availability
+        WHERE kind = $1 ORDER BY weekday, start_time`, [b.kind])
     res.json({ success: true, data: rows })
+  } catch (e) { next(e) }
+})
+
+// ── S596: the subscribe calendar feed URL (owner adds it once) + rotate ──
+// Prefer an explicit API_PUBLIC_URL; otherwise derive the public origin from
+// the request (behind the Cloudflare tunnel the Host is api.goldassetmanagement
+// .com), so the subscribe URL is correct with zero env config.
+function salesFeedUrls(req: Request, token: string): { url: string; webcalUrl: string } {
+  const first = (v?: string) => (v || '').split(',')[0].trim()
+  const derived = `${first(req.get('x-forwarded-proto')) || req.protocol || 'https'}://` +
+                  `${first(req.get('x-forwarded-host')) || req.get('host') || 'localhost:4000'}`
+  const base = (process.env.API_PUBLIC_URL || derived).replace(/\/$/, '')
+  const url = `${base}/api/public/sales-calendar/${token}.ics`
+  const webcalUrl = url.replace(/^https?:\/\//, 'webcal://')
+  return { url, webcalUrl }
+}
+
+adminRouter.get('/demo-feed', async (req, res, next) => {
+  try {
+    const row = await queryOne<{ feed_token: string; busy_feed_token: string }>(
+      `UPDATE sales_calendar_feed
+          SET feed_token = COALESCE(feed_token, gen_random_uuid()),
+              busy_feed_token = COALESCE(busy_feed_token, gen_random_uuid())
+        WHERE id = true
+      RETURNING feed_token, busy_feed_token`)
+    const token = row!.feed_token
+    const busyToken = row!.busy_feed_token
+    res.json({
+      success: true,
+      data: {
+        token, ...salesFeedUrls(req, token),
+        // Shareable family/assistant link: same calendar, prospect data stripped.
+        busyToken, busy: salesFeedUrls(req, busyToken),
+      },
+    })
+  } catch (e) { next(e) }
+})
+
+adminRouter.post('/demo-feed/rotate', async (req, res, next) => {
+  try {
+    const row = await queryOne<{ feed_token: string }>(
+      `UPDATE sales_calendar_feed SET feed_token = gen_random_uuid(), updated_at = now()
+        WHERE id = true RETURNING feed_token`)
+    const token = row!.feed_token
+    res.json({ success: true, data: { token, ...salesFeedUrls(req, token) } })
   } catch (e) { next(e) }
 })

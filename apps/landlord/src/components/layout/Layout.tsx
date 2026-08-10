@@ -12,7 +12,8 @@ import {
   ArrowDownToLine, Wrench, FileText, LogOut, Settings,
   ShoppingCart, Shield, Package, BarChart2, ScrollText,
   UserSearch, ClipboardList, HeartHandshake, PenTool, UserPlus,
-  Landmark, ClipboardCheck, CalendarClock, RefreshCw, MessageSquare
+  Landmark, ClipboardCheck, CalendarClock, RefreshCw, MessageSquare,
+  Sun, Moon, Globe
 } from 'lucide-react'
 
 // S82: each nav item has a `roles` admission list (which roles MAY see
@@ -46,6 +47,7 @@ const NAV_ITEMS: Array<{
   { to: '/properties',    icon: Building2,        label: 'Properties',       section: 'Portfolio',   category: 'properties' },
   { to: '/units',         icon: DoorOpen,         label: 'Unit Overview',    section: null,          category: 'units' },
   { to: '/schedule',      icon: DoorOpen,         label: 'Master Schedule',  section: null,          category: 'schedule' },
+  { to: '/booking-sites', icon: Globe,            label: 'Booking Site',     section: null,          category: 'booking_sites' },
   { to: '/tenants',       icon: Users,            label: 'Tenants',          section: null,          category: 'tenants' },
   { to: '/tenant-onboarding', icon: UserPlus,    label: 'Tenant Onboarding',section: null,          category: 'tenant_onboarding' },
   { to: '/leases',        icon: ScrollText,       label: 'Leases',           section: null,          category: 'leases' },
@@ -319,6 +321,19 @@ export function Layout() {
 .sidebar-logo-mark{color:${accent};}a{color:${accent};}.kpi-card::before{background:${accent};}
 `
 
+  // S595: light/dark toggle in the topbar (next to notifications/settings).
+  // Per-device — the initial value is applied before paint by the inline script
+  // in index.html; this state just reflects it and re-renders the sun/moon icon.
+  const [theme, setTheme] = useState<'dark' | 'light'>(
+    () => (document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark')
+  )
+  const toggleTheme = () => {
+    const next = theme === 'dark' ? 'light' : 'dark'
+    document.documentElement.setAttribute('data-theme', next)
+    try { localStorage.setItem('gam_theme', next) } catch {}
+    setTheme(next)
+  }
+
   const handleLogout = () => { logout(); navigate('/login') }
 
   // Visibility rule lives in visibleNavItemsFor (shared with RoleRedirect); the
@@ -406,6 +421,15 @@ export function Layout() {
           <AnnouncementBar />
           <div style={{ flex:1 }} />
           <NotificationBell />
+          <button
+            className="btn btn-ghost btn-sm"
+            style={{ padding:'6px' }}
+            onClick={toggleTheme}
+            title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+            aria-label="Toggle light/dark theme"
+          >
+            {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
+          </button>
           <button className="btn btn-ghost btn-sm" style={{ padding:'6px' }}>
             <Settings size={16} style={{ cursor:'pointer' }} onClick={() => window.location.href='/settings'} />
           </button>

@@ -49,6 +49,7 @@ import { businessAttachmentsRouter } from './routes/businessAttachments'
 import { publicCardUpdateRouter } from './routes/publicCardUpdate'
 import { publicCustomerPortalRouter } from './routes/publicCustomerPortal'
 import { publicBusinessCalendarRouter } from './routes/publicBusinessCalendar'
+import { publicSalesCalendarRouter } from './routes/publicSalesCalendar'
 import { businessSearchRouter } from './routes/businessSearch'
 import { appointmentsRouter } from './routes/appointments'
 import { recurringSchedulesRouter } from './routes/recurringSchedules'
@@ -104,7 +105,7 @@ import { bookingsRouter }     from './routes/bookings'
 import { inspectionsRouter }  from './routes/inspections'
 import { commonAreasRouter }  from './routes/commonAreas'
 import { serviceInterruptionsRouter } from './routes/serviceInterruptions'
-import { agentRouter, salesAgentRouter, guestAgentRouter } from './routes/agent'
+import { agentRouter, salesAgentRouter, guestAgentRouter, propertyAgentRouter } from './routes/agent'
 import { entryRequestsRouter } from './routes/entryRequests'
 import { notificationsRouter } from './routes/notifications'
 import { bankAccountsRouter } from './routes/bankAccounts'
@@ -305,6 +306,7 @@ app.use('/api/business-search', businessSearchRouter)
 app.use('/api/public', publicCardUpdateRouter)
 app.use('/api/public', publicCustomerPortalRouter)
 app.use('/api/public', publicBusinessCalendarRouter)
+app.use('/api/public', publicSalesCalendarRouter)
 app.use('/api/appointments',  appointmentsRouter)
 app.use('/api/recurring-schedules', recurringSchedulesRouter)
 app.use('/api/routes',        routesRouter)
@@ -382,6 +384,7 @@ app.use('/api/service-interruptions', serviceInterruptionsRouter)
 app.use('/api/agent',          agentRouter)
 app.use('/api/sales',          salesAgentRouter)
 app.use('/api/guest',          guestAgentRouter)
+app.use('/api/property',       propertyAgentRouter)
 app.use('/api/entry-requests', entryRequestsRouter)
 app.use('/webhooks',          webhooksRouter)
 

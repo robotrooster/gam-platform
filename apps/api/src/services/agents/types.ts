@@ -38,9 +38,12 @@ export type AgentType = (typeof AGENT_TYPES)[number]
 
 /** Who the agent talks to. 'prospect' is an unauthenticated marketing-site
  *  visitor (no GAM account) the sales agent talks to. */
-export const AGENT_AUDIENCES = ['tenant', 'landlord', 'prospect', 'guest'] as const
+export const AGENT_AUDIENCES = ['tenant', 'landlord', 'prospect', 'guest', 'visitor'] as const
 // 'guest' = a no-account booking guest (RV/STR/extended-stay) talking to the
 // booking agent, identified by a per-booking access token rather than a JWT.
+// 'visitor' = a no-account visitor browsing ONE property's public booking site
+// (pre-booking), scoped by the site's slug → propertyId; the property agent
+// answers pricing/availability and can start a reservation for that property only.
 export type AgentAudience = (typeof AGENT_AUDIENCES)[number]
 
 /** Where the agent sits in the escalation ladder. 'human' is the

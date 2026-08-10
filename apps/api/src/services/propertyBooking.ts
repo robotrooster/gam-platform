@@ -67,6 +67,10 @@ interface PropertyRow {
 interface UnitRow {
   id: string; unit_number: string
   nightly_rate: string | null; weekly_rate: string | null; monthly_rate: string | null
+  // Site-type (subtype) rates — the natural place a landlord prices RV sites
+  // (back-in vs pull-through). Take precedence over the unit's own rate, matching
+  // the availability quote (services/propertyBookingQuote.typeAvailability).
+  subtype_nightly: string | null; subtype_weekly: string | null; subtype_monthly: string | null
   min_stay_nights: number | null; max_stay_nights: number | null; is_bookable: boolean
 }
 
@@ -81,8 +85,12 @@ async function resolvePropertyBySlug(slug: string): Promise<PropertyRow> {
 
 async function resolveUnit(propertyId: string, unitId: string): Promise<UnitRow> {
   const unit = await queryOne<UnitRow & { unit_type?: string }>(
-    `SELECT id, unit_number, unit_type, nightly_rate, weekly_rate, monthly_rate, min_stay_nights, max_stay_nights, is_bookable
-       FROM units WHERE id=$1 AND property_id=$2`, [unitId, propertyId])
+    `SELECT u.id, u.unit_number, u.unit_type, u.nightly_rate, u.weekly_rate, u.monthly_rate,
+            u.min_stay_nights, u.max_stay_nights, u.is_bookable,
+            s.nightly_rate AS subtype_nightly, s.weekly_rate AS subtype_weekly, s.monthly_rate AS subtype_monthly
+       FROM units u
+       LEFT JOIN property_unit_subtypes s ON s.id = u.subtype_id
+      WHERE u.id=$1 AND u.property_id=$2`, [unitId, propertyId])
   if (!unit || !unit.is_bookable) throw new AppError(404, 'Unit not bookable')
   // S538 (Nic): storage is hard-locked out of short-term rental — belt over
   // the config gates, covers legacy rows flagged bookable before the lock.
@@ -109,11 +117,14 @@ function quoteStay(unit: UnitRow, prop: PropertyRow, checkIn: string, checkOut: 
   if (ci < DateTime.now().startOf('day')) throw new AppError(400, 'Check-in is in the past')
   if (unit.min_stay_nights != null && nights < unit.min_stay_nights) throw new AppError(400, `Minimum stay is ${unit.min_stay_nights} nights`)
   if (unit.max_stay_nights != null && nights > unit.max_stay_nights) throw new AppError(400, `Maximum stay is ${unit.max_stay_nights} nights`)
+  // Rate resolution mirrors the availability quote exactly: SITE TYPE (subtype)
+  // first, then the unit's own rate, then the property default — so a property
+  // priced only at the site-type level books at the same number it quotes.
   const num = (x: string | null) => x != null ? Number(x) : null
-  const monthlyRate = num(unit.monthly_rate) ?? num(prop.monthly_rate)
+  const monthlyRate = num(unit.subtype_monthly) ?? num(unit.monthly_rate) ?? num(prop.monthly_rate)
   const price = computeStayPrice(
-    { nightly: num(unit.nightly_rate) ?? num(prop.nightly_rate),
-      weekly:  num(unit.weekly_rate)  ?? num(prop.weekly_rate),
+    { nightly: num(unit.subtype_nightly) ?? num(unit.nightly_rate) ?? num(prop.nightly_rate),
+      weekly:  num(unit.subtype_weekly)  ?? num(unit.weekly_rate)  ?? num(prop.weekly_rate),
       monthly: monthlyRate },
     Number(prop.short_term_tax_rate || 0), nights)
   if (price.total <= 0) throw new AppError(400, 'No rate is configured for this unit')

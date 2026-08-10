@@ -1220,7 +1220,10 @@ export function SchedulePage() {
     { key: 'history',      perm: 'schedule.tab.history', label: 'History' },
     { key: 'reservations', perm: 'bookings.view', label: 'Reservations' },
     { key: 'requests',     perm: 'bookings.change_requests', label: 'Requests' },
-    { key: 'booking_page', perm: 'booking_sites.view', label: 'Booking Page' },
+    // Booking-site editor moved to its own discoverable page (BookingSitePage,
+    // nav "Booking Site", route /booking-sites) in S602. The bp* state/handlers
+    // + the `view==='booking_page'` block below are now dormant (this tab is the
+    // only thing that set that view) — safe to delete in a focused cleanup pass.
   ] as { key: string; perm: string; label?: string }[]).filter(t => can(t.perm))
   // If the active view isn't visible to this user, snap to their first tab.
   const visibleTabKeys = SCHEDULE_TABS.map(t => t.key).join(',')

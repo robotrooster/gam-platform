@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import { Outlet, NavLink, useNavigate } from 'react-router-dom'
 import { humanize, BUSINESS_STAFF_ROLE_LABEL, BusinessStaffRole } from '@gam/shared'
 import { useAuth } from '../../context/AuthContext'
@@ -6,7 +7,7 @@ import {
   LayoutDashboard, Users, UserCog, Settings, LogOut,
   Building2, Truck, Trash2, CalendarClock, Route as RouteIcon,
   Receipt, CalendarDays, Package, ShoppingCart, Wrench, Car, FileText,
-  BarChart3, Repeat, Tag, Banknote, BookOpen,
+  BarChart3, Repeat, Tag, Banknote, BookOpen, Sun, Moon,
 } from 'lucide-react'
 
 // S466 + S492: section-grouped nav with feature-gating.
@@ -103,6 +104,9 @@ const NAV_ITEMS: Array<{
 
 export function Layout() {
   const { user, business, logout } = useAuth()
+  // S595: per-device light/dark toggle (initial value applied pre-paint by index.html).
+  const [theme, setTheme] = useState<'dark' | 'light'>(() => document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark')
+  const toggleTheme = () => { const n = theme === 'dark' ? 'light' : 'dark'; document.documentElement.setAttribute('data-theme', n); try { localStorage.setItem('gam_theme', n) } catch {}; setTheme(n) }
   const navigate = useNavigate()
   const enabled = new Set(business?.enabledFeatures ?? [])
   // Until the business summary loads, render every role-admitted item
@@ -229,8 +233,11 @@ export function Layout() {
           borderBottom: '1px solid var(--border-0)',
           background: 'var(--bg-0)',
           position: 'sticky' as const, top: 0, zIndex: 50,
-          display: 'flex' as const, justifyContent: 'flex-end',
+          display: 'flex' as const, justifyContent: 'flex-end', alignItems: 'center' as const, gap: 12,
         }}>
+          <button className="btn btn-ghost btn-sm" onClick={toggleTheme} title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'} aria-label="Toggle light/dark theme" style={{ padding: '6px' }}>
+            {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
+          </button>
           <GlobalSearch />
         </header>
         <div style={{ padding: 32 }}>

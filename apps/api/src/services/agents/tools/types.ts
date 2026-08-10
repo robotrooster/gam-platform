@@ -24,6 +24,10 @@ export interface AgentActor {
   /** the unit_bookings.id a guest actor is scoped to. Set ONLY for
    *  role='guest'; guest tools read/write only this one booking. */
   bookingId?: string
+  /** the properties.id a visitor actor is scoped to. Set ONLY for
+   *  role='visitor' (an unauthenticated property-website visitor); visitor
+   *  tools read/write only this one property, never a neighboring one. */
+  propertyId?: string
 }
 
 export interface AgentTool {

@@ -33,12 +33,12 @@ export function ShelfLabelPage() {
         <div style={{ fontSize: '5rem', marginBottom: 16, lineHeight: 1 }}>{item.icon}</div>
 
         {/* Name */}
-        <div style={{ fontFamily: 'system-ui', fontSize: '2rem', fontWeight: 900, color: '#eef1f8', marginBottom: 8, lineHeight: 1.2 }}>
+        <div style={{ fontFamily: 'system-ui', fontSize: '2rem', fontWeight: 900, color: 'var(--text-0)', marginBottom: 8, lineHeight: 1.2 }}>
           {item.name}
         </div>
 
         {/* Category */}
-        <div style={{ fontSize: '.85rem', color: '#7a8aaa', textTransform: 'capitalize', marginBottom: 32, letterSpacing: '.06em' }}>
+        <div style={{ fontSize: '.85rem', color: 'var(--text-2)', textTransform: 'capitalize', marginBottom: 32, letterSpacing: '.06em' }}>
           {item.category}
         </div>
 
@@ -51,7 +51,7 @@ export function ShelfLabelPage() {
             {fmt(item.sellPrice)}
           </div>
           {item.taxRate > 0 && (
-            <div style={{ fontSize: '.75rem', color: '#7a8aaa', marginTop: 8 }}>
+            <div style={{ fontSize: '.75rem', color: 'var(--text-2)', marginTop: 8 }}>
               +{(item.taxRate * 100).toFixed(0)}% tax · {fmt(priceWithTax)} after tax
             </div>
           )}

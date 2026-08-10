@@ -5257,3 +5257,11 @@ export type PaymentReversalLateFeeOwner = typeof PAYMENT_REVERSAL_LATE_FEE_OWNER
 
 export const PAYMENT_REVERSAL_STATUS_VALUES = ['open', 'recovering', 'resolved'] as const
 export type PaymentReversalStatus = typeof PAYMENT_REVERSAL_STATUS_VALUES[number]
+
+// S596 — sales/demo booking `kind`. One slot engine (sales_call_availability +
+// sales_call_slots) serves multiple scheduling windows: prospect product demos
+// ('demo', live) and post-signup landlord onboarding walkthroughs ('onboarding',
+// window reserved, scheduling built later). CHECK constraints on both tables
+// list these exact values — keep in sync.
+export const SALES_BOOKING_KIND_VALUES = ['demo', 'onboarding'] as const
+export type SalesBookingKind = typeof SALES_BOOKING_KIND_VALUES[number]

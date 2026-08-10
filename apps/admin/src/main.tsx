@@ -24,7 +24,7 @@ import {
   LayoutDashboard, Rocket, Building2, Users, Zap, ClipboardList, DoorOpen,
   CreditCard, ArrowDownToLine, Plug, Activity, Map as MapIcon, FileText,
   Scale, SlidersHorizontal, BookOpen, Lightbulb,
-  Target, TrendingUp, Bot, Lock, LogOut, DollarSign,
+  Target, TrendingUp, Bot, Lock, LogOut, DollarSign, Sun, Moon,
 } from 'lucide-react'
 import axios from 'axios'
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
@@ -213,7 +213,9 @@ a{color:var(--gold);text-decoration:none}
 .ks,.kpi-s{font-size:.7rem;color:var(--t3)}
 .kv.g{color:var(--green)}.kv.r{color:var(--red)}.kv.a{color:var(--amber)}.kv.gold{color:var(--gold)}.kv.b{color:var(--blue)}
 .btn{display:inline-flex;align-items:center;gap:6px;padding:7px 14px;border-radius:7px;font-size:.78rem;font-weight:600;border:none;cursor:pointer;transition:all .12s;font-family:var(--font-b);text-decoration:none}
-.bp,.btn-p,.btn-primary{background:var(--gold);color:#080a0c}.bp:hover,.btn-p:hover,.btn-primary:hover{background:#d9af3a}
+.bp,.btn-p,.btn-primary{background:var(--gold);color:#080a0c}
+.bg-btn{background:var(--red);color:#fff}
+.bg-btn:hover{filter:brightness(1.08)}.bp:hover,.btn-p:hover,.btn-primary:hover{background:#d9af3a}
 .bg,.btn-g,.btn-ghost{background:var(--bg4);color:var(--t1);border:1px solid var(--b2)}.bg:hover,.btn-g:hover,.btn-ghost:hover{background:var(--bg3)}
 .bd{background:rgba(239,68,68,.08);color:var(--red);border:1px solid rgba(239,68,68,.2)}.bd:hover{background:rgba(239,68,68,.14)}
 .bsm{padding:4px 9px;font-size:.72rem}
@@ -258,15 +260,28 @@ a{color:var(--gold);text-decoration:none}
 .modal-f{display:flex;justify-content:flex-end;gap:10px;margin-top:20px;padding-top:16px;border-top:1px solid var(--b0)}
 .fg{margin-bottom:16px}
 .fl{display:block;font-size:.72rem;font-weight:600;color:var(--t2);margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em}
-.inp,.form-input{width:100%;background:var(--bg3);border:1px solid var(--b1);border-radius:8px;color:var(--t0);padding:10px 12px;font-size:.88rem;color-scheme:dark}
-.inp:focus,.form-input:focus{outline:none;border-color:var(--gold)}
+.inp,.input,.form-input{width:100%;background:var(--bg3);border:1px solid var(--b1);border-radius:8px;color:var(--t0);padding:10px 12px;font-size:.88rem;color-scheme:dark}
+.inp:focus,.input:focus,.form-input:focus{outline:none;border-color:var(--gold)}
 textarea.inp{resize:vertical}
+/* S595: className="input" fields were never aliased (same drift .inp had) —
+   they fell back to white browser boxes. Alias + uniform +6% type lift +
+   readable disabled state. */
+html{font-size:17px}
+.inp:disabled,.input:disabled,.form-input:disabled,input:disabled,select:disabled,textarea:disabled,input[readonly],textarea[readonly]{background:var(--bg2);border-color:var(--b0);color:var(--t1);-webkit-text-fill-color:var(--t1);opacity:1;cursor:not-allowed}
+/* S595 LIGHT THEME (short token names). Admin's accent is red — darkened for light. */
+:root[data-theme="light"]{color-scheme:light;--bg0:#f4f5f7;--bg1:#ffffff;--bg2:#ffffff;--bg3:#eef0f4;--bg4:#e5e8ee;--b0:#e7e9ef;--b1:#dde0e8;--b2:#ccd2de;--t0:#12151c;--t1:#333b49;--t2:#5b6474;--t3:#8a93a5;--gold-ink:#7a5f0f;--red:#c0201f}
+:root[data-theme="light"] .inp,:root[data-theme="light"] .input,:root[data-theme="light"] .form-input{color-scheme:light}
+:root[data-theme="light"] a{color:var(--gold-ink)}
+:root[data-theme="light"] .ni.active{background:rgba(239,68,68,.10);border-color:rgba(239,68,68,.28)}
 `
 
 // ── LAYOUT ────────────────────────────────────────────────────
 function Layout(){
   const{user,logout,loading}=useAuth();const navigate=useNavigate()
   const isSuperAdmin=user?.role==='super_admin'
+  // S595: per-device light/dark toggle (initial value applied pre-paint by index.html).
+  const [theme, setTheme] = useState<'dark' | 'light'>(() => document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark')
+  const toggleTheme = () => { const n = theme === 'dark' ? 'light' : 'dark'; document.documentElement.setAttribute('data-theme', n); try { localStorage.setItem('gam_theme', n) } catch {}; setTheme(n) }
   if(loading||!user)return<div className="loading">Loading…</div>
   return(
     <div className="shell">
@@ -323,6 +338,9 @@ function Layout(){
       <div className="main">
         <header className="topbar">
           <span style={{fontSize:'.72rem',color:'var(--t3)',fontFamily:'var(--font-m)'}}>Gold Asset Management — Admin Console</span>
+          <button onClick={toggleTheme} title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'} aria-label="Toggle light/dark theme" style={{ marginLeft: 'auto', background: 'transparent', border: 'none', cursor: 'pointer', color: 'var(--t2)', padding: 6, display: 'inline-flex', alignItems: 'center', borderRadius: 6 }}>
+            {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
+          </button>
         </header>
         <div className="page"><Outlet /></div>
       </div>
@@ -693,6 +711,11 @@ function SalesLeads(){
   const callMut=useMutation(({id,status}:{id:string;status:string})=>api.patch(`/admin/call-slots/${id}/status`,{status}).then(r=>r.data),{
     onSuccess:()=>{qc.invalidateQueries('sales-calls');toast('Call updated')},
   })
+  const{data:feed}=useQuery('demo-feed',()=>get<any>('/admin/demo-feed'),{staleTime:300000})
+  const rotateMut=useMutation(()=>api.post('/admin/demo-feed/rotate').then(r=>r.data),{
+    onSuccess:()=>{qc.invalidateQueries('demo-feed');toast('Feed link rotated — re-subscribe with the new link')},
+    onError:()=>toast('Could not rotate the feed link — try again.'),
+  })
   const[showAvail,setShowAvail]=useState(false)
   if(isLoading&&leads.length===0)return<div style={{padding:32,color:'var(--t3)'}}>Loading leads…</div>
   const CALL_HEX:Record<string,string>={booked:'#c9a227',completed:'#22c55e',cancelled:'#6b7280',no_show:'#ef4444'}
@@ -710,14 +733,22 @@ function SalesLeads(){
 
       <div className="card" style={{marginBottom:16}}>
         <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:10}}>
-          <div style={{fontWeight:700,color:'var(--t0)'}}>Upcoming calls <span style={{fontWeight:400,color:'var(--t3)',fontSize:'.72rem'}}>(video calls: email the meeting link before the call)</span></div>
+          <div style={{fontWeight:700,color:'var(--t0)'}}>Upcoming demos <span style={{fontWeight:400,color:'var(--t3)',fontSize:'.72rem'}}>(video link auto-created + emailed to the prospect; also on your subscribed calendar)</span></div>
           <button className="btn bd bsm" onClick={()=>setShowAvail(s=>!s)}>{showAvail?'Hide availability':'Edit availability'}</button>
         </div>
+        {feed&&<div style={{display:'flex',alignItems:'center',gap:10,flexWrap:'wrap',background:'var(--s1)',border:'1px solid var(--b1)',borderRadius:8,padding:'10px 12px',marginBottom:12}}>
+          <span style={{fontSize:'.78rem',color:'var(--t1)'}}>📅 Subscribe once — every booking auto-appears on your calendar:</span>
+          <a className="btn bgold bsm" href={feed.webcalUrl}>Add to calendar</a>
+          <code style={{fontSize:'.68rem',color:'var(--t2)',background:'var(--s2)',padding:'3px 7px',borderRadius:5,wordBreak:'break-all'}}>{feed.url}</code>
+          <button className="btn bd bsm" onClick={()=>{navigator.clipboard?.writeText(feed.url).then(()=>toast('Feed link copied'))}}>Copy</button>
+          <button className="btn bd bsm" onClick={()=>{appConfirm('Rotate the feed link? Your current calendar subscription will stop updating until you re-subscribe with the new link.',{confirmLabel:'Rotate link'}).then(ok=>{if(ok)rotateMut.mutate()})}}>Rotate</button>
+        </div>}
         {showAvail&&<AvailabilityEditor/>}
-        <table className="tbl"><thead><tr><th>When</th><th>Prospect</th><th>Contact</th><th>Mode</th><th>Portfolio</th><th>Status</th><th></th></tr></thead>
+        <table className="tbl"><thead><tr><th>When</th><th>Type</th><th>Prospect</th><th>Contact</th><th>Mode</th><th>Portfolio</th><th>Status</th><th></th></tr></thead>
           <tbody>{calls.map((c:any)=>(
             <tr key={c.id}>
               <td style={{fontWeight:600}}>{new Date(c.startsAt).toLocaleString([],{weekday:'short',month:'short',day:'numeric',hour:'numeric',minute:'2-digit'})}</td>
+              <td><span className="badge" style={{background:'var(--gold)22',color:'var(--gold)'}}>{humanize(c.kind||'demo')}</span></td>
               <td>{c.prospectName||'—'}</td>
               <td style={{fontSize:'.75rem'}}>{[c.prospectEmail,c.prospectPhone].filter(Boolean).join(' · ')||'—'}</td>
               <td>{c.mode==='video'?'📹 Video':'📞 Phone'}</td>
@@ -729,7 +760,7 @@ function SalesLeads(){
                 <button className="btn bd bsm" onClick={()=>{appConfirm('Cancel this call? The prospect is NOT notified automatically — reply to their confirmation email.',{confirmLabel:'Cancel call'}).then(ok=>{if(ok)callMut.mutate({id:c.id,status:'cancelled'})})}}>Cancel</button>
               </span>}</td>
             </tr>
-          ))}{calls.length===0&&<tr><td colSpan={7} style={{color:'var(--t3)'}}>No upcoming calls.</td></tr>}</tbody>
+          ))}{calls.length===0&&<tr><td colSpan={8} style={{color:'var(--t3)'}}>No upcoming demos.</td></tr>}</tbody>
         </table>
       </div>
 

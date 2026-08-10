@@ -53,14 +53,14 @@ router.post('/register', async (req: Request, res: Response) => {
       { expiresIn: '7d' }
     );
     res.json({ success: true, data: { token, user: { id: user.id, email: user.email, role: user.role, first_name: user.first_name, last_name: user.last_name } } });
-  } catch (e: any) { res.json({ success: false, error: e.message }); }
+  } catch (e: any) { console.error('[fitness]', e?.message); res.json({ success: false, error: 'Something went wrong' }); }
 });
 
 router.get('/profile', auth, async (req: Request, res: Response) => {
   try {
     const { rows } = await pool.query('SELECT * FROM fitness_profiles WHERE user_id = $1', [req.user!.userId]);
     res.json({ success: true, data: rows[0] || null });
-  } catch (e: any) { res.json({ success: false, error: e.message }); }
+  } catch (e: any) { console.error('[fitness]', e?.message); res.json({ success: false, error: 'Something went wrong' }); }
 });
 
 router.post('/profile', auth, async (req: Request, res: Response) => {
@@ -69,14 +69,14 @@ router.post('/profile', auth, async (req: Request, res: Response) => {
     const { rows } = await pool.query(`INSERT INTO fitness_profiles (user_id, height_inches, weight_lbs, age, goal_physique, target_weight_lbs, experience_level, injuries, available_equipment, days_per_week, minutes_per_session, fitness_goal, onboarding_complete, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW()) ON CONFLICT (user_id) DO UPDATE SET height_inches=EXCLUDED.height_inches, weight_lbs=EXCLUDED.weight_lbs, age=EXCLUDED.age, goal_physique=EXCLUDED.goal_physique, target_weight_lbs=EXCLUDED.target_weight_lbs, experience_level=EXCLUDED.experience_level, injuries=EXCLUDED.injuries, available_equipment=EXCLUDED.available_equipment, days_per_week=EXCLUDED.days_per_week, minutes_per_session=EXCLUDED.minutes_per_session, fitness_goal=EXCLUDED.fitness_goal, onboarding_complete=EXCLUDED.onboarding_complete, updated_at=NOW() RETURNING *`,
       [req.user!.userId, height_inches, weight_lbs, age, goal_physique, target_weight_lbs, experience_level, injuries, available_equipment, days_per_week, minutes_per_session, fitness_goal, onboarding_complete ?? false]);
     res.json({ success: true, data: rows[0] });
-  } catch (e: any) { res.json({ success: false, error: e.message }); }
+  } catch (e: any) { console.error('[fitness]', e?.message); res.json({ success: false, error: 'Something went wrong' }); }
 });
 
 router.get('/routines', auth, async (req: Request, res: Response) => {
   try {
     const { rows } = await pool.query('SELECT * FROM fitness_routines WHERE user_id = $1 ORDER BY created_at DESC', [req.user!.userId]);
     res.json({ success: true, data: rows });
-  } catch (e: any) { res.json({ success: false, error: e.message }); }
+  } catch (e: any) { console.error('[fitness]', e?.message); res.json({ success: false, error: 'Something went wrong' }); }
 });
 
 router.get('/routines/:id/full', auth, async (req: Request, res: Response) => {
@@ -93,7 +93,7 @@ router.get('/routines/:id/full', auth, async (req: Request, res: Response) => {
       (day as any).sections = sections;
     }
     res.json({ success: true, data: { ...routineRows[0], days } });
-  } catch (e: any) { res.json({ success: false, error: e.message }); }
+  } catch (e: any) { console.error('[fitness]', e?.message); res.json({ success: false, error: 'Something went wrong' }); }
 });
 
 router.post('/routines', auth, async (req: Request, res: Response) => {
@@ -122,7 +122,7 @@ router.post('/routines', auth, async (req: Request, res: Response) => {
     }
     await client.query('COMMIT');
     res.json({ success: true, data: routine });
-  } catch (e: any) { await client.query('ROLLBACK'); res.json({ success: false, error: e.message }); }
+  } catch (e: any) { await client.query('ROLLBACK'); console.error('[fitness]', e?.message); res.json({ success: false, error: 'Something went wrong' }); }
   finally { client.release(); }
 });
 
@@ -130,7 +130,7 @@ router.delete('/routines/:id', auth, async (req: Request, res: Response) => {
   try {
     await pool.query('DELETE FROM fitness_routines WHERE id = $1 AND user_id = $2', [req.params.id, req.user!.userId]);
     res.json({ success: true });
-  } catch (e: any) { res.json({ success: false, error: e.message }); }
+  } catch (e: any) { console.error('[fitness]', e?.message); res.json({ success: false, error: 'Something went wrong' }); }
 });
 
 router.post('/logs', auth, async (req: Request, res: Response) => {
@@ -138,28 +138,28 @@ router.post('/logs', auth, async (req: Request, res: Response) => {
   try {
     const { rows } = await pool.query('INSERT INTO fitness_workout_logs (user_id, day_id, day_title, logged_date) VALUES ($1,$2,$3,$4) RETURNING *', [req.user!.userId, day_id, day_title, logged_date || new Date().toISOString().split('T')[0]]);
     res.json({ success: true, data: rows[0] });
-  } catch (e: any) { res.json({ success: false, error: e.message }); }
+  } catch (e: any) { console.error('[fitness]', e?.message); res.json({ success: false, error: 'Something went wrong' }); }
 });
 
 router.get('/logs/today', auth, async (req: Request, res: Response) => {
   try {
     const { rows } = await pool.query("SELECT * FROM fitness_workout_logs WHERE user_id = $1 AND logged_date = CURRENT_DATE ORDER BY created_at DESC LIMIT 1", [req.user!.userId]);
     res.json({ success: true, data: rows[0] || null });
-  } catch (e: any) { res.json({ success: false, error: e.message }); }
+  } catch (e: any) { console.error('[fitness]', e?.message); res.json({ success: false, error: 'Something went wrong' }); }
 });
 
 router.get('/logs/history', auth, async (req: Request, res: Response) => {
   try {
     const { rows } = await pool.query('SELECT * FROM fitness_workout_logs WHERE user_id = $1 ORDER BY logged_date DESC LIMIT 60', [req.user!.userId]);
     res.json({ success: true, data: rows });
-  } catch (e: any) { res.json({ success: false, error: e.message }); }
+  } catch (e: any) { console.error('[fitness]', e?.message); res.json({ success: false, error: 'Something went wrong' }); }
 });
 
 router.patch('/logs/:id/complete', auth, async (req: Request, res: Response) => {
   try {
     const { rows } = await pool.query('UPDATE fitness_workout_logs SET completed_at = NOW(), duration_minutes = $1 WHERE id = $2 AND user_id = $3 RETURNING *', [req.body.duration_minutes, req.params.id, req.user!.userId]);
     res.json({ success: true, data: rows[0] });
-  } catch (e: any) { res.json({ success: false, error: e.message }); }
+  } catch (e: any) { console.error('[fitness]', e?.message); res.json({ success: false, error: 'Something went wrong' }); }
 });
 
 router.post('/sets', auth, async (req: Request, res: Response) => {
@@ -179,7 +179,7 @@ router.post('/sets', auth, async (req: Request, res: Response) => {
     }
     await client.query('COMMIT');
     res.json({ success: true, data: setLog, total_lbs: totalLbs });
-  } catch (e: any) { await client.query('ROLLBACK'); res.json({ success: false, error: e.message }); }
+  } catch (e: any) { await client.query('ROLLBACK'); console.error('[fitness]', e?.message); res.json({ success: false, error: 'Something went wrong' }); }
   finally { client.release(); }
 });
 
@@ -187,7 +187,7 @@ router.get('/sets/:log_id', auth, async (req: Request, res: Response) => {
   try {
     const { rows } = await pool.query('SELECT * FROM fitness_set_logs WHERE log_id = $1 AND user_id = $2 ORDER BY logged_at', [req.params.log_id, req.user!.userId]);
     res.json({ success: true, data: rows });
-  } catch (e: any) { res.json({ success: false, error: e.message }); }
+  } catch (e: any) { console.error('[fitness]', e?.message); res.json({ success: false, error: 'Something went wrong' }); }
 });
 
 router.get('/stats', auth, async (req: Request, res: Response) => {
@@ -208,28 +208,28 @@ router.get('/stats', auth, async (req: Request, res: Response) => {
       if (date === checkDate) { streak++; const d = new Date(checkDate); d.setDate(d.getDate() - 1); checkDate = d.toISOString().split('T')[0]; } else break;
     }
     res.json({ success: true, data: { total_lbs_lifted: parseFloat(totals.rows[0].total_lbs_lifted), total_reps: parseInt(totals.rows[0].total_reps), total_sets: parseInt(totals.rows[0].total_sets), total_workouts: parseInt(workoutCount.rows[0].count), current_streak: streak, weekly_volume: weeklyVolume.rows, milestones: milestones.rows, body_weight_history: bodyWeight.rows } });
-  } catch (e: any) { res.json({ success: false, error: e.message }); }
+  } catch (e: any) { console.error('[fitness]', e?.message); res.json({ success: false, error: 'Something went wrong' }); }
 });
 
 router.get('/prs', auth, async (req: Request, res: Response) => {
   try {
     const { rows } = await pool.query('SELECT exercise_name, MAX(weight_lbs) as pr_weight, COUNT(*) as total_sets, MAX(logged_at) as last_logged FROM fitness_set_logs WHERE user_id = $1 AND is_counted = TRUE AND weight_lbs > 0 GROUP BY exercise_name ORDER BY exercise_name', [req.user!.userId]);
     res.json({ success: true, data: rows });
-  } catch (e: any) { res.json({ success: false, error: e.message }); }
+  } catch (e: any) { console.error('[fitness]', e?.message); res.json({ success: false, error: 'Something went wrong' }); }
 });
 
 router.get('/prs/:exercise/history', auth, async (req: Request, res: Response) => {
   try {
     const { rows } = await pool.query('SELECT sl.weight_lbs, sl.reps, sl.logged_at, wl.logged_date FROM fitness_set_logs sl JOIN fitness_workout_logs wl ON sl.log_id = wl.id WHERE sl.user_id = $1 AND sl.exercise_name = $2 AND sl.is_counted = TRUE ORDER BY sl.logged_at DESC', [req.user!.userId, decodeURIComponent(req.params.exercise)]);
     res.json({ success: true, data: rows });
-  } catch (e: any) { res.json({ success: false, error: e.message }); }
+  } catch (e: any) { console.error('[fitness]', e?.message); res.json({ success: false, error: 'Something went wrong' }); }
 });
 
 router.get('/progress/:exercise', auth, async (req: Request, res: Response) => {
   try {
     const { rows } = await pool.query("SELECT DATE_TRUNC('day', sl.logged_at) as date, MAX(sl.weight_lbs) as max_weight, SUM(sl.weight_lbs * sl.reps) as volume FROM fitness_set_logs sl WHERE sl.user_id = $1 AND sl.exercise_name = $2 AND sl.is_counted = TRUE GROUP BY DATE_TRUNC('day', sl.logged_at) ORDER BY date", [req.user!.userId, decodeURIComponent(req.params.exercise)]);
     res.json({ success: true, data: rows });
-  } catch (e: any) { res.json({ success: false, error: e.message }); }
+  } catch (e: any) { console.error('[fitness]', e?.message); res.json({ success: false, error: 'Something went wrong' }); }
 });
 
 router.post('/bodyweight', auth, async (req: Request, res: Response) => {
@@ -237,7 +237,7 @@ router.post('/bodyweight', auth, async (req: Request, res: Response) => {
   try {
     const { rows } = await pool.query('INSERT INTO fitness_body_weight_logs (user_id, weight_lbs, logged_date) VALUES ($1,$2,$3) ON CONFLICT (user_id, logged_date) DO UPDATE SET weight_lbs = EXCLUDED.weight_lbs RETURNING *', [req.user!.userId, weight_lbs, logged_date || new Date().toISOString().split('T')[0]]);
     res.json({ success: true, data: rows[0] });
-  } catch (e: any) { res.json({ success: false, error: e.message }); }
+  } catch (e: any) { console.error('[fitness]', e?.message); res.json({ success: false, error: 'Something went wrong' }); }
 });
 
 router.get('/admin/stats', adminAuth, async (req: Request, res: Response) => {
@@ -249,7 +249,7 @@ router.get('/admin/stats', adminAuth, async (req: Request, res: Response) => {
       pool.query('SELECT milestone_type, COUNT(*) as users_achieved FROM fitness_milestones GROUP BY milestone_type ORDER BY milestone_type')
     ]);
     res.json({ success: true, data: { platform: platform.rows[0], top_lifters: topLifters.rows, recent_users: recentUsers.rows, milestone_counts: milestoneCounts.rows } });
-  } catch (e: any) { res.json({ success: false, error: e.message }); }
+  } catch (e: any) { console.error('[fitness]', e?.message); res.json({ success: false, error: 'Something went wrong' }); }
 });
 
 // Platform-wide leaderboard — visible to ANY authenticated user (not admin-
@@ -290,7 +290,7 @@ router.get('/leaderboard', auth, async (req: Request, res: Response) => {
     const top = rows.map((r: any) => ({ ...r, total_lbs: parseFloat(r.total_lbs), total_reps: parseInt(r.total_reps), total_workouts: parseInt(r.total_workouts), rank: parseInt(r.rank) }));
     const me = top.find((r: any) => r.is_me) || null;
     res.json({ success: true, data: { top, me, total_lifters: top.length } });
-  } catch (e: any) { res.json({ success: false, error: e.message }); }
+  } catch (e: any) { console.error('[fitness]', e?.message); res.json({ success: false, error: 'Something went wrong' }); }
 });
 
 export { router as fitnessRouter };

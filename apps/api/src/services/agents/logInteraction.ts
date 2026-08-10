@@ -59,6 +59,16 @@ export async function resolveInteractionProperty(
       ? { propertyId: rows[0].property_id, landlordId: rows[0].landlord_id }
       : { propertyId: null, landlordId: null }
   }
+  if (actor.role === 'visitor') {
+    // Property visitor (pre-booking): attribute to the property they're browsing
+    // and its landlord. The property id is the visitor actor's scope.
+    if (!actor.propertyId) return { propertyId: null, landlordId: null }
+    const rows = await query<{ landlord_id: string }>(
+      `SELECT landlord_id FROM properties WHERE id = $1`,
+      [actor.propertyId]
+    )
+    return { propertyId: actor.propertyId, landlordId: rows[0]?.landlord_id ?? null }
+  }
   if (actor.role !== 'tenant') {
     return { propertyId: null, landlordId: null }
   }
@@ -153,9 +163,9 @@ export async function logInteraction(
         outcome,
         propertyId,
         landlordId,
-        // Prospects and booking guests are anonymous (no GAM user) — the
-        // actor_user_id FK must be NULL for them.
-        input.audience === 'prospect' || input.audience === 'guest' ? null : actor.userId,
+        // Prospects, booking guests, and property visitors are anonymous (no
+        // GAM user) — the actor_user_id FK must be NULL for them.
+        input.audience === 'prospect' || input.audience === 'guest' || input.audience === 'visitor' ? null : actor.userId,
         actor.role,
         actor.profileId,
         result.escalations.length,

@@ -75,6 +75,8 @@ propertyBookingAdminRouter.get('/properties/:id/booking-config', requireAuth, as
         slug: prop.booking_slug,
         suggestedSlug: prop.booking_slug ?? await suggestBookingSlug(prop),
         intro: prop.booking_intro,
+        about: prop.booking_about,
+        area: prop.booking_area,
         depositPct: Number(prop.booking_deposit_pct),
         monthlyDeposit: prop.booking_monthly_deposit != null ? Number(prop.booking_monthly_deposit) : null,
         utilitiesBilled: prop.booking_utilities_billed,
@@ -99,6 +101,9 @@ propertyBookingAdminRouter.patch('/properties/:id/booking-config', requireAuth, 
       enabled:    z.boolean().optional(),
       slug:       z.string().nullable().optional(),
       intro:      z.string().nullable().optional(),
+      // S602 personalization sections — the landlord's story + local-area guide.
+      about:      z.string().max(8000).nullable().optional(),
+      area:       z.string().max(8000).nullable().optional(),
       depositPct: z.number().min(0).max(100).optional(),
       // Flat deposit for 30+ night stays (null = platform default). The quote
       // layer additionally hard-caps it at one month's rent per site type.
@@ -152,6 +157,8 @@ propertyBookingAdminRouter.patch('/properties/:id/booking-config', requireAuth, 
               office_phone = CASE WHEN $16::boolean THEN $17 ELSE office_phone END,
               office_email = CASE WHEN $18::boolean THEN $19 ELSE office_email END,
               office_hours = CASE WHEN $20::boolean THEN $21 ELSE office_hours END,
+              booking_about = CASE WHEN $22::boolean THEN $23 ELSE booking_about END,
+              booking_area  = CASE WHEN $24::boolean THEN $25 ELSE booking_area END,
               updated_at=now()
         WHERE id=$5 RETURNING *`,
       [enabled, slug,
@@ -166,7 +173,9 @@ propertyBookingAdminRouter.patch('/properties/:id/booking-config', requireAuth, 
        body.utilitiesBilled === undefined ? null : body.utilitiesBilled,
        body.officePhone !== undefined, body.officePhone ?? null,
        body.officeEmail !== undefined, body.officeEmail ?? null,
-       body.officeHours !== undefined, body.officeHours ?? null])
+       body.officeHours !== undefined, body.officeHours ?? null,
+       body.about !== undefined, body.about ?? null,
+       body.area  !== undefined, body.area  ?? null])
 
     res.json({
       success: true,
@@ -174,6 +183,8 @@ propertyBookingAdminRouter.patch('/properties/:id/booking-config', requireAuth, 
         enabled: updated.public_booking_enabled,
         slug: updated.booking_slug,
         intro: updated.booking_intro,
+        about: updated.booking_about,
+        area: updated.booking_area,
         depositPct: Number(updated.booking_deposit_pct),
         monthlyDeposit: updated.booking_monthly_deposit != null ? Number(updated.booking_monthly_deposit) : null,
         utilitiesBilled: updated.booking_utilities_billed,
