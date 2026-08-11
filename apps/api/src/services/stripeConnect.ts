@@ -280,7 +280,8 @@ export function computeApplicationFee(opts: {
   cardCountry?: string | null  // Stripe payment_method.card.country
 }): number {
   if (opts.paymentMethod === 'ach') {
-    return Math.min(opts.amount * PROCESSING_FEES.ACH_PCT, PROCESSING_FEES.ACH_CAP)
+    // S601: flat $6 bank fee at any rent (ACH_PCT=0, ACH_FLAT=$6, cap $6).
+    return Math.round((Math.min(opts.amount * PROCESSING_FEES.ACH_PCT + PROCESSING_FEES.ACH_FLAT, PROCESSING_FEES.ACH_CAP)) * 100) / 100
   }
   let pct: number = PROCESSING_FEES.CARD_PCT
   if (opts.cardCountry && opts.cardCountry !== 'US') {

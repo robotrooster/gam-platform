@@ -258,17 +258,21 @@ describe('fetchAccountStatus', () => {
 
 // ─── computeApplicationFee ───────────────────────────────────
 
-describe('computeApplicationFee — ACH', () => {
-  it('ACH 1% on small amounts ($100 → $1)', () => {
-    expect(computeApplicationFee({ amount: 100, paymentMethod: 'ach' })).toBe(1)
+describe('computeApplicationFee — ACH (S601: flat $6 at any rent)', () => {
+  it('$100 → $6', () => {
+    expect(computeApplicationFee({ amount: 100, paymentMethod: 'ach' })).toBe(6)
   })
 
-  it('ACH cap at $6 ($1000 → $6, not $10)', () => {
-    expect(computeApplicationFee({ amount: 1000, paymentMethod: 'ach' })).toBe(6)
+  it('$200 → $6', () => {
+    expect(computeApplicationFee({ amount: 200, paymentMethod: 'ach' })).toBe(6)
   })
 
-  it('ACH at exact cap boundary ($600 → $6)', () => {
+  it('$600 → $6', () => {
     expect(computeApplicationFee({ amount: 600, paymentMethod: 'ach' })).toBe(6)
+  })
+
+  it('$2000 → $6 (flat, no cap surprise)', () => {
+    expect(computeApplicationFee({ amount: 2000, paymentMethod: 'ach' })).toBe(6)
   })
 })
 

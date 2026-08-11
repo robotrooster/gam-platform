@@ -12,7 +12,7 @@ GAM's pricing is straightforward and built so you only pay for what you're actua
 - **Optional programs** like **FlexVault** — GAM holding your tenant deposits in custody for you — change what a tailored quote looks like.
 - **State-specific requirements** your properties are subject to can affect the picture too.
 
-**Tenant payment processing.** When tenants pay electronically: bank (ACH) payments run **1% capped at $6**, cards run **3.25% + $0.26 per transaction**. Card fees are always covered by the tenant; for ACH, a per-property setting lets you decide whether the tenant covers it or you do. GAM never absorbs costs in a way that's hidden from you — you always see the breakdown.
+**Tenant payment processing.** When tenants pay electronically: bank (ACH) payments are a **flat $6 per payment**, cards run **3.25% + $0.26 per transaction**. Card fees are always covered by the tenant; for ACH, a per-property setting lets you decide whether the tenant covers it or you do. GAM never absorbs costs in a way that's hidden from you — you always see the breakdown.
 
 **Getting paid.** Payouts to your bank run through Stripe, and the small per-account cost Stripe charges is absorbed into the platform fee — no separate line item.
 

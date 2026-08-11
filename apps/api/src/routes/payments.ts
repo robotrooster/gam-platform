@@ -18,6 +18,41 @@ import { logger } from '../lib/logger'
 export const paymentsRouter = Router()
 paymentsRouter.use(requireAuth)
 
+// POST /api/payments/quote — pre-charge fee disclosure (S601, Nic). Given the rent
+// amount + method + lease, returns EXACTLY what the tenant will be charged: base rent
+// plus the processing fee when the property routes the fee to the tenant (card is
+// ALWAYS tenant-paid; ACH depends on the property's ach_fee_payer). Mirrors the charge
+// math in POST /:id/pay so the pay UI shows the real total BEFORE the tenant confirms —
+// no tenant should be blindsided by a card surcharge they never saw.
+paymentsRouter.post('/quote', async (req, res, next) => {
+  try {
+    const body = z.object({
+      amount:  z.number().positive(),
+      method:  z.enum(['ach', 'card']),
+      leaseId: z.string().uuid().optional(),
+    }).parse(req.body)
+
+    let feePayer: string = 'tenant'   // default when no rule (mirrors /pay: null → tenant pays)
+    if (body.leaseId) {
+      const row = await queryOne<{ ach_fee_payer: string | null; card_fee_payer: string | null }>(
+        `SELECT r.ach_fee_payer, r.card_fee_payer
+           FROM leases l
+           JOIN units u ON u.id = l.unit_id
+           JOIN property_allocation_rules r ON r.property_id = u.property_id
+          WHERE l.id = $1`, [body.leaseId])
+      feePayer = (body.method === 'ach' ? row?.ach_fee_payer : row?.card_fee_payer) ?? 'tenant'
+    }
+    const tenantPaysFee = feePayer !== 'landlord'
+    // cardCountry omitted → US base rate; a non-US card adds 1.5% at charge time (flagged in the UI).
+    const fee = tenantPaysFee ? computeApplicationFee({ amount: body.amount, paymentMethod: body.method }) : 0
+    const total = Math.round((body.amount + fee) * 100) / 100
+    res.json({ success: true, data: {
+      base: body.amount, method: body.method, fee, tenantPaysFee, total,
+      intlCardSurcharge: body.method === 'card',
+    } })
+  } catch (e) { next(e) }
+})
+
 // GET /api/payments — filtered by landlord or tenant
 paymentsRouter.get('/', async (req, res, next) => {
   try {

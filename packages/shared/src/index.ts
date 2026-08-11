@@ -3592,12 +3592,16 @@ export const STRIPE_CONFIG = {
 //         IC+ contract (interchange + 0.7% + $0.26) exactly — S552 (Nic),
 //         raised from the earlier $0.10 so no transaction size loses on
 //         the fixed component.
-//   ACH:  1.0% capped at $6.00
+//   ACH:  flat $6.00 (S601, Nic). One flat bank fee at any rent — simple to state
+//         honestly ("$6 flat"), no percentage. GAM nets $3–$6 after Stripe's cost
+//         (0.5% capped $3): $3 at the top, more on lower rent. Tiny payments rarely
+//         go ACH (a card is cheaper at that size), so the flat fee doesn't sting there.
 export const PROCESSING_FEES = {
   CARD_PCT:      0.0325,
   CARD_FLAT:     0.26,
   CARD_INTL_PCT: 0.015,
-  ACH_PCT:       0.01,
+  ACH_PCT:       0,
+  ACH_FLAT:      6.00,
   ACH_CAP:       6.00,
 } as const
 

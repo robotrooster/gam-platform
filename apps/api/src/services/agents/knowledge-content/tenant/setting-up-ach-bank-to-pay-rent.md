@@ -2,7 +2,7 @@
 scope: tenant
 title: Setting up bank (ACH) payments to pay your rent
 ---
-Paying rent straight from your bank account (ACH) is the lowest-cost way to pay in GAM — the fee is 1% of the payment, capped at $6.00, so even on a large rent payment it never goes above six dollars. Paying by card works too, but it costs more (3.25% plus $0.26 per transaction). So if you can, connecting a bank account is the way to go.
+Paying rent straight from your bank account (ACH) is the lowest-cost way to pay in GAM — the fee is a flat $6.00 per payment, no matter the amount — so on any decent-sized rent it never costs more than six dollars. Paying by card works too, but it costs more (3.25% plus $0.26 per transaction). So if you can, connecting a bank account is the way to go.
 
 You set this up in the **Payments** section of your portal. To add a bank account, you connect it instantly: sign in to your bank through a secure connection and pick the account. There are no micro-deposits and no waiting — it verifies right away, so you can pay by bank immediately.
 

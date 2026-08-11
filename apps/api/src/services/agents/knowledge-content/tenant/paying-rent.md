@@ -13,11 +13,11 @@ You can pay two ways:
 
 A processing fee may apply depending on how you pay:
 
-- **ACH (bank account):** 1.0% of the payment, capped at $6.00.
+- **ACH (bank account):** a flat $6.00 per payment, whatever the amount.
 - **Card:** 3.25% of the payment plus $0.26 per transaction.
 - **Non-US-issued cards:** an additional 1.5%.
 
-Because ACH is capped at $6.00, paying from a bank account is usually the lowest-cost option for larger payments.
+Because ACH is a flat $6.00, paying from a bank account is usually the lowest-cost way to pay larger amounts; for a small payment, a card can be cheaper.
 
 ## Who pays the fee
 

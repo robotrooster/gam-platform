@@ -16,11 +16,11 @@
  *   - Types: SavedPaymentMethod / SavedAch / SavedCard / PayTarget
  *
  * Backend pricing math lives in services/stripeConnect.computeApplicationFee
- * (S113/S552: 1.0% capped $6 ACH; 3.25% + $0.26/txn card, +1.5% non-US-issued).
+ * (S113/S552: flat $6 ACH; 3.25% + $0.26/txn card, +1.5% non-US-issued).
  * Frontend never computes the fee — it's shown in the authorization line
  * as customer-facing copy only.
  */
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import { loadStripe, Stripe as StripeJs } from '@stripe/stripe-js'
 import { Elements, PaymentElement, useStripe, useElements } from '@stripe/react-stripe-js'
@@ -197,6 +197,22 @@ export function PayNowModal({
   const selectedType   = selectedMethod?.type ?? null
   const selectedPending = selectedMethod ? isPending(selectedMethod) : false
   const hasPendingBank = achMethods.some(isPending)
+
+  // S601 (Nic): pre-charge fee disclosure. Fetch the EXACT total for the selected
+  // method so the tenant sees "$rent + $fee = $total" before paying — never blindside
+  // them with a card surcharge. Single payment only; "Pay all" batches keep the header
+  // total. Re-fetches when the method flips (card vs bank change the fee).
+  const [quote, setQuote] = useState<
+    { base: number; fee: number; total: number; method: 'ach' | 'card'; tenantPaysFee: boolean; intlCardSurcharge: boolean } | null
+  >(null)
+  useEffect(() => {
+    if ((target.batch && target.batch.length > 0) || !selectedType) { setQuote(null); return }
+    let cancelled = false
+    apiPost<any>('/payments/quote', { amount: target.amount, method: selectedType, leaseId: target.leaseId })
+      .then((res: any) => { if (!cancelled) setQuote(res?.data ?? null) })
+      .catch(() => { if (!cancelled) setQuote(null) })
+    return () => { cancelled = true }
+  }, [selectedType, target.amount, target.leaseId])
 
   const submit = async () => {
     if (!selectedMethod) {
@@ -384,6 +400,11 @@ export function PayNowModal({
             </button>
           )}
 
+          {/* S601 (Nic): flat-$6 bank fee note + card-costs-more, their choice. */}
+          <div style={{ fontSize: '.75rem', color: 'var(--t3)', lineHeight: 1.5, margin: '2px 0 12px' }}>
+            Paying by <strong style={{ color: 'var(--t2)' }}>bank transfer is a flat $6 fee</strong>. You're welcome to pay by card instead, but card fees are usually higher — completely your call.
+          </div>
+
           {error && (
             <div className="alert a-warn" style={{ marginBottom: 12, fontSize: '.78rem' }}>
               {error}
@@ -413,6 +434,28 @@ export function PayNowModal({
             </div>
           )}
 
+          {quote && !success && (
+            <div style={{ border: '1px solid var(--b1)', borderRadius: 8, padding: '10px 12px', marginBottom: 10, fontSize: '.82rem' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', color: 'var(--t2)' }}>
+                <span>{target.kind === 'utility' ? 'Utility bill' : 'Rent'}</span>
+                <span>{formatCurrency(quote.base)}</span>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', color: 'var(--t2)', marginTop: 4 }}>
+                <span>{quote.method === 'card' ? 'Card processing fee' : 'Bank (ACH) fee'}{quote.fee === 0 ? ' — covered by your landlord' : ''}</span>
+                <span>{formatCurrency(quote.fee)}</span>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontWeight: 700, color: 'var(--t0)', marginTop: 6, paddingTop: 6, borderTop: '1px solid var(--b1)' }}>
+                <span>You&apos;ll be charged</span>
+                <span>{formatCurrency(quote.total)}</span>
+              </div>
+              {quote.method === 'card' && quote.fee > 0 && (
+                <div style={{ fontSize: '.72rem', color: 'var(--t3)', marginTop: 6, lineHeight: 1.4 }}>
+                  This covers card processing — GAM doesn&apos;t profit from it. Pay by bank to lower the fee.{quote.intlCardSurcharge ? ' Cards issued outside the US add 1.5%.' : ''}
+                </div>
+              )}
+            </div>
+          )}
+
           <button
             className="btn btn-p"
             style={{ width: '100%' }}
@@ -423,7 +466,7 @@ export function PayNowModal({
               ? 'Submitting…'
               : success
                 ? '✓ Submitted'
-                : `Pay ${formatCurrency(target.amount)}`}
+                : `Pay ${formatCurrency(quote?.total ?? target.amount)}`}
           </button>
           <div style={{ fontSize: '.7rem', color: 'var(--t3)', marginTop: 10, lineHeight: 1.5 }}>
             {authorizationCopy(selectedType, target.kind)}
@@ -440,7 +483,7 @@ function authorizationCopy(
 ): string {
   const subject = kind === 'utility' ? 'utility bill' : 'payment'
   if (selectedType === 'card') {
-    return `By clicking Pay you authorize a one-time charge to the selected card for the ${subject} above. Card payments include a 3.25% + $0.26 processing fee (plus 1.5% for non-US-issued cards) which may be passed through depending on your landlord's settings.`
+    return `By clicking Pay you authorize a one-time charge to the selected card for the total shown above (${subject} + card processing fee).`
   }
   return `By clicking Pay you authorize a one-time ACH debit from the selected account for the ${subject} above. ACH typically settles in 3–5 business days.`
 }
